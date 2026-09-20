@@ -9,13 +9,16 @@
   "trust_level": "trusted",
   "kind": "operator.command",
   "actor_id": "operator:local",
-  "priority_hint": 1.0,
+  "priority_hint": 1,
   "authorization": {
     "principal": "operator:local",
     "method": "operator_hotkey",
-    "capabilities": ["performer.stop"]
+    "capabilities": [
+      "performer.stop"
+    ]
   },
   "payload": {
     "action": "stop"
-  }
+  },
+  "source_class": "operator"
 }
