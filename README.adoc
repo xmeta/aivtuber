@@ -31,3 +31,31 @@ The core design separates three time scales:
 == Status
 
 Early design / bootstrap. The first implementation target is a deterministic, replayable performer core before external AI integrations.
+
+
+== Development
+
+The repository pins Rust 1.98.1.
+
+Run the Rust checks locally:
+
+[source,shell]
+----
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo build --workspace
+----
+
+Validate Performance Asset examples with `check-jsonschema 0.38.0`:
+
+[source,shell]
+----
+python -m pip install check-jsonschema==0.38.0
+check-jsonschema --schemafile schemas/performance-asset.schema.json examples/performance-assets/valid/*.json
+
+# This command is expected to fail because these are negative fixtures.
+check-jsonschema --schemafile schemas/performance-asset.schema.json examples/performance-assets/invalid/*.json
+----
+
+CI performs both the positive validation and the expected rejection of invalid fixtures.
