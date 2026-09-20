@@ -1,0 +1,214 @@
+= Jev Reflex Routing Contract
+:toc:
+
+== 1. Role
+
+Jev is used as the default *Reflex Brain*: a low-latency structured decision engine between deterministic rules and the generative LLM.
+
+The domain layer depends on a generic `DecisionEngine` interface. Jev-specific request/response types remain inside the adapter.
+
+== 2. What Jev decides
+
+A single reflex evaluation should batch independent atomic judgments when possible.
+
+Recommended decisions:
+
+[cols="1,1,2"]
+|===
+|Decision |Type |Meaning
+
+|response_route
+|choice
+|`silent | reaction | cached | template | llm`
+
+|reaction
+|choice
+|Semantic reaction family, not raw animation parameters
+
+|gesture
+|choice
+|Gesture family or `none`
+
+|attention_target
+|choice
+|`camera | chat | game | speaker | away`
+
+|interrupt
+|boolean probability
+|Whether current performance should be interrupted
+
+|cache_reuse
+|boolean probability
+|Whether the retrieved candidate is sufficiently appropriate
+
+|importance
+|ordinal score
+|Working-memory/event priority
+
+|emotion_intensity
+|ordinal score
+|Strength of expression
+|===
+
+The Jev adapter may map these concepts to Jev primitives such as Choice, Score, and Noul. The core does not depend on primitive names.
+
+== 3. Compact state
+
+Do not send the entire transcript for each reflex call.
+
+Example:
+
+[source,json]
+----
+{
+  "event": {
+    "type": "chat_message",
+    "text": "昨日もまた負けてたよねｗ",
+    "actor_class": "regular_viewer"
+  },
+  "stream": {
+    "mode": "competitive_game",
+    "topic": "ranked_match"
+  },
+  "performer": {
+    "mood_valence": 0.62,
+    "arousal": 0.71,
+    "currently_speaking": true,
+    "current_interruptible": false
+  },
+  "recent": {
+    "reaction_families": ["laugh", "nod"],
+    "seconds_since_last_direct_reply": 4.2
+  },
+  "retrieval": {
+    "candidate_count": 6,
+    "best_similarity": 0.91
+  }
+}
+----
+
+== 4. Decision output
+
+Normalize every backend into the following conceptual result:
+
+[source,json]
+----
+{
+  "route": {
+    "value": "cached",
+    "confidence": 0.91
+  },
+  "reaction": {
+    "value": "embarrassed_laugh",
+    "confidence": 0.78
+  },
+  "gesture": {
+    "value": "head_shake_small",
+    "confidence": 0.66
+  },
+  "attention": {
+    "value": "camera",
+    "confidence": 0.88
+  },
+  "interrupt_probability": 0.08,
+  "cache_reuse_probability": 0.94,
+  "importance": 0.37,
+  "emotion_intensity": 0.64
+}
+----
+
+== 5. Policy remains deterministic
+
+Jev returns evidence for decisions. Final execution policy lives in code.
+
+Example:
+
+[source,text]
+----
+if operator_override:
+    obey_operator()
+else if interrupt_probability >= 0.95 and scheduler.safe_interrupt_point:
+    interrupt()
+else if interrupt_probability >= 0.70:
+    interrupt_at_next_phrase_boundary()
+else:
+    keep_current_performance()
+----
+
+Do not put irreversible policy solely inside a probabilistic model.
+
+== 6. Route policy
+
+Initial thresholds are hypotheses and MUST be calibrated using recorded sessions.
+
+[source,text]
+----
+exact cache hit            -> cached
+semantic candidate + reuse probability >= T_reuse
+                           -> cached
+route = template           -> template
+route = llm                -> llm
+low confidence             -> deterministic fallback
+timeout                    -> deterministic fallback
+----
+
+== 7. Candidate selection
+
+Do not expose a very large asset library as one flat decision.
+
+[source,text]
+----
+semantic embedding / metadata filter
+              |
+            Top-K
+              |
+              v
+         Jev reranker
+              |
+          final asset
+----
+
+The retrieval layer finds plausible candidates; Jev decides contextual suitability.
+
+== 8. Timeout budget
+
+The ReflexDirector must have a strict deadline. A timeout is a normal control-flow event, not a fatal error.
+
+Record:
+
+* decision latency
+* timeout count
+* fallback route
+* chosen route
+* confidence
+* downstream outcome
+
+== 9. Calibration dataset
+
+Store replayable decision records with privacy controls:
+
+[source,text]
+----
+event_snapshot
+state_snapshot
+candidate_ids
+jev_output
+executed_action
+operator_override
+human_quality_label (optional)
+latencies
+cost
+----
+
+These records support threshold calibration and future replacement/comparison of Jev with local models.
+
+== 10. Anti-patterns
+
+Do not:
+
+* call Jev at 30-60 Hz;
+* ask it to output raw Live2D parameter values per frame;
+* use one opaque "overall quality" score where atomic decisions can be measured;
+* route every chat message into an LLM after Jev;
+* treat probability as certainty;
+* make the system unusable when Jev is unavailable.
