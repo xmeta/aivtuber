@@ -150,6 +150,14 @@ mod tests {
     }
 
     #[test]
+    fn repository_reflex_fixture_matches_domain_contract() {
+        let json = include_str!("../../../examples/reflex-decisions/cached-reaction.json");
+        let decision: ReflexDecision =
+            serde_json::from_str(json).expect("deserialize reflex fixture");
+        decision.validate().expect("reflex fixture must remain valid");
+    }
+
+    #[test]
     fn invalid_probability_is_rejected() {
         let mut decision = valid_decision();
         decision.cache_reuse_probability = 1.01;
