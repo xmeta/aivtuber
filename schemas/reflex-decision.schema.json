@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xmeta/aivtuber/schemas/reflex-decision.schema.json",
+  "title": "AI VTuber Normalized Reflex Decision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "route",
+    "reaction_family",
+    "gesture_family",
+    "attention_target",
+    "interrupt_probability",
+    "cache_reuse_probability",
+    "importance",
+    "emotion_intensity",
+    "backend",
+    "latency_ms",
+    "fallback_reason"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "0.1.0"
+    },
+    "route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value"],
+      "properties": {
+        "value": {
+          "type": "string",
+          "enum": ["silent", "reaction", "cached", "template", "llm"]
+        },
+        "confidence": {
+          "type": ["number", "null"],
+          "minimum": 0.0,
+          "maximum": 1.0
+        }
+      }
+    },
+    "reaction_family": {
+      "type": ["string", "null"]
+    },
+    "gesture_family": {
+      "type": ["string", "null"]
+    },
+    "attention_target": {
+      "type": "string",
+      "enum": ["camera", "chat", "game", "speaker", "away"]
+    },
+    "interrupt_probability": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0
+    },
+    "cache_reuse_probability": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0
+    },
+    "importance": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0
+    },
+    "emotion_intensity": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0
+    },
+    "backend": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "model_alias": {"type": ["string", "null"]},
+        "model_version": {"type": ["string", "null"]}
+      }
+    },
+    "latency_ms": {
+      "type": "number",
+      "minimum": 0.0
+    },
+    "fallback_reason": {
+      "type": "string",
+      "enum": [
+        "none",
+        "timeout",
+        "unavailable",
+        "rate_limited",
+        "overloaded",
+        "authentication",
+        "invalid_request",
+        "low_confidence",
+        "policy_override",
+        "operator_override"
+      ]
+    }
+  }
+}
