@@ -1,0 +1,21 @@
+{
+  "schema_version": "0.2.0",
+  "event_id": "evt-op-000001",
+  "correlation_id": "corr-op-000001",
+  "sequence": 2,
+  "observed_at": "2026-09-20T10:00:01Z",
+  "source": "local-operator-hotkey",
+  "plane": "control",
+  "trust_level": "trusted",
+  "kind": "operator.command",
+  "actor_id": "operator:local",
+  "priority_hint": 1.0,
+  "authorization": {
+    "principal": "operator:local",
+    "method": "operator_hotkey",
+    "capabilities": ["performer.stop"]
+  },
+  "payload": {
+    "action": "stop"
+  }
+}
