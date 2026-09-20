@@ -216,3 +216,16 @@ Security regression tests must cover at least:
 * memory poisoning attempts;
 * oversized/repeated chat events;
 * emergency stop while Jev/LLM/TTS are unavailable.
+
+
+== 14. Machine-readable regression suite
+
+The baseline regression fixtures are:
+
+* `examples/security/prompt-injection-chat.json`
+* `examples/security/memory-poisoning-chat.json`
+* `examples/security/emergency-stop-offline.json`
+
+They conform to `schemas/security-regression-case.schema.json`.
+
+The runtime implementation should load these fixtures and assert the expected authorization, memory-write, and model-dependency outcomes.
