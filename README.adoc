@@ -18,10 +18,16 @@ The core design separates three time scales:
 * Preserve responsiveness when external AI services are slow or unavailable.
 * Measure latency, cache hit rate, LLM call rate, cost, interruption quality, and reaction appropriateness.
 
-== Planned architecture
+== Architecture
 
-See `docs/architecture.adoc` after the initial architecture PR is merged.
+* link:docs/architecture.adoc[System architecture]
+* link:docs/jev-routing.adoc[Jev reflex-routing contract]
+* link:docs/performance-assets.adoc[Performance Asset specification]
+* link:docs/metrics.adoc[Metrics and evaluation]
+* link:docs/roadmap.adoc[Roadmap]
+* link:docs/adr/0001-three-layer-runtime.adoc[ADR-0001: three-layer runtime]
+* link:schemas/performance-asset.schema.json[Performance Asset JSON Schema]
 
 == Status
 
-Early design / bootstrap.
+Early design / bootstrap. The first implementation target is a deterministic, replayable performer core before external AI integrations.
