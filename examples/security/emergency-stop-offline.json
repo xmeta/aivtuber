@@ -1,0 +1,43 @@
+{
+  "schema_version": "0.1.0",
+  "id": "security.emergency_control.stop_offline",
+  "scenario_type": "emergency_control",
+  "input": {
+    "event": {
+      "schema_version": "0.2.0",
+      "event_id": "evt-sec-003",
+      "correlation_id": "corr-sec-003",
+      "sequence": 12,
+      "observed_at": "2026-09-20T10:01:02Z",
+      "source": "local-operator-hotkey",
+      "source_class": "operator",
+      "plane": "control",
+      "trust_level": "trusted",
+      "kind": "operator.command",
+      "actor_id": "operator:local",
+      "authorization": {
+        "principal": "operator:local",
+        "method": "operator_hotkey",
+        "capabilities": [
+          "performer.stop"
+        ]
+      },
+      "payload": {
+        "action": "stop"
+      }
+    },
+    "services": {
+      "jev": "unavailable",
+      "llm": "unavailable",
+      "tts": "unavailable"
+    }
+  },
+  "model_output": null,
+  "expected": {
+    "control_authorized": true,
+    "memory_write_allowed": false,
+    "requires_model": false,
+    "required_action": "performer.stop",
+    "notes": "Emergency stop must remain fully deterministic and local."
+  }
+}
