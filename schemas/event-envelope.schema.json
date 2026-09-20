@@ -11,6 +11,7 @@
     "sequence",
     "observed_at",
     "source",
+    "source_class",
     "plane",
     "trust_level",
     "kind",
@@ -41,13 +42,34 @@
       "type": "string",
       "minLength": 1
     },
+    "source_class": {
+      "type": "string",
+      "enum": [
+        "public_chat",
+        "donation",
+        "speech",
+        "game",
+        "stream",
+        "timer",
+        "operator",
+        "system"
+      ]
+    },
     "plane": {
       "type": "string",
-      "enum": ["content", "control", "system"]
+      "enum": [
+        "content",
+        "control",
+        "system"
+      ]
     },
     "trust_level": {
       "type": "string",
-      "enum": ["untrusted", "semi_trusted", "trusted"]
+      "enum": [
+        "untrusted",
+        "semi_trusted",
+        "trusted"
+      ]
     },
     "kind": {
       "type": "string",
@@ -63,17 +85,27 @@
       ]
     },
     "actor_id": {
-      "type": ["string", "null"]
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "priority_hint": {
-      "type": ["number", "null"],
-      "minimum": 0.0,
-      "maximum": 1.0
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0,
+      "maximum": 1
     },
     "authorization": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["principal", "method", "capabilities"],
+      "required": [
+        "principal",
+        "method",
+        "capabilities"
+      ],
       "properties": {
         "principal": {
           "type": "string",
@@ -81,7 +113,11 @@
         },
         "method": {
           "type": "string",
-          "enum": ["operator_ui", "operator_hotkey", "signed_local_api"]
+          "enum": [
+            "operator_ui",
+            "operator_hotkey",
+            "signed_local_api"
+          ]
         },
         "capabilities": {
           "type": "array",
@@ -110,70 +146,250 @@
       "if": {
         "properties": {
           "kind": {
-            "enum": ["chat.message", "chat.donation", "speech.input", "game.event"]
+            "const": "chat.message"
           }
         },
-        "required": ["kind"]
+        "required": [
+          "kind"
+        ]
       },
       "then": {
         "properties": {
-          "plane": {"const": "content"},
-          "trust_level": {"enum": ["untrusted", "semi_trusted"]}
+          "source_class": {
+            "const": "public_chat"
+          },
+          "plane": {
+            "const": "content"
+          },
+          "trust_level": {
+            "enum": [
+              "untrusted",
+              "semi_trusted"
+            ]
+          }
         },
         "not": {
-          "required": ["authorization"]
+          "required": [
+            "authorization"
+          ]
         }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "kind": {"const": "operator.command"}
-        },
-        "required": ["kind"]
-      },
-      "then": {
-        "properties": {
-          "plane": {"const": "control"},
-          "trust_level": {"const": "trusted"}
-        },
-        "required": ["authorization"]
       }
     },
     {
       "if": {
         "properties": {
           "kind": {
-            "enum": ["timer.tick", "system.health"]
+            "const": "chat.donation"
           }
         },
-        "required": ["kind"]
+        "required": [
+          "kind"
+        ]
       },
       "then": {
         "properties": {
-          "plane": {"const": "system"},
-          "trust_level": {"const": "trusted"}
+          "source_class": {
+            "const": "donation"
+          },
+          "plane": {
+            "const": "content"
+          },
+          "trust_level": {
+            "enum": [
+              "untrusted",
+              "semi_trusted"
+            ]
+          }
         },
         "not": {
-          "required": ["authorization"]
+          "required": [
+            "authorization"
+          ]
         }
       }
     },
     {
       "if": {
         "properties": {
-          "kind": {"const": "stream.event"}
+          "kind": {
+            "const": "speech.input"
+          }
         },
-        "required": ["kind"]
+        "required": [
+          "kind"
+        ]
       },
       "then": {
         "properties": {
-          "plane": {"const": "system"},
-          "trust_level": {"enum": ["semi_trusted", "trusted"]}
+          "source_class": {
+            "const": "speech"
+          },
+          "plane": {
+            "const": "content"
+          },
+          "trust_level": {
+            "enum": [
+              "untrusted",
+              "semi_trusted"
+            ]
+          }
         },
         "not": {
-          "required": ["authorization"]
+          "required": [
+            "authorization"
+          ]
         }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "game.event"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "properties": {
+          "source_class": {
+            "const": "game"
+          },
+          "plane": {
+            "const": "content"
+          },
+          "trust_level": {
+            "const": "semi_trusted"
+          }
+        },
+        "not": {
+          "required": [
+            "authorization"
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "stream.event"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "properties": {
+          "source_class": {
+            "const": "stream"
+          },
+          "plane": {
+            "const": "system"
+          },
+          "trust_level": {
+            "enum": [
+              "semi_trusted",
+              "trusted"
+            ]
+          }
+        },
+        "not": {
+          "required": [
+            "authorization"
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "timer.tick"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "properties": {
+          "source_class": {
+            "const": "timer"
+          },
+          "plane": {
+            "const": "system"
+          },
+          "trust_level": {
+            "const": "trusted"
+          }
+        },
+        "not": {
+          "required": [
+            "authorization"
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "system.health"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "properties": {
+          "source_class": {
+            "const": "system"
+          },
+          "plane": {
+            "const": "system"
+          },
+          "trust_level": {
+            "const": "trusted"
+          }
+        },
+        "not": {
+          "required": [
+            "authorization"
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "operator.command"
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      },
+      "then": {
+        "properties": {
+          "source_class": {
+            "const": "operator"
+          },
+          "plane": {
+            "const": "control"
+          },
+          "trust_level": {
+            "const": "trusted"
+          }
+        },
+        "required": [
+          "authorization"
+        ]
       }
     }
   ]
