@@ -22,6 +22,7 @@ The core design separates three time scales:
 
 * link:docs/architecture.adoc[System architecture]
 * link:docs/domain-contract.adoc[Provider-neutral domain contract]
+* link:docs/security-threat-model.adoc[Security threat model and trust boundaries]
 * link:docs/jev-routing.adoc[Jev reflex-routing contract]
 * link:docs/performance-assets.adoc[Performance Asset specification]
 * link:docs/metrics.adoc[Metrics and evaluation]
@@ -30,6 +31,7 @@ The core design separates three time scales:
 * link:schemas/performance-asset.schema.json[Performance Asset JSON Schema]
 * link:schemas/event-envelope.schema.json[Event Envelope JSON Schema]
 * link:schemas/reflex-decision.schema.json[Reflex Decision JSON Schema]
+* link:schemas/security-regression-case.schema.json[Security Regression Case JSON Schema]
 
 == Status
 
