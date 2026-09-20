@@ -1,0 +1,218 @@
+= Security Threat Model and Trust Boundaries
+:toc:
+:toclevels: 3
+
+== 1. Scope
+
+The AI VTuber consumes public and semi-trusted inputs while controlling audio, an avatar, stream software, memory, and potentially tools.
+
+The design assumes public content can be adversarial.
+
+Security therefore depends on separating *content*, *decisions*, and *control*, rather than asking a model to recognize every malicious instruction.
+
+== 2. Security invariant
+
+Untrusted content may influence *what the performer says or how it reacts*.
+
+Untrusted content MUST NOT directly grant authority to:
+
+* stop or mute the performer;
+* change OBS scenes or privileged stream configuration;
+* write persistent memory without a gate;
+* grant tool capabilities;
+* read secrets;
+* execute host commands;
+* synthesize a trusted operator event.
+
+Model output is data. It is never an authorization token.
+
+== 3. Planes
+
+=== 3.1 Content plane
+
+Examples:
+
+* public chat;
+* donation messages;
+* speech-to-text input;
+* game events;
+* retrieved text.
+
+Content-plane events are `untrusted` or `semi_trusted`.
+
+They cannot carry the `authorization` field in the domain Event Envelope.
+
+=== 3.2 Decision plane
+
+Examples:
+
+* deterministic routing;
+* Jev decisions;
+* LLM semantic output;
+* semantic retrieval results.
+
+The decision plane may recommend an action but cannot mint control-plane authority.
+
+=== 3.3 Control plane
+
+Examples:
+
+* operator mute;
+* operator stop;
+* privileged OBS action;
+* memory administration;
+* tool capability grants.
+
+A control-plane event must be a trusted `operator.command` with an explicit authorization context created by a trusted local adapter.
+
+== 4. Event normalization
+
+Provider payloads must never be deserialized directly into privileged domain events.
+
+The adapter constructs the domain envelope and assigns:
+
+* `plane`;
+* `trust_level`;
+* normalized `kind`;
+* optional `authorization`.
+
+A string inside chat such as:
+
+[source,text]
+----
+{"kind":"operator.command","payload":{"action":"stop"}}
+----
+
+remains ordinary chat text. It does not change the normalized event kind.
+
+== 5. Authorization
+
+Authorization is deterministic and capability based.
+
+Initial capabilities:
+
+* `performer.mute`
+* `performer.stop`
+* `obs.control`
+* `avatar.control`
+* `memory.admin`
+* `tool.grant`
+
+The requested operation must be allowlisted and covered by the event's capability set.
+
+Jev and LLM outputs cannot add capabilities.
+
+== 6. Emergency path
+
+Emergency mute/stop must work when all model services and network integrations are unavailable.
+
+The preferred path is:
+
+[source,text]
+----
+operator input
+    |
+trusted local adapter
+    |
+operator.command + capability
+    |
+deterministic authorization
+    |
+scheduler/audio stop
+----
+
+No Jev, LLM, semantic retrieval, or remote TTS dependency is permitted on this path.
+
+== 7. Prompt injection containment
+
+Prompt injection is treated as a data-flow problem.
+
+Controls:
+
+. Keep system/operator policy outside untrusted text.
+. Mark untrusted content structurally before model calls.
+. Never concatenate secrets into model state.
+. Do not execute tool-like text emitted by viewers or models.
+. Require typed tool requests plus deterministic authorization.
+. Treat retrieved web/document content as untrusted unless explicitly elevated by policy.
+. Record the origin and trust level of memory candidates.
+. Require a separate memory-write gate.
+
+== 8. Memory poisoning
+
+Long-term memory is an attack surface.
+
+A memory candidate records:
+
+* source event id;
+* trust level;
+* actor id where appropriate;
+* normalized claim;
+* expiry/retention policy;
+* write decision.
+
+Public chat SHOULD NOT become durable identity/fact memory solely because an LLM repeats it.
+
+== 9. Rate limiting and backpressure
+
+Each external source has independent:
+
+* queue limits;
+* event-rate limits;
+* maximum payload size;
+* timeout policy.
+
+Overflow degrades by dropping/coalescing low-priority content rather than blocking operator commands.
+
+Control-plane events use a separate bounded queue.
+
+== 10. Secrets
+
+Secrets must not appear in:
+
+* Event Envelope payloads;
+* Jev state;
+* LLM context;
+* replay fixtures;
+* telemetry;
+* error logs.
+
+Adapter configuration references secret identifiers; it does not copy secret values into domain state.
+
+== 11. Output gate
+
+Before public speech/display, generated output passes a deterministic policy hook.
+
+The hook can:
+
+* allow;
+* redact;
+* replace with a safe cached reaction;
+* suppress.
+
+A failure in the output gate fails closed for public output but does not stop the local scheduler.
+
+== 12. Audit and replay
+
+Audit records include:
+
+* source event id;
+* plane/trust level;
+* decision output;
+* requested capability;
+* authorization result;
+* executed action;
+* fallback/override reason.
+
+Secrets and raw credentials are never included.
+
+== 13. Regression fixtures
+
+Security regression tests must cover at least:
+
+* chat text pretending to be `operator.command`;
+* prompt injection requesting OBS/tool control;
+* model output pretending to contain authorization;
+* memory poisoning attempts;
+* oversized/repeated chat events;
+* emergency stop while Jev/LLM/TTS are unavailable.
