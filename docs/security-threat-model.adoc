@@ -93,7 +93,7 @@ Initial capabilities:
 
 * `performer.mute`
 * `performer.stop`
-* `obs.control`
+* `stream.control`
 * `avatar.control`
 * `memory.admin`
 * `tool.grant`
