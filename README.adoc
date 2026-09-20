@@ -31,6 +31,7 @@ The core design separates three time scales:
 * link:schemas/performance-asset.schema.json[Performance Asset JSON Schema]
 * link:schemas/event-envelope.schema.json[Event Envelope JSON Schema]
 * link:schemas/reflex-decision.schema.json[Reflex Decision JSON Schema]
+* link:schemas/security-regression-case.schema.json[Security Regression Case JSON Schema]
 
 == Status
 
