@@ -13,9 +13,10 @@ pub use event::{
     SourceClass, TrustLevel, EVENT_SCHEMA_VERSION,
 };
 pub use interfaces::{
-    AvatarAction, AvatarAdapter, DecisionEngine, EngineError, EngineErrorKind, EngineFuture,
-    GeneratedReply, ReflexRequest, SpeechArtifact, SpeechRequest, StreamAction, StreamAdapter,
-    ThinkingEngine, TtsEngine,
+    authorize_avatar_action, authorize_stream_action, Authorized, AuthorizedAvatarAction,
+    AuthorizedStreamAction, AvatarAction, AvatarAdapter, DecisionEngine, EngineError,
+    EngineErrorKind, EngineFuture, GeneratedReply, ReflexRequest, SpeechArtifact, SpeechRequest,
+    StreamAction, StreamAdapter, ThinkingEngine, TtsEngine,
 };
 pub use reflex::{
     AttentionTarget, BackendIdentity, FallbackReason, ReflexDecision, ResponseRoute,
