@@ -18,6 +18,9 @@ Required concepts:
 * globally unique event id
 * correlation id
 * source
+* typed source class
+* security plane
+* trust level
 * event kind
 * monotonic sequence number
 * observed wall-clock timestamp
@@ -41,6 +44,61 @@ Initial normalized event kinds:
 * `system.health`
 
 Provider-specific subtypes belong inside payload metadata rather than creating provider-specific domain enums.
+
+=== 3.1 Source class and trust invariants
+
+The normalizer, not the incoming payload, assigns `source_class`, `plane`, and `trust_level`.
+
+The initial mapping is intentionally strict:
+
+[cols="2,2,2,2"]
+|===
+|Kind |Source class |Plane |Allowed trust
+
+|chat.message
+|public_chat
+|content
+|untrusted / semi_trusted
+
+|chat.donation
+|donation
+|content
+|untrusted / semi_trusted
+
+|speech.input
+|speech
+|content
+|untrusted / semi_trusted
+
+|game.event
+|game
+|content
+|semi_trusted
+
+|stream.event
+|stream
+|system
+|semi_trusted / trusted
+
+|timer.tick
+|timer
+|system
+|trusted
+
+|system.health
+|system
+|system
+|trusted
+
+|operator.command
+|operator
+|control
+|trusted
+|===
+
+Only `operator.command` may carry an `authorization` object. A public content adapter cannot mint a trusted operator event merely because its payload contains command-like text.
+
+Security rationale and capability rules are defined in `security-threat-model.adoc`.
 
 == 4. Performer state snapshot
 
@@ -183,3 +241,5 @@ Retention of raw chat/STT text must be configurable separately from normalized r
 
 * `schemas/event-envelope.schema.json`
 * `schemas/reflex-decision.schema.json`
+
+The Event Envelope schema is currently version `0.2.0`; this version introduces required trust-boundary fields and is intentionally incompatible with the earlier `0.1.0` envelope.
