@@ -306,6 +306,29 @@ mod tests {
     }
 
     #[test]
+    fn repository_chat_fixture_matches_domain_contract() {
+        let json = include_str!("../../../examples/events/chat-message.json");
+        let event: EventEnvelope = serde_json::from_str(json).expect("deserialize chat fixture");
+        event.validate().expect("chat fixture must remain valid");
+    }
+
+    #[test]
+    fn repository_operator_fixture_matches_domain_contract() {
+        let json = include_str!("../../../examples/events/operator-stop.json");
+        let event: EventEnvelope = serde_json::from_str(json).expect("deserialize operator fixture");
+        event.validate().expect("operator fixture must remain valid");
+    }
+
+    #[test]
+    fn repository_forged_operator_fixture_is_rejected() {
+        let json =
+            include_str!("../../../examples/events/invalid/forged-operator-command.json");
+        let event: EventEnvelope = serde_json::from_str(json).expect("deserialize negative fixture");
+        let error = event.validate().expect_err("forged operator must fail");
+        assert_eq!(error.field(), "source_class");
+    }
+
+    #[test]
     fn operator_command_requires_authorization() {
         let mut event = chat_event();
         event.source = "local-hotkey".to_owned();
