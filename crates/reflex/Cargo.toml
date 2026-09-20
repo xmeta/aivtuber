@@ -1,0 +1,8 @@
+[package]
+name = "aivtuber-reflex"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aivtuber-domain = { path = "../domain" }
