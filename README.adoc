@@ -1,0 +1,27 @@
+= AI VTuber
+:toc:
+:toclevels: 2
+
+AI VTuber runtime focused on low latency, efficient reuse, and graceful degradation.
+
+The core design separates three time scales:
+
+* *Motor layer*: deterministic animation/audio scheduling.
+* *Reflex layer*: fast structured decisions (Jev or compatible decision engine).
+* *Thinking layer*: expensive generative reasoning only when necessary.
+
+== Design goals
+
+* Reuse pre-generated speech, lip-sync, expressions, gestures, and timing as versioned *Performance Assets*.
+* Route common events through deterministic rules or Jev before invoking a large language model.
+* Keep avatar, TTS, LLM, stream platform, and decision-engine integrations behind adapters.
+* Preserve responsiveness when external AI services are slow or unavailable.
+* Measure latency, cache hit rate, LLM call rate, cost, interruption quality, and reaction appropriateness.
+
+== Planned architecture
+
+See `docs/architecture.adoc` after the initial architecture PR is merged.
+
+== Status
+
+Early design / bootstrap.
