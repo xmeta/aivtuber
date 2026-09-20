@@ -21,17 +21,19 @@ The core design separates three time scales:
 == Architecture
 
 * link:docs/architecture.adoc[System architecture]
+* link:docs/domain-contract.adoc[Provider-neutral domain contract]
 * link:docs/jev-routing.adoc[Jev reflex-routing contract]
 * link:docs/performance-assets.adoc[Performance Asset specification]
 * link:docs/metrics.adoc[Metrics and evaluation]
 * link:docs/roadmap.adoc[Roadmap]
 * link:docs/adr/0001-three-layer-runtime.adoc[ADR-0001: three-layer runtime]
 * link:schemas/performance-asset.schema.json[Performance Asset JSON Schema]
+* link:schemas/event-envelope.schema.json[Event Envelope JSON Schema]
+* link:schemas/reflex-decision.schema.json[Reflex Decision JSON Schema]
 
 == Status
 
 Early design / bootstrap. The first implementation target is a deterministic, replayable performer core before external AI integrations.
-
 
 == Development
 
