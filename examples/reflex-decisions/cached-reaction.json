@@ -1,0 +1,21 @@
+{
+  "schema_version": "0.1.0",
+  "route": {
+    "value": "cached",
+    "confidence": 0.91
+  },
+  "reaction_family": "embarrassed_laugh",
+  "gesture_family": "head_shake_small",
+  "attention_target": "camera",
+  "interrupt_probability": 0.08,
+  "cache_reuse_probability": 0.94,
+  "importance": 0.37,
+  "emotion_intensity": 0.64,
+  "backend": {
+    "name": "jev",
+    "model_alias": "jev-latest",
+    "model_version": "example"
+  },
+  "latency_ms": 120.0,
+  "fallback_reason": "none"
+}

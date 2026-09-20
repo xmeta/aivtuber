@@ -1,0 +1,15 @@
+{
+  "schema_version": "0.1.0",
+  "event_id": "evt-000001",
+  "correlation_id": "corr-chat-000001",
+  "sequence": 1,
+  "observed_at": "2026-09-20T10:00:00Z",
+  "source": "example-chat",
+  "kind": "chat.message",
+  "actor_id": "viewer:8f84c2",
+  "priority_hint": null,
+  "payload": {
+    "text": "昨日もまた負けてたよねｗ",
+    "language": "ja"
+  }
+}
