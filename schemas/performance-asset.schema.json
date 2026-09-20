@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xmeta/aivtuber/schemas/performance-asset.schema.json",
+  "title": "AI VTuber Performance Asset",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "intent",
+    "class",
+    "compatibility",
+    "timeline"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "0.1.0"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{2,127}$"
+    },
+    "intent": {
+      "type": "string",
+      "minLength": 1
+    },
+    "class": {
+      "type": "string",
+      "enum": ["filler", "reaction", "phrase", "template", "dynamic"]
+    },
+    "variant_group": {
+      "type": ["string", "null"]
+    },
+    "speech": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "text": {"type": "string"},
+        "audio_ref": {"type": "string"},
+        "duration_ms": {"type": "integer", "minimum": 0},
+        "viseme_ref": {"type": ["string", "null"]}
+      }
+    },
+    "expression": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "preset": {"type": "string"},
+        "intensity": {"type": "number", "minimum": 0.0, "maximum": 1.0}
+      },
+      "required": ["preset", "intensity"]
+    },
+    "gesture": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "preset": {"type": "string"},
+        "amplitude": {"type": "number", "minimum": 0.0, "maximum": 2.0}
+      },
+      "required": ["preset"]
+    },
+    "gaze": {
+      "type": ["string", "null"],
+      "enum": ["camera", "chat", "game", "speaker", "away", null]
+    },
+    "timeline": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["at_ms", "event"],
+        "properties": {
+          "at_ms": {"type": "integer", "minimum": 0},
+          "event": {"type": "string", "minLength": 1},
+          "payload": {}
+        }
+      }
+    },
+    "interrupt_points_ms": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "integer", "minimum": 0}
+    },
+    "variation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "speed_pct": {"type": "number", "minimum": 0, "maximum": 25},
+        "amplitude_pct": {"type": "number", "minimum": 0, "maximum": 25},
+        "start_delay_ms": {"type": "integer", "minimum": 0, "maximum": 500}
+      }
+    },
+    "compatibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["compiler_version"],
+      "properties": {
+        "compiler_version": {"type": "string"},
+        "voice_model": {"type": ["string", "null"]},
+        "avatar_profile": {"type": ["string", "null"]},
+        "viseme_mapping": {"type": ["string", "null"]},
+        "motion_library": {"type": ["string", "null"]}
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "generated": {"type": "boolean"},
+        "generator": {"type": ["string", "null"]},
+        "created_at": {"type": ["string", "null"], "format": "date-time"}
+      }
+    }
+  }
+}

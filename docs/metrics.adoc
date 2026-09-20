@@ -1,0 +1,66 @@
+= Metrics and Evaluation
+:toc:
+
+== 1. Objective
+
+Optimization must not reduce cost by making the performer feel slow, repetitive, or contextually wrong.
+
+Measure efficiency and perceptual quality together.
+
+== 2. Core latency metrics
+
+* event-to-first-visible-reaction p50/p95/p99
+* event-to-first-audio p50/p95/p99
+* LLM-routed event latency
+* TTS cold/warm latency
+* Jev/reflex latency and timeout rate
+* avatar command latency
+* scheduler queue delay
+
+== 3. Efficiency metrics
+
+* exact-cache hit rate
+* semantic-cache accepted hit rate
+* semantic-cache rejected hit rate
+* template route rate
+* LLM call rate
+* TTS generation rate
+* generated-to-promoted asset ratio
+* GPU VRAM high-water mark
+* CPU utilization
+* network egress and inference cost per stream hour
+
+== 4. Quality metrics
+
+* reaction appropriateness
+* wrong-cache reuse rate
+* interruption appropriateness
+* repetition rate by semantic family
+* average time between repeated variants
+* lip-sync alignment error
+* audio-motion synchronization error
+* operator override frequency
+* silence/failure fallback frequency
+
+== 5. Evaluation protocol
+
+A change should be evaluated on replayable event traces.
+
+Compare at least:
+
+. deterministic baseline
+. deterministic + semantic retrieval
+. deterministic + retrieval + Jev
+. full system with LLM/TTS fallback
+
+Do not infer benefit from a single demo.
+
+== 6. Initial acceptance targets
+
+These are engineering targets, not empirical claims, and should be revised after measurement.
+
+* Cached filler/reaction starts without an LLM dependency.
+* Jev failure does not block streaming.
+* Every LLM call records why cheaper routes were rejected.
+* Every semantic cache reuse records candidate score and reuse decision.
+* All scheduler decisions are replayable from trace + seed.
