@@ -1,0 +1,51 @@
+= ADR-0001: Three-layer runtime with Jev as an adapter
+:status: Accepted
+:date: 2026-09-20
+
+== Context
+
+An AI VTuber has control loops with very different latency and reasoning requirements.
+
+Frame-level animation cannot tolerate network-model latency, while novel conversation benefits from a capable generative model. Many stream events require neither.
+
+== Decision
+
+Use three layers:
+
+. *Motor*: deterministic 30-60 Hz control.
+. *Reflex*: event-driven structured decision engine.
+. *Thinking*: generative LLM invoked only by routing policy.
+
+Jev is the initial Reflex backend behind a `DecisionEngine` interface.
+
+The domain model MUST NOT import Jev-specific primitive types.
+
+== Consequences
+
+=== Positive
+
+* Common events avoid LLM cost and latency.
+* Frame control remains deterministic.
+* Jev can be replaced or compared with future local decision models.
+* Failure of an AI service does not freeze animation.
+* Recorded traces can replay routing decisions.
+
+=== Trade-offs
+
+* More interfaces and telemetry are required.
+* Threshold calibration becomes an explicit engineering task.
+* The system must maintain both deterministic fallbacks and model-based routing.
+
+== Rejected alternatives
+
+=== LLM for every event
+
+Rejected because it increases latency/cost and makes availability of the performer depend on a generative service.
+
+=== Jev in the frame loop
+
+Rejected because semantic decision models should select high-level actions, not interpolate avatar parameters at render cadence.
+
+=== Jev-specific domain model
+
+Rejected because it would couple scheduler, assets, and tests to one provider.
