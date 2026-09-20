@@ -22,7 +22,7 @@
   },
   "model_output": {
     "requested_actions": [
-      "obs.control",
+      "stream.control",
       "tool.grant"
     ]
   },
