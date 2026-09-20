@@ -1,0 +1,123 @@
+= Performance Asset Specification
+:toc:
+
+== 1. Definition
+
+A Performance Asset is a reusable unit of performed behavior, not merely a sound file.
+
+It can bundle:
+
+* semantic intent
+* utterance text
+* audio
+* phoneme/viseme timing
+* expression
+* gesture/body motion
+* gaze
+* timeline markers
+* interruption points
+* bounded variation parameters
+
+== 2. Why bundle these signals
+
+If cached audio is reused but lip sync, expression, and motion are recomputed each time, a large part of the latency and synchronization problem remains.
+
+A precompiled asset can start immediately and remain internally synchronized.
+
+== 3. Asset classes
+
+[cols="1,2,2"]
+|===
+|Class |Examples |Expected treatment
+
+|Filler
+|"えーっと", "んー", thinking sounds
+|RAM-hot, instant
+
+|Reaction
+|surprise, laugh, agreement, confusion
+|RAM/SSD, multiple variants
+
+|Phrase
+|"ありがとう！", greetings, transitions
+|SSD, semantic retrieval
+
+|Template
+|"<name>さん、ありがとう"
+|Precompiled fixed segments plus generated slot
+
+|Dynamic
+|Novel long-form answer
+|Generated, then optionally promoted
+|===
+
+== 4. Versioning
+
+An asset identity must include compatibility-relevant versions:
+
+* voice identity/model
+* TTS model
+* avatar/model profile
+* viseme mapping version
+* motion/expression library version
+* compiler version
+
+A change that breaks timing or parameter semantics requires regeneration or migration.
+
+== 5. Promotion
+
+Generated outputs may be promoted into reusable assets.
+
+A simple utility estimate is:
+
+[stem]
+++++
+U = f_{use} * C_{regen} * P_{reuse} - C_{storage} - C_{staleness}
+++++
+
+Promotion policy should consider:
+
+* reuse frequency
+* generation cost
+* semantic generality
+* storage cost
+* quality
+* model staleness
+* privacy constraints
+
+== 6. Variation
+
+Equivalent variants are grouped by semantic intent.
+
+Example:
+
+[source,text]
+----
+gratitude.viewer
+  |- happy.01
+  |- happy.02
+  |- excited.01
+  |- embarrassed.01
+----
+
+The scheduler avoids immediate repetition and applies bounded procedural variation.
+
+== 7. Interruptibility
+
+Each asset provides safe points:
+
+[source,text]
+----
+0 ms       hard start
+420 ms     phrase boundary
+890 ms     soft interrupt
+1310 ms    completed
+----
+
+The scheduler decides whether to stop immediately, crossfade, or wait.
+
+== 8. Schema
+
+The machine-readable baseline is `schemas/performance-asset.schema.json`.
+
+The schema deliberately stores references to binary media instead of committing generated audio into the Git repository.
