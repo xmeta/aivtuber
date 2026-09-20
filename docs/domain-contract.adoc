@@ -1,0 +1,245 @@
+= Provider-Neutral Domain Contract
+:toc:
+:toclevels: 3
+
+== 1. Purpose
+
+This document defines the stable data contract shared by event ingestion, deterministic scheduling, reflex decisions, replay, and future provider adapters.
+
+Provider-specific wire types MUST remain outside this contract.
+
+== 2. Event envelope
+
+Every external or internal stimulus is normalized into an `EventEnvelope`.
+
+Required concepts:
+
+* schema version
+* globally unique event id
+* correlation id
+* source
+* typed source class
+* security plane
+* trust level
+* event kind
+* monotonic sequence number
+* observed wall-clock timestamp
+* normalized payload
+* optional pseudonymous actor id
+* optional upstream priority hint
+
+The wall-clock timestamp is for observability. Ordering and replay MUST use the monotonic sequence/timeline, not wall-clock time.
+
+== 3. Event kinds
+
+Initial normalized event kinds:
+
+* `chat.message`
+* `chat.donation`
+* `speech.input`
+* `game.event`
+* `stream.event`
+* `timer.tick`
+* `operator.command`
+* `system.health`
+
+Provider-specific subtypes belong inside payload metadata rather than creating provider-specific domain enums.
+
+=== 3.1 Source class and trust invariants
+
+The normalizer, not the incoming payload, assigns `source_class`, `plane`, and `trust_level`.
+
+The initial mapping is intentionally strict:
+
+[cols="2,2,2,2"]
+|===
+|Kind |Source class |Plane |Allowed trust
+
+|chat.message
+|public_chat
+|content
+|untrusted / semi_trusted
+
+|chat.donation
+|donation
+|content
+|untrusted / semi_trusted
+
+|speech.input
+|speech
+|content
+|untrusted / semi_trusted
+
+|game.event
+|game
+|content
+|semi_trusted
+
+|stream.event
+|stream
+|system
+|semi_trusted / trusted
+
+|timer.tick
+|timer
+|system
+|trusted
+
+|system.health
+|system
+|system
+|trusted
+
+|operator.command
+|operator
+|control
+|trusted
+|===
+
+Only `operator.command` may carry an `authorization` object. A public content adapter cannot mint a trusted operator event merely because its payload contains command-like text.
+
+Security rationale and capability rules are defined in `security-threat-model.adoc`.
+
+== 4. Performer state snapshot
+
+A reflex decision receives a compact snapshot, not an unbounded transcript.
+
+Recommended groups:
+
+[source,json]
+----
+{
+  "performer": {
+    "currently_speaking": true,
+    "current_asset_id": "phrase.example.01",
+    "current_interruptible": false,
+    "mood_valence": 0.45,
+    "arousal": 0.62
+  },
+  "stream": {
+    "mode": "competitive_game",
+    "topic": "ranked_match"
+  },
+  "recent": {
+    "last_reaction_families": ["laugh", "nod"],
+    "seconds_since_direct_reply": 4.2
+  },
+  "retrieval": {
+    "candidate_ids": ["reaction.tease.01", "reaction.tease.02"],
+    "best_similarity": 0.91
+  }
+}
+----
+
+Large raw histories SHOULD be reduced before entering the reflex layer.
+
+== 5. Normalized reflex decision
+
+The provider-neutral output contains both selected values and uncertainty.
+
+Minimum fields:
+
+* chosen response route
+* route confidence, when available
+* reaction family
+* gesture family
+* attention target
+* interrupt probability
+* cache-reuse probability
+* normalized importance in 0..1
+* normalized emotion intensity in 0..1
+* backend identity
+* backend model alias/version when available
+* decision latency
+* fallback reason, if fallback occurred
+
+The domain contract must not expose Jev's wire DTOs or another provider's schema.
+
+== 6. Response route
+
+Allowed initial routes:
+
+* `silent`
+* `reaction`
+* `cached`
+* `template`
+* `llm`
+
+A provider may recommend a route, but deterministic policy is authoritative.
+
+== 7. Fallback reasons
+
+Normalize failures so scheduler/replay logic does not depend on provider-specific errors.
+
+Initial reasons:
+
+* `none`
+* `timeout`
+* `unavailable`
+* `rate_limited`
+* `overloaded`
+* `authentication`
+* `invalid_request`
+* `low_confidence`
+* `policy_override`
+* `operator_override`
+
+== 8. Performance plan
+
+A compiled `PerformancePlan` references immutable or versioned assets and a shared monotonic timeline.
+
+Conceptual fields:
+
+* plan id
+* source event id(s)
+* priority
+* asset ids
+* start policy
+* safe interrupt points
+* cancellation token/generation id
+* seeded variation value
+* fallback action
+
+The scheduler owns execution. The decision engine does not directly execute avatar parameters.
+
+== 9. Replay contract
+
+Every decision-affecting input must be recordable:
+
+* normalized event
+* compact state snapshot
+* retrieval candidates
+* decision output
+* deterministic threshold/config version
+* executed action
+* random seed
+* operator override
+* latency/cost metadata
+
+Given the same trace, config, assets, and seed, deterministic scheduling SHOULD reproduce the same planned actions.
+
+External model calls may be replayed from recorded outputs rather than reissued.
+
+== 10. Versioning
+
+Domain JSON documents carry `schema_version`.
+
+Rules:
+
+* additive optional fields may remain compatible;
+* changed enum semantics require a schema-version change;
+* replay fixtures record the exact schema/config versions;
+* adapters must reject unsupported major versions.
+
+== 11. Privacy boundary
+
+Durable traces SHOULD avoid raw platform identifiers when a pseudonymous actor id is sufficient.
+
+Retention of raw chat/STT text must be configurable separately from normalized replay metadata.
+
+== 12. Machine-readable schemas
+
+* `schemas/event-envelope.schema.json`
+* `schemas/reflex-decision.schema.json`
+
+The Event Envelope schema is currently version `0.2.0`; this version introduces required trust-boundary fields and is intentionally incompatible with the earlier `0.1.0` envelope.
