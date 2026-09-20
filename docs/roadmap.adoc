@@ -1,0 +1,65 @@
+= Roadmap
+:toc:
+
+== Phase 0 -- Architecture baseline
+
+* Define domain events and state snapshots.
+* Define DecisionEngine boundary.
+* Define Performance Asset schema.
+* Define telemetry and replay requirements.
+* Establish Rust workspace and CI.
+
+== Phase 1 -- Deterministic performer
+
+* Event bus.
+* Performance scheduler.
+* In-memory asset store.
+* Mock audio/avatar adapters.
+* Deterministic fillers/reactions.
+* Replay harness.
+
+Exit criterion: a recorded event trace deterministically produces the same performance plan.
+
+== Phase 2 -- Real avatar/audio integration
+
+* VTube Studio adapter.
+* OBS WebSocket adapter.
+* audio playback abstraction.
+* pre-generated filler/reaction asset pack.
+* viseme timeline support.
+
+Exit criterion: cached reaction path works end-to-end without LLM/TTS.
+
+== Phase 3 -- Jev reflex layer
+
+* Jev adapter.
+* batched routing decisions.
+* strict timeout/fallback behavior.
+* semantic retrieval + Jev reuse gate.
+* decision telemetry.
+
+Exit criterion: Jev can reduce LLM routing while preserving operator-reviewed reaction quality.
+
+== Phase 4 -- Generative fallback
+
+* OpenAI-compatible LLM adapter.
+* TTS adapter(s).
+* streaming text/audio path.
+* dynamic Performance Asset compilation.
+* promotion policy.
+
+== Phase 5 -- Memory and adaptation
+
+* working-memory compaction.
+* viewer/topic relevance.
+* frequency-based asset promotion.
+* bounded variation and anti-repetition.
+* offline threshold calibration.
+
+== Phase 6 -- Benchmark and hardening
+
+* replay benchmark suite.
+* failure injection.
+* long-stream soak tests.
+* cost/latency dashboards.
+* privacy retention policies.
