@@ -1,0 +1,293 @@
+= AI VTuber Architecture
+:toc:
+:toclevels: 3
+
+== 1. Purpose
+
+This project builds an AI VTuber that remains responsive without invoking a large generative model for every event.
+
+The system treats frequent speech and motion as reusable assets and separates deterministic motor control, fast structured decisions, and expensive generative reasoning.
+
+== 2. Design principles
+
+. *Reuse before generation.* Exact cache, semantic retrieval, and templating precede new TTS/LLM generation.
+. *Decide at the highest useful abstraction.* AI selects intent, reaction, route, and gesture; deterministic code performs frame-level interpolation.
+. *Fast path first.* Common cases must not depend on the LLM.
+. *Graceful degradation.* Jev, LLM, TTS, avatar, or stream adapters may fail independently without freezing the performer.
+. *Measure every route.* Latency and quality decisions are observable and replayable.
+. *Adapters over lock-in.* Jev is the first reflex engine, not a hard dependency of the domain model.
+
+== 3. Three time scales
+
+[cols="1,1,2,2"]
+|===
+|Layer |Typical cadence |Responsibility |Implementation
+
+|Motor
+|30-60 Hz
+|Blinking, breathing, gaze interpolation, lip interpolation, animation blending, physics
+|Deterministic runtime
+
+|Reflex
+|Event-driven
+|Attention, reply/no-reply, interruption, emotion class, route selection, cache suitability
+|Jev-compatible DecisionEngine
+
+|Thinking
+|Only when routed
+|Novel response generation, explanation, reasoning, storytelling, tool use
+|LLM adapter
+|===
+
+Jev MUST NOT sit in the frame loop.
+
+== 4. Event flow
+
+[source,text]
+----
+Chat / STT / Game / Donation / OBS / Timers
+                  |
+             EventNormalizer
+                  |
+        DeterministicFastPath
+     exact rules / cooldown / cache
+                  |
+              unresolved
+                  v
+            ReflexDirector
+       (Jev DecisionEngine)
+                  |
+        +---------+----------+
+        |         |          |
+     SILENT    REUSE      GENERATE
+        |         |          |
+        |    AssetResolver   |
+        |         |      ThinkingEngine
+        |         |          |
+        |         |        TTSAdapter
+        +---------+----------+
+                  |
+        PerformanceCompiler
+                  |
+        PerformanceScheduler
+             /          \
+          Audio       AvatarAdapter
+                         |
+                    VTube Studio
+                  |
+               OBSAdapter
+----
+
+== 5. Routing order
+
+The baseline route is:
+
+[source,text]
+----
+1. hard safety / operator override
+2. deterministic exact rule
+3. exact Performance Asset cache
+4. semantic candidate retrieval
+5. reflex decision over candidates
+6. template composition
+7. LLM generation
+8. TTS generation
+9. persist eligible generated asset
+----
+
+A slower route MUST NOT be entered when a cheaper route is sufficiently appropriate.
+
+== 6. Domain components
+
+=== 6.1 EventNormalizer
+
+Converts provider-specific inputs to a common event envelope.
+
+Minimum fields:
+
+* event id
+* monotonic timestamp
+* source
+* event type
+* actor id (pseudonymous where possible)
+* text/payload
+* priority hints
+* correlation id
+
+=== 6.2 ReflexDirector
+
+Consumes a compact state snapshot and returns structured decisions.
+
+The director MUST NOT generate long-form natural language.
+
+Candidate decisions include:
+
+* response route
+* attention target
+* reaction class
+* emotional intensity
+* gesture family
+* whether current speech may be interrupted
+* whether the event should enter working memory
+* whether a semantic-cache candidate is safe to reuse
+
+The first adapter is Jev. See `jev-routing.adoc`.
+
+=== 6.3 ThinkingEngine
+
+Generates new semantic content only when the reflex route requests it.
+
+It receives a curated context rather than the complete raw stream history.
+
+=== 6.4 PerformanceCompiler
+
+Compiles semantic output into an executable performance plan:
+
+* speech/audio
+* phoneme/viseme timing
+* face expression
+* gesture
+* gaze
+* timing
+* interrupt points
+* fallback behavior
+
+=== 6.5 PerformanceScheduler
+
+Owns the shared timeline and arbitration.
+
+Priority classes:
+
+. operator/emergency
+. direct paid/high-priority interaction
+. strong game/system reaction
+. direct conversation
+. normal stream commentary
+. background/idle
+
+Priority alone is insufficient. The scheduler must also honor:
+
+* interruptibility
+* cooldowns
+* asset exclusivity
+* blend compatibility
+* minimum reaction spacing
+* sentence/phrase boundaries
+
+=== 6.6 PerformanceAssetStore
+
+Stores reusable, versioned performance units.
+
+An asset may contain:
+
+* normalized semantic intent
+* canonical text
+* encoded audio
+* viseme track
+* expression track
+* gesture/motion references
+* gaze plan
+* timing markers
+* interrupt points
+* provenance/model versions
+* usage statistics
+
+See `performance-assets.adoc`.
+
+== 7. Cache hierarchy
+
+[source,text]
+----
+L0 RAM: hot reactions/fillers
+L1 local SSD: reusable Performance Assets
+L2 semantic index: nearest reusable candidates
+L3 dynamic generation: LLM/TTS
+----
+
+Cache keys include model/version information. A model update MUST NOT silently reuse incompatible audio or timing.
+
+== 8. Controlled variation
+
+Avoid visible repetition without regenerating the entire performance.
+
+The runtime may vary within bounded ranges:
+
+* animation speed
+* amplitude
+* start delay
+* gaze offset
+* blink timing
+* selection among equivalent asset variants
+
+Variation MUST be deterministic under a recorded random seed so sessions can be replayed.
+
+== 9. Failure behavior
+
+[cols="1,2"]
+|===
+|Failure |Required behavior
+
+|Jev unavailable
+|Use deterministic routing defaults; permit LLM only for explicitly configured event classes.
+
+|LLM unavailable
+|Use reaction-only, cached speech, templates, or silence.
+
+|TTS unavailable
+|Use cached audio; otherwise degrade to non-verbal reaction.
+
+|Avatar API unavailable
+|Continue audio and OBS control; reconnect asynchronously.
+
+|OBS unavailable
+|Continue local performer state; report degraded stream-control status.
+|===
+
+== 10. Adapters
+
+Initial adapters:
+
+* `DecisionEngine`: Jev
+* `ThinkingEngine`: OpenAI-compatible API first
+* `TtsEngine`: local/API implementations
+* `AvatarAdapter`: VTube Studio Public API
+* `StreamAdapter`: obs-websocket 5.x
+* `VectorIndex`: local implementation first
+
+VTube Studio exposes a public WebSocket API and supports hotkeys, tracking parameter input, items, model state, and events. Its default endpoint is `ws://localhost:8001`.
+
+OBS control targets obs-websocket 5.x and must keep authentication enabled in normal operation.
+
+== 11. Proposed implementation boundaries
+
+The low-latency core SHOULD be Rust:
+
+[source,text]
+----
+crates/
+  domain/
+  event-bus/
+  reflex/
+  asset-store/
+  scheduler/
+  adapters-vts/
+  adapters-obs/
+  telemetry/
+----
+
+External inference services remain process/network boundaries when practical. This avoids forcing GPU-heavy dependencies into the scheduler process.
+
+== 12. Security and privacy
+
+* Secrets MUST come from environment/secret stores, never committed files.
+* Viewer identifiers SHOULD be pseudonymized before durable storage.
+* Raw chat retention MUST be configurable.
+* Generated memory entries MUST record source and expiry policy.
+* External model calls MUST expose an explicit data-egress policy.
+* Operator override MUST bypass autonomous routing.
+
+== 13. Sources
+
+* TypeSafe AI, Jev/System One introduction: https://typesafe.ai/blog/introducing-system-one-models-and-jev
+* VTube Studio Public API: https://github.com/DenchiSoft/VTubeStudio
+* obs-websocket 5.x protocol: https://github.com/obsproject/obs-websocket/blob/master/docs/generated/protocol.md
