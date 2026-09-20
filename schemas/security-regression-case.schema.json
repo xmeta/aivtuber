@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xmeta/aivtuber/schemas/security-regression-case.schema.json",
+  "title": "AI VTuber Security Regression Case",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "scenario_type",
+    "input",
+    "expected"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "0.1.0"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{2,127}$"
+    },
+    "scenario_type": {
+      "type": "string",
+      "enum": [
+        "prompt_injection",
+        "memory_poisoning",
+        "emergency_control"
+      ]
+    },
+    "input": {
+      "type": "object"
+    },
+    "model_output": {
+      "type": [
+        "object",
+        "string",
+        "null"
+      ]
+    },
+    "expected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "control_authorized",
+        "memory_write_allowed",
+        "requires_model"
+      ],
+      "properties": {
+        "control_authorized": {
+          "type": "boolean"
+        },
+        "memory_write_allowed": {
+          "type": "boolean"
+        },
+        "requires_model": {
+          "type": "boolean"
+        },
+        "required_action": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "notes": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}
