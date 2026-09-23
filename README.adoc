@@ -55,6 +55,13 @@ A minimal deterministic security core lives under `src/`:
 * `src/rate-limit.ts` -- per-source token-bucket rate limiting with a separate bounded control-plane queue.
 * `src/regression.ts` -- loads the fixtures from `examples/security/` and asserts the expected outcomes (threat model section 14).
 
+The first slice of the deterministic performer (roadmap phase 1) is also implemented:
+
+* `src/rng.ts` -- seeded mulberry32 PRNG with bounded variation (architecture section 8).
+* `src/asset-store.ts` -- in-memory Performance Asset store with variant groups and compatibility lookups.
+* `src/scheduler.ts` -- priority classes, cooldowns, minimum reaction spacing, and deterministic interruption arbitration.
+* `src/performer.ts` -- event trace to performance plan. The replay exit criterion is enforced by tests: the same trace, assets, and seed reproduce the identical plan; a different seed changes variation but not structure.
+
 Run the unit and regression suites with:
 
 [source,text]
@@ -64,4 +71,4 @@ bun test
 
 == Status
 
-Bootstrap phase. Schema/fixture validation, CI, and the deterministic security core (normalization, authorization, rate limiting, regression evaluation) are implemented; the next implementation target is the deterministic, replayable performer core before external AI integrations.
+Bootstrap phase. Schema/fixture validation, CI, the deterministic security core, and the first replayable performer slice (seeded variation, asset store, scheduler, deterministic trace runner) are implemented; next targets are the event bus, reflex routing adapter, and mock audio/avatar adapters.
