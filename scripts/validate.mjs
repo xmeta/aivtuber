@@ -113,5 +113,33 @@ for (const file of listJson("examples/assets")) {
   report(asset(loadJson(join(root, file))), file, asset);
 }
 
+// Verify AsciiDoc `link:` targets exist (catches broken doc links).
+function collectAdocFiles(dir, out = []) {
+  const abs = join(root, dir);
+  if (!existsSync(abs)) return out;
+  for (const entry of readdirSync(abs, { withFileTypes: true })) {
+    const rel = `${dir}/${entry.name}`;
+    if (entry.isDirectory()) collectAdocFiles(rel, out);
+    else if (entry.name.endsWith(".adoc")) out.push(rel);
+  }
+  return out;
+}
+
+for (const file of ["README.adoc", ...collectAdocFiles("docs")]) {
+  const text = readFileSync(join(root, file), "utf8");
+  const base = join(root, file, "..");
+  for (const match of text.matchAll(/link:([^\[\s]+)\[/g)) {
+    const target = match[1];
+    if (/^[a-z][a-z0-9+.-]*:/i.test(target)) continue; // external (http:, https:, mailto:)
+    if (!existsSync(join(base, target))) {
+      failures += 1;
+      console.error(`FAIL      ${file}: broken link -> ${target}`);
+    } else {
+      passes += 1;
+      console.log(`ok        ${file}: link ${target}`);
+    }
+  }
+}
+
 console.log(`\n${passes} passed, ${failures} failed`);
 process.exit(failures > 0 ? 1 : 0);
