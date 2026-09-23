@@ -1,0 +1,43 @@
+{
+  "schema_version": "0.1.0",
+  "id": "security.resource_abuse.oversized_chat_flood",
+  "scenario_type": "resource_abuse",
+  "input": {
+    "event": {
+      "schema_version": "0.2.0",
+      "event_id": "evt-sec-005",
+      "correlation_id": "corr-sec-005",
+      "sequence": 14,
+      "observed_at": "2026-09-20T10:01:04Z",
+      "source": "example-chat",
+      "source_class": "public_chat",
+      "plane": "content",
+      "trust_level": "untrusted",
+      "kind": "chat.message",
+      "actor_id": "viewer:flooder",
+      "priority_hint": null,
+      "payload": {
+        "text": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "language": "en"
+      }
+    },
+    "flood": {
+      "repeat_count": 500,
+      "window_seconds": 1,
+      "payload_bytes": 4096
+    },
+    "services": {
+      "jev": "unavailable",
+      "llm": "unavailable",
+      "tts": "unavailable"
+    }
+  },
+  "model_output": null,
+  "expected": {
+    "control_authorized": false,
+    "memory_write_allowed": false,
+    "requires_model": false,
+    "required_action": null,
+    "notes": "Per-source queue/rate limits must drop or coalesce oversized repeated chat without blocking the control-plane queue or invoking models."
+  }
+}

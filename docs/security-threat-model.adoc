@@ -224,7 +224,10 @@ The baseline regression fixtures are:
 
 * `examples/security/prompt-injection-chat.json`
 * `examples/security/memory-poisoning-chat.json`
+* `examples/security/model-output-forged-authorization.json`
+* `examples/security/oversized-chat-flood.json`
 * `examples/security/emergency-stop-offline.json`
+* `examples/events/invalid/forged-operator-command.json` (must be rejected by the Event Envelope schema)
 
 They conform to `schemas/security-regression-case.schema.json`.
 

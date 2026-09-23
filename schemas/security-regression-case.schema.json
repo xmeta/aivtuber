@@ -25,7 +25,9 @@
       "enum": [
         "prompt_injection",
         "memory_poisoning",
-        "emergency_control"
+        "emergency_control",
+        "authorization_forgery",
+        "resource_abuse"
       ]
     },
     "input": {
