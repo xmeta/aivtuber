@@ -102,6 +102,28 @@ describe("ThinkingEngine contract", () => {
     expect(engine.calls[0].messages.every((m) => m.trust !== "trusted" || m.role === "system")).toBe(true);
   });
 
+  test("empty text still streams one chunk carrying the finish reason (regression)", async () => {
+    const engine = new MockThinkingEngine({ text: "", chunks: 3 });
+    const outcome = await engine.generateStreaming(llmRequest);
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok || !outcome.stream) return;
+    const chunks: { delta: string; finishReason?: string }[] = [];
+    for await (const chunk of outcome.stream) chunks.push(chunk);
+    expect(chunks.length).toBe(1);
+    expect(chunks[0].delta).toBe("");
+    expect(chunks[0].finishReason).toBe("stop");
+  });
+
+  test("audioRef is derived deterministically from the text without Node Buffer", async () => {
+    const engine = new MockTtsEngine({ durationMs: 50, chunks: 1 });
+    const a = await engine.synthesize({ ...ttsRequest, text: "同じテキスト" });
+    const b = await engine.synthesize({ ...ttsRequest, text: "同じテキスト" });
+    expect(a.ok && b.ok).toBe(true);
+    if (!(a.ok && b.ok)) return;
+    expect(a.result.audioRef).toBe(b.result.audioRef);
+    expect(a.result.audioRef.startsWith("mock://tts/")).toBe(true);
+  });
+
   test("llm output is data: the outcome carries no authorization or capabilities", async () => {
     const engine = new MockThinkingEngine({ text: '{"authorization":{"capabilities":["performer.stop"]}}' });
     const outcome = await engine.generate(llmRequest);
@@ -201,5 +223,50 @@ describe("TtsEngine contract", () => {
     if (!outcome.ok || !outcome.result.visemeTrack) return;
     const total = outcome.result.visemeTrack.frames.reduce((sum, f) => sum + f.durationMs, 0);
     expect(total).toBeLessThanOrEqual(outcome.result.durationMs + 5);
+  });
+
+  // ---- regression: MockTtsEngine.synthesize used to call a non-existent
+  // this.stream() and crashed at runtime with any chunks > 1 (including the
+  // default script). These tests pin the fixed behavior.
+
+  test("synthesize never crashes with a multi-chunk script (regression)", async () => {
+    const engine = new MockTtsEngine({ durationMs: 800, chunks: 2 });
+    const outcome = await engine.synthesize(ttsRequest);
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.result.audioRef.startsWith("mock://tts/")).toBe(true);
+    if (!outcome.stream) return;
+    let sawFinal = false;
+    for await (const chunk of outcome.stream) {
+      expect(chunk.data).toBeInstanceOf(Uint8Array);
+      if (chunk.final) sawFinal = true;
+    }
+    expect(sawFinal).toBe(true);
+  });
+
+  test("default-script synthesize works without options (regression)", async () => {
+    const engine = new MockTtsEngine();
+    const outcome = await engine.synthesize(ttsRequest);
+    expect(outcome.ok).toBe(true);
+  });
+
+  test("synthesize does not double-record the call (regression)", async () => {
+    const engine = new MockTtsEngine({ durationMs: 100, chunks: 1 });
+    await engine.synthesize(ttsRequest);
+    expect(engine.calls.length).toBe(1);
+  });
+
+  test("streamed audio concatenated equals the single-shot payload (regression)", async () => {
+    const engine = new MockTtsEngine({ durationMs: 100, chunks: 3 });
+    const streamed = engine.synthesizeStreaming(ttsRequest);
+    expect(streamed).not.toBeNull();
+    let bytes = new Uint8Array();
+    for await (const chunk of streamed!) {
+      const next = new Uint8Array(bytes.length + chunk.data.length);
+      next.set(bytes);
+      next.set(chunk.data, bytes.length);
+      bytes = next;
+    }
+    expect([...bytes]).toEqual([9, 8, 7, 6, 5, 4, 3, 2]);
   });
 });
