@@ -21,6 +21,14 @@ import type {
   VisemeFrame,
 } from "./tts.js";
 
+/** Base64url without relying on Node/Bun's Buffer (portable across runtimes). */
+function base64Url(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
 // ---------------- ThinkingEngine mock ----------------
 
 export interface MockLlmScript {
@@ -67,19 +75,26 @@ export class MockThinkingEngine implements ThinkingEngine {
     return this.outcome(request);
   }
 
+  /**
+   * Stream the scripted text in `chunks` ordered pieces; the final chunk
+   * carries the finish reason. Always yields at least one chunk, even for
+   * empty text, so consumers always observe a finish reason.
+   */
   private stream(request: LlmRequest): AsyncIterable<LlmStreamChunk> {
     const text = this.script.text;
-    const parts = this.script.chunks ?? 1;
+    const parts = Math.max(1, this.script.chunks ?? 1);
     const finish = this.script.finishReason ?? "stop";
     const size = Math.ceil(text.length / parts);
-    const self = this;
     return {
       async *[Symbol.asyncIterator]() {
+        if (text.length === 0) {
+          yield { delta: "", finishReason: finish };
+          return;
+        }
         for (let i = 0; i < text.length; i += size) {
           const isLast = i + size >= text.length;
           yield { delta: text.slice(i, i + size), ...(isLast ? { finishReason: finish } : {}) };
         }
-        void self;
         void request;
       },
     };
@@ -133,7 +148,7 @@ export class MockTtsEngine implements TtsEngine {
 
     const durationMs = this.script.durationMs ?? 800;
     const result: TtsResult = {
-      audioRef: `mock://tts/${Buffer.from(request.text).toString("base64url").slice(0, 24)}.wav`,
+      audioRef: `mock://tts/${base64Url(request.text).slice(0, 24)}.wav`,
       audioData: new Uint8Array([1, 2, 3, 4]),
       durationMs,
       visemeTrack: {
@@ -144,6 +159,8 @@ export class MockTtsEngine implements TtsEngine {
       backend: { name: this.name, model_alias: this.version().model_alias },
       latency_ms: 3,
     };
+    // Streaming audio is offered only for multi-chunk scripts; a single-shot
+    // result carries stream: null (contract: null => no incremental play).
     return { ok: true, result, stream: this.script.chunks && this.script.chunks > 1 ? this.stream() : null };
   }
 
@@ -152,17 +169,30 @@ export class MockTtsEngine implements TtsEngine {
     if (this.script.failWith || (this.script.failVoiceId && request.voiceId === this.script.failVoiceId)) {
       return null; // streaming contract: null -> caller falls back to synthesize()
     }
-    const chunks = this.script.chunks ?? 1;
+    const chunks = Math.max(1, this.script.chunks ?? 1);
     const payload = new Uint8Array([9, 8, 7, 6, 5, 4, 3, 2]);
     const size = Math.ceil(payload.length / chunks);
-    const self = this;
     return {
       async *[Symbol.asyncIterator]() {
         for (let i = 0; i < payload.length; i += size) {
           const isLast = i + size >= payload.length;
           yield { data: payload.slice(i, i + size), final: isLast };
         }
-        void self;
+      },
+    };
+  }
+
+  /** Shared incremental audio stream used by both synthesize and synthesizeStreaming. */
+  private stream(): AsyncIterable<TtsStreamChunk> {
+    const chunks = Math.max(1, this.script.chunks ?? 1);
+    const payload = new Uint8Array([9, 8, 7, 6, 5, 4, 3, 2]);
+    const size = Math.ceil(payload.length / chunks);
+    return {
+      async *[Symbol.asyncIterator]() {
+        for (let i = 0; i < payload.length; i += size) {
+          const isLast = i + size >= payload.length;
+          yield { data: payload.slice(i, i + size), final: isLast };
+        }
       },
     };
   }
