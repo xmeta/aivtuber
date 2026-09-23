@@ -61,6 +61,9 @@ The first slice of the deterministic performer (roadmap phase 1) is also impleme
 * `src/asset-store.ts` -- in-memory Performance Asset store with variant groups and compatibility lookups.
 * `src/scheduler.ts` -- priority classes, cooldowns, minimum reaction spacing, and deterministic interruption arbitration.
 * `src/performer.ts` -- event trace to performance plan. The replay exit criterion is enforced by tests: the same trace, assets, and seed reproduce the identical plan; a different seed changes variation but not structure.
+* `src/event-bus.ts` -- bounded prioritized event bus; control plane drains first and content overflow drops the lowest priority (threat model section 9).
+* `src/adapters.ts` -- mock audio/avatar adapters producing recorded deterministic outputs, with independent degradation.
+* `src/session.ts` -- end-to-end session runner (bus -> performer -> adapters) with a replay fingerprint: identical inputs produce identical recordings.
 
 Run the unit and regression suites with:
 
@@ -71,4 +74,4 @@ bun test
 
 == Status
 
-Bootstrap phase. Schema/fixture validation, CI, the deterministic security core, and the first replayable performer slice (seeded variation, asset store, scheduler, deterministic trace runner) are implemented; next targets are the event bus, reflex routing adapter, and mock audio/avatar adapters.
+Bootstrap phase. Schema/fixture validation, CI, the deterministic security core, and roadmap phase 1 (event bus, seeded variation, asset store, scheduler, deterministic performer, mock adapters, session replay recording) are implemented; next targets are viseme/gesture timeline playback in the mock adapters, the reflex routing adapter, and VTube Studio/OBS integration planning.
