@@ -85,10 +85,7 @@ impl ReflexDecision {
             validate_unit_interval("route.confidence", confidence)?;
         }
         validate_unit_interval("interrupt_probability", self.interrupt_probability)?;
-        validate_unit_interval(
-            "cache_reuse_probability",
-            self.cache_reuse_probability,
-        )?;
+        validate_unit_interval("cache_reuse_probability", self.cache_reuse_probability)?;
         validate_unit_interval("importance", self.importance)?;
         validate_unit_interval("emotion_intensity", self.emotion_intensity)?;
 
@@ -102,10 +99,7 @@ impl ReflexDecision {
     }
 }
 
-fn validate_unit_interval(
-    field: &'static str,
-    value: f64,
-) -> Result<(), DomainValidationError> {
+fn validate_unit_interval(field: &'static str, value: f64) -> Result<(), DomainValidationError> {
     if value.is_finite() && (0.0..=1.0).contains(&value) {
         Ok(())
     } else {
@@ -154,7 +148,9 @@ mod tests {
         let json = include_str!("../../../examples/reflex-decisions/cached-reaction.json");
         let decision: ReflexDecision =
             serde_json::from_str(json).expect("deserialize reflex fixture");
-        decision.validate().expect("reflex fixture must remain valid");
+        decision
+            .validate()
+            .expect("reflex fixture must remain valid");
     }
 
     #[test]

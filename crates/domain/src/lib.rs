@@ -9,18 +9,18 @@ mod reflex;
 
 pub use error::DomainValidationError;
 pub use event::{
-    AuthorizationContext, AuthorizationMethod, Capability, EventEnvelope, EventKind, SecurityPlane,
-    SourceClass, TrustLevel, EVENT_SCHEMA_VERSION,
+    AuthorizationContext, AuthorizationMethod, Capability, EVENT_SCHEMA_VERSION, EventEnvelope,
+    EventKind, SecurityPlane, SourceClass, TrustLevel,
 };
 pub use interfaces::{
-    authorize_avatar_action, authorize_stream_action, Authorized, AuthorizedAvatarAction,
-    AuthorizedStreamAction, AvatarAction, AvatarAdapter, DecisionEngine, EngineError,
-    EngineErrorKind, EngineFuture, GeneratedReply, ReflexRequest, SpeechArtifact, SpeechRequest,
-    StreamAction, StreamAdapter, ThinkingEngine, TtsEngine,
+    Authorized, AuthorizedAvatarAction, AuthorizedStreamAction, AvatarAction, AvatarAdapter,
+    DecisionEngine, EngineError, EngineErrorKind, EngineFuture, GeneratedReply, ReflexRequest,
+    SpeechArtifact, SpeechRequest, StreamAction, StreamAdapter, ThinkingEngine, TtsEngine,
+    authorize_avatar_action, authorize_stream_action,
 };
 pub use reflex::{
-    AttentionTarget, BackendIdentity, FallbackReason, ReflexDecision, ResponseRoute,
-    RouteDecision, REFLEX_SCHEMA_VERSION,
+    AttentionTarget, BackendIdentity, FallbackReason, REFLEX_SCHEMA_VERSION, ReflexDecision,
+    ResponseRoute, RouteDecision,
 };
 
 /// Runtime time-scale layers.

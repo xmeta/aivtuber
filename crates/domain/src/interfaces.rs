@@ -1,17 +1,8 @@
-use crate::{
-    AuthorizationContext, Capability, EventEnvelope, ReflexDecision,
-};
+use crate::{AuthorizationContext, Capability, EventEnvelope, ReflexDecision};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeMap,
-    error::Error,
-    fmt,
-    future::Future,
-    pin::Pin,
-};
+use std::{collections::BTreeMap, error::Error, fmt, future::Future, pin::Pin};
 
-pub type EngineFuture<'a, T> =
-    Pin<Box<dyn Future<Output = Result<T, EngineError>> + Send + 'a>>;
+pub type EngineFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, EngineError>> + Send + 'a>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineErrorKind {

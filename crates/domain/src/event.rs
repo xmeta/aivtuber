@@ -213,10 +213,7 @@ impl EventEnvelope {
         }
 
         let authorization = self.authorization.as_ref().ok_or_else(|| {
-            DomainValidationError::new(
-                "authorization",
-                "operator.command requires authorization",
-            )
+            DomainValidationError::new("authorization", "operator.command requires authorization")
         })?;
         require_non_empty("authorization.principal", &authorization.principal)?;
         if authorization.capabilities.is_empty() {
@@ -237,10 +234,7 @@ fn require_non_empty(field: &'static str, value: &str) -> Result<(), DomainValid
     }
 }
 
-fn validate_unit_interval(
-    field: &'static str,
-    value: f64,
-) -> Result<(), DomainValidationError> {
+fn validate_unit_interval(field: &'static str, value: f64) -> Result<(), DomainValidationError> {
     if value.is_finite() && (0.0..=1.0).contains(&value) {
         Ok(())
     } else {
@@ -315,15 +309,18 @@ mod tests {
     #[test]
     fn repository_operator_fixture_matches_domain_contract() {
         let json = include_str!("../../../examples/events/operator-stop.json");
-        let event: EventEnvelope = serde_json::from_str(json).expect("deserialize operator fixture");
-        event.validate().expect("operator fixture must remain valid");
+        let event: EventEnvelope =
+            serde_json::from_str(json).expect("deserialize operator fixture");
+        event
+            .validate()
+            .expect("operator fixture must remain valid");
     }
 
     #[test]
     fn repository_forged_operator_fixture_is_rejected() {
-        let json =
-            include_str!("../../../examples/events/invalid/forged-operator-command.json");
-        let event: EventEnvelope = serde_json::from_str(json).expect("deserialize negative fixture");
+        let json = include_str!("../../../examples/events/invalid/forged-operator-command.json");
+        let event: EventEnvelope =
+            serde_json::from_str(json).expect("deserialize negative fixture");
         let error = event.validate().expect_err("forged operator must fail");
         assert_eq!(error.field(), "source_class");
     }
