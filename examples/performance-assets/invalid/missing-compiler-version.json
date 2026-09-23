@@ -1,0 +1,8 @@
+{
+  "schema_version": "0.1.0",
+  "id": "reaction.invalid.01",
+  "intent": "reaction.invalid",
+  "class": "reaction",
+  "timeline": [],
+  "compatibility": {}
+}
