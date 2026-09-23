@@ -1,0 +1,53 @@
+{
+  "schema_version": "0.1.0",
+  "id": "reaction.surprise.01",
+  "intent": "reaction.surprise",
+  "class": "reaction",
+  "variant_group": "reaction.surprise",
+  "speech": {
+    "text": "えっ、本当に！？",
+    "audio_ref": "assets/audio/reaction-surprise-01.opus",
+    "duration_ms": 1250,
+    "viseme_ref": "assets/viseme/reaction-surprise-01.json"
+  },
+  "expression": {
+    "preset": "surprise_medium",
+    "intensity": 0.72
+  },
+  "gesture": {
+    "preset": "recoil_small",
+    "amplitude": 1.0
+  },
+  "gaze": "camera",
+  "timeline": [
+    {
+      "at_ms": 0,
+      "event": "expression.start",
+      "payload": {
+        "preset": "surprise_medium"
+      }
+    },
+    {
+      "at_ms": 170,
+      "event": "speech.start"
+    }
+  ],
+  "interrupt_points_ms": [680, 1250],
+  "variation": {
+    "speed_pct": 8,
+    "amplitude_pct": 5,
+    "start_delay_ms": 80
+  },
+  "compatibility": {
+    "compiler_version": "0.1.0",
+    "voice_model": "example-voice-v1",
+    "avatar_profile": "example-live2d-v1",
+    "viseme_mapping": "ja-5vowel-v1",
+    "motion_library": "starter-v1"
+  },
+  "provenance": {
+    "generated": false,
+    "generator": null,
+    "created_at": "2026-09-20T00:00:00Z"
+  }
+}

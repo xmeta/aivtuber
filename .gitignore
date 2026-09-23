@@ -1,1 +1,7 @@
 node_modules/
+/target/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store

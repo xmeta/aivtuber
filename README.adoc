@@ -33,6 +33,18 @@ The core design separates three time scales:
 * link:schemas/reflex-decision.schema.json[Reflex Decision JSON Schema]
 * link:schemas/security-regression-case.schema.json[Security Regression Case JSON Schema]
 
+== Rust workspace
+
+The repository also pins a Rust 1.98.1 workspace under `crates/` for the deterministic core. Run the Rust checks locally:
+
+[source,shell]
+----
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo build --workspace
+----
+
 == Validation
 
 Every example and regression fixture is validated against its schema by:
@@ -80,4 +92,4 @@ bun test
 
 == Status
 
-Bootstrap phase. Schema/fixture validation, CI, the deterministic security core, roadmap phase 1 (event bus, seeded variation, asset store, scheduler, deterministic performer, mock adapters, session replay recording), the reflex routing layer (phase 3 contract), and the phase 4 adapter contracts (`ThinkingEngine` LLM and `TtsEngine` with mock implementations) are implemented; next targets are real OpenAI-compatible LLM/TTS providers behind those contracts, viseme/gesture timeline playback in the mock adapters, and VTube Studio/OBS integration planning.
+Bootstrap phase. Schema/fixture validation, CI, the Rust workspace (domain, asset-store, scheduler, reflex, telemetry crates), the deterministic security core, roadmap phase 1 (event bus, seeded variation, asset store, scheduler, deterministic performer, mock adapters, session replay recording), the reflex routing layer (phase 3 contract), and the phase 4 adapter contracts (`ThinkingEngine` LLM and `TtsEngine` with mock implementations) are implemented; next targets are real OpenAI-compatible LLM/TTS providers behind those contracts, viseme/gesture timeline playback in the mock adapters, and VTube Studio/OBS integration planning.
