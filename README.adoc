@@ -46,6 +46,22 @@ bun run validate
 The harness also asserts that fixtures under `examples/events/invalid/` are rejected by the Event Envelope schema.
 CI runs this check on every push and pull request.
 
+== Runtime bootstrap (TypeScript)
+
+A minimal deterministic security core lives under `src/`:
+
+* `src/envelope.ts` -- provider-neutral event normalization with strict kind bindings and trust-boundary enforcement (threat model sections 3-5).
+* `src/security.ts` -- deterministic capability authorization and memory-write gating.
+* `src/rate-limit.ts` -- per-source token-bucket rate limiting with a separate bounded control-plane queue.
+* `src/regression.ts` -- loads the fixtures from `examples/security/` and asserts the expected outcomes (threat model section 14).
+
+Run the unit and regression suites with:
+
+[source,text]
+----
+bun test
+----
+
 == Status
 
-Early design / bootstrap. The first implementation target is a deterministic, replayable performer core before external AI integrations.
+Bootstrap phase. Schema/fixture validation, CI, and the deterministic security core (normalization, authorization, rate limiting, regression evaluation) are implemented; the next implementation target is the deterministic, replayable performer core before external AI integrations.
