@@ -67,6 +67,9 @@ The first slice of the deterministic performer (roadmap phase 1) is also impleme
 * `src/reflex.ts` -- provider-neutral `DecisionEngine` contract and `ReflexDirector`: strict deadline with timeout-as-control-flow, deterministic interrupt/route policy in code, low-confidence and cache-reuse thresholds, and a normalized deterministic fallback (domain contract sections 5-7, jev-routing sections 4-6). Jev wire types stay inside future adapters.
 * `src/adapters-jev.ts` -- Jev HTTP adapter implementing `DecisionEngine`: wire DTOs sealed inside the adapter, HTTP failure modes mapped to typed fallback reasons, deadline aborts surfaced as `timeout`, secrets referenced by identifier only.
 * `src/output-gate.ts` -- deterministic output gate (threat model section 11): allow / redact secret-shaped tokens / replace with a cached reaction / suppress control-plane text; hook failures fail closed.
+* `src/thinking.ts` -- provider-neutral `ThinkingEngine` LLM contract (roadmap phase 4): curated request context (never raw history), structured-output expectations, ordered streaming chunks with a final finish reason, typed failure reasons, and LLM output kept strictly as data with no capabilities (threat model section 2).
+* `src/tts.ts` -- provider-neutral `TtsEngine` contract (roadmap phase 4): single-shot and streaming audio synthesis with ordered chunks, aligned viseme timelines, typed failure reasons, and version identity for cache keys (architecture section 7).
+* `src/adapters-mocks.ts` -- deterministic mock implementations of both contracts: scriptable streaming/failure scenarios proving the generic interface and every failure path without external services.
 
 Run the unit and regression suites with:
 
@@ -77,4 +80,4 @@ bun test
 
 == Status
 
-Bootstrap phase. Schema/fixture validation, CI, the deterministic security core, and roadmap phase 1 (event bus, seeded variation, asset store, scheduler, deterministic performer, mock adapters, session replay recording) are implemented; next targets are viseme/gesture timeline playback in the mock adapters, the reflex routing adapter, and VTube Studio/OBS integration planning.
+Bootstrap phase. Schema/fixture validation, CI, the deterministic security core, roadmap phase 1 (event bus, seeded variation, asset store, scheduler, deterministic performer, mock adapters, session replay recording), the reflex routing layer (phase 3 contract), and the phase 4 adapter contracts (`ThinkingEngine` LLM and `TtsEngine` with mock implementations) are implemented; next targets are real OpenAI-compatible LLM/TTS providers behind those contracts, viseme/gesture timeline playback in the mock adapters, and VTube Studio/OBS integration planning.
