@@ -65,6 +65,8 @@ The first slice of the deterministic performer (roadmap phase 1) is also impleme
 * `src/adapters.ts` -- mock audio/avatar adapters producing recorded deterministic outputs, with independent degradation.
 * `src/session.ts` -- end-to-end session runner (bus -> performer -> adapters) with a replay fingerprint: identical inputs produce identical recordings.
 * `src/reflex.ts` -- provider-neutral `DecisionEngine` contract and `ReflexDirector`: strict deadline with timeout-as-control-flow, deterministic interrupt/route policy in code, low-confidence and cache-reuse thresholds, and a normalized deterministic fallback (domain contract sections 5-7, jev-routing sections 4-6). Jev wire types stay inside future adapters.
+* `src/adapters-jev.ts` -- Jev HTTP adapter implementing `DecisionEngine`: wire DTOs sealed inside the adapter, HTTP failure modes mapped to typed fallback reasons, deadline aborts surfaced as `timeout`, secrets referenced by identifier only.
+* `src/output-gate.ts` -- deterministic output gate (threat model section 11): allow / redact secret-shaped tokens / replace with a cached reaction / suppress control-plane text; hook failures fail closed.
 
 Run the unit and regression suites with:
 
