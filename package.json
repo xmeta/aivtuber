@@ -1,0 +1,13 @@
+{
+  "name": "aivtuber",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "validate": "bun scripts/validate.mjs"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1"
+  }
+}
