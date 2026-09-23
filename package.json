@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "validate": "bun scripts/validate.mjs"
+    "validate": "bun scripts/validate.mjs",
+    "test": "bun test"
   },
   "dependencies": {},
   "devDependencies": {
