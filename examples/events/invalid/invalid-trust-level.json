@@ -1,0 +1,13 @@
+{
+  "schema_version": "0.2.0",
+  "event_id": "evt-invalid-trust",
+  "correlation_id": "corr-invalid-trust",
+  "sequence": 109,
+  "observed_at": "2026-09-20T10:10:08Z",
+  "source": "runtime-timer",
+  "source_class": "timer",
+  "plane": "system",
+  "trust_level": "semi_trusted",
+  "kind": "timer.tick",
+  "payload": {"timer_id": "heartbeat"}
+}

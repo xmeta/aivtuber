@@ -130,7 +130,7 @@ Paste a valid content Event Envelope as one line, for example:
 
 [source,json]
 ----
-{"schema_version":"0.2.0","event_id":"evt-live-1","correlation_id":"corr-live-1","sequence":1,"observed_at":"2026-09-24T00:00:00Z","source":"local-smoke","source_class":"public_chat","plane":"content","trust_level":"untrusted","kind":"chat.message","actor_id":"viewer:smoke","priority_hint":null,"authorization":null,"payload":{"text":"hello","intent":"reaction.agree"}}
+{"schema_version":"0.2.0","event_id":"evt-live-1","correlation_id":"corr-live-1","sequence":1,"observed_at":"2026-09-24T00:00:00Z","source":"local-smoke","source_class":"public_chat","plane":"content","trust_level":"untrusted","kind":"chat.message","actor_id":"viewer:smoke","priority_hint":null,"payload":{"text":"hello","intent":"reaction.agree"}}
 ----
 
 Expected behavior:

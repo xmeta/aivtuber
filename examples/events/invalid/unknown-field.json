@@ -1,0 +1,14 @@
+{
+  "schema_version": "0.2.0",
+  "event_id": "evt-invalid-unknown",
+  "correlation_id": "corr-invalid-unknown",
+  "sequence": 101,
+  "observed_at": "2026-09-20T10:10:00Z",
+  "source": "example-chat",
+  "source_class": "public_chat",
+  "plane": "content",
+  "trust_level": "untrusted",
+  "kind": "chat.message",
+  "payload": {"text": "hello"},
+  "unexpected": true
+}

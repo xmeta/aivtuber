@@ -1,0 +1,18 @@
+{
+  "schema_version": "0.2.0",
+  "event_id": "evt-game-000001",
+  "correlation_id": "corr-game-000001",
+  "sequence": 5,
+  "observed_at": "2026-09-20T10:00:04+09:00",
+  "source": "example-game",
+  "source_class": "game",
+  "plane": "content",
+  "trust_level": "semi_trusted",
+  "kind": "game.event",
+  "actor_id": null,
+  "priority_hint": 0.8,
+  "payload": {
+    "event": "boss.spawn",
+    "boss": "example-boss"
+  }
+}

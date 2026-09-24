@@ -57,10 +57,11 @@ Every example and regression fixture is validated against its schema by:
 ----
 bun install
 bun run validate
+bun run validate:rust-parity
 ----
 
-The harness also asserts that fixtures under `examples/events/invalid/` are rejected by the Event Envelope schema.
-CI runs this check on every push and pull request.
+The harness asserts that fixtures under `examples/events/invalid/` and `examples/reflex-decisions/invalid/` are rejected by their schemas. The Rust parity check round-trips all eight Event kinds plus representative Reflex Decisions through the Rust production-domain types and validates the serialized output against the same repository JSON Schemas.
+CI runs these checks on every push and pull request.
 
 == Implementation roles
 

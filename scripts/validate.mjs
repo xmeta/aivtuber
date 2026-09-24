@@ -2,6 +2,7 @@
 // - examples/events/*.json must conform to event-envelope.schema.json
 // - examples/events/invalid/*.json must REJECT against event-envelope.schema.json
 // - examples/reflex-decisions/*.json must conform to reflex-decision.schema.json
+// - examples/reflex-decisions/invalid/*.json must REJECT against reflex-decision.schema.json
 // - examples/security/*.json must conform to security-regression-case.schema.json,
 //   and their embedded input.event must conform to event-envelope.schema.json
 // - examples/assets/*.json must conform to performance-asset.schema.json
@@ -98,6 +99,18 @@ for (const file of listJson("examples/events/invalid")) {
 for (const file of listJson("examples/reflex-decisions")) {
   if (!reflex) break;
   report(reflex(loadJson(join(root, file))), file, reflex);
+}
+
+for (const file of listJson("examples/reflex-decisions/invalid")) {
+  if (!reflex) break;
+  const valid = reflex(loadJson(join(root, file)));
+  if (valid) {
+    failures += 1;
+    console.error(`FAIL      ${file} (expected rejection, but it validated)`);
+  } else {
+    passes += 1;
+    console.log(`ok        ${file} (rejected as intended)`);
+  }
 }
 
 for (const file of listJson("examples/security")) {

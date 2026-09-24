@@ -224,12 +224,22 @@ External model calls may be replayed from recorded outputs rather than reissued.
 
 Domain JSON documents carry `schema_version`.
 
-Rules:
+The repository JSON Schemas under +schemas/+ are the normative wire-format source of truth. Rust production-domain types and validators must accept and reject the same versioned documents; TypeScript/reference code must follow the same schemas rather than defining a second wire contract.
 
-* additive optional fields may remain compatible;
-* changed enum semantics require a schema-version change;
+Change procedure:
+
+. Change the relevant JSON Schema and positive/negative fixtures first.
+. In the same pull request, update the Rust type/validator and any reference implementation.
+. Run both directions of parity: repository fixtures -> Rust deserialize/validate, and Rust serialize -> repository JSON Schema.
+. Update replay fixtures and documentation with the exact schema version.
+
+Version rules:
+
+* additive optional fields may remain on the current version when old readers can safely ignore them and the schema remains backward compatible;
+* any incompatible wire change requires a +schema_version+ change, including adding a required field, removing/renaming a field, changing a field type, narrowing an accepted value set, or changing enum/security semantics;
+* validator fixes that only make an implementation enforce constraints already present in the current normative schema do not by themselves require a version bump;
 * replay fixtures record the exact schema/config versions;
-* adapters must reject unsupported major versions.
+* adapters must reject unsupported versions rather than guessing or coercing them.
 
 == 11. Privacy boundary
 
@@ -242,4 +252,6 @@ Retention of raw chat/STT text must be configurable separately from normalized r
 * `schemas/event-envelope.schema.json`
 * `schemas/reflex-decision.schema.json`
 
-The Event Envelope schema is currently version `0.2.0`; this version introduces required trust-boundary fields and is intentionally incompatible with the earlier `0.1.0` envelope.
+CI validates repository fixtures with the schemas, then deserializes/validates the same fixtures through the Rust production-domain types. It also serializes Rust values for every Event kind plus representative Reflex Decisions and validates those JSON documents against the repository schemas.
+
+The Event Envelope schema is currently version `0.2.0`; this version introduces required trust-boundary fields and is intentionally incompatible with the earlier `0.1.0` envelope. The normalized Reflex Decision schema remains `0.1.0`.
