@@ -106,6 +106,18 @@ For an intentional wire change:
 
 Do not create a second implicit wire contract in an adapter or prototype.
 
+## Reuse-first rule
+
+Before writing generic infrastructure, check docs/reuse-first.adoc and search maintained crates/reference implementations.
+
+- Reuse generic mechanisms when they fit.
+- Keep aivtuber-specific policy, authority, replay, determinism, and bounded-state semantics project-owned.
+- Record adopt / wrap / partial reuse / reference only / benchmark first / reject with a short reason in the issue or PR.
+- Do not add a dependency without checking license, maintenance status, transitive/runtime impact, security advisories, determinism/replay effects, and bounded-state behavior.
+- Do not repeatedly revisit a rejected candidate unless new evidence changes the trade-off.
+
+See #100 for dependency/supply-chain policy and docs/reuse-first.adoc for the current candidate matrix.
+
 ## Implementation style
 
 - Prefer one issue-sized vertical slice per branch/PR.

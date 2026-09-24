@@ -32,6 +32,7 @@ The core design separates three time scales:
 * link:docs/maintenance.adoc[Maintenance and merge policy]
 * link:AGENTS.md[AI coding-agent development contract]
 * link:docs/agent-development.adoc[AI agent development playbook]
+* link:docs/reuse-first.adoc[Reuse-first library and reference-implementation matrix]
 * link:docs/metrics.adoc[Metrics and evaluation]
 * link:docs/roadmap.adoc[Roadmap]
 * link:docs/adr/0001-three-layer-runtime.adoc[ADR-0001: three-layer runtime]
