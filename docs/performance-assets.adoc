@@ -121,3 +121,18 @@ The scheduler decides whether to stop immediately, crossfade, or wait.
 The machine-readable baseline is `schemas/performance-asset.schema.json`.
 
 The schema deliberately stores references to binary media instead of committing generated audio into the Git repository.
+
+== 9. Rust loader and cache
+
+The production-target implementation lives in `crates/asset-store`.
+
+It enforces:
+
+* strict deserialization and runtime invariants, including ordered interrupt points and timeline markers;
+* external media references only; embedded `data:` media is rejected;
+* exact compiler compatibility and optional voice/avatar/viseme/motion requirements;
+* a stable identity containing the asset id, schema version, and all compatibility-relevant versions;
+* L0 validated in-memory descriptors and L1 local filesystem descriptor lookup with no network dependency;
+* deterministic variant selection from stable asset-id ordering, with explicit recent-id exclusion to avoid immediate repetition.
+
+L1 directory indexing is intentionally non-recursive. Asset-pack subdirectories may contain viseme or other JSON media that are not Performance Asset descriptors.
