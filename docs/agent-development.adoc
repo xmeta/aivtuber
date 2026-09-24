@@ -1,0 +1,374 @@
+= AI Agent Development Playbook
+:toc:
+:toclevels: 3
+
+This document expands the root +AGENTS.md+.
++AGENTS.md+ is the canonical machine-oriented entry point; architecture, security, domain, and maintenance documents remain authoritative for their own subjects.
+
+== 1. Objective
+
+AI-assisted development should reduce navigation and implementation cost without weakening:
+
+* GitHub Flow;
+* trust and capability boundaries;
+* deterministic/replayable behavior;
+* bounded runtime state;
+* schema parity;
+* test/benchmark evidence.
+
+The repository should make the safe path the easiest path for an implementation agent.
+
+== 2. Task triage
+
+Before editing code, classify the task.
+
+[cols="1,2,2"]
+|===
+|Task |Read first |Likely validation
+
+|Domain/schema
+|+docs/domain-contract.adoc+, schemas and matching Rust types
+|Bun schema validation, Rust parity, affected Rust tests
+
+|Security/authority
+|+docs/security-threat-model.adoc+, +crates/runtime+
+|Affected tests plus full workspace/security fixtures
+
+|Jev/reflex/retrieval
+|+docs/jev-routing.adoc+, +crates/reflex+
+|Crate tests, replay benchmark when behavior/performance changes
+
+|Scheduler/performance
+|+docs/architecture.adoc+, +docs/performance-assets.adoc+
+|Scheduler/runtime tests, replay, soak when long-running state changes
+
+|Generative/TTS
+|+docs/generative-fallback.adoc+
+|Generative/app/adapters tests plus output-gate/cancellation paths
+
+|Memory/adaptation
+|+docs/memory-adaptation.adoc+
+|Adaptation/store tests and retention/soak checks
+
+|Provider adapter
+|Relevant adapter docs plus #66 conformance assumptions
+|Adapter tests, deterministic fixtures, optional live probe only when explicitly safe
+
+|Benchmark/evaluation
+|+docs/metrics.adoc+, related #58-#62 issue
+|Schema/result validation plus reproducibility metadata
+
+|Docs/process only
+|+AGENTS.md+, +docs/maintenance.adoc+
+|Syntax/link/manual review; no unnecessary provider/runtime calls
+|===
+
+== 3. GitHub issue as executable specification
+
+Read the full issue before implementation.
+
+Confirm:
+
+* goal and non-goals;
+* acceptance criteria;
+* dependencies / related issues;
+* milestone and priority;
+* explicit security or compatibility constraints;
+* expected evidence/benchmark requirements;
+* whether another issue owns part of the requested behavior.
+* whether +status:agent-ready+ or +status:blocked+ constrains autonomous selection.
+
+If the issue is ambiguous but useful progress is possible, implement the smallest safe vertical slice rather than inventing a broad redesign.
+
+Do not treat issue existence as proof that the proposed mechanism is correct.
+
+When a user explicitly asks an agent to continue autonomously without naming an issue, prefer +status:agent-ready+ issues, then the earliest active milestone and higher priority. Never start +status:blocked+ work. If no issue is marked ready, inspect dependency state rather than guessing readiness.
+For uncertain work, use the cheapest decision-changing test first.
+
+== 4. Branch procedure
+
+From a clean working tree:
+
+[source,shell]
+----
+git fetch origin main
+git switch -c <type>/<short-topic>-issue-<number> origin/main
+----
+
+Recommended prefixes:
+
+* +feat/+ -- runtime/product behavior;
+* +fix/+ -- defect;
+* +test/+ -- testing/hardening;
+* +docs/+ -- documentation/process;
+* +build/+ -- dependencies/toolchain/CI.
+
+Do not reuse an unrelated stale branch.
+
+Before merging long-running work, integrate current +main+ and rerun affected checks.
+
+== 5. Repository navigation with tgrep
+
+Use +tgrep+ for repository-content search.
+
+Create the local index once:
+
+[source,shell]
+----
+tgrep index .
+tgrep status .
+----
+
+Search examples:
+
+[source,shell]
+----
+tgrep -n -g 'crates/**/*.rs' 'ExecutedAction::|PlaybackRoute' .
+tgrep -n -i -g 'crates/**/*.rs' 'permit|authority|authorization' .
+tgrep -n -g 'docs/**/*.adoc' 'PerformanceScheduler|interrupt' .
+tgrep -n -g 'schemas/**' -g 'crates/**/*.rs' -e 'schema_version' -e 'additionalProperties' .
+----
+
+Use +-g/--glob+ for file globs.
+Use PATH +.+ from the repository root to reuse +.tgrep/+; narrow scope with +-g/--glob+ or +-t/--type+ instead of changing the search root.
+The index is a snapshot. Rebuild it with +tgrep index .+ after edits when searches must include changed files, or use +--no-index+ for a one-off live scan.
+
+Search for existing types, tests, telemetry vocabulary, and fallback logic before creating new abstractions.
+
+== 6. Production ownership
+
+Rust under +crates/+ is the production-target deterministic core.
+
+TypeScript under +src/+ is useful for:
+
+* prototypes;
+* security/reference fixtures;
+* contract exploration;
+* regression harnesses;
+* cross-runtime parity.
+
+Do not satisfy a production acceptance criterion only in TypeScript unless the issue explicitly scopes it that way.
+
++crates/app+ is the production composition root.
+Prefer wiring a new capability there rather than adding a second executable ownership path.
+
+== 7. Vertical-slice implementation loop
+
+A productive agent loop is:
+
+. Locate existing contract/type and tests with +tgrep+.
+. Write or update the smallest failing regression test/fixture.
+. Implement through the existing production boundary.
+. Run the narrow affected test.
+. Add telemetry/replay metadata if the decision affects runtime behavior.
+. Run crate-level fmt/clippy/tests.
+. Re-read acceptance criteria.
+. Run the full relevant repository gate.
+. Inspect the final diff.
+
+Avoid large speculative refactors before the observable vertical slice works.
+
+== 8. Security checklist
+
+For content, model, moderation, tool, OBS/avatar, or memory changes, verify all applicable statements:
+
+* untrusted payload cannot assign trusted source class/plane;
+* serializable claims cannot mint non-serializable authority;
+* Jev/LLM output cannot directly invoke privileged adapters;
+* memory durability passes the explicit write gate;
+* output passes the public-output gate before irreversible publication;
+* operator emergency control does not depend on content/model queue health;
+* secrets are not logged, persisted in assets, or added to diagnostic bundles;
+* retained viewer/context state is bounded and pseudonymized where required.
+
+Add a regression fixture for boundary failures when practical.
+
+== 9. Schema evolution checklist
+
+Repository JSON Schemas are normative wire contracts.
+
+For a compatible implementation fix that merely enforces the existing schema, a version bump may not be necessary.
+
+For an incompatible change such as a new required field, renamed/removed field, type change, narrowed enum, or changed security semantics:
+
+. update schema version;
+. update positive and negative fixtures;
+. update Rust types and validation;
+. update shared TypeScript/reference contract;
+. update replay/config metadata;
+. run both directions of schema parity;
+. document compatibility impact.
+
+Never let adapter wire types become the domain source of truth.
+
+== 10. Validation matrix
+
+=== 10.1 Fast Rust iteration
+
+[source,shell]
+----
+cargo fmt --all -- --check
+cargo clippy --locked -p <crate> --all-targets -- -D warnings
+cargo test --locked -p <crate>
+----
+
+Use package-specific test filters when they shorten the edit loop, but run the complete affected crate before finishing.
+
+=== 10.2 Schema / TypeScript reference
+
+[source,shell]
+----
+bun run validate:toolchains
+bun run validate
+bun run validate:rust-parity
+bun test
+----
+
+=== 10.3 Full code-PR gate
+
+[source,shell]
+----
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
+cargo build --locked --workspace
+bun install --frozen-lockfile
+bun run validate:toolchains
+bun run validate
+bun run validate:rust-parity
+bun test
+----
+
+=== 10.4 Behavioral/performance changes
+
+Use the replay benchmark when routing, latency, cost, reuse, scheduling, or quality-related behavior changes:
+
+[source,shell]
+----
+cargo run --locked -p aivtuber-app --bin replay-benchmark --   examples/benchmarks/replay-comparison.json target/aivtuber-benchmarks
+----
+
+Use hardening/soak when failure behavior, queueing, retention, cache growth, reconnect, or long-running state changes:
+
+[source,shell]
+----
+cargo run --locked -p aivtuber-hardening --bin failure-soak --   target/hardening-soak.json 5000
+----
+
+Do not make live billable providers a normal CI prerequisite.
+
+== 11. Evidence-driven changes
+
+For optimization, routing, threshold, moderation, naturalness, and other uncertain behavior:
+
+* state the hypothesis or expected direction;
+* identify baseline/evidence;
+* name guardrails that must not regress;
+* identify evidence that would change the decision;
+* prefer replay/shadow evaluation before risky activation;
+* record actual results rather than describing the implementation itself as proof of improvement.
+
+Use the measurement/evaluation issues and +docs/metrics.adoc+ rather than inventing a private benchmark format.
+
+== 12. Dependency changes
+
+Normal feature work must not implicitly update dependencies.
+
+Rust:
+
+* keep +Cargo.lock+ unchanged unless the dependency change is intentional;
+* use +--locked+ for build/test/clippy.
+
+Bun:
+
+* direct dependencies are exact-versioned;
+* keep +bun.lock+ unchanged unless intentional;
+* use +bun install --frozen-lockfile+.
+
+For deliberate upgrades, follow +docs/maintenance.adoc+ and isolate the update from unrelated feature work when practical.
+
+== 13. Documentation discipline
+
+When behavior changes, update the nearest canonical document.
+
+Examples:
+
+* trust/authority -> security threat model;
+* wire/domain -> domain contract/schema docs;
+* routing -> Jev/routing docs;
+* generated response -> generative fallback docs;
+* runtime composition/operator behavior -> production runtime docs;
+* metrics/evaluation -> metrics docs;
+* durable architectural decision -> ADR.
+
+Do not create a parallel document when an existing canonical document owns the concept.
+
+== 14. PR and review preparation
+
+A complete PR should:
+
+* close one primary issue;
+* explain the smallest useful vertical slice;
+* list exact local verification;
+* describe architecture/security impact;
+* describe failure mode and rollback;
+* contain no accidental lockfile/generated/secret changes;
+* be rebased/merged with current +main+ as required by branch protection;
+* have required CI green on the final head.
+
+For high-consequence security/schema/persistence/destructive changes, seek independent review when available.
+
+== 15. Interrupted-work handoff
+
+Do not open a normal completion PR just to preserve unfinished work.
+
+Use a checkpoint commit and push the branch.
+The handoff must state:
+
+[source,text]
+----
+Issue:
+Goal:
+Branch:
+Latest checkpoint:
+Current main/base:
+
+Completed:
+- ...
+
+Remaining:
+- ...
+
+Verification run:
+- command -> result
+
+Known failures/blockers:
+- ...
+
+Next recommended action:
+- file/command/decision
+----
+
+A new agent should be able to continue without reconstructing hidden context from chat history.
+
+== 16. Agent anti-patterns
+
+Do not:
+
+* implement only the happy path while the issue requires degradation/fallback;
+* create a second scheduler, security gate, context model, or telemetry vocabulary without first checking existing ownership;
+* pass whole transcripts/raw runtime state into model requests for convenience;
+* use AI output as authenticated authority;
+* use wall-clock time for replay ordering;
+* make unbounded +Vec+/map/queue/history state in long-running production paths without a retention policy;
+* silently regenerate lockfiles;
+* change schema acceptance without parity fixtures;
+* claim performance/quality improvement from one anecdotal run;
+* keep coding after discovering the issue premise is invalid without recording/reassessing the decision.
+
+== 17. Tool-specific instruction files
+
+Tool-specific files should be thin adapters to +AGENTS.md+.
+
+If another coding tool needs +CLAUDE.md+, Cursor rules, or similar in the future, prefer a short pointer plus only tool-specific mechanics.
+Do not fork architecture/security/workflow policy across multiple instruction files.

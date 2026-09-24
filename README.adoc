@@ -30,6 +30,8 @@ The core design separates three time scales:
 * link:docs/memory-adaptation.adoc[Bounded memory and deterministic adaptation]
 * link:docs/production-runtime.adoc[Production Rust composition runtime]
 * link:docs/maintenance.adoc[Maintenance and merge policy]
+* link:AGENTS.md[AI coding-agent development contract]
+* link:docs/agent-development.adoc[AI agent development playbook]
 * link:docs/metrics.adoc[Metrics and evaluation]
 * link:docs/roadmap.adoc[Roadmap]
 * link:docs/adr/0001-three-layer-runtime.adoc[ADR-0001: three-layer runtime]
