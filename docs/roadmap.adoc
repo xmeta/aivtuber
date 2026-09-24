@@ -1,75 +1,147 @@
 = Roadmap
 :toc:
+:toclevels: 2
 
-== Phase 0 -- Architecture baseline
+== How to read this roadmap
 
-* Define domain events and state snapshots.
-* Define DecisionEngine boundary.
-* Define Performance Asset schema.
-* Define telemetry and replay requirements.
-* Establish Rust workspace and CI.
+The active delivery plan is the GitHub milestone sequence below.
 
-== Phase 1 -- Deterministic performer
+For day-to-day execution, GitHub issue metadata is the live source of truth:
 
-* Event bus.
-* Performance scheduler.
-* In-memory asset store.
-* Mock audio/avatar adapters.
-* Deterministic fillers/reactions.
-* Replay harness.
+* milestone = delivery stage;
+* `priority:P1` / `priority:P2` / `priority:P3` = ordering within and across stages;
+* `status:agent-ready` = dependencies are satisfied and an implementation agent may start;
+* `status:blocked` = do not start until the named blocker is resolved.
 
-Exit criterion: a recorded event trace deterministically produces the same performance plan.
+The older Phase 0-6 sequence is retained at the end of this document as implementation history.
+It describes how the architecture was bootstrapped; it is not a second active PM hierarchy.
 
-== Phase 2 -- Real avatar/audio integration
+== Stage 1 -- Production Runtime Foundation
 
-* VTube Studio adapter.
-* OBS WebSocket adapter.
-* audio playback abstraction.
-* pre-generated filler/reaction asset pack.
-* viseme timeline support.
+Goal: a bounded, secure, operable production runtime that can be exercised as a minimum usable live stream.
 
-Exit criterion: cached reaction path works end-to-end without LLM/TTS.
+The product-level release gate is tracked by https://github.com/xmeta/aivtuber/issues/97[#97, v0.1 minimum usable live-stream release gate].
 
-The Rust production composition for this exit criterion lives in +crates/app+: content ingress, compatibility-checked cached asset resolution, the deterministic scheduler, process audio playback, and VTube Studio output share one lifecycle. Local live smoke still requires materialized audio files and a configured VTube Studio model; see link:production-runtime.adoc[Production Rust composition runtime].
+Stage 1 exit requires the core runtime to be bounded and operable, with explicit production profiles, usable template/reflex/generative routing, authenticated operator control, provider/deadline boundaries, diagnostics, and degradation behavior.
 
-== Phase 3 -- Jev reflex layer
+=== Immediate critical path
 
-* Jev adapter.
-* batched routing decisions.
-* strict timeout/fallback behavior.
-* semantic retrieval + Jev reuse gate.
-* decision telemetry.
+The current dependency-critical sequence is:
 
-The Rust semantic path builds deterministic indices from compatibility-checked AssetStore entries with precomputed versioned embeddings. Replay records the embedding/index/compiler metadata and selected asset identity; stale identity is rejected before playback.
+. https://github.com/xmeta/aivtuber/issues/52[#52] separate scheduler active state from bounded terminal history.
+. https://github.com/xmeta/aivtuber/issues/53[#53] bound generated Performance Asset L0 with deterministic eviction.
+. Run #52 and #53 in parallel where practical.
+. https://github.com/xmeta/aivtuber/issues/51[#51] integrate their limits into the unified runtime retention policy after both blockers land.
+. https://github.com/xmeta/aivtuber/issues/54[#54] fix the user-visible Template route so a valid Template decision is not mapped to silence; this may proceed in parallel with #52/#53.
+. https://github.com/xmeta/aivtuber/issues/65[#65] add retained causal tracing only after #51 provides the shared retention contract.
 
-Exit criterion: comparative replay reports whether Jev changes LLM routing, cost, and latency while preserving operator-reviewed reaction quality. Benefit is not assumed without measurements from an identified dataset/configuration.
+Other Stage 1 work may proceed in parallel when ownership is independent.
+In particular, provider conformance, end-to-end deadline accounting, production composition profiles, and local operator control should not duplicate the retention/scheduler ownership above.
 
-== Phase 4 -- Generative fallback
+Stage 1 is complete only when the subsystem criteria and the #97 end-to-end release checklist both pass.
 
-* OpenAI-compatible LLM adapter.
-* TTS adapter(s).
-* streaming text/audio path.
-* dynamic Performance Asset compilation.
-* promotion policy.
+== Stage 2 -- Evidence-Driven Engineering Loop
 
-Status: implemented on the Rust production path. Generated assets are published atomically only after complete LLM/TTS output, with priority cancellation, cached/non-verbal degradation, streaming compilation state, and replayable provenance. Promotion policy decisions beyond making assets promotable remain an offline/adaptation concern.
+Goal: make product and engineering changes measurable, reproducible, and reversible.
 
-== Phase 5 -- Memory and adaptation
+Exit condition:
 
-* working-memory compaction.
-* viewer/topic relevance.
-* frequency-based asset promotion.
-* bounded variation and anti-repetition.
-* offline threshold calibration.
+* product objectives and guardrails are explicit;
+* continuous benchmark comparison detects regressions;
+* hypothesis-driven experiments record expected versus actual outcomes;
+* risk-proportional decisions/assumptions are durable;
+* after-action review feeds measured bottlenecks back into prioritization;
+* shadow evaluation can compare policies without causing production side effects.
 
-Status: implemented on the Rust production path. Working memory is byte/time/count bounded and stores pseudonymous viewer metadata; durable retention requires a `SecurityRuntime` memory-write permit. Generated-asset promotion/invalidation uses explicit deterministic frequency/quality policy, preserves provenance/runtime compatibility, and emits replayable decision records. Threshold inputs come from the Phase 6/#10 calibration dataset rather than live self-tuning. See link:memory-adaptation.adoc[Memory and Adaptation Runtime].
+Stage 2 should turn benchmark and quality evidence into a repeatable improvement loop rather than treating implementation completion as proof of improvement.
 
-== Phase 6 -- Benchmark and hardening
+== Stage 3 -- Engagement & Community Intelligence
 
-* replay benchmark suite.
-* failure injection.
-* long-stream soak tests.
-* cost/latency dashboards.
-* privacy retention policies.
+Goal: let the performer decide what, when, and how to engage instead of assuming every admitted comment deserves an immediate spoken response.
 
-Status: the Rust production path records bounded event observations and the checked-in replay runner compares deterministic, semantic, semantic+Jev, and full-generative modes on one fixture boundary with reproducibility metadata and calibration export. `crates/hardening` adds deterministic cross-subsystem fault injection, content-flood/emergency-control verification, and an eight-logical-hour soak report using the same telemetry summary vocabulary. The soak intentionally reports remaining lifetime-growth findings tracked by #50-#53 rather than masking them. See link:failure-soak.adoc[Failure Injection and Long-Stream Soak].
+Exit condition:
+
+* Jev-powered engagement triage is bounded and policy-controlled;
+* moderation recommendations/actions preserve capability boundaries;
+* delayed responses have explicit expiry and bounded storage;
+* chat bursts can be micro-batched without losing explicit outcomes;
+* audience-level signals reduce redundant work while preserving important outliers;
+* conversation/topic context remains bounded.
+
+Stage 3 must build on Stage 1 boundedness and Stage 2 measurement rather than creating independent queues, histories, or quality metrics.
+
+== Stage 4 -- Natural Live Performance
+
+Goal: make the AI VTuber feel temporally and behaviorally coherent during live interaction.
+
+Exit condition:
+
+* conversational-floor/backchannel behavior is explicit;
+* visible acknowledgement can mask useful latency without extending deadlines;
+* generated speech can commit/play at phrase-safe boundaries;
+* speech, gaze, gesture, and expression share a provider-neutral PerformanceIntent;
+* clarification/repair behavior exists for uncertainty and misunderstanding;
+* affect, initiative, scene context, repetition control, and gaze state are bounded and measurable.
+
+https://github.com/xmeta/aivtuber/issues/94[#94] is the Stage 4 tracking issue.
+
+Naturalness work must retain deterministic fallbacks, bounded state, and human-evaluable guardrails; lower raw latency is not automatically better conversational timing.
+
+== Stage 5 -- Multimodal Voice & Multi-party Expansion
+
+Goal: add optional perception, full-duplex speech observations, and multi-party/co-host routing without making them baseline runtime dependencies.
+
+Exit condition:
+
+* multimodal observations are provider-neutral and bounded;
+* speech activity / turn-end observations can drive full-duplex interaction;
+* multiple speakers/co-hosts can be routed with explicit attention arbitration;
+* perception or speaker-model failure cannot gain control authority or freeze the deterministic performer.
+
+These capabilities remain optional until the earlier stages provide the boundedness, evaluation, and operator controls needed to deploy them safely.
+
+== Implementation history -- Phase 0-6
+
+The repository was originally bootstrapped through the following architecture implementation phases.
+References elsewhere to a numbered Phase describe this history unless they explicitly say otherwise.
+
+=== Phase 0 -- Architecture baseline
+
+Defined domain events/state snapshots, the DecisionEngine boundary, Performance Asset/schema contracts, telemetry/replay requirements, and the Rust workspace/CI baseline.
+
+=== Phase 1 -- Deterministic performer
+
+Implemented the event bus, scheduler, in-memory asset store, mock output adapters, deterministic fillers/reactions, and replay harness.
+
+Historical exit criterion: the same recorded event trace deterministically produces the same performance plan.
+
+=== Phase 2 -- Real avatar/audio integration
+
+Added VTube Studio, OBS WebSocket, audio playback, cached reaction assets, and viseme-timeline support.
+
+Historical exit criterion: the cached reaction path works end-to-end without LLM/TTS.
+
+=== Phase 3 -- Jev reflex layer
+
+Added semantic retrieval, the Jev/System One adapter, strict timeout/fallback behavior, reuse gating, and decision telemetry.
+
+The production path records enough identity/version metadata to compare routing, cost, and latency without assuming Jev improves quality by construction.
+
+=== Phase 4 -- Generative fallback
+
+Added provider-neutral Thinking/TTS adapters, generated Performance Asset compilation, cancellation/degradation behavior, and reusable generated assets.
+
+This capability is implemented on the Rust production path; later delivery stages refine operability, budgets, evaluation, and natural live behavior.
+
+=== Phase 5 -- Memory and adaptation
+
+Added bounded working memory, pseudonymous viewer/topic relevance, deterministic promotion/invalidation, bounded variation, and offline-calibrated policy inputs.
+
+See link:memory-adaptation.adoc[Memory and Adaptation Runtime].
+
+=== Phase 6 -- Benchmark and hardening
+
+Added replay comparison, failure injection, long-stream logical-time soak coverage, and bounded telemetry summaries.
+
+The historical Phase 6 work exposed remaining production-boundedness gaps that are now owned by Stage 1 issues such as #51-#53.
+See link:failure-soak.adoc[Failure Injection and Long-Stream Soak].
