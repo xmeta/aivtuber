@@ -1,7 +1,6 @@
 use crate::AppError;
-use aivtuber_domain::{EventEnvelope, ReflexRequest};
+use aivtuber_domain::{EventEnvelope, ReflexContext, ReflexRequest};
 use aivtuber_reflex::{DecisionReplayRecord, ExecutedAction, ReflexPipeline, ReflexPipelineInput};
-use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlaybackRoute {
@@ -39,7 +38,7 @@ where
 {
     pipeline: ReflexPipeline,
     embeddings: E,
-    state: BTreeMap<String, serde_json::Value>,
+    context: ReflexContext,
     last_record: Option<DecisionReplayRecord>,
 }
 
@@ -51,13 +50,13 @@ where
         Self {
             pipeline,
             embeddings,
-            state: BTreeMap::new(),
+            context: ReflexContext::default(),
             last_record: None,
         }
     }
 
-    pub fn set_state(&mut self, state: BTreeMap<String, serde_json::Value>) {
-        self.state = state;
+    pub fn set_context(&mut self, context: ReflexContext) {
+        self.context = context;
     }
 
     pub fn last_record(&self) -> Option<&DecisionReplayRecord> {
@@ -74,11 +73,7 @@ where
         let record = self
             .pipeline
             .run(ReflexPipelineInput {
-                request: ReflexRequest {
-                    event: event.clone(),
-                    state: self.state.clone(),
-                    candidate_asset_ids: Vec::new(),
-                },
+                request: ReflexRequest::new(event.clone(), self.context.clone()),
                 query_embedding,
             })
             .map_err(|error| AppError::Routing(error.to_string()))?;

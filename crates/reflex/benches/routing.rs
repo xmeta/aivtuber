@@ -46,8 +46,8 @@ fn metadata() -> RetrievalMetadata {
 }
 
 fn request() -> ReflexRequest {
-    ReflexRequest {
-        event: EventEnvelope {
+    ReflexRequest::new(
+        EventEnvelope {
             schema_version: EVENT_SCHEMA_VERSION.to_owned(),
             event_id: "evt-bench".to_owned(),
             correlation_id: "corr-bench".to_owned(),
@@ -66,9 +66,8 @@ fn request() -> ReflexRequest {
                 Value::String("surprising play".to_owned()),
             )]),
         },
-        state: BTreeMap::new(),
-        candidate_asset_ids: Vec::new(),
-    }
+        aivtuber_domain::ReflexContext::default(),
+    )
 }
 
 fn success_body() -> Vec<u8> {
