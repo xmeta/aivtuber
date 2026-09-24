@@ -14,6 +14,7 @@ pub struct RetrievalMetadata {
     pub retriever_version: String,
     pub embedding_model: String,
     pub index_version: String,
+    pub asset_compiler_version: String,
     pub similarity_metric: SimilarityMetric,
     pub tie_break_rule: String,
 }
@@ -21,6 +22,7 @@ pub struct RetrievalMetadata {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RetrievalCandidate {
     pub asset_id: String,
+    pub asset_identity: Option<String>,
     pub rank: u32,
     pub similarity: f64,
 }
@@ -34,6 +36,7 @@ pub struct RetrievalResult {
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexedAsset {
     pub asset_id: String,
+    pub asset_identity: Option<String>,
     pub embedding: Vec<f32>,
 }
 
@@ -124,11 +127,15 @@ impl SemanticIndex {
             .map(|asset| {
                 let similarity =
                     dot(query, &asset.embedding) / (query_norm * norm(&asset.embedding));
-                (asset.asset_id.clone(), similarity)
+                (
+                    asset.asset_id.clone(),
+                    asset.asset_identity.clone(),
+                    similarity,
+                )
             })
             .collect::<Vec<_>>();
 
-        scored.sort_by(|(left_id, left_score), (right_id, right_score)| {
+        scored.sort_by(|(left_id, _, left_score), (right_id, _, right_score)| {
             right_score
                 .partial_cmp(left_score)
                 .unwrap_or(Ordering::Equal)
@@ -139,11 +146,14 @@ impl SemanticIndex {
             .into_iter()
             .take(top_k)
             .enumerate()
-            .map(|(index, (asset_id, similarity))| RetrievalCandidate {
-                asset_id,
-                rank: (index + 1) as u32,
-                similarity,
-            })
+            .map(
+                |(index, (asset_id, asset_identity, similarity))| RetrievalCandidate {
+                    asset_id,
+                    asset_identity,
+                    rank: (index + 1) as u32,
+                    similarity,
+                },
+            )
             .collect();
 
         Ok(RetrievalResult {
@@ -189,6 +199,7 @@ mod tests {
             retriever_version: "semantic-v1".to_owned(),
             embedding_model: "example-embed-v1".to_owned(),
             index_version: "assets-2026-09-24".to_owned(),
+            asset_compiler_version: "0.1.0".to_owned(),
             similarity_metric: SimilarityMetric::Cosine,
             tie_break_rule: "similarity_desc_then_asset_id_asc".to_owned(),
         }
@@ -201,14 +212,17 @@ mod tests {
             vec![
                 IndexedAsset {
                     asset_id: "asset.b".to_owned(),
+                    asset_identity: None,
                     embedding: vec![1.0, 0.0],
                 },
                 IndexedAsset {
                     asset_id: "asset.a".to_owned(),
+                    asset_identity: None,
                     embedding: vec![1.0, 0.0],
                 },
                 IndexedAsset {
                     asset_id: "asset.c".to_owned(),
+                    asset_identity: None,
                     embedding: vec![0.0, 1.0],
                 },
             ],
@@ -239,10 +253,12 @@ mod tests {
             vec![
                 IndexedAsset {
                     asset_id: "surprise".to_owned(),
+                    asset_identity: None,
                     embedding: vec![1.0, 0.0],
                 },
                 IndexedAsset {
                     asset_id: "gratitude".to_owned(),
+                    asset_identity: None,
                     embedding: vec![0.0, 1.0],
                 },
             ],
@@ -260,6 +276,7 @@ mod tests {
             metadata(),
             vec![IndexedAsset {
                 asset_id: "asset.a".to_owned(),
+                asset_identity: None,
                 embedding: vec![1.0, 0.0],
             }],
         )

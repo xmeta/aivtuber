@@ -8,7 +8,7 @@ It contains three semantic families with two variants each:
 * `reaction.agree`
 * `filler.thinking`
 
-`descriptors/` contains Performance Asset JSON files. `viseme/` contains compact local timing tracks consumed by `crates/runtime::cached_playback`.
+`descriptors/` contains Performance Asset JSON files. Each starter descriptor also carries a small precomputed `starter-semantic@1` embedding used by AssetStore -> `SemanticIndex` integration tests; production retrieval never computes these embeddings in the scheduler/frame path. `viseme/` contains compact local timing tracks consumed by `crates/runtime::cached_playback`.
 
 Audio remains external through `audio://starter/...` references. Generated audio binaries are intentionally not committed to Git.
 

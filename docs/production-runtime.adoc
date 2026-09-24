@@ -36,7 +36,8 @@ OBS remains an independent control adapter. Its availability never owns schedule
 * Content bytes always pass through +SecurityRuntime::admit_content_bytes+.
 * Operator/control events cannot enter the content ingress path.
 * Cached playback uses the existing +CachedPerformer+ scheduler, not a second application scheduler.
-* A reflex-selected asset id is resolved by +AssetStore::resolve+ before playback.
+* A production semantic index is built from the compatibility-checked `AssetStore` snapshot and precomputed versioned embeddings; index build/rebuild performs no scheduler/frame-path network I/O.
+* A reflex-selected asset id is resolved by +AssetStore::resolve+ before playback. When retrieval supplied an asset identity, the current `AssetIdentity::stable_key()` must still match or playback is rejected as stale.
 * Adapter commands are dispatched only while their scheduler generation is still live.
 * Commands older than +AIVTUBER_MAX_DISPATCH_LATENESS_MS+ are dropped.
 * Failed audio/avatar commands are not requeued. Reconnecting an adapter therefore cannot replay an already-due stale command.

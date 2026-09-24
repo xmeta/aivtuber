@@ -7,6 +7,10 @@ pub enum PlaybackRoute {
     Silent,
     Intent(String),
     AssetId(String),
+    AssetIdentity {
+        asset_id: String,
+        asset_identity: String,
+    },
 }
 
 pub trait RoutePlanner: Send {
@@ -79,12 +83,17 @@ where
             .map_err(|error| AppError::Routing(error.to_string()))?;
 
         let route = match record.executed.action {
-            ExecutedAction::Cached => record
-                .executed
-                .asset_id
-                .clone()
-                .map(PlaybackRoute::AssetId)
-                .unwrap_or(PlaybackRoute::Silent),
+            ExecutedAction::Cached => match (
+                record.executed.asset_id.clone(),
+                record.executed.asset_identity.clone(),
+            ) {
+                (Some(asset_id), Some(asset_identity)) => PlaybackRoute::AssetIdentity {
+                    asset_id,
+                    asset_identity,
+                },
+                (Some(asset_id), None) => PlaybackRoute::AssetId(asset_id),
+                (None, _) => PlaybackRoute::Silent,
+            },
             ExecutedAction::Reaction => event
                 .payload
                 .get("intent")

@@ -220,6 +220,12 @@ pub struct CachedPlaybackTiming {
     pub seed: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CachedAssetSelection<'a> {
+    pub asset_id: &'a str,
+    pub expected_identity: &'a str,
+}
+
 impl Default for CachedPlaybackConfig {
     fn default() -> Self {
         Self {
@@ -247,6 +253,11 @@ pub enum CachedPlaybackError {
     InvalidEvent(String),
     MissingIntent,
     NoPlayableTracks(String),
+    StaleAssetIdentity {
+        asset_id: String,
+        expected: String,
+        actual: String,
+    },
     Scheduler(Rejection),
     InvalidVisemeReference(String),
     InvalidVisemeTrack(String),
@@ -273,6 +284,14 @@ impl fmt::Display for CachedPlaybackError {
             Self::NoPlayableTracks(asset_id) => {
                 write!(f, "asset {asset_id:?} has no playable tracks")
             }
+            Self::StaleAssetIdentity {
+                asset_id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "asset {asset_id:?} identity changed after retrieval: expected {expected:?}, got {actual:?}"
+            ),
             Self::Scheduler(reason) => write!(f, "scheduler rejected cached playback: {reason:?}"),
             Self::InvalidVisemeReference(reference) => {
                 write!(f, "invalid local viseme reference: {reference:?}")
@@ -438,6 +457,56 @@ impl CachedPerformer {
         }
 
         let asset = self.assets.resolve(asset_id)?;
+        let recent_group = asset
+            .variant_group
+            .as_deref()
+            .unwrap_or(asset.intent.as_str())
+            .to_owned();
+        let outcome = self.schedule_asset(event, timing, &asset, visemes, audio, avatar)?;
+        self.record_recent(&recent_group, &asset.id);
+        Ok(outcome)
+    }
+
+    /// Play a semantic selection only if the current compatibility-checked
+    /// asset still has the exact identity recorded by retrieval.
+    pub fn handle_asset_identity<R, A, V>(
+        &mut self,
+        event: &EventEnvelope,
+        selection: CachedAssetSelection<'_>,
+        timing: CachedPlaybackTiming,
+        visemes: &R,
+        audio: &mut A,
+        avatar: &mut V,
+    ) -> Result<CachedPlaybackOutcome, CachedPlaybackError>
+    where
+        R: VisemeResolver,
+        A: AudioPlaybackSink,
+        V: AvatarPlaybackSink,
+    {
+        event
+            .validate()
+            .map_err(|error| CachedPlaybackError::InvalidEvent(error.to_string()))?;
+        if event.kind == EventKind::OperatorCommand {
+            return Err(CachedPlaybackError::InvalidEvent(
+                "operator commands use the authenticated control path".to_owned(),
+            ));
+        }
+        if selection.asset_id.trim().is_empty() || selection.expected_identity.trim().is_empty() {
+            return Err(CachedPlaybackError::InvalidEvent(
+                "selected asset id and identity must not be empty".to_owned(),
+            ));
+        }
+
+        let asset = self.assets.resolve(selection.asset_id)?;
+        let actual_identity = asset.identity().stable_key();
+        if actual_identity != selection.expected_identity {
+            return Err(CachedPlaybackError::StaleAssetIdentity {
+                asset_id: selection.asset_id.to_owned(),
+                expected: selection.expected_identity.to_owned(),
+                actual: actual_identity,
+            });
+        }
+
         let recent_group = asset
             .variant_group
             .as_deref()

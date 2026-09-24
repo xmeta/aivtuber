@@ -2,18 +2,20 @@
 
 mod outputs;
 mod routing;
+mod semantic;
 
 pub use outputs::*;
 pub use routing::*;
+pub use semantic::*;
 
 use aivtuber_domain::{
     AuthenticatedControlCommand, AuthorizedStreamAction, EngineError, EventEnvelope,
 };
 use aivtuber_runtime::{
     AudioPlaybackCommand, AudioPlaybackSink, AvatarPlaybackCommand, AvatarPlaybackSink,
-    CachedPerformer, CachedPlaybackError, CachedPlaybackOutcome, CachedPlaybackTiming,
-    ContentAdmitDecision, ControlOutcome, FastPathPreloadReport, LocalVisemeStore, RuntimeError,
-    SecurityRuntime,
+    CachedAssetSelection, CachedPerformer, CachedPlaybackError, CachedPlaybackOutcome,
+    CachedPlaybackTiming, ContentAdmitDecision, ControlOutcome, FastPathPreloadReport,
+    LocalVisemeStore, RuntimeError, SecurityRuntime,
 };
 use aivtuber_scheduler::{Scheduler, Status};
 use std::error::Error;
@@ -241,6 +243,23 @@ where
                 )?;
                 Ok(Some(outcome))
             }
+            PlaybackRoute::AssetIdentity {
+                asset_id,
+                asset_identity,
+            } => {
+                let outcome = self.performer.handle_asset_identity(
+                    &event,
+                    CachedAssetSelection {
+                        asset_id: &asset_id,
+                        expected_identity: &asset_identity,
+                    },
+                    CachedPlaybackTiming { at_ms, seed },
+                    &self.visemes,
+                    &mut self.pending_audio,
+                    &mut self.pending_avatar,
+                )?;
+                Ok(Some(outcome))
+            }
         }
     }
 
@@ -415,9 +434,8 @@ mod tests {
         LocalControlIngress, OperatorCommandInput, SecurityPlane, SourceClass, TrustLevel,
     };
     use aivtuber_reflex::{
-        HttpResponse, HttpTransport, IndexedAsset, JevAdapter, JevAdapterConfig, JevApiKey,
-        PolicyConfig, ReflexPipeline, RetrievalMetadata, SemanticIndex, SimilarityMetric,
-        TransportError,
+        HttpResponse, HttpTransport, JevAdapter, JevAdapterConfig, JevApiKey, PolicyConfig,
+        ReflexPipeline, TransportError,
     };
     use aivtuber_runtime::{CachedPlaybackConfig, SecurityRuntimeConfig};
     use aivtuber_scheduler::SchedulerConfig;
@@ -440,12 +458,27 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct FixedIdentityRoute {
+        asset_id: &'static str,
+        asset_identity: &'static str,
+    }
+
+    impl RoutePlanner for FixedIdentityRoute {
+        fn route(&mut self, _event: &EventEnvelope) -> Result<PlaybackRoute, AppError> {
+            Ok(PlaybackRoute::AssetIdentity {
+                asset_id: self.asset_id.to_owned(),
+                asset_identity: self.asset_identity.to_owned(),
+            })
+        }
+    }
+
     #[derive(Debug, Default)]
     struct FixedEmbedding;
 
     impl QueryEmbeddingProvider for FixedEmbedding {
         fn embedding(&mut self, _event: &EventEnvelope) -> Result<Vec<f32>, AppError> {
-            Ok(vec![1.0, 0.0])
+            Ok(vec![1.0, 0.0, 0.0])
         }
     }
 
@@ -620,24 +653,15 @@ mod tests {
     }
 
     fn reflex_router() -> ReflexRoutePlanner<FixedEmbedding> {
-        let index = SemanticIndex::new(
-            RetrievalMetadata {
+        let mut assets = AssetStore::new(pack_root().join("descriptors"), runtime_compatibility());
+        assets.index_local().expect("index Performance Assets");
+        let index = build_semantic_index_from_asset_store(
+            &assets,
+            &AssetSemanticIndexConfig {
                 retriever_version: "semantic-test-v1".to_owned(),
-                embedding_model: "embed-test-v1".to_owned(),
-                index_version: "app-e2e-v1".to_owned(),
-                similarity_metric: SimilarityMetric::Cosine,
-                tie_break_rule: "similarity_desc_then_asset_id_asc".to_owned(),
+                embedding_model: "starter-semantic".to_owned(),
+                embedding_model_version: "1".to_owned(),
             },
-            vec![
-                IndexedAsset {
-                    asset_id: "reaction.agree.01".to_owned(),
-                    embedding: vec![1.0, 0.0],
-                },
-                IndexedAsset {
-                    asset_id: "reaction.surprise.01".to_owned(),
-                    embedding: vec![0.0, 1.0],
-                },
-            ],
         )
         .expect("semantic index");
 
@@ -808,16 +832,61 @@ mod tests {
         let playback = outcome.playback.expect("cached reuse playback");
 
         assert_eq!(playback.asset_id, "reaction.agree.01");
-        assert_eq!(
-            app.router()
-                .last_record()
-                .and_then(|record| record.executed.asset_id.as_deref()),
-            Some("reaction.agree.01")
+        let (selected_id, selected_identity, metadata) = {
+            let record = app.router().last_record().expect("decision record");
+            (
+                record.executed.asset_id.clone(),
+                record.executed.asset_identity.clone(),
+                record.evidence.retrieval.metadata.clone(),
+            )
+        };
+        assert_eq!(selected_id.as_deref(), Some("reaction.agree.01"));
+        assert_eq!(metadata.embedding_model, "starter-semantic@1");
+        assert_eq!(metadata.asset_compiler_version, "0.1.0");
+        assert!(
+            metadata
+                .index_version
+                .starts_with("asset-semantic-fnv1a64-")
         );
+
+        let actual_identity = app
+            .performer()
+            .assets()
+            .local_entry("reaction.agree.01")
+            .expect("playback asset")
+            .identity
+            .stable_key();
+        assert_eq!(selected_identity.as_deref(), Some(actual_identity.as_str()));
 
         app.tick(playback.plan.start_at_ms.saturating_add(150));
         assert_eq!(audio_log.lock().expect("audio log").len(), 1);
         assert!(!avatar_log.lock().expect("avatar log").is_empty());
+    }
+
+    #[test]
+    fn stale_semantic_identity_is_rejected_before_playback() {
+        let mut app = app(
+            FixedIdentityRoute {
+                asset_id: "reaction.agree.01",
+                asset_identity: "stale-identity",
+            },
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        );
+        app.startup().expect("startup");
+
+        let raw = serde_json::to_vec(&chat_event(22)).expect("event json");
+        let error = app
+            .process_content_bytes(&raw, 0, 31)
+            .expect_err("stale selection must not play");
+
+        match error {
+            AppError::Playback(CachedPlaybackError::StaleAssetIdentity { asset_id, .. }) => {
+                assert_eq!(asset_id, "reaction.agree.01");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]
