@@ -54,6 +54,19 @@ describe("SourceRateLimiter", () => {
     expect(limiter.admit("chat:a", big)).toBe("dropped_size");
   });
 
+  test("payload limits count UTF-8 bytes, not JavaScript string length", () => {
+    const clock = fakeClock();
+    const payload = { text: "あ".repeat(10) };
+    const json = JSON.stringify(payload);
+    expect(new TextEncoder().encode(json).byteLength).toBeGreaterThan(json.length);
+
+    const limiter = new SourceRateLimiter(
+      { ratePerSecond: 100, burst: 100, maxPayloadBytes: json.length },
+      clock.now,
+    );
+    expect(limiter.admit("chat:utf8", payload)).toBe("dropped_size");
+  });
+
   test("control plane bypasses content flood and stays bounded", () => {
     const clock = fakeClock();
     const limiter = new SourceRateLimiter(

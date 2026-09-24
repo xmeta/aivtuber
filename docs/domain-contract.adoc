@@ -96,7 +96,7 @@ The initial mapping is intentionally strict:
 |trusted
 |===
 
-Only `operator.command` may carry an `authorization` object. A public content adapter cannot mint a trusted operator event merely because its payload contains command-like text.
+Only `operator.command` may carry an `authorization` object. A public content adapter cannot mint a trusted operator event merely because its payload contains command-like text. The serialized `AuthorizationContext` is an audit/replay claim, not authenticated runtime authority; privileged Rust actions require the non-serializable `AuthenticatedControl` minted by the local ingress path.
 
 Security rationale and capability rules are defined in `security-threat-model.adoc`.
 

@@ -5,6 +5,7 @@ members = [
     "crates/scheduler",
     "crates/reflex",
     "crates/telemetry",
+    "crates/runtime",
 ]
 resolver = "3"
 
