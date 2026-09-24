@@ -16,6 +16,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 pub const PERFORMANCE_ASSET_SCHEMA_VERSION: &str = "0.1.0";
+pub const MAX_SEMANTIC_EMBEDDING_DIMENSIONS: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheTier {
@@ -106,6 +107,20 @@ pub struct AssetCompatibility {
     pub motion_library: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticEmbedding {
+    pub model: String,
+    pub model_version: String,
+    pub vector: Vec<f32>,
+}
+
+impl SemanticEmbedding {
+    pub fn model_key(&self) -> String {
+        format!("{}@{}", self.model, self.model_version)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Provenance {
@@ -140,6 +155,8 @@ pub struct PerformanceAsset {
     #[serde(default)]
     pub variation: Option<VariationSpec>,
     pub compatibility: AssetCompatibility,
+    #[serde(default)]
+    pub semantic_embedding: Option<SemanticEmbedding>,
     #[serde(default)]
     pub provenance: Option<Provenance>,
 }
@@ -335,6 +352,46 @@ impl PerformanceAsset {
             self.compatibility.motion_library.as_deref(),
             &mut issues,
         );
+
+        if let Some(embedding) = &self.semantic_embedding {
+            if embedding.model.trim().is_empty() {
+                issues.push(ValidationIssue::new(
+                    "semantic_embedding.model",
+                    "must not be empty",
+                ));
+            }
+            if embedding.model_version.trim().is_empty() {
+                issues.push(ValidationIssue::new(
+                    "semantic_embedding.model_version",
+                    "must not be empty",
+                ));
+            }
+            if embedding.vector.is_empty()
+                || embedding.vector.len() > MAX_SEMANTIC_EMBEDDING_DIMENSIONS
+            {
+                issues.push(ValidationIssue::new(
+                    "semantic_embedding.vector",
+                    format!("must contain 1..={MAX_SEMANTIC_EMBEDDING_DIMENSIONS} dimensions"),
+                ));
+            } else if embedding.vector.iter().any(|value| !value.is_finite()) {
+                issues.push(ValidationIssue::new(
+                    "semantic_embedding.vector",
+                    "must contain only finite values",
+                ));
+            } else {
+                let norm_squared: f64 = embedding
+                    .vector
+                    .iter()
+                    .map(|value| f64::from(*value) * f64::from(*value))
+                    .sum();
+                if norm_squared == 0.0 {
+                    issues.push(ValidationIssue::new(
+                        "semantic_embedding.vector",
+                        "must have non-zero norm",
+                    ));
+                }
+            }
+        }
 
         if issues.is_empty() {
             Ok(())
@@ -677,13 +734,14 @@ pub fn load_asset_file(path: impl AsRef<Path>) -> Result<PerformanceAsset, Asset
     Ok(asset)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AssetIndexEntry {
     pub identity: AssetIdentity,
     pub path: PathBuf,
     pub class: AssetClass,
     pub variant_group: Option<String>,
     pub compatibility: CompatibilityStatus,
+    pub semantic_embedding: Option<SemanticEmbedding>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -741,6 +799,15 @@ impl AssetStore {
         self.local.get(id)
     }
 
+    /// Stable asset-id ordered view of the current validated L1 snapshot.
+    ///
+    /// Consumers such as semantic-index builders must use this snapshot rather
+    /// than walking descriptor files independently, so compatibility and
+    /// transactional reindexing stay owned by AssetStore.
+    pub fn indexed_entries(&self) -> impl Iterator<Item = (&str, &AssetIndexEntry)> {
+        self.local.iter().map(|(id, entry)| (id.as_str(), entry))
+    }
+
     /// Validate and index descriptor JSON files directly under the L1 root.
     ///
     /// The update is transactional: invalid or duplicate descriptors leave
@@ -782,6 +849,7 @@ impl AssetStore {
                 class: asset.class,
                 variant_group: asset.variant_group.clone(),
                 compatibility: compatibility.clone(),
+                semantic_embedding: asset.semantic_embedding.clone(),
             };
 
             if let Some(previous) = next.get(&asset.id) {
@@ -1047,6 +1115,29 @@ mod tests {
         assert_eq!(key_a, key_b);
         assert!(key_a.contains("reaction.surprise.01"));
         assert!(key_a.contains("example-voice-v1"));
+    }
+
+    #[test]
+    fn semantic_embedding_metadata_is_validated() {
+        let mut asset = valid_asset();
+        asset.semantic_embedding = Some(SemanticEmbedding {
+            model: "starter-semantic".to_owned(),
+            model_version: "1".to_owned(),
+            vector: vec![0.0, 0.0, 0.0],
+        });
+        let error = asset.validate().expect_err("zero vector must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("semantic_embedding.vector: must have non-zero norm")
+        );
+
+        asset.semantic_embedding = Some(SemanticEmbedding {
+            model: "starter-semantic".to_owned(),
+            model_version: "1".to_owned(),
+            vector: vec![1.0, 0.0, 0.0],
+        });
+        asset.validate().expect("versioned embedding is valid");
     }
 
     #[test]

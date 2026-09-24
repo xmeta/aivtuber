@@ -31,6 +31,7 @@ pub struct DecisionEvidence {
 pub struct PolicyDecision {
     pub route: ResponseRoute,
     pub selected_candidate_id: Option<String>,
+    pub selected_candidate_identity: Option<String>,
     pub fallback_reason: FallbackReason,
     pub reason: String,
 }
@@ -50,6 +51,7 @@ pub enum ExecutedAction {
 pub struct ExecutedDecision {
     pub action: ExecutedAction,
     pub asset_id: Option<String>,
+    pub asset_identity: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DecisionReplayRecord {
@@ -203,6 +205,7 @@ pub fn apply_policy(evidence: &DecisionEvidence, config: PolicyConfig) -> Policy
         return PolicyDecision {
             route: ResponseRoute::Silent,
             selected_candidate_id: None,
+            selected_candidate_identity: None,
             fallback_reason: decision.fallback_reason,
             reason: "model_or_transport_fallback".to_owned(),
         };
@@ -216,6 +219,7 @@ pub fn apply_policy(evidence: &DecisionEvidence, config: PolicyConfig) -> Policy
         return PolicyDecision {
             route: ResponseRoute::Silent,
             selected_candidate_id: None,
+            selected_candidate_identity: None,
             fallback_reason: FallbackReason::LowConfidence,
             reason: "route_confidence_below_threshold".to_owned(),
         };
@@ -224,9 +228,22 @@ pub fn apply_policy(evidence: &DecisionEvidence, config: PolicyConfig) -> Policy
         if decision.cache_reuse_probability >= config.reuse_threshold
             && evidence.selected_candidate_id.is_some()
         {
+            let selected_candidate_identity =
+                evidence
+                    .selected_candidate_id
+                    .as_ref()
+                    .and_then(|selected_id| {
+                        evidence
+                            .retrieval
+                            .candidates
+                            .iter()
+                            .find(|candidate| &candidate.asset_id == selected_id)
+                            .and_then(|candidate| candidate.asset_identity.clone())
+                    });
             return PolicyDecision {
                 route: ResponseRoute::Cached,
                 selected_candidate_id: evidence.selected_candidate_id.clone(),
+                selected_candidate_identity,
                 fallback_reason: FallbackReason::None,
                 reason: "explicit_candidate_passed_reuse_gate".to_owned(),
             };
@@ -234,6 +251,7 @@ pub fn apply_policy(evidence: &DecisionEvidence, config: PolicyConfig) -> Policy
         return PolicyDecision {
             route: ResponseRoute::Silent,
             selected_candidate_id: None,
+            selected_candidate_identity: None,
             fallback_reason: FallbackReason::PolicyOverride,
             reason: "cached_route_failed_explicit_reuse_gate".to_owned(),
         };
@@ -242,6 +260,7 @@ pub fn apply_policy(evidence: &DecisionEvidence, config: PolicyConfig) -> Policy
     PolicyDecision {
         route: decision.route.value,
         selected_candidate_id: None,
+        selected_candidate_identity: None,
         fallback_reason: FallbackReason::None,
         reason: "route_accepted".to_owned(),
     }
@@ -264,6 +283,9 @@ pub fn execute_policy(policy: &PolicyDecision) -> ExecutedDecision {
         action,
         asset_id: (action == ExecutedAction::Cached)
             .then(|| policy.selected_candidate_id.clone())
+            .flatten(),
+        asset_identity: (action == ExecutedAction::Cached)
+            .then(|| policy.selected_candidate_identity.clone())
             .flatten(),
     }
 }
@@ -353,6 +375,7 @@ mod tests {
             retriever_version: "semantic-v1".to_owned(),
             embedding_model: "embed-v1".to_owned(),
             index_version: "index-v7".to_owned(),
+            asset_compiler_version: "0.1.0".to_owned(),
             similarity_metric: SimilarityMetric::Cosine,
             tie_break_rule: "similarity_desc_then_asset_id_asc".to_owned(),
         }
@@ -363,14 +386,17 @@ mod tests {
             vec![
                 IndexedAsset {
                     asset_id: "asset.a".to_owned(),
+                    asset_identity: Some("identity-a".to_owned()),
                     embedding: vec![1.0, 0.0],
                 },
                 IndexedAsset {
                     asset_id: "asset.b".to_owned(),
+                    asset_identity: None,
                     embedding: vec![0.8, 0.2],
                 },
                 IndexedAsset {
                     asset_id: "asset.c".to_owned(),
+                    asset_identity: None,
                     embedding: vec![0.0, 1.0],
                 },
             ],
@@ -494,6 +520,10 @@ mod tests {
 
         assert_eq!(record.executed.action, ExecutedAction::Cached);
         assert_eq!(record.executed.asset_id.as_deref(), Some("asset.a"));
+        assert_eq!(
+            record.executed.asset_identity.as_deref(),
+            Some("identity-a")
+        );
 
         let serialized = String::from_utf8(record.to_json_bytes()).expect("utf8");
         assert!(serialized.contains("\"evidence\""));

@@ -213,7 +213,8 @@ Every decision-affecting input must be recordable:
 * normalized event
 * compact typed state snapshot
 * exact ReflexRequest/ReflexContext schema versions
-* retrieval candidates with rank/similarity
+* retrieval candidates with compatibility-stable asset identity, rank, and similarity
+* retriever/embedding-model/index-snapshot/asset-compiler versions
 * decision output
 * deterministic threshold/config version
 * executed action
