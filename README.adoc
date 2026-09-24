@@ -26,6 +26,7 @@ The core design separates three time scales:
 * link:docs/jev-routing.adoc[Jev reflex-routing contract]
 * link:docs/performance-assets.adoc[Performance Asset specification]
 * link:docs/vts-obs-adapters.adoc[VTube Studio and OBS adapter integration]
+* link:docs/production-runtime.adoc[Production Rust composition runtime]
 * link:docs/metrics.adoc[Metrics and evaluation]
 * link:docs/roadmap.adoc[Roadmap]
 * link:docs/adr/0001-three-layer-runtime.adoc[ADR-0001: three-layer runtime]
@@ -46,7 +47,7 @@ cargo test --workspace
 cargo build --workspace
 ----
 
-The Rust production path includes `crates/runtime` for security enforcement: byte-aware content ingress limits/backpressure, authenticated emergency-control bypass, memory-write gating, public-output gating, and redacted audit records. Privileged OBS/avatar/tool actions require the non-serializable `AuthenticatedControl` authority minted by `LocalControlIngress`; serialized `AuthorizationContext` values are audit/replay data only.
+The Rust production path includes `crates/runtime` for security enforcement: byte-aware content ingress limits/backpressure, authenticated emergency-control bypass, memory-write gating, public-output gating, and redacted audit records. Privileged OBS/avatar/tool actions require the non-serializable `AuthenticatedControl` authority minted by `LocalControlIngress`; serialized `AuthorizationContext` values are audit/replay data only. `crates/app` is the executable composition root: it owns lifecycle, content ingress, cached/reflex-selected asset playback, the shared deterministic scheduler, and dispatch to real audio/VTube Studio/OBS adapter boundaries.
 
 == Validation
 
@@ -106,4 +107,4 @@ bun test
 
 Bootstrap/hardening phase. CI and the Rust workspace are operational. The Rust provider-neutral domain and deterministic scheduler/replay core include explicit lifecycle state, safe-point/phrase-boundary preemption, blend/exclusivity arbitration, seeded variation, causal replay ordering, and deterministic mock sinks. `crates/reflex` now adds deterministic semantic Top-K retrieval, the current TypeSafe System One/Jev wire adapter, absolute-deadline retry/fallback handling, explicit candidate reuse gating, and separate evidence/policy/execution replay stages. The TypeScript reference harness remains useful for security fixtures and LLM/TTS mock contracts.
 
-The Rust production core includes the executable Performance Asset subsystem in `crates/asset-store`, the cached filler/reaction playback path in `crates/runtime`, and real VTube Studio/OBS websocket adapters in `crates/adapters`: strict descriptor validation, compatibility-aware L0/L1 caching, deterministic anti-repetition variants, synchronized cached playback, VTube Studio token authentication/hotkeys/parameter injection/events, and obs-websocket 5.x authentication/scene/source/audio control/events with bounded reconnect behavior. Adapter disconnects do not own or stop scheduler state, and reconnects do not replay stale actions. The Rust control/security path separates serialized authorization claims from authenticated local authority and wires rate/backpressure, emergency control, output gating, memory gating, and audit redaction into `crates/runtime`. Remaining production work is centered on generative fallback (#9) and comparative telemetry/calibration (#10).
+The Rust production core includes the executable Performance Asset subsystem in `crates/asset-store`, cached filler/reaction playback in `crates/runtime`, real VTube Studio/OBS/audio adapters in `crates/adapters`, and the executable `aivtuber-app` composition root in `crates/app`. The cached path now traverses normalized content ingress -> deterministic or reflex-selected asset routing -> compatibility-checked AssetStore resolution -> deterministic Scheduler -> audio/avatar output without LLM/TTS. Adapter failures degrade independently; failed/due commands are not replayed after reconnect, and authenticated emergency stop operates on the same scheduler used by production playback. Remaining production hardening is tracked by #35-#41 together with generative fallback #9 and comparative telemetry/calibration #10.

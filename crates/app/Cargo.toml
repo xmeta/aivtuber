@@ -1,0 +1,15 @@
+[package]
+name = "aivtuber-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aivtuber-adapters = { path = "../adapters" }
+aivtuber-asset-store = { path = "../asset-store" }
+aivtuber-domain = { path = "../domain" }
+aivtuber-reflex = { path = "../reflex" }
+aivtuber-runtime = { path = "../runtime" }
+aivtuber-scheduler = { path = "../scheduler" }
+aivtuber-telemetry = { path = "../telemetry" }
+serde_json = "1.0"

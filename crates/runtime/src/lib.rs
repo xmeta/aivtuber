@@ -267,6 +267,48 @@ impl SecurityRuntime {
         Ok(outcome)
     }
 
+    /// Apply an authenticated control command to a scheduler owned by a
+    /// production composition root. This keeps emergency stop on the same
+    /// timeline as cached playback instead of maintaining a shadow scheduler.
+    pub fn handle_control_with_scheduler(
+        &mut self,
+        command: &AuthenticatedControlCommand,
+        at_ms: u64,
+        scheduler: &mut Scheduler,
+    ) -> Result<ControlOutcome, RuntimeError> {
+        let event = command.event();
+        let authority = command.authority();
+        validate_authority_matches_event(authority, event)?;
+
+        let action = event
+            .payload
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(RuntimeError::UnauthorizedControl("missing action"))?;
+
+        let outcome = match action {
+            "stop" | "performer.stop" => {
+                require_capability(authority, Capability::PerformerStop)?;
+                let cancelled = scheduler.stop_all(at_ms).len();
+                ControlOutcome::Stopped { cancelled }
+            }
+            "mute" | "performer.mute" => {
+                require_capability(authority, Capability::PerformerMute)?;
+                self.muted = true;
+                ControlOutcome::Muted
+            }
+            _ => ControlOutcome::AuthenticatedOther,
+        };
+
+        self.audit.push(self.redactor.record(
+            Some(&event.event_id),
+            AuditCategory::Authorization,
+            "authorized_control",
+            format!("principal={} action={action}", authority.principal()),
+        ));
+        Ok(outcome)
+    }
+
     /// The production public-output surface always applies the deterministic
     /// output gate before returning text that may be spoken/displayed.
     pub fn publish_text(&mut self, text: &str) -> PublicOutput {
