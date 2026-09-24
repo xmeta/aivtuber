@@ -59,6 +59,8 @@ An incomplete implementation should remain on its issue branch with a pushed che
 
 Repository content search uses +tgrep+; a local root +.tgrep/+ index may be built with +tgrep index .+ and is intentionally ignored by Git.
 
+Before implementing generic infrastructure, check +docs/reuse-first.adoc+ for existing library/reference candidates. A new dependency or custom replacement should record why it is adopted, wrapped, used only as reference, benchmarked first, or rejected. Project-specific authority, replay, deterministic scheduling, and bounded-state semantics remain repository-owned even when a third-party primitive is used.
+
 == Dependency updates
 
 Dependency updates are deliberate changes and should be isolated from unrelated feature work when practical.

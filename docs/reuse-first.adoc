@@ -1,0 +1,213 @@
+= Reuse-First Library and Reference-Implementation Matrix
+:toc:
+:toclevels: 3
+
+This document records the first candidates to evaluate before aivtuber contributors implement generic infrastructure from scratch.
+
+It is not a dependency lock-in list.
+A candidate may be adopted directly, wrapped, partially reused, used only as a reference, benchmarked first, or rejected.
+
+The issue or PR that introduces a dependency still owns final due diligence.
+See #100 for supply-chain policy and CI gates.
+
+== 1. Decision rule
+
+Prefer:
+
+[source,text]
+----
+aivtuber-specific policy / authority / replay semantics
+        +
+mature library for the generic mechanism
+----
+
+Do not outsource project-owned semantics merely because a library offers a convenient default.
+
+Before custom infrastructure is added, check license, maintenance, transitive/runtime cost, async/runtime assumptions, security advisories, determinism/replay impact, bounded-state behavior, provider lock-in, and fallback/removal cost.
+
+Record the result as one of:
+
+* +adopt+
+* +wrap+
+* +partial reuse+
+* +reference only+
+* +benchmark first+
+* +reject+
+
+== 2. Candidate matrix
+
+[cols="2,2,2,4,2"]
+|===
+|Problem area |Preferred first candidate |Default mode |aivtuber-owned semantics / caveats |Issue
+
+|Scheduler active-object storage
+|+slotmap+
+|Evaluate / likely adopt
+|Use stable/versioned handles for active state. Keep priority, reservation, preemption, safe interrupt, generation fencing, deterministic ordering, and terminal-history policy in aivtuber.
+|#52
+
+|Keyed rate limiting
+|+governor+
+|Partial reuse
+|Reuse quota/GCRA mechanics and custom-clock support. Keep source identity/trust, hard maximum key cardinality, eviction, retention, and overload policy in aivtuber.
+|#51
+
+|Local operator IPC
+|+interprocess+
+|Evaluate / likely adopt
+|Use Unix-domain-socket / Windows named-pipe mechanics where suitable. Authentication, capability minting, command bounds, emergency path, and audit remain project-owned.
+|#56
+
+|Operator CLI
+|+clap+
+|Adopt unless a concrete gap appears
+|Use parsing/help generation only. Commands still enter the authenticated local-control boundary.
+|#56
+
+|Causal instrumentation
+|+tracing+
+|Wrap
+|Reuse spans/events/parent relationships and subscriber plumbing. Keep stable stage vocabulary, privacy/redaction, correlation IDs, replay identity, retention, and benchmark attribution in aivtuber.
+|#65
+
+|Runtime metrics
+|+metrics+
+|Wrap
+|Reuse counter/gauge/histogram facade. Keep the #58 reproducible benchmark/result schema, comparison semantics, dataset/config identity, and budgets project-owned.
+|#58
+
+|Property-based tests
+|+proptest+
+|Adopt
+|Use generated action/state sequences and shrinking. Convert discovered failures into deterministic regression tests.
+|#57
+
+|Fuzzing
+|+cargo-fuzz+ / libFuzzer
+|Adopt
+|Use for parser/wire/security boundaries. Longer campaigns belong in scheduled/manual Linux jobs; normal PR CI keeps deterministic reduced regressions.
+|#57
+
+|Phrase/sentence boundary primitives
+|+unicode-segmentation+
+|Evaluate / likely adopt
+|Use Unicode-aware boundary primitives only. aivtuber still owns semantic phrase completeness, public-output gating, TTS completion, irreversible commit horizon, and cancellation.
+|#83
+
+|Phrase-streaming reference
+|Open-LLM-VTuber
+|Reference only
+|Study sentence-divider, faster-first-response, interruption, and segmented TTS behavior. Do not copy publication semantics that bypass aivtuber's stronger output-gate/atomic-commit requirements.
+|#83
+
+|Twitch moderation API
+|+twitch_api+
+|Wrap
+|Reuse Helix HTTP/API types and endpoint mechanics. Recommendation/execution split, ModerationAuthority, approval, idempotency/freshness, and audit stay in aivtuber.
+|#76
+
+|YouTube moderation API
+|+google-youtube3+
+|Wrap
+|Reuse generated YouTube Data API resources. Keep provider-neutral ModerationAdapter and project authority semantics above it.
+|#76
+
+|VTube Studio protocol/client
+|+vtubestudio+
+|Partial reuse / conformance spike first
+|Typed protocol/auth/multiplexing may replace hand-written wire code. Do not inherit reconnect/retry behavior that could replay stale avatar commands. Measure async/Tokio footprint.
+|#66
+
+|OBS WebSocket protocol/client
+|+obws+
+|Partial reuse / conformance spike first
+|Reuse protocol/request/event handling where it fits. Keep authenticated capability, freshness, cancellation, safe reconnect, deterministic decision/audit records in aivtuber. Measure Tokio/runtime impact.
+|#66
+
+|Generated L0 cache
+|+lru+; also evaluate +moka+ / +quick_cache+
+|Determinism first
+|A generic adaptive cache is unsuitable if survivor/eviction order cannot be reproduced for recorded inputs/config. A simple deterministic LRU-like mechanism may be preferable.
+|#53
+
+|Native audio backend
+|+rodio+
+|Benchmark first
+|Compare against current per-playback process spawn. Measure first-audio/startup distribution, cancellation, consecutive-clip gap, CPU/memory, device lifecycle, and Windows behavior before changing the default.
+|#101
+
+|Natural avatar behavior / gaze / idle motion
+|AIRI
+|Reference only by default
+|Study Live2D/VRM auto blink, look-at, idle eye movement, motion UX, and repository organization. Keep aivtuber's Rust provider-neutral PerformanceIntent, replay, budgets, and authority boundaries.
+|#94
+
+|Semantic ANN/vector search
+|+hnsw_rs+, +usearch+, or equivalent
+|Defer until measured bottleneck
+|Current exact cosine Top-K is simple and deterministic. Approximate indexing adds tuning, serialization/versioning, and replay concerns. Introduce only when #58 proves retrieval is material.
+|#58
+
+|Rust dependency policy
+|+cargo-deny+
+|Preferred supply-chain gate
+|Use for licenses, advisories, bans/duplicates, and sources. Repository policy defines exceptions/revisit conditions.
+|#100
+|===
+
+== 3. Areas intentionally kept project-owned
+
+The following are not generic mechanisms to outsource wholesale:
+
+* scheduler priority, reservation, safe-interrupt, and cancellation semantics;
+* non-serializable authenticated control and memory-write capabilities;
+* source trust/plane classification;
+* public-output security gate;
+* replay ordering and deterministic fallback decisions;
+* Jev/LLM recommendation-to-policy boundary;
+* moderation recommendation vs privileged execution;
+* deadline classes, attention policy, and stale-command policy;
+* benchmark/evaluation result meaning and product guardrails.
+
+A library may implement a lower-level primitive used by these systems, but it must not become the authority for these semantics.
+
+== 4. Reference implementations
+
+=== 4.1 Open-LLM-VTuber
+
+Study sentence segmentation, early first response, speech interruption, segmented TTS, and live voice interaction.
+Use it to identify tested patterns and failure cases, not as a reason to weaken aivtuber's atomic Performance Asset and output-gate requirements.
+
+=== 4.2 AIRI
+
+Study Live2D/VRM behavior, auto blink, auto look-at, idle eye movement, motion mapping, attention UX, and agent-oriented repository organization.
+Use it primarily as behavior/UX/architecture evidence unless a package independently fits a provider-neutral Rust boundary.
+
+== 5. Dependency adoption record
+
+For a new dependency or custom replacement, record at least:
+
+[source,text]
+----
+Problem:
+Candidate(s):
+Decision: adopt | wrap | partial reuse | reference only | benchmark first | reject
+Why:
+License:
+Maintenance / release status:
+Runtime / transitive impact:
+Determinism / replay impact:
+Bounded-state impact:
+Security / authority impact:
+Fallback / removal plan:
+Revisit condition:
+----
+
+For small utility crates this can be a short issue/PR section.
+For high-consequence runtime/provider changes, use #61's decision/assumption process.
+
+== 6. Revisit policy
+
+Revisit a decision when #58 identifies a different bottleneck, provider behavior changes, a crate becomes unmaintained or receives an unmitigated advisory, dependency/runtime cost becomes material, deterministic/replay requirements change, or #66 conformance disproves an assumption.
+
+Do not repeatedly re-evaluate a previously rejected candidate without new evidence.
