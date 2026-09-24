@@ -58,6 +58,15 @@ bun run validate
 The harness also asserts that fixtures under `examples/events/invalid/` are rejected by the Event Envelope schema.
 CI runs this check on every push and pull request.
 
+== Implementation roles
+
+The repository currently keeps two implementations for different purposes:
+
+* *Rust under `crates/` is the production-target deterministic core.* Roadmap/P0 acceptance criteria for domain, scheduling, assets, replay, and reflex execution are not considered complete until the required behavior exists and is tested on the Rust path, unless an issue explicitly says otherwise.
+* *TypeScript under `src/` is an executable reference/prototype and regression harness.* It is useful for contract exploration, security fixtures, mocks, and cross-runtime parity tests, but a TypeScript-only implementation does not by itself close a Rust production-core acceptance criterion.
+
+Cross-runtime behavior that is intentionally shared (for example seeded variation) should be pinned by parity tests or common fixtures.
+
 == Runtime bootstrap (TypeScript)
 
 A minimal deterministic security core lives under `src/`:
@@ -77,7 +86,7 @@ The first slice of the deterministic performer (roadmap phase 1) is also impleme
 * `src/adapters.ts` -- mock audio/avatar adapters producing recorded deterministic outputs, with independent degradation.
 * `src/session.ts` -- end-to-end session runner (bus -> performer -> adapters) with a replay fingerprint: identical inputs produce identical recordings.
 * `src/reflex.ts` -- provider-neutral `DecisionEngine` contract and `ReflexDirector`: strict deadline with timeout-as-control-flow, deterministic interrupt/route policy in code, low-confidence and cache-reuse thresholds, and a normalized deterministic fallback (domain contract sections 5-7, jev-routing sections 4-6). Jev wire types stay inside future adapters.
-* `src/adapters-jev.ts` -- Jev HTTP adapter implementing `DecisionEngine`: wire DTOs sealed inside the adapter, HTTP failure modes mapped to typed fallback reasons, deadline aborts surfaced as `timeout`, secrets referenced by identifier only.
+* `src/adapters-jev.ts` -- Jev adapter prototype/reference implementation. Its provider-neutral boundary and fallback tests are useful, but Issue #8 tracks replacing its prototype wire shape with the current official TypeSafe System One `state` / `model` / `questions` request and `answers` response contract before treating it as an integration-complete adapter.
 * `src/output-gate.ts` -- deterministic output gate (threat model section 11): allow / redact secret-shaped tokens / replace with a cached reaction / suppress control-plane text; hook failures fail closed.
 * `src/thinking.ts` -- provider-neutral `ThinkingEngine` LLM contract (roadmap phase 4): curated request context (never raw history), structured-output expectations, ordered streaming chunks with a final finish reason, typed failure reasons, and LLM output kept strictly as data with no capabilities (threat model section 2).
 * `src/tts.ts` -- provider-neutral `TtsEngine` contract (roadmap phase 4): single-shot and streaming audio synthesis with ordered chunks, aligned viseme timelines, typed failure reasons, and version identity for cache keys (architecture section 7).
@@ -92,4 +101,6 @@ bun test
 
 == Status
 
-Bootstrap phase. Schema/fixture validation, CI, the Rust workspace (domain, asset-store, scheduler, reflex, telemetry crates), the deterministic security core, roadmap phase 1 (event bus, seeded variation, asset store, scheduler, deterministic performer, mock adapters, session replay recording), the reflex routing layer (phase 3 contract), and the phase 4 adapter contracts (`ThinkingEngine` LLM and `TtsEngine` with mock implementations) are implemented; next targets are real OpenAI-compatible LLM/TTS providers behind those contracts, viseme/gesture timeline playback in the mock adapters, and VTube Studio/OBS integration planning.
+Bootstrap/hardening phase. CI and the Rust workspace are operational, and the Rust provider-neutral domain plus deterministic scheduler core have landed. The TypeScript reference harness covers deterministic performer/replay concepts, security fixtures, reflex routing concepts, and LLM/TTS mock contracts.
+
+The production-target milestones are not yet complete: Issue #3 remains open for the remaining Rust event round-trip coverage; Issue #4 remains open for scheduler safe-point/phrase-boundary execution and Rust replay completion; Issue #8 remains open for semantic retrieval and a real TypeSafe System One adapter; Issue #14 remains open for authenticated control-plane provenance and production-path security enforcement. Real VTube Studio/OBS and generative providers should build on those corrected boundaries rather than treating the reference TypeScript prototypes as completion evidence.
