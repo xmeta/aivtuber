@@ -18,7 +18,8 @@ use std::sync::Arc;
 pub const PERFORMANCE_ASSET_SCHEMA_VERSION: &str = "0.1.0";
 pub const MAX_SEMANTIC_EMBEDDING_DIMENSIONS: usize = 4096;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CacheTier {
     Memory,
     LocalStorage,
@@ -972,8 +973,19 @@ impl AssetStore {
     /// and its stable identity is compared with the indexed identity so a file
     /// changed after indexing cannot silently bypass compatibility checks.
     pub fn resolve(&mut self, id: &str) -> Result<Arc<PerformanceAsset>, AssetStoreError> {
+        self.resolve_with_tier(id).map(|(asset, _)| asset)
+    }
+
+    /// Resolve an asset and report the cache tier that satisfied this lookup.
+    ///
+    /// L1 hits are promoted to L0 after the returned tier is captured, so
+    /// telemetry can distinguish a true memory hit from local descriptor I/O.
+    pub fn resolve_with_tier(
+        &mut self,
+        id: &str,
+    ) -> Result<(Arc<PerformanceAsset>, CacheTier), AssetStoreError> {
         if let Some(asset) = self.hot_get(id) {
-            return Ok(asset);
+            return Ok((asset, CacheTier::Memory));
         }
 
         let entry = self
@@ -1007,6 +1019,7 @@ impl AssetStore {
         }
 
         self.insert_hot(asset)
+            .map(|asset| (asset, CacheTier::LocalStorage))
     }
 
     pub fn preload_compatible(&mut self) -> Result<usize, AssetStoreError> {
@@ -1092,12 +1105,22 @@ impl AssetStore {
         seed: u64,
         recently_used: &[&str],
     ) -> Result<Arc<PerformanceAsset>, AssetStoreError> {
+        self.select_variant_with_tier(variant_group, seed, recently_used)
+            .map(|(asset, _)| asset)
+    }
+
+    pub fn select_variant_with_tier(
+        &mut self,
+        variant_group: &str,
+        seed: u64,
+        recently_used: &[&str],
+    ) -> Result<(Arc<PerformanceAsset>, CacheTier), AssetStoreError> {
         let id = self
             .select_variant_id(variant_group, seed, recently_used)
             .ok_or_else(|| AssetStoreError::NotFound {
                 id: format!("variant_group:{variant_group}"),
             })?;
-        self.resolve(&id)
+        self.resolve_with_tier(&id)
     }
 }
 
@@ -1325,10 +1348,17 @@ mod tests {
             Some(CacheTier::LocalStorage)
         );
 
-        let loaded = store.resolve("reaction.surprise.01").expect("resolve L1");
+        let (loaded, source_tier) = store
+            .resolve_with_tier("reaction.surprise.01")
+            .expect("resolve L1");
         assert_eq!(loaded.id, "reaction.surprise.01");
+        assert_eq!(source_tier, CacheTier::LocalStorage);
         assert_eq!(store.hot_len(), 1);
         assert_eq!(store.tier("reaction.surprise.01"), Some(CacheTier::Memory));
+        let (_, hot_tier) = store
+            .resolve_with_tier("reaction.surprise.01")
+            .expect("resolve L0");
+        assert_eq!(hot_tier, CacheTier::Memory);
 
         fs::remove_file(path).expect("remove L1 descriptor");
         let hot = store.hot_get("reaction.surprise.01").expect("L0 hit");

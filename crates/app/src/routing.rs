@@ -30,6 +30,10 @@ pub enum PlaybackRoute {
 
 pub trait RoutePlanner: Send {
     fn route(&mut self, event: &EventEnvelope) -> Result<PlaybackRoute, AppError>;
+
+    fn decision_record(&self) -> Option<&DecisionReplayRecord> {
+        None
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -126,6 +130,10 @@ where
 
         self.last_record = Some(record);
         Ok(route)
+    }
+
+    fn decision_record(&self) -> Option<&DecisionReplayRecord> {
+        self.last_record.as_ref()
     }
 }
 

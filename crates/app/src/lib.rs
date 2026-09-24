@@ -8,13 +8,15 @@ pub use outputs::*;
 pub use routing::*;
 pub use semantic::*;
 
+use aivtuber_asset_store::CacheTier;
 use aivtuber_domain::{
-    AuthenticatedControlCommand, AuthorizedStreamAction, EngineError, EventEnvelope,
+    AuthenticatedControlCommand, AuthorizedStreamAction, EngineError, EventEnvelope, FallbackReason,
 };
 use aivtuber_generative::{
     FallbackDirective, GeneratedTextGateDecision, GenerationCancellationRegistry,
-    GenerationDisposition, GenerationRequest, GenerativePipeline,
+    GenerationDisposition, GenerationRequest, GenerationTrace, GenerativePipeline,
 };
+use aivtuber_reflex::{DecisionReplayRecord, ExecutedAction};
 use aivtuber_runtime::{
     AudioPlaybackCommand, AudioPlaybackSink, AvatarPlaybackCommand, AvatarPlaybackSink,
     CachedAssetSelection, CachedPerformer, CachedPlaybackError, CachedPlaybackOutcome,
@@ -22,9 +24,13 @@ use aivtuber_runtime::{
     LocalVisemeStore, OutputVerdict, RuntimeError, SecurityRuntime,
 };
 use aivtuber_scheduler::{Scheduler, Status};
+use aivtuber_telemetry::{
+    CacheLevel, ComparisonMode, DegradedSubsystem, EventObservation, RouteClass, TelemetryCollector,
+};
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Instant;
 
 pub trait AudioOutput: Send {
     fn execute(&mut self, command: &AudioPlaybackCommand) -> Result<(), EngineError>;
@@ -132,6 +138,23 @@ impl GenerativeRuntime {
     }
 }
 
+struct HandledEvent {
+    playback: Option<CachedPlaybackOutcome>,
+    route: RouteClass,
+    routing_latency_us: u64,
+    generation_latency_us: Option<u64>,
+    generation_trace: Option<GenerationTrace>,
+    decision: Option<DecisionReplayRecord>,
+    cache_level: Option<CacheLevel>,
+}
+
+struct HandledGeneration {
+    playback: Option<CachedPlaybackOutcome>,
+    route: RouteClass,
+    trace: GenerationTrace,
+    cache_level: Option<CacheLevel>,
+}
+
 pub struct ProductionApp<R>
 where
     R: RoutePlanner,
@@ -148,6 +171,8 @@ where
     pending_avatar: PendingAvatar,
     max_dispatch_lateness_ms: u64,
     health: AdapterHealth,
+    telemetry: TelemetryCollector,
+    comparison_mode: ComparisonMode,
 }
 
 impl<R> ProductionApp<R>
@@ -178,12 +203,28 @@ where
             pending_avatar: PendingAvatar::default(),
             max_dispatch_lateness_ms,
             health: AdapterHealth::default(),
+            telemetry: TelemetryCollector::default(),
+            comparison_mode: ComparisonMode::DeterministicOnly,
         }
     }
 
     pub fn with_generation(mut self, generative: GenerativeRuntime) -> Self {
         self.generative = Some(generative);
+        self.comparison_mode = ComparisonMode::FullGenerative;
         self
+    }
+
+    pub fn with_comparison_mode(mut self, mode: ComparisonMode) -> Self {
+        self.comparison_mode = mode;
+        self
+    }
+
+    pub fn telemetry(&self) -> &TelemetryCollector {
+        &self.telemetry
+    }
+
+    pub fn telemetry_mut(&mut self) -> &mut TelemetryCollector {
+        &mut self.telemetry
     }
 
     pub fn generation_cancellation_registry(&self) -> Option<Arc<GenerationCancellationRegistry>> {
@@ -241,11 +282,14 @@ where
         let event = self.security.pop_content().ok_or_else(|| {
             AppError::Routing("queued content was unavailable for dispatch".to_owned())
         })?;
+        let event_id = event.event_id.clone();
         if let Some(generative) = &self.generative {
             generative.cancellation.cancel_for_event(&event);
         }
-        let playback = self.handle_event(event, at_ms, seed)?;
+        let handled = self.handle_event(event, at_ms, seed)?;
         self.tick(at_ms);
+        self.record_handled_event(&event_id, &handled);
+        let playback = handled.playback;
         Ok(ContentProcessOutcome {
             admission,
             playback,
@@ -257,9 +301,16 @@ where
         mut event: EventEnvelope,
         at_ms: u64,
         seed: u64,
-    ) -> Result<Option<CachedPlaybackOutcome>, AppError> {
-        match self.router.route(&event)? {
-            PlaybackRoute::Silent => Ok(None),
+    ) -> Result<HandledEvent, AppError> {
+        let route_started = Instant::now();
+        let route = self.router.route(&event)?;
+        let routing_latency_us = elapsed_us(route_started);
+        let decision = self.router.decision_record().cloned();
+        let mut generation_latency_us = None;
+        let mut generation_trace = None;
+
+        let (playback, route_class, cache_level) = match route {
+            PlaybackRoute::Silent => (None, RouteClass::Silent, None),
             PlaybackRoute::Intent(intent) => {
                 event
                     .payload
@@ -272,7 +323,8 @@ where
                     &mut self.pending_audio,
                     &mut self.pending_avatar,
                 )?;
-                Ok(Some(outcome))
+                let cache_level = cache_level(Some(outcome.cache_tier));
+                (Some(outcome), RouteClass::Deterministic, cache_level)
             }
             PlaybackRoute::AssetId(asset_id) => {
                 let outcome = self.performer.handle_asset_id(
@@ -283,7 +335,8 @@ where
                     &mut self.pending_audio,
                     &mut self.pending_avatar,
                 )?;
-                Ok(Some(outcome))
+                let cache_level = cache_level(Some(outcome.cache_tier));
+                (Some(outcome), RouteClass::SemanticReuse, cache_level)
             }
             PlaybackRoute::AssetIdentity {
                 asset_id,
@@ -300,10 +353,33 @@ where
                     &mut self.pending_audio,
                     &mut self.pending_avatar,
                 )?;
-                Ok(Some(outcome))
+                let cache_level = cache_level(Some(outcome.cache_tier));
+                (Some(outcome), RouteClass::SemanticReuse, cache_level)
             }
-            PlaybackRoute::Generate(route) => self.handle_generation(event, *route, at_ms, seed),
-        }
+            PlaybackRoute::Generate(route) => {
+                let generation_started = Instant::now();
+                let handled = self.handle_generation(event, *route, at_ms, seed)?;
+                generation_latency_us = Some(elapsed_us(generation_started));
+                let HandledGeneration {
+                    playback,
+                    route,
+                    trace,
+                    cache_level,
+                } = handled;
+                generation_trace = Some(trace);
+                (playback, route, cache_level)
+            }
+        };
+
+        Ok(HandledEvent {
+            playback,
+            route: route_class,
+            routing_latency_us,
+            generation_latency_us,
+            generation_trace,
+            decision,
+            cache_level,
+        })
     }
 
     fn handle_generation(
@@ -312,7 +388,7 @@ where
         route: GenerationRoute,
         at_ms: u64,
         seed: u64,
-    ) -> Result<Option<CachedPlaybackOutcome>, AppError> {
+    ) -> Result<HandledGeneration, AppError> {
         if route.source_event != event {
             return Err(AppError::Generation(
                 "generation route source event does not match dispatched event".to_owned(),
@@ -365,6 +441,7 @@ where
                 call.backend.model_version.as_deref(),
             );
         }
+        let trace = result.trace.clone();
 
         match result.disposition {
             GenerationDisposition::Generated { asset } => {
@@ -381,36 +458,128 @@ where
                     &mut self.pending_audio,
                     &mut self.pending_avatar,
                 )?;
-                Ok(Some(outcome))
+                Ok(HandledGeneration {
+                    playback: Some(outcome),
+                    route: RouteClass::Generated,
+                    trace,
+                    cache_level: Some(CacheLevel::Generated),
+                })
             }
-            GenerationDisposition::Fallback { directive } => {
-                self.handle_generation_fallback(&event, directive, at_ms, seed)
-            }
-            GenerationDisposition::Cancelled { .. } => Ok(None),
+            GenerationDisposition::Fallback { directive } => match directive {
+                FallbackDirective::CachedReaction { asset_id, .. } => {
+                    let outcome = self.performer.handle_asset_id(
+                        &event,
+                        &asset_id,
+                        CachedPlaybackTiming { at_ms, seed },
+                        &self.visemes,
+                        &mut self.pending_audio,
+                        &mut self.pending_avatar,
+                    )?;
+                    let cache_level = cache_level(Some(outcome.cache_tier));
+                    Ok(HandledGeneration {
+                        playback: Some(outcome),
+                        route: RouteClass::CachedFallback,
+                        trace,
+                        cache_level,
+                    })
+                }
+                FallbackDirective::NonVerbalReaction { .. } => Ok(HandledGeneration {
+                    playback: None,
+                    route: RouteClass::NonVerbalFallback,
+                    trace,
+                    cache_level: None,
+                }),
+            },
+            GenerationDisposition::Cancelled { .. } => Ok(HandledGeneration {
+                playback: None,
+                route: RouteClass::Generated,
+                trace,
+                cache_level: None,
+            }),
         }
     }
 
-    fn handle_generation_fallback(
-        &mut self,
-        event: &EventEnvelope,
-        directive: FallbackDirective,
-        at_ms: u64,
-        seed: u64,
-    ) -> Result<Option<CachedPlaybackOutcome>, AppError> {
-        match directive {
-            FallbackDirective::CachedReaction { asset_id, .. } => {
-                let outcome = self.performer.handle_asset_id(
-                    event,
-                    &asset_id,
-                    CachedPlaybackTiming { at_ms, seed },
-                    &self.visemes,
-                    &mut self.pending_audio,
-                    &mut self.pending_avatar,
-                )?;
-                Ok(Some(outcome))
-            }
-            FallbackDirective::NonVerbalReaction { .. } => Ok(None),
+    fn record_handled_event(&mut self, event_id: &str, handled: &HandledEvent) {
+        let mut route = handled.route;
+        let mut observation = EventObservation::new(event_id, self.comparison_mode, route);
+        observation.routing_latency_us = handled.routing_latency_us;
+        observation.generation_latency_us = handled.generation_latency_us;
+        observation.cache_level = handled.cache_level;
+        observation.cache_lookup = matches!(
+            handled.route,
+            RouteClass::Deterministic
+                | RouteClass::SemanticReuse
+                | RouteClass::JevReaction
+                | RouteClass::CachedFallback
+        );
+        observation.cache_hit = handled.playback.is_some()
+            && matches!(
+                handled.cache_level,
+                Some(CacheLevel::Memory | CacheLevel::LocalStorage)
+            );
+
+        if let Some(playback) = &handled.playback {
+            observation.event_to_first_audio_ms = playback.metrics.event_to_first_audio_ms;
+            observation.event_to_first_visible_reaction_ms =
+                playback.metrics.event_to_first_visible_reaction_ms;
         }
+
+        if let Some(decision) = &handled.decision {
+            observation.retrieval_candidates = decision.evidence.retrieval.candidates.len();
+            observation.jev_attempts = decision.evidence.model.attempts;
+            observation.jev_latency_us = millis_to_micros(decision.evidence.model.latency_ms);
+            observation.semantic_reuse_accepted =
+                decision.executed.action == ExecutedAction::Cached;
+            observation.semantic_reuse_score = decision
+                .evidence
+                .selected_candidate_id
+                .as_ref()
+                .and_then(|selected| {
+                    decision
+                        .evidence
+                        .retrieval
+                        .candidates
+                        .iter()
+                        .find(|candidate| &candidate.asset_id == selected)
+                        .map(|candidate| candidate.similarity)
+                });
+            if decision.executed.action == ExecutedAction::Reaction
+                && route == RouteClass::Deterministic
+            {
+                route = RouteClass::JevReaction;
+                observation.route = route;
+            }
+            observation.fallback_reason =
+                fallback_reason_name(decision.evidence.normalized.fallback_reason)
+                    .map(str::to_owned);
+        }
+
+        if self.health.audio_error.is_some() {
+            observation
+                .degraded_subsystems
+                .insert(DegradedSubsystem::Audio);
+        }
+        if self.health.avatar_error.is_some() {
+            observation
+                .degraded_subsystems
+                .insert(DegradedSubsystem::Avatar);
+        }
+        if self.health.stream_error.is_some() {
+            observation
+                .degraded_subsystems
+                .insert(DegradedSubsystem::Stream);
+        }
+
+        if let Some(trace) = &handled.generation_trace {
+            observation.llm_calls = trace.llm_calls.len().min(u32::MAX as usize) as u32;
+            observation.tts_calls = u32::from(trace.tts_attempted);
+            observation.cancelled = trace.cancelled_stage.is_some();
+            if let Some(reason) = fallback_reason_name(trace.fallback_reason) {
+                observation.fallback_reason = Some(reason.to_owned());
+            }
+        }
+
+        self.telemetry.record(observation);
     }
 
     pub fn tick(&mut self, now_ms: u64) {
@@ -444,7 +613,10 @@ where
 
             match self.audio.execute(&command) {
                 Ok(()) => self.health.audio_error = None,
-                Err(error) => self.health.audio_error = Some(error.to_string()),
+                Err(error) => {
+                    self.health.audio_error = Some(error.to_string());
+                    self.mark_degraded(&command.event_id, DegradedSubsystem::Audio);
+                }
             }
         }
         self.pending_audio.commands = keep;
@@ -471,9 +643,21 @@ where
                 continue;
             }
 
+            let event_id = self
+                .performer
+                .scheduler()
+                .items()
+                .iter()
+                .find(|item| item.plan.generation == avatar_generation(&command))
+                .map(|item| item.plan.event_id.clone());
             match self.avatar.execute(&command) {
                 Ok(()) => self.health.avatar_error = None,
-                Err(error) => self.health.avatar_error = Some(error.to_string()),
+                Err(error) => {
+                    self.health.avatar_error = Some(error.to_string());
+                    if let Some(event_id) = event_id {
+                        self.mark_degraded(&event_id, DegradedSubsystem::Avatar);
+                    }
+                }
             }
         }
         self.pending_avatar.commands = keep;
@@ -489,15 +673,47 @@ where
             at_ms,
             self.performer.scheduler_mut(),
         )?;
-        if matches!(
+        let is_override = matches!(
             outcome,
             ControlOutcome::Stopped { .. } | ControlOutcome::Muted
-        ) && let Some(generative) = &self.generative
-        {
-            generative.cancellation.cancel_active();
-        }
+        );
+        let generation_cancelled = if is_override {
+            self.generative
+                .as_ref()
+                .is_some_and(|generative| generative.cancellation.cancel_active())
+        } else {
+            false
+        };
         if matches!(outcome, ControlOutcome::Stopped { .. }) {
             self.purge_cancelled_pending();
+        }
+        if is_override {
+            let scheduler_cancelled =
+                matches!(outcome, ControlOutcome::Stopped { cancelled } if cancelled > 0);
+            let mut observation = EventObservation::new(
+                command.event().event_id.clone(),
+                self.comparison_mode,
+                RouteClass::Silent,
+            );
+            observation.operator_override = true;
+            observation.cancelled = generation_cancelled || scheduler_cancelled;
+            observation.fallback_reason = Some("operator_override".to_owned());
+            if self.health.audio_error.is_some() {
+                observation
+                    .degraded_subsystems
+                    .insert(DegradedSubsystem::Audio);
+            }
+            if self.health.avatar_error.is_some() {
+                observation
+                    .degraded_subsystems
+                    .insert(DegradedSubsystem::Avatar);
+            }
+            if self.health.stream_error.is_some() {
+                observation
+                    .degraded_subsystems
+                    .insert(DegradedSubsystem::Stream);
+            }
+            self.telemetry.record(observation);
         }
         self.tick(at_ms);
         Ok(outcome)
@@ -542,6 +758,18 @@ where
         }
     }
 
+    fn mark_degraded(&mut self, event_id: &str, subsystem: DegradedSubsystem) {
+        if let Some(observation) = self
+            .telemetry
+            .events_mut()
+            .iter_mut()
+            .rev()
+            .find(|observation| observation.event_id == event_id)
+        {
+            observation.degraded_subsystems.insert(subsystem);
+        }
+    }
+
     fn purge_cancelled_pending(&mut self) {
         let scheduler = self.performer.scheduler();
         self.pending_audio
@@ -550,6 +778,40 @@ where
         self.pending_avatar.commands.retain(|command| {
             command_not_cancelled(scheduler, avatar_generation(command), command.at_ms())
         });
+    }
+}
+
+fn cache_level(tier: Option<CacheTier>) -> Option<CacheLevel> {
+    tier.map(|tier| match tier {
+        CacheTier::Memory => CacheLevel::Memory,
+        CacheTier::LocalStorage => CacheLevel::LocalStorage,
+        CacheTier::Generated => CacheLevel::Generated,
+    })
+}
+
+fn elapsed_us(started: Instant) -> u64 {
+    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn millis_to_micros(value: f64) -> Option<u64> {
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    Some((value * 1_000.0).round().min(u64::MAX as f64) as u64)
+}
+
+fn fallback_reason_name(reason: FallbackReason) -> Option<&'static str> {
+    match reason {
+        FallbackReason::None => None,
+        FallbackReason::Timeout => Some("timeout"),
+        FallbackReason::Unavailable => Some("unavailable"),
+        FallbackReason::RateLimited => Some("rate_limited"),
+        FallbackReason::Overloaded => Some("overloaded"),
+        FallbackReason::Authentication => Some("authentication"),
+        FallbackReason::InvalidRequest => Some("invalid_request"),
+        FallbackReason::LowConfidence => Some("low_confidence"),
+        FallbackReason::PolicyOverride => Some("policy_override"),
+        FallbackReason::OperatorOverride => Some("operator_override"),
     }
 }
 
@@ -1259,6 +1521,21 @@ mod tests {
         );
         assert!(llm_audit.detail.contains("backend=mock-thinking"));
         assert!(!llm_audit.detail.contains("generated hello"));
+
+        let metric = app.telemetry().events().last().expect("generation metric");
+        assert_eq!(metric.mode, ComparisonMode::FullGenerative);
+        assert_eq!(metric.route, RouteClass::Generated);
+        assert_eq!(metric.llm_calls, 1);
+        assert_eq!(metric.tts_calls, 1);
+        assert_eq!(metric.cache_level, Some(CacheLevel::Generated));
+        assert_eq!(
+            metric.event_to_first_audio_ms,
+            playback.metrics.event_to_first_audio_ms
+        );
+        assert_eq!(
+            metric.event_to_first_visible_reaction_ms,
+            playback.metrics.event_to_first_visible_reaction_ms
+        );
     }
 
     #[test]
@@ -1561,6 +1838,10 @@ mod tests {
             .expect("authenticated emergency stop");
         assert_eq!(outcome, ControlOutcome::Stopped { cancelled: 0 });
         assert!(token.is_cancelled());
+        let metric = app.telemetry().events().last().expect("operator metric");
+        assert!(metric.operator_override);
+        assert!(metric.cancelled);
+        assert_eq!(metric.fallback_reason.as_deref(), Some("operator_override"));
     }
 
     #[test]
@@ -1637,7 +1918,8 @@ mod tests {
             Box::new(audio),
             Box::new(avatar),
             Box::new(NoopStreamOutput),
-        );
+        )
+        .with_comparison_mode(ComparisonMode::DeterministicSemanticJev);
         app.startup().expect("startup");
 
         let raw = serde_json::to_vec(&chat_event(20)).expect("event json");
@@ -1676,6 +1958,15 @@ mod tests {
         app.tick(playback.plan.start_at_ms.saturating_add(150));
         assert_eq!(audio_log.lock().expect("audio log").len(), 1);
         assert!(!avatar_log.lock().expect("avatar log").is_empty());
+
+        let metric = app.telemetry().events().last().expect("reflex metric");
+        assert_eq!(metric.mode, ComparisonMode::DeterministicSemanticJev);
+        assert_eq!(metric.route, RouteClass::SemanticReuse);
+        assert_eq!(metric.retrieval_candidates, 2);
+        assert!(metric.semantic_reuse_accepted);
+        assert!(metric.semantic_reuse_score.is_some());
+        assert_eq!(metric.jev_attempts, 1);
+        assert!(metric.cache_hit);
     }
 
     #[test]
@@ -1727,6 +2018,12 @@ mod tests {
         app.tick(dispatch_at);
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         assert!(app.health().audio_error.is_some());
+        let metric = app.telemetry().events().last().expect("degraded metric");
+        assert!(
+            metric
+                .degraded_subsystems
+                .contains(&DegradedSubsystem::Audio)
+        );
 
         app.tick(dispatch_at.saturating_add(10));
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
