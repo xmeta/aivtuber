@@ -115,6 +115,20 @@ pub struct Provenance {
     pub generator: Option<String>,
     #[serde(default)]
     pub created_at: Option<String>,
+    #[serde(default)]
+    pub thinking_backend: Option<String>,
+    #[serde(default)]
+    pub thinking_model_alias: Option<String>,
+    #[serde(default)]
+    pub thinking_model_version: Option<String>,
+    #[serde(default)]
+    pub tts_backend: Option<String>,
+    #[serde(default)]
+    pub tts_model_alias: Option<String>,
+    #[serde(default)]
+    pub tts_model_version: Option<String>,
+    #[serde(default)]
+    pub routing_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -335,6 +349,52 @@ impl PerformanceAsset {
             self.compatibility.motion_library.as_deref(),
             &mut issues,
         );
+
+        if let Some(provenance) = &self.provenance {
+            validate_optional_nonempty(
+                "provenance.generator",
+                provenance.generator.as_deref(),
+                &mut issues,
+            );
+            validate_optional_nonempty(
+                "provenance.thinking_backend",
+                provenance.thinking_backend.as_deref(),
+                &mut issues,
+            );
+            validate_optional_nonempty(
+                "provenance.tts_backend",
+                provenance.tts_backend.as_deref(),
+                &mut issues,
+            );
+            validate_optional_nonempty(
+                "provenance.routing_reason",
+                provenance.routing_reason.as_deref(),
+                &mut issues,
+            );
+
+            if provenance.generated == Some(true) {
+                for (field, value) in [
+                    ("provenance.generator", provenance.generator.as_deref()),
+                    ("provenance.created_at", provenance.created_at.as_deref()),
+                    (
+                        "provenance.thinking_backend",
+                        provenance.thinking_backend.as_deref(),
+                    ),
+                    ("provenance.tts_backend", provenance.tts_backend.as_deref()),
+                    (
+                        "provenance.routing_reason",
+                        provenance.routing_reason.as_deref(),
+                    ),
+                ] {
+                    if value.is_none() {
+                        issues.push(ValidationIssue::new(
+                            field,
+                            "is required when provenance.generated is true",
+                        ));
+                    }
+                }
+            }
+        }
 
         if issues.is_empty() {
             Ok(())
@@ -1086,6 +1146,32 @@ mod tests {
             error
                 .to_string()
                 .contains("binary media must remain external")
+        );
+    }
+
+    #[test]
+    fn generated_asset_requires_replayable_provenance() {
+        let mut asset = valid_asset();
+        asset.class = AssetClass::Dynamic;
+        asset.provenance = Some(Provenance {
+            generated: Some(true),
+            generator: Some("aivtuber-generative".to_owned()),
+            created_at: Some("2026-09-24T00:00:00Z".to_owned()),
+            thinking_backend: Some("openai-compatible-responses".to_owned()),
+            thinking_model_alias: Some("reasoner".to_owned()),
+            thinking_model_version: Some("2026-09".to_owned()),
+            tts_backend: Some("example-tts".to_owned()),
+            tts_model_alias: Some("tts-fast".to_owned()),
+            tts_model_version: Some("2026-09".to_owned()),
+            routing_reason: None,
+        });
+
+        let error = asset
+            .validate()
+            .expect_err("generated provenance without routing reason must fail");
+        assert!(
+            error.to_string().contains("provenance.routing_reason"),
+            "{error}"
         );
     }
 

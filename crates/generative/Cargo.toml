@@ -1,17 +1,13 @@
 [package]
-name = "aivtuber-adapters"
+name = "aivtuber-generative"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+aivtuber-asset-store = { path = "../asset-store" }
 aivtuber-domain = { path = "../domain" }
-base64 = "0.23.1"
+aivtuber-scheduler = { path = "../scheduler" }
+futures = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.11.0"
-tungstenite = "0.30.0"
-ureq = { version = "3.4", features = ["json"] }
-
-[dev-dependencies]
-aivtuber-scheduler = { path = "../scheduler" }

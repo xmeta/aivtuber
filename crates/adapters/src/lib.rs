@@ -6,12 +6,18 @@
 //! provider-neutral domain. Connections fail closed, actions are never queued
 //! for replay after a disconnect, and secrets use redacted debug output.
 
+mod http;
 mod obs;
+mod openai;
 mod transport;
+mod tts_http;
 mod vts;
 
+pub use http::*;
 pub use obs::*;
+pub use openai::*;
 pub use transport::*;
+pub use tts_http::*;
 pub use vts::*;
 
 use serde_json::Value;

@@ -151,3 +151,11 @@ For compatible filler/reaction assets it:
 * exposes per-event event-to-first-audio and event-to-first-visible-reaction measurements.
 
 The source-controlled starter fixture is link:../examples/starter-reaction-pack/README.adoc[`examples/starter-reaction-pack`]. It contains three semantic families with two variants each. Audio remains an external `audio://` reference; only descriptors and compact viseme timing JSON are committed.
+
+== 11. Generated asset provenance
+
+Dynamic assets produced by `crates/generative` are still ordinary Performance Assets and pass the same schema/runtime validation before they can be promoted.
+
+When `provenance.generated` is true, the core provenance includes the generator, ThinkingEngine backend, TTS backend, and the routing reason that caused the LLM call. Model aliases/versions, voice model, and viseme mapping are retained when the provider exposes them.
+
+The schema and Rust validator reject generated assets missing the required provenance core. This prevents a promoted dynamic asset from becoming detached from the model/routing context that created it.

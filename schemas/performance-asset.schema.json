@@ -109,8 +109,39 @@
       "properties": {
         "generated": {"type": "boolean"},
         "generator": {"type": ["string", "null"]},
-        "created_at": {"type": ["string", "null"], "format": "date-time"}
-      }
+        "created_at": {"type": ["string", "null"], "format": "date-time"},
+        "thinking_backend": {"type": ["string", "null"]},
+        "thinking_model_alias": {"type": ["string", "null"]},
+        "thinking_model_version": {"type": ["string", "null"]},
+        "tts_backend": {"type": ["string", "null"]},
+        "tts_model_alias": {"type": ["string", "null"]},
+        "tts_model_version": {"type": ["string", "null"]},
+        "routing_reason": {"type": ["string", "null"]}
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"generated": {"const": true}},
+            "required": ["generated"]
+          },
+          "then": {
+            "required": [
+              "generator",
+              "created_at",
+              "thinking_backend",
+              "tts_backend",
+              "routing_reason"
+            ],
+            "properties": {
+              "generator": {"type": "string", "minLength": 1},
+              "created_at": {"type": "string", "format": "date-time"},
+              "thinking_backend": {"type": "string", "minLength": 1},
+              "tts_backend": {"type": "string", "minLength": 1},
+              "routing_reason": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      ]
     }
   }
 }

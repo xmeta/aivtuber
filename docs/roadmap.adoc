@@ -48,6 +48,8 @@ Exit criterion: Jev can reduce LLM routing while preserving operator-reviewed re
 * dynamic Performance Asset compilation.
 * promotion policy.
 
+Status: implemented on the Rust production path. Generated assets are published atomically only after complete LLM/TTS output, with priority cancellation, cached/non-verbal degradation, streaming compilation state, and replayable provenance. Promotion policy decisions beyond making assets promotable remain an offline/adaptation concern.
+
 == Phase 5 -- Memory and adaptation
 
 * working-memory compaction.

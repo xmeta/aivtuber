@@ -1,4 +1,4 @@
-use crate::{AuthenticatedControl, Capability, EventEnvelope, ReflexDecision};
+use crate::{AuthenticatedControl, BackendIdentity, Capability, EventEnvelope, ReflexDecision};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, error::Error, fmt, future::Future, pin::Pin};
 
@@ -62,6 +62,26 @@ pub struct SpeechArtifact {
     pub audio_ref: String,
     pub duration_ms: u64,
     pub viseme_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeechProgress {
+    pub sequence: u64,
+    pub audio_ref: String,
+    pub duration_ms: u64,
+    pub viseme_ref: Option<String>,
+    pub final_chunk: bool,
+}
+
+pub trait SpeechProgressSink: Send {
+    fn push(&mut self, progress: SpeechProgress) -> Result<(), EngineError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TtsBackendIdentity {
+    pub backend: BackendIdentity,
+    pub voice_model: Option<String>,
+    pub viseme_mapping: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -159,10 +179,24 @@ pub trait DecisionEngine: Send + Sync {
 
 pub trait ThinkingEngine: Send + Sync {
     fn generate<'a>(&'a self, request: &'a ReflexRequest) -> EngineFuture<'a, GeneratedReply>;
+    fn identity(&self) -> BackendIdentity;
 }
 
 pub trait TtsEngine: Send + Sync {
     fn synthesize<'a>(&'a self, request: &'a SpeechRequest) -> EngineFuture<'a, SpeechArtifact>;
+
+    /// Optional streaming synthesis. Backends that support incremental output
+    /// push stable-reference progress records and still return one final artifact.
+    /// Returning None explicitly selects the buffered synthesize path.
+    fn synthesize_streaming<'a>(
+        &'a self,
+        _request: &'a SpeechRequest,
+        _sink: &'a mut dyn SpeechProgressSink,
+    ) -> Option<EngineFuture<'a, SpeechArtifact>> {
+        None
+    }
+
+    fn identity(&self) -> TtsBackendIdentity;
 }
 
 pub trait AvatarAdapter: Send + Sync {
