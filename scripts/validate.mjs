@@ -108,9 +108,11 @@ for (const file of listJson("examples/security")) {
   }
 }
 
-for (const file of listJson("examples/assets")) {
-  if (!asset) break;
-  report(asset(loadJson(join(root, file))), file, asset);
+for (const dir of ["examples/assets", "examples/starter-reaction-pack/descriptors"]) {
+  for (const file of listJson(dir)) {
+    if (!asset) break;
+    report(asset(loadJson(join(root, file))), file, asset);
+  }
 }
 
 // Verify AsciiDoc `link:` targets exist (catches broken doc links).

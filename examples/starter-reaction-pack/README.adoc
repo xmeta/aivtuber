@@ -1,0 +1,15 @@
+= Starter Cached Reaction Pack
+
+This pack is a source-controlled descriptor/timing fixture for the Rust cached playback path.
+
+It contains three semantic families with two variants each:
+
+* `reaction.surprise`
+* `reaction.agree`
+* `filler.thinking`
+
+`descriptors/` contains Performance Asset JSON files. `viseme/` contains compact local timing tracks consumed by `crates/runtime::cached_playback`.
+
+Audio remains external through `audio://starter/...` references. Generated audio binaries are intentionally not committed to Git.
+
+The fast-path preload policy loads compatible `filler` and `reaction` descriptors into the L0 asset cache. Variant selection is deterministic for a recorded seed and excludes the immediately recent variant when another compatible variant exists.

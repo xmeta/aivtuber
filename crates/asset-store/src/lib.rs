@@ -681,6 +681,7 @@ pub fn load_asset_file(path: impl AsRef<Path>) -> Result<PerformanceAsset, Asset
 pub struct AssetIndexEntry {
     pub identity: AssetIdentity,
     pub path: PathBuf,
+    pub class: AssetClass,
     pub variant_group: Option<String>,
     pub compatibility: CompatibilityStatus,
 }
@@ -778,6 +779,7 @@ impl AssetStore {
             let entry = AssetIndexEntry {
                 identity: asset.identity(),
                 path: path.clone(),
+                class: asset.class,
                 variant_group: asset.variant_group.clone(),
                 compatibility: compatibility.clone(),
             };
@@ -884,6 +886,21 @@ impl AssetStore {
             .local
             .iter()
             .filter(|(_, entry)| entry.compatibility.is_usable())
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for id in &ids {
+            self.resolve(id)?;
+        }
+        Ok(ids.len())
+    }
+
+    /// Preload compatible descriptors from selected semantic classes into L0.
+    pub fn preload_classes(&mut self, classes: &[AssetClass]) -> Result<usize, AssetStoreError> {
+        let ids: Vec<String> = self
+            .local
+            .iter()
+            .filter(|(_, entry)| entry.compatibility.is_usable() && classes.contains(&entry.class))
             .map(|(id, _)| id.clone())
             .collect();
 

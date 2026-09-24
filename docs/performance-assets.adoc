@@ -136,3 +136,18 @@ It enforces:
 * deterministic variant selection from stable asset-id ordering, with explicit recent-id exclusion to avoid immediate repetition.
 
 L1 directory indexing is intentionally non-recursive. Asset-pack subdirectories may contain viseme or other JSON media that are not Performance Asset descriptors.
+
+== 10. Cached playback fast path
+
+The Rust production path in `crates/runtime::cached_playback` composes the asset store and scheduler without invoking LLM or TTS services.
+
+For compatible filler/reaction assets it:
+
+* preloads descriptors into L0 RAM;
+* selects deterministic variants with recent-id exclusion;
+* resolves local viseme tracks;
+* schedules audio, expression, gesture, gaze, and viseme commands from one monotonic performance start;
+* applies the same deterministic time-variation factor to duration, interrupt points, audio start, and viseme offsets;
+* exposes per-event event-to-first-audio and event-to-first-visible-reaction measurements.
+
+The source-controlled starter fixture is link:../examples/starter-reaction-pack/README.adoc[`examples/starter-reaction-pack`]. It contains three semantic families with two variants each. Audio remains an external `audio://` reference; only descriptors and compact viseme timing JSON are committed.

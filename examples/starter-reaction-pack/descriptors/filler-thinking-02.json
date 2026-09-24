@@ -1,0 +1,71 @@
+{
+  "schema_version": "0.1.0",
+  "id": "filler.thinking.02",
+  "intent": "filler.thinking",
+  "class": "filler",
+  "variant_group": "filler.thinking",
+  "speech": {
+    "text": "んー…",
+    "audio_ref": "audio://starter/filler-thinking-02.opus",
+    "duration_ms": 600,
+    "viseme_ref": "viseme/filler-thinking-02.json"
+  },
+  "expression": {
+    "preset": "thinking_side",
+    "intensity": 0.45
+  },
+  "gesture": {
+    "preset": "tilt_head_small",
+    "amplitude": 0.45
+  },
+  "gaze": "camera",
+  "timeline": [
+    {
+      "at_ms": 0,
+      "event": "expression.start",
+      "payload": {
+        "preset": "thinking_side"
+      }
+    },
+    {
+      "at_ms": 40,
+      "event": "speech.start"
+    },
+    {
+      "at_ms": 120,
+      "event": "gesture.start",
+      "payload": {
+        "preset": "tilt_head_small"
+      }
+    },
+    {
+      "at_ms": 300,
+      "event": "phrase.boundary"
+    },
+    {
+      "at_ms": 640,
+      "event": "speech.end"
+    }
+  ],
+  "interrupt_points_ms": [
+    300,
+    600
+  ],
+  "variation": {
+    "speed_pct": 6,
+    "amplitude_pct": 6,
+    "start_delay_ms": 60
+  },
+  "compatibility": {
+    "compiler_version": "0.1.0",
+    "voice_model": "example-voice-v1",
+    "avatar_profile": "example-live2d-v1",
+    "viseme_mapping": "ja-5vowel-v1",
+    "motion_library": "starter-v1"
+  },
+  "provenance": {
+    "generated": false,
+    "generator": null,
+    "created_at": "2026-09-24T00:00:00Z"
+  }
+}

@@ -5,6 +5,9 @@
 //! Public content enters through byte-aware rate/backpressure gates. Privileged
 //! control uses a separate authenticated path and never waits behind content.
 
+mod cached_playback;
+pub use cached_playback::*;
+
 use aivtuber_domain::{
     AuthenticatedControl, AuthenticatedControlCommand, Capability, EventEnvelope, EventKind,
     SecurityPlane, TrustLevel,

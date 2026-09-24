@@ -1,0 +1,26 @@
+{
+  "schema_version": "0.1.0",
+  "duration_ms": 860,
+  "cues": [
+    {
+      "at_ms": 0,
+      "viseme": "A",
+      "weight": 1
+    },
+    {
+      "at_ms": 160,
+      "viseme": "U",
+      "weight": 0.8
+    },
+    {
+      "at_ms": 380,
+      "viseme": "I",
+      "weight": 0.9
+    },
+    {
+      "at_ms": 650,
+      "viseme": "A",
+      "weight": 0.7
+    }
+  ]
+}

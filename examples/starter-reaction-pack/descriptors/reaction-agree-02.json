@@ -1,0 +1,71 @@
+{
+  "schema_version": "0.1.0",
+  "id": "reaction.agree.02",
+  "intent": "reaction.agree",
+  "class": "reaction",
+  "variant_group": "reaction.agree",
+  "speech": {
+    "text": "わかる、それ！",
+    "audio_ref": "audio://starter/reaction-agree-02.opus",
+    "duration_ms": 720,
+    "viseme_ref": "viseme/reaction-agree-02.json"
+  },
+  "expression": {
+    "preset": "smile_bright",
+    "intensity": 0.62
+  },
+  "gesture": {
+    "preset": "nod_double",
+    "amplitude": 0.7
+  },
+  "gaze": "camera",
+  "timeline": [
+    {
+      "at_ms": 0,
+      "event": "expression.start",
+      "payload": {
+        "preset": "smile_bright"
+      }
+    },
+    {
+      "at_ms": 70,
+      "event": "speech.start"
+    },
+    {
+      "at_ms": 120,
+      "event": "gesture.start",
+      "payload": {
+        "preset": "nod_double"
+      }
+    },
+    {
+      "at_ms": 360,
+      "event": "phrase.boundary"
+    },
+    {
+      "at_ms": 790,
+      "event": "speech.end"
+    }
+  ],
+  "interrupt_points_ms": [
+    360,
+    720
+  ],
+  "variation": {
+    "speed_pct": 6,
+    "amplitude_pct": 6,
+    "start_delay_ms": 60
+  },
+  "compatibility": {
+    "compiler_version": "0.1.0",
+    "voice_model": "example-voice-v1",
+    "avatar_profile": "example-live2d-v1",
+    "viseme_mapping": "ja-5vowel-v1",
+    "motion_library": "starter-v1"
+  },
+  "provenance": {
+    "generated": false,
+    "generator": null,
+    "created_at": "2026-09-24T00:00:00Z"
+  }
+}
