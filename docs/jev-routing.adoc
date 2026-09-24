@@ -212,3 +212,87 @@ Do not:
 * route every chat message into an LLM after Jev;
 * treat probability as certainty;
 * make the system unusable when Jev is unavailable.
+
+== 11. Current System One wire contract and Rust production path
+
+The production Rust adapter in `crates/reflex` targets the current TypeSafe System One API:
+
+[source,text]
+----
+POST https://api.typesafe.ai/v1/systemone
+Authorization: Bearer <API_KEY>
+Content-Type: application/json
+----
+
+The request contains exactly the System One concepts `state`, string-valued `model`, and caller-named `questions`. The routine reflex bundle uses Choice questions for route/reaction/gesture/attention, Noul questions for interruption and cache reuse, and two-level Score questions for normalized importance and emotion intensity. When semantic candidates exist, a separate Choice question selects an explicit asset id or `none`.
+
+The response records the concrete returned `model`, named `answers`, and `usage` token counts. The requested model alias and returned concrete model remain separate evidence fields.
+
+=== 11.1 Compact state
+
+Routine reflex requests do not forward an arbitrary transcript/history field. The Rust adapter builds a compact state from the normalized current event plus allowlisted performer/stream/recent runtime state and Top-K candidate ids. A byte cap is applied before transport.
+
+=== 11.2 Semantic retrieval
+
+`SemanticIndex` performs deterministic cosine Top-K retrieval over versioned embeddings. Replay evidence records:
+
+* candidate asset id, rank, and similarity;
+* retriever version;
+* embedding model;
+* index version;
+* similarity metric;
+* deterministic tie-break rule.
+
+Equal similarities are ordered by asset id.
+
+=== 11.3 Evidence, policy, execution
+
+The Rust path keeps three separate stages:
+
+[source,text]
+----
+DecisionEvidence
+      |
+      v
+PolicyDecision
+      |
+      v
+ExecutedDecision
+----
+
+A cached route is executable only when Jev explicitly selects a Top-K candidate and the deterministic cache-reuse threshold passes. Model evidence cannot directly execute an asset.
+
+Full replay records retain measured latency. Deterministic replay fingerprints normalize observational wall-clock latency while preserving every decision-affecting field.
+
+=== 11.4 Deadline and retries
+
+One absolute reflex deadline covers request serialization, transport attempts, retry backoff, response parsing, and normalization.
+
+* HTTP 401/403 fails as authentication without retry.
+* HTTP 400/422 fails as invalid request without retry.
+* HTTP 429 and 529 use bounded exponential backoff only while deadline budget remains.
+* transport timeout maps to the deterministic timeout fallback;
+* transport unavailability maps to the deterministic unavailable fallback.
+
+The generic Rust `DecisionEngine` implementation runs blocking HTTP work on a worker thread and propagates cooperative cancellation. No Jev transport is part of the scheduler/frame loop.
+
+=== 11.5 Benchmark boundary
+
+Run:
+
+[source,shell]
+----
+cargo bench -p aivtuber-reflex --bench routing
+----
+
+The benchmark compares deterministic-only policy evaluation with semantic retrieval plus System One request/response normalization through an in-process mock transport. It measures local routing overhead and intentionally excludes external network/model latency.
+
+On the development machine used for the Issue #8 implementation, one representative run measured approximately:
+
+[source,text]
+----
+deterministic-only policy:                 19.3 ns/op
+semantic retrieval + Jev adapter boundary: 28.4 us/op
+----
+
+These numbers are diagnostic rather than a cross-machine performance guarantee.
