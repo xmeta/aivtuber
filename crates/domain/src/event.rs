@@ -1,5 +1,5 @@
 use crate::DomainValidationError;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const EVENT_SCHEMA_VERSION: &str = "0.2.0";
@@ -83,13 +83,16 @@ pub enum AuthorizationMethod {
 /// actions require a non-serializable `AuthenticatedControl` minted by the
 /// trusted local ingress path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorizationContext {
     pub principal: String,
     pub method: AuthorizationMethod,
+    #[serde(deserialize_with = "deserialize_unique_capabilities")]
     pub capabilities: BTreeSet<Capability>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EventEnvelope {
     pub schema_version: String,
     pub event_id: String,
@@ -103,6 +106,11 @@ pub struct EventEnvelope {
     pub kind: EventKind,
     pub actor_id: Option<String>,
     pub priority_hint: Option<f64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_authorization"
+    )]
     pub authorization: Option<AuthorizationContext>,
     pub payload: BTreeMap<String, serde_json::Value>,
 }
@@ -118,6 +126,7 @@ impl EventEnvelope {
         }
         require_non_empty("event_id", &self.event_id)?;
         require_non_empty("correlation_id", &self.correlation_id)?;
+        validate_date_time("observed_at", &self.observed_at)?;
         require_non_empty("source", &self.source)?;
 
         if let Some(priority) = self.priority_hint {
@@ -231,8 +240,145 @@ impl EventEnvelope {
     }
 }
 
+fn deserialize_unique_capabilities<'de, D>(
+    deserializer: D,
+) -> Result<BTreeSet<Capability>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let capabilities = Vec::<Capability>::deserialize(deserializer)?;
+    let mut unique = BTreeSet::new();
+    for capability in capabilities {
+        if !unique.insert(capability) {
+            return Err(de::Error::custom(
+                "authorization capabilities must be unique",
+            ));
+        }
+    }
+    Ok(unique)
+}
+
+fn deserialize_present_authorization<'de, D>(
+    deserializer: D,
+) -> Result<Option<AuthorizationContext>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<AuthorizationContext>::deserialize(deserializer)?
+        .map(Some)
+        .ok_or_else(|| de::Error::custom("authorization must be an object when present"))
+}
+
+fn validate_date_time(field: &'static str, value: &str) -> Result<(), DomainValidationError> {
+    if is_json_schema_date_time(value) {
+        Ok(())
+    } else {
+        Err(DomainValidationError::new(
+            field,
+            "must be an RFC 3339 date-time",
+        ))
+    }
+}
+
+fn is_json_schema_date_time(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() < 20
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || !matches!(bytes.get(10), Some(b'T' | b't'))
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+    {
+        return false;
+    }
+
+    let Some(year) = parse_digits(bytes, 0, 4) else {
+        return false;
+    };
+    let Some(month) = parse_digits(bytes, 5, 2) else {
+        return false;
+    };
+    let Some(day) = parse_digits(bytes, 8, 2) else {
+        return false;
+    };
+    let Some(hour) = parse_digits(bytes, 11, 2) else {
+        return false;
+    };
+    let Some(minute) = parse_digits(bytes, 14, 2) else {
+        return false;
+    };
+    let Some(second) = parse_digits(bytes, 17, 2) else {
+        return false;
+    };
+
+    if !(1..=12).contains(&month)
+        || day == 0
+        || day > days_in_month(year, month)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return false;
+    }
+
+    let mut index = 19;
+    if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        let start = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        if index == start {
+            return false;
+        }
+    }
+
+    match bytes.get(index) {
+        Some(b'Z' | b'z') => index + 1 == bytes.len(),
+        Some(b'+' | b'-') => {
+            if index + 6 != bytes.len() || bytes.get(index + 3) != Some(&b':') {
+                return false;
+            }
+            let Some(offset_hour) = parse_digits(bytes, index + 1, 2) else {
+                return false;
+            };
+            let Some(offset_minute) = parse_digits(bytes, index + 4, 2) else {
+                return false;
+            };
+            offset_hour <= 23 && offset_minute <= 59
+        }
+        _ => false,
+    }
+}
+
+fn parse_digits(bytes: &[u8], start: usize, len: usize) -> Option<u32> {
+    let slice = bytes.get(start..start + len)?;
+    if !slice.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    slice.iter().try_fold(0_u32, |value, digit| {
+        value
+            .checked_mul(10)?
+            .checked_add(u32::from(digit.saturating_sub(b'0')))
+    })
+}
+
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn is_leap_year(year: u32) -> bool {
+    year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
+}
+
 fn require_non_empty(field: &'static str, value: &str) -> Result<(), DomainValidationError> {
-    if value.trim().is_empty() {
+    if value.is_empty() {
         Err(DomainValidationError::new(field, "must not be empty"))
     } else {
         Ok(())
@@ -253,6 +399,12 @@ fn validate_unit_interval(field: &'static str, value: f64) -> Result<(), DomainV
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    fn repository_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
 
     fn chat_event() -> EventEnvelope {
         EventEnvelope {
@@ -420,5 +572,78 @@ mod tests {
 
         let error = event.validate().expect_err("authorization is required");
         assert_eq!(error.field(), "authorization");
+    }
+
+    #[test]
+    fn every_repository_event_kind_fixture_deserializes_and_validates() {
+        let files = [
+            "chat-message.json",
+            "chat-donation.json",
+            "speech-input.json",
+            "game-event.json",
+            "stream-event.json",
+            "timer-tick.json",
+            "operator-stop.json",
+            "system-health.json",
+        ];
+        let mut kinds = BTreeSet::new();
+
+        for file in files {
+            let path = repository_root().join("examples/events").join(file);
+            let json = fs::read_to_string(&path).expect("read event fixture");
+            let event: EventEnvelope =
+                serde_json::from_str(&json).expect("schema-valid fixture must deserialize");
+            event.validate().expect("fixture must pass Rust validation");
+            kinds.insert(format!("{:?}", event.kind));
+        }
+
+        assert_eq!(kinds.len(), 8);
+    }
+
+    #[test]
+    fn repository_negative_event_fixtures_are_rejected_by_rust() {
+        let root = repository_root().join("examples/events/invalid");
+        let mut files = fs::read_dir(root)
+            .expect("negative fixture directory")
+            .map(|entry| entry.expect("directory entry").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .collect::<Vec<_>>();
+        files.sort();
+
+        assert!(!files.is_empty());
+        for path in files {
+            let json = fs::read_to_string(&path).expect("read negative fixture");
+            let rejected = match serde_json::from_str::<EventEnvelope>(&json) {
+                Ok(event) => event.validate().is_err(),
+                Err(_) => true,
+            };
+            assert!(
+                rejected,
+                "negative event fixture unexpectedly accepted: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn json_schema_date_time_examples_match_expected_acceptance() {
+        for value in [
+            "2026-09-24T10:00:00Z",
+            "2026-09-24t10:00:00z",
+            "2026-09-24T10:00:00+09:30",
+            "2026-09-24T10:00:00.125Z",
+        ] {
+            assert!(is_json_schema_date_time(value), "{value}");
+        }
+        for value in [
+            "2026-02-29T00:00:00Z",
+            "2026-09-24T10:00:00",
+            "2026-09-24 10:00:00+09:30",
+            "2026-09-24T24:00:00Z",
+            "2016-12-31T23:59:60Z",
+            "2026-09-24T10:00:00+24:00",
+        ] {
+            assert!(!is_json_schema_date_time(value), "{value}");
+        }
     }
 }

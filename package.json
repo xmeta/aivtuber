@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "validate": "bun scripts/validate.mjs",
+    "validate:rust-parity": "bun scripts/validate-rust-schema-parity.mjs",
     "test": "bun test"
   },
   "dependencies": {},

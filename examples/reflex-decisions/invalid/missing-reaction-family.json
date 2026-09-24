@@ -1,0 +1,13 @@
+{
+  "schema_version": "0.1.0",
+  "route": {"value": "silent", "confidence": null},
+  "gesture_family": null,
+  "attention_target": "away",
+  "interrupt_probability": 0.0,
+  "cache_reuse_probability": 0.0,
+  "importance": 0.1,
+  "emotion_intensity": 0.0,
+  "backend": {"name": "jev", "model_alias": "jev-latest", "model_version": "example"},
+  "latency_ms": 10.0,
+  "fallback_reason": "none"
+}

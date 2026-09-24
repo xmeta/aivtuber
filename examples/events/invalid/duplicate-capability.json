@@ -1,0 +1,18 @@
+{
+  "schema_version": "0.2.0",
+  "event_id": "evt-invalid-duplicate-capability",
+  "correlation_id": "corr-invalid-duplicate-capability",
+  "sequence": 106,
+  "observed_at": "2026-09-20T10:10:05Z",
+  "source": "local-operator-hotkey",
+  "source_class": "operator",
+  "plane": "control",
+  "trust_level": "trusted",
+  "kind": "operator.command",
+  "authorization": {
+    "principal": "operator:local",
+    "method": "operator_hotkey",
+    "capabilities": ["performer.stop", "performer.stop"]
+  },
+  "payload": {"action": "stop"}
+}

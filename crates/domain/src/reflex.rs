@@ -1,5 +1,5 @@
 use crate::DomainValidationError;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 pub const REFLEX_SCHEMA_VERSION: &str = "0.1.0";
 
@@ -14,6 +14,7 @@ pub enum ResponseRoute {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RouteDecision {
     pub value: ResponseRoute,
     pub confidence: Option<f64>,
@@ -45,6 +46,7 @@ pub enum FallbackReason {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackendIdentity {
     pub name: String,
     pub model_alias: Option<String>,
@@ -52,10 +54,13 @@ pub struct BackendIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReflexDecision {
     pub schema_version: String,
     pub route: RouteDecision,
+    #[serde(deserialize_with = "deserialize_required_nullable_string")]
     pub reaction_family: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable_string")]
     pub gesture_family: Option<String>,
     pub attention_target: AttentionTarget,
     pub interrupt_probability: f64,
@@ -75,7 +80,7 @@ impl ReflexDecision {
                 format!("expected {REFLEX_SCHEMA_VERSION}"),
             ));
         }
-        if self.backend.name.trim().is_empty() {
+        if self.backend.name.is_empty() {
             return Err(DomainValidationError::new(
                 "backend.name",
                 "must not be empty",
@@ -99,6 +104,13 @@ impl ReflexDecision {
     }
 }
 
+fn deserialize_required_nullable_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)
+}
+
 fn validate_unit_interval(field: &'static str, value: f64) -> Result<(), DomainValidationError> {
     if value.is_finite() && (0.0..=1.0).contains(&value) {
         Ok(())
@@ -113,6 +125,12 @@ fn validate_unit_interval(field: &'static str, value: f64) -> Result<(), DomainV
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    fn repository_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
 
     fn valid_decision() -> ReflexDecision {
         ReflexDecision {
@@ -160,5 +178,64 @@ mod tests {
 
         let error = decision.validate().expect_err("probability must fail");
         assert_eq!(error.field(), "cache_reuse_probability");
+    }
+
+    #[test]
+    fn repository_reflex_fixtures_deserialize_and_validate() {
+        for file in ["cached-reaction.json", "timeout-fallback.json"] {
+            let path = repository_root()
+                .join("examples/reflex-decisions")
+                .join(file);
+            let json = fs::read_to_string(&path).expect("read reflex fixture");
+            let decision: ReflexDecision =
+                serde_json::from_str(&json).expect("schema-valid reflex fixture must deserialize");
+            decision
+                .validate()
+                .expect("reflex fixture must pass Rust validation");
+        }
+    }
+
+    #[test]
+    fn repository_negative_reflex_fixtures_are_rejected_by_rust() {
+        let root = repository_root().join("examples/reflex-decisions/invalid");
+        let mut files = fs::read_dir(root)
+            .expect("negative reflex fixture directory")
+            .map(|entry| entry.expect("directory entry").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .collect::<Vec<_>>();
+        files.sort();
+
+        assert!(!files.is_empty());
+        for path in files {
+            let json = fs::read_to_string(&path).expect("read negative reflex fixture");
+            let rejected = match serde_json::from_str::<ReflexDecision>(&json) {
+                Ok(decision) => decision.validate().is_err(),
+                Err(_) => true,
+            };
+            assert!(
+                rejected,
+                "negative reflex fixture unexpectedly accepted: {}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn closed_nested_reflex_objects_reject_unknown_fields() {
+        let json = serde_json::json!({
+            "schema_version": "0.1.0",
+            "route": {"value": "silent", "confidence": null, "unexpected": true},
+            "reaction_family": null,
+            "gesture_family": null,
+            "attention_target": "away",
+            "interrupt_probability": 0.0,
+            "cache_reuse_probability": 0.0,
+            "importance": 0.0,
+            "emotion_intensity": 0.0,
+            "backend": {"name": "jev"},
+            "latency_ms": 0.0,
+            "fallback_reason": "none"
+        });
+        assert!(serde_json::from_value::<ReflexDecision>(json).is_err());
     }
 }

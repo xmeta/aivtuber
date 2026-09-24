@@ -1,0 +1,18 @@
+{
+  "schema_version": "0.2.0",
+  "event_id": "evt-health-000001",
+  "correlation_id": "corr-health-000001",
+  "sequence": 8,
+  "observed_at": "2026-09-20t10:00:07z",
+  "source": "runtime-health",
+  "source_class": "system",
+  "plane": "system",
+  "trust_level": "trusted",
+  "kind": "system.health",
+  "actor_id": null,
+  "priority_hint": null,
+  "payload": {
+    "component": "scheduler",
+    "status": "ok"
+  }
+}

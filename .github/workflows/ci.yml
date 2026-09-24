@@ -18,8 +18,13 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
       - run: bun install --frozen-lockfile
       - run: bun run validate
+      - run: bun run validate:rust-parity
       - run: bun test
 
   rust:
@@ -72,8 +77,7 @@ jobs:
       - name: Validate Event Envelopes
         run: |
           check-jsonschema --schemafile schemas/event-envelope.schema.json \
-            examples/events/chat-message.json \
-            examples/events/operator-stop.json
+            examples/events/*.json
 
       - name: Reject forged Event Envelopes
         shell: bash
@@ -85,6 +89,14 @@ jobs:
 
       - name: Validate Reflex Decisions
         run: check-jsonschema --schemafile schemas/reflex-decision.schema.json examples/reflex-decisions/*.json
+
+      - name: Reject invalid Reflex Decisions
+        shell: bash
+        run: |
+          if check-jsonschema --schemafile schemas/reflex-decision.schema.json examples/reflex-decisions/invalid/*.json; then
+            echo "Invalid Reflex Decision fixture unexpectedly passed."
+            exit 1
+          fi
 
       - name: Validate security regression fixtures
         run: check-jsonschema --schemafile schemas/security-regression-case.schema.json examples/security/*.json
