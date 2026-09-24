@@ -173,3 +173,5 @@ Dynamic assets produced by `crates/generative` are still ordinary Performance As
 When `provenance.generated` is true, the core provenance includes the generator, ThinkingEngine backend, TTS backend, and the routing reason that caused the LLM call. Model aliases/versions, voice model, and viseme mapping are retained when the provider exposes them.
 
 The schema and Rust validator reject generated assets missing the required provenance core. This prevents a promoted dynamic asset from becoming detached from the model/routing context that created it.
+
+Promotion policy lives in `crates/adaptation`, not in AssetStore. `AssetStore::persist_generated_descriptor` accepts only already validated generated L0 assets that remain compatible with the current runtime, writes the descriptor atomically through a temporary file, and refuses to overwrite an existing L1 id. `invalidate_generated_asset` likewise verifies generated provenance before removing L0/L1 state, so static pack assets cannot be deleted through the adaptation rollback path. See link:memory-adaptation.adoc[Memory and Adaptation Runtime].

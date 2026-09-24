@@ -8,9 +8,11 @@ pub use outputs::*;
 pub use routing::*;
 pub use semantic::*;
 
+use aivtuber_adaptation::{AdaptationEngine, AppliedAdaptation, MemoryEntry, WorkingMemory};
 use aivtuber_asset_store::CacheTier;
 use aivtuber_domain::{
-    AuthenticatedControlCommand, AuthorizedStreamAction, EngineError, EventEnvelope, FallbackReason,
+    AuthenticatedControl, AuthenticatedControlCommand, AuthorizedStreamAction, EngineError,
+    EventEnvelope, FallbackReason,
 };
 use aivtuber_generative::{
     FallbackDirective, GeneratedTextGateDecision, GenerationCancellationRegistry,
@@ -64,6 +66,7 @@ pub enum AppError {
     Playback(CachedPlaybackError),
     Routing(String),
     Generation(String),
+    Adaptation(String),
 }
 
 impl fmt::Display for AppError {
@@ -73,6 +76,7 @@ impl fmt::Display for AppError {
             Self::Playback(error) => write!(f, "{error}"),
             Self::Routing(message) => write!(f, "routing failed: {message}"),
             Self::Generation(message) => write!(f, "generation failed: {message}"),
+            Self::Adaptation(message) => write!(f, "adaptation failed: {message}"),
         }
     }
 }
@@ -138,6 +142,26 @@ impl GenerativeRuntime {
     }
 }
 
+#[derive(Debug)]
+pub struct AdaptationRuntime {
+    memory: WorkingMemory,
+    engine: AdaptationEngine,
+}
+
+impl AdaptationRuntime {
+    pub fn new(memory: WorkingMemory, engine: AdaptationEngine) -> Self {
+        Self { memory, engine }
+    }
+
+    pub fn memory(&self) -> &WorkingMemory {
+        &self.memory
+    }
+
+    pub fn engine(&self) -> &AdaptationEngine {
+        &self.engine
+    }
+}
+
 struct HandledEvent {
     playback: Option<CachedPlaybackOutcome>,
     route: RouteClass,
@@ -164,6 +188,7 @@ where
     visemes: LocalVisemeStore,
     router: R,
     generative: Option<GenerativeRuntime>,
+    adaptation: Option<AdaptationRuntime>,
     audio: Box<dyn AudioOutput>,
     avatar: Box<dyn AvatarOutput>,
     stream: Box<dyn StreamOutput>,
@@ -196,6 +221,7 @@ where
             visemes,
             router,
             generative: None,
+            adaptation: None,
             audio,
             avatar,
             stream,
@@ -214,9 +240,18 @@ where
         self
     }
 
+    pub fn with_adaptation(mut self, adaptation: AdaptationRuntime) -> Self {
+        self.adaptation = Some(adaptation);
+        self
+    }
+
     pub fn with_comparison_mode(mut self, mode: ComparisonMode) -> Self {
         self.comparison_mode = mode;
         self
+    }
+
+    pub fn adaptation(&self) -> Option<&AdaptationRuntime> {
+        self.adaptation.as_ref()
     }
 
     pub fn telemetry(&self) -> &TelemetryCollector {
@@ -225,6 +260,82 @@ where
 
     pub fn telemetry_mut(&mut self) -> &mut TelemetryCollector {
         &mut self.telemetry
+    }
+
+    pub fn remember_working_memory(
+        &mut self,
+        event: &EventEnvelope,
+        claim: &str,
+        topic: Option<&str>,
+        now_ms: u64,
+    ) -> Result<MemoryEntry, AppError> {
+        event
+            .validate()
+            .map_err(|error| AppError::Adaptation(error.to_string()))?;
+        let adaptation = self.adaptation.as_mut().ok_or_else(|| {
+            AppError::Adaptation(
+                "working memory requested without configured adaptation runtime".to_owned(),
+            )
+        })?;
+        adaptation
+            .memory
+            .remember_working(event, claim, topic, now_ms)
+            .cloned()
+            .map_err(|error| AppError::Adaptation(error.to_string()))
+    }
+
+    pub fn remember_durable_memory(
+        &mut self,
+        event: &EventEnvelope,
+        authority: Option<&AuthenticatedControl>,
+        claim: &str,
+        topic: Option<&str>,
+        now_ms: u64,
+    ) -> Result<MemoryEntry, AppError> {
+        event
+            .validate()
+            .map_err(|error| AppError::Adaptation(error.to_string()))?;
+        let (_, permit) = self.security.authorize_memory_write(event, authority);
+        let permit = permit.ok_or_else(|| {
+            AppError::Adaptation("durable memory write denied by security gate".to_owned())
+        })?;
+        let adaptation = self.adaptation.as_mut().ok_or_else(|| {
+            AppError::Adaptation(
+                "durable memory requested without configured adaptation runtime".to_owned(),
+            )
+        })?;
+        adaptation
+            .memory
+            .remember_durable(&permit, claim, topic, now_ms)
+            .cloned()
+            .map_err(|error| AppError::Adaptation(error.to_string()))
+    }
+
+    pub fn label_generated_asset_quality(
+        &mut self,
+        asset_id: &str,
+        positive: bool,
+    ) -> Result<(), AppError> {
+        let adaptation = self.adaptation.as_mut().ok_or_else(|| {
+            AppError::Adaptation(
+                "quality label requested without configured adaptation runtime".to_owned(),
+            )
+        })?;
+        adaptation.engine.record_quality(asset_id, positive);
+        Ok(())
+    }
+
+    pub fn apply_generated_asset_adaptation(
+        &mut self,
+        asset_id: &str,
+    ) -> Result<AppliedAdaptation, AppError> {
+        let adaptation = self.adaptation.as_mut().ok_or_else(|| {
+            AppError::Adaptation("asset adaptation requested without configured runtime".to_owned())
+        })?;
+        adaptation
+            .engine
+            .apply(self.performer.assets_mut(), asset_id)
+            .map_err(|error| AppError::Adaptation(error.to_string()))
     }
 
     pub fn generation_cancellation_registry(&self) -> Option<Arc<GenerationCancellationRegistry>> {
@@ -522,6 +633,15 @@ where
             observation.event_to_first_audio_ms = playback.metrics.event_to_first_audio_ms;
             observation.event_to_first_visible_reaction_ms =
                 playback.metrics.event_to_first_visible_reaction_ms;
+            if let Some(asset) = self.performer.assets().hot_get(&playback.asset_id)
+                && asset
+                    .provenance
+                    .as_ref()
+                    .is_some_and(|provenance| provenance.generated == Some(true))
+                && let Some(adaptation) = self.adaptation.as_mut()
+            {
+                adaptation.engine.record_use(&asset);
+            }
         }
 
         if let Some(decision) = &handled.decision {
@@ -850,7 +970,8 @@ fn command_is_live(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
+    use aivtuber_adaptation::{PromotionPolicy, WorkingMemoryConfig};
+    use aivtuber_asset_store::{AssetStore, RuntimeCompatibility, load_asset_file};
     use aivtuber_domain::{
         AuthorizationMethod, BackendIdentity, Capability, ControlSecret, EVENT_SCHEMA_VERSION,
         EngineErrorKind, EngineFuture, GeneratedReply, LocalControlIngress, OperatorCommandInput,
@@ -868,6 +989,7 @@ mod tests {
     use aivtuber_telemetry::SecretRedactor;
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
+    use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::{
         Arc, Mutex,
@@ -1189,6 +1311,31 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/starter-reaction-pack")
     }
 
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(name: &str) -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "aivtuber-app-{name}-{}-{serial}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("create test dir");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
     fn runtime_compatibility() -> RuntimeCompatibility {
         RuntimeCompatibility {
             compiler_version: "0.1.0".to_owned(),
@@ -1343,6 +1490,21 @@ mod tests {
         )
     }
 
+    fn adaptation_runtime(policy: PromotionPolicy) -> AdaptationRuntime {
+        AdaptationRuntime::new(
+            WorkingMemory::new(WorkingMemoryConfig {
+                max_entries: 8,
+                working_ttl_ms: 100,
+                durable_ttl_ms: 1_000,
+                max_claim_bytes: 128,
+                max_topic_bytes: 64,
+                pseudonym_salt: 7,
+            })
+            .expect("working memory"),
+            AdaptationEngine::new(policy, "test-adaptation-v1", 42).expect("adaptation engine"),
+        )
+    }
+
     fn generative_runtime<T>(thinking: MockThinking, tts: T) -> GenerativeRuntime
     where
         T: TtsEngine + 'static,
@@ -1396,6 +1558,33 @@ mod tests {
         .with_generation(generative_runtime(thinking, tts))
     }
 
+    fn memory_admin_authority() -> AuthenticatedControl {
+        let secret = [0x33_u8; 32];
+        let ingress = LocalControlIngress::new(
+            "local-test",
+            "operator:memory",
+            AuthorizationMethod::OperatorHotkey,
+            BTreeSet::from([Capability::MemoryAdmin]),
+            ControlSecret::new(secret),
+        )
+        .expect("memory control ingress");
+        ingress
+            .authenticate(
+                OperatorCommandInput {
+                    event_id: "evt-memory-admin".to_owned(),
+                    correlation_id: "corr-memory-admin".to_owned(),
+                    sequence: 98,
+                    observed_at: "2026-09-24T00:00:00Z".to_owned(),
+                    action: "memory.admin".to_owned(),
+                    payload: BTreeMap::new(),
+                },
+                &secret,
+            )
+            .expect("authenticated memory admin")
+            .authority()
+            .clone()
+    }
+
     fn stop_command() -> AuthenticatedControlCommand {
         let secret = [0x45_u8; 32];
         let ingress = LocalControlIngress::new(
@@ -1439,6 +1628,171 @@ mod tests {
             aivtuber_generative::GenerationRoutingReason::ExplicitLlmRoute
         );
         route.thinking.validate().expect("typed thinking request");
+    }
+
+    #[test]
+    fn production_memory_api_requires_gate_for_durable_public_chat() {
+        let mut app = app(
+            FixedSilentRoute,
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        )
+        .with_adaptation(adaptation_runtime(PromotionPolicy::default()));
+        app.startup().expect("startup");
+        let event = chat_event(25);
+
+        let working = app
+            .remember_working_memory(&event, "  Viewer likes Rust ", Some("coding"), 10)
+            .expect("working memory");
+        assert_eq!(
+            working.retention,
+            aivtuber_adaptation::RetentionClass::Working
+        );
+        assert_ne!(
+            working.source.pseudonymous_actor_id.as_deref(),
+            event.actor_id.as_deref()
+        );
+
+        let denied = app
+            .remember_durable_memory(&event, None, "viewer likes Rust", Some("coding"), 10)
+            .expect_err("public chat without authority must not become durable");
+        assert!(denied.to_string().contains("security gate"));
+
+        let authority = memory_admin_authority();
+        let durable = app
+            .remember_durable_memory(
+                &event,
+                Some(&authority),
+                "viewer likes Rust",
+                Some("coding"),
+                20,
+            )
+            .expect("memory-admin durable write");
+        assert_eq!(
+            durable.retention,
+            aivtuber_adaptation::RetentionClass::Durable
+        );
+        assert_eq!(
+            durable.write_decision,
+            aivtuber_adaptation::MemoryGateDecision::AllowedMemoryAdmin
+        );
+        assert_eq!(app.adaptation().expect("adaptation").memory().len(), 2);
+    }
+
+    #[test]
+    fn generated_asset_promotion_and_rollback_run_through_production_app() {
+        let dir = TestDir::new("generated-promotion");
+        let performer = CachedPerformer::new(
+            AssetStore::new(dir.path(), runtime_compatibility()),
+            Scheduler::new(SchedulerConfig {
+                min_reaction_spacing_ms: 0,
+            }),
+            CachedPlaybackConfig {
+                recent_variant_window: 1,
+            },
+        );
+        let security = SecurityRuntime::new(
+            SecurityRuntimeConfig::default(),
+            SchedulerConfig {
+                min_reaction_spacing_ms: 0,
+            },
+            SecretRedactor::default(),
+            None,
+        )
+        .expect("security runtime");
+        let policy = PromotionPolicy {
+            min_uses: 1,
+            min_quality_labels: 1,
+            min_quality_ratio: 1.0,
+            invalidate_after_negative_labels: 1,
+            recent_variant_window: 1,
+        };
+        let mut app = ProductionApp::new(
+            security,
+            performer,
+            LocalVisemeStore::new(pack_root()),
+            FixedGenerateRoute {
+                reply_context: ReflexContext::default(),
+                fallback_variant_group: None,
+            },
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+            250,
+        )
+        .with_generation(generative_runtime(
+            MockThinking {
+                reply: "promotable generated reply".to_owned(),
+                failure: None,
+            },
+            MockTts::default(),
+        ))
+        .with_adaptation(adaptation_runtime(policy));
+        app.startup().expect("startup");
+
+        let raw = serde_json::to_vec(&chat_event(26)).expect("event json");
+        let playback = app
+            .process_content_bytes(&raw, 0, 26)
+            .expect("generation")
+            .playback
+            .expect("generated playback");
+        let asset_id = playback.asset_id;
+        assert_eq!(
+            app.adaptation()
+                .expect("adaptation")
+                .engine()
+                .feedback(&asset_id)
+                .uses,
+            1
+        );
+        assert_eq!(
+            app.apply_generated_asset_adaptation(&asset_id)
+                .expect("unlabelled keep-hot"),
+            AppliedAdaptation::KeptHot
+        );
+
+        app.label_generated_asset_quality(&asset_id, true)
+            .expect("positive quality label");
+        let promoted = app
+            .apply_generated_asset_adaptation(&asset_id)
+            .expect("promotion");
+        let path = match promoted {
+            AppliedAdaptation::Promoted(path) => path,
+            other => panic!("expected promotion, got {other:?}"),
+        };
+        assert_eq!(path.parent(), Some(dir.path()));
+        let persisted = load_asset_file(&path).expect("persisted generated asset");
+        assert!(
+            persisted
+                .provenance
+                .as_ref()
+                .is_some_and(|provenance| provenance.generated == Some(true))
+        );
+        assert!(
+            persisted
+                .compatibility
+                .check(&runtime_compatibility())
+                .is_usable()
+        );
+
+        app.label_generated_asset_quality(&asset_id, false)
+            .expect("negative quality label");
+        assert_eq!(
+            app.apply_generated_asset_adaptation(&asset_id)
+                .expect("rollback"),
+            AppliedAdaptation::Invalidated
+        );
+        assert!(!path.exists());
+        assert!(app.performer().assets().hot_get(&asset_id).is_none());
+        assert_eq!(
+            app.adaptation()
+                .expect("adaptation")
+                .engine()
+                .decisions()
+                .len(),
+            3
+        );
     }
 
     #[test]

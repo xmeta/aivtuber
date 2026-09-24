@@ -27,6 +27,7 @@ The core design separates three time scales:
 * link:docs/performance-assets.adoc[Performance Asset specification]
 * link:docs/vts-obs-adapters.adoc[VTube Studio and OBS adapter integration]
 * link:docs/generative-fallback.adoc[Generative fallback and dynamic compilation]
+* link:docs/memory-adaptation.adoc[Bounded memory and deterministic adaptation]
 * link:docs/production-runtime.adoc[Production Rust composition runtime]
 * link:docs/maintenance.adoc[Maintenance and merge policy]
 * link:docs/metrics.adoc[Metrics and evaluation]
@@ -50,7 +51,7 @@ cargo build --locked --workspace
 cargo run --locked -p aivtuber-app --bin replay-benchmark -- examples/benchmarks/replay-comparison.json target/aivtuber-benchmarks
 ----
 
-The Rust production path includes `crates/runtime` for security enforcement: byte-aware content ingress limits/backpressure, authenticated emergency-control bypass, memory-write gating, public-output gating, and redacted audit records. Privileged OBS/avatar/tool actions require the non-serializable `AuthenticatedControl` authority minted by `LocalControlIngress`; serialized `AuthorizationContext` values are audit/replay data only. `crates/domain` defines bounded/versioned `ReflexRequest` snapshots and a separate curated `ThinkingRequest` carrying explicit trust/privacy metadata rather than arbitrary state maps or raw history. `crates/app` is the executable composition root: it owns lifecycle, content ingress, cached/reflex-selected asset playback, the shared deterministic scheduler, and dispatch to real audio/VTube Studio/OBS adapter boundaries.
+The Rust production path includes `crates/runtime` for security enforcement: byte-aware content ingress limits/backpressure, authenticated emergency-control bypass, memory-write gating, public-output gating, and redacted audit records. `crates/adaptation` adds bounded working memory, pseudonymous viewer/topic relevance, deterministic generated-asset promotion/invalidation, and replayable adaptation decisions; durable memory still requires the non-serializable permit minted by `SecurityRuntime`. Privileged OBS/avatar/tool actions require the non-serializable `AuthenticatedControl` authority minted by `LocalControlIngress`; serialized `AuthorizationContext` values are audit/replay data only. `crates/domain` defines bounded/versioned `ReflexRequest` snapshots and a separate curated `ThinkingRequest` carrying explicit trust/privacy metadata rather than arbitrary state maps or raw history. `crates/app` is the executable composition root: it owns lifecycle, content ingress, cached/reflex-selected/generated asset playback, adaptation APIs, the shared deterministic scheduler, and dispatch to real audio/VTube Studio/OBS adapter boundaries.
 
 == Validation
 

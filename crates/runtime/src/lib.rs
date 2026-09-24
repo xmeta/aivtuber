@@ -86,6 +86,44 @@ pub enum MemoryWriteDecision {
     Denied,
 }
 
+/// Non-serializable proof that the deterministic memory-write gate authorized
+/// one concrete source event. Only `SecurityRuntime` can construct permits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryWritePermit {
+    event_id: String,
+    source: String,
+    source_class: aivtuber_domain::SourceClass,
+    trust_level: TrustLevel,
+    actor_id: Option<String>,
+    decision: MemoryWriteDecision,
+}
+
+impl MemoryWritePermit {
+    pub fn event_id(&self) -> &str {
+        &self.event_id
+    }
+
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub fn source_class(&self) -> aivtuber_domain::SourceClass {
+        self.source_class
+    }
+
+    pub fn trust_level(&self) -> TrustLevel {
+        self.trust_level
+    }
+
+    pub fn actor_id(&self) -> Option<&str> {
+        self.actor_id.as_deref()
+    }
+
+    pub fn decision(&self) -> MemoryWriteDecision {
+        self.decision
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputVerdict {
     Allow,
@@ -387,6 +425,14 @@ impl SecurityRuntime {
         event: &EventEnvelope,
         authority: Option<&AuthenticatedControl>,
     ) -> MemoryWriteDecision {
+        self.authorize_memory_write(event, authority).0
+    }
+
+    pub fn authorize_memory_write(
+        &mut self,
+        event: &EventEnvelope,
+        authority: Option<&AuthenticatedControl>,
+    ) -> (MemoryWriteDecision, Option<MemoryWritePermit>) {
         let decision = if authority.is_some_and(|auth| auth.has_capability(Capability::MemoryAdmin))
         {
             MemoryWriteDecision::AllowedMemoryAdmin
@@ -407,7 +453,16 @@ impl SecurityRuntime {
             format!("{decision:?}"),
             "memory write gate",
         ));
-        decision
+        let permit =
+            (!matches!(decision, MemoryWriteDecision::Denied)).then(|| MemoryWritePermit {
+                event_id: event.event_id.clone(),
+                source: event.source.clone(),
+                source_class: event.source_class,
+                trust_level: event.trust_level,
+                actor_id: event.actor_id.clone(),
+                decision,
+            });
+        (decision, permit)
     }
 
     fn consume_token(&mut self, source: &str, now_ms: u64) -> bool {
@@ -744,15 +799,19 @@ mod tests {
         let mut runtime = runtime_with(SecurityRuntimeConfig::default(), &[]);
         let chat = chat_event("evt-memory", 1, "chat-a", "remember this");
 
-        assert_eq!(
-            runtime.gate_memory_write(&chat, None),
-            MemoryWriteDecision::Denied
-        );
+        let (denied, denied_permit) = runtime.authorize_memory_write(&chat, None);
+        assert_eq!(denied, MemoryWriteDecision::Denied);
+        assert!(denied_permit.is_none());
 
         let admin = authenticated(Capability::MemoryAdmin, "memory.admin");
-        assert_eq!(
-            runtime.gate_memory_write(&chat, Some(admin.authority())),
-            MemoryWriteDecision::AllowedMemoryAdmin
-        );
+        let (allowed, permit) = runtime.authorize_memory_write(&chat, Some(admin.authority()));
+        assert_eq!(allowed, MemoryWriteDecision::AllowedMemoryAdmin);
+        let permit = permit.expect("memory permit");
+        assert_eq!(permit.event_id(), chat.event_id);
+        assert_eq!(permit.source(), chat.source);
+        assert_eq!(permit.source_class(), chat.source_class);
+        assert_eq!(permit.trust_level(), chat.trust_level);
+        assert_eq!(permit.actor_id(), chat.actor_id.as_deref());
+        assert_eq!(permit.decision(), MemoryWriteDecision::AllowedMemoryAdmin);
     }
 }

@@ -142,7 +142,7 @@ The calibration CSV contains:
 * cancellation;
 * fallback reason.
 
-These rows are inputs for offline threshold calibration. Threshold changes remain production policy decisions and must be evaluated against replay data rather than tuned from a single live event.
+These rows are inputs for offline threshold calibration. Threshold changes remain production policy decisions and must be evaluated against replay data rather than tuned from a single live event. Phase 5 consumes those offline results through the explicit `PromotionPolicy` / runtime environment thresholds documented in link:memory-adaptation.adoc[Memory and Adaptation Runtime]; the adaptation runtime does not self-tune from model output.
 
 == 9. Optional cost normalization
 

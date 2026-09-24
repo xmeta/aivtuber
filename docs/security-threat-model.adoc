@@ -154,6 +154,8 @@ A memory candidate records:
 
 Public chat SHOULD NOT become durable identity/fact memory solely because an LLM repeats it.
 
+The Rust production path enforces this with a non-serializable `MemoryWritePermit`: `SecurityRuntime::authorize_memory_write` can mint the permit only for an allowed system source or authenticated `memory.admin` authority. `crates/adaptation` accepts public content into bounded working memory, but its durable-write API requires that permit and stores only a pseudonymous actor identifier.
+
 == 9. Rate limiting and backpressure
 
 Each external source has independent:

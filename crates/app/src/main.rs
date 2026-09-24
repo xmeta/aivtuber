@@ -1,12 +1,13 @@
+use aivtuber_adaptation::{AdaptationEngine, PromotionPolicy, WorkingMemory, WorkingMemoryConfig};
 use aivtuber_adapters::{
     NormalizedHttpTtsAdapter, NormalizedHttpTtsConfig, ObsWebSocketAdapter, ObsWebSocketConfig,
     OpenAiResponsesAdapter, OpenAiResponsesConfig, ProcessAudioConfig, ProcessAudioPlayer,
     SecretString, VTubeStudioAdapter, VTubeStudioConfig,
 };
 use aivtuber_app::{
-    AdapterHealth, AvatarOutput, GenerativeRuntime, IntentRoutePlanner, NoopAvatarOutput,
-    NoopStreamOutput, ObsStreamOutput, ProductionApp, StreamOutput, VtsAvatarOutput,
-    VtsPlaybackConfig,
+    AdaptationRuntime, AdapterHealth, AvatarOutput, GenerativeRuntime, IntentRoutePlanner,
+    NoopAvatarOutput, NoopStreamOutput, ObsStreamOutput, ProductionApp, StreamOutput,
+    VtsAvatarOutput, VtsPlaybackConfig,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
@@ -53,6 +54,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
 
     let generative = build_generative_runtime(&compatibility)?;
+    let adaptation = build_adaptation_runtime()?;
     let scheduler_config = SchedulerConfig::default();
     let performer = CachedPerformer::new(
         AssetStore::new(descriptors, compatibility),
@@ -88,7 +90,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         avatar,
         stream,
         max_lateness_ms,
-    );
+    )
+    .with_adaptation(adaptation);
     if let Some(generative) = generative {
         app = app.with_generation(generative);
     }
@@ -221,6 +224,33 @@ fn build_generative_runtime(
     ))))
 }
 
+fn build_adaptation_runtime() -> Result<AdaptationRuntime, Box<dyn Error>> {
+    let seed = env_u64("AIVTUBER_ADAPTATION_SEED", 0)?;
+    let memory = WorkingMemory::new(WorkingMemoryConfig {
+        max_entries: env_usize("AIVTUBER_MEMORY_MAX_ENTRIES", 256)?,
+        working_ttl_ms: env_u64("AIVTUBER_MEMORY_WORKING_TTL_MS", 15 * 60 * 1_000)?,
+        durable_ttl_ms: env_u64("AIVTUBER_MEMORY_DURABLE_TTL_MS", 24 * 60 * 60 * 1_000)?,
+        max_claim_bytes: env_usize("AIVTUBER_MEMORY_MAX_CLAIM_BYTES", 1_024)?,
+        max_topic_bytes: env_usize("AIVTUBER_MEMORY_MAX_TOPIC_BYTES", 128)?,
+        pseudonym_salt: env_u64("AIVTUBER_MEMORY_PSEUDONYM_SALT", seed)?,
+    })?;
+    let engine = AdaptationEngine::new(
+        PromotionPolicy {
+            min_uses: env_u64("AIVTUBER_PROMOTION_MIN_USES", 3)?,
+            min_quality_labels: env_u64("AIVTUBER_PROMOTION_MIN_QUALITY_LABELS", 2)?,
+            min_quality_ratio: env_f64("AIVTUBER_PROMOTION_MIN_QUALITY_RATIO", 0.8)?,
+            invalidate_after_negative_labels: env_u64(
+                "AIVTUBER_PROMOTION_INVALIDATE_NEGATIVE_LABELS",
+                3,
+            )?,
+            recent_variant_window: env_usize("AIVTUBER_ADAPTATION_RECENT_VARIANT_WINDOW", 2)?,
+        },
+        env_string("AIVTUBER_ADAPTATION_POLICY_VERSION", "adaptation-v1"),
+        seed,
+    )?;
+    Ok(AdaptationRuntime::new(memory, engine))
+}
+
 fn build_avatar_output() -> Result<Box<dyn AvatarOutput>, Box<dyn Error>> {
     if !env_bool("AIVTUBER_VTS_ENABLED", false)? {
         return Ok(Box::new(NoopAvatarOutput));
@@ -351,6 +381,30 @@ fn env_u64(name: &str, default: u64) -> Result<u64, Box<dyn Error>> {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("{name} must be an unsigned integer: {error}"),
+        )
+        .into()
+    })
+}
+
+fn env_usize(name: &str, default: usize) -> Result<usize, Box<dyn Error>> {
+    let value = env_u64(name, default as u64)?;
+    usize::try_from(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} is too large for this platform"),
+        )
+        .into()
+    })
+}
+
+fn env_f64(name: &str, default: f64) -> Result<f64, Box<dyn Error>> {
+    let Some(value) = env_optional(name) else {
+        return Ok(default);
+    };
+    value.parse::<f64>().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must be a number: {error}"),
         )
         .into()
     })

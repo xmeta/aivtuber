@@ -270,6 +270,7 @@ crates/
   reflex/
   asset-store/
   scheduler/
+  adaptation/
   adapters-vts/
   adapters-obs/
   telemetry/
