@@ -72,4 +72,4 @@ Status: implemented on the Rust production path. Working memory is byte/time/cou
 * cost/latency dashboards.
 * privacy retention policies.
 
-Status: the Rust production path now records bounded event observations and the checked-in replay runner compares deterministic, semantic, semantic+Jev, and full-generative modes on one fixture boundary with reproducibility metadata and calibration export. Memory retention/promotion behavior is covered by Phase 5; failure injection/soak work remains in #40.
+Status: the Rust production path records bounded event observations and the checked-in replay runner compares deterministic, semantic, semantic+Jev, and full-generative modes on one fixture boundary with reproducibility metadata and calibration export. `crates/hardening` adds deterministic cross-subsystem fault injection, content-flood/emergency-control verification, and an eight-logical-hour soak report using the same telemetry summary vocabulary. The soak intentionally reports remaining lifetime-growth findings tracked by #50-#53 rather than masking them. See link:failure-soak.adoc[Failure Injection and Long-Stream Soak].

@@ -9,6 +9,7 @@ members = [
     "crates/adapters",
     "crates/generative",
     "crates/adaptation",
+    "crates/hardening",
     "crates/app",
 ]
 resolver = "3"

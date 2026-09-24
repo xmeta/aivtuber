@@ -318,6 +318,11 @@ impl TelemetryCollector {
     ) -> Result<BenchmarkReport, TelemetryError> {
         BenchmarkReport::from_events(metadata, mode, self.events.clone())
     }
+
+    /// Aggregate retained observations without cloning the event detail set.
+    pub fn summary(&self, stream_duration_ms: Option<u64>) -> BenchmarkSummary {
+        summarize(&self.events, stream_duration_ms)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

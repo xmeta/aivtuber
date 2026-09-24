@@ -1,0 +1,17 @@
+[package]
+name = "aivtuber-hardening"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aivtuber-adaptation = { path = "../adaptation" }
+aivtuber-adapters = { path = "../adapters" }
+aivtuber-asset-store = { path = "../asset-store" }
+aivtuber-domain = { path = "../domain" }
+aivtuber-reflex = { path = "../reflex" }
+aivtuber-runtime = { path = "../runtime" }
+aivtuber-scheduler = { path = "../scheduler" }
+aivtuber-telemetry = { path = "../telemetry" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
