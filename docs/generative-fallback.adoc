@@ -10,7 +10,8 @@ The production-target implementation is split across:
 * `crates/adapters::OpenAiResponsesAdapter` -- OpenAI-compatible Responses API ThinkingEngine.
 * `crates/adapters::NormalizedHttpTtsAdapter` -- normalized HTTP TTS implementation.
 * `crates/generative` -- routing audit, cancellation, fallback, streaming compilation state, and dynamic Performance Asset compilation.
-* `crates/asset-store` -- validates generated provenance and can accept completed dynamic assets into the hot cache for later promotion.
+* `crates/asset-store` -- validates generated provenance and accepts only completed compatible dynamic assets into the hot cache for later promotion.
+* `crates/app` -- production composition: builds the curated ThinkingRequest, applies the deterministic public-output gate, inserts the completed generated asset, and reuses CachedPerformer/Scheduler for playback.
 
 == Atomic generation pipeline
 
@@ -21,19 +22,22 @@ For one event the buffered path is:
 . record the explicit LLM routing reason before the ThinkingEngine call;
 . invoke the ThinkingEngine;
 . check cancellation;
-. invoke TTS;
+. pass generated text through `SecurityRuntime::publish_text` in the production composition root;
+. reject/suppress unsafe output or use the redacted text returned by the gate;
+. invoke TTS only with gated public text;
 . check cancellation;
-. compile a dynamic Performance Asset;
+. compile a dynamic Performance Asset from the gated text and complete speech artifact;
 . validate the asset;
-. return the completed asset to the caller.
+. return the completed asset to the caller;
+. production inserts it with `AssetStore::insert_hot` and schedules it through the existing `CachedPerformer`.
 
 The generative crate does not mutate Scheduler state while LLM/TTS work is in flight. A timeout, cancellation, malformed backend result, or partial stream therefore cannot leave a half-scheduled performance behind.
 
 == Cancellation
 
-`GenerationCancellationRegistry` associates the active generation with the event priority used by the scheduler. A newly arrived event cancels the active token only when the new event has strictly higher priority.
+`GenerationCancellationRegistry` associates the active generation with the same `aivtuber_scheduler::priority_for_event` mapping used by cached playback. A newly admitted event cancels the active token only when the new event has strictly higher scheduler priority. Authenticated emergency stop/mute also cancels the active generation without depending on model/network availability.
 
-The pipeline checks cancellation before ThinkingEngine, after ThinkingEngine, after TTS, and immediately before publish.
+The pipeline checks cancellation before ThinkingEngine, after ThinkingEngine, after TTS, and immediately before publish. Cancellation or partial streaming never inserts an asset or mutates the production scheduler.
 
 Callers should finish/remove the registry entry after the generation result has been consumed.
 
@@ -49,7 +53,7 @@ The current normalized HTTP TTS adapter is buffered; a provider with streaming t
 
 Backend failures are converted to typed `FallbackReason` values.
 
-If `fallback_variant_group` has a compatible cached asset, the result is `CachedReaction` with a deterministic asset id. Otherwise the result is a `NonVerbalReaction` directive. TTS failure never publishes a text-only partial dynamic asset.
+If `fallback_variant_group` has a compatible cached asset, the result is `CachedReaction` with a deterministic asset id and production routes it through the normal cached performer path. Otherwise the result is a `NonVerbalReaction` directive; the current production implementation performs no speech/publication for that directive. Thinking/TTS/output-gate failure never publishes a text-only or partial dynamic asset.
 
 == Provenance and promotion
 
@@ -69,6 +73,28 @@ API keys are passed only through adapter configuration and use redacted debug ou
 
 The OpenAI-compatible adapter uses the Responses API shape and keeps endpoint/model selection configurable. The normalized TTS adapter likewise keeps endpoint, backend identity, model identity, voice model, and viseme mapping configurable.
 
+The executable composition root creates the generative runtime only when explicitly enabled:
+
+[source,text]
+----
+AIVTUBER_GENERATIVE_ENABLED=true
+AIVTUBER_OPENAI_API_KEY=<secret>
+AIVTUBER_OPENAI_ENDPOINT=https://api.openai.com/v1/responses
+AIVTUBER_OPENAI_MODEL=<model-alias>
+AIVTUBER_OPENAI_MODEL_VERSION=<optional-version>
+AIVTUBER_OPENAI_MAX_OUTPUT_TOKENS=256
+AIVTUBER_OPENAI_TIMEOUT_MS=15000
+
+AIVTUBER_TTS_ENDPOINT=http://127.0.0.1:PORT/...
+AIVTUBER_TTS_BACKEND_NAME=normalized-http-tts
+AIVTUBER_TTS_API_KEY=<optional-secret>
+AIVTUBER_TTS_MODEL_ALIAS=<optional-alias>
+AIVTUBER_TTS_MODEL_VERSION=<optional-version>
+AIVTUBER_TTS_TIMEOUT_MS=15000
+----
+
+Voice model, viseme mapping, compiler version, avatar profile, and motion library are inherited from the same runtime compatibility configuration used by `AssetStore`, so a generated asset cannot be inserted when its compiler/TTS compatibility disagrees with production playback.
+
 == Verification
 
 The Rust tests cover:
@@ -82,4 +108,10 @@ The Rust tests cover:
 * full thinking/TTS model provenance;
 * promotion into `AssetStore`;
 * streaming final-chunk gating and cancellation;
+* production generate -> output gate -> TTS -> hot insert -> shared scheduler playback;
+* production output redaction and suppression before TTS;
+* production thinking timeout/TTS failure -> cached or non-verbal fallback;
+* production high-priority and authenticated emergency cancellation;
+* serialized control events cannot cancel generation through content ingress;
+* partial streaming output never inserts/schedules a generated asset;
 * secret redaction and HTTP wire mapping in provider adapters.

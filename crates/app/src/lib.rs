@@ -11,15 +11,20 @@ pub use semantic::*;
 use aivtuber_domain::{
     AuthenticatedControlCommand, AuthorizedStreamAction, EngineError, EventEnvelope,
 };
+use aivtuber_generative::{
+    FallbackDirective, GeneratedTextGateDecision, GenerationCancellationRegistry,
+    GenerationDisposition, GenerationRequest, GenerativePipeline,
+};
 use aivtuber_runtime::{
     AudioPlaybackCommand, AudioPlaybackSink, AvatarPlaybackCommand, AvatarPlaybackSink,
     CachedAssetSelection, CachedPerformer, CachedPlaybackError, CachedPlaybackOutcome,
     CachedPlaybackTiming, ContentAdmitDecision, ControlOutcome, FastPathPreloadReport,
-    LocalVisemeStore, RuntimeError, SecurityRuntime,
+    LocalVisemeStore, OutputVerdict, RuntimeError, SecurityRuntime,
 };
 use aivtuber_scheduler::{Scheduler, Status};
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 pub trait AudioOutput: Send {
     fn execute(&mut self, command: &AudioPlaybackCommand) -> Result<(), EngineError>;
@@ -52,6 +57,7 @@ pub enum AppError {
     Runtime(RuntimeError),
     Playback(CachedPlaybackError),
     Routing(String),
+    Generation(String),
 }
 
 impl fmt::Display for AppError {
@@ -60,6 +66,7 @@ impl fmt::Display for AppError {
             Self::Runtime(error) => write!(f, "{error}"),
             Self::Playback(error) => write!(f, "{error}"),
             Self::Routing(message) => write!(f, "routing failed: {message}"),
+            Self::Generation(message) => write!(f, "generation failed: {message}"),
         }
     }
 }
@@ -106,6 +113,25 @@ impl AvatarPlaybackSink for PendingAvatar {
     }
 }
 
+#[derive(Clone)]
+pub struct GenerativeRuntime {
+    pipeline: Arc<GenerativePipeline>,
+    cancellation: Arc<GenerationCancellationRegistry>,
+}
+
+impl GenerativeRuntime {
+    pub fn new(pipeline: GenerativePipeline) -> Self {
+        Self {
+            pipeline: Arc::new(pipeline),
+            cancellation: Arc::new(GenerationCancellationRegistry::default()),
+        }
+    }
+
+    pub fn cancellation_registry(&self) -> Arc<GenerationCancellationRegistry> {
+        Arc::clone(&self.cancellation)
+    }
+}
+
 pub struct ProductionApp<R>
 where
     R: RoutePlanner,
@@ -114,6 +140,7 @@ where
     performer: CachedPerformer,
     visemes: LocalVisemeStore,
     router: R,
+    generative: Option<GenerativeRuntime>,
     audio: Box<dyn AudioOutput>,
     avatar: Box<dyn AvatarOutput>,
     stream: Box<dyn StreamOutput>,
@@ -143,6 +170,7 @@ where
             performer,
             visemes,
             router,
+            generative: None,
             audio,
             avatar,
             stream,
@@ -151,6 +179,17 @@ where
             max_dispatch_lateness_ms,
             health: AdapterHealth::default(),
         }
+    }
+
+    pub fn with_generation(mut self, generative: GenerativeRuntime) -> Self {
+        self.generative = Some(generative);
+        self
+    }
+
+    pub fn generation_cancellation_registry(&self) -> Option<Arc<GenerationCancellationRegistry>> {
+        self.generative
+            .as_ref()
+            .map(GenerativeRuntime::cancellation_registry)
     }
 
     pub fn startup(&mut self) -> Result<FastPathPreloadReport, AppError> {
@@ -202,6 +241,9 @@ where
         let event = self.security.pop_content().ok_or_else(|| {
             AppError::Routing("queued content was unavailable for dispatch".to_owned())
         })?;
+        if let Some(generative) = &self.generative {
+            generative.cancellation.cancel_for_event(&event);
+        }
         let playback = self.handle_event(event, at_ms, seed)?;
         self.tick(at_ms);
         Ok(ContentProcessOutcome {
@@ -260,6 +302,105 @@ where
                 )?;
                 Ok(Some(outcome))
             }
+            PlaybackRoute::Generate(route) => self.handle_generation(event, *route, at_ms, seed),
+        }
+    }
+
+    fn handle_generation(
+        &mut self,
+        event: EventEnvelope,
+        route: GenerationRoute,
+        at_ms: u64,
+        seed: u64,
+    ) -> Result<Option<CachedPlaybackOutcome>, AppError> {
+        if route.source_event != event {
+            return Err(AppError::Generation(
+                "generation route source event does not match dispatched event".to_owned(),
+            ));
+        }
+        let generative = self.generative.clone().ok_or_else(|| {
+            AppError::Generation("generative route requested without configured runtime".to_owned())
+        })?;
+        let request = GenerationRequest {
+            source_event: event.clone(),
+            thinking: route.thinking,
+            routing_reason: route.routing_reason,
+            intent: route.intent,
+            style: route.style,
+            fallback_variant_group: route.fallback_variant_group,
+            seed,
+        };
+        let cancellation = generative.cancellation.begin(&event);
+        let result = {
+            let fallback_assets = self.performer.assets();
+            let security = &mut self.security;
+            generative.pipeline.run_with_output_gate(
+                &request,
+                &cancellation,
+                Some(fallback_assets),
+                |text| match security.publish_text(text) {
+                    output
+                        if matches!(
+                            output.verdict,
+                            OutputVerdict::Allow | OutputVerdict::Redact
+                        ) =>
+                    {
+                        output
+                            .text
+                            .map(GeneratedTextGateDecision::Publish)
+                            .unwrap_or(GeneratedTextGateDecision::Reject)
+                    }
+                    _ => GeneratedTextGateDecision::Reject,
+                },
+            )
+        };
+        generative.cancellation.finish(&event.event_id);
+        let result = result.map_err(|error| AppError::Generation(error.to_string()))?;
+
+        match result.disposition {
+            GenerationDisposition::Generated { asset } => {
+                let asset_id = asset.id.clone();
+                self.performer
+                    .assets_mut()
+                    .insert_hot(*asset)
+                    .map_err(|error| AppError::Generation(error.to_string()))?;
+                let outcome = self.performer.handle_asset_id(
+                    &event,
+                    &asset_id,
+                    CachedPlaybackTiming { at_ms, seed },
+                    &self.visemes,
+                    &mut self.pending_audio,
+                    &mut self.pending_avatar,
+                )?;
+                Ok(Some(outcome))
+            }
+            GenerationDisposition::Fallback { directive } => {
+                self.handle_generation_fallback(&event, directive, at_ms, seed)
+            }
+            GenerationDisposition::Cancelled { .. } => Ok(None),
+        }
+    }
+
+    fn handle_generation_fallback(
+        &mut self,
+        event: &EventEnvelope,
+        directive: FallbackDirective,
+        at_ms: u64,
+        seed: u64,
+    ) -> Result<Option<CachedPlaybackOutcome>, AppError> {
+        match directive {
+            FallbackDirective::CachedReaction { asset_id, .. } => {
+                let outcome = self.performer.handle_asset_id(
+                    event,
+                    &asset_id,
+                    CachedPlaybackTiming { at_ms, seed },
+                    &self.visemes,
+                    &mut self.pending_audio,
+                    &mut self.pending_avatar,
+                )?;
+                Ok(Some(outcome))
+            }
+            FallbackDirective::NonVerbalReaction { .. } => Ok(None),
         }
     }
 
@@ -339,6 +480,13 @@ where
             at_ms,
             self.performer.scheduler_mut(),
         )?;
+        if matches!(
+            outcome,
+            ControlOutcome::Stopped { .. } | ControlOutcome::Muted
+        ) && let Some(generative) = &self.generative
+        {
+            generative.cancellation.cancel_active();
+        }
         if matches!(outcome, ControlOutcome::Stopped { .. }) {
             self.purge_cancelled_pending();
         }
@@ -347,6 +495,9 @@ where
     }
 
     pub fn shutdown(&mut self, at_ms: u64) {
+        if let Some(generative) = &self.generative {
+            generative.cancellation.cancel_active();
+        }
         self.performer.scheduler_mut().stop_all(at_ms);
         self.purge_cancelled_pending();
         self.tick(at_ms);
@@ -430,9 +581,13 @@ mod tests {
     use super::*;
     use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
     use aivtuber_domain::{
-        AuthorizationMethod, Capability, ControlSecret, EVENT_SCHEMA_VERSION, EngineErrorKind,
-        LocalControlIngress, OperatorCommandInput, SecurityPlane, SourceClass, TrustLevel,
+        AuthorizationMethod, BackendIdentity, Capability, ControlSecret, EVENT_SCHEMA_VERSION,
+        EngineErrorKind, EngineFuture, GeneratedReply, LocalControlIngress, OperatorCommandInput,
+        PrivacyClass, ReflexContext, RetrievalSnapshot, SecurityPlane, SourceClass, SpeechArtifact,
+        SpeechProgress, SpeechProgressSink, SpeechRequest, ThinkingEngine, TrustLevel,
+        TtsBackendIdentity, TtsEngine,
     };
+    use aivtuber_generative::{PerformanceCompiler, PerformanceCompilerConfig};
     use aivtuber_reflex::{
         HttpResponse, HttpTransport, JevAdapter, JevAdapterConfig, JevApiKey, PolicyConfig,
         ReflexPipeline, TransportError,
@@ -448,6 +603,15 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use std::time::Duration;
+
+    #[derive(Clone, Copy)]
+    struct FixedSilentRoute;
+
+    impl RoutePlanner for FixedSilentRoute {
+        fn route(&mut self, _event: &EventEnvelope) -> Result<PlaybackRoute, AppError> {
+            Ok(PlaybackRoute::Silent)
+        }
+    }
 
     #[derive(Clone)]
     struct FixedAssetRoute(&'static str);
@@ -470,6 +634,158 @@ mod tests {
                 asset_id: self.asset_id.to_owned(),
                 asset_identity: self.asset_identity.to_owned(),
             })
+        }
+    }
+
+    #[derive(Clone)]
+    struct FixedGenerateRoute {
+        reply_context: ReflexContext,
+        fallback_variant_group: Option<String>,
+    }
+
+    impl RoutePlanner for FixedGenerateRoute {
+        fn route(&mut self, event: &EventEnvelope) -> Result<PlaybackRoute, AppError> {
+            Ok(PlaybackRoute::Generate(Box::new(GenerationRoute {
+                source_event: event.clone(),
+                thinking: aivtuber_domain::ThinkingRequest::from_event(
+                    event,
+                    event
+                        .payload
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("event"),
+                    PrivacyClass::Pseudonymous,
+                    self.reply_context.clone(),
+                    RetrievalSnapshot::default(),
+                    Vec::new(),
+                ),
+                routing_reason: aivtuber_generative::GenerationRoutingReason::ExplicitLlmRoute,
+                intent: "generated.reply".to_owned(),
+                style: None,
+                fallback_variant_group: self.fallback_variant_group.clone(),
+            })))
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockThinking {
+        reply: String,
+        failure: Option<EngineErrorKind>,
+    }
+
+    impl ThinkingEngine for MockThinking {
+        fn generate<'a>(
+            &'a self,
+            _request: &'a aivtuber_domain::ThinkingRequest,
+        ) -> EngineFuture<'a, GeneratedReply> {
+            Box::pin(async move {
+                if let Some(kind) = self.failure {
+                    Err(EngineError::new(kind, "mock thinking failure"))
+                } else {
+                    Ok(GeneratedReply {
+                        text: self.reply.clone(),
+                    })
+                }
+            })
+        }
+
+        fn identity(&self) -> BackendIdentity {
+            BackendIdentity {
+                name: "mock-thinking".to_owned(),
+                model_alias: Some("mock-model".to_owned()),
+                model_version: Some("1".to_owned()),
+            }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct MockTts {
+        texts: Arc<Mutex<Vec<String>>>,
+        failure: Option<EngineErrorKind>,
+    }
+
+    impl TtsEngine for MockTts {
+        fn synthesize<'a>(
+            &'a self,
+            request: &'a SpeechRequest,
+        ) -> EngineFuture<'a, SpeechArtifact> {
+            Box::pin(async move {
+                self.texts
+                    .lock()
+                    .expect("tts log")
+                    .push(request.text.clone());
+                if let Some(kind) = self.failure {
+                    Err(EngineError::new(kind, "mock tts failure"))
+                } else {
+                    Ok(SpeechArtifact {
+                        audio_ref: "audio://generated/mock.opus".to_owned(),
+                        duration_ms: 760,
+                        viseme_ref: Some("viseme/reaction-agree-01.json".to_owned()),
+                    })
+                }
+            })
+        }
+
+        fn identity(&self) -> TtsBackendIdentity {
+            TtsBackendIdentity {
+                backend: BackendIdentity {
+                    name: "mock-tts".to_owned(),
+                    model_alias: Some("mock-voice".to_owned()),
+                    model_version: Some("1".to_owned()),
+                },
+                voice_model: Some("example-voice-v1".to_owned()),
+                viseme_mapping: Some("ja-5vowel-v1".to_owned()),
+            }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct PartialStreamingTts;
+
+    impl TtsEngine for PartialStreamingTts {
+        fn synthesize<'a>(
+            &'a self,
+            _request: &'a SpeechRequest,
+        ) -> EngineFuture<'a, SpeechArtifact> {
+            Box::pin(async {
+                Err(EngineError::new(
+                    EngineErrorKind::Backend,
+                    "buffered path must not be used",
+                ))
+            })
+        }
+
+        fn synthesize_streaming<'a>(
+            &'a self,
+            _request: &'a SpeechRequest,
+            sink: &'a mut dyn SpeechProgressSink,
+        ) -> Option<EngineFuture<'a, SpeechArtifact>> {
+            sink.push(SpeechProgress {
+                sequence: 1,
+                audio_ref: "audio://generated/partial.opus".to_owned(),
+                duration_ms: 100,
+                viseme_ref: None,
+                final_chunk: false,
+            })
+            .expect("partial streaming progress");
+            Some(Box::pin(async {
+                Err(EngineError::new(
+                    EngineErrorKind::Timeout,
+                    "stream ended before final chunk",
+                ))
+            }))
+        }
+
+        fn identity(&self) -> TtsBackendIdentity {
+            TtsBackendIdentity {
+                backend: BackendIdentity {
+                    name: "partial-streaming-tts".to_owned(),
+                    model_alias: None,
+                    model_version: None,
+                },
+                voice_model: Some("example-voice-v1".to_owned()),
+                viseme_mapping: Some("ja-5vowel-v1".to_owned()),
+            }
         }
     }
 
@@ -653,6 +969,10 @@ mod tests {
     }
 
     fn reflex_router() -> ReflexRoutePlanner<FixedEmbedding> {
+        reflex_router_with_route("cached")
+    }
+
+    fn reflex_router_with_route(response_route: &str) -> ReflexRoutePlanner<FixedEmbedding> {
         let mut assets = AssetStore::new(pack_root().join("descriptors"), runtime_compatibility());
         assets.index_local().expect("index Performance Assets");
         let index = build_semantic_index_from_asset_store(
@@ -678,7 +998,7 @@ mod tests {
             body: serde_json::to_vec(&json!({
                 "model": "jev-test-v1",
                 "answers": {
-                    "response_route": choice("cached"),
+                    "response_route": choice(response_route),
                     "reaction_family": choice("agree"),
                     "gesture_family": choice("nod_small"),
                     "attention_target": choice("camera"),
@@ -752,6 +1072,59 @@ mod tests {
         )
     }
 
+    fn generative_runtime<T>(thinking: MockThinking, tts: T) -> GenerativeRuntime
+    where
+        T: TtsEngine + 'static,
+    {
+        let compiler = PerformanceCompiler::new(PerformanceCompilerConfig {
+            compiler_version: "0.1.0".to_owned(),
+            avatar_profile: Some("example-live2d-v1".to_owned()),
+            motion_library: Some("starter-v1".to_owned()),
+            expression_preset: Some("speaking.neutral".to_owned()),
+            expression_intensity: 0.4,
+        })
+        .expect("compiler");
+        GenerativeRuntime::new(GenerativePipeline::new(
+            Arc::new(thinking),
+            Arc::new(tts),
+            compiler,
+        ))
+    }
+
+    fn generation_app<T>(
+        router: FixedGenerateRoute,
+        thinking: MockThinking,
+        tts: T,
+        redactor: SecretRedactor,
+        cached_reaction: Option<String>,
+        audio: RecordingAudio,
+        avatar: RecordingAvatar,
+    ) -> ProductionApp<FixedGenerateRoute>
+    where
+        T: TtsEngine + 'static,
+    {
+        let security = SecurityRuntime::new(
+            SecurityRuntimeConfig::default(),
+            SchedulerConfig {
+                min_reaction_spacing_ms: 0,
+            },
+            redactor,
+            cached_reaction,
+        )
+        .expect("security runtime");
+        ProductionApp::new(
+            security,
+            performer(),
+            LocalVisemeStore::new(pack_root()),
+            router,
+            Box::new(audio),
+            Box::new(avatar),
+            Box::new(NoopStreamOutput),
+            250,
+        )
+        .with_generation(generative_runtime(thinking, tts))
+    }
+
     fn stop_command() -> AuthenticatedControlCommand {
         let secret = [0x45_u8; 32];
         let ingress = LocalControlIngress::new(
@@ -775,6 +1148,411 @@ mod tests {
                 &secret,
             )
             .expect("authenticated stop")
+    }
+
+    #[test]
+    fn reflex_llm_route_builds_typed_generation_request() {
+        let mut router = reflex_router_with_route("llm");
+        let event = chat_event(24);
+        let route = router.route(&event).expect("LLM route");
+        let PlaybackRoute::Generate(route) = route else {
+            panic!("expected generation route");
+        };
+
+        assert_eq!(route.source_event, event);
+        assert_eq!(route.thinking.input.text, "hello");
+        assert_eq!(route.thinking.context, ReflexContext::default());
+        assert_eq!(route.thinking.retrieval.candidates.len(), 2);
+        assert_eq!(
+            route.routing_reason,
+            aivtuber_generative::GenerationRoutingReason::ExplicitLlmRoute
+        );
+        route.thinking.validate().expect("typed thinking request");
+    }
+
+    #[test]
+    fn generated_reply_is_gated_inserted_and_scheduled_on_production_timeline() {
+        let tts = MockTts::default();
+        let tts_log = Arc::clone(&tts.texts);
+        let audio = RecordingAudio::default();
+        let audio_log = Arc::clone(&audio.commands);
+        let avatar = RecordingAvatar::default();
+        let avatar_log = Arc::clone(&avatar.commands);
+        let mut app = generation_app(
+            FixedGenerateRoute {
+                reply_context: ReflexContext::default(),
+                fallback_variant_group: Some("reaction.agree".to_owned()),
+            },
+            MockThinking {
+                reply: "generated hello".to_owned(),
+                failure: None,
+            },
+            tts,
+            SecretRedactor::default(),
+            None,
+            audio,
+            avatar,
+        );
+        app.startup().expect("startup");
+
+        let raw = serde_json::to_vec(&chat_event(30)).expect("event json");
+        let outcome = app.process_content_bytes(&raw, 0, 30).expect("generation");
+        let playback = outcome.playback.expect("generated playback");
+
+        assert!(playback.asset_id.starts_with("dynamic.generated."));
+        assert_eq!(
+            tts_log.lock().expect("tts log").as_slice(),
+            ["generated hello"]
+        );
+        assert!(
+            app.performer()
+                .assets()
+                .hot_get(&playback.asset_id)
+                .is_some()
+        );
+        assert_eq!(app.performer().scheduler().items().len(), 1);
+        let audio_commands = audio_log.lock().expect("audio log");
+        assert_eq!(audio_commands.len(), 1);
+        assert_eq!(audio_commands[0].generation, playback.plan.generation);
+        assert_eq!(audio_commands[0].at_ms, playback.plan.start_at_ms);
+        drop(audio_commands);
+
+        let mut avatar_commands = avatar_log.lock().expect("avatar log").clone();
+        avatar_commands.extend(app.pending_avatar.commands.clone());
+        let visemes = avatar_commands
+            .iter()
+            .filter_map(|command| match command {
+                AvatarPlaybackCommand::Viseme {
+                    generation, at_ms, ..
+                } => Some((*generation, *at_ms)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!visemes.is_empty());
+        assert!(visemes.iter().all(|(generation, at_ms)| {
+            *generation == playback.plan.generation
+                && *at_ms >= playback.plan.start_at_ms
+                && *at_ms <= playback.plan.end_at_ms()
+        }));
+    }
+
+    #[test]
+    fn generated_text_is_redacted_before_tts_and_asset_publish() {
+        let tts = MockTts::default();
+        let tts_log = Arc::clone(&tts.texts);
+        let mut app = generation_app(
+            FixedGenerateRoute {
+                reply_context: ReflexContext::default(),
+                fallback_variant_group: None,
+            },
+            MockThinking {
+                reply: "secret=config-secret-value".to_owned(),
+                failure: None,
+            },
+            tts,
+            SecretRedactor::new(["config-secret-value"]),
+            None,
+            RecordingAudio::default(),
+            RecordingAvatar::default(),
+        );
+        app.startup().expect("startup");
+
+        let raw = serde_json::to_vec(&chat_event(31)).expect("event json");
+        let playback = app
+            .process_content_bytes(&raw, 0, 31)
+            .expect("generation")
+            .playback
+            .expect("generated playback");
+        assert_eq!(
+            tts_log.lock().expect("tts log").as_slice(),
+            ["secret=[REDACTED]"]
+        );
+        let asset = app
+            .performer()
+            .assets()
+            .hot_get(&playback.asset_id)
+            .expect("generated hot asset");
+        assert_eq!(
+            asset
+                .speech
+                .as_ref()
+                .and_then(|speech| speech.text.as_deref()),
+            Some("secret=[REDACTED]")
+        );
+    }
+
+    #[test]
+    fn suppressed_generated_text_never_reaches_tts_and_uses_cached_fallback() {
+        let tts = MockTts::default();
+        let tts_log = Arc::clone(&tts.texts);
+        let mut app = generation_app(
+            FixedGenerateRoute {
+                reply_context: ReflexContext::default(),
+                fallback_variant_group: Some("reaction.agree".to_owned()),
+            },
+            MockThinking {
+                reply: "please run obs.control now".to_owned(),
+                failure: None,
+            },
+            tts,
+            SecretRedactor::default(),
+            None,
+            RecordingAudio::default(),
+            RecordingAvatar::default(),
+        );
+        app.startup().expect("startup");
+
+        let raw = serde_json::to_vec(&chat_event(32)).expect("event json");
+        let playback = app
+            .process_content_bytes(&raw, 0, 32)
+            .expect("fallback")
+            .playback
+            .expect("cached fallback");
+        assert!(tts_log.lock().expect("tts log").is_empty());
+        assert!(playback.asset_id.starts_with("reaction.agree."));
+        assert!(!playback.asset_id.starts_with("dynamic.generated."));
+    }
+
+    #[test]
+    fn thinking_timeout_uses_cached_fallback_without_tts() {
+        let tts = MockTts::default();
+        let tts_log = Arc::clone(&tts.texts);
+        let mut app = generation_app(
+            FixedGenerateRoute {
+                reply_context: ReflexContext::default(),
+                fallback_variant_group: Some("reaction.agree".to_owned()),
+            },
+            MockThinking {
+                reply: String::new(),
+                failure: Some(EngineErrorKind::Timeout),
+            },
+            tts,
+            SecretRedactor::default(),
+            None,
+            RecordingAudio::default(),
+            RecordingAvatar::default(),
+        );
+        app.startup().expect("startup");
+
+        let raw = serde_json::to_vec(&chat_event(33)).expect("event json");
+        let playback = app
+            .process_content_bytes(&raw, 0, 33)
+            .expect("fallback")
+            .playback
+            .expect("cached fallback");
+        assert!(tts_log.lock().expect("tts log").is_empty());
+        assert!(playback.asset_id.starts_with("reaction.agree."));
+    }
+
+    #[test]
+    fn tts_failure_uses_cached_fallback_without_generated_publish() {
+        let tts = MockTts {
+            texts: Arc::new(Mutex::new(Vec::new())),
+            failure: Some(EngineErrorKind::Unavailable),
+        };
+        let tts_log = Arc::clone(&tts.texts);
+        let mut app = generation_app(
+            FixedGenerateRoute {
+                reply_context: ReflexContext::default(),
+                fallback_variant_group: Some("reaction.agree".to_owned()),
+            },
+            MockThinking {
+                reply: "speak me".to_owned(),
+                failure: None,
+            },
+            tts,
+            SecretRedactor::default(),
+            None,
+            RecordingAudio::default(),
+            RecordingAvatar::default(),
+        );
+        app.startup().expect("startup");
+        let hot_before = app.performer().assets().hot_len();
+
+        let raw = serde_json::to_vec(&chat_event(34)).expect("event json");
+        let playback = app
+            .process_content_bytes(&raw, 0, 34)
+            .expect("fallback")
+            .playback
+            .expect("cached fallback");
+        assert_eq!(tts_log.lock().expect("tts log").len(), 1);
+        assert!(playback.asset_id.starts_with("reaction.agree."));
+        assert_eq!(app.performer().assets().hot_len(), hot_before);
+    }
+
+    #[test]
+    fn missing_cached_fallback_degrades_without_publishing_partial_work() {
+        let mut app = generation_app(
+            FixedGenerateRoute {
+                reply_context: ReflexContext::default(),
+                fallback_variant_group: Some("reaction.missing".to_owned()),
+            },
+            MockThinking {
+                reply: String::new(),
+                failure: Some(EngineErrorKind::Unavailable),
+            },
+            MockTts::default(),
+            SecretRedactor::default(),
+            None,
+            RecordingAudio::default(),
+            RecordingAvatar::default(),
+        );
+        app.startup().expect("startup");
+        let hot_before = app.performer().assets().hot_len();
+
+        let raw = serde_json::to_vec(&chat_event(35)).expect("event json");
+        let outcome = app
+            .process_content_bytes(&raw, 0, 35)
+            .expect("non-verbal fallback");
+        assert!(outcome.playback.is_none());
+        assert!(app.performer().scheduler().items().is_empty());
+        assert_eq!(app.performer().assets().hot_len(), hot_before);
+    }
+
+    #[test]
+    fn higher_priority_production_ingress_cancels_active_generation() {
+        let runtime = generative_runtime(
+            MockThinking {
+                reply: "unused".to_owned(),
+                failure: None,
+            },
+            MockTts::default(),
+        );
+        let registry = runtime.cancellation_registry();
+        let mut app = ProductionApp::new(
+            SecurityRuntime::new(
+                SecurityRuntimeConfig::default(),
+                SchedulerConfig::default(),
+                SecretRedactor::default(),
+                None,
+            )
+            .expect("security"),
+            performer(),
+            LocalVisemeStore::new(pack_root()),
+            FixedSilentRoute,
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+            250,
+        )
+        .with_generation(runtime);
+        app.startup().expect("startup");
+
+        let low = chat_event(36);
+        let token = registry.begin(&low);
+        let mut high = chat_event(37);
+        high.kind = aivtuber_domain::EventKind::ChatDonation;
+        high.source_class = SourceClass::Donation;
+        let raw = serde_json::to_vec(&high).expect("event json");
+        app.process_content_bytes(&raw, 0, 37)
+            .expect("high-priority ingress");
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn serialized_control_event_cannot_cancel_generation_through_content_ingress() {
+        let runtime = generative_runtime(
+            MockThinking {
+                reply: "unused".to_owned(),
+                failure: None,
+            },
+            MockTts::default(),
+        );
+        let registry = runtime.cancellation_registry();
+        let mut app = ProductionApp::new(
+            SecurityRuntime::new(
+                SecurityRuntimeConfig::default(),
+                SchedulerConfig::default(),
+                SecretRedactor::default(),
+                None,
+            )
+            .expect("security"),
+            performer(),
+            LocalVisemeStore::new(pack_root()),
+            FixedSilentRoute,
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+            250,
+        )
+        .with_generation(runtime);
+        app.startup().expect("startup");
+
+        let token = registry.begin(&chat_event(40));
+        let command = stop_command();
+        let raw = serde_json::to_vec(command.event()).expect("serialized control event");
+        let outcome = app
+            .process_content_bytes(&raw, 0, 40)
+            .expect("content ingress rejection");
+        assert_eq!(outcome.admission, ContentAdmitDecision::RejectedNonContent);
+        assert!(outcome.playback.is_none());
+        assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn authenticated_emergency_control_cancels_active_generation() {
+        let runtime = generative_runtime(
+            MockThinking {
+                reply: "unused".to_owned(),
+                failure: None,
+            },
+            MockTts::default(),
+        );
+        let registry = runtime.cancellation_registry();
+        let mut app = ProductionApp::new(
+            SecurityRuntime::new(
+                SecurityRuntimeConfig::default(),
+                SchedulerConfig::default(),
+                SecretRedactor::default(),
+                None,
+            )
+            .expect("security"),
+            performer(),
+            LocalVisemeStore::new(pack_root()),
+            FixedSilentRoute,
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+            250,
+        )
+        .with_generation(runtime);
+        app.startup().expect("startup");
+
+        let token = registry.begin(&chat_event(38));
+        let outcome = app
+            .handle_control(&stop_command(), 0)
+            .expect("authenticated emergency stop");
+        assert_eq!(outcome, ControlOutcome::Stopped { cancelled: 0 });
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn partial_streaming_tts_never_publishes_or_schedules_generated_asset() {
+        let mut app = generation_app(
+            FixedGenerateRoute {
+                reply_context: ReflexContext::default(),
+                fallback_variant_group: Some("reaction.missing".to_owned()),
+            },
+            MockThinking {
+                reply: "partial reply".to_owned(),
+                failure: None,
+            },
+            PartialStreamingTts,
+            SecretRedactor::default(),
+            None,
+            RecordingAudio::default(),
+            RecordingAvatar::default(),
+        );
+        app.startup().expect("startup");
+        let hot_before = app.performer().assets().hot_len();
+
+        let raw = serde_json::to_vec(&chat_event(39)).expect("event json");
+        let outcome = app
+            .process_content_bytes(&raw, 0, 39)
+            .expect("partial streaming fallback");
+        assert!(outcome.playback.is_none());
+        assert!(app.performer().scheduler().items().is_empty());
+        assert_eq!(app.performer().assets().hot_len(), hot_before);
     }
 
     #[test]

@@ -8,6 +8,7 @@
 mod replay;
 pub use replay::*;
 
+use aivtuber_domain::EventKind;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -33,6 +34,17 @@ impl Priority {
             Self::HighPriorityInteraction => 1,
             Self::Operator => 0,
         }
+    }
+}
+
+pub fn priority_for_event(kind: EventKind) -> Priority {
+    match kind {
+        EventKind::OperatorCommand => Priority::Operator,
+        EventKind::ChatDonation => Priority::HighPriorityInteraction,
+        EventKind::GameEvent => Priority::StrongReaction,
+        EventKind::ChatMessage | EventKind::SpeechInput => Priority::Conversation,
+        EventKind::StreamEvent => Priority::Commentary,
+        EventKind::TimerTick | EventKind::SystemHealth => Priority::Background,
     }
 }
 

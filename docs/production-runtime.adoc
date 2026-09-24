@@ -13,10 +13,21 @@ SecurityRuntime content ingress
         |
         v
 RoutePlanner
-   | deterministic intent
-   | or ReflexPipeline selected asset id
-        |
-        v
+   | deterministic intent / cached asset
+   | or ReflexPipeline -> explicit LLM route
+        |                         |
+        |                         v
+        |                  GenerativePipeline
+        |                  ThinkingEngine
+        |                         |
+        |                  SecurityRuntime::publish_text
+        |                         |
+        |                  TtsEngine -> complete PerformanceAsset
+        |                         |
+        |                  AssetStore::insert_hot
+        |_________________________|
+                  |
+                  v
 CachedPerformer
         |
         +--> compatibility-checked AssetStore
@@ -41,9 +52,13 @@ OBS remains an independent control adapter. Its availability never owns schedule
 * Adapter commands are dispatched only while their scheduler generation is still live.
 * Commands older than +AIVTUBER_MAX_DISPATCH_LATENESS_MS+ are dropped.
 * Failed audio/avatar commands are not requeued. Reconnecting an adapter therefore cannot replay an already-due stale command.
-* Authenticated emergency stop operates on the same scheduler used by cached playback and purges pending commands.
+* Authenticated emergency stop operates on the same scheduler used by cached/generated playback, purges pending commands, and cancels active generation independently of model/network availability.
+* Generated public text always passes through +SecurityRuntime::publish_text+ before TTS; suppressed output never reaches TTS.
+* Only complete, validated, runtime-compatible generated assets enter +AssetStore::insert_hot+; partial text/audio never reaches reusable asset or scheduler state.
+* Generated assets are scheduled by the same +CachedPerformer+ / +Scheduler+ instance as cached assets, preserving one monotonic timeline for audio/visemes/avatar commands.
+* Higher-priority generation cancellation uses the scheduler's shared +priority_for_event+ mapping.
+* Serialized control events remain data only: content ingress rejects them and cannot use them to cancel/stop privileged runtime work.
 * VTube Studio and OBS connection failure is degraded state, not scheduler failure.
-* Generative LLM/TTS behavior is intentionally outside this issue.
 
 == Executable
 
@@ -80,6 +95,12 @@ $AIVTUBER_AUDIO_ROOT/starter/reaction-agree-01.opus
 ----
 
 Traversal outside the configured root and symlink resolution outside the canonical root are rejected.
+
+== Generative fallback configuration
+
+The executable constructs the production `GenerativeRuntime` only when `AIVTUBER_GENERATIVE_ENABLED=true`. Enabling it requires `AIVTUBER_OPENAI_API_KEY` and `AIVTUBER_TTS_ENDPOINT`; endpoint/model/timeouts and optional TTS credentials are documented in `docs/generative-fallback.adoc`. The runtime compatibility values used by generated assets are the same compiler/voice/avatar/viseme/motion values used by the production `AssetStore`.
+
+A `PlaybackRoute::Generate` is produced by the reflex composition when Jev executes the LLM route. The default stdin smoke configuration still uses `IntentRoutePlanner`; production hosts that enable reflex routing compose `ReflexRoutePlanner` with the same `ProductionApp` and generative runtime exercised by the E2E tests.
 
 == VTube Studio output
 

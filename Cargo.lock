@@ -29,6 +29,7 @@ dependencies = [
  "aivtuber-adapters",
  "aivtuber-asset-store",
  "aivtuber-domain",
+ "aivtuber-generative",
  "aivtuber-reflex",
  "aivtuber-runtime",
  "aivtuber-scheduler",

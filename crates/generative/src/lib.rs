@@ -11,11 +11,11 @@ use aivtuber_asset_store::{
     PERFORMANCE_ASSET_SCHEMA_VERSION, PerformanceAsset, Provenance, SpeechTrack, TimelineEvent,
 };
 use aivtuber_domain::{
-    BackendIdentity, EngineError, EngineErrorKind, EventEnvelope, EventKind, FallbackReason,
-    SpeechArtifact, SpeechProgress, SpeechProgressSink, SpeechRequest, ThinkingEngine,
-    ThinkingRequest, TtsBackendIdentity, TtsEngine,
+    BackendIdentity, EngineError, EngineErrorKind, EventEnvelope, FallbackReason, SpeechArtifact,
+    SpeechProgress, SpeechProgressSink, SpeechRequest, ThinkingEngine, ThinkingRequest,
+    TtsBackendIdentity, TtsEngine,
 };
-use aivtuber_scheduler::Priority;
+use aivtuber_scheduler::{Priority, priority_for_event};
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -113,6 +113,13 @@ pub struct GenerationResult {
     pub trace: GenerationTrace,
     pub disposition: GenerationDisposition,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GeneratedTextGateDecision {
+    Publish(String),
+    Reject,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GenerationRequest {
     pub source_event: EventEnvelope,
@@ -198,7 +205,7 @@ impl GenerationCancellationRegistry {
         let token = GenerationCancellationToken::default();
         let active = ActiveGeneration {
             event_id: event.event_id.clone(),
-            priority: generation_priority(event.kind),
+            priority: priority_for_event(event.kind),
             token: token.clone(),
         };
         let mut guard = self.active.lock().expect("generation registry lock");
@@ -213,12 +220,21 @@ impl GenerationCancellationRegistry {
         let Some(active) = guard.as_ref() else {
             return false;
         };
-        if generation_priority(event.kind).rank() < active.priority.rank() {
+        if priority_for_event(event.kind).rank() < active.priority.rank() {
             active.token.cancel();
             true
         } else {
             false
         }
+    }
+
+    pub fn cancel_active(&self) -> bool {
+        let guard = self.active.lock().expect("generation registry lock");
+        let Some(active) = guard.as_ref() else {
+            return false;
+        };
+        active.token.cancel();
+        true
     }
 
     pub fn finish(&self, event_id: &str) {
@@ -595,6 +611,21 @@ impl GenerativePipeline {
         cancellation: &GenerationCancellationToken,
         fallback_assets: Option<&AssetStore>,
     ) -> Result<GenerationResult, GenerationError> {
+        self.run_with_output_gate(request, cancellation, fallback_assets, |text| {
+            GeneratedTextGateDecision::Publish(text.to_owned())
+        })
+    }
+
+    pub fn run_with_output_gate<F>(
+        &self,
+        request: &GenerationRequest,
+        cancellation: &GenerationCancellationToken,
+        fallback_assets: Option<&AssetStore>,
+        mut output_gate: F,
+    ) -> Result<GenerationResult, GenerationError>
+    where
+        F: FnMut(&str) -> GeneratedTextGateDecision,
+    {
         request
             .source_event
             .validate()
@@ -641,11 +672,19 @@ impl GenerativePipeline {
             return Ok(cancelled_result(trace, CancellationStage::AfterThinking));
         }
 
+        let gated_reply_text = match output_gate(&reply.text) {
+            GeneratedTextGateDecision::Publish(text) if !text.trim().is_empty() => text,
+            GeneratedTextGateDecision::Publish(_) | GeneratedTextGateDecision::Reject => {
+                trace.fallback_reason = FallbackReason::PolicyOverride;
+                return Ok(fallback_result(request, fallback_assets, trace));
+            }
+        };
+
         let tts_identity = self.tts.identity();
         trace.tts_attempted = true;
         trace.tts_backend = Some(tts_identity.clone());
         let speech_request = SpeechRequest {
-            text: reply.text.clone(),
+            text: gated_reply_text.clone(),
             style: request.style.clone(),
         };
 
@@ -676,7 +715,7 @@ impl GenerativePipeline {
 
         let asset = match self.compiler.compile(
             request,
-            &reply.text,
+            &gated_reply_text,
             &speech,
             &thinking_identity,
             &tts_identity,
@@ -745,16 +784,6 @@ fn fallback_reason_from_error(error: &EngineError) -> FallbackReason {
         EngineErrorKind::Unauthorized | EngineErrorKind::Backend => FallbackReason::Unavailable,
     }
 }
-fn generation_priority(kind: EventKind) -> Priority {
-    match kind {
-        EventKind::OperatorCommand => Priority::Operator,
-        EventKind::ChatDonation => Priority::HighPriorityInteraction,
-        EventKind::GameEvent => Priority::StrongReaction,
-        EventKind::ChatMessage | EventKind::SpeechInput => Priority::Conversation,
-        EventKind::StreamEvent => Priority::Commentary,
-        EventKind::TimerTick | EventKind::SystemHealth => Priority::Background,
-    }
-}
 
 fn generated_asset_id(
     event: &EventEnvelope,
@@ -795,7 +824,7 @@ mod tests {
     use super::*;
     use aivtuber_asset_store::{RuntimeCompatibility, load_asset_file};
     use aivtuber_domain::{
-        EngineFuture, GeneratedReply, PrivacyClass, ReflexContext, RetrievalSnapshot,
+        EngineFuture, EventKind, GeneratedReply, PrivacyClass, ReflexContext, RetrievalSnapshot,
         SecurityPlane, SourceClass, TrustLevel,
     };
     use aivtuber_scheduler::{BlendChannel, PlannedPerformance, Scheduler, SchedulerConfig};

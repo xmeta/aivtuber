@@ -8,6 +8,7 @@ rust-version.workspace = true
 aivtuber-adapters = { path = "../adapters" }
 aivtuber-asset-store = { path = "../asset-store" }
 aivtuber-domain = { path = "../domain" }
+aivtuber-generative = { path = "../generative" }
 aivtuber-reflex = { path = "../reflex" }
 aivtuber-runtime = { path = "../runtime" }
 aivtuber-scheduler = { path = "../scheduler" }
