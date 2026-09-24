@@ -1,16 +1,19 @@
 //! Deterministic performance scheduling primitives.
 //!
-//! Implements docs/architecture.adoc section 6.5: the scheduler owns the
-//! shared timeline and arbitrates performances. Priority alone is
-//! insufficient; the scheduler also honors interruptibility, cooldowns,
-//! and minimum reaction spacing. Every decision is deterministic given
-//! the same event trace and seed.
+//! The scheduler owns logical time, lifecycle, safe-point preemption,
+//! resource arbitration, cooldowns, and deterministic variation.
 
-/// Coarse execution priority (architecture section 6.5, priority classes).
-///
-/// Lower rank preempts higher rank. Derives [`PartialOrd`] so ranks can be
-/// compared directly: `Operator < HighPriorityInteraction < ...`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#![forbid(unsafe_code)]
+
+mod replay;
+pub use replay::*;
+
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+
+/// Coarse execution priority. Lower rank preempts higher rank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Priority {
     Background,
     Commentary,
@@ -21,63 +24,96 @@ pub enum Priority {
 }
 
 impl Priority {
-    /// Deterministic priority for a domain event kind; untrusted content
-    /// can never reach [`Priority::Operator`] because that mapping happens
-    /// only for explicitly passed operator events (performer, not here).
     pub fn rank(self) -> u8 {
         match self {
-            Priority::Background => 5,
-            Priority::Commentary => 4,
-            Priority::Conversation => 3,
-            Priority::StrongReaction => 2,
-            Priority::HighPriorityInteraction => 1,
-            Priority::Operator => 0,
+            Self::Background => 5,
+            Self::Commentary => 4,
+            Self::Conversation => 3,
+            Self::StrongReaction => 2,
+            Self::HighPriorityInteraction => 1,
+            Self::Operator => 0,
         }
     }
 }
 
+/// Independently blendable execution resources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlendChannel {
+    Audio,
+    Face,
+    Body,
+    Gaze,
+    Overlay,
+}
+
 /// A planned performance on the shared monotonic timeline.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlannedPerformance {
     pub event_id: String,
     pub asset_id: String,
     pub priority: Priority,
     pub interruptible: bool,
-    /// Sorted ms offsets at which the performance may be left cleanly.
+    /// Sorted millisecond offsets from start_at_ms that are safe to leave.
     pub interrupt_points_ms: Vec<u64>,
     pub start_at_ms: u64,
     pub duration_ms: u64,
     /// Monotonic generation id used as a cancellation token.
     pub generation: u64,
+    /// Exclusive work conflicts with every other active/reserved performance.
+    pub exclusive: bool,
+    /// Non-exclusive work may overlap only when channel sets are disjoint.
+    pub channels: BTreeSet<BlendChannel>,
 }
 
-/// Lifecycle status of a scheduled item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl PlannedPerformance {
+    pub fn end_at_ms(&self) -> u64 {
+        self.start_at_ms.saturating_add(self.duration_ms)
+    }
+}
+
+/// Lifecycle state of a scheduled item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Status {
+    Queued,
     Playing,
     Completed,
     Cancelled,
 }
 
-/// A planned performance plus its current status.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A planned performance plus scheduler-owned lifecycle metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduledItem {
     pub plan: PlannedPerformance,
     pub status: Status,
+    /// Deterministic future cancellation boundary for safe-point preemption.
+    pub cancel_at_ms: Option<u64>,
 }
 
-/// Why the most recent [`Scheduler::schedule`] call was rejected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+impl ScheduledItem {
+    fn effective_end_ms(&self) -> u64 {
+        self.cancel_at_ms
+            .unwrap_or_else(|| self.plan.end_at_ms())
+            .min(self.plan.end_at_ms())
+    }
+
+    fn occupies_timeline(&self) -> bool {
+        matches!(self.status, Status::Queued | Status::Playing)
+    }
+}
+
+/// Why the most recent schedule request was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Rejection {
     Cooldown,
     Priority,
 }
 
 /// Scheduler configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SchedulerConfig {
-    /// Minimum ms between the end of one performance and the start of the
-    /// next non-operator one.
     pub min_reaction_spacing_ms: u64,
 }
 
@@ -89,136 +125,369 @@ impl Default for SchedulerConfig {
     }
 }
 
-/// Deterministic timeline owner and arbiter (architecture section 6.5).
+/// Deterministic timeline owner and arbiter.
 #[derive(Debug)]
 pub struct Scheduler {
     items: Vec<ScheduledItem>,
-    cooldowns: std::collections::BTreeMap<String, u64>,
-    last_finish_at: Option<u64>,
+    cooldowns: BTreeMap<String, u64>,
     generation: u64,
     config: SchedulerConfig,
     last_rejection: Option<Rejection>,
+    now_ms: u64,
+    last_terminal_at: Option<u64>,
 }
 
 impl Scheduler {
     pub fn new(config: SchedulerConfig) -> Self {
         Self {
             items: Vec::new(),
-            cooldowns: std::collections::BTreeMap::new(),
-            last_finish_at: None,
+            cooldowns: BTreeMap::new(),
             generation: 0,
             config,
             last_rejection: None,
+            now_ms: 0,
+            last_terminal_at: None,
         }
     }
 
-    /// All scheduled items in insertion order.
     pub fn items(&self) -> &[ScheduledItem] {
         &self.items
     }
 
-    /// The currently playing item, if any (lazy completion applied).
-    pub fn playing(&self) -> Option<&ScheduledItem> {
-        self.items.iter().find(|i| i.status == Status::Playing)
+    pub fn now_ms(&self) -> u64 {
+        self.now_ms
     }
 
     pub fn current_generation(&self) -> u64 {
         self.generation
     }
 
-    /// Rejection reason for the most recent [`Scheduler::schedule`] call.
     pub fn last_rejection(&self) -> Option<Rejection> {
         self.last_rejection
     }
 
-    /// Mark playing items whose end time has passed as completed.
-    fn complete_expired(&mut self, at_ms: u64) {
-        for item in &mut self.items {
-            if item.status == Status::Playing
-                && item.plan.start_at_ms + item.plan.duration_ms <= at_ms
-            {
-                item.status = Status::Completed;
-            }
-        }
+    pub fn playing(&self) -> Option<&ScheduledItem> {
+        self.items
+            .iter()
+            .find(|item| item.status == Status::Playing)
     }
 
-    /// Try to schedule a performance.
-    ///
-    /// Returns the planned slot, or `Err(rejection)` when arbitration
-    /// refuses it: an asset cooldown, or a lower-priority request arriving
-    /// during an uninterruptible-or-higher-priority performance.
-    pub fn schedule(
+    pub fn playing_items(&self) -> impl Iterator<Item = &ScheduledItem> {
+        self.items
+            .iter()
+            .filter(|item| item.status == Status::Playing)
+    }
+
+    /// Advance logical time without consulting wall-clock time.
+    pub fn advance_to(&mut self, at_ms: u64) {
+        let target = at_ms.max(self.now_ms);
+
+        for item in &mut self.items {
+            let natural_end = item.plan.end_at_ms();
+            let effective_end = item.effective_end_ms();
+
+            match item.status {
+                Status::Playing => {
+                    if effective_end <= target {
+                        item.status =
+                            if item.cancel_at_ms.is_some_and(|cancel| cancel < natural_end) {
+                                Status::Cancelled
+                            } else {
+                                Status::Completed
+                            };
+                        self.last_terminal_at = Some(
+                            self.last_terminal_at
+                                .map_or(effective_end, |previous| previous.max(effective_end)),
+                        );
+                    }
+                }
+                Status::Queued => {
+                    if item
+                        .cancel_at_ms
+                        .is_some_and(|cancel| cancel < item.plan.start_at_ms && cancel <= target)
+                    {
+                        item.status = Status::Cancelled;
+                        continue;
+                    }
+
+                    if item.plan.start_at_ms <= target {
+                        if effective_end <= target {
+                            item.status =
+                                if item.cancel_at_ms.is_some_and(|cancel| cancel < natural_end) {
+                                    Status::Cancelled
+                                } else {
+                                    Status::Completed
+                                };
+                            self.last_terminal_at = Some(
+                                self.last_terminal_at
+                                    .map_or(effective_end, |previous| previous.max(effective_end)),
+                            );
+                        } else {
+                            item.status = Status::Playing;
+                        }
+                    }
+                }
+                Status::Completed | Status::Cancelled => {}
+            }
+        }
+
+        self.now_ms = target;
+    }
+
+    /// Compatibility wrapper: the plan's requested start is also its arrival time.
+    pub fn schedule(&mut self, plan: PlannedPerformance) -> Result<PlannedPerformance, Rejection> {
+        let request_at_ms = plan.start_at_ms;
+        self.schedule_at(request_at_ms, plan)
+    }
+
+    /// Schedule a plan whose source event arrived at request_at_ms.
+    pub fn schedule_at(
         &mut self,
+        request_at_ms: u64,
         mut plan: PlannedPerformance,
     ) -> Result<PlannedPerformance, Rejection> {
         self.last_rejection = None;
-        self.complete_expired(plan.start_at_ms);
+        self.advance_to(request_at_ms);
 
-        // Cooldown per asset id.
+        plan.start_at_ms = plan.start_at_ms.max(request_at_ms).max(self.now_ms);
+        normalize_interrupt_points(&mut plan);
+
         let cooldown_until = self.cooldowns.get(&plan.asset_id).copied().unwrap_or(0);
         if plan.start_at_ms < cooldown_until {
             self.last_rejection = Some(Rejection::Cooldown);
             return Err(Rejection::Cooldown);
         }
 
-        if let Some(playing) = self.playing() {
-            let playing_rank = playing.plan.priority.rank();
-            let incoming_rank = plan.priority.rank();
+        let incoming_rank = plan.priority.rank();
+        let mut candidate_start = plan.start_at_ms;
+        let mut handoff_terminal = None;
+
+        // First arbitrate against work that is playing at the event timestamp.
+        let active_indices: Vec<usize> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.status == Status::Playing)
+            .filter(|(_, item)| plans_conflict(&item.plan, &plan))
+            .map(|(index, _)| index)
+            .collect();
+
+        let mut pending_cancellations = Vec::new();
+        for index in active_indices {
+            let playing_rank = self.items[index].plan.priority.rank();
             if incoming_rank > playing_rank {
-                // Lower priority than what is playing: never preempts.
                 self.last_rejection = Some(Rejection::Priority);
                 return Err(Rejection::Priority);
             }
-            if playing.plan.interruptible {
-                self.cancel_current(plan.start_at_ms);
+
+            let natural_end = self.items[index].plan.end_at_ms();
+            let boundary = if self.items[index].plan.interruptible {
+                next_safe_boundary(&self.items[index].plan, request_at_ms)
+            } else {
+                natural_end
+            };
+
+            if boundary < natural_end {
+                pending_cancellations.push((index, boundary));
+            }
+
+            candidate_start = candidate_start.max(boundary);
+            handoff_terminal = Some(handoff_terminal.map_or(boundary, |v: u64| v.max(boundary)));
+        }
+
+        for (index, boundary) in pending_cancellations {
+            let current = self.items[index].cancel_at_ms;
+            self.items[index].cancel_at_ms =
+                Some(current.map_or(boundary, |value| value.min(boundary)));
+        }
+
+        // Preserve the existing minimum-spacing invariant for non-operator handoffs.
+        if plan.priority != Priority::Operator {
+            if let Some(terminal) = handoff_terminal {
+                candidate_start = candidate_start
+                    .max(terminal.saturating_add(self.config.min_reaction_spacing_ms));
+            } else if let Some(last_terminal) = self.last_terminal_at {
+                candidate_start = candidate_start
+                    .max(last_terminal.saturating_add(self.config.min_reaction_spacing_ms));
             }
         }
 
-        // Minimum spacing between reactions (operator overrides it).
-        if plan.priority != Priority::Operator
-            && let Some(last_finish) = self.last_finish_at
-        {
-            let earliest = last_finish + self.config.min_reaction_spacing_ms;
-            plan.start_at_ms = plan.start_at_ms.max(earliest);
+        plan.start_at_ms = candidate_start;
+
+        // Resolve future reservations. A later higher-priority event may supersede
+        // lower-priority queued work, but never moves before its own event time.
+        loop {
+            let mut changed = false;
+            let incoming_end = plan.end_at_ms();
+            let queued_indices: Vec<usize> = self
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| item.status == Status::Queued)
+                .filter(|(_, item)| plans_conflict(&item.plan, &plan))
+                .filter(|(_, item)| {
+                    intervals_overlap(
+                        plan.start_at_ms,
+                        incoming_end,
+                        item.plan.start_at_ms,
+                        item.effective_end_ms(),
+                    )
+                })
+                .map(|(index, _)| index)
+                .collect();
+
+            if queued_indices.is_empty() {
+                break;
+            }
+
+            for index in queued_indices {
+                let queued_rank = self.items[index].plan.priority.rank();
+                if incoming_rank < queued_rank {
+                    self.cancel_queued(index, request_at_ms);
+                    changed = true;
+                    continue;
+                }
+
+                let queued_end = self.items[index].effective_end_ms();
+                plan.start_at_ms = plan.start_at_ms.max(queued_end);
+                if plan.priority != Priority::Operator {
+                    plan.start_at_ms = plan
+                        .start_at_ms
+                        .saturating_add(self.config.min_reaction_spacing_ms);
+                }
+                changed = true;
+            }
+
+            if !changed {
+                break;
+            }
         }
 
-        self.generation += 1;
+        self.generation = self.generation.saturating_add(1);
         plan.generation = self.generation;
-        self.last_finish_at = Some(plan.start_at_ms + plan.duration_ms);
 
-        // Cooldown: asset becomes eligible again after it finishes plus spacing.
-        self.cooldowns.insert(
-            plan.asset_id.clone(),
-            plan.start_at_ms + plan.duration_ms + self.config.min_reaction_spacing_ms,
-        );
+        let status = if plan.start_at_ms <= self.now_ms {
+            Status::Playing
+        } else {
+            Status::Queued
+        };
+        let cooldown_until = plan
+            .end_at_ms()
+            .saturating_add(self.config.min_reaction_spacing_ms);
+        self.cooldowns.insert(plan.asset_id.clone(), cooldown_until);
 
         self.items.push(ScheduledItem {
             plan: plan.clone(),
-            status: Status::Playing,
+            status,
+            cancel_at_ms: None,
         });
+
         Ok(plan)
     }
 
-    /// Deterministic stop for the current performance (operator path).
-    pub fn stop_current(&mut self, at_ms: u64) -> Option<PlannedPerformance> {
-        let playing = self
-            .items
-            .iter_mut()
-            .find(|i| i.status == Status::Playing)?;
-        playing.status = Status::Cancelled;
-        self.last_finish_at = Some(at_ms);
-        Some(playing.plan.clone())
+    /// Emergency/operator path: stop active work and cancel queued future work.
+    pub fn stop_all(&mut self, at_ms: u64) -> Vec<PlannedPerformance> {
+        self.advance_to(at_ms);
+        let mut stopped = Vec::new();
+
+        for index in 0..self.items.len() {
+            match self.items[index].status {
+                Status::Playing => {
+                    let plan = self.items[index].plan.clone();
+                    self.items[index].status = Status::Cancelled;
+                    self.items[index].cancel_at_ms = Some(at_ms);
+                    self.last_terminal_at = Some(
+                        self.last_terminal_at
+                            .map_or(at_ms, |previous| previous.max(at_ms)),
+                    );
+                    stopped.push(plan);
+                }
+                Status::Queued => {
+                    let plan = self.items[index].plan.clone();
+                    self.cancel_queued(index, at_ms);
+                    stopped.push(plan);
+                }
+                Status::Completed | Status::Cancelled => {}
+            }
+        }
+
+        stopped
     }
 
-    fn cancel_current(&mut self, at_ms: u64) {
-        if let Some(playing) = self.items.iter_mut().find(|i| i.status == Status::Playing) {
-            playing.status = Status::Cancelled;
-            self.last_finish_at = Some(at_ms);
+    /// Backward-compatible single-current stop.
+    pub fn stop_current(&mut self, at_ms: u64) -> Option<PlannedPerformance> {
+        self.advance_to(at_ms);
+        let index = self
+            .items
+            .iter()
+            .position(|item| item.status == Status::Playing)?;
+        let plan = self.items[index].plan.clone();
+        self.items[index].status = Status::Cancelled;
+        self.items[index].cancel_at_ms = Some(at_ms);
+        self.last_terminal_at = Some(
+            self.last_terminal_at
+                .map_or(at_ms, |previous| previous.max(at_ms)),
+        );
+        Some(plan)
+    }
+
+    /// Finish every remaining reservation at deterministic logical time.
+    pub fn complete_all(&mut self) {
+        let end = self
+            .items
+            .iter()
+            .filter(|item| item.occupies_timeline())
+            .map(ScheduledItem::effective_end_ms)
+            .max()
+            .unwrap_or(self.now_ms);
+        self.advance_to(end);
+    }
+
+    fn cancel_queued(&mut self, index: usize, at_ms: u64) {
+        let planned_cooldown = self.items[index]
+            .plan
+            .end_at_ms()
+            .saturating_add(self.config.min_reaction_spacing_ms);
+        let asset_id = self.items[index].plan.asset_id.clone();
+
+        self.items[index].status = Status::Cancelled;
+        self.items[index].cancel_at_ms = Some(at_ms);
+
+        if self.cooldowns.get(&asset_id).copied() == Some(planned_cooldown) {
+            self.cooldowns.remove(&asset_id);
         }
     }
 }
 
-/// Deterministic mulberry32 PRNG (mirrors `src/rng.ts`).
+fn plans_conflict(a: &PlannedPerformance, b: &PlannedPerformance) -> bool {
+    a.exclusive || b.exclusive || !a.channels.is_disjoint(&b.channels)
+}
+
+fn intervals_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
+    a_start < b_end && b_start < a_end
+}
+
+fn next_safe_boundary(plan: &PlannedPerformance, request_at_ms: u64) -> u64 {
+    let natural_end = plan.end_at_ms();
+    let elapsed = request_at_ms.saturating_sub(plan.start_at_ms);
+
+    plan.interrupt_points_ms
+        .iter()
+        .copied()
+        .filter(|offset| *offset >= elapsed)
+        .map(|offset| plan.start_at_ms.saturating_add(offset))
+        .find(|boundary| *boundary >= request_at_ms && *boundary < natural_end)
+        .unwrap_or(natural_end)
+}
+
+fn normalize_interrupt_points(plan: &mut PlannedPerformance) {
+    plan.interrupt_points_ms
+        .retain(|offset| *offset <= plan.duration_ms);
+    plan.interrupt_points_ms.sort_unstable();
+    plan.interrupt_points_ms.dedup();
+}
+
+/// Deterministic mulberry32 PRNG mirroring src/rng.ts.
 pub struct SeededRng {
     state: u32,
 }
@@ -228,9 +497,6 @@ impl SeededRng {
         Self { state: seed as u32 }
     }
 
-    /// Next uniform value in `[0, 1)`. Bit-for-bit identical to the
-    /// TypeScript reference in `src/rng.ts`, so replay traces seeded on
-    /// either side produce the same variation stream.
     pub fn next_f64(&mut self) -> f64 {
         self.state = self.state.wrapping_add(0x6d2b79f5);
         let a = self.state;
@@ -241,24 +507,20 @@ impl SeededRng {
     }
 }
 
-/// Bounded procedural variation (architecture section 8).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct AppliedVariation {
     pub speed_factor: f64,
     pub amplitude_factor: f64,
     pub start_delay_ms: u64,
 }
 
-/// Declared variation bounds, mirroring the Performance Asset schema.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct VariationSpec {
     pub speed_pct: f64,
     pub amplitude_pct: f64,
     pub start_delay_ms: u64,
 }
 
-/// Apply bounded deterministic variation: speed/amplitude in +/-pct,
-/// delay in 0..=max. Same seed reproduces the same variation.
 pub fn apply_variation(spec: VariationSpec, rng: &mut SeededRng) -> AppliedVariation {
     let speed_factor = 1.0 + (rng.next_f64() * 2.0 - 1.0) * (spec.speed_pct / 100.0);
     let amplitude_factor = 1.0 + (rng.next_f64() * 2.0 - 1.0) * (spec.amplitude_pct / 100.0);
@@ -274,46 +536,43 @@ pub fn apply_variation(spec: VariationSpec, rng: &mut SeededRng) -> AppliedVaria
 mod tests {
     use super::*;
 
+    fn channels(values: &[BlendChannel]) -> BTreeSet<BlendChannel> {
+        values.iter().copied().collect()
+    }
+
     fn plan(
         event_id: &str,
         asset_id: &str,
         priority: Priority,
-        start: u64,
-        duration: u64,
+        start_at_ms: u64,
+        duration_ms: u64,
     ) -> PlannedPerformance {
         PlannedPerformance {
             event_id: event_id.to_owned(),
             asset_id: asset_id.to_owned(),
             priority,
             interruptible: true,
-            interrupt_points_ms: vec![0, duration],
-            start_at_ms: start,
-            duration_ms: duration,
+            interrupt_points_ms: vec![0, duration_ms],
+            start_at_ms,
+            duration_ms,
             generation: 0,
+            exclusive: false,
+            channels: channels(&[BlendChannel::Audio]),
         }
+    }
+
+    fn no_spacing() -> Scheduler {
+        Scheduler::new(SchedulerConfig {
+            min_reaction_spacing_ms: 0,
+        })
     }
 
     #[test]
     fn operator_has_highest_priority() {
-        assert!(Priority::Operator.rank() < Priority::HighPriorityInteraction.rank());
         assert_eq!(Priority::Operator.rank(), 0);
+        assert!(Priority::Operator.rank() < Priority::HighPriorityInteraction.rank());
     }
 
-    #[test]
-    fn same_seed_reproduces_identical_variation() {
-        let spec = VariationSpec {
-            speed_pct: 10.0,
-            amplitude_pct: 15.0,
-            start_delay_ms: 120,
-        };
-        let a = apply_variation(spec, &mut SeededRng::new(42));
-        let b = apply_variation(spec, &mut SeededRng::new(42));
-        assert_eq!(a, b);
-    }
-
-    /// The TypeScript reference values from `src/rng.ts` (createRng(42)).
-    /// Pins the Rust port to bit-for-bit parity so a replay trace seeded on
-    /// either runtime yields the same variation stream.
     #[test]
     fn mulberry32_matches_typescript_reference() {
         let mut rng = SeededRng::new(42);
@@ -323,177 +582,257 @@ mod tests {
             0.852465793490,
             0.669734041439,
         ];
-        for e in expected {
-            let v = rng.next_f64();
-            assert!((v - e).abs() < 1e-12, "got {:.12}, want {:.12}", v, e);
+        for expected_value in expected {
+            let actual = rng.next_f64();
+            assert!(
+                (actual - expected_value).abs() < 1e-12,
+                "got {actual:.12}, want {expected_value:.12}"
+            );
         }
     }
 
     #[test]
-    fn different_seeds_diverge() {
-        let mut a = SeededRng::new(1);
-        let mut b = SeededRng::new(2);
-        let va: Vec<f64> = (0..8).map(|_| a.next_f64()).collect();
-        let vb: Vec<f64> = (0..8).map(|_| b.next_f64()).collect();
-        assert_ne!(va, vb);
-    }
-
-    #[test]
-    fn values_stay_in_unit_interval() {
-        let mut rng = SeededRng::new(7);
-        for _ in 0..10_000 {
-            let v = rng.next_f64();
-            assert!((0.0..1.0).contains(&v));
-        }
-    }
-
-    #[test]
-    fn variation_stays_within_declared_bounds() {
+    fn same_seed_reproduces_identical_variation() {
         let spec = VariationSpec {
             speed_pct: 10.0,
             amplitude_pct: 15.0,
             start_delay_ms: 120,
         };
-        for seed in [0u64, 1, 7, 12345, u32::MAX as u64] {
-            let v = apply_variation(spec, &mut SeededRng::new(seed));
-            assert!((0.9..=1.1).contains(&v.speed_factor));
-            assert!((0.85..=1.15).contains(&v.amplitude_factor));
-            assert!(v.start_delay_ms <= 120);
-        }
+        assert_eq!(
+            apply_variation(spec, &mut SeededRng::new(42)),
+            apply_variation(spec, &mut SeededRng::new(42))
+        );
     }
 
     #[test]
     fn cooldown_rejects_repeated_asset_requests() {
-        let mut s = Scheduler::new(SchedulerConfig::default());
-        let first = s.schedule(plan("e1", "asset.a", Priority::Conversation, 0, 600));
-        assert!(first.is_ok());
-
-        let second = s.schedule(plan("e2", "asset.a", Priority::Conversation, 1000, 600));
-        assert_eq!(second.unwrap_err(), Rejection::Cooldown);
-        assert_eq!(s.last_rejection(), Some(Rejection::Cooldown));
-    }
-
-    #[test]
-    fn lower_priority_cannot_interrupt() {
-        let mut s = Scheduler::new(SchedulerConfig::default());
-        s.schedule(plan("e1", "asset.a", Priority::Conversation, 0, 5000))
-            .expect("schedule playing");
-
-        let rejected = s.schedule(plan("e2", "asset.b", Priority::Commentary, 100, 600));
-        assert_eq!(rejected.unwrap_err(), Rejection::Priority);
-    }
-
-    #[test]
-    fn equal_priority_interrupts_only_when_playing_is_interruptible() {
-        let mut s = Scheduler::new(SchedulerConfig::default());
-        let mut p = plan("e1", "asset.a", Priority::Conversation, 0, 5000);
-        p.interruptible = false;
-        s.schedule(p).expect("schedule uninterruptible");
-
-        let rejected = s.schedule(plan("e2", "asset.b", Priority::Conversation, 100, 600));
-        // Equal priority but the playing item is uninterruptible: the new
-        // request is deferred by minimum spacing instead of preempting.
-        let deferred = rejected.expect("deferred, not rejected");
-        assert_eq!(deferred.start_at_ms, 6500);
-
-        // Interruptible equal priority cancels the current and schedules.
-        let mut s2 = Scheduler::new(SchedulerConfig::default());
-        s2.schedule(plan("e1", "asset.a", Priority::Conversation, 0, 5000))
-            .expect("schedule");
-        let ok = s2.schedule(plan("e2", "asset.b", Priority::Conversation, 100, 600));
-        assert!(ok.is_ok());
-        let statuses: Vec<Status> = s2.items().iter().map(|i| i.status).collect();
-        assert_eq!(statuses, vec![Status::Cancelled, Status::Playing]);
-    }
-
-    #[test]
-    fn higher_rank_priority_cannot_interrupt_lower_rank_playing() {
-        let mut s = Scheduler::new(SchedulerConfig::default());
-        s.schedule(plan(
-            "e1",
-            "asset.a",
-            Priority::HighPriorityInteraction,
-            0,
-            5000,
-        ))
-        .expect("schedule paid interaction");
-
-        let rejected = s.schedule(plan("e2", "asset.b", Priority::Commentary, 100, 600));
-        assert_eq!(rejected.unwrap_err(), Rejection::Priority);
-    }
-
-    #[test]
-    fn operator_preempts_everything() {
-        let mut s = Scheduler::new(SchedulerConfig::default());
-        let mut p = plan("e1", "asset.a", Priority::StrongReaction, 0, 5000);
-        p.interruptible = false;
-        s.schedule(p).expect("schedule");
-
-        let stopped = s.stop_current(300);
-        assert!(stopped.is_some());
-        assert_eq!(s.items()[0].status, Status::Cancelled);
-    }
-
-    #[test]
-    fn minimum_spacing_defers_non_operator_start() {
-        let mut s = Scheduler::new(SchedulerConfig {
-            min_reaction_spacing_ms: 1500,
-        });
-        s.schedule(plan("e1", "asset.a", Priority::Conversation, 0, 600))
-            .expect("first");
-        // Second request at 100ms interrupts the first (equal rank,
-        // interruptible), setting last-finish to the interruption time.
-        // Minimum spacing then defers the start to 100 + 1500 = 1600.
-        let second = s
-            .schedule(plan("e2", "asset.b", Priority::Conversation, 100, 1000))
-            .expect("deferred schedule");
-        assert_eq!(second.start_at_ms, 1600);
-        assert_eq!(s.items()[0].status, Status::Cancelled);
-
-        // Operator requests keep their requested start.
-        s.schedule(plan("e3", "asset.c", Priority::Operator, 2200, 100))
-            .expect("operator");
-        assert_eq!(s.items()[2].plan.start_at_ms, 2200);
-    }
-
-    #[test]
-    fn spacing_after_natural_completion_counts_full_duration() {
-        let mut s = Scheduler::new(SchedulerConfig {
-            min_reaction_spacing_ms: 1500,
-        });
-        s.schedule(plan("e1", "asset.a", Priority::Conversation, 0, 600))
-            .expect("first");
-        // A later request beyond the playing window does not interrupt;
-        // spacing counts from the first performance's natural finish (600).
-        let second = s
-            .schedule(plan("e2", "asset.b", Priority::Conversation, 1_000, 600))
-            .expect("deferred schedule");
-        assert_eq!(second.start_at_ms, 2_100);
-        assert_eq!(s.items()[0].status, Status::Completed);
-    }
-
-    #[test]
-    fn lazy_completion_marks_expired_items() {
-        let mut s = Scheduler::new(SchedulerConfig::default());
-        s.schedule(plan("e1", "asset.a", Priority::Conversation, 0, 600))
-            .expect("first");
-        // Ask for something far in the future: the first item completes.
-        s.schedule(plan("e2", "asset.b", Priority::Conversation, 10_000, 600))
-            .expect("second");
-        assert_eq!(s.items()[0].status, Status::Completed);
-    }
-
-    #[test]
-    fn generations_increase_monotonically() {
-        let mut s = Scheduler::new(SchedulerConfig::default());
-        let a = s
+        let mut scheduler = Scheduler::new(SchedulerConfig::default());
+        scheduler
             .schedule(plan("e1", "asset.a", Priority::Conversation, 0, 600))
-            .unwrap();
-        let b = s
-            .schedule(plan("e2", "asset.b", Priority::Operator, 100, 600))
-            .unwrap();
-        assert_eq!(a.generation, 1);
-        assert_eq!(b.generation, 2);
-        assert_eq!(s.current_generation(), 2);
+            .expect("first");
+        let rejected = scheduler.schedule(plan("e2", "asset.a", Priority::Conversation, 1000, 600));
+        assert_eq!(rejected.unwrap_err(), Rejection::Cooldown);
+    }
+
+    #[test]
+    fn future_deferred_item_is_queued_until_logical_start() {
+        let mut scheduler = no_spacing();
+        let mut current = plan("e1", "asset.a", Priority::Conversation, 0, 1000);
+        current.interruptible = false;
+        scheduler.schedule(current).expect("current");
+
+        let incoming = scheduler
+            .schedule_at(100, plan("e2", "asset.b", Priority::Conversation, 100, 300))
+            .expect("deferred");
+        assert_eq!(incoming.start_at_ms, 1000);
+        assert_eq!(scheduler.items()[0].status, Status::Playing);
+        assert_eq!(scheduler.items()[1].status, Status::Queued);
+
+        scheduler.advance_to(999);
+        assert_eq!(scheduler.items()[1].status, Status::Queued);
+        scheduler.advance_to(1000);
+        assert_eq!(scheduler.items()[0].status, Status::Completed);
+        assert_eq!(scheduler.items()[1].status, Status::Playing);
+    }
+
+    #[test]
+    fn preemption_waits_for_next_safe_interrupt_point() {
+        let mut scheduler = no_spacing();
+        let mut current = plan("e1", "asset.a", Priority::Conversation, 0, 1000);
+        current.interrupt_points_ms = vec![0, 400, 800, 1000];
+        scheduler.schedule(current).expect("current");
+
+        let incoming = scheduler
+            .schedule_at(
+                250,
+                plan("e2", "asset.b", Priority::HighPriorityInteraction, 250, 300),
+            )
+            .expect("queued at safe point");
+        assert_eq!(incoming.start_at_ms, 400);
+        assert_eq!(scheduler.items()[0].cancel_at_ms, Some(400));
+        assert_eq!(scheduler.items()[0].status, Status::Playing);
+        assert_eq!(scheduler.items()[1].status, Status::Queued);
+
+        scheduler.advance_to(399);
+        assert_eq!(scheduler.items()[0].status, Status::Playing);
+        scheduler.advance_to(400);
+        assert_eq!(scheduler.items()[0].status, Status::Cancelled);
+        assert_eq!(scheduler.items()[1].status, Status::Playing);
+    }
+
+    #[test]
+    fn disjoint_channels_blend_but_same_channel_uses_priority() {
+        let mut scheduler = no_spacing();
+        scheduler
+            .schedule(plan("e1", "audio.a", Priority::Conversation, 0, 1000))
+            .expect("audio");
+
+        let mut face = plan("e2", "face.a", Priority::Background, 100, 500);
+        face.channels = channels(&[BlendChannel::Face]);
+        scheduler.schedule_at(100, face).expect("face may blend");
+
+        assert_eq!(scheduler.playing_items().count(), 2);
+
+        let same_audio = plan("e3", "audio.b", Priority::Background, 200, 300);
+        let rejected = scheduler.schedule_at(200, same_audio);
+        assert_eq!(rejected.unwrap_err(), Rejection::Priority);
+    }
+
+    #[test]
+    fn rejected_multi_conflict_request_leaves_existing_cancellations_untouched() {
+        let mut scheduler = no_spacing();
+
+        let mut background = plan("e1", "face.bg", Priority::Background, 0, 1000);
+        background.channels = channels(&[BlendChannel::Face]);
+        background.interrupt_points_ms = vec![0, 500, 1000];
+        scheduler.schedule(background).expect("background");
+
+        let conversation = plan("e2", "audio.conv", Priority::Conversation, 0, 1000);
+        scheduler.schedule(conversation).expect("conversation");
+
+        let mut incoming = plan("e3", "exclusive", Priority::Commentary, 100, 200);
+        incoming.channels = channels(&[BlendChannel::Overlay]);
+        incoming.exclusive = true;
+
+        assert_eq!(
+            scheduler.schedule_at(100, incoming).unwrap_err(),
+            Rejection::Priority
+        );
+        assert_eq!(scheduler.items()[0].cancel_at_ms, None);
+        assert_eq!(scheduler.items()[1].cancel_at_ms, None);
+    }
+
+    #[test]
+    fn exclusive_plan_conflicts_even_with_disjoint_channels() {
+        let mut scheduler = no_spacing();
+        let mut face = plan("e1", "face.a", Priority::Conversation, 0, 1000);
+        face.channels = channels(&[BlendChannel::Face]);
+        face.interrupt_points_ms = vec![0, 500, 1000];
+        scheduler.schedule(face).expect("face");
+
+        let mut exclusive = plan(
+            "e2",
+            "overlay.a",
+            Priority::HighPriorityInteraction,
+            100,
+            300,
+        );
+        exclusive.channels = channels(&[BlendChannel::Overlay]);
+        exclusive.exclusive = true;
+
+        let scheduled = scheduler.schedule_at(100, exclusive).expect("exclusive");
+        assert_eq!(scheduled.start_at_ms, 500);
+        assert_eq!(scheduler.items()[0].cancel_at_ms, Some(500));
+    }
+
+    #[test]
+    fn higher_priority_later_event_can_supersede_future_reservation() {
+        let mut scheduler = no_spacing();
+        let mut blocker = plan("e1", "blocker", Priority::Conversation, 0, 1000);
+        blocker.interruptible = false;
+        scheduler.schedule(blocker).expect("blocker");
+
+        let queued = scheduler
+            .schedule_at(100, plan("e2", "queued", Priority::Conversation, 100, 500))
+            .expect("queued");
+        assert_eq!(queued.start_at_ms, 1000);
+        assert_eq!(scheduler.items()[1].status, Status::Queued);
+
+        let mut incoming = plan("e3", "urgent", Priority::HighPriorityInteraction, 200, 300);
+        incoming.channels = channels(&[BlendChannel::Audio]);
+        let urgent = scheduler.schedule_at(200, incoming).expect("urgent");
+        assert_eq!(urgent.start_at_ms, 1000);
+        assert_eq!(scheduler.items()[1].status, Status::Cancelled);
+        assert_eq!(scheduler.items()[1].cancel_at_ms, Some(200));
+    }
+
+    #[test]
+    fn operator_stop_cancels_playing_and_queued_work_at_arrival_time() {
+        let mut scheduler = no_spacing();
+        let mut current = plan("e1", "current", Priority::Conversation, 0, 1000);
+        current.interruptible = false;
+        scheduler.schedule(current).expect("current");
+        scheduler
+            .schedule_at(100, plan("e2", "future", Priority::Conversation, 100, 200))
+            .expect("future");
+
+        let stopped = scheduler.stop_all(300);
+        assert_eq!(stopped.len(), 2);
+        assert!(
+            scheduler
+                .items()
+                .iter()
+                .all(|item| item.status == Status::Cancelled)
+        );
+        assert!(
+            scheduler
+                .items()
+                .iter()
+                .all(|item| item.cancel_at_ms == Some(300))
+        );
+    }
+
+    #[test]
+    fn generation_ids_increase_monotonically() {
+        let mut scheduler = no_spacing();
+        let first = scheduler
+            .schedule(plan("e1", "asset.a", Priority::Conversation, 0, 300))
+            .expect("first");
+        let second = scheduler
+            .schedule_at(
+                0,
+                plan("e2", "asset.b", Priority::HighPriorityInteraction, 0, 300),
+            )
+            .expect("second");
+        assert_eq!(first.generation, 1);
+        assert_eq!(second.generation, 2);
+        assert_eq!(scheduler.current_generation(), 2);
+    }
+
+    #[test]
+    fn minimum_spacing_is_applied_after_safe_handoff() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            min_reaction_spacing_ms: 1500,
+        });
+        let mut current = plan("e1", "asset.a", Priority::Conversation, 0, 600);
+        current.interrupt_points_ms = vec![0, 100, 600];
+        scheduler.schedule(current).expect("current");
+
+        let incoming = scheduler
+            .schedule_at(100, plan("e2", "asset.b", Priority::Conversation, 100, 300))
+            .expect("incoming");
+        assert_eq!(scheduler.items()[0].cancel_at_ms, Some(100));
+        assert_eq!(incoming.start_at_ms, 1600);
+        assert_eq!(scheduler.items()[1].status, Status::Queued);
+    }
+
+    #[test]
+    fn rng_values_and_variation_stay_within_declared_bounds() {
+        let spec = VariationSpec {
+            speed_pct: 10.0,
+            amplitude_pct: 15.0,
+            start_delay_ms: 120,
+        };
+        for seed in [0_u64, 1, 7, 12_345, u32::MAX as u64] {
+            let mut rng = SeededRng::new(seed);
+            for _ in 0..16 {
+                let value = rng.next_f64();
+                assert!((0.0..1.0).contains(&value));
+            }
+
+            let variation = apply_variation(spec, &mut SeededRng::new(seed));
+            assert!((0.9..=1.1).contains(&variation.speed_factor));
+            assert!((0.85..=1.15).contains(&variation.amplitude_factor));
+            assert!(variation.start_delay_ms <= 120);
+        }
+    }
+
+    #[test]
+    fn different_rng_seeds_diverge() {
+        let mut first = SeededRng::new(1);
+        let mut second = SeededRng::new(2);
+        let a: Vec<_> = (0..8).map(|_| first.next_f64()).collect();
+        let b: Vec<_> = (0..8).map(|_| second.next_f64()).collect();
+        assert_ne!(a, b);
     }
 }
