@@ -29,9 +29,9 @@ pub use event::{
 pub use interfaces::{
     Authorized, AuthorizedAvatarAction, AuthorizedStreamAction, AuthorizedToolAction, AvatarAction,
     AvatarAdapter, DecisionEngine, EngineError, EngineErrorKind, EngineFuture, GeneratedReply,
-    SpeechArtifact, SpeechRequest, StreamAction, StreamAdapter, ThinkingEngine, ToolAction,
-    ToolAdapter, TtsEngine, authorize_avatar_action, authorize_stream_action,
-    authorize_tool_action,
+    SpeechArtifact, SpeechProgress, SpeechProgressSink, SpeechRequest, StreamAction, StreamAdapter,
+    ThinkingEngine, ToolAction, ToolAdapter, TtsBackendIdentity, TtsEngine,
+    authorize_avatar_action, authorize_stream_action, authorize_tool_action,
 };
 pub use reflex::{
     AttentionTarget, BackendIdentity, FallbackReason, REFLEX_SCHEMA_VERSION, ReflexDecision,

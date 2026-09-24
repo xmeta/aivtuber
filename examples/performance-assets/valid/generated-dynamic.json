@@ -1,0 +1,56 @@
+{
+  "schema_version": "0.1.0",
+  "id": "dynamic.generated.example",
+  "intent": "dynamic.reply",
+  "class": "dynamic",
+  "speech": {
+    "text": "生成された返答です",
+    "audio_ref": "audio://generated/example.opus",
+    "duration_ms": 1200,
+    "viseme_ref": "viseme/generated/example.json"
+  },
+  "expression": {
+    "preset": "speaking.neutral",
+    "intensity": 0.4
+  },
+  "gaze": "camera",
+  "timeline": [
+    {
+      "at_ms": 0,
+      "event": "expression.start",
+      "payload": {
+        "preset": "speaking.neutral"
+      }
+    },
+    {
+      "at_ms": 0,
+      "event": "speech.start"
+    },
+    {
+      "at_ms": 1200,
+      "event": "speech.end"
+    }
+  ],
+  "interrupt_points_ms": [
+    1200
+  ],
+  "compatibility": {
+    "compiler_version": "0.1.0",
+    "voice_model": "voice-ja-v2",
+    "avatar_profile": "example-live2d-v1",
+    "viseme_mapping": "ja-5vowel-v2",
+    "motion_library": "starter-v1"
+  },
+  "provenance": {
+    "generated": true,
+    "generator": "aivtuber-generative",
+    "created_at": "2026-09-24T00:00:00Z",
+    "thinking_backend": "openai-compatible-responses",
+    "thinking_model_alias": "gpt-5.6-luna",
+    "thinking_model_version": "2026-09",
+    "tts_backend": "example-tts",
+    "tts_model_alias": "tts-fast",
+    "tts_model_version": "2026-09",
+    "routing_reason": "no_cached_match"
+  }
+}

@@ -3,8 +3,8 @@ use aivtuber_asset_store::{
 };
 use aivtuber_domain::{EventEnvelope, EventKind};
 use aivtuber_scheduler::{
-    AppliedVariation, BlendChannel, PlannedPerformance, Priority, Rejection, Scheduler, SeededRng,
-    VariationSpec as SchedulerVariationSpec, apply_variation,
+    AppliedVariation, BlendChannel, PlannedPerformance, Rejection, Scheduler, SeededRng,
+    VariationSpec as SchedulerVariationSpec, apply_variation, priority_for_event,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -690,16 +690,6 @@ fn scale_offset(offset_ms: u64, speed_factor: f64) -> u64 {
     ((offset_ms as f64) * speed_factor).round() as u64
 }
 
-fn priority_for_event(kind: EventKind) -> Priority {
-    match kind {
-        EventKind::ChatDonation => Priority::HighPriorityInteraction,
-        EventKind::GameEvent => Priority::StrongReaction,
-        EventKind::ChatMessage | EventKind::SpeechInput => Priority::Conversation,
-        EventKind::StreamEvent => Priority::Commentary,
-        EventKind::TimerTick | EventKind::SystemHealth => Priority::Background,
-        EventKind::OperatorCommand => Priority::Operator,
-    }
-}
 fn dispatch_asset<A, V>(
     asset: &PerformanceAsset,
     visemes: Option<&VisemeTrack>,

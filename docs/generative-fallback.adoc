@@ -1,0 +1,119 @@
+= Generative Fallback
+:toc:
+
+== Purpose
+
+The generative path is the last resort after deterministic/cached reuse and the reflex/retrieval layer cannot satisfy an event. It runs outside the scheduler until a complete, validated Performance Asset exists.
+
+The production-target implementation is split across:
+
+* `crates/adapters::OpenAiResponsesAdapter` -- OpenAI-compatible Responses API ThinkingEngine.
+* `crates/adapters::NormalizedHttpTtsAdapter` -- normalized HTTP TTS implementation.
+* `crates/generative` -- routing audit, cancellation, fallback, streaming compilation state, and dynamic Performance Asset compilation.
+* `crates/asset-store` -- validates generated provenance and accepts only completed compatible dynamic assets into the hot cache for later promotion.
+* `crates/app` -- production composition: builds the curated ThinkingRequest, applies the deterministic public-output gate, inserts the completed generated asset, and reuses CachedPerformer/Scheduler for playback.
+
+== Atomic generation pipeline
+
+For one event the buffered path is:
+
+. validate the source EventEnvelope and the bounded curated ThinkingRequest;
+. verify the ThinkingRequest input provenance matches the source event;
+. record the explicit LLM routing reason before the ThinkingEngine call;
+. invoke the ThinkingEngine;
+. check cancellation;
+. pass generated text through `SecurityRuntime::publish_text` in the production composition root;
+. reject/suppress unsafe output or use the redacted text returned by the gate;
+. invoke TTS only with gated public text;
+. check cancellation;
+. compile a dynamic Performance Asset from the gated text and complete speech artifact;
+. validate the asset;
+. return the completed asset to the caller;
+. production inserts it with `AssetStore::insert_hot` and schedules it through the existing `CachedPerformer`.
+
+The generative crate does not mutate Scheduler state while LLM/TTS work is in flight. A timeout, cancellation, malformed backend result, or partial stream therefore cannot leave a half-scheduled performance behind.
+
+Every attempted LLM invocation emits a production audit record containing the source event id, deterministic generation routing reason, and provider/model identity. Prompt text and generated reply text are deliberately excluded from this audit record, and configured secrets are redacted by the runtime audit boundary.
+
+== Cancellation
+
+`GenerationCancellationRegistry` associates the active generation with the same `aivtuber_scheduler::priority_for_event` mapping used by cached playback. A newly admitted event cancels the active token only when the new event has strictly higher scheduler priority. Authenticated emergency stop/mute also cancels the active generation without depending on model/network availability.
+
+The pipeline checks cancellation before ThinkingEngine, after ThinkingEngine, after TTS, and immediately before publish. Cancellation or partial streaming never inserts an asset or mutates the production scheduler.
+
+Callers should finish/remove the registry entry after the generation result has been consumed.
+
+== Streaming compilation
+
+`StreamingCompilationSession` is the provider-neutral path for streaming-capable LLM/TTS implementations.
+
+Text may arrive in chunks. TTS progress may update a stable `audio_ref` with monotonically increasing duration. A Performance Asset cannot be finalized until a final speech chunk has been observed. Cancellation makes finalization fail. This keeps partial audio/text outside the scheduler while allowing a streaming provider to build the final artifact incrementally.
+
+The current normalized HTTP TTS adapter is buffered; a provider with streaming transport can feed the same compilation session without changing asset or scheduler semantics.
+
+== Graceful degradation
+
+Backend failures are converted to typed `FallbackReason` values.
+
+If `fallback_variant_group` has a compatible cached asset, the result is `CachedReaction` with a deterministic asset id and production routes it through the normal cached performer path. Otherwise the result is a `NonVerbalReaction` directive; the current production implementation performs no speech/publication for that directive. Thinking/TTS/output-gate failure never publishes a text-only or partial dynamic asset.
+
+== Provenance and promotion
+
+Generated assets set `provenance.generated=true` and store:
+
+* generator identity;
+* ThinkingEngine backend, model alias, and model version when available;
+* TTS backend, model alias, and model version when available;
+* the routing reason that caused the LLM call;
+* the source event timestamp.
+
+The Performance Asset JSON Schema and Rust runtime validator require the core provenance fields for generated assets. This allows a completed asset to be serialized, reviewed, and promoted into the asset store without losing the model/version/routing context that produced it.
+
+== Configuration and secrets
+
+API keys are passed only through adapter configuration and use redacted debug output. They are never embedded in the LLM/TTS request body, Performance Asset provenance, or public output.
+
+The OpenAI-compatible adapter uses the Responses API shape and keeps endpoint/model selection configurable. The normalized TTS adapter likewise keeps endpoint, backend identity, model identity, voice model, and viseme mapping configurable.
+
+The executable composition root creates the generative runtime only when explicitly enabled:
+
+[source,text]
+----
+AIVTUBER_GENERATIVE_ENABLED=true
+AIVTUBER_OPENAI_API_KEY=<secret>
+AIVTUBER_OPENAI_ENDPOINT=https://api.openai.com/v1/responses
+AIVTUBER_OPENAI_MODEL=<model-alias>
+AIVTUBER_OPENAI_MODEL_VERSION=<optional-version>
+AIVTUBER_OPENAI_MAX_OUTPUT_TOKENS=256
+AIVTUBER_OPENAI_TIMEOUT_MS=15000
+
+AIVTUBER_TTS_ENDPOINT=http://127.0.0.1:PORT/...
+AIVTUBER_TTS_BACKEND_NAME=normalized-http-tts
+AIVTUBER_TTS_API_KEY=<optional-secret>
+AIVTUBER_TTS_MODEL_ALIAS=<optional-alias>
+AIVTUBER_TTS_MODEL_VERSION=<optional-version>
+AIVTUBER_TTS_TIMEOUT_MS=15000
+----
+
+Voice model, viseme mapping, compiler version, avatar profile, and motion library are inherited from the same runtime compatibility configuration used by `AssetStore`, so a generated asset cannot be inserted when its compiler/TTS compatibility disagrees with production playback.
+
+== Verification
+
+The Rust tests cover:
+
+* routing-reason recording for successful and failed LLM calls;
+* higher-priority cancellation;
+* cancellation before LLM, after LLM, and after TTS;
+* unchanged scheduler state after cancelled partial generation;
+* cached and non-verbal fallback after TTS failure;
+* deterministic generated asset identity;
+* full thinking/TTS model provenance;
+* promotion into `AssetStore`;
+* streaming final-chunk gating and cancellation;
+* production generate -> output gate -> TTS -> hot insert -> shared scheduler playback;
+* production output redaction and suppression before TTS;
+* production thinking timeout/TTS failure -> cached or non-verbal fallback;
+* production high-priority and authenticated emergency cancellation;
+* serialized control events cannot cancel generation through content ingress;
+* partial streaming output never inserts/schedules a generated asset;
+* secret redaction and HTTP wire mapping in provider adapters.

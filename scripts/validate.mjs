@@ -5,7 +5,8 @@
 // - examples/reflex-decisions/invalid/*.json must REJECT against reflex-decision.schema.json
 // - examples/security/*.json must conform to security-regression-case.schema.json,
 //   and their embedded input.event must conform to event-envelope.schema.json
-// - examples/assets/*.json must conform to performance-asset.schema.json
+// - Performance Asset valid/starter fixtures must conform to performance-asset.schema.json
+// - examples/performance-assets/invalid/*.json must REJECT against that schema
 //
 // Usage: bun scripts/validate.mjs  (or: node scripts/validate.mjs)
 
@@ -121,10 +122,26 @@ for (const file of listJson("examples/security")) {
   }
 }
 
-for (const dir of ["examples/assets", "examples/starter-reaction-pack/descriptors"]) {
+for (const dir of [
+  "examples/assets",
+  "examples/starter-reaction-pack/descriptors",
+  "examples/performance-assets/valid",
+]) {
   for (const file of listJson(dir)) {
     if (!asset) break;
     report(asset(loadJson(join(root, file))), file, asset);
+  }
+}
+
+for (const file of listJson("examples/performance-assets/invalid")) {
+  if (!asset) break;
+  const valid = asset(loadJson(join(root, file)));
+  if (valid) {
+    failures += 1;
+    console.error(`FAIL      ${file} (expected rejection, but it validated)`);
+  } else {
+    passes += 1;
+    console.log(`ok        ${file} (rejected as intended)`);
   }
 }
 

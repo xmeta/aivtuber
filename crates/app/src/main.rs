@@ -1,15 +1,18 @@
 use aivtuber_adapters::{
-    ObsWebSocketAdapter, ObsWebSocketConfig, ProcessAudioConfig, ProcessAudioPlayer, SecretString,
-    VTubeStudioAdapter, VTubeStudioConfig,
+    NormalizedHttpTtsAdapter, NormalizedHttpTtsConfig, ObsWebSocketAdapter, ObsWebSocketConfig,
+    OpenAiResponsesAdapter, OpenAiResponsesConfig, ProcessAudioConfig, ProcessAudioPlayer,
+    SecretString, VTubeStudioAdapter, VTubeStudioConfig,
 };
 use aivtuber_app::{
-    AdapterHealth, AvatarOutput, IntentRoutePlanner, NoopAvatarOutput, NoopStreamOutput,
-    ObsStreamOutput, ProductionApp, StreamOutput, VtsAvatarOutput, VtsPlaybackConfig,
+    AdapterHealth, AvatarOutput, GenerativeRuntime, IntentRoutePlanner, NoopAvatarOutput,
+    NoopStreamOutput, ObsStreamOutput, ProductionApp, StreamOutput, VtsAvatarOutput,
+    VtsPlaybackConfig,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
     AuthorizationMethod, Capability, ControlSecret, LocalControlIngress, OperatorCommandInput,
 };
+use aivtuber_generative::{GenerativePipeline, PerformanceCompiler, PerformanceCompilerConfig};
 use aivtuber_runtime::{
     CachedPerformer, CachedPlaybackConfig, LocalVisemeStore, SecurityRuntime, SecurityRuntimeConfig,
 };
@@ -20,7 +23,7 @@ use std::env;
 use std::error::Error;
 use std::io::{self, BufRead};
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -49,6 +52,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             .or_else(|| Some("starter-v1".to_owned())),
     };
 
+    let generative = build_generative_runtime(&compatibility)?;
     let scheduler_config = SchedulerConfig::default();
     let performer = CachedPerformer::new(
         AssetStore::new(descriptors, compatibility),
@@ -85,6 +89,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         stream,
         max_lateness_ms,
     );
+    if let Some(generative) = generative {
+        app = app.with_generation(generative);
+    }
     let preload = app.startup()?;
     eprintln!(
         "aivtuber-app ready: indexed={} usable={} preloaded={}",
@@ -150,6 +157,68 @@ fn run() -> Result<(), Box<dyn Error>> {
 
 fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn build_generative_runtime(
+    compatibility: &RuntimeCompatibility,
+) -> Result<Option<GenerativeRuntime>, Box<dyn Error>> {
+    if !env_bool("AIVTUBER_GENERATIVE_ENABLED", false)? {
+        return Ok(None);
+    }
+
+    let mut thinking_config = OpenAiResponsesConfig::default();
+    if let Some(endpoint) = env_optional("AIVTUBER_OPENAI_ENDPOINT") {
+        thinking_config.endpoint = endpoint;
+    }
+    if let Some(model) = env_optional("AIVTUBER_OPENAI_MODEL") {
+        thinking_config.model_alias = model;
+    }
+    thinking_config.model_version = env_optional("AIVTUBER_OPENAI_MODEL_VERSION");
+    thinking_config.max_output_tokens = env_u64(
+        "AIVTUBER_OPENAI_MAX_OUTPUT_TOKENS",
+        thinking_config.max_output_tokens,
+    )?;
+    thinking_config.timeout = Duration::from_millis(env_u64(
+        "AIVTUBER_OPENAI_TIMEOUT_MS",
+        thinking_config
+            .timeout
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64,
+    )?);
+    let thinking = OpenAiResponsesAdapter::new(
+        thinking_config,
+        SecretString::new(required_env("AIVTUBER_OPENAI_API_KEY")?),
+    )?;
+
+    let tts = NormalizedHttpTtsAdapter::new(
+        NormalizedHttpTtsConfig {
+            endpoint: required_env("AIVTUBER_TTS_ENDPOINT")?,
+            backend_name: env_string("AIVTUBER_TTS_BACKEND_NAME", "normalized-http-tts"),
+            model_alias: env_optional("AIVTUBER_TTS_MODEL_ALIAS"),
+            model_version: env_optional("AIVTUBER_TTS_MODEL_VERSION"),
+            voice_model: compatibility.voice_model.clone(),
+            viseme_mapping: compatibility.viseme_mapping.clone(),
+            timeout: Duration::from_millis(env_u64("AIVTUBER_TTS_TIMEOUT_MS", 15_000)?),
+        },
+        env_optional("AIVTUBER_TTS_API_KEY").map(SecretString::new),
+    )?;
+
+    let compiler = PerformanceCompiler::new(PerformanceCompilerConfig {
+        compiler_version: compatibility.compiler_version.clone(),
+        avatar_profile: compatibility.avatar_profile.clone(),
+        motion_library: compatibility.motion_library.clone(),
+        expression_preset: Some(env_string(
+            "AIVTUBER_GENERATED_EXPRESSION_PRESET",
+            "speaking.neutral",
+        )),
+        expression_intensity: 0.4,
+    })?;
+
+    Ok(Some(GenerativeRuntime::new(GenerativePipeline::new(
+        Arc::new(thinking),
+        Arc::new(tts),
+        compiler,
+    ))))
 }
 
 fn build_avatar_output() -> Result<Box<dyn AvatarOutput>, Box<dyn Error>> {
@@ -235,6 +304,16 @@ fn report_degraded(health: &AdapterHealth) {
     if let Some(error) = &health.stream_error {
         eprintln!("OBS degraded: {error}");
     }
+}
+
+fn required_env(name: &str) -> Result<String, Box<dyn Error>> {
+    env_optional(name).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} is required when generative fallback is enabled"),
+        )
+        .into()
+    })
 }
 
 fn env_optional(name: &str) -> Option<String> {
