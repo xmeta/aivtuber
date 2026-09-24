@@ -16,7 +16,8 @@ The production-target implementation is split across:
 
 For one event the buffered path is:
 
-. validate the curated ReflexRequest;
+. validate the source EventEnvelope and the bounded curated ThinkingRequest;
+. verify the ThinkingRequest input provenance matches the source event;
 . record the explicit LLM routing reason before the ThinkingEngine call;
 . invoke the ThinkingEngine;
 . check cancellation;
