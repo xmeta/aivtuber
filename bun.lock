@@ -1,11 +1,12 @@
 {
-  "lockfileVersion": 2,
+  "lockfileVersion": 1,
   "configVersion": 1,
   "workspaces": {
     "": {
+      "name": "aivtuber",
       "devDependencies": {
-        "ajv": "^8.20.0",
-        "ajv-formats": "^3.0.1",
+        "ajv": "8.20.0",
+        "ajv-formats": "3.0.1",
       },
     },
   },

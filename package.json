@@ -2,14 +2,16 @@
   "name": "aivtuber",
   "private": true,
   "type": "module",
+  "packageManager": "bun@1.3.14",
   "scripts": {
     "validate": "bun scripts/validate.mjs",
     "validate:rust-parity": "bun scripts/validate-rust-schema-parity.mjs",
+    "validate:toolchains": "bun scripts/validate-toolchain-pins.mjs",
     "test": "bun test"
   },
   "dependencies": {},
   "devDependencies": {
-    "ajv": "^8.20.0",
-    "ajv-formats": "^3.0.1"
+    "ajv": "8.20.0",
+    "ajv-formats": "3.0.1"
   }
 }

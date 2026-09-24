@@ -21,7 +21,7 @@ const reflexSchema = ajv.compile(loadJson("schemas/reflex-decision.schema.json")
 
 const output = execFileSync(
   "cargo",
-  ["run", "--quiet", "-p", "aivtuber-domain", "--example", "schema_parity"],
+  ["run", "--locked", "--quiet", "-p", "aivtuber-domain", "--example", "schema_parity"],
   { cwd: root, encoding: "utf8" },
 );
 const emitted = JSON.parse(output);
