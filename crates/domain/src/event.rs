@@ -77,6 +77,11 @@ pub enum AuthorizationMethod {
     SignedLocalApi,
 }
 
+/// Serializable authorization claim carried for validation/replay/audit.
+///
+/// This value is data, not proof of authenticated ingress. Privileged runtime
+/// actions require a non-serializable `AuthenticatedControl` minted by the
+/// trusted local ingress path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorizationContext {
     pub principal: String,

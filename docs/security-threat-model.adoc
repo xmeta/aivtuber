@@ -63,18 +63,19 @@ Examples:
 * memory administration;
 * tool capability grants.
 
-A control-plane event must be a trusted `operator.command` with an explicit authorization context created by a trusted local adapter.
+A serialized `operator.command` and its `AuthorizationContext` are audit/replay data, not proof of authenticated ingress. Privileged runtime authority is represented by the non-serializable Rust `AuthenticatedControl` token, which is minted only by `LocalControlIngress` after local secret/session verification.
 
 == 4. Event normalization
 
 Provider payloads must never be deserialized directly into privileged domain events.
 
-The adapter constructs the domain envelope and assigns:
+Content adapters construct the domain envelope and assign:
 
 * `plane`;
 * `trust_level`;
-* normalized `kind`;
-* optional `authorization`.
+* normalized `kind`.
+
+They do not mint runtime authority. The `authorization` field is a serializable claim for control audit/replay only; authenticated control commands are created through the separate local ingress API.
 
 A string inside chat such as:
 
@@ -98,9 +99,9 @@ Initial capabilities:
 * `memory.admin`
 * `tool.grant`
 
-The requested operation must be allowlisted and covered by the event's capability set.
+The requested operation must be allowlisted and covered by the authenticated local authority. `AuthorizationContext` alone cannot authorize an OBS/avatar/tool adapter; Rust privileged adapter helpers require `AuthenticatedControl`.
 
-Jev and LLM outputs cannot add capabilities.
+Jev, LLM output, replay JSON, and ordinary Event Envelopes cannot construct that token or add capabilities.
 
 == 6. Emergency path
 
@@ -112,11 +113,11 @@ The preferred path is:
 ----
 operator input
     |
-trusted local adapter
+LocalControlIngress authentication
     |
-operator.command + capability
+AuthenticatedControlCommand
     |
-deterministic authorization
+separate runtime control path
     |
 scheduler/audio stop
 ----
@@ -164,7 +165,7 @@ Each external source has independent:
 
 Overflow degrades by dropping/coalescing low-priority content rather than blocking operator commands.
 
-Control-plane events use a separate bounded queue.
+Public content enters the Rust runtime through byte-aware per-source token buckets and a bounded content queue. Payload caps are measured as serialized UTF-8 bytes. Authenticated emergency control bypasses that content queue entirely, so content flood/backpressure cannot starve mute/stop.
 
 == 10. Secrets
 
@@ -177,7 +178,7 @@ Secrets must not appear in:
 * telemetry;
 * error logs.
 
-Adapter configuration references secret identifiers; it does not copy secret values into domain state.
+Adapter configuration references secret identifiers; it does not copy secret values into domain state. Rust control secrets use redacted `Debug`, and telemetry/public-output paths apply a configured `SecretRedactor` before emitting text.
 
 == 11. Output gate
 

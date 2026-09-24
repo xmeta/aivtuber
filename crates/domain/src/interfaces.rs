@@ -1,4 +1,4 @@
-use crate::{AuthorizationContext, Capability, EventEnvelope, ReflexDecision};
+use crate::{AuthenticatedControl, Capability, EventEnvelope, ReflexDecision};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, error::Error, fmt, future::Future, pin::Pin};
 
@@ -76,7 +76,15 @@ pub struct StreamAction {
     pub arguments: BTreeMap<String, serde_json::Value>,
 }
 
-/// Privileged action that has passed deterministic capability authorization.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolAction {
+    pub tool: String,
+    pub operation: String,
+    pub arguments: BTreeMap<String, serde_json::Value>,
+}
+
+/// Privileged action that has passed authenticated ingress and deterministic
+/// capability authorization.
 ///
 /// Fields are intentionally private. Callers must use the authorization
 /// helpers in this module rather than deserializing or constructing this type.
@@ -103,42 +111,44 @@ impl<T> Authorized<T> {
 
 pub type AuthorizedAvatarAction = Authorized<AvatarAction>;
 pub type AuthorizedStreamAction = Authorized<StreamAction>;
+pub type AuthorizedToolAction = Authorized<ToolAction>;
 
 pub fn authorize_avatar_action(
-    authorization: &AuthorizationContext,
+    authority: &AuthenticatedControl,
     action: AvatarAction,
 ) -> Result<AuthorizedAvatarAction, EngineError> {
-    authorize(authorization, Capability::AvatarControl, action)
+    authorize(authority, Capability::AvatarControl, action)
 }
 
 pub fn authorize_stream_action(
-    authorization: &AuthorizationContext,
+    authority: &AuthenticatedControl,
     action: StreamAction,
 ) -> Result<AuthorizedStreamAction, EngineError> {
-    authorize(authorization, Capability::ObsControl, action)
+    authorize(authority, Capability::ObsControl, action)
+}
+
+pub fn authorize_tool_action(
+    authority: &AuthenticatedControl,
+    action: ToolAction,
+) -> Result<AuthorizedToolAction, EngineError> {
+    authorize(authority, Capability::ToolGrant, action)
 }
 
 fn authorize<T>(
-    authorization: &AuthorizationContext,
+    authority: &AuthenticatedControl,
     required: Capability,
     action: T,
 ) -> Result<Authorized<T>, EngineError> {
-    if authorization.principal.trim().is_empty() {
+    if !authority.has_capability(required) {
         return Err(EngineError::new(
             EngineErrorKind::Unauthorized,
-            "authorization principal is empty",
-        ));
-    }
-    if !authorization.capabilities.contains(&required) {
-        return Err(EngineError::new(
-            EngineErrorKind::Unauthorized,
-            format!("missing required capability: {required:?}"),
+            format!("missing authenticated capability: {required:?}"),
         ));
     }
 
     Ok(Authorized {
         action,
-        principal: authorization.principal.clone(),
+        principal: authority.principal().to_owned(),
         capability: required,
     })
 }
@@ -163,29 +173,60 @@ pub trait StreamAdapter: Send + Sync {
     fn execute<'a>(&'a self, action: &'a AuthorizedStreamAction) -> EngineFuture<'a, ()>;
 }
 
+pub trait ToolAdapter: Send + Sync {
+    fn execute<'a>(&'a self, action: &'a AuthorizedToolAction) -> EngineFuture<'a, ()>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::AuthorizationMethod;
+    use crate::{AuthorizationMethod, ControlSecret, LocalControlIngress, OperatorCommandInput};
     use std::collections::BTreeSet;
 
-    fn authorization(capability: Capability) -> AuthorizationContext {
-        AuthorizationContext {
-            principal: "operator:local".to_owned(),
-            method: AuthorizationMethod::OperatorHotkey,
-            capabilities: BTreeSet::from([capability]),
-        }
+    fn authenticated(capability: Capability) -> AuthenticatedControl {
+        let action = match capability {
+            Capability::PerformerMute => "performer.mute",
+            Capability::PerformerStop => "performer.stop",
+            Capability::ObsControl => "obs.control",
+            Capability::AvatarControl => "avatar.control",
+            Capability::MemoryAdmin => "memory.admin",
+            Capability::ToolGrant => "tool.grant",
+        };
+        let secret = [7_u8; 32];
+        let ingress = LocalControlIngress::new(
+            "local-hotkey",
+            "operator:local",
+            AuthorizationMethod::OperatorHotkey,
+            BTreeSet::from([capability]),
+            ControlSecret::new(secret),
+        )
+        .expect("trusted ingress");
+        ingress
+            .authenticate(
+                OperatorCommandInput {
+                    event_id: "evt-control".to_owned(),
+                    correlation_id: "corr-control".to_owned(),
+                    sequence: 1,
+                    observed_at: "2026-09-24T00:00:00Z".to_owned(),
+                    action: action.to_owned(),
+                    payload: BTreeMap::new(),
+                },
+                &secret,
+            )
+            .expect("authenticated")
+            .authority()
+            .clone()
     }
 
     #[test]
-    fn stream_action_requires_obs_capability() {
+    fn stream_action_requires_authenticated_obs_capability() {
         let action = StreamAction {
             action: "scene.set".to_owned(),
             arguments: BTreeMap::new(),
         };
-        let auth = authorization(Capability::PerformerStop);
+        let authority = authenticated(Capability::PerformerStop);
 
-        let error = authorize_stream_action(&auth, action).expect_err("must reject");
+        let error = authorize_stream_action(&authority, action).expect_err("must reject");
         assert_eq!(error.kind, EngineErrorKind::Unauthorized);
     }
 
@@ -195,10 +236,21 @@ mod tests {
             action: "scene.set".to_owned(),
             arguments: BTreeMap::new(),
         };
-        let auth = authorization(Capability::ObsControl);
+        let authority = authenticated(Capability::ObsControl);
 
-        let authorized = authorize_stream_action(&auth, action).expect("authorized");
+        let authorized = authorize_stream_action(&authority, action).expect("authorized");
         assert_eq!(authorized.principal(), "operator:local");
         assert_eq!(authorized.capability(), Capability::ObsControl);
+    }
+
+    #[test]
+    fn tool_action_requires_authenticated_tool_grant() {
+        let action = ToolAction {
+            tool: "example".to_owned(),
+            operation: "run".to_owned(),
+            arguments: BTreeMap::new(),
+        };
+        let authority = authenticated(Capability::AvatarControl);
+        assert!(authorize_tool_action(&authority, action).is_err());
     }
 }

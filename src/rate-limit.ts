@@ -47,8 +47,8 @@ export class SourceRateLimiter {
       return "admitted";
     }
 
-    const size = JSON.stringify(payload ?? null)?.length ?? 0;
-    if (size > this.options.maxPayloadBytes) return "dropped_size";
+    const encoded = new TextEncoder().encode(JSON.stringify(payload ?? null));
+    if (encoded.byteLength > this.options.maxPayloadBytes) return "dropped_size";
 
     const t = this.now();
     let bucket = this.buckets.get(source);

@@ -2,21 +2,27 @@
 
 //! Provider-neutral domain types and interfaces for the AI VTuber runtime.
 
+mod control;
 mod error;
 mod event;
 mod interfaces;
 mod reflex;
 
+pub use control::{
+    AuthenticatedControl, AuthenticatedControlCommand, CONTROL_SECRET_LEN, ControlIngressError,
+    ControlSecret, LocalControlIngress, OperatorCommandInput,
+};
 pub use error::DomainValidationError;
 pub use event::{
     AuthorizationContext, AuthorizationMethod, Capability, EVENT_SCHEMA_VERSION, EventEnvelope,
     EventKind, SecurityPlane, SourceClass, TrustLevel,
 };
 pub use interfaces::{
-    Authorized, AuthorizedAvatarAction, AuthorizedStreamAction, AvatarAction, AvatarAdapter,
-    DecisionEngine, EngineError, EngineErrorKind, EngineFuture, GeneratedReply, ReflexRequest,
-    SpeechArtifact, SpeechRequest, StreamAction, StreamAdapter, ThinkingEngine, TtsEngine,
-    authorize_avatar_action, authorize_stream_action,
+    Authorized, AuthorizedAvatarAction, AuthorizedStreamAction, AuthorizedToolAction, AvatarAction,
+    AvatarAdapter, DecisionEngine, EngineError, EngineErrorKind, EngineFuture, GeneratedReply,
+    ReflexRequest, SpeechArtifact, SpeechRequest, StreamAction, StreamAdapter, ThinkingEngine,
+    ToolAction, ToolAdapter, TtsEngine, authorize_avatar_action, authorize_stream_action,
+    authorize_tool_action,
 };
 pub use reflex::{
     AttentionTarget, BackendIdentity, FallbackReason, REFLEX_SCHEMA_VERSION, ReflexDecision,
