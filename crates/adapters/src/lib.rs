@@ -6,10 +6,12 @@
 //! provider-neutral domain. Connections fail closed, actions are never queued
 //! for replay after a disconnect, and secrets use redacted debug output.
 
+mod audio;
 mod obs;
 mod transport;
 mod vts;
 
+pub use audio::*;
 pub use obs::*;
 pub use transport::*;
 pub use vts::*;

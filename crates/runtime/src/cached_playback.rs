@@ -214,6 +214,12 @@ pub struct CachedPlaybackConfig {
     pub recent_variant_window: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CachedPlaybackTiming {
+    pub at_ms: u64,
+    pub seed: u64,
+}
+
 impl Default for CachedPlaybackConfig {
     fn default() -> Self {
         Self {
@@ -389,7 +395,74 @@ impl CachedPerformer {
         let asset =
             self.assets
                 .select_variant(intent, seed.wrapping_add(event.sequence), &recent_refs)?;
-        let viseme_track = resolve_asset_visemes(&asset, visemes)?;
+        let outcome = self.schedule_asset(
+            event,
+            CachedPlaybackTiming { at_ms, seed },
+            &asset,
+            visemes,
+            audio,
+            avatar,
+        )?;
+        self.record_recent(intent, &asset.id);
+        Ok(outcome)
+    }
+    /// Play an explicitly selected, compatibility-checked asset through the
+    /// same scheduler path used by deterministic intent routing. Semantic index
+    /// construction remains an upstream responsibility.
+    pub fn handle_asset_id<R, A, V>(
+        &mut self,
+        event: &EventEnvelope,
+        asset_id: &str,
+        timing: CachedPlaybackTiming,
+        visemes: &R,
+        audio: &mut A,
+        avatar: &mut V,
+    ) -> Result<CachedPlaybackOutcome, CachedPlaybackError>
+    where
+        R: VisemeResolver,
+        A: AudioPlaybackSink,
+        V: AvatarPlaybackSink,
+    {
+        event
+            .validate()
+            .map_err(|error| CachedPlaybackError::InvalidEvent(error.to_string()))?;
+        if event.kind == EventKind::OperatorCommand {
+            return Err(CachedPlaybackError::InvalidEvent(
+                "operator commands use the authenticated control path".to_owned(),
+            ));
+        }
+        if asset_id.trim().is_empty() {
+            return Err(CachedPlaybackError::InvalidEvent(
+                "selected asset id must not be empty".to_owned(),
+            ));
+        }
+
+        let asset = self.assets.resolve(asset_id)?;
+        let recent_group = asset
+            .variant_group
+            .as_deref()
+            .unwrap_or(asset.intent.as_str())
+            .to_owned();
+        let outcome = self.schedule_asset(event, timing, &asset, visemes, audio, avatar)?;
+        self.record_recent(&recent_group, &asset.id);
+        Ok(outcome)
+    }
+
+    fn schedule_asset<R, A, V>(
+        &mut self,
+        event: &EventEnvelope,
+        timing: CachedPlaybackTiming,
+        asset: &PerformanceAsset,
+        visemes: &R,
+        audio: &mut A,
+        avatar: &mut V,
+    ) -> Result<CachedPlaybackOutcome, CachedPlaybackError>
+    where
+        R: VisemeResolver,
+        A: AudioPlaybackSink,
+        V: AvatarPlaybackSink,
+    {
+        let viseme_track = resolve_asset_visemes(asset, visemes)?;
         let variation_spec = asset.variation.unwrap_or_default();
         let variation = apply_variation(
             SchedulerVariationSpec {
@@ -397,15 +470,15 @@ impl CachedPerformer {
                 amplitude_pct: variation_spec.amplitude_pct.unwrap_or(0.0),
                 start_delay_ms: variation_spec.start_delay_ms.unwrap_or(0),
             },
-            &mut SeededRng::new(seed.wrapping_add(event.sequence)),
+            &mut SeededRng::new(timing.seed.wrapping_add(event.sequence)),
         );
 
-        let channels = playback_channels(&asset, viseme_track.as_ref());
+        let channels = playback_channels(asset, viseme_track.as_ref());
         if channels.is_empty() {
             return Err(CachedPlaybackError::NoPlayableTracks(asset.id.clone()));
         }
 
-        let base_duration_ms = asset_base_duration_ms(&asset, viseme_track.as_ref()).max(1);
+        let base_duration_ms = asset_base_duration_ms(asset, viseme_track.as_ref()).max(1);
         let duration_ms = scale_offset(base_duration_ms, variation.speed_factor).max(1);
         let interrupt_points_ms = asset
             .interrupt_points_ms
@@ -419,7 +492,7 @@ impl CachedPerformer {
             priority: priority_for_event(event.kind),
             interruptible: !interrupt_points_ms.is_empty(),
             interrupt_points_ms,
-            start_at_ms: at_ms.saturating_add(variation.start_delay_ms),
+            start_at_ms: timing.at_ms.saturating_add(variation.start_delay_ms),
             duration_ms,
             generation: 0,
             exclusive: false,
@@ -428,20 +501,17 @@ impl CachedPerformer {
 
         let plan = self
             .scheduler
-            .schedule_at(at_ms, plan)
+            .schedule_at(timing.at_ms, plan)
             .map_err(CachedPlaybackError::Scheduler)?;
-
         let metrics = dispatch_asset(
-            &asset,
+            asset,
             viseme_track.as_ref(),
             &plan,
             variation,
-            at_ms,
+            timing.at_ms,
             audio,
             avatar,
         );
-
-        self.record_recent(intent, &asset.id);
         Ok(CachedPlaybackOutcome {
             asset_id: asset.id.clone(),
             plan,
@@ -449,6 +519,7 @@ impl CachedPerformer {
             metrics,
         })
     }
+
     fn record_recent(&mut self, group: &str, asset_id: &str) {
         if self.config.recent_variant_window == 0 {
             return;

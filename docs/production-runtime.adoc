@@ -1,0 +1,144 @@
+= Production Rust composition runtime
+
+Issue #34 adds the first executable Rust composition root under +crates/app+.
+
+The production path composes existing subsystems instead of duplicating them:
+
+[source,text]
+----
+serialized EventEnvelope
+        |
+        v
+SecurityRuntime content ingress
+        |
+        v
+RoutePlanner
+   | deterministic intent
+   | or ReflexPipeline selected asset id
+        |
+        v
+CachedPerformer
+        |
+        +--> compatibility-checked AssetStore
+        +--> deterministic Scheduler
+        |
+        v
+scheduled audio/avatar commands
+        |
+        +--> ProcessAudioPlayer
+        +--> VtsAvatarOutput
+----
+
+OBS remains an independent control adapter. Its availability never owns scheduler state.
+
+== Runtime invariants
+
+* Content bytes always pass through +SecurityRuntime::admit_content_bytes+.
+* Operator/control events cannot enter the content ingress path.
+* Cached playback uses the existing +CachedPerformer+ scheduler, not a second application scheduler.
+* A reflex-selected asset id is resolved by +AssetStore::resolve+ before playback.
+* Adapter commands are dispatched only while their scheduler generation is still live.
+* Commands older than +AIVTUBER_MAX_DISPATCH_LATENESS_MS+ are dropped.
+* Failed audio/avatar commands are not requeued. Reconnecting an adapter therefore cannot replay an already-due stale command.
+* Authenticated emergency stop operates on the same scheduler used by cached playback and purges pending commands.
+* VTube Studio and OBS connection failure is degraded state, not scheduler failure.
+* Generative LLM/TTS behavior is intentionally outside this issue.
+
+== Executable
+
+Run the daemon from the repository root:
+
+[source,shell]
+----
+cargo run -p aivtuber-app
+----
+
+The process reads one Event Envelope JSON document per stdin line. It advances the scheduler from a monotonic process clock and services due output commands on a short polling interval.
+
+The starter pack contains descriptors and viseme metadata only. Audio binaries remain external to Git. Materialize the referenced files below the configured audio root before testing real playback.
+
+== Audio output
+
++ProcessAudioPlayer+ uses an external player process without invoking a shell. The default command is +ffplay+, and references are restricted to +audio://+ paths below +AIVTUBER_AUDIO_ROOT+.
+
+Important variables:
+
+[source,text]
+----
+AIVTUBER_PACK_ROOT=examples/starter-reaction-pack
+AIVTUBER_AUDIO_ROOT=/path/to/materialized/audio
+AIVTUBER_AUDIO_PROGRAM=ffplay
+AIVTUBER_MAX_DISPATCH_LATENESS_MS=250
+----
+
+For the starter descriptors, for example +audio://starter/reaction-agree-01.opus+ resolves to:
+
+[source,text]
+----
+$AIVTUBER_AUDIO_ROOT/starter/reaction-agree-01.opus
+----
+
+Traversal outside the configured root and symlink resolution outside the canonical root are rejected.
+
+== VTube Studio output
+
+Enable VTube Studio only when its local websocket API is available:
+
+[source,shell]
+----
+export AIVTUBER_VTS_ENABLED=true
+export AIVTUBER_VTS_ENDPOINT=ws://127.0.0.1:8001
+export AIVTUBER_CONTROL_SECRET='0123456789abcdef0123456789abcdef'
+# Optional when reusing an existing VTube Studio token:
+export AIVTUBER_VTS_TOKEN='<token>'
+----
+
+The control secret must be exactly 32 UTF-8 bytes. It is used only to mint the existing non-serializable local +AuthenticatedControl+ authority required by the avatar adapter boundary.
+
+Cached expression and gesture presets map to VTube Studio hotkeys using the preset name. Gaze commands default to hotkeys named +gaze.<target>+. Visemes map to injected parameters +VisemeA+, +VisemeI+, +VisemeU+, +VisemeE+, +VisemeO+, and +VisemeN+.
+
+The corresponding VTube Studio hotkeys/parameters must exist in the local model/profile.
+
+== OBS output
+
+OBS is optional:
+
+[source,shell]
+----
+export AIVTUBER_OBS_ENABLED=true
+export AIVTUBER_OBS_ENDPOINT=ws://127.0.0.1:4455
+export AIVTUBER_OBS_PASSWORD='<obs-websocket-password>'
+----
+
+Startup or reconnect failure is recorded as degraded adapter health. It does not stop cached scheduling.
+
+== Local cached-path live smoke
+
+Prepare at least one real starter audio file under the configured audio root and configure the corresponding VTube Studio hotkeys/viseme parameters.
+
+Then run:
+
+[source,shell]
+----
+AIVTUBER_AUDIO_ROOT=/path/to/materialized/audio \
+AIVTUBER_VTS_ENABLED=true \
+AIVTUBER_CONTROL_SECRET='0123456789abcdef0123456789abcdef' \
+cargo run -p aivtuber-app
+----
+
+Paste a valid content Event Envelope as one line, for example:
+
+[source,json]
+----
+{"schema_version":"0.2.0","event_id":"evt-live-1","correlation_id":"corr-live-1","sequence":1,"observed_at":"2026-09-24T00:00:00Z","source":"local-smoke","source_class":"public_chat","plane":"content","trust_level":"untrusted","kind":"chat.message","actor_id":"viewer:smoke","priority_hint":null,"authorization":null,"payload":{"text":"hello","intent":"reaction.agree"}}
+----
+
+Expected behavior:
+
+. ingress reports +Queued+;
+. a compatible +reaction.agree+ asset is selected without LLM/TTS;
+. audio is launched by the configured player at its scheduled time;
+. expression/gesture/viseme/gaze commands are sent to VTube Studio;
+. VTube Studio or OBS failure does not freeze scheduler progress.
+
+To include OBS in the same smoke, also set the OBS variables above. OBS is not required for cached avatar/audio playback.
