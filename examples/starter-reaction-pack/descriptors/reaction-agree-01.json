@@ -1,0 +1,71 @@
+{
+  "schema_version": "0.1.0",
+  "id": "reaction.agree.01",
+  "intent": "reaction.agree",
+  "class": "reaction",
+  "variant_group": "reaction.agree",
+  "speech": {
+    "text": "うん、そうだね。",
+    "audio_ref": "audio://starter/reaction-agree-01.opus",
+    "duration_ms": 760,
+    "viseme_ref": "viseme/reaction-agree-01.json"
+  },
+  "expression": {
+    "preset": "smile_soft",
+    "intensity": 0.55
+  },
+  "gesture": {
+    "preset": "nod_small",
+    "amplitude": 0.8
+  },
+  "gaze": "camera",
+  "timeline": [
+    {
+      "at_ms": 0,
+      "event": "expression.start",
+      "payload": {
+        "preset": "smile_soft"
+      }
+    },
+    {
+      "at_ms": 70,
+      "event": "speech.start"
+    },
+    {
+      "at_ms": 120,
+      "event": "gesture.start",
+      "payload": {
+        "preset": "nod_small"
+      }
+    },
+    {
+      "at_ms": 380,
+      "event": "phrase.boundary"
+    },
+    {
+      "at_ms": 830,
+      "event": "speech.end"
+    }
+  ],
+  "interrupt_points_ms": [
+    380,
+    760
+  ],
+  "variation": {
+    "speed_pct": 6,
+    "amplitude_pct": 6,
+    "start_delay_ms": 60
+  },
+  "compatibility": {
+    "compiler_version": "0.1.0",
+    "voice_model": "example-voice-v1",
+    "avatar_profile": "example-live2d-v1",
+    "viseme_mapping": "ja-5vowel-v1",
+    "motion_library": "starter-v1"
+  },
+  "provenance": {
+    "generated": false,
+    "generator": null,
+    "created_at": "2026-09-24T00:00:00Z"
+  }
+}

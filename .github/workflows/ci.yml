@@ -56,7 +56,10 @@ jobs:
         run: python -m pip install --disable-pip-version-check check-jsonschema==0.38.0
 
       - name: Validate Performance Assets
-        run: check-jsonschema --schemafile schemas/performance-asset.schema.json examples/performance-assets/valid/*.json
+        run: |
+          check-jsonschema --schemafile schemas/performance-asset.schema.json \
+            examples/performance-assets/valid/*.json \
+            examples/starter-reaction-pack/descriptors/*.json
 
       - name: Reject invalid Performance Assets
         shell: bash
