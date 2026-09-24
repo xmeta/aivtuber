@@ -3,7 +3,8 @@ use crate::{
 };
 use aivtuber_domain::{
     AttentionTarget, BackendIdentity, EngineError, EngineErrorKind, FallbackReason,
-    REFLEX_SCHEMA_VERSION, ReflexDecision, ReflexRequest, ResponseRoute, RouteDecision,
+    MAX_RETRIEVAL_CANDIDATES, REFLEX_SCHEMA_VERSION, ReflexDecision, ReflexRequest, ResponseRoute,
+    RetrievalCandidateContext, RetrievalSnapshot, RouteDecision,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -53,6 +54,8 @@ pub struct ExecutedDecision {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DecisionReplayRecord {
     pub event_id: String,
+    pub request_schema_version: String,
+    pub context_schema_version: String,
     pub evidence: DecisionEvidence,
     pub policy: PolicyDecision,
     pub executed: ExecutedDecision,
@@ -110,10 +113,10 @@ impl ReflexPipeline {
         policy: PolicyConfig,
         top_k: usize,
     ) -> Result<Self, EngineError> {
-        if top_k == 0 {
+        if top_k == 0 || top_k > MAX_RETRIEVAL_CANDIDATES {
             return Err(EngineError::new(
                 EngineErrorKind::InvalidRequest,
-                "reflex Top-K must be positive",
+                format!("reflex Top-K must be in 1..={MAX_RETRIEVAL_CANDIDATES}"),
             ));
         }
         if !(0.0..=1.0).contains(&policy.reuse_threshold)
@@ -137,11 +140,17 @@ impl ReflexPipeline {
         mut input: ReflexPipelineInput,
     ) -> Result<DecisionReplayRecord, RetrievalError> {
         let retrieval = self.index.search(&input.query_embedding, self.top_k)?;
-        input.request.candidate_asset_ids = retrieval
-            .candidates
-            .iter()
-            .map(|candidate| candidate.asset_id.clone())
-            .collect();
+        input.request.retrieval = RetrievalSnapshot {
+            candidates: retrieval
+                .candidates
+                .iter()
+                .map(|candidate| RetrievalCandidateContext {
+                    asset_id: candidate.asset_id.clone(),
+                    rank: candidate.rank,
+                    similarity: candidate.similarity,
+                })
+                .collect(),
+        };
 
         let evidence = match self.adapter.evaluate_evidence(&input.request) {
             Ok(model) => DecisionEvidence {
@@ -179,6 +188,8 @@ impl ReflexPipeline {
         let executed = execute_policy(&policy);
         Ok(DecisionReplayRecord {
             event_id: input.request.event.event_id,
+            request_schema_version: input.request.schema_version,
+            context_schema_version: input.request.context.schema_version,
             evidence,
             policy,
             executed,
@@ -368,8 +379,8 @@ mod tests {
     }
 
     fn request() -> ReflexRequest {
-        ReflexRequest {
-            event: EventEnvelope {
+        ReflexRequest::new(
+            EventEnvelope {
                 schema_version: EVENT_SCHEMA_VERSION.to_owned(),
                 event_id: "evt-pipeline".to_owned(),
                 correlation_id: "corr-pipeline".to_owned(),
@@ -388,9 +399,8 @@ mod tests {
                     Value::String("that was surprising".to_owned()),
                 )]),
             },
-            state: BTreeMap::new(),
-            candidate_asset_ids: Vec::new(),
-        }
+            aivtuber_domain::ReflexContext::default(),
+        )
     }
 
     fn choice(value: &str) -> Value {
@@ -455,6 +465,14 @@ mod tests {
             })
             .expect("record");
 
+        assert_eq!(
+            record.request_schema_version,
+            aivtuber_domain::REFLEX_REQUEST_SCHEMA_VERSION
+        );
+        assert_eq!(
+            record.context_schema_version,
+            aivtuber_domain::REFLEX_CONTEXT_SCHEMA_VERSION
+        );
         assert_eq!(record.evidence.retrieval.candidates[0].asset_id, "asset.a");
         assert_eq!(
             record.evidence.selected_candidate_id.as_deref(),

@@ -456,11 +456,17 @@ impl JevAdapter {
         self.config.initial_backoff.saturating_mul(multiplier)
     }
     fn build_request_body(&self, request: &ReflexRequest) -> Result<Vec<u8>, EngineError> {
+        request.validate().map_err(|error| {
+            EngineError::new(
+                EngineErrorKind::InvalidRequest,
+                format!("invalid reflex request: {error}"),
+            )
+        })?;
         let candidates = request
-            .candidate_asset_ids
-            .iter()
+            .retrieval
+            .candidate_asset_ids()
             .take(self.config.max_candidates)
-            .cloned()
+            .map(str::to_owned)
             .collect::<Vec<_>>();
 
         let state = compact_state(request, &candidates);
@@ -514,9 +520,15 @@ impl JevAdapter {
             ));
         }
 
+        let candidates = request
+            .retrieval
+            .candidate_asset_ids()
+            .take(self.config.max_candidates)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
         let normalized = normalize_answers(
             &response.answers,
-            &request.candidate_asset_ids,
+            &candidates,
             &self.config.model_alias,
             &response.model,
             started.elapsed().as_secs_f64() * 1000.0,
@@ -573,14 +585,15 @@ struct SystemOneResponse {
 }
 
 fn compact_state(request: &ReflexRequest, candidates: &[String]) -> Value {
-    let mut runtime = BTreeMap::new();
-    for key in ["performer", "stream", "recent", "now_ms"] {
-        if let Some(value) = request.state.get(key) {
-            runtime.insert(key.to_owned(), value.clone());
-        }
-    }
+    let retrieval = request
+        .retrieval
+        .candidates
+        .iter()
+        .take(candidates.len())
+        .collect::<Vec<_>>();
 
     json!({
+        "request_schema_version": request.schema_version,
         "event": {
             "kind": request.event.kind,
             "source_class": request.event.source_class,
@@ -588,9 +601,15 @@ fn compact_state(request: &ReflexRequest, candidates: &[String]) -> Value {
             "actor_id": request.event.actor_id,
             "payload": request.event.payload,
         },
-        "runtime": runtime,
+        "runtime": {
+            "schema_version": request.context.schema_version,
+            "performer": request.context.performer,
+            "stream": request.context.stream,
+            "recent": request.context.recent,
+            "now_ms": request.context.now_ms,
+        },
         "retrieval": {
-            "candidate_ids": candidates,
+            "candidates": retrieval,
         }
     })
 }
@@ -1013,7 +1032,9 @@ impl<T> Drop for WorkerFuture<T> {
 mod tests {
     use super::*;
     use aivtuber_domain::{
-        EVENT_SCHEMA_VERSION, EventEnvelope, EventKind, SecurityPlane, SourceClass, TrustLevel,
+        EVENT_SCHEMA_VERSION, EventEnvelope, EventKind, PerformerSnapshot,
+        RecentInteractionSnapshot, ReflexContext, RetrievalCandidateContext, RetrievalSnapshot,
+        SecurityPlane, SourceClass, TrustLevel,
     };
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::Mutex;
@@ -1092,21 +1113,34 @@ mod tests {
             payload: BTreeMap::from([("text".to_owned(), Value::String("hello".to_owned()))]),
         };
 
-        ReflexRequest {
-            event,
-            state: BTreeMap::from([
-                (
-                    "performer".to_owned(),
-                    json!({"currently_speaking": true, "current_interruptible": true}),
-                ),
-                ("recent".to_owned(), json!({"reaction_families": ["laugh"]})),
-                (
-                    "transcript".to_owned(),
-                    Value::String("RAW_HISTORY_MUST_NOT_BE_SENT".to_owned()),
-                ),
-            ]),
-            candidate_asset_ids: vec!["asset.a".to_owned(), "asset.b".to_owned()],
-        }
+        let context = ReflexContext {
+            performer: PerformerSnapshot {
+                currently_speaking: true,
+                current_interruptible: true,
+                ..PerformerSnapshot::default()
+            },
+            recent: RecentInteractionSnapshot {
+                reaction_families: vec!["laugh".to_owned()],
+                ..RecentInteractionSnapshot::default()
+            },
+            ..ReflexContext::default()
+        };
+        let mut request = ReflexRequest::new(event, context);
+        request.retrieval = RetrievalSnapshot {
+            candidates: vec![
+                RetrievalCandidateContext {
+                    asset_id: "asset.a".to_owned(),
+                    rank: 1,
+                    similarity: 0.98,
+                },
+                RetrievalCandidateContext {
+                    asset_id: "asset.b".to_owned(),
+                    rank: 2,
+                    similarity: 0.82,
+                },
+            ],
+        };
+        request
     }
 
     fn choice(choice: &str) -> Value {
@@ -1184,7 +1218,20 @@ mod tests {
 
         let body: Value = serde_json::from_slice(&recorded[0].body).expect("request JSON");
         assert_eq!(body["model"], "jev-latest");
-        assert!(body["state"].is_object());
+        assert_eq!(body["state"]["request_schema_version"], "0.1.0");
+        assert_eq!(body["state"]["runtime"]["schema_version"], "0.1.0");
+        assert_eq!(
+            body["state"]["runtime"]["performer"]["currently_speaking"],
+            true
+        );
+        assert_eq!(
+            body["state"]["retrieval"]["candidates"][0]["asset_id"],
+            "asset.a"
+        );
+        assert_eq!(body["state"]["retrieval"]["candidates"][0]["rank"], 1);
+        assert!(body["state"]["retrieval"]["candidates"][0]["similarity"].is_number());
+        assert!(body["state"].get("transcript").is_none());
+        assert!(body["state"]["runtime"].get("transcript").is_none());
         assert!(body["questions"].is_object());
         assert_eq!(body["questions"]["interrupt"]["type"], "noul");
         assert_eq!(body["questions"]["importance"]["type"], "score");
@@ -1193,7 +1240,7 @@ mod tests {
 
         let serialized = String::from_utf8(recorded[0].body.clone()).expect("utf8");
         assert!(!serialized.contains("secret-value"));
-        assert!(!serialized.contains("RAW_HISTORY_MUST_NOT_BE_SENT"));
+        assert!(!serialized.contains("\"transcript\""));
     }
     #[test]
     fn authentication_and_validation_fail_fast_without_retry() {

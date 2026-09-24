@@ -100,38 +100,42 @@ Only `operator.command` may carry an `authorization` object. A public content ad
 
 Security rationale and capability rules are defined in `security-threat-model.adoc`.
 
-== 4. Performer state snapshot
+== 4. Typed reflex and thinking context
 
-A reflex decision receives a compact snapshot, not an unbounded transcript.
+Routine reflex decisions receive a versioned `ReflexRequest`, not an arbitrary JSON state map and not an unbounded transcript.
 
-Recommended groups:
+`ReflexRequest` contains:
 
-[source,json]
-----
-{
-  "performer": {
-    "currently_speaking": true,
-    "current_asset_id": "phrase.example.01",
-    "current_interruptible": false,
-    "mood_valence": 0.45,
-    "arousal": 0.62
-  },
-  "stream": {
-    "mode": "competitive_game",
-    "topic": "ranked_match"
-  },
-  "recent": {
-    "last_reaction_families": ["laugh", "nod"],
-    "seconds_since_direct_reply": 4.2
-  },
-  "retrieval": {
-    "candidate_ids": ["reaction.tease.01", "reaction.tease.02"],
-    "best_similarity": 0.91
-  }
-}
-----
+* the normalized current `EventEnvelope`;
+* a versioned `ReflexContext`;
+* a bounded `RetrievalSnapshot`.
 
-Large raw histories SHOULD be reduced before entering the reflex layer.
+`ReflexContext` contains explicit provider-neutral snapshots:
+
+* `PerformerSnapshot`: speaking state, current asset/interruptibility, bounded mood/arousal values;
+* `StreamSnapshot`: bounded mode/topic labels;
+* `RecentInteractionSnapshot`: bounded recent reaction families, asset ids, and time since direct reply;
+* optional monotonic `now_ms`.
+
+`RetrievalSnapshot` contains at most eight ordered candidates. Each candidate records `asset_id`, one-based `rank`, and normalized similarity. Candidate ids and ranks must be unique and ranks must be contiguous from one.
+
+All snapshot strings and lists have fixed production bounds in `crates/domain/src/context.rs`. The Jev adapter serializes only these explicit fields plus the current normalized event and applies its own compact-state byte cap before transport.
+
+=== 4.1 ThinkingRequest
+
+`ThinkingEngine` accepts a dedicated versioned `ThinkingRequest`; it does not reuse `ReflexRequest`.
+
+A thinking request contains only:
+
+* one explicitly curated current-event `ThinkingContent`;
+* typed performer/stream/recent/retrieval snapshots;
+* a bounded list of explicitly curated context items.
+
+Every `ThinkingContent` item carries its source class, trust level, privacy class, optional event provenance, and bounded text. Untrusted viewer content therefore remains marked `untrusted` when it crosses the thinking boundary; constructing the request does not elevate trust.
+
+Raw transcript or stream-history fields are not part of either request type. If historical content is needed for generation, an upstream component must deliberately reduce/select it into bounded `curated_context` items with explicit provenance, trust, and privacy metadata.
+
+The initial internal request schema versions are `ReflexRequest 0.1.0`, `ReflexContext 0.1.0`, and `ThinkingRequest 0.1.0`. Reflex replay records carry both the request and context schema versions.
 
 == 5. Normalized reflex decision
 
@@ -207,8 +211,9 @@ The scheduler owns execution. The decision engine does not directly execute avat
 Every decision-affecting input must be recordable:
 
 * normalized event
-* compact state snapshot
-* retrieval candidates
+* compact typed state snapshot
+* exact ReflexRequest/ReflexContext schema versions
+* retrieval candidates with rank/similarity
 * decision output
 * deterministic threshold/config version
 * executed action

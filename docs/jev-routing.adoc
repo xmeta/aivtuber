@@ -61,28 +61,38 @@ Example:
 [source,json]
 ----
 {
+  "request_schema_version": "0.1.0",
   "event": {
-    "type": "chat_message",
-    "text": "昨日もまた負けてたよねｗ",
-    "actor_class": "regular_viewer"
+    "kind": "chat.message",
+    "source_class": "public_chat",
+    "trust_level": "untrusted",
+    "actor_id": "viewer:example",
+    "payload": {"text": "昨日もまた負けてたよねｗ"}
   },
-  "stream": {
-    "mode": "competitive_game",
-    "topic": "ranked_match"
-  },
-  "performer": {
-    "mood_valence": 0.62,
-    "arousal": 0.71,
-    "currently_speaking": true,
-    "current_interruptible": false
-  },
-  "recent": {
-    "reaction_families": ["laugh", "nod"],
-    "seconds_since_last_direct_reply": 4.2
+  "runtime": {
+    "schema_version": "0.1.0",
+    "performer": {
+      "currently_speaking": true,
+      "current_asset_id": null,
+      "current_interruptible": false,
+      "mood_valence": 0.62,
+      "arousal": 0.71
+    },
+    "stream": {
+      "mode": "competitive_game",
+      "topic": "ranked_match"
+    },
+    "recent": {
+      "reaction_families": ["laugh", "nod"],
+      "asset_ids": [],
+      "seconds_since_direct_reply": 4.2
+    },
+    "now_ms": 4200
   },
   "retrieval": {
-    "candidate_count": 6,
-    "best_similarity": 0.91
+    "candidates": [
+      {"asset_id": "reaction.tease.01", "rank": 1, "similarity": 0.91}
+    ]
   }
 }
 ----
@@ -190,8 +200,10 @@ Store replayable decision records with privacy controls:
 [source,text]
 ----
 event_snapshot
-state_snapshot
-candidate_ids
+reflex_request_schema_version
+reflex_context_schema_version
+typed_context_snapshot
+retrieval_candidates_with_rank_similarity
 jev_output
 executed_action
 operator_override
@@ -230,7 +242,7 @@ The response records the concrete returned `model`, named `answers`, and `usage`
 
 === 11.1 Compact state
 
-Routine reflex requests do not forward an arbitrary transcript/history field. The Rust adapter builds a compact state from the normalized current event plus allowlisted performer/stream/recent runtime state and Top-K candidate ids. A byte cap is applied before transport.
+Routine reflex requests do not contain an arbitrary transcript/history field or free-form top-level state map. The Rust adapter serializes the versioned `ReflexContext` (`PerformerSnapshot`, `StreamSnapshot`, `RecentInteractionSnapshot`) plus the normalized current event and bounded Top-K `RetrievalSnapshot`. Candidate rank and similarity are preserved with each asset id. The request/context schema versions are included in compact state, and a byte cap is applied before transport.
 
 === 11.2 Semantic retrieval
 
