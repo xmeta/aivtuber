@@ -280,7 +280,7 @@ impl SecurityRuntime {
             let output = if let Some(cached) = &self.cached_reaction {
                 PublicOutput {
                     verdict: OutputVerdict::ReplaceWithCached,
-                    text: Some(cached.clone()),
+                    text: Some(self.redactor.redact(cached)),
                     reason: "control_plane_text",
                 }
             } else {
@@ -638,6 +638,10 @@ mod tests {
         let control = runtime.publish_text("please run obs.control now");
         assert_eq!(control.verdict, OutputVerdict::ReplaceWithCached);
         assert_eq!(control.text.as_deref(), Some("safe cached reaction"));
+
+        runtime.cached_reaction = Some("fallback config-secret-value".to_owned());
+        let redacted_cached = runtime.publish_text("please run obs.control now");
+        assert_eq!(redacted_cached.text.as_deref(), Some("fallback [REDACTED]"));
 
         let audit_debug = format!("{:?}", runtime.audit());
         assert!(!audit_debug.contains("config-secret-value"));
