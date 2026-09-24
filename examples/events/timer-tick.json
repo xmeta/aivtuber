@@ -3,7 +3,7 @@
   "event_id": "evt-timer-000001",
   "correlation_id": "corr-timer-000001",
   "sequence": 7,
-  "observed_at": "2026-09-20 10:00:06Z",
+  "observed_at": "2026-09-20T10:00:06Z",
   "source": "runtime-timer",
   "source_class": "timer",
   "plane": "system",

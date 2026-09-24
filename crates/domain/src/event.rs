@@ -285,7 +285,7 @@ fn is_json_schema_date_time(value: &str) -> bool {
     if bytes.len() < 20
         || bytes.get(4) != Some(&b'-')
         || bytes.get(7) != Some(&b'-')
-        || !matches!(bytes.get(10), Some(b'T' | b't' | b' '))
+        || !matches!(bytes.get(10), Some(b'T' | b't'))
         || bytes.get(13) != Some(&b':')
         || bytes.get(16) != Some(&b':')
     {
@@ -316,8 +316,7 @@ fn is_json_schema_date_time(value: &str) -> bool {
         || day > days_in_month(year, month)
         || hour > 23
         || minute > 59
-        || second > 60
-        || (second == 60 && (hour != 23 || minute != 59))
+        || second > 59
     {
         return false;
     }
@@ -631,17 +630,17 @@ mod tests {
         for value in [
             "2026-09-24T10:00:00Z",
             "2026-09-24t10:00:00z",
-            "2026-09-24 10:00:00+09:30",
+            "2026-09-24T10:00:00+09:30",
             "2026-09-24T10:00:00.125Z",
-            "2016-12-31T23:59:60Z",
         ] {
             assert!(is_json_schema_date_time(value), "{value}");
         }
         for value in [
             "2026-02-29T00:00:00Z",
             "2026-09-24T10:00:00",
+            "2026-09-24 10:00:00+09:30",
             "2026-09-24T24:00:00Z",
-            "2026-09-24T23:58:60Z",
+            "2016-12-31T23:59:60Z",
             "2026-09-24T10:00:00+24:00",
         ] {
             assert!(!is_json_schema_date_time(value), "{value}");
