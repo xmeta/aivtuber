@@ -1,0 +1,120 @@
+= VTube Studio and OBS Adapter Integration
+:toc:
+
+== 1. Scope
+
+The Rust production adapters live in `crates/adapters`.
+
+They implement the provider-neutral `AvatarAdapter` and `StreamAdapter` contracts from `aivtuber-domain` while keeping websocket wire details outside the domain layer.
+
+The adapters are deliberately replaceable through injected `WebSocketConnector` / `WebSocketTransport` implementations. Unit tests use scripted transports; production uses Tungstenite.
+
+== 2. VTube Studio
+
+Official API documentation:
+
+* https://github.com/DenchiSoft/VTubeStudio[VTube Studio Public API]
+* https://github.com/DenchiSoft/VTubeStudio/blob/master/Events/README.md[VTube Studio Event API]
+
+Default endpoint: `ws://127.0.0.1:8001`.
+
+Supported production slice:
+
+* token request and plugin authentication;
+* configurable endpoint;
+* hotkey execution through `HotkeyTriggerRequest`;
+* parameter injection through `InjectParameterDataRequest`;
+* event subscription through `EventSubscriptionRequest`;
+* bounded reconnect/backoff;
+* no queued action replay after reconnect.
+
+The authentication token is held in `SecretString`, whose `Debug` output is redacted.
+
+== 3. OBS websocket 5.x
+
+Official protocol documentation:
+
+* https://github.com/obsproject/obs-websocket/blob/master/docs/generated/protocol.md[obs-websocket 5.x protocol]
+
+Default endpoint: `ws://127.0.0.1:4455`.
+
+The adapter implements the required 5.x handshake:
+
+. receive `Hello` (op 0);
+. derive the SHA-256/base64 authentication response when a challenge is present;
+. send `Identify` (op 1), including configured event subscriptions;
+. wait for `Identified` (op 2);
+. issue requests using op 6 and validate op 7 responses.
+
+Supported performer control actions:
+
+[cols="1,1"]
+|===
+|Domain action |OBS 5.x request
+
+|`scene.set`
+|`SetCurrentProgramScene`
+
+|`source.visibility.set`
+|`SetSceneItemEnabled`
+
+|`audio.mute.set`
+|`SetInputMute`
+
+|`audio.volume.set`
+|`SetInputVolume`
+|===
+
+OBS passwords are held in `SecretString` and are redacted from `Debug` output.
+
+== 4. Disconnect and reconnect behavior
+
+Adapters do not own scheduler state.
+
+A failed connection/request returns a typed `EngineErrorKind::Unavailable` to the adapter caller. It does not mutate or stop the deterministic scheduler.
+
+Reconnect uses bounded exponential backoff. The adapter does not keep a pending action queue across disconnects, so reconnect cannot replay a stale avatar or OBS action. Only a newly submitted action after reconnection is sent.
+
+VTube Studio event subscriptions are remembered as configuration and re-established after reconnect. OBS subscriptions are part of Identify/Reidentify state and are likewise restored without replaying control actions.
+
+== 5. Local smoke tests
+
+Live tests are ignored by default and never run in CI.
+
+=== VTube Studio
+
+Enable *Allow Plugin API access* in VTube Studio, then run:
+
+[source,shell]
+----
+AIVTUBER_VTS_ENDPOINT=ws://127.0.0.1:8001 AIVTUBER_VTS_TOKEN='<existing-token-if-you-have-one>' cargo test -p aivtuber-adapters --test live_smoke vtube_studio_live_smoke -- --ignored --nocapture
+----
+
+If `AIVTUBER_VTS_TOKEN` is omitted, VTube Studio may show the normal plugin approval prompt and the acquired token is session-local.
+
+To additionally test a disposable hotkey:
+
+[source,shell]
+----
+AIVTUBER_VTS_HOTKEY='Wave' cargo test -p aivtuber-adapters --test live_smoke vtube_studio_live_smoke -- --ignored --nocapture
+----
+
+Use a harmless hotkey on a test model.
+
+=== OBS
+
+Enable obs-websocket 5.x in OBS and run:
+
+[source,shell]
+----
+AIVTUBER_OBS_ENDPOINT=ws://127.0.0.1:4455 AIVTUBER_OBS_PASSWORD='<obs-websocket-password>' cargo test -p aivtuber-adapters --test live_smoke obs_live_smoke -- --ignored --nocapture
+----
+
+To additionally switch to a disposable test scene:
+
+[source,shell]
+----
+AIVTUBER_OBS_SCENE='Adapter Smoke Test' cargo test -p aivtuber-adapters --test live_smoke obs_live_smoke -- --ignored --nocapture
+----
+
+Do not place real tokens/passwords in repository files, shell history shared with others, test output, or issue/PR text.
