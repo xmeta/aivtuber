@@ -6,8 +6,9 @@ use aivtuber_adapters::{
 };
 use aivtuber_app::{
     AdaptationRuntime, AdapterHealth, AvatarOutput, GenerativeRuntime, IntentRoutePlanner,
-    NoopAvatarOutput, NoopStreamOutput, ObsStreamOutput, ProductionApp, StreamOutput,
-    VtsAvatarOutput, VtsPlaybackConfig,
+    NoopAvatarOutput, NoopStreamOutput, ObsStreamOutput, ProductionApp, RawIngressConfig,
+    RawIngressMetrics, RawIngressMetricsSnapshot, StreamOutput, VtsAvatarOutput, VtsPlaybackConfig,
+    pump_bounded_records,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
@@ -22,7 +23,7 @@ use aivtuber_telemetry::SecretRedactor;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::error::Error;
-use std::io::{self, BufRead};
+use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -56,13 +57,15 @@ fn run() -> Result<(), Box<dyn Error>> {
     let generative = build_generative_runtime(&compatibility)?;
     let adaptation = build_adaptation_runtime()?;
     let scheduler_config = SchedulerConfig::default();
+    let security_config = SecurityRuntimeConfig::default();
+    let raw_ingress_config = RawIngressConfig::from_security(security_config)?;
     let performer = CachedPerformer::new(
         AssetStore::new(descriptors, compatibility),
         Scheduler::new(scheduler_config),
         CachedPlaybackConfig::default(),
     );
     let security = SecurityRuntime::new(
-        SecurityRuntimeConfig::default(),
+        security_config,
         scheduler_config,
         SecretRedactor::default(),
         Some("safe cached reaction".to_owned()),
@@ -101,20 +104,27 @@ fn run() -> Result<(), Box<dyn Error>> {
         preload.indexed.indexed, preload.indexed.usable, preload.preloaded
     );
     report_degraded(app.health());
+    eprintln!(
+        "raw_ingress: max_record_bytes={} queue_capacity={}",
+        raw_ingress_config.max_record_bytes, raw_ingress_config.queue_capacity
+    );
 
-    let (sender, receiver) = mpsc::channel::<Vec<u8>>();
+    let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(raw_ingress_config.queue_capacity);
+    let raw_ingress_metrics = RawIngressMetrics::default();
+    let reader_metrics = raw_ingress_metrics.clone();
     thread::spawn(move || {
         let stdin = io::stdin();
-        for line in stdin.lock().lines().map_while(Result::ok) {
-            if sender.send(line.into_bytes()).is_err() {
-                break;
-            }
+        if let Err(error) =
+            pump_bounded_records(stdin.lock(), &sender, raw_ingress_config, &reader_metrics)
+        {
+            eprintln!("raw_ingress: reader_error={error}");
         }
     });
 
     let started = Instant::now();
     let mut sequence_seed = 0_u64;
     let mut next_maintenance_ms = 0_u64;
+    let mut last_raw_ingress_metrics = RawIngressMetricsSnapshot::default();
 
     loop {
         match receiver.recv_timeout(Duration::from_millis(10)) {
@@ -141,6 +151,11 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
+                report_raw_ingress_metrics(
+                    &raw_ingress_metrics,
+                    &mut last_raw_ingress_metrics,
+                    true,
+                );
                 let now_ms = elapsed_ms(started);
                 app.shutdown(now_ms);
                 break;
@@ -151,6 +166,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         app.tick(now_ms);
         if now_ms >= next_maintenance_ms {
             app.maintain_adapters();
+            report_raw_ingress_metrics(&raw_ingress_metrics, &mut last_raw_ingress_metrics, false);
             next_maintenance_ms = now_ms.saturating_add(1_000);
         }
     }
@@ -160,6 +176,28 @@ fn run() -> Result<(), Box<dyn Error>> {
 
 fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn report_raw_ingress_metrics(
+    metrics: &RawIngressMetrics,
+    previous: &mut RawIngressMetricsSnapshot,
+    final_report: bool,
+) {
+    let current = metrics.snapshot();
+    let drops_changed = current.dropped_queue_full != previous.dropped_queue_full
+        || current.dropped_oversize != previous.dropped_oversize
+        || current.read_errors != previous.read_errors;
+    if drops_changed || final_report {
+        eprintln!(
+            "raw_ingress_metrics: enqueued={} dropped_queue_full={} dropped_oversize={} read_errors={} max_retained_record_bytes={}",
+            current.enqueued,
+            current.dropped_queue_full,
+            current.dropped_oversize,
+            current.read_errors,
+            current.max_retained_record_bytes,
+        );
+    }
+    *previous = current;
 }
 
 fn build_generative_runtime(
