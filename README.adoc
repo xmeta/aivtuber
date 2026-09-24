@@ -27,6 +27,8 @@ The core design separates three time scales:
 * link:docs/performance-assets.adoc[Performance Asset specification]
 * link:docs/vts-obs-adapters.adoc[VTube Studio and OBS adapter integration]
 * link:docs/generative-fallback.adoc[Generative fallback and dynamic compilation]
+* link:docs/production-runtime.adoc[Production Rust composition runtime]
+* link:docs/maintenance.adoc[Maintenance and merge policy]
 * link:docs/metrics.adoc[Metrics and evaluation]
 * link:docs/roadmap.adoc[Roadmap]
 * link:docs/adr/0001-three-layer-runtime.adoc[ADR-0001: three-layer runtime]
@@ -42,12 +44,12 @@ The repository also pins a Rust 1.98.1 workspace under `crates/` for the determi
 [source,shell]
 ----
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo build --workspace
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
+cargo build --locked --workspace
 ----
 
-The Rust production path includes `crates/runtime` for security enforcement: byte-aware content ingress limits/backpressure, authenticated emergency-control bypass, memory-write gating, public-output gating, and redacted audit records. Privileged OBS/avatar/tool actions require the non-serializable `AuthenticatedControl` authority minted by `LocalControlIngress`; serialized `AuthorizationContext` values are audit/replay data only.
+The Rust production path includes `crates/runtime` for security enforcement: byte-aware content ingress limits/backpressure, authenticated emergency-control bypass, memory-write gating, public-output gating, and redacted audit records. Privileged OBS/avatar/tool actions require the non-serializable `AuthenticatedControl` authority minted by `LocalControlIngress`; serialized `AuthorizationContext` values are audit/replay data only. `crates/domain` defines bounded/versioned `ReflexRequest` snapshots and a separate curated `ThinkingRequest` carrying explicit trust/privacy metadata rather than arbitrary state maps or raw history. `crates/app` is the executable composition root: it owns lifecycle, content ingress, cached/reflex-selected asset playback, the shared deterministic scheduler, and dispatch to real audio/VTube Studio/OBS adapter boundaries.
 
 == Validation
 
@@ -55,12 +57,20 @@ Every example and regression fixture is validated against its schema by:
 
 [source,text]
 ----
-bun install
+bun install --frozen-lockfile
+bun run validate:toolchains
 bun run validate
+bun run validate:rust-parity
+bun test
+
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
+cargo build --locked --workspace
 ----
 
-The harness also asserts that fixtures under `examples/events/invalid/` are rejected by the Event Envelope schema.
-CI runs this check on every push and pull request.
+Local and CI toolchains are pinned to Rust 1.98.1 and Bun 1.3.14. The harness asserts that fixtures under `examples/events/invalid/` and `examples/reflex-decisions/invalid/` are rejected by their schemas. The Rust parity check round-trips all eight Event kinds plus representative Reflex Decisions through the Rust production-domain types and validates the serialized output against the same repository JSON Schemas.
+CI runs these checks on every push and pull request. Dependency-update and main-merge policy is documented in `docs/maintenance.adoc`.
 
 == Implementation roles
 
@@ -107,4 +117,4 @@ bun test
 
 Bootstrap/hardening phase. CI and the Rust workspace are operational. The Rust provider-neutral domain and deterministic scheduler/replay core include explicit lifecycle state, safe-point/phrase-boundary preemption, blend/exclusivity arbitration, seeded variation, causal replay ordering, and deterministic mock sinks. `crates/reflex` now adds deterministic semantic Top-K retrieval, the current TypeSafe System One/Jev wire adapter, absolute-deadline retry/fallback handling, explicit candidate reuse gating, and separate evidence/policy/execution replay stages. The TypeScript reference harness remains useful for security fixtures and LLM/TTS mock contracts.
 
-The Rust production core includes the executable Performance Asset subsystem in `crates/asset-store`, the cached filler/reaction playback path in `crates/runtime`, real VTube Studio/OBS websocket adapters plus OpenAI-compatible/TTS provider adapters in `crates/adapters`, and the atomic generative fallback/compiler in `crates/generative`. The generative path records the LLM routing reason, supports priority cancellation and incremental streaming compilation, degrades TTS/backend failures to cached or non-verbal reactions, and stores thinking/TTS model provenance on promotable dynamic assets without mutating scheduler state during partial generation. Adapter disconnects do not own or stop scheduler state, and reconnects do not replay stale actions. The Rust control/security path separates serialized authorization claims from authenticated local authority and wires rate/backpressure, emergency control, output gating, memory gating, and audit redaction into `crates/runtime`. The next measurement-focused milestone is comparative telemetry/calibration (#10).
+The Rust production core includes the executable Performance Asset subsystem in `crates/asset-store`, cached filler/reaction playback in `crates/runtime`, real VTube Studio/OBS/audio adapters in `crates/adapters`, and the executable `aivtuber-app` composition root in `crates/app`. The cached/reflex path traverses normalized content ingress -> compatibility-filtered AssetStore embedding snapshot -> deterministic semantic Top-K/Jev reuse gate -> retrieval-time asset identity check -> deterministic Scheduler -> audio/avatar output. The #9 branch additionally provides OpenAI-compatible Thinking/TTS adapters and the atomic dynamic-performance compiler in `crates/generative`; production composition wiring is completed as part of #9 using the dedicated curated `ThinkingRequest` boundary. Adapter failures degrade independently, failed/due commands are not replayed after reconnect, and authenticated emergency stop operates on the same scheduler used by production playback.

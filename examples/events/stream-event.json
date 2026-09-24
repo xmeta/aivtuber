@@ -1,0 +1,18 @@
+{
+  "schema_version": "0.2.0",
+  "event_id": "evt-stream-000001",
+  "correlation_id": "corr-stream-000001",
+  "sequence": 6,
+  "observed_at": "2026-09-20T10:00:05.125Z",
+  "source": "example-stream",
+  "source_class": "stream",
+  "plane": "system",
+  "trust_level": "semi_trusted",
+  "kind": "stream.event",
+  "actor_id": null,
+  "priority_hint": null,
+  "payload": {
+    "event": "scene.changed",
+    "scene": "game"
+  }
+}

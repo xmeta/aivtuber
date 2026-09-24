@@ -1,0 +1,19 @@
+{
+  "schema_version": "0.2.0",
+  "event_id": "evt-donation-000001",
+  "correlation_id": "corr-donation-000001",
+  "sequence": 3,
+  "observed_at": "2026-09-20T10:00:02Z",
+  "source": "example-donation",
+  "source_class": "donation",
+  "plane": "content",
+  "trust_level": "semi_trusted",
+  "kind": "chat.donation",
+  "actor_id": "viewer:donor",
+  "priority_hint": 0.9,
+  "payload": {
+    "amount": 500,
+    "currency": "JPY",
+    "message": "応援しています"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "schema_version": "0.2.0",
+  "event_id": "evt-speech-000001",
+  "correlation_id": "corr-speech-000001",
+  "sequence": 4,
+  "observed_at": "2026-09-20T10:00:03Z",
+  "source": "example-stt",
+  "source_class": "speech",
+  "plane": "content",
+  "trust_level": "untrusted",
+  "kind": "speech.input",
+  "actor_id": "speaker:guest",
+  "priority_hint": null,
+  "payload": {
+    "text": "こんにちは",
+    "language": "ja"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "schema_version": "9.9.9",
+  "event_id": "evt-invalid-version",
+  "correlation_id": "corr-invalid-version",
+  "sequence": 104,
+  "observed_at": "2026-09-20T10:10:03Z",
+  "source": "example-chat",
+  "source_class": "public_chat",
+  "plane": "content",
+  "trust_level": "untrusted",
+  "kind": "chat.message",
+  "payload": {"text": "hello"}
+}

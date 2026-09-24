@@ -137,7 +137,21 @@ It enforces:
 
 L1 directory indexing is intentionally non-recursive. Asset-pack subdirectories may contain viseme or other JSON media that are not Performance Asset descriptors.
 
-== 10. Cached playback fast path
+== 10. Semantic embedding and index boundary
+
+`semantic_embedding` is optional descriptor metadata containing a versioned embedding model id and a precomputed finite, non-zero vector. The scheduler and frame path never compute embeddings or perform network retrieval.
+
+The production index builder in `crates/app` consumes only `AssetStore::indexed_entries()`. It does not walk descriptor files independently. It includes an asset only when:
+
+* the current `AssetStore` compatibility check reports it usable;
+* a semantic embedding is present;
+* the embedding model and model version match the configured index model.
+
+Each indexed candidate records both the asset id and the `AssetIdentity::stable_key()` captured from the compatibility-checked L1 snapshot. Before semantic reuse is scheduled, `CachedPerformer` resolves the id again through `AssetStore` and rejects playback if the current stable identity no longer matches the retrieval identity.
+
+The semantic index version is deterministic over the retriever version, embedding model/version, asset compiler version, stable asset identities, and embedding vectors. L0 promotion does not change the index snapshot. A successful L1 reindex followed by rebuild reflects additions/removals; a failed transactional reindex leaves the previous snapshot and therefore the previous deterministic index version available.
+
+== 11. Cached playback fast path
 
 The Rust production path in `crates/runtime::cached_playback` composes the asset store and scheduler without invoking LLM or TTS services.
 

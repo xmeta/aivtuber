@@ -30,6 +30,8 @@ Exit criterion: a recorded event trace deterministically produces the same perfo
 
 Exit criterion: cached reaction path works end-to-end without LLM/TTS.
 
+The Rust production composition for this exit criterion lives in +crates/app+: content ingress, compatibility-checked cached asset resolution, the deterministic scheduler, process audio playback, and VTube Studio output share one lifecycle. Local live smoke still requires materialized audio files and a configured VTube Studio model; see link:production-runtime.adoc[Production Rust composition runtime].
+
 == Phase 3 -- Jev reflex layer
 
 * Jev adapter.
@@ -37,6 +39,8 @@ Exit criterion: cached reaction path works end-to-end without LLM/TTS.
 * strict timeout/fallback behavior.
 * semantic retrieval + Jev reuse gate.
 * decision telemetry.
+
+The Rust semantic path builds deterministic indices from compatibility-checked AssetStore entries with precomputed versioned embeddings. Replay records the embedding/index/compiler metadata and selected asset identity; stale identity is rejected before playback.
 
 Exit criterion: Jev can reduce LLM routing while preserving operator-reviewed reaction quality.
 

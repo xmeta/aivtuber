@@ -1,0 +1,18 @@
+{
+  "schema_version": "0.2.0",
+  "event_id": "evt-timer-000001",
+  "correlation_id": "corr-timer-000001",
+  "sequence": 7,
+  "observed_at": "2026-09-20T10:00:06Z",
+  "source": "runtime-timer",
+  "source_class": "timer",
+  "plane": "system",
+  "trust_level": "trusted",
+  "kind": "timer.tick",
+  "actor_id": null,
+  "priority_hint": null,
+  "payload": {
+    "timer_id": "heartbeat",
+    "elapsed_ms": 1000
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "schema_version": "0.2.0",
+  "event_id": "evt-invalid-binding",
+  "correlation_id": "corr-invalid-binding",
+  "sequence": 103,
+  "observed_at": "2026-09-20T10:10:02Z",
+  "source": "example-game",
+  "source_class": "game",
+  "plane": "content",
+  "trust_level": "semi_trusted",
+  "kind": "chat.message",
+  "payload": {"text": "hello"}
+}

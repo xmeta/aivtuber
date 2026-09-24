@@ -100,38 +100,42 @@ Only `operator.command` may carry an `authorization` object. A public content ad
 
 Security rationale and capability rules are defined in `security-threat-model.adoc`.
 
-== 4. Performer state snapshot
+== 4. Typed reflex and thinking context
 
-A reflex decision receives a compact snapshot, not an unbounded transcript.
+Routine reflex decisions receive a versioned `ReflexRequest`, not an arbitrary JSON state map and not an unbounded transcript.
 
-Recommended groups:
+`ReflexRequest` contains:
 
-[source,json]
-----
-{
-  "performer": {
-    "currently_speaking": true,
-    "current_asset_id": "phrase.example.01",
-    "current_interruptible": false,
-    "mood_valence": 0.45,
-    "arousal": 0.62
-  },
-  "stream": {
-    "mode": "competitive_game",
-    "topic": "ranked_match"
-  },
-  "recent": {
-    "last_reaction_families": ["laugh", "nod"],
-    "seconds_since_direct_reply": 4.2
-  },
-  "retrieval": {
-    "candidate_ids": ["reaction.tease.01", "reaction.tease.02"],
-    "best_similarity": 0.91
-  }
-}
-----
+* the normalized current `EventEnvelope`;
+* a versioned `ReflexContext`;
+* a bounded `RetrievalSnapshot`.
 
-Large raw histories SHOULD be reduced before entering the reflex layer.
+`ReflexContext` contains explicit provider-neutral snapshots:
+
+* `PerformerSnapshot`: speaking state, current asset/interruptibility, bounded mood/arousal values;
+* `StreamSnapshot`: bounded mode/topic labels;
+* `RecentInteractionSnapshot`: bounded recent reaction families, asset ids, and time since direct reply;
+* optional monotonic `now_ms`.
+
+`RetrievalSnapshot` contains at most eight ordered candidates. Each candidate records `asset_id`, one-based `rank`, and normalized similarity. Candidate ids and ranks must be unique and ranks must be contiguous from one.
+
+All snapshot strings and lists have fixed production bounds in `crates/domain/src/context.rs`. The Jev adapter serializes only these explicit fields plus the current normalized event and applies its own compact-state byte cap before transport.
+
+=== 4.1 ThinkingRequest
+
+`ThinkingEngine` accepts a dedicated versioned `ThinkingRequest`; it does not reuse `ReflexRequest`.
+
+A thinking request contains only:
+
+* one explicitly curated current-event `ThinkingContent`;
+* typed performer/stream/recent/retrieval snapshots;
+* a bounded list of explicitly curated context items.
+
+Every `ThinkingContent` item carries its source class, trust level, privacy class, optional event provenance, and bounded text. Untrusted viewer content therefore remains marked `untrusted` when it crosses the thinking boundary; constructing the request does not elevate trust.
+
+Raw transcript or stream-history fields are not part of either request type. If historical content is needed for generation, an upstream component must deliberately reduce/select it into bounded `curated_context` items with explicit provenance, trust, and privacy metadata.
+
+The initial internal request schema versions are `ReflexRequest 0.1.0`, `ReflexContext 0.1.0`, and `ThinkingRequest 0.1.0`. Reflex replay records carry both the request and context schema versions.
 
 == 5. Normalized reflex decision
 
@@ -207,8 +211,10 @@ The scheduler owns execution. The decision engine does not directly execute avat
 Every decision-affecting input must be recordable:
 
 * normalized event
-* compact state snapshot
-* retrieval candidates
+* compact typed state snapshot
+* exact ReflexRequest/ReflexContext schema versions
+* retrieval candidates with compatibility-stable asset identity, rank, and similarity
+* retriever/embedding-model/index-snapshot/asset-compiler versions
 * decision output
 * deterministic threshold/config version
 * executed action
@@ -224,12 +230,22 @@ External model calls may be replayed from recorded outputs rather than reissued.
 
 Domain JSON documents carry `schema_version`.
 
-Rules:
+The repository JSON Schemas under +schemas/+ are the normative wire-format source of truth. Rust production-domain types and validators must accept and reject the same versioned documents; TypeScript/reference code must follow the same schemas rather than defining a second wire contract.
 
-* additive optional fields may remain compatible;
-* changed enum semantics require a schema-version change;
+Change procedure:
+
+. Change the relevant JSON Schema and positive/negative fixtures first.
+. In the same pull request, update the Rust type/validator and any reference implementation.
+. Run both directions of parity: repository fixtures -> Rust deserialize/validate, and Rust serialize -> repository JSON Schema.
+. Update replay fixtures and documentation with the exact schema version.
+
+Version rules:
+
+* additive optional fields may remain on the current version when old readers can safely ignore them and the schema remains backward compatible;
+* any incompatible wire change requires a +schema_version+ change, including adding a required field, removing/renaming a field, changing a field type, narrowing an accepted value set, or changing enum/security semantics;
+* validator fixes that only make an implementation enforce constraints already present in the current normative schema do not by themselves require a version bump;
 * replay fixtures record the exact schema/config versions;
-* adapters must reject unsupported major versions.
+* adapters must reject unsupported versions rather than guessing or coercing them.
 
 == 11. Privacy boundary
 
@@ -242,4 +258,6 @@ Retention of raw chat/STT text must be configurable separately from normalized r
 * `schemas/event-envelope.schema.json`
 * `schemas/reflex-decision.schema.json`
 
-The Event Envelope schema is currently version `0.2.0`; this version introduces required trust-boundary fields and is intentionally incompatible with the earlier `0.1.0` envelope.
+CI validates repository fixtures with the schemas, then deserializes/validates the same fixtures through the Rust production-domain types. It also serializes Rust values for every Event kind plus representative Reflex Decisions and validates those JSON documents against the repository schemas.
+
+The Event Envelope schema is currently version `0.2.0`; this version introduces required trust-boundary fields and is intentionally incompatible with the earlier `0.1.0` envelope. The normalized Reflex Decision schema remains `0.1.0`.

@@ -116,7 +116,7 @@ Minimum fields:
 
 === 6.2 ReflexDirector
 
-Consumes a compact state snapshot and returns structured decisions.
+Consumes a versioned, bounded `ReflexRequest` with typed performer/stream/recent/retrieval snapshots and returns structured decisions. Arbitrary state maps and raw transcript history are outside this boundary.
 
 The director MUST NOT generate long-form natural language.
 
@@ -137,7 +137,7 @@ The first adapter is Jev. See `jev-routing.adoc`.
 
 Generates new semantic content only when the reflex route requests it.
 
-It receives a curated context rather than the complete raw stream history.
+It receives a dedicated versioned `ThinkingRequest`, not `ReflexRequest`. The request contains typed snapshots plus bounded `ThinkingContent` items with explicit source, trust, privacy, and provenance metadata. Complete raw stream history is never implicitly available.
 
 === 6.4 PerformanceCompiler
 

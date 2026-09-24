@@ -1,0 +1,90 @@
+= Maintenance and Merge Policy
+
+== Toolchain pins
+
+The repository is an application workspace and commits both Rust and Bun lockfiles.
+
+* Rust: `1.98.1`, pinned by `rust-toolchain.toml` and the CI Rust setup steps.
+* Bun: `1.3.14`, pinned by `package.json#packageManager` and `.github/workflows/ci.yml`.
+* JavaScript dependencies use exact direct versions in `package.json` and are resolved by the committed `bun.lock`.
+* Rust dependencies are resolved by the committed `Cargo.lock`.
+
+CI must not silently refresh dependency resolution. Rust build/test/clippy and Rust schema-parity execution use `--locked`. Bun installation uses `bun install --frozen-lockfile`.
+
+== Required checks for main
+
+Every merge to `main` must go through a pull request and have these CI jobs green:
+
+* `Validate schemas and fixtures`
+* `Rust checks`
+* `Schema and security fixtures`
+
+The intended branch/ruleset configuration is:
+
+* target: `main`;
+* require a pull request before merge;
+* require the three checks above and require the branch to be up to date before merge;
+* block force pushes and branch deletion;
+* do not require an approving review while the repository has only one regular maintainer;
+* do not add a CODEOWNERS rule that merely requests review from the PR author;
+* once a second regular maintainer/reviewer is available, add an appropriate CODEOWNERS/reviewer mapping and require at least one approving review;
+* resolve review conversations before merge when review is used.
+
+GitHub branch protection on `main` enforces this policy for administrators as well as ordinary writers: pull requests are required, the three checks above are strict required checks, review conversations must be resolved, and force pushes/deletion are disabled. No repository-level ruleset is currently configured; branch protection is the active enforcement mechanism. If repository-plan or automation permissions prevent recreating that protection in another environment, this document is the source of truth for the intended configuration.
+
+== Self-merge policy
+
+A sole maintainer may self-merge only when:
+
+* the PR links the issue it implements;
+* all required CI jobs are green on the final head commit;
+* the PR template documents verification, architecture/security impact, and rollback risk;
+* there are no unresolved review comments;
+* dependency and lockfile changes are intentional;
+* the PR is a coherent testable unit rather than an unrelated bundle.
+
+Security-boundary, authorization, secret-handling, schema-compatibility, or destructive migration changes should receive independent review when another qualified reviewer is available. Lack of a second reviewer does not justify bypassing CI or merging directly to `main`.
+
+== Dependency updates
+
+Dependency updates are deliberate changes and should be isolated from unrelated feature work when practical.
+
+=== Rust
+
+. Start from current `main` on a dedicated branch.
+. Change explicit dependency requirements in the relevant `Cargo.toml` files when needed.
+. Run `cargo update` (or a targeted `cargo update -p <crate>`) to regenerate `Cargo.lock`.
+. Review `Cargo.lock` for unexpected package/source changes.
+. Run:
++
+----
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
+cargo build --locked --workspace
+----
+. Commit manifest and `Cargo.lock` changes together.
+
+Normal feature branches must use `--locked` and must not regenerate `Cargo.lock` implicitly.
+
+=== Bun
+
+. Change the exact direct dependency version in `package.json`.
+. Run `bun install` with the pinned Bun version to regenerate `bun.lock`.
+. Review the lockfile diff for unexpected transitive changes.
+. Verify:
++
+----
+bun install --frozen-lockfile
+bun run validate:toolchains
+bun run validate
+bun run validate:rust-parity
+bun test
+----
+. Commit `package.json` and `bun.lock` together.
+
+To update Bun itself, change `packageManager` and the CI `bun-version` in the same PR, regenerate the lockfile with that exact Bun version, and run the full Rust/Bun validation suite.
+
+== Pull-request sizing
+
+Prefer one issue-sized, testable vertical slice per PR. Split work when independent schema, infrastructure, adapter, or runtime changes can be validated separately. A larger PR is acceptable when splitting would create an uncompilable or unverifiable intermediate state; record that reason in the PR description.

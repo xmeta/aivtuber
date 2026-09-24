@@ -1,4 +1,7 @@
-use crate::{AuthenticatedControl, BackendIdentity, Capability, EventEnvelope, ReflexDecision};
+use crate::{
+    AuthenticatedControl, BackendIdentity, Capability, ReflexDecision, ReflexRequest,
+    ThinkingRequest,
+};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, error::Error, fmt, future::Future, pin::Pin};
 
@@ -38,13 +41,6 @@ impl fmt::Display for EngineError {
 }
 
 impl Error for EngineError {}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ReflexRequest {
-    pub event: EventEnvelope,
-    pub state: BTreeMap<String, serde_json::Value>,
-    pub candidate_asset_ids: Vec<String>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeneratedReply {
@@ -178,7 +174,7 @@ pub trait DecisionEngine: Send + Sync {
 }
 
 pub trait ThinkingEngine: Send + Sync {
-    fn generate<'a>(&'a self, request: &'a ReflexRequest) -> EngineFuture<'a, GeneratedReply>;
+    fn generate<'a>(&'a self, request: &'a ThinkingRequest) -> EngineFuture<'a, GeneratedReply>;
     fn identity(&self) -> BackendIdentity;
 }
 

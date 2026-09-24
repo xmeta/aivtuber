@@ -1,0 +1,19 @@
+{
+  "schema_version": "0.2.0",
+  "event_id": "evt-invalid-auth-field",
+  "correlation_id": "corr-invalid-auth-field",
+  "sequence": 107,
+  "observed_at": "2026-09-20T10:10:06Z",
+  "source": "local-operator-hotkey",
+  "source_class": "operator",
+  "plane": "control",
+  "trust_level": "trusted",
+  "kind": "operator.command",
+  "authorization": {
+    "principal": "operator:local",
+    "method": "operator_hotkey",
+    "capabilities": ["performer.stop"],
+    "unexpected": true
+  },
+  "payload": {"action": "stop"}
+}

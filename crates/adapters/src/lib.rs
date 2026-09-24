@@ -6,6 +6,7 @@
 //! provider-neutral domain. Connections fail closed, actions are never queued
 //! for replay after a disconnect, and secrets use redacted debug output.
 
+mod audio;
 mod http;
 mod obs;
 mod openai;
@@ -13,6 +14,7 @@ mod transport;
 mod tts_http;
 mod vts;
 
+pub use audio::*;
 pub use http::*;
 pub use obs::*;
 pub use openai::*;

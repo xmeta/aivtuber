@@ -8,6 +8,7 @@ members = [
     "crates/runtime",
     "crates/adapters",
     "crates/generative",
+    "crates/app",
 ]
 resolver = "3"
 

@@ -12,8 +12,8 @@ use aivtuber_asset_store::{
 };
 use aivtuber_domain::{
     BackendIdentity, EngineError, EngineErrorKind, EventEnvelope, EventKind, FallbackReason,
-    ReflexRequest, SpeechArtifact, SpeechProgress, SpeechProgressSink, SpeechRequest,
-    ThinkingEngine, TtsBackendIdentity, TtsEngine,
+    SpeechArtifact, SpeechProgress, SpeechProgressSink, SpeechRequest, ThinkingEngine,
+    ThinkingRequest, TtsBackendIdentity, TtsEngine,
 };
 use aivtuber_scheduler::Priority;
 use futures::executor::block_on;
@@ -115,7 +115,8 @@ pub struct GenerationResult {
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GenerationRequest {
-    pub reflex: ReflexRequest,
+    pub source_event: EventEnvelope,
+    pub thinking: ThinkingRequest,
     pub routing_reason: GenerationRoutingReason,
     pub intent: String,
     pub style: Option<String>,
@@ -401,7 +402,7 @@ impl PerformanceCompiler {
             ));
         }
 
-        let asset_id = generated_asset_id(&request.reflex.event, reply_text, thinking, tts);
+        let asset_id = generated_asset_id(&request.source_event, reply_text, thinking, tts);
         let expression = self
             .config
             .expression_preset
@@ -454,10 +455,11 @@ impl PerformanceCompiler {
                 viseme_mapping: tts.viseme_mapping.clone(),
                 motion_library: self.config.motion_library.clone(),
             },
+            semantic_embedding: None,
             provenance: Some(Provenance {
                 generated: Some(true),
                 generator: Some("aivtuber-generative".to_owned()),
-                created_at: Some(request.reflex.event.observed_at.clone()),
+                created_at: Some(request.source_event.observed_at.clone()),
                 thinking_backend: Some(thinking.name.clone()),
                 thinking_model_alias: thinking.model_alias.clone(),
                 thinking_model_version: thinking.model_version.clone(),
@@ -594,10 +596,23 @@ impl GenerativePipeline {
         fallback_assets: Option<&AssetStore>,
     ) -> Result<GenerationResult, GenerationError> {
         request
-            .reflex
-            .event
+            .source_event
             .validate()
             .map_err(|error| GenerationError::new(format!("invalid generation event: {error}")))?;
+        request
+            .thinking
+            .validate()
+            .map_err(|error| GenerationError::new(format!("invalid thinking request: {error}")))?;
+        if request.thinking.input.event_id.as_deref()
+            != Some(request.source_event.event_id.as_str())
+            || request.thinking.input.event_kind != Some(request.source_event.kind)
+            || request.thinking.input.source_class != Some(request.source_event.source_class)
+            || request.thinking.input.trust_level != request.source_event.trust_level
+        {
+            return Err(GenerationError::new(
+                "thinking request input provenance must match source_event",
+            ));
+        }
         if request.intent.trim().is_empty() {
             return Err(GenerationError::new("generation intent must not be empty"));
         }
@@ -609,12 +624,12 @@ impl GenerativePipeline {
 
         let thinking_identity = self.thinking.identity();
         trace.llm_calls.push(LlmCallRecord {
-            event_id: request.reflex.event.event_id.clone(),
+            event_id: request.source_event.event_id.clone(),
             routing_reason: request.routing_reason.clone(),
             backend: thinking_identity.clone(),
         });
 
-        let reply = match block_on(self.thinking.generate(&request.reflex)) {
+        let reply = match block_on(self.thinking.generate(&request.thinking)) {
             Ok(reply) => reply,
             Err(error) => {
                 trace.fallback_reason = fallback_reason_from_error(&error);
@@ -779,9 +794,12 @@ fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
 mod tests {
     use super::*;
     use aivtuber_asset_store::{RuntimeCompatibility, load_asset_file};
-    use aivtuber_domain::{EngineFuture, GeneratedReply, SecurityPlane, SourceClass, TrustLevel};
+    use aivtuber_domain::{
+        EngineFuture, GeneratedReply, PrivacyClass, ReflexContext, RetrievalSnapshot,
+        SecurityPlane, SourceClass, TrustLevel,
+    };
     use aivtuber_scheduler::{BlendChannel, PlannedPerformance, Scheduler, SchedulerConfig};
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeSet;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
@@ -813,7 +831,10 @@ mod tests {
     }
 
     impl ThinkingEngine for MockThinking {
-        fn generate<'a>(&'a self, _request: &'a ReflexRequest) -> EngineFuture<'a, GeneratedReply> {
+        fn generate<'a>(
+            &'a self,
+            _request: &'a ThinkingRequest,
+        ) -> EngineFuture<'a, GeneratedReply> {
             self.calls.fetch_add(1, AtomicOrdering::SeqCst);
             if let Some(token) = &self.cancel_on_call {
                 token.cancel();
@@ -959,12 +980,18 @@ mod tests {
     }
 
     fn generation_request(sequence: u64) -> GenerationRequest {
+        let source_event = chat_event(sequence);
+        let thinking = ThinkingRequest::from_event(
+            &source_event,
+            "hello from the current event",
+            PrivacyClass::Pseudonymous,
+            ReflexContext::default(),
+            RetrievalSnapshot::default(),
+            Vec::new(),
+        );
         GenerationRequest {
-            reflex: ReflexRequest {
-                event: chat_event(sequence),
-                state: BTreeMap::from([("performer".to_owned(), json!({ "mood": "neutral" }))]),
-                candidate_asset_ids: Vec::new(),
-            },
+            source_event,
+            thinking,
             routing_reason: GenerationRoutingReason::NoCachedMatch,
             intent: "dynamic.reply".to_owned(),
             style: Some("cheerful".to_owned()),
