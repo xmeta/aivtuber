@@ -1,3 +1,5 @@
+<!-- Follow /AGENTS.md and docs/maintenance.adoc. The linked issue should define the primary milestone/priority and acceptance criteria. -->
+
 ## Linked issue
 
 Closes #
