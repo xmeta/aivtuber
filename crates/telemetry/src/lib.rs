@@ -68,6 +68,14 @@ pub enum CacheLevel {
     Generated,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DegradedSubsystem {
+    Audio,
+    Avatar,
+    Stream,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventObservation {
     pub event_id: String,
@@ -79,7 +87,9 @@ pub struct EventObservation {
     pub event_to_first_audio_ms: Option<u64>,
     pub event_to_first_visible_reaction_ms: Option<u64>,
     pub cache_level: Option<CacheLevel>,
+    pub cache_lookup: bool,
     pub cache_hit: bool,
+    pub degraded_subsystems: BTreeSet<DegradedSubsystem>,
     pub retrieval_candidates: usize,
     pub semantic_reuse_score: Option<f64>,
     pub semantic_reuse_accepted: bool,
@@ -105,7 +115,9 @@ impl EventObservation {
             event_to_first_audio_ms: None,
             event_to_first_visible_reaction_ms: None,
             cache_level: None,
+            cache_lookup: false,
             cache_hit: false,
+            degraded_subsystems: BTreeSet::new(),
             retrieval_candidates: 0,
             semantic_reuse_score: None,
             semantic_reuse_accepted: false,
@@ -179,6 +191,7 @@ pub struct BenchmarkSummary {
     pub route_counts: BTreeMap<RouteClass, u64>,
     pub cache_hits_by_level: BTreeMap<CacheLevel, u64>,
     pub cache_misses: u64,
+    pub degraded_counts: BTreeMap<DegradedSubsystem, u64>,
     pub semantic_reuse_accepted: u64,
     pub semantic_reuse_rejected: u64,
     pub wrong_reuse_labels: u64,
@@ -191,6 +204,8 @@ pub struct BenchmarkSummary {
     pub tts_calls: u64,
     pub llm_calls_per_event: f64,
     pub tts_calls_per_event: f64,
+    pub llm_avoidance_rate_vs_one_call_per_event: Option<f64>,
+    pub tts_avoidance_rate_vs_one_call_per_event: Option<f64>,
     pub estimated_cost_observations: u64,
     pub estimated_cost_microunits: u64,
     pub estimated_cost_microunits_per_event: Option<f64>,
@@ -381,6 +396,7 @@ impl ComparisonSuite {
 fn summarize(events: &[EventObservation], stream_duration_ms: Option<u64>) -> BenchmarkSummary {
     let mut route_counts = BTreeMap::new();
     let mut cache_hits_by_level = BTreeMap::new();
+    let mut degraded_counts = BTreeMap::new();
     let mut fallback_counts = BTreeMap::new();
     let mut cache_misses = 0_u64;
     let mut semantic_reuse_accepted = 0_u64;
@@ -397,12 +413,17 @@ fn summarize(events: &[EventObservation], stream_duration_ms: Option<u64>) -> Be
 
     for event in events {
         *route_counts.entry(event.route).or_insert(0) += 1;
-        if event.cache_hit {
-            if let Some(level) = event.cache_level {
-                *cache_hits_by_level.entry(level).or_insert(0) += 1;
+        if event.cache_lookup {
+            if event.cache_hit {
+                if let Some(level) = event.cache_level {
+                    *cache_hits_by_level.entry(level).or_insert(0) += 1;
+                }
+            } else {
+                cache_misses += 1;
             }
-        } else {
-            cache_misses += 1;
+        }
+        for subsystem in &event.degraded_subsystems {
+            *degraded_counts.entry(*subsystem).or_insert(0) += 1;
         }
         if event.retrieval_candidates > 0 {
             if event.semantic_reuse_accepted {
@@ -448,6 +469,7 @@ fn summarize(events: &[EventObservation], stream_duration_ms: Option<u64>) -> Be
         route_counts,
         cache_hits_by_level,
         cache_misses,
+        degraded_counts,
         semantic_reuse_accepted,
         semantic_reuse_rejected,
         wrong_reuse_labels,
@@ -468,6 +490,10 @@ fn summarize(events: &[EventObservation], stream_duration_ms: Option<u64>) -> Be
         } else {
             tts_calls as f64 / count
         },
+        llm_avoidance_rate_vs_one_call_per_event: (count > 0.0)
+            .then(|| (1.0 - llm_calls as f64 / count).clamp(0.0, 1.0)),
+        tts_avoidance_rate_vs_one_call_per_event: (count > 0.0)
+            .then(|| (1.0 - tts_calls as f64 / count).clamp(0.0, 1.0)),
         estimated_cost_observations: cost_observations,
         estimated_cost_microunits: cost,
         estimated_cost_microunits_per_event: if cost_observations == 0 || count == 0.0 {
@@ -638,6 +664,7 @@ mod tests {
                 event.routing_latency_us = index;
                 event.event_to_first_audio_ms = Some(index);
                 event.event_to_first_visible_reaction_ms = Some(index + 1);
+                event.cache_lookup = true;
                 event.cache_hit = true;
                 event.cache_level = Some(CacheLevel::Memory);
                 event.retrieval_candidates = 3;
@@ -689,6 +716,40 @@ mod tests {
         let csv = report.calibration_csv();
         assert!(csv.contains("semantic_reuse_score"));
         assert!(csv.contains("evt-1,0.900000,true,true"));
+    }
+
+    #[test]
+    fn non_cache_routes_do_not_inflate_misses_and_degraded_state_is_counted() {
+        let mode = ComparisonMode::FullGenerative;
+        let mut silent = EventObservation::new("evt-silent", mode, RouteClass::Silent);
+        silent.degraded_subsystems.insert(DegradedSubsystem::Audio);
+        let mut cache_miss =
+            EventObservation::new("evt-cache-miss", mode, RouteClass::SemanticReuse);
+        cache_miss.cache_lookup = true;
+        cache_miss
+            .degraded_subsystems
+            .insert(DegradedSubsystem::Audio);
+        cache_miss
+            .degraded_subsystems
+            .insert(DegradedSubsystem::Avatar);
+        let report =
+            BenchmarkReport::from_events(metadata("fixture-a"), mode, vec![silent, cache_miss])
+                .expect("report");
+
+        assert_eq!(report.summary.cache_misses, 1);
+        assert_eq!(report.summary.degraded_counts[&DegradedSubsystem::Audio], 2);
+        assert_eq!(
+            report.summary.degraded_counts[&DegradedSubsystem::Avatar],
+            1
+        );
+        assert_eq!(
+            report.summary.llm_avoidance_rate_vs_one_call_per_event,
+            Some(1.0)
+        );
+        assert_eq!(
+            report.summary.tts_avoidance_rate_vs_one_call_per_event,
+            Some(1.0)
+        );
     }
 
     #[test]

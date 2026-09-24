@@ -18,7 +18,8 @@ The production composition root records:
 * generation latency when the LLM/TTS fallback ran;
 * event-to-first-audio and event-to-first-visible-reaction;
 * route class;
-* cache level and cache hit/miss;
+* cache lookup outcome and the exact resolving tier (L0 memory vs L1 local storage before promotion);
+* audio/avatar/stream degraded-state annotations reusable by failure-injection runs;
 * retrieval candidate count and selected semantic similarity;
 * semantic reuse accepted/rejected;
 * LLM and TTS call counts;
@@ -47,11 +48,12 @@ Reports include:
 
 * route counters for deterministic, semantic reuse, Jev reaction, generated, cached fallback, non-verbal fallback, and silent outcomes;
 * cache hits split by L0 memory / L1 local storage;
-* cache misses;
+* cache misses only for events that actually attempted an asset-cache lookup;
+* degraded audio/avatar/stream observation counts;
 * semantic reuse accepted/rejected counts;
 * Jev attempt counts and typed fallback reasons;
-* LLM calls per event;
-* TTS calls per event;
+* LLM calls per event and avoidance rate versus a one-LLM-call-per-event reference;
+* TTS calls per event and avoidance rate versus a one-TTS-call-per-event reference;
 * operator overrides and cancellations;
 * reviewed wrong-reuse label count and confirmed wrong-reuse count.
 

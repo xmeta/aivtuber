@@ -25,7 +25,7 @@ use aivtuber_runtime::{
 };
 use aivtuber_scheduler::{Scheduler, Status};
 use aivtuber_telemetry::{
-    CacheLevel, ComparisonMode, EventObservation, RouteClass, TelemetryCollector,
+    CacheLevel, ComparisonMode, DegradedSubsystem, EventObservation, RouteClass, TelemetryCollector,
 };
 use std::error::Error;
 use std::fmt;
@@ -287,9 +287,9 @@ where
             generative.cancellation.cancel_for_event(&event);
         }
         let handled = self.handle_event(event, at_ms, seed)?;
+        self.tick(at_ms);
         self.record_handled_event(&event_id, &handled);
         let playback = handled.playback;
-        self.tick(at_ms);
         Ok(ContentProcessOutcome {
             admission,
             playback,
@@ -323,11 +323,10 @@ where
                     &mut self.pending_audio,
                     &mut self.pending_avatar,
                 )?;
-                let cache_level = cache_level(self.performer.assets().tier(&outcome.asset_id));
+                let cache_level = cache_level(Some(outcome.cache_tier));
                 (Some(outcome), RouteClass::Deterministic, cache_level)
             }
             PlaybackRoute::AssetId(asset_id) => {
-                let cache_level = cache_level(self.performer.assets().tier(&asset_id));
                 let outcome = self.performer.handle_asset_id(
                     &event,
                     &asset_id,
@@ -336,13 +335,13 @@ where
                     &mut self.pending_audio,
                     &mut self.pending_avatar,
                 )?;
+                let cache_level = cache_level(Some(outcome.cache_tier));
                 (Some(outcome), RouteClass::SemanticReuse, cache_level)
             }
             PlaybackRoute::AssetIdentity {
                 asset_id,
                 asset_identity,
             } => {
-                let cache_level = cache_level(self.performer.assets().tier(&asset_id));
                 let outcome = self.performer.handle_asset_identity(
                     &event,
                     CachedAssetSelection {
@@ -354,6 +353,7 @@ where
                     &mut self.pending_audio,
                     &mut self.pending_avatar,
                 )?;
+                let cache_level = cache_level(Some(outcome.cache_tier));
                 (Some(outcome), RouteClass::SemanticReuse, cache_level)
             }
             PlaybackRoute::Generate(route) => {
@@ -467,7 +467,6 @@ where
             }
             GenerationDisposition::Fallback { directive } => match directive {
                 FallbackDirective::CachedReaction { asset_id, .. } => {
-                    let cache_level = cache_level(self.performer.assets().tier(&asset_id));
                     let outcome = self.performer.handle_asset_id(
                         &event,
                         &asset_id,
@@ -476,6 +475,7 @@ where
                         &mut self.pending_audio,
                         &mut self.pending_avatar,
                     )?;
+                    let cache_level = cache_level(Some(outcome.cache_tier));
                     Ok(HandledGeneration {
                         playback: Some(outcome),
                         route: RouteClass::CachedFallback,
@@ -505,6 +505,13 @@ where
         observation.routing_latency_us = handled.routing_latency_us;
         observation.generation_latency_us = handled.generation_latency_us;
         observation.cache_level = handled.cache_level;
+        observation.cache_lookup = matches!(
+            handled.route,
+            RouteClass::Deterministic
+                | RouteClass::SemanticReuse
+                | RouteClass::JevReaction
+                | RouteClass::CachedFallback
+        );
         observation.cache_hit = handled.playback.is_some()
             && matches!(
                 handled.cache_level,
@@ -545,6 +552,22 @@ where
             observation.fallback_reason =
                 fallback_reason_name(decision.evidence.normalized.fallback_reason)
                     .map(str::to_owned);
+        }
+
+        if self.health.audio_error.is_some() {
+            observation
+                .degraded_subsystems
+                .insert(DegradedSubsystem::Audio);
+        }
+        if self.health.avatar_error.is_some() {
+            observation
+                .degraded_subsystems
+                .insert(DegradedSubsystem::Avatar);
+        }
+        if self.health.stream_error.is_some() {
+            observation
+                .degraded_subsystems
+                .insert(DegradedSubsystem::Stream);
         }
 
         if let Some(trace) = &handled.generation_trace {
@@ -590,7 +613,10 @@ where
 
             match self.audio.execute(&command) {
                 Ok(()) => self.health.audio_error = None,
-                Err(error) => self.health.audio_error = Some(error.to_string()),
+                Err(error) => {
+                    self.health.audio_error = Some(error.to_string());
+                    self.mark_degraded(&command.event_id, DegradedSubsystem::Audio);
+                }
             }
         }
         self.pending_audio.commands = keep;
@@ -617,9 +643,21 @@ where
                 continue;
             }
 
+            let event_id = self
+                .performer
+                .scheduler()
+                .items()
+                .iter()
+                .find(|item| item.plan.generation == avatar_generation(&command))
+                .map(|item| item.plan.event_id.clone());
             match self.avatar.execute(&command) {
                 Ok(()) => self.health.avatar_error = None,
-                Err(error) => self.health.avatar_error = Some(error.to_string()),
+                Err(error) => {
+                    self.health.avatar_error = Some(error.to_string());
+                    if let Some(event_id) = event_id {
+                        self.mark_degraded(&event_id, DegradedSubsystem::Avatar);
+                    }
+                }
             }
         }
         self.pending_avatar.commands = keep;
@@ -660,6 +698,21 @@ where
             observation.operator_override = true;
             observation.cancelled = generation_cancelled || scheduler_cancelled;
             observation.fallback_reason = Some("operator_override".to_owned());
+            if self.health.audio_error.is_some() {
+                observation
+                    .degraded_subsystems
+                    .insert(DegradedSubsystem::Audio);
+            }
+            if self.health.avatar_error.is_some() {
+                observation
+                    .degraded_subsystems
+                    .insert(DegradedSubsystem::Avatar);
+            }
+            if self.health.stream_error.is_some() {
+                observation
+                    .degraded_subsystems
+                    .insert(DegradedSubsystem::Stream);
+            }
             self.telemetry.record(observation);
         }
         self.tick(at_ms);
@@ -702,6 +755,18 @@ where
         match self.stream.connect() {
             Ok(()) => self.health.stream_error = None,
             Err(error) => self.health.stream_error = Some(error.to_string()),
+        }
+    }
+
+    fn mark_degraded(&mut self, event_id: &str, subsystem: DegradedSubsystem) {
+        if let Some(observation) = self
+            .telemetry
+            .events_mut()
+            .iter_mut()
+            .rev()
+            .find(|observation| observation.event_id == event_id)
+        {
+            observation.degraded_subsystems.insert(subsystem);
         }
     }
 
@@ -1953,6 +2018,12 @@ mod tests {
         app.tick(dispatch_at);
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         assert!(app.health().audio_error.is_some());
+        let metric = app.telemetry().events().last().expect("degraded metric");
+        assert!(
+            metric
+                .degraded_subsystems
+                .contains(&DegradedSubsystem::Audio)
+        );
 
         app.tick(dispatch_at.saturating_add(10));
         assert_eq!(attempts.load(Ordering::SeqCst), 1);

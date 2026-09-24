@@ -1,5 +1,5 @@
 use aivtuber_asset_store::{
-    AssetClass, AssetStore, AssetStoreError, IndexReport, PerformanceAsset,
+    AssetClass, AssetStore, AssetStoreError, CacheTier, IndexReport, PerformanceAsset,
 };
 use aivtuber_domain::{EventEnvelope, EventKind};
 use aivtuber_scheduler::{
@@ -226,6 +226,12 @@ pub struct CachedAssetSelection<'a> {
     pub expected_identity: &'a str,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ResolvedPlaybackAsset<'a> {
+    asset: &'a PerformanceAsset,
+    cache_tier: CacheTier,
+}
+
 impl Default for CachedPlaybackConfig {
     fn default() -> Self {
         Self {
@@ -242,6 +248,7 @@ pub struct FastPathMetrics {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CachedPlaybackOutcome {
     pub asset_id: String,
+    pub cache_tier: CacheTier,
     pub plan: PlannedPerformance,
     pub variation: AppliedVariation,
     pub metrics: FastPathMetrics,
@@ -411,13 +418,18 @@ impl CachedPerformer {
             .unwrap_or_default();
         let recent_refs: Vec<&str> = recent_owned.iter().map(String::as_str).collect();
 
-        let asset =
-            self.assets
-                .select_variant(intent, seed.wrapping_add(event.sequence), &recent_refs)?;
+        let (asset, cache_tier) = self.assets.select_variant_with_tier(
+            intent,
+            seed.wrapping_add(event.sequence),
+            &recent_refs,
+        )?;
         let outcome = self.schedule_asset(
             event,
             CachedPlaybackTiming { at_ms, seed },
-            &asset,
+            ResolvedPlaybackAsset {
+                asset: &asset,
+                cache_tier,
+            },
             visemes,
             audio,
             avatar,
@@ -456,13 +468,23 @@ impl CachedPerformer {
             ));
         }
 
-        let asset = self.assets.resolve(asset_id)?;
+        let (asset, cache_tier) = self.assets.resolve_with_tier(asset_id)?;
         let recent_group = asset
             .variant_group
             .as_deref()
             .unwrap_or(asset.intent.as_str())
             .to_owned();
-        let outcome = self.schedule_asset(event, timing, &asset, visemes, audio, avatar)?;
+        let outcome = self.schedule_asset(
+            event,
+            timing,
+            ResolvedPlaybackAsset {
+                asset: &asset,
+                cache_tier,
+            },
+            visemes,
+            audio,
+            avatar,
+        )?;
         self.record_recent(&recent_group, &asset.id);
         Ok(outcome)
     }
@@ -497,7 +519,7 @@ impl CachedPerformer {
             ));
         }
 
-        let asset = self.assets.resolve(selection.asset_id)?;
+        let (asset, cache_tier) = self.assets.resolve_with_tier(selection.asset_id)?;
         let actual_identity = asset.identity().stable_key();
         if actual_identity != selection.expected_identity {
             return Err(CachedPlaybackError::StaleAssetIdentity {
@@ -512,7 +534,17 @@ impl CachedPerformer {
             .as_deref()
             .unwrap_or(asset.intent.as_str())
             .to_owned();
-        let outcome = self.schedule_asset(event, timing, &asset, visemes, audio, avatar)?;
+        let outcome = self.schedule_asset(
+            event,
+            timing,
+            ResolvedPlaybackAsset {
+                asset: &asset,
+                cache_tier,
+            },
+            visemes,
+            audio,
+            avatar,
+        )?;
         self.record_recent(&recent_group, &asset.id);
         Ok(outcome)
     }
@@ -521,7 +553,7 @@ impl CachedPerformer {
         &mut self,
         event: &EventEnvelope,
         timing: CachedPlaybackTiming,
-        asset: &PerformanceAsset,
+        resolved: ResolvedPlaybackAsset<'_>,
         visemes: &R,
         audio: &mut A,
         avatar: &mut V,
@@ -531,6 +563,7 @@ impl CachedPerformer {
         A: AudioPlaybackSink,
         V: AvatarPlaybackSink,
     {
+        let ResolvedPlaybackAsset { asset, cache_tier } = resolved;
         let viseme_track = resolve_asset_visemes(asset, visemes)?;
         let variation_spec = asset.variation.unwrap_or_default();
         let variation = apply_variation(
@@ -583,6 +616,7 @@ impl CachedPerformer {
         );
         Ok(CachedPlaybackOutcome {
             asset_id: asset.id.clone(),
+            cache_tier,
             plan,
             variation,
             metrics,
