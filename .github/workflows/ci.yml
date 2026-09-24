@@ -52,6 +52,9 @@ jobs:
       - name: Build
         run: cargo build --locked --workspace
 
+      - name: Replay benchmark smoke
+        run: cargo run --locked -p aivtuber-app --bin replay-benchmark -- examples/benchmarks/replay-comparison.json target/ci-benchmark
+
   schema:
     name: Schema and security fixtures
     runs-on: ubuntu-latest

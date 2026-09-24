@@ -5,62 +5,173 @@
 
 Optimization must not reduce cost by making the performer feel slow, repetitive, or contextually wrong.
 
-Measure efficiency and perceptual quality together.
+Measure efficiency and perceptual quality together. Comparative claims about cache reuse, semantic retrieval, Jev, or generative fallback require measurements from the same replay dataset boundary; a single demo is not evidence of benefit.
 
-== 2. Core latency metrics
+== 2. Production observation model
 
-* event-to-first-visible-reaction p50/p95/p99
-* event-to-first-audio p50/p95/p99
-* LLM-routed event latency
-* TTS cold/warm latency
-* Jev/reflex latency and timeout rate
-* avatar command latency
-* scheduler queue delay
++crates/telemetry+ defines one bounded +EventObservation+ per admitted production event.
 
-== 3. Efficiency metrics
+The production composition root records:
 
-* exact-cache hit rate
-* semantic-cache accepted hit rate
-* semantic-cache rejected hit rate
-* template route rate
-* LLM call rate
-* TTS generation rate
-* generated-to-promoted asset ratio
-* GPU VRAM high-water mark
-* CPU utilization
-* network egress and inference cost per stream hour
+* routing latency;
+* Jev latency and attempt count when a Reflex decision was used;
+* generation latency when the LLM/TTS fallback ran;
+* event-to-first-audio and event-to-first-visible-reaction;
+* route class;
+* cache level and cache hit/miss;
+* retrieval candidate count and selected semantic similarity;
+* semantic reuse accepted/rejected;
+* LLM and TTS call counts;
+* deterministic fallback reason;
+* cancellation and operator-override annotations;
+* optional offline +wrong_reuse+ review labels;
+* optional estimated cost in integer microunits.
 
-== 4. Quality metrics
+Prompt text and generated reply text are not required for these metric records.
 
-* reaction appropriateness
-* wrong-cache reuse rate
-* interruption appropriateness
-* repetition rate by semantic family
-* average time between repeated variants
-* lip-sync alignment error
-* audio-motion synchronization error
-* operator override frequency
-* silence/failure fallback frequency
+== 3. Latency distributions
 
-== 5. Evaluation protocol
++BenchmarkReport+ aggregates nearest-rank p50/p95/p99 and maximum values for:
 
-A change should be evaluated on replayable event traces.
+* routing latency;
+* Jev/reflex latency;
+* generation latency;
+* event-to-first-audio;
+* event-to-first-visible-reaction.
 
-Compare at least:
+The first-audio/visible timings come from the production +CachedPerformer+ plan and therefore use the same monotonic scheduler timeline as playback.
 
-. deterministic baseline
-. deterministic + semantic retrieval
-. deterministic + retrieval + Jev
-. full system with LLM/TTS fallback
+== 4. Routing and efficiency metrics
 
-Do not infer benefit from a single demo.
+Reports include:
 
-== 6. Initial acceptance targets
+* route counters for deterministic, semantic reuse, Jev reaction, generated, cached fallback, non-verbal fallback, and silent outcomes;
+* cache hits split by L0 memory / L1 local storage;
+* cache misses;
+* semantic reuse accepted/rejected counts;
+* Jev attempt counts and typed fallback reasons;
+* LLM calls per event;
+* TTS calls per event;
+* operator overrides and cancellations;
+* reviewed wrong-reuse label count and confirmed wrong-reuse count.
 
-These are engineering targets, not empirical claims, and should be revised after measurement.
+Generated output is identified separately from cache hits even though a completed generated asset is inserted into L0 for playback.
 
-* Cached filler/reaction starts without an LLM dependency.
-* Jev failure does not block streaming.
-* Every LLM call records why cheaper routes were rejected.
-* Every semantic cache reuse records candidate score and reuse decision.
-* All scheduler decisions are replayable from trace + seed.
+Cost fields are populated only when cost inputs are supplied. Zero configured cost is not interpreted as a measured zero-cost model.
+
+== 5. Reproducibility metadata
+
+Every benchmark report records:
+
+* dataset id;
+* Git revision, including a `+dirty` suffix when applicable;
+* Rust toolchain;
+* Bun toolchain when available;
+* benchmark/config version;
+* asset/compiler version;
+* semantic index version;
+* Jev model;
+* ThinkingEngine model;
+* TTS model;
+* deterministic seed;
+* represented stream duration.
+
+This metadata is part of the report rather than an external note.
+
+== 6. Comparison modes
+
+The required modes are:
+
+. +deterministic_only+
+. +deterministic_semantic+
+. +deterministic_semantic_jev+
+. +full_generative+
+
++ComparisonSuite::complete+ rejects a comparison unless all four modes use the same dataset id and the same ordered event fixture.
+
+The checked-in smoke fixture is:
+
+[source,text]
+----
+examples/benchmarks/replay-comparison.json
+----
+
+It intentionally uses deterministic in-process Jev/Thinking/TTS mocks. It validates the comparison machinery and routing boundaries without making an empirical claim about hosted-provider latency or quality.
+
+== 7. Replay benchmark runner
+
+Run all four modes from the repository root:
+
+[source,shell]
+----
+cargo run --locked -p aivtuber-app --bin replay-benchmark -- \
+  examples/benchmarks/replay-comparison.json \
+  target/aivtuber-benchmarks
+----
+
+The runner writes:
+
+[source,text]
+----
+01-deterministic.json
+01-deterministic-calibration.csv
+02-semantic.json
+02-semantic-calibration.csv
+03-semantic-jev.json
+03-semantic-jev-calibration.csv
+04-full-generative.json
+04-full-generative-calibration.csv
+comparison-suite.json
+----
+
+The required Rust CI job runs this fixture as a benchmark smoke test.
+
+== 8. Calibration and operator labels
+
++TelemetryCollector::label_wrong_reuse+ attaches an offline review result to a recorded event without changing the routing decision that was executed.
+
+The calibration CSV contains:
+
+* dataset/mode/event id;
+* selected semantic similarity;
+* reuse accepted/rejected;
+* wrong-reuse review label;
+* operator override;
+* cancellation;
+* fallback reason.
+
+These rows are inputs for offline threshold calibration. Threshold changes remain production policy decisions and must be evaluated against replay data rather than tuned from a single live event.
+
+== 9. Optional cost normalization
+
+When known pricing or internal accounting values are available, pass integer microunits per call:
+
+[source,shell]
+----
+export AIVTUBER_BENCH_LLM_COST_MICROUNITS=...
+export AIVTUBER_BENCH_TTS_COST_MICROUNITS=...
+----
+
+The runner stores those values in the config metadata and reports total estimated microunits, microunits per event, and normalized microunits per represented stream hour.
+
+Without those variables, cost-per-hour remains absent rather than being reported as measured zero.
+
+== 10. Additional quality metrics
+
+The following still require domain-specific or human labels beyond the initial replay fixture:
+
+* reaction appropriateness;
+* interruption appropriateness;
+* repetition rate by semantic family;
+* average time between repeated variants;
+* lip-sync alignment error;
+* audio-motion synchronization error;
+* generated-to-promoted asset ratio once #39 promotion policy exists;
+* hardware CPU/GPU/resource telemetry;
+* network egress.
+
+== 11. Evaluation rule
+
+A change affecting routing thresholds, cache policy, Jev usage, or generative fallback should be compared on a replayable event dataset with fixed seed/config metadata.
+
+Do not accept statements such as "Jev reduces LLM usage" or "semantic reuse improves latency" unless the corresponding reports show that difference for an identified dataset and configuration.

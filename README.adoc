@@ -47,6 +47,7 @@ cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
 cargo build --locked --workspace
+cargo run --locked -p aivtuber-app --bin replay-benchmark -- examples/benchmarks/replay-comparison.json target/aivtuber-benchmarks
 ----
 
 The Rust production path includes `crates/runtime` for security enforcement: byte-aware content ingress limits/backpressure, authenticated emergency-control bypass, memory-write gating, public-output gating, and redacted audit records. Privileged OBS/avatar/tool actions require the non-serializable `AuthenticatedControl` authority minted by `LocalControlIngress`; serialized `AuthorizationContext` values are audit/replay data only. `crates/domain` defines bounded/versioned `ReflexRequest` snapshots and a separate curated `ThinkingRequest` carrying explicit trust/privacy metadata rather than arbitrary state maps or raw history. `crates/app` is the executable composition root: it owns lifecycle, content ingress, cached/reflex-selected asset playback, the shared deterministic scheduler, and dispatch to real audio/VTube Studio/OBS adapter boundaries.
@@ -67,6 +68,7 @@ cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
 cargo build --locked --workspace
+cargo run --locked -p aivtuber-app --bin replay-benchmark -- examples/benchmarks/replay-comparison.json target/aivtuber-benchmarks
 ----
 
 Local and CI toolchains are pinned to Rust 1.98.1 and Bun 1.3.14. The harness asserts that fixtures under `examples/events/invalid/` and `examples/reflex-decisions/invalid/` are rejected by their schemas. The Rust parity check round-trips all eight Event kinds plus representative Reflex Decisions through the Rust production-domain types and validates the serialized output against the same repository JSON Schemas.

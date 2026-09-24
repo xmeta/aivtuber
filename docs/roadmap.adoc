@@ -42,7 +42,7 @@ The Rust production composition for this exit criterion lives in +crates/app+: c
 
 The Rust semantic path builds deterministic indices from compatibility-checked AssetStore entries with precomputed versioned embeddings. Replay records the embedding/index/compiler metadata and selected asset identity; stale identity is rejected before playback.
 
-Exit criterion: Jev can reduce LLM routing while preserving operator-reviewed reaction quality.
+Exit criterion: comparative replay reports whether Jev changes LLM routing, cost, and latency while preserving operator-reviewed reaction quality. Benefit is not assumed without measurements from an identified dataset/configuration.
 
 == Phase 4 -- Generative fallback
 
@@ -69,3 +69,5 @@ Status: implemented on the Rust production path. Generated assets are published 
 * long-stream soak tests.
 * cost/latency dashboards.
 * privacy retention policies.
+
+Status: the Rust production path now records bounded event observations and the checked-in replay runner compares deterministic, semantic, semantic+Jev, and full-generative modes on one fixture boundary with reproducibility metadata and calibration export. Failure injection/soak work remains in #40; memory retention/promotion behavior remains in #39.

@@ -1,0 +1,74 @@
+{
+  "dataset_id": "starter-replay-comparison-v1",
+  "seed": 4242,
+  "stream_duration_ms": 180000,
+  "events": [
+    {
+      "query_embedding": [1.0, 0.0, 0.0],
+      "wrong_reuse": false,
+      "event": {
+        "schema_version": "0.2.0",
+        "event_id": "bench-agree",
+        "correlation_id": "bench-run",
+        "sequence": 1,
+        "observed_at": "2026-09-25T00:00:00Z",
+        "source": "benchmark",
+        "source_class": "public_chat",
+        "plane": "content",
+        "trust_level": "untrusted",
+        "kind": "chat.message",
+        "actor_id": "viewer:bench-a",
+        "priority_hint": null,
+        "payload": {
+          "text": "yes, exactly",
+          "intent": "reaction.agree"
+        }
+      }
+    },
+    {
+      "query_embedding": [0.0, 1.0, 0.0],
+      "wrong_reuse": false,
+      "event": {
+        "schema_version": "0.2.0",
+        "event_id": "bench-surprise",
+        "correlation_id": "bench-run",
+        "sequence": 2,
+        "observed_at": "2026-09-25T00:00:01Z",
+        "source": "benchmark",
+        "source_class": "public_chat",
+        "plane": "content",
+        "trust_level": "untrusted",
+        "kind": "chat.message",
+        "actor_id": "viewer:bench-b",
+        "priority_hint": null,
+        "payload": {
+          "text": "that was unexpected",
+          "intent": "reaction.surprise"
+        }
+      }
+    },
+    {
+      "query_embedding": [1.0, 0.0, 0.0],
+      "wrong_reuse": null,
+      "event": {
+        "schema_version": "0.2.0",
+        "event_id": "bench-novel",
+        "correlation_id": "bench-run",
+        "sequence": 3,
+        "observed_at": "2026-09-25T00:00:02Z",
+        "source": "benchmark",
+        "source_class": "public_chat",
+        "plane": "content",
+        "trust_level": "untrusted",
+        "kind": "chat.message",
+        "actor_id": "viewer:bench-c",
+        "priority_hint": null,
+        "payload": {
+          "text": "say something novel about this play",
+          "intent": "reaction.agree",
+          "novel": true
+        }
+      }
+    }
+  ]
+}
