@@ -55,6 +55,9 @@ jobs:
       - name: Replay benchmark smoke
         run: cargo run --locked -p aivtuber-app --bin replay-benchmark -- examples/benchmarks/replay-comparison.json target/ci-benchmark
 
+      - name: Failure/soak hardening smoke
+        run: cargo run --locked -p aivtuber-hardening --bin failure-soak -- target/ci-hardening-soak.json 5000
+
   schema:
     name: Schema and security fixtures
     runs-on: ubuntu-latest

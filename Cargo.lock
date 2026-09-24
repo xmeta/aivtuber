@@ -80,6 +80,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "aivtuber-hardening"
+version = "0.1.0"
+dependencies = [
+ "aivtuber-adaptation",
+ "aivtuber-adapters",
+ "aivtuber-asset-store",
+ "aivtuber-domain",
+ "aivtuber-reflex",
+ "aivtuber-runtime",
+ "aivtuber-scheduler",
+ "aivtuber-telemetry",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "aivtuber-reflex"
 version = "0.1.0"
 dependencies = [
