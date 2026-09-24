@@ -77,10 +77,11 @@ impl SecretRedactor {
         decision: impl Into<String>,
         detail: impl AsRef<str>,
     ) -> AuditRecord {
+        let decision = decision.into();
         AuditRecord {
             event_id: event_id.map(str::to_owned),
             category,
-            decision: decision.into(),
+            decision: self.redact(&decision),
             detail: self.redact(detail.as_ref()),
         }
     }
@@ -101,10 +102,11 @@ mod tests {
         let record = redactor.record(
             Some("evt-1"),
             AuditCategory::Authorization,
-            "rejected",
+            "rejected api-secret-123",
             "token=api-secret-123 session=session-secret-456",
         );
 
+        assert_eq!(record.decision, "rejected [REDACTED]");
         assert_eq!(record.detail, "token=[REDACTED] session=[REDACTED]");
         assert!(!format!("{record:?}").contains("api-secret-123"));
         assert!(!format!("{record:?}").contains("session-secret-456"));
