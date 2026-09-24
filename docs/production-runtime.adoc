@@ -57,6 +57,9 @@ OBS remains an independent control adapter. Its availability never owns schedule
 * Every attempted LLM call is retained in the production audit with source event id, deterministic routing reason, and provider/model identity; prompt and generated reply text are excluded.
 * Only complete, validated, runtime-compatible generated assets enter +AssetStore::insert_hot+; partial text/audio never reaches reusable asset or scheduler state.
 * Generated assets are scheduled by the same +CachedPerformer+ / +Scheduler+ instance as cached assets, preserving one monotonic timeline for audio/visemes/avatar commands.
+* Working memory is explicitly bounded by entry count, TTL, claim bytes, and topic bytes; raw viewer actor ids are replaced with deterministic pseudonyms before storage.
+* Durable memory writes require a non-serializable +MemoryWritePermit+ from +SecurityRuntime::authorize_memory_write+; public chat without that gate cannot become durable memory.
+* Generated-asset promotion is explicit and deterministic: production records generated use, accepts quality labels separately, and only +apply_generated_asset_adaptation+ can promote or invalidate through the validated AssetStore path.
 * Higher-priority generation cancellation uses the scheduler's shared +priority_for_event+ mapping.
 * Serialized control events remain data only: content ingress rejects them and cannot use them to cancel/stop privileged runtime work.
 * VTube Studio and OBS connection failure is degraded state, not scheduler failure.

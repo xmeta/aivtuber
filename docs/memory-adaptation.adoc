@@ -1,0 +1,141 @@
+= Memory and Adaptation Runtime
+:toc:
+
+== 1. Scope
+
+Roadmap Phase 5 is implemented by +crates/adaptation+ and the production composition in +crates/app+.
+
+The design keeps three responsibilities separate:
+
+* +SecurityRuntime+ owns authority for durable memory writes.
+* +AdaptationEngine+ owns deterministic memory/adaptation policy and replay metadata.
+* +AssetStore+ owns validation, compatibility checks, generated-asset persistence, and invalidation.
+
+Neither model output nor serialized authorization claims can directly create durable memory or persist a generated asset.
+
+== 2. Bounded working memory
+
++WorkingMemory+ stores normalized entries with:
+
+* source event id and source name;
+* source class and trust level;
+* a pseudonymous actor id when an actor exists;
+* normalized claim and optional topic;
+* creation and expiry timestamps;
+* retention class;
+* the deterministic write-gate decision.
+
+Working memory has explicit bounds for entry count, working TTL, durable TTL, claim bytes, and topic bytes. Expired entries are removed during compaction. If the capacity bound is exceeded, the oldest remaining entries are removed deterministically.
+
+Viewer/topic retrieval is local and deterministic. Matching prefers pseudonymous viewer identity, then topic, then recency, with event id as a stable tie break.
+
+Raw actor ids are not stored in +MemoryEntry+.
+
+== 3. Durable memory gate
+
+Short-lived working memory may contain untrusted public content. Durable retention is different.
+
++ProductionApp::remember_durable_memory+ first calls +SecurityRuntime::authorize_memory_write+. The runtime returns a non-serializable +MemoryWritePermit+ only for an allowed system source or authenticated +memory.admin+ authority.
+
+Public chat without that permit is rejected before +WorkingMemory::remember_durable+ can be called.
+
+A permit records the source event id, source, source class, trust level, optional actor, and the deterministic gate decision. The stored entry converts the actor to the configured pseudonym before retention.
+
+== 4. Generated-asset promotion
+
+Generated assets initially live in L0 after the complete LLM/TTS/compiler pipeline succeeds.
+
++AdaptationEngine+ records generated-asset usage and explicit positive/negative quality labels. +PromotionPolicy+ contains deterministic thresholds for:
+
+* minimum uses;
+* minimum quality labels;
+* minimum positive quality ratio;
+* negative-label invalidation threshold;
+* recent-variant anti-repetition window.
+
+The policy produces one of:
+
+* +keep_hot+;
+* +promote+;
+* +invalidate+.
+
+Promotion is never triggered by generated text itself. A production host must explicitly supply quality labels and call +ProductionApp::apply_generated_asset_adaptation+.
+
+== 5. Persistence and rollback
+
++AssetStore::persist_generated_descriptor+ is intentionally a storage primitive, not a policy engine.
+
+Before writing L1 it requires:
+
+* a complete validated Performance Asset;
+* +provenance.generated=true+;
+* compatibility with the current compiler/voice/avatar/viseme/motion runtime.
+
+The descriptor is written through a temporary file and renamed only after the bytes are flushed. Existing L1 ids are not overwritten.
+
++AssetStore::invalidate_generated_asset+ removes only assets whose persisted or hot provenance identifies them as generated. Static pack assets cannot use this invalidation path.
+
+Promotion therefore preserves the original model/TTS/routing provenance and the compatibility identity already present on the generated asset.
+
+== 6. Replay and audit metadata
+
+Every adaptation policy evaluation yields an +AdaptationDecisionRecord+ containing:
+
+* monotonically increasing decision sequence;
+* asset id and stable asset identity;
+* decision and deterministic reason;
+* usage/quality feedback snapshot;
+* policy version and the complete threshold snapshot;
+* seed.
+
+The record has a stable JSON serialization boundary. The same asset, seed, policy, and feedback produce byte-equivalent decision records.
+
+Working-memory compaction also records the timestamp and counts of expired/capacity removals.
+
+== 7. Anti-repetition and deterministic variation
+
++AdaptationEngine::select_variant+ excludes recent ids for the semantic group when alternatives exist, sorts candidates by stable asset id, and uses the recorded seed plus event sequence for deterministic selection.
+
+Performance Asset variation itself remains bounded by the existing asset schema/validator. Adaptation does not widen those bounds.
+
+== 8. Calibration
+
+Offline calibration data comes from the #10 replay benchmark outputs documented in link:metrics.adoc[Metrics and Evaluation].
+
+Operator wrong-reuse labels, route/fallback measurements, and cost/latency comparisons are used to choose promotion/reuse thresholds offline. The runtime does not self-tune thresholds from a single live stream.
+
+Relevant production variables are:
+
+[source,text]
+----
+AIVTUBER_ADAPTATION_SEED=0
+AIVTUBER_ADAPTATION_POLICY_VERSION=adaptation-v1
+AIVTUBER_ADAPTATION_RECENT_VARIANT_WINDOW=2
+
+AIVTUBER_MEMORY_MAX_ENTRIES=256
+AIVTUBER_MEMORY_WORKING_TTL_MS=900000
+AIVTUBER_MEMORY_DURABLE_TTL_MS=86400000
+AIVTUBER_MEMORY_MAX_CLAIM_BYTES=1024
+AIVTUBER_MEMORY_MAX_TOPIC_BYTES=128
+AIVTUBER_MEMORY_PSEUDONYM_SALT=0
+
+AIVTUBER_PROMOTION_MIN_USES=3
+AIVTUBER_PROMOTION_MIN_QUALITY_LABELS=2
+AIVTUBER_PROMOTION_MIN_QUALITY_RATIO=0.8
+AIVTUBER_PROMOTION_INVALIDATE_NEGATIVE_LABELS=3
+----
+
+== 9. Production tests
+
+The Rust tests cover:
+
+* public chat denied for durable memory without a gate permit;
+* authenticated +memory.admin+ durable retention;
+* pseudonymous viewer storage and TTL expiry;
+* deterministic capacity compaction;
+* viewer/topic relevance;
+* frequency/quality promotion;
+* provenance and compatibility preservation across L1 persistence;
+* negative-quality rollback/invalidation;
+* deterministic decision replay and anti-repetition;
+* full +ProductionApp+ generated-asset promotion/rollback flow.

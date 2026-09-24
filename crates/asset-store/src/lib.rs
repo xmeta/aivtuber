@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -724,6 +724,13 @@ pub enum AssetStoreError {
         id: String,
         mismatches: Vec<CompatibilityMismatch>,
     },
+    NotGenerated {
+        id: String,
+    },
+    AlreadyPersisted {
+        id: String,
+        path: PathBuf,
+    },
 }
 
 impl fmt::Display for AssetStoreError {
@@ -756,6 +763,14 @@ impl fmt::Display for AssetStoreError {
                 }
                 Ok(())
             }
+            Self::NotGenerated { id } => {
+                write!(f, "asset {id:?} is not an eligible generated asset")
+            }
+            Self::AlreadyPersisted { id, path } => write!(
+                f,
+                "asset {id:?} already has a persisted descriptor at {}",
+                path.display()
+            ),
         }
     }
 }
@@ -767,6 +782,20 @@ impl Error for AssetStoreError {
             Self::InvalidAsset { source, .. } => Some(source),
             _ => None,
         }
+    }
+}
+
+fn ensure_generated(asset: &PerformanceAsset) -> Result<(), AssetStoreError> {
+    if asset
+        .provenance
+        .as_ref()
+        .is_some_and(|provenance| provenance.generated == Some(true))
+    {
+        Ok(())
+    } else {
+        Err(AssetStoreError::NotGenerated {
+            id: asset.id.clone(),
+        })
     }
 }
 
@@ -962,6 +991,101 @@ impl AssetStore {
         Ok(asset)
     }
 
+    /// Persist an already validated generated L0 asset into the local L1 descriptor store.
+    ///
+    /// This method deliberately contains no promotion policy. Callers must make
+    /// that deterministic decision before invoking this storage primitive.
+    pub fn persist_generated_descriptor(&mut self, id: &str) -> Result<PathBuf, AssetStoreError> {
+        let asset = self
+            .hot_get(id)
+            .ok_or_else(|| AssetStoreError::NotFound { id: id.to_owned() })?;
+        ensure_generated(&asset)?;
+        if let CompatibilityStatus::Incompatible(mismatches) =
+            asset.compatibility.check(&self.runtime)
+        {
+            return Err(AssetStoreError::Incompatible {
+                id: id.to_owned(),
+                mismatches,
+            });
+        }
+        if let Some(existing) = self.local.get(id) {
+            return Err(AssetStoreError::AlreadyPersisted {
+                id: id.to_owned(),
+                path: existing.path.clone(),
+            });
+        }
+
+        fs::create_dir_all(&self.root).map_err(|source| AssetStoreError::Io {
+            path: self.root.clone(),
+            source,
+        })?;
+        let destination = self.root.join(format!("{id}.json"));
+        if destination.exists() {
+            return Err(AssetStoreError::AlreadyPersisted {
+                id: id.to_owned(),
+                path: destination,
+            });
+        }
+        let temporary = self
+            .root
+            .join(format!(".{id}.promote-{}.tmp", std::process::id()));
+        let bytes =
+            serde_json::to_vec_pretty(asset.as_ref()).map_err(|source| AssetStoreError::Json {
+                path: destination.clone(),
+                message: source.to_string(),
+            })?;
+        let mut file = fs::File::create(&temporary).map_err(|source| AssetStoreError::Io {
+            path: temporary.clone(),
+            source,
+        })?;
+        file.write_all(&bytes)
+            .map_err(|source| AssetStoreError::Io {
+                path: temporary.clone(),
+                source,
+            })?;
+        file.sync_all().map_err(|source| AssetStoreError::Io {
+            path: temporary.clone(),
+            source,
+        })?;
+        fs::rename(&temporary, &destination).map_err(|source| AssetStoreError::Io {
+            path: destination.clone(),
+            source,
+        })?;
+
+        self.local.insert(
+            id.to_owned(),
+            AssetIndexEntry {
+                identity: asset.identity(),
+                path: destination.clone(),
+                class: asset.class,
+                variant_group: asset.variant_group.clone(),
+                compatibility: CompatibilityStatus::Usable,
+                semantic_embedding: asset.semantic_embedding.clone(),
+            },
+        );
+        Ok(destination)
+    }
+
+    /// Remove a generated asset from both L1 and L0 after provenance validation.
+    pub fn invalidate_generated_asset(&mut self, id: &str) -> Result<(), AssetStoreError> {
+        let local_path = self.local.get(id).map(|entry| entry.path.clone());
+        if let Some(path) = local_path.as_ref() {
+            let persisted = load_asset_file(path)?;
+            ensure_generated(&persisted)?;
+        } else if let Some(asset) = self.hot_get(id) {
+            ensure_generated(&asset)?;
+        } else {
+            return Err(AssetStoreError::NotFound { id: id.to_owned() });
+        }
+
+        if let Some(path) = local_path {
+            fs::remove_file(&path).map_err(|source| AssetStoreError::Io { path, source })?;
+            self.local.remove(id);
+        }
+        self.hot.remove(id);
+        Ok(())
+    }
+
     /// Pure L0 lookup. This performs no filesystem or network access.
     pub fn hot_get(&self, id: &str) -> Option<Arc<PerformanceAsset>> {
         self.hot.get(id).cloned()
@@ -1155,6 +1279,16 @@ mod tests {
         }
     }
 
+    fn generated_runtime() -> RuntimeCompatibility {
+        RuntimeCompatibility {
+            compiler_version: "0.1.0".to_owned(),
+            voice_model: Some("voice-ja-v2".to_owned()),
+            avatar_profile: Some("example-live2d-v1".to_owned()),
+            viseme_mapping: Some("ja-5vowel-v2".to_owned()),
+            motion_library: Some("starter-v1".to_owned()),
+        }
+    }
+
     fn valid_asset() -> PerformanceAsset {
         load_asset_file(fixture("valid/reaction-surprise.json")).expect("valid fixture")
     }
@@ -1261,6 +1395,60 @@ mod tests {
                 .to_string()
                 .contains("binary media must remain external")
         );
+    }
+
+    #[test]
+    fn generated_descriptor_promotion_and_invalidation_preserve_provenance() {
+        let dir = TestDir::new("generated-promotion");
+        let generated =
+            load_asset_file(fixture("valid/generated-dynamic.json")).expect("generated fixture");
+        let expected_provenance = generated.provenance.clone();
+        let id = generated.id.clone();
+        let mut store = AssetStore::new(dir.path(), generated_runtime());
+        store
+            .insert_hot(generated)
+            .expect("insert generated hot asset");
+
+        let path = store
+            .persist_generated_descriptor(&id)
+            .expect("persist generated descriptor");
+        assert!(path.exists());
+        let persisted = load_asset_file(&path).expect("persisted descriptor");
+        assert_eq!(persisted.provenance, expected_provenance);
+        assert_eq!(
+            persisted.compatibility.check(store.runtime()),
+            CompatibilityStatus::Usable
+        );
+        assert!(matches!(
+            store.persist_generated_descriptor(&id),
+            Err(AssetStoreError::AlreadyPersisted { .. })
+        ));
+
+        store
+            .invalidate_generated_asset(&id)
+            .expect("invalidate generated asset");
+        assert!(!path.exists());
+        assert!(store.hot_get(&id).is_none());
+        assert!(store.local_entry(&id).is_none());
+    }
+
+    #[test]
+    fn static_asset_cannot_use_generated_promotion_or_invalidation_path() {
+        let dir = TestDir::new("static-promotion");
+        let asset = valid_asset();
+        let id = asset.id.clone();
+        let mut store = AssetStore::new(dir.path(), runtime());
+        store.insert_hot(asset).expect("insert static hot asset");
+
+        assert!(matches!(
+            store.persist_generated_descriptor(&id),
+            Err(AssetStoreError::NotGenerated { .. })
+        ));
+        assert!(matches!(
+            store.invalidate_generated_asset(&id),
+            Err(AssetStoreError::NotGenerated { .. })
+        ));
+        assert!(store.hot_get(&id).is_some());
     }
 
     #[test]

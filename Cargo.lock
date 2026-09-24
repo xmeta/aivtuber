@@ -9,6 +9,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "aivtuber-adaptation"
+version = "0.1.0"
+dependencies = [
+ "aivtuber-asset-store",
+ "aivtuber-domain",
+ "aivtuber-runtime",
+ "aivtuber-scheduler",
+ "aivtuber-telemetry",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "aivtuber-adapters"
 version = "0.1.0"
 dependencies = [
@@ -26,6 +39,7 @@ dependencies = [
 name = "aivtuber-app"
 version = "0.1.0"
 dependencies = [
+ "aivtuber-adaptation",
  "aivtuber-adapters",
  "aivtuber-asset-store",
  "aivtuber-domain",
