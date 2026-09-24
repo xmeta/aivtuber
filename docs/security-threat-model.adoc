@@ -167,7 +167,9 @@ Each external source has independent:
 
 Overflow degrades by dropping/coalescing low-priority content rather than blocking operator commands.
 
-Public content enters the Rust runtime through byte-aware per-source token buckets and a bounded content queue. Payload caps are measured as serialized UTF-8 bytes. Authenticated emergency control bypasses that content queue entirely, so content flood/backpressure cannot starve mute/stop.
+The default Rust stdin boundary is bounded before parsing: raw records use the same `max_envelope_bytes` limit as `SecurityRuntime`, oversized records are drained without retaining the full line, and the pre-runtime queue is a bounded `sync_channel` sized from the runtime content-queue limit. Queue saturation drops the newest raw record with an observable metric instead of accumulating unbounded input or blocking the producer.
+
+Public content then enters the Rust runtime through byte-aware per-source token buckets and a bounded content queue. Payload caps are measured as serialized UTF-8 bytes. Authenticated emergency control bypasses that content queue entirely, so content flood/backpressure cannot starve mute/stop.
 
 == 10. Secrets
 

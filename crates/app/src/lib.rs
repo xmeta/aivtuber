@@ -1,10 +1,12 @@
 #![forbid(unsafe_code)]
 
 mod outputs;
+mod raw_ingress;
 mod routing;
 mod semantic;
 
 pub use outputs::*;
+pub use raw_ingress::*;
 pub use routing::*;
 pub use semantic::*;
 

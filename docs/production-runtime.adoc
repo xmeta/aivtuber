@@ -44,6 +44,7 @@ OBS remains an independent control adapter. Its availability never owns schedule
 
 == Runtime invariants
 
+* Raw stdin is byte-bounded and queue-bounded before +SecurityRuntime+; hostile line size or producer rate cannot create an unbounded pre-runtime buffer.
 * Content bytes always pass through +SecurityRuntime::admit_content_bytes+.
 * Operator/control events cannot enter the content ingress path.
 * Cached playback uses the existing +CachedPerformer+ scheduler, not a second application scheduler.
@@ -73,7 +74,11 @@ Run the daemon from the repository root:
 cargo run -p aivtuber-app
 ----
 
-The process reads one Event Envelope JSON document per stdin line. It advances the scheduler from a monotonic process clock and services due output commands on a short polling interval.
+The process reads one Event Envelope JSON document per stdin line. Raw stdin is bounded before `SecurityRuntime`: the pre-runtime channel uses `sync_channel` with capacity equal to `SecurityRuntimeConfig::content_queue_limit`, and the line reader retains at most `max_envelope_bytes + 1` bytes while determining whether a record is oversized. An oversized record is drained through its newline and dropped; a record arriving while the raw queue is full is also dropped rather than blocking the reader. Both outcomes are exposed through `RawIngressMetricsSnapshot` and reported by the executable. Valid records retain input order.
+
+Because the producer uses non-blocking `try_send`, a saturated raw queue cannot leave the stdin producer blocked on the application consumer during shutdown. The raw record-size limit is derived directly from `SecurityRuntimeConfig::max_envelope_bytes`, so the pre-runtime and runtime envelope limits cannot silently diverge. With the current default `SecurityRuntimeConfig`, this means a 64 KiB raw-record limit and a 1024-record pre-runtime queue.
+
+The process advances the scheduler from a monotonic process clock and services due output commands on a short polling interval.
 
 The starter pack contains descriptors and viseme metadata only. Audio binaries remain external to Git. Materialize the referenced files below the configured audio root before testing real playback.
 
