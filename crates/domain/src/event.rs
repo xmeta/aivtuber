@@ -271,16 +271,95 @@ mod tests {
         }
     }
 
-    #[test]
-    fn valid_chat_round_trips() {
-        let event = chat_event();
-        event.validate().expect("valid chat event");
+    fn assert_valid_round_trip(event: EventEnvelope) {
+        event
+            .validate()
+            .expect("representative event must be valid");
 
         let json = serde_json::to_string(&event).expect("serialize");
         let decoded: EventEnvelope = serde_json::from_str(&json).expect("deserialize");
 
-        assert_eq!(decoded.kind, EventKind::ChatMessage);
+        assert_eq!(decoded, event);
         decoded.validate().expect("round-trip remains valid");
+    }
+
+    #[test]
+    fn representative_chat_event_round_trips() {
+        assert_valid_round_trip(chat_event());
+    }
+
+    #[test]
+    fn representative_donation_event_round_trips() {
+        let mut event = chat_event();
+        event.event_id = "evt-donation-1".to_owned();
+        event.source = "example-donation".to_owned();
+        event.source_class = SourceClass::Donation;
+        event.trust_level = TrustLevel::SemiTrusted;
+        event.kind = EventKind::ChatDonation;
+        event.payload = BTreeMap::from([
+            (
+                "amount".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(500)),
+            ),
+            (
+                "currency".to_owned(),
+                serde_json::Value::String("JPY".to_owned()),
+            ),
+            (
+                "message".to_owned(),
+                serde_json::Value::String("応援しています".to_owned()),
+            ),
+        ]);
+
+        assert_valid_round_trip(event);
+    }
+
+    #[test]
+    fn representative_game_event_round_trips() {
+        let mut event = chat_event();
+        event.event_id = "evt-game-1".to_owned();
+        event.source = "example-game".to_owned();
+        event.source_class = SourceClass::Game;
+        event.trust_level = TrustLevel::SemiTrusted;
+        event.kind = EventKind::GameEvent;
+        event.actor_id = None;
+        event.priority_hint = Some(0.8);
+        event.payload = BTreeMap::from([
+            (
+                "event".to_owned(),
+                serde_json::Value::String("boss.spawn".to_owned()),
+            ),
+            (
+                "boss".to_owned(),
+                serde_json::Value::String("example-boss".to_owned()),
+            ),
+        ]);
+
+        assert_valid_round_trip(event);
+    }
+
+    #[test]
+    fn representative_timer_event_round_trips() {
+        let mut event = chat_event();
+        event.event_id = "evt-timer-1".to_owned();
+        event.source = "runtime-timer".to_owned();
+        event.source_class = SourceClass::Timer;
+        event.plane = SecurityPlane::System;
+        event.trust_level = TrustLevel::Trusted;
+        event.kind = EventKind::TimerTick;
+        event.actor_id = None;
+        event.payload = BTreeMap::from([
+            (
+                "timer_id".to_owned(),
+                serde_json::Value::String("heartbeat".to_owned()),
+            ),
+            (
+                "elapsed_ms".to_owned(),
+                serde_json::Value::Number(serde_json::Number::from(1_000)),
+            ),
+        ]);
+
+        assert_valid_round_trip(event);
     }
 
     #[test]
