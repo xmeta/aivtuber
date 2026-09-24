@@ -33,6 +33,8 @@ For one event the buffered path is:
 
 The generative crate does not mutate Scheduler state while LLM/TTS work is in flight. A timeout, cancellation, malformed backend result, or partial stream therefore cannot leave a half-scheduled performance behind.
 
+Every attempted LLM invocation emits a production audit record containing the source event id, deterministic generation routing reason, and provider/model identity. Prompt text and generated reply text are deliberately excluded from this audit record, and configured secrets are redacted by the runtime audit boundary.
+
 == Cancellation
 
 `GenerationCancellationRegistry` associates the active generation with the same `aivtuber_scheduler::priority_for_event` mapping used by cached playback. A newly admitted event cancels the active token only when the new event has strictly higher scheduler priority. Authenticated emergency stop/mute also cancels the active generation without depending on model/network availability.

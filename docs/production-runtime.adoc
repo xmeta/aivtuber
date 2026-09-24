@@ -54,6 +54,7 @@ OBS remains an independent control adapter. Its availability never owns schedule
 * Failed audio/avatar commands are not requeued. Reconnecting an adapter therefore cannot replay an already-due stale command.
 * Authenticated emergency stop operates on the same scheduler used by cached/generated playback, purges pending commands, and cancels active generation independently of model/network availability.
 * Generated public text always passes through +SecurityRuntime::publish_text+ before TTS; suppressed output never reaches TTS.
+* Every attempted LLM call is retained in the production audit with source event id, deterministic routing reason, and provider/model identity; prompt and generated reply text are excluded.
 * Only complete, validated, runtime-compatible generated assets enter +AssetStore::insert_hot+; partial text/audio never reaches reusable asset or scheduler state.
 * Generated assets are scheduled by the same +CachedPerformer+ / +Scheduler+ instance as cached assets, preserving one monotonic timeline for audio/visemes/avatar commands.
 * Higher-priority generation cancellation uses the scheduler's shared +priority_for_event+ mapping.

@@ -159,6 +159,31 @@ impl SecurityRuntime {
         &self.audit
     }
 
+    /// Persist a generation-provider invocation without storing prompt or reply text.
+    ///
+    /// The source event id and deterministic routing reason are retained for audit,
+    /// while configured secrets are redacted from provider identity fields.
+    pub fn record_generation_call(
+        &mut self,
+        event_id: &str,
+        routing_reason: &str,
+        backend_name: &str,
+        model_alias: Option<&str>,
+        model_version: Option<&str>,
+    ) {
+        let detail = format!(
+            "routing_reason={routing_reason} backend={backend_name} model_alias={} model_version={}",
+            model_alias.unwrap_or("-"),
+            model_version.unwrap_or("-")
+        );
+        self.audit.push(self.redactor.record(
+            Some(event_id),
+            AuditCategory::Generation,
+            "llm_call",
+            detail,
+        ));
+    }
+
     pub fn pop_content(&mut self) -> Option<EventEnvelope> {
         self.content_queue.pop_front()
     }
@@ -690,6 +715,28 @@ mod tests {
 
         let audit_debug = format!("{:?}", runtime.audit());
         assert!(!audit_debug.contains("config-secret-value"));
+    }
+
+    #[test]
+    fn generation_call_audit_records_source_route_and_redacts_provider_identity() {
+        let mut runtime = runtime_with(SecurityRuntimeConfig::default(), &["secret-model"]);
+
+        runtime.record_generation_call(
+            "evt-generation",
+            "explicit_llm_route",
+            "openai",
+            Some("secret-model"),
+            Some("2026-09-01"),
+        );
+
+        let record = runtime.audit().last().expect("generation audit");
+        assert_eq!(record.event_id.as_deref(), Some("evt-generation"));
+        assert_eq!(record.category, AuditCategory::Generation);
+        assert_eq!(record.decision, "llm_call");
+        assert!(record.detail.contains("routing_reason=explicit_llm_route"));
+        assert!(record.detail.contains("backend=openai"));
+        assert!(record.detail.contains("model_alias=[REDACTED]"));
+        assert!(!record.detail.contains("secret-model"));
     }
 
     #[test]

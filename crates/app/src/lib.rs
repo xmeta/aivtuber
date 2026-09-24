@@ -356,6 +356,15 @@ where
         };
         generative.cancellation.finish(&event.event_id);
         let result = result.map_err(|error| AppError::Generation(error.to_string()))?;
+        for call in &result.trace.llm_calls {
+            self.security.record_generation_call(
+                &call.event_id,
+                call.routing_reason.as_str(),
+                &call.backend.name,
+                call.backend.model_alias.as_deref(),
+                call.backend.model_version.as_deref(),
+            );
+        }
 
         match result.disposition {
             GenerationDisposition::Generated { asset } => {
@@ -1234,6 +1243,22 @@ mod tests {
                 && *at_ms >= playback.plan.start_at_ms
                 && *at_ms <= playback.plan.end_at_ms()
         }));
+
+        let llm_audit = app
+            .security()
+            .audit()
+            .iter()
+            .find(|record| record.category == aivtuber_telemetry::AuditCategory::Generation)
+            .expect("generation audit");
+        assert_eq!(llm_audit.event_id.as_deref(), Some("evt-30"));
+        assert_eq!(llm_audit.decision, "llm_call");
+        assert!(
+            llm_audit
+                .detail
+                .contains("routing_reason=explicit_llm_route")
+        );
+        assert!(llm_audit.detail.contains("backend=mock-thinking"));
+        assert!(!llm_audit.detail.contains("generated hello"));
     }
 
     #[test]
@@ -1342,6 +1367,18 @@ mod tests {
             .expect("cached fallback");
         assert!(tts_log.lock().expect("tts log").is_empty());
         assert!(playback.asset_id.starts_with("reaction.agree."));
+        let llm_audit = app
+            .security()
+            .audit()
+            .iter()
+            .find(|record| record.category == aivtuber_telemetry::AuditCategory::Generation)
+            .expect("timeout LLM audit");
+        assert_eq!(llm_audit.event_id.as_deref(), Some("evt-33"));
+        assert!(
+            llm_audit
+                .detail
+                .contains("routing_reason=explicit_llm_route")
+        );
     }
 
     #[test]

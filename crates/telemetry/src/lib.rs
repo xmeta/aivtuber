@@ -13,12 +13,13 @@ pub enum MetricGroup {
     Security,
 }
 
-/// Security audit categories contain decisions, never credentials.
+/// Runtime audit categories contain decisions, never credentials or generated content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditCategory {
     Ingress,
     Authorization,
     Output,
+    Generation,
     Memory,
 }
 
