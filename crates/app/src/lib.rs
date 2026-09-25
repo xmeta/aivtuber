@@ -171,6 +171,9 @@ struct HandledEvent {
     generation_latency_us: Option<u64>,
     generation_trace: Option<GenerationTrace>,
     decision: Option<DecisionReplayRecord>,
+    /// Deterministic fallback recorded by the planner for a Template
+    /// decision (issue #54); `None` when no template fallback applies.
+    template_fallback: Option<&'static str>,
     cache_level: Option<CacheLevel>,
 }
 
@@ -424,6 +427,10 @@ where
         let route = self.router.route(&event)?;
         let routing_latency_us = elapsed_us(route_started);
         let decision = self.router.decision_record().cloned();
+        let template_fallback = self
+            .router
+            .template_fallback()
+            .map(|fallback| fallback.reason());
         let mut generation_latency_us = None;
         let mut generation_trace = None;
 
@@ -497,6 +504,7 @@ where
                         generation_latency_us,
                         generation_trace,
                         decision,
+                        template_fallback,
                         cache_level: None,
                     });
                 }
@@ -533,6 +541,7 @@ where
             generation_latency_us,
             generation_trace,
             decision,
+            template_fallback,
             cache_level,
         })
     }
@@ -784,6 +793,12 @@ where
             observation.fallback_reason =
                 fallback_reason_name(decision.evidence.normalized.fallback_reason)
                     .map(str::to_owned);
+        }
+
+        // Template fallbacks are recorded by the planner itself (issue #54);
+        // prefer that reason when the template route degraded to silence.
+        if let Some(reason) = handled.template_fallback {
+            observation.fallback_reason = Some(reason.to_owned());
         }
 
         if self.health.audio_error.is_some() {
@@ -1678,6 +1693,21 @@ mod tests {
         let pipeline =
             ReflexPipeline::new(index, adapter, PolicyConfig::default(), 2).expect("pipeline");
         ReflexRoutePlanner::new(pipeline, FixedEmbedding)
+    }
+
+    /// Issue #54: reflex planner wired to answer `template` with the curated
+    /// template pack installed.
+    fn template_planner() -> ReflexRoutePlanner<FixedEmbedding> {
+        reflex_router_with_route("template").with_template_pack(test_template_pack())
+    }
+
+    fn test_template_pack() -> TemplatePack {
+        TemplatePack::new(vec![ResponseTemplate {
+            id: "thanks.donation".to_owned(),
+            version: "curated-v1".to_owned(),
+            text: "{name}さん、ありがとう！".to_owned(),
+            slots: vec!["name".to_owned()],
+        }])
     }
 
     fn app<R>(
@@ -2862,5 +2892,75 @@ mod tests {
                 },
             })
         }
+    }
+
+    /// Issue #54: the reflex planner must compose Template decisions against
+    /// the curated pack (not the previous silent stub).
+    #[test]
+    fn planner_composes_template_from_pack_with_slots() {
+        let mut planner = template_planner();
+        let mut event = chat_event(41);
+        event.payload.insert(
+            "template_id".to_owned(),
+            serde_json::Value::String("thanks.donation".to_owned()),
+        );
+        event.payload.insert(
+            "name".to_owned(),
+            serde_json::Value::String("たろう".to_owned()),
+        );
+
+        let route = planner.route(&event).expect("route");
+        let PlaybackRoute::Template {
+            template_id,
+            composition,
+        } = route
+        else {
+            panic!("expected Template route, got {route:?}");
+        };
+        assert_eq!(template_id, "thanks.donation");
+        assert_eq!(composition.template_version, "curated-v1");
+        assert_eq!(composition.text, "たろうさん、ありがとう！");
+        assert_eq!(planner.template_fallback(), None);
+    }
+
+    /// Issue #54: a template missing from the pack degrades deterministically
+    /// to silence with the fallback reason recorded for telemetry.
+    #[test]
+    fn planner_falls_back_to_silent_for_unknown_template_id() {
+        let mut planner = template_planner();
+        let mut event = chat_event(42);
+        event.payload.insert(
+            "template_id".to_owned(),
+            serde_json::Value::String("does.not.exist".to_owned()),
+        );
+
+        let route = planner.route(&event).expect("route");
+        assert_eq!(route, PlaybackRoute::Silent);
+        assert_eq!(
+            planner.template_fallback(),
+            Some(TemplateFallback::MissingTemplate)
+        );
+    }
+
+    /// Issue #54: oversized slot content is rejected by the composer bounds.
+    #[test]
+    fn planner_falls_back_to_silent_for_oversized_slot_content() {
+        let mut planner = template_planner();
+        let oversized = "x".repeat(MAX_TEMPLATE_SLOT_BYTES + 1);
+        let mut event = chat_event(43);
+        event.payload.insert(
+            "template_id".to_owned(),
+            serde_json::Value::String("thanks.donation".to_owned()),
+        );
+        event
+            .payload
+            .insert("name".to_owned(), serde_json::Value::String(oversized));
+
+        let route = planner.route(&event).expect("route");
+        assert_eq!(route, PlaybackRoute::Silent);
+        assert_eq!(
+            planner.template_fallback(),
+            Some(TemplateFallback::SlotValueTooLarge)
+        );
     }
 }
