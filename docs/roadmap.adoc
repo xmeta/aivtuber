@@ -25,6 +25,7 @@ It describes how the architecture was bootstrapped; it is not a second active PM
 Goal: a bounded, secure, operable production runtime that can be exercised as a minimum usable live stream.
 
 The product-level release gate is tracked by https://github.com/xmeta/aivtuber/issues/97[#97, v0.1 minimum usable live-stream release gate].
+The reusable execution/evidence template is link:release-v0.1.adoc[v0.1 Release Checklist and Evidence Record].
 
 Stage 1 exit requires the core runtime to be bounded and operable, with explicit production profiles, usable template/reflex/generative routing, authenticated operator control, provider/deadline boundaries, diagnostics, and degradation behavior.
 
@@ -149,5 +150,7 @@ Added replay comparison, failure injection, long-stream logical-time soak covera
 
 The historical Phase 6 work exposed remaining production-boundedness gaps that are now owned by Stage 1 issues such as #51-#53.
 See link:failure-soak.adoc[Failure Injection and Long-Stream Soak].
+
+[executed on device: DESKTOP (2bf3ba04-d7b4-4fb7-99c6-76b0fc11abcc)]
 
 [executed on device: DESKTOP (2bf3ba04-d7b4-4fb7-99c6-76b0fc11abcc)]

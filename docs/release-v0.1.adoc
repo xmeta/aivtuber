@@ -1,0 +1,413 @@
+= v0.1 Release Checklist and Evidence Record
+:toc:
+:toclevels: 2
+
+This document operationalizes GitHub issue #97, the minimum usable live-stream release gate.
+
+It defines *how to collect release evidence*.
+It does not claim that the current repository already satisfies v0.1, and it does not replace subsystem acceptance criteria.
+
+== 1. Release decision principle
+
+The v0.1 question is:
+
+> Can an operator start the production runtime, connect the selected live adapters, admit content, produce a useful reaction through the intended routing hierarchy, remain bounded/degraded under failure, retain emergency control, and shut down cleanly?
+
+A release candidate is acceptable only when the exercised production profile has coherent end-to-end evidence.
+
+Do not substitute "all unit tests pass" for product-level release evidence.
+Do not substitute one successful live demo for deterministic CI/replay/failure evidence.
+
+== 2. Evidence classes
+
+=== 2.1 Deterministic CI / local reproducible evidence
+
+Expected to be runnable without live billable providers:
+
+* toolchain/lockfile validation;
+* schema/security fixtures;
+* Rust workspace checks;
+* deterministic replay benchmark;
+* deterministic failure/fallback scenarios;
+* bounded logical-time soak where applicable.
+
+=== 2.2 Scheduled/manual provider conformance
+
+Owned primarily by #66.
+
+May require controlled credentials or test environments:
+
+* VTube Studio protocol/auth compatibility;
+* OBS compatibility;
+* configured Thinking/TTS provider health;
+* authentication/permission failures;
+* timeout/cancellation normalization;
+* provider/version identity.
+
+These probes must not perform destructive/public actions against unrelated real channels.
+
+=== 2.3 Local live-smoke evidence
+
+A bounded 30-60 minute operator-observed session using the selected v0.1 production profile.
+
+The live smoke validates system composition and operability.
+It does not define statistical performance targets by itself.
+
+== 3. Release-candidate identity
+
+Record before testing:
+
+[source,text]
+----
+Release candidate:
+Commit SHA:
+Date/time:
+Operator/tester:
+Host OS / relevant environment:
+Rust toolchain:
+Bun toolchain:
+
+Production profile:
+Profile/config fingerprint:
+Asset/index version:
+Persona/policy version where applicable:
+
+VTube Studio version / adapter mode:
+OBS version / adapter mode:
+Audio backend:
+Thinking provider/model:
+TTS provider/model:
+Jev provider/model:
+Other external provider versions:
+----
+
+Do not place secrets, tokens, API keys, or raw credentials in the record.
+
+== 4. Required release checklist
+
+=== 4.1 Clean checkout and launchability
+
+* [ ] clean checkout/install instructions are current;
+* [ ] committed lockfiles are used;
+* [ ] documented production profile starts without hidden local state;
+* [ ] required configuration is explicit;
+* [ ] optional provider/adapters are distinguishable from required ones;
+* [ ] startup failure reports an actionable reason rather than hanging.
+
+Evidence:
+
+[source,text]
+----
+Command/profile:
+Result:
+Logs/diagnostic artifact reference:
+Owning issue if failed:
+----
+
+=== 4.2 Cached reaction path
+
+* [ ] admitted event reaches the production Rust composition root;
+* [ ] exact/cached route produces the expected bounded Performance Asset;
+* [ ] audio dispatch succeeds or degrades explicitly;
+* [ ] avatar dispatch succeeds or degrades explicitly;
+* [ ] route/correlation identity is observable.
+
+This is the cheapest end-to-end production path and should remain usable even when generative providers are unavailable.
+
+=== 4.3 Template route
+
+* [ ] valid Template routing no longer maps to silence solely because the route is absent;
+* [ ] output remains subject to the normal public-output/security boundary;
+* [ ] unsupported/missing template content has a typed fallback.
+
+Primary owner: #54.
+
+=== 4.4 Reflex/Jev degradation
+
+Exercise at least:
+
+* normal bounded reflex decision;
+* provider timeout;
+* provider unavailable;
+* invalid/malformed decision where supported by fixtures.
+
+Verify:
+
+* [ ] scheduler/motor loop does not freeze;
+* [ ] deterministic fallback is selected;
+* [ ] fallback reason is observable;
+* [ ] stale provider result cannot override the newer decision.
+
+=== 4.5 Generative / TTS degradation
+
+Exercise controlled failure or mock fault for:
+
+* Thinking provider timeout/unavailable;
+* TTS timeout/unavailable;
+* cancellation while generation is pending.
+
+Verify:
+
+* [ ] performer remains responsive;
+* [ ] cheaper route/non-verbal/silence fallback is explicit;
+* [ ] stale/cancelled generated output is not dispatched later;
+* [ ] operator stop/mute remains available.
+
+=== 4.6 Bounded retained state
+
+For the selected v0.1 profile, collect available high-water/plateau evidence for retained state such as:
+
+* scheduler active/terminal state;
+* generated L0 assets;
+* working/adaptation memory;
+* rate-limit/source state;
+* telemetry/diagnostic retained history;
+* provider queues.
+
+Do not invent a numeric release threshold before #51/#58/#71 establish the relevant contract/baseline.
+
+The release gate instead requires:
+
+* [ ] all exercised long-lived state has an explicit configured bound;
+* [ ] no observed process-lifetime collection grows without ownership/retention policy;
+* [ ] any unresolved growth is linked to a blocking issue.
+
+=== 4.7 Operator emergency control
+
+Verify independently of normal content/model health:
+
+* [ ] stop;
+* [ ] mute;
+* [ ] recovery/resume if included in the selected profile;
+* [ ] operator command cannot be forged through public content;
+* [ ] emergency control remains usable while a provider is slow/unavailable;
+* [ ] emergency control remains usable under content backlog/saturation scenario where safely testable.
+
+A failure here is a no-go for the affected production profile.
+
+=== 4.8 Diagnostics / health visibility
+
+The operator must be able to identify at least:
+
+* selected production profile;
+* runtime/build identity;
+* adapter connection/degradation state;
+* current provider identity where relevant;
+* bounded queue/high-water or equivalent health information needed to diagnose stalls;
+* fallback/error reason for the exercised failures.
+
+Do not require raw prompts/replies or secrets in a support artifact.
+
+=== 4.9 Replay benchmark
+
+Record:
+
+[source,text]
+----
+Replay fixture/dataset version:
+Command:
+Result artifact:
+Baseline comparison:
+Hard-invariant failures:
+Noisy/non-blocking deltas:
+Owning issue for any unresolved regression:
+----
+
+Numeric performance budgets become authoritative only after #58 establishes their measurement/variance policy.
+
+=== 4.10 Failure / soak evidence
+
+Record:
+
+[source,text]
+----
+Failure/soak scenario:
+Logical/live duration:
+Command/config:
+Queue/retention high-water:
+Fallback/reconnect observations:
+Invariant failures:
+Owning issue:
+----
+
+At minimum, exercise the failure classes required by the selected production profile.
+
+=== 4.11 30-60 minute local live smoke
+
+Use controlled content/test accounts where appropriate.
+
+Suggested sequence:
+
+. Start from the documented production profile.
+. Confirm initial adapter/provider health.
+. Exercise several cached reactions.
+. Exercise at least one Template response.
+. Exercise normal reflex/Jev routing where enabled.
+. Exercise one generative response where enabled.
+. Trigger or simulate a safe provider degradation.
+. Verify fallback while the performer continues operating.
+. Verify operator mute/stop during non-idle activity.
+. Resume/restart only if the selected profile supports it.
+. Continue normal mixed events long enough to observe queue/retention behavior.
+. Perform clean shutdown.
+. Inspect diagnostic/telemetry evidence for unexplained errors or growth.
+
+Record notable incidents, even if recovered automatically.
+
+=== 4.12 Clean shutdown
+
+* [ ] content ingress stops;
+* [ ] pending/cancelled provider work cannot publish after shutdown begins;
+* [ ] audio/avatar/OBS adapters terminate or disconnect predictably;
+* [ ] operator does not need to kill an orphaned process under the normal path;
+* [ ] expected local state is flushed/closed without persisting secrets.
+
+== 5. Known limitations and deferrals
+
+Use a standard entry:
+
+[source,text]
+----
+Limitation:
+Affected profile/path:
+User/operator impact:
+Workaround:
+Owning issue:
+Target milestone:
+Release-blocking: yes | no
+Reason:
+----
+
+v0.1 does not require completion of Stage 2-5 merely because those stages contain desirable capabilities.
+
+Explicitly document deferred items rather than silently treating them as implemented.
+
+== 6. Incident record
+
+For each notable release-candidate incident:
+
+[source,text]
+----
+Incident ID:
+Time / correlation ID:
+Observed behavior:
+Expected behavior:
+Recovered automatically: yes | no
+Operator action required:
+Privacy/security impact:
+Likely owning subsystem:
+Owning GitHub issue:
+Trace/diagnostic reference:
+Release impact:
+----
+
+If the incident reveals a new defect, create/link a focused issue instead of expanding #97 into an implementation owner.
+
+== 7. Final evidence record template
+
+Copy this section for each release candidate.
+
+[source,text]
+----
+= aivtuber v0.1 Release Candidate Evidence
+
+Decision: GO | NO-GO | DEFER
+Decision date:
+Commit SHA:
+Production profile:
+Operator/tester:
+
+== Automated evidence
+
+Toolchains/locks:
+Schema/security:
+Rust workspace:
+Replay benchmark:
+Failure/soak:
+
+== Provider / adapter conformance
+
+VTS:
+OBS:
+Audio:
+Jev:
+Thinking:
+TTS:
+Other:
+
+== Live smoke
+
+Duration:
+Configuration fingerprint:
+Cached path:
+Template path:
+Reflex/Jev path:
+Generative path:
+Provider-degradation test:
+Operator stop/mute:
+Clean shutdown:
+
+== Boundedness / diagnostics
+
+Scheduler:
+Generated assets:
+Memory:
+Rate/source state:
+Telemetry/trace:
+Queues:
+Diagnostic/support output:
+
+== Incidents
+
+- ...
+
+== Known limitations / deferrals
+
+- ...
+
+== Blocking issues
+
+- ...
+
+== Decision rationale
+
+Why GO / NO-GO / DEFER:
+----
+
+== 8. Go / no-go rules
+
+A release decision must be explicit.
+
+=== GO
+
+Use when:
+
+* #97 criteria are met for the selected profile;
+* required CI/replay/failure evidence is green or understood within documented non-blocking variance;
+* no unresolved release-blocking security/operator/boundedness issue remains;
+* live smoke completed without unexplained release-blocking incidents;
+* limitations are documented.
+
+=== NO-GO
+
+Use when a release-blocking defect/invariant failure is known, especially:
+
+* operator emergency control failure;
+* privileged-control/trust bypass;
+* stale/cancelled public output escaping its fence;
+* exercised retained state is known unbounded without an accepted temporary release restriction;
+* runtime freezes on a required degraded path.
+
+=== DEFER
+
+Use when evidence is incomplete rather than known-bad.
+
+Do not convert missing evidence into an implicit GO.
+
+== 9. Relationship to later stages
+
+Stage 2+ adds stronger measurement, engagement intelligence, natural performance, and multimodal capabilities.
+
+Those stages can change future release criteria, but they are not retroactively required for the minimum v0.1 profile unless #97 is explicitly amended.
+
+Future numeric SLO/error-budget gates belong to #58/#71 after measured baselines exist.
