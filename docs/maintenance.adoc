@@ -55,9 +55,12 @@ Those files summarize procedure but do not override the architecture, security t
 
 Implementation issues should carry one primary milestone plus one +priority:P1+, +priority:P2+, or +priority:P3+ label so an agent can determine delivery stage and ordering without inferring them from chat history.
 Use +status:agent-ready+ only when dependencies are satisfied and the issue is sufficiently specified for autonomous implementation; use +status:blocked+ when a named blocker remains.
+Use +status:design-ready+ when architecture, research, evaluation design, or assumption review can proceed without authorizing implementation. An issue may be both +status:blocked+ and +status:design-ready+.
 An incomplete implementation should remain on its issue branch with a pushed checkpoint and explicit handoff rather than being represented as a normal completion PR.
 
 Repository content search uses +tgrep+; a local root +.tgrep/+ index may be built with +tgrep index .+ and is intentionally ignored by Git.
+
+Before research/design work derived from external papers or OSS, check +docs/research-register.adoc+ so prior transfer assumptions and local validation owners are not rediscovered.
 
 Before implementing generic infrastructure, check +docs/reuse-first.adoc+ for existing library/reference candidates. A new dependency or custom replacement should record why it is adopted, wrapped, used only as reference, benchmarked first, or rejected. Project-specific authority, replay, deterministic scheduling, and bounded-state semantics remain repository-owned even when a third-party primitive is used.
 
@@ -104,3 +107,5 @@ To update Bun itself, change `packageManager` and the CI `bun-version` in the sa
 == Pull-request sizing
 
 Prefer one issue-sized, testable vertical slice per PR. Split work when independent schema, infrastructure, adapter, or runtime changes can be validated separately. A larger PR is acceptable when splitting would create an uncompilable or unverifiable intermediate state; record that reason in the PR description.
+
+[executed on device: DESKTOP (2bf3ba04-d7b4-4fb7-99c6-76b0fc11abcc)]

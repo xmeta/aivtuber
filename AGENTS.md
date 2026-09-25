@@ -189,12 +189,14 @@ Development method is GitHub Flow.
 - Assign/retain one primary delivery milestone and one priority:P1/P2/P3 label for implementation issues.
 - Use milestone stage for delivery grouping; use priority label for ordering within/among stages.
 - status:agent-ready means dependencies are satisfied and an agent may self-select the issue when asked to continue autonomously; status:blocked means do not start it until the named blocker is resolved.
+- status:design-ready means architecture/research/evaluation design may proceed, but it does not authorize implementation; an issue may be both design-ready and implementation-blocked.
 - Link the issue from the PR and use Closes #... when the PR fully completes it.
 - Required CI must be green on the final head commit before merge.
 - Do not bypass branch protection or force-push main.
 - Prefer conventional, scoped commits such as feat(reflex): ... (#74) or docs: ... (#95).
 
 For evidence-sensitive work, follow the hypothesis/guardrail/benchmark process linked from the issue and docs/metrics.adoc.
+For non-implementation research/design work, prefer status:design-ready issues and consult docs/research-register.adoc; autonomous code implementation still requires status:agent-ready.
 
 ## Finish / handoff
 
@@ -219,3 +221,5 @@ If work must stop before completion, leave a handoff containing:
 - next recommended command/file to inspect.
 
 See docs/agent-development.adoc for the detailed playbook.
+
+[executed on device: DESKTOP (2bf3ba04-d7b4-4fb7-99c6-76b0fc11abcc)]

@@ -12,6 +12,10 @@ For day-to-day execution, GitHub issue metadata is the live source of truth:
 * `priority:P1` / `priority:P2` / `priority:P3` = ordering within and across stages;
 * `status:agent-ready` = dependencies are satisfied and an implementation agent may start;
 * `status:blocked` = do not start until the named blocker is resolved.
+* `status:design-ready` = architecture/research/evaluation design may proceed even when implementation remains blocked; it does not authorize code implementation.
+
+Research-derived design questions and external paper/OSS mappings are tracked in link:research-register.adoc[Research and Design Register].
+This allows non-implementation work to progress without changing the active milestone hierarchy or prematurely marking issues implementation-ready.
 
 The older Phase 0-6 sequence is retained at the end of this document as implementation history.
 It describes how the architecture was bootstrapped; it is not a second active PM hierarchy.
@@ -145,3 +149,5 @@ Added replay comparison, failure injection, long-stream logical-time soak covera
 
 The historical Phase 6 work exposed remaining production-boundedness gaps that are now owned by Stage 1 issues such as #51-#53.
 See link:failure-soak.adoc[Failure Injection and Long-Stream Soak].
+
+[executed on device: DESKTOP (2bf3ba04-d7b4-4fb7-99c6-76b0fc11abcc)]
