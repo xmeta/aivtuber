@@ -8,7 +8,7 @@ It is not a dependency lock-in list.
 A candidate may be adopted directly, wrapped, partially reused, used only as a reference, benchmarked first, or rejected.
 
 The issue or PR that introduces a dependency still owns final due diligence.
-See #100 for supply-chain policy and CI gates.
+See #100 for supply-chain policy and CI gates; the enforced policy lives in +deny.toml+ (cargo-deny) with the exception procedure in +docs/supply-chain.adoc+.
 
 == 1. Decision rule
 

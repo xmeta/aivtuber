@@ -18,3 +18,7 @@ resolver = "3"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
+# Internal workspace: crates are not published to crates.io (issue #100).
+# Members inherit this, which also lets cargo-deny treat them as private
+# (skipping their license expressions) and allow intra-workspace path deps.
+publish = false

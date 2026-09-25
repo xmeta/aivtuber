@@ -33,6 +33,7 @@ The core design separates three time scales:
 * link:AGENTS.md[AI coding-agent development contract]
 * link:docs/agent-development.adoc[AI agent development playbook]
 * link:docs/reuse-first.adoc[Reuse-first library and reference-implementation matrix]
+* link:docs/supply-chain.adoc[Supply-chain policy (cargo-deny gate and advisory exceptions)]
 * link:docs/research-register.adoc[Research and design register]
 * link:docs/release-v0.1.adoc[v0.1 release checklist and evidence record]
 * link:docs/assumptions.adoc[Assumption register]

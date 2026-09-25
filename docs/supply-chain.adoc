@@ -1,0 +1,68 @@
+= Supply-chain policy (cargo-deny)
+
+Issue: #100 · Policy file: `deny.toml` · CI job: `supply-chain` in `.github/workflows/ci.yml`
+
+== 1. What the gate checks
+
+`cargo deny --locked check` runs four checks against the locked dependency graph:
+
+* *advisories* — known https://rustsec.org/[RustSec] advisories fail the build.
+* *licenses* — only the permissive licenses listed in `deny.toml` (`allow`) are accepted. Copyleft (GPL/AGPL) is rejected. Workspace crates are not published (`publish = false` inherited via `[workspace.package]`), so their own license expressions are not gated.
+* *bans* — duplicate crate versions are reported as warnings; wildcard version requirements from external crates are denied (intra-workspace path dependencies are allowed). Known `std`-replacement and duplicate findings should be resolved by upgrading rather than skip-listing.
+* *sources* — only crates.io is accepted as a registry; unknown git sources and registries are denied.
+
+`--locked` guarantees the gate never mutates `Cargo.lock`.
+
+== 2. Local commands
+
+[source,bash]
+----
+cargo deny --locked check          # all four checks
+cargo deny --offline check         # without network (uses cached advisory db)
+cargo deny check licenses          # a single check
+----
+
+The advisory database is fetched on first run; CI fetches it automatically.
+
+== 3. Advisory handling policy
+
+When a RustSec advisory appears:
+
+1. Check whether a patched version exists. If yes, upgrade in a normal PR (`cargo update -p <crate>`), let CI run the gate, and record the upgrade in the PR description.
+2. If there is no actionable fix (unmaintained transitive dependency, no patched release, or the fix is incompatible with toolchain constraints), add a *temporary exception* to `deny.toml` under `[advisories] ignore`, then document it here.
+
+An advisory with a fix is never ignored; an advisory without a fix may be ignored only through the procedure below.
+
+== 4. Temporary exception procedure
+
+Every exception in `[advisories] ignore` (or a licenses/bans exception) must carry:
+
+* *reason* — why the finding cannot be fixed right now;
+* *owner* — the maintainer or issue tracking it;
+* *revisit condition* — the event that removes the exception (patched release available, crate dropped from the graph, toolchain upgrade).
+
+Example entry in `deny.toml`:
+
+[source,toml]
+----
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0123: unmaintained transitive dep of <crate>, no patch.
+    # Owner: @maintainer · Tracked: #NNN · Revisit: when <crate> releases the fix.
+    { id = "RUSTSEC-2026-0123", reason = "no patched release; see #NNN" },
+]
+----
+
+Exceptions are re-reviewed when the dependency graph changes (dependency-upgrade PRs must confirm each still-applies exception) and at least when a revisit condition fires. An exception without a revisit condition is invalid and should be rejected in review.
+
+== 5. Dependency-upgrade PRs
+
+A PR that changes `Cargo.lock` must:
+
+* pass `cargo deny --locked check`;
+* add or remove exception entries together with the reason/owner/revisit fields;
+* note the license/source impact of any newly introduced crate in the PR description, per the adoption record in `docs/reuse-first.adoc` section 5.
+
+== 6. Current policy validation (2026-09)
+
+The initial graph was validated with cargo-deny 0.20.2: advisories ok, bans ok (duplicates at warn), licenses ok, sources ok. No exceptions are currently active. Licenses in `allow` that exist in the current graph include MIT, Apache-2.0, BSD-3-Clause, ISC, 0BSD, Zlib, Unlicense, Unicode-3.0, CDLA-Permissive-2.0 (webpki-roots), and LGPL-2.1-or-later (r-efi). When either crate drops out of the graph, remove the corresponding license from the allow list.
