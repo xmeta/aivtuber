@@ -43,6 +43,23 @@ The pipeline checks cancellation before ThinkingEngine, after ThinkingEngine, af
 
 Callers should finish/remove the registry entry after the generation result has been consumed.
 
+== Future-compatible speculative preparation invariant
+
+The current production path remains buffered/atomic. A future implementation may reduce latency by starting bounded retrieval, Thinking, or TTS work before a turn/context is fully committed, but that optimization MUST NOT weaken publication fencing.
+
+Any future speculative path must:
+
+* bind work to source event/revision plus generation/turn identity;
+* treat provider output as disposable until the current context is revalidated;
+* keep Scheduler mutation/public dispatch outside speculative work;
+* run the normal deterministic output gate before irreversible publication;
+* reject late/stale provider completion after cancellation or supersession;
+* preserve #83-style atomic phrase/performance commit semantics when phrase streaming is enabled.
+
+Remote-provider cancellation is best-effort. The local generation/revision fence is the authoritative stale-result defense.
+
+Therefore "provider call completed" is never equivalent to "safe to publish".
+
 == Streaming compilation
 
 `StreamingCompilationSession` is the provider-neutral path for streaming-capable LLM/TTS implementations.
@@ -117,3 +134,5 @@ The Rust tests cover:
 * serialized control events cannot cancel generation through content ingress;
 * partial streaming output never inserts/schedules a generated asset;
 * secret redaction and HTTP wire mapping in provider adapters.
+
+[executed on device: DESKTOP (2bf3ba04-d7b4-4fb7-99c6-76b0fc11abcc)]

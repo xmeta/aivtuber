@@ -139,6 +139,27 @@ Generates new semantic content only when the reflex route requests it.
 
 It receives a dedicated versioned `ThinkingRequest`, not `ReflexRequest`. The request contains typed snapshots plus bounded `ThinkingContent` items with explicit source, trust, privacy, and provenance metadata. Complete raw stream history is never implicitly available.
 
+=== 6.3.1 Speculative preparation and irreversible commit boundary
+
+Future latency optimizations MAY start bounded retrieval, Thinking, or TTS preparation before a conversational turn/context is finally committed.
+
+That work is *speculative data*, not public output and not scheduler state.
+
+Before any speculative result becomes irreversible/public, a deterministic commit path MUST revalidate at least:
+
+* source event/revision is still current;
+* generation/turn epoch is still current;
+* moderation/context has not invalidated or superseded the response;
+* remaining deadline/resource policy still permits completion;
+* the normal deterministic public-output gate passes;
+* the performance/phrase unit satisfies the applicable atomic commit rules.
+
+Provider-side cancellation is best-effort. Local generation/revision fencing remains authoritative even when a remote provider finishes after cancellation.
+
+A stale or superseded speculative result MUST be discarded; reconnect, retry, or late provider completion MUST NOT publish it.
+
+This is a future-compatible invariant. The current production generative path remains buffered/atomic unless a later issue explicitly implements speculative preparation.
+
 === 6.4 PerformanceCompiler
 
 Compiles semantic output into an executable performance plan:
@@ -292,3 +313,5 @@ External inference services remain process/network boundaries when practical. Th
 * TypeSafe AI, Jev/System One introduction: https://typesafe.ai/blog/introducing-system-one-models-and-jev
 * VTube Studio Public API: https://github.com/DenchiSoft/VTubeStudio
 * obs-websocket 5.x protocol: https://github.com/obsproject/obs-websocket/blob/master/docs/generated/protocol.md
+
+[executed on device: DESKTOP (2bf3ba04-d7b4-4fb7-99c6-76b0fc11abcc)]

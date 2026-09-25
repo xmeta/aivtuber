@@ -41,6 +41,24 @@ Public chat without that permit is rejected before +WorkingMemory::remember_dura
 
 A permit records the source event id, source, source class, trust level, optional actor, and the deterministic gate decision. The stored entry converts the actor to the configured pseudonym before retention.
 
+=== 3.1 Future-compatible epistemic classes and crystallization
+
+The current memory model stores normalized claims with provenance/trust and enforces durable-write authority. A future extension may add explicit epistemic classes such as:
+
+* verified fact;
+* viewer claim;
+* performer experience;
+* observation;
+* persona opinion.
+
+Those classes describe provenance/epistemic status; they are not authorization.
+
+Public content MUST NOT self-promote from claim/observation to verified fact. Model repetition, summarization, retrieval rank, or temporal/graph linkage alone is insufficient verification.
+
+Likewise, short-lived conversation/thread context is not automatically durable memory. Any future "crystallization" from active context into a retained atomic memory still passes the existing non-serializable +MemoryWritePermit+ gate and retention policy.
+
+If future temporal/causal links are added between retained memories, node deletion/expiry must deterministically remove or repair links without preserving deleted raw/private content inside edge metadata.
+
 == 4. Generated-asset promotion
 
 Generated assets initially live in L0 after the complete LLM/TTS/compiler pipeline succeeds.
@@ -139,3 +157,5 @@ The Rust tests cover:
 * negative-quality rollback/invalidation;
 * deterministic decision replay and anti-repetition;
 * full +ProductionApp+ generated-asset promotion/rollback flow.
+
+[executed on device: DESKTOP (2bf3ba04-d7b4-4fb7-99c6-76b0fc11abcc)]

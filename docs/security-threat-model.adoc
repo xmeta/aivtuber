@@ -154,6 +154,12 @@ A memory candidate records:
 
 Public chat SHOULD NOT become durable identity/fact memory solely because an LLM repeats it.
 
+Claim provenance must not silently become epistemic authority.
+
+If future memory features distinguish fact/claim/observation/experience/opinion classes, an untrusted viewer assertion remains a viewer claim unless a separate trusted verification/update policy explicitly changes its class. LLM repetition, summarization, semantic similarity, or graph linkage alone MUST NOT promote a claim to verified fact.
+
+Deletion/expiry semantics also apply to future relation metadata: an edge or summary MUST NOT become a covert archive of content that retention policy removed.
+
 The Rust production path enforces this with a non-serializable `MemoryWritePermit`: `SecurityRuntime::authorize_memory_write` can mint the permit only for an allowed system source or authenticated `memory.admin` authority. `crates/adaptation` accepts public content into bounded working memory, but its durable-write API requires that permit and stores only a pseudonymous actor identifier.
 
 == 9. Rate limiting and backpressure
@@ -197,6 +203,20 @@ The hook can:
 
 A failure in the output gate fails closed for public output but does not stop the local scheduler.
 
+=== 11.1 Speculative output is uncommitted data
+
+If a future latency optimization starts model/TTS work before final turn/context commitment, its result remains untrusted/uncommitted data until the deterministic publication path revalidates it.
+
+At minimum:
+
+* source revision/generation identity must still be current;
+* cancellation/supersession must be honored locally even if provider cancellation failed;
+* the normal output gate must still run before irreversible publication;
+* a late provider result must not be replayed after a newer event/turn decision replaced it;
+* operator emergency control remains independent of speculative provider work.
+
+This separates "compute started" from "permission to publish".
+
 == 12. Audit and replay
 
 Audit records include:
@@ -237,3 +257,5 @@ The baseline regression fixtures are:
 They conform to `schemas/security-regression-case.schema.json`.
 
 The runtime implementation should load these fixtures and assert the expected authorization, memory-write, and model-dependency outcomes.
+
+[executed on device: DESKTOP (2bf3ba04-d7b4-4fb7-99c6-76b0fc11abcc)]
