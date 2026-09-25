@@ -115,6 +115,7 @@ Before writing generic infrastructure, check docs/reuse-first.adoc and search ma
 - Record adopt / wrap / partial reuse / reference only / benchmark first / reject with a short reason in the issue or PR.
 - Do not add a dependency without checking license, maintenance status, transitive/runtime impact, security advisories, determinism/replay effects, and bounded-state behavior.
 - Do not repeatedly revisit a rejected candidate unless new evidence changes the trade-off.
+- Any dependency-affecting PR must pass the supply-chain gate (`cargo deny --locked check`; policy in deny.toml, procedure in docs/supply-chain.adoc).
 
 See #100 for dependency/supply-chain policy and docs/reuse-first.adoc for the current candidate matrix.
 

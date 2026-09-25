@@ -1,0 +1,65 @@
+# Supply-chain policy for aivtuber (issue #100).
+# Local check:  cargo deny check
+# CI: runs the same command in the `supply-chain` job (.github/workflows/ci.yml).
+# Advisory exception procedure: see docs/supply-chain.adoc.
+
+[graph]
+# Check the dependency graph for all workspace targets.
+
+[advisories]
+# Known RustSec advisories are denied. A temporary exception goes here with
+# reason, owner, and revisit condition — see docs/supply-chain.adoc.
+version = 2
+ignore = [
+    # { id = "RUSTSEC-0000-0000", reason = "example: unmaintained transitive dep, no actionable fix; revisit when X" },
+]
+
+# This section is considered when running `cargo deny check licenses`.
+[licenses]
+version = 2
+# Permissive licenses only. Copyleft (GPL/AGPL) is not allowed; LGPL-2.1 in
+# r-efi and CDLA-Permissive-2.0 in webpki-roots are documented exceptions
+# below until the crates drop out of the graph.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "ISC",
+    "0BSD",
+    "Zlib",
+    "Unlicense",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "LGPL-2.1-or-later",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+# Workspace crates are internal and not published; skip their license check.
+ignore = true
+registries = []
+
+[bans]
+# Duplicate crate versions are tolerated for now but reported; revisit if the
+# duplicate count grows without consolidation.
+multiple-versions = "warn"
+# Path dependencies between workspace members read as wildcard requirements
+# (`version.workspace = true` inheritance); allow them explicitly. External
+# wildcard requirements remain denied.
+wildcards = "allow"
+allow-wildcard-paths = true
+highlight = "all"
+
+# This section is considered when running `cargo deny check sources`.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []
