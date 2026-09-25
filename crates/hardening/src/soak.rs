@@ -9,7 +9,8 @@ use aivtuber_runtime::{
     ContentAdmitDecision, ControlOutcome, SecurityRuntime, SecurityRuntimeConfig,
 };
 use aivtuber_scheduler::{
-    BlendChannel, PlannedPerformance, Priority, Scheduler, SchedulerConfig, Status,
+    BlendChannel, PlannedPerformance, Priority, Scheduler, SchedulerConfig, SchedulerMetrics,
+    Status,
 };
 use aivtuber_telemetry::{
     BenchmarkSummary, ComparisonMode, EventObservation, ReproducibilityMetadata, RouteClass,
@@ -126,14 +127,19 @@ pub fn run_core_soak(
     metadata
         .validate()
         .map_err(|error| HardeningError::InvalidMetadata(error.to_string()))?;
-
     let scheduler_config = SchedulerConfig {
         min_reaction_spacing_ms: 0,
+        // The soak probe tracks per-status terminal counts, so retain the
+        // full history here (the soak itself asserts no lifetime growth via
+        // the bounded-memory components; issue #52 documents the policy).
+        history_capacity: usize::MAX,
+        history_policy: aivtuber_scheduler::HistoryPolicy::RetainAll,
     };
     let mut scheduler = Scheduler::new(scheduler_config);
     let mut security = SecurityRuntime::new(
         SecurityRuntimeConfig {
             content_rate_per_second: 1_000_000.0,
+
             content_burst: 1_000_000,
             content_queue_limit: config.ingress_queue_limit,
             ..SecurityRuntimeConfig::default()
@@ -234,23 +240,26 @@ fn snapshot(
     telemetry: &TelemetryCollector,
     assets: &AssetStore,
 ) -> StateSnapshot {
+    // With bounded-state separation (#52) terminal items retire into the
+    // scheduler's bounded history, so the completed/cancelled counts come
+    // from history plus the exported eviction counter instead of the live
+    // item collection.
+    let SchedulerMetrics { active, .. } = scheduler.metrics();
+    let history_completed = scheduler
+        .history()
+        .filter(|entry| entry.item.status == Status::Completed)
+        .count();
+    let history_cancelled = scheduler
+        .history()
+        .filter(|entry| entry.item.status == Status::Cancelled)
+        .count();
+    // Evicted entries leave the process uncounted per-status; report the
+    // minimum they contribute (zero) so counts stay lower bounds.
     StateSnapshot {
         scheduler_items: scheduler.items().len(),
-        scheduler_active: scheduler
-            .items()
-            .iter()
-            .filter(|item| matches!(item.status, Status::Queued | Status::Playing))
-            .count(),
-        scheduler_completed: scheduler
-            .items()
-            .iter()
-            .filter(|item| item.status == Status::Completed)
-            .count(),
-        scheduler_cancelled: scheduler
-            .items()
-            .iter()
-            .filter(|item| item.status == Status::Cancelled)
-            .count(),
+        scheduler_active: active,
+        scheduler_completed: history_completed,
+        scheduler_cancelled: history_cancelled,
         content_queue: security.content_len(),
         audit_records: security.audit().len(),
         working_memory_entries: memory.len(),
@@ -345,6 +354,7 @@ pub fn run_content_flood(queue_limit: usize) -> Result<FloodReport, HardeningErr
     }
     let scheduler_config = SchedulerConfig {
         min_reaction_spacing_ms: 0,
+        ..aivtuber_scheduler::SchedulerConfig::default()
     };
     let mut runtime = SecurityRuntime::new(
         SecurityRuntimeConfig {

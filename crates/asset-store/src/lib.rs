@@ -841,11 +841,80 @@ pub struct IndexReport {
     pub incompatible: usize,
 }
 
+/// Bounded-retention policy for generated/dynamic L0 assets (issue #53).
+///
+/// Static/preloaded assets are pinned and never evicted by dynamic churn.
+/// Dynamic eviction is deterministic LRU with a stable asset-id tie-break so
+/// identical recorded inputs/config always produce identical survivor sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HotCacheConfig {
+    /// Maximum number of generated/dynamic assets resident in L0.
+    pub max_dynamic_assets: usize,
+    /// Optional estimated-byte budget for generated/dynamic assets. A single
+    /// asset larger than the budget still resides (capacity of one floor).
+    pub max_dynamic_bytes: usize,
+}
+
+impl Default for HotCacheConfig {
+    fn default() -> Self {
+        Self {
+            max_dynamic_assets: 1024,
+            max_dynamic_bytes: usize::MAX,
+        }
+    }
+}
+
+/// Cache occupancy and hit/miss counters (issue #53).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HotCacheMetrics {
+    pub pinned_resident: usize,
+    pub dynamic_resident: usize,
+    pub estimated_bytes: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+}
+
+/// Lightweight promotion/adaptation metadata that survives full-asset
+/// eviction so #39 promotion scoring keeps its inputs without retaining all
+/// media/descriptor state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PromotionMetadata {
+    pub id: String,
+    pub use_count: u64,
+    pub last_used_at_ms: Option<u64>,
+}
+
+/// Monotonic logical-use counter for deterministic LRU ordering.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct HotUsage {
+    use_tick: u64,
+    last_used_at_ms: Option<u64>,
+    note_count: u64,
+}
+
+fn estimate_asset_bytes(asset: &PerformanceAsset) -> usize {
+    // Estimated residency cost: the descriptor's serialized footprint.
+    serde_json::to_vec(asset)
+        .map(|bytes| bytes.len())
+        .unwrap_or(0)
+}
+
 #[derive(Debug)]
 pub struct AssetStore {
     root: PathBuf,
     runtime: RuntimeCompatibility,
     hot: BTreeMap<String, Arc<PerformanceAsset>>,
+    /// Which resident assets are pinned (static/preloaded) vs dynamic.
+    pinned_ids: BTreeSet<String>,
+    hot_config: HotCacheConfig,
+    hot_usage: BTreeMap<String, HotUsage>,
+    /// Promotion metadata that survives eviction (#39/#53).
+    promotion_metadata: BTreeMap<String, PromotionMetadata>,
+    hot_hits: u64,
+    hot_misses: u64,
+    hot_evictions: u64,
+    next_use_tick: u64,
     local: BTreeMap<String, AssetIndexEntry>,
 }
 
@@ -855,6 +924,14 @@ impl AssetStore {
             root: root.into(),
             runtime,
             hot: BTreeMap::new(),
+            pinned_ids: BTreeSet::new(),
+            hot_config: HotCacheConfig::default(),
+            hot_usage: BTreeMap::new(),
+            promotion_metadata: BTreeMap::new(),
+            hot_hits: 0,
+            hot_misses: 0,
+            hot_evictions: 0,
+            next_use_tick: 0,
             local: BTreeMap::new(),
         }
     }
@@ -869,6 +946,126 @@ impl AssetStore {
 
     pub fn hot_len(&self) -> usize {
         self.hot.len()
+    }
+
+    /// Configure the bounded-retention policy for generated/dynamic L0
+    /// assets (issue #53). Applying the config trims residency immediately.
+    pub fn set_hot_cache_config(&mut self, config: HotCacheConfig) {
+        self.hot_config = config;
+        self.evict_dynamic_to_capacity();
+    }
+
+    /// Cache occupancy and hit/miss/eviction counters.
+    pub fn hot_cache_metrics(&self) -> HotCacheMetrics {
+        let estimated_bytes: usize = self
+            .hot
+            .values()
+            .map(|asset| estimate_asset_bytes(asset))
+            .sum();
+        HotCacheMetrics {
+            pinned_resident: self
+                .hot
+                .keys()
+                .filter(|id| self.pinned_ids.contains(*id))
+                .count(),
+            dynamic_resident: self
+                .hot
+                .keys()
+                .filter(|id| !self.pinned_ids.contains(*id))
+                .count(),
+            estimated_bytes,
+            hits: self.hot_hits,
+            misses: self.hot_misses,
+            evictions: self.hot_evictions,
+        }
+    }
+
+    /// Record a use of a hot asset at a logical time, feeding both the
+    /// deterministic LRU clock and the lightweight promotion metadata.
+    pub fn note_hot_use(&mut self, id: &str, at_ms: u64) {
+        let tick = self.next_use_tick;
+        self.next_use_tick = self.next_use_tick.saturating_add(1);
+        let usage = self.hot_usage.entry(id.to_owned()).or_default();
+        usage.use_tick = tick;
+        usage.note_count = usage.note_count.saturating_add(1);
+        usage.last_used_at_ms = Some(at_ms);
+        let metadata = self.promotion_metadata.entry(id.to_owned()).or_default();
+        metadata.id = id.to_owned();
+        metadata.use_count = metadata.use_count.saturating_add(1);
+        metadata.last_used_at_ms = Some(at_ms);
+    }
+
+    /// Lightweight promotion/adaptation metadata, independent of full hot
+    /// asset retention (survives eviction; issue #39/#53).
+    pub fn promotion_metadata(&self, id: &str) -> Option<&PromotionMetadata> {
+        self.promotion_metadata.get(id)
+    }
+
+    /// Deterministically evict the least-recently-used dynamic assets until
+    /// both the count capacity and the byte budget are respected. Ties on
+    /// recency break by stable asset id (ascending evicts first).
+    fn evict_dynamic_to_capacity(&mut self) {
+        loop {
+            let dynamic_ids: Vec<String> = self
+                .hot
+                .keys()
+                .filter(|id| !self.pinned_ids.contains(*id))
+                .cloned()
+                .collect();
+
+            if dynamic_ids.len() <= self.hot_config.max_dynamic_assets {
+                let mut estimated_bytes: usize = self
+                    .hot
+                    .values()
+                    .map(|asset| estimate_asset_bytes(asset))
+                    .sum();
+                if estimated_bytes <= self.hot_config.max_dynamic_bytes || dynamic_ids.is_empty() {
+                    return;
+                }
+                // Byte budget exceeded: evict LRU dynamic assets until within
+                // budget, always keeping at least one dynamic asset.
+                let mut evict_candidates: Vec<(String, HotUsage)> = dynamic_ids
+                    .iter()
+                    .map(|id| {
+                        (
+                            id.clone(),
+                            self.hot_usage.get(id).copied().unwrap_or_default(),
+                        )
+                    })
+                    .collect();
+                evict_candidates
+                    .sort_by(|a, b| a.1.use_tick.cmp(&b.1.use_tick).then_with(|| a.0.cmp(&b.0)));
+                while estimated_bytes > self.hot_config.max_dynamic_bytes
+                    && evict_candidates.len() > 1
+                {
+                    let (victim_id, _) = evict_candidates.remove(0);
+                    if let Some(asset) = self.hot.remove(&victim_id) {
+                        estimated_bytes =
+                            estimated_bytes.saturating_sub(estimate_asset_bytes(&asset));
+                        self.hot_usage.remove(&victim_id);
+                        self.hot_evictions = self.hot_evictions.saturating_add(1);
+                    }
+                }
+                return;
+            }
+
+            // Count capacity exceeded: evict LRU with stable id tie-break.
+            let mut evict_candidates: Vec<(String, HotUsage)> = dynamic_ids
+                .iter()
+                .map(|id| {
+                    (
+                        id.clone(),
+                        self.hot_usage.get(id).copied().unwrap_or_default(),
+                    )
+                })
+                .collect();
+            evict_candidates
+                .sort_by(|a, b| a.1.use_tick.cmp(&b.1.use_tick).then_with(|| a.0.cmp(&b.0)));
+            let (victim_id, _) = evict_candidates.remove(0);
+            self.hot.remove(&victim_id);
+            self.hot_usage.remove(&victim_id);
+            self.hot_evictions = self.hot_evictions.saturating_add(1);
+        }
     }
 
     pub fn local_len(&self) -> usize {
@@ -987,7 +1184,20 @@ impl AssetStore {
 
         let id = asset.id.clone();
         let asset = Arc::new(asset);
+        let is_dynamic = asset
+            .provenance
+            .as_ref()
+            .is_some_and(|provenance| provenance.generated == Some(true));
+        // A fresh insert (or overwrite) counts as a use for recency ordering.
+        let tick = self.next_use_tick;
+        self.next_use_tick = self.next_use_tick.saturating_add(1);
+        let usage = self.hot_usage.entry(id.clone()).or_default();
+        usage.use_tick = tick;
+        if !is_dynamic {
+            self.pinned_ids.insert(id.clone());
+        }
         self.hot.insert(id, Arc::clone(&asset));
+        self.evict_dynamic_to_capacity();
         Ok(asset)
     }
 
@@ -1087,8 +1297,18 @@ impl AssetStore {
     }
 
     /// Pure L0 lookup. This performs no filesystem or network access.
-    pub fn hot_get(&self, id: &str) -> Option<Arc<PerformanceAsset>> {
-        self.hot.get(id).cloned()
+    /// Records a cache hit/miss and touches recency for deterministic LRU.
+    pub fn hot_get(&mut self, id: &str) -> Option<Arc<PerformanceAsset>> {
+        if let Some(asset) = self.hot.get(id).cloned() {
+            self.hot_hits = self.hot_hits.saturating_add(1);
+            let tick = self.next_use_tick;
+            self.next_use_tick = self.next_use_tick.saturating_add(1);
+            let usage = self.hot_usage.entry(id.to_owned()).or_default();
+            usage.use_tick = tick;
+            return Some(asset);
+        }
+        self.hot_misses = self.hot_misses.saturating_add(1);
+        None
     }
 
     /// Resolve L0 first, then the indexed local L1 descriptor.
@@ -1668,5 +1888,244 @@ mod tests {
 
         assert_eq!(report.indexed, 1);
         assert_eq!(store.local_len(), 1);
+    }
+
+    fn generated_asset_with_id(id: &str) -> PerformanceAsset {
+        let mut asset =
+            load_asset_file(fixture("valid/generated-dynamic.json")).expect("generated fixture");
+        asset.id = id.to_owned();
+        asset
+    }
+
+    #[test]
+    fn generated_churn_bounded_dynamic_capacity_keeps_pinned_static_assets() {
+        let dir = TestDir::new("bounded-churn");
+        // Copy the static pack descriptors beside the generated fixture's
+        // compatibility requirements so one runtime accepts both, letting the
+        // pinned-vs-dynamic split be exercised in a single store.
+        let combined_runtime = RuntimeCompatibility {
+            voice_model: Some("voice-ja-v2".to_owned()),
+            viseme_mapping: Some("ja-5vowel-v2".to_owned()),
+            ..runtime()
+        };
+        // Static pack uses the v1 voice/viseme; patch descriptors into the
+        // temp dir with the v2 runtime identity for this test only.
+        let pack_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/starter-reaction-pack/descriptors");
+        for entry in fs::read_dir(&pack_dir).expect("read pack") {
+            let entry = entry.expect("pack entry");
+            let mut asset = load_asset_file(entry.path()).expect("pack asset");
+            asset.compatibility.voice_model = Some("voice-ja-v2".to_owned());
+            asset.compatibility.viseme_mapping = Some("ja-5vowel-v2".to_owned());
+            write_asset(&dir.path().join(entry.file_name()), &asset);
+        }
+        let mut store = AssetStore::new(dir.path(), combined_runtime);
+        store.index_local().expect("index");
+        store
+            .preload_compatible()
+            .expect("preload static pinned assets");
+        let pinned_before = store.hot_len();
+        assert!(pinned_before > 0, "precondition: static assets resident");
+
+        store.set_hot_cache_config(HotCacheConfig {
+            max_dynamic_assets: 3,
+            ..HotCacheConfig::default()
+        });
+
+        // Generate far more unique dynamic assets than capacity.
+        for index in 0..10 {
+            let asset = generated_asset_with_id(&format!("dynamic.churn.{index:02}"));
+            store.insert_hot(asset).expect("insert generated asset");
+        }
+
+        // Bounded plateau: dynamic residency must not exceed capacity.
+        let metrics = store.hot_cache_metrics();
+        assert_eq!(
+            metrics.dynamic_resident, 3,
+            "dynamic residency must plateau at capacity"
+        );
+        assert_eq!(
+            metrics.pinned_resident, pinned_before,
+            "static assets must not be evicted by dynamic churn"
+        );
+        assert_eq!(metrics.evictions, 7, "oldest generated assets evicted");
+        // The most recently inserted survivors remain resident.
+        assert!(store.hot_get("dynamic.churn.07").is_some());
+        assert!(store.hot_get("dynamic.churn.08").is_some());
+        assert!(store.hot_get("dynamic.churn.09").is_some());
+        // The oldest dynamic assets were evicted first.
+        assert!(store.hot_get("dynamic.churn.00").is_none());
+        assert!(store.hot_get("dynamic.churn.06").is_none());
+    }
+
+    #[test]
+    fn hot_get_touches_recency_so_recently_used_assets_survive() {
+        let dir = TestDir::new("recency");
+        let mut store = AssetStore::new(dir.path(), generated_runtime());
+        store.set_hot_cache_config(HotCacheConfig {
+            max_dynamic_assets: 3,
+            ..HotCacheConfig::default()
+        });
+
+        for index in 0..3 {
+            let asset = generated_asset_with_id(&format!("dynamic.recency.{index}"));
+            store.insert_hot(asset).expect("insert");
+        }
+        // Touch dynamic.recency.0 so its recency tick becomes the newest.
+        let _ = store.hot_get("dynamic.recency.0");
+
+        let asset = generated_asset_with_id("dynamic.recency.3");
+        store.insert_hot(asset).expect("insert overflow");
+
+        // Without the touch, .0 would have been the LRU victim; the touch
+        // demotes .1 to LRU instead.
+        assert!(
+            store.hot_get("dynamic.recency.0").is_some(),
+            "recently used survivor"
+        );
+        assert!(store.hot_get("dynamic.recency.2").is_some());
+        assert!(store.hot_get("dynamic.recency.3").is_some());
+        assert!(store.hot_get("dynamic.recency.1").is_none(), "LRU evicted");
+    }
+
+    #[test]
+    fn eviction_is_deterministic_with_stable_asset_id_tie_break() {
+        // Two identical recorded input sequences run in separate stores.
+        let survivors = |store_tag: &str| {
+            let dir = TestDir::new(store_tag);
+            let mut store = AssetStore::new(dir.path(), generated_runtime());
+            store.set_hot_cache_config(HotCacheConfig {
+                max_dynamic_assets: 2,
+                ..HotCacheConfig::default()
+            });
+            for suffix in ["b", "a", "c", "d"] {
+                let asset = generated_asset_with_id(&format!("dynamic.tie.{suffix}"));
+                store.insert_hot(asset).expect("insert");
+            }
+            let mut ids: Vec<String> = Vec::new();
+            for suffix in ["a", "b", "c", "d"] {
+                let id = format!("dynamic.tie.{suffix}");
+                if store.hot_get(&id).is_some() {
+                    ids.push(id);
+                }
+            }
+            ids.sort();
+            ids
+        };
+
+        assert_eq!(
+            survivors("tie-a"),
+            survivors("tie-b"),
+            "identical recorded inputs must produce identical survivors"
+        );
+    }
+
+    #[test]
+    fn arc_handle_remains_valid_after_store_eviction() {
+        let dir = TestDir::new("arc-safety");
+        let mut store = AssetStore::new(dir.path(), generated_runtime());
+        store.set_hot_cache_config(HotCacheConfig {
+            max_dynamic_assets: 1,
+            ..HotCacheConfig::default()
+        });
+
+        let first = store
+            .insert_hot(generated_asset_with_id("dynamic.arc.first"))
+            .expect("insert first");
+        let arc_weak = Arc::downgrade(&first);
+
+        let _second = store
+            .insert_hot(generated_asset_with_id("dynamic.arc.second"))
+            .expect("insert second evicts first");
+
+        assert!(store.hot_get("dynamic.arc.first").is_none());
+        // The in-flight consumer keeps the asset alive safely.
+        let still_alive = arc_weak
+            .upgrade()
+            .expect("Arc must stay alive for in-flight playback");
+        assert_eq!(still_alive.id, "dynamic.arc.first");
+    }
+
+    #[test]
+    fn estimated_byte_budget_enforced_on_dynamic_assets() {
+        let dir = TestDir::new("byte-budget");
+        let mut store = AssetStore::new(dir.path(), generated_runtime());
+        store.set_hot_cache_config(HotCacheConfig {
+            max_dynamic_assets: usize::MAX,
+            max_dynamic_bytes: 1,
+        });
+
+        store
+            .insert_hot(generated_asset_with_id("dynamic.bytes.first"))
+            .expect("first insert always fits");
+        store
+            .insert_hot(generated_asset_with_id("dynamic.bytes.second"))
+            .expect("second insert evicts first to respect budget");
+
+        assert!(store.hot_get("dynamic.bytes.first").is_none());
+        assert!(store.hot_get("dynamic.bytes.second").is_some());
+    }
+
+    #[test]
+    fn cache_metrics_expose_residency_hits_and_misses() {
+        let dir = TestDir::new("metrics");
+        let mut store = AssetStore::new(dir.path(), generated_runtime());
+        store.set_hot_cache_config(HotCacheConfig {
+            max_dynamic_assets: 2,
+            ..HotCacheConfig::default()
+        });
+
+        let before = store.hot_cache_metrics();
+        store
+            .insert_hot(generated_asset_with_id("dynamic.metrics.a"))
+            .expect("insert a");
+        store
+            .insert_hot(generated_asset_with_id("dynamic.metrics.b"))
+            .expect("insert b");
+        let _ = store.hot_get("dynamic.metrics.a"); // hit
+        let _ = store.hot_get("missing.asset"); // miss
+
+        let metrics = store.hot_cache_metrics();
+        assert_eq!(metrics.dynamic_resident, 2);
+        assert_eq!(metrics.pinned_resident, 0);
+        assert_eq!(metrics.hits, before.hits + 1);
+        assert_eq!(metrics.misses, before.misses + 1);
+        assert_eq!(metrics.evictions, before.evictions);
+        assert!(metrics.estimated_bytes > 0);
+    }
+
+    #[test]
+    fn promotion_metadata_survives_full_asset_eviction() {
+        let dir = TestDir::new("promo-metadata");
+        let mut store = AssetStore::new(dir.path(), generated_runtime());
+        store.set_hot_cache_config(HotCacheConfig {
+            max_dynamic_assets: 1,
+            ..HotCacheConfig::default()
+        });
+
+        let first = store
+            .insert_hot(generated_asset_with_id("dynamic.promo.first"))
+            .expect("insert first");
+        store.note_hot_use("dynamic.promo.first", 100);
+        let first_snapshot = store
+            .promotion_metadata("dynamic.promo.first")
+            .expect("metadata");
+        assert_eq!(first_snapshot.use_count, 1);
+        assert_eq!(first_snapshot.last_used_at_ms, Some(100));
+        drop(first);
+
+        // Evict via churn.
+        store
+            .insert_hot(generated_asset_with_id("dynamic.promo.second"))
+            .expect("insert second");
+        assert!(store.hot_get("dynamic.promo.first").is_none());
+
+        // Lightweight metadata must outlive full-asset eviction (#39).
+        let survivor = store
+            .promotion_metadata("dynamic.promo.first")
+            .expect("metadata survives");
+        assert_eq!(survivor.use_count, 1);
+        assert_eq!(survivor.last_used_at_ms, Some(100));
+        assert_eq!(survivor.id, "dynamic.promo.first");
     }
 }
