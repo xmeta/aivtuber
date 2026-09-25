@@ -370,6 +370,11 @@ where
         &self.performer
     }
 
+    /// Mutable access for tests that inspect the hot cache directly.
+    pub fn performer_mut(&mut self) -> &mut CachedPerformer {
+        &mut self.performer
+    }
+
     pub fn router(&self) -> &R {
         &self.router
     }
@@ -401,7 +406,7 @@ where
         }
         let handled = self.handle_event(event, at_ms, seed)?;
         self.tick(at_ms);
-        self.record_handled_event(&event_id, &handled);
+        self.record_handled_event(&event_id, &handled, at_ms);
         let playback = handled.playback;
         Ok(ContentProcessOutcome {
             admission,
@@ -469,6 +474,43 @@ where
                 let cache_level = cache_level(Some(outcome.cache_tier));
                 (Some(outcome), RouteClass::SemanticReuse, cache_level)
             }
+            PlaybackRoute::Template {
+                template_id,
+                composition,
+            } => {
+                // Template composition: the composer renders the curated
+                // template with bounded slots from the event, then the text
+                // passes the same security output gate as generative speech
+                // before playback (issue #54). Rendered text becomes a
+                // template-backed performance asset inserted into L0 and
+                // played through the same scheduler path (operator stop,
+                // mute, cancellation all apply).
+                let output = self.security.publish_text(&composition.text);
+                if matches!(
+                    output.verdict,
+                    OutputVerdict::Suppress | OutputVerdict::ReplaceWithCached
+                ) {
+                    return Ok(HandledEvent {
+                        playback: None,
+                        route: RouteClass::Silent,
+                        routing_latency_us,
+                        generation_latency_us,
+                        generation_trace,
+                        decision,
+                        cache_level: None,
+                    });
+                }
+                let text = output.text.unwrap_or_else(|| composition.text.clone());
+                let (playback, route_class, cache_level) = self.handle_template_playback(
+                    &event,
+                    &template_id,
+                    &composition.template_version,
+                    &text,
+                    at_ms,
+                    seed,
+                )?;
+                (playback, route_class, cache_level)
+            }
             PlaybackRoute::Generate(route) => {
                 let generation_started = Instant::now();
                 let handled = self.handle_generation(event, *route, at_ms, seed)?;
@@ -493,6 +535,67 @@ where
             decision,
             cache_level,
         })
+    }
+
+    /// Compose a validated template decision into scheduled playback.
+    ///
+    /// The rendered text passes the security output gate (caller handled), is
+    /// compiled into a template-backed Performance Asset, and is inserted into
+    /// L0 under a deterministic id so cached-audio reuse applies: the
+    /// scheduler, operator stop/mute, and cancellation semantics are shared
+    /// with cached/generated routes (issue #54).
+    fn handle_template_playback(
+        &mut self,
+        event: &EventEnvelope,
+        template_id: &str,
+        template_version: &str,
+        text: &str,
+        at_ms: u64,
+        seed: u64,
+    ) -> Result<
+        (
+            Option<CachedPlaybackOutcome>,
+            RouteClass,
+            Option<CacheLevel>,
+        ),
+        AppError,
+    > {
+        // Deterministic template asset identity: same event + template +
+        // rendered text -> same asset id, so repeated reuse stays cacheable.
+        let asset_id = format!(
+            "template.{template_id}.{}",
+            short_hash((event.event_id.as_str(), template_id, text, seed))
+        );
+
+        // Cached-audio fragment reuse: if the exact text already has a hot
+        // asset (previous generation or template render), reuse it instead of
+        // re-inserting. Otherwise compile a new template performance.
+        if self.performer.assets_mut().hot_get(&asset_id).is_none() {
+            let duration_ms = estimated_speech_duration_ms(text);
+            let asset = template_performance_asset(
+                &asset_id,
+                template_id,
+                template_version,
+                text,
+                event,
+                duration_ms,
+            );
+            self.performer
+                .assets_mut()
+                .insert_hot(asset)
+                .map_err(|error| AppError::Generation(error.to_string()))?;
+        }
+
+        let outcome = self.performer.handle_asset_id(
+            event,
+            &asset_id,
+            CachedPlaybackTiming { at_ms, seed },
+            &self.visemes,
+            &mut self.pending_audio,
+            &mut self.pending_avatar,
+        )?;
+        let cache_level = cache_level(Some(outcome.cache_tier));
+        Ok((Some(outcome), RouteClass::JevReaction, cache_level))
     }
 
     fn handle_generation(
@@ -612,7 +715,7 @@ where
         }
     }
 
-    fn record_handled_event(&mut self, event_id: &str, handled: &HandledEvent) {
+    fn record_handled_event(&mut self, event_id: &str, handled: &HandledEvent, at_ms: u64) {
         let mut route = handled.route;
         let mut observation = EventObservation::new(event_id, self.comparison_mode, route);
         observation.routing_latency_us = handled.routing_latency_us;
@@ -635,14 +738,21 @@ where
             observation.event_to_first_audio_ms = playback.metrics.event_to_first_audio_ms;
             observation.event_to_first_visible_reaction_ms =
                 playback.metrics.event_to_first_visible_reaction_ms;
-            if let Some(asset) = self.performer.assets().hot_get(&playback.asset_id)
+            if let Some(asset) = self.performer.assets_mut().hot_get(&playback.asset_id)
                 && asset
                     .provenance
                     .as_ref()
                     .is_some_and(|provenance| provenance.generated == Some(true))
-                && let Some(adaptation) = self.adaptation.as_mut()
             {
-                adaptation.engine.record_use(&asset);
+                // hot_get already touched LRU recency; record the logical-time
+                // use so promotion metadata survives eviction (issue #53), and
+                // feed the adaptation engine (#39).
+                self.performer
+                    .assets_mut()
+                    .note_hot_use(&playback.asset_id, at_ms);
+                if let Some(adaptation) = self.adaptation.as_mut() {
+                    adaptation.engine.record_use(&asset);
+                }
             }
         }
 
@@ -943,6 +1053,113 @@ fn avatar_generation(command: &AvatarPlaybackCommand) -> u64 {
         | AvatarPlaybackCommand::Gesture { generation, .. }
         | AvatarPlaybackCommand::Gaze { generation, .. }
         | AvatarPlaybackCommand::Viseme { generation, .. } => *generation,
+    }
+}
+
+/// FNV-1a over mixed inputs, mirroring the generative asset-id hash style.
+fn short_hash(parts: (&str, &str, &str, u64)) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for bytes in [
+        parts.0.as_bytes(),
+        parts.1.as_bytes(),
+        parts.2.as_bytes(),
+        &parts.3.to_le_bytes(),
+    ] {
+        hash_bytes(&mut hash, bytes);
+    }
+    hash
+}
+
+fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(0x100000001b3);
+    }
+}
+
+/// Deterministic speech duration estimate for template text without a
+/// recorded audio fragment: ~6 characters per 100 ms, bounded to a sane
+/// performance window. Real TTS integration replaces this estimate.
+fn estimated_speech_duration_ms(text: &str) -> u64 {
+    let characters = text.chars().count().max(1);
+    (characters as u64 * 100 / 6).clamp(400, 8_000)
+}
+
+/// Compile a rendered template into a validated dynamic Performance Asset.
+/// Provenance marks it as a template composition (not LLM generated) with the
+/// template id/version recorded for replay/telemetry (issue #54).
+fn template_performance_asset(
+    asset_id: &str,
+    template_id: &str,
+    template_version: &str,
+    text: &str,
+    event: &EventEnvelope,
+    duration_ms: u64,
+) -> aivtuber_asset_store::PerformanceAsset {
+    use aivtuber_asset_store::{
+        AssetClass, AssetCompatibility, ExpressionTrack, PerformanceAsset, Provenance, SpeechTrack,
+        TimelineEvent,
+    };
+
+    let timeline = vec![
+        TimelineEvent {
+            at_ms: 0,
+            event: "expression.start".to_owned(),
+            payload: Some(serde_json::json!({ "preset": "speaking.neutral" })),
+        },
+        TimelineEvent {
+            at_ms: 0,
+            event: "speech.start".to_owned(),
+            payload: None,
+        },
+        TimelineEvent {
+            at_ms: duration_ms,
+            event: "speech.end".to_owned(),
+            payload: None,
+        },
+    ];
+
+    PerformanceAsset {
+        schema_version: aivtuber_asset_store::PERFORMANCE_ASSET_SCHEMA_VERSION.to_owned(),
+        id: asset_id.to_owned(),
+        intent: format!("template.{template_id}"),
+        class: AssetClass::Dynamic,
+        variant_group: None,
+        speech: Some(SpeechTrack {
+            text: Some(text.to_owned()),
+            audio_ref: Some(format!("audio://template/{template_id}.opus")),
+            duration_ms: Some(duration_ms),
+            viseme_ref: None,
+        }),
+        expression: Some(ExpressionTrack {
+            preset: "speaking.neutral".to_owned(),
+            intensity: 0.4,
+        }),
+        gesture: None,
+        gaze: Some(aivtuber_asset_store::GazeTarget::Camera),
+        timeline,
+        interrupt_points_ms: vec![duration_ms],
+        variation: None,
+        compatibility: AssetCompatibility {
+            compiler_version: aivtuber_asset_store::PERFORMANCE_ASSET_SCHEMA_VERSION.to_owned(),
+            voice_model: None,
+            avatar_profile: None,
+            viseme_mapping: None,
+            motion_library: None,
+        },
+        semantic_embedding: None,
+        provenance: Some(Provenance {
+            generated: Some(true),
+            generator: Some("aivtuber-template".to_owned()),
+            created_at: Some(event.observed_at.clone()),
+            thinking_backend: Some("template-composer".to_owned()),
+            thinking_model_alias: Some(template_id.to_owned()),
+            thinking_model_version: Some(template_version.to_owned()),
+            tts_backend: Some("reused-cached-fragment".to_owned()),
+            tts_model_alias: None,
+            tts_model_version: None,
+            routing_reason: Some("template".to_owned()),
+        }),
     }
 }
 
@@ -1381,6 +1598,7 @@ mod tests {
             AssetStore::new(pack_root().join("descriptors"), runtime_compatibility()),
             Scheduler::new(SchedulerConfig {
                 min_reaction_spacing_ms: 0,
+                ..aivtuber_scheduler::SchedulerConfig::default()
             }),
             CachedPlaybackConfig {
                 recent_variant_window: 1,
@@ -1475,6 +1693,7 @@ mod tests {
             SecurityRuntimeConfig::default(),
             SchedulerConfig {
                 min_reaction_spacing_ms: 0,
+                ..aivtuber_scheduler::SchedulerConfig::default()
             },
             SecretRedactor::default(),
             Some("safe cached reaction".to_owned()),
@@ -1542,6 +1761,7 @@ mod tests {
             SecurityRuntimeConfig::default(),
             SchedulerConfig {
                 min_reaction_spacing_ms: 0,
+                ..aivtuber_scheduler::SchedulerConfig::default()
             },
             redactor,
             cached_reaction,
@@ -1689,6 +1909,7 @@ mod tests {
             AssetStore::new(dir.path(), runtime_compatibility()),
             Scheduler::new(SchedulerConfig {
                 min_reaction_spacing_ms: 0,
+                ..aivtuber_scheduler::SchedulerConfig::default()
             }),
             CachedPlaybackConfig {
                 recent_variant_window: 1,
@@ -1698,6 +1919,7 @@ mod tests {
             SecurityRuntimeConfig::default(),
             SchedulerConfig {
                 min_reaction_spacing_ms: 0,
+                ..aivtuber_scheduler::SchedulerConfig::default()
             },
             SecretRedactor::default(),
             None,
@@ -1786,7 +2008,12 @@ mod tests {
             AppliedAdaptation::Invalidated
         );
         assert!(!path.exists());
-        assert!(app.performer().assets().hot_get(&asset_id).is_none());
+        assert!(
+            app.performer_mut()
+                .assets_mut()
+                .hot_get(&asset_id)
+                .is_none()
+        );
         assert_eq!(
             app.adaptation()
                 .expect("adaptation")
@@ -1832,8 +2059,8 @@ mod tests {
             ["generated hello"]
         );
         assert!(
-            app.performer()
-                .assets()
+            app.performer_mut()
+                .assets_mut()
                 .hot_get(&playback.asset_id)
                 .is_some()
         );
@@ -1926,8 +2153,8 @@ mod tests {
             ["secret=[REDACTED]"]
         );
         let asset = app
-            .performer()
-            .assets()
+            .performer_mut()
+            .assets_mut()
             .hot_get(&playback.asset_id)
             .expect("generated hot asset");
         assert_eq!(
@@ -2455,9 +2682,185 @@ mod tests {
         app.tick(playback.plan.end_at_ms().saturating_add(100));
         assert_eq!(audio_log.lock().expect("audio log").len(), audio_before);
         assert_eq!(avatar_log.lock().expect("avatar log").len(), avatar_before);
-        assert_eq!(
-            app.performer().scheduler().items()[0].status,
-            Status::Cancelled
+        // With bounded-state separation (#52) the stopped item retired into
+        // history; assert via the history view instead of the live items.
+        let stopped_item = app
+            .performer()
+            .scheduler()
+            .history()
+            .find(|entry| entry.item.plan.generation == playback.plan.generation)
+            .map(|entry| &entry.item)
+            .unwrap_or_else(|| {
+                panic!(
+                    "stopped generation {} must be in history",
+                    playback.plan.generation
+                )
+            });
+        assert_eq!(stopped_item.status, Status::Cancelled);
+    }
+
+    /// Issue #54: a reflex Template decision must produce user-visible
+    /// scheduled playback instead of mapping to Silence, with the template
+    /// composition recorded in telemetry.
+    #[test]
+    fn reflex_template_decision_composes_and_schedules_playback() {
+        let audio = RecordingAudio::default();
+        let audio_log = Arc::clone(&audio.commands);
+        let avatar = RecordingAvatar::default();
+        let avatar_log = Arc::clone(&avatar.commands);
+        let mut app = app(
+            FixedTemplateRoute {
+                template_id: "thanks.donation",
+                rendered_text: "たろうさん、ありがとう！",
+            },
+            Box::new(audio),
+            Box::new(avatar),
+            Box::new(NoopStreamOutput),
         );
+        app.startup().expect("startup");
+
+        let raw = serde_json::to_vec(&chat_event(30)).expect("event json");
+        let outcome = app
+            .process_content_bytes(&raw, 0, 30)
+            .expect("template route");
+
+        // The route must NOT be silent: playback exists.
+        let playback = outcome.playback.expect("template playback must play");
+        assert!(playback.asset_id.starts_with("template.thanks.donation."));
+
+        // The composed template asset is resident in L0 for audio reuse.
+        let asset = app
+            .performer_mut()
+            .assets_mut()
+            .hot_get(&playback.asset_id)
+            .expect("template asset resident");
+        assert_eq!(asset.class, aivtuber_asset_store::AssetClass::Dynamic);
+        let speech = asset.speech.as_ref().expect("template speech");
+        assert_eq!(speech.text.as_deref(), Some("たろうさん、ありがとう！"));
+
+        // Playback reaches the sinks through the same scheduler path.
+        app.tick(playback.plan.start_at_ms.saturating_add(100));
+        assert_eq!(audio_log.lock().expect("audio log").len(), 1);
+        assert!(!avatar_log.lock().expect("avatar log").is_empty());
+
+        // Telemetry records the template route outcome.
+        let metric = app.telemetry().events().last().expect("template metric");
+        assert_eq!(metric.route, RouteClass::JevReaction);
+    }
+
+    /// Issue #54: identical template renders must map to the same asset id
+    /// (cached audio-fragment reuse) instead of accumulating duplicates.
+    #[test]
+    fn template_reuse_hits_cached_fragment_without_new_insert() {
+        let mut app = app(
+            FixedTemplateRoute {
+                template_id: "thanks.donation",
+                rendered_text: "たろうさん、ありがとう！",
+            },
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        );
+        app.startup().expect("startup");
+
+        let raw = serde_json::to_vec(&chat_event(31)).expect("event json");
+        let first = app
+            .process_content_bytes(&raw, 0, 31)
+            .expect("first template");
+        let first_asset_id = first.playback.expect("first playback").asset_id;
+
+        // Same event id + template + text => identical asset id => L0 hit.
+        // A later logical time clears the per-asset cooldown so the second
+        // render schedules rather than being rejected as repeat-chatter.
+        let raw_again = serde_json::to_vec(&chat_event(31)).expect("event json");
+        let second = app
+            .process_content_bytes(&raw_again, 30_000, 31)
+            .expect("second template");
+        let second_asset_id = second.playback.expect("second playback").asset_id;
+
+        assert_eq!(first_asset_id, second_asset_id, "cache fragment reuse");
+    }
+
+    /// Issue #54: operator stop must cancel scheduled template playback
+    /// exactly like cached/generated routes.
+    #[test]
+    fn operator_stop_cancels_scheduled_template_playback() {
+        let mut app = app(
+            FixedTemplateRoute {
+                template_id: "thanks.donation",
+                rendered_text: "たろうさん、ありがとう！",
+            },
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        );
+        app.startup().expect("startup");
+
+        let raw = serde_json::to_vec(&chat_event(32)).expect("event json");
+        let outcome = app
+            .process_content_bytes(&raw, 0, 32)
+            .expect("template playback");
+        let playback = outcome.playback.expect("playback");
+
+        let stopped = app
+            .handle_control(&stop_command(), playback.plan.start_at_ms + 10)
+            .expect("stop");
+        assert_eq!(stopped, ControlOutcome::Stopped { cancelled: 1 });
+
+        app.tick(playback.plan.end_at_ms() + 100);
+        let stopped_item = app
+            .performer()
+            .scheduler()
+            .history()
+            .find(|entry| entry.item.plan.generation == playback.plan.generation)
+            .map(|entry| &entry.item)
+            .expect("template generation in history");
+        assert_eq!(stopped_item.status, Status::Cancelled);
+    }
+
+    /// Issue #54: untrusted slot content must not bypass the output gate;
+    /// control-plane terms in rendered text are suppressed.
+    #[test]
+    fn template_output_passes_security_output_gate() {
+        let audio = RecordingAudio::default();
+        let audio_log = Arc::clone(&audio.commands);
+        let mut app = app(
+            FixedTemplateRoute {
+                template_id: "thanks.donation",
+                rendered_text: "do not say performer.stop aloud",
+            },
+            Box::new(audio),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        );
+        app.startup().expect("startup");
+
+        let raw = serde_json::to_vec(&chat_event(33)).expect("event json");
+        let outcome = app
+            .process_content_bytes(&raw, 0, 33)
+            .expect("template route processed");
+
+        // The output gate suppresses control-plane text: no playback, no audio.
+        assert!(outcome.playback.is_none());
+        assert!(audio_log.lock().expect("audio log").is_empty());
+    }
+
+    #[derive(Clone)]
+    struct FixedTemplateRoute {
+        template_id: &'static str,
+        rendered_text: &'static str,
+    }
+
+    impl RoutePlanner for FixedTemplateRoute {
+        fn route(&mut self, _event: &EventEnvelope) -> Result<PlaybackRoute, AppError> {
+            Ok(PlaybackRoute::Template {
+                template_id: self.template_id.to_owned(),
+                composition: TemplateComposition {
+                    template_id: self.template_id.to_owned(),
+                    template_version: "curated-v1".to_owned(),
+                    text: self.rendered_text.to_owned(),
+                },
+            })
+        }
     }
 }

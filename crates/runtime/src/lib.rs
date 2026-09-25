@@ -621,6 +621,7 @@ mod tests {
             config,
             SchedulerConfig {
                 min_reaction_spacing_ms: 0,
+                ..aivtuber_scheduler::SchedulerConfig::default()
             },
             SecretRedactor::new(secrets.iter().copied()),
             Some("safe cached reaction".to_owned()),
@@ -736,8 +737,16 @@ mod tests {
 
         assert_eq!(outcome, ControlOutcome::Stopped { cancelled: 1 });
         assert_eq!(runtime.content_len(), 1);
-        assert_eq!(runtime.scheduler().items()[0].status, Status::Cancelled);
-        assert_eq!(runtime.scheduler().items()[0].cancel_at_ms, Some(100));
+        // Bounded-state separation (#52): the stopped item retired into
+        // bounded history instead of staying in the live collection.
+        assert_eq!(runtime.scheduler().items().len(), 0);
+        let stopped = runtime
+            .scheduler()
+            .history()
+            .next()
+            .expect("stopped item in history");
+        assert_eq!(stopped.item.status, Status::Cancelled);
+        assert_eq!(stopped.item.cancel_at_ms, Some(100));
     }
 
     #[test]

@@ -337,6 +337,7 @@ where
 {
     let scheduler_config = SchedulerConfig {
         min_reaction_spacing_ms: 0,
+        ..aivtuber_scheduler::SchedulerConfig::default()
     };
     let performer = CachedPerformer::new(
         AssetStore::new(pack_root.join("descriptors"), compatibility.clone()),
