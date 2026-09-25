@@ -406,7 +406,7 @@ where
         }
         let handled = self.handle_event(event, at_ms, seed)?;
         self.tick(at_ms);
-        self.record_handled_event(&event_id, &handled);
+        self.record_handled_event(&event_id, &handled, at_ms);
         let playback = handled.playback;
         Ok(ContentProcessOutcome {
             admission,
@@ -715,7 +715,7 @@ where
         }
     }
 
-    fn record_handled_event(&mut self, event_id: &str, handled: &HandledEvent) {
+    fn record_handled_event(&mut self, event_id: &str, handled: &HandledEvent, at_ms: u64) {
         let mut route = handled.route;
         let mut observation = EventObservation::new(event_id, self.comparison_mode, route);
         observation.routing_latency_us = handled.routing_latency_us;
@@ -744,8 +744,12 @@ where
                     .as_ref()
                     .is_some_and(|provenance| provenance.generated == Some(true))
             {
-                // hot_get already touched LRU recency; feed promotion metadata
-                // through note_hot_use so it survives eviction (issue #53).
+                // hot_get already touched LRU recency; record the logical-time
+                // use so promotion metadata survives eviction (issue #53), and
+                // feed the adaptation engine (#39).
+                self.performer
+                    .assets_mut()
+                    .note_hot_use(&playback.asset_id, at_ms);
                 if let Some(adaptation) = self.adaptation.as_mut() {
                     adaptation.engine.record_use(&asset);
                 }
