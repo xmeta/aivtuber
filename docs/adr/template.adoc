@@ -1,0 +1,152 @@
+= ADR-NNNN: Decision title
+:status: Proposed
+:date: YYYY-MM-DD
+
+== Context
+
+What decision is required, what problem/evidence triggered it, and why is a durable record appropriate?
+
+== Hard constraints
+
+List verified requirements that are not merely preferences.
+
+Examples:
+
+* security/trust boundary;
+* deterministic replay;
+* bounded retained state;
+* supported deployment/platform;
+* compatibility requirement.
+
+Do not mix assumptions into this section.
+
+== Assumptions
+
+List assumption IDs from link:../assumptions.adoc[Assumption Register] where available.
+
+For any new material assumption, add it to the register or state it explicitly here with a validation/revisit plan.
+
+== Alternatives considered
+
+Include materially different choices where meaningful:
+
+. status quo / do nothing;
+. reuse existing project component;
+. adopt/reuse external component;
+. adapt/wrap an external/internal component;
+. build new.
+
+Do not create cosmetic alternatives solely to justify a preferred choice.
+
+== Reuse / Adapt / Build comparison
+
+[cols="2,1,1,1"]
+|===
+|Dimension |Candidate A |Candidate B |Status quo
+
+|Implementation effort
+|
+|
+|
+
+|Maintenance / upgrade cost
+|
+|
+|
+
+|Security / supply-chain risk
+|
+|
+|
+
+|Determinism / replay
+|
+|
+|
+
+|Runtime performance
+|
+|
+|
+
+|Platform / deployment fit
+|
+|
+|
+
+|Operational complexity
+|
+|
+|
+
+|License / project health
+|
+|
+|
+|===
+
+Remove dimensions that are genuinely irrelevant; add decision-specific dimensions when needed.
+
+== Evidence
+
+Reference measurements, protocol/spec documentation, tests, fixtures, prototypes, research, or conformance results.
+
+Distinguish:
+
+* authoritative/spec evidence;
+* repository executable evidence;
+* observed external behavior;
+* mock-only evidence;
+* unverified expectation.
+
+== Decision
+
+State the selected option and important boundaries.
+
+== Consequences
+
+=== Positive
+
+* ...
+
+=== Costs / trade-offs
+
+* ...
+
+=== Known limitations
+
+* ...
+
+== Staging and rollback
+
+How can the change be introduced reversibly?
+
+State:
+
+* shadow/profile/feature-gated steps where useful;
+* compatibility/migration period;
+* rollback point;
+* point after which rollback becomes materially expensive.
+
+If safe rollback is impossible, explain why.
+
+== Revisit conditions
+
+Observable triggers that should reopen this decision.
+
+Examples:
+
+* protocol/provider major version;
+* assumption invalidated;
+* measured bottleneck changes;
+* dependency becomes unmaintained;
+* security advisory;
+* platform requirement changes;
+* operating/maintenance cost exceeds expectation.
+
+== Related
+
+* Issue:
+* PR:
+* Assumptions:
+* Other ADRs:
