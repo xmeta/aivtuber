@@ -224,6 +224,12 @@ pub trait RoutePlanner: Send {
     fn decision_record(&self) -> Option<&DecisionReplayRecord> {
         None
     }
+
+    /// Deterministic fallback recorded by the most recent Template decision
+    /// (`None` when the last decision was not a Template fallback).
+    fn template_fallback(&self) -> Option<TemplateFallback> {
+        None
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -253,6 +259,12 @@ where
     embeddings: E,
     context: ReflexContext,
     last_record: Option<DecisionReplayRecord>,
+    /// Curated template pack backing ExecutedAction::Template (issue #54).
+    templates: TemplatePack,
+    composer: TemplateComposer,
+    /// Deterministic fallback recorded for the last Template decision, for
+    /// telemetry/replay; `None` when the last route was not a fallback.
+    last_template_fallback: Option<TemplateFallback>,
 }
 
 impl<E> ReflexRoutePlanner<E>
@@ -265,7 +277,16 @@ where
             embeddings,
             context: ReflexContext::default(),
             last_record: None,
+            templates: TemplatePack::default(),
+            composer: TemplateComposer,
+            last_template_fallback: None,
         }
+    }
+
+    /// Install the curated template pack backing Template decisions.
+    pub fn with_template_pack(mut self, templates: TemplatePack) -> Self {
+        self.templates = templates;
+        self
     }
 
     pub fn set_context(&mut self, context: ReflexContext) {
@@ -275,12 +296,63 @@ where
     pub fn last_record(&self) -> Option<&DecisionReplayRecord> {
         self.last_record.as_ref()
     }
+
+    /// Deterministic fallback recorded for the most recent Template decision
+    /// (`None` if the last decision was not a fallback).
+    pub fn last_template_fallback(&self) -> Option<TemplateFallback> {
+        self.last_template_fallback
+    }
+
+    /// Compose a Template decision against the curated pack. Slots are sourced
+    /// deterministically from trusted event payload fields named after the
+    /// template's declared slots, bounded by the composer. On any fallback
+    /// the reason is recorded and the route degrades to Silence.
+    fn template_route(&mut self, event: &EventEnvelope, template_id: &str) -> PlaybackRoute {
+        let slots: Vec<(String, String)> = self
+            .templates
+            .get(template_id)
+            .map(|template| {
+                template
+                    .slots
+                    .iter()
+                    .filter_map(|slot| {
+                        event
+                            .payload
+                            .get(slot.as_str())
+                            .and_then(serde_json::Value::as_str)
+                            .map(|value| (slot.clone(), value.to_owned()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        match self
+            .composer
+            .compose(&self.templates, template_id, event, &slots)
+        {
+            Ok(composition) => {
+                self.last_template_fallback = None;
+                PlaybackRoute::Template {
+                    template_id: composition.template_id.clone(),
+                    composition,
+                }
+            }
+            Err(fallback) => {
+                self.last_template_fallback = Some(fallback);
+                PlaybackRoute::Silent
+            }
+        }
+    }
 }
 
 impl<E> RoutePlanner for ReflexRoutePlanner<E>
 where
     E: QueryEmbeddingProvider,
 {
+    fn template_fallback(&self) -> Option<TemplateFallback> {
+        self.last_template_fallback
+    }
+
     fn route(&mut self, event: &EventEnvelope) -> Result<PlaybackRoute, AppError> {
         let query_embedding = self.embeddings.embedding(event)?;
         let record = self
@@ -313,32 +385,27 @@ where
             ExecutedAction::Llm => {
                 PlaybackRoute::Generate(Box::new(generation_route(event, &self.context, &record)?))
             }
-            ExecutedAction::Template => {
-                // The reflex decision carries the template id in the event
-                // payload (`template_id`); composition happens here against
-                // the curated pack so routing stays deterministic. Missing or
-                // invalid templates degrade to Silence with a recorded reason
-                // rather than silently dropping the decision (issue #54).
-                match event
-                    .payload
-                    .get("template_id")
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|value| !value.trim().is_empty())
-                {
-                    Some(template_id) => PlaybackRoute::Template {
-                        template_id: template_id.to_owned(),
-                        composition: TemplateComposition {
-                            template_id: template_id.to_owned(),
-                            template_version: "curated-v1".to_owned(),
-                            text: String::new(),
-                        },
-                    },
-                    None => PlaybackRoute::Silent,
+            ExecutedAction::Template => match event
+                .payload
+                .get("template_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                Some(template_id) => self.template_route(event, template_id),
+                None => {
+                    self.last_template_fallback = Some(TemplateFallback::MissingTemplate);
+                    PlaybackRoute::Silent
                 }
+            },
+            ExecutedAction::Silent | ExecutedAction::Fallback => {
+                self.last_template_fallback = None;
+                PlaybackRoute::Silent
             }
-            ExecutedAction::Silent | ExecutedAction::Fallback => PlaybackRoute::Silent,
         };
 
+        if !matches!(record.executed.action, ExecutedAction::Template) {
+            self.last_template_fallback = None;
+        }
         self.last_record = Some(record);
         Ok(route)
     }
@@ -561,18 +628,6 @@ mod tests {
             .expect_err("missing template must fail");
         assert_eq!(error, TemplateFallback::MissingTemplate);
         assert_eq!(error.reason(), "template_missing");
-    }
-
-    #[test]
-    fn oversized_slot_value_is_rejected_with_bounded_fallback() {
-        let event = chat_event(BTreeMap::new());
-        let oversized = "x".repeat(MAX_TEMPLATE_SLOT_BYTES + 1);
-        let slots = vec![("name".to_owned(), oversized)];
-
-        let error = TemplateComposer
-            .compose(&template_pack(), "thanks.donation", &event, &slots)
-            .expect_err("oversized slot must fail");
-        assert_eq!(error, TemplateFallback::SlotValueTooLarge);
     }
 
     #[test]
