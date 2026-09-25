@@ -1291,6 +1291,7 @@ mod tests {
 
         let mut scheduler = Scheduler::new(SchedulerConfig {
             min_reaction_spacing_ms: 0,
+            ..aivtuber_scheduler::SchedulerConfig::default()
         });
         scheduler
             .schedule(PlannedPerformance {

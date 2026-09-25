@@ -853,6 +853,7 @@ mod tests {
             AssetStore::new(pack_root().join("descriptors"), runtime_compatibility()),
             Scheduler::new(SchedulerConfig {
                 min_reaction_spacing_ms: 0,
+                ..aivtuber_scheduler::SchedulerConfig::default()
             }),
             CachedPlaybackConfig {
                 recent_variant_window: 1,
