@@ -49,3 +49,26 @@ Rejected because semantic decision models should select high-level actions, not 
 === Jev-specific domain model
 
 Rejected because it would couple scheduler, assets, and tests to one provider.
+
+[executed on device: DESKTOP (2bf3ba04-d7b4-4fb7-99c6-76b0fc11abcc)]
+
+== Assumptions
+
+This decision depends on the following durable assumptions/invariants:
+
+* frame/motor control remains deterministic and must not depend on network-model latency;
+* semantic/reflex providers remain replaceable behind provider-neutral domain interfaces;
+* deterministic fallback behavior is maintained when Reflex/Thinking providers are slow or unavailable.
+
+These are tracked more generally in link:../assumptions.adoc[Assumption Register].
+
+== Revisit conditions
+
+Revisit this ADR when one of the following becomes true:
+
+* measured evidence shows the three-layer split itself is a material product/runtime bottleneck;
+* a new local inference architecture can safely satisfy the required deterministic timing boundary without coupling frame control to semantic inference;
+* provider-neutral boundaries no longer represent required Reflex/Thinking capabilities without material leakage;
+* a security/replay requirement invalidates the current layer ownership.
+
+Do not revisit solely because a newer framework/model exists.

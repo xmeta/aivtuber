@@ -128,6 +128,7 @@ See #100 for dependency/supply-chain policy and docs/reuse-first.adoc for the cu
 - Add regression tests with the bug/behavior change, not later.
 - Avoid unrelated refactors while implementing an issue.
 - Document assumptions/revisit conditions for uncertain or high-consequence changes.
+- Check docs/assumptions.adoc before changing provider/protocol/security/runtime assumptions; use docs/adr/template.adoc for substantial decisions.
 - Keep comments focused on invariants/reasons rather than restating code.
 
 ## Validation strategy
@@ -221,5 +222,7 @@ If work must stop before completion, leave a handoff containing:
 - next recommended command/file to inspect.
 
 See docs/agent-development.adoc for the detailed playbook.
+
+[executed on device: DESKTOP (2bf3ba04-d7b4-4fb7-99c6-76b0fc11abcc)]
 
 [executed on device: DESKTOP (2bf3ba04-d7b4-4fb7-99c6-76b0fc11abcc)]

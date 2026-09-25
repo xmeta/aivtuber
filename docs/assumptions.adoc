@@ -1,0 +1,252 @@
+= Assumption Register
+:toc:
+:toclevels: 2
+
+This register captures architectural and external assumptions whose failure could invalidate implementation or operational decisions.
+
+It is intentionally human-readable.
+GitHub issues, executable tests, provider conformance results, and ADRs remain the evidence/ownership sources.
+
+== Status vocabulary
+
+* *Invariant* -- repository policy/security boundary; changing it requires an explicit architecture/security decision.
+* *Verified* -- currently supported by executable repository evidence or an authoritative protocol guarantee.
+* *Needs validation* -- plausible/current design assumption, but local/provider evidence is incomplete.
+* *Invalidated* -- known false; linked design/implementation must be reviewed.
+* *Retired* -- no longer relevant because the owning design was removed/replaced.
+
+A mock proving the repository behaves a certain way does not prove a hosted provider behaves the same way.
+
+== Register fields
+
+Each important assumption should record:
+
+* stable assumption ID;
+* statement;
+* subsystem/owner;
+* status;
+* evidence/source;
+* last verified repository revision/date when practical;
+* validating test/fixture or conformance probe;
+* consequence if false;
+* revisit/invalidation trigger;
+* related issue/ADR.
+
+Do not record secrets, private user data, or raw provider credentials.
+
+== Current assumptions
+
+=== A-CTRL-001 -- Serialized authorization is not runtime authority
+
+*Subsystem:* security / control plane
+
+*Status:* Invariant
+
+*Statement:* Serialized +AuthorizationContext+ and model/provider output are audit/data only. Privileged runtime actions require non-serializable +AuthenticatedControl+ minted by authenticated local control ingress.
+
+*Evidence:*
+
+* +docs/security-threat-model.adoc+
+* +crates/domain/src/control.rs+
+* privileged adapter interfaces in +crates/domain/src/interfaces.rs+
+* runtime/control tests using +AuthenticatedControlCommand+
+
+*Consequence if false:* Public/model content could forge privileged control.
+
+*Revisit when:* Only through an explicit security-boundary redesign and corresponding threat-model/fixture changes.
+
+*Related:* ADR-0001, #14, #56.
+
+=== A-MEM-001 -- Durable memory requires explicit write authority
+
+*Subsystem:* security / adaptation
+
+*Status:* Invariant
+
+*Statement:* Public content may participate in bounded working context, but durable memory writes require the non-serializable +MemoryWritePermit+ issued by the runtime write gate.
+
+*Evidence:*
+
+* +docs/security-threat-model.adoc+
+* +docs/memory-adaptation.adoc+
+* +crates/runtime/src/lib.rs+ (+MemoryWritePermit+)
+* +crates/adaptation/src/lib.rs+
+
+*Consequence if false:* Prompt injection/public content could poison durable memory without the intended gate.
+
+*Revisit when:* Only through an explicit memory-authority/privacy redesign.
+
+*Related:* #51, #105, #114.
+
+=== A-VTS-001 -- Reconnect does not justify stale avatar-command replay
+
+*Subsystem:* VTube Studio adapter / output freshness
+
+*Status:* Verified
+
+*Statement:* A command that failed or became stale before VTube Studio reconnect must not be replayed solely because connectivity recovered.
+
+*Evidence:*
+
+* +crates/app/src/lib.rs+ test +avatar_reconnect_does_not_replay_failed_due_commands+
+* VTS reconnect policy implementation in +crates/adapters/src/vts.rs+
+
+*Consequence if false:* Old expressions/motions could execute after their conversational moment, producing incorrect or unsafe performer behavior.
+
+*Revisit when:* VTS adapter architecture/protocol changes, or a third-party VTS client is introduced.
+
+*Related:* #66, #100.
+
+=== A-OBS-001 -- Reconnect does not justify stale OBS action replay
+
+*Subsystem:* OBS adapter / privileged output freshness
+
+*Status:* Verified
+
+*Statement:* A stale stream action is not replayed automatically after OBS reconnect.
+
+*Evidence:*
+
+* +crates/adapters/src/obs.rs+ test +reconnect_does_not_replay_stale_stream_action+
+
+*Consequence if false:* A delayed privileged stream action could execute in the wrong context after recovery.
+
+*Revisit when:* OBS WebSocket major protocol/adapter changes or an external client library is adopted.
+
+*Related:* #56, #66, #100.
+
+=== A-JEV-001 -- Reflex transport timeout degrades deterministically
+
+*Subsystem:* reflex / Jev
+
+*Status:* Verified for repository adapter behavior; external provider semantics require #66 conformance
+
+*Statement:* A Jev/System One transport timeout is normalized into a deterministic fallback record rather than freezing the performer.
+
+*Evidence:*
+
+* +crates/reflex/src/pipeline.rs+ test +transport_timeout_becomes_deterministic_fallback_record+
+* +docs/jev-routing.adoc+
+
+*Consequence if false:* External decision latency could block or make replay/fallback behavior inconsistent.
+
+*Revisit when:* Jev transport/API/retry behavior changes.
+
+*Related:* #58, #66, #67.
+
+=== A-LLM-001 -- "OpenAI-compatible" does not imply identical behavior
+
+*Subsystem:* Thinking provider adapters
+
+*Status:* Needs validation
+
+*Statement:* Providers exposing an OpenAI-compatible API may differ in structured output, streaming order, finish reasons, cancellation, rate limits, prompt caching, reasoning controls, and model identity semantics.
+
+*Evidence:* Provider documentation plus repository normalization contracts; complete live evidence is intentionally deferred to #66.
+
+*Consequence if false assumption is ignored:* Mocks may remain green while production provider behavior drifts.
+
+*Revisit when:* A provider/model/API version changes, #66 conformance evidence lands, or the provider gateway changes.
+
+*Related:* #61, #66, #104.
+
+=== A-TTS-001 -- TTS streaming/prosody controls are provider-specific
+
+*Subsystem:* TTS adapters / performance compilation
+
+*Status:* Needs validation
+
+*Statement:* Streaming completion, cancellation, viseme/timeline support, prosody/style controls, and voice/model identity are not assumed equivalent across TTS backends.
+
+*Evidence:* Existing provider-neutral TTS contract; future #66 capability/conformance matrix.
+
+*Consequence if false assumption is ignored:* Phrase commit, cancellation, cache keys, or PerformanceIntent mapping may become provider-dependent in hidden ways.
+
+*Revisit when:* TTS backend/version changes or #83/#84 requires a new capability.
+
+*Related:* #66, #83, #84.
+
+=== A-AUDIO-001 -- Current process-player startup cost is acceptable until measured otherwise
+
+*Subsystem:* audio output
+
+*Status:* Needs validation
+
+*Statement:* The existing external process-player backend is operationally acceptable for the current production profile; native audio is not assumed better without measurement.
+
+*Evidence:* Current adapter behavior; no comparative native-backend benchmark yet.
+
+*Consequence if false:* Process startup may materially hurt first-audio latency or phrase continuity.
+
+*Revisit when:* #101 produces native-vs-process evidence, #58 identifies audio startup as a bottleneck, or #83 phrase streaming requires tighter gaps.
+
+*Related:* #58, #101.
+
+=== A-RESEARCH-001 -- External benchmark results do not define aivtuber production thresholds
+
+*Subsystem:* research / evaluation
+
+*Status:* Invariant
+
+*Statement:* Results from papers, benchmarks, or other repositories are transfer hypotheses. Differences in language, population, workload, hardware, and product behavior require local validation before adopting thresholds or promotion decisions.
+
+*Evidence:*
+
+* +docs/research-register.adoc+
+* #60 research-derived hypothesis policy
+
+*Consequence if false:* The project could optimize against inappropriate external targets and regress actual VTuber behavior.
+
+*Revisit when:* Never implicitly; a specific external threshold may become local policy only after a documented evidence/decision process.
+
+*Related:* #58-#61, #64.
+
+=== A-PERCEPT-001 -- Multimodal turn cues require local Japanese/product validation
+
+*Subsystem:* future perception / full-duplex interaction
+
+*Status:* Needs validation
+
+*Statement:* Research evidence that face/head/gaze cues improve turn prediction in other datasets does not establish useful incremental value in aivtuber's Japanese/co-host deployment.
+
+*Evidence:* Primary research recorded in +docs/research-register.adoc+.
+
+*Consequence if false assumption is ignored:* The project could add costly/privacy-sensitive visual perception with negligible product value.
+
+*Revisit when:* #90/#92 shadow/replay evaluation produces local evidence.
+
+*Related:* #90, #92.
+
+== Adding or updating an assumption
+
+Use the following compact form:
+
+[source,text]
+----
+=== A-<SUBSYSTEM>-NNN -- Short name
+
+Subsystem:
+Status:
+Statement:
+Evidence:
+Consequence if false:
+Revisit when:
+Related:
+----
+
+For a dependency/protocol upgrade:
+
+. search this register for the provider/subsystem;
+. run linked tests/fixtures/conformance probes;
+. update status/evidence if behavior changed;
+. review related ADRs/issues;
+. create a focused issue when an invalidated assumption requires implementation work.
+
+== Relationship to ADRs
+
+An ADR captures a substantial decision and alternatives.
+This register captures facts/expectations that the decision depends on.
+
+One ADR may depend on multiple assumptions, and one assumption may affect several decisions.
+
+If an assumption is invalidated, do not silently rewrite history in an accepted ADR. Record the changed evidence, then supersede/amend the decision explicitly when needed.

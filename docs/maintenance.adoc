@@ -109,3 +109,40 @@ To update Bun itself, change `packageManager` and the CI `bun-version` in the sa
 Prefer one issue-sized, testable vertical slice per PR. Split work when independent schema, infrastructure, adapter, or runtime changes can be validated separately. A larger PR is acceptable when splitting would create an uncompilable or unverifiable intermediate state; record that reason in the PR description.
 
 [executed on device: DESKTOP (2bf3ba04-d7b4-4fb7-99c6-76b0fc11abcc)]
+
+[executed on device: DESKTOP (2bf3ba04-d7b4-4fb7-99c6-76b0fc11abcc)]
+
+== Risk-proportional decisions and assumptions
+
+Routine low-risk changes do not require an ADR.
+
+Use a durable ADR/decision record when a choice materially changes one or more of:
+
+* security/trust boundary;
+* public/network attack surface;
+* persistent storage/privacy behavior;
+* scheduler/arbitration semantics;
+* breaking schema/protocol contract;
+* major runtime composition;
+* large framework/dependency adoption;
+* hard-to-reverse migration;
+* benchmark/evaluation methodology that changes conclusions;
+* long-lived architecture constraints.
+
+Use link:adr/template.adoc[ADR template] as the default structure.
+
+A substantial decision should:
+
+* distinguish hard constraints from assumptions;
+* include materially different alternatives;
+* consider status quo/do nothing when meaningful;
+* compare Reuse / Adapt / Build lifecycle trade-offs;
+* identify evidence quality;
+* record staging/rollback options;
+* state observable revisit conditions.
+
+Important assumptions live in link:assumptions.adoc[Assumption Register].
+
+When a dependency/protocol/model version changes, review affected assumptions and linked tests/conformance evidence before treating the upgrade as behaviorally equivalent.
+
+An accepted ADR records historical reasoning. If evidence changes, update the assumption register and supersede/amend the decision explicitly rather than silently rewriting the old decision.
