@@ -31,17 +31,20 @@ Stage 1 exit requires the core runtime to be bounded and operable, with explicit
 
 === Immediate critical path
 
-The current dependency-critical sequence is:
+Current dependency state:
 
-. https://github.com/xmeta/aivtuber/issues/52[#52] separate scheduler active state from bounded terminal history.
-. https://github.com/xmeta/aivtuber/issues/53[#53] bound generated Performance Asset L0 with deterministic eviction.
-. Run #52 and #53 in parallel where practical.
-. https://github.com/xmeta/aivtuber/issues/51[#51] integrate their limits into the unified runtime retention policy after both blockers land.
-. https://github.com/xmeta/aivtuber/issues/54[#54] fix the user-visible Template route so a valid Template decision is not mapped to silence; this may proceed in parallel with #52/#53.
-. https://github.com/xmeta/aivtuber/issues/65[#65] add retained causal tracing only after #51 provides the shared retention contract.
+. https://github.com/xmeta/aivtuber/issues/52[#52] scheduler active/history boundedness is *complete*.
+. https://github.com/xmeta/aivtuber/issues/53[#53] generated Performance Asset L0 deterministic eviction is *complete*.
+. Their shared blocker on https://github.com/xmeta/aivtuber/issues/51[#51] is resolved; #51 is now the next retention-integration step and is `status:agent-ready`.
+. https://github.com/xmeta/aivtuber/issues/65[#65] retained causal tracing remains implementation-blocked until #51 provides the shared retention contract, although trace vocabulary/design work is `status:design-ready`.
+. https://github.com/xmeta/aivtuber/issues/54[#54] remains independently agent-ready as the user-visible Template route defect.
 
 Other Stage 1 work may proceed in parallel when ownership is independent.
-In particular, provider conformance, end-to-end deadline accounting, production composition profiles, and local operator control should not duplicate the retention/scheduler ownership above.
+Current independent agent-ready work includes provider conformance (#66), end-to-end deadline accounting (#67), supply-chain gates (#100), and the evidence spike for native audio (#101).
+
+Production composition profiles (#55), local operator control (#56), diagnostics (#68), generative budgets (#69), workload models (#70), and operational SLO work (#71) should continue to use the shared boundedness/evidence contracts rather than creating parallel ownership.
+
+The reusable v0.1 evidence procedure is link:release-v0.1.adoc[v0.1 Release Checklist and Evidence Record].
 
 Stage 1 is complete only when the subsystem criteria and the #97 end-to-end release checklist both pass.
 
@@ -150,6 +153,8 @@ Added replay comparison, failure injection, long-stream logical-time soak covera
 
 The historical Phase 6 work exposed remaining production-boundedness gaps that are now owned by Stage 1 issues such as #51-#53.
 See link:failure-soak.adoc[Failure Injection and Long-Stream Soak].
+
+[executed on device: DESKTOP (2bf3ba04-d7b4-4fb7-99c6-76b0fc11abcc)]
 
 [executed on device: DESKTOP (2bf3ba04-d7b4-4fb7-99c6-76b0fc11abcc)]
 
