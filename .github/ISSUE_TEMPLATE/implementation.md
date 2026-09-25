@@ -8,6 +8,7 @@ assignees: ''
 
 > Before implementation, assign one primary milestone and exactly one priority:P1, priority:P2, or priority:P3 label.
 > Add status:agent-ready only after dependencies are satisfied and the acceptance/verification sections are actionable. Use status:blocked when a known blocker prevents implementation.
+> Add status:design-ready when research/architecture/evaluation work may proceed before implementation; it does not imply code readiness.
 
 ## Goal
 
@@ -52,3 +53,5 @@ assignees: ''
 ## Agent notes
 
 <!-- Optional: likely files/types to inspect. Avoid prescribing an implementation when the decision is still open. -->
+
+[executed on device: DESKTOP (2bf3ba04-d7b4-4fb7-99c6-76b0fc11abcc)]

@@ -1,0 +1,224 @@
+= Research and Design Register
+:toc:
+:toclevels: 2
+
+This register maps external research and mature open-source implementations to aivtuber design questions.
+
+It is not a second roadmap and it does not authorize implementation.
+GitHub issues remain the source of truth for ownership, milestone, priority, blockers, and acceptance criteria.
+
+Use this register to avoid:
+
+* rediscovering the same paper or repository in later AI-assisted sessions;
+* copying an external architecture without checking local constraints;
+* turning benchmark numbers from a different population/workload into aivtuber production thresholds;
+* treating GitHub popularity as evidence that a dependency fits deterministic/replay/security requirements.
+
+== Status semantics
+
+Repository issue labels distinguish implementation and design work:
+
+* +status:agent-ready+ -- dependencies are satisfied for implementation work.
+* +status:blocked+ -- implementation must not start until the named blocker is resolved.
+* +status:design-ready+ -- architecture, research, evaluation design, interface design, or assumption review may proceed; this does *not* authorize code implementation.
+
+An issue may be both +status:blocked+ and +status:design-ready+.
+
+== Research-to-project workflow
+
+[source,text]
+----
+external paper / OSS pattern
+        |
+transfer hypothesis
+        |
+linked GitHub issue
+        |
+bounded architecture / evaluation design
+        |
+local replay / benchmark / shadow evidence
+        |
+keep | narrow | defer | reject
+        |
+implementation only when dependencies/readiness permit
+----
+
+For high-consequence assumptions, use #61.
+For experiment evidence, use #58-#60 and #64.
+For third-party dependency decisions, use link:reuse-first.adoc[Reuse-First Library and Reference-Implementation Matrix] and #100.
+
+== Current research and OSS matrix
+
+[cols="2,3,3,2,4"]
+|===
+|Area |Primary reference(s) |Pattern worth evaluating |Issues |Local validation still required
+
+|Turn-taking / floor timing
+|Prompt-Guided Turn-Taking Prediction (SIGDIAL 2025);
+Full-Duplex-Bench family;
+LiveKit Agents / Pipecat
+|Persona-conditioned turn style; distinguish hold/shift/backchannel/interruption; tentative interruption before irreversible cancellation
+|#59, #70, #81, #92
+|Japanese/multilingual timing; false-turn-take rate; interruption/resume behavior under aivtuber phrase/scheduler boundaries
+
+|Backchannels
+|Yeah, Un, Oh: Continuous and Real-time Backchannel Prediction with VAP (NAACL 2025)
+|Separate backchannel timing from backchannel function/type; allow non-verbal acknowledgement
+|#59, #81, #92
+|Which intent classes improve perceived naturalness; frequency/strength by persona; false agreement signals
+
+|Multimodal turn cues
+|Visual Cues Enhance Predictive Turn-Taking (Findings of ACL 2025)
+|Use bounded face/head-pose/gaze cues as optional turn evidence before attempting general-purpose continuous vision
+|#90, #92, #93
+|Incremental value over audio-only observations; privacy/cost; cue age and confidence thresholds
+
+|Full-duplex evaluation
+|Full-Duplex-Bench v1/v1.5/v3
+|Evaluate pause handling, backchannels, interruption, overlap, side speech, disfluency, and self-correction
+|#59, #70, #81
+|Synthetic/replay scenarios that reflect VTuber/Japanese use rather than copying benchmark thresholds
+
+|Preemptive generation
+|LiveKit Agents preemptive generation;
+recent speculative full-duplex speech work
+|Prepare expensive work before final turn commitment, but publish only through a deterministic irreversible commit barrier
+|#67, #81, #83, #106
+|Useful latency saved versus wasted LLM/TTS cost; stale-result rejection; self-correction safety
+
+|Listening avatar behavior
+|Recent listening/speaking avatar research;
+AIRI implementation patterns
+|Continuous listening/presence prior distinct from discrete reaction and latency-masking assets
+|#59, #84, #89, #91, #107
+|How much motion is enough; foreground-to-listening transitions; avoid random over-animation
+
+|Causal co-speech motion
+|EMAGE (CVPR 2024);
+recent streamable co-speech gesture work
+|Sparse performance anchors plus causal phrase-local compilation; no dependency on unseen future phrases
+|#83, #84, #89
+|Mapping to available Live2D/VTS assets; Japanese prosody usefulness; anchor count/budget
+
+|Live-stream moderation
+|Analyzing Norm Violations in Live-Stream Chat (EMNLP 2023);
+Twitch/emote-aware moderation research
+|Bounded reply/recent/topic/emote context; community-specific evaluation instead of global toxicity score only
+|#74, #77
+|False positive/negative change on synthetic/licensed community scenarios; destructive-action guardrails
+
+|Clarification / abstention
+|ReCoVERR / selective-prediction research
+|One bounded evidence probe before unnecessary clarification or confident guessing
+|#85
+|Which sources improve correctness without exceeding interaction deadline; prevent recovery of deleted/private content
+
+|Long-term conversational memory
+|LoCoMo (ACL 2024);
+THEANINE (NAACL 2025);
+Reflective Memory Management (ACL 2025)
+|Temporal/causal links among retained memories; explicit update/supersession; bounded retrieval neighborhood
+|#51, #80, #105
+|Retention plateau; stale-fact reduction; deterministic deletion/edge cleanup; privacy
+
+|Hybrid / epistemic memory
+|Hindsight;
+Graphiti;
+Letta
+|Combine semantic/keyword/temporal/graph retrieval; distinguish VerifiedFact, ViewerClaim, Observation, Experience, Opinion
+|#105
+|Whether extra retrieval arms beat exact/simple retrieval at current scale; provenance-aware wording; dependency/runtime cost
+
+|LLM routing / adaptive compute
+|RouteLLM;
+adaptive budget-constrained routing research;
+adaptive-compute / reasoning-budget research
+|Route based on expected incremental value versus latency/cost; also choose a bounded thinking-budget class
+|#58, #64, #69, #104
+|Pairwise quality calibration on aivtuber data; deadline/budget veto behavior; provider-specific compute controls
+
+|Prompt caching
+|Recent prompt-caching evaluations;
+provider cache-capability documentation
+|Separate stable policy/persona/schema prefix from dynamic event/context suffix; measure cache savings and TTFT
+|#58, #66, #69
+|Provider-specific semantics; cache hit behavior with persona/policy versions; whether layout harms dynamic-context quality
+
+|Trace evaluation
+|Recent multi-level agent evaluation / trace-attribution research;
+Langfuse/TensorZero observability patterns
+|Evaluate system outcome, trace path, and stage/node separately; deterministic attribution before optional LLM judge
+|#58, #59, #62, #65, #108
+|Agreement with human attribution; privacy-safe evidence; unknown/ambiguous rate; false causal claims
+
+|Local Japanese speech
+|sherpa-onnx;
+current Japanese-capable VAD/ASR ecosystems
+|Prefer a sidecar boundary for local VAD/ASR/diarization rather than embedding a heavy model runtime into deterministic Rust core
+|#66, #92
+|Japanese accuracy/latency; CPU/GPU footprint; IPC/reconnect; model/license suitability at implementation time
+
+|Modern TTS
+|GPT-SoVITS;
+CosyVoice;
+Fish Speech;
+VoxCPM family or successors
+|Maintain a capability matrix instead of choosing by subjective samples alone
+|#66, #83, #84, #101
+|Japanese quality; first-audio latency; phrase streaming/cancellation; emotion/prosody; RTF; memory/VRAM; license
+
+|Remote voice / co-host transport
+|LiveKit;
+WebRTC ecosystem
+|Reuse media transport, participant tracks, reconnect, jitter/media plumbing; keep aivtuber decision/control core separate
+|#93
+|Deployment complexity; latency; identity/trust normalization; optional-profile boundaries
+
+|Provider gateway / experiments
+|TensorZero
+|Optional gateway for provider normalization, experiment/shadow plumbing, and feedback collection
+|#64, #66, #104
+|Added latency; retry semantics; model identity propagation; whether it duplicates existing aivtuber responsibilities
+|===
+
+== Current design-ready queue
+
+The following groups are suitable for architecture/research progress even when implementation is blocked or intentionally deferred:
+
+* #104 -- marginal-value routing and thinking-budget contract;
+* #105 -- temporal/causal/epistemic memory model and retrieval evaluation;
+* #106 -- speculative preparation and commit-barrier contract;
+* #107 -- continuous listening-performance state and evaluation;
+* #108 -- failure-attribution result schema and evaluator ordering;
+* #90/#92/#93 -- future perception, speech-turn observations, and media/speaker boundaries.
+
+Design work should produce bounded types, ownership boundaries, acceptance criteria, scenario/evaluation definitions, or assumption records.
+It should not silently create runtime dependencies or production code while the issue remains implementation-blocked.
+
+== Research applicability checklist
+
+When adding a paper or OSS pattern to this register, record or verify:
+
+. Is the source a peer-reviewed paper, preprint, official documentation, or repository?
+. What language, modality, population, workload, and hardware did it evaluate?
+. Which *pattern* is expected to transfer to aivtuber?
+. Which reported result should *not* be assumed to transfer?
+. Which local issue owns validation?
+. What local replay/benchmark/shadow evidence would keep, narrow, or reject the idea?
+. Does the idea preserve bounded state, replay, privacy, authority, and graceful degradation?
+. Is a mature library/reference implementation available before custom infrastructure is written?
+
+Prefer primary papers and official repositories/docs.
+
+== Maintenance
+
+Update this register when:
+
+* a research-derived idea becomes a dedicated issue;
+* a candidate is rejected or materially narrowed;
+* a newer paper/repository changes the design assumption;
+* implementation evidence resolves a transfer hypothesis;
+* a dependency/reuse decision moves to link:reuse-first.adoc[the reuse-first matrix].
+
+Do not copy large issue bodies into this document.
+The register should stay a concise map from external evidence to local validation work.
