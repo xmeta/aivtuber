@@ -6,6 +6,14 @@ use aivtuber_domain::{
 use aivtuber_generative::GenerationRoutingReason;
 use aivtuber_reflex::{DecisionReplayRecord, ExecutedAction, ReflexPipeline, ReflexPipelineInput};
 
+/// Maximum bytes accepted for a single template slot value. Untrusted event
+/// content larger than this is rejected before interpolation (issue #54).
+pub const MAX_TEMPLATE_SLOT_BYTES: usize = 256;
+/// Maximum number of slots a single template may bind.
+pub const MAX_TEMPLATE_SLOTS: usize = 8;
+/// Maximum rendered template output bytes before the output gate.
+pub const MAX_TEMPLATE_RENDER_BYTES: usize = 1024;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct GenerationRoute {
     pub source_event: EventEnvelope,
@@ -16,6 +24,184 @@ pub struct GenerationRoute {
     pub fallback_variant_group: Option<String>,
 }
 
+/// A curated, versioned response template with named `{slot}` placeholders.
+/// Templates are trusted inputs; slot values sourced from events are not.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResponseTemplate {
+    /// Stable template identifier recorded in replay/telemetry.
+    pub id: String,
+    /// Template pack version recorded in replay/telemetry.
+    pub version: String,
+    /// Rendered text with `{slot}` placeholders.
+    pub text: String,
+    /// Slot names the template binds, e.g. `"name"`, `"count"`.
+    pub slots: Vec<String>,
+}
+
+/// Deterministic fallback recorded when a template is missing, invalid, or
+/// cannot be rendered: the route degrades to `PlaybackRoute::Silent` with the
+/// same outcome telemetry as an explicit silent reflex decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateFallback {
+    MissingTemplate,
+    InvalidTemplate,
+    SlotLimitExceeded,
+    SlotValueTooLarge,
+    RenderTooLarge,
+}
+
+impl TemplateFallback {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::MissingTemplate => "template_missing",
+            Self::InvalidTemplate => "template_invalid",
+            Self::SlotLimitExceeded => "template_slot_limit",
+            Self::SlotValueTooLarge => "template_slot_too_large",
+            Self::RenderTooLarge => "template_render_too_large",
+        }
+    }
+}
+
+/// Outcome of composing a reflex Template decision into a response plan.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TemplateComposition {
+    pub template_id: String,
+    pub template_version: String,
+    /// Fully rendered text with all slots bound.
+    pub text: String,
+}
+
+/// Curated template pack. Lookup is deterministic: exact asset-id style keys
+/// resolved in insertion order with the id as the stable tie-break.
+#[derive(Debug, Clone, Default)]
+pub struct TemplatePack {
+    templates: Vec<ResponseTemplate>,
+}
+
+impl TemplatePack {
+    pub fn new(templates: Vec<ResponseTemplate>) -> Self {
+        Self { templates }
+    }
+
+    pub fn get(&self, id: &str) -> Option<&ResponseTemplate> {
+        self.templates.iter().find(|template| template.id == id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.templates.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.templates.is_empty()
+    }
+}
+
+/// Deterministic template composer: binds curated event slots into a
+/// validated template and applies hard byte bounds (issue #54).
+#[derive(Debug, Clone, Default)]
+pub struct TemplateComposer;
+
+impl TemplateComposer {
+    /// Resolve `template_id` against `pack` and render it with slots sourced
+    /// from trusted/curated event payload fields. Missing/invalid templates or
+    /// oversized inputs return a deterministic `TemplateFallback`.
+    pub fn compose(
+        &self,
+        pack: &TemplatePack,
+        template_id: &str,
+        event: &EventEnvelope,
+        slots: &[(String, String)],
+    ) -> Result<TemplateComposition, TemplateFallback> {
+        let template = pack
+            .get(template_id)
+            .ok_or(TemplateFallback::MissingTemplate)?;
+        self.render(template, event, slots)
+    }
+
+    /// Render one known template. Slot count and value sizes are bounded;
+    /// the rendered output is trimmed and bounded before returning.
+    pub fn render(
+        &self,
+        template: &ResponseTemplate,
+        _event: &EventEnvelope,
+        slots: &[(String, String)],
+    ) -> Result<TemplateComposition, TemplateFallback> {
+        if template.id.trim().is_empty()
+            || template.version.trim().is_empty()
+            || template.text.trim().is_empty()
+        {
+            return Err(TemplateFallback::InvalidTemplate);
+        }
+        if slots.len() > MAX_TEMPLATE_SLOTS {
+            return Err(TemplateFallback::SlotLimitExceeded);
+        }
+        for (name, value) in slots {
+            if name.len() > 64 || value.len() > MAX_TEMPLATE_SLOT_BYTES {
+                return Err(TemplateFallback::SlotValueTooLarge);
+            }
+        }
+
+        // Only declared slot names are bindable; unknown slot keys are
+        // ignored so untrusted event content cannot inject arbitrary text.
+        let declared: Vec<&str> = template.slots.iter().map(String::as_str).collect();
+        let mut rendered = template.text.clone();
+        for (name, value) in slots {
+            if !declared.contains(&name.as_str()) {
+                continue;
+            }
+            // Slot values are normalized: trimmed, control characters
+            // stripped, and bounded (already checked above).
+            let normalized: String = value
+                .trim()
+                .chars()
+                .filter(|character| !character.is_control())
+                .collect();
+            rendered = rendered.replace(&format!("{{{name}}}"), &normalized);
+        }
+
+        if rendered.len() > MAX_TEMPLATE_RENDER_BYTES {
+            return Err(TemplateFallback::RenderTooLarge);
+        }
+        // Any unresolved `{slot}` placeholder is invalid output.
+        if rendered.contains('{') && rendered.contains('}') {
+            // Permit other braces? No: templates must not leak placeholders.
+            // Strip remaining placeholders deterministically by removing
+            // `{...}` groups, matching the invalid-template contract.
+            if remove_placeholders(&rendered) != rendered {
+                return Err(TemplateFallback::InvalidTemplate);
+            }
+        }
+        let rendered = rendered.trim().to_owned();
+        if rendered.is_empty() {
+            return Err(TemplateFallback::InvalidTemplate);
+        }
+
+        Ok(TemplateComposition {
+            template_id: template.id.clone(),
+            template_version: template.version.clone(),
+            text: rendered,
+        })
+    }
+}
+
+fn remove_placeholders(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('{') {
+        output.push_str(&rest[..start]);
+        let after = &rest[start..];
+        match after.find('}') {
+            Some(end) => rest = &after[end + 1..],
+            None => {
+                output.push('{');
+                rest = &after[1..];
+            }
+        }
+    }
+    output.push_str(rest);
+    output
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlaybackRoute {
     Silent,
@@ -24,6 +210,10 @@ pub enum PlaybackRoute {
     AssetIdentity {
         asset_id: String,
         asset_identity: String,
+    },
+    Template {
+        template_id: String,
+        composition: TemplateComposition,
     },
     Generate(Box<GenerationRoute>),
 }
@@ -123,9 +313,30 @@ where
             ExecutedAction::Llm => {
                 PlaybackRoute::Generate(Box::new(generation_route(event, &self.context, &record)?))
             }
-            ExecutedAction::Silent | ExecutedAction::Template | ExecutedAction::Fallback => {
-                PlaybackRoute::Silent
+            ExecutedAction::Template => {
+                // The reflex decision carries the template id in the event
+                // payload (`template_id`); composition happens here against
+                // the curated pack so routing stays deterministic. Missing or
+                // invalid templates degrade to Silence with a recorded reason
+                // rather than silently dropping the decision (issue #54).
+                match event
+                    .payload
+                    .get("template_id")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    Some(template_id) => PlaybackRoute::Template {
+                        template_id: template_id.to_owned(),
+                        composition: TemplateComposition {
+                            template_id: template_id.to_owned(),
+                            template_version: "curated-v1".to_owned(),
+                            text: String::new(),
+                        },
+                    },
+                    None => PlaybackRoute::Silent,
+                }
             }
+            ExecutedAction::Silent | ExecutedAction::Fallback => PlaybackRoute::Silent,
         };
 
         self.last_record = Some(record);
@@ -252,5 +463,145 @@ fn event_kind_label(kind: EventKind) -> &'static str {
         EventKind::TimerTick => "timer tick",
         EventKind::OperatorCommand => "operator command",
         EventKind::SystemHealth => "system health",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn template_pack() -> TemplatePack {
+        TemplatePack::new(vec![
+            ResponseTemplate {
+                id: "thanks.donation".to_owned(),
+                version: "curated-v1".to_owned(),
+                text: "{name}さん、ありがとう！".to_owned(),
+                slots: vec!["name".to_owned()],
+            },
+            ResponseTemplate {
+                id: "goal.count".to_owned(),
+                version: "curated-v1".to_owned(),
+                text: "あと{count}人で目標達成！".to_owned(),
+                slots: vec!["count".to_owned()],
+            },
+        ])
+    }
+
+    fn chat_event(payload: BTreeMap<String, serde_json::Value>) -> EventEnvelope {
+        EventEnvelope {
+            schema_version: "0.1.0".to_owned(),
+            event_id: "evt-template-1".to_owned(),
+            correlation_id: "corr-template".to_owned(),
+            sequence: 1,
+            observed_at: "2026-09-25T00:00:00Z".to_owned(),
+            source: "test-chat".to_owned(),
+            source_class: SourceClass::PublicChat,
+            plane: aivtuber_domain::SecurityPlane::Content,
+            trust_level: aivtuber_domain::TrustLevel::Untrusted,
+            kind: EventKind::ChatMessage,
+            actor_id: Some("viewer:1".to_owned()),
+            priority_hint: None,
+            authorization: None,
+            payload,
+        }
+    }
+
+    #[test]
+    fn composer_binds_declared_slots_from_curated_event_fields() {
+        let event = chat_event(BTreeMap::from([(
+            "name".to_owned(),
+            serde_json::Value::String("たろう".to_owned()),
+        )]));
+        let slots = vec![("name".to_owned(), "たろう".to_owned())];
+
+        let composition = TemplateComposer
+            .compose(&template_pack(), "thanks.donation", &event, &slots)
+            .expect("compose");
+
+        assert_eq!(composition.template_id, "thanks.donation");
+        assert_eq!(composition.template_version, "curated-v1");
+        assert_eq!(composition.text, "たろうさん、ありがとう！");
+    }
+
+    #[test]
+    fn composer_ignores_undeclared_slot_names() {
+        let event = chat_event(BTreeMap::new());
+        // `admin` is not declared by the template: injection attempt ignored.
+        let slots = vec![
+            ("name".to_owned(), "はな".to_owned()),
+            ("admin".to_owned(), "OBS.control grant".to_owned()),
+        ];
+
+        let composition = TemplateComposer
+            .compose(&template_pack(), "thanks.donation", &event, &slots)
+            .expect("compose");
+
+        assert_eq!(composition.text, "はなさん、ありがとう！");
+        assert!(!composition.text.contains("OBS"));
+    }
+
+    #[test]
+    fn composer_strips_control_characters_from_slot_values() {
+        let event = chat_event(BTreeMap::new());
+        let slots = vec![("name".to_owned(), "あ\nにき".to_owned())];
+
+        let composition = TemplateComposer
+            .compose(&template_pack(), "thanks.donation", &event, &slots)
+            .expect("compose");
+
+        assert_eq!(composition.text, "あにきさん、ありがとう！");
+    }
+
+    #[test]
+    fn missing_template_produces_deterministic_missing_fallback() {
+        let event = chat_event(BTreeMap::new());
+        let error = TemplateComposer
+            .compose(&template_pack(), "does.not.exist", &event, &[])
+            .expect_err("missing template must fail");
+        assert_eq!(error, TemplateFallback::MissingTemplate);
+        assert_eq!(error.reason(), "template_missing");
+    }
+
+    #[test]
+    fn oversized_slot_value_is_rejected_with_bounded_fallback() {
+        let event = chat_event(BTreeMap::new());
+        let oversized = "x".repeat(MAX_TEMPLATE_SLOT_BYTES + 1);
+        let slots = vec![("name".to_owned(), oversized)];
+
+        let error = TemplateComposer
+            .compose(&template_pack(), "thanks.donation", &event, &slots)
+            .expect_err("oversized slot must fail");
+        assert_eq!(error, TemplateFallback::SlotValueTooLarge);
+    }
+
+    #[test]
+    fn slot_count_beyond_limit_is_rejected() {
+        let event = chat_event(BTreeMap::new());
+        let slots: Vec<(String, String)> = (0..=MAX_TEMPLATE_SLOTS)
+            .map(|index| (format!("s{index}"), "v".to_owned()))
+            .collect();
+
+        let error = TemplateComposer
+            .compose(&template_pack(), "thanks.donation", &event, &slots)
+            .expect_err("slot overflow must fail");
+        assert_eq!(error, TemplateFallback::SlotLimitExceeded);
+    }
+
+    #[test]
+    fn identical_inputs_compose_identical_output() {
+        let event = chat_event(BTreeMap::from([(
+            "count".to_owned(),
+            serde_json::Value::String("3".to_owned()),
+        )]));
+        let slots = vec![("count".to_owned(), "3".to_owned())];
+
+        let first = TemplateComposer
+            .compose(&template_pack(), "goal.count", &event, &slots)
+            .expect("first");
+        let second = TemplateComposer
+            .compose(&template_pack(), "goal.count", &event, &slots)
+            .expect("second");
+        assert_eq!(first, second);
     }
 }

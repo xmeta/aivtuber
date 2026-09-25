@@ -1,6 +1,6 @@
 use crate::{
-    AppliedVariation, BlendChannel, PlannedPerformance, Priority, Rejection, ScheduledItem,
-    Scheduler, SchedulerConfig, SeededRng, Status, VariationSpec, apply_variation,
+    AppliedVariation, BlendChannel, HistoryPolicy, PlannedPerformance, Priority, Rejection,
+    ScheduledItem, Scheduler, SchedulerConfig, SeededRng, Status, VariationSpec, apply_variation,
 };
 use aivtuber_domain::{EventEnvelope, EventKind, FallbackReason};
 use serde::{Deserialize, Serialize};
@@ -154,7 +154,13 @@ impl ReplayHarness {
                 .then_with(|| left.event.event_id.cmp(&right.event.event_id))
         });
 
-        let mut scheduler = Scheduler::new(self.config.scheduler);
+        // Replay tooling intentionally retains full terminal history so the
+        // complete expected trace stays byte-comparable (issue #52).
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            history_capacity: usize::MAX,
+            history_policy: HistoryPolicy::RetainAll,
+            ..self.config.scheduler
+        });
         let mut steps = Vec::with_capacity(ordered.len());
 
         for input in ordered {
@@ -225,7 +231,18 @@ impl ReplayHarness {
 
         scheduler.complete_all();
 
-        let scheduled_items = scheduler.items().to_vec();
+        // With bounded-state separation (issue #52) terminal items retire out
+        // of the live collection into history. Replay runs under
+        // HistoryPolicy::RetainAll, so draining history recovers every        // terminal item; sorting by schedule order (start, then generation)
+        // restores the stable trace order the live collection used to carry.
+        let mut scheduled_items: Vec<ScheduledItem> = scheduler
+            .drain_history()
+            .into_iter()
+            .map(|entry| entry.item)
+            .collect();
+        scheduled_items.sort_by_key(|item| (item.plan.start_at_ms, item.plan.generation));
+        scheduled_items.extend(scheduler.items().iter().cloned());
+
         let audio_actions = build_sink_actions(
             &scheduled_items,
             self.config.audio_available,
@@ -464,6 +481,7 @@ mod tests {
             seed,
             scheduler: SchedulerConfig {
                 min_reaction_spacing_ms: 0,
+                ..SchedulerConfig::default()
             },
             audio_available: true,
             avatar_available: true,
@@ -623,6 +641,7 @@ mod tests {
             seed: 3,
             scheduler: SchedulerConfig {
                 min_reaction_spacing_ms: 0,
+                ..SchedulerConfig::default()
             },
             audio_available: false,
             avatar_available: false,

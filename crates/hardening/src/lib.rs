@@ -106,8 +106,11 @@ mod tests {
         assert!(report.final_state.scheduler_completed >= 1_700);
         assert_eq!(report.final_state.content_queue, 0);
         assert!(report.final_state.working_memory_entries <= config.working_memory_limit);
+        // Issue #52: live scheduler items no longer grow with lifetime event
+        // count - terminal items retire into bounded history, so the soak
+        // probe must find NO lifetime growth in scheduler_items.
         assert!(report.finding("scheduler_items").is_some_and(|finding| {
-            finding.lifetime_growth_detected && finding.related_issue == Some(52)
+            !finding.lifetime_growth_detected && finding.related_issue == Some(52)
         }));
         assert!(report.finding("telemetry_events").is_some_and(|finding| {
             finding.lifetime_growth_detected && finding.related_issue == Some(51)
