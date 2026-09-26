@@ -139,6 +139,62 @@ pub struct PublicOutput {
     pub reason: &'static str,
 }
 
+/// Cloneable, side-effect-free snapshot of the deterministic public-output policy.
+///
+/// Provider workers may evaluate generated text with this snapshot before TTS without
+/// gaining access to scheduler/control authority or mutating the security audit. The
+/// composition thread revalidates completed work before publication and records the
+/// resulting audit decision.
+#[derive(Debug, Clone)]
+pub struct PublicOutputPolicy {
+    redactor: SecretRedactor,
+    cached_reaction: Option<String>,
+}
+
+impl PublicOutputPolicy {
+    pub fn evaluate(&self, text: &str) -> PublicOutput {
+        const CONTROL_TERMS: [&str; 5] = [
+            "obs.control",
+            "tool.grant",
+            "memory.admin",
+            "performer.stop",
+            "performer.mute",
+        ];
+
+        let lower = text.to_ascii_lowercase();
+        if CONTROL_TERMS.iter().any(|term| lower.contains(term)) {
+            return if let Some(cached) = &self.cached_reaction {
+                PublicOutput {
+                    verdict: OutputVerdict::ReplaceWithCached,
+                    text: Some(self.redactor.redact(cached)),
+                    reason: "control_plane_text",
+                }
+            } else {
+                PublicOutput {
+                    verdict: OutputVerdict::Suppress,
+                    text: None,
+                    reason: "control_plane_text",
+                }
+            };
+        }
+
+        let redacted = self.redactor.redact(text);
+        if redacted != text {
+            PublicOutput {
+                verdict: OutputVerdict::Redact,
+                text: Some(redacted),
+                reason: "configured_secret_redacted",
+            }
+        } else {
+            PublicOutput {
+                verdict: OutputVerdict::Allow,
+                text: Some(text.to_owned()),
+                reason: "clean",
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Bucket {
     tokens: f64,
@@ -372,51 +428,27 @@ impl SecurityRuntime {
         Ok(outcome)
     }
 
+    /// Capture the immutable portion of the public-output gate for provider
+    /// workers. The snapshot has no control/scheduler authority and does not
+    /// write audit records.
+    pub fn public_output_policy(&self) -> PublicOutputPolicy {
+        PublicOutputPolicy {
+            redactor: self.redactor.clone(),
+            cached_reaction: self.cached_reaction.clone(),
+        }
+    }
+
+    /// Record a previously evaluated public-output decision on the composition
+    /// thread. Worker-side policy evaluation deliberately does not audit.
+    pub fn record_public_output_decision(&mut self, output: &PublicOutput) {
+        self.record_output(output.reason);
+    }
+
     /// The production public-output surface always applies the deterministic
     /// output gate before returning text that may be spoken/displayed.
     pub fn publish_text(&mut self, text: &str) -> PublicOutput {
-        const CONTROL_TERMS: [&str; 5] = [
-            "obs.control",
-            "tool.grant",
-            "memory.admin",
-            "performer.stop",
-            "performer.mute",
-        ];
-
-        let lower = text.to_ascii_lowercase();
-        if CONTROL_TERMS.iter().any(|term| lower.contains(term)) {
-            let output = if let Some(cached) = &self.cached_reaction {
-                PublicOutput {
-                    verdict: OutputVerdict::ReplaceWithCached,
-                    text: Some(self.redactor.redact(cached)),
-                    reason: "control_plane_text",
-                }
-            } else {
-                PublicOutput {
-                    verdict: OutputVerdict::Suppress,
-                    text: None,
-                    reason: "control_plane_text",
-                }
-            };
-            self.record_output(output.reason);
-            return output;
-        }
-
-        let redacted = self.redactor.redact(text);
-        let output = if redacted != text {
-            PublicOutput {
-                verdict: OutputVerdict::Redact,
-                text: Some(redacted),
-                reason: "configured_secret_redacted",
-            }
-        } else {
-            PublicOutput {
-                verdict: OutputVerdict::Allow,
-                text: Some(text.to_owned()),
-                reason: "clean",
-            }
-        };
-        self.record_output(output.reason);
+        let output = self.public_output_policy().evaluate(text);
+        self.record_public_output_decision(&output);
         output
     }
 

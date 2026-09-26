@@ -217,6 +217,8 @@ At minimum:
 
 This separates "compute started" from "permission to publish".
 
+The production generation worker follows this rule directly. It receives only immutable request/fallback data, a cancellation token, and a cloneable side-effect-free public-output policy snapshot. It does not receive Scheduler/AssetStore mutation authority or authenticated control capability. A completed result is revalidated on the composition thread before hot-cache insertion or scheduling, and shutdown/cancellation/supersession fences late completions locally.
+
 == 12. Audit and replay
 
 Audit records include:

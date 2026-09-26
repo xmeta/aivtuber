@@ -158,7 +158,7 @@ Provider-side cancellation is best-effort. Local generation/revision fencing rem
 
 A stale or superseded speculative result MUST be discarded; reconnect, retry, or late provider completion MUST NOT publish it.
 
-This is a future-compatible invariant. The current production generative path remains buffered/atomic unless a later issue explicitly implements speculative preparation.
+This invariant is enforced by the current bounded generation execution boundary: provider waits run off the composition thread, while completed output remains uncommitted until `ProductionApp::tick()` revalidates the generation/cancellation/publication fence. The provider result is still buffered/atomic; pre-commit speculative turn preparation remains future work.
 
 === 6.4 PerformanceCompiler
 

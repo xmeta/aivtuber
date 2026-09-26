@@ -203,16 +203,20 @@ pub struct GenerationCancellationRegistry {
 impl GenerationCancellationRegistry {
     pub fn begin(&self, event: &EventEnvelope) -> GenerationCancellationToken {
         let token = GenerationCancellationToken::default();
+        self.activate(event, token.clone());
+        token
+    }
+
+    pub fn activate(&self, event: &EventEnvelope, token: GenerationCancellationToken) {
         let active = ActiveGeneration {
             event_id: event.event_id.clone(),
             priority: priority_for_event(event.kind),
-            token: token.clone(),
+            token,
         };
         let mut guard = self.active.lock().expect("generation registry lock");
         if let Some(previous) = guard.replace(active) {
             previous.token.cancel();
         }
-        token
     }
 
     pub fn cancel_for_event(&self, event: &EventEnvelope) -> bool {
@@ -621,6 +625,26 @@ impl GenerativePipeline {
         request: &GenerationRequest,
         cancellation: &GenerationCancellationToken,
         fallback_assets: Option<&AssetStore>,
+        output_gate: F,
+    ) -> Result<GenerationResult, GenerationError>
+    where
+        F: FnMut(&str) -> GeneratedTextGateDecision,
+    {
+        let fallback = select_fallback_directive(request, fallback_assets);
+        self.run_with_output_gate_and_fallback(request, cancellation, fallback, output_gate)
+    }
+
+    /// Run generation with a fallback directive selected by the composition
+    /// thread before work is submitted to a provider worker.
+    ///
+    /// This avoids sharing the mutable AssetStore across the execution boundary:
+    /// workers receive only immutable request data, cancellation state, and the
+    /// already-authorized deterministic fallback choice.
+    pub fn run_with_output_gate_and_fallback<F>(
+        &self,
+        request: &GenerationRequest,
+        cancellation: &GenerationCancellationToken,
+        fallback: FallbackDirective,
         mut output_gate: F,
     ) -> Result<GenerationResult, GenerationError>
     where
@@ -664,7 +688,7 @@ impl GenerativePipeline {
             Ok(reply) => reply,
             Err(error) => {
                 trace.fallback_reason = fallback_reason_from_error(&error);
-                return Ok(fallback_result(request, fallback_assets, trace));
+                return Ok(fallback_result(trace, fallback.clone()));
             }
         };
 
@@ -676,7 +700,7 @@ impl GenerativePipeline {
             GeneratedTextGateDecision::Publish(text) if !text.trim().is_empty() => text,
             GeneratedTextGateDecision::Publish(_) | GeneratedTextGateDecision::Reject => {
                 trace.fallback_reason = FallbackReason::PolicyOverride;
-                return Ok(fallback_result(request, fallback_assets, trace));
+                return Ok(fallback_result(trace, fallback.clone()));
             }
         };
 
@@ -705,7 +729,7 @@ impl GenerativePipeline {
             Ok(speech) => speech,
             Err(error) => {
                 trace.fallback_reason = fallback_reason_from_error(&error);
-                return Ok(fallback_result(request, fallback_assets, trace));
+                return Ok(fallback_result(trace, fallback.clone()));
             }
         };
 
@@ -723,7 +747,7 @@ impl GenerativePipeline {
             Ok(asset) => asset,
             Err(_) => {
                 trace.fallback_reason = FallbackReason::InvalidRequest;
-                return Ok(fallback_result(request, fallback_assets, trace));
+                return Ok(fallback_result(trace, fallback.clone()));
             }
         };
 
@@ -747,26 +771,27 @@ fn cancelled_result(mut trace: GenerationTrace, stage: CancellationStage) -> Gen
     }
 }
 
-fn fallback_result(
+pub fn select_fallback_directive(
     request: &GenerationRequest,
     fallback_assets: Option<&AssetStore>,
-    trace: GenerationTrace,
-) -> GenerationResult {
+) -> FallbackDirective {
     let reaction_family = request
         .fallback_variant_group
         .clone()
         .unwrap_or_else(|| "reaction.neutral".to_owned());
 
-    let directive = match fallback_assets
+    match fallback_assets
         .and_then(|assets| assets.select_variant_id(&reaction_family, request.seed, &[]))
     {
         Some(asset_id) => FallbackDirective::CachedReaction {
-            variant_group: reaction_family.clone(),
+            variant_group: reaction_family,
             asset_id,
         },
         None => FallbackDirective::NonVerbalReaction { reaction_family },
-    };
+    }
+}
 
+fn fallback_result(trace: GenerationTrace, directive: FallbackDirective) -> GenerationResult {
     GenerationResult {
         trace,
         disposition: GenerationDisposition::Fallback { directive },
