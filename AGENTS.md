@@ -25,7 +25,7 @@ Do not silently reinterpret a security or schema rule to make implementation eas
 1. Run git status --short --branch; do not overwrite unrelated local work.
 2. Read the complete GitHub issue, its milestone, priority label, dependencies, and linked ADR/docs.
 3. Fetch current main. Create one issue-sized branch from current origin/main; never develop directly on main.
-4. Search the repository with tgrep, not another repository-content search command.
+4. Search the repository with tgrep, not another repository-content search command. If tgrep is not installed or not indexed for this checkout, say so explicitly before proceeding; do not silently substitute another search tool for the rest of the task without saying so.
 5. Read the smallest relevant authoritative docs before editing code.
 6. Form a testable vertical-slice plan. Prefer the cheapest evidence that can invalidate the plan before a large implementation.
 
@@ -91,6 +91,17 @@ tgrep -n -t rust 'struct ReflexRequest' .
 tgrep uses -g/--glob; it does not use ripgrep's --include option.
 Search with PATH . from the repository root so one root index is reused; narrow scope with -g/--glob or -t/--type rather than changing the search root.
 The index is a snapshot: rebuild with tgrep index . after edits when you need searches to include changed files, or use --no-index for a one-off live scan.
+
+### When tgrep is unavailable
+
+Confirm tgrep before relying on it (tgrep status .; run tgrep index . first if that fails).
+
+If tgrep cannot be installed or run in the current environment:
+
+- State this explicitly in the task output; do not proceed as if tgrep were used.
+- Use rg (ripgrep) as a same-session fallback only, noting that rg's --include/glob syntax differs from tgrep's -g/--glob and -t/--type, and that rg has no persistent index to go stale.
+- Do not treat a fallback-tool search as equivalent evidence to a tgrep search when the two could plausibly disagree (binary/generated paths, .gitignore handling, stale index state); re-run with tgrep once available if the result is load-bearing for the change.
+- Record the substitution in the PR/handoff so reviewers know the search tool differed from policy.
 
 ## Schema/domain change order
 
@@ -182,6 +193,7 @@ Docs-only changes do not need expensive runtime benchmarks unless they alter ben
 - Do not refresh Cargo.lock or bun.lock implicitly.
 - Isolate deliberate dependency upgrades when practical and follow docs/maintenance.adoc.
 - Do not commit secrets, generated media, target/, node_modules/, .tgrep/, local logs, or diagnostic bundles.
+- Do not commit local tool/automation signatures, debug banners, or session/device identifiers into repository files, including docs and issue templates. If you find such content already committed, remove it as part of an otherwise-relevant edit or file a docs cleanup issue.
 
 ## GitHub workflow
 
@@ -199,6 +211,15 @@ Development method is GitHub Flow.
 
 For evidence-sensitive work, follow the hypothesis/guardrail/benchmark process linked from the issue and docs/metrics.adoc.
 For non-implementation research/design work, prefer status:design-ready issues and consult docs/research-register.adoc; autonomous code implementation still requires status:agent-ready.
+
+### When GitHub issue/label state is unavailable
+
+Issue status/priority/milestone labels are the live source of truth (docs/roadmap.adoc). If GitHub or the gh CLI is unreachable, unauthenticated, or rate-limited during a task:
+
+- Do not infer readiness from a cached chat summary, this file, or a roadmap snapshot; those can be stale.
+- Do not self-select or start status:agent-ready-only work under this condition.
+- Report the access failure and either wait/retry, ask the requester which issue to work on, or restrict scope to work that does not depend on live label state, such as a docs-only fix with no ambiguity or research/design notes explicitly flagged as non-implementation.
+- Never treat status:blocked as lifted because label state could not be checked.
 
 ## Finish / handoff
 
@@ -223,7 +244,3 @@ If work must stop before completion, leave a handoff containing:
 - next recommended command/file to inspect.
 
 See docs/agent-development.adoc for the detailed playbook.
-
-[executed on device: DESKTOP (2bf3ba04-d7b4-4fb7-99c6-76b0fc11abcc)]
-
-[executed on device: DESKTOP (2bf3ba04-d7b4-4fb7-99c6-76b0fc11abcc)]
