@@ -17,15 +17,18 @@ use aivtuber_domain::{
     EventEnvelope, FallbackReason,
 };
 use aivtuber_generative::{
-    FallbackDirective, GeneratedTextGateDecision, GenerationCancellationRegistry,
-    GenerationDisposition, GenerationRequest, GenerationTrace, GenerativePipeline,
+    CancellationStage, FallbackDirective, GeneratedTextGateDecision,
+    GenerationCancellationRegistry, GenerationCancellationToken, GenerationDisposition,
+    GenerationRequest, GenerationResult, GenerationTrace, GenerativePipeline,
+    select_fallback_directive,
 };
 use aivtuber_reflex::{DecisionReplayRecord, ExecutedAction};
 use aivtuber_runtime::{
     AudioPlaybackCommand, AudioPlaybackSink, AvatarPlaybackCommand, AvatarPlaybackSink,
     CachedAssetSelection, CachedPerformer, CachedPlaybackError, CachedPlaybackOutcome,
     CachedPlaybackTiming, ContentAdmitDecision, ControlOutcome, FastPathPreloadReport,
-    LocalVisemeStore, OutputVerdict, RuntimeError, SecurityRuntime,
+    LocalVisemeStore, OutputVerdict, PublicOutput, PublicOutputPolicy, RuntimeError,
+    SecurityRuntime,
 };
 use aivtuber_scheduler::{Scheduler, Status};
 use aivtuber_telemetry::{
@@ -33,7 +36,12 @@ use aivtuber_telemetry::{
 };
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    mpsc::{self, Receiver, SyncSender, TrySendError},
+};
+use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 pub trait AudioOutput: Send {
@@ -125,22 +133,391 @@ impl AvatarPlaybackSink for PendingAvatar {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenerationExecutionConfig {
+    /// Maximum provider jobs waiting behind the one active worker.
+    pub queue_capacity: usize,
+}
+
+impl Default for GenerationExecutionConfig {
+    fn default() -> Self {
+        Self { queue_capacity: 8 }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GenerationExecutionSnapshot {
+    pub pending: usize,
+    pub in_flight: usize,
+    pub pending_high_water: usize,
+    pub in_flight_high_water: usize,
+    pub saturated: u64,
+    pub completed: u64,
+    pub cancelled_or_stale: u64,
+    pub failed: u64,
+    pub queue_capacity: usize,
+    pub max_in_flight: usize,
+    pub shutting_down: bool,
+    pub worker_running: bool,
+}
+
+#[derive(Debug, Default)]
+struct GenerationExecutionCounters {
+    pending: AtomicUsize,
+    in_flight: AtomicUsize,
+    pending_high_water: AtomicUsize,
+    in_flight_high_water: AtomicUsize,
+    saturated: AtomicU64,
+    completed: AtomicU64,
+    cancelled_or_stale: AtomicU64,
+    failed: AtomicU64,
+}
+
+impl GenerationExecutionCounters {
+    fn snapshot(
+        &self,
+        config: GenerationExecutionConfig,
+        shutting_down: bool,
+    ) -> GenerationExecutionSnapshot {
+        GenerationExecutionSnapshot {
+            pending: self.pending.load(Ordering::Relaxed),
+            in_flight: self.in_flight.load(Ordering::Relaxed),
+            pending_high_water: self.pending_high_water.load(Ordering::Relaxed),
+            in_flight_high_water: self.in_flight_high_water.load(Ordering::Relaxed),
+            saturated: self.saturated.load(Ordering::Relaxed),
+            completed: self.completed.load(Ordering::Relaxed),
+            cancelled_or_stale: self.cancelled_or_stale.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+            queue_capacity: config.queue_capacity,
+            max_in_flight: 1,
+            shutting_down,
+            worker_running: false,
+        }
+    }
+}
+
+fn update_high_water(counter: &AtomicUsize, value: usize) {
+    let mut current = counter.load(Ordering::Relaxed);
+    while value > current {
+        match counter.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GenerationCompletionContext {
+    routing_latency_us: u64,
+    decision: Option<DecisionReplayRecord>,
+    template_fallback: Option<&'static str>,
+}
+
+struct GenerationWork {
+    generation_id: u64,
+    request: GenerationRequest,
+    cancellation: GenerationCancellationToken,
+    fallback: FallbackDirective,
+    output_policy: PublicOutputPolicy,
+    submitted_at: Instant,
+    context: GenerationCompletionContext,
+}
+
+struct GenerationCompletion {
+    generation_id: u64,
+    request: GenerationRequest,
+    cancellation: GenerationCancellationToken,
+    fallback: FallbackDirective,
+    result: Result<GenerationResult, String>,
+    output_decision: Option<PublicOutput>,
+    generation_latency_us: u64,
+    context: GenerationCompletionContext,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenerationSubmitError {
+    Saturated,
+    ShuttingDown,
+    Disconnected,
+}
+
+struct GenerationExecutor {
+    config: GenerationExecutionConfig,
+    work_tx: Option<SyncSender<GenerationWork>>,
+    completion_rx: Receiver<GenerationCompletion>,
+    counters: Arc<GenerationExecutionCounters>,
+    shutting_down: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl GenerationExecutor {
+    fn new(
+        pipeline: GenerativePipeline,
+        config: GenerationExecutionConfig,
+    ) -> Result<Self, &'static str> {
+        if config.queue_capacity == 0 {
+            return Err("generation queue_capacity must be greater than zero");
+        }
+
+        let (work_tx, work_rx) = mpsc::sync_channel::<GenerationWork>(config.queue_capacity);
+        // One active worker plus every queued job can complete before the composition
+        // thread drains the mailbox. Keep the mailbox bounded to that exact maximum.
+        let completion_capacity = config.queue_capacity.saturating_add(1);
+        let (completion_tx, completion_rx) =
+            mpsc::sync_channel::<GenerationCompletion>(completion_capacity);
+        let counters = Arc::new(GenerationExecutionCounters::default());
+        let worker_counters = Arc::clone(&counters);
+        let shutting_down = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutting_down);
+        let pipeline = Arc::new(pipeline);
+
+        let worker = thread::Builder::new()
+            .name("aivtuber-generation-worker".to_owned())
+            .spawn(move || {
+                while let Ok(work) = work_rx.recv() {
+                    worker_counters.pending.fetch_sub(1, Ordering::Relaxed);
+                    if worker_shutdown.load(Ordering::Acquire) {
+                        worker_counters
+                            .cancelled_or_stale
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+
+                    let in_flight = worker_counters.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+                    update_high_water(&worker_counters.in_flight_high_water, in_flight);
+
+                    let mut output_decision = None;
+                    let result = pipeline
+                        .run_with_output_gate_and_fallback(
+                            &work.request,
+                            &work.cancellation,
+                            work.fallback.clone(),
+                            |generated_text| {
+                                let output = work.output_policy.evaluate(generated_text);
+                                let decision = if matches!(
+                                    output.verdict,
+                                    OutputVerdict::Allow | OutputVerdict::Redact
+                                ) {
+                                    output
+                                        .text
+                                        .clone()
+                                        .map(GeneratedTextGateDecision::Publish)
+                                        .unwrap_or(GeneratedTextGateDecision::Reject)
+                                } else {
+                                    GeneratedTextGateDecision::Reject
+                                };
+                                output_decision = Some(output);
+                                decision
+                            },
+                        )
+                        .map_err(|error| error.to_string());
+
+                    worker_counters.in_flight.fetch_sub(1, Ordering::Relaxed);
+                    let completion = GenerationCompletion {
+                        generation_id: work.generation_id,
+                        request: work.request,
+                        cancellation: work.cancellation,
+                        fallback: work.fallback,
+                        result,
+                        output_decision,
+                        generation_latency_us: elapsed_us(work.submitted_at),
+                        context: work.context,
+                    };
+
+                    // Blocking here is safe: only the provider worker can block, while
+                    // the composition/control thread remains responsive. The bounded
+                    // mailbox prevents unbounded completed-result retention.
+                    if completion_tx.send(completion).is_err() {
+                        break;
+                    }
+                    worker_counters.completed.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+            .map_err(|_| "failed to spawn generation worker")?;
+
+        Ok(Self {
+            config,
+            work_tx: Some(work_tx),
+            completion_rx,
+            counters,
+            shutting_down,
+            worker: Some(worker),
+        })
+    }
+
+    fn try_submit(&self, work: GenerationWork) -> Result<(), GenerationSubmitError> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(GenerationSubmitError::ShuttingDown);
+        }
+        let Some(sender) = &self.work_tx else {
+            return Err(GenerationSubmitError::ShuttingDown);
+        };
+
+        let pending = self.counters.pending.fetch_add(1, Ordering::Relaxed) + 1;
+        match sender.try_send(work) {
+            Ok(()) => {
+                update_high_water(&self.counters.pending_high_water, pending);
+                Ok(())
+            }
+            Err(TrySendError::Full(_)) => {
+                self.counters.pending.fetch_sub(1, Ordering::Relaxed);
+                self.counters.saturated.fetch_add(1, Ordering::Relaxed);
+                Err(GenerationSubmitError::Saturated)
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.counters.pending.fetch_sub(1, Ordering::Relaxed);
+                Err(GenerationSubmitError::Disconnected)
+            }
+        }
+    }
+
+    fn try_recv(&self) -> Option<GenerationCompletion> {
+        self.completion_rx.try_recv().ok()
+    }
+
+    fn snapshot(&self) -> GenerationExecutionSnapshot {
+        let mut snapshot = self
+            .counters
+            .snapshot(self.config, self.shutting_down.load(Ordering::Acquire));
+        snapshot.worker_running = self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished());
+        snapshot
+    }
+
+    fn note_cancelled_or_stale(&self) {
+        self.counters
+            .cancelled_or_stale
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_failed(&self) {
+        self.counters.failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn shutdown(&mut self) {
+        self.shutting_down.store(true, Ordering::Release);
+        self.work_tx.take();
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for GenerationExecutor {
+    fn drop(&mut self) {
+        self.shutdown();
+        if self.worker.as_ref().is_some_and(JoinHandle::is_finished)
+            && let Some(worker) = self.worker.take()
+        {
+            let _ = worker.join();
+        }
+        // If a provider ignores cancellation, dropping the JoinHandle detaches the
+        // bounded worker until that provider call returns. The sender is already
+        // closed and shutdown fencing prevents any late result from publishing.
+    }
+}
+
 pub struct GenerativeRuntime {
-    pipeline: Arc<GenerativePipeline>,
+    executor: GenerationExecutor,
     cancellation: Arc<GenerationCancellationRegistry>,
+    next_generation_id: u64,
+    active_generation_id: Option<u64>,
 }
 
 impl GenerativeRuntime {
     pub fn new(pipeline: GenerativePipeline) -> Self {
-        Self {
-            pipeline: Arc::new(pipeline),
+        Self::with_execution_config(pipeline, GenerationExecutionConfig::default())
+            .expect("default generation execution config must be valid")
+    }
+
+    pub fn with_execution_config(
+        pipeline: GenerativePipeline,
+        config: GenerationExecutionConfig,
+    ) -> Result<Self, &'static str> {
+        Ok(Self {
+            executor: GenerationExecutor::new(pipeline, config)?,
             cancellation: Arc::new(GenerationCancellationRegistry::default()),
-        }
+            next_generation_id: 0,
+            active_generation_id: None,
+        })
     }
 
     pub fn cancellation_registry(&self) -> Arc<GenerationCancellationRegistry> {
         Arc::clone(&self.cancellation)
+    }
+
+    pub fn execution_snapshot(&self) -> GenerationExecutionSnapshot {
+        self.executor.snapshot()
+    }
+
+    fn submit(
+        &mut self,
+        request: GenerationRequest,
+        fallback: FallbackDirective,
+        output_policy: PublicOutputPolicy,
+        context: GenerationCompletionContext,
+    ) -> Result<u64, GenerationSubmitError> {
+        self.next_generation_id = self.next_generation_id.saturating_add(1);
+        let generation_id = self.next_generation_id;
+        let source_event = request.source_event.clone();
+        let cancellation = GenerationCancellationToken::default();
+        let work = GenerationWork {
+            generation_id,
+            request,
+            cancellation: cancellation.clone(),
+            fallback,
+            output_policy,
+            submitted_at: Instant::now(),
+            context,
+        };
+        match self.executor.try_submit(work) {
+            Ok(()) => {
+                self.cancellation.activate(&source_event, cancellation);
+                self.active_generation_id = Some(generation_id);
+                Ok(generation_id)
+            }
+            Err(error) => {
+                cancellation.cancel();
+                Err(error)
+            }
+        }
+    }
+
+    fn is_current(&self, generation_id: u64, event_id: &str) -> bool {
+        self.active_generation_id == Some(generation_id)
+            && self.cancellation.active_event_id().as_deref() == Some(event_id)
+    }
+
+    fn finish(&mut self, generation_id: u64, event_id: &str) {
+        if self.active_generation_id == Some(generation_id) {
+            self.active_generation_id = None;
+        }
+        self.cancellation.finish(event_id);
+    }
+
+    fn try_next_completion(&self) -> Option<GenerationCompletion> {
+        self.executor.try_recv()
+    }
+
+    fn note_cancelled_or_stale(&self) {
+        self.executor.note_cancelled_or_stale();
+    }
+
+    fn note_failed(&self) {
+        self.executor.note_failed();
+    }
+
+    fn shutdown(&mut self) {
+        self.cancellation.cancel_active();
+        self.active_generation_id = None;
+        self.executor.shutdown();
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        self.executor.is_shutting_down()
     }
 }
 
@@ -175,6 +552,9 @@ struct HandledEvent {
     /// decision (issue #54); `None` when no template fallback applies.
     template_fallback: Option<&'static str>,
     cache_level: Option<CacheLevel>,
+    /// Generation was accepted by the bounded worker and will be observed
+    /// when a completion is committed from tick().
+    deferred_generation: bool,
 }
 
 struct HandledGeneration {
@@ -182,6 +562,11 @@ struct HandledGeneration {
     route: RouteClass,
     trace: GenerationTrace,
     cache_level: Option<CacheLevel>,
+}
+
+enum GenerationSubmission {
+    Deferred,
+    Immediate(Box<HandledGeneration>),
 }
 
 pub struct ProductionApp<R>
@@ -349,6 +734,12 @@ where
             .map(GenerativeRuntime::cancellation_registry)
     }
 
+    pub fn generation_execution_snapshot(&self) -> Option<GenerationExecutionSnapshot> {
+        self.generative
+            .as_ref()
+            .map(GenerativeRuntime::execution_snapshot)
+    }
+
     pub fn startup(&mut self) -> Result<FastPathPreloadReport, AppError> {
         let report = self.performer.index_and_preload_fast_path()?;
         self.try_connect_avatar();
@@ -409,7 +800,9 @@ where
         }
         let handled = self.handle_event(event, at_ms, seed)?;
         self.tick(at_ms);
-        self.record_handled_event(&event_id, &handled, at_ms);
+        if !handled.deferred_generation {
+            self.record_handled_event(&event_id, &handled, at_ms);
+        }
         let playback = handled.playback;
         Ok(ContentProcessOutcome {
             admission,
@@ -506,6 +899,7 @@ where
                         decision,
                         template_fallback,
                         cache_level: None,
+                        deferred_generation: false,
                     });
                 }
                 let text = output.text.unwrap_or_else(|| composition.text.clone());
@@ -521,16 +915,37 @@ where
             }
             PlaybackRoute::Generate(route) => {
                 let generation_started = Instant::now();
-                let handled = self.handle_generation(event, *route, at_ms, seed)?;
-                generation_latency_us = Some(elapsed_us(generation_started));
-                let HandledGeneration {
-                    playback,
-                    route,
-                    trace,
-                    cache_level,
-                } = handled;
-                generation_trace = Some(trace);
-                (playback, route, cache_level)
+                let context = GenerationCompletionContext {
+                    routing_latency_us,
+                    decision: decision.clone(),
+                    template_fallback,
+                };
+                match self.submit_generation(event, *route, at_ms, seed, context)? {
+                    GenerationSubmission::Deferred => {
+                        return Ok(HandledEvent {
+                            playback: None,
+                            route: RouteClass::Generated,
+                            routing_latency_us,
+                            generation_latency_us: None,
+                            generation_trace: None,
+                            decision: None,
+                            template_fallback: None,
+                            cache_level: None,
+                            deferred_generation: true,
+                        });
+                    }
+                    GenerationSubmission::Immediate(handled) => {
+                        generation_latency_us = Some(elapsed_us(generation_started));
+                        let HandledGeneration {
+                            playback,
+                            route,
+                            trace,
+                            cache_level,
+                        } = *handled;
+                        generation_trace = Some(trace);
+                        (playback, route, cache_level)
+                    }
+                }
             }
         };
 
@@ -543,6 +958,7 @@ where
             decision,
             template_fallback,
             cache_level,
+            deferred_generation: false,
         })
     }
 
@@ -607,21 +1023,20 @@ where
         Ok((Some(outcome), RouteClass::JevReaction, cache_level))
     }
 
-    fn handle_generation(
+    fn submit_generation(
         &mut self,
         event: EventEnvelope,
         route: GenerationRoute,
         at_ms: u64,
         seed: u64,
-    ) -> Result<HandledGeneration, AppError> {
+        context: GenerationCompletionContext,
+    ) -> Result<GenerationSubmission, AppError> {
         if route.source_event != event {
             return Err(AppError::Generation(
                 "generation route source event does not match dispatched event".to_owned(),
             ));
         }
-        let generative = self.generative.clone().ok_or_else(|| {
-            AppError::Generation("generative route requested without configured runtime".to_owned())
-        })?;
+
         let request = GenerationRequest {
             source_event: event.clone(),
             thinking: route.thinking,
@@ -631,33 +1046,48 @@ where
             fallback_variant_group: route.fallback_variant_group,
             seed,
         };
-        let cancellation = generative.cancellation.begin(&event);
-        let result = {
-            let fallback_assets = self.performer.assets();
-            let security = &mut self.security;
-            generative.pipeline.run_with_output_gate(
-                &request,
-                &cancellation,
-                Some(fallback_assets),
-                |text| match security.publish_text(text) {
-                    output
-                        if matches!(
-                            output.verdict,
-                            OutputVerdict::Allow | OutputVerdict::Redact
-                        ) =>
-                    {
-                        output
-                            .text
-                            .map(GeneratedTextGateDecision::Publish)
-                            .unwrap_or(GeneratedTextGateDecision::Reject)
-                    }
-                    _ => GeneratedTextGateDecision::Reject,
-                },
-            )
-        };
-        generative.cancellation.finish(&event.event_id);
-        let result = result.map_err(|error| AppError::Generation(error.to_string()))?;
-        for call in &result.trace.llm_calls {
+        let fallback = select_fallback_directive(&request, Some(self.performer.assets()));
+        let output_policy = self.security.public_output_policy();
+        let submit = self
+            .generative
+            .as_mut()
+            .ok_or_else(|| {
+                AppError::Generation(
+                    "generative route requested without configured runtime".to_owned(),
+                )
+            })?
+            .submit(request.clone(), fallback.clone(), output_policy, context);
+
+        match submit {
+            Ok(_) => Ok(GenerationSubmission::Deferred),
+            Err(error) => {
+                let trace = GenerationTrace {
+                    fallback_reason: match error {
+                        GenerationSubmitError::Saturated => FallbackReason::Overloaded,
+                        GenerationSubmitError::ShuttingDown
+                        | GenerationSubmitError::Disconnected => FallbackReason::Unavailable,
+                    },
+                    ..GenerationTrace::default()
+                };
+                let handled = self.commit_generation_result(
+                    &event,
+                    GenerationResult {
+                        trace,
+                        disposition: GenerationDisposition::Fallback {
+                            directive: fallback,
+                        },
+                    },
+                    None,
+                    at_ms,
+                    seed,
+                )?;
+                Ok(GenerationSubmission::Immediate(Box::new(handled)))
+            }
+        }
+    }
+
+    fn record_generation_calls(&mut self, trace: &GenerationTrace) {
+        for call in &trace.llm_calls {
             self.security.record_generation_call(
                 &call.event_id,
                 call.routing_reason.as_str(),
@@ -666,17 +1096,80 @@ where
                 call.backend.model_version.as_deref(),
             );
         }
-        let trace = result.trace.clone();
+    }
+
+    fn record_worker_output_decision(&mut self, output: Option<&PublicOutput>) {
+        if let Some(output) = output {
+            self.security.record_public_output_decision(output);
+        }
+    }
+
+    fn commit_generation_result(
+        &mut self,
+        event: &EventEnvelope,
+        result: GenerationResult,
+        output_decision: Option<PublicOutput>,
+        at_ms: u64,
+        seed: u64,
+    ) -> Result<HandledGeneration, AppError> {
+        self.record_generation_calls(&result.trace);
+        let mut trace = result.trace;
 
         match result.disposition {
             GenerationDisposition::Generated { asset } => {
+                let generated_text = asset
+                    .speech
+                    .as_ref()
+                    .and_then(|speech| speech.text.as_deref());
+
+                let initial_gate_matches = output_decision.as_ref().is_some_and(|output| {
+                    matches!(output.verdict, OutputVerdict::Allow | OutputVerdict::Redact)
+                        && output.text.as_deref() == generated_text
+                        && generated_text.is_some()
+                });
+
+                if !initial_gate_matches {
+                    self.record_worker_output_decision(output_decision.as_ref());
+                    trace.fallback_reason = FallbackReason::PolicyOverride;
+                    return Ok(HandledGeneration {
+                        playback: None,
+                        route: RouteClass::NonVerbalFallback,
+                        trace,
+                        cache_level: None,
+                    });
+                }
+
+                let generated_text = generated_text.expect("checked above");
+                let rechecked = self
+                    .security
+                    .public_output_policy()
+                    .evaluate(generated_text);
+                let recheck_allows_same_text = matches!(
+                    rechecked.verdict,
+                    OutputVerdict::Allow | OutputVerdict::Redact
+                ) && rechecked.text.as_deref()
+                    == Some(generated_text);
+
+                if !recheck_allows_same_text {
+                    self.security.record_public_output_decision(&rechecked);
+                    trace.fallback_reason = FallbackReason::PolicyOverride;
+                    return Ok(HandledGeneration {
+                        playback: None,
+                        route: RouteClass::NonVerbalFallback,
+                        trace,
+                        cache_level: None,
+                    });
+                }
+
+                self.record_worker_output_decision(output_decision.as_ref());
+
                 let asset_id = asset.id.clone();
                 self.performer
                     .assets_mut()
                     .insert_hot(*asset)
                     .map_err(|error| AppError::Generation(error.to_string()))?;
                 let outcome = self.performer.handle_asset_id(
-                    &event,
+                    event,
                     &asset_id,
                     CachedPlaybackTiming { at_ms, seed },
                     &self.visemes,
@@ -690,37 +1183,153 @@ where
                     cache_level: Some(CacheLevel::Generated),
                 })
             }
-            GenerationDisposition::Fallback { directive } => match directive {
-                FallbackDirective::CachedReaction { asset_id, .. } => {
-                    let outcome = self.performer.handle_asset_id(
-                        &event,
-                        &asset_id,
-                        CachedPlaybackTiming { at_ms, seed },
-                        &self.visemes,
-                        &mut self.pending_audio,
-                        &mut self.pending_avatar,
-                    )?;
-                    let cache_level = cache_level(Some(outcome.cache_tier));
-                    Ok(HandledGeneration {
-                        playback: Some(outcome),
-                        route: RouteClass::CachedFallback,
+            GenerationDisposition::Fallback { directive } => {
+                self.record_worker_output_decision(output_decision.as_ref());
+                match directive {
+                    FallbackDirective::CachedReaction { asset_id, .. } => {
+                        let outcome = self.performer.handle_asset_id(
+                            event,
+                            &asset_id,
+                            CachedPlaybackTiming { at_ms, seed },
+                            &self.visemes,
+                            &mut self.pending_audio,
+                            &mut self.pending_avatar,
+                        )?;
+                        let cache_level = cache_level(Some(outcome.cache_tier));
+                        Ok(HandledGeneration {
+                            playback: Some(outcome),
+                            route: RouteClass::CachedFallback,
+                            trace,
+                            cache_level,
+                        })
+                    }
+                    FallbackDirective::NonVerbalReaction { .. } => Ok(HandledGeneration {
+                        playback: None,
+                        route: RouteClass::NonVerbalFallback,
                         trace,
-                        cache_level,
-                    })
+                        cache_level: None,
+                    }),
                 }
-                FallbackDirective::NonVerbalReaction { .. } => Ok(HandledGeneration {
+            }
+            GenerationDisposition::Cancelled { .. } => {
+                self.record_worker_output_decision(output_decision.as_ref());
+                Ok(HandledGeneration {
                     playback: None,
-                    route: RouteClass::NonVerbalFallback,
+                    route: RouteClass::Generated,
                     trace,
                     cache_level: None,
-                }),
-            },
-            GenerationDisposition::Cancelled { .. } => Ok(HandledGeneration {
-                playback: None,
-                route: RouteClass::Generated,
-                trace,
-                cache_level: None,
-            }),
+                })
+            }
+        }
+    }
+
+    fn drain_generation_completions(&mut self, now_ms: u64) {
+        loop {
+            let completion = self
+                .generative
+                .as_ref()
+                .and_then(GenerativeRuntime::try_next_completion);
+            let Some(completion) = completion else {
+                break;
+            };
+
+            let event_id = completion.request.source_event.event_id.clone();
+            let stale_or_cancelled = self.generative.as_ref().is_none_or(|generative| {
+                generative.is_shutting_down()
+                    || !generative.is_current(completion.generation_id, &event_id)
+                    || completion.cancellation.is_cancelled()
+            });
+
+            if stale_or_cancelled {
+                let mut trace = completion
+                    .result
+                    .as_ref()
+                    .ok()
+                    .map(|result| result.trace.clone())
+                    .unwrap_or_default();
+                self.record_generation_calls(&trace);
+                self.record_worker_output_decision(completion.output_decision.as_ref());
+                if trace.cancelled_stage.is_none() {
+                    trace.cancelled_stage = Some(CancellationStage::BeforePublish);
+                }
+
+                let handled = HandledEvent {
+                    playback: None,
+                    route: RouteClass::Generated,
+                    routing_latency_us: completion.context.routing_latency_us,
+                    generation_latency_us: Some(completion.generation_latency_us),
+                    generation_trace: Some(trace),
+                    decision: completion.context.decision,
+                    template_fallback: completion.context.template_fallback,
+                    cache_level: None,
+                    deferred_generation: false,
+                };
+                self.record_handled_event(&event_id, &handled, now_ms);
+
+                if let Some(generative) = self.generative.as_mut() {
+                    generative.note_cancelled_or_stale();
+                    generative.finish(completion.generation_id, &event_id);
+                }
+                continue;
+            }
+
+            let result = match completion.result {
+                Ok(result) => result,
+                Err(_) => {
+                    if let Some(generative) = self.generative.as_ref() {
+                        generative.note_failed();
+                    }
+                    GenerationResult {
+                        trace: GenerationTrace {
+                            fallback_reason: FallbackReason::InvalidRequest,
+                            ..GenerationTrace::default()
+                        },
+                        disposition: GenerationDisposition::Fallback {
+                            directive: completion.fallback,
+                        },
+                    }
+                }
+            };
+
+            let handled_generation = self.commit_generation_result(
+                &completion.request.source_event,
+                result,
+                completion.output_decision,
+                now_ms,
+                completion.request.seed,
+            );
+
+            match handled_generation {
+                Ok(handled_generation) => {
+                    let HandledGeneration {
+                        playback,
+                        route,
+                        trace,
+                        cache_level,
+                    } = handled_generation;
+                    let handled = HandledEvent {
+                        playback,
+                        route,
+                        routing_latency_us: completion.context.routing_latency_us,
+                        generation_latency_us: Some(completion.generation_latency_us),
+                        generation_trace: Some(trace),
+                        decision: completion.context.decision,
+                        template_fallback: completion.context.template_fallback,
+                        cache_level,
+                        deferred_generation: false,
+                    };
+                    self.record_handled_event(&event_id, &handled, now_ms);
+                }
+                Err(_) => {
+                    if let Some(generative) = self.generative.as_ref() {
+                        generative.note_failed();
+                    }
+                }
+            }
+
+            if let Some(generative) = self.generative.as_mut() {
+                generative.finish(completion.generation_id, &event_id);
+            }
         }
     }
 
@@ -830,6 +1439,7 @@ where
     }
 
     pub fn tick(&mut self, now_ms: u64) {
+        self.drain_generation_completions(now_ms);
         self.performer.scheduler_mut().advance_to(now_ms);
         self.dispatch_audio(now_ms);
         self.dispatch_avatar(now_ms);
@@ -967,8 +1577,8 @@ where
     }
 
     pub fn shutdown(&mut self, at_ms: u64) {
-        if let Some(generative) = &self.generative {
-            generative.cancellation.cancel_active();
+        if let Some(generative) = self.generative.as_mut() {
+            generative.shutdown();
         }
         self.performer.scheduler_mut().stop_all(at_ms);
         self.purge_cancelled_pending();
@@ -1226,8 +1836,8 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use std::time::Duration;
 
@@ -1295,6 +1905,21 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct GenerateChatSilentDonation {
+        generate: FixedGenerateRoute,
+    }
+
+    impl RoutePlanner for GenerateChatSilentDonation {
+        fn route(&mut self, event: &EventEnvelope) -> Result<PlaybackRoute, AppError> {
+            if event.kind == aivtuber_domain::EventKind::ChatDonation {
+                Ok(PlaybackRoute::Silent)
+            } else {
+                self.generate.route(event)
+            }
+        }
+    }
+
+    #[derive(Clone)]
     struct MockThinking {
         reply: String,
         failure: Option<EngineErrorKind>,
@@ -1320,6 +1945,70 @@ mod tests {
             BackendIdentity {
                 name: "mock-thinking".to_owned(),
                 model_alias: Some("mock-model".to_owned()),
+                model_version: Some("1".to_owned()),
+            }
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct BlockingGate {
+        entered: AtomicBool,
+        released: Mutex<bool>,
+        wake: Condvar,
+    }
+
+    impl BlockingGate {
+        fn wait_until_entered(&self) {
+            for _ in 0..1_000 {
+                if self.entered.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            panic!("blocking provider was never entered");
+        }
+
+        fn release(&self) {
+            *self.released.lock().expect("blocking gate") = true;
+            self.wake.notify_all();
+        }
+    }
+
+    #[derive(Clone)]
+    struct BlockingThinking {
+        gate: Arc<BlockingGate>,
+        reply: String,
+    }
+
+    impl ThinkingEngine for BlockingThinking {
+        fn generate<'a>(
+            &'a self,
+            _request: &'a aivtuber_domain::ThinkingRequest,
+        ) -> EngineFuture<'a, GeneratedReply> {
+            Box::pin(async move {
+                self.gate.entered.store(true, Ordering::Release);
+                let released = self.gate.released.lock().expect("blocking gate");
+                let (released, wait) = self
+                    .gate
+                    .wake
+                    .wait_timeout_while(released, Duration::from_secs(2), |released| !*released)
+                    .expect("blocking gate wait");
+                if wait.timed_out() && !*released {
+                    return Err(EngineError::new(
+                        EngineErrorKind::Timeout,
+                        "blocking thinking watchdog timeout",
+                    ));
+                }
+                Ok(GeneratedReply {
+                    text: self.reply.clone(),
+                })
+            })
+        }
+
+        fn identity(&self) -> BackendIdentity {
+            BackendIdentity {
+                name: "blocking-thinking".to_owned(),
+                model_alias: Some("blocked-model".to_owned()),
                 model_version: Some("1".to_owned()),
             }
         }
@@ -1756,9 +2445,22 @@ mod tests {
         )
     }
 
-    fn generative_runtime<T>(thinking: MockThinking, tts: T) -> GenerativeRuntime
+    fn generative_runtime<Thinking, Tts>(thinking: Thinking, tts: Tts) -> GenerativeRuntime
     where
-        T: TtsEngine + 'static,
+        Thinking: ThinkingEngine + 'static,
+        Tts: TtsEngine + 'static,
+    {
+        generative_runtime_with_config(thinking, tts, GenerationExecutionConfig::default())
+    }
+
+    fn generative_runtime_with_config<Thinking, Tts>(
+        thinking: Thinking,
+        tts: Tts,
+        execution: GenerationExecutionConfig,
+    ) -> GenerativeRuntime
+    where
+        Thinking: ThinkingEngine + 'static,
+        Tts: TtsEngine + 'static,
     {
         let compiler = PerformanceCompiler::new(PerformanceCompilerConfig {
             compiler_version: "0.1.0".to_owned(),
@@ -1768,24 +2470,25 @@ mod tests {
             expression_intensity: 0.4,
         })
         .expect("compiler");
-        GenerativeRuntime::new(GenerativePipeline::new(
-            Arc::new(thinking),
-            Arc::new(tts),
-            compiler,
-        ))
+        GenerativeRuntime::with_execution_config(
+            GenerativePipeline::new(Arc::new(thinking), Arc::new(tts), compiler),
+            execution,
+        )
+        .expect("generation execution config")
     }
 
-    fn generation_app<T>(
+    fn generation_app<Thinking, Tts>(
         router: FixedGenerateRoute,
-        thinking: MockThinking,
-        tts: T,
+        thinking: Thinking,
+        tts: Tts,
         redactor: SecretRedactor,
         cached_reaction: Option<String>,
         audio: RecordingAudio,
         avatar: RecordingAvatar,
     ) -> ProductionApp<FixedGenerateRoute>
     where
-        T: TtsEngine + 'static,
+        Thinking: ThinkingEngine + 'static,
+        Tts: TtsEngine + 'static,
     {
         let security = SecurityRuntime::new(
             SecurityRuntimeConfig::default(),
@@ -1808,6 +2511,43 @@ mod tests {
             250,
         )
         .with_generation(generative_runtime(thinking, tts))
+    }
+
+    fn wait_for_generation_completion<R>(app: &mut ProductionApp<R>, now_ms: u64)
+    where
+        R: RoutePlanner,
+    {
+        for _ in 0..1_000 {
+            app.tick(now_ms);
+            let active = app
+                .generation_cancellation_registry()
+                .and_then(|registry| registry.active_event_id());
+            let snapshot = app
+                .generation_execution_snapshot()
+                .expect("generation execution snapshot");
+            if active.is_none() && snapshot.pending == 0 && snapshot.in_flight == 0 {
+                app.tick(now_ms);
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!(
+            "generation did not quiesce: {:?}",
+            app.generation_execution_snapshot()
+        );
+    }
+
+    fn last_scheduled_plan<R>(app: &ProductionApp<R>) -> aivtuber_scheduler::PlannedPerformance
+    where
+        R: RoutePlanner,
+    {
+        app.performer()
+            .scheduler()
+            .items()
+            .last()
+            .expect("scheduled generation/fallback")
+            .plan
+            .clone()
     }
 
     fn memory_admin_authority() -> AuthenticatedControl {
@@ -1986,12 +2726,12 @@ mod tests {
         app.startup().expect("startup");
 
         let raw = serde_json::to_vec(&chat_event(26)).expect("event json");
-        let playback = app
+        let outcome = app
             .process_content_bytes(&raw, 0, 26)
-            .expect("generation")
-            .playback
-            .expect("generated playback");
-        let asset_id = playback.asset_id;
+            .expect("generation submission");
+        assert!(outcome.playback.is_none());
+        wait_for_generation_completion(&mut app, 0);
+        let asset_id = last_scheduled_plan(&app).asset_id;
         assert_eq!(
             app.adaptation()
                 .expect("adaptation")
@@ -2080,10 +2820,14 @@ mod tests {
         app.startup().expect("startup");
 
         let raw = serde_json::to_vec(&chat_event(30)).expect("event json");
-        let outcome = app.process_content_bytes(&raw, 0, 30).expect("generation");
-        let playback = outcome.playback.expect("generated playback");
+        let outcome = app
+            .process_content_bytes(&raw, 0, 30)
+            .expect("generation submission");
+        assert!(outcome.playback.is_none());
+        wait_for_generation_completion(&mut app, 0);
+        let plan = last_scheduled_plan(&app);
 
-        assert!(playback.asset_id.starts_with("dynamic.generated."));
+        assert!(plan.asset_id.starts_with("dynamic.generated."));
         assert_eq!(
             tts_log.lock().expect("tts log").as_slice(),
             ["generated hello"]
@@ -2091,14 +2835,14 @@ mod tests {
         assert!(
             app.performer_mut()
                 .assets_mut()
-                .hot_get(&playback.asset_id)
+                .hot_get(&plan.asset_id)
                 .is_some()
         );
         assert_eq!(app.performer().scheduler().items().len(), 1);
         let audio_commands = audio_log.lock().expect("audio log");
         assert_eq!(audio_commands.len(), 1);
-        assert_eq!(audio_commands[0].generation, playback.plan.generation);
-        assert_eq!(audio_commands[0].at_ms, playback.plan.start_at_ms);
+        assert_eq!(audio_commands[0].generation, plan.generation);
+        assert_eq!(audio_commands[0].at_ms, plan.start_at_ms);
         drop(audio_commands);
 
         let mut avatar_commands = avatar_log.lock().expect("avatar log").clone();
@@ -2114,9 +2858,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!visemes.is_empty());
         assert!(visemes.iter().all(|(generation, at_ms)| {
-            *generation == playback.plan.generation
-                && *at_ms >= playback.plan.start_at_ms
-                && *at_ms <= playback.plan.end_at_ms()
+            *generation == plan.generation
+                && *at_ms >= plan.start_at_ms
+                && *at_ms <= plan.end_at_ms()
         }));
 
         let llm_audit = app
@@ -2141,13 +2885,11 @@ mod tests {
         assert_eq!(metric.llm_calls, 1);
         assert_eq!(metric.tts_calls, 1);
         assert_eq!(metric.cache_level, Some(CacheLevel::Generated));
-        assert_eq!(
-            metric.event_to_first_audio_ms,
-            playback.metrics.event_to_first_audio_ms
-        );
+        assert!(metric.generation_latency_us.is_some());
+        assert_eq!(metric.event_to_first_audio_ms, Some(plan.start_at_ms));
         assert_eq!(
             metric.event_to_first_visible_reaction_ms,
-            playback.metrics.event_to_first_visible_reaction_ms
+            Some(plan.start_at_ms)
         );
     }
 
@@ -2173,11 +2915,12 @@ mod tests {
         app.startup().expect("startup");
 
         let raw = serde_json::to_vec(&chat_event(31)).expect("event json");
-        let playback = app
+        let outcome = app
             .process_content_bytes(&raw, 0, 31)
-            .expect("generation")
-            .playback
-            .expect("generated playback");
+            .expect("generation submission");
+        assert!(outcome.playback.is_none());
+        wait_for_generation_completion(&mut app, 0);
+        let plan = last_scheduled_plan(&app);
         assert_eq!(
             tts_log.lock().expect("tts log").as_slice(),
             ["secret=[REDACTED]"]
@@ -2185,7 +2928,7 @@ mod tests {
         let asset = app
             .performer_mut()
             .assets_mut()
-            .hot_get(&playback.asset_id)
+            .hot_get(&plan.asset_id)
             .expect("generated hot asset");
         assert_eq!(
             asset
@@ -2218,14 +2961,15 @@ mod tests {
         app.startup().expect("startup");
 
         let raw = serde_json::to_vec(&chat_event(32)).expect("event json");
-        let playback = app
+        let outcome = app
             .process_content_bytes(&raw, 0, 32)
-            .expect("fallback")
-            .playback
-            .expect("cached fallback");
+            .expect("generation submission");
+        assert!(outcome.playback.is_none());
+        wait_for_generation_completion(&mut app, 0);
+        let plan = last_scheduled_plan(&app);
         assert!(tts_log.lock().expect("tts log").is_empty());
-        assert!(playback.asset_id.starts_with("reaction.agree."));
-        assert!(!playback.asset_id.starts_with("dynamic.generated."));
+        assert!(plan.asset_id.starts_with("reaction.agree."));
+        assert!(!plan.asset_id.starts_with("dynamic.generated."));
     }
 
     #[test]
@@ -2250,13 +2994,14 @@ mod tests {
         app.startup().expect("startup");
 
         let raw = serde_json::to_vec(&chat_event(33)).expect("event json");
-        let playback = app
+        let outcome = app
             .process_content_bytes(&raw, 0, 33)
-            .expect("fallback")
-            .playback
-            .expect("cached fallback");
+            .expect("generation submission");
+        assert!(outcome.playback.is_none());
+        wait_for_generation_completion(&mut app, 0);
+        let plan = last_scheduled_plan(&app);
         assert!(tts_log.lock().expect("tts log").is_empty());
-        assert!(playback.asset_id.starts_with("reaction.agree."));
+        assert!(plan.asset_id.starts_with("reaction.agree."));
         let llm_audit = app
             .security()
             .audit()
@@ -2297,13 +3042,14 @@ mod tests {
         let hot_before = app.performer().assets().hot_len();
 
         let raw = serde_json::to_vec(&chat_event(34)).expect("event json");
-        let playback = app
+        let outcome = app
             .process_content_bytes(&raw, 0, 34)
-            .expect("fallback")
-            .playback
-            .expect("cached fallback");
+            .expect("generation submission");
+        assert!(outcome.playback.is_none());
+        wait_for_generation_completion(&mut app, 0);
+        let plan = last_scheduled_plan(&app);
         assert_eq!(tts_log.lock().expect("tts log").len(), 1);
-        assert!(playback.asset_id.starts_with("reaction.agree."));
+        assert!(plan.asset_id.starts_with("reaction.agree."));
         assert_eq!(app.performer().assets().hot_len(), hot_before);
     }
 
@@ -2330,10 +3076,285 @@ mod tests {
         let raw = serde_json::to_vec(&chat_event(35)).expect("event json");
         let outcome = app
             .process_content_bytes(&raw, 0, 35)
-            .expect("non-verbal fallback");
+            .expect("non-verbal fallback submission");
         assert!(outcome.playback.is_none());
+        wait_for_generation_completion(&mut app, 0);
         assert!(app.performer().scheduler().items().is_empty());
         assert_eq!(app.performer().assets().hot_len(), hot_before);
+    }
+
+    #[test]
+    fn blocked_provider_keeps_tick_control_and_adapter_maintenance_responsive() {
+        let gate = Arc::new(BlockingGate::default());
+        let mut app = generation_app(
+            FixedGenerateRoute {
+                reply_context: ReflexContext::default(),
+                fallback_variant_group: Some("reaction.missing".to_owned()),
+            },
+            BlockingThinking {
+                gate: Arc::clone(&gate),
+                reply: "late generated reply".to_owned(),
+            },
+            MockTts::default(),
+            SecretRedactor::default(),
+            None,
+            RecordingAudio::default(),
+            RecordingAvatar::default(),
+        );
+        app.startup().expect("startup");
+        let hot_before = app.performer().assets().hot_len();
+
+        let raw = serde_json::to_vec(&chat_event(141)).expect("event json");
+        let outcome = app
+            .process_content_bytes(&raw, 0, 141)
+            .expect("non-blocking generation submission");
+        assert!(outcome.playback.is_none());
+
+        gate.wait_until_entered();
+        let pending = app
+            .generation_execution_snapshot()
+            .expect("generation execution snapshot");
+        assert_eq!(pending.in_flight, 1);
+        assert_eq!(pending.max_in_flight, 1);
+        assert!(pending.worker_running);
+
+        // These composition/control operations must not wait for the blocked
+        // provider worker.
+        app.tick(5);
+        app.maintain_adapters();
+        let control = app
+            .handle_control(&stop_command(), 5)
+            .expect("authenticated stop while provider is blocked");
+        assert_eq!(control, ControlOutcome::Stopped { cancelled: 0 });
+
+        gate.release();
+        wait_for_generation_completion(&mut app, 5);
+
+        assert_eq!(app.performer().assets().hot_len(), hot_before);
+        assert!(app.performer().scheduler().items().is_empty());
+        let completed = app
+            .generation_execution_snapshot()
+            .expect("generation execution snapshot");
+        assert_eq!(completed.pending, 0);
+        assert_eq!(completed.in_flight, 0);
+        assert!(completed.cancelled_or_stale >= 1);
+    }
+
+    #[test]
+    fn higher_priority_ingress_cancels_blocked_generation_without_waiting() {
+        let gate = Arc::new(BlockingGate::default());
+        let runtime = generative_runtime(
+            BlockingThinking {
+                gate: Arc::clone(&gate),
+                reply: "must never publish".to_owned(),
+            },
+            MockTts::default(),
+        );
+        let mut app = app(
+            GenerateChatSilentDonation {
+                generate: FixedGenerateRoute {
+                    reply_context: ReflexContext::default(),
+                    fallback_variant_group: Some("reaction.missing".to_owned()),
+                },
+            },
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        )
+        .with_generation(runtime);
+        app.startup().expect("startup");
+        let hot_before = app.performer().assets().hot_len();
+
+        let first = serde_json::to_vec(&chat_event(142)).expect("first event");
+        app.process_content_bytes(&first, 0, 142)
+            .expect("blocked generation submission");
+        gate.wait_until_entered();
+
+        let mut donation = chat_event(143);
+        donation.kind = aivtuber_domain::EventKind::ChatDonation;
+        donation.source_class = SourceClass::Donation;
+        let high = serde_json::to_vec(&donation).expect("high priority event");
+        let outcome = app
+            .process_content_bytes(&high, 1, 143)
+            .expect("high priority ingress");
+        assert!(outcome.playback.is_none());
+        assert_eq!(
+            app.generation_execution_snapshot()
+                .expect("generation snapshot")
+                .in_flight,
+            1
+        );
+
+        gate.release();
+        wait_for_generation_completion(&mut app, 1);
+
+        assert_eq!(app.performer().assets().hot_len(), hot_before);
+        assert!(
+            app.performer()
+                .scheduler()
+                .items()
+                .iter()
+                .all(|item| item.plan.event_id != "evt-142")
+        );
+        assert!(
+            app.generation_execution_snapshot()
+                .expect("generation snapshot")
+                .cancelled_or_stale
+                >= 1
+        );
+    }
+
+    #[test]
+    fn saturated_generation_queue_uses_bounded_observable_cached_fallback() {
+        let gate = Arc::new(BlockingGate::default());
+        let runtime = generative_runtime_with_config(
+            BlockingThinking {
+                gate: Arc::clone(&gate),
+                reply: "blocked queue head".to_owned(),
+            },
+            MockTts::default(),
+            GenerationExecutionConfig { queue_capacity: 1 },
+        );
+        let mut app = app(
+            FixedGenerateRoute {
+                reply_context: ReflexContext::default(),
+                fallback_variant_group: Some("reaction.agree".to_owned()),
+            },
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        )
+        .with_generation(runtime);
+        app.startup().expect("startup");
+        let hot_before = app.performer().assets().hot_len();
+
+        let first = serde_json::to_vec(&chat_event(144)).expect("first event");
+        app.process_content_bytes(&first, 0, 144)
+            .expect("first generation");
+        gate.wait_until_entered();
+
+        let second = serde_json::to_vec(&chat_event(145)).expect("second event");
+        let second_outcome = app
+            .process_content_bytes(&second, 0, 145)
+            .expect("queued generation");
+        assert!(second_outcome.playback.is_none());
+
+        let before_saturation = app
+            .generation_execution_snapshot()
+            .expect("generation snapshot");
+        assert_eq!(before_saturation.in_flight, 1);
+        assert_eq!(before_saturation.pending, 1);
+
+        let third = serde_json::to_vec(&chat_event(146)).expect("third event");
+        let third_outcome = app
+            .process_content_bytes(&third, 0, 146)
+            .expect("saturated deterministic fallback");
+        let fallback = third_outcome.playback.expect("cached fallback");
+        assert!(fallback.asset_id.starts_with("reaction.agree."));
+
+        let saturated = app
+            .generation_execution_snapshot()
+            .expect("generation snapshot");
+        assert_eq!(saturated.queue_capacity, 1);
+        assert_eq!(saturated.max_in_flight, 1);
+        assert_eq!(saturated.pending_high_water, 1);
+        assert_eq!(saturated.in_flight_high_water, 1);
+        assert_eq!(saturated.saturated, 1);
+        assert_eq!(
+            app.generation_cancellation_registry()
+                .and_then(|registry| registry.active_event_id())
+                .as_deref(),
+            Some("evt-145"),
+            "a rejected saturated submission must not replace accepted generation state"
+        );
+
+        gate.release();
+        wait_for_generation_completion(&mut app, 0);
+
+        assert_eq!(app.performer().assets().hot_len(), hot_before + 1);
+        let accepted = app
+            .telemetry()
+            .events()
+            .iter()
+            .find(|event| event.event_id == "evt-145")
+            .expect("accepted queued generation observation");
+        assert!(!accepted.cancelled);
+        assert_eq!(accepted.cache_level, Some(CacheLevel::Generated));
+        let saturated_event = app
+            .telemetry()
+            .events()
+            .iter()
+            .find(|event| event.event_id == "evt-146")
+            .expect("saturated fallback observation");
+        assert_eq!(
+            saturated_event.fallback_reason.as_deref(),
+            Some("overloaded")
+        );
+        let settled = app
+            .generation_execution_snapshot()
+            .expect("generation snapshot");
+        assert_eq!(settled.pending, 0);
+        assert_eq!(settled.in_flight, 0);
+        assert!(settled.cancelled_or_stale >= 1);
+    }
+
+    #[test]
+    fn shutdown_fences_late_generation_and_worker_exits_after_provider_returns() {
+        let gate = Arc::new(BlockingGate::default());
+        let mut app = generation_app(
+            FixedGenerateRoute {
+                reply_context: ReflexContext::default(),
+                fallback_variant_group: Some("reaction.missing".to_owned()),
+            },
+            BlockingThinking {
+                gate: Arc::clone(&gate),
+                reply: "late after shutdown".to_owned(),
+            },
+            MockTts::default(),
+            SecretRedactor::default(),
+            None,
+            RecordingAudio::default(),
+            RecordingAvatar::default(),
+        );
+        app.startup().expect("startup");
+        let hot_before = app.performer().assets().hot_len();
+
+        let raw = serde_json::to_vec(&chat_event(147)).expect("event json");
+        app.process_content_bytes(&raw, 0, 147)
+            .expect("generation submission");
+        gate.wait_until_entered();
+
+        app.shutdown(10);
+        let during_shutdown = app
+            .generation_execution_snapshot()
+            .expect("generation snapshot");
+        assert!(during_shutdown.shutting_down);
+        assert!(during_shutdown.worker_running);
+
+        gate.release();
+        wait_for_generation_completion(&mut app, 10);
+        for _ in 0..1_000 {
+            app.tick(10);
+            if !app
+                .generation_execution_snapshot()
+                .expect("generation snapshot")
+                .worker_running
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let settled = app
+            .generation_execution_snapshot()
+            .expect("generation snapshot");
+        assert!(settled.shutting_down);
+        assert!(!settled.worker_running);
+        assert_eq!(settled.pending, 0);
+        assert_eq!(settled.in_flight, 0);
+        assert!(settled.cancelled_or_stale >= 1);
+        assert_eq!(app.performer().assets().hot_len(), hot_before);
+        assert!(app.performer().scheduler().items().is_empty());
     }
 
     #[test]
@@ -2480,8 +3501,9 @@ mod tests {
         let raw = serde_json::to_vec(&chat_event(39)).expect("event json");
         let outcome = app
             .process_content_bytes(&raw, 0, 39)
-            .expect("partial streaming fallback");
+            .expect("partial streaming fallback submission");
         assert!(outcome.playback.is_none());
+        wait_for_generation_completion(&mut app, 0);
         assert!(app.performer().scheduler().items().is_empty());
         assert_eq!(app.performer().assets().hot_len(), hot_before);
     }

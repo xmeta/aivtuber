@@ -32,6 +32,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 const CONFIG_VERSION: &str = "replay-benchmark-v1";
@@ -282,6 +283,9 @@ where
             at_ms,
             fixture.seed.wrapping_add(fixture_event.event.sequence),
         )?;
+        if mode == ComparisonMode::FullGenerative {
+            wait_for_generation_observation(&mut app, &fixture_event.event.event_id, at_ms)?;
+        }
 
         if mode == ComparisonMode::DeterministicSemantic {
             let result = semantic_metrics
@@ -325,6 +329,49 @@ where
             mode,
         )
         .map_err(Into::into)
+}
+
+fn wait_for_generation_observation<R>(
+    app: &mut ProductionApp<R>,
+    event_id: &str,
+    at_ms: u64,
+) -> Result<(), Box<dyn Error>>
+where
+    R: RoutePlanner,
+{
+    for _ in 0..1_000 {
+        app.tick(at_ms);
+        if app
+            .telemetry()
+            .events()
+            .last()
+            .is_some_and(|observation| observation.event_id == event_id)
+        {
+            return Ok(());
+        }
+
+        let Some(snapshot) = app.generation_execution_snapshot() else {
+            break;
+        };
+        if snapshot.pending == 0 && snapshot.in_flight == 0 {
+            app.tick(at_ms);
+            if app
+                .telemetry()
+                .events()
+                .last()
+                .is_some_and(|observation| observation.event_id == event_id)
+            {
+                return Ok(());
+            }
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    Err(io::Error::other(format!(
+        "full-generative replay did not record event {event_id} before the bounded worker quiesced"
+    ))
+    .into())
 }
 
 fn benchmark_app<R>(

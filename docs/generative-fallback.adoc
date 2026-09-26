@@ -11,41 +11,48 @@ The production-target implementation is split across:
 * `crates/adapters::NormalizedHttpTtsAdapter` -- normalized HTTP TTS implementation.
 * `crates/generative` -- routing audit, cancellation, fallback, streaming compilation state, and dynamic Performance Asset compilation.
 * `crates/asset-store` -- validates generated provenance and accepts only completed compatible dynamic assets into the hot cache for later promotion.
-* `crates/app` -- production composition: builds the curated ThinkingRequest, applies the deterministic public-output gate, inserts the completed generated asset, and reuses CachedPerformer/Scheduler for playback.
+* `crates/app` -- production composition: builds the curated ThinkingRequest, submits bounded provider work, revalidates completed output, inserts the completed generated asset, and reuses CachedPerformer/Scheduler for playback.
 
-== Atomic generation pipeline
+== Bounded non-blocking generation execution
 
-For one event the buffered path is:
+`ProductionApp` never waits for remote Thinking/TTS completion on the composition thread. `GenerativeRuntime` owns one bounded provider worker with a bounded submission queue and a bounded completion mailbox. The default execution configuration permits one in-flight provider job and eight queued jobs; queue saturation does not spawn another thread or task.
+
+Before submission, the composition thread selects the deterministic cached/non-verbal fallback and snapshots the side-effect-free public-output policy. The worker may perform provider waits and evaluate generated text before TTS, but it has no Scheduler, AssetStore mutation, authenticated control, or audit authority. Completed results return as immutable data and are committed only from `ProductionApp::tick()` after generation identity, cancellation, shutdown, and output-policy fencing pass.
+
+If the submission queue is saturated, production immediately chooses the already-selected deterministic fallback and increments the saturation counter. `GenerationExecutionSnapshot` exposes pending/in-flight counts, high-water marks, saturation, completed, failed, cancelled/stale, queue capacity, shutdown state, and worker liveness without retaining per-request history.
+
+For one event the buffered provider pipeline is:
 
 . validate the source EventEnvelope and the bounded curated ThinkingRequest;
 . verify the ThinkingRequest input provenance matches the source event;
 . record the explicit LLM routing reason before the ThinkingEngine call;
 . invoke the ThinkingEngine;
 . check cancellation;
-. pass generated text through `SecurityRuntime::publish_text` in the production composition root;
-. reject/suppress unsafe output or use the redacted text returned by the gate;
+. evaluate generated text with the cloneable `PublicOutputPolicy` snapshot on the provider worker;
+. reject/suppress unsafe output or use the redacted text returned by that gate;
 . invoke TTS only with gated public text;
 . check cancellation;
 . compile a dynamic Performance Asset from the gated text and complete speech artifact;
 . validate the asset;
-. return the completed asset to the caller;
-. production inserts it with `AssetStore::insert_hot` and schedules it through the existing `CachedPerformer`.
+. return the completed asset through the bounded completion mailbox;
+. the composition thread revalidates publication policy and generation currency;
+. production inserts it with `AssetStore::insert_hot` and schedules it through the existing `CachedPerformer` only after that commit fence.
 
-The generative crate does not mutate Scheduler state while LLM/TTS work is in flight. A timeout, cancellation, malformed backend result, or partial stream therefore cannot leave a half-scheduled performance behind.
+The generative worker does not mutate Scheduler or AssetStore state while LLM/TTS work is in flight. A timeout, cancellation, malformed backend result, partial stream, late completion, or superseded result therefore cannot leave a half-scheduled performance behind.
 
 Every attempted LLM invocation emits a production audit record containing the source event id, deterministic generation routing reason, and provider/model identity. Prompt text and generated reply text are deliberately excluded from this audit record, and configured secrets are redacted by the runtime audit boundary.
 
 == Cancellation
 
-`GenerationCancellationRegistry` associates the active generation with the same `aivtuber_scheduler::priority_for_event` mapping used by cached playback. A newly admitted event cancels the active token only when the new event has strictly higher scheduler priority. Authenticated emergency stop/mute also cancels the active generation without depending on model/network availability.
+`GenerationCancellationRegistry` associates the active generation with the same `aivtuber_scheduler::priority_for_event` mapping used by cached playback. A newly admitted higher-priority event cancels the active token before routing, and submitting a newer generation supersedes the previously active generation identity. Authenticated emergency stop/mute cancels the active generation without depending on model/network availability.
 
-The pipeline checks cancellation before ThinkingEngine, after ThinkingEngine, after TTS, and immediately before publish. Cancellation or partial streaming never inserts an asset or mutates the production scheduler.
+The pipeline checks cancellation before ThinkingEngine, after ThinkingEngine, after TTS, and immediately before returning a completed asset. The composition thread independently rejects any completion whose generation id/event id is no longer current, whose token is cancelled, or whose runtime is shutting down. Cancellation or partial streaming never inserts an asset or mutates the production scheduler.
 
-Callers should finish/remove the registry entry after the generation result has been consumed.
+Completion consumption finishes/removes the matching registry entry. Finishing a stale older completion cannot clear a newer active generation.
 
 == Future-compatible speculative preparation invariant
 
-The current production path remains buffered/atomic. A future implementation may reduce latency by starting bounded retrieval, Thinking, or TTS work before a turn/context is fully committed, but that optimization MUST NOT weaken publication fencing.
+The current production provider result remains buffered/atomic, but provider waits already run behind the bounded non-blocking execution boundary. A future implementation may additionally start speculative retrieval, Thinking, or TTS work before a turn/context is fully committed; that optimization MUST NOT weaken publication fencing.
 
 Any future speculative path must:
 
