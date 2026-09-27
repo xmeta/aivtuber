@@ -8,6 +8,7 @@ use aivtuber_domain::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelEvidence {
@@ -137,10 +138,16 @@ impl ReflexPipeline {
         })
     }
     /// Event-driven reflex path. This is intentionally not a frame-loop API.
-    pub fn run(
+    pub fn run(&self, input: ReflexPipelineInput) -> Result<DecisionReplayRecord, RetrievalError> {
+        self.run_with_budget(input, None)
+    }
+
+    pub fn run_with_budget(
         &self,
         mut input: ReflexPipelineInput,
+        remaining_budget: Option<Duration>,
     ) -> Result<DecisionReplayRecord, RetrievalError> {
+        let budget_started = Instant::now();
         let retrieval = self.index.search(&input.query_embedding, self.top_k)?;
         input.request.retrieval = RetrievalSnapshot {
             candidates: retrieval
@@ -154,7 +161,17 @@ impl ReflexPipeline {
                 .collect(),
         };
 
-        let evidence = match self.adapter.evaluate_evidence(&input.request) {
+        let model_result = match remaining_budget {
+            Some(budget) => {
+                let budget = budget
+                    .checked_sub(budget_started.elapsed())
+                    .unwrap_or(Duration::ZERO);
+                self.adapter
+                    .evaluate_evidence_with_budget(&input.request, budget)
+            }
+            None => self.adapter.evaluate_evidence(&input.request),
+        };
+        let evidence = match model_result {
             Ok(model) => DecisionEvidence {
                 retrieval,
                 selected_candidate_id: model.selected_candidate_id.clone(),

@@ -25,6 +25,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -82,6 +83,8 @@ pub struct GenerationTrace {
     pub tts_streaming: bool,
     pub tts_progress_chunks: usize,
     pub tts_backend: Option<TtsBackendIdentity>,
+    pub thinking_timeout_ms: Option<u64>,
+    pub tts_timeout_ms: Option<u64>,
     pub fallback_reason: FallbackReason,
     pub cancelled_stage: Option<CancellationStage>,
 }
@@ -94,6 +97,8 @@ impl Default for GenerationTrace {
             tts_streaming: false,
             tts_progress_chunks: 0,
             tts_backend: None,
+            thinking_timeout_ms: None,
+            tts_timeout_ms: None,
             fallback_reason: FallbackReason::None,
             cancelled_stage: None,
         }
@@ -567,15 +572,39 @@ impl StreamingSpeechCollector {
     }
 }
 
+fn remaining_provider_timeout(deadline: Option<Instant>) -> Result<Option<Duration>, ()> {
+    match deadline {
+        None => Ok(None),
+        Some(deadline) => deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .map(Some)
+            .ok_or(()),
+    }
+}
+
+fn duration_ms_ceil(duration: Duration) -> u64 {
+    let nanos = duration.as_nanos();
+    nanos
+        .saturating_add(999_999)
+        .checked_div(1_000_000)
+        .unwrap_or(0)
+        .min(u128::from(u64::MAX)) as u64
+}
+
 fn run_streaming_tts(
     tts: &dyn TtsEngine,
     request: &SpeechRequest,
+    timeout: Option<Duration>,
 ) -> Option<(
     Result<SpeechArtifact, EngineError>,
     StreamingSpeechCollector,
 )> {
     let mut progress = StreamingSpeechCollector::default();
-    let streaming = tts.synthesize_streaming(request, &mut progress)?;
+    let streaming = match timeout {
+        Some(timeout) => tts.synthesize_streaming_with_timeout(request, &mut progress, timeout)?,
+        None => tts.synthesize_streaming(request, &mut progress)?,
+    };
     let result = block_on(streaming);
     Some((result, progress))
 }
@@ -645,6 +674,26 @@ impl GenerativePipeline {
         request: &GenerationRequest,
         cancellation: &GenerationCancellationToken,
         fallback: FallbackDirective,
+        output_gate: F,
+    ) -> Result<GenerationResult, GenerationError>
+    where
+        F: FnMut(&str) -> GeneratedTextGateDecision,
+    {
+        self.run_with_output_gate_and_fallback_deadline(
+            request,
+            cancellation,
+            fallback,
+            None,
+            output_gate,
+        )
+    }
+
+    pub fn run_with_output_gate_and_fallback_deadline<F>(
+        &self,
+        request: &GenerationRequest,
+        cancellation: &GenerationCancellationToken,
+        fallback: FallbackDirective,
+        provider_deadline: Option<Instant>,
         mut output_gate: F,
     ) -> Result<GenerationResult, GenerationError>
     where
@@ -677,6 +726,15 @@ impl GenerativePipeline {
             return Ok(cancelled_result(trace, CancellationStage::BeforeThinking));
         }
 
+        let thinking_timeout = match remaining_provider_timeout(provider_deadline) {
+            Ok(timeout) => timeout,
+            Err(()) => {
+                trace.fallback_reason = FallbackReason::Timeout;
+                return Ok(fallback_result(trace, fallback.clone()));
+            }
+        };
+        trace.thinking_timeout_ms = thinking_timeout.map(duration_ms_ceil);
+
         let thinking_identity = self.thinking.identity();
         trace.llm_calls.push(LlmCallRecord {
             event_id: request.source_event.event_id.clone(),
@@ -684,7 +742,13 @@ impl GenerativePipeline {
             backend: thinking_identity.clone(),
         });
 
-        let reply = match block_on(self.thinking.generate(&request.thinking)) {
+        let thinking = match thinking_timeout {
+            Some(timeout) => self
+                .thinking
+                .generate_with_timeout(&request.thinking, timeout),
+            None => self.thinking.generate(&request.thinking),
+        };
+        let reply = match block_on(thinking) {
             Ok(reply) => reply,
             Err(error) => {
                 trace.fallback_reason = fallback_reason_from_error(&error);
@@ -704,6 +768,15 @@ impl GenerativePipeline {
             }
         };
 
+        let tts_timeout = match remaining_provider_timeout(provider_deadline) {
+            Ok(timeout) => timeout,
+            Err(()) => {
+                trace.fallback_reason = FallbackReason::Timeout;
+                return Ok(fallback_result(trace, fallback.clone()));
+            }
+        };
+        trace.tts_timeout_ms = tts_timeout.map(duration_ms_ceil);
+
         let tts_identity = self.tts.identity();
         trace.tts_attempted = true;
         trace.tts_backend = Some(tts_identity.clone());
@@ -713,7 +786,7 @@ impl GenerativePipeline {
         };
 
         let speech_result = if let Some((result, progress)) =
-            run_streaming_tts(self.tts.as_ref(), &speech_request)
+            run_streaming_tts(self.tts.as_ref(), &speech_request, tts_timeout)
         {
             trace.tts_streaming = true;
             trace.tts_progress_chunks = progress.progress.len();
@@ -722,7 +795,11 @@ impl GenerativePipeline {
                 Err(error) => Err(error),
             }
         } else {
-            block_on(self.tts.synthesize(&speech_request))
+            let synthesis = match tts_timeout {
+                Some(timeout) => self.tts.synthesize_with_timeout(&speech_request, timeout),
+                None => self.tts.synthesize(&speech_request),
+            };
+            block_on(synthesis)
         };
 
         let speech = match speech_result {

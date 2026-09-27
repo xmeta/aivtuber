@@ -1,10 +1,12 @@
 #![forbid(unsafe_code)]
 
+mod deadline;
 mod outputs;
 mod raw_ingress;
 mod routing;
 mod semantic;
 
+pub use deadline::*;
 pub use outputs::*;
 pub use raw_ingress::*;
 pub use routing::*;
@@ -13,8 +15,9 @@ pub use semantic::*;
 use aivtuber_adaptation::{AdaptationEngine, AppliedAdaptation, MemoryEntry, WorkingMemory};
 use aivtuber_asset_store::CacheTier;
 use aivtuber_domain::{
-    AuthenticatedControl, AuthenticatedControlCommand, AuthorizedStreamAction, EngineError,
-    EventEnvelope, FallbackReason,
+    AuthenticatedControl, AuthenticatedControlCommand, AuthorizedStreamAction,
+    DeadlineExhaustionReason, DeadlineStage, EngineError, EventEnvelope, FallbackReason,
+    InteractionDeadline,
 };
 use aivtuber_generative::{
     CancellationStage, FallbackDirective, GeneratedTextGateDecision,
@@ -42,7 +45,7 @@ use std::sync::{
     mpsc::{self, Receiver, SyncSender, TrySendError},
 };
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub trait AudioOutput: Send {
     fn execute(&mut self, command: &AudioPlaybackCommand) -> Result<(), EngineError>;
@@ -211,6 +214,9 @@ struct GenerationCompletionContext {
     routing_latency_us: u64,
     decision: Option<DecisionReplayRecord>,
     template_fallback: Option<&'static str>,
+    interaction_deadline: InteractionDeadline,
+    remaining_at_route_ms: u64,
+    remaining_at_generation_ms: u64,
 }
 
 struct GenerationWork {
@@ -220,6 +226,7 @@ struct GenerationWork {
     fallback: FallbackDirective,
     output_policy: PublicOutputPolicy,
     submitted_at: Instant,
+    provider_deadline: Instant,
     context: GenerationCompletionContext,
 }
 
@@ -231,6 +238,10 @@ struct GenerationCompletion {
     result: Result<GenerationResult, String>,
     output_decision: Option<PublicOutput>,
     generation_latency_us: u64,
+    queue_wait_us: u64,
+    provider_latency_us: u64,
+    completed_at: Instant,
+    provider_deadline: Instant,
     context: GenerationCompletionContext,
 }
 
@@ -285,13 +296,16 @@ impl GenerationExecutor {
 
                     let in_flight = worker_counters.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
                     update_high_water(&worker_counters.in_flight_high_water, in_flight);
+                    let provider_started = Instant::now();
+                    let queue_wait_us = elapsed_us(work.submitted_at);
 
                     let mut output_decision = None;
                     let result = pipeline
-                        .run_with_output_gate_and_fallback(
+                        .run_with_output_gate_and_fallback_deadline(
                             &work.request,
                             &work.cancellation,
                             work.fallback.clone(),
+                            Some(work.provider_deadline),
                             |generated_text| {
                                 let output = work.output_policy.evaluate(generated_text);
                                 let decision = if matches!(
@@ -312,6 +326,8 @@ impl GenerationExecutor {
                         )
                         .map_err(|error| error.to_string());
 
+                    let provider_latency_us = elapsed_us(provider_started);
+                    let completed_at = Instant::now();
                     worker_counters.in_flight.fetch_sub(1, Ordering::Relaxed);
                     let completion = GenerationCompletion {
                         generation_id: work.generation_id,
@@ -321,6 +337,10 @@ impl GenerationExecutor {
                         result,
                         output_decision,
                         generation_latency_us: elapsed_us(work.submitted_at),
+                        queue_wait_us,
+                        provider_latency_us,
+                        completed_at,
+                        provider_deadline: work.provider_deadline,
                         context: work.context,
                     };
 
@@ -458,6 +478,7 @@ impl GenerativeRuntime {
         request: GenerationRequest,
         fallback: FallbackDirective,
         output_policy: PublicOutputPolicy,
+        provider_deadline: Instant,
         context: GenerationCompletionContext,
     ) -> Result<u64, GenerationSubmitError> {
         self.next_generation_id = self.next_generation_id.saturating_add(1);
@@ -471,6 +492,7 @@ impl GenerativeRuntime {
             fallback,
             output_policy,
             submitted_at: Instant::now(),
+            provider_deadline,
             context,
         };
         match self.executor.try_submit(work) {
@@ -541,6 +563,52 @@ impl AdaptationRuntime {
     }
 }
 
+#[derive(Debug, Clone)]
+struct DeadlineObservation {
+    deadline: InteractionDeadline,
+    remaining_at_route_ms: u64,
+    remaining_at_generation_ms: Option<u64>,
+    exhaustion_stage: Option<DeadlineStage>,
+    exhaustion_reason: Option<DeadlineExhaustionReason>,
+    generation_queue_wait_us: Option<u64>,
+    generation_provider_latency_us: Option<u64>,
+    generation_commit_delay_us: Option<u64>,
+}
+
+impl DeadlineObservation {
+    fn new(deadline: InteractionDeadline, remaining_at_route_ms: u64) -> Self {
+        Self {
+            deadline,
+            remaining_at_route_ms,
+            remaining_at_generation_ms: None,
+            exhaustion_stage: None,
+            exhaustion_reason: None,
+            generation_queue_wait_us: None,
+            generation_provider_latency_us: None,
+            generation_commit_delay_us: None,
+        }
+    }
+}
+
+fn completion_deadline_observation(
+    completion: &GenerationCompletion,
+    exhaustion: Option<(DeadlineStage, DeadlineExhaustionReason)>,
+) -> DeadlineObservation {
+    let mut observation = DeadlineObservation::new(
+        completion.context.interaction_deadline,
+        completion.context.remaining_at_route_ms,
+    );
+    observation.remaining_at_generation_ms = Some(completion.context.remaining_at_generation_ms);
+    observation.generation_queue_wait_us = Some(completion.queue_wait_us);
+    observation.generation_provider_latency_us = Some(completion.provider_latency_us);
+    observation.generation_commit_delay_us = Some(elapsed_us(completion.completed_at));
+    if let Some((stage, reason)) = exhaustion {
+        observation.exhaustion_stage = Some(stage);
+        observation.exhaustion_reason = Some(reason);
+    }
+    observation
+}
+
 struct HandledEvent {
     playback: Option<CachedPlaybackOutcome>,
     route: RouteClass,
@@ -552,6 +620,7 @@ struct HandledEvent {
     /// decision (issue #54); `None` when no template fallback applies.
     template_fallback: Option<&'static str>,
     cache_level: Option<CacheLevel>,
+    deadline: Option<DeadlineObservation>,
     /// Generation was accepted by the bounded worker and will be observed
     /// when a completion is committed from tick().
     deferred_generation: bool,
@@ -566,7 +635,10 @@ struct HandledGeneration {
 
 enum GenerationSubmission {
     Deferred,
-    Immediate(Box<HandledGeneration>),
+    Immediate {
+        handled: Box<HandledGeneration>,
+        deadline_exhaustion: Option<(DeadlineStage, DeadlineExhaustionReason)>,
+    },
 }
 
 pub struct ProductionApp<R>
@@ -585,6 +657,7 @@ where
     pending_audio: PendingAudio,
     pending_avatar: PendingAvatar,
     max_dispatch_lateness_ms: u64,
+    interaction_deadlines: InteractionDeadlinePolicy,
     health: AdapterHealth,
     telemetry: TelemetryCollector,
     comparison_mode: ComparisonMode,
@@ -618,6 +691,7 @@ where
             pending_audio: PendingAudio::default(),
             pending_avatar: PendingAvatar::default(),
             max_dispatch_lateness_ms,
+            interaction_deadlines: InteractionDeadlinePolicy::default(),
             health: AdapterHealth::default(),
             telemetry: TelemetryCollector::default(),
             comparison_mode: ComparisonMode::DeterministicOnly,
@@ -628,6 +702,18 @@ where
         self.generative = Some(generative);
         self.comparison_mode = ComparisonMode::FullGenerative;
         self
+    }
+
+    pub fn with_interaction_deadline_policy(
+        mut self,
+        policy: InteractionDeadlinePolicy,
+    ) -> Result<Self, AppError> {
+        self.interaction_deadlines = policy.validate()?;
+        Ok(self)
+    }
+
+    pub fn interaction_deadline_policy(&self) -> InteractionDeadlinePolicy {
+        self.interaction_deadlines
     }
 
     pub fn with_adaptation(mut self, adaptation: AdaptationRuntime) -> Self {
@@ -783,6 +869,7 @@ where
         at_ms: u64,
         seed: u64,
     ) -> Result<ContentProcessOutcome, AppError> {
+        let interaction_started = Instant::now();
         let admission = self.security.admit_content_bytes(raw, at_ms)?;
         if admission != ContentAdmitDecision::Queued {
             return Ok(ContentProcessOutcome {
@@ -795,10 +882,24 @@ where
             AppError::Routing("queued content was unavailable for dispatch".to_owned())
         })?;
         let event_id = event.event_id.clone();
+        let interaction_deadline = self
+            .interaction_deadlines
+            .deadline_for(event.kind, at_ms)?
+            .ok_or_else(|| {
+                AppError::Routing(
+                    "operator/control events must not enter the content deadline path".to_owned(),
+                )
+            })?;
+        let provider_deadline = interaction_started
+            .checked_add(Duration::from_millis(
+                interaction_deadline.total_budget_ms(),
+            ))
+            .ok_or_else(|| AppError::Routing("interaction deadline overflow".to_owned()))?;
         if let Some(generative) = &self.generative {
             generative.cancellation.cancel_for_event(&event);
         }
-        let handled = self.handle_event(event, at_ms, seed)?;
+        let handled =
+            self.handle_event(event, at_ms, seed, interaction_deadline, provider_deadline)?;
         self.tick(at_ms);
         if !handled.deferred_generation {
             self.record_handled_event(&event_id, &handled, at_ms);
@@ -815,9 +916,15 @@ where
         mut event: EventEnvelope,
         at_ms: u64,
         seed: u64,
+        interaction_deadline: InteractionDeadline,
+        provider_deadline: Instant,
     ) -> Result<HandledEvent, AppError> {
+        let remaining_at_route_ms = interaction_deadline.remaining_ms(at_ms);
+        let mut deadline_observation =
+            DeadlineObservation::new(interaction_deadline, remaining_at_route_ms);
         let route_started = Instant::now();
-        let route = self.router.route(&event)?;
+        let route_budget = remaining_instant(provider_deadline).unwrap_or(Duration::ZERO);
+        let route = self.router.route_with_budget(&event, Some(route_budget))?;
         let routing_latency_us = elapsed_us(route_started);
         let decision = self.router.decision_record().cloned();
         let template_fallback = self
@@ -899,6 +1006,7 @@ where
                         decision,
                         template_fallback,
                         cache_level: None,
+                        deadline: Some(deadline_observation.clone()),
                         deferred_generation: false,
                     });
                 }
@@ -919,8 +1027,22 @@ where
                     routing_latency_us,
                     decision: decision.clone(),
                     template_fallback,
+                    interaction_deadline,
+                    remaining_at_route_ms,
+                    remaining_at_generation_ms: remaining_instant(provider_deadline)
+                        .map(|remaining| remaining.as_millis().min(u128::from(u64::MAX)) as u64)
+                        .unwrap_or(0),
                 };
-                match self.submit_generation(event, *route, at_ms, seed, context)? {
+                deadline_observation.remaining_at_generation_ms =
+                    Some(context.remaining_at_generation_ms);
+                match self.submit_generation(
+                    event,
+                    *route,
+                    at_ms,
+                    seed,
+                    provider_deadline,
+                    context,
+                )? {
                     GenerationSubmission::Deferred => {
                         return Ok(HandledEvent {
                             playback: None,
@@ -931,11 +1053,19 @@ where
                             decision: None,
                             template_fallback: None,
                             cache_level: None,
+                            deadline: None,
                             deferred_generation: true,
                         });
                     }
-                    GenerationSubmission::Immediate(handled) => {
+                    GenerationSubmission::Immediate {
+                        handled,
+                        deadline_exhaustion,
+                    } => {
                         generation_latency_us = Some(elapsed_us(generation_started));
+                        if let Some((stage, reason)) = deadline_exhaustion {
+                            deadline_observation.exhaustion_stage = Some(stage);
+                            deadline_observation.exhaustion_reason = Some(reason);
+                        }
                         let HandledGeneration {
                             playback,
                             route,
@@ -958,6 +1088,7 @@ where
             decision,
             template_fallback,
             cache_level,
+            deadline: Some(deadline_observation),
             deferred_generation: false,
         })
     }
@@ -1029,6 +1160,7 @@ where
         route: GenerationRoute,
         at_ms: u64,
         seed: u64,
+        provider_deadline: Instant,
         context: GenerationCompletionContext,
     ) -> Result<GenerationSubmission, AppError> {
         if route.source_event != event {
@@ -1048,6 +1180,32 @@ where
         };
         let fallback = select_fallback_directive(&request, Some(self.performer.assets()));
         let output_policy = self.security.public_output_policy();
+        let minimum_start =
+            Duration::from_millis(self.interaction_deadlines.min_generation_start_ms);
+        if remaining_instant(provider_deadline).is_none_or(|remaining| remaining < minimum_start) {
+            let handled = self.commit_generation_result(
+                &event,
+                GenerationResult {
+                    trace: GenerationTrace {
+                        fallback_reason: FallbackReason::Timeout,
+                        ..GenerationTrace::default()
+                    },
+                    disposition: GenerationDisposition::Fallback {
+                        directive: fallback,
+                    },
+                },
+                None,
+                at_ms,
+                seed,
+            )?;
+            return Ok(GenerationSubmission::Immediate {
+                handled: Box::new(handled),
+                deadline_exhaustion: Some((
+                    DeadlineStage::GenerationQueue,
+                    DeadlineExhaustionReason::InsufficientBudget,
+                )),
+            });
+        }
         let submit = self
             .generative
             .as_mut()
@@ -1056,7 +1214,13 @@ where
                     "generative route requested without configured runtime".to_owned(),
                 )
             })?
-            .submit(request.clone(), fallback.clone(), output_policy, context);
+            .submit(
+                request.clone(),
+                fallback.clone(),
+                output_policy,
+                provider_deadline,
+                context,
+            );
 
         match submit {
             Ok(_) => Ok(GenerationSubmission::Deferred),
@@ -1081,7 +1245,10 @@ where
                     at_ms,
                     seed,
                 )?;
-                Ok(GenerationSubmission::Immediate(Box::new(handled)))
+                Ok(GenerationSubmission::Immediate {
+                    handled: Box::new(handled),
+                    deadline_exhaustion: None,
+                })
             }
         }
     }
@@ -1234,10 +1401,12 @@ where
             };
 
             let event_id = completion.request.source_event.event_id.clone();
+            let deadline_expired = remaining_instant(completion.provider_deadline).is_none();
             let stale_or_cancelled = self.generative.as_ref().is_none_or(|generative| {
                 generative.is_shutting_down()
                     || !generative.is_current(completion.generation_id, &event_id)
                     || completion.cancellation.is_cancelled()
+                    || deadline_expired
             });
 
             if stale_or_cancelled {
@@ -1252,6 +1421,17 @@ where
                 if trace.cancelled_stage.is_none() {
                     trace.cancelled_stage = Some(CancellationStage::BeforePublish);
                 }
+                let exhaustion = if deadline_expired {
+                    (DeadlineStage::Commit, DeadlineExhaustionReason::Expired)
+                } else if completion.cancellation.is_cancelled() {
+                    (DeadlineStage::Commit, DeadlineExhaustionReason::Cancelled)
+                } else {
+                    (
+                        DeadlineStage::Commit,
+                        DeadlineExhaustionReason::StaleCompletion,
+                    )
+                };
+                let deadline = completion_deadline_observation(&completion, Some(exhaustion));
 
                 let handled = HandledEvent {
                     playback: None,
@@ -1262,6 +1442,7 @@ where
                     decision: completion.context.decision,
                     template_fallback: completion.context.template_fallback,
                     cache_level: None,
+                    deadline: Some(deadline),
                     deferred_generation: false,
                 };
                 self.record_handled_event(&event_id, &handled, now_ms);
@@ -1273,6 +1454,7 @@ where
                 continue;
             }
 
+            let mut deadline = completion_deadline_observation(&completion, None);
             let result = match completion.result {
                 Ok(result) => result,
                 Err(_) => {
@@ -1307,6 +1489,15 @@ where
                         trace,
                         cache_level,
                     } = handled_generation;
+                    if trace.fallback_reason == FallbackReason::Timeout {
+                        deadline.exhaustion_stage = Some(if trace.tts_attempted {
+                            DeadlineStage::Tts
+                        } else {
+                            DeadlineStage::Thinking
+                        });
+                        deadline.exhaustion_reason =
+                            Some(DeadlineExhaustionReason::ProviderTimeout);
+                    }
                     let handled = HandledEvent {
                         playback,
                         route,
@@ -1316,6 +1507,7 @@ where
                         decision: completion.context.decision,
                         template_fallback: completion.context.template_fallback,
                         cache_level,
+                        deadline: Some(deadline),
                         deferred_generation: false,
                     };
                     self.record_handled_event(&event_id, &handled, now_ms);
@@ -1424,6 +1616,18 @@ where
             observation
                 .degraded_subsystems
                 .insert(DegradedSubsystem::Stream);
+        }
+
+        if let Some(deadline) = &handled.deadline {
+            observation.deadline_class = Some(deadline.deadline.class);
+            observation.deadline_budget_ms = Some(deadline.deadline.total_budget_ms());
+            observation.deadline_remaining_at_route_ms = Some(deadline.remaining_at_route_ms);
+            observation.deadline_remaining_at_generation_ms = deadline.remaining_at_generation_ms;
+            observation.deadline_exhaustion_stage = deadline.exhaustion_stage;
+            observation.deadline_exhaustion_reason = deadline.exhaustion_reason;
+            observation.generation_queue_wait_us = deadline.generation_queue_wait_us;
+            observation.generation_provider_latency_us = deadline.generation_provider_latency_us;
+            observation.generation_commit_delay_us = deadline.generation_commit_delay_us;
         }
 
         if let Some(trace) = &handled.generation_trace {
@@ -1648,6 +1852,12 @@ fn cache_level(tier: Option<CacheTier>) -> Option<CacheLevel> {
 
 fn elapsed_us(started: Instant) -> u64 {
     started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn remaining_instant(deadline: Instant) -> Option<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
 }
 
 fn millis_to_micros(value: f64) -> Option<u64> {
@@ -3081,6 +3291,124 @@ mod tests {
         wait_for_generation_completion(&mut app, 0);
         assert!(app.performer().scheduler().items().is_empty());
         assert_eq!(app.performer().assets().hot_len(), hot_before);
+    }
+
+    #[test]
+    fn insufficient_budget_skips_generation_and_records_deadline_exhaustion() {
+        let gate = Arc::new(BlockingGate::default());
+        let mut app = generation_app(
+            FixedGenerateRoute {
+                reply_context: ReflexContext::default(),
+                fallback_variant_group: Some("reaction.missing".to_owned()),
+            },
+            BlockingThinking {
+                gate: Arc::clone(&gate),
+                reply: "must not run".to_owned(),
+            },
+            MockTts::default(),
+            SecretRedactor::default(),
+            None,
+            RecordingAudio::default(),
+            RecordingAvatar::default(),
+        )
+        .with_interaction_deadline_policy(InteractionDeadlinePolicy {
+            high_priority_ms: 10,
+            strong_reaction_ms: 10,
+            conversation_ms: 10,
+            commentary_ms: 10,
+            background_ms: 10,
+            min_generation_start_ms: 20,
+        })
+        .expect("deadline policy");
+        app.startup().expect("startup");
+
+        let raw = serde_json::to_vec(&chat_event(140)).expect("event json");
+        let outcome = app
+            .process_content_bytes(&raw, 0, 140)
+            .expect("deadline fallback");
+        assert!(outcome.playback.is_none());
+        assert!(!gate.entered.load(Ordering::Acquire));
+        let snapshot = app
+            .generation_execution_snapshot()
+            .expect("generation snapshot");
+        assert_eq!(snapshot.pending, 0);
+        assert_eq!(snapshot.in_flight, 0);
+
+        let metric = app.telemetry().events().last().expect("deadline metric");
+        assert_eq!(
+            metric.deadline_class,
+            Some(aivtuber_domain::InteractionDeadlineClass::Conversation)
+        );
+        assert_eq!(metric.deadline_budget_ms, Some(10));
+        assert_eq!(
+            metric.deadline_exhaustion_stage,
+            Some(DeadlineStage::GenerationQueue)
+        );
+        assert_eq!(
+            metric.deadline_exhaustion_reason,
+            Some(DeadlineExhaustionReason::InsufficientBudget)
+        );
+        assert_eq!(metric.llm_calls, 0);
+        assert_eq!(metric.tts_calls, 0);
+    }
+
+    #[test]
+    fn completion_after_interaction_deadline_is_fenced_before_publish() {
+        let gate = Arc::new(BlockingGate::default());
+        let mut app = generation_app(
+            FixedGenerateRoute {
+                reply_context: ReflexContext::default(),
+                fallback_variant_group: Some("reaction.missing".to_owned()),
+            },
+            BlockingThinking {
+                gate: Arc::clone(&gate),
+                reply: "late generated reply".to_owned(),
+            },
+            MockTts::default(),
+            SecretRedactor::default(),
+            None,
+            RecordingAudio::default(),
+            RecordingAvatar::default(),
+        )
+        .with_interaction_deadline_policy(InteractionDeadlinePolicy {
+            high_priority_ms: 10,
+            strong_reaction_ms: 10,
+            conversation_ms: 10,
+            commentary_ms: 10,
+            background_ms: 10,
+            min_generation_start_ms: 1,
+        })
+        .expect("deadline policy");
+        app.startup().expect("startup");
+        let hot_before = app.performer().assets().hot_len();
+
+        let raw = serde_json::to_vec(&chat_event(139)).expect("event json");
+        let outcome = app
+            .process_content_bytes(&raw, 0, 139)
+            .expect("generation submission");
+        assert!(outcome.playback.is_none());
+        gate.wait_until_entered();
+        std::thread::sleep(Duration::from_millis(20));
+        gate.release();
+        wait_for_generation_completion(&mut app, 20);
+
+        assert_eq!(app.performer().assets().hot_len(), hot_before);
+        assert!(app.performer().scheduler().items().is_empty());
+        let metric = app
+            .telemetry()
+            .events()
+            .iter()
+            .find(|event| event.event_id == "evt-139")
+            .expect("deadline completion metric");
+        assert_eq!(
+            metric.deadline_exhaustion_stage,
+            Some(DeadlineStage::Commit)
+        );
+        assert_eq!(
+            metric.deadline_exhaustion_reason,
+            Some(DeadlineExhaustionReason::Expired)
+        );
+        assert!(metric.cancelled);
     }
 
     #[test]

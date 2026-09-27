@@ -50,6 +50,12 @@ The pipeline checks cancellation before ThinkingEngine, after ThinkingEngine, af
 
 Completion consumption finishes/removes the matching registry entry. Finishing a stale older completion cannot clear a newer active generation.
 
+== Interaction deadline propagation
+
+The composition root attaches the same end-to-end interaction deadline used by routing to submitted generation work. Before Thinking and again before TTS, the worker recomputes the remaining real execution time and caps the provider timeout to that remainder. Provider-specific maximum timeouts remain upper bounds; they never extend the interaction deadline.
+
+If the remaining budget is below the configured minimum useful generation-start budget, the provider worker is skipped and the deterministic cached/non-verbal fallback is used. If provider work returns after the deadline, the composition-thread commit fence discards the completion even when the provider itself ignored cancellation or timeout. Generation telemetry records queue wait, provider execution, commit delay, the remaining budget, and typed deadline exhaustion without retaining generated text.
+
 == Future-compatible speculative preparation invariant
 
 The current production provider result remains buffered/atomic, but provider waits already run behind the bounded non-blocking execution boundary. A future implementation may additionally start speculative retrieval, Thinking, or TTS work before a turn/context is fully committed; that optimization MUST NOT weaken publication fencing.

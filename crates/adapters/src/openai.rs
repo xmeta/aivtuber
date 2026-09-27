@@ -82,6 +82,21 @@ impl OpenAiResponsesAdapter {
     }
 
     pub fn generate_sync(&self, request: &ThinkingRequest) -> Result<GeneratedReply, EngineError> {
+        self.generate_sync_with_timeout(request, self.config.timeout)
+    }
+
+    pub fn generate_sync_with_timeout(
+        &self,
+        request: &ThinkingRequest,
+        timeout: Duration,
+    ) -> Result<GeneratedReply, EngineError> {
+        if timeout.is_zero() {
+            return Err(EngineError::new(
+                EngineErrorKind::Timeout,
+                "OpenAI-compatible call has no remaining interaction budget",
+            ));
+        }
+        let effective_timeout = self.config.timeout.min(timeout);
         let input = compact_generation_input(request)?;
         let body = serde_json::to_vec(&json!({
             "model": self.config.model_alias,
@@ -96,7 +111,7 @@ impl OpenAiResponsesAdapter {
                 &self.config.endpoint,
                 Some(self.api_key.expose()),
                 &body,
-                self.config.timeout,
+                effective_timeout,
             )
             .map_err(map_transport_error)?;
 
@@ -130,6 +145,14 @@ impl OpenAiResponsesAdapter {
 impl ThinkingEngine for OpenAiResponsesAdapter {
     fn generate<'a>(&'a self, request: &'a ThinkingRequest) -> EngineFuture<'a, GeneratedReply> {
         Box::pin(async move { self.generate_sync(request) })
+    }
+
+    fn generate_with_timeout<'a>(
+        &'a self,
+        request: &'a ThinkingRequest,
+        timeout: Duration,
+    ) -> EngineFuture<'a, GeneratedReply> {
+        Box::pin(async move { self.generate_sync_with_timeout(request, timeout) })
     }
 
     fn identity(&self) -> BackendIdentity {
@@ -314,6 +337,27 @@ mod tests {
         assert_eq!(identity.name, "openai-compatible-responses");
         assert_eq!(identity.model_alias.as_deref(), Some("gpt-5-test"));
         assert_eq!(identity.model_version.as_deref(), Some("2026-09-01"));
+    }
+
+    #[test]
+    fn interaction_budget_caps_openai_transport_timeout() {
+        let transport = MockHttpTransport::new(Ok(response("bounded reply")));
+        let adapter = OpenAiResponsesAdapter::with_transport(
+            OpenAiResponsesConfig {
+                timeout: Duration::from_secs(5),
+                ..OpenAiResponsesConfig::default()
+            },
+            SecretString::new("openai-secret-value"),
+            Arc::new(transport.clone()),
+        )
+        .expect("adapter");
+
+        adapter
+            .generate_sync_with_timeout(&request(), Duration::from_millis(37))
+            .expect("bounded reply");
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].timeout, Duration::from_millis(37));
     }
 
     #[test]

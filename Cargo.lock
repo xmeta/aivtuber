@@ -130,6 +130,7 @@ dependencies = [
 name = "aivtuber-telemetry"
 version = "0.1.0"
 dependencies = [
+ "aivtuber-domain",
  "serde",
  "serde_json",
 ]

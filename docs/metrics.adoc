@@ -16,6 +16,9 @@ The production composition root records:
 * routing latency;
 * Jev latency and attempt count when a Reflex decision was used;
 * generation latency when the LLM/TTS fallback ran;
+* generation queue wait, provider execution, and completion-to-commit delay;
+* trusted deadline class, total budget, remaining budget at route/generation entry, and typed exhaustion stage/reason;
+* intentional conversational delay separately from technical processing latency (currently zero until an intentional-wait feature owns it);
 * event-to-first-audio and event-to-first-visible-reaction;
 * route class;
 * cache lookup outcome and the exact resolving tier (L0 memory vs L1 local storage before promotion);
@@ -55,6 +58,7 @@ Reports include:
 * LLM calls per event and avoidance rate versus a one-LLM-call-per-event reference;
 * TTS calls per event and avoidance rate versus a one-TTS-call-per-event reference;
 * operator overrides and cancellations;
+* deadline exhaustion counts by stage and trusted event/deadline class;
 * reviewed wrong-reuse label count and confirmed wrong-reuse count.
 
 Generated output is identified separately from cache hits even though a completed generated asset is inserted into L0 for playback.

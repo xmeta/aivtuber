@@ -3,7 +3,7 @@ use crate::{
     ThinkingRequest,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, error::Error, fmt, future::Future, pin::Pin};
+use std::{collections::BTreeMap, error::Error, fmt, future::Future, pin::Pin, time::Duration};
 
 pub type EngineFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, EngineError>> + Send + 'a>>;
 
@@ -175,11 +175,28 @@ pub trait DecisionEngine: Send + Sync {
 
 pub trait ThinkingEngine: Send + Sync {
     fn generate<'a>(&'a self, request: &'a ThinkingRequest) -> EngineFuture<'a, GeneratedReply>;
+
+    fn generate_with_timeout<'a>(
+        &'a self,
+        request: &'a ThinkingRequest,
+        _timeout: Duration,
+    ) -> EngineFuture<'a, GeneratedReply> {
+        self.generate(request)
+    }
+
     fn identity(&self) -> BackendIdentity;
 }
 
 pub trait TtsEngine: Send + Sync {
     fn synthesize<'a>(&'a self, request: &'a SpeechRequest) -> EngineFuture<'a, SpeechArtifact>;
+
+    fn synthesize_with_timeout<'a>(
+        &'a self,
+        request: &'a SpeechRequest,
+        _timeout: Duration,
+    ) -> EngineFuture<'a, SpeechArtifact> {
+        self.synthesize(request)
+    }
 
     /// Optional streaming synthesis. Backends that support incremental output
     /// push stable-reference progress records and still return one final artifact.
@@ -190,6 +207,15 @@ pub trait TtsEngine: Send + Sync {
         _sink: &'a mut dyn SpeechProgressSink,
     ) -> Option<EngineFuture<'a, SpeechArtifact>> {
         None
+    }
+
+    fn synthesize_streaming_with_timeout<'a>(
+        &'a self,
+        request: &'a SpeechRequest,
+        sink: &'a mut dyn SpeechProgressSink,
+        _timeout: Duration,
+    ) -> Option<EngineFuture<'a, SpeechArtifact>> {
+        self.synthesize_streaming(request, sink)
     }
 
     fn identity(&self) -> TtsBackendIdentity;

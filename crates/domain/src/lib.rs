@@ -4,6 +4,7 @@
 
 mod context;
 mod control;
+mod deadline;
 mod error;
 mod event;
 mod interfaces;
@@ -20,6 +21,9 @@ pub use context::{
 pub use control::{
     AuthenticatedControl, AuthenticatedControlCommand, CONTROL_SECRET_LEN, ControlIngressError,
     ControlSecret, LocalControlIngress, OperatorCommandInput,
+};
+pub use deadline::{
+    DeadlineExhaustionReason, DeadlineStage, InteractionDeadline, InteractionDeadlineClass,
 };
 pub use error::DomainValidationError;
 pub use event::{

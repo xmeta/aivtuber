@@ -5,6 +5,7 @@
 //! Runtime instrumentation records bounded structured observations. Benchmark
 //! reports aggregate those observations without retaining prompt/generated text.
 
+use aivtuber_domain::{DeadlineExhaustionReason, DeadlineStage, InteractionDeadlineClass};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -84,6 +85,16 @@ pub struct EventObservation {
     pub routing_latency_us: u64,
     pub jev_latency_us: Option<u64>,
     pub generation_latency_us: Option<u64>,
+    pub generation_queue_wait_us: Option<u64>,
+    pub generation_provider_latency_us: Option<u64>,
+    pub generation_commit_delay_us: Option<u64>,
+    pub deadline_class: Option<InteractionDeadlineClass>,
+    pub deadline_budget_ms: Option<u64>,
+    pub deadline_remaining_at_route_ms: Option<u64>,
+    pub deadline_remaining_at_generation_ms: Option<u64>,
+    pub deadline_exhaustion_stage: Option<DeadlineStage>,
+    pub deadline_exhaustion_reason: Option<DeadlineExhaustionReason>,
+    pub intentional_conversational_delay_ms: u64,
     pub event_to_first_audio_ms: Option<u64>,
     pub event_to_first_visible_reaction_ms: Option<u64>,
     pub cache_level: Option<CacheLevel>,
@@ -112,6 +123,16 @@ impl EventObservation {
             routing_latency_us: 0,
             jev_latency_us: None,
             generation_latency_us: None,
+            generation_queue_wait_us: None,
+            generation_provider_latency_us: None,
+            generation_commit_delay_us: None,
+            deadline_class: None,
+            deadline_budget_ms: None,
+            deadline_remaining_at_route_ms: None,
+            deadline_remaining_at_generation_ms: None,
+            deadline_exhaustion_stage: None,
+            deadline_exhaustion_reason: None,
+            intentional_conversational_delay_ms: 0,
             event_to_first_audio_ms: None,
             event_to_first_visible_reaction_ms: None,
             cache_level: None,
@@ -199,6 +220,8 @@ pub struct BenchmarkSummary {
     pub operator_overrides: u64,
     pub cancellations: u64,
     pub fallback_counts: BTreeMap<String, u64>,
+    pub deadline_exhaustions_by_stage: BTreeMap<DeadlineStage, u64>,
+    pub deadline_exhaustions_by_class: BTreeMap<InteractionDeadlineClass, u64>,
     pub jev_attempts: u64,
     pub llm_calls: u64,
     pub tts_calls: u64,
@@ -403,6 +426,8 @@ fn summarize(events: &[EventObservation], stream_duration_ms: Option<u64>) -> Be
     let mut cache_hits_by_level = BTreeMap::new();
     let mut degraded_counts = BTreeMap::new();
     let mut fallback_counts = BTreeMap::new();
+    let mut deadline_exhaustions_by_stage = BTreeMap::new();
+    let mut deadline_exhaustions_by_class = BTreeMap::new();
     let mut cache_misses = 0_u64;
     let mut semantic_reuse_accepted = 0_u64;
     let mut semantic_reuse_rejected = 0_u64;
@@ -448,6 +473,12 @@ fn summarize(events: &[EventObservation], stream_duration_ms: Option<u64>) -> Be
         if let Some(reason) = &event.fallback_reason {
             *fallback_counts.entry(reason.clone()).or_insert(0) += 1;
         }
+        if let Some(stage) = event.deadline_exhaustion_stage {
+            *deadline_exhaustions_by_stage.entry(stage).or_insert(0) += 1;
+            if let Some(class) = event.deadline_class {
+                *deadline_exhaustions_by_class.entry(class).or_insert(0) += 1;
+            }
+        }
         jev_attempts += u64::from(event.jev_attempts);
         llm_calls += u64::from(event.llm_calls);
         tts_calls += u64::from(event.tts_calls);
@@ -482,6 +513,8 @@ fn summarize(events: &[EventObservation], stream_duration_ms: Option<u64>) -> Be
         operator_overrides,
         cancellations,
         fallback_counts,
+        deadline_exhaustions_by_stage,
+        deadline_exhaustions_by_class,
         jev_attempts,
         llm_calls,
         tts_calls,
@@ -754,6 +787,32 @@ mod tests {
         assert_eq!(
             report.summary.tts_avoidance_rate_vs_one_call_per_event,
             Some(1.0)
+        );
+    }
+
+    #[test]
+    fn deadline_exhaustions_are_aggregated_by_stage_and_class() {
+        let mode = ComparisonMode::FullGenerative;
+        let mut first = EventObservation::new("evt-deadline-1", mode, RouteClass::CachedFallback);
+        first.deadline_class = Some(InteractionDeadlineClass::Conversation);
+        first.deadline_exhaustion_stage = Some(DeadlineStage::GenerationQueue);
+        first.deadline_exhaustion_reason = Some(DeadlineExhaustionReason::InsufficientBudget);
+
+        let mut second = EventObservation::new("evt-deadline-2", mode, RouteClass::Silent);
+        second.deadline_class = Some(InteractionDeadlineClass::Conversation);
+        second.deadline_exhaustion_stage = Some(DeadlineStage::GenerationQueue);
+        second.deadline_exhaustion_reason = Some(DeadlineExhaustionReason::Expired);
+
+        let report = BenchmarkReport::from_events(metadata("fixture-a"), mode, vec![first, second])
+            .expect("report");
+
+        assert_eq!(
+            report.summary.deadline_exhaustions_by_stage[&DeadlineStage::GenerationQueue],
+            2
+        );
+        assert_eq!(
+            report.summary.deadline_exhaustions_by_class[&InteractionDeadlineClass::Conversation],
+            2
         );
     }
 

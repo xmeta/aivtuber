@@ -306,7 +306,23 @@ impl JevAdapter {
         &self,
         request: &ReflexRequest,
     ) -> Result<JevCallEvidence, JevCallFailure> {
-        self.evaluate_with_cancellation(request, &JevCancellationToken::default())
+        self.evaluate_with_cancellation_and_budget(
+            request,
+            &JevCancellationToken::default(),
+            self.config.deadline,
+        )
+    }
+
+    pub fn evaluate_evidence_with_budget(
+        &self,
+        request: &ReflexRequest,
+        remaining_budget: Duration,
+    ) -> Result<JevCallEvidence, JevCallFailure> {
+        self.evaluate_with_cancellation_and_budget(
+            request,
+            &JevCancellationToken::default(),
+            remaining_budget,
+        )
     }
 
     pub fn evaluate_with_cancellation(
@@ -314,8 +330,27 @@ impl JevAdapter {
         request: &ReflexRequest,
         cancellation: &JevCancellationToken,
     ) -> Result<JevCallEvidence, JevCallFailure> {
+        self.evaluate_with_cancellation_and_budget(request, cancellation, self.config.deadline)
+    }
+
+    pub fn evaluate_with_cancellation_and_budget(
+        &self,
+        request: &ReflexRequest,
+        cancellation: &JevCancellationToken,
+        remaining_budget: Duration,
+    ) -> Result<JevCallEvidence, JevCallFailure> {
         let started = Instant::now();
-        let deadline = started + self.config.deadline;
+        let effective_budget = self.config.deadline.min(remaining_budget);
+        if effective_budget.is_zero() {
+            return Err(JevCallFailure::new(
+                EngineErrorKind::Timeout,
+                "Jev has no remaining interaction budget",
+                &self.config.model_alias,
+                0,
+                started,
+            ));
+        }
+        let deadline = started + effective_budget;
         let body = self.build_request_body(request).map_err(|error| {
             JevCallFailure::new(
                 error.kind,
