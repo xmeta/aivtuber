@@ -8,7 +8,9 @@
 use aivtuber_asset_store::{AssetStore, AssetStoreError, PerformanceAsset};
 use aivtuber_domain::{EventEnvelope, SourceClass, TrustLevel};
 use aivtuber_runtime::{MemoryWriteDecision, MemoryWritePermit};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
 use std::fmt;
@@ -59,6 +61,68 @@ pub struct MemoryEntry {
     pub write_decision: MemoryGateDecision,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct ActorPseudonymizer {
+    key_version: String,
+    key: [u8; 32],
+}
+
+impl fmt::Debug for ActorPseudonymizer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ActorPseudonymizer")
+            .field("key_version", &self.key_version)
+            .field("key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl ActorPseudonymizer {
+    pub fn new(key_version: impl Into<String>, key: [u8; 32]) -> Result<Self, AdaptationError> {
+        let key_version = key_version.into();
+        if key_version.is_empty()
+            || key_version.len() > 64
+            || !key_version
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err(AdaptationError::InvalidConfiguration(
+                "pseudonym key_version must be 1..=64 bytes of [A-Za-z0-9._-]",
+            ));
+        }
+        if key.iter().all(|byte| *byte == 0) {
+            return Err(AdaptationError::InvalidConfiguration(
+                "pseudonym key must not be all zeroes",
+            ));
+        }
+        Ok(Self { key_version, key })
+    }
+
+    pub fn key_version(&self) -> &str {
+        &self.key_version
+    }
+
+    pub fn pseudonymize(&self, source_namespace: &str, actor_id: &str) -> String {
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(&self.key).expect("HMAC accepts 32-byte keys");
+        mac.update(b"aivtuber.actor-pseudonym.v1\0");
+        update_len_prefixed(&mut mac, self.key_version.as_bytes());
+        update_len_prefixed(&mut mac, source_namespace.as_bytes());
+        update_len_prefixed(&mut mac, actor_id.as_bytes());
+        let digest = mac.finalize().into_bytes();
+        let mut encoded = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            use std::fmt::Write as _;
+            write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        format!("actor:{}:{encoded}", self.key_version)
+    }
+}
+
+fn update_len_prefixed(mac: &mut Hmac<Sha256>, value: &[u8]) {
+    mac.update(&(value.len() as u64).to_be_bytes());
+    mac.update(value);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkingMemoryConfig {
     pub max_entries: usize,
@@ -67,7 +131,6 @@ pub struct WorkingMemoryConfig {
     pub max_claim_bytes: usize,
     pub max_topic_bytes: usize,
     pub max_compaction_records: usize,
-    pub pseudonym_salt: u64,
 }
 
 impl Default for WorkingMemoryConfig {
@@ -79,7 +142,6 @@ impl Default for WorkingMemoryConfig {
             max_claim_bytes: 1_024,
             max_topic_bytes: 128,
             max_compaction_records: 256,
-            pseudonym_salt: 0,
         }
     }
 }
@@ -103,6 +165,7 @@ pub struct WorkingMemoryRetentionMetrics {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryQuery<'a> {
+    pub source_namespace: Option<&'a str>,
     pub actor_id: Option<&'a str>,
     pub topic: Option<&'a str>,
     pub limit: usize,
@@ -111,6 +174,7 @@ pub struct MemoryQuery<'a> {
 #[derive(Debug, Clone)]
 pub struct WorkingMemory {
     config: WorkingMemoryConfig,
+    pseudonymizer: ActorPseudonymizer,
     entries: VecDeque<MemoryEntry>,
     compactions: Vec<MemoryCompactionRecord>,
     entries_high_water: usize,
@@ -119,7 +183,10 @@ pub struct WorkingMemory {
 }
 
 impl WorkingMemory {
-    pub fn new(config: WorkingMemoryConfig) -> Result<Self, AdaptationError> {
+    pub fn new(
+        config: WorkingMemoryConfig,
+        pseudonymizer: ActorPseudonymizer,
+    ) -> Result<Self, AdaptationError> {
         if config.max_entries == 0
             || config.working_ttl_ms == 0
             || config.durable_ttl_ms == 0
@@ -133,6 +200,7 @@ impl WorkingMemory {
         }
         Ok(Self {
             config,
+            pseudonymizer,
             entries: VecDeque::new(),
             compactions: Vec::new(),
             entries_high_water: 0,
@@ -201,7 +269,7 @@ impl WorkingMemory {
         let topic = bounded_optional(topic, self.config.max_topic_bytes, "memory topic")?;
         let actor = permit
             .actor_id()
-            .map(|actor| pseudonymous_actor(actor, self.config.pseudonym_salt));
+            .map(|actor| self.pseudonymizer.pseudonymize(permit.source(), actor));
         let ttl = self.config.durable_ttl_ms;
         let entry = MemoryEntry {
             source: MemorySourceMetadata {
@@ -254,8 +322,9 @@ impl WorkingMemory {
             return Vec::new();
         }
         let actor = query
-            .actor_id
-            .map(|actor| pseudonymous_actor(actor, self.config.pseudonym_salt));
+            .source_namespace
+            .zip(query.actor_id)
+            .map(|(source, actor)| self.pseudonymizer.pseudonymize(source, actor));
         let normalized_topic = query.topic.map(normalize);
 
         let mut ranked = self
@@ -310,7 +379,7 @@ impl WorkingMemory {
         let actor = event
             .actor_id
             .as_deref()
-            .map(|actor| pseudonymous_actor(actor, self.config.pseudonym_salt));
+            .map(|actor| self.pseudonymizer.pseudonymize(&event.source, actor));
         let ttl = match retention {
             RetentionClass::Working => self.config.working_ttl_ms,
             RetentionClass::Durable => self.config.durable_ttl_ms,
@@ -871,15 +940,6 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
     value[..end].to_owned()
 }
 
-fn pseudonymous_actor(actor_id: &str, salt: u64) -> String {
-    let mut hash = 0xcbf29ce484222325_u64 ^ salt;
-    for byte in actor_id.bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("actor:{hash:016x}")
-}
-
 #[derive(Debug)]
 pub enum AdaptationError {
     InvalidConfiguration(&'static str),
@@ -983,6 +1043,54 @@ mod tests {
         .expect("security runtime")
     }
 
+    fn test_pseudonymizer() -> ActorPseudonymizer {
+        ActorPseudonymizer::new("test-v1", [0x42; 32]).expect("test pseudonymizer")
+    }
+
+    fn test_memory(config: WorkingMemoryConfig) -> WorkingMemory {
+        WorkingMemory::new(config, test_pseudonymizer()).expect("working memory")
+    }
+
+    #[test]
+    fn keyed_actor_pseudonyms_are_deterministic_domain_separated_and_full_length() {
+        let pseudonymizer = ActorPseudonymizer::new("v7", [0x11; 32]).expect("pseudonymizer");
+        let first = pseudonymizer.pseudonymize("youtube.chat", "viewer-123");
+        let repeated = pseudonymizer.pseudonymize("youtube.chat", "viewer-123");
+        let other_source = pseudonymizer.pseudonymize("twitch.chat", "viewer-123");
+
+        assert_eq!(first, repeated);
+        assert_ne!(first, other_source);
+        assert!(first.starts_with("actor:v7:"));
+        assert_eq!(first.len(), "actor:v7:".len() + 64);
+    }
+
+    #[test]
+    fn pseudonym_key_and_version_rotation_break_historical_linkability() {
+        let v1 = ActorPseudonymizer::new("v1", [0x21; 32]).expect("v1");
+        let rotated_key = ActorPseudonymizer::new("v1", [0x22; 32]).expect("rotated key");
+        let v2 = ActorPseudonymizer::new("v2", [0x21; 32]).expect("v2");
+        let baseline = v1.pseudonymize("public-chat", "viewer-a");
+
+        assert_ne!(
+            baseline,
+            rotated_key.pseudonymize("public-chat", "viewer-a")
+        );
+        assert_ne!(baseline, v2.pseudonymize("public-chat", "viewer-a"));
+        assert!(
+            v2.pseudonymize("public-chat", "viewer-a")
+                .starts_with("actor:v2:")
+        );
+    }
+
+    #[test]
+    fn pseudonym_key_is_required_nonzero_and_redacted_from_debug() {
+        assert!(ActorPseudonymizer::new("v1", [0; 32]).is_err());
+        let pseudonymizer = ActorPseudonymizer::new("v1", [0xab; 32]).expect("pseudonymizer");
+        let debug = format!("{pseudonymizer:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("abababab"));
+    }
+
     fn generated_fixture() -> PerformanceAsset {
         load_asset_file(
             Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1028,14 +1136,13 @@ mod tests {
 
     #[test]
     fn retained_adaptation_state_plateaus_under_logical_churn() {
-        let mut memory = WorkingMemory::new(WorkingMemoryConfig {
+        let mut memory = test_memory(WorkingMemoryConfig {
             max_entries: 2,
             working_ttl_ms: 10_000,
             durable_ttl_ms: 10_000,
             max_compaction_records: 3,
             ..WorkingMemoryConfig::default()
-        })
-        .expect("bounded working memory");
+        });
         let chat = event(
             "evt-retention",
             SourceClass::PublicChat,
@@ -1100,14 +1207,12 @@ mod tests {
         assert_eq!(decision, MemoryWriteDecision::Denied);
         assert!(permit.is_none());
 
-        let mut memory = WorkingMemory::new(WorkingMemoryConfig {
+        let mut memory = test_memory(WorkingMemoryConfig {
             max_entries: 2,
             working_ttl_ms: 100,
             durable_ttl_ms: 1_000,
-            pseudonym_salt: 99,
             ..WorkingMemoryConfig::default()
-        })
-        .expect("working memory");
+        });
         let stored = memory
             .remember_working(&chat, "  Likes   Rust  ", Some(" Coding "), 10)
             .expect("working entry");
@@ -1119,6 +1224,15 @@ mod tests {
             stored.source.pseudonymous_actor_id.as_deref(),
             Some("viewer-real-id")
         );
+        assert!(
+            stored
+                .source
+                .pseudonymous_actor_id
+                .as_deref()
+                .is_some_and(|value| value.starts_with("actor:test-v1:"))
+        );
+        let serialized = serde_json::to_string(stored).expect("serialize memory entry");
+        assert!(!serialized.contains("viewer-real-id"));
         assert_eq!(stored.expires_at_ms, 110);
 
         let compacted = memory.compact(110);
@@ -1134,13 +1248,12 @@ mod tests {
         assert_eq!(decision, MemoryWriteDecision::AllowedSystemSource);
         let permit = permit.expect("system permit");
 
-        let mut memory = WorkingMemory::new(WorkingMemoryConfig {
+        let mut memory = test_memory(WorkingMemoryConfig {
             max_entries: 4,
             working_ttl_ms: 100,
             durable_ttl_ms: 1_000,
             ..WorkingMemoryConfig::default()
-        })
-        .expect("working memory");
+        });
         let stored = memory
             .remember_durable(&permit, "stream is healthy", Some("health"), 50)
             .expect("durable entry");
@@ -1163,8 +1276,8 @@ mod tests {
             durable_ttl_ms: 20_000,
             ..WorkingMemoryConfig::default()
         };
-        let mut first = WorkingMemory::new(config).expect("memory");
-        let mut second = WorkingMemory::new(config).expect("memory");
+        let mut first = test_memory(config);
+        let mut second = test_memory(config);
 
         for memory in [&mut first, &mut second] {
             for index in 1..=3 {
@@ -1202,11 +1315,9 @@ mod tests {
 
     #[test]
     fn viewer_and_topic_relevance_is_deterministic_without_raw_actor_identity() {
-        let mut memory = WorkingMemory::new(WorkingMemoryConfig {
-            pseudonym_salt: 7,
+        let mut memory = test_memory(WorkingMemoryConfig {
             ..WorkingMemoryConfig::default()
-        })
-        .expect("memory");
+        });
         let a = event(
             "evt-a",
             SourceClass::PublicChat,
@@ -1228,6 +1339,7 @@ mod tests {
 
         let result = memory.relevant(
             MemoryQuery {
+                source_namespace: Some("public-chat"),
                 actor_id: Some("viewer-a"),
                 topic: Some("coding"),
                 limit: 2,

@@ -1,5 +1,5 @@
 use crate::HardeningError;
-use aivtuber_adaptation::{WorkingMemory, WorkingMemoryConfig};
+use aivtuber_adaptation::{ActorPseudonymizer, WorkingMemory, WorkingMemoryConfig};
 use aivtuber_asset_store::{
     AssetStore, HotCacheConfig, PerformanceAsset, RuntimeCompatibility, load_asset_file,
 };
@@ -173,12 +173,16 @@ pub fn run_core_soak(
         None,
     )
     .map_err(|error| HardeningError::Runtime(error.to_string()))?;
-    let mut memory = WorkingMemory::new(WorkingMemoryConfig {
-        max_entries: config.working_memory_limit,
-        working_ttl_ms: config.logical_duration_ms().saturating_add(1),
-        max_compaction_records: config.memory_compaction_limit,
-        ..WorkingMemoryConfig::default()
-    })
+    let mut memory = WorkingMemory::new(
+        WorkingMemoryConfig {
+            max_entries: config.working_memory_limit,
+            working_ttl_ms: config.logical_duration_ms().saturating_add(1),
+            max_compaction_records: config.memory_compaction_limit,
+            ..WorkingMemoryConfig::default()
+        },
+        ActorPseudonymizer::new("hardening-test-v1", [0x24; 32])
+            .map_err(|error| HardeningError::Adaptation(error.to_string()))?,
+    )
     .map_err(|error| HardeningError::Adaptation(error.to_string()))?;
     let mut telemetry = TelemetryCollector::with_retention(TelemetryRetentionConfig {
         max_events: config.telemetry_limit,

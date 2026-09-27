@@ -1,4 +1,6 @@
-use aivtuber_adaptation::{AdaptationEngine, PromotionPolicy, WorkingMemory, WorkingMemoryConfig};
+use aivtuber_adaptation::{
+    ActorPseudonymizer, AdaptationEngine, PromotionPolicy, WorkingMemory, WorkingMemoryConfig,
+};
 use aivtuber_adapters::{
     NormalizedHttpTtsAdapter, NormalizedHttpTtsConfig, ObsWebSocketAdapter, ObsWebSocketConfig,
     OpenAiResponsesAdapter, OpenAiResponsesConfig, ProcessAudioConfig, ProcessAudioPlayer,
@@ -361,10 +363,14 @@ fn build_adaptation_runtime(
         durable_ttl_ms: env_u64("AIVTUBER_MEMORY_DURABLE_TTL_MS", 24 * 60 * 60 * 1_000)?,
         max_claim_bytes: env_usize("AIVTUBER_MEMORY_MAX_CLAIM_BYTES", 1_024)?,
         max_topic_bytes: env_usize("AIVTUBER_MEMORY_MAX_TOPIC_BYTES", 128)?,
-        pseudonym_salt: env_u64("AIVTUBER_MEMORY_PSEUDONYM_SALT", seed)?,
         ..WorkingMemoryConfig::default()
     });
-    let memory = WorkingMemory::new(memory_config)?;
+    let pseudonym_key = fixed_hex_key("AIVTUBER_MEMORY_PSEUDONYM_KEY_HEX")?;
+    let pseudonymizer = ActorPseudonymizer::new(
+        env_string("AIVTUBER_MEMORY_PSEUDONYM_KEY_VERSION", "v1"),
+        pseudonym_key,
+    )?;
+    let memory = WorkingMemory::new(memory_config, pseudonymizer)?;
     let engine = AdaptationEngine::with_retention(
         PromotionPolicy {
             min_uses: env_u64("AIVTUBER_PROMOTION_MIN_USES", 3)?,
@@ -436,6 +442,34 @@ fn runtime_avatar_authority() -> Result<aivtuber_domain::AuthenticatedControl, B
         &secret,
     )?;
     Ok(command.authority().clone())
+}
+
+fn fixed_hex_key(name: &str) -> Result<[u8; 32], Box<dyn Error>> {
+    let value = env::var(name).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} is required for actor pseudonymization"),
+        )
+    })?;
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must contain exactly 64 hexadecimal characters"),
+        )
+        .into());
+    }
+
+    let mut key = [0_u8; 32];
+    for (index, slot) in key.iter_mut().enumerate() {
+        let offset = index * 2;
+        *slot = u8::from_str_radix(&value[offset..offset + 2], 16).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name} contains invalid hexadecimal key material: {error}"),
+            )
+        })?;
+    }
+    Ok(key)
 }
 
 fn fixed_control_secret(name: &str) -> Result<[u8; 32], Box<dyn Error>> {

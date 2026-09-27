@@ -58,7 +58,7 @@ OBS remains an independent control adapter. Its availability never owns schedule
 * Every attempted LLM call is retained in the production audit with source event id, deterministic routing reason, and provider/model identity; prompt and generated reply text are excluded.
 * Only complete, validated, runtime-compatible generated assets enter +AssetStore::insert_hot+; partial text/audio never reaches reusable asset or scheduler state.
 * Generated assets are scheduled by the same +CachedPerformer+ / +Scheduler+ instance as cached assets, preserving one monotonic timeline for audio/visemes/avatar commands.
-* Working memory is explicitly bounded by entry count, TTL, claim bytes, and topic bytes; raw viewer actor ids are replaced with deterministic pseudonyms before storage.
+* Working memory is explicitly bounded by entry count, TTL, claim bytes, and topic bytes; raw viewer actor ids are replaced before storage with source-namespaced HMAC-SHA-256 pseudonyms under a deployment-only key.
 * Durable memory writes require a non-serializable +MemoryWritePermit+ from +SecurityRuntime::authorize_memory_write+; public chat without that gate cannot become durable memory.
 * Generated-asset promotion is explicit and deterministic: production records generated use, accepts quality labels separately, and only +apply_generated_asset_adaptation+ can promote or invalidate through the validated AssetStore path.
 * Higher-priority generation cancellation uses the scheduler's shared +priority_for_event+ mapping.
@@ -75,8 +75,13 @@ Run the daemon from the repository root:
 
 [source,shell]
 ----
+export AIVTUBER_MEMORY_PSEUDONYM_KEY_HEX='<64 hex characters / 32 random bytes>'
+# Optional non-secret rotation label; default is v1.
+export AIVTUBER_MEMORY_PSEUDONYM_KEY_VERSION='v1'
 cargo run -p aivtuber-app
 ----
+
+The actor pseudonymization key is mandatory for the production composition root and is independent of the operator-control secret. Generate and store it as deployment secret material; do not place it in fixtures, replay metadata, logs, or model context. Rotating key/version intentionally breaks historical actor correlation unless records are explicitly migrated.
 
 The process reads one Event Envelope JSON document per stdin line. Raw stdin is bounded before `SecurityRuntime`: the pre-runtime channel uses `sync_channel` with capacity equal to `SecurityRuntimeConfig::content_queue_limit`, and the line reader retains at most `max_envelope_bytes + 1` bytes while determining whether a record is oversized. An oversized record is drained through its newline and dropped; a record arriving while the raw queue is full is also dropped rather than blocking the reader. Both outcomes are exposed through `RawIngressMetricsSnapshot` and reported by the executable. Valid records retain input order.
 
