@@ -87,12 +87,18 @@ mod tests {
     }
 
     #[test]
-    fn logical_soak_detects_lifetime_growth_and_bounded_working_state() {
+    fn logical_soak_retained_state_plateaus_at_configured_limits() {
         let config = SoakConfig {
             logical_events: 2_000,
             event_interval_ms: 50,
             ingress_queue_limit: 16,
+            scheduler_history_limit: 64,
+            audit_limit: 64,
+            telemetry_limit: 64,
             working_memory_limit: 32,
+            memory_compaction_limit: 16,
+            generated_asset_limit: 16,
+            promotion_metadata_limit: 16,
             generated_asset_every: 25,
         };
         let report = run_core_soak(
@@ -102,27 +108,52 @@ mod tests {
         .expect("soak");
 
         assert_eq!(report.final_state.scheduler_active, 0);
-        assert!(report.final_state.scheduler_cancelled >= 200);
-        assert!(report.final_state.scheduler_completed >= 1_700);
-        assert_eq!(report.final_state.content_queue, 0);
-        assert!(report.final_state.working_memory_entries <= config.working_memory_limit);
-        // Issue #52: live scheduler items no longer grow with lifetime event
-        // count - terminal items retire into bounded history, so the soak
-        // probe must find NO lifetime growth in scheduler_items.
-        assert!(report.finding("scheduler_items").is_some_and(|finding| {
-            !finding.lifetime_growth_detected && finding.related_issue == Some(52)
-        }));
-        assert!(report.finding("telemetry_events").is_some_and(|finding| {
-            finding.lifetime_growth_detected && finding.related_issue == Some(51)
-        }));
-        assert!(report.finding("hot_assets").is_some_and(
-            |finding| finding.lifetime_growth_detected && finding.related_issue == Some(53)
-        ));
-        assert!(
-            report
-                .finding("working_memory_entries")
-                .is_some_and(|finding| !finding.configured_limit_exceeded)
+        assert_eq!(
+            report.final_state.scheduler_history,
+            config.scheduler_history_limit
         );
+        assert_eq!(report.final_state.scheduler_cooldowns, 0);
+        assert_eq!(report.final_state.content_queue, 0);
+        assert_eq!(report.final_state.audit_records, config.audit_limit);
+        assert_eq!(report.final_state.rate_limit_sources, 1);
+        assert_eq!(
+            report.final_state.working_memory_entries,
+            config.working_memory_limit
+        );
+        assert_eq!(
+            report.final_state.memory_compaction_records,
+            config.memory_compaction_limit
+        );
+        assert_eq!(report.final_state.telemetry_events, config.telemetry_limit);
+        assert_eq!(report.final_state.hot_assets, config.generated_asset_limit);
+        assert_eq!(
+            report.final_state.promotion_metadata,
+            config.promotion_metadata_limit
+        );
+
+        for metric in [
+            "scheduler_items",
+            "scheduler_history",
+            "scheduler_cooldowns",
+            "content_queue",
+            "audit_records",
+            "rate_limit_sources",
+            "working_memory_entries",
+            "memory_compaction_records",
+            "telemetry_events",
+            "hot_assets",
+            "promotion_metadata",
+        ] {
+            let finding = report.finding(metric).expect("soak finding");
+            assert!(
+                !finding.lifetime_growth_detected,
+                "{metric} must plateau after warm-up: {finding:?}"
+            );
+            assert!(
+                !finding.configured_limit_exceeded,
+                "{metric} must stay within its configured bound: {finding:?}"
+            );
+        }
         assert_eq!(report.metadata.dataset_id, "hardening-unit-soak");
     }
 }

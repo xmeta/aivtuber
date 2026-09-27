@@ -7,8 +7,8 @@ use aivtuber_adapters::{
 use aivtuber_app::{
     AdaptationRuntime, AdapterHealth, AvatarOutput, GenerativeRuntime, IntentRoutePlanner,
     NoopAvatarOutput, NoopStreamOutput, ObsStreamOutput, ProductionApp, RawIngressConfig,
-    RawIngressMetrics, RawIngressMetricsSnapshot, StreamOutput, VtsAvatarOutput, VtsPlaybackConfig,
-    pump_bounded_records,
+    RawIngressMetrics, RawIngressMetricsSnapshot, RuntimeRetentionPolicy, StreamOutput,
+    VtsAvatarOutput, VtsPlaybackConfig, pump_bounded_records,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
@@ -54,15 +54,18 @@ fn run() -> Result<(), Box<dyn Error>> {
             .or_else(|| Some("starter-v1".to_owned())),
     };
 
-    let generative = build_generative_runtime(&compatibility)?;
-    let adaptation = build_adaptation_runtime()?;
-    let scheduler_config = SchedulerConfig::default();
-    let security_config = SecurityRuntimeConfig::default();
+    let retention = build_runtime_retention_policy()?;
+    let generative = build_generative_runtime(&compatibility, retention)?;
+    let adaptation = build_adaptation_runtime(retention)?;
+    let scheduler_config = retention.scheduler_config(SchedulerConfig::default());
+    let security_config = retention.security_config(SecurityRuntimeConfig::default());
     let raw_ingress_config = RawIngressConfig::from_security(security_config)?;
+    let mut assets = AssetStore::new(descriptors, compatibility);
+    assets.set_hot_cache_config(retention.hot_cache_config());
     let performer = CachedPerformer::new(
-        AssetStore::new(descriptors, compatibility),
+        assets,
         Scheduler::new(scheduler_config),
-        CachedPlaybackConfig::default(),
+        retention.cached_playback_config(CachedPlaybackConfig::default()),
     );
     let security = SecurityRuntime::new(
         security_config,
@@ -94,7 +97,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         stream,
         max_lateness_ms,
     )
-    .with_adaptation(adaptation);
+    .with_adaptation(adaptation)
+    .with_telemetry_retention(retention.telemetry_config());
     if let Some(generative) = generative {
         app = app.with_generation(generative);
     }
@@ -200,8 +204,94 @@ fn report_raw_ingress_metrics(
     *previous = current;
 }
 
+fn build_runtime_retention_policy() -> Result<RuntimeRetentionPolicy, Box<dyn Error>> {
+    let defaults = RuntimeRetentionPolicy::default();
+    let policy = RuntimeRetentionPolicy {
+        max_telemetry_events: env_usize(
+            "AIVTUBER_RETENTION_MAX_TELEMETRY_EVENTS",
+            defaults.max_telemetry_events,
+        )?,
+        max_audit_records: env_usize(
+            "AIVTUBER_RETENTION_MAX_AUDIT_RECORDS",
+            defaults.max_audit_records,
+        )?,
+        max_rate_limit_sources: env_usize(
+            "AIVTUBER_RETENTION_MAX_RATE_LIMIT_SOURCES",
+            defaults.max_rate_limit_sources,
+        )?,
+        rate_limit_source_ttl_ms: env_u64(
+            "AIVTUBER_RETENTION_RATE_LIMIT_SOURCE_TTL_MS",
+            defaults.rate_limit_source_ttl_ms,
+        )?,
+        max_scheduler_history: env_usize(
+            "AIVTUBER_RETENTION_MAX_SCHEDULER_HISTORY",
+            defaults.max_scheduler_history,
+        )?,
+        max_hot_generated_assets: env_usize(
+            "AIVTUBER_RETENTION_MAX_HOT_GENERATED_ASSETS",
+            defaults.max_hot_generated_assets,
+        )?,
+        max_hot_generated_bytes: env_usize(
+            "AIVTUBER_RETENTION_MAX_HOT_GENERATED_BYTES",
+            defaults.max_hot_generated_bytes,
+        )?,
+        max_promotion_metadata: env_usize(
+            "AIVTUBER_RETENTION_MAX_PROMOTION_METADATA",
+            defaults.max_promotion_metadata,
+        )?,
+        max_cached_variant_groups: env_usize(
+            "AIVTUBER_RETENTION_MAX_CACHED_VARIANT_GROUPS",
+            defaults.max_cached_variant_groups,
+        )?,
+        max_working_memory_entries: env_usize(
+            "AIVTUBER_MEMORY_MAX_ENTRIES",
+            defaults.max_working_memory_entries,
+        )?,
+        max_memory_compaction_records: env_usize(
+            "AIVTUBER_MEMORY_MAX_COMPACTION_RECORDS",
+            defaults.max_memory_compaction_records,
+        )?,
+        max_adaptation_feedback_assets: env_usize(
+            "AIVTUBER_RETENTION_MAX_ADAPTATION_FEEDBACK_ASSETS",
+            defaults.max_adaptation_feedback_assets,
+        )?,
+        max_adaptation_recent_groups: env_usize(
+            "AIVTUBER_RETENTION_MAX_ADAPTATION_RECENT_GROUPS",
+            defaults.max_adaptation_recent_groups,
+        )?,
+        max_adaptation_decisions: env_usize(
+            "AIVTUBER_RETENTION_MAX_ADAPTATION_DECISIONS",
+            defaults.max_adaptation_decisions,
+        )?,
+        generation_queue_capacity: env_usize(
+            "AIVTUBER_RETENTION_GENERATION_QUEUE_CAPACITY",
+            defaults.generation_queue_capacity,
+        )?,
+    };
+    if policy.max_telemetry_events == 0
+        || policy.max_audit_records == 0
+        || policy.max_rate_limit_sources == 0
+        || policy.rate_limit_source_ttl_ms == 0
+        || policy.max_scheduler_history == 0
+        || policy.max_hot_generated_assets == 0
+        || policy.max_hot_generated_bytes == 0
+        || policy.max_promotion_metadata == 0
+        || policy.max_cached_variant_groups == 0
+        || policy.max_working_memory_entries == 0
+        || policy.max_memory_compaction_records == 0
+        || policy.max_adaptation_feedback_assets == 0
+        || policy.max_adaptation_recent_groups == 0
+        || policy.max_adaptation_decisions == 0
+        || policy.generation_queue_capacity == 0
+    {
+        return Err(io::Error::other("runtime retention limits must be positive").into());
+    }
+    Ok(policy)
+}
+
 fn build_generative_runtime(
     compatibility: &RuntimeCompatibility,
+    retention: RuntimeRetentionPolicy,
 ) -> Result<Option<GenerativeRuntime>, Box<dyn Error>> {
     if !env_bool("AIVTUBER_GENERATIVE_ENABLED", false)? {
         return Ok(None);
@@ -255,24 +345,27 @@ fn build_generative_runtime(
         expression_intensity: 0.4,
     })?;
 
-    Ok(Some(GenerativeRuntime::new(GenerativePipeline::new(
-        Arc::new(thinking),
-        Arc::new(tts),
-        compiler,
-    ))))
+    let pipeline = GenerativePipeline::new(Arc::new(thinking), Arc::new(tts), compiler);
+    let runtime =
+        GenerativeRuntime::with_execution_config(pipeline, retention.generation_execution_config())
+            .map_err(io::Error::other)?;
+    Ok(Some(runtime))
 }
 
-fn build_adaptation_runtime() -> Result<AdaptationRuntime, Box<dyn Error>> {
+fn build_adaptation_runtime(
+    retention: RuntimeRetentionPolicy,
+) -> Result<AdaptationRuntime, Box<dyn Error>> {
     let seed = env_u64("AIVTUBER_ADAPTATION_SEED", 0)?;
-    let memory = WorkingMemory::new(WorkingMemoryConfig {
-        max_entries: env_usize("AIVTUBER_MEMORY_MAX_ENTRIES", 256)?,
+    let memory_config = retention.working_memory_config(WorkingMemoryConfig {
         working_ttl_ms: env_u64("AIVTUBER_MEMORY_WORKING_TTL_MS", 15 * 60 * 1_000)?,
         durable_ttl_ms: env_u64("AIVTUBER_MEMORY_DURABLE_TTL_MS", 24 * 60 * 60 * 1_000)?,
         max_claim_bytes: env_usize("AIVTUBER_MEMORY_MAX_CLAIM_BYTES", 1_024)?,
         max_topic_bytes: env_usize("AIVTUBER_MEMORY_MAX_TOPIC_BYTES", 128)?,
         pseudonym_salt: env_u64("AIVTUBER_MEMORY_PSEUDONYM_SALT", seed)?,
-    })?;
-    let engine = AdaptationEngine::new(
+        ..WorkingMemoryConfig::default()
+    });
+    let memory = WorkingMemory::new(memory_config)?;
+    let engine = AdaptationEngine::with_retention(
         PromotionPolicy {
             min_uses: env_u64("AIVTUBER_PROMOTION_MIN_USES", 3)?,
             min_quality_labels: env_u64("AIVTUBER_PROMOTION_MIN_QUALITY_LABELS", 2)?,
@@ -285,6 +378,7 @@ fn build_adaptation_runtime() -> Result<AdaptationRuntime, Box<dyn Error>> {
         },
         env_string("AIVTUBER_ADAPTATION_POLICY_VERSION", "adaptation-v1"),
         seed,
+        retention.adaptation_config(),
     )?;
     Ok(AdaptationRuntime::new(memory, engine))
 }

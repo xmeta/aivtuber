@@ -3,12 +3,14 @@
 mod deadline;
 mod outputs;
 mod raw_ingress;
+mod retention;
 mod routing;
 mod semantic;
 
 pub use deadline::*;
 pub use outputs::*;
 pub use raw_ingress::*;
+pub use retention::*;
 pub use routing::*;
 pub use semantic::*;
 
@@ -35,7 +37,8 @@ use aivtuber_runtime::{
 };
 use aivtuber_scheduler::{Scheduler, Status};
 use aivtuber_telemetry::{
-    CacheLevel, ComparisonMode, DegradedSubsystem, EventObservation, RouteClass, TelemetryCollector,
+    CacheLevel, ComparisonMode, DegradedSubsystem, EventObservation, RouteClass,
+    TelemetryCollector, TelemetryRetentionConfig,
 };
 use std::error::Error;
 use std::fmt;
@@ -726,6 +729,11 @@ where
         self
     }
 
+    pub fn with_telemetry_retention(mut self, retention: TelemetryRetentionConfig) -> Self {
+        self.telemetry.set_retention(retention);
+        self
+    }
+
     pub fn adaptation(&self) -> Option<&AdaptationRuntime> {
         self.adaptation.as_ref()
     }
@@ -824,6 +832,28 @@ where
         self.generative
             .as_ref()
             .map(GenerativeRuntime::execution_snapshot)
+    }
+
+    pub fn retention_snapshot(&self) -> RuntimeRetentionSnapshot {
+        RuntimeRetentionSnapshot {
+            telemetry: self.telemetry.retention_metrics(),
+            security: self.security.retention_metrics(),
+            scheduler: self.performer.scheduler().metrics(),
+            hot_cache: self.performer.assets().hot_cache_metrics(),
+            cached_playback: self.performer.retention_metrics(),
+            working_memory: self
+                .adaptation
+                .as_ref()
+                .map(|adaptation| adaptation.memory.retention_metrics()),
+            adaptation: self
+                .adaptation
+                .as_ref()
+                .map(|adaptation| adaptation.engine.retention_metrics()),
+            generation: self
+                .generative
+                .as_ref()
+                .map(GenerativeRuntime::execution_snapshot),
+        }
     }
 
     pub fn startup(&mut self) -> Result<FastPathPreloadReport, AppError> {
@@ -2516,6 +2546,7 @@ mod tests {
             }),
             CachedPlaybackConfig {
                 recent_variant_window: 1,
+                ..CachedPlaybackConfig::default()
             },
         )
     }
@@ -2649,6 +2680,7 @@ mod tests {
                 max_claim_bytes: 128,
                 max_topic_bytes: 64,
                 pseudonym_salt: 7,
+                ..WorkingMemoryConfig::default()
             })
             .expect("working memory"),
             AdaptationEngine::new(policy, "test-adaptation-v1", 42).expect("adaptation engine"),
@@ -2893,6 +2925,7 @@ mod tests {
             }),
             CachedPlaybackConfig {
                 recent_variant_window: 1,
+                ..CachedPlaybackConfig::default()
             },
         );
         let security = SecurityRuntime::new(
@@ -3624,6 +3657,68 @@ mod tests {
         assert_eq!(settled.pending, 0);
         assert_eq!(settled.in_flight, 0);
         assert!(settled.cancelled_or_stale >= 1);
+    }
+
+    #[test]
+    fn generation_and_telemetry_retention_plateau_under_saturation_churn() {
+        let gate = Arc::new(BlockingGate::default());
+        let runtime = generative_runtime_with_config(
+            BlockingThinking {
+                gate: Arc::clone(&gate),
+                reply: "bounded generation".to_owned(),
+            },
+            MockTts::default(),
+            GenerationExecutionConfig { queue_capacity: 1 },
+        );
+        let mut app = app(
+            FixedGenerateRoute {
+                reply_context: ReflexContext::default(),
+                fallback_variant_group: Some("reaction.missing".to_owned()),
+            },
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        )
+        .with_generation(runtime)
+        .with_telemetry_retention(TelemetryRetentionConfig { max_events: 32 });
+        app.startup().expect("startup");
+
+        let first = serde_json::to_vec(&chat_event(200)).expect("first event");
+        app.process_content_bytes(&first, 0, 200)
+            .expect("blocked generation submission");
+        gate.wait_until_entered();
+
+        for sequence in 201_u64..400 {
+            let raw = serde_json::to_vec(&chat_event(sequence)).expect("churn event");
+            let outcome = app
+                .process_content_bytes(&raw, (sequence - 200) * 100, sequence)
+                .expect("bounded saturation fallback");
+            assert!(outcome.playback.is_none());
+        }
+
+        let saturated = app.retention_snapshot();
+        let generation = saturated.generation.expect("generation retention");
+        assert_eq!(generation.in_flight, 1);
+        assert_eq!(generation.pending, 1);
+        assert_eq!(generation.in_flight_high_water, 1);
+        assert_eq!(generation.pending_high_water, 1);
+        assert_eq!(generation.saturated, 198);
+        assert_eq!(saturated.telemetry.retained, 32);
+        assert_eq!(saturated.telemetry.high_water, 32);
+        assert!(saturated.telemetry.evicted > 100);
+
+        gate.release();
+        wait_for_generation_completion(&mut app, 20_000);
+
+        let settled = app.retention_snapshot();
+        let generation = settled.generation.expect("settled generation retention");
+        assert_eq!(generation.in_flight, 0);
+        assert_eq!(generation.pending, 0);
+        assert_eq!(generation.in_flight_high_water, 1);
+        assert_eq!(generation.pending_high_water, 1);
+        assert!(generation.cancelled_or_stale >= 1);
+        assert_eq!(settled.telemetry.retained, 32);
+        assert_eq!(settled.telemetry.high_water, 32);
     }
 
     #[test]

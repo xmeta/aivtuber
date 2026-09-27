@@ -853,6 +853,8 @@ pub struct HotCacheConfig {
     /// Optional estimated-byte budget for generated/dynamic assets. A single
     /// asset larger than the budget still resides (capacity of one floor).
     pub max_dynamic_bytes: usize,
+    /// Maximum lightweight promotion records retained after full-asset eviction.
+    pub max_promotion_metadata: usize,
 }
 
 impl Default for HotCacheConfig {
@@ -860,6 +862,7 @@ impl Default for HotCacheConfig {
         Self {
             max_dynamic_assets: 1024,
             max_dynamic_bytes: usize::MAX,
+            max_promotion_metadata: 4_096,
         }
     }
 }
@@ -873,6 +876,9 @@ pub struct HotCacheMetrics {
     pub hits: u64,
     pub misses: u64,
     pub evictions: u64,
+    pub promotion_metadata_retained: usize,
+    pub promotion_metadata_high_water: usize,
+    pub promotion_metadata_evictions: u64,
 }
 
 /// Lightweight promotion/adaptation metadata that survives full-asset
@@ -911,6 +917,8 @@ pub struct AssetStore {
     hot_usage: BTreeMap<String, HotUsage>,
     /// Promotion metadata that survives eviction (#39/#53).
     promotion_metadata: BTreeMap<String, PromotionMetadata>,
+    promotion_metadata_high_water: usize,
+    promotion_metadata_evictions: u64,
     hot_hits: u64,
     hot_misses: u64,
     hot_evictions: u64,
@@ -928,6 +936,8 @@ impl AssetStore {
             hot_config: HotCacheConfig::default(),
             hot_usage: BTreeMap::new(),
             promotion_metadata: BTreeMap::new(),
+            promotion_metadata_high_water: 0,
+            promotion_metadata_evictions: 0,
             hot_hits: 0,
             hot_misses: 0,
             hot_evictions: 0,
@@ -953,6 +963,7 @@ impl AssetStore {
     pub fn set_hot_cache_config(&mut self, config: HotCacheConfig) {
         self.hot_config = config;
         self.evict_dynamic_to_capacity();
+        self.evict_promotion_metadata_to_capacity();
     }
 
     /// Cache occupancy and hit/miss/eviction counters.
@@ -977,6 +988,9 @@ impl AssetStore {
             hits: self.hot_hits,
             misses: self.hot_misses,
             evictions: self.hot_evictions,
+            promotion_metadata_retained: self.promotion_metadata.len(),
+            promotion_metadata_high_water: self.promotion_metadata_high_water,
+            promotion_metadata_evictions: self.promotion_metadata_evictions,
         }
     }
 
@@ -989,16 +1003,40 @@ impl AssetStore {
         usage.use_tick = tick;
         usage.note_count = usage.note_count.saturating_add(1);
         usage.last_used_at_ms = Some(at_ms);
-        let metadata = self.promotion_metadata.entry(id.to_owned()).or_default();
-        metadata.id = id.to_owned();
-        metadata.use_count = metadata.use_count.saturating_add(1);
-        metadata.last_used_at_ms = Some(at_ms);
+        {
+            let metadata = self.promotion_metadata.entry(id.to_owned()).or_default();
+            metadata.id = id.to_owned();
+            metadata.use_count = metadata.use_count.saturating_add(1);
+            metadata.last_used_at_ms = Some(at_ms);
+        }
+        self.evict_promotion_metadata_to_capacity();
+        self.promotion_metadata_high_water = self
+            .promotion_metadata_high_water
+            .max(self.promotion_metadata.len());
     }
 
     /// Lightweight promotion/adaptation metadata, independent of full hot
     /// asset retention (survives eviction; issue #39/#53).
     pub fn promotion_metadata(&self, id: &str) -> Option<&PromotionMetadata> {
         self.promotion_metadata.get(id)
+    }
+
+    fn evict_promotion_metadata_to_capacity(&mut self) {
+        while self.promotion_metadata.len() > self.hot_config.max_promotion_metadata {
+            let victim = self
+                .promotion_metadata
+                .iter()
+                .min_by(|(left_id, left), (right_id, right)| {
+                    left.last_used_at_ms
+                        .unwrap_or(0)
+                        .cmp(&right.last_used_at_ms.unwrap_or(0))
+                        .then_with(|| left_id.cmp(right_id))
+                })
+                .map(|(id, _)| id.clone())
+                .expect("promotion metadata exists while above capacity");
+            self.promotion_metadata.remove(&victim);
+            self.promotion_metadata_evictions = self.promotion_metadata_evictions.saturating_add(1);
+        }
     }
 
     /// Deterministically evict the least-recently-used dynamic assets until
@@ -1959,6 +1997,34 @@ mod tests {
     }
 
     #[test]
+    fn promotion_metadata_plateaus_after_full_asset_eviction() {
+        let dir = TestDir::new("bounded-promotion-metadata");
+        let mut store = AssetStore::new(dir.path(), generated_runtime());
+        store.set_hot_cache_config(HotCacheConfig {
+            max_dynamic_assets: 1,
+            max_promotion_metadata: 3,
+            ..HotCacheConfig::default()
+        });
+
+        for index in 0_u64..10 {
+            let id = format!("dynamic.metadata.{index:02}");
+            store
+                .insert_hot(generated_asset_with_id(&id))
+                .expect("insert generated asset");
+            store.note_hot_use(&id, index);
+        }
+
+        let metrics = store.hot_cache_metrics();
+        assert_eq!(metrics.dynamic_resident, 1);
+        assert_eq!(metrics.promotion_metadata_retained, 3);
+        assert_eq!(metrics.promotion_metadata_high_water, 3);
+        assert_eq!(metrics.promotion_metadata_evictions, 7);
+        assert!(store.promotion_metadata("dynamic.metadata.00").is_none());
+        assert!(store.promotion_metadata("dynamic.metadata.07").is_some());
+        assert!(store.promotion_metadata("dynamic.metadata.09").is_some());
+    }
+
+    #[test]
     fn hot_get_touches_recency_so_recently_used_assets_survive() {
         let dir = TestDir::new("recency");
         let mut store = AssetStore::new(dir.path(), generated_runtime());
@@ -2053,6 +2119,7 @@ mod tests {
         store.set_hot_cache_config(HotCacheConfig {
             max_dynamic_assets: usize::MAX,
             max_dynamic_bytes: 1,
+            ..HotCacheConfig::default()
         });
 
         store

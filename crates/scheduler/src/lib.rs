@@ -165,6 +165,9 @@ pub struct SchedulerMetrics {
     pub active: usize,
     pub terminal_retained: usize,
     pub terminal_evicted: usize,
+    pub cooldowns: usize,
+    pub cooldowns_high_water: usize,
+    pub cooldowns_expired: u64,
 }
 
 /// Scheduler configuration.
@@ -217,6 +220,8 @@ pub struct Scheduler {
     /// under [`HistoryPolicy::RetainAll`]).
     history: std::collections::VecDeque<HistoryEntry>,
     cooldowns: BTreeMap<String, u64>,
+    cooldowns_high_water: usize,
+    cooldowns_expired: u64,
     generation: u64,
     config: SchedulerConfig,
     last_rejection: Option<Rejection>,
@@ -233,6 +238,8 @@ impl Scheduler {
             live_by_event: BTreeMap::new(),
             history: std::collections::VecDeque::new(),
             cooldowns: BTreeMap::new(),
+            cooldowns_high_water: 0,
+            cooldowns_expired: 0,
             generation: 0,
             config,
             last_rejection: None,
@@ -277,6 +284,9 @@ impl Scheduler {
             active: queued + playing,
             terminal_retained: self.history.len(),
             terminal_evicted: self.terminal_evicted,
+            cooldowns: self.cooldowns.len(),
+            cooldowns_high_water: self.cooldowns_high_water,
+            cooldowns_expired: self.cooldowns_expired,
         }
     }
 
@@ -357,6 +367,11 @@ impl Scheduler {
     /// Advance logical time without consulting wall-clock time.
     pub fn advance_to(&mut self, at_ms: u64) {
         let target = at_ms.max(self.now_ms);
+        let cooldowns_before = self.cooldowns.len();
+        self.cooldowns.retain(|_, until_ms| *until_ms > target);
+        self.cooldowns_expired = self
+            .cooldowns_expired
+            .saturating_add(cooldowns_before.saturating_sub(self.cooldowns.len()) as u64);
 
         // Retiring items swap-removes slots, so re-check the slot at the same
         // index (without bumping `index`) after every terminal transition.
@@ -567,6 +582,7 @@ impl Scheduler {
             .end_at_ms()
             .saturating_add(self.config.min_reaction_spacing_ms);
         self.cooldowns.insert(plan.asset_id.clone(), cooldown_until);
+        self.cooldowns_high_water = self.cooldowns_high_water.max(self.cooldowns.len());
 
         let index = self.items.len();
         self.live_by_generation.insert(plan.generation, index);
@@ -825,6 +841,40 @@ mod tests {
             .expect("first");
         let rejected = scheduler.schedule(plan("e2", "asset.a", Priority::Conversation, 1000, 600));
         assert_eq!(rejected.unwrap_err(), Rejection::Cooldown);
+    }
+
+    #[test]
+    fn logical_time_prunes_cooldowns_and_history_plateaus() {
+        let mut scheduler = Scheduler::new(SchedulerConfig {
+            min_reaction_spacing_ms: 0,
+            history_capacity: 3,
+            history_policy: HistoryPolicy::Ring,
+        });
+
+        for index in 0_u64..100 {
+            let at_ms = index * 10;
+            scheduler
+                .schedule_at(
+                    at_ms,
+                    plan(
+                        &format!("evt-{index}"),
+                        &format!("asset-{index}"),
+                        Priority::Conversation,
+                        at_ms,
+                        1,
+                    ),
+                )
+                .expect("schedule churn item");
+            scheduler.advance_to(at_ms + 2);
+        }
+
+        let metrics = scheduler.metrics();
+        assert_eq!(metrics.active, 0);
+        assert_eq!(metrics.terminal_retained, 3);
+        assert_eq!(metrics.terminal_evicted, 97);
+        assert_eq!(metrics.cooldowns, 0);
+        assert_eq!(metrics.cooldowns_high_water, 1);
+        assert_eq!(metrics.cooldowns_expired, 100);
     }
 
     #[test]

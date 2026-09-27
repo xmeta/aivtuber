@@ -301,14 +301,82 @@ impl BenchmarkReport {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TelemetryRetentionConfig {
+    pub max_events: usize,
+}
+
+impl Default for TelemetryRetentionConfig {
+    fn default() -> Self {
+        Self { max_events: 4_096 }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryRetentionMetrics {
+    pub retained: usize,
+    pub high_water: usize,
+    pub evicted: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct TelemetryCollector {
     events: Vec<EventObservation>,
+    retention: TelemetryRetentionConfig,
+    high_water: usize,
+    evicted: u64,
+}
+
+impl Default for TelemetryCollector {
+    fn default() -> Self {
+        Self::with_retention(TelemetryRetentionConfig::default())
+    }
 }
 
 impl TelemetryCollector {
+    pub fn with_retention(retention: TelemetryRetentionConfig) -> Self {
+        assert!(
+            retention.max_events > 0,
+            "telemetry max_events must be positive"
+        );
+        Self {
+            events: Vec::new(),
+            retention,
+            high_water: 0,
+            evicted: 0,
+        }
+    }
+
+    pub fn set_retention(&mut self, retention: TelemetryRetentionConfig) {
+        assert!(
+            retention.max_events > 0,
+            "telemetry max_events must be positive"
+        );
+        self.retention = retention;
+        self.trim_to_retention();
+    }
+
+    pub fn retention_metrics(&self) -> TelemetryRetentionMetrics {
+        TelemetryRetentionMetrics {
+            retained: self.events.len(),
+            high_water: self.high_water,
+            evicted: self.evicted,
+        }
+    }
+
     pub fn record(&mut self, observation: EventObservation) {
         self.events.push(observation);
+        self.trim_to_retention();
+        self.high_water = self.high_water.max(self.events.len());
+    }
+
+    fn trim_to_retention(&mut self) {
+        if self.events.len() <= self.retention.max_events {
+            return;
+        }
+        let remove = self.events.len() - self.retention.max_events;
+        self.events.drain(..remove);
+        self.evicted = self.evicted.saturating_add(remove as u64);
     }
 
     pub fn events(&self) -> &[EventObservation] {
@@ -718,6 +786,26 @@ mod tests {
                 event
             })
             .collect()
+    }
+
+    #[test]
+    fn retention_plateaus_at_configured_event_limit() {
+        let mut collector =
+            TelemetryCollector::with_retention(TelemetryRetentionConfig { max_events: 4 });
+        for index in 0_u64..100 {
+            collector.record(EventObservation::new(
+                format!("evt-{index}"),
+                ComparisonMode::DeterministicOnly,
+                RouteClass::Silent,
+            ));
+        }
+
+        let metrics = collector.retention_metrics();
+        assert_eq!(metrics.retained, 4);
+        assert_eq!(metrics.high_water, 4);
+        assert_eq!(metrics.evicted, 96);
+        assert_eq!(collector.events()[0].event_id, "evt-96");
+        assert_eq!(collector.events()[3].event_id, "evt-99");
     }
 
     #[test]
