@@ -66,6 +66,7 @@ pub struct WorkingMemoryConfig {
     pub durable_ttl_ms: u64,
     pub max_claim_bytes: usize,
     pub max_topic_bytes: usize,
+    pub max_compaction_records: usize,
     pub pseudonym_salt: u64,
 }
 
@@ -77,6 +78,7 @@ impl Default for WorkingMemoryConfig {
             durable_ttl_ms: 24 * 60 * 60 * 1_000,
             max_claim_bytes: 1_024,
             max_topic_bytes: 128,
+            max_compaction_records: 256,
             pseudonym_salt: 0,
         }
     }
@@ -88,6 +90,15 @@ pub struct MemoryCompactionRecord {
     pub expired_removed: usize,
     pub capacity_removed: usize,
     pub remaining: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkingMemoryRetentionMetrics {
+    pub entries: usize,
+    pub entries_high_water: usize,
+    pub compactions: usize,
+    pub compactions_high_water: usize,
+    pub compactions_evicted: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +113,9 @@ pub struct WorkingMemory {
     config: WorkingMemoryConfig,
     entries: VecDeque<MemoryEntry>,
     compactions: Vec<MemoryCompactionRecord>,
+    entries_high_water: usize,
+    compactions_high_water: usize,
+    compactions_evicted: u64,
 }
 
 impl WorkingMemory {
@@ -111,6 +125,7 @@ impl WorkingMemory {
             || config.durable_ttl_ms == 0
             || config.max_claim_bytes == 0
             || config.max_topic_bytes == 0
+            || config.max_compaction_records == 0
         {
             return Err(AdaptationError::InvalidConfiguration(
                 "working-memory bounds must be positive",
@@ -120,6 +135,9 @@ impl WorkingMemory {
             config,
             entries: VecDeque::new(),
             compactions: Vec::new(),
+            entries_high_water: 0,
+            compactions_high_water: 0,
+            compactions_evicted: 0,
         })
     }
 
@@ -141,6 +159,16 @@ impl WorkingMemory {
 
     pub fn compactions(&self) -> &[MemoryCompactionRecord] {
         &self.compactions
+    }
+
+    pub fn retention_metrics(&self) -> WorkingMemoryRetentionMetrics {
+        WorkingMemoryRetentionMetrics {
+            entries: self.entries.len(),
+            entries_high_water: self.entries_high_water,
+            compactions: self.compactions.len(),
+            compactions_high_water: self.compactions_high_water,
+            compactions_evicted: self.compactions_evicted,
+        }
     }
 
     pub fn remember_working(
@@ -202,6 +230,7 @@ impl WorkingMemory {
             self.entries.pop_front();
             capacity_removed += 1;
         }
+        self.entries_high_water = self.entries_high_water.max(self.entries.len());
         let record = MemoryCompactionRecord {
             at_ms: now_ms,
             expired_removed,
@@ -210,6 +239,12 @@ impl WorkingMemory {
         };
         if expired_removed > 0 || capacity_removed > 0 {
             self.compactions.push(record.clone());
+            if self.compactions.len() > self.config.max_compaction_records {
+                let remove = self.compactions.len() - self.config.max_compaction_records;
+                self.compactions.drain(..remove);
+                self.compactions_evicted = self.compactions_evicted.saturating_add(remove as u64);
+            }
+            self.compactions_high_water = self.compactions_high_water.max(self.compactions.len());
         }
         record
     }
@@ -398,15 +433,55 @@ pub enum AppliedAdaptation {
     Invalidated,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdaptationRetentionConfig {
+    pub max_feedback_assets: usize,
+    pub max_recent_groups: usize,
+    pub max_decisions: usize,
+}
+
+impl Default for AdaptationRetentionConfig {
+    fn default() -> Self {
+        Self {
+            max_feedback_assets: 1_024,
+            max_recent_groups: 256,
+            max_decisions: 1_024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdaptationRetentionMetrics {
+    pub feedback_assets: usize,
+    pub feedback_assets_high_water: usize,
+    pub feedback_assets_evicted: u64,
+    pub recent_groups: usize,
+    pub recent_groups_high_water: usize,
+    pub recent_groups_evicted: u64,
+    pub decisions: usize,
+    pub decisions_high_water: usize,
+    pub decisions_evicted: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct AdaptationEngine {
     policy: PromotionPolicy,
     policy_version: String,
     seed: u64,
     sequence: u64,
+    retention: AdaptationRetentionConfig,
     feedback: BTreeMap<String, AssetFeedback>,
+    feedback_touch: BTreeMap<String, u64>,
     recent_by_group: BTreeMap<String, VecDeque<String>>,
+    recent_group_touch: BTreeMap<String, u64>,
     decisions: Vec<AdaptationDecisionRecord>,
+    next_touch: u64,
+    feedback_high_water: usize,
+    feedback_evicted: u64,
+    recent_groups_high_water: usize,
+    recent_groups_evicted: u64,
+    decisions_high_water: usize,
+    decisions_evicted: u64,
 }
 
 impl AdaptationEngine {
@@ -415,6 +490,20 @@ impl AdaptationEngine {
         policy_version: impl Into<String>,
         seed: u64,
     ) -> Result<Self, AdaptationError> {
+        Self::with_retention(
+            policy,
+            policy_version,
+            seed,
+            AdaptationRetentionConfig::default(),
+        )
+    }
+
+    pub fn with_retention(
+        policy: PromotionPolicy,
+        policy_version: impl Into<String>,
+        seed: u64,
+        retention: AdaptationRetentionConfig,
+    ) -> Result<Self, AdaptationError> {
         let policy = policy.validate()?;
         let policy_version = policy_version.into();
         if policy_version.trim().is_empty() {
@@ -422,14 +511,32 @@ impl AdaptationEngine {
                 "policy_version must not be empty",
             ));
         }
+        if retention.max_feedback_assets == 0
+            || retention.max_recent_groups == 0
+            || retention.max_decisions == 0
+        {
+            return Err(AdaptationError::InvalidConfiguration(
+                "adaptation retention bounds must be positive",
+            ));
+        }
         Ok(Self {
             policy,
             policy_version,
             seed,
             sequence: 0,
+            retention,
             feedback: BTreeMap::new(),
+            feedback_touch: BTreeMap::new(),
             recent_by_group: BTreeMap::new(),
+            recent_group_touch: BTreeMap::new(),
             decisions: Vec::new(),
+            next_touch: 0,
+            feedback_high_water: 0,
+            feedback_evicted: 0,
+            recent_groups_high_water: 0,
+            recent_groups_evicted: 0,
+            decisions_high_water: 0,
+            decisions_evicted: 0,
         })
     }
 
@@ -445,15 +552,37 @@ impl AdaptationEngine {
         &self.decisions
     }
 
+    pub fn retention_metrics(&self) -> AdaptationRetentionMetrics {
+        AdaptationRetentionMetrics {
+            feedback_assets: self.feedback.len(),
+            feedback_assets_high_water: self.feedback_high_water,
+            feedback_assets_evicted: self.feedback_evicted,
+            recent_groups: self.recent_by_group.len(),
+            recent_groups_high_water: self.recent_groups_high_water,
+            recent_groups_evicted: self.recent_groups_evicted,
+            decisions: self.decisions.len(),
+            decisions_high_water: self.decisions_high_water,
+            decisions_evicted: self.decisions_evicted,
+        }
+    }
+
     pub fn record_use(&mut self, asset: &PerformanceAsset) {
-        let feedback = self.feedback.entry(asset.id.clone()).or_default();
+        self.ensure_feedback_asset(&asset.id);
+        let feedback = self
+            .feedback
+            .get_mut(&asset.id)
+            .expect("feedback asset inserted before use");
         feedback.uses = feedback.uses.saturating_add(1);
         let group = asset
             .variant_group
             .as_deref()
             .unwrap_or(asset.intent.as_str())
             .to_owned();
-        let recent = self.recent_by_group.entry(group).or_default();
+        self.ensure_recent_group(&group);
+        let recent = self
+            .recent_by_group
+            .get_mut(&group)
+            .expect("recent group inserted before use");
         recent.push_back(asset.id.clone());
         while recent.len() > self.policy.recent_variant_window {
             recent.pop_front();
@@ -461,11 +590,102 @@ impl AdaptationEngine {
     }
 
     pub fn record_quality(&mut self, asset_id: &str, positive: bool) {
-        let feedback = self.feedback.entry(asset_id.to_owned()).or_default();
+        self.ensure_feedback_asset(asset_id);
+        let feedback = self
+            .feedback
+            .get_mut(asset_id)
+            .expect("feedback asset inserted before quality label");
         if positive {
             feedback.positive_quality_labels = feedback.positive_quality_labels.saturating_add(1);
         } else {
             feedback.negative_quality_labels = feedback.negative_quality_labels.saturating_add(1);
+        }
+    }
+
+    fn next_touch_tick(&mut self) -> u64 {
+        let tick = self.next_touch;
+        self.next_touch = self.next_touch.saturating_add(1);
+        tick
+    }
+
+    fn ensure_feedback_asset(&mut self, asset_id: &str) {
+        let tick = self.next_touch_tick();
+        if !self.feedback.contains_key(asset_id)
+            && self.feedback.len() >= self.retention.max_feedback_assets
+        {
+            let victim = self
+                .feedback_touch
+                .iter()
+                .min_by(|(left_id, left_tick), (right_id, right_tick)| {
+                    left_tick
+                        .cmp(right_tick)
+                        .then_with(|| left_id.cmp(right_id))
+                })
+                .map(|(id, _)| id.clone())
+                .expect("bounded feedback map has a touch record");
+            self.feedback.remove(&victim);
+            self.feedback_touch.remove(&victim);
+            self.feedback_evicted = self.feedback_evicted.saturating_add(1);
+
+            let mut empty_groups = Vec::new();
+            for (group, recent) in &mut self.recent_by_group {
+                recent.retain(|id| id != &victim);
+                if recent.is_empty() {
+                    empty_groups.push(group.clone());
+                }
+            }
+            for group in empty_groups {
+                self.recent_by_group.remove(&group);
+                self.recent_group_touch.remove(&group);
+                self.recent_groups_evicted = self.recent_groups_evicted.saturating_add(1);
+            }
+        }
+
+        self.feedback.entry(asset_id.to_owned()).or_default();
+        self.feedback_touch.insert(asset_id.to_owned(), tick);
+        self.feedback_high_water = self.feedback_high_water.max(self.feedback.len());
+    }
+
+    fn ensure_recent_group(&mut self, group: &str) {
+        let tick = self.next_touch_tick();
+        if !self.recent_by_group.contains_key(group)
+            && self.recent_by_group.len() >= self.retention.max_recent_groups
+        {
+            let victim = self
+                .recent_group_touch
+                .iter()
+                .min_by(|(left_id, left_tick), (right_id, right_tick)| {
+                    left_tick
+                        .cmp(right_tick)
+                        .then_with(|| left_id.cmp(right_id))
+                })
+                .map(|(id, _)| id.clone())
+                .expect("bounded recent-group map has a touch record");
+            self.recent_by_group.remove(&victim);
+            self.recent_group_touch.remove(&victim);
+            self.recent_groups_evicted = self.recent_groups_evicted.saturating_add(1);
+        }
+
+        self.recent_by_group.entry(group.to_owned()).or_default();
+        self.recent_group_touch.insert(group.to_owned(), tick);
+        self.recent_groups_high_water = self
+            .recent_groups_high_water
+            .max(self.recent_by_group.len());
+    }
+
+    fn forget_asset(&mut self, asset_id: &str) {
+        self.feedback.remove(asset_id);
+        self.feedback_touch.remove(asset_id);
+        let mut empty_groups = Vec::new();
+        for (group, recent) in &mut self.recent_by_group {
+            recent.retain(|id| id != asset_id);
+            if recent.is_empty() {
+                empty_groups.push(group.clone());
+            }
+        }
+        for group in empty_groups {
+            self.recent_by_group.remove(&group);
+            self.recent_group_touch.remove(&group);
         }
     }
 
@@ -511,6 +731,12 @@ impl AdaptationEngine {
             seed: self.seed,
         };
         self.decisions.push(record.clone());
+        if self.decisions.len() > self.retention.max_decisions {
+            let remove = self.decisions.len() - self.retention.max_decisions;
+            self.decisions.drain(..remove);
+            self.decisions_evicted = self.decisions_evicted.saturating_add(remove as u64);
+        }
+        self.decisions_high_water = self.decisions_high_water.max(self.decisions.len());
         Ok(record)
     }
 
@@ -535,6 +761,7 @@ impl AdaptationEngine {
                 store
                     .invalidate_generated_asset(asset_id)
                     .map_err(AdaptationError::AssetStore)?;
+                self.forget_asset(asset_id);
                 Ok(AppliedAdaptation::Invalidated)
             }
         }
@@ -797,6 +1024,67 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn retained_adaptation_state_plateaus_under_logical_churn() {
+        let mut memory = WorkingMemory::new(WorkingMemoryConfig {
+            max_entries: 2,
+            working_ttl_ms: 10_000,
+            durable_ttl_ms: 10_000,
+            max_compaction_records: 3,
+            ..WorkingMemoryConfig::default()
+        })
+        .expect("bounded working memory");
+        let chat = event(
+            "evt-retention",
+            SourceClass::PublicChat,
+            TrustLevel::Untrusted,
+            Some("viewer:retention"),
+        );
+        for index in 0_u64..20 {
+            memory
+                .remember_working(&chat, &format!("claim-{index}"), Some("retention"), index)
+                .expect("remember churn");
+        }
+        let memory_metrics = memory.retention_metrics();
+        assert_eq!(memory_metrics.entries, 2);
+        assert_eq!(memory_metrics.entries_high_water, 2);
+        assert_eq!(memory_metrics.compactions, 3);
+        assert_eq!(memory_metrics.compactions_high_water, 3);
+        assert!(memory_metrics.compactions_evicted > 0);
+
+        let mut engine = AdaptationEngine::with_retention(
+            PromotionPolicy::default(),
+            "bounded-retention-v1",
+            42,
+            AdaptationRetentionConfig {
+                max_feedback_assets: 3,
+                max_recent_groups: 2,
+                max_decisions: 2,
+            },
+        )
+        .expect("bounded adaptation engine");
+        for index in 0_u64..10 {
+            let mut asset = generated_fixture();
+            asset.id = format!("dynamic.retention.{index}");
+            asset.intent = format!("retention.intent.{index}");
+            asset.variant_group = Some(format!("retention.group.{index}"));
+            engine.record_use(&asset);
+            engine.record_quality(&asset.id, true);
+            engine.evaluate(&asset).expect("evaluate churn asset");
+        }
+
+        let metrics = engine.retention_metrics();
+        assert_eq!(metrics.feedback_assets, 3);
+        assert_eq!(metrics.feedback_assets_high_water, 3);
+        assert!(metrics.feedback_assets_evicted > 0);
+        assert_eq!(metrics.recent_groups, 2);
+        assert_eq!(metrics.recent_groups_high_water, 2);
+        assert!(metrics.recent_groups_evicted > 0);
+        assert_eq!(metrics.decisions, 2);
+        assert_eq!(metrics.decisions_high_water, 2);
+        assert_eq!(metrics.decisions_evicted, 8);
     }
 
     #[test]

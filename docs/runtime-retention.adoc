@@ -1,0 +1,110 @@
+:toc:
+
+== Purpose
+
++RuntimeRetentionPolicy+ is the production-wide bounded-state contract for long-running streams.
+
+The invariant is:
+
+> Process lifetime and cumulative event count must not, by themselves, determine resident memory usage.
+
+The production composition root builds one policy and derives subsystem-local limits from it. Replay/test tools may deliberately retain more detail when they are finite/offline, but production defaults remain bounded.
+
+== Safe production defaults
+
+The default policy currently caps retained detail/state as follows:
+
+[cols="2,1,3",options="header"]
+|===
+|State |Default |Policy
+|Telemetry event detail |4096 |FIFO detail retention; aggregate counters remain available
+|Security audit records |4096 |FIFO in-memory detail; durable audit, when required, belongs behind an external streaming sink
+|Rate-limit source keys |4096 |Hard cardinality ceiling plus 10 minute logical inactivity TTL
+|Scheduler terminal history |1024 |Deterministic bounded ring
+|Generated/dynamic L0 assets |1024 |Deterministic LRU, additionally bounded by 64 MiB estimated descriptor bytes
+|Promotion metadata |4096 |Deterministic bounded metadata set independent of full asset residency
+|Cached-playback recent variant groups |256 |Deterministic LRU key bound; each group also has a bounded recent window
+|Working-memory entries |256 |Count + TTL + claim/topic byte bounds
+|Working-memory compaction records |256 |FIFO retained diagnostics
+|Adaptation feedback assets |1024 |Deterministic bounded key set
+|Adaptation recent groups |256 |Deterministic bounded key set
+|Adaptation decision records |1024 |FIFO retained diagnostics
+|Generation pending queue |8 |Bounded worker queue; one provider job is in flight
+|===
+
+All limits are configurable through +AIVTUBER_RETENTION_*+ environment variables in +crates/app/src/main.rs+.
+
+== Process-lifetime collection classification
+
+[cols="2,2,3",options="header"]
+|===
+|Subsystem/state |Classification |Notes
+|Raw stdin queue |Bounded |Capacity derives from +SecurityRuntimeConfig::content_queue_limit+
+|Security content queue |Bounded |Backpressure rejects new content at capacity
+|Security audit |Bounded RAM |Oldest in-memory detail is evicted; secret redaction is applied before retention
+|Per-source rate-limit buckets |Bounded + logical TTL |A new source is rejected when the hard key cap is full and no stale key can expire
+|Telemetry event detail |Bounded RAM |Oldest detail is evicted; current/high-water/evicted counts are exposed
+|Scheduler live items |Bounded by admission/scheduling semantics |Terminal items move to bounded history
+|Scheduler terminal history |Bounded ring |Production uses +HistoryPolicy::Ring+; finite replay may explicitly use +RetainAll+
+|Scheduler cooldown keys |Logical-time bounded |Expired cooldowns are pruned deterministically
+|Generated/dynamic L0 assets |Bounded count/bytes |Static/preloaded assets are pinned and are not displaced by dynamic churn
+|Promotion metadata |Bounded RAM |Metadata may outlive full L0 assets but cannot grow with process lifetime
+|Cached recent-variant groups |Bounded RAM |Group keys use deterministic logical recency
+|Working-memory entries |Bounded count/time/bytes |No hidden transcript is retained
+|Working-memory compaction history |Bounded RAM |Oldest diagnostic records are evicted
+|Adaptation feedback/recent groups |Bounded RAM |Logical recency determines deterministic eviction
+|Adaptation decisions |Bounded RAM |Oldest decision detail is evicted
+|Generation queue/completions |Bounded RAM |#121 owns execution semantics; no per-request tombstone history is retained
+|===
+
+Future retained-state features must either derive a limit from this policy, document an equivalent bounded/external contract, or explicitly justify why an unbounded structure is safe outside the production event path.
+
+== Rate-limit cardinality security
+
+Rate-limit buckets are keyed only after event/source validation. A source-id churn attack must not reset effective throughput by forcing arbitrary active-key eviction.
+
+When a previously unseen source arrives:
+
+. stale buckets are expired using the supplied logical +now_ms+;
+. if the hard key limit is still reached, the unseen source is rate-dropped;
+. active buckets are not evicted merely to admit a new attacker-controlled key.
+This keeps memory bounded without turning eviction into a token-bucket reset primitive. The implementation stays local rather than adopting +governor+ for #51: +governor+ provides useful quota/GCRA and clock primitives but does not remove the need for this repository-owned hard key admission/retention policy.
+
+== Determinism and time
+
+Expiry and LRU decisions use explicit logical/monotonic inputs or deterministic counters. Retention must not call ambient wall clock from replay-sensitive code.
+
+Deterministic survivors therefore depend on recorded input order, logical timestamps, seeds/configuration, and stable tie-breaks rather than thread timing or hash iteration order.
+
+== Observability
+
++ProductionApp::retention_snapshot()+ exposes a single current view containing:
+
+* telemetry retained/high-water/evicted detail;
+* audit and rate-limit current/high-water/eviction/expiry/rejection counts;
+* scheduler active/history/cooldown counters;
+* hot static/dynamic asset and promotion-metadata counters;
+* cached-playback recent-group counters;
+* working-memory and adaptation current/high-water/evicted counters;
+* generation pending/in-flight/high-water/saturation/cancellation counters.
+
+These are bounded aggregate counters; observability does not retain an unbounded per-event history.
+
+== Verification
+
++crates/hardening+ provides a logical-time soak that processes high event counts without waiting for wall-clock hours. It verifies retained structures plateau at configured limits after warm-up.
+
+Additional unit/integration coverage exercises:
+
+* high-cardinality rate-limit source churn and TTL expiry;
+* telemetry FIFO retention;
+* scheduler history/cooldown plateau behavior;
+* generated L0 and promotion-metadata churn;
+* cached variant-group key churn;
+* working-memory compaction and adaptation churn;
+* delayed generation, cancellation/supersession, queue saturation, and telemetry retention.
+== External persistence boundary
+
+Bounded in-memory audit/telemetry retention is not a claim that all installations may discard historical records. Deployments with durable audit requirements should stream already-redacted records to a file/database/observability sink outside the in-process retention ring.
+
+The in-process policy intentionally prevents RAM from becoming the durable archive.

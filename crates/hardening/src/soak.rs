@@ -1,6 +1,8 @@
 use crate::HardeningError;
 use aivtuber_adaptation::{WorkingMemory, WorkingMemoryConfig};
-use aivtuber_asset_store::{AssetStore, PerformanceAsset, RuntimeCompatibility, load_asset_file};
+use aivtuber_asset_store::{
+    AssetStore, HotCacheConfig, PerformanceAsset, RuntimeCompatibility, load_asset_file,
+};
 use aivtuber_domain::{
     AuthorizationMethod, Capability, ControlSecret, EVENT_SCHEMA_VERSION, EventEnvelope, EventKind,
     LocalControlIngress, OperatorCommandInput, SecurityPlane, SourceClass, TrustLevel,
@@ -9,12 +11,11 @@ use aivtuber_runtime::{
     ContentAdmitDecision, ControlOutcome, SecurityRuntime, SecurityRuntimeConfig,
 };
 use aivtuber_scheduler::{
-    BlendChannel, PlannedPerformance, Priority, Scheduler, SchedulerConfig, SchedulerMetrics,
-    Status,
+    BlendChannel, PlannedPerformance, Priority, Scheduler, SchedulerConfig, Status,
 };
 use aivtuber_telemetry::{
     BenchmarkSummary, ComparisonMode, EventObservation, ReproducibilityMetadata, RouteClass,
-    SecretRedactor, TelemetryCollector,
+    SecretRedactor, TelemetryCollector, TelemetryRetentionConfig,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -26,7 +27,13 @@ pub struct SoakConfig {
     pub logical_events: u64,
     pub event_interval_ms: u64,
     pub ingress_queue_limit: usize,
+    pub scheduler_history_limit: usize,
+    pub audit_limit: usize,
+    pub telemetry_limit: usize,
     pub working_memory_limit: usize,
+    pub memory_compaction_limit: usize,
+    pub generated_asset_limit: usize,
+    pub promotion_metadata_limit: usize,
     pub generated_asset_every: u64,
 }
 
@@ -37,7 +44,15 @@ impl Default for SoakConfig {
             logical_events: 576_000,
             event_interval_ms: 50,
             ingress_queue_limit: 128,
+            // Probe limits are intentionally smaller than production defaults
+            // so the 5k-event CI smoke reaches a retention plateau before its midpoint.
+            scheduler_history_limit: 512,
+            audit_limit: 1_024,
+            telemetry_limit: 1_024,
             working_memory_limit: 256,
+            memory_compaction_limit: 128,
+            generated_asset_limit: 8,
+            promotion_metadata_limit: 8,
             generated_asset_every: 200,
         }
     }
@@ -48,7 +63,13 @@ impl SoakConfig {
         if self.logical_events < 2
             || self.event_interval_ms == 0
             || self.ingress_queue_limit == 0
+            || self.scheduler_history_limit == 0
+            || self.audit_limit == 0
+            || self.telemetry_limit == 0
             || self.working_memory_limit == 0
+            || self.memory_compaction_limit == 0
+            || self.generated_asset_limit == 0
+            || self.promotion_metadata_limit == 0
             || self.generated_asset_every == 0
         {
             return Err(HardeningError::InvalidConfiguration(
@@ -69,11 +90,16 @@ pub struct StateSnapshot {
     pub scheduler_active: usize,
     pub scheduler_completed: usize,
     pub scheduler_cancelled: usize,
+    pub scheduler_history: usize,
+    pub scheduler_cooldowns: usize,
     pub content_queue: usize,
     pub audit_records: usize,
+    pub rate_limit_sources: usize,
     pub working_memory_entries: usize,
+    pub memory_compaction_records: usize,
     pub telemetry_events: usize,
     pub hot_assets: usize,
+    pub promotion_metadata: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,11 +155,8 @@ pub fn run_core_soak(
         .map_err(|error| HardeningError::InvalidMetadata(error.to_string()))?;
     let scheduler_config = SchedulerConfig {
         min_reaction_spacing_ms: 0,
-        // The soak probe tracks per-status terminal counts, so retain the
-        // full history here (the soak itself asserts no lifetime growth via
-        // the bounded-memory components; issue #52 documents the policy).
-        history_capacity: usize::MAX,
-        history_policy: aivtuber_scheduler::HistoryPolicy::RetainAll,
+        history_capacity: config.scheduler_history_limit,
+        history_policy: aivtuber_scheduler::HistoryPolicy::Ring,
     };
     let mut scheduler = Scheduler::new(scheduler_config);
     let mut security = SecurityRuntime::new(
@@ -142,6 +165,7 @@ pub fn run_core_soak(
 
             content_burst: 1_000_000,
             content_queue_limit: config.ingress_queue_limit,
+            max_audit_records: config.audit_limit,
             ..SecurityRuntimeConfig::default()
         },
         scheduler_config,
@@ -152,13 +176,21 @@ pub fn run_core_soak(
     let mut memory = WorkingMemory::new(WorkingMemoryConfig {
         max_entries: config.working_memory_limit,
         working_ttl_ms: config.logical_duration_ms().saturating_add(1),
+        max_compaction_records: config.memory_compaction_limit,
         ..WorkingMemoryConfig::default()
     })
     .map_err(|error| HardeningError::Adaptation(error.to_string()))?;
-    let mut telemetry = TelemetryCollector::default();
+    let mut telemetry = TelemetryCollector::with_retention(TelemetryRetentionConfig {
+        max_events: config.telemetry_limit,
+    });
 
     let generated_fixture = generated_fixture()?;
     let mut assets = AssetStore::new(PathBuf::from("."), generated_runtime());
+    assets.set_hot_cache_config(HotCacheConfig {
+        max_dynamic_assets: config.generated_asset_limit,
+        max_promotion_metadata: config.promotion_metadata_limit,
+        ..HotCacheConfig::default()
+    });
     let midpoint_index = config.logical_events / 2;
     let mut midpoint = None;
 
@@ -203,9 +235,11 @@ pub fn run_core_soak(
         if index % config.generated_asset_every == 0 {
             let mut generated = generated_fixture.clone();
             generated.id = format!("dynamic.soak.{index:016x}");
+            let generated_id = generated.id.clone();
             assets
                 .insert_hot(generated)
                 .map_err(|error| HardeningError::AssetStore(error.to_string()))?;
+            assets.note_hot_use(&generated_id, at_ms);
         }
 
         if index + 1 == midpoint_index {
@@ -241,10 +275,9 @@ fn snapshot(
     assets: &AssetStore,
 ) -> StateSnapshot {
     // With bounded-state separation (#52) terminal items retire into the
-    // scheduler's bounded history, so the completed/cancelled counts come
-    // from history plus the exported eviction counter instead of the live
-    // item collection.
-    let SchedulerMetrics { active, .. } = scheduler.metrics();
+    // scheduler's bounded history. Per-status counts below cover only retained
+    // history; exact retained-state sizes come from subsystem metrics.
+    let scheduler_metrics = scheduler.metrics();
     let history_completed = scheduler
         .history()
         .filter(|entry| entry.item.status == Status::Completed)
@@ -253,18 +286,26 @@ fn snapshot(
         .history()
         .filter(|entry| entry.item.status == Status::Cancelled)
         .count();
-    // Evicted entries leave the process uncounted per-status; report the
-    // minimum they contribute (zero) so counts stay lower bounds.
+    let security_metrics = security.retention_metrics();
+    let memory_metrics = memory.retention_metrics();
+    let hot_metrics = assets.hot_cache_metrics();
+    // Evicted scheduler entries leave the process uncounted per-status; the
+    // status counts remain lower bounds while retained-state sizes stay exact.
     StateSnapshot {
         scheduler_items: scheduler.items().len(),
-        scheduler_active: active,
+        scheduler_active: scheduler_metrics.active,
         scheduler_completed: history_completed,
         scheduler_cancelled: history_cancelled,
-        content_queue: security.content_len(),
-        audit_records: security.audit().len(),
-        working_memory_entries: memory.len(),
-        telemetry_events: telemetry.events().len(),
-        hot_assets: assets.hot_len(),
+        scheduler_history: scheduler_metrics.terminal_retained,
+        scheduler_cooldowns: scheduler_metrics.cooldowns,
+        content_queue: security_metrics.content_queue,
+        audit_records: security_metrics.audit_retained,
+        rate_limit_sources: security_metrics.rate_limit_sources,
+        working_memory_entries: memory_metrics.entries,
+        memory_compaction_records: memory_metrics.compactions,
+        telemetry_events: telemetry.retention_metrics().retained,
+        hot_assets: hot_metrics.dynamic_resident,
+        promotion_metadata: hot_metrics.promotion_metadata_retained,
     }
 }
 
@@ -289,6 +330,20 @@ fn growth_findings(
             Some(52),
         ),
         growth(
+            "scheduler_history",
+            midpoint.scheduler_history,
+            final_state.scheduler_history,
+            Some(config.scheduler_history_limit),
+            Some(51),
+        ),
+        growth(
+            "scheduler_cooldowns",
+            midpoint.scheduler_cooldowns,
+            final_state.scheduler_cooldowns,
+            None,
+            Some(51),
+        ),
+        growth(
             "content_queue",
             midpoint.content_queue,
             final_state.content_queue,
@@ -299,7 +354,14 @@ fn growth_findings(
             "audit_records",
             midpoint.audit_records,
             final_state.audit_records,
-            None,
+            Some(config.audit_limit),
+            Some(51),
+        ),
+        growth(
+            "rate_limit_sources",
+            midpoint.rate_limit_sources,
+            final_state.rate_limit_sources,
+            Some(SecurityRuntimeConfig::default().max_rate_limit_sources),
             Some(51),
         ),
         growth(
@@ -307,21 +369,35 @@ fn growth_findings(
             midpoint.working_memory_entries,
             final_state.working_memory_entries,
             Some(config.working_memory_limit),
-            None,
+            Some(51),
+        ),
+        growth(
+            "memory_compaction_records",
+            midpoint.memory_compaction_records,
+            final_state.memory_compaction_records,
+            Some(config.memory_compaction_limit),
+            Some(51),
         ),
         growth(
             "telemetry_events",
             midpoint.telemetry_events,
             final_state.telemetry_events,
-            None,
+            Some(config.telemetry_limit),
             Some(51),
         ),
         growth(
             "hot_assets",
             midpoint.hot_assets,
             final_state.hot_assets,
-            None,
+            Some(config.generated_asset_limit),
             Some(53),
+        ),
+        growth(
+            "promotion_metadata",
+            midpoint.promotion_metadata,
+            final_state.promotion_metadata,
+            Some(config.promotion_metadata_limit),
+            Some(51),
         ),
     ]
 }

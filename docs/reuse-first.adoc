@@ -48,8 +48,8 @@ Record the result as one of:
 
 |Keyed rate limiting
 |+governor+
-|Partial reuse
-|Reuse quota/GCRA mechanics and custom-clock support. Keep source identity/trust, hard maximum key cardinality, eviction, retention, and overload policy in aivtuber.
+|Reference only / revisit
+|#51 evaluated governor's keyed GCRA, custom-clock, and stale-key housekeeping. Those mechanisms do not supply a hard attacker-resistant key-cardinality ceiling by themselves, so aivtuber would still own admission, trusted source identity, absolute capacity, logical TTL, reject-on-capacity behavior, replay, and metrics. The current arithmetic remains small and deterministic; no dependency is added until quota complexity or benchmark evidence justifies the wrapper/runtime cost.
 |#51
 
 |Local operator IPC

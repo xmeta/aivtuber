@@ -65,6 +65,10 @@ OBS remains an independent control adapter. Its availability never owns schedule
 * Serialized control events remain data only: content ingress rejects them and cannot use them to cancel/stop privileged runtime work.
 * VTube Studio and OBS connection failure is degraded state, not scheduler failure.
 
+== Runtime retention
+
+Long-running production state is governed by the shared +RuntimeRetentionPolicy+. Safe defaults, subsystem classification, logical-time eviction rules, observability, and the high-volume plateau verification are documented in +docs/runtime-retention.adoc+.
+
 == Executable
 
 Run the daemon from the repository root:

@@ -212,6 +212,14 @@ pub struct FastPathPreloadReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CachedPlaybackConfig {
     pub recent_variant_window: usize,
+    pub max_recent_variant_groups: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct CachedPlaybackRetentionMetrics {
+    pub recent_variant_groups: usize,
+    pub recent_variant_groups_high_water: usize,
+    pub recent_variant_groups_evicted: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,6 +244,7 @@ impl Default for CachedPlaybackConfig {
     fn default() -> Self {
         Self {
             recent_variant_window: 1,
+            max_recent_variant_groups: 256,
         }
     }
 }
@@ -345,6 +354,10 @@ pub struct CachedPerformer {
     scheduler: Scheduler,
     config: CachedPlaybackConfig,
     recent_by_group: BTreeMap<String, VecDeque<String>>,
+    recent_group_touch: BTreeMap<String, u64>,
+    next_recent_group_touch: u64,
+    recent_groups_high_water: usize,
+    recent_groups_evicted: u64,
 }
 impl CachedPerformer {
     pub fn new(assets: AssetStore, scheduler: Scheduler, config: CachedPlaybackConfig) -> Self {
@@ -353,6 +366,10 @@ impl CachedPerformer {
             scheduler,
             config,
             recent_by_group: BTreeMap::new(),
+            recent_group_touch: BTreeMap::new(),
+            next_recent_group_touch: 0,
+            recent_groups_high_water: 0,
+            recent_groups_evicted: 0,
         }
     }
 
@@ -371,6 +388,15 @@ impl CachedPerformer {
     pub fn scheduler_mut(&mut self) -> &mut Scheduler {
         &mut self.scheduler
     }
+
+    pub fn retention_metrics(&self) -> CachedPlaybackRetentionMetrics {
+        CachedPlaybackRetentionMetrics {
+            recent_variant_groups: self.recent_by_group.len(),
+            recent_variant_groups_high_water: self.recent_groups_high_water,
+            recent_variant_groups_evicted: self.recent_groups_evicted,
+        }
+    }
+
     pub fn index_and_preload_fast_path(
         &mut self,
     ) -> Result<FastPathPreloadReport, CachedPlaybackError> {
@@ -624,14 +650,37 @@ impl CachedPerformer {
     }
 
     fn record_recent(&mut self, group: &str, asset_id: &str) {
-        if self.config.recent_variant_window == 0 {
+        if self.config.recent_variant_window == 0 || self.config.max_recent_variant_groups == 0 {
             return;
+        }
+        let touch = self.next_recent_group_touch;
+        self.next_recent_group_touch = self.next_recent_group_touch.saturating_add(1);
+        if !self.recent_by_group.contains_key(group)
+            && self.recent_by_group.len() >= self.config.max_recent_variant_groups
+        {
+            let victim = self
+                .recent_group_touch
+                .iter()
+                .min_by(|(left_id, left_tick), (right_id, right_tick)| {
+                    left_tick
+                        .cmp(right_tick)
+                        .then_with(|| left_id.cmp(right_id))
+                })
+                .map(|(id, _)| id.clone())
+                .expect("bounded recent group has a touch record");
+            self.recent_by_group.remove(&victim);
+            self.recent_group_touch.remove(&victim);
+            self.recent_groups_evicted = self.recent_groups_evicted.saturating_add(1);
         }
         let recent = self.recent_by_group.entry(group.to_owned()).or_default();
         recent.push_back(asset_id.to_owned());
         while recent.len() > self.config.recent_variant_window {
             recent.pop_front();
         }
+        self.recent_group_touch.insert(group.to_owned(), touch);
+        self.recent_groups_high_water = self
+            .recent_groups_high_water
+            .max(self.recent_by_group.len());
     }
 }
 fn resolve_asset_visemes<R: VisemeResolver>(
@@ -857,8 +906,26 @@ mod tests {
             }),
             CachedPlaybackConfig {
                 recent_variant_window: 1,
+                ..CachedPlaybackConfig::default()
             },
         )
+    }
+
+    #[test]
+    fn recent_variant_group_keys_are_bounded_deterministically() {
+        let mut performer = performer();
+        performer.config.max_recent_variant_groups = 2;
+        for index in 0_u64..10 {
+            performer.record_recent(&format!("group-{index:02}"), &format!("asset-{index:02}"));
+        }
+
+        let metrics = performer.retention_metrics();
+        assert_eq!(metrics.recent_variant_groups, 2);
+        assert_eq!(metrics.recent_variant_groups_high_water, 2);
+        assert_eq!(metrics.recent_variant_groups_evicted, 8);
+        assert!(!performer.recent_by_group.contains_key("group-00"));
+        assert!(performer.recent_by_group.contains_key("group-08"));
+        assert!(performer.recent_by_group.contains_key("group-09"));
     }
 
     fn chat_event(sequence: u64, intent: &str) -> EventEnvelope {

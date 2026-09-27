@@ -391,6 +391,7 @@ where
         Scheduler::new(scheduler_config),
         CachedPlaybackConfig {
             recent_variant_window: 1,
+            ..CachedPlaybackConfig::default()
         },
     );
     let security = SecurityRuntime::new(

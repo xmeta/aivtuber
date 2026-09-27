@@ -25,6 +25,9 @@ pub struct SecurityRuntimeConfig {
     pub max_envelope_bytes: usize,
     pub max_payload_bytes: usize,
     pub content_queue_limit: usize,
+    pub max_audit_records: usize,
+    pub max_rate_limit_sources: usize,
+    pub rate_limit_source_ttl_ms: u64,
 }
 
 impl Default for SecurityRuntimeConfig {
@@ -35,8 +38,24 @@ impl Default for SecurityRuntimeConfig {
             max_envelope_bytes: 64 * 1024,
             max_payload_bytes: 16 * 1024,
             content_queue_limit: 1024,
+            max_audit_records: 4_096,
+            max_rate_limit_sources: 4_096,
+            rate_limit_source_ttl_ms: 10 * 60 * 1_000,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SecurityRetentionMetrics {
+    pub audit_retained: usize,
+    pub audit_high_water: usize,
+    pub audit_evicted: u64,
+    pub rate_limit_sources: usize,
+    pub rate_limit_sources_high_water: usize,
+    pub rate_limit_sources_expired: u64,
+    pub rate_limit_sources_rejected: u64,
+    pub content_queue: usize,
+    pub content_queue_high_water: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +230,12 @@ pub struct SecurityRuntime {
     redactor: SecretRedactor,
     cached_reaction: Option<String>,
     audit: Vec<AuditRecord>,
+    audit_high_water: usize,
+    audit_evicted: u64,
+    rate_limit_sources_high_water: usize,
+    rate_limit_sources_expired: u64,
+    rate_limit_sources_rejected: u64,
+    content_queue_high_water: usize,
 }
 
 impl SecurityRuntime {
@@ -230,6 +255,12 @@ impl SecurityRuntime {
             redactor,
             cached_reaction,
             audit: Vec::new(),
+            audit_high_water: 0,
+            audit_evicted: 0,
+            rate_limit_sources_high_water: 0,
+            rate_limit_sources_expired: 0,
+            rate_limit_sources_rejected: 0,
+            content_queue_high_water: 0,
         })
     }
 
@@ -253,6 +284,30 @@ impl SecurityRuntime {
         &self.audit
     }
 
+    pub fn retention_metrics(&self) -> SecurityRetentionMetrics {
+        SecurityRetentionMetrics {
+            audit_retained: self.audit.len(),
+            audit_high_water: self.audit_high_water,
+            audit_evicted: self.audit_evicted,
+            rate_limit_sources: self.buckets.len(),
+            rate_limit_sources_high_water: self.rate_limit_sources_high_water,
+            rate_limit_sources_expired: self.rate_limit_sources_expired,
+            rate_limit_sources_rejected: self.rate_limit_sources_rejected,
+            content_queue: self.content_queue.len(),
+            content_queue_high_water: self.content_queue_high_water,
+        }
+    }
+
+    fn push_audit(&mut self, record: AuditRecord) {
+        self.audit.push(record);
+        if self.audit.len() > self.config.max_audit_records {
+            let remove = self.audit.len() - self.config.max_audit_records;
+            self.audit.drain(..remove);
+            self.audit_evicted = self.audit_evicted.saturating_add(remove as u64);
+        }
+        self.audit_high_water = self.audit_high_water.max(self.audit.len());
+    }
+
     /// Persist a generation-provider invocation without storing prompt or reply text.
     ///
     /// The source event id and deterministic routing reason are retained for audit,
@@ -270,7 +325,7 @@ impl SecurityRuntime {
             model_alias.unwrap_or("-"),
             model_version.unwrap_or("-")
         );
-        self.audit.push(self.redactor.record(
+        self.push_audit(self.redactor.record(
             Some(event_id),
             AuditCategory::Generation,
             "llm_call",
@@ -292,7 +347,7 @@ impl SecurityRuntime {
         now_ms: u64,
     ) -> Result<ContentAdmitDecision, RuntimeError> {
         if raw.len() > self.config.max_envelope_bytes {
-            self.audit.push(self.redactor.record(
+            self.push_audit(self.redactor.record(
                 None,
                 AuditCategory::Ingress,
                 "dropped_envelope_bytes",
@@ -343,6 +398,7 @@ impl SecurityRuntime {
 
         self.record_ingress(&event, "queued", &format!("payload_bytes={payload_bytes}"));
         self.content_queue.push_back(event);
+        self.content_queue_high_water = self.content_queue_high_water.max(self.content_queue.len());
         Ok(ContentAdmitDecision::Queued)
     }
 
@@ -377,7 +433,7 @@ impl SecurityRuntime {
             _ => ControlOutcome::AuthenticatedOther,
         };
 
-        self.audit.push(self.redactor.record(
+        self.push_audit(self.redactor.record(
             Some(&event.event_id),
             AuditCategory::Authorization,
             "authorized_control",
@@ -419,7 +475,7 @@ impl SecurityRuntime {
             _ => ControlOutcome::AuthenticatedOther,
         };
 
-        self.audit.push(self.redactor.record(
+        self.push_audit(self.redactor.record(
             Some(&event.event_id),
             AuditCategory::Authorization,
             "authorized_control",
@@ -479,7 +535,7 @@ impl SecurityRuntime {
             MemoryWriteDecision::Denied
         };
 
-        self.audit.push(self.redactor.record(
+        self.push_audit(self.redactor.record(
             Some(&event.event_id),
             AuditCategory::Memory,
             format!("{decision:?}"),
@@ -498,10 +554,28 @@ impl SecurityRuntime {
     }
 
     fn consume_token(&mut self, source: &str, now_ms: u64) -> bool {
-        let bucket = self.buckets.entry(source.to_owned()).or_insert(Bucket {
-            tokens: f64::from(self.config.content_burst),
-            last_refill_ms: now_ms,
-        });
+        if !self.buckets.contains_key(source) {
+            self.expire_rate_limit_sources(now_ms);
+            if self.buckets.len() >= self.config.max_rate_limit_sources {
+                self.rate_limit_sources_rejected =
+                    self.rate_limit_sources_rejected.saturating_add(1);
+                return false;
+            }
+            self.buckets.insert(
+                source.to_owned(),
+                Bucket {
+                    tokens: f64::from(self.config.content_burst),
+                    last_refill_ms: now_ms,
+                },
+            );
+            self.rate_limit_sources_high_water =
+                self.rate_limit_sources_high_water.max(self.buckets.len());
+        }
+
+        let bucket = self
+            .buckets
+            .get_mut(source)
+            .expect("rate-limit bucket inserted or already present");
         let elapsed_ms = now_ms.saturating_sub(bucket.last_refill_ms);
         bucket.tokens = (bucket.tokens
             + (elapsed_ms as f64 / 1000.0) * self.config.content_rate_per_second)
@@ -516,8 +590,19 @@ impl SecurityRuntime {
         }
     }
 
+    fn expire_rate_limit_sources(&mut self, now_ms: u64) {
+        let before = self.buckets.len();
+        let ttl_ms = self.config.rate_limit_source_ttl_ms;
+        self.buckets
+            .retain(|_, bucket| now_ms.saturating_sub(bucket.last_refill_ms) < ttl_ms);
+        let expired = before.saturating_sub(self.buckets.len());
+        self.rate_limit_sources_expired = self
+            .rate_limit_sources_expired
+            .saturating_add(expired as u64);
+    }
+
     fn record_ingress(&mut self, event: &EventEnvelope, decision: &str, detail: &str) {
-        self.audit.push(self.redactor.record(
+        self.push_audit(self.redactor.record(
             Some(&event.event_id),
             AuditCategory::Ingress,
             decision,
@@ -526,7 +611,7 @@ impl SecurityRuntime {
     }
 
     fn record_output(&mut self, reason: &str) {
-        self.audit.push(
+        self.push_audit(
             self.redactor
                 .record(None, AuditCategory::Output, reason, reason),
         );
@@ -550,6 +635,17 @@ fn validate_config(config: SecurityRuntimeConfig) -> Result<(), RuntimeError> {
     }
     if config.content_queue_limit == 0 {
         return Err(RuntimeError::InvalidConfiguration("content_queue_limit"));
+    }
+    if config.max_audit_records == 0 {
+        return Err(RuntimeError::InvalidConfiguration("max_audit_records"));
+    }
+    if config.max_rate_limit_sources == 0 {
+        return Err(RuntimeError::InvalidConfiguration("max_rate_limit_sources"));
+    }
+    if config.rate_limit_source_ttl_ms == 0 {
+        return Err(RuntimeError::InvalidConfiguration(
+            "rate_limit_source_ttl_ms",
+        ));
     }
     Ok(())
 }
@@ -711,6 +807,68 @@ mod tests {
             ContentAdmitDecision::RejectedNonContent
         );
         assert_eq!(runtime.content_len(), 0);
+    }
+
+    #[test]
+    fn security_retention_bounds_audit_and_source_cardinality_with_logical_ttl() {
+        let config = SecurityRuntimeConfig {
+            content_rate_per_second: 1_000.0,
+            content_burst: 100,
+            content_queue_limit: 4,
+            max_audit_records: 5,
+            max_rate_limit_sources: 2,
+            rate_limit_source_ttl_ms: 10,
+            ..SecurityRuntimeConfig::default()
+        };
+        let mut runtime = runtime_with(config, &[]);
+
+        for (id, source) in [("evt-a", "source-a"), ("evt-b", "source-b")] {
+            let raw = serde_json::to_vec(&chat_event(id, 1, source, "hello")).unwrap();
+            assert_eq!(
+                runtime.admit_content_bytes(&raw, 0).unwrap(),
+                ContentAdmitDecision::Queued
+            );
+            runtime.pop_content().expect("queued event");
+        }
+
+        let blocked = serde_json::to_vec(&chat_event("evt-c0", 2, "source-c", "blocked")).unwrap();
+        assert_eq!(
+            runtime.admit_content_bytes(&blocked, 1).unwrap(),
+            ContentAdmitDecision::DroppedRate
+        );
+        let full = runtime.retention_metrics();
+        assert_eq!(full.rate_limit_sources, 2);
+        assert_eq!(full.rate_limit_sources_high_water, 2);
+        assert_eq!(full.rate_limit_sources_rejected, 1);
+
+        let admitted =
+            serde_json::to_vec(&chat_event("evt-c1", 3, "source-c", "admitted")).unwrap();
+        assert_eq!(
+            runtime.admit_content_bytes(&admitted, 11).unwrap(),
+            ContentAdmitDecision::Queued
+        );
+        runtime.pop_content().expect("queued after ttl");
+
+        for index in 0_u64..20 {
+            let raw = serde_json::to_vec(&chat_event(
+                &format!("evt-audit-{index}"),
+                10 + index,
+                "source-c",
+                "audit churn",
+            ))
+            .unwrap();
+            runtime.admit_content_bytes(&raw, 11 + index).unwrap();
+            let _ = runtime.pop_content();
+        }
+
+        let metrics = runtime.retention_metrics();
+        assert_eq!(metrics.rate_limit_sources, 1);
+        assert_eq!(metrics.rate_limit_sources_high_water, 2);
+        assert_eq!(metrics.rate_limit_sources_expired, 2);
+        assert_eq!(metrics.audit_retained, 5);
+        assert_eq!(metrics.audit_high_water, 5);
+        assert!(metrics.audit_evicted > 0);
+        assert!(runtime.audit().len() <= config.max_audit_records);
     }
 
     #[test]
