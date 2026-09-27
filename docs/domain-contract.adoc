@@ -251,6 +251,8 @@ Version rules:
 
 Durable traces SHOULD avoid raw platform identifiers when a pseudonymous actor id is sufficient.
 
+Production actor pseudonyms use a keyed cryptographic construction outside the serialized domain contract. The deployment key is not Event Envelope/replay/model state; source/provider namespace is part of the pseudonymization domain so identical raw actor strings from different providers do not become the same durable identifier.
+
 Retention of raw chat/STT text must be configurable separately from normalized replay metadata.
 
 == 12. Machine-readable schemas

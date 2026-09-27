@@ -27,9 +27,17 @@ Neither model output nor serialized authorization claims can directly create dur
 
 Working memory has explicit bounds for entry count, working TTL, durable TTL, claim bytes, and topic bytes. Expired entries are removed during compaction. If the capacity bound is exceeded, the oldest remaining entries are removed deterministically.
 
-Viewer/topic retrieval is local and deterministic. Matching prefers pseudonymous viewer identity, then topic, then recency, with event id as a stable tie break.
+Viewer/topic retrieval is local and deterministic. Actor matching requires both the actor id and its source/provider namespace; matching prefers the resulting pseudonymous viewer identity, then topic, then recency, with event id as a stable tie break.
 
 Raw actor ids are not stored in +MemoryEntry+.
+
+=== 2.1 Keyed actor pseudonymization
+
++ActorPseudonymizer+ uses HMAC-SHA-256 with a deployment secret that is separate from Event Envelopes, replay metadata, model context, telemetry, and operator-control credentials. The MAC domain includes a fixed aivtuber domain tag, the configured key version, the source/provider namespace, and the raw actor id using length-prefixed fields. The complete 256-bit MAC is retained as hexadecimal text; it is not truncated to the former 64-bit identifier.
+
+Production requires +AIVTUBER_MEMORY_PSEUDONYM_KEY_HEX+ containing exactly 32 bytes as 64 hexadecimal characters. +AIVTUBER_MEMORY_PSEUDONYM_KEY_VERSION+ defaults to +v1+ and is non-secret. There is no production zero/default key fallback. Tests and deterministic tooling pass explicit test-only key material directly to +WorkingMemory+.
+
+Key rotation intentionally breaks historical linkability: changing either key material or key version produces a different pseudonym. The key version is embedded in the pseudonym so operators can identify which generation produced a retained record without exposing the key. Existing records are not silently relinked across rotations; deployments that require continuity must perform an explicit offline migration under their own retention/privacy policy.
 
 == 3. Durable memory gate
 
@@ -135,7 +143,8 @@ AIVTUBER_MEMORY_WORKING_TTL_MS=900000
 AIVTUBER_MEMORY_DURABLE_TTL_MS=86400000
 AIVTUBER_MEMORY_MAX_CLAIM_BYTES=1024
 AIVTUBER_MEMORY_MAX_TOPIC_BYTES=128
-AIVTUBER_MEMORY_PSEUDONYM_SALT=0
+AIVTUBER_MEMORY_PSEUDONYM_KEY_HEX=<64 hex characters / 32 random bytes>
+AIVTUBER_MEMORY_PSEUDONYM_KEY_VERSION=v1
 
 AIVTUBER_PROMOTION_MIN_USES=3
 AIVTUBER_PROMOTION_MIN_QUALITY_LABELS=2
@@ -149,7 +158,8 @@ The Rust tests cover:
 
 * public chat denied for durable memory without a gate permit;
 * authenticated +memory.admin+ durable retention;
-* pseudonymous viewer storage and TTL expiry;
+* keyed pseudonymous viewer storage, namespace separation, key/version rotation, and TTL expiry;
+* pseudonym-key redaction plus absence of raw actor ids from serialized memory records;
 * deterministic capacity compaction;
 * viewer/topic relevance;
 * frequency/quality promotion;

@@ -2054,7 +2054,7 @@ fn command_is_live(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aivtuber_adaptation::{PromotionPolicy, WorkingMemoryConfig};
+    use aivtuber_adaptation::{ActorPseudonymizer, PromotionPolicy, WorkingMemoryConfig};
     use aivtuber_asset_store::{AssetStore, RuntimeCompatibility, load_asset_file};
     use aivtuber_domain::{
         AuthorizationMethod, BackendIdentity, Capability, ControlSecret, EVENT_SCHEMA_VERSION,
@@ -2673,15 +2673,17 @@ mod tests {
 
     fn adaptation_runtime(policy: PromotionPolicy) -> AdaptationRuntime {
         AdaptationRuntime::new(
-            WorkingMemory::new(WorkingMemoryConfig {
-                max_entries: 8,
-                working_ttl_ms: 100,
-                durable_ttl_ms: 1_000,
-                max_claim_bytes: 128,
-                max_topic_bytes: 64,
-                pseudonym_salt: 7,
-                ..WorkingMemoryConfig::default()
-            })
+            WorkingMemory::new(
+                WorkingMemoryConfig {
+                    max_entries: 8,
+                    working_ttl_ms: 100,
+                    durable_ttl_ms: 1_000,
+                    max_claim_bytes: 128,
+                    max_topic_bytes: 64,
+                    ..WorkingMemoryConfig::default()
+                },
+                ActorPseudonymizer::new("test-v1", [0x42; 32]).expect("test pseudonymizer"),
+            )
             .expect("working memory"),
             AdaptationEngine::new(policy, "test-adaptation-v1", 42).expect("adaptation engine"),
         )
