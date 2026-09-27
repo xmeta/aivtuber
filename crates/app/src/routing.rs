@@ -5,6 +5,7 @@ use aivtuber_domain::{
 };
 use aivtuber_generative::GenerationRoutingReason;
 use aivtuber_reflex::{DecisionReplayRecord, ExecutedAction, ReflexPipeline, ReflexPipelineInput};
+use std::time::Duration;
 
 /// Maximum bytes accepted for a single template slot value. Untrusted event
 /// content larger than this is rejected before interpolation (issue #54).
@@ -221,6 +222,14 @@ pub enum PlaybackRoute {
 pub trait RoutePlanner: Send {
     fn route(&mut self, event: &EventEnvelope) -> Result<PlaybackRoute, AppError>;
 
+    fn route_with_budget(
+        &mut self,
+        event: &EventEnvelope,
+        _remaining_budget: Option<Duration>,
+    ) -> Result<PlaybackRoute, AppError> {
+        self.route(event)
+    }
+
     fn decision_record(&self) -> Option<&DecisionReplayRecord> {
         None
     }
@@ -343,24 +352,22 @@ where
             }
         }
     }
-}
 
-impl<E> RoutePlanner for ReflexRoutePlanner<E>
-where
-    E: QueryEmbeddingProvider,
-{
-    fn template_fallback(&self) -> Option<TemplateFallback> {
-        self.last_template_fallback
-    }
-
-    fn route(&mut self, event: &EventEnvelope) -> Result<PlaybackRoute, AppError> {
+    fn plan_route(
+        &mut self,
+        event: &EventEnvelope,
+        remaining_budget: Option<Duration>,
+    ) -> Result<PlaybackRoute, AppError> {
         let query_embedding = self.embeddings.embedding(event)?;
         let record = self
             .pipeline
-            .run(ReflexPipelineInput {
-                request: ReflexRequest::new(event.clone(), self.context.clone()),
-                query_embedding,
-            })
+            .run_with_budget(
+                ReflexPipelineInput {
+                    request: ReflexRequest::new(event.clone(), self.context.clone()),
+                    query_embedding,
+                },
+                remaining_budget,
+            )
             .map_err(|error| AppError::Routing(error.to_string()))?;
 
         let route = match record.executed.action {
@@ -408,6 +415,27 @@ where
         }
         self.last_record = Some(record);
         Ok(route)
+    }
+}
+
+impl<E> RoutePlanner for ReflexRoutePlanner<E>
+where
+    E: QueryEmbeddingProvider,
+{
+    fn template_fallback(&self) -> Option<TemplateFallback> {
+        self.last_template_fallback
+    }
+
+    fn route(&mut self, event: &EventEnvelope) -> Result<PlaybackRoute, AppError> {
+        self.plan_route(event, None)
+    }
+
+    fn route_with_budget(
+        &mut self,
+        event: &EventEnvelope,
+        remaining_budget: Option<Duration>,
+    ) -> Result<PlaybackRoute, AppError> {
+        self.plan_route(event, remaining_budget)
     }
 
     fn decision_record(&self) -> Option<&DecisionReplayRecord> {

@@ -72,6 +72,21 @@ impl NormalizedHttpTtsAdapter {
     }
 
     pub fn synthesize_sync(&self, request: &SpeechRequest) -> Result<SpeechArtifact, EngineError> {
+        self.synthesize_sync_with_timeout(request, self.config.timeout)
+    }
+
+    pub fn synthesize_sync_with_timeout(
+        &self,
+        request: &SpeechRequest,
+        timeout: Duration,
+    ) -> Result<SpeechArtifact, EngineError> {
+        if timeout.is_zero() {
+            return Err(EngineError::new(
+                EngineErrorKind::Timeout,
+                "TTS call has no remaining interaction budget",
+            ));
+        }
+        let effective_timeout = self.config.timeout.min(timeout);
         if request.text.trim().is_empty() {
             return Err(EngineError::new(
                 EngineErrorKind::InvalidRequest,
@@ -93,7 +108,7 @@ impl NormalizedHttpTtsAdapter {
                 &self.config.endpoint,
                 self.api_key.as_ref().map(|secret| secret.expose()),
                 &body,
-                self.config.timeout,
+                effective_timeout,
             )
             .map_err(map_transport_error)?;
 
@@ -126,6 +141,14 @@ impl NormalizedHttpTtsAdapter {
 impl TtsEngine for NormalizedHttpTtsAdapter {
     fn synthesize<'a>(&'a self, request: &'a SpeechRequest) -> EngineFuture<'a, SpeechArtifact> {
         Box::pin(async move { self.synthesize_sync(request) })
+    }
+
+    fn synthesize_with_timeout<'a>(
+        &'a self,
+        request: &'a SpeechRequest,
+        timeout: Duration,
+    ) -> EngineFuture<'a, SpeechArtifact> {
+        Box::pin(async move { self.synthesize_sync_with_timeout(request, timeout) })
     }
 
     fn identity(&self) -> TtsBackendIdentity {
@@ -261,6 +284,35 @@ mod tests {
         assert_eq!(identity.backend.model_version.as_deref(), Some("2026-09"));
         assert_eq!(identity.voice_model.as_deref(), Some("voice-ja-v2"));
         assert_eq!(identity.viseme_mapping.as_deref(), Some("ja-5vowel-v2"));
+    }
+
+    #[test]
+    fn interaction_budget_caps_tts_transport_timeout() {
+        let transport = MockHttpTransport::new(Ok(HttpResponse {
+            status: 200,
+            body: serde_json::to_vec(&json!({
+                "audio_ref": "audio://generated/test.opus",
+                "duration_ms": 1234
+            }))
+            .expect("response JSON"),
+            content_type: Some("application/json".to_owned()),
+        }));
+        let adapter =
+            NormalizedHttpTtsAdapter::with_transport(config(), None, Arc::new(transport.clone()))
+                .expect("adapter");
+
+        adapter
+            .synthesize_sync_with_timeout(
+                &SpeechRequest {
+                    text: "bounded speech".to_owned(),
+                    style: None,
+                },
+                Duration::from_millis(29),
+            )
+            .expect("speech");
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].timeout, Duration::from_millis(29));
     }
 
     #[test]

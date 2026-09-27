@@ -111,6 +111,16 @@ The executable constructs the production `GenerativeRuntime` only when `AIVTUBER
 
 A `PlaybackRoute::Generate` is produced by the reflex composition when Jev executes the LLM route. Generation is submitted to the bounded `GenerativeRuntime` worker and returns immediately to the composition loop; `tick()` drains completed immutable results, revalidates publication/cancellation state, and only then mutates the hot asset store or scheduler. Slow providers therefore do not stop scheduler advancement or adapter maintenance. The default execution boundary has one in-flight provider job and eight queued jobs; saturation deterministically uses the preselected cached/non-verbal fallback rather than spawning unbounded work. The default stdin smoke configuration still uses `IntentRoutePlanner`; production hosts that enable reflex routing compose `ReflexRoutePlanner` with the same `ProductionApp` and generative runtime exercised by the E2E tests.
 
+== End-to-end interaction deadlines
+
+Every admitted content event receives a trusted runtime deadline class derived from its normalized `EventKind`; untrusted payload fields do not choose or extend the class. Operator commands remain on the independent authenticated control path and do not enter this content-deadline policy.
+
+The current classes are `high_priority`, `strong_reaction`, `conversation`, `commentary`, and `background`. `InteractionDeadlinePolicy` owns their budgets and the minimum useful budget required before starting generation. The default 30-second values are conservative safety ceilings that preserve existing behavior; they are not latency SLO targets and should be calibrated by #58 before tightening production profiles.
+
+One interaction budget spans routing and provider work. Retrieval time is subtracted before Jev admission. OpenAI-compatible Thinking, normalized HTTP TTS, and Jev each receive an effective timeout no larger than both their provider-specific maximum and the remaining interaction budget. If too little useful budget remains before generation, production selects the already-determined cached/non-verbal fallback without entering the provider worker. A generation completion that arrives after the useful deadline is discarded at the composition-thread commit fence and cannot insert a hot asset or schedule playback.
+
+The immediate interaction deadline is distinct from any future deferred-response expiry (#75): missing the immediate useful-time budget vetoes immediate work, but does not by itself define whether a separately retained deferred item is still contextually valid.
+
 == VTube Studio output
 
 Enable VTube Studio only when its local websocket API is available:
