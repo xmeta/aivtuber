@@ -151,7 +151,8 @@ Before any speculative result becomes irreversible/public, a deterministic commi
 * generation/turn epoch is still current;
 * moderation/context has not invalidated or superseded the response;
 * remaining deadline/resource policy still permits completion;
-* the normal deterministic public-output gate passes;
+* the normal deterministic publication-containment gate passes (currently control-plane terms plus configured-secret redaction, not general content moderation);
+* any separate moderation/context policy required by the active product profile passes;
 * the performance/phrase unit satisfies the applicable atomic commit rules.
 
 Provider-side cancellation is best-effort. Local generation/revision fencing remains authoritative even when a remote provider finishes after cancellation.

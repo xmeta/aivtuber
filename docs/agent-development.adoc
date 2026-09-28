@@ -176,7 +176,7 @@ For content, model, moderation, tool, OBS/avatar, or memory changes, verify all 
 * serializable claims cannot mint non-serializable authority;
 * Jev/LLM output cannot directly invoke privileged adapters;
 * memory durability passes the explicit write gate;
-* output passes the public-output gate before irreversible publication;
+* output passes the narrow publication-containment gate (control terms + configured-secret redaction) before irreversible publication; do not treat this as general content moderation;
 * operator emergency control does not depend on content/model queue health;
 * secrets are not logged, persisted in assets, or added to diagnostic bundles;
 * retained viewer/context state is bounded and pseudonymized where required.

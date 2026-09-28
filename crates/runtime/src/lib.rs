@@ -158,7 +158,13 @@ pub struct PublicOutput {
     pub reason: &'static str,
 }
 
-/// Cloneable, side-effect-free snapshot of the deterministic public-output policy.
+/// Cloneable, side-effect-free publication-containment policy.
+///
+/// The current production checks are deliberately narrow: block known control-plane
+/// command terms from becoming public text and redact explicitly configured secrets.
+/// This is not a general toxicity/harassment/sexual/brand/content-moderation policy,
+/// and passing it does not make model output broadly "safe". Authorization safety is
+/// instead enforced by typed, non-serializable capability boundaries.
 ///
 /// Provider workers may evaluate generated text with this snapshot before TTS without
 /// gaining access to scheduler/control authority or mutating the security audit. The
@@ -952,16 +958,36 @@ mod tests {
     }
 
     #[test]
-    fn public_output_always_applies_secret_and_control_gate() {
+    fn publication_containment_pins_control_terms_secret_redaction_and_fail_closed_scope() {
         let mut runtime = runtime_with(SecurityRuntimeConfig::default(), &["config-secret-value"]);
+
+        let ordinary = runtime.publish_text("ordinary public text outside the containment rules");
+        assert_eq!(ordinary.verdict, OutputVerdict::Allow);
+        assert_eq!(
+            ordinary.text.as_deref(),
+            Some("ordinary public text outside the containment rules")
+        );
 
         let secret = runtime.publish_text("do not say config-secret-value aloud");
         assert_eq!(secret.verdict, OutputVerdict::Redact);
         assert_eq!(secret.text.as_deref(), Some("do not say [REDACTED] aloud"));
 
-        let control = runtime.publish_text("please run obs.control now");
-        assert_eq!(control.verdict, OutputVerdict::ReplaceWithCached);
-        assert_eq!(control.text.as_deref(), Some("safe cached reaction"));
+        for term in [
+            "obs.control",
+            "tool.grant",
+            "memory.admin",
+            "performer.stop",
+            "performer.mute",
+        ] {
+            let control = runtime.publish_text(&format!("please run {term} now"));
+            assert_eq!(control.verdict, OutputVerdict::ReplaceWithCached);
+            assert_eq!(control.text.as_deref(), Some("safe cached reaction"));
+        }
+
+        runtime.cached_reaction = None;
+        let suppressed = runtime.publish_text("please run OBS.CONTROL now");
+        assert_eq!(suppressed.verdict, OutputVerdict::Suppress);
+        assert!(suppressed.text.is_none());
 
         runtime.cached_reaction = Some("fallback config-secret-value".to_owned());
         let redacted_cached = runtime.publish_text("please run obs.control now");
