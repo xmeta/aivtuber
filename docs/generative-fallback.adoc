@@ -29,7 +29,7 @@ For one event the buffered provider pipeline is:
 . invoke the ThinkingEngine;
 . check cancellation;
 . evaluate generated text with the cloneable `PublicOutputPolicy` snapshot on the provider worker;
-. reject/suppress unsafe output or use the redacted text returned by that gate;
+. reject/suppress text blocked by the narrow publication-containment policy or use the configured-secret-redacted text returned by that gate;
 . invoke TTS only with gated public text;
 . check cancellation;
 . compile a dynamic Performance Asset from the gated text and complete speech artifact;
@@ -65,7 +65,7 @@ Any future speculative path must:
 * bind work to source event/revision plus generation/turn identity;
 * treat provider output as disposable until the current context is revalidated;
 * keep Scheduler mutation/public dispatch outside speculative work;
-* run the normal deterministic output gate before irreversible publication;
+* run the deterministic publication-containment gate before irreversible publication;
 * reject late/stale provider completion after cancellation or supersession;
 * preserve #83-style atomic phrase/performance commit semantics when phrase streaming is enabled.
 
@@ -140,7 +140,7 @@ The Rust tests cover:
 * full thinking/TTS model provenance;
 * promotion into `AssetStore`;
 * streaming final-chunk gating and cancellation;
-* production generate -> output gate -> TTS -> hot insert -> shared scheduler playback;
+* production generate -> publication-containment gate -> TTS -> hot insert -> shared scheduler playback;
 * production output redaction and suppression before TTS;
 * production thinking timeout/TTS failure -> cached or non-verbal fallback;
 * production high-priority and authenticated emergency cancellation;

@@ -192,18 +192,20 @@ Secrets must not appear in:
 
 Adapter configuration references secret identifiers; it does not copy secret values into domain state. Rust control secrets use redacted `Debug`, and telemetry/public-output paths apply a configured `SecretRedactor` before emitting text.
 
-== 11. Output gate
+== 11. Publication containment gate
 
-Before public speech/display, generated output passes a deterministic policy hook.
+Before public speech/display, generated output passes a deterministic publication-containment policy.
 
-The hook can:
+The current production Rust policy is intentionally narrower than general content moderation. It checks only:
 
-* allow;
-* redact;
-* replace with a safe cached reaction;
-* suppress.
+* known control-plane command terms (`obs.control`, `tool.grant`, `memory.admin`, `performer.stop`, `performer.mute`), which are replaced with the configured cached reaction or suppressed when no fallback exists;
+* explicitly configured secret values, which are redacted before publication/TTS.
 
-A failure in the output gate fails closed for public output but does not stop the local scheduler.
+All other text is allowed by this stage. Passing this gate therefore does *not* establish that output is generally safe, non-toxic, non-harassing, sexually appropriate, brand-safe, or otherwise content-moderated.
+
+Capability/authorization safety does not depend on this text filter. Viewer/model strings cannot mint `AuthenticatedControl` or another typed privileged capability; that separate authority boundary remains decisive even if arbitrary text passes publication containment.
+
+A future general moderation policy should be a separate typed policy stage that may veto publication without gaining capability authority. The current control-term path fails closed: when text contains a control-plane term and no cached fallback is configured, public output is suppressed. Publication suppression does not stop the local scheduler.
 
 === 11.1 Speculative output is uncommitted data
 
@@ -213,7 +215,7 @@ At minimum:
 
 * source revision/generation identity must still be current;
 * cancellation/supersession must be honored locally even if provider cancellation failed;
-* the normal output gate must still run before irreversible publication;
+* the normal publication-containment gate must still run before irreversible publication, independently of any separate general moderation policy;
 * a late provider result must not be replayed after a newer event/turn decision replaced it;
 * operator emergency control remains independent of speculative provider work.
 
