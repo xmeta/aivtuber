@@ -271,7 +271,7 @@ impl OperatorControlServer {
         }
         #[cfg(unix)]
         {
-            use interprocess::local_socket::{GenericFilePath, ToFsPath};
+            use interprocess::local_socket::{GenericFilePath, ToFsName};
             let path = std::path::PathBuf::from(&self.name);
             let name = path.to_fs_name::<GenericFilePath>()?;
             interprocess::local_socket::ListenerOptions::new()
@@ -492,17 +492,20 @@ mod tests {
                     let _ = server.serve(rate_clone).await;
                 });
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                // Client side
-                use interprocess::local_socket::{
-                    GenericNamespaced, ToNsName, traits::tokio::Stream as _,
-                };
+                // Client side. The name-type traits are cfg-gated so each
+                // platform only imports what it uses.
+                use interprocess::local_socket::traits::tokio::Stream as _;
+                #[cfg(unix)]
+                use interprocess::local_socket::{GenericFilePath, ToFsName};
+                #[cfg(windows)]
+                use interprocess::local_socket::{GenericNamespaced, ToNsName};
                 #[cfg(windows)]
                 let name = "aivtuber-lib-test"
                     .to_ns_name::<GenericNamespaced>()
                     .unwrap();
                 #[cfg(unix)]
                 let name = std::path::PathBuf::from("aivtuber-lib-test")
-                    .to_fs_name::<interprocess::local_socket::GenericFilePath>()
+                    .to_fs_name::<GenericFilePath>()
                     .unwrap();
                 let mut conn = interprocess::local_socket::tokio::Stream::connect(name)
                     .await

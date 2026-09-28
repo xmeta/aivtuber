@@ -173,7 +173,7 @@ async fn connect(endpoint: &str) -> std::io::Result<interprocess::local_socket::
     }
     #[cfg(unix)]
     {
-        use interprocess::local_socket::{GenericFilePath, ToFsPath, traits::tokio::Stream as _};
+        use interprocess::local_socket::{GenericFilePath, ToFsName, traits::tokio::Stream as _};
         let name = std::path::PathBuf::from(endpoint).to_fs_name::<GenericFilePath>()?;
         interprocess::local_socket::tokio::Stream::connect(name).await
     }
