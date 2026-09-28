@@ -1,0 +1,102 @@
+= Continuous Benchmark Gate (issue #58 — Phase A + B)
+:status: Implemented (result contract + comparator + budgets; CI wiring and tiers follow)
+:date: 2026-09-29
+
+== 1. Scope
+
+This note documents the first two phases of the continuous benchmark loop
+from issue #58:
+
+* *Phase A — result contract*: a versioned, machine-readable benchmark
+  result document validated by `schemas/benchmark-result.schema.json` in CI.
+* *Phase B — comparator*: `benchmark-compare`, which evaluates base vs head
+  results against repository-controlled budgets and fails the job on a
+  configured regression or hard-invariant violation.
+
+Phases C (PR CI base-vs-head job), D (scheduled high-volume resource tier),
+and E (historical trend storage) build directly on this contract and follow
+in later changes.
+
+== 2. Result contract
+
+`crates/app/src/bin/replay-benchmark` now emits, next to the existing
+comparison-suite documents, one `*-result.json` per comparison mode
+conforming to the schema:
+
+* `schema_version` — currently `"1"`; incompatible versions are rejected
+  rather than silently compared.
+* identity: `benchmark_suite`, `mode`, `dataset_id`, `git.commit`
+  (+`base_commit` for comparisons).
+* reproduction metadata: OS/arch/rust/bun/profile, `config_version`,
+  `asset_version`, `index_version`, `retriever_version`, model IDs,
+  `seed`, `stream_duration_ms`, and `cost_model_version` whenever cost
+  metrics are present.
+* `metrics` — flat map with unit-explicit names
+  (`cached.first_audio.p95_ms`, `routing.route_decision.p95_us`,
+  `routing.llm_calls_per_100_events`, `semantic.wrong_reuse_rate_pct`, ...)
+  and sample counts.
+* `invariants` — hard correctness counters
+  (`reliability.stale_dispatch_count`,
+  `reliability.unauthorized_privileged_action_count`,
+  `reliability.deterministic_replay_mismatch_count`,
+  `resource.retention_bound_violation_count`,
+  `resource.invalid_route_transition_count`).
+
+CI validates valid and invalid fixtures via `check-jsonschema` in the
+schema job.
+
+== 3. Comparator and budgets
+
+`benchmark-compare <base.json> <head.json> [budgets.json] [out-dir]`:
+
+1. loads and validates both results (schema version, identity metadata);
+2. refuses to compare across differing `benchmark_suite`, `mode`,
+   `dataset_id`, `config_version`, or `seed`;
+3. computes improvement-positive deltas per metric;
+4. applies `benchmarks/budgets.json`:
+   * `direction` `lower`/`higher`,
+   * `warn_regression_percent` / `fail_regression_percent`,
+   * `warn_absolute_change` / `fail_absolute_change`,
+   * `min_samples` — below it the metric reports `ungated`;
+5. enforces exact hard invariants (any value above `max` fails the gate);
+6. prints a Markdown table (metric / base / head / delta / status) for the
+   PR job summary and writes `gate-report.json` + `gate-summary.md`;
+7. exits non-zero on `fail`.
+
+Verdicts:
+
+* *pass* — all budgeted metrics within budget, invariants clean;
+* *warning* — a budgeted metric breached only its warn threshold;
+* *fail* — a fail threshold breached or any hard invariant violated.
+
+Metrics without a budget entry are reported as `ungated` with a warning but
+never gate. This is deliberate (#58 "noise calibration"): timing thresholds
+become strict only after runner variance is measured; correctness/state
+invariants are strict from day one.
+
+== 4. Workflow
+
+PR CI (Phase C) will:
+
+```text
+resolve base SHA → benchmark base → benchmark head (same runner/job)
+→ benchmark-compare base head → Job Summary + artifacts
+```
+
+The comparator is deterministic: the same inputs always produce the same
+verdict, so gate decisions are reviewable after the fact from the uploaded
+JSON.
+
+Accepting a regression intentionally means editing `benchmarks/budgets.json`
+in the same PR — the change is reviewed like code.
+
+== 5. Verification
+
+* telemetry unit tests (12): improvement/ok/warning/fail paths,
+  higher-is-better, absolute thresholds on small denominators,
+  min_samples gating, invariant violation overrides improvements,
+  incompatible dataset/schema detection, ungated reporting, markdown
+  summary, JSON round-trip.
+* end-to-end: `replay-benchmark` emits contract results; comparator PASSes
+  identical results (exit 0) and FAILs an artificially regressed result
+  (first-audio p95 +78%, stale dispatch 3) with exit 1.

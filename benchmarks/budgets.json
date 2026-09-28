@@ -1,0 +1,48 @@
+{
+  "schema_version": "1",
+  "description": "Benchmark regression budgets (issue #58). Percent thresholds are relative to the base value; absolute thresholds are in the metric's own unit. Metrics without an entry are reported ungated (warning-only) until calibrated. Changes to this file are reviewed like code: accepting a regression intentionally requires editing it.",
+  "metrics": {
+    "cached.first_audio.p95_ms": {
+      "direction": "lower",
+      "warn_regression_percent": 10,
+      "fail_regression_percent": 25,
+      "min_samples": 3
+    },
+    "cached.first_audio.p50_ms": {
+      "direction": "lower",
+      "warn_regression_percent": 15,
+      "fail_regression_percent": 30,
+      "min_samples": 3
+    },
+    "cached.first_visible.p95_ms": {
+      "direction": "lower",
+      "warn_regression_percent": 10,
+      "fail_regression_percent": 25,
+      "min_samples": 3
+    },
+    "routing.route_decision.p95_us": {
+      "direction": "lower",
+      "warn_regression_percent": 20,
+      "fail_regression_percent": 40,
+      "min_samples": 3
+    },
+    "routing.llm_calls_per_100_events": {
+      "direction": "lower",
+      "warn_absolute_change": 5,
+      "fail_absolute_change": 15
+    },
+    "semantic.wrong_reuse_rate_pct": {
+      "direction": "lower",
+      "warn_absolute_change": 0.5,
+      "fail_absolute_change": 2.0
+    }
+  },
+  "invariants": {
+    "reliability.stale_dispatch_count": { "max": 0 },
+    "reliability.unauthorized_privileged_action_count": { "max": 0 },
+    "reliability.deterministic_replay_mismatch_count": { "max": 0 },
+    "resource.retention_bound_violation_count": { "max": 0 },
+    "resource.invalid_route_transition_count": { "max": 0 }
+  },
+  "ungated_metrics_warning_only": true
+}

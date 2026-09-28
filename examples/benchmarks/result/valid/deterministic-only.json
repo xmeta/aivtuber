@@ -1,0 +1,40 @@
+{
+  "schema_version": "1",
+  "benchmark_suite": "replay-comparison",
+  "mode": "deterministic_only",
+  "dataset_id": "starter-replay-comparison-v1",
+  "git": {
+    "commit": "bfe0b7e0c0ffee",
+    "base_commit": null
+  },
+  "environment": {
+    "os": "windows",
+    "architecture": "x86_64",
+    "cpu": null,
+    "rust_version": "rustc 1.98.1",
+    "bun_version": null,
+    "cargo_profile": "release"
+  },
+  "configuration": {
+    "config_version": "replay-benchmark-v1",
+    "runtime_profile": null,
+    "asset_version": "starter-v1/compiler-0.1.0",
+    "index_version": "benchmark-semantic-v1",
+    "retriever_version": "benchmark-semantic-v1",
+    "jev_model": null,
+    "thinking_model": null,
+    "tts_model": null,
+    "cost_model_version": null,
+    "seed": 4242,
+    "stream_duration_ms": 180000
+  },
+  "metrics": {
+    "cached.first_audio.p95_ms": { "value": 2, "sample_count": 3 },
+    "routing.generative_rate_pct": { "value": 0.0, "sample_count": 3 },
+    "semantic.wrong_reuse_count": { "value": 0, "sample_count": 3 }
+  },
+  "invariants": {
+    "reliability.stale_dispatch_count": { "value": 0, "detail": null },
+    "resource.retention_bound_violation_count": { "value": 0, "detail": null }
+  }
+}

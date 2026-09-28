@@ -5,8 +5,15 @@
 //! Runtime instrumentation records bounded structured observations. Benchmark
 //! reports aggregate those observations without retaining prompt/generated text.
 
+mod benchmark_gate;
 mod causal_trace;
 
+pub use benchmark_gate::{
+    BenchmarkConfiguration, BenchmarkEnvironment, BenchmarkGateError, BenchmarkGit,
+    BenchmarkResult, BudgetDirection, Budgets, GateReport, GateVerdict, InvariantBudget,
+    InvariantComparison, InvariantValue, MetricBudget, MetricComparison, MetricStatus, MetricValue,
+    RESULT_SCHEMA_VERSION, compare,
+};
 pub use causal_trace::{
     CausalTrace, CausalTraceCollector, CausalTraceError, CausalTraceRetentionConfig,
     CausalTraceRetentionMetrics, StageOutcome, StageReason, TraceSpan, TraceStage,

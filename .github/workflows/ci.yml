@@ -129,3 +129,14 @@ jobs:
 
       - name: Validate security regression fixtures
         run: check-jsonschema --schemafile schemas/security-regression-case.schema.json examples/security/*.json
+
+      - name: Validate benchmark results
+        run: check-jsonschema --schemafile schemas/benchmark-result.schema.json examples/benchmarks/result/valid/*.json
+
+      - name: Reject invalid benchmark results
+        shell: bash
+        run: |
+          if check-jsonschema --schemafile schemas/benchmark-result.schema.json examples/benchmarks/result/invalid/*.json; then
+            echo "Invalid benchmark result fixture unexpectedly passed."
+            exit 1
+          fi
