@@ -132,8 +132,8 @@ Record the result as one of:
 
 |Native audio backend
 |+rodio+
-|Benchmark first
-|Compare against current per-playback process spawn. Measure first-audio/startup distribution, cancellation, consecutive-clip gap, CPU/memory, device lifecycle, and Windows behavior before changing the default.
+|Dual backend / opt-in native spike
+|#101 measured Windows backend-return proxies with a persistent rodio stream: native start/stop/handoff were materially lower than per-playback ffplay spawn/termination, but acoustic onset, phrase-gap perception, and device-loss recovery remain unverified. Keep the process backend as the production default and the native backend opt-in until those measurements exist. See link:audio-backend-spike.adoc[Native audio backend spike].
 |#101
 
 |Natural avatar behavior / gaze / idle motion

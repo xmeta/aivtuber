@@ -172,17 +172,17 @@ Do not record secrets, private user data, or raw provider credentials.
 
 *Subsystem:* audio output
 
-*Status:* Needs validation
+*Status:* Invalidated
 
 *Statement:* The existing external process-player backend is operationally acceptable for the current production profile; native audio is not assumed better without measurement.
 
-*Evidence:* Current adapter behavior; no comparative native-backend benchmark yet.
+*Evidence:* #101 Windows evidence in link:audio-backend-spike.adoc[Native audio backend spike] and +../examples/benchmarks/audio-backend-windows-2026-09-28.json+ shows materially lower backend-return start/stop/handoff proxies for a persistent rodio stream than per-playback ffplay. This does not yet prove lower acoustic first-audible latency or better phrase continuity.
 
-*Consequence if false:* Process startup may materially hurt first-audio latency or phrase continuity.
+*Consequence if false:* Process startup may materially hurt first-audio latency or phrase continuity. The spike confirms the startup mechanism is non-negligible at the measured backend boundary, so the process path should not be treated as latency-equivalent to native playback.
 
-*Revisit when:* #101 produces native-vs-process evidence, #58 identifies audio startup as a bottleneck, or #83 phrase streaming requires tighter gaps.
+*Revisit when:* #58 provides end-to-end/acoustic first-audio evidence, #83 measures phrase continuity, or native device-loss/reconnect behavior is validated well enough to reconsider the production default.
 
-*Related:* #58, #101.
+*Related:* #58, #83, #101.
 
 === A-RESEARCH-001 -- External benchmark results do not define aivtuber production thresholds
 

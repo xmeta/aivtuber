@@ -1,0 +1,133 @@
+:toc:
+:toclevels: 2
+
+= Native Audio Backend Evidence Spike (#101)
+
+== Decision
+
+Keep the existing process-player backend as the production default for now, and retain the native Rust backend as an opt-in experimental path behind the existing `AudioPlayer` boundary.
+
+The Windows measurements show a large reduction in backend start, stop, and consecutive-handoff proxy latency for a persistent `rodio` device stream. They do not measure acoustic first-audible latency, real VTuber clip formats, or device-loss recovery well enough to justify replacing the default globally.
+
+Revisit the default when #58/#83 can add acoustic/on-device first-audio and phrase-continuity measurements on the actual deployment profile.
+
+== Compared implementations
+
+Process baseline::
+`ProcessAudioPlayer` resolves `audio://` under the configured root and starts `ffplay` for each playback. Production behavior is unchanged. A tracked-start helper exposes the child only to the benchmark so process spawn and stop can be measured without duplicating validation logic.
+
+Native candidate::
+`RodioAudioPlayer` is available only on Windows when the `native-audio-spike` feature is enabled. It opens one default output stream, decodes a file per playback, and creates a player attached to the persistent mixer. It remains an `AudioPlayer`; no device handle enters domain/replay state.
+
+== Measurement setup
+
+Evidence file: `../examples/benchmarks/audio-backend-windows-2026-09-28.json`.
+
+Environment used for the recorded run:
+
+* Microsoft Windows 11 Pro, version 10.0.26200, build 26200, x86_64.
+* `ffplay` 9.0.2 as the process backend.
+* `rodio` 0.22.2 with the Windows playback feature.
+* 30 repetitions per distribution.
+* synthetic silent PCM S16LE mono 48 kHz WAV files: 120 ms for start/handoff and 2 s for stop.
+* process playback used `-volume 0`; native input samples were zero, so the measurement did not intentionally emit audible program material.
+
+The benchmark command is:
+
+[source,powershell]
+----
+$env:AIVTUBER_AUDIO_BENCH_REPETITIONS="30"
+cargo run --locked -p aivtuber-adapters --features native-audio-spike \
+  --bin audio-backend-benchmark -- target\audio-backend-benchmark-windows.json
+----
+
+The start metric is a *backend-return proxy*, not microphone/acoustic first-audible time: process = validated `spawn()` return; native = validated decode plus mixer enqueue return. Stop measures `kill()+wait()` for `ffplay` and `Player::stop()` for rodio. Handoff measures the second backend start after the first short clip reaches its backend-complete condition.
+
+== Results
+
+All latency values below are microseconds.
+
+[cols="2,1,1,1,1,1,1"]
+|===
+|Metric |Backend |p50 |p95 |p99 |min |max
+|Start proxy |process / ffplay |5972 |8767 |13517 |5534 |13517
+|Start proxy |rodio |499 |747 |791 |458 |791
+|Stop |process / ffplay |2020 |2806 |4617 |1789 |4617
+|Stop |rodio |4 |10 |10 |2 |10
+|Consecutive handoff proxy |process / ffplay |6514 |14347 |14438 |5966 |14438
+|Consecutive handoff proxy |rodio |685 |897 |1025 |594 |1025
+|===
+
+Cold-path observations:
+
+* process cold start proxy: 9242 us;
+* opening the native default device stream: 77293 us;
+* first native playback after stream initialization: 901 us.
+
+This makes persistent device initialization part of the native-backend requirement. Reopening the device for every reaction would erase a substantial part of the measured benefit.
+
+== Resource observations
+
+The harness records coarse Windows process snapshots; they are diagnostic observations, not a controlled CPU/memory benchmark.
+
+* sampled `ffplay` child: about 15.8 MB working set and 15.8 MB private bytes;
+* benchmark host before the run: about 12.0 MB working set / 1.84 MB private bytes;
+* benchmark host after the run: about 12.5 MB working set / 2.27 MB private bytes.
+
+The host process includes the benchmark code and persistent native stream, so the before/after difference must not be interpreted as rodio-only memory. A future default-backend decision should use isolated steady-state CPU/memory profiling.
+
+== Cancellation and continuity
+
+The native candidate exposes local `stop()` over the currently active player. The benchmark shows that this local operation is much cheaper than terminating and reaping an external process at the measured boundary.
+
+The current `AudioPlayer` production interface remains intentionally authority-free. Operator stop/mute is still decided by the application/security/scheduler path; a native audio object does not receive `AuthenticatedControl`.
+
+The handoff proxy favors the persistent native stream, but this spike does not measure the actual DAC/speaker gap between waveforms. Phrase-level continuity for #83 therefore remains an explicit revisit condition rather than a completed claim.
+
+== Device and deployment behavior
+
+Windows::
+The feature build and live benchmark succeeded against the default Windows output device. `RodioAudioPlayer::new` fails with an unavailable error when the default stream cannot be opened. The current spike does not automatically rebuild the stream after device removal/default-device change; production adoption would need an explicit reconnect/reconstruction policy.
+
+WSL/Linux development::
+The WSL environment used during the spike has WSLg/PulseAudio endpoints and `ffplay`, but no `aplay` command or ALSA development package visible through `pkg-config`. To keep deterministic CI and normal WSL builds independent of host audio development libraries, the native playback implementation is Windows-gated and the rodio dependency is optional.
+
+Fallback::
+The process backend remains available and remains the production default. Failure of the optional native experiment therefore does not remove the existing operational path.
+
+== Dependency and runtime risks
+
+* `rodio` pulls platform audio/runtime dependencies when native playback is enabled.
+* audio device availability and latency are environmental and observational, not replay inputs.
+* one persistent stream is required for the measured low start cost; device lifecycle becomes a long-lived adapter responsibility.
+* real OPUS/generated assets and actual deployment devices were not exercised by this synthetic WAV benchmark.
+* acoustic onset, underrun/glitch behavior, and phrase-boundary perceptual gaps remain unmeasured.
+
+== Reproduction and verification
+
+Default CI does not require a native audio device:
+
+[source,text]
+----
+cargo test --locked -p aivtuber-adapters
+----
+
+The optional implementation can be type-checked without changing the application default. The recorded live evidence was produced on Windows:
+
+[source,text]
+----
+cargo check --locked -p aivtuber-adapters --features native-audio-spike \
+  --bin audio-backend-benchmark
+----
+
+The benchmark output is intentionally a checked-in evidence snapshot; fresh local results belong under `target/` until reviewed and selected for an evidence update.
+
+== Revisit conditions
+
+Reconsider replacing the process default when at least one of these produces new evidence:
+
+* #58 shows audio backend startup is material in the end-to-end latency budget;
+* #83 needs phrase-level gap/continuity below what process playback can provide;
+* an acoustic loopback/microphone measurement confirms the proxy advantage at first audible output;
+* production device-loss/reconnect tests establish a robust persistent-stream lifecycle;
+* isolated CPU/memory measurements reveal a material regression or advantage.
