@@ -79,6 +79,29 @@ pub struct TemplatePack {
     templates: Vec<ResponseTemplate>,
 }
 
+/// Curated starter template pack for production `reflex`/`full` profiles
+/// (issue #55): matches the starter reaction pack's donation-thanks flow and
+/// keeps the Template route reachable without external configuration.
+pub fn starter_template_pack() -> TemplatePack {
+    TemplatePack::new(vec![
+        ResponseTemplate {
+            id: "thanks.donation".to_owned(),
+            version: "starter-v1".to_owned(),
+            text: "{name}\u{3055}\u{3093}\u{3001}\u{3042}\u{308a}\u{304c}\u{3068}\u{3046}\u{ff01}"
+                .to_owned(),
+            slots: vec!["name".to_owned()],
+        },
+        ResponseTemplate {
+            id: "greet.viewers".to_owned(),
+            version: "starter-v1".to_owned(),
+            text:
+                "\u{307f}\u{3093}\u{306a}\u{3001}\u{3053}\u{3093}\u{306b}\u{3061}\u{306f}\u{ff01}"
+                    .to_owned(),
+            slots: Vec::new(),
+        },
+    ])
+}
+
 impl TemplatePack {
     pub fn new(templates: Vec<ResponseTemplate>) -> Self {
         Self { templates }
@@ -238,6 +261,30 @@ pub trait RoutePlanner: Send {
     /// (`None` when the last decision was not a Template fallback).
     fn template_fallback(&self) -> Option<TemplateFallback> {
         None
+    }
+}
+
+/// Object-safe forwarding impl so executables can compose either planner
+/// behind `Box<dyn RoutePlanner>` (issue #55 profile selection).
+impl RoutePlanner for Box<dyn RoutePlanner> {
+    fn route(&mut self, event: &EventEnvelope) -> Result<PlaybackRoute, AppError> {
+        (**self).route(event)
+    }
+
+    fn route_with_budget(
+        &mut self,
+        event: &EventEnvelope,
+        remaining_budget: Option<Duration>,
+    ) -> Result<PlaybackRoute, AppError> {
+        (**self).route_with_budget(event, remaining_budget)
+    }
+
+    fn decision_record(&self) -> Option<&DecisionReplayRecord> {
+        (**self).decision_record()
+    }
+
+    fn template_fallback(&self) -> Option<TemplateFallback> {
+        (**self).template_fallback()
     }
 }
 

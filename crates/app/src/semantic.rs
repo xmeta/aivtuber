@@ -7,6 +7,69 @@ use std::fmt;
 
 pub const SEMANTIC_TIE_BREAK_RULE: &str = "similarity_desc_then_asset_id_asc";
 
+/// Production query-embedding provider for the starter-semantic model space
+/// (issue #55): maps an event's `intent` payload field into the same
+/// three-axis vocabulary the indexed assets use
+/// (`reaction.agree` / `reaction.surprise` / `filler.thinking` axes), with a
+/// deterministic fallback projection for unknown intents. The intent text
+/// itself never leaves the process.
+pub struct PayloadIntentEmbedding {
+    dimension: usize,
+}
+
+impl PayloadIntentEmbedding {
+    /// Build the provider for the given embedding dimension (must match the
+    /// composed semantic index).
+    pub fn new(dimension: usize) -> Self {
+        Self { dimension }
+    }
+
+    /// Project a known intent family into its dominant axis.
+    fn intent_vector(&self, family: &str) -> Vec<f32> {
+        let mut vector = vec![0.0_f32; self.dimension];
+        match family {
+            "agree" if self.dimension > 0 => vector[0] = 1.0,
+            "surprise" if self.dimension > 1 => vector[1] = 1.0,
+            "thinking" if self.dimension > 2 => vector[2] = 1.0,
+            _ => {
+                // Unknown family: deterministic mild projection spread over
+                // all axes so retrieval still ranks curated assets.
+                if self.dimension > 0 {
+                    let weight = 1.0 / self.dimension as f32;
+                    vector.fill(weight);
+                }
+            }
+        }
+        vector
+    }
+}
+
+impl super::QueryEmbeddingProvider for PayloadIntentEmbedding {
+    fn embedding(
+        &mut self,
+        event: &aivtuber_domain::EventEnvelope,
+    ) -> Result<Vec<f32>, super::AppError> {
+        let intent = event
+            .payload
+            .get("intent")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let family = intent
+            .strip_prefix("reaction.")
+            .or_else(|| intent.strip_prefix("filler."))
+            .unwrap_or_default();
+        let vector = self.intent_vector(family);
+        if vector.len() != self.dimension {
+            return Err(super::AppError::Routing(format!(
+                "intent embedding dimension mismatch: expected {}, produced {}",
+                self.dimension,
+                vector.len()
+            )));
+        }
+        Ok(vector)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssetSemanticIndexConfig {
     pub retriever_version: String,

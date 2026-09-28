@@ -118,7 +118,46 @@ Traversal outside the configured root and symlink resolution outside the canonic
 
 The executable constructs the production `GenerativeRuntime` only when `AIVTUBER_GENERATIVE_ENABLED=true`. Enabling it requires `AIVTUBER_OPENAI_API_KEY` and `AIVTUBER_TTS_ENDPOINT`; endpoint/model/timeouts and optional TTS credentials are documented in `docs/generative-fallback.adoc`. The runtime compatibility values used by generated assets are the same compiler/voice/avatar/viseme/motion values used by the production `AssetStore`.
 
-A `PlaybackRoute::Generate` is produced by the reflex composition when Jev executes the LLM route. Generation is submitted to the bounded `GenerativeRuntime` worker and returns immediately to the composition loop; `tick()` drains completed immutable results, revalidates publication/cancellation state, and only then mutates the hot asset store or scheduler. Slow providers therefore do not stop scheduler advancement or adapter maintenance. The default execution boundary has one in-flight provider job and eight queued jobs; saturation deterministically uses the preselected cached/non-verbal fallback rather than spawning unbounded work. The default stdin smoke configuration still uses `IntentRoutePlanner`; production hosts that enable reflex routing compose `ReflexRoutePlanner` with the same `ProductionApp` and generative runtime exercised by the E2E tests.
+A `PlaybackRoute::Generate` is produced by the reflex composition when Jev executes the LLM route. Generation is submitted to the bounded `GenerativeRuntime` worker and returns immediately to the composition loop; `tick()` drains completed immutable results, revalidates publication/cancellation state, and only then mutates the hot asset store or scheduler. Slow providers therefore do not stop scheduler advancement or adapter maintenance. The default execution boundary has one in-flight provider job and eight queued jobs; saturation deterministically uses the preselected cached/non-verbal fallback rather than spawning unbounded work.
+
+== Composition profiles (issue #55)
+
+`AIVTUBER_MODE` names the active route graph explicitly. The mode — not disconnected environment flags — determines which planner, semantic index, Jev adapter, template pack, and generative runtime are composed. Startup prints a non-secret summary line (`composition profile: profile=... fingerprint=...`), and the fingerprint is recorded in benchmark result documents (`configuration.runtime_profile`) so base/head comparisons compare like-for-like compositions.
+
+Profiles:
+
+* `cached` (default) — exact/preselected cached playback via `IntentRoutePlanner` only. No semantic retrieval, Jev, templates, or generation.
+* `reflex` — semantic retrieval + Jev + curated template decisions via `ReflexRoutePlanner` with the starter template pack. No generative fallback.
+* `full` — the reflex route graph plus the LLM/TTS generative fallback.
+
+Profiles fail fast on misleading configurations before composition:
+
+* `reflex`/`full` without `AIVTUBER_JEV_API_KEY` refuse to start instead of silently degrading.
+* `full` without a fully configured generative backend (`AIVTUBER_GENERATIVE_ENABLED=true` plus thinking/TTS endpoints) refuses to start; use `reflex` for the documented degraded fallback.
+* `cached` with a configured generative backend is rejected as misleading — either select `full` or remove the configuration.
+
+Minimal commands:
+
+[source,shell]
+----
+# cached (default; no extra credentials needed)
+cargo run -p aivtuber-app
+
+# reflex
+export AIVTUBER_MODE=reflex
+export AIVTUBER_JEV_API_KEY='<jev key>'
+cargo run -p aivtuber-app
+
+# full
+export AIVTUBER_MODE=full
+export AIVTUBER_JEV_API_KEY='<jev key>'
+export AIVTUBER_GENERATIVE_ENABLED=true
+export AIVTUBER_OPENAI_API_KEY='<thinking key>'
+export AIVTUBER_TTS_ENDPOINT='https://tts.example/v1'
+cargo run -p aivtuber-app
+----
+
+All profiles still require `AIVTUBER_MEMORY_PSEUDONYM_KEY_HEX`; VTube Studio/OBS and the remaining tuning variables apply unchanged to every profile.
 
 == End-to-end interaction deadlines
 

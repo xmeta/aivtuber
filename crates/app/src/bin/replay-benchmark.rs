@@ -425,7 +425,7 @@ fn write_gate_results(output_dir: &Path, suite: &ComparisonSuite) -> Result<(), 
             },
             configuration: BenchmarkConfiguration {
                 config_version: metadata.config_version.clone(),
-                runtime_profile: None,
+                runtime_profile: Some(gate_runtime_profile(report.mode).to_owned()),
                 asset_version: metadata.asset_version.clone(),
                 index_version: metadata.index_version.clone(),
                 retriever_version: Some(RETRIEVER_VERSION.to_owned()),
@@ -892,6 +892,18 @@ fn mode_slug(mode: ComparisonMode) -> &'static str {
         ComparisonMode::DeterministicSemantic => "02-semantic",
         ComparisonMode::DeterministicSemanticJev => "03-semantic-jev",
         ComparisonMode::FullGenerative => "04-full-generative",
+    }
+}
+
+/// Composition profile (#55) matching each benchmark mode's route graph so
+/// base/head comparisons compare like-for-like compositions.
+fn gate_runtime_profile(mode: ComparisonMode) -> &'static str {
+    match mode {
+        ComparisonMode::DeterministicOnly => "cached",
+        ComparisonMode::DeterministicSemantic | ComparisonMode::DeterministicSemanticJev => {
+            "reflex"
+        }
+        ComparisonMode::FullGenerative => "full",
     }
 }
 
