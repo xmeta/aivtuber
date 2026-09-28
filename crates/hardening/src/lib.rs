@@ -4,10 +4,12 @@
 //!
 //! This crate is test/tooling infrastructure. Production crates do not depend on it.
 
+mod conformance;
 mod error;
 mod fault;
 mod soak;
 
+pub use conformance::*;
 pub use error::*;
 pub use fault::*;
 pub use soak::*;

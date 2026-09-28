@@ -327,6 +327,8 @@ Failure/soak:
 
 == Provider / adapter conformance
 
+Record deterministic fixture and exact live-version evidence according to +docs/provider-conformance.adoc+ and +examples/conformance/compatibility-matrix.json+. A +fixture_verified_live_unverified+ entry is not a live compatibility claim.
+
 VTS:
 OBS:
 Audio:

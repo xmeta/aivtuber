@@ -119,13 +119,15 @@ Do not record secrets, private user data, or raw provider credentials.
 
 *Subsystem:* reflex / Jev
 
-*Status:* Verified for repository adapter behavior; external provider semantics require #66 conformance
+*Status:* Fixture-verified for repository adapter behavior; exact live provider/version remains unverified until an opt-in #66 probe records evidence
 
 *Statement:* A Jev/System One transport timeout is normalized into a deterministic fallback record rather than freezing the performer.
 
 *Evidence:*
 
 * +crates/reflex/src/pipeline.rs+ test +transport_timeout_becomes_deterministic_fallback_record+
+* +examples/conformance/jev-system-one.json+ and the #66 offline conformance harness
+* +examples/conformance/compatibility-matrix.json+ (currently +fixture_verified_live_unverified+)
 * +docs/jev-routing.adoc+
 
 *Consequence if false:* External decision latency could block or make replay/fallback behavior inconsistent.
@@ -138,11 +140,11 @@ Do not record secrets, private user data, or raw provider credentials.
 
 *Subsystem:* Thinking provider adapters
 
-*Status:* Needs validation
+*Status:* Repository normalization fixture-verified; provider/model-specific live behavior still needs validation
 
 *Statement:* Providers exposing an OpenAI-compatible API may differ in structured output, streaming order, finish reasons, cancellation, rate limits, prompt caching, reasoning controls, and model identity semantics.
 
-*Evidence:* Provider documentation plus repository normalization contracts; complete live evidence is intentionally deferred to #66.
+*Evidence:* Provider documentation, repository normalization contracts, +examples/conformance/openai-responses.json+, and the versioned #66 compatibility matrix. Live provider/model evidence remains opt-in and version-specific.
 
 *Consequence if false assumption is ignored:* Mocks may remain green while production provider behavior drifts.
 

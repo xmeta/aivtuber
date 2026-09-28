@@ -1,0 +1,152 @@
+{
+  "schema_version": "1",
+  "fixture_version": "jev-systemone-fixture-v1",
+  "provider_id": "jev-system-one",
+  "cases": [
+    {
+      "id": "success-cached-selection",
+      "transport": {
+        "status": 200,
+        "body": {
+          "model": "jev-fixture-2026-09-15",
+          "answers": {
+            "response_route": {
+              "type": "choice",
+              "choice": "cached",
+              "confidence": 0.9,
+              "probabilities": {
+                "cached": 0.9,
+                "other": 0.1
+              }
+            },
+            "reaction_family": {
+              "type": "choice",
+              "choice": "laugh",
+              "confidence": 0.9,
+              "probabilities": {
+                "laugh": 0.9,
+                "other": 0.1
+              }
+            },
+            "gesture_family": {
+              "type": "choice",
+              "choice": "nod_small",
+              "confidence": 0.9,
+              "probabilities": {
+                "nod_small": 0.9,
+                "other": 0.1
+              }
+            },
+            "attention_target": {
+              "type": "choice",
+              "choice": "camera",
+              "confidence": 0.9,
+              "probabilities": {
+                "camera": 0.9,
+                "other": 0.1
+              }
+            },
+            "interrupt": {
+              "type": "noul",
+              "noul": 0.2
+            },
+            "cache_reuse": {
+              "type": "noul",
+              "noul": 0.94
+            },
+            "importance": {
+              "type": "score",
+              "score": 0.4,
+              "confidence": 0.8,
+              "legend": {
+                "0": "low",
+                "1": "high"
+              },
+              "probabilities": {
+                "0": 0.6,
+                "1": 0.4
+              }
+            },
+            "emotion_intensity": {
+              "type": "score",
+              "score": 0.7,
+              "confidence": 0.85,
+              "legend": {
+                "0": "low",
+                "1": "high"
+              },
+              "probabilities": {
+                "0": 0.3,
+                "1": 0.7
+              }
+            },
+            "selected_candidate": {
+              "type": "choice",
+              "choice": "asset.a",
+              "confidence": 0.9,
+              "probabilities": {
+                "asset.a": 0.9,
+                "other": 0.1
+              }
+            }
+          },
+          "usage": {
+            "input_tokens": 120,
+            "output_tokens": 9
+          }
+        }
+      },
+      "expected": {
+        "kind": "success",
+        "returned_model": "jev-fixture-2026-09-15",
+        "selected_candidate_id": "asset.a"
+      }
+    },
+    {
+      "id": "authentication-failure",
+      "transport": {
+        "status": 401,
+        "body": {}
+      },
+      "expected": {
+        "kind": "error",
+        "error_kind": "authentication"
+      }
+    },
+    {
+      "id": "rate-limit-normalization",
+      "transport": {
+        "status": 429,
+        "body": {}
+      },
+      "expected": {
+        "kind": "error",
+        "error_kind": "rate_limited"
+      }
+    },
+    {
+      "id": "transport-timeout",
+      "transport": {
+        "error": "timeout"
+      },
+      "expected": {
+        "kind": "error",
+        "error_kind": "timeout"
+      }
+    },
+    {
+      "id": "malformed-response",
+      "transport": {
+        "status": 200,
+        "body": {
+          "model": "jev-fixture-2026-09-15",
+          "answers": {}
+        }
+      },
+      "expected": {
+        "kind": "error",
+        "error_kind": "invalid_request"
+      }
+    }
+  ]
+}
