@@ -42,6 +42,7 @@ The core design separates three time scales:
 * link:docs/audio-backend-spike.adoc[Native audio backend evidence spike]
 * link:docs/roadmap.adoc[Roadmap]
 * link:docs/adr/0001-three-layer-runtime.adoc[ADR-0001: three-layer runtime]
+* link:docs/causal-trace.adoc[Causal trace design (#65)]
 * link:schemas/performance-asset.schema.json[Performance Asset JSON Schema]
 * link:schemas/event-envelope.schema.json[Event Envelope JSON Schema]
 * link:schemas/reflex-decision.schema.json[Reflex Decision JSON Schema]

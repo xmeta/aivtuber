@@ -37,8 +37,9 @@ use aivtuber_runtime::{
 };
 use aivtuber_scheduler::{Scheduler, Status};
 use aivtuber_telemetry::{
-    CacheLevel, ComparisonMode, DegradedSubsystem, EventObservation, RouteClass,
-    TelemetryCollector, TelemetryRetentionConfig,
+    CacheLevel, CausalTraceCollector, CausalTraceRetentionConfig, ComparisonMode,
+    DegradedSubsystem, EventObservation, RouteClass, StageOutcome, StageReason, TelemetryCollector,
+    TelemetryRetentionConfig, TraceStage,
 };
 use std::error::Error;
 use std::fmt;
@@ -220,6 +221,8 @@ struct GenerationCompletionContext {
     interaction_deadline: InteractionDeadline,
     remaining_at_route_ms: u64,
     remaining_at_generation_ms: u64,
+    /// Causal trace identity for the originating event (#65).
+    correlation_id: String,
 }
 
 struct GenerationWork {
@@ -627,6 +630,11 @@ struct HandledEvent {
     /// Generation was accepted by the bounded worker and will be observed
     /// when a completion is committed from tick().
     deferred_generation: bool,
+    /// Admitted content bytes observed at ingress (bounded, size only).
+    admitted_bytes: Option<u64>,
+    /// Causal trace identity (#65); `None` on deferred completions that
+    /// carry it through `GenerationCompletionContext` instead.
+    correlation_id: Option<String>,
 }
 
 struct HandledGeneration {
@@ -663,6 +671,7 @@ where
     interaction_deadlines: InteractionDeadlinePolicy,
     health: AdapterHealth,
     telemetry: TelemetryCollector,
+    causal_traces: CausalTraceCollector,
     comparison_mode: ComparisonMode,
 }
 
@@ -697,6 +706,7 @@ where
             interaction_deadlines: InteractionDeadlinePolicy::default(),
             health: AdapterHealth::default(),
             telemetry: TelemetryCollector::default(),
+            causal_traces: CausalTraceCollector::default(),
             comparison_mode: ComparisonMode::DeterministicOnly,
         }
     }
@@ -732,6 +742,18 @@ where
     pub fn with_telemetry_retention(mut self, retention: TelemetryRetentionConfig) -> Self {
         self.telemetry.set_retention(retention);
         self
+    }
+
+    /// Configure causal trace retention from the unified runtime policy (#65,
+    /// #51): trace retention never invents a separate policy contract.
+    pub fn with_causal_trace_retention(mut self, retention: CausalTraceRetentionConfig) -> Self {
+        self.causal_traces.set_retention(retention);
+        self
+    }
+
+    /// Retained privacy-safe causal traces for diagnostics/benchmarks.
+    pub fn causal_traces(&self) -> &CausalTraceCollector {
+        &self.causal_traces
     }
 
     pub fn adaptation(&self) -> Option<&AdaptationRuntime> {
@@ -837,6 +859,7 @@ where
     pub fn retention_snapshot(&self) -> RuntimeRetentionSnapshot {
         RuntimeRetentionSnapshot {
             telemetry: self.telemetry.retention_metrics(),
+            causal_traces: self.causal_traces.retention_metrics(),
             security: self.security.retention_metrics(),
             scheduler: self.performer.scheduler().metrics(),
             hot_cache: self.performer.assets().hot_cache_metrics(),
@@ -952,6 +975,12 @@ where
         let remaining_at_route_ms = interaction_deadline.remaining_ms(at_ms);
         let mut deadline_observation =
             DeadlineObservation::new(interaction_deadline, remaining_at_route_ms);
+        // Bounded size observation only: the serialized payload length, never
+        // the payload content (privacy is structural in causal traces).
+        let admitted_bytes = serde_json::to_vec(&event.payload)
+            .map(|bytes| bytes.len() as u64)
+            .ok();
+        let causal_correlation_id = event.correlation_id.clone();
         let route_started = Instant::now();
         let route_budget = remaining_instant(provider_deadline).unwrap_or(Duration::ZERO);
         let route = self.router.route_with_budget(&event, Some(route_budget))?;
@@ -1038,6 +1067,8 @@ where
                         cache_level: None,
                         deadline: Some(deadline_observation.clone()),
                         deferred_generation: false,
+                        admitted_bytes: None,
+                        correlation_id: Some(causal_correlation_id.clone()),
                     });
                 }
                 let text = output.text.unwrap_or_else(|| composition.text.clone());
@@ -1062,6 +1093,7 @@ where
                     remaining_at_generation_ms: remaining_instant(provider_deadline)
                         .map(|remaining| remaining.as_millis().min(u128::from(u64::MAX)) as u64)
                         .unwrap_or(0),
+                    correlation_id: causal_correlation_id.clone(),
                 };
                 deadline_observation.remaining_at_generation_ms =
                     Some(context.remaining_at_generation_ms);
@@ -1085,6 +1117,8 @@ where
                             cache_level: None,
                             deadline: None,
                             deferred_generation: true,
+                            admitted_bytes: None,
+                            correlation_id: None,
                         });
                     }
                     GenerationSubmission::Immediate {
@@ -1120,6 +1154,8 @@ where
             cache_level,
             deadline: Some(deadline_observation),
             deferred_generation: false,
+            admitted_bytes,
+            correlation_id: Some(causal_correlation_id),
         })
     }
 
@@ -1474,6 +1510,8 @@ where
                     cache_level: None,
                     deadline: Some(deadline),
                     deferred_generation: false,
+                    admitted_bytes: None,
+                    correlation_id: Some(completion.context.correlation_id.clone()),
                 };
                 self.record_handled_event(&event_id, &handled, now_ms);
 
@@ -1539,6 +1577,8 @@ where
                         cache_level,
                         deadline: Some(deadline),
                         deferred_generation: false,
+                        admitted_bytes: None,
+                        correlation_id: Some(completion.context.correlation_id.clone()),
                     };
                     self.record_handled_event(&event_id, &handled, now_ms);
                 }
@@ -1670,6 +1710,185 @@ where
         }
 
         self.telemetry.record(observation);
+        self.commit_causal_trace(event_id, handled);
+    }
+
+    /// Build and retain the privacy-safe causal trace for one handled event
+    /// (#65): stage chain from ingress through dispatch, deterministic
+    /// identity separate from observational timing, no payload content.
+    fn commit_causal_trace(&mut self, event_id: &str, handled: &HandledEvent) {
+        let correlation_id = handled
+            .correlation_id
+            .clone()
+            .unwrap_or_else(|| event_id.to_owned());
+        let mut trace = self.causal_traces.begin_trace(event_id, correlation_id);
+
+        // Ingress/security admission: byte size only, never content.
+        let ingress = trace.push_span(
+            TraceStage::IngressNormalization,
+            StageOutcome::Completed,
+            StageReason::None,
+            0,
+            0,
+        );
+        if let Some(bytes) = handled.admitted_bytes {
+            trace.with_bytes(ingress, bytes);
+        }
+        trace.push_span(
+            TraceStage::SecurityAdmission,
+            StageOutcome::Completed,
+            StageReason::None,
+            0,
+            0,
+        );
+
+        // Retrieval/reflex stages from the decision evidence, when present.
+        if let Some(decision) = &handled.decision {
+            trace.push_span(
+                TraceStage::CacheLookup,
+                if decision.evidence.retrieval.candidates.is_empty() {
+                    StageOutcome::Skipped
+                } else {
+                    StageOutcome::Completed
+                },
+                if decision.evidence.retrieval.candidates.is_empty() {
+                    StageReason::CacheMiss
+                } else {
+                    StageReason::None
+                },
+                0,
+                0,
+            );
+            let retrieval = trace.push_span(
+                TraceStage::SemanticRetrieval,
+                StageOutcome::Completed,
+                StageReason::None,
+                0,
+                0,
+            );
+            trace.with_count(
+                retrieval,
+                decision
+                    .evidence
+                    .retrieval
+                    .candidates
+                    .len()
+                    .min(u32::MAX as usize) as u32,
+            );
+            let jev = trace.push_span(
+                TraceStage::ReflexJev,
+                StageOutcome::Completed,
+                StageReason::None,
+                0,
+                u64::from(decision.evidence.model.attempts),
+            );
+            let _ = jev;
+        }
+
+        // Template resolution / output gate / generation per route.
+        if handled.template_fallback.is_some() {
+            trace.push_span(
+                TraceStage::TemplateResolution,
+                StageOutcome::Degraded,
+                StageReason::None,
+                0,
+                0,
+            );
+        }
+        if let Some(generation_trace) = &handled.generation_trace {
+            let cancelled = generation_trace.cancelled_stage;
+            if let Some(stage) = cancelled {
+                let reason = match stage {
+                    aivtuber_generative::CancellationStage::BeforeThinking
+                    | aivtuber_generative::CancellationStage::AfterThinking
+                    | aivtuber_generative::CancellationStage::AfterTts
+                    | aivtuber_generative::CancellationStage::BeforePublish => {
+                        StageReason::GenerationCancelled
+                    }
+                };
+                trace.push_span(
+                    TraceStage::Generation,
+                    StageOutcome::Cancelled,
+                    reason,
+                    0,
+                    0,
+                );
+                trace.record_cancellation(reason, 0);
+            } else {
+                let outcome = if fallback_reason_name(generation_trace.fallback_reason).is_none() {
+                    StageOutcome::Completed
+                } else {
+                    StageOutcome::Degraded
+                };
+                let generation = trace.push_span(
+                    TraceStage::Generation,
+                    outcome,
+                    StageReason::None,
+                    0,
+                    handled
+                        .generation_latency_us
+                        .map(|micros| micros / 1_000)
+                        .unwrap_or(0),
+                );
+                trace.with_count(
+                    generation,
+                    generation_trace.llm_calls.len().min(u32::MAX as usize) as u32,
+                );
+                if let Some(backend) = &generation_trace.tts_backend {
+                    trace.with_provider(generation, backend.backend.name.clone());
+                }
+            }
+        }
+
+        // Dispatch stages: playback presence implies scheduler admission and
+        // audio dispatch; degraded subsystems surface as failed stages.
+        if handled.playback.is_some() {
+            trace.push_span(
+                TraceStage::SchedulerAdmission,
+                StageOutcome::Completed,
+                StageReason::None,
+                0,
+                0,
+            );
+        }
+        let audio_degraded = self.health.audio_error.is_some();
+        trace.push_span(
+            TraceStage::AudioDispatch,
+            if audio_degraded {
+                StageOutcome::Failed
+            } else if handled.playback.is_some() {
+                StageOutcome::Completed
+            } else {
+                StageOutcome::Skipped
+            },
+            if audio_degraded {
+                StageReason::AdapterError
+            } else {
+                StageReason::None
+            },
+            0,
+            0,
+        );
+
+        // Deadline exhaustion appears in the same causal chain.
+        if let Some(reason) = handled
+            .deadline
+            .as_ref()
+            .and_then(|deadline| deadline.exhaustion_reason)
+        {
+            let stage_reason = match reason {
+                DeadlineExhaustionReason::Expired => StageReason::DeadlineExhausted,
+                DeadlineExhaustionReason::InsufficientBudget => {
+                    StageReason::DeadlineInsufficientBudget
+                }
+                DeadlineExhaustionReason::ProviderTimeout => StageReason::DeadlineExhausted,
+                DeadlineExhaustionReason::Cancelled => StageReason::GenerationCancelled,
+                DeadlineExhaustionReason::StaleCompletion => StageReason::DeadlineExhausted,
+            };
+            trace.record_cancellation(stage_reason, 0);
+        }
+
+        self.causal_traces.commit(trace);
     }
 
     pub fn tick(&mut self, now_ms: u64) {
@@ -1805,6 +2024,15 @@ where
                     .insert(DegradedSubsystem::Stream);
             }
             self.telemetry.record(observation);
+
+            // Operator override closes any active causal chain (#65): the
+            // cancellation stage joins the same trace as the event stages.
+            let mut trace = self.causal_traces.begin_trace(
+                command.event().event_id.clone(),
+                command.event().correlation_id.clone(),
+            );
+            trace.record_cancellation(StageReason::OperatorStop, 0);
+            self.causal_traces.commit(trace);
         }
         self.tick(at_ms);
         Ok(outcome)
@@ -4408,6 +4636,103 @@ mod tests {
         assert_eq!(
             planner.template_fallback(),
             Some(TemplateFallback::SlotValueTooLarge)
+        );
+    }
+
+    /// Issue #65: the causal trace follows the cached route end to end and
+    /// stays free of payload content.
+    #[test]
+    fn causal_trace_follows_cached_route_without_payload_content() {
+        let mut app = app(
+            reflex_router(),
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        );
+        app.startup().expect("startup");
+        let raw = serde_json::to_vec(&chat_event(44)).expect("event json");
+        app.process_content_bytes(&raw, 0, 44)
+            .expect("cached playback");
+
+        let trace = app
+            .causal_traces()
+            .trace_for_correlation("corr-app-e2e")
+            .expect("trace retained for correlation id");
+        assert_eq!(trace.event_id, "evt-44");
+        let stages: Vec<_> = trace.spans.iter().map(|span| span.stage).collect();
+        assert!(stages.contains(&TraceStage::IngressNormalization));
+        assert!(stages.contains(&TraceStage::SecurityAdmission));
+        assert!(stages.contains(&TraceStage::AudioDispatch));
+
+        // Privacy: no payload text anywhere in the retained record.
+        let serialized = serde_json::to_string(trace).expect("trace json");
+        assert!(!serialized.contains("hello"));
+        assert!(!serialized.contains("reaction.agree"));
+        // Ingress observes size, never content.
+        let ingress = trace
+            .spans
+            .iter()
+            .find(|span| span.stage == TraceStage::IngressNormalization)
+            .expect("ingress span");
+        assert!(ingress.bytes.is_some_and(|bytes| bytes > 0));
+    }
+
+    /// Issue #65: operator override closes the causal chain in the same
+    /// vocabulary as event stages.
+    #[test]
+    fn causal_trace_records_operator_override_cancellation() {
+        let mut app = app(
+            FixedSilentRoute,
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        );
+        app.startup().expect("startup");
+        app.handle_control(&stop_command(), 5)
+            .expect("stop control");
+        let trace = app
+            .causal_traces()
+            .trace_for_correlation("corr-stop")
+            .expect("override trace");
+        let last = trace.spans.last().expect("cancellation span");
+        assert_eq!(last.stage, TraceStage::Cancellation);
+        assert_eq!(last.reason, StageReason::OperatorStop);
+    }
+
+    /// Issue #65: trace retention rides the unified runtime retention policy.
+    #[test]
+    fn causal_trace_retention_is_bounded_by_runtime_policy() {
+        let mut app = app(
+            FixedSilentRoute,
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        )
+        .with_causal_trace_retention(aivtuber_telemetry::CausalTraceRetentionConfig {
+            max_traces: 2,
+        });
+        app.startup().expect("startup");
+
+        for sequence in 45..49_u64 {
+            let mut event = chat_event(sequence);
+            event.correlation_id = format!("corr-{sequence}");
+            let raw = serde_json::to_vec(&event).expect("event json");
+            app.process_content_bytes(&raw, 0, sequence)
+                .expect("content");
+        }
+        let snapshot = app.retention_snapshot();
+        assert_eq!(snapshot.causal_traces.retained, 2);
+        assert_eq!(snapshot.causal_traces.high_water, 2);
+        assert_eq!(snapshot.causal_traces.evicted, 2);
+        assert!(
+            app.causal_traces()
+                .trace_for_correlation("corr-45")
+                .is_none()
+        );
+        assert!(
+            app.causal_traces()
+                .trace_for_correlation("corr-48")
+                .is_some()
         );
     }
 }
