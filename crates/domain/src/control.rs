@@ -162,6 +162,13 @@ impl LocalControlIngress {
         })
     }
 
+    /// Constant-time secret verification for non-privileged reads (issue
+    /// #56 operator status). Privileged actions must still go through
+    /// authenticate so capability checks cannot be bypassed.
+    pub fn verify_secret(&self, presented_secret: &[u8; CONTROL_SECRET_LEN]) -> bool {
+        constant_time_eq(&self.secret.0, presented_secret)
+    }
+
     pub fn authenticate(
         &self,
         mut input: OperatorCommandInput,
