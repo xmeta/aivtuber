@@ -28,7 +28,7 @@ The core design separates three time scales:
 * link:docs/vts-obs-adapters.adoc[VTube Studio and OBS adapter integration]
 * link:docs/generative-fallback.adoc[Generative fallback and dynamic compilation]
 * link:docs/memory-adaptation.adoc[Bounded memory and deterministic adaptation]
-* link:docs/production-runtime.adoc[Production Rust composition runtime]
+* link:docs/production-runtime.adoc[Production Rust composition runtime (incl. composition profiles: cached / reflex / full)]
 * link:docs/maintenance.adoc[Maintenance and merge policy]
 * link:AGENTS.md[AI coding-agent development contract]
 * link:docs/agent-development.adoc[AI agent development playbook]

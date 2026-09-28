@@ -7,16 +7,17 @@ use aivtuber_adapters::{
     SecretString, VTubeStudioAdapter, VTubeStudioConfig,
 };
 use aivtuber_app::{
-    AdaptationRuntime, AdapterHealth, AvatarOutput, GenerativeRuntime, IntentRoutePlanner,
-    NoopAvatarOutput, NoopStreamOutput, ObsStreamOutput, ProductionApp, RawIngressConfig,
-    RawIngressMetrics, RawIngressMetricsSnapshot, RuntimeRetentionPolicy, StreamOutput,
-    VtsAvatarOutput, VtsPlaybackConfig, pump_bounded_records,
+    AdaptationRuntime, AdapterHealth, AvatarOutput, CompositionProfile, GenerativeRuntime,
+    IntentRoutePlanner, NoopAvatarOutput, NoopStreamOutput, ObsStreamOutput, ProductionApp,
+    ProfileSummary, RawIngressConfig, RawIngressMetrics, RawIngressMetricsSnapshot, RoutePlanner,
+    RuntimeRetentionPolicy, StreamOutput, VtsAvatarOutput, VtsPlaybackConfig, pump_bounded_records,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
     AuthorizationMethod, Capability, ControlSecret, LocalControlIngress, OperatorCommandInput,
 };
 use aivtuber_generative::{GenerativePipeline, PerformanceCompiler, PerformanceCompilerConfig};
+use aivtuber_reflex::{JevAdapter, JevAdapterConfig, JevApiKey, PolicyConfig, ReflexPipeline};
 use aivtuber_runtime::{
     CachedPerformer, CachedPlaybackConfig, LocalVisemeStore, SecurityRuntime, SecurityRuntimeConfig,
 };
@@ -57,12 +58,30 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
 
     let retention = build_runtime_retention_policy()?;
-    let generative = build_generative_runtime(&compatibility, retention)?;
+
+    // Issue #55: the composition profile — not disconnected env flags —
+    // names the active route graph. Resolve and validate before composing.
+    let profile = match env_optional("AIVTUBER_MODE") {
+        Some(mode) => CompositionProfile::parse(&mode)?,
+        None => CompositionProfile::Cached,
+    };
+    let generative_configured = build_generative_runtime(&compatibility, retention)?;
+    let jev_api_key_present =
+        env_optional("AIVTUBER_JEV_API_KEY").is_some_and(|key| !key.trim().is_empty());
+    profile.validate(generative_configured.is_some(), jev_api_key_present)?;
+    // Profiles that cannot reach generative routes must not compose the
+    // generative runtime (a configured-but-unreachable backend is rejected
+    // above as misleading).
+    let generative = if profile.generative_route() {
+        generative_configured
+    } else {
+        None
+    };
     let adaptation = build_adaptation_runtime(retention)?;
     let scheduler_config = retention.scheduler_config(SchedulerConfig::default());
     let security_config = retention.security_config(SecurityRuntimeConfig::default());
     let raw_ingress_config = RawIngressConfig::from_security(security_config)?;
-    let mut assets = AssetStore::new(descriptors, compatibility);
+    let mut assets = AssetStore::new(descriptors, compatibility.clone());
     assets.set_hot_cache_config(retention.hot_cache_config());
     let performer = CachedPerformer::new(
         assets,
@@ -89,22 +108,88 @@ fn run() -> Result<(), Box<dyn Error>> {
     let stream = build_stream_output()?;
     let max_lateness_ms = env_u64("AIVTUBER_MAX_DISPATCH_LATENESS_MS", 250)?;
 
-    let mut app = ProductionApp::new(
-        security,
-        performer,
-        visemes,
-        IntentRoutePlanner,
-        Box::new(audio),
-        avatar,
-        stream,
-        max_lateness_ms,
-    )
-    .with_adaptation(adaptation)
-    .with_telemetry_retention(retention.telemetry_config())
-    .with_causal_trace_retention(retention.causal_trace_config());
+    // Compose the planner from the selected profile (issue #55): the mode
+    // unambiguously determines the routing stack.
+    let startup_summary;
+    let mut app = match profile {
+        CompositionProfile::Cached => {
+            startup_summary = ProfileSummary::for_profile(
+                profile,
+                generative.is_some(),
+                aivtuber_app::config_fingerprint(profile, generative.is_some()),
+            );
+            ProductionApp::new(
+                security,
+                performer,
+                visemes,
+                Box::new(IntentRoutePlanner) as Box<dyn RoutePlanner>,
+                Box::new(audio),
+                avatar,
+                stream,
+                max_lateness_ms,
+            )
+        }
+        CompositionProfile::Reflex | CompositionProfile::Full => {
+            let semantic_pack_root = env_path("AIVTUBER_PACK_ROOT")
+                .unwrap_or_else(|| PathBuf::from("examples/starter-reaction-pack"));
+            let mut semantic_assets = AssetStore::new(
+                semantic_pack_root.join("descriptors"),
+                compatibility.clone(),
+            );
+            semantic_assets.index_local()?;
+            let semantic_index = aivtuber_app::build_semantic_index_from_asset_store(
+                &semantic_assets,
+                &aivtuber_app::AssetSemanticIndexConfig {
+                    retriever_version: "production-v1".to_owned(),
+                    embedding_model: "starter-semantic".to_owned(),
+                    embedding_model_version: "1".to_owned(),
+                },
+            )?;
+            let embedding_provider =
+                aivtuber_app::PayloadIntentEmbedding::new(semantic_index.dimension());
+            let jev_adapter = JevAdapter::new(
+                JevAdapterConfig {
+                    endpoint: env_string(
+                        "AIVTUBER_JEV_ENDPOINT",
+                        "https://api.typesafe.ai/v1/systemone",
+                    ),
+                    model_alias: env_string("AIVTUBER_JEV_MODEL", "jev-latest"),
+                    ..JevAdapterConfig::default()
+                },
+                JevApiKey::new(env_optional("AIVTUBER_JEV_API_KEY").unwrap_or_default())?,
+            )?;
+            let pipeline =
+                ReflexPipeline::new(semantic_index, jev_adapter, PolicyConfig::default(), 2)?;
+            startup_summary = ProfileSummary::for_profile(
+                profile,
+                generative.is_some(),
+                aivtuber_app::config_fingerprint(profile, generative.is_some()),
+            );
+            ProductionApp::new(
+                security,
+                performer,
+                visemes,
+                Box::new(
+                    aivtuber_app::ReflexRoutePlanner::new(pipeline, embedding_provider)
+                        .with_template_pack(aivtuber_app::starter_template_pack()),
+                ) as Box<dyn RoutePlanner>,
+                Box::new(audio),
+                avatar,
+                stream,
+                max_lateness_ms,
+            )
+        }
+    };
+    app = app
+        .with_adaptation(adaptation)
+        .with_telemetry_retention(retention.telemetry_config())
+        .with_causal_trace_retention(retention.causal_trace_config());
     if let Some(generative) = generative {
         app = app.with_generation(generative);
     }
+    // Issue #55 acceptance: startup states the active routing capabilities
+    // without leaking secrets.
+    eprintln!("{}", startup_summary.log_line());
     let preload = app.startup()?;
     eprintln!(
         "aivtuber-app ready: indexed={} usable={} preloaded={}",

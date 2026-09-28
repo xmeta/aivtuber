@@ -111,6 +111,11 @@ impl SemanticIndex {
         &self.metadata
     }
 
+    /// Embedding dimension all queries must match.
+    pub fn dimension(&self) -> usize {
+        self.dimension
+    }
+
     pub fn search(&self, query: &[f32], top_k: usize) -> Result<RetrievalResult, RetrievalError> {
         validate_vector(query, self.dimension)?;
         if top_k == 0 {
