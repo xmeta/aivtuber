@@ -1,5 +1,5 @@
-= Continuous Benchmark Gate (issue #58 — Phase A + B)
-:status: Implemented (result contract + comparator + budgets; CI wiring and tiers follow)
+= Continuous Benchmark Gate (issue #58 — Phase A + B + C)
+:status: Implemented (result contract + comparator + budgets + PR CI gate; scheduled tier and history follow)
 :date: 2026-09-29
 
 == 1. Scope
@@ -12,6 +12,9 @@ from issue #58:
 * *Phase B — comparator*: `benchmark-compare`, which evaluates base vs head
   results against repository-controlled budgets and fails the job on a
   configured regression or hard-invariant violation.
+* *Phase C — PR CI integration*: `.github/workflows/benchmark-gate.yml`
+  benchmarks the exact base SHA and head SHA in one job/runner and enforces
+  the comparator verdict.
 
 Phases C (PR CI base-vs-head job), D (scheduled high-volume resource tier),
 and E (historical trend storage) build directly on this contract and follow
@@ -76,16 +79,29 @@ invariants are strict from day one.
 
 == 4. Workflow
 
-PR CI (Phase C) will:
+PR CI (Phase C, implemented) runs on pull requests that touch `crates/`,
+the lockfile, or benchmark inputs:
 
 ```text
-resolve base SHA → benchmark base → benchmark head (same runner/job)
+resolve base SHA (GitHub API)
+→ checkout head → replay-benchmark → results/head
+→ checkout base SHA → replay-benchmark → results/base
 → benchmark-compare base head → Job Summary + artifacts
+→ enforce verdict (exit status)
 ```
 
-The comparator is deterministic: the same inputs always produce the same
-verdict, so gate decisions are reviewable after the fact from the uploaded
-JSON.
+* Both revisions are measured on the same runner under the identical
+  fixture/seed/config boundaries, so latency deltas are relative to the
+  base measured moments earlier — not to a stale cross-runner history
+  record (issue #58 engineering principle 1).
+* The Job Summary always contains the metric table, even when the gate
+  fails, because summary/artifact publication precedes verdict enforcement.
+* Security boundary: the `pull_request` job runs with `contents: read` only.
+  Untrusted forked code never receives credentials capable of modifying
+  benchmark history; trusted-main persistence is Phase E, on main only.
+* The comparator is deterministic: the same inputs always produce the same
+  verdict, so gate decisions are reviewable after the fact from the uploaded
+  JSON.
 
 Accepting a regression intentionally means editing `benchmarks/budgets.json`
 in the same PR — the change is reviewed like code.
