@@ -5,6 +5,13 @@
 //! Runtime instrumentation records bounded structured observations. Benchmark
 //! reports aggregate those observations without retaining prompt/generated text.
 
+mod causal_trace;
+
+pub use causal_trace::{
+    CausalTrace, CausalTraceCollector, CausalTraceError, CausalTraceRetentionConfig,
+    CausalTraceRetentionMetrics, StageOutcome, StageReason, TraceSpan, TraceStage,
+};
+
 use aivtuber_domain::{DeadlineExhaustionReason, DeadlineStage, InteractionDeadlineClass};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};

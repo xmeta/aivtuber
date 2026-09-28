@@ -100,7 +100,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         max_lateness_ms,
     )
     .with_adaptation(adaptation)
-    .with_telemetry_retention(retention.telemetry_config());
+    .with_telemetry_retention(retention.telemetry_config())
+    .with_causal_trace_retention(retention.causal_trace_config());
     if let Some(generative) = generative {
         app = app.with_generation(generative);
     }
@@ -269,6 +270,10 @@ fn build_runtime_retention_policy() -> Result<RuntimeRetentionPolicy, Box<dyn Er
             "AIVTUBER_RETENTION_GENERATION_QUEUE_CAPACITY",
             defaults.generation_queue_capacity,
         )?,
+        max_causal_traces: env_usize(
+            "AIVTUBER_RETENTION_MAX_CAUSAL_TRACES",
+            defaults.max_causal_traces,
+        )?,
     };
     if policy.max_telemetry_events == 0
         || policy.max_audit_records == 0
@@ -285,6 +290,7 @@ fn build_runtime_retention_policy() -> Result<RuntimeRetentionPolicy, Box<dyn Er
         || policy.max_adaptation_recent_groups == 0
         || policy.max_adaptation_decisions == 0
         || policy.generation_queue_capacity == 0
+        || policy.max_causal_traces == 0
     {
         return Err(io::Error::other("runtime retention limits must be positive").into());
     }

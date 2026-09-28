@@ -1,0 +1,93 @@
+= Privacy-Safe Causal Trace Design (issue #65)
+:status: Implemented (production vocabulary + retention; propagation continues per-stage)
+:date: 2026-09-29
+
+== 1. Purpose
+
+One admitted event must be traceable across normalization, security,
+retrieval, reflex/Jev, routing, generation, asset resolution, scheduling, and
+adapter dispatch — without retaining sensitive content — so that latency or
+failure regressions found by #58 can be attributed to the causal stage that
+produced them, and incidents can be explained from a single correlation ID
+(#68, #62).
+
+== 2. What was implemented
+
+* `TraceStage` — stable typed stage vocabulary in `aivtuber-telemetry`
+  (`crates/telemetry/src/causal_trace.rs`): `ingress_normalization`,
+  `security_admission`, `cache_lookup`, `semantic_retrieval`, `reflex_jev`,
+  `template_resolution`, `generation`, `output_gate`, `asset_compilation`,
+  `scheduler_admission`, `audio_dispatch`, `avatar_dispatch`,
+  `stream_dispatch`, `cancellation`. New stages append; existing names are
+  contract for #58/#68/#108.
+* `TraceSpan` — one stage observation with causal `parent` index, typed
+  `StageOutcome` (`completed/skipped/degraded/failed/cancelled/overridden`),
+  typed `StageReason` vocabulary (cache miss, reuse-threshold rejection,
+  deadline exhaustion, adapter error, operator stop, ...), monotonic
+  `start_offset_ms`/`duration_ms`, bounded `bytes`/`count`, and
+  provider/version identity. **There is no free-text field**: prompt text,
+  generated text, secrets, and private memory contents have no way into a
+  trace record — privacy is structural, not by convention.
+* `CausalTrace` — the per-event timeline keyed by the existing
+  `event_id`/`correlation_id` identity from `EventEnvelope` (no new ID
+  scheme).
+* `CausalTraceCollector` — bounded ring with the same metrics shape as every
+  other retained state (`retained/high_water/evicted`), wired into
+  `RuntimeRetentionPolicy.max_causal_traces` (env
+  `AIVTUBER_RETENTION_MAX_CAUSAL_TRACES`, default 1024) so traces follow the
+  unified #51 retention contract rather than a separate policy.
+* `ProductionApp` records the stage chain for every handled event:
+  ingress (size only) → security admission → cache lookup / semantic
+  retrieval (candidate count) → reflex/Jev (attempt count) → template
+  fallback / generation (cancelled or degraded per `GenerationTrace`) →
+  scheduler admission + audio dispatch (failed when the adapter degraded).
+  Deadline exhaustion and operator override (stop/mute) close the same
+  causal chain with a `cancellation` span.
+* Correlation identity propagates through deferred generation via
+  `GenerationCompletionContext.correlation_id`, so asynchronous completions
+  commit their trace under the originating event's correlation ID.
+
+== 3. Determinism vs observation
+
+`CausalTrace::deterministic_bytes` serializes the stage sequence, outcomes,
+reasons, counts, and causal relationships while normalizing away
+`start_offset_ms`, `duration_ms`, and `bytes`. Replay therefore compares
+deterministic causal structure separately from observed wall-clock timing,
+matching the contract of `DecisionReplayRecord::deterministic_bytes`.
+
+`CausalTrace::stage_latency_totals` and the collector-level aggregate give
+#58 stage-level attribution (diagnostic decomposition, not proof of
+independent causality).
+
+== 4. Evaluation of the `tracing` ecosystem
+
+The reuse-first evaluation considered the Rust `tracing` ecosystem for span
+lifecycle/parent relationships. Decision: keep the typed in-crate vocabulary
+for retained traces, because
+
+* retention must be bounded and replay-comparable with deterministic
+  identity, which `tracing`'s subscriber model does not provide out of the
+  box;
+* trace records must reject free text structurally, not by discipline;
+* the existing audit/telemetry collectors already implement the bounded
+  retention pattern (#51).
+
+`tracing` can still be added later as an *export* subscriber emitting these
+typed spans; the contract does not depend on it. Revisit if spans need to
+cross process boundaries.
+
+== 5. Non-goals honored
+
+* No external observability SaaS.
+* No duplication of telemetry payloads into spans.
+* No sensitive content logged for convenience.
+* No claim that stage timing decomposition proves independent causality.
+
+== 6. Tests
+
+* telemetry: stage chain parenting, deterministic identity stability under
+  timing changes, identity sensitivity to structure, stage latency totals,
+  redacted timeline, retention ring metrics, correlation lookup, cross-trace
+  attribution, stage vocabulary stability.
+* app: cached-route trace end-to-end with payload-content-free assertion,
+  operator-override cancellation span, retention bounded by runtime policy.

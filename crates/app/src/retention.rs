@@ -9,7 +9,10 @@ use aivtuber_runtime::{
     SecurityRuntimeConfig,
 };
 use aivtuber_scheduler::{HistoryPolicy, SchedulerConfig, SchedulerMetrics};
-use aivtuber_telemetry::{TelemetryRetentionConfig, TelemetryRetentionMetrics};
+use aivtuber_telemetry::{
+    CausalTraceRetentionConfig, CausalTraceRetentionMetrics, TelemetryRetentionConfig,
+    TelemetryRetentionMetrics,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeRetentionPolicy {
@@ -28,6 +31,7 @@ pub struct RuntimeRetentionPolicy {
     pub max_adaptation_recent_groups: usize,
     pub max_adaptation_decisions: usize,
     pub generation_queue_capacity: usize,
+    pub max_causal_traces: usize,
 }
 
 impl Default for RuntimeRetentionPolicy {
@@ -48,6 +52,7 @@ impl Default for RuntimeRetentionPolicy {
             max_adaptation_recent_groups: 256,
             max_adaptation_decisions: 1_024,
             generation_queue_capacity: 8,
+            max_causal_traces: 1_024,
         }
     }
 }
@@ -98,6 +103,14 @@ impl RuntimeRetentionPolicy {
         }
     }
 
+    /// Causal traces join the unified bounded retention policy (#65, #51):
+    /// no separate retention contract is invented for traces.
+    pub fn causal_trace_config(self) -> CausalTraceRetentionConfig {
+        CausalTraceRetentionConfig {
+            max_traces: self.max_causal_traces,
+        }
+    }
+
     pub fn generation_execution_config(self) -> GenerationExecutionConfig {
         GenerationExecutionConfig {
             queue_capacity: self.generation_queue_capacity,
@@ -108,6 +121,7 @@ impl RuntimeRetentionPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeRetentionSnapshot {
     pub telemetry: TelemetryRetentionMetrics,
+    pub causal_traces: CausalTraceRetentionMetrics,
     pub security: SecurityRetentionMetrics,
     pub scheduler: SchedulerMetrics,
     pub hot_cache: HotCacheMetrics,
@@ -139,6 +153,7 @@ mod tests {
             max_adaptation_recent_groups: 23,
             max_adaptation_decisions: 24,
             generation_queue_capacity: 25,
+            max_causal_traces: 26,
         };
 
         let security = policy.security_config(SecurityRuntimeConfig::default());
@@ -167,6 +182,7 @@ mod tests {
         assert_eq!(adaptation.max_recent_groups, 23);
         assert_eq!(adaptation.max_decisions, 24);
         assert_eq!(policy.telemetry_config().max_events, 11);
+        assert_eq!(policy.causal_trace_config().max_traces, 26);
         assert_eq!(policy.generation_execution_config().queue_capacity, 25);
     }
 }
