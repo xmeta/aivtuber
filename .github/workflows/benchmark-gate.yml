@@ -1,0 +1,116 @@
+name: Benchmark gate
+
+# Issue #58 Phase C: same-runner base-vs-head replay comparison.
+# The job checks out base and head revisions, benchmarks both under the
+# identical fixture/seed/config boundaries, and gates with benchmark-compare.
+#
+# Security boundary (issue #58): pull_request jobs from untrusted forked code
+# must not receive write credentials. This job only reads the repository and
+# uploads artifacts — `permissions: contents: read` is sufficient. Gate
+# history/trust updates (Phase E) are handled on main, never here.
+
+on:
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "examples/benchmarks/**"
+      - "benchmarks/**"
+      - ".github/workflows/benchmark-gate.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  base-vs-head:
+    name: Replay base vs head
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+
+      - name: Resolve base SHA
+        id: base
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha="$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" --jq .base.sha)"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "base SHA: ${sha}"
+
+      # Head checkout (working tree used for both benchmark binaries; the
+      # binaries are identical, only the benchmarked revision differs).
+      - uses: actions/checkout@v4
+
+      - name: Benchmark head
+        run: |
+          cargo run --locked -p aivtuber-app --bin replay-benchmark -- \
+            examples/benchmarks/replay-comparison.json target/bench-head
+          mkdir -p results/head
+          cp target/bench-head/*-result.json results/head/
+
+      # Base checkout second so post-steps and artifacts describe the PR.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.base.outputs.sha }}
+          clean: false
+
+      - name: Benchmark base
+        run: |
+          cargo run --locked -p aivtuber-app --bin replay-benchmark -- \
+            examples/benchmarks/replay-comparison.json target/bench-base
+          mkdir -p results/base
+          cp target/bench-base/*-result.json results/base/
+
+      - name: Restore head sources for the comparator
+        run: |
+          git checkout -- . 2>/dev/null || true
+          git clean -fd -e target -e results 2>/dev/null || true
+
+      # Deterministic comparator: same inputs always yield the same verdict.
+      # Hard invariants gate strictly; noisy timing metrics are warning-only
+      # until calibrated (benchmarks/budgets.json, issue #58).
+      - name: Compare base vs head
+        id: gate
+        run: |
+          set +e
+          cargo run --locked -p aivtuber-app --bin benchmark-compare -- \
+            results/base/01-deterministic-result.json \
+            results/head/01-deterministic-result.json \
+            benchmarks/budgets.json \
+            results/gate
+          status=$?
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Publish job summary
+        if: always()
+        run: |
+          if [ -f results/gate/gate-summary.md ]; then
+            cat results/gate/gate-summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Benchmark gate did not produce a summary (see logs)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-gate-results
+          path: |
+            results/base/
+            results/head/
+            results/gate/
+          retention-days: 30
+
+      # Enforce the gate verdict after summary/artifact publication so
+      # reviewers always get the table even on failure.
+      - name: Enforce gate verdict
+        if: always()
+        run: |
+          status="${{ steps.gate.outputs.status }}"
+          echo "comparator exit: ${status}"
+          exit "${status}"
