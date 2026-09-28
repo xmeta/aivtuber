@@ -1,0 +1,79 @@
+{
+  "environment": {
+    "arch": "x86_64",
+    "measurement_boundary": "backend start/queue proxy; not acoustic first-audible latency",
+    "native_cold_device_init_us": 77293,
+    "native_first_start_proxy_us": 901,
+    "os": "windows",
+    "process_cold_start_proxy_us": 9242,
+    "process_program": "ffplay",
+    "repetitions": 30,
+    "rodio_version": "0.22.2",
+    "sample_format": "pcm_s16le_mono_48000hz_wav"
+  },
+  "process": {
+    "consecutive_handoff_proxy_us": {
+      "max": 14438,
+      "min": 5966,
+      "p50": 6514,
+      "p95": 14347,
+      "p99": 14438
+    },
+    "start_proxy_us": {
+      "max": 13517,
+      "min": 5534,
+      "p50": 5972,
+      "p95": 8767,
+      "p99": 13517
+    },
+    "stop_us": {
+      "max": 4617,
+      "min": 1789,
+      "p50": 2020,
+      "p95": 2806,
+      "p99": 4617
+    }
+  },
+  "resource_observation": {
+    "benchmark_host_after": {
+      "cpu_seconds": 1.203125,
+      "private_bytes": 2265088,
+      "working_set_bytes": 12460032
+    },
+    "benchmark_host_before": {
+      "cpu_seconds": 0.21875,
+      "private_bytes": 1839104,
+      "working_set_bytes": 11980800
+    },
+    "ffplay_child_sample": {
+      "cpu_seconds": 0.0625,
+      "private_bytes": 15835136,
+      "working_set_bytes": 15818752
+    },
+    "note": "coarse OS process snapshots; host includes harness/native stream and ffplay is a separate child"
+  },
+  "rodio": {
+    "consecutive_handoff_proxy_us": {
+      "max": 1025,
+      "min": 594,
+      "p50": 685,
+      "p95": 897,
+      "p99": 1025
+    },
+    "start_proxy_us": {
+      "max": 791,
+      "min": 458,
+      "p50": 499,
+      "p95": 747,
+      "p99": 791
+    },
+    "stop_us": {
+      "max": 10,
+      "min": 2,
+      "p50": 4,
+      "p95": 10,
+      "p99": 10
+    }
+  },
+  "schema": "aivtuber.audio-backend-benchmark.v1"
+}
