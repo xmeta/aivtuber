@@ -167,5 +167,3 @@ The Rust tests cover:
 * negative-quality rollback/invalidation;
 * deterministic decision replay and anti-repetition;
 * full +ProductionApp+ generated-asset promotion/rollback flow.
-
-[executed on device: DESKTOP (2bf3ba04-d7b4-4fb7-99c6-76b0fc11abcc)]

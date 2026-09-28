@@ -313,5 +313,3 @@ External inference services remain process/network boundaries when practical. Th
 * TypeSafe AI, Jev/System One introduction: https://typesafe.ai/blog/introducing-system-one-models-and-jev
 * VTube Studio Public API: https://github.com/DenchiSoft/VTubeStudio
 * obs-websocket 5.x protocol: https://github.com/obsproject/obs-websocket/blob/master/docs/generated/protocol.md
-
-[executed on device: DESKTOP (2bf3ba04-d7b4-4fb7-99c6-76b0fc11abcc)]

@@ -153,9 +153,3 @@ Added replay comparison, failure injection, long-stream logical-time soak covera
 
 The historical Phase 6 work exposed remaining production-boundedness gaps that are now owned by Stage 1 issues such as #51-#53.
 See link:failure-soak.adoc[Failure Injection and Long-Stream Soak].
-
-[executed on device: DESKTOP (2bf3ba04-d7b4-4fb7-99c6-76b0fc11abcc)]
-
-[executed on device: DESKTOP (2bf3ba04-d7b4-4fb7-99c6-76b0fc11abcc)]
-
-[executed on device: DESKTOP (2bf3ba04-d7b4-4fb7-99c6-76b0fc11abcc)]
