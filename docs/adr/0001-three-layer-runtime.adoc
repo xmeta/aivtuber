@@ -50,7 +50,6 @@ Rejected because semantic decision models should select high-level actions, not 
 
 Rejected because it would couple scheduler, assets, and tests to one provider.
 
-[executed on device: DESKTOP (2bf3ba04-d7b4-4fb7-99c6-76b0fc11abcc)]
 
 == Assumptions
 

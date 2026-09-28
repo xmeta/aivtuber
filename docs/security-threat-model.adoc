@@ -261,5 +261,3 @@ The baseline regression fixtures are:
 They conform to `schemas/security-regression-case.schema.json`.
 
 The runtime implementation should load these fixtures and assert the expected authorization, memory-write, and model-dependency outcomes.
-
-[executed on device: DESKTOP (2bf3ba04-d7b4-4fb7-99c6-76b0fc11abcc)]

@@ -53,5 +53,3 @@ assignees: ''
 ## Agent notes
 
 <!-- Optional: likely files/types to inspect. Avoid prescribing an implementation when the decision is still open. -->
-
-[executed on device: DESKTOP (2bf3ba04-d7b4-4fb7-99c6-76b0fc11abcc)]

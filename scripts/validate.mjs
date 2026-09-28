@@ -13,6 +13,7 @@
 import { Ajv2020 } from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import { readFileSync, readdirSync, existsSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -170,6 +171,23 @@ for (const file of ["README.adoc", ...collectAdocFiles("docs")]) {
       passes += 1;
       console.log(`ok        ${file}: link ${target}`);
     }
+  }
+}
+
+// Reject leaked local automation/device execution signatures in any tracked file.
+const trackedFiles = execFileSync("git", ["ls-files", "-z"], {
+  cwd: root,
+  encoding: "utf8",
+})
+  .split("\0")
+  .filter(Boolean);
+
+const leakedSignature = `[${"executed"} on ${"device"}:`;
+for (const file of trackedFiles) {
+  const text = readFileSync(join(root, file)).toString("utf8").toLowerCase();
+  if (text.includes(leakedSignature)) {
+    failures += 1;
+    console.error(`FAIL      ${file}: leaked automation/device execution signature`);
   }
 }
 

@@ -147,5 +147,3 @@ The Rust tests cover:
 * serialized control events cannot cancel generation through content ingress;
 * partial streaming output never inserts/schedules a generated asset;
 * secret redaction and HTTP wire mapping in provider adapters.
-
-[executed on device: DESKTOP (2bf3ba04-d7b4-4fb7-99c6-76b0fc11abcc)]
