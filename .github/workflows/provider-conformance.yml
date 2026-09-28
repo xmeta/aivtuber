@@ -1,0 +1,49 @@
+name: Provider conformance (opt-in)
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: Live provider probe to run
+        required: true
+        type: choice
+        options:
+          - jev
+          - openai-responses
+
+permissions:
+  contents: read
+
+jobs:
+  live-conformance:
+    name: Live conformance (${{ inputs.provider }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: Jev / System One probe
+        if: inputs.provider == 'jev'
+        env:
+          AIVTUBER_JEV_ENDPOINT: ${{ vars.AIVTUBER_JEV_ENDPOINT }}
+          AIVTUBER_JEV_MODEL: ${{ vars.AIVTUBER_JEV_MODEL }}
+          AIVTUBER_JEV_API_KEY: ${{ secrets.AIVTUBER_JEV_API_KEY }}
+        run: >-
+          cargo test --locked -p aivtuber-hardening
+          --test live_provider_conformance live_jev_conformance
+          -- --ignored --exact
+
+      - name: OpenAI-compatible Responses probe
+        if: inputs.provider == 'openai-responses'
+        env:
+          AIVTUBER_OPENAI_ENDPOINT: ${{ vars.AIVTUBER_OPENAI_ENDPOINT }}
+          AIVTUBER_OPENAI_MODEL: ${{ vars.AIVTUBER_OPENAI_MODEL }}
+          AIVTUBER_OPENAI_MODEL_VERSION: ${{ vars.AIVTUBER_OPENAI_MODEL_VERSION }}
+          AIVTUBER_OPENAI_API_KEY: ${{ secrets.AIVTUBER_OPENAI_API_KEY }}
+        run: >-
+          cargo test --locked -p aivtuber-hardening
+          --test live_provider_conformance live_openai_responses_conformance
+          -- --ignored --exact

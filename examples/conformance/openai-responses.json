@@ -1,0 +1,80 @@
+{
+  "schema_version": "1",
+  "fixture_version": "openai-responses-fixture-v1",
+  "provider_id": "openai-responses",
+  "cases": [
+    {
+      "id": "success-output-text",
+      "transport": {
+        "status": 200,
+        "body": {
+          "id": "resp_fixture",
+          "model": "gpt-fixture-2026-09",
+          "output": [
+            {
+              "type": "message",
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "output_text",
+                  "text": "fixture reply",
+                  "annotations": []
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "expected": {
+        "kind": "success",
+        "output_text": "fixture reply"
+      }
+    },
+    {
+      "id": "authentication-failure",
+      "transport": {
+        "status": 401,
+        "body": {}
+      },
+      "expected": {
+        "kind": "error",
+        "error_kind": "authentication"
+      }
+    },
+    {
+      "id": "rate-limit-normalization",
+      "transport": {
+        "status": 429,
+        "body": {}
+      },
+      "expected": {
+        "kind": "error",
+        "error_kind": "rate_limited"
+      }
+    },
+    {
+      "id": "transport-timeout",
+      "transport": {
+        "error": "timeout"
+      },
+      "expected": {
+        "kind": "error",
+        "error_kind": "timeout"
+      }
+    },
+    {
+      "id": "malformed-response",
+      "transport": {
+        "status": 200,
+        "body": {
+          "id": "resp_bad",
+          "output": []
+        }
+      },
+      "expected": {
+        "kind": "error",
+        "error_kind": "backend"
+      }
+    }
+  ]
+}

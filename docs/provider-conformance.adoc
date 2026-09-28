@@ -1,0 +1,89 @@
+:toc:
+
+== Purpose
+
+Provider conformance protects the adapter boundary from silent drift between deterministic mocks and external services.
+
+Stage 1 uses two explicitly separate layers:
+
+* deterministic fixture conformance, required in normal CI and requiring no network or credentials;
+* opt-in live probes, run only when an operator explicitly supplies provider credentials/environment.
+
+Passing fixture tests is evidence for repository normalization behavior. It is not evidence that every provider version currently behaves the same way.
+
+== Deterministic fixture layer
+
+Versioned fixtures live under +examples/conformance/+.
+
+The provider-neutral harness in +crates/hardening/src/conformance.rs+ loads the same fixture case schema and executes it through the real adapter normalization path.
+
+Current Stage 1 coverage includes:
+
+* Jev / TypeSafe System One through +JevAdapter+;
+* OpenAI-compatible Responses through +OpenAiResponsesAdapter+.
+
+Run the offline layer with:
+
+[source,shell]
+----
+cargo test --locked -p aivtuber-hardening conformance
+----
+Cases cover successful normalization plus authentication, rate-limit, timeout, and malformed-response behavior. Regression cases discovered from live drift should be reduced to non-secret fixtures and checked in when licensing/privacy allow.
+
+== Compatibility matrix
+
++examples/conformance/compatibility-matrix.json+ is the reviewable compatibility record.
+
+Each entry records provider/system identity, protocol/API statement, adapter, fixture version, required and optional capabilities, verification status, known deviations, related assumption IDs, and optional last live-verification evidence.
+
+Allowed Stage 1 status meanings are:
+
+* +fixture_verified_live_unverified+ -- deterministic adapter fixtures pass; no current live-version compatibility claim is made;
+* +live_verified+ -- an exact provider/model/protocol was probed and +last_live_verified+ is recorded;
+* +unsupported+ -- the listed integration/version is explicitly not supported.
+
+The matrix validator rejects duplicate providers, fixture-version mismatches, incomplete entries, unknown status values, and a +live_verified+ entry without live-verification evidence.
+
+Do not turn an exact live result into an unbounded version-range compatibility claim.
+
+== Opt-in live probes
+
+Live Jev and OpenAI-compatible probes are ignored Rust tests in +crates/hardening/tests/live_provider_conformance.rs+.
+
+They use bounded five-second provider timeouts, do not mutate scheduler state, do not write memory, and do not perform public stream actions. Generated reply text and credentials are not printed.
+
+GitHub Actions exposes them only through +Provider conformance (opt-in)+ via +workflow_dispatch+. They are not called from +ci.yml+ and therefore are not a normal PR requirement.
+Required GitHub repository configuration depends on the selected probe:
+
+Jev::
+
+* secret +AIVTUBER_JEV_API_KEY+
+* variable +AIVTUBER_JEV_ENDPOINT+
+* optional variable +AIVTUBER_JEV_MODEL+
+
+OpenAI-compatible Responses::
+
+* secret +AIVTUBER_OPENAI_API_KEY+
+* optional variables +AIVTUBER_OPENAI_ENDPOINT+, +AIVTUBER_OPENAI_MODEL+, +AIVTUBER_OPENAI_MODEL_VERSION+
+
+A live probe may be billable. Use least-privilege/test credentials, a bounded model/output configuration, and an environment where a probe response cannot become public output.
+
+After a successful live verification, update the matrix with the exact tested provider/model/protocol identity, date, repository revision, result, and any known deviation. Do not record credentials, prompts containing private data, or generated user content.
+
+== VTube Studio and OBS
+
+Existing ignored live-smoke tests under +crates/adapters/tests/live_smoke.rs+ remain the current safe local conformance boundary for VTube Studio and OBS. They are documented in +docs/vts-obs-adapters.adoc+ and remain outside normal CI.
+
+Future migration spikes for +vtubestudio+ or +obws+ must preserve aivtuber-owned freshness, capability, cancellation, and no-stale-replay policy. A third-party client library does not acquire authority merely by owning protocol mechanics.
+
+== Revalidation
+
+When a provider model/API/protocol version changes:
+
+. locate its compatibility-matrix entry and linked assumption IDs;
+. rerun deterministic fixtures;
+. run the relevant opt-in live probe where credentials/cost policy permit;
+. capture any drift as a reduced regression fixture;
+. update matrix evidence without broadening compatibility beyond what was tested.
+
+This keeps provider-specific evidence outside the deterministic core while making drift visible and reviewable.

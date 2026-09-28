@@ -1,0 +1,57 @@
+{
+  "schema_version": "1",
+  "matrix_version": "stage1-2026-09-28",
+  "providers": [
+    {
+      "provider_id": "jev-system-one",
+      "system": "Jev / TypeSafe System One",
+      "api_protocol_version": "v1/systemone (exact live service revision unverified)",
+      "adapter": "aivtuber_reflex::JevAdapter",
+      "fixture_version": "jev-systemone-fixture-v1",
+      "verification_status": "fixture_verified_live_unverified",
+      "required_capabilities": [
+        "bearer authentication",
+        "typed named answers",
+        "provider/model identity",
+        "timeout normalization",
+        "rate-limit normalization",
+        "malformed response rejection"
+      ],
+      "optional_capabilities": [],
+      "last_live_verified": null,
+      "known_deviations": [
+        "Live provider/version semantics are not claimed until an opt-in probe records evidence."
+      ],
+      "assumption_ids": [
+        "A-JEV-001"
+      ]
+    },
+    {
+      "provider_id": "openai-responses",
+      "system": "OpenAI-compatible Responses ThinkingEngine",
+      "api_protocol_version": "Responses-style HTTP JSON (provider/model version unverified)",
+      "adapter": "aivtuber_adapters::OpenAiResponsesAdapter",
+      "fixture_version": "openai-responses-fixture-v1",
+      "verification_status": "fixture_verified_live_unverified",
+      "required_capabilities": [
+        "bearer authentication",
+        "output_text extraction",
+        "provider/model identity",
+        "timeout normalization",
+        "rate-limit normalization",
+        "malformed response rejection"
+      ],
+      "optional_capabilities": [
+        "streaming",
+        "prompt-cache metadata"
+      ],
+      "last_live_verified": null,
+      "known_deviations": [
+        "Only the normalized Responses subset used by aivtuber is fixture-verified; universal OpenAI-compatible behavior is not claimed."
+      ],
+      "assumption_ids": [
+        "A-LLM-001"
+      ]
+    }
+  ]
+}
