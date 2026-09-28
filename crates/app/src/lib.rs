@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod deadline;
+mod operator_control;
 mod outputs;
 mod profile;
 mod raw_ingress;
@@ -9,6 +10,7 @@ mod routing;
 mod semantic;
 
 pub use deadline::*;
+pub use operator_control::*;
 pub use outputs::*;
 pub use profile::*;
 pub use raw_ingress::*;
@@ -2038,6 +2040,45 @@ where
         }
         self.tick(at_ms);
         Ok(outcome)
+    }
+
+    /// Whether the security runtime is latched into the operator mute state.
+    pub fn is_muted(&self) -> bool {
+        self.security.is_muted()
+    }
+
+    /// Current untrusted content queue depth (status snapshot only).
+    pub fn content_queue_len(&self) -> usize {
+        self.security.content_len()
+    }
+
+    /// Current scheduler item count (status snapshot only).
+    pub fn scheduler_item_count(&self) -> usize {
+        self.performer.scheduler().items().len()
+    }
+
+    /// Audit an accepted or rejected operator control action (issue #56).
+    ///
+    /// Audit records pass through the security redactor and never contain
+    /// secret material: callers pass decision/detail strings only.
+    pub fn audit_operator_action(
+        &mut self,
+        request_id: &str,
+        action: &str,
+        decision: &str,
+        accepted: bool,
+    ) {
+        let record = self.security.redactor_record(
+            Some(&format!("operator-{request_id}")),
+            aivtuber_telemetry::AuditCategory::Authorization,
+            if accepted {
+                "operator_accepted"
+            } else {
+                "operator_rejected"
+            },
+            format!("action={action} decision={decision}"),
+        );
+        self.security.push_external_audit(record);
     }
 
     pub fn shutdown(&mut self, at_ms: u64) {
@@ -4844,5 +4885,171 @@ mod tests {
             app.process_content_bytes(&raw, 0, 72).expect("content");
             app.shutdown(1_000);
         }
+    }
+
+    // Issue #56: authenticated local operator control.
+
+    mod operator_control_helpers {
+        use super::*;
+
+        pub(super) const SECRET: [u8; 32] = [0x5A_u8; 32];
+
+        pub(super) fn operator_ingress() -> LocalControlIngress {
+            LocalControlIngress::new(
+                "operator-control",
+                "operator:local",
+                AuthorizationMethod::SignedLocalApi,
+                BTreeSet::from([Capability::PerformerStop, Capability::PerformerMute]),
+                ControlSecret::new(SECRET),
+            )
+            .expect("operator ingress")
+        }
+
+        pub(super) fn request(action: &str, secret: &[u8]) -> super::OperatorRequest {
+            super::OperatorRequest {
+                action: action.to_owned(),
+                secret: String::from_utf8(secret.to_vec()).expect("utf8 secret"),
+                request_id: Some("req-test".to_owned()),
+            }
+        }
+
+        pub(super) fn dispatched(
+            request: super::OperatorRequest,
+        ) -> super::DispatchedOperatorRequest {
+            let (tx, _rx) = tokio::sync::oneshot::channel();
+            super::DispatchedOperatorRequest {
+                request,
+                respond: tx,
+            }
+        }
+    }
+
+    #[test]
+    fn operator_endpoint_rejects_wrong_secret_and_unknown_action() {
+        use operator_control_helpers::*;
+        let ingress = operator_ingress();
+        let mut app = app(
+            FixedSilentRoute,
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        );
+
+        let wrong_secret = dispatched(request("stop", &[0x41_u8; 32]));
+        let response = apply_dispatched_request(&ingress, &mut app, &wrong_secret, 100);
+        assert!(!response.ok);
+        assert!(response.detail.contains("authentication"));
+
+        let unknown = dispatched(request("unmute", &SECRET));
+        let response = apply_dispatched_request(&ingress, &mut app, &unknown, 100);
+        assert!(!response.ok);
+        assert!(response.detail.contains("unknown action"));
+
+        // Rejected requests must be audited but must not mint authority or
+        // mutate the runtime.
+        assert!(!app.is_muted());
+        assert!(
+            app.security()
+                .audit()
+                .iter()
+                .any(|record| record.decision == "operator_rejected")
+        );
+    }
+
+    #[test]
+    fn operator_status_never_contains_secret_material() {
+        use operator_control_helpers::*;
+        let ingress = operator_ingress();
+        let mut app = app(
+            FixedSilentRoute,
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        );
+
+        let status = dispatched(request("status", &SECRET));
+        let response = apply_dispatched_request(&ingress, &mut app, &status, 100);
+        assert!(response.ok);
+        let snapshot = response.status.as_ref().expect("status snapshot");
+        assert!(!snapshot.muted);
+        assert_eq!(snapshot.content_queue, 0);
+        let serialized = serde_json::to_string(&response).expect("serialize");
+        assert!(!serialized.contains("5a5a"));
+        assert!(!serialized.contains("secret"));
+    }
+
+    #[test]
+    fn operator_stop_and_mute_work_while_content_ingress_is_saturated() {
+        use operator_control_helpers::*;
+        let ingress = operator_ingress();
+        let mut app = app(
+            FixedSilentRoute,
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        );
+        app.startup().expect("startup");
+
+        // Saturate the content ingress queue with untrusted chat events.
+        let raw = serde_json::to_vec(&chat_event(1)).expect("serialize");
+        let mut queued = 0;
+        for sequence in 0..500 {
+            let mut raw = raw.clone();
+            let mut event: EventEnvelope = serde_json::from_slice(&raw).expect("parse");
+            event.sequence = sequence;
+            event.event_id = format!("evt-sat-{sequence}");
+            raw = serde_json::to_vec(&event).expect("serialize");
+            if app.process_content_bytes(&raw, 10, sequence).is_ok() {
+                queued += 1;
+            }
+        }
+        assert!(queued > 0, "saturation precondition");
+
+        // A content event that forges operator authority must be rejected by
+        // the content ingress, never accepted as control.
+        let mut forge: EventEnvelope = serde_json::from_slice(&raw).expect("parse");
+        forge.kind = aivtuber_domain::EventKind::OperatorCommand;
+        forge.authorization = Some(aivtuber_domain::AuthorizationContext {
+            principal: "attacker".to_owned(),
+            method: AuthorizationMethod::SignedLocalApi,
+            capabilities: BTreeSet::from([Capability::PerformerStop]),
+        });
+        let forge_raw = serde_json::to_vec(&forge).expect("serialize");
+        let forged = app.process_content_bytes(&forge_raw, 10, 900);
+        if let Ok(outcome) = forged {
+            assert!(matches!(
+                outcome.admission,
+                aivtuber_runtime::ContentAdmitDecision::RejectedNonContent
+            ));
+        }
+
+        // Operator stop still executes on the same runtime thread.
+        let stop = dispatched(request("stop", &SECRET));
+        let response = apply_dispatched_request(&ingress, &mut app, &stop, 200);
+        assert!(response.ok, "stop must succeed: {}", response.detail);
+
+        // Mute latches and unmute is not implemented.
+        let mute = dispatched(request("mute", &SECRET));
+        let response = apply_dispatched_request(&ingress, &mut app, &mute, 210);
+        assert!(response.ok, "mute must succeed: {}", response.detail);
+        assert!(app.is_muted());
+
+        assert!(
+            app.security()
+                .audit()
+                .iter()
+                .any(|record| record.decision == "operator_accepted")
+        );
+    }
+
+    #[test]
+    fn operator_rate_limiter_blocks_floods_but_refills() {
+        let mut limiter = OperatorRateLimiter::new(2, 100);
+        assert!(limiter.try_acquire());
+        assert!(limiter.try_acquire());
+        assert!(!limiter.try_acquire());
+        assert_eq!(limiter.rejected(), 1);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(limiter.try_acquire(), "tokens should refill");
     }
 }

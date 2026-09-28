@@ -63,6 +63,7 @@ OBS remains an independent control adapter. Its availability never owns schedule
 * Generated-asset promotion is explicit and deterministic: production records generated use, accepts quality labels separately, and only +apply_generated_asset_adaptation+ can promote or invalidate through the validated AssetStore path.
 * Higher-priority generation cancellation uses the scheduler's shared +priority_for_event+ mapping.
 * Serialized control events remain data only: content ingress rejects them and cannot use them to cancel/stop privileged runtime work.
+* Operator control (issue #56) terminates in +LocalControlIngress+ on its own local-socket transport; the presented secret is verified in constant time before any +AuthenticatedControl+ is minted, every privileged action is capability-checked, and accepted/rejected actions are audited. The control endpoint never shares the untrusted content queue.
 * VTube Studio and OBS connection failure is degraded state, not scheduler failure.
 
 == Runtime retention
@@ -158,6 +159,58 @@ cargo run -p aivtuber-app
 ----
 
 All profiles still require `AIVTUBER_MEMORY_PSEUDONYM_KEY_HEX`; VTube Studio/OBS and the remaining tuning variables apply unchanged to every profile.
+
+== Operator control (issue #56)
+
+The daemon can expose a local, authenticated operator control endpoint for emergency stop/mute and a health/status snapshot. It is enabled by default on the endpoint name +aivtuber-operator-control+ and can be renamed with:
+
+[source,shell]
+----
+export AIVTUBER_CONTROL_ENDPOINT='aivtuber-operator-control' # optional
+----
+
+The transport is an interprocess local socket: a named pipe under the `\\.\pipe\` namespace on Windows and a Unix domain socket on Unix-like systems. It is local-machine scope by construction and cannot be accidentally exposed to the network (no TCP is involved).
+
+Authentication uses +AIVTUBER_CONTROL_SECRET+ (exactly 32 UTF-8 bytes; if unset, the daemon generates a random session secret). Operator clients present the same secret. If the daemon runs with VTube Studio enabled, the value is shared with the avatar adapter boundary by design.
+
+Actions:
+
+[cols="1,3,2"]
+|===
+|Action |Effect |Authority
+
+|+status+
+|Adapter health, mute state, content queue depth, scheduler item count, generation activity. Contains no secret material.
+|Secret verification only (constant time); no control authority is minted.
+
+|+stop+
+|Stops and cancels current and queued performer work through +SecurityRuntime::handle_control_with_scheduler+.
+|+performer.stop+ capability.
+
+|+mute+
+|Latches the operator mute state; scheduled audio dispatch is suppressed while muted.
+|+performer.mute+ capability.
+|===
+
+*Unmute is intentionally not supported.* Mute is a latching emergency state: resuming output requires restarting the daemon with a verified configuration. This is a deliberate choice so a compromised operator session cannot silently re-enable output.
+
+CLI client (clap-based):
+
+[source,shell]
+----
+export AIVTUBER_CONTROL_SECRET='0123456789abcdef0123456789abcdef'
+cargo run -p aivtuber-app --bin aivtuberctl -- status
+cargo run -p aivtuber-app --bin aivtuberctl -- stop
+cargo run -p aivtuber-app --bin aivtuberctl -- mute
+----
+
+Security properties:
+
+* Operator commands never enter the untrusted content queue; they are applied directly on the runtime thread through the same emergency path as operator hotkeys.
+* Privileged actions pass through +LocalControlIngress::authenticate+ (constant-time secret comparison, action allowlist, scoped capability minting) before reaching the scheduler; content events cannot forge control authority (ingress rejects any serialized +OperatorCommand+ / authorization metadata).
+* Requests are token-bucket rate-limited (burst 16, refill 8/s); the endpoint has its own bounded queue so saturated content ingress, blocked generation workers, or disconnected adapters cannot starve emergency control.
+* The secret is never written to logs, telemetry, audit records, or status output. Audit records use the shared redactor.
+* Transport failure (listener error, dropped connection) cannot corrupt scheduler/runtime state: requests are applied atomically on the runtime thread and connections are stateless.
 
 == End-to-end interaction deadlines
 

@@ -8,9 +8,10 @@ use aivtuber_adapters::{
 };
 use aivtuber_app::{
     AdaptationRuntime, AdapterHealth, AvatarOutput, CompositionProfile, GenerativeRuntime,
-    IntentRoutePlanner, NoopAvatarOutput, NoopStreamOutput, ObsStreamOutput, ProductionApp,
-    ProfileSummary, RawIngressConfig, RawIngressMetrics, RawIngressMetricsSnapshot, RoutePlanner,
-    RuntimeRetentionPolicy, StreamOutput, VtsAvatarOutput, VtsPlaybackConfig, pump_bounded_records,
+    IntentRoutePlanner, NoopAvatarOutput, NoopStreamOutput, ObsStreamOutput, OperatorControlServer,
+    OperatorRateLimiter, ProductionApp, ProfileSummary, RawIngressConfig, RawIngressMetrics,
+    RawIngressMetricsSnapshot, RoutePlanner, RuntimeRetentionPolicy, StreamOutput, VtsAvatarOutput,
+    VtsPlaybackConfig, apply_dispatched_request, pump_bounded_records,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
@@ -28,7 +29,7 @@ use std::env;
 use std::error::Error;
 use std::io;
 use std::path::PathBuf;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -201,6 +202,39 @@ fn run() -> Result<(), Box<dyn Error>> {
         raw_ingress_config.max_record_bytes, raw_ingress_config.queue_capacity
     );
 
+    // Issue #56: authenticated local operator control endpoint. The endpoint
+    // is opt-in (AIVTUBER_CONTROL_ENDPOINT), local-machine scope only, and
+    // terminates in LocalControlIngress so privileged commands can never be
+    // forged through the untrusted content ingress.
+    let operator_secret = match env_optional("AIVTUBER_CONTROL_SECRET") {
+        Some(_) => fixed_control_secret("AIVTUBER_CONTROL_SECRET")?,
+        None => {
+            let mut generated = [0_u8; 32];
+            fill_random(&mut generated);
+            generated
+        }
+    };
+    let operator_endpoint = env_string("AIVTUBER_CONTROL_ENDPOINT", "aivtuber-operator-control");
+    let (operator_server, mut operator_receiver) =
+        OperatorControlServer::new(&operator_endpoint, operator_secret)?;
+    let operator_ingress = operator_server.ingress();
+    let operator_rate = Arc::new(Mutex::new(OperatorRateLimiter::new(16, 8)));
+    {
+        let rate = operator_rate.clone();
+        let server = operator_server;
+        thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            if let Ok(runtime) = runtime
+                && let Err(error) = runtime.block_on(server.serve(rate))
+            {
+                eprintln!("operator_control: server_error={error}");
+            }
+        });
+    }
+    eprintln!("operator_control: endpoint={operator_endpoint} unmute=restart-only");
+
     let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(raw_ingress_config.queue_capacity);
     let raw_ingress_metrics = RawIngressMetrics::default();
     let reader_metrics = raw_ingress_metrics.clone();
@@ -243,6 +277,11 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // The stdin producer closed the pipe. Without this log, an
+                // operator who launches the daemon in the background only
+                // sees a fast exit after startup — the local operator
+                // control endpoint is bound and immediately torn down.
+                eprintln!("raw_ingress: stdin closed; shutting down");
                 report_raw_ingress_metrics(
                     &raw_ingress_metrics,
                     &mut last_raw_ingress_metrics,
@@ -255,6 +294,15 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
 
         let now_ms = elapsed_ms(started);
+        // Issue #56: drain dispatched operator requests on the runtime thread.
+        // The control endpoint has its own queue and never contends with the
+        // untrusted content ingress, so stop/mute stay responsive even while
+        // content is saturated and generation workers are blocked.
+        while let Ok(dispatched) = operator_receiver.try_recv() {
+            let response =
+                apply_dispatched_request(&operator_ingress, &mut app, &dispatched, now_ms);
+            let _ = dispatched.respond.send(response);
+        }
         app.tick(now_ms);
         if now_ms >= next_maintenance_ms {
             app.maintain_adapters();
@@ -561,6 +609,10 @@ fn fixed_hex_key(name: &str) -> Result<[u8; 32], Box<dyn Error>> {
         })?;
     }
     Ok(key)
+}
+
+fn fill_random(bytes: &mut [u8; 32]) {
+    getrandom::fill(bytes).expect("OS entropy source failed");
 }
 
 fn fixed_control_secret(name: &str) -> Result<[u8; 32], Box<dyn Error>> {

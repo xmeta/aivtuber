@@ -304,6 +304,23 @@ impl SecurityRuntime {
         }
     }
 
+    /// Redact and record an externally-produced audit record (issue #56
+    /// operator control). Keeps the same retention policy as internal audit
+    /// records while letting the app crate append operator decisions.
+    pub fn redactor_record(
+        &self,
+        event_id: Option<&str>,
+        category: AuditCategory,
+        decision: impl Into<String>,
+        detail: impl AsRef<str>,
+    ) -> AuditRecord {
+        self.redactor.record(event_id, category, decision, detail)
+    }
+
+    pub fn push_external_audit(&mut self, record: AuditRecord) {
+        self.push_audit(record);
+    }
+
     fn push_audit(&mut self, record: AuditRecord) {
         self.audit.push(record);
         if self.audit.len() > self.config.max_audit_records {
