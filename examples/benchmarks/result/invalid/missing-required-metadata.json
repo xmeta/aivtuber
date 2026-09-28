@@ -1,0 +1,19 @@
+{
+  "schema_version": "1",
+  "benchmark_suite": "replay-comparison",
+  "mode": "deterministic_only",
+  "git": {
+    "commit": "bfe0b7e0c0ffee"
+  },
+  "environment": {
+    "os": "windows",
+    "architecture": "x86_64",
+    "cargo_profile": "release"
+  },
+  "configuration": {
+    "config_version": "replay-benchmark-v1",
+    "asset_version": "starter-v1/compiler-0.1.0"
+  },
+  "metrics": {},
+  "invariants": {}
+}

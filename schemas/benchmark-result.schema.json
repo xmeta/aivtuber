@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xmeta/aivtuber/schemas/benchmark-result.schema.json",
+  "title": "AIVTuber Benchmark Result (issue #58 Phase A)",
+  "description": "Versioned machine-readable result contract for replay/benchmark runs. Metric names carry unambiguous units; results record commit, toolchain, config, seed, and dataset identity required for reproduction.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "benchmark_suite",
+    "mode",
+    "git",
+    "environment",
+    "configuration",
+    "metrics",
+    "invariants"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "1",
+      "description": "Result contract version. Incompatible schema versions must not be compared silently."
+    },
+    "benchmark_suite": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Suite identity, e.g. replay-comparison. Suites own their dataset identity."
+    },
+    "mode": {
+      "type": "string",
+      "enum": [
+        "deterministic_only",
+        "deterministic_semantic",
+        "deterministic_semantic_jev",
+        "full_generative"
+      ],
+      "description": "Comparison mode the observation ran under."
+    },
+    "dataset_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Versioned fixture/dataset identity; results with different datasets must not be compared."
+    },
+    "git": {
+      "type": "object",
+      "required": ["commit"],
+      "additionalProperties": false,
+      "properties": {
+        "commit": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Exact revision measured; may carry a +dirty suffix for local runs."
+        },
+        "base_commit": {
+          "type": ["string", "null"],
+          "description": "Base revision when this result is one side of a base/head comparison."
+        }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "required": ["os", "architecture", "rust_version", "cargo_profile"],
+      "additionalProperties": false,
+      "properties": {
+        "os": { "type": "string", "minLength": 1 },
+        "architecture": { "type": "string", "minLength": 1 },
+        "cpu": { "type": ["string", "null"] },
+        "rust_version": { "type": "string", "minLength": 1 },
+        "bun_version": { "type": ["string", "null"] },
+        "cargo_profile": {
+          "type": "string",
+          "enum": ["debug", "release"]
+        }
+      }
+    },
+    "configuration": {
+      "type": "object",
+      "required": ["config_version", "asset_version", "seed"],
+      "additionalProperties": false,
+      "properties": {
+        "config_version": { "type": "string", "minLength": 1 },
+        "runtime_profile": { "type": ["string", "null"] },
+        "asset_version": { "type": "string", "minLength": 1 },
+        "index_version": { "type": ["string", "null"] },
+        "retriever_version": { "type": ["string", "null"] },
+        "jev_model": { "type": ["string", "null"] },
+        "thinking_model": { "type": ["string", "null"] },
+        "tts_model": { "type": ["string", "null"] },
+        "cost_model_version": {
+          "type": ["string", "null"],
+          "description": "Version/inputs of the pricing configuration used for cost metrics; never baked into history without it."
+        },
+        "seed": { "type": "integer", "minimum": 0 },
+        "stream_duration_ms": { "type": ["integer", "null"], "minimum": 1 }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "description": "Flat metric map. Names encode subsystem, metric, and unit (e.g. cached.first_audio.p95_ms). Units: _ms/_us microseconds-vs-milliseconds suffixes, _pct for 0-100 percentages, _count for integer counters.",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["value"],
+        "additionalProperties": false,
+        "properties": {
+          "value": { "type": "number" },
+          "sample_count": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "invariants": {
+      "type": "object",
+      "description": "Hard correctness/safety counters. Any value above its configured maximum fails the gate regardless of performance.",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["value"],
+        "additionalProperties": false,
+        "properties": {
+          "value": { "type": "integer", "minimum": 0 },
+          "detail": { "type": ["string", "null"] }
+        }
+      }
+    }
+  }
+}

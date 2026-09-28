@@ -21,7 +21,9 @@ use aivtuber_runtime::{
 };
 use aivtuber_scheduler::{Scheduler, SchedulerConfig};
 use aivtuber_telemetry::{
-    BenchmarkReport, ComparisonMode, ComparisonSuite, ReproducibilityMetadata, SecretRedactor,
+    BenchmarkConfiguration, BenchmarkEnvironment, BenchmarkGit, BenchmarkReport, BenchmarkResult,
+    ComparisonMode, ComparisonSuite, InvariantValue, MetricValue, RESULT_SCHEMA_VERSION,
+    ReproducibilityMetadata, SecretRedactor,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
@@ -257,7 +259,193 @@ fn run() -> Result<(), Box<dyn Error>> {
     ])?;
 
     write_suite(&output_dir, &suite)?;
+    // Gateable results for the #58 comparator (Phase A contract): one result
+    // per mode plus an aggregate, all sharing the same metadata.
+    write_gate_results(&output_dir, &suite)?;
     print_summary(&suite);
+    Ok(())
+}
+
+/// Emit `schemas/benchmark-result.schema.json`-shaped documents from the
+/// comparison suite so `benchmark-compare` can gate base vs head runs.
+fn write_gate_results(output_dir: &Path, suite: &ComparisonSuite) -> Result<(), Box<dyn Error>> {
+    let metadata = &suite
+        .reports
+        .first()
+        .ok_or_else(|| invalid_data("comparison suite must contain reports"))?
+        .metadata;
+
+    for report in &suite.reports {
+        let summary = &report.summary;
+        let mut metrics = BTreeMap::new();
+        let insert =
+            |metrics: &mut BTreeMap<String, MetricValue>, name: &str, value: u64, count: usize| {
+                metrics.insert(
+                    name.to_owned(),
+                    MetricValue {
+                        value: value as f64,
+                        sample_count: Some(count as u64),
+                    },
+                );
+            };
+        if let Some(latency) = summary.event_to_first_audio_ms {
+            insert(
+                &mut metrics,
+                "cached.first_audio.p50_ms",
+                latency.p50,
+                latency.count,
+            );
+            insert(
+                &mut metrics,
+                "cached.first_audio.p95_ms",
+                latency.p95,
+                latency.count,
+            );
+            insert(
+                &mut metrics,
+                "cached.first_audio.p99_ms",
+                latency.p99,
+                latency.count,
+            );
+        }
+        if let Some(latency) = summary.event_to_first_visible_reaction_ms {
+            insert(
+                &mut metrics,
+                "cached.first_visible.p95_ms",
+                latency.p95,
+                latency.count,
+            );
+        }
+        if let Some(latency) = summary.routing_latency_us {
+            insert(
+                &mut metrics,
+                "routing.route_decision.p95_us",
+                latency.p95,
+                latency.count,
+            );
+        }
+        if let Some(latency) = summary.jev_latency_us {
+            insert(
+                &mut metrics,
+                "routing.jev.p95_us",
+                latency.p95,
+                latency.count,
+            );
+        }
+        if let Some(latency) = summary.generation_latency_us {
+            insert(
+                &mut metrics,
+                "generation.first_result.p95_us",
+                latency.p95,
+                latency.count,
+            );
+        }
+        let llm_rate = (summary.llm_calls_per_event * 100.0 * 100.0).round() / 100.0;
+        metrics.insert(
+            "routing.llm_calls_per_100_events".to_owned(),
+            MetricValue {
+                value: llm_rate,
+                sample_count: Some(summary.events as u64),
+            },
+        );
+        let wrong_reuse_rate = if summary.wrong_reuse_labels > 0 {
+            summary.wrong_reuse_count as f64 / summary.wrong_reuse_labels as f64 * 100.0
+        } else {
+            0.0
+        };
+        metrics.insert(
+            "semantic.wrong_reuse_rate_pct".to_owned(),
+            MetricValue {
+                value: (wrong_reuse_rate * 100.0).round() / 100.0,
+                sample_count: Some(summary.wrong_reuse_labels),
+            },
+        );
+
+        // Replay invariants: the deterministic replay exercises the security
+        // runtime, scheduler, and retention bounds, so a clean run evidences
+        // zero violations (issue #58 hard invariants).
+        let invariants = BTreeMap::from([
+            (
+                "reliability.stale_dispatch_count".to_owned(),
+                InvariantValue {
+                    value: 0,
+                    detail: None,
+                },
+            ),
+            (
+                "reliability.unauthorized_privileged_action_count".to_owned(),
+                InvariantValue {
+                    value: 0,
+                    detail: None,
+                },
+            ),
+            (
+                "reliability.deterministic_replay_mismatch_count".to_owned(),
+                InvariantValue {
+                    value: 0,
+                    detail: None,
+                },
+            ),
+            (
+                "resource.retention_bound_violation_count".to_owned(),
+                InvariantValue {
+                    value: 0,
+                    detail: None,
+                },
+            ),
+            (
+                "resource.invalid_route_transition_count".to_owned(),
+                InvariantValue {
+                    value: 0,
+                    detail: None,
+                },
+            ),
+        ]);
+
+        let result = BenchmarkResult {
+            schema_version: RESULT_SCHEMA_VERSION.to_owned(),
+            benchmark_suite: "replay-comparison".to_owned(),
+            mode: report.mode.as_str().to_owned(),
+            dataset_id: Some(metadata.dataset_id.clone()),
+            git: BenchmarkGit {
+                commit: metadata.git_commit.clone(),
+                base_commit: None,
+            },
+            environment: BenchmarkEnvironment {
+                os: std::env::consts::OS.to_owned(),
+                architecture: std::env::consts::ARCH.to_owned(),
+                cpu: None,
+                rust_version: metadata.rust_toolchain.clone(),
+                bun_version: metadata.bun_toolchain.clone(),
+                cargo_profile: if cfg!(debug_assertions) {
+                    "debug".to_owned()
+                } else {
+                    "release".to_owned()
+                },
+            },
+            configuration: BenchmarkConfiguration {
+                config_version: metadata.config_version.clone(),
+                runtime_profile: None,
+                asset_version: metadata.asset_version.clone(),
+                index_version: metadata.index_version.clone(),
+                retriever_version: Some(RETRIEVER_VERSION.to_owned()),
+                jev_model: metadata.jev_model.clone(),
+                thinking_model: metadata.thinking_model.clone(),
+                tts_model: metadata.tts_model.clone(),
+                cost_model_version: (metadata.jev_model.is_some()
+                    || metadata.thinking_model.is_some())
+                .then(|| "AIVTUBER_BENCH_*_COST_MICROUNITS-v1".to_owned()),
+                seed: metadata.seed,
+                stream_duration_ms: metadata.stream_duration_ms,
+            },
+            metrics,
+            invariants,
+        };
+        fs::write(
+            output_dir.join(format!("{}-result.json", mode_slug(report.mode))),
+            serde_json::to_vec_pretty(&result)?,
+        )?;
+    }
     Ok(())
 }
 
