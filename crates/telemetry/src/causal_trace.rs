@@ -446,6 +446,25 @@ impl CausalTraceCollector {
             .find(|trace| trace.correlation_id == correlation_id)
     }
 
+    /// Bounded allowlist feed for diagnostic/support bundles (#68): the most
+    /// recent distinct correlation ids, newest first. Correlation ids are
+    /// operator-generated references, not viewer identities, so listing them
+    /// exposes no private content — only which incidents can be expanded via
+    /// `trace_for_correlation` / `redacted_timeline`.
+    pub fn recent_correlation_ids(&self, limit: usize) -> Vec<&str> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut out = Vec::new();
+        for trace in self.traces.iter().rev() {
+            if out.len() >= limit {
+                break;
+            }
+            if seen.insert(trace.correlation_id.as_str()) {
+                out.push(trace.correlation_id.as_str());
+            }
+        }
+        out
+    }
+
     /// Aggregate stage-level latency attribution across retained traces (#58
     /// integration point). Returns total observed duration per stage.
     pub fn stage_latency_totals(&self) -> BTreeMap<TraceStage, u64> {

@@ -25,7 +25,10 @@
 //! restarting the daemon with a verified configuration. This is documented in
 //! `docs/production-runtime.adoc`.
 
-use crate::{AdapterHealth, ProductionApp, RoutePlanner};
+use crate::{
+    AdapterHealth, ProductionApp, RoutePlanner, SupportBundle, SupportBundleBuilder,
+    SupportBundleProvenance,
+};
 use aivtuber_domain::{LocalControlIngress, OperatorCommandInput};
 use aivtuber_runtime::ControlOutcome;
 use interprocess::local_socket::traits::tokio::Listener as _;
@@ -377,7 +380,11 @@ pub fn apply_dispatched_request<R: RoutePlanner>(
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    if request.action != "status" && request.action != "stop" && request.action != "mute" {
+    if request.action != "status"
+        && request.action != "stop"
+        && request.action != "mute"
+        && request.action != "diagnose"
+    {
         let detail = format!("unknown action {}", request.action);
         app.audit_operator_action(&request_id, &request.action, &detail, false);
         return rejection(&request_id, &detail);
@@ -392,22 +399,42 @@ pub fn apply_dispatched_request<R: RoutePlanner>(
     let mut presented = [0_u8; 32];
     presented.copy_from_slice(secret_bytes);
 
-    if request.action == "status" {
-        // `status` only reads non-secret health state, so it uses constant-
-        // time secret verification without minting control authority. All
-        // privileged actions go through `authenticate` below.
+    if request.action == "status" || request.action == "diagnose" {
+        // `status` and `diagnose` only read non-secret runtime state, so they
+        // use constant-time secret verification without minting control
+        // authority. All privileged actions go through `authenticate` below.
         if !ingress.verify_secret(&presented) {
             let detail = "authentication failed".to_owned();
-            app.audit_operator_action(&request_id, "status", &detail, false);
+            app.audit_operator_action(&request_id, &request.action, &detail, false);
             return rejection(&request_id, &detail);
         }
-        let snapshot = OperatorStatusSnapshot::from_app(app);
-        app.audit_operator_action(&request_id, "status", "status", true);
+        if request.action == "status" {
+            let snapshot = OperatorStatusSnapshot::from_app(app);
+            app.audit_operator_action(&request_id, "status", "status", true);
+            return OperatorResponse {
+                request_id,
+                ok: true,
+                detail: "status".to_owned(),
+                status: Some(snapshot),
+            };
+        }
+        // Issue #68: capture the bounded support bundle. Generation is
+        // synchronous local work over already-retained state (no provider
+        // calls, no scheduler mutation) so emergency control stays live.
+        let builder = SupportBundleBuilder::new(
+            "daemon",
+            "daemon-runtime",
+            SupportBundleProvenance::from_build_env(),
+        );
+        let bundle: SupportBundle = builder.generate(app, wall_unix_millis());
+        let detail = serde_json::to_string(&bundle)
+            .unwrap_or_else(|_| "{\"error\":\"bundle serialization failed\"}".to_owned());
+        app.audit_operator_action(&request_id, "diagnose", "bundle generated", true);
         return OperatorResponse {
             request_id,
             ok: true,
-            detail: "status".to_owned(),
-            status: Some(snapshot),
+            detail,
+            status: None,
         };
     }
 
@@ -459,6 +486,16 @@ fn rejection(request_id: &str, detail: &str) -> OperatorResponse {
         detail: detail.to_owned(),
         status: None,
     }
+}
+
+/// Wall-clock Unix time in milliseconds for bundle manifests only. The
+/// control path itself stays on the monotonic runtime clock; the manifest
+/// timestamp is explicitly a wall-clock capture time for incident reports.
+fn wall_unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
 }
 
 /// The scheduler/runtime timeline is a monotonic millisecond counter, so the
