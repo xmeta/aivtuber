@@ -212,6 +212,38 @@ Security properties:
 * The secret is never written to logs, telemetry, audit records, or status output. Audit records use the shared redactor.
 * Transport failure (listener error, dropped connection) cannot corrupt scheduler/runtime state: requests are applied atomically on the runtime thread and connections are stateless.
 
+== Support bundle / diagnostics (issue #68)
+
+`aivtuberctl diagnose` captures a bounded, privacy-safe support bundle over the same local operator endpoint as `status`. Authentication is the same constant-time secret verification (no control authority is minted), so generating a bundle cannot stop, mute, or otherwise disturb the runtime.
+
+[source,shell]
+----
+export AIVTUBER_CONTROL_SECRET='0123456789abcdef0123456789abcdef'
+cargo run -p aivtuber-app --bin aivtuberctl -- diagnose > support-bundle.json
+----
+
+The bundle is a single versioned JSON document (`schema_version` in the manifest, currently `0.1.0`) containing:
+
+* runtime/build/config identity: git revision (best effort), rustc/OS/arch, composition profile, non-secret config fingerprint, asset pack/compiler versions, semantic retriever identity, provider/model **names** (never keys or endpoints);
+* adapter health (redacted error text; endpoint URLs are masked as `[ENDPOINT]`);
+* bounded resource counters from #51/#52/#53 (queue depths, scheduler active/terminal counts, hot-cache occupancy, audit/telemetry/trace retention, generation worker counts);
+* the most recent incident references (correlation ids only) with their redacted #65 causal timelines (one line per stage, no payloads);
+* bounded redacted audit summaries (category + decision codes only, newest last);
+* a manifest with generation timestamp and a SHA-256 of the bundle body for integrity comparison.
+
+Privacy model — the exporter is allowlist-based:
+
+* it serializes explicit typed fields only; it never dumps environment variables, configuration files, payloads, transcripts, durable memory, or viewer identifiers;
+* payloads and actor ids never enter causal traces or the correlation registry, so they cannot reach the bundle through them;
+* every audit record has already passed the shared secret redactor at write time, and adapter error text is redacted again at export time;
+* bundle generation is synchronous local work over already-retained state: no external provider calls, no unbounded history retention, and no scheduler/control mutation, so it works while providers are down and never blocks emergency control.
+
+Bounds: causal timelines default to 8 and audit summaries to 32; both are clamped to 256 and configurable via `SupportBundleBuilder`. The correlation registry on `SecurityRuntime` retains at most 128 references.
+
+Reproducibility workflow (#62 AAR): attach the bundle JSON to the incident issue. The correlation ids inside map 1:1 to `trace_for_correlation` lookups in a replay; the identity section decides whether two bundles are comparable (same profile fingerprint and compiler version) before comparing counters.
+
+Limitations: the bundle is evidence, not a replay artifact. It does not include private conversation text by design, so some behavioral incidents will need a separate minimal reproduction case.
+
 == End-to-end interaction deadlines
 
 Every admitted content event receives a trusted runtime deadline class derived from its normalized `EventKind`; untrusted payload fields do not choose or extend the class. Operator commands remain on the independent authenticated control path and do not enter this content-deadline policy.

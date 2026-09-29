@@ -242,7 +242,35 @@ pub struct SecurityRuntime {
     rate_limit_sources_expired: u64,
     rate_limit_sources_rejected: u64,
     content_queue_high_water: usize,
+    /// Bounded allowlist feed for the #68 support bundle: the last K admitted
+    /// content events' correlation ids, mapped to their event id and sequence.
+    /// Correlation ids are operator-generated incident references (never raw
+    /// viewer identifiers), so they are safe to expose; payloads never enter
+    /// this registry.
+    correlations: BTreeMap<String, CorrelationRef>,
+    /// Insertion-ordered correlation ids backing `correlations` so "recent"
+    /// means recency of admission rather than lexicographic key order.
+    correlation_order: Vec<String>,
 }
+
+#[derive(Debug, Clone)]
+struct CorrelationRef {
+    event_id: String,
+    sequence: u64,
+}
+
+/// Borrowed view of one registered correlation for the #68 support bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CorrelationEntry<'a> {
+    pub correlation_id: &'a str,
+    pub event_id: &'a str,
+    pub sequence: u64,
+}
+
+/// Upper bound of the #68 correlation registry. Small, fixed, and independent
+/// of the content queue so bundle generation can never retain unbounded
+/// history.
+const MAX_CORRELATION_REFS: usize = 128;
 
 impl SecurityRuntime {
     pub fn new(
@@ -267,6 +295,8 @@ impl SecurityRuntime {
             rate_limit_sources_expired: 0,
             rate_limit_sources_rejected: 0,
             content_queue_high_water: 0,
+            correlations: BTreeMap::new(),
+            correlation_order: Vec::new(),
         })
     }
 
@@ -288,6 +318,12 @@ impl SecurityRuntime {
 
     pub fn audit(&self) -> &[AuditRecord] {
         &self.audit
+    }
+
+    /// Shared secret redactor used for every record stored here (issue #68
+    /// support-bundle export path applies it again at capture time).
+    pub fn redactor(&self) -> &SecretRedactor {
+        &self.redactor
     }
 
     pub fn retention_metrics(&self) -> SecurityRetentionMetrics {
@@ -420,6 +456,7 @@ impl SecurityRuntime {
         }
 
         self.record_ingress(&event, "queued", &format!("payload_bytes={payload_bytes}"));
+        self.record_correlation(&event);
         self.content_queue.push_back(event);
         self.content_queue_high_water = self.content_queue_high_water.max(self.content_queue.len());
         Ok(ContentAdmitDecision::Queued)
@@ -631,6 +668,52 @@ impl SecurityRuntime {
             decision,
             detail,
         ));
+    }
+
+    /// Record an admitted content event's correlation id for #68 bundle
+    /// assembly. Called only after admission succeeds. Insertion order is
+    /// tracked separately so "recent" means recency, not key order.
+    fn record_correlation(&mut self, event: &EventEnvelope) {
+        if self.correlations.contains_key(&event.correlation_id) {
+            self.correlation_order
+                .retain(|id| id != &event.correlation_id);
+        }
+        self.correlation_order.push(event.correlation_id.clone());
+        self.correlations.insert(
+            event.correlation_id.clone(),
+            CorrelationRef {
+                event_id: event.event_id.clone(),
+                sequence: event.sequence,
+            },
+        );
+        while self.correlations.len() > MAX_CORRELATION_REFS {
+            let oldest = self
+                .correlation_order
+                .first()
+                .cloned()
+                .expect("order track is non-empty while map is non-empty");
+            self.correlation_order.remove(0);
+            self.correlations.remove(&oldest);
+        }
+    }
+
+    /// Bounded allowlist feed for the #68 support bundle: the most recently
+    /// admitted correlation ids with their event id and sequence, newest
+    /// first. No payload text, actor identifier, or authorization material is
+    /// exposed — correlation ids are operator-generated incident references.
+    pub fn recent_correlations(&self, limit: usize) -> Vec<CorrelationEntry<'_>> {
+        self.correlation_order
+            .iter()
+            .rev()
+            .take(limit)
+            .filter_map(|id| {
+                self.correlations.get(id).map(|entry| CorrelationEntry {
+                    correlation_id: id,
+                    event_id: &entry.event_id,
+                    sequence: entry.sequence,
+                })
+            })
+            .collect()
     }
 
     fn record_output(&mut self, reason: &str) {

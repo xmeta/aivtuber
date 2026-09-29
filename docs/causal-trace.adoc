@@ -9,7 +9,9 @@ retrieval, reflex/Jev, routing, generation, asset resolution, scheduling, and
 adapter dispatch — without retaining sensitive content — so that latency or
 failure regressions found by #58 can be attributed to the causal stage that
 produced them, and incidents can be explained from a single correlation ID
-(#68, #62).
+(#68, #62). Since #68 shipped, `aivtuberctl diagnose` exports these traces as
+redacted timelines inside the support bundle (see
+`docs/production-runtime.adoc`, "Support bundle / diagnostics").
 
 == 2. What was implemented
 

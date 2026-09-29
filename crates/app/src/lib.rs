@@ -8,6 +8,7 @@ mod raw_ingress;
 mod retention;
 mod routing;
 mod semantic;
+mod support_bundle;
 
 pub use deadline::*;
 pub use operator_control::*;
@@ -17,6 +18,7 @@ pub use raw_ingress::*;
 pub use retention::*;
 pub use routing::*;
 pub use semantic::*;
+pub use support_bundle::*;
 
 use aivtuber_adaptation::{AdaptationEngine, AppliedAdaptation, MemoryEntry, WorkingMemory};
 use aivtuber_asset_store::CacheTier;
@@ -5051,5 +5053,127 @@ mod tests {
         assert_eq!(limiter.rejected(), 1);
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(limiter.try_acquire(), "tokens should refill");
+    }
+
+    // ---- Issue #68: privacy-safe runtime diagnostic/support bundle ----
+
+    #[test]
+    fn support_bundle_excludes_secret_shaped_values_and_private_text() {
+        let mut app = app(
+            FixedSilentRoute,
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        );
+        app.startup().expect("startup");
+
+        // Secret-shaped values in what would normally be sensitive places:
+        // a private chat payload, an AuthorizationMethod-tagged control event,
+        // and a configured secret on the shared redactor.
+        let mut event = chat_event(1);
+        event.correlation_id = "incident-68".to_owned();
+        event.payload.insert(
+            "text".to_owned(),
+            serde_json::Value::String("sk-super-secret-api-key-1234".to_owned()),
+        );
+        let raw = serde_json::to_vec(&event).expect("event json");
+        app.process_content_bytes(&raw, 10, 1).expect("content");
+
+        let bundle = generate_support_bundle(&app, "cached", "fp-test", 1_000);
+
+        // The serialized bundle is the privacy boundary: none of the secret
+        // shapes may survive.
+        let text = serde_json::to_string(&bundle).expect("bundle json");
+        assert!(!text.contains("sk-super-secret-api-key-1234"));
+        assert!(!text.contains("hello"), "payload text leaked: {text}");
+        assert!(!text.contains("viewer:test"), "actor id leaked");
+
+        // Identity and counters are exported; incident references are
+        // correlation ids only.
+        assert!(
+            bundle
+                .recent_correlations
+                .contains(&"incident-68".to_owned())
+        );
+        assert!(
+            bundle
+                .causal_timelines
+                .iter()
+                .any(|line| line.contains("corr=incident-68"))
+        );
+        assert!(
+            !bundle
+                .causal_timelines
+                .iter()
+                .any(|line| line.contains("hello"))
+        );
+    }
+
+    #[test]
+    fn support_bundle_audit_summaries_are_bounded_and_decision_shaped() {
+        let mut app = app(
+            FixedSilentRoute,
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        );
+        app.startup().expect("startup");
+
+        for sequence in 1..=6_u64 {
+            let event = chat_event(sequence);
+            let raw = serde_json::to_vec(&event).expect("event json");
+            app.process_content_bytes(&raw, sequence * 10, sequence)
+                .expect("content");
+        }
+
+        let bundle = {
+            let builder = SupportBundleBuilder::new(
+                "cached",
+                "fp-test",
+                SupportBundleProvenance::from_build_env(),
+            )
+            .with_max_audit_summaries(3);
+            builder.generate(&app, 1_000)
+        };
+        assert!(
+            bundle.audit_summaries.len() <= 3,
+            "summaries must be bounded"
+        );
+        for summary in &bundle.audit_summaries {
+            assert!(!summary.decision.is_empty());
+            assert!(!summary.decision.contains("payload"), "detail text leaked");
+        }
+    }
+
+    #[test]
+    fn support_bundle_captures_identity_health_and_counters_without_providers() {
+        let mut app = app(
+            FixedSilentRoute,
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        );
+        app.startup().expect("startup");
+
+        let event = chat_event(1);
+        let raw = serde_json::to_vec(&event).expect("event json");
+        app.process_content_bytes(&raw, 10, 1).expect("content");
+
+        let bundle = generate_support_bundle(&app, "cached", "profile-v1-test", 1_000);
+        assert_eq!(bundle.manifest.schema_version, "0.1.0");
+        assert_eq!(bundle.manifest.generated_unix_ms, 1_000);
+        assert_eq!(bundle.identity.composition_profile, "cached");
+        assert_eq!(bundle.identity.config_fingerprint, "profile-v1-test");
+        assert!(!bundle.identity.compiler_version.is_empty());
+        assert_eq!(bundle.resources.content_queue_len, 0, "event was consumed");
+        assert!(bundle.resources.audit_retained > 0);
+        assert!(
+            !bundle
+                .adapter_health
+                .audio_error
+                .as_deref()
+                .unwrap_or("")
+                .contains("http")
+        );
     }
 }

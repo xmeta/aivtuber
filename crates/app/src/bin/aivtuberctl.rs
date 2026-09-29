@@ -1,4 +1,4 @@
-//! `aivtuberctl` — local operator control client (issue #56).
+//! `aivtuberctl` — local operator control client (issues #56 and #68).
 //!
 //! Sends one line-delimited JSON request over the daemon's local operator
 //! control endpoint (Windows named pipe / Unix domain socket) and prints the
@@ -6,7 +6,9 @@
 //! value the daemon uses) or `--secret` on the command line.
 //!
 //! Unmute is intentionally not implemented: mute is a latching emergency
-//! state and resuming output requires restarting the daemon. See
+//! state and resuming output requires restarting the daemon. The `diagnose`
+//! subcommand captures a bounded, redacted support bundle over the same
+//! status path (secret verification only, no control authority); see
 //! `docs/production-runtime.adoc` for the security model.
 
 use aivtuber_app::{OperatorRequest, OperatorResponse};
@@ -37,7 +39,7 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone, Copy, PartialEq, Eq)]
 enum Command {
     /// Adapter/runtime health snapshot (no secret material).
     Status,
@@ -45,6 +47,9 @@ enum Command {
     Stop,
     /// Latch the operator mute state (unmute is restart-only).
     Mute,
+    /// Capture a bounded, redacted diagnostic/support bundle (issue #68).
+    /// Uses the status path (secret verification only, no control authority).
+    Diagnose,
 }
 
 fn action_name(command: &Command) -> &'static str {
@@ -52,6 +57,7 @@ fn action_name(command: &Command) -> &'static str {
         Command::Status => "status",
         Command::Stop => "stop",
         Command::Mute => "mute",
+        Command::Diagnose => "diagnose",
     }
 }
 
@@ -96,7 +102,11 @@ fn main() -> ExitCode {
 
     match runtime.block_on(send_request(&endpoint, &request)) {
         Ok(response) => {
-            print_response(&response);
+            if cli.command == Command::Diagnose && response.ok {
+                print_diagnose(&response);
+            } else {
+                print_response(&response);
+            }
             if response.ok {
                 ExitCode::SUCCESS
             } else {
@@ -128,6 +138,13 @@ fn print_response(response: &OperatorResponse) {
     } else {
         println!("{}", response.detail);
     }
+}
+
+/// Render the #68 support bundle from the daemon's diagnose response. The
+/// bundle sections ride the response's detail JSON when the daemon supports
+/// #68; the client prints it verbatim as the shareable artifact.
+fn print_diagnose(response: &OperatorResponse) {
+    println!("{}", response.detail);
 }
 
 async fn send_request(
