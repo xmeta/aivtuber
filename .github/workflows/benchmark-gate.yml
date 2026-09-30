@@ -55,9 +55,12 @@ jobs:
           echo "sha=${sha}" >> "$GITHUB_OUTPUT"
           echo "base SHA: ${sha}"
 
-      # Head checkout (working tree used for both benchmark binaries; the
-      # binaries are identical, only the benchmarked revision differs).
+      # Head checkout: pin the exact PR head SHA. The pull_request default
+      # (refs/pull/<n>/merge) is a synthetic merge commit, not the reviewed
+      # revision — #58 Phase C requires exact base vs exact head.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Benchmark head
         run: |
@@ -79,10 +82,17 @@ jobs:
           mkdir -p results/base
           cp target/bench-base/*-result.json results/base/
 
-      - name: Restore head sources for the comparator
-        run: |
-          git checkout -- . 2>/dev/null || true
-          git clean -fd -e target -e results 2>/dev/null || true
+      # Return to the exact PR head revision before comparing: the
+      # comparator, the budgets it loads (benchmarks/budgets.json), and the
+      # binary that runs them must be exactly what the PR reviewed — a
+      # `git checkout -- .` after the base benchmark would only re-expand the
+      # base index and silently gate with base-side semantics. Benchmark
+      # results survive in results/ (checkout leaves untracked files alone);
+      # target/ carries the head-built binaries, so no rebuild is needed.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          clean: false
 
       # Deterministic comparator: same inputs always yield the same verdict.
       # Hard invariants gate strictly; noisy timing metrics are warning-only

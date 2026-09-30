@@ -94,12 +94,19 @@ the lockfile, or benchmark inputs:
 
 ```text
 resolve base SHA (GitHub API)
-→ checkout head → replay-benchmark → results/head
+→ checkout exact PR head SHA → replay-benchmark → results/head
 → checkout base SHA → replay-benchmark → results/base
+→ re-checkout exact PR head SHA (comparator + budgets from the PR)
 → benchmark-compare base head → Job Summary + artifacts
 → enforce verdict (exit status)
 ```
 
+* Both revisions are the exact reviewed SHAs: the PR head is checked out
+  explicitly (the pull_request default `refs/pull/<n>/merge` is a synthetic
+  merge commit, not the reviewed revision), and the comparator/budgets run
+  from a second head checkout so a PR's own budget changes gate itself —
+  intentional regressions therefore require the reviewed budgets edit
+  (issue #58 Phase C acceptance).
 * Both revisions are measured on the same runner under the identical
   fixture/seed/config boundaries, so latency deltas are relative to the
   base measured moments earlier — not to a stale cross-runner history
