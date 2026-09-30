@@ -407,6 +407,7 @@ fn write_gate_results(output_dir: &Path, suite: &ComparisonSuite) -> Result<(), 
             benchmark_suite: "replay-comparison".to_owned(),
             mode: report.mode.as_str().to_owned(),
             dataset_id: Some(metadata.dataset_id.clone()),
+            recording: None,
             git: BenchmarkGit {
                 commit: metadata.git_commit.clone(),
                 base_commit: None,

@@ -3,6 +3,10 @@
   "benchmark_suite": "resource-soak",
   "mode": "resource_soak",
   "dataset_id": "hardening-soak-v1",
+  "recording": {
+    "run_id": "run-1234567890-attempt-1",
+    "recorded_at": "2026-09-30T03:12:45Z"
+  },
   "git": {
     "commit": "1437684f00dbeef",
     "base_commit": null

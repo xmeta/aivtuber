@@ -179,6 +179,7 @@ pub fn resource_bench_result(
         benchmark_suite: RESOURCE_BENCH_SUITE.to_owned(),
         mode: RESOURCE_BENCH_MODE.to_owned(),
         dataset_id: Some(RESOURCE_BENCH_DATASET.to_owned()),
+        recording: None,
         git: BenchmarkGit {
             commit: report.metadata.git_commit.clone(),
             base_commit: None,

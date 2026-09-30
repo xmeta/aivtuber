@@ -41,6 +41,24 @@
       "minLength": 1,
       "description": "Versioned fixture/dataset identity; results with different datasets must not be compared."
     },
+    "recording": {
+      "type": "object",
+      "required": ["run_id", "recorded_at"],
+      "additionalProperties": false,
+      "description": "History-recording provenance, added by scripts/benchmark-record.mjs when a trusted job appends the result to the benchmark-data branch. Benchmark producers never emit it. run_id identifies the workflow run: retries of the same run share it (re-recording is idempotent), while distinct runs accumulate so repeated observations of one revision can calibrate runner variance.",
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable identity of the benchmark run (workflow run id or explicit override)."
+        },
+        "recorded_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "RFC 3339 UTC instant at which the result was recorded into history."
+        }
+      }
+    },
     "git": {
       "type": "object",
       "required": ["commit"],

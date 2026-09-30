@@ -30,6 +30,11 @@ conforming to the schema:
   rather than silently compared.
 * identity: `benchmark_suite`, `mode`, `dataset_id`, `git.commit`
   (+`base_commit` for comparisons).
+* history provenance: `recording.run_id` + `recording.recorded_at`, appended
+  by `scripts/benchmark-record.mjs` when a trusted job stores the result on
+  `benchmark-data`; benchmark producers never emit it. `run_id` makes retries
+  of one run idempotent while distinct runs of the same revision accumulate
+  (see section 6).
 * reproduction metadata: OS/arch/rust/bun/profile, `config_version`,
   `asset_version`, `index_version`, `retriever_version`, model IDs,
   `seed`, `stream_duration_ms`, and `cost_model_version` whenever cost
@@ -141,12 +146,24 @@ result/history contract.
 
 Trusted results are persisted on the orphan `benchmark-data` branch:
 
-* `data/<suite>.jsonl` — one contract document per line, deduped on
-  (suite, mode, commit) with the last line winning; re-recording a commit is
-  a no-op.
-* `trends/<suite>.md` — generated tables for the key metrics (first-audio
-  p95, first-visible p95, wrong-reuse rate, LLM calls/100 events, retained
-  state, throughput) plus per-run invariant status.
+* `data/<suite>.<series>.jsonl` — one contract document per line, grouped
+  into compatibility series and deduped on
+  (suite, mode, commit, `recording.run_id`) with the last line winning.
+  Re-running the *same* workflow run (a retry, identified by
+  `github.run_id` + `github.run_attempt`) is a no-op, but repeated runs of
+  the same revision *accumulate*: nightly observations of an unchanged main
+  are the raw material for runner-variance calibration.
+* `<series>` encodes the comparator's compatibility boundary —
+  `mode` + `dataset_id` + `configuration.config_version` +
+  `configuration.seed` — plus a short stable hash. Results from different
+  datasets, configs, or seeds get separate data and trend files and are
+  never rendered into one table, so incompatible workloads are not silently
+  compared across a boundary bump.
+* `trends/<suite>.<series>.md` — generated tables for the key metrics
+  (first-audio p95, first-visible p95, wrong-reuse rate, LLM calls/100
+  events, retained state, throughput) plus per-run invariant status. Each
+  table's heading states its compatibility boundary and the table has a
+  `run` column.
 
 Writers are limited to jobs that run repository-owned code: the `record-main`
 job (push to main only) for replay results and the nightly resource bench.
@@ -154,6 +171,9 @@ Both serialize through the `benchmark-data-append` concurrency group. The
 recorder (`scripts/benchmark-record.mjs`) operates in an isolated git
 worktree so it never touches the main checkout, and pull_request jobs keep
 `contents: read` only — untrusted forked code cannot write history.
+Recording jobs pass `--run-id "run-${{ github.run_id }}-attempt-${{
+github.run_attempt }}"`; the recorder refuses to run without a run identity
+so retries and repeated observations can always be told apart.
 
 Trend views are informational. Gating decisions always come from the
 machine-readable comparator. Baseline/target methodology, budget rationale,
@@ -171,8 +191,11 @@ link:performance-goals.adoc[Performance Goals and Baselines].
   contract mapping — clean soaks map to zero invariants, growth findings map
   to non-zero invariants with details, results round-trip through the
   comparator's parser.
-* recorder bun tests (7): identity keying, dedupe/idempotence, stable
-  ordering, trend rendering, invariant status flags, metric filtering.
+* recorder bun tests (16): run-id identity keying, retry idempotence vs
+  repeated-observation accumulation, stable ordering, compatibility-series
+  splitting (dataset/config_version/seed/mode boundaries), collision-free
+  series file stems, trend rendering with the boundary heading and run
+  column, invariant status flags, metric filtering.
 * end-to-end: `replay-benchmark` emits contract results; comparator PASSes
   identical results (exit 0) and FAILs an artificially regressed result
   (first-audio p95 +78%, stale dispatch 3) with exit 1.

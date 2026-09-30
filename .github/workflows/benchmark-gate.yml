@@ -164,6 +164,7 @@ jobs:
         run: |
           bun scripts/benchmark-record.mjs \
             --suite replay-comparison \
+            --run-id "run-${{ github.run_id }}-attempt-${{ github.run_attempt }}" \
             --files results/main/01-deterministic-result.json \
                     results/main/02-semantic-result.json \
                     results/main/03-semantic-jev-result.json \

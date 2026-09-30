@@ -29,11 +29,16 @@ Do not invent absolute targets without baseline data. The process is:
 . Merge the Phase C/D benchmark infrastructure (done: PR gate + nightly
   resource benchmark + main-branch history recording).
 . Let `record-main` and the nightly `resource-bench` accumulate trusted
-  results on the `benchmark-data` branch (one JSONL line per result, keyed by
-  suite/mode/commit).
+  results on the `benchmark-data` branch (one JSONL line per result, keyed
+  by suite/mode/commit/run). Repeated nightly runs of an unchanged revision
+  accumulate as distinct rows — they are the variance signal; only a retry
+  of the same run (`recording.run_id`) replaces its earlier row.
 . After enough stable runs (target: 10+ nightly runs for the resource tier),
-  read `trends/<suite>.md`, estimate normal runner variance per metric, and
-  publish the baseline in this document.
+  read `trends/<suite>.<series>.md`, estimate normal runner variance per
+  metric, and publish the baseline in this document. Series are split on the
+  comparator's compatibility boundary (mode + dataset_id + config_version +
+  seed); a baseline is only valid within one series, and a boundary bump
+  starts a new series and a new baseline.
 . Choose realistic product targets against the published baseline.
 . File optimization issues for the measured gaps and link them here.
 

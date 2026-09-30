@@ -1,13 +1,13 @@
 // Benchmark history recorder — issue #58 Phase E.
 //
 // Appends trusted main-branch / scheduled benchmark results to the
-// `benchmark-data` branch as JSONL (one line per result) keyed by suite, and
-// regenerates the trend Markdown. Run only from jobs that own write
-// credentials for that branch (push to main, scheduled resource bench);
-// untrusted pull_request jobs must never invoke this script.
+// `benchmark-data` branch as JSONL (one line per result) grouped into
+// compatibility series, and regenerates the trend Markdown. Run only from
+// jobs that own write credentials for that branch (push to main, scheduled
+// resource bench); untrusted pull_request jobs must never invoke this script.
 //
 // Usage:
-//   bun scripts/benchmark-record.mjs --suite <suite> --files <result.json>...
+//   bun scripts/benchmark-record.mjs --suite <suite> --run-id <id> --files <result.json>...
 //
 // Implementation notes:
 // - history lives in a SEPARATE git worktree (`target/benchmark-data-wt`) so
@@ -17,16 +17,29 @@
 //   detached HEAD), so a plain `git push origin benchmark-data` from a fresh
 //   runner finds its source ref;
 // - appends each result JSON as one JSONL line to `data/<suite>.jsonl`;
-// - dedupes on (benchmark_suite, mode, git.commit): the last line wins, and
-//   re-recording the same commit is a no-op instead of duplicating rows;
-// - regenerates `trends/<suite>.md` from the full series;
+// - dedupes on (benchmark_suite, mode, git.commit, recording.run_id): a retry
+//   of the SAME run replaces its earlier row (re-recording is idempotent),
+//   while distinct runs of one revision ACCUMULATE — repeated observations
+//   are the raw material for runner-variance baselines
+//   (docs/performance-goals.adoc "10+ nightly runs");
+// - series are split on the comparator's compatibility boundary
+//   (mode + dataset_id + config_version + seed): incompatible workloads get
+//   separate data/trend files and are never rendered into one table;
+// - regenerates `trends/<suite>.<series>.md` from the full series;
 // - commits data + trends in one commit inside the worktree (never pushes).
 //
 // Security: results carry only commit identity, environment, config, and
 // aggregate metrics. Prompts, generated private content, and secrets are not
 // part of the result contract, so they cannot leak into history.
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync } from "node:fs";
+import {
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  existsSync,
+  rmSync,
+  readdirSync,
+} from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -36,15 +49,16 @@ const BRANCH = "benchmark-data";
 const WORKTREE = join(root, "target", "benchmark-data-wt");
 
 function parseArgs(argv) {
-  const args = { suite: undefined, files: [] };
+  const args = { suite: undefined, runId: undefined, files: [] };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--suite") args.suite = argv[++i];
+    else if (argv[i] === "--run-id") args.runId = argv[++i];
     else if (argv[i] === "--files") {
       for (++i; i < argv.length && !argv[i].startsWith("--"); i++) args.files.push(argv[i]);
     }
   }
   if (!args.suite || args.files.length === 0) {
-    console.error("usage: benchmark-record.mjs --suite <suite> --files <result.json>...");
+    console.error("usage: benchmark-record.mjs --suite <suite> [--run-id <id>] --files <result.json>...");
     process.exit(1);
   }
   return args;
@@ -82,7 +96,7 @@ function ensureHistoryWorktree() {
     git(["worktree", "add", "-B", BRANCH, WORKTREE, `origin/${BRANCH}`]);
   } else {
     const localBranchExists =
-      git(["for-each-ref", `refs/heads/${BRANCH}`, "--format=%(refname)" ]).length > 0;
+      git(["for-each-ref", `refs/heads/${BRANCH}`, "--format=%(refname)"]).length > 0;
     if (localBranchExists) {
       // Local branch survived a previous run in this job; reuse it.
       git(["worktree", "add", WORKTREE, BRANCH]);
@@ -102,8 +116,30 @@ function loadJsonl(path) {
     .map((line) => JSON.parse(line));
 }
 
-function identityOf(result) {
-  return [result.benchmark_suite, result.mode, result.git.commit].join("|");
+/// Load every compatibility series of a suite (`data/<suite>.<series>.jsonl`).
+/// A legacy flat `data/<suite>.jsonl` from before the series split is folded
+/// in once; the caller removes it afterwards so a single write path remains.
+function loadHistory(suite) {
+  const dataDir = join(WORKTREE, "data");
+  const legacyPath = join(dataDir, `${suite}.jsonl`);
+  const seriesFiles = existsSync(dataDir)
+    ? readdirSync(dataDir).filter(
+        (file) => file.startsWith(`${suite}.`) && file.endsWith(".jsonl"),
+      )
+    : [];
+  const rows = [
+    ...seriesFiles.flatMap((file) => loadJsonl(join(dataDir, file))),
+    ...loadJsonl(legacyPath),
+  ];
+  return { rows, legacyPath };
+}
+
+/// Identity of one recorded observation. The run id makes retries of the same
+/// run idempotent (same identity → replaced) while distinct runs of one
+/// revision accumulate as separate rows.
+function identityOf(result, runId) {
+  const run = runId ?? result.recording?.run_id ?? "-";
+  return [result.benchmark_suite, result.mode, result.git.commit, run].join("|");
 }
 
 function dedupe(rows) {
@@ -113,6 +149,48 @@ function dedupe(rows) {
   return [...byIdentity.values()].sort((a, b) =>
     identityOf(a).localeCompare(identityOf(b), "en"),
   );
+}
+
+/// The compatibility boundary, mirroring benchmark-compare's
+/// `ensure_comparable`: results that differ in any of these fields must never
+/// be silently compared, so they never share a history series or trend table.
+/// `dataset_id` is Optional in the contract; `undefined` and null collapse to
+/// one key so legacy rows and contract-optional producers stay comparable.
+function compatKey(result) {
+  // Optional boundaries collapse to "" (join renders null/undefined as "")
+  // so absent and explicit-null stay comparable.
+  return [
+    result.mode,
+    result.dataset_id ?? "",
+    result.configuration?.config_version ?? "",
+    result.configuration?.seed ?? "",
+  ].join("|");
+}
+
+/// Short stable hash (32-bit FNV-1a, base36) so long config_version strings
+/// cannot overflow filesystem filename limits.
+function stableHash(text) {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+/// Filesystem-safe, collision-free stem for a series' data/trend files.
+function seriesFileStem(key) {
+  const slug = key
+    .split("|")
+    .map((part) => part.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "-")
+    .join("__");
+  return `${slug}-${stableHash(key)}`;
+}
+
+/// Human-readable series identity for trend headings.
+function seriesLabel(key) {
+  const [mode, dataset, configVersion, seed] = key.split("|");
+  return `${mode} @ ${dataset || "-"} (${configVersion || "-"}, seed ${seed ?? "-"})`;
 }
 
 // Metrics surfaced in the trend table, per suite family. Keys are exact
@@ -144,15 +222,15 @@ function invariantStatus(row) {
   return failed.length === 0 ? "pass" : `FAIL(${failed.map(([n]) => n).join(",")})`;
 }
 
-function renderTrend(suite, rows) {
+function renderTrend(series, rows) {
   const lines = [
-    `# Benchmark trend: ${suite}`,
+    `# Benchmark trend: ${series}`,
     "",
     "Generated by `scripts/benchmark-record.mjs` (issue #58 Phase E).",
     "Informational only — PR gating is decided by the machine-readable",
     "`benchmark-compare` comparator, never by visual inspection here.",
     "",
-    `Results: ${rows.length} recorded run(s) (deduped on suite+mode+commit).`,
+    `Results: ${rows.length} recorded run(s) (deduped on suite+mode+commit+run).`,
     "",
   ];
 
@@ -169,11 +247,11 @@ function renderTrend(suite, rows) {
     );
     if (present.length === 0) continue;
     lines.push(`## mode: ${mode}`, "");
-    lines.push("| commit | " + present.join(" | ") + " | invariants |");
-    lines.push("|---" + "|---".repeat(present.length + 1) + "|");
+    lines.push("| commit | run | " + present.join(" | ") + " | invariants |");
+    lines.push("|---" + "|---".repeat(present.length + 2) + "|");
     for (const row of modeRows) {
       lines.push(
-        `| \`${row.git.commit}\` | ${present.map((m) => fmtCell(row, m)).join(" | ")} | ${invariantStatus(row)} |`,
+        `| \`${row.git.commit}\` | \`${row.recording?.run_id ?? "-"}\` | ${present.map((m) => fmtCell(row, m)).join(" | ")} | ${invariantStatus(row)} |`,
       );
     }
     lines.push("");
@@ -181,12 +259,23 @@ function renderTrend(suite, rows) {
   return lines.join("\n");
 }
 
-function writeHistoryFiles(suite, rows) {
-  writeFileSync(
-    join(WORKTREE, "data", `${suite}.jsonl`),
-    rows.map((row) => JSON.stringify(row)).join("\n") + (rows.length ? "\n" : ""),
-  );
-  writeFileSync(join(WORKTREE, "trends", `${suite}.md`), renderTrend(suite, rows));
+/// Write every compatibility series' data + trend files. Returns the relative
+/// paths it produced so the caller can stage exactly those.
+function writeHistoryFiles(suite, bySeries) {
+  const dataFiles = [];
+  const trendFiles = [];
+  for (const [key, rows] of bySeries) {
+    const stem = seriesFileStem(key);
+    const dataPath = `data/${suite}.${stem}.jsonl`;
+    const trendPath = `trends/${suite}.${stem}.md`;
+    writeFileSync(
+      join(WORKTREE, dataPath),
+      rows.map((row) => JSON.stringify(row)).join("\n") + (rows.length ? "\n" : ""),
+    );
+    writeFileSync(join(WORKTREE, trendPath), renderTrend(seriesLabel(key), rows));
+    dataFiles.push(dataPath);
+    trendFiles.push(trendPath);
+  }
   writeFileSync(
     join(WORKTREE, "README.md"),
     [
@@ -194,9 +283,16 @@ function writeHistoryFiles(suite, rows) {
       "",
       "Durable benchmark history for the continuous benchmark loop (issue #58).",
       "",
-      "- `data/<suite>.jsonl` — one `schemas/benchmark-result.schema.json` document per line;",
-      "  deduped on (benchmark_suite, mode, git.commit), last write wins.",
-      "- `trends/<suite>.md` — generated trend tables; do not edit by hand.",
+      `- \`data/<suite>.<series>.jsonl\` — one \`schemas/benchmark-result.schema.json\` document per line;`,
+      "  deduped on (benchmark_suite, mode, git.commit, recording.run_id), last write wins.",
+      "  Retries of one workflow run are idempotent; distinct runs of the same revision",
+      "  accumulate so runner variance can be calibrated (docs/performance-goals.adoc).",
+      "- `<series>` encodes the comparator's compatibility boundary (mode + dataset_id +",
+      "  config_version + seed) plus a short stable hash: results from different datasets,",
+      "  configs, or seeds are never rendered into the same trend table.",
+      "- `trends/<suite>.<series>.md` — generated trend tables; do not edit by hand.",
+      "- `recording.run_id` / `recording.recorded_at` are appended by the recorder when a",
+      "  trusted job stores the result; benchmark producers never emit them.",
       "- Written only by trusted jobs (push to main, scheduled benchmark);",
       "  pull_request jobs never receive credentials for this branch.",
       "- Commit identity and dataset/config metadata are preserved verbatim so",
@@ -204,14 +300,34 @@ function writeHistoryFiles(suite, rows) {
       "",
     ].join("\n"),
   );
+  return { dataFiles, trendFiles };
+}
+
+/// Run identity: explicit --run-id wins, then GitHub Actions' run id, then a
+/// caller-provided BENCHMARK_RUN_ID. Without one, retries and repeated
+/// observations of a revision would be indistinguishable.
+function resolveRunId(explicit) {
+  if (explicit && explicit.trim().length > 0) return explicit.trim();
+  const env = process.env;
+  if (env.GITHUB_RUN_ID && env.GITHUB_RUN_ID.trim().length > 0) {
+    return `run-${env.GITHUB_RUN_ID.trim()}`;
+  }
+  if (env.BENCHMARK_RUN_ID && env.BENCHMARK_RUN_ID.trim().length > 0) {
+    return env.BENCHMARK_RUN_ID.trim();
+  }
+  console.error(
+    "no benchmark run identity: pass --run-id <id> (or set GITHUB_RUN_ID / BENCHMARK_RUN_ID); " +
+      "without it retries and repeated observations of one revision cannot be told apart",
+  );
+  process.exit(1);
 }
 
 function main() {
-  const { suite, files } = parseArgs(process.argv.slice(2));
+  const { suite, files, runId: explicitRunId } = parseArgs(process.argv.slice(2));
+  const runId = resolveRunId(explicitRunId);
   ensureHistoryWorktree();
 
-  const dataPath = join(WORKTREE, "data", `${suite}.jsonl`);
-  const existing = loadJsonl(dataPath);
+  const { rows: existing, legacyPath } = loadHistory(suite);
   const incoming = files.map((file) => JSON.parse(readFileSync(join(root, file), "utf8")));
 
   // Guard: results must declare the suite they are recorded under so a stray
@@ -225,18 +341,54 @@ function main() {
     }
   }
 
+  // History provenance: the run id distinguishes retries (same run → row
+  // replaced) from repeated observations (distinct runs → accumulated), and
+  // recorded_at timestamps the append itself. Producers never emit these.
+  const recordedAt = `${new Date().toISOString().slice(0, 19)}Z`;
+  for (const result of incoming) {
+    result.recording = { run_id: runId, recorded_at: recordedAt };
+  }
+
+  // The recording run must not straddle a compatibility boundary: mixed
+  // --files inputs would split one logical run across series.
+  const incomingSeries = new Set(incoming.map((result) => compatKey(result)));
+  if (incomingSeries.size !== 1) {
+    console.error(
+      `incoming results span ${incomingSeries.size} compatibility boundaries ` +
+        "(mode + dataset_id + config_version + seed must match); refusing to record",
+    );
+    process.exit(1);
+  }
+
   const merged = dedupe([...existing, ...incoming]);
   const added = merged.length - existing.length;
 
-  writeHistoryFiles(suite, merged);
+  // One series per compatibility boundary; rows sorted for stable JSONL diffs.
+  const bySeries = new Map();
+  for (const row of merged) {
+    const key = compatKey(row);
+    if (!bySeries.has(key)) bySeries.set(key, []);
+    bySeries.get(key).push(row);
+  }
+  for (const rows of bySeries.values()) {
+    rows.sort((a, b) => identityOf(a).localeCompare(identityOf(b), "en"));
+  }
 
-  gitInWorktree(["add", `data/${suite}.jsonl`, `trends/${suite}.md`, "README.md"]);
+  const { dataFiles, trendFiles } = writeHistoryFiles(suite, bySeries);
+
+  // Fold the legacy flat file into the split layout once, then delete it so
+  // exactly one write path remains. `-A` with directory pathspecs also stages
+  // the deletion (the file itself must not be a pathspec: it does not exist
+  // in the common case).
+  rmSync(legacyPath, { force: true });
+
+  gitInWorktree(["add", "-A", "--", "data", "trends", "README.md"]);
   const dirty = gitInWorktree([
     "status",
     "--porcelain",
     "--",
-    `data/${suite}.jsonl`,
-    `trends/${suite}.md`,
+    ...dataFiles,
+    ...trendFiles,
     "README.md",
   ]);
   if (dirty.length > 0) {
@@ -256,9 +408,11 @@ function main() {
       "-m",
       `benchmark: record ${suite} results (${added} new)`,
     ]);
-    console.log(`recorded ${added} new result(s) for ${suite} on ${BRANCH} (worktree ${WORKTREE})`);
+    console.log(
+      `recorded ${added} new result(s) for ${suite} on ${BRANCH} (run ${runId}, worktree ${WORKTREE})`,
+    );
   } else {
-    console.log(`no changes for ${suite} (already recorded)`);
+    console.log(`no changes for ${suite} (run ${runId} already recorded)`);
   }
 }
 
@@ -268,4 +422,11 @@ if (invokedDirectly) {
 }
 
 // Exported for tests (tests/benchmark-record.test.mjs).
-export const __testables = { identityOf, dedupe, renderTrend };
+export const __testables = {
+  identityOf,
+  dedupe,
+  compatKey,
+  seriesFileStem,
+  seriesLabel,
+  renderTrend,
+};

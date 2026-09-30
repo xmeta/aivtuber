@@ -53,6 +53,11 @@ pub struct BenchmarkResult {
     pub mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dataset_id: Option<String>,
+    /// History-recording provenance, appended by the Phase E recorder when a
+    /// trusted job stores the result on `benchmark-data`. Benchmark producers
+    /// never emit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording: Option<BenchmarkRecording>,
     pub git: BenchmarkGit,
     pub environment: BenchmarkEnvironment,
     pub configuration: BenchmarkConfiguration,
@@ -60,6 +65,16 @@ pub struct BenchmarkResult {
     pub metrics: BTreeMap<String, MetricValue>,
     #[serde(default)]
     pub invariants: BTreeMap<String, InvariantValue>,
+}
+
+/// Provenance of one recorded history row. `run_id` makes retries of the
+/// same benchmark run idempotent while distinct runs of one revision
+/// accumulate for runner-variance calibration (docs/performance-goals.adoc).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BenchmarkRecording {
+    pub run_id: String,
+    pub recorded_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -610,6 +625,7 @@ mod tests {
             benchmark_suite: "replay-comparison".to_owned(),
             mode: "deterministic_only".to_owned(),
             dataset_id: Some("starter-replay-comparison-v1".to_owned()),
+            recording: None,
             git: BenchmarkGit {
                 commit: commit.to_owned(),
                 base_commit: None,
