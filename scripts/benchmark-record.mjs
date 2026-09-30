@@ -13,6 +13,9 @@
 // - history lives in a SEPARATE git worktree (`target/benchmark-data-wt`) so
 //   the main working tree is never switched, cleaned, or touched; the caller
 //   pushes `benchmark-data` afterwards;
+// - commits always advance the real local `benchmark-data` ref (never a
+//   detached HEAD), so a plain `git push origin benchmark-data` from a fresh
+//   runner finds its source ref;
 // - appends each result JSON as one JSONL line to `data/<suite>.jsonl`;
 // - dedupes on (benchmark_suite, mode, git.commit): the last line wins, and
 //   re-recording the same commit is a no-op instead of duplicating rows;
@@ -70,7 +73,13 @@ function ensureHistoryWorktree() {
   }
   git(["worktree", "prune"]);
   if (remoteHasBranch) {
-    git(["worktree", "add", "--detach", WORKTREE, `origin/${BRANCH}`]);
+    // -B (re)creates the local `benchmark-data` branch at origin's tip and
+    // checks it out here, so the commit below advances a real ref instead of
+    // a detached HEAD (a detached HEAD cannot be pushed as `benchmark-data`
+    // from a fresh runner: "src refspec benchmark-data does not match any").
+    // Re-running before a push resets the local branch to origin; the dropped
+    // commits only ever re-record results the next run re-appends.
+    git(["worktree", "add", "-B", BRANCH, WORKTREE, `origin/${BRANCH}`]);
   } else {
     const localBranchExists =
       git(["for-each-ref", `refs/heads/${BRANCH}`, "--format=%(refname)" ]).length > 0;
@@ -231,7 +240,15 @@ function main() {
     "README.md",
   ]);
   if (dirty.length > 0) {
+    // Explicit commit identity: fresh GitHub-hosted runners have no
+    // user.name/user.email configured, and the commit would fail with
+    // "Author identity unknown". Setting it here (instead of via workflow
+    // `git config`) protects every current and future caller.
     gitInWorktree([
+      "-c",
+      "user.name=benchmark-bot",
+      "-c",
+      "user.email=actions@users.noreply.github.com",
       "-c",
       "commit.gpgsign=false",
       "commit",

@@ -31,6 +31,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -90,8 +95,6 @@ jobs:
         env:
           BENCH_DIR: target/resource-bench
         run: |
-          git config user.name "benchmark-bot"
-          git config user.email "actions@users.noreply.github.com"
           bun scripts/benchmark-record.mjs \
             --suite resource-soak \
             --files "$BENCH_DIR/resource-soak-result.json"
