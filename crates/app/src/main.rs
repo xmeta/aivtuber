@@ -7,11 +7,12 @@ use aivtuber_adapters::{
     SecretString, VTubeStudioAdapter, VTubeStudioConfig,
 };
 use aivtuber_app::{
-    AdaptationRuntime, AdapterHealth, AvatarOutput, CompositionProfile, GenerativeRuntime,
-    IntentRoutePlanner, NoopAvatarOutput, NoopStreamOutput, ObsStreamOutput, OperatorControlServer,
-    OperatorRateLimiter, ProductionApp, ProfileSummary, RawIngressConfig, RawIngressMetrics,
-    RawIngressMetricsSnapshot, RoutePlanner, RuntimeRetentionPolicy, StreamOutput, VtsAvatarOutput,
-    VtsPlaybackConfig, apply_dispatched_request, pump_bounded_records,
+    AdaptationRuntime, AdapterHealth, AvatarOutput, CompositionProfile, GenerativeBudgetPolicy,
+    GenerativeRuntime, IntentRoutePlanner, NoopAvatarOutput, NoopStreamOutput, ObsStreamOutput,
+    OperatorControlServer, OperatorRateLimiter, ProductionApp, ProfileSummary, RawIngressConfig,
+    RawIngressMetrics, RawIngressMetricsSnapshot, RoutePlanner, RuntimeRetentionPolicy,
+    StreamOutput, VtsAvatarOutput, VtsPlaybackConfig, apply_dispatched_request,
+    pump_bounded_records,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
@@ -187,6 +188,58 @@ fn run() -> Result<(), Box<dyn Error>> {
         .with_causal_trace_retention(retention.causal_trace_config());
     if let Some(generative) = generative {
         app = app.with_generation(generative);
+    }
+    // Issue #69: generative resource budgets are opt-in (disabled by default
+    // so existing deployments keep identical behavior). All limits are
+    // optional; an enabled budget with no limits records nothing enforced.
+    if env_bool("AIVTUBER_BUDGET_ENABLED", false)? {
+        let opt_u64 = |name: &str| -> Result<Option<u64>, Box<dyn Error>> {
+            if env_optional(name).is_some() {
+                Ok(Some(env_u64(name, 1)?))
+            } else {
+                Ok(None)
+            }
+        };
+        let opt_u32 = |name: &str| -> Result<Option<u32>, Box<dyn Error>> {
+            match opt_u64(name)? {
+                Some(value) => Ok(Some(u32::try_from(value).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, format!("{name} is too large"))
+                })?)),
+                None => Ok(None),
+            }
+        };
+        let policy = GenerativeBudgetPolicy {
+            enabled: true,
+            max_concurrent_generations: opt_u32("AIVTUBER_BUDGET_MAX_CONCURRENT_GENERATIONS")?,
+            max_llm_calls_per_interval: opt_u32("AIVTUBER_BUDGET_MAX_LLM_CALLS")?,
+            max_tts_calls_per_interval: opt_u32("AIVTUBER_BUDGET_MAX_TTS_CALLS")?,
+            max_llm_units_per_interval: opt_u64("AIVTUBER_BUDGET_MAX_LLM_UNITS")?,
+            max_tts_chars_per_interval: opt_u64("AIVTUBER_BUDGET_MAX_TTS_CHARS")?,
+            max_estimated_cost_milliunits_per_interval: opt_u64(
+                "AIVTUBER_BUDGET_MAX_COST_MILLIUNITS",
+            )?,
+            pricing_input_version: env_optional("AIVTUBER_BUDGET_PRICING_INPUT_VERSION")
+                .map(|version| Box::leak(version.into_boxed_str()) as &'static str),
+            interval_ms: env_u64("AIVTUBER_BUDGET_INTERVAL_MS", 60_000)?,
+            high_priority_reserve_percent: env_u64("AIVTUBER_BUDGET_RESERVE_PERCENT", 0)?.min(100)
+                as u32,
+            charge_shadow_to_budget: env_bool("AIVTUBER_BUDGET_CHARGE_SHADOW", false)?,
+        };
+        let policy = policy.validate().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "AIVTUBER_BUDGET_* configuration invalid: {} ({})",
+                    error,
+                    error.field()
+                ),
+            )
+        })?;
+        eprintln!(
+            "generative_budget: enabled interval_ms={} reserve_percent={}",
+            policy.interval_ms, policy.high_priority_reserve_percent
+        );
+        app = app.with_generative_budget_policy(policy);
     }
     // Issue #55 acceptance: startup states the active routing capabilities
     // without leaking secrets.

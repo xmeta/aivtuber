@@ -43,6 +43,9 @@ pub enum FallbackReason {
     LowConfidence,
     PolicyOverride,
     OperatorOverride,
+    /// Generative resource budget denied admission before provider work
+    /// began (issue #69); distinct from #67 deadline and #121 capacity.
+    BudgetExhausted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
