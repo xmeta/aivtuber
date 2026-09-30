@@ -254,6 +254,40 @@ One interaction budget spans routing and provider work. Retrieval time is subtra
 
 The immediate interaction deadline is distinct from any future deferred-response expiry (#75): missing the immediate useful-time budget vetoes immediate work, but does not by itself define whether a separately retained deferred item is still contextually valid.
 
+== Generative resource budgets (issue #69)
+
+The generative resource budget is a provider-neutral admission policy that sits **before** generation submit: a denial never allocates provider work that must then be cancelled. It is disabled by default — existing deployments keep identical behavior until it is enabled explicitly.
+
+[source,shell]
+----
+export AIVTUBER_BUDGET_ENABLED=1
+export AIVTUBER_BUDGET_INTERVAL_MS=60000
+export AIVTUBER_BUDGET_MAX_CONCURRENT_GENERATIONS=2
+export AIVTUBER_BUDGET_MAX_LLM_CALLS=30
+export AIVTUBER_BUDGET_MAX_TTS_CALLS=30
+# Optional finer-grained ledgers:
+export AIVTUBER_BUDGET_MAX_LLM_UNITS=200000
+export AIVTUBER_BUDGET_MAX_TTS_CHARS=20000
+# Optional cost ceiling (requires a pricing input version):
+export AIVTUBER_BUDGET_MAX_COST_MILLIUNITS=500
+export AIVTUBER_BUDGET_PRICING_INPUT_VERSION=pricing-2026-09
+# Share of every call budget reserved for high-priority deadline classes:
+export AIVTUBER_BUDGET_RESERVE_PERCENT=25
+# Whether #64 shadow evaluation spends billable budget (default: no):
+export AIVTUBER_BUDGET_CHARGE_SHADOW=0
+----
+
+Semantics:
+
+* all ledgers roll over `AIVTUBER_BUDGET_INTERVAL_MS` using the runtime's logical clock, so recorded decisions replay identically;
+* priority comes **only** from the trusted #67 deadline class (`high_priority`/`strong_reaction` may spend the reserved share); untrusted content fields can never promote priority;
+* on denial the request degrades deterministically — reuse → semantic/template → cached/non-verbal → safe silence — exactly like other fallbacks, with a typed reason (`concurrent_budget_exhausted`, `llm_call_budget_exhausted`, `tts_call_budget_exhausted`, `llm_unit_budget_exhausted`, `tts_char_budget_exhausted`, `cost_budget_exhausted`) that stays distinct from #67 deadline exhaustion and #121 `capacity_saturated`;
+* granted reservations settle with observed TTS usage at commit time and release automatically on stale/cancelled completions, so enforcing the budget never strands provider work or leaks in-flight slots;
+* #64 shadow evaluation does not consume billable budget unless `AIVTUBER_BUDGET_CHARGE_SHADOW=1`;
+* operator emergency control (stop/mute/diagnose) runs on the independent authenticated control path and is budget-independent by construction.
+
+Accounting is observable in three places: the support bundle's `resources.generative_budget` section (six bounded budget-type records with limit/consumed/remaining/rejected_or_degraded), the telemetry `budget_denial_reason` column, and the `budget_denied` audit records with typed reasons.
+
 == VTube Studio output
 
 Enable VTube Studio only when its local websocket API is available:

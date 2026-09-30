@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod budget;
 mod deadline;
 mod operator_control;
 mod outputs;
@@ -10,6 +11,7 @@ mod routing;
 mod semantic;
 mod support_bundle;
 
+pub use budget::*;
 pub use deadline::*;
 pub use operator_control::*;
 pub use outputs::*;
@@ -221,6 +223,11 @@ fn update_high_water(counter: &AtomicUsize, value: usize) {
 
 #[derive(Debug, Clone)]
 struct GenerationCompletionContext {
+    /// Granted budget reservation for this generation (issue #69). Cloned
+    /// shallowly into completions; settled once by the committing path via
+    /// the `finished` flag, and its concurrency slot returns on drop even if
+    /// the completion is never observed.
+    budget_reservation: Option<BudgetReservation>,
     routing_latency_us: u64,
     decision: Option<DecisionReplayRecord>,
     template_fallback: Option<&'static str>,
@@ -675,6 +682,10 @@ where
     pending_avatar: PendingAvatar,
     max_dispatch_lateness_ms: u64,
     interaction_deadlines: InteractionDeadlinePolicy,
+    /// Generative resource budget governor (issue #69); `None` when the
+    /// budget feature is disabled (default) so existing behavior is
+    /// untouched.
+    budget: Option<GenerativeBudgetGovernor>,
     health: AdapterHealth,
     telemetry: TelemetryCollector,
     causal_traces: CausalTraceCollector,
@@ -710,6 +721,7 @@ where
             pending_avatar: PendingAvatar::default(),
             max_dispatch_lateness_ms,
             interaction_deadlines: InteractionDeadlinePolicy::default(),
+            budget: None,
             health: AdapterHealth::default(),
             telemetry: TelemetryCollector::default(),
             causal_traces: CausalTraceCollector::default(),
@@ -729,6 +741,29 @@ where
     ) -> Result<Self, AppError> {
         self.interaction_deadlines = policy.validate()?;
         Ok(self)
+    }
+
+    /// Enable the generative resource budget governor (issue #69). Disabled
+    /// by default; when absent, admission always succeeds and no accounting
+    /// state changes, preserving pre-#69 behavior exactly.
+    pub fn with_generative_budget_policy(mut self, policy: GenerativeBudgetPolicy) -> Self {
+        self.budget = Some(GenerativeBudgetGovernor::new(policy));
+        self
+    }
+
+    /// Budget governor access for diagnostics/support bundles; `None` when
+    /// the budget feature is disabled.
+    pub fn generative_budget_governor(&self) -> Option<&GenerativeBudgetGovernor> {
+        self.budget.as_ref()
+    }
+
+    /// Bounded budget snapshot for support bundles/operator diagnostics
+    /// (issue #69); empty when the budget is disabled.
+    pub fn generative_budget_snapshot(&self, now_ms: u64) -> Vec<GenerativeBudgetRecord> {
+        self.budget
+            .as_ref()
+            .map(|governor| governor.snapshot(now_ms))
+            .unwrap_or_default()
     }
 
     pub fn interaction_deadline_policy(&self) -> InteractionDeadlinePolicy {
@@ -1094,6 +1129,7 @@ where
                     routing_latency_us,
                     decision: decision.clone(),
                     template_fallback,
+                    budget_reservation: None,
                     interaction_deadline,
                     remaining_at_route_ms,
                     remaining_at_generation_ms: remaining_instant(provider_deadline)
@@ -1233,7 +1269,7 @@ where
         at_ms: u64,
         seed: u64,
         provider_deadline: Instant,
-        context: GenerationCompletionContext,
+        mut context: GenerationCompletionContext,
     ) -> Result<GenerationSubmission, AppError> {
         if route.source_event != event {
             return Err(AppError::Generation(
@@ -1255,6 +1291,8 @@ where
         let minimum_start =
             Duration::from_millis(self.interaction_deadlines.min_generation_start_ms);
         if remaining_instant(provider_deadline).is_none_or(|remaining| remaining < minimum_start) {
+            // The deadline expired before the budget was consulted; release
+            // any reservation granted above (never charged units).
             let handled = self.commit_generation_result(
                 &event,
                 GenerationResult {
@@ -1269,6 +1307,7 @@ where
                 None,
                 at_ms,
                 seed,
+                context.budget_reservation.as_mut(),
             )?;
             return Ok(GenerationSubmission::Immediate {
                 handled: Box::new(handled),
@@ -1277,6 +1316,50 @@ where
                     DeadlineExhaustionReason::InsufficientBudget,
                 )),
             });
+        }
+        // Issue #69: budget admission happens strictly before submit, so a
+        // denial never allocates provider work that must then be cancelled.
+        // Priority comes from the trusted #67 deadline class, never from
+        // untrusted content fields. On submit failure the reservation is
+        // released (rejected/degraded accounting); on success it travels
+        // with the completion context and is settled at commit time.
+        if let Some(governor) = self.budget.as_mut() {
+            let admission = budget_admission_for(&context.interaction_deadline);
+            match governor.try_admit(admission, at_ms) {
+                Ok(reservation) => context.budget_reservation = Some(reservation),
+                Err(denial) => {
+                    governor.note_degraded();
+                    let record = self.security.redactor_record(
+                        Some(&event.event_id),
+                        aivtuber_telemetry::AuditCategory::Generation,
+                        "budget_denied",
+                        format!("reason={}", denial.as_str()),
+                    );
+                    self.security.push_external_audit(record);
+                    let trace = GenerationTrace {
+                        fallback_reason: FallbackReason::BudgetExhausted,
+                        budget_denial_reason: Some(denial.as_str().to_owned()),
+                        ..GenerationTrace::default()
+                    };
+                    let handled = self.commit_generation_result(
+                        &event,
+                        GenerationResult {
+                            trace,
+                            disposition: GenerationDisposition::Fallback {
+                                directive: fallback,
+                            },
+                        },
+                        None,
+                        at_ms,
+                        seed,
+                        None,
+                    )?;
+                    return Ok(GenerationSubmission::Immediate {
+                        handled: Box::new(handled),
+                        deadline_exhaustion: None,
+                    });
+                }
+            }
         }
         let submit = self
             .generative
@@ -1297,6 +1380,11 @@ where
         match submit {
             Ok(_) => Ok(GenerationSubmission::Deferred),
             Err(error) => {
+                // The submit failed; the context (with its reservation) was
+                // moved into the runtime, but `GenerationExecutor::try_submit`
+                // dropped the work item on error, so the reservation's
+                // concurrency slot was already returned by Drop. Nothing more
+                // is owed to the budget here.
                 let trace = GenerationTrace {
                     fallback_reason: match error {
                         GenerationSubmitError::Saturated => FallbackReason::Overloaded,
@@ -1316,6 +1404,7 @@ where
                     None,
                     at_ms,
                     seed,
+                    None,
                 )?;
                 Ok(GenerationSubmission::Immediate {
                     handled: Box::new(handled),
@@ -1350,9 +1439,24 @@ where
         output_decision: Option<PublicOutput>,
         at_ms: u64,
         seed: u64,
+        budget_reservation: Option<&mut BudgetReservation>,
     ) -> Result<HandledGeneration, AppError> {
         self.record_generation_calls(&result.trace);
         let mut trace = result.trace;
+
+        // Issue #69: settle the budget reservation with observed TTS usage
+        // (reply text length). The concurrency slot is released either way;
+        // unit ledgers are topped up to actuals when a budget enforces them.
+        if let Some(reservation) = budget_reservation {
+            let actual_tts_chars = if trace.tts_attempted {
+                result_text_chars(&trace, output_decision.as_ref())
+            } else {
+                0
+            };
+            if let Some(governor) = self.budget.as_mut() {
+                reservation.settle(governor, actual_tts_chars, 0);
+            }
+        }
 
         match result.disposition {
             GenerationDisposition::Generated { asset } => {
@@ -1468,7 +1572,7 @@ where
                 .generative
                 .as_ref()
                 .and_then(GenerativeRuntime::try_next_completion);
-            let Some(completion) = completion else {
+            let Some(mut completion) = completion else {
                 break;
             };
 
@@ -1490,6 +1594,15 @@ where
                     .unwrap_or_default();
                 self.record_generation_calls(&trace);
                 self.record_worker_output_decision(completion.output_decision.as_ref());
+                // Issue #69: a stale/cancelled completion releases its budget
+                // reservation without charging unit ledgers (rejected/degraded
+                // accounting); the concurrency slot returns either way.
+                if let (Some(reservation), Some(governor)) = (
+                    completion.context.budget_reservation.as_mut(),
+                    self.budget.as_mut(),
+                ) {
+                    reservation.release(governor);
+                }
                 if trace.cancelled_stage.is_none() {
                     trace.cancelled_stage = Some(CancellationStage::BeforePublish);
                 }
@@ -1553,6 +1666,7 @@ where
                 completion.output_decision,
                 now_ms,
                 completion.request.seed,
+                completion.context.budget_reservation.as_mut(),
             );
 
             match handled_generation {
@@ -1713,6 +1827,7 @@ where
             if let Some(reason) = fallback_reason_name(trace.fallback_reason) {
                 observation.fallback_reason = Some(reason.to_owned());
             }
+            observation.budget_denial_reason = trace.budget_denial_reason.clone();
         }
 
         self.telemetry.record(observation);
@@ -1899,6 +2014,9 @@ where
 
     pub fn tick(&mut self, now_ms: u64) {
         self.drain_generation_completions(now_ms);
+        if let Some(governor) = self.budget.as_mut() {
+            governor.tick(now_ms);
+        }
         self.performer.scheduler_mut().advance_to(now_ms);
         self.dispatch_audio(now_ms);
         self.dispatch_avatar(now_ms);
@@ -2170,6 +2288,31 @@ fn millis_to_micros(value: f64) -> Option<u64> {
     Some((value * 1_000.0).round().min(u64::MAX as f64) as u64)
 }
 
+/// Observed TTS character usage for budget settlement (issue #69): the
+/// published/replayed text length when available, else the generated asset
+/// text length. Bounded to u64; never content itself.
+fn result_text_chars(trace: &GenerationTrace, output: Option<&PublicOutput>) -> u64 {
+    let _ = trace;
+    output
+        .and_then(|output| output.text.as_deref())
+        .map(|text| text.chars().count() as u64)
+        .unwrap_or(0)
+}
+
+/// Derive the budget admission from the trusted #67 deadline class (issue
+/// #69): only HighPriority/StrongReaction interactions may spend the
+/// high-priority reserve; the class is runtime policy, never an untrusted
+/// content field, so non-trusted content can never promote its priority.
+fn budget_admission_for(deadline: &InteractionDeadline) -> BudgetAdmission {
+    match deadline.class {
+        aivtuber_domain::InteractionDeadlineClass::HighPriority
+        | aivtuber_domain::InteractionDeadlineClass::StrongReaction => {
+            BudgetAdmission::high_priority()
+        }
+        _ => BudgetAdmission::ordinary(),
+    }
+}
+
 fn fallback_reason_name(reason: FallbackReason) -> Option<&'static str> {
     match reason {
         FallbackReason::None => None,
@@ -2182,6 +2325,7 @@ fn fallback_reason_name(reason: FallbackReason) -> Option<&'static str> {
         FallbackReason::LowConfidence => Some("low_confidence"),
         FallbackReason::PolicyOverride => Some("policy_override"),
         FallbackReason::OperatorOverride => Some("operator_override"),
+        FallbackReason::BudgetExhausted => Some("budget_exhausted"),
     }
 }
 
@@ -5175,5 +5319,237 @@ mod tests {
                 .unwrap_or("")
                 .contains("http")
         );
+    }
+
+    fn plain_app() -> ProductionApp<FixedSilentRoute> {
+        app(
+            FixedSilentRoute,
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        )
+    }
+
+    fn budget_test_app<R>(router: R, policy: GenerativeBudgetPolicy) -> ProductionApp<R>
+    where
+        R: RoutePlanner,
+    {
+        app(
+            router,
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        )
+        .with_generative_budget_policy(policy)
+    }
+
+    #[test]
+    fn budget_disabled_by_default_keeps_generation_unchanged() {
+        let mut app = app(
+            FixedGenerateRoute {
+                reply_context: ReflexContext::default(),
+                fallback_variant_group: None,
+            },
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        )
+        .with_generation(generative_runtime(
+            MockThinking {
+                reply: "no budget reply".to_owned(),
+                failure: None,
+            },
+            MockTts::default(),
+        ));
+        app.startup().expect("startup");
+
+        let raw = serde_json::to_vec(&chat_event(1)).expect("event json");
+        let outcome = app.process_content_bytes(&raw, 10, 1).expect("content");
+        assert!(outcome.playback.is_none(), "generation is deferred");
+        wait_for_generation_completion(&mut app, 20);
+        assert!(
+            app.generative_budget_snapshot(20).is_empty(),
+            "no governor means no budget records"
+        );
+        assert!(
+            last_scheduled_plan(&app)
+                .asset_id
+                .starts_with("dynamic.generated."),
+            "generation still completes without the budget governor"
+        );
+    }
+
+    #[test]
+    fn budget_exhaustion_degrades_deterministically_with_typed_reason() {
+        let policy = GenerativeBudgetPolicy {
+            enabled: true,
+            max_llm_calls_per_interval: Some(1),
+            interval_ms: 60_000,
+            ..GenerativeBudgetPolicy::default()
+        };
+        let mut app = budget_test_app(
+            FixedGenerateRoute {
+                reply_context: ReflexContext::default(),
+                fallback_variant_group: None,
+            },
+            policy,
+        )
+        .with_generation(generative_runtime(
+            MockThinking {
+                reply: "should never run".to_owned(),
+                failure: None,
+            },
+            MockTts::default(),
+        ));
+        app.startup().expect("startup");
+
+        // First request is admitted and completes normally.
+        let raw = serde_json::to_vec(&chat_event(1)).expect("event json");
+        app.process_content_bytes(&raw, 10, 1).expect("content");
+        wait_for_generation_completion(&mut app, 20);
+
+        // Second request inside the window is denied before provider work:
+        // deterministic fallback (cached/non-verbal), never a provider call.
+        let raw = serde_json::to_vec(&chat_event(2)).expect("event json");
+        let outcome = app.process_content_bytes(&raw, 30, 2).expect("content");
+        let _ = outcome;
+
+        let observations: Vec<_> = app
+            .telemetry()
+            .events()
+            .iter()
+            .filter(|event| event.event_id == "evt-2")
+            .cloned()
+            .collect();
+        let denied = observations
+            .iter()
+            .find(|event| event.budget_denial_reason.is_some())
+            .expect("budget denial recorded in telemetry");
+        assert_eq!(
+            denied.budget_denial_reason.as_deref(),
+            Some("llm_call_budget_exhausted")
+        );
+        assert_eq!(denied.fallback_reason.as_deref(), Some("budget_exhausted"));
+        assert!(
+            matches!(
+                denied.route,
+                RouteClass::CachedFallback | RouteClass::NonVerbalFallback
+            ),
+            "denial degrades deterministically, got {:?}",
+            denied.route
+        );
+        assert_eq!(denied.llm_calls, 0, "no provider work on denial");
+
+        // Accounting: one admission, one rejection visible in the snapshot.
+        let snapshot = app.generative_budget_snapshot(30);
+        let llm = snapshot
+            .iter()
+            .find(|record| record.budget_type == BudgetType::LlmCalls)
+            .expect("llm budget record");
+        assert_eq!(llm.limit, Some(1));
+        assert_eq!(llm.rejected_or_degraded, 1);
+    }
+
+    #[test]
+    fn budget_window_reset_allows_generation_again() {
+        let policy = GenerativeBudgetPolicy {
+            enabled: true,
+            max_llm_calls_per_interval: Some(1),
+            interval_ms: 100,
+            ..GenerativeBudgetPolicy::default()
+        };
+        let mut app = budget_test_app(
+            FixedGenerateRoute {
+                reply_context: ReflexContext::default(),
+                fallback_variant_group: None,
+            },
+            policy,
+        )
+        .with_generation(generative_runtime(
+            MockThinking {
+                reply: "window reply".to_owned(),
+                failure: None,
+            },
+            MockTts::default(),
+        ));
+        app.startup().expect("startup");
+
+        let raw = serde_json::to_vec(&chat_event(1)).expect("event json");
+        app.process_content_bytes(&raw, 10, 1).expect("content");
+        wait_for_generation_completion(&mut app, 20);
+
+        // Denied inside the window.
+        let raw = serde_json::to_vec(&chat_event(2)).expect("event json");
+        app.process_content_bytes(&raw, 30, 2).expect("content");
+        let denials_before = app
+            .telemetry()
+            .events()
+            .iter()
+            .filter(|event| event.budget_denial_reason.is_some())
+            .count();
+        assert_eq!(denials_before, 1);
+
+        // Admitted again after the window expires; the first reservation was
+        // settled, so the concurrency slot is free and the call ledger trimmed.
+        let raw = serde_json::to_vec(&chat_event(3)).expect("event json");
+        app.process_content_bytes(&raw, 500, 3).expect("content");
+        wait_for_generation_completion(&mut app, 520);
+        let denials_after = app
+            .telemetry()
+            .events()
+            .iter()
+            .filter(|event| event.budget_denial_reason.is_some())
+            .count();
+        assert_eq!(denials_after, 1, "window reset admits again");
+    }
+
+    #[test]
+    fn budget_high_priority_reserve_favors_trusted_deadline_class() {
+        let policy = GenerativeBudgetPolicy {
+            enabled: true,
+            max_llm_calls_per_interval: Some(2),
+            interval_ms: 60_000,
+            high_priority_reserve_percent: 50,
+            ..GenerativeBudgetPolicy::default()
+        };
+        let mut governor = GenerativeBudgetGovernor::new(policy);
+        // Ordinary share = 1; high priority can spend the reserved slot.
+        // (Priority derivation itself is exercised through the deadline class
+        // mapping in the admission path; the governor math is unit-tested in
+        // budget.rs.)
+        assert!(governor.try_admit(BudgetAdmission::ordinary(), 0).is_ok());
+        assert!(governor.try_admit(BudgetAdmission::ordinary(), 1).is_err());
+        assert!(
+            governor
+                .try_admit(BudgetAdmission::high_priority(), 2)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn support_bundle_includes_budget_snapshot_when_enabled() {
+        let policy = GenerativeBudgetPolicy {
+            enabled: true,
+            max_concurrent_generations: Some(2),
+            interval_ms: 60_000,
+            ..GenerativeBudgetPolicy::default()
+        };
+        let mut app = budget_test_app(FixedSilentRoute, policy);
+        app.startup().expect("startup");
+
+        let bundle = generate_support_bundle(&app, "cached", "fp-budget", 5_000);
+        let concurrent = bundle
+            .resources
+            .generative_budget
+            .iter()
+            .find(|record| record.budget_type == BudgetType::Concurrent)
+            .expect("concurrent budget record in support bundle");
+        assert_eq!(concurrent.limit, Some(2));
+        assert_eq!(concurrent.consumed, 0);
+
+        // Disabled budgets contribute no records.
+        let plain = plain_app();
+        let bundle = generate_support_bundle(&plain, "cached", "fp-plain", 5_000);
+        assert!(bundle.resources.generative_budget.is_empty());
     }
 }

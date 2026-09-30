@@ -87,6 +87,10 @@ pub struct GenerationTrace {
     pub tts_timeout_ms: Option<u64>,
     pub fallback_reason: FallbackReason,
     pub cancelled_stage: Option<CancellationStage>,
+    /// Typed generative-budget denial reason (issue #69), present only when
+    /// admission was denied before provider work began.
+    #[serde(default)]
+    pub budget_denial_reason: Option<String>,
 }
 
 impl Default for GenerationTrace {
@@ -101,6 +105,7 @@ impl Default for GenerationTrace {
             tts_timeout_ms: None,
             fallback_reason: FallbackReason::None,
             cancelled_stage: None,
+            budget_denial_reason: None,
         }
     }
 }

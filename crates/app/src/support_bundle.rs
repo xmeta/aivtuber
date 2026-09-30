@@ -27,7 +27,7 @@ use aivtuber_telemetry::{AuditCategory, AuditRecord};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::RoutePlanner;
+use crate::{GenerativeBudgetRecord, RoutePlanner};
 
 /// Manifest schema version. Bump on any bundle-shape change so two reports
 /// can be compared like-for-like.
@@ -125,6 +125,10 @@ pub struct SupportResourceCounters {
     pub generation_saturated: u64,
     pub generation_completed: u64,
     pub generation_failed: u64,
+    /// Generative budget accounting (issue #69), bounded to the six fixed
+    /// budget types; empty when the budget feature is disabled.
+    #[serde(default)]
+    pub generative_budget: Vec<GenerativeBudgetRecord>,
 }
 
 /// One redacted audit summary line (bounded decision text; never a payload).
@@ -357,6 +361,7 @@ impl SupportBundleBuilder {
             generation_saturated: generation.saturated,
             generation_completed: generation.completed,
             generation_failed: generation.failed,
+            generative_budget: app.generative_budget_snapshot(generated_unix_ms),
         };
 
         // Recent incident references from the security runtime's bounded

@@ -122,6 +122,10 @@ pub struct EventObservation {
     pub operator_override: bool,
     pub cancelled: bool,
     pub fallback_reason: Option<String>,
+    /// Typed budget denial reason (issue #69); present only when admission
+    /// into the generative budget was denied.
+    #[serde(default)]
+    pub budget_denial_reason: Option<String>,
     pub jev_attempts: u32,
     pub llm_calls: u32,
     pub tts_calls: u32,
@@ -160,6 +164,7 @@ impl EventObservation {
             operator_override: false,
             cancelled: false,
             fallback_reason: None,
+            budget_denial_reason: None,
             jev_attempts: 0,
             llm_calls: 0,
             tts_calls: 0,
@@ -234,6 +239,8 @@ pub struct BenchmarkSummary {
     pub operator_overrides: u64,
     pub cancellations: u64,
     pub fallback_counts: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub budget_denials_by_reason: BTreeMap<String, u64>,
     pub deadline_exhaustions_by_stage: BTreeMap<DeadlineStage, u64>,
     pub deadline_exhaustions_by_class: BTreeMap<InteractionDeadlineClass, u64>,
     pub jev_attempts: u64,
@@ -508,6 +515,7 @@ fn summarize(events: &[EventObservation], stream_duration_ms: Option<u64>) -> Be
     let mut cache_hits_by_level = BTreeMap::new();
     let mut degraded_counts = BTreeMap::new();
     let mut fallback_counts = BTreeMap::new();
+    let mut budget_denials_by_reason = BTreeMap::new();
     let mut deadline_exhaustions_by_stage = BTreeMap::new();
     let mut deadline_exhaustions_by_class = BTreeMap::new();
     let mut cache_misses = 0_u64;
@@ -555,6 +563,9 @@ fn summarize(events: &[EventObservation], stream_duration_ms: Option<u64>) -> Be
         if let Some(reason) = &event.fallback_reason {
             *fallback_counts.entry(reason.clone()).or_insert(0) += 1;
         }
+        if let Some(reason) = &event.budget_denial_reason {
+            *budget_denials_by_reason.entry(reason.clone()).or_insert(0) += 1;
+        }
         if let Some(stage) = event.deadline_exhaustion_stage {
             *deadline_exhaustions_by_stage.entry(stage).or_insert(0) += 1;
             if let Some(class) = event.deadline_class {
@@ -595,6 +606,7 @@ fn summarize(events: &[EventObservation], stream_duration_ms: Option<u64>) -> Be
         operator_overrides,
         cancellations,
         fallback_counts,
+        budget_denials_by_reason,
         deadline_exhaustions_by_stage,
         deadline_exhaustions_by_class,
         jev_attempts,
