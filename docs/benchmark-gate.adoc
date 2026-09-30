@@ -30,11 +30,12 @@ conforming to the schema:
   rather than silently compared.
 * identity: `benchmark_suite`, `mode`, `dataset_id`, `git.commit`
   (+`base_commit` for comparisons).
-* history provenance: `recording.run_id` + `recording.recorded_at`, appended
-  by `scripts/benchmark-record.mjs` when a trusted job stores the result on
-  `benchmark-data`; benchmark producers never emit it. `run_id` makes retries
-  of one run idempotent while distinct runs of the same revision accumulate
-  (see section 6).
+* history provenance: `recording.run_id` + `recording.recorded_at`
+  (+ diagnostic-only `recording.attempt`), appended by
+  `scripts/benchmark-record.mjs` when a trusted job stores the result on
+  `benchmark-data`; benchmark producers never emit it. `run_id` is GitHub's
+  re-run-invariant run id, so a re-run of one run is idempotent while
+  distinct runs of the same revision accumulate (see section 6).
 * reproduction metadata: OS/arch/rust/bun/profile, `config_version`,
   `asset_version`, `index_version`, `retriever_version`, model IDs,
   `seed`, `stream_duration_ms`, and `cost_model_version` whenever cost
@@ -149,10 +150,12 @@ Trusted results are persisted on the orphan `benchmark-data` branch:
 * `data/<suite>.<series>.jsonl` — one contract document per line, grouped
   into compatibility series and deduped on
   (suite, mode, commit, `recording.run_id`) with the last line winning.
-  Re-running the *same* workflow run (a retry, identified by
-  `github.run_id` + `github.run_attempt`) is a no-op, but repeated runs of
-  the same revision *accumulate*: nightly observations of an unchanged main
-  are the raw material for runner-variance calibration.
+  `run_id` is GitHub's re-run-invariant run id, so re-running the *same*
+  workflow run (any `run_attempt`) is a no-op, but repeated runs of the same
+  revision *accumulate*: nightly observations of an unchanged main are the
+  raw material for runner-variance calibration. One invocation may record
+  several compatibility boundaries at once (record-main stores all four
+  replay modes of one run); each lands in its own series.
 * `<series>` encodes the comparator's compatibility boundary —
   `mode` + `dataset_id` + `configuration.config_version` +
   `configuration.seed` — plus a short stable hash. Results from different
@@ -171,9 +174,10 @@ Both serialize through the `benchmark-data-append` concurrency group. The
 recorder (`scripts/benchmark-record.mjs`) operates in an isolated git
 worktree so it never touches the main checkout, and pull_request jobs keep
 `contents: read` only — untrusted forked code cannot write history.
-Recording jobs pass `--run-id "run-${{ github.run_id }}-attempt-${{
-github.run_attempt }}"`; the recorder refuses to run without a run identity
-so retries and repeated observations can always be told apart.
+Recording jobs pass `--run-id "run-${{ github.run_id }}"` (re-run-invariant;
+`--attempt ${{ github.run_attempt }}` is recorded as diagnostic metadata
+only), and the recorder refuses to run without a run identity so retries and
+repeated observations can always be told apart.
 
 Trend views are informational. Gating decisions always come from the
 machine-readable comparator. Baseline/target methodology, budget rationale,
@@ -191,11 +195,11 @@ link:performance-goals.adoc[Performance Goals and Baselines].
   contract mapping — clean soaks map to zero invariants, growth findings map
   to non-zero invariants with details, results round-trip through the
   comparator's parser.
-* recorder bun tests (16): run-id identity keying, retry idempotence vs
-  repeated-observation accumulation, stable ordering, compatibility-series
-  splitting (dataset/config_version/seed/mode boundaries), collision-free
-  series file stems, trend rendering with the boundary heading and run
-  column, invariant status flags, metric filtering.
+* recorder bun tests (18): run-id identity keying (attempt excluded), retry
+  idempotence vs repeated-observation accumulation, stable ordering,
+  compatibility-series splitting (dataset/config_version/seed/mode
+  boundaries), collision-free series file stems, trend rendering with the
+  boundary heading and run column, invariant status flags, metric filtering.
 * end-to-end: `replay-benchmark` emits contract results; comparator PASSes
   identical results (exit 0) and FAILs an artificially regressed result
   (first-audio p95 +78%, stale dispatch 3) with exit 1.

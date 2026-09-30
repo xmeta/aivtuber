@@ -49,16 +49,19 @@ const BRANCH = "benchmark-data";
 const WORKTREE = join(root, "target", "benchmark-data-wt");
 
 function parseArgs(argv) {
-  const args = { suite: undefined, runId: undefined, files: [] };
+  const args = { suite: undefined, runId: undefined, attempt: undefined, files: [] };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === "--suite") args.suite = argv[++i];
     else if (argv[i] === "--run-id") args.runId = argv[++i];
+    else if (argv[i] === "--attempt") args.attempt = argv[++i];
     else if (argv[i] === "--files") {
       for (++i; i < argv.length && !argv[i].startsWith("--"); i++) args.files.push(argv[i]);
     }
   }
   if (!args.suite || args.files.length === 0) {
-    console.error("usage: benchmark-record.mjs --suite <suite> [--run-id <id>] --files <result.json>...");
+    console.error(
+      "usage: benchmark-record.mjs --suite <suite> [--run-id <id>] [--attempt <n>] --files <result.json>...",
+    );
     process.exit(1);
   }
   return args;
@@ -291,8 +294,10 @@ function writeHistoryFiles(suite, bySeries) {
       "  config_version + seed) plus a short stable hash: results from different datasets,",
       "  configs, or seeds are never rendered into the same trend table.",
       "- `trends/<suite>.<series>.md` — generated trend tables; do not edit by hand.",
-      "- `recording.run_id` / `recording.recorded_at` are appended by the recorder when a",
-      "  trusted job stores the result; benchmark producers never emit them.",
+      "- `recording.run_id` / `recording.recorded_at` (+ diagnostic `attempt`) are appended by",
+      "  the recorder when a trusted job stores the result; benchmark producers never emit them.",
+      "  run_id is stable across re-runs of one workflow run (GitHub run_id), so a re-run",
+      "  replaces its earlier row; attempt never participates in identity.",
       "- Written only by trusted jobs (push to main, scheduled benchmark);",
       "  pull_request jobs never receive credentials for this branch.",
       "- Commit identity and dataset/config metadata are preserved verbatim so",
@@ -304,8 +309,11 @@ function writeHistoryFiles(suite, bySeries) {
 }
 
 /// Run identity: explicit --run-id wins, then GitHub Actions' run id, then a
-/// caller-provided BENCHMARK_RUN_ID. Without one, retries and repeated
-/// observations of a revision would be indistinguishable.
+/// caller-provided BENCHMARK_RUN_ID. GITHUB_RUN_ID is invariant across
+/// re-runs of one workflow run (only run_attempt increments), so keying on it
+/// keeps retries idempotent while distinct runs accumulate. Without an
+/// identity, retries and repeated observations of a revision would be
+/// indistinguishable.
 function resolveRunId(explicit) {
   if (explicit && explicit.trim().length > 0) return explicit.trim();
   const env = process.env;
@@ -322,17 +330,30 @@ function resolveRunId(explicit) {
   process.exit(1);
 }
 
+/// Attach history provenance. run_id keys dedupe (stable across re-runs);
+/// attempt is DIAGNOSTIC ONLY — it never participates in identity, so a
+/// re-run replaces its earlier row instead of accumulating a phantom
+/// observation.
+function stampRecording(result, { runId, recordedAt, attempt }) {
+  const recording = { run_id: runId, recorded_at: recordedAt };
+  const attemptNum = Number.parseInt(attempt, 10);
+  if (Number.isInteger(attemptNum) && attemptNum >= 1) {
+    recording.attempt = attemptNum;
+  }
+  return { ...result, recording };
+}
+
 function main() {
-  const { suite, files, runId: explicitRunId } = parseArgs(process.argv.slice(2));
+  const { suite, files, runId: explicitRunId, attempt } = parseArgs(process.argv.slice(2));
   const runId = resolveRunId(explicitRunId);
   ensureHistoryWorktree();
 
   const { rows: existing, legacyPath } = loadHistory(suite);
-  const incoming = files.map((file) => JSON.parse(readFileSync(join(root, file), "utf8")));
+  const incomingRaw = files.map((file) => JSON.parse(readFileSync(join(root, file), "utf8")));
 
   // Guard: results must declare the suite they are recorded under so a stray
   // file cannot pollute another suite's series.
-  for (const result of incoming) {
+  for (const result of incomingRaw) {
     if (result.benchmark_suite !== suite) {
       console.error(
         `result ${result.benchmark_suite ?? "?"} does not match --suite ${suite}; refusing to record`,
@@ -343,23 +364,16 @@ function main() {
 
   // History provenance: the run id distinguishes retries (same run → row
   // replaced) from repeated observations (distinct runs → accumulated), and
-  // recorded_at timestamps the append itself. Producers never emit these.
+  // recorded_at/attempt timestamp the append itself. Producers never emit
+  // these.
   const recordedAt = `${new Date().toISOString().slice(0, 19)}Z`;
-  for (const result of incoming) {
-    result.recording = { run_id: runId, recorded_at: recordedAt };
-  }
+  const incoming = incomingRaw.map((result) =>
+    stampRecording(result, { runId, recordedAt, attempt }),
+  );
 
-  // The recording run must not straddle a compatibility boundary: mixed
-  // --files inputs would split one logical run across series.
-  const incomingSeries = new Set(incoming.map((result) => compatKey(result)));
-  if (incomingSeries.size !== 1) {
-    console.error(
-      `incoming results span ${incomingSeries.size} compatibility boundaries ` +
-        "(mode + dataset_id + config_version + seed must match); refusing to record",
-    );
-    process.exit(1);
-  }
-
+  // One logical run may legitimately span several compatibility boundaries
+  // (record-main records all four replay modes of one run in a single
+  // invocation); every boundary lands in its own series below.
   const merged = dedupe([...existing, ...incoming]);
   const added = merged.length - existing.length;
 
@@ -429,4 +443,5 @@ export const __testables = {
   seriesFileStem,
   seriesLabel,
   renderTrend,
+  stampRecording,
 };

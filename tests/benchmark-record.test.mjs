@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test";
 
 import { __testables } from "../scripts/benchmark-record.mjs";
 
-const { identityOf, dedupe, compatKey, seriesFileStem, seriesLabel, renderTrend } = __testables;
+const { identityOf, dedupe, compatKey, seriesFileStem, seriesLabel, renderTrend, stampRecording } =
+  __testables;
 
 function result(commit, overrides = {}) {
   return {
@@ -55,6 +56,21 @@ describe("benchmark-record identity", () => {
     expect(identityOf(result("aaa"))).toBe("resource-soak|resource_soak|aaa|-");
   });
 
+  test("attempt never participates in identity (GitHub re-runs keep run_id)", () => {
+    const first = stampRecording(result("aaa"), { runId: "run-9", recordedAt: "t1", attempt: "1" });
+    const rerun = stampRecording(result("aaa"), { runId: "run-9", recordedAt: "t2", attempt: "2" });
+    expect(identityOf(first)).toBe(identityOf(rerun));
+    expect(dedupe([first, rerun])).toHaveLength(1);
+  });
+
+  test("stampRecording carries the attempt as diagnostic metadata only", () => {
+    const stamped = stampRecording(result("aaa"), { runId: "run-9", recordedAt: "t", attempt: "3" });
+    expect(stamped.recording).toEqual({ run_id: "run-9", recorded_at: "t", attempt: 3 });
+    expect(stamped.recording.run_id).not.toContain("attempt");
+    // Non-numeric / out-of-range attempts are omitted rather than recorded.
+    expect(stampRecording(result("aaa"), { runId: "r", recordedAt: "t", attempt: "x" }).recording).not.toHaveProperty("attempt");
+  });
+
   test("the same commit under two run ids has distinct identities", () => {
     expect(identityOf(result("aaa"), "run-1")).not.toBe(identityOf(result("aaa"), "run-2"));
   });
@@ -84,9 +100,10 @@ describe("benchmark-record dedupe", () => {
   });
 
   test("a retry of the same run replaces its earlier observation", () => {
-    const original = result("aaa", { recording: { run_id: "run-1", recorded_at: "2026-09-30T00:00:00Z" } });
-    const retried = result("aaa", { recording: { run_id: "run-1", recorded_at: "2026-09-30T01:00:00Z" } });
+    const original = result("aaa", { recording: { run_id: "run-1", recorded_at: "2026-09-30T00:00:00Z", attempt: 1 } });
+    const retried = result("aaa", { recording: { run_id: "run-1", recorded_at: "2026-09-30T01:00:00Z", attempt: 2 } });
     expect(dedupe([original, retried])).toHaveLength(1);
+    expect(dedupe([original, retried])[0].recording.attempt).toBe(2);
   });
 
   test("different commits and modes both survive", () => {

@@ -67,14 +67,18 @@ pub struct BenchmarkResult {
     pub invariants: BTreeMap<String, InvariantValue>,
 }
 
-/// Provenance of one recorded history row. `run_id` makes retries of the
-/// same benchmark run idempotent while distinct runs of one revision
-/// accumulate for runner-variance calibration (docs/performance-goals.adoc).
+/// Provenance of one recorded history row. `run_id` is stable across re-runs
+/// of one workflow run, so a re-run replaces its earlier row (idempotent)
+/// while distinct runs accumulate for runner-variance calibration
+/// (docs/performance-goals.adoc). `attempt` is diagnostic only and never
+/// participates in identity.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BenchmarkRecording {
     pub run_id: String,
     pub recorded_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

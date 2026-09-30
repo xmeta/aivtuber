@@ -97,7 +97,10 @@ jobs:
         run: |
           bun scripts/benchmark-record.mjs \
             --suite resource-soak \
-            --run-id "run-${{ github.run_id }}-attempt-${{ github.run_attempt }}" \
+            # run_id is invariant across re-runs (only run_attempt increments),
+            # so identity keys on it alone and a re-run stays idempotent.
+            --run-id "run-${{ github.run_id }}" \
+            --attempt "${{ github.run_attempt }}" \
             --files "$BENCH_DIR/resource-soak-result.json"
 
       - name: Push benchmark history
