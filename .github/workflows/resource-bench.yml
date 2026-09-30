@@ -1,0 +1,101 @@
+name: Resource benchmark
+
+# Issue #58 Phase D: nightly high-volume logical-time resource benchmark
+# (Tier 3). Runs the deterministic soak workload on a schedule, emits the
+# #58 result contract, and gates the hard bounded-state invariants
+# (retention bound + plateau). Wall-clock soak/failure injection remains
+# owned by #40; this job covers the resource-boundedness tier only.
+#
+# Scheduled/dispatched runs execute repository-owned code only, so write
+# credentials for benchmark-history persistence (Phase E, benchmark-data
+# branch) are safe here. pull_request jobs never receive those credentials.
+
+on:
+  schedule:
+    # 03:00 UTC daily, outside the main US/EU working-hour CI peaks.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: benchmark-data-append
+  cancel-in-progress: false
+
+jobs:
+  resource-soak:
+    name: High-volume logical-time soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+
+      - name: Run resource benchmark
+        run: |
+          cargo run --locked -p aivtuber-hardening --bin resource-bench -- \
+            target/resource-bench
+
+      - name: Publish job summary
+        if: always()
+        run: |
+          {
+            echo "## Resource benchmark (resource-soak, logical time)"
+            echo
+            if [ -f target/resource-bench/resource-soak-result.json ]; then
+              python3 - <<'PY'
+          import json
+          result = json.load(open("target/resource-bench/resource-soak-result.json"))
+          print(f"commit: `{result['git']['commit']}`  ")
+          print(f"config: `{result['configuration']['config_version']}`  ")
+          print()
+          print("| Metric | Value |")
+          print("|---|---|")
+          for name, metric in sorted(result["metrics"].items()):
+              count = metric.get("sample_count")
+              suffix = f" (n={count})" if count else ""
+              print(f"| `{name}` | {metric['value']}{suffix} |")
+          print()
+          print("| Invariant | Value | Status |")
+          print("|---|---|---|")
+          for name, invariant in sorted(result["invariants"].items()):
+              status = "pass" if invariant["value"] == 0 else "FAIL"
+              print(f"| `{name}` | {invariant['value']} | {status} |")
+          PY
+            else
+              echo "resource-bench did not produce a result (see logs)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resource-bench-results
+          path: |
+            target/resource-bench/resource-soak-result.json
+            target/resource-bench/resource-soak-report.json
+          retention-days: 90
+
+      # Phase E persistence: append the trusted result to the benchmark-data
+      # branch so trend charts can follow the resource tier over time. The
+      # record script dedupes by (suite, mode, commit) and renders trends.
+      - name: Record to benchmark history
+        if: success()
+        env:
+          BENCH_DIR: target/resource-bench
+        run: |
+          git config user.name "benchmark-bot"
+          git config user.email "actions@users.noreply.github.com"
+          bun scripts/benchmark-record.mjs \
+            --suite resource-soak \
+            --files "$BENCH_DIR/resource-soak-result.json"
+
+      - name: Push benchmark history
+        if: success()
+        run: git push origin benchmark-data

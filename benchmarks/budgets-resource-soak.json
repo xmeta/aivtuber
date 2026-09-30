@@ -1,0 +1,17 @@
+{
+  "schema_version": "1",
+  "description": "Resource-bench (issue #58 Phase D) regression budgets. Scoped to the invariants and state sizes the logical-time soak actually evidences; replay-latency budgets stay in benchmarks/budgets.json. Changes to this file are reviewed like code: accepting a regression intentionally requires editing it.",
+  "metrics": {
+    "resource.throughput_events_per_s": {
+      "direction": "higher",
+      "warn_regression_percent": 25,
+      "fail_regression_percent": 50,
+      "min_samples": 1000
+    }
+  },
+  "invariants": {
+    "resource.retention_bound_violation_count": { "max": 0 },
+    "resource.non_plateau_state_count": { "max": 0 }
+  },
+  "ungated_metrics_warning_only": true
+}

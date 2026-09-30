@@ -31,9 +31,10 @@
         "deterministic_only",
         "deterministic_semantic",
         "deterministic_semantic_jev",
-        "full_generative"
+        "full_generative",
+        "resource_soak"
       ],
-      "description": "Comparison mode the observation ran under."
+      "description": "Comparison mode the observation ran under. `resource_soak` results come from the high-volume logical-time resource benchmark (issue #58 Phase D) and carry retained-state/high-water metrics instead of latency percentiles."
     },
     "dataset_id": {
       "type": "string",

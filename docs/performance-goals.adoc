@@ -1,0 +1,106 @@
+= Performance Goals and Baselines (issue #58 Phase E)
+:status: Active methodology (baseline data collection in progress)
+:date: 2026-09-30
+
+== 1. Two separate concepts
+
+Keep these apart; conflating them is how proxy metrics become targets.
+
+Regression budget::
+Used by CI (`benchmark-compare` + `benchmarks/budgets.json` and
+`benchmarks/budgets-resource-soak.json`) to answer:
++
+> Did this change materially worsen the current system?
+
+Product/performance target::
+Used by project planning to answer:
++
+> Is the current system good enough?
+
+A PR that passes its regression budget has not proven the system is good
+enough — only that it is no worse than before. Optimization issues are filed
+against the gap between the measured baseline and the product target, not
+against budget headroom.
+
+== 2. Baseline methodology
+
+Do not invent absolute targets without baseline data. The process is:
+
+. Merge the Phase C/D benchmark infrastructure (done: PR gate + nightly
+  resource benchmark + main-branch history recording).
+. Let `record-main` and the nightly `resource-bench` accumulate trusted
+  results on the `benchmark-data` branch (one JSONL line per result, keyed by
+  suite/mode/commit).
+. After enough stable runs (target: 10+ nightly runs for the resource tier),
+  read `trends/<suite>.md`, estimate normal runner variance per metric, and
+  publish the baseline in this document.
+. Choose realistic product targets against the published baseline.
+. File optimization issues for the measured gaps and link them here.
+
+== 3. Current budgets (regression, not targets)
+
+Replay comparison suite (`benchmarks/budgets.json`):
+
+* timing metrics (first-audio p50/p95, first-visible p95, route p95) are
+  warning-gated at 10–20% relative regression, fail at 25–40%;
+* `routing.llm_calls_per_100_events` fails at +15 calls absolute;
+* `semantic.wrong_reuse_rate_pct` fails at +2.0pp absolute;
+* hard invariants (`stale_dispatch`, `unauthorized_privileged_action`,
+  `deterministic_replay_mismatch`, `retention_bound_violation`,
+  `invalid_route_transition`, `non_plateau_state`) must stay exactly 0.
+
+Resource soak suite (`benchmarks/budgets-resource-soak.json`):
+
+* `resource.throughput_events_per_s` warns at −25%, fails at −50%
+  (higher-is-better; hosted-runner wall clock is noisy, so thresholds are
+  deliberately loose until calibrated);
+* retained-state sizes are reported ungated; their bound violations and
+  non-plateau findings are hard invariants instead;
+* `resource.peak_rss_kib` is diagnostic only — never a gate.
+
+Timing thresholds intentionally stay warning-only until noise calibration
+(issue #58): correctness/state invariants are strict from day one.
+
+== 4. Candidate product targets (to be baselined)
+
+Do not treat these as commitments; they become targets only after step 3 of
+the methodology publishes a measured baseline:
+
+* cached event-to-first-visible p95
+* cached event-to-first-audio p95
+* reflex/Jev decision p95
+* operator stop-to-cancellation p99 (requires #56 metrics in the replay path)
+* maximum semantic wrong-reuse rate
+* maximum generative calls per 100 events
+* zero stale dispatch, zero retention-bound violations (already gated)
+* retained-state plateau at configured limits for 100k+ event runs
+
+== 5. When a regression is reported
+
+. Read the PR Job Summary table; identify which metric/invariant failed.
+. Pull `gate-report.json` from the workflow artifacts for the exact deltas.
+. If the failure is a hard invariant: treat it as a correctness bug, not a
+   performance trade-off. Fix or revert before merge.
+. If it is a budgeted timing metric: investigate the causal trace/diff for
+   the touched subsystem; compare against the trend on `benchmark-data` to
+   distinguish a real regression from runner noise.
+. If the regression is intentional (a documented trade-off), edit the relevant
+   budgets file in the same PR with a comment explaining the acceptance; the
+   change is reviewed like code. Silently loosening budgets is not allowed.
+. For surprising or persistent regressions, export the result identity
+   (suite/mode/commit/config_version) into the after-action review (#62) and
+   file an optimization issue referencing the trend.
+
+== 6. Guardrails and hypothesis integration
+
+Per issue #58's governance section:
+
+* An optimization metric is only meaningful together with its guardrail
+  (e.g., LLM avoidance ↔ wrong-reuse rate; throughput ↔ drop/backpressure).
+  The comparator reports linked metrics side by side; reviewers must reject
+  "unqualified improvement" claims when a guardrail regressed.
+* For hypothesis-driven changes (#60), record the expected outcome in the PR
+  and attach the actual base-vs-head `gate-report.json` as the evidence for
+  the Keep/Expand/Narrow/Revert/Defer/Stop decision.
+* #59 quality labels and #64–#71 runtime signals extend the result contract
+  additively; existing metric names never change meaning.

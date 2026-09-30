@@ -42,7 +42,8 @@
     "reliability.unauthorized_privileged_action_count": { "max": 0 },
     "reliability.deterministic_replay_mismatch_count": { "max": 0 },
     "resource.retention_bound_violation_count": { "max": 0 },
-    "resource.invalid_route_transition_count": { "max": 0 }
+    "resource.invalid_route_transition_count": { "max": 0 },
+    "resource.non_plateau_state_count": { "max": 0 }
   },
   "ungated_metrics_warning_only": true
 }

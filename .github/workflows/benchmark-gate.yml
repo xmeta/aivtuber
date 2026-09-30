@@ -18,6 +18,16 @@ on:
       - "examples/benchmarks/**"
       - "benchmarks/**"
       - ".github/workflows/benchmark-gate.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "examples/benchmarks/**"
+      - "benchmarks/**"
+      - ".github/workflows/benchmark-gate.yml"
 
 permissions:
   contents: read
@@ -114,3 +124,51 @@ jobs:
           status="${{ steps.gate.outputs.status }}"
           echo "comparator exit: ${status}"
           exit "${status}"
+
+  # Issue #58 Phase E: persist trusted main-branch replay results to the
+  # benchmark-data branch for trend analysis. This job runs only on push to
+  # main, so it executes repository-owned code and may hold write access;
+  # the pull_request job above keeps contents: read only.
+  record-main:
+    name: Record main benchmark history
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    concurrency:
+      group: benchmark-data-append
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+
+      - name: Benchmark main
+        run: |
+          cargo run --locked -p aivtuber-app --bin replay-benchmark -- \
+            examples/benchmarks/replay-comparison.json target/bench-main
+          mkdir -p results/main
+          cp target/bench-main/*-result.json results/main/
+
+      - name: Record to benchmark history
+        if: success()
+        run: |
+          bun scripts/benchmark-record.mjs \
+            --suite replay-comparison \
+            --files results/main/01-deterministic-result.json \
+                    results/main/02-semantic-result.json \
+                    results/main/03-semantic-jev-result.json \
+                    results/main/04-full-generative-result.json
+
+      - name: Push benchmark history
+        if: success()
+        run: git push origin benchmark-data
