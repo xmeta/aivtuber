@@ -1,11 +1,10 @@
-= Continuous Benchmark Gate (issue #58 — Phase A + B + C)
-:status: Implemented (result contract + comparator + budgets + PR CI gate; scheduled tier and history follow)
-:date: 2026-09-29
+= Continuous Benchmark Gate (issue #58 — Phase A–E)
+:status: Implemented (result contract + comparator + budgets + PR CI gate + scheduled resource tier + history/trends)
+:date: 2026-09-30
 
 == 1. Scope
 
-This note documents the first two phases of the continuous benchmark loop
-from issue #58:
+This note documents the continuous benchmark loop from issue #58:
 
 * *Phase A — result contract*: a versioned, machine-readable benchmark
   result document validated by `schemas/benchmark-result.schema.json` in CI.
@@ -15,10 +14,11 @@ from issue #58:
 * *Phase C — PR CI integration*: `.github/workflows/benchmark-gate.yml`
   benchmarks the exact base SHA and head SHA in one job/runner and enforces
   the comparator verdict.
-
-Phases C (PR CI base-vs-head job), D (scheduled high-volume resource tier),
-and E (historical trend storage) build directly on this contract and follow
-in later changes.
+* *Phase D — scheduled resource tier*: `resource-bench` runs the high-volume
+  logical-time soak (Tier 3) nightly and emits contract results whose
+  bounded-state findings are hard invariants.
+* *Phase E — history and trends*: trusted main/nightly results are persisted
+  to the `benchmark-data` branch and summarized as trend Markdown.
 
 == 2. Result contract
 
@@ -30,6 +30,12 @@ conforming to the schema:
   rather than silently compared.
 * identity: `benchmark_suite`, `mode`, `dataset_id`, `git.commit`
   (+`base_commit` for comparisons).
+* history provenance: `recording.run_id` + `recording.recorded_at`
+  (+ diagnostic-only `recording.attempt`), appended by
+  `scripts/benchmark-record.mjs` when a trusted job stores the result on
+  `benchmark-data`; benchmark producers never emit it. `run_id` is GitHub's
+  re-run-invariant run id, so a re-run of one run is idempotent while
+  distinct runs of the same revision accumulate (see section 6).
 * reproduction metadata: OS/arch/rust/bun/profile, `config_version`,
   `asset_version`, `index_version`, `retriever_version`, model IDs,
   `seed`, `stream_duration_ms`, and `cost_model_version` whenever cost
@@ -56,7 +62,11 @@ schema job.
 2. refuses to compare across differing `benchmark_suite`, `mode`,
    `dataset_id`, `config_version`, or `seed`;
 3. computes improvement-positive deltas per metric;
-4. applies `benchmarks/budgets.json`:
+4. applies the suite-scoped budget file — `benchmarks/budgets.json` for the
+   replay-comparison suite and `benchmarks/budgets-resource-soak.json` for
+   the resource-soak suite (each result must carry the invariants its suite
+   actually evidences; every budgeted invariant present in a result is
+   required in both sides of the comparison):
    * `direction` `lower`/`higher`,
    * `warn_regression_percent` / `fail_regression_percent`,
    * `warn_absolute_change` / `fail_absolute_change`,
@@ -84,12 +94,19 @@ the lockfile, or benchmark inputs:
 
 ```text
 resolve base SHA (GitHub API)
-→ checkout head → replay-benchmark → results/head
+→ checkout exact PR head SHA → replay-benchmark → results/head
 → checkout base SHA → replay-benchmark → results/base
+→ re-checkout exact PR head SHA (comparator + budgets from the PR)
 → benchmark-compare base head → Job Summary + artifacts
 → enforce verdict (exit status)
 ```
 
+* Both revisions are the exact reviewed SHAs: the PR head is checked out
+  explicitly (the pull_request default `refs/pull/<n>/merge` is a synthetic
+  merge commit, not the reviewed revision), and the comparator/budgets run
+  from a second head checkout so a PR's own budget changes gate itself —
+  intentional regressions therefore require the reviewed budgets edit
+  (issue #58 Phase C acceptance).
 * Both revisions are measured on the same runner under the identical
   fixture/seed/config boundaries, so latency deltas are relative to the
   base measured moments earlier — not to a stale cross-runner history
@@ -103,16 +120,96 @@ resolve base SHA (GitHub API)
   verdict, so gate decisions are reviewable after the fact from the uploaded
   JSON.
 
-Accepting a regression intentionally means editing `benchmarks/budgets.json`
-in the same PR — the change is reviewed like code.
+Accepting a regression intentionally means editing the suite's budgets file
+(`benchmarks/budgets.json` or `benchmarks/budgets-resource-soak.json`) in the
+same PR — the change is reviewed like code.
 
-== 5. Verification
+== 5. Phase D — scheduled resource benchmark (Tier 3)
+
+`crates/hardening/src/bin/resource-bench` runs the deterministic logical-time
+soak workload (`run_core_soak`, default 576k events ≈ eight logical stream
+hours at 20 events/second) and converts the existing mid-vs-final
+`GrowthFinding` comparison into contract results:
+
+* retained-state sizes become `resource.*_count` metrics;
+* `configured_limit_exceeded` findings become the
+  `resource.retention_bound_violation_count` hard invariant;
+* `lifetime_growth_detected` findings become the
+  `resource.non_plateau_state_count` hard invariant (the #50–#53 plateau
+  property, gated exactly);
+* throughput and (Linux-only, `/proc`-sourced) peak RSS are reported as
+  context metrics — RSS is diagnostic only, never a gate.
+
+`resource-bench` exits non-zero when either hard invariant is violated.
+
+`.github/workflows/resource-bench.yml` runs it nightly (03:00 UTC) and on
+`workflow_dispatch`, publishes a metrics/invariants job summary, uploads
+results as 90-day artifacts, and records the trusted result to the
+`benchmark-data` branch (Phase E). A 5k-event smoke in the `rust` CI job
+keeps the contract output verified on every PR. The wall-clock soak and
+failure-injection tier remains owned by #40; its results can reuse this
+result/history contract.
+
+== 6. Phase E — history and trends
+
+Trusted results are persisted on the orphan `benchmark-data` branch:
+
+* `data/<suite>.<series>.jsonl` — one contract document per line, grouped
+  into compatibility series and deduped on
+  (suite, mode, commit, `recording.run_id`) with the last line winning.
+  `run_id` is GitHub's re-run-invariant run id, so re-running the *same*
+  workflow run (any `run_attempt`) is a no-op, but repeated runs of the same
+  revision *accumulate*: nightly observations of an unchanged main are the
+  raw material for runner-variance calibration. One invocation may record
+  several compatibility boundaries at once (record-main stores all four
+  replay modes of one run); each lands in its own series.
+* `<series>` encodes the comparator's compatibility boundary —
+  `mode` + `dataset_id` + `configuration.config_version` +
+  `configuration.seed` — plus a short stable hash. Results from different
+  datasets, configs, or seeds get separate data and trend files and are
+  never rendered into one table, so incompatible workloads are not silently
+  compared across a boundary bump.
+* `trends/<suite>.<series>.md` — generated tables for the key metrics
+  (first-audio p95, first-visible p95, wrong-reuse rate, LLM calls/100
+  events, retained state, throughput) plus per-run invariant status. Each
+  table's heading states its compatibility boundary and the table has a
+  `run` column.
+
+Writers are limited to jobs that run repository-owned code: the `record-main`
+job (push to main only) for replay results and the nightly resource bench.
+Both serialize through the `benchmark-data-append` concurrency group. The
+recorder (`scripts/benchmark-record.mjs`) operates in an isolated git
+worktree so it never touches the main checkout, and pull_request jobs keep
+`contents: read` only — untrusted forked code cannot write history.
+Recording jobs pass `--run-id "run-${{ github.run_id }}"` (re-run-invariant;
+`--attempt ${{ github.run_attempt }}` is recorded as diagnostic metadata
+only), and the recorder refuses to run without a run identity so retries and
+repeated observations can always be told apart.
+
+Trend views are informational. Gating decisions always come from the
+machine-readable comparator. Baseline/target methodology, budget rationale,
+and the regression-investigation procedure live in
+link:performance-goals.adoc[Performance Goals and Baselines].
+
+== 7. Verification
 
 * telemetry unit tests (12): improvement/ok/warning/fail paths,
   higher-is-better, absolute thresholds on small denominators,
   min_samples gating, invariant violation overrides improvements,
   incompatible dataset/schema detection, ungated reporting, markdown
   summary, JSON round-trip.
+* hardening unit tests (10): soak plateau detection, plus the Phase D
+  contract mapping — clean soaks map to zero invariants, growth findings map
+  to non-zero invariants with details, results round-trip through the
+  comparator's parser.
+* recorder bun tests (18): run-id identity keying (attempt excluded), retry
+  idempotence vs repeated-observation accumulation, stable ordering,
+  compatibility-series splitting (dataset/config_version/seed/mode
+  boundaries), collision-free series file stems, trend rendering with the
+  boundary heading and run column, invariant status flags, metric filtering.
 * end-to-end: `replay-benchmark` emits contract results; comparator PASSes
   identical results (exit 0) and FAILs an artificially regressed result
   (first-audio p95 +78%, stale dispatch 3) with exit 1.
+* end-to-end (Phase D): `resource-bench` emits `resource_soak` contract
+  results; comparator PASSes identical results with the resource budgets and
+  FAILs an artificially non-plateauing head with exit 1.

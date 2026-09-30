@@ -14,13 +14,217 @@ use aivtuber_scheduler::{
     BlendChannel, PlannedPerformance, Priority, Scheduler, SchedulerConfig, Status,
 };
 use aivtuber_telemetry::{
-    BenchmarkSummary, ComparisonMode, EventObservation, ReproducibilityMetadata, RouteClass,
-    SecretRedactor, TelemetryCollector, TelemetryRetentionConfig,
+    BenchmarkConfiguration, BenchmarkEnvironment, BenchmarkGit, BenchmarkResult, BenchmarkSummary,
+    ComparisonMode, EventObservation, InvariantValue, MetricValue, RESULT_SCHEMA_VERSION,
+    ReproducibilityMetadata, RouteClass, SecretRedactor, TelemetryCollector,
+    TelemetryRetentionConfig,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+
+/// Suite identity emitted by the high-volume resource benchmark (issue #58
+/// Phase D). History storage keys trend series on (suite, mode, dataset).
+pub const RESOURCE_BENCH_SUITE: &str = "resource-soak";
+/// Dataset identity of the logical-time soak workload; changing the workload
+/// shape materially requires changing this id so history series never mix.
+pub const RESOURCE_BENCH_DATASET: &str = "hardening-soak-v1";
+/// Result `mode` for resource-soak runs (schemas/benchmark-result.schema.json).
+pub const RESOURCE_BENCH_MODE: &str = "resource_soak";
+/// Config identity prefix; the CLI appends the workload parameters it ran so
+/// recorded history remains reproducible.
+pub const RESOURCE_BENCH_CONFIG_VERSION: &str = "resource-bench-v1";
+
+/// Wall-clock context for a soak run, measured around `run_core_soak`.
+/// The soak itself uses logical time and stays deterministic; wall clock is
+/// reported as throughput context only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceBenchTiming {
+    pub wall_clock_ms: u64,
+    /// Peak resident set size in KiB when the platform exposes it
+    /// (Linux `/proc/self/status` VmHWM); `None` elsewhere. Diagnostic only:
+    /// hosted-runner RSS is too noisy for strict gating (issue #58 noise
+    /// calibration), so this never becomes a hard invariant.
+    pub peak_rss_kib: Option<u64>,
+}
+
+impl ResourceBenchTiming {
+    /// Linux-only peak-RSS read without unsafe code or new dependencies.
+    pub fn peak_rss_kib_from_proc() -> Option<u64> {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmHWM:") {
+                let value = rest.split_whitespace().next()?;
+                return value.parse().ok();
+            }
+        }
+        None
+    }
+}
+
+/// Build the `schemas/benchmark-result.schema.json` result for a completed
+/// soak. Retained-state sizes become metrics with explicit `_count` units;
+/// plateau/limit findings from the existing mid-vs-final comparison become
+/// hard invariants so the #58 comparator gates them exactly.
+pub fn resource_bench_result(
+    report: &SoakReport,
+    timing: ResourceBenchTiming,
+    environment: BenchmarkEnvironment,
+) -> Result<BenchmarkResult, HardeningError> {
+    let events = report.config.logical_events;
+    let seconds = timing.wall_clock_ms as f64 / 1_000.0;
+    let throughput = if seconds > 0.0 {
+        events as f64 / seconds
+    } else {
+        0.0
+    };
+
+    let metric = |value: usize| MetricValue {
+        value: value as f64,
+        sample_count: Some(events),
+    };
+    let mut metrics = BTreeMap::from([
+        (
+            "resource.throughput_events_per_s".to_owned(),
+            MetricValue {
+                value: (throughput * 100.0).round() / 100.0,
+                sample_count: Some(events),
+            },
+        ),
+        (
+            "resource.scheduler_history_retained_count".to_owned(),
+            metric(report.final_state.scheduler_history),
+        ),
+        (
+            "resource.audit_records_retained_count".to_owned(),
+            metric(report.final_state.audit_records),
+        ),
+        (
+            "resource.rate_limit_sources_count".to_owned(),
+            metric(report.final_state.rate_limit_sources),
+        ),
+        (
+            "resource.working_memory_entries_count".to_owned(),
+            metric(report.final_state.working_memory_entries),
+        ),
+        (
+            "resource.memory_compaction_records_count".to_owned(),
+            metric(report.final_state.memory_compaction_records),
+        ),
+        (
+            "resource.telemetry_events_retained_count".to_owned(),
+            metric(report.final_state.telemetry_events),
+        ),
+        (
+            "resource.hot_assets_resident_count".to_owned(),
+            metric(report.final_state.hot_assets),
+        ),
+        (
+            "resource.promotion_metadata_retained_count".to_owned(),
+            metric(report.final_state.promotion_metadata),
+        ),
+        (
+            "resource.content_queue_final_count".to_owned(),
+            metric(report.final_state.content_queue),
+        ),
+    ]);
+    if let Some(peak_rss_kib) = timing.peak_rss_kib {
+        metrics.insert(
+            "resource.peak_rss_kib".to_owned(),
+            MetricValue {
+                value: peak_rss_kib as f64,
+                sample_count: Some(1),
+            },
+        );
+    }
+
+    // Hard invariants: limit violations (the existing failure-soak gate) and
+    // non-plateauing retained state both fail the comparator regardless of
+    // any timing improvement (issue #58 hard-invariant principle).
+    let limit_violations = report
+        .growth
+        .iter()
+        .filter(|finding| finding.configured_limit_exceeded)
+        .count();
+    let non_plateau = report
+        .growth
+        .iter()
+        .filter(|finding| finding.lifetime_growth_detected)
+        .count();
+    let invariant = |value: u64, detail: Option<String>| InvariantValue { value, detail };
+    let invariants = BTreeMap::from([
+        (
+            "resource.retention_bound_violation_count".to_owned(),
+            invariant(
+                limit_violations as u64,
+                (limit_violations > 0).then(|| {
+                    growth_detail(&report.growth, |finding| finding.configured_limit_exceeded)
+                }),
+            ),
+        ),
+        (
+            "resource.non_plateau_state_count".to_owned(),
+            invariant(
+                non_plateau as u64,
+                (non_plateau > 0).then(|| {
+                    growth_detail(&report.growth, |finding| finding.lifetime_growth_detected)
+                }),
+            ),
+        ),
+    ]);
+
+    Ok(BenchmarkResult {
+        schema_version: RESULT_SCHEMA_VERSION.to_owned(),
+        benchmark_suite: RESOURCE_BENCH_SUITE.to_owned(),
+        mode: RESOURCE_BENCH_MODE.to_owned(),
+        dataset_id: Some(RESOURCE_BENCH_DATASET.to_owned()),
+        recording: None,
+        git: BenchmarkGit {
+            commit: report.metadata.git_commit.clone(),
+            base_commit: None,
+        },
+        environment,
+        configuration: BenchmarkConfiguration {
+            config_version: format!(
+                "{};events={};interval_ms={}",
+                RESOURCE_BENCH_CONFIG_VERSION, events, report.config.event_interval_ms
+            ),
+            runtime_profile: Some("full".to_owned()),
+            asset_version: report.metadata.asset_version.clone(),
+            index_version: report.metadata.index_version.clone(),
+            retriever_version: None,
+            jev_model: report.metadata.jev_model.clone(),
+            thinking_model: report.metadata.thinking_model.clone(),
+            tts_model: report.metadata.tts_model.clone(),
+            cost_model_version: None,
+            seed: report.metadata.seed,
+            stream_duration_ms: report.metadata.stream_duration_ms,
+        },
+        metrics,
+        invariants,
+    })
+}
+
+/// Compact violation listing for invariant details, e.g.
+/// `scheduler_history(final=600>limit=512)`. Empty when nothing matched.
+fn growth_detail(findings: &[GrowthFinding], predicate: impl Fn(&GrowthFinding) -> bool) -> String {
+    let parts: Vec<String> = findings
+        .iter()
+        .filter(|finding| predicate(finding))
+        .map(|finding| match finding.configured_limit {
+            Some(limit) => format!(
+                "{}(final={} > limit={})",
+                finding.metric, finding.final_count, limit
+            ),
+            None => format!(
+                "{}(midpoint={} final={})",
+                finding.metric, finding.midpoint, finding.final_count
+            ),
+        })
+        .collect();
+    parts.join(", ")
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SoakConfig {

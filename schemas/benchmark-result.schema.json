@@ -31,14 +31,38 @@
         "deterministic_only",
         "deterministic_semantic",
         "deterministic_semantic_jev",
-        "full_generative"
+        "full_generative",
+        "resource_soak"
       ],
-      "description": "Comparison mode the observation ran under."
+      "description": "Comparison mode the observation ran under. `resource_soak` results come from the high-volume logical-time resource benchmark (issue #58 Phase D) and carry retained-state/high-water metrics instead of latency percentiles."
     },
     "dataset_id": {
       "type": "string",
       "minLength": 1,
       "description": "Versioned fixture/dataset identity; results with different datasets must not be compared."
+    },
+    "recording": {
+      "type": "object",
+      "required": ["run_id", "recorded_at"],
+      "additionalProperties": false,
+      "description": "History-recording provenance, added by scripts/benchmark-record.mjs when a trusted job appends the result to the benchmark-data branch. Benchmark producers never emit it. run_id identifies the workflow run and is stable across re-runs: a re-run of the same run_id replaces its earlier row (idempotent), while distinct runs accumulate so repeated observations of one revision can calibrate runner variance. attempt is diagnostic only and never participates in identity.",
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable identity of the benchmark run (workflow run id or explicit override); invariant across re-runs."
+        },
+        "recorded_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "RFC 3339 UTC instant at which the result was recorded into history."
+        },
+        "attempt": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Diagnostic-only re-run counter (GitHub run_attempt) of the recording attempt; identity is run_id alone."
+        }
+      }
     },
     "git": {
       "type": "object",
