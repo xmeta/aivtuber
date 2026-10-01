@@ -11,6 +11,22 @@ The repository is an application workspace and commits both Rust and Bun lockfil
 
 CI must not silently refresh dependency resolution. Rust build/test/clippy and Rust schema-parity execution use `--locked`. Bun installation uses `bun install --frozen-lockfile`.
 
+== Line endings across Windows and WSL
+
+Repository text is normalized by `.gitattributes`: LF is the default checkout line ending, while Windows-native `.cmd` and `.bat` files are checked out as CRLF. This repository-level policy is authoritative even when a contributor's global Git configuration differs.
+
+For a checkout that is used from both Windows and WSL, prefer repository-local settings so another repository's policy is not changed:
+
+----
+git config --local core.autocrlf false
+git config --local core.eol lf
+git config --local core.safecrlf true
+----
+
+Do not interpret a working tree with widespread line-ending-only changes as implementation work. Compare with `git diff --ignore-cr-at-eol` before editing or cleaning it. If a checkout is already polluted, preserve any semantic/untracked work first, update to a revision containing `.gitattributes`, and only then restore or renormalize from a clean state. Never use `reset --hard` or `clean` to repair line endings until real local work has been backed up.
+
+CI rejects tracked CRLF content in the Git index. New text files should therefore be added normally and allowed to normalize through `.gitattributes`; do not bypass attributes with plumbing commands or binary overrides unless the file is genuinely binary.
+
 == Required checks for main
 
 Every merge to `main` must go through a pull request and have these CI jobs green:
