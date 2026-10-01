@@ -1,0 +1,152 @@
+= Product Objectives and Guardrails
+:toc:
+:toclevels: 2
+
+This document is the canonical product-objective and proxy-governance reference for aivtuber.
+It complements link:metrics.adoc[Metrics and Evaluation]: metrics describe observations, while this document describes what those observations are intended to protect or improve.
+
+== 1. Primary product objective
+
+Produce contextually appropriate, natural, timely, and operationally safe AI VTuber reactions to stream events while avoiding unnecessary dependence on slow or expensive external generation.
+
+The intended beneficiaries are viewers receiving the performance and the operator responsible for running, diagnosing, and stopping the system.
+Material third-party effects include privacy, platform/community safety, provider usage, and resource/network externalities.
+
+The objective is deliberately multi-dimensional.
+No single latency, cache, cost, or model-usage metric is a substitute for the product objective.
+
+== 2. Secondary objectives
+
+Within the hard guardrails below, prefer changes that:
+
+* reduce avoidable interaction latency;
+* reduce unnecessary LLM/TTS/provider calls and stream-hour cost;
+* increase safe reuse of validated Performance Assets;
+* preserve useful reaction variety and avoid inappropriate repetition;
+* improve long-running reliability and graceful degradation;
+* improve observability, deterministic replay, and reproducibility;
+* keep operator intervention fast and predictable.
+
+Secondary objectives may trade off against one another.
+A change is not an unqualified improvement merely because one secondary objective improves.
+
+== 3. Hard guardrails
+
+The following are constraints, not performance scores to trade away:
+
+* security and authorization boundaries remain intact;
+* serialized/model-provided claims never mint runtime authority;
+* operator stop/mute remains independently effective under content/provider failure or saturation;
+* stale or cancelled actions do not dispatch after their cancellation fence;
+* privacy and durable-memory write policy remain enforced;
+* replay-relevant decisions remain deterministic where the contract requires it;
+* long-lived queues, histories, caches, observations, and retained context remain explicitly bounded;
+* required degraded paths do not freeze the deterministic performer.
+
+A candidate that violates a hard guardrail is not made acceptable by better latency, cost, reuse, throughput, or subjective quality.
+
+== 4. Proxy-metric governance
+
+Important optimization proxies must be interpreted with counter-metrics or guardrails.
+
+[cols="2,3,3",options="header"]
+|===
+|Optimization proxy
+|What it can miss
+|Required counter-metric / guardrail
+
+|Cache / semantic reuse hit rate
+|Contextually wrong or stale reuse
+|Wrong-reuse labels; reaction appropriateness; semantic near-miss review
+
+|LLM / TTS avoidance
+|Missing useful responses or overusing canned behavior
+|Reaction-quality review; intentional-silence vs unintended-silence outcomes; fallback reason
+
+|Event-to-first-audio / visible latency
+|Awkward interruption, premature response, or unnatural timing
+|Timing/interruption quality review; cancellation and operator-override behavior
+
+|Template utilization
+|Repetition or contextually poor template selection
+|Repetition measures; reaction appropriateness; semantic/template error labels
+
+|Generation latency
+|Higher failure rate, degraded output, or stale completion
+|Generation failure/degradation rate; stale-dispatch invariant; cancellation outcome
+
+|Throughput
+|Silent overload, excessive drop, or control-path starvation
+|Drop/backpressure counters; priority outcome; emergency-control responsiveness
+
+|Lower retained-state footprint
+|Excess eviction, regeneration, cache misses, or quality loss
+|Cache/regeneration metrics; latency/cost changes; configured-bound invariants
+
+|Estimated cost
+|Quality loss or unmeasured provider work
+|Quality guardrails; call counts; explicit "unmeasured" rather than zero when inputs are absent
+|===
+
+When a new optimization metric becomes decision-relevant, its owning issue/PR should name what important product quality the metric does not measure and identify a corresponding counter-metric or hard guardrail before it is treated as a target.
+
+== 5. Qualities not fully captured by runtime counters
+
+Current deterministic telemetry is necessary but not sufficient for product quality.
+Important qualities that require offline or human-reviewed evidence include, as applicable:
+
+* contextual reaction appropriateness;
+* naturalness and timing appropriateness;
+* repetition and behavior variety;
+* personality consistency;
+* interruption/preemption quality;
+* semantic near-miss and wrong-reuse severity;
+* whether silence, deferral, or non-verbal acknowledgement was preferable to a spoken response.
+
+Issue #59 owns the versioned reaction-quality evaluation path.
+Until reviewed evidence exists for a dimension, do not claim that a timing/cost/reuse improvement proves that dimension improved.
+
+== 6. Relationship to measurement
+
+link:metrics.adoc[Metrics and Evaluation] defines the production observations and replay comparison boundary.
+link:performance-goals.adoc[Performance Goals and Baselines] distinguishes regression budgets from product targets.
+
+Issue #58 supplies quantitative comparison infrastructure.
+A comparable base-vs-head measurement can show that a proxy changed; it does not by itself prove that the primary product objective improved.
+
+Numeric product targets and operational SLOs must be derived from representative evidence and measured baselines.
+Do not invent absolute thresholds in this document; #70 and #71 own representative workloads and operational SLO calibration.
+
+== 7. Proxy divergence and review
+
+Treat the following as evidence that a proxy may be diverging from the product objective:
+
+* a proxy improves while its counter-metric or quality review regresses;
+* operators compensate manually more often despite "better" benchmark numbers;
+* a policy learns to satisfy a benchmark fixture while degrading held-out or live behavior;
+* an optimization shifts cost/latency to an unmeasured stage;
+* metric definitions or workload composition change enough that historical comparisons are no longer like-for-like;
+* repeated qualitative incidents are not visible in the metrics used to justify the change.
+
+When this happens:
+
+. do not describe the change as an unqualified improvement;
+. identify whether the metric, workload, guardrail, or intervention is wrong/incomplete;
+. create or link the focused measurement/quality issue;
+. use the expected-vs-actual / decision workflow from #60;
+. revise or retire the proxy if it no longer tracks the intended product quality.
+
+Do not silently loosen a guardrail to preserve an optimization result.
+
+== 8. Revisit conditions
+
+Review this objective model when:
+
+* #59 quality evaluation exposes a missing product-quality dimension;
+* #70 representative workloads materially change the measured behavior;
+* #71 operational SLO evidence shows persistent failure not represented here;
+* a significant #62 after-action review identifies a missing guardrail or misleading proxy;
+* a new Stage 3-5 capability materially changes who is affected or what "useful reaction" means;
+* a security/privacy/platform constraint changes.
+
+Changes to the primary objective or hard guardrails require an issue and explicit review rather than being hidden inside a local optimization PR.
