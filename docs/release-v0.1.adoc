@@ -611,7 +611,7 @@ Date/time: 2026-10-01 (UTC)
 Operator/tester: AI coding agent, authorized local development environment
 Host OS / relevant environment: Windows x86_64 (Git Bash tooling)
 Rust toolchain: rustc 1.98.1 (repository pin)
-Bun toolchain: local supplementary run used bun 1.4.2; authoritative pinned-Bun (1.3.14) and line-ending evidence is this PR's green CI job `Validate schemas and fixtures` on the record head -- it installs Bun 1.3.14, runs the full command set, and runs `Validate repository line endings` (introduced by PR #171, closing #170).
+Bun toolchain: local supplementary run used bun 1.4.2; authoritative pinned-Bun (1.3.14) and line-ending evidence for this RC is PR #172 workflow run `36885191797`, which tested head `49b6025` against base `abd02a5` (merge ref `a83f4da`) and ran the green `Validate schemas and fixtures` job, including `Validate repository line endings` (introduced by PR #171, closing #170).
 
 Production profile: cached (AIVTUBER_MODE=cached)
 Profile/config fingerprint: profile-v1-84c56f1d2e897e80
