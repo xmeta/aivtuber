@@ -37,6 +37,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Validate repository line endings
+        shell: bash
+        run: |
+          bad="$(git ls-files --eol | awk '$1 == "i/crlf" { print }')"
+          if [[ -n "$bad" ]]; then
+            echo "Tracked files contain CRLF in the Git index; repository text must be normalized to LF."
+            printf '%s\n' "$bad"
+            exit 1
+          fi
+
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.14
