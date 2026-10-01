@@ -30,6 +30,32 @@ Describe any boundary, schema, dependency, privilege, network, secret, replay, s
 
 Describe the main failure mode and how to revert or disable this change safely.
 
+## Expected / evidence
+
+For uncertain, optimization, policy, threshold, dependency, or other evidence-sensitive changes, fill this section before interpreting the result. Routine deterministic fixes/docs may write `Not applicable — <reason>`.
+
+**Mode:** Routine | Investigative | High-consequence/high-uncertainty | Not applicable
+
+**Expected:** What observable behavior should improve or change?
+
+**Baseline / evidence:** What is the current measured/reproduced state, and what evidence supports trying this direction?
+
+**Guardrails:** What must not regress?
+
+**Decision-changing evidence:** What result would make us narrow, redesign, defer, revert, or stop?
+
+## Result / decision
+
+For evidence-sensitive changes, complete this after verification/CI. Do not treat implementation completion itself as proof of improvement.
+
+**Actual:** What was observed?
+
+**Difference / interpretation:** How did the result differ from the expectation, including noise or missing evidence?
+
+**Decision:** Keep | Expand | Narrow | Revert | Defer | Stop | Not applicable
+
+If a confirmatory success criterion changed after results were visible, state the old criterion, new criterion, reason, and effective point; do not rewrite the original criterion as if it had always applied.
+
 ## Merge checklist
 
 - [ ] The branch is based on current `main`.
