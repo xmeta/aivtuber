@@ -286,7 +286,7 @@ If a confirmatory criterion changes after results are visible, preserve the orig
 A disconfirmed hypothesis may still be a successful engineering result when it prevents low-value implementation or causes a justified narrow/revert/defer/stop decision.
 
 Use the measurement/evaluation issues and +docs/metrics.adoc+ rather than inventing a private benchmark format.
-Use a durable experiment artifact only when the evidence must outlive the PR or requires a larger reproducible record; #153 owns that reusable format.
+Use a durable experiment artifact only when the evidence must outlive the PR or requires a larger reproducible record; follow link:experiments/README.adoc[Durable Experiment Records].
 
 == 12. Dependency changes
 

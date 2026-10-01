@@ -1,0 +1,134 @@
+= Durable Experiment Records
+:toc:
+:toclevels: 2
+
+Most aivtuber work should keep its evidence loop in the GitHub issue and pull request.
+Create a durable experiment record only when the evidence must outlive the PR, multiple changes or runs contribute to one decision, or reproduction requires a larger versioned record.
+
+This format reuses the Expected -> Actual -> Decision semantics from link:../agent-development.adoc[AI Agent Development Playbook].
+It is not a second decision protocol and is not required for routine deterministic fixes or ordinary documentation changes.
+
+== 1. When a durable record is useful
+
+Use one when:
+
+* a benchmark or quality experiment spans multiple PRs or runs;
+* a threshold or policy decision needs a stable dataset/config/result trail;
+* a reusable spike or prototype changes a long-lived architecture or dependency choice;
+* a confirmatory criterion needs to remain visible across later revisions;
+* the result is likely to be revisited after workloads, providers, or product targets change.
+
+Do not create one merely to make a small task look more rigorous.
+If the result cannot change a real decision, the experiment should usually be narrowed or skipped.
+
+== 2. Record template
+
+Copy the following into +docs/experiments/EXP-NNNN-short-name.adoc+ or keep equivalent fields in an already-canonical experiment document.
+
+[source,text]
+----
+Decision question:
+Context / baseline:
+Hypothesis / expected outcome:
+Guardrails:
+Decision-changing evidence:
+Cheapest informative test:
+Dataset/workload:
+Commit/base/head:
+Profile/config fingerprint:
+Seed:
+Asset/index/compiler version:
+Provider/model versions:
+Toolchain:
+Other relevant environment:
+
+Exploratory unknowns:
+Confirmatory success/guardrail criteria:
+Criterion version / recorded-at:
+
+Actual:
+Evidence artifacts:
+Noise / uncertainty / missing evidence:
+
+Expected-vs-actual difference:
+Likely explanation:
+
+Decision:
+Keep | Expand | Narrow | Revert | Defer | Stop
+
+Follow-up / owning issue:
+Revisit condition:
+----
+
+Not every field needs content when genuinely inapplicable, but do not omit the fields that determine whether the result is comparable or decision-changing.
+
+== 3. Exploratory versus confirmatory work
+
+Exploratory characterization asks what the system does or which variables matter.
+Confirmatory comparison tests a pre-stated criterion or decision rule.
+
+For confirmatory work, record important success and guardrail criteria before reading the result where practical.
+If new evidence requires a criterion change after results are visible:
+
+. preserve the old criterion;
+. record the new criterion and reason;
+. record when the new criterion becomes effective;
+. apply it to a future/new analysis unless the change is an explicit protocol deviation.
+
+Do not edit history so that a changed criterion appears to have existed before the result.
+== 4. Reproduction identity
+
+Use the repository's existing machine-readable benchmark identity when available rather than copying values by hand.
+A durable record should link to the result artifact and state enough compatibility metadata to know whether two results can be compared.
+
+For replay/benchmark work this commonly includes:
+
+* dataset/workload ID;
+* commit/base/head revision;
+* config/profile version or fingerprint;
+* deterministic seed;
+* asset/compiler/semantic-index versions;
+* Jev/Thinking/TTS provider/model versions when relevant;
+* toolchain identity;
+* represented stream duration.
+
+If a field is unmeasured or unavailable, say so.
+Do not convert missing cost, quality, or provider data into a measured zero.
+
+== 5. Valid decisions
+
+The experiment does not have to end in shipping the original plan.
+
+Keep:: Evidence supports the current scoped intervention.
+Expand:: Evidence supports a larger staged test or rollout.
+Narrow:: Only part of the intervention is supported or the original scope is unnecessarily large.
+Revert:: The active change violates a guardrail or has negative expected value relative to the prior state.
+Defer:: More valuable dependencies or evidence should precede the decision.
+Stop:: Current evidence no longer justifies continued work.
+
+A disconfirmed hypothesis can be a successful experiment when it prevents a low-value implementation or exposes a better decision.
+
+== 6. Repository example: native audio backend spike
+
+link:../audio-backend-spike.adoc[Native Audio Backend Evidence Spike] is an existing example of the same decision pattern, even though it predates this template.
+
+Decision question:: Whether the measured native Rust audio path had enough evidence to replace the existing process-player path as the default.
+Baseline / expected direction:: Process startup/handoff overhead was suspected to be material; a persistent native stream was expected to reduce backend-return proxy latency.
+Cheapest informative test:: A bounded synthetic local spike compared the process backend with the native path before changing the production default.
+Actual evidence:: The native persistent stream substantially improved the measured backend-return start/stop/handoff proxies, but the test did not establish acoustic first-audible latency, real deployment-device recovery, or all production media behavior.
+Decision:: Keep the process backend as the production default and retain the native backend as an opt-in experimental path rather than over-generalizing the proxy result.
+Decision-changing / revisit evidence:: Acoustic loopback, real asset/device behavior, or future measured bottleneck evidence can justify revisiting the default.
+
+This example demonstrates why an implementation or proxy win does not automatically imply that the broader product decision should be promoted.
+
+== 7. Relationship to other evidence
+
+* link:../metrics.adoc[Metrics and Evaluation] owns production/replay observation definitions.
+* link:../performance-goals.adoc[Performance Goals and Baselines] owns regression-budget and baseline methodology.
+* link:../product-objectives.adoc[Product Objectives and Guardrails] owns proxy/counter-metric interpretation.
+* #59 owns reaction-quality evaluation.
+* #64 owns side-effect-free shadow policy evaluation.
+* link:../current-constraint.adoc[Current Measured Constraint] owns tactical reprioritization evidence.
+
+A durable experiment record links these sources; it does not redefine them.
+After #154 lands, significant surprising results or incidents should also follow the repository AAR workflow.
