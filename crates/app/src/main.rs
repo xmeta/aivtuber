@@ -185,7 +185,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     app = app
         .with_adaptation(adaptation)
         .with_telemetry_retention(retention.telemetry_config())
-        .with_causal_trace_retention(retention.causal_trace_config());
+        .with_causal_trace_retention(retention.causal_trace_config())
+        // #167: operator diagnostics report the same profile/fingerprint the
+        // startup summary prints, never placeholders.
+        .with_composition_identity(
+            &startup_summary.profile,
+            &startup_summary.config_fingerprint,
+        );
     if let Some(generative) = generative {
         app = app.with_generation(generative);
     }
