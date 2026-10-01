@@ -1,0 +1,180 @@
+= Reaction-Quality Evaluation Dataset
+:toc:
+:toclevels: 2
+
+This document defines the versioned offline scenario dataset used to evaluate reaction quality without treating live private transcripts as test fixtures.
+
+The machine-readable contract is link:../schemas/reaction-quality-dataset.schema.json[reaction-quality-dataset.schema.json].
+The initial fixtures live under +examples/evaluation/reaction-quality/+.
+
+== 1. Purpose
+
+Runtime counters can show latency, reuse, generation, cancellation, and cost behavior, but they do not fully measure whether a reaction is contextually appropriate, repetitive, semantically correct, well-timed, or better left silent.
+
+The dataset provides reproducible inputs and evaluation context for those quality dimensions.
+It does not define one scalar "quality score" and it does not turn subjective labels into runtime authority.
+
+The product-level interpretation of these measures remains governed by link:product-objectives.adoc[Product Objectives and Guardrails].
+
+== 2. Dataset identity
+
+A comparable dataset partition records:
+
+* +schema_version+ -- machine-readable contract version;
+* +dataset_id+ and +dataset_version+ -- logical evaluation-set identity;
+* +partition+ and +partition_revision+ -- development or holdout boundary;
+* provenance and privacy metadata;
+* compatibility metadata for event schema, runtime profile, config, persona, and route policy;
+* versioned cases with stable +case_id+ and +leakage_group+.
+
+Do not compare or aggregate results silently when dataset/version or compatibility metadata changes.
+A change that can alter the interpretation of results requires a new dataset version or compatibility version rather than editing history in place.
+
+== 3. Development and holdout partitions
+
+Development::
+May be inspected repeatedly while designing routing, assets, prompts, thresholds, reviewer instructions, or evaluation tooling.
+Calibration and debugging belong here.
+
+Holdout::
+Used for confirmatory evaluation after a candidate/configuration has been selected using development evidence.
+Case-level holdout feedback must not be fed back into tuning while the same holdout remains active.
+
+The repository validator requires both partitions for each checked-in dataset identity and rejects duplicate +case_id+ values or +leakage_group+ values that cross the partition boundary.
+
+== 4. Leakage groups
+
+A +leakage_group+ is broader than exact-text equality.
+Cases that are paraphrases, templated variants, or share the same decisive semantic structure should use the same leakage group.
+
+Examples:
+
+* "which graphics setting caused the stutter?" and a paraphrase of that same causal hardware question belong to one group;
+* two small-donation thank-you variants that differ only in wording belong to one group;
+* a schedule question and a game-rule question do not automatically belong to one group merely because both are questions.
+
+Development/holdout leakage groups must be disjoint.
+When uncertain, prefer grouping variants together rather than claiming false independence.
+
+The validator enforces declared leakage-group separation; human review is still required when adding cases because semantic near-duplication cannot be detected reliably from string identity alone.
+== 5. Holdout exposure and rotation
+
+This is a public repository.
+A repository-visible holdout is therefore a *process holdout*, not a secret blind test.
+
+The checked-in holdout may support confirmatory discipline only while its case-level outcomes have not been used to tune the candidate under evaluation.
+Its +holdout_policy.case_level_feedback_used_for_tuning+ must remain +false+.
+
+Rotate the holdout before the next confirmatory claim when any of these occur:
+
+* case-level holdout feedback is used to tune routing, prompts, thresholds, assets, persona behavior, or evaluator instructions;
+* repeated manual inspection makes the cases effectively part of normal development;
+* near-duplicate leakage with the development set is discovered;
+* coverage no longer represents the decision being made;
+* a major compatibility boundary changes enough that old cases no longer test the same behavior.
+
+Rotation means introducing fresh leakage groups and incrementing the relevant dataset/partition identity.
+Do not "refresh" a holdout by merely paraphrasing the same leaked cases.
+
+For stronger claims that require genuinely blind evaluation, use a restricted external holdout artifact and record only its non-sensitive identity/provenance metadata in the repository result record.
+Do not commit private production conversations to create a blind set.
+
+== 6. Provenance and privacy
+
+Checked-in dataset documents allow only:
+
+* +synthetic+ scenarios; or
+* deliberately +public_curated+ sources with an explicit reference.
+
+The schema requires +contains_private_production_content=false+.
+Raw private viewer conversations, API secrets, account identifiers, or support-bundle payloads do not belong in this dataset.
+
+When a live incident or real interaction motivates a case, synthesize the minimum scenario structure needed to preserve the failure or quality question.
+Use link:after-action-review.adoc[After-Action Review and Regression Learning] for the incident evidence trail.
+
+== 7. Ambiguity and disagreement
+
+The dataset does not force every case into one "correct" response.
+
+Each case records:
+
+* quality dimensions relevant to the decision;
+* acceptable route classes when known;
+* known unacceptable traits;
+* an +ambiguity+ marker: +low+, +intentional+, or +unknown+.
+
++intentional+ means multiple reactions or routes may reasonably be acceptable.
++unknown+ means the project does not yet have enough evidence to claim a narrow reference.
+
+#151 owns the pairwise human-review result format.
+That result must preserve tie, both-unacceptable, and reviewer disagreement instead of converting disagreement into fabricated ground truth.
+
+== 8. Stage 2 categories
+
+The schema currently supports categories needed for routing/reaction-quality work:
+
+* +common_chat+
+* +question+
+* +donation+
+* +semantic_near_miss+
+* +repetition_pressure+
+* +fallback_generation+
+* +silence_or_nonverbal+
+* +interruption_context+
+* +game_event+
+* +system_health+
+
+These are evaluation strata, not a claim that every category needs equal frequency.
+Add a category only when it represents a materially different decision/quality boundary and can be supported by representative cases.
+Later Stage 3-5 naturalness/moderation features may extend the schema in a new compatible version rather than overloading these labels.
+== 9. Current checked-in coverage
+
+The initial +reaction-quality-stage2@2026-10-01.1+ dataset contains:
+
+* development: eight synthetic cases covering common chat, question, donation, semantic near-miss, repetition pressure, generative fallback, silence/non-verbal choice, and interruption context;
+* holdout: five synthetic cases covering question, donation, semantic near-miss, repetition pressure, and silence/non-verbal choice.
+
+Coverage is reported dynamically by:
+
+[source,shell]
+----
+bun run validate
+----
+
+The validator prints per-partition category counts and fails when the same dataset identity is missing a development/holdout partition, duplicates a case ID, changes compatibility metadata across partitions, or declares a leakage group in both partitions.
+
+Do not use these small seed counts as a claim of production representativeness.
+Expand or rotate the dataset based on decision-changing evidence, #70 representative workload work, and #59/#151 reviewer evidence.
+
+== 10. Compatibility with benchmark and review results
+
+Evaluation output should carry at least:
+
+* dataset ID/version and partition revision;
+* exact case IDs used;
+* route/config/persona compatibility identity;
+* candidate/base revision or policy identity;
+* reviewer/evaluator protocol version.
+
+This permits #58 benchmark evidence and #151 human quality evidence to be shown side by side without pretending they measure the same thing.
+
+A latency/cost/reuse improvement may be described as an overall product improvement only when the relevant quality guardrails do not regress.
+
+== 11. Updating the dataset
+
+For a development-only addition that does not alter existing case meaning:
+
+. add a fresh +case_id+ and leakage group;
+. update the partition revision or dataset version according to the comparison boundary used by the consuming tool;
+. run +bun run validate+;
+. document why the new case changes coverage.
+
+For holdout rotation:
+
+. do not reuse leaked leakage groups;
+. create fresh cases;
+. increment +rotation_generation+;
+. bump the partition/dataset identity used by confirmatory results;
+. retain old result artifacts so historical decisions remain interpretable.
+
+Never silently move a case from development into the active holdout and call it independent evidence.

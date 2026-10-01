@@ -40,6 +40,7 @@ The core design separates three time scales:
 * link:docs/assumptions.adoc[Assumption register]
 * link:docs/adr/template.adoc[Architecture decision record template]
 * link:docs/product-objectives.adoc[Product objectives and proxy guardrails]
+* link:docs/reaction-quality-evaluation.adoc[Reaction-quality evaluation dataset and holdout governance]
 * link:docs/current-constraint.adoc[Current measured constraint and reprioritization evidence]
 * link:docs/metrics.adoc[Metrics and evaluation]
 * link:docs/audio-backend-spike.adoc[Native audio backend evidence spike]
@@ -52,6 +53,7 @@ The core design separates three time scales:
 * link:schemas/event-envelope.schema.json[Event Envelope JSON Schema]
 * link:schemas/reflex-decision.schema.json[Reflex Decision JSON Schema]
 * link:schemas/security-regression-case.schema.json[Security Regression Case JSON Schema]
+* link:schemas/reaction-quality-dataset.schema.json[Reaction Quality Dataset JSON Schema]
 
 == Rust workspace
 

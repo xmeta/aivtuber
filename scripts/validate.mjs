@@ -7,6 +7,8 @@
 //   and their embedded input.event must conform to event-envelope.schema.json
 // - Performance Asset valid/starter fixtures must conform to performance-asset.schema.json
 // - examples/performance-assets/invalid/*.json must REJECT against that schema
+// - examples/evaluation/reaction-quality/*.json must conform to the reaction-quality dataset schema
+//   and development/holdout partitions must not share case IDs or leakage groups.
 //
 // Usage: bun scripts/validate.mjs  (or: node scripts/validate.mjs)
 
@@ -67,6 +69,7 @@ const envelope = validators["schemas/event-envelope.schema.json"];
 const reflex = validators["schemas/reflex-decision.schema.json"];
 const regression = validators["schemas/security-regression-case.schema.json"];
 const asset = validators["schemas/performance-asset.schema.json"];
+const reactionQuality = validators["schemas/reaction-quality-dataset.schema.json"];
 
 function report(ok, label, validator) {
   if (ok) {
@@ -143,6 +146,86 @@ for (const file of listJson("examples/performance-assets/invalid")) {
   } else {
     passes += 1;
     console.log(`ok        ${file} (rejected as intended)`);
+  }
+}
+
+const reactionDocuments = [];
+for (const file of listJson("examples/evaluation/reaction-quality")) {
+  if (!reactionQuality) break;
+  const doc = loadJson(join(root, file));
+  const valid = reactionQuality(doc);
+  report(valid, file, reactionQuality);
+  if (valid) reactionDocuments.push({ file, doc });
+}
+
+const reactionGroups = new Map();
+for (const { file, doc } of reactionDocuments) {
+  const identity = `${doc.dataset_id}@${doc.dataset_version}`;
+  let group = reactionGroups.get(identity);
+  if (!group) {
+    group = {
+      compatibility: JSON.stringify(doc.compatibility),
+      partitions: new Set(),
+      caseIds: new Map(),
+      leakageGroups: new Map(),
+      coverage: new Map(),
+    };
+    reactionGroups.set(identity, group);
+  }
+
+  if (group.compatibility !== JSON.stringify(doc.compatibility)) {
+    failures += 1;
+    console.error(`FAIL      ${identity}: incompatible compatibility metadata in ${file}`);
+  }
+
+  group.partitions.add(doc.partition);
+  if (!group.coverage.has(doc.partition)) group.coverage.set(doc.partition, new Map());
+
+  for (const testCase of doc.cases) {
+    const priorCase = group.caseIds.get(testCase.case_id);
+    if (priorCase) {
+      failures += 1;
+      console.error(
+        `FAIL      ${identity}: duplicate case_id ${testCase.case_id} in ${priorCase} and ${file}`,
+      );
+    } else {
+      group.caseIds.set(testCase.case_id, file);
+    }
+
+    const priorPartition = group.leakageGroups.get(testCase.leakage_group);
+    if (priorPartition && priorPartition !== doc.partition) {
+      failures += 1;
+      console.error(
+        `FAIL      ${identity}: leakage_group ${testCase.leakage_group} crosses ${priorPartition} and ${doc.partition}`,
+      );
+    } else {
+      group.leakageGroups.set(testCase.leakage_group, doc.partition);
+    }
+
+    const coverage = group.coverage.get(doc.partition);
+    coverage.set(testCase.category, (coverage.get(testCase.category) ?? 0) + 1);
+  }
+}
+
+for (const [identity, group] of reactionGroups) {
+  for (const requiredPartition of ["development", "holdout"]) {
+    if (!group.partitions.has(requiredPartition)) {
+      failures += 1;
+      console.error(`FAIL      ${identity}: missing ${requiredPartition} partition`);
+    }
+  }
+
+  if (group.partitions.has("development") && group.partitions.has("holdout")) {
+    passes += 1;
+    console.log(`ok        ${identity}: development/holdout partition boundary`);
+  }
+
+  for (const [partition, categories] of [...group.coverage.entries()].sort()) {
+    const summary = [...categories.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([category, count]) => `${category}=${count}`)
+      .join(", ");
+    console.log(`coverage  ${identity} ${partition}: ${summary}`);
   }
 }
 

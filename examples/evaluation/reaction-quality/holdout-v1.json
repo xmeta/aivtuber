@@ -1,0 +1,109 @@
+{
+  "schema_version": "1",
+  "dataset_id": "reaction-quality-stage2",
+  "dataset_version": "2026-10-01.1",
+  "partition": "holdout",
+  "partition_revision": 1,
+  "provenance": {
+    "source_kind": "synthetic",
+    "authored_at": "2026-10-01",
+    "contains_private_production_content": false,
+    "source_reference": null,
+    "notes": "Repository-visible process holdout. Rotate when case-level feedback is used for tuning."
+  },
+  "compatibility": {
+    "event_schema_version": "0.2.0",
+    "runtime_profile": "stage2-routing-eval-v1",
+    "config_version": "quality-eval-v1",
+    "persona_version": "neutral-demo-v1",
+    "route_policy_version": "stage2-routing-v1"
+  },
+  "holdout_policy": {
+    "visibility": "repository_visible",
+    "rotation_generation": 1,
+    "case_level_feedback_used_for_tuning": false,
+    "rotation_trigger": "Rotate before the next confirmatory claim after any case-level holdout feedback is used to tune routing, prompts, thresholds, assets, or evaluator instructions."
+  },
+  "cases": [
+    {
+      "case_id": "holdout-question-stream-schedule",
+      "leakage_group": "question-stream-schedule",
+      "category": "question",
+      "stimulus": {
+        "event_kind": "chat.message",
+        "synthetic_summary": "A viewer asks about the next planned stream time while unrelated game chatter is active.",
+        "context_tags": ["question", "schedule", "specific-answer"]
+      },
+      "quality_dimensions": ["appropriateness", "semantic_correctness", "generation_necessity"],
+      "reference": {
+        "ambiguity": "low",
+        "acceptable_route_classes": ["jev", "generated"],
+        "known_unacceptable_traits": ["semantic_mismatch", "stale_context"]
+      }
+    },
+    {
+      "case_id": "holdout-donation-milestone",
+      "leakage_group": "donation-milestone",
+      "category": "donation",
+      "stimulus": {
+        "event_kind": "chat.donation",
+        "synthetic_summary": "A donation message mentions reaching a community milestone during a busy segment.",
+        "context_tags": ["donation", "milestone", "busy-segment"]
+      },
+      "quality_dimensions": ["appropriateness", "timing", "personality_consistency"],
+      "reference": {
+        "ambiguity": "intentional",
+        "acceptable_route_classes": ["semantic_reuse", "jev", "generated"],
+        "known_unacceptable_traits": ["underreaction", "interrupts_higher_priority_action"]
+      }
+    },
+    {
+      "case_id": "holdout-near-miss-food-preference",
+      "leakage_group": "near-miss-food-preference",
+      "category": "semantic_near_miss",
+      "stimulus": {
+        "event_kind": "chat.message",
+        "synthetic_summary": "A viewer asks which of two foods the persona prefers; a cached generic food-positive reply is similar but does not express the requested comparison.",
+        "context_tags": ["near-miss", "preference", "comparison"]
+      },
+      "quality_dimensions": ["semantic_correctness", "appropriateness", "personality_consistency"],
+      "reference": {
+        "ambiguity": "low",
+        "acceptable_route_classes": ["jev", "generated"],
+        "known_unacceptable_traits": ["semantic_mismatch", "stale_context"]
+      }
+    },
+    {
+      "case_id": "holdout-repetition-celebration-loop",
+      "leakage_group": "repetition-celebration-loop",
+      "category": "repetition_pressure",
+      "stimulus": {
+        "event_kind": "game.event",
+        "synthetic_summary": "Several similar small victories have occurred recently and another one arrives before prior celebratory phrasing has cooled down.",
+        "context_tags": ["repetition", "game-event", "cooldown"]
+      },
+      "quality_dimensions": ["repetition", "appropriateness", "timing"],
+      "reference": {
+        "ambiguity": "intentional",
+        "acceptable_route_classes": ["deterministic", "semantic_reuse", "non_verbal"],
+        "known_unacceptable_traits": ["repetitive_response", "overreaction"]
+      }
+    },
+    {
+      "case_id": "holdout-silence-background-status",
+      "leakage_group": "silence-background-status",
+      "category": "silence_or_nonverbal",
+      "stimulus": {
+        "event_kind": "system.health",
+        "synthetic_summary": "A non-critical background health update arrives while the performer is engaged in a viewer-facing answer and no operator intervention is required.",
+        "context_tags": ["system-health", "non-critical", "concurrent-answer"]
+      },
+      "quality_dimensions": ["silence_choice", "interruption_quality", "appropriateness"],
+      "reference": {
+        "ambiguity": "low",
+        "acceptable_route_classes": ["silent", "non_verbal"],
+        "known_unacceptable_traits": ["interrupts_higher_priority_action", "overreaction"]
+      }
+    }
+  ]
+}
