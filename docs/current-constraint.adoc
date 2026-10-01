@@ -1,0 +1,113 @@
+= Current Measured Constraint
+:toc:
+:toclevels: 2
+
+This document records the current tactical, evidence-driven constraint for project prioritization.
+It does not replace link:roadmap.adoc[the strategic roadmap], milestone ordering, or hard security/privacy/operator guardrails.
+
+== 1. Current status
+
+Status:: Not yet established from representative live product evidence.
+As of:: 2026-10-01.
+
+The repository has strong deterministic/local evidence, but the remaining #97 provider/adapter conformance and 30-60 minute operator-observed live-smoke evidence has not been completed for the selected v0.1 production profile.
+
+Do not infer a product bottleneck merely from which subsystem has the most open issues or implementation activity.
+
+== 2. Evidence available now
+
+The 2026-10-01 #97 automated release-evidence pass on commit +039c151696b0ce8faedd27cf0b2d3e956f51222e+ reported green local/reproducible evidence for:
+
+* Rust fmt/clippy/test/build;
+* schema/security and Rust-schema parity validation;
+* deterministic replay benchmark;
+* a 5,000-event failure/boundedness soak with no reported lifetime-growth or configured-bound violations.
+
+The current +main+ contains subsequent documentation-only changes that do not establish new representative live runtime evidence.
+
+link:performance-goals.adoc[Performance Goals and Baselines] and the +benchmark-data+ history provide regression/trend evidence within their compatible workload/configuration series.
+They are useful candidate-constraint evidence, but a synthetic or hosted-runner benchmark is not automatically the primary product bottleneck.
+
+== 3. Evidence still missing for constraint selection
+
+Before naming the first representative product constraint, collect the remaining #97 evidence for the selected v0.1 profile:
+
+* VTube Studio adapter/live compatibility;
+* OBS adapter/live compatibility when enabled;
+* configured Jev/Thinking/TTS provider conformance as applicable;
+* 30-60 minute mixed live smoke;
+* operator stop/mute during non-idle/degraded behavior;
+* clean shutdown;
+* notable incidents and operator-observed friction;
+* retained-state/diagnostic observations from that session.
+
+Missing evidence means +not established+, not +no bottleneck+.
+
+== 4. Competing candidate constraints
+
+The following are candidates to evaluate, not declared priorities:
+
+* provider/adapter operability or reconnect/degradation behavior;
+* event-to-first-audio / first-visible tail latency under representative traffic;
+* reaction appropriateness, repetition, or other quality guardrails from #59;
+* generative/provider wait or queue latency;
+* resource/backpressure behavior under #70 representative workloads;
+* operator diagnostics and intervention friction;
+* external-call/cost pressure after quality guardrails are available.
+
+A candidate becomes the current measured constraint only when the evidence packet below supports it and the intervention is actionable.
+
+== 5. Constraint evidence packet
+
+When establishing or changing the current measured constraint, record at least:
+
+[source,text]
+----
+Constraint:
+Decision date:
+Evidence status: established | provisional | not established
+
+Dataset / workload / session:
+Config/profile fingerprint:
+Relevant commit/version:
+Observed magnitude:
+Competing candidate constraints:
+Why this constraint is actionable:
+Hard guardrails:
+Planned intervention / owning issue:
+Next measurement / review condition:
+----
+
+Quantitative claims should link to reproducible #58/#70/#71 evidence where available.
+Qualitative product-quality claims should link to the versioned #59 evaluation evidence or a privacy-safe incident/live-smoke record.
+
+== 6. Reprioritization rules
+
+Revisit the current constraint when one or more of these occur:
+
+* #97 completes representative provider/live-smoke evidence or exposes a release-blocking incident;
+* a major issue aimed at the current constraint closes;
+* a compatible #58 benchmark trend changes materially beyond expected variance;
+* #40 fault/soak evidence exposes a different limiting failure mode;
+* #59 quality evaluation identifies a dominant quality regression;
+* #71 shows a persistent operational SLO miss;
+* a provider/platform/dependency change invalidates a load-bearing assumption;
+* the current intervention reaches its target/plateau or shows low marginal value.
+
+Do not reorder priorities from one noisy run or an incompatible benchmark series.
+Separate the strategic roadmap from this tactical constraint statement: roadmap capability direction may remain valid even when the current measured bottleneck moves.
+
+Hard security, privacy, authorization, operator-control, stale-dispatch, and bounded-state constraints remain binding regardless of the selected bottleneck.
+
+== 7. Next decision point
+
+Complete the remaining #97 provider/adapter and local live-smoke evidence for the selected v0.1 production profile.
+
+After that evidence exists:
+
+. create or update the constraint evidence packet;
+. file focused P1 defects for release-blocking failures rather than hiding them in this document;
+. if no release blocker dominates, compare the strongest measured performance/quality/operability candidates;
+. declare one actionable current measured constraint, or explicitly retain +not established+ if the evidence is still insufficient.
+
+Issue #62 owns the longer-term after-action and evidence-driven reprioritization loop.
