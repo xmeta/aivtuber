@@ -258,7 +258,7 @@ Record notable incidents, even if recovered automatically.
 
 * [x] content ingress stops;
 * [x] pending/cancelled provider work cannot publish after shutdown begins;
-* [x] audio/avatar/OBS adapters terminate or disconnect predictably;
+* [ ] audio/avatar/OBS adapters terminate or disconnect predictably (RC-20261001 exercised only no-op/substitute adapters; real VTS/OBS termination awaits the live adapter smoke);
 * [x] operator does not need to kill an orphaned process under the normal path;
 * [x] expected local state is flushed/closed without persisting secrets.
 
@@ -428,7 +428,7 @@ Date/time: 2026-10-01 (UTC)
 Operator/tester: AI coding agent, authorized local development environment
 Host OS / relevant environment: Windows x86_64 (Git Bash tooling)
 Rust toolchain: rustc 1.98.1 (repository pin)
-Bun toolchain: bun 1.4.2 CLI executing the pinned suite; `bun run validate:toolchains` verified the repository pins (Rust 1.98.1, Bun 1.3.14)
+Bun toolchain: local supplementary run used bun 1.4.2; authoritative pinned-Bun (1.3.14) evidence is this PR's green CI job `Validate schemas and fixtures` (see Automated evidence below). `bun run validate:toolchains` verifies the declared pins (Rust 1.98.1, Bun 1.3.14) only, not the executing binary.
 
 Production profile: cached (AIVTUBER_MODE=cached)
 Profile/config fingerprint: profile-v1-84c56f1d2e897e80
@@ -454,12 +454,14 @@ cargo fmt --all -- --check                                          PASS (exit 0
 cargo clippy --locked --workspace --all-targets -- -D warnings     PASS (exit 0)
 cargo test --locked --workspace                                     PASS: 31 suites, 307 passed, 0 failed, 4 ignored
 cargo build --locked --workspace                                    PASS (exit 0)
-bun install --frozen-lockfile                                       PASS (no lockfile changes)
-bun run validate:toolchains                                         PASS (pins verified)
-bun run validate                                                    PASS: 132 passed, 0 failed
-bun run validate:rust-parity                                        PASS: 10 passed, 0 failed
-bun test                                                            PASS: 119 passed, 0 failed (2410 assertions)
+bun install --frozen-lockfile                                       PASS (local bun 1.4.2, supplementary)
+bun run validate:toolchains                                         PASS (checks declared pins only, not the executing bun)
+bun run validate                                                    PASS: 132 passed, 0 failed (local bun 1.4.2, supplementary)
+bun run validate:rust-parity                                        PASS: 10 passed, 0 failed (local bun 1.4.2, supplementary)
+bun test                                                            PASS: 119 passed, 0 failed (2410 assertions; local bun 1.4.2, supplementary)
 ----
+
+Authoritative pinned-Bun evidence: the repository CI job `Validate schemas and fixtures` installs the pinned Bun 1.3.14 via `oven-sh/setup-bun` and runs this exact command set (`bun install --frozen-lockfile`, `validate:toolchains`, `validate`, `validate:rust-parity`, `bun test`); it is green on this pull request's head. The local 1.4.2 numbers above are supplementary and are not claimed as pinned-toolchain evidence.
 
 The 4 ignored tests are the manual live-only probes: `vtube_studio_live_smoke`, `obs_live_smoke`, `live_jev_conformance`, `live_openai_responses_conformance`.
 
@@ -531,8 +533,8 @@ User/operator impact: attached bundles cannot attest the composition profile, co
 Workaround: record the startup `composition profile:` line alongside any attached bundle.
 Owning issue: #167.
 Target milestone: Stage 1.
-Release-blocking: no.
-Reason: found during this evidence pass and tracked as a focused P1 operability defect instead of being fixed inside #97.
+Release-blocking: yes -- section 4.8 requires runtime/build identity, which this release candidate cannot report while #167 is open.
+Reason: found during this evidence pass and tracked as a focused P1 operability defect instead of being fixed inside #97; remediation PR #169. This is the known blocker behind the NO-GO decision below.
 ----
 
 [source,text]
@@ -575,16 +577,16 @@ Reason: frozen lockfiles and clean worktree were enforced; only the fresh-clone 
 
 [source,text]
 ----
-Decision: DEFER
+Decision: NO-GO
 Decision date: 2026-10-01
 Commit SHA: 0dd1153
 Production profile: cached
 Operator/tester: AI coding agent, authorized local environment
 
-Automated evidence: PASS (all gates green; replay benchmark and failure/soak exit 0 with no hard-invariant failures).
-Local substitute smoke: PASS (bounded, degraded explicitly, operator-controlled, clean shutdown; no incidents).
+Automated evidence: PASS (all gates green; replay benchmark and failure/soak exit 0 with no hard-invariant failures; Bun suite authoritative under pinned 1.3.14 via CI, local 1.4.2 run supplementary).
+Local substitute smoke: PASS for the exercised cached/no-op path (bounded, degraded explicitly, operator-controlled, clean shutdown; no incidents). Avatar/OBS adapter termination was not exercised -- section 4.12 is qualified accordingly.
 Provider / adapter conformance: NOT EXECUTED (missing evidence).
 30-60 minute live smoke: NOT EXECUTED (missing evidence).
 
-Decision rationale: DEFER per section 8 -- evidence is incomplete rather than known-bad. No release-blocking defect was found in the executed classes; the one operability defect found (#167) is tracked separately. GO requires the live conformance and live-smoke evidence above.
+Decision rationale: NO-GO per section 8 -- a known release-blocking defect exists at this commit. Section 4.8 requires the operator to identify the selected profile *and* runtime/build identity; while #167 is open no operator-visible diagnostic reports build identity (support-bundle profile/fingerprint are placeholders and git/rustc provenance is always unknown; the startup line carries profile/fingerprint but no build revision). The unexecuted live conformance and 30-60 minute live smoke independently prevent GO. Remediation for the known blocker is PR #169; after it merges, re-run this checklist against a new release candidate and re-decide.
 ----
