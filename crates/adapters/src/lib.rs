@@ -22,6 +22,7 @@ pub use transport::*;
 pub use tts_http::*;
 pub use vts::*;
 
+use aivtuber_domain::{EngineError, EngineErrorKind};
 use serde_json::Value;
 use std::fmt;
 use std::sync::Arc;
@@ -128,6 +129,22 @@ impl ReconnectState {
     pub(crate) fn next_retry_at_ms(self) -> u64 {
         self.next_retry_at_ms
     }
+}
+
+/// Whether an adapter error invalidates the underlying websocket session.
+///
+/// Only transport-level failures (broken socket, unresponsive peer, rejected
+/// authentication) require tearing the session down and rebuilding it through
+/// reconnect backoff. Application-level rejections -- VTS `APIError` responses,
+/// OBS `requestStatus` failures, malformed payloads -- leave the session
+/// healthy: closing it there cycled a live VTS session through reconnect
+/// backoff on every request the loaded model rejected, observed as roughly
+/// 60-second session drops during the release live smoke.
+pub(crate) fn error_breaks_session(error: &EngineError) -> bool {
+    matches!(
+        error.kind,
+        EngineErrorKind::Timeout | EngineErrorKind::Unavailable | EngineErrorKind::Authentication
+    )
 }
 
 #[cfg(test)]

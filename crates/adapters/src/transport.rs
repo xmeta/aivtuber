@@ -68,9 +68,9 @@ pub struct TungsteniteConnector;
 
 impl WebSocketConnector for TungsteniteConnector {
     fn connect(&self, endpoint: &str) -> Result<Box<dyn WebSocketTransport>, TransportError> {
-        let request = endpoint.into_client_request().map_err(|error| {
-            TransportError::new(format!("invalid websocket endpoint: {error}"))
-        })?;
+        let request = endpoint
+            .into_client_request()
+            .map_err(|error| TransportError::new(format!("invalid websocket endpoint: {error}")))?;
         let uri = request.uri();
         let host = uri.host().ok_or_else(|| {
             TransportError::new(format!("websocket endpoint has no host: {endpoint}"))
@@ -90,9 +90,8 @@ impl WebSocketConnector for TungsteniteConnector {
             .ok_or_else(|| {
                 TransportError::new(format!("websocket endpoint did not resolve: {endpoint}"))
             })?;
-        let tcp = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT).map_err(|error| {
-            TransportError::new(format!("websocket connect failed: {error}"))
-        })?;
+        let tcp = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)
+            .map_err(|error| TransportError::new(format!("websocket connect failed: {error}")))?;
         tcp.set_read_timeout(Some(HANDSHAKE_TIMEOUT))
             .map_err(|error| {
                 TransportError::new(format!("failed to set handshake read timeout: {error}"))
@@ -110,9 +109,7 @@ impl WebSocketConnector for TungsteniteConnector {
 fn set_stream_timeouts(stream: &mut MaybeTlsStream<TcpStream>) -> Result<(), TransportError> {
     if let MaybeTlsStream::Plain(tcp) = stream {
         tcp.set_read_timeout(Some(READ_TIMEOUT))
-            .map_err(|error| {
-                TransportError::new(format!("failed to set read timeout: {error}"))
-            })?;
+            .map_err(|error| TransportError::new(format!("failed to set read timeout: {error}")))?;
         tcp.set_write_timeout(Some(WRITE_TIMEOUT))
             .map_err(|error| {
                 TransportError::new(format!("failed to set write timeout: {error}"))

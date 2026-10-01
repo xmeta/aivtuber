@@ -1,7 +1,7 @@
 use crate::{
-    AdapterClock, AdapterEvent, ReconnectPolicy, ReconnectState, SecretString,
-    TransportError, TungsteniteConnector, WebSocketConnector, WebSocketTransport,
-    default_clock, receive_text_with_deadline, REQUEST_TIMEOUT,
+    AdapterClock, AdapterEvent, REQUEST_TIMEOUT, ReconnectPolicy, ReconnectState, SecretString,
+    TransportError, TungsteniteConnector, WebSocketConnector, WebSocketTransport, default_clock,
+    error_breaks_session, receive_text_with_deadline,
 };
 use aivtuber_domain::{
     AuthorizedStreamAction, EngineError, EngineErrorKind, EngineFuture, StreamAdapter,
@@ -173,7 +173,10 @@ impl ObsWebSocketAdapter {
             Err(error) if error.is_timed_out() => return Ok(None),
             Err(error) => {
                 self.disconnect(&mut state);
-                return Err(engine_error(EngineErrorKind::Unavailable, error.to_string()));
+                return Err(engine_error(
+                    EngineErrorKind::Unavailable,
+                    error.to_string(),
+                ));
             }
         };
         let message: Value = serde_json::from_str(&text).map_err(|error| {
@@ -250,7 +253,10 @@ impl ObsWebSocketAdapter {
                 ));
             }
             Err(error) => {
-                return Err(engine_error(EngineErrorKind::Unavailable, error.to_string()));
+                return Err(engine_error(
+                    EngineErrorKind::Unavailable,
+                    error.to_string(),
+                ));
             }
         };
         let hello: Value = serde_json::from_str(&hello_text).map_err(|error| {
@@ -348,7 +354,10 @@ impl ObsWebSocketAdapter {
                     continue;
                 }
                 Err(error) => {
-                    return Err(engine_error(EngineErrorKind::Unavailable, error.to_string()));
+                    return Err(engine_error(
+                        EngineErrorKind::Unavailable,
+                        error.to_string(),
+                    ));
                 }
             };
             let message: Value = serde_json::from_str(&text).map_err(|error| {
@@ -389,10 +398,19 @@ impl ObsWebSocketAdapter {
                 Ok(value)
             }
             Err(error) => {
-                transport.close();
-                state
-                    .reconnect
-                    .failed(self.clock.now_ms(), self.config.reconnect);
+                if error_breaks_session(&error) {
+                    transport.close();
+                    state
+                        .reconnect
+                        .failed(self.clock.now_ms(), self.config.reconnect);
+                } else {
+                    // The peer answered with an application-level rejection,
+                    // for example an OBS requestStatus failure for a request
+                    // the session cannot serve; the session is still healthy,
+                    // so keep it for the next request instead of cycling
+                    // through reconnect backoff.
+                    state.transport = Some(transport);
+                }
                 Err(error)
             }
         }
@@ -452,7 +470,10 @@ fn request_with_transport(
                 continue;
             }
             Err(error) => {
-                return Err(engine_error(EngineErrorKind::Unavailable, error.to_string()));
+                return Err(engine_error(
+                    EngineErrorKind::Unavailable,
+                    error.to_string(),
+                ));
             }
         };
         let response: Value = serde_json::from_str(&text).map_err(|error| {
@@ -725,6 +746,18 @@ mod tests {
         .to_string()
     }
 
+    fn request_failed(id: &str, request_type: &str, code: u64, comment: &str) -> String {
+        json!({
+            "op": 7,
+            "d": {
+                "requestType": request_type,
+                "requestId": id,
+                "requestStatus": { "result": false, "code": code, "comment": comment }
+            }
+        })
+        .to_string()
+    }
+
     fn config() -> ObsWebSocketConfig {
         ObsWebSocketConfig {
             password: Some(SecretString::new("obs-password-secret")),
@@ -834,6 +867,50 @@ mod tests {
             .expect("scene set survives read stalls");
 
         assert_eq!(handle.sent().len(), 2);
+    }
+
+    #[test]
+    fn request_failure_status_keeps_the_session_usable() {
+        let challenge = "challenge";
+        let salt = "salt";
+        let script = Script::new(vec![
+            Ok(hello(Some((challenge, salt)))),
+            Ok(identified()),
+            Ok(request_failed(
+                "aivtuber-obs-1",
+                "SetCurrentProgramScene",
+                103,
+                "request type not found",
+            )),
+            Ok(request_ok("aivtuber-obs-2", "SetCurrentProgramScene")),
+        ]);
+        let handle = script.handle.clone();
+        let connector = Arc::new(ScriptedConnector::new(vec![Ok(script)]));
+        let clock = Arc::new(TestClock::new(0));
+        let adapter =
+            ObsWebSocketAdapter::with_dependencies(config(), connector, clock).expect("adapter");
+
+        let scene = || {
+            authorized_stream(
+                "scene.set",
+                BTreeMap::from([("scene_name".to_owned(), Value::String("Live".to_owned()))]),
+            )
+        };
+
+        let rejected = adapter.execute_sync(&scene());
+        assert_eq!(
+            rejected
+                .expect_err("failed request status is an application-level rejection")
+                .kind,
+            EngineErrorKind::Backend
+        );
+
+        adapter
+            .execute_sync(&scene())
+            .expect("session survives a failed request status");
+
+        assert_eq!(handle.closed_count(), 0, "session must stay open");
+        assert_eq!(handle.sent().len(), 3);
     }
 
     #[test]

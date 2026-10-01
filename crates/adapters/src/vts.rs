@@ -1,7 +1,7 @@
 use crate::{
-    AdapterClock, AdapterEvent, ReconnectPolicy, ReconnectState, SecretString,
-    TransportError, TungsteniteConnector, WebSocketConnector, WebSocketTransport,
-    default_clock, REQUEST_TIMEOUT,
+    AdapterClock, AdapterEvent, REQUEST_TIMEOUT, ReconnectPolicy, ReconnectState, SecretString,
+    TransportError, TungsteniteConnector, WebSocketConnector, WebSocketTransport, default_clock,
+    error_breaks_session,
 };
 use aivtuber_domain::{
     AuthorizedAvatarAction, AvatarAdapter, EngineError, EngineErrorKind, EngineFuture,
@@ -203,7 +203,10 @@ impl VTubeStudioAdapter {
             Err(error) if error.is_timed_out() => return Ok(None),
             Err(error) => {
                 self.disconnect(&mut state);
-                return Err(engine_error(EngineErrorKind::Unavailable, error.to_string()));
+                return Err(engine_error(
+                    EngineErrorKind::Unavailable,
+                    error.to_string(),
+                ));
             }
         };
         let message: Value = serde_json::from_str(&text).map_err(|error| {
@@ -360,10 +363,19 @@ impl VTubeStudioAdapter {
                 Ok(value)
             }
             Err(error) => {
-                transport.close();
-                state
-                    .reconnect
-                    .failed(self.clock.now_ms(), self.config.reconnect);
+                if error_breaks_session(&error) {
+                    transport.close();
+                    state
+                        .reconnect
+                        .failed(self.clock.now_ms(), self.config.reconnect);
+                } else {
+                    // The peer answered with an application-level rejection,
+                    // for example a VTS APIError for a hotkey the loaded model
+                    // does not define; the session is still healthy, so keep
+                    // it for the next request instead of cycling through
+                    // reconnect backoff.
+                    state.transport = Some(transport);
+                }
                 Err(error)
             }
         }
@@ -424,7 +436,10 @@ fn request_with_transport(
                 continue;
             }
             Err(error) => {
-                return Err(engine_error(EngineErrorKind::Unavailable, error.to_string()));
+                return Err(engine_error(
+                    EngineErrorKind::Unavailable,
+                    error.to_string(),
+                ));
             }
         };
         let response: Value = serde_json::from_str(&text).map_err(|error| {
@@ -658,6 +673,50 @@ mod tests {
             .expect("hotkey survives read stalls");
 
         assert_eq!(handle.sent().len(), 3);
+    }
+
+    #[test]
+    fn api_error_response_keeps_the_session_usable() {
+        let script = Script::new(vec![
+            Ok(auth_response("aivtuber-vts-1")),
+            Ok(ok_response("aivtuber-vts-2", "EventSubscriptionResponse")),
+            Ok(json!({
+                "apiName": VTS_API_NAME,
+                "apiVersion": VTS_API_VERSION,
+                "requestID": "aivtuber-vts-3",
+                "messageType": "APIError",
+                "data": {
+                    "errorID": 202,
+                    "message": "hotkey ID or name was not found in model"
+                }
+            })
+            .to_string()),
+            Ok(ok_response("aivtuber-vts-4", "HotkeyTriggerResponse")),
+        ]);
+        let handle = script.handle.clone();
+        let connector = Arc::new(ScriptedConnector::new(vec![Ok(script)]));
+        let clock = Arc::new(TestClock::new(0));
+        let adapter =
+            VTubeStudioAdapter::with_dependencies(config(), connector, clock).expect("adapter");
+
+        adapter
+            .subscribe_event("ModelLoadedEvent")
+            .expect("subscribe");
+
+        let rejected = adapter.execute_sync(&authorized_avatar("hotkey.trigger:smile_soft"));
+        assert_eq!(
+            rejected
+                .expect_err("missing hotkey is an application-level rejection")
+                .kind,
+            EngineErrorKind::Backend
+        );
+
+        adapter
+            .execute_sync(&authorized_avatar("hotkey.trigger:Wave"))
+            .expect("session survives an APIError response");
+
+        assert_eq!(handle.closed_count(), 0, "session must stay open");
+        assert_eq!(handle.sent().len(), 4);
     }
 
     #[test]
