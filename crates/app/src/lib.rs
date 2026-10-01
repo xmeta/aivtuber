@@ -9,6 +9,7 @@ mod raw_ingress;
 mod retention;
 mod routing;
 mod semantic;
+mod shadow;
 mod support_bundle;
 
 pub use budget::*;
@@ -20,6 +21,7 @@ pub use raw_ingress::*;
 pub use retention::*;
 pub use routing::*;
 pub use semantic::*;
+pub use shadow::*;
 pub use support_bundle::*;
 
 use aivtuber_adaptation::{AdaptationEngine, AppliedAdaptation, MemoryEntry, WorkingMemory};
@@ -2513,6 +2515,15 @@ mod tests {
     impl RoutePlanner for FixedAssetRoute {
         fn route(&mut self, _event: &EventEnvelope) -> Result<PlaybackRoute, AppError> {
             Ok(PlaybackRoute::AssetId(self.0.to_owned()))
+        }
+    }
+
+    #[derive(Clone)]
+    struct FixedShadowDecision(ShadowDecision);
+
+    impl ShadowPolicy for FixedShadowDecision {
+        fn evaluate(&mut self, _input: &ShadowPolicyInput<'_>) -> Result<ShadowDecision, AppError> {
+            Ok(self.0.clone())
         }
     }
 
@@ -5318,6 +5329,74 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("http")
+        );
+    }
+
+    #[test]
+    fn shadow_enabled_keeps_active_playback_and_adapter_commands_equivalent() {
+        let baseline_audio = RecordingAudio::default();
+        let baseline_avatar = RecordingAvatar::default();
+        let shadow_audio = RecordingAudio::default();
+        let shadow_avatar = RecordingAvatar::default();
+
+        let mut baseline = app(
+            FixedAssetRoute("reaction.agree.01"),
+            Box::new(baseline_audio.clone()),
+            Box::new(baseline_avatar.clone()),
+            Box::new(NoopStreamOutput),
+        );
+        let identity = |policy_id: &str| ShadowPolicyIdentity {
+            policy_id: policy_id.to_owned(),
+            policy_version: "v1".to_owned(),
+            config_fingerprint: format!("{policy_id}-cfg"),
+            runtime_profile: "cached".to_owned(),
+            dataset_id: Some("reaction-quality-stage2".to_owned()),
+        };
+        let shadow_router = ShadowingRoutePlanner::new(
+            FixedAssetRoute("reaction.agree.01"),
+            FixedShadowDecision(ShadowDecision::silent()),
+            identity("active"),
+            identity("shadow"),
+        )
+        .expect("shadow router");
+        let mut shadowed = app(
+            shadow_router,
+            Box::new(shadow_audio.clone()),
+            Box::new(shadow_avatar.clone()),
+            Box::new(NoopStreamOutput),
+        );
+
+        baseline.startup().expect("baseline startup");
+        shadowed.startup().expect("shadow startup");
+        let raw = serde_json::to_vec(&chat_event(1)).expect("event json");
+        let baseline_outcome = baseline
+            .process_content_bytes(&raw, 10, 7)
+            .expect("baseline content");
+        let shadow_outcome = shadowed
+            .process_content_bytes(&raw, 10, 7)
+            .expect("shadow content");
+
+        assert_eq!(shadow_outcome, baseline_outcome);
+        assert_eq!(
+            *shadow_audio.commands.lock().expect("shadow audio"),
+            *baseline_audio.commands.lock().expect("baseline audio")
+        );
+        assert_eq!(
+            *shadow_avatar.commands.lock().expect("shadow avatar"),
+            *baseline_avatar.commands.lock().expect("baseline avatar")
+        );
+
+        let comparison = shadowed
+            .router
+            .last_comparison()
+            .expect("shadow comparison");
+        assert_eq!(comparison.route_diverged, Some(true));
+        assert_eq!(comparison.active.route, ShadowRouteClass::SemanticReuse);
+        assert_eq!(
+            comparison.shadow,
+            ShadowEvaluationOutcome::Evaluated {
+                decision: ShadowDecision::silent()
+            }
         );
     }
 
