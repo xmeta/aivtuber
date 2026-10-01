@@ -9,11 +9,14 @@
 // - examples/performance-assets/invalid/*.json must REJECT against that schema
 // - examples/evaluation/reaction-quality/*.json must conform to the reaction-quality dataset schema
 //   and development/holdout partitions must not share case IDs or leakage groups.
+// - examples/evaluation/reaction-quality-review/*.json must conform to the pairwise-review schema
+//   and match the referenced dataset partition, case categories, quality dimensions, and seeded A/B mapping.
 //
 // Usage: bun scripts/validate.mjs  (or: node scripts/validate.mjs)
 
 import { Ajv2020 } from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
+import { createHash } from "node:crypto";
 import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { join, dirname } from "node:path";
@@ -70,6 +73,7 @@ const reflex = validators["schemas/reflex-decision.schema.json"];
 const regression = validators["schemas/security-regression-case.schema.json"];
 const asset = validators["schemas/performance-asset.schema.json"];
 const reactionQuality = validators["schemas/reaction-quality-dataset.schema.json"];
+const reactionQualityReview = validators["schemas/reaction-quality-review.schema.json"];
 
 function report(ok, label, validator) {
   if (ok) {
@@ -226,6 +230,131 @@ for (const [identity, group] of reactionGroups) {
       .map(([category, count]) => `${category}=${count}`)
       .join(", ");
     console.log(`coverage  ${identity} ${partition}: ${summary}`);
+  }
+}
+
+function reviewPresentation(caseId, seed) {
+  const firstByte = createHash("sha256").update(`${seed}:${caseId}`).digest()[0];
+  return firstByte % 2 === 0
+    ? { a_role: "base", b_role: "candidate" }
+    : { a_role: "candidate", b_role: "base" };
+}
+
+function sameReviewPresentation(actual, expected) {
+  return actual?.a_role === expected.a_role && actual?.b_role === expected.b_role;
+}
+
+const reactionReviewDocuments = [];
+for (const file of listJson("examples/evaluation/reaction-quality-review")) {
+  if (!reactionQualityReview) break;
+  const doc = loadJson(join(root, file));
+  const valid = reactionQualityReview(doc);
+  report(valid, file, reactionQualityReview);
+  if (valid) reactionReviewDocuments.push({ file, doc });
+}
+
+for (const { file, doc } of reactionReviewDocuments) {
+  const source = reactionDocuments.find(
+    ({ doc: candidate }) =>
+      candidate.dataset_id === doc.dataset.dataset_id &&
+      candidate.dataset_version === doc.dataset.dataset_version &&
+      candidate.partition === doc.dataset.partition &&
+      candidate.partition_revision === doc.dataset.partition_revision,
+  );
+
+  if (!source) {
+    failures += 1;
+    console.error(
+      `FAIL      ${file}: no matching reaction-quality dataset partition for review identity`,
+    );
+    continue;
+  }
+
+  let reviewValid = true;
+  if (JSON.stringify(source.doc.compatibility) !== JSON.stringify(doc.dataset.compatibility)) {
+    failures += 1;
+    reviewValid = false;
+    console.error(`FAIL      ${file}: review compatibility does not match source dataset`);
+  }
+
+  const sourceCases = new Map(source.doc.cases.map((testCase) => [testCase.case_id, testCase]));
+  const seenReviewCases = new Set();
+  for (const reviewCase of doc.cases) {
+    const sourceCase = sourceCases.get(reviewCase.case_id);
+    if (!sourceCase) {
+      failures += 1;
+      reviewValid = false;
+      console.error(`FAIL      ${file}: unknown review case_id ${reviewCase.case_id}`);
+      continue;
+    }
+
+    if (seenReviewCases.has(reviewCase.case_id)) {
+      failures += 1;
+      reviewValid = false;
+      console.error(`FAIL      ${file}: duplicate review case_id ${reviewCase.case_id}`);
+    }
+    seenReviewCases.add(reviewCase.case_id);
+
+    if (sourceCase.category !== reviewCase.category) {
+      failures += 1;
+      reviewValid = false;
+      console.error(
+        `FAIL      ${file}: category mismatch for ${reviewCase.case_id}: ${reviewCase.category} vs ${sourceCase.category}`,
+      );
+    }
+
+    const expected = reviewPresentation(reviewCase.case_id, doc.protocol.randomization_seed);
+    if (!sameReviewPresentation(reviewCase.presentation, expected)) {
+      failures += 1;
+      reviewValid = false;
+      console.error(
+        `FAIL      ${file}: seeded A/B presentation mismatch for ${reviewCase.case_id}`,
+      );
+    }
+
+    if (doc.status === "complete" && reviewCase.reviews.length === 0) {
+      failures += 1;
+      reviewValid = false;
+      console.error(`FAIL      ${file}: complete review has no labels for ${reviewCase.case_id}`);
+    }
+
+    const reviewers = new Set();
+    for (const review of reviewCase.reviews) {
+      if (reviewers.has(review.reviewer_id)) {
+        failures += 1;
+        reviewValid = false;
+        console.error(
+          `FAIL      ${file}: duplicate reviewer_id ${review.reviewer_id} for ${reviewCase.case_id}`,
+        );
+      }
+      reviewers.add(review.reviewer_id);
+
+      const dimensions = new Set();
+      for (const label of review.dimension_labels) {
+        if (dimensions.has(label.dimension)) {
+          failures += 1;
+          reviewValid = false;
+          console.error(
+            `FAIL      ${file}: duplicate dimension ${label.dimension} for ${reviewCase.case_id}/${review.reviewer_id}`,
+          );
+        }
+        dimensions.add(label.dimension);
+        if (!sourceCase.quality_dimensions.includes(label.dimension)) {
+          failures += 1;
+          reviewValid = false;
+          console.error(
+            `FAIL      ${file}: dimension ${label.dimension} is not declared by source case ${reviewCase.case_id}`,
+          );
+        }
+      }
+    }
+  }
+
+  if (reviewValid) {
+    passes += 1;
+    console.log(
+      `ok        ${file}: review identity, cases, dimensions, and seeded blinding match source dataset`,
+    );
   }
 }
 
