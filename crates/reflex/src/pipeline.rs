@@ -387,6 +387,31 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct LateSuccessTransport {
+        delay: Duration,
+        body: Vec<u8>,
+    }
+
+    impl HttpTransport for LateSuccessTransport {
+        fn post_json(
+            &self,
+            _endpoint: &str,
+            _bearer_token: &str,
+            _body: &[u8],
+            _timeout: Duration,
+        ) -> Result<HttpResponse, TransportError> {
+            // Deliberately violate the transport timeout contract: the adapter
+            // must still fence this successful response against its own
+            // absolute interaction deadline before accepting model evidence.
+            std::thread::sleep(self.delay);
+            Ok(HttpResponse {
+                status: 200,
+                body: self.body.clone(),
+            })
+        }
+    }
+
     fn metadata() -> RetrievalMetadata {
         RetrievalMetadata {
             retriever_version: "semantic-v1".to_owned(),
@@ -591,6 +616,43 @@ mod tests {
         assert_eq!(record.policy.fallback_reason, FallbackReason::Timeout);
         assert_eq!(record.executed.action, ExecutedAction::Fallback);
         assert!(record.evidence.model.returned_model.is_none());
+    }
+
+    #[test]
+    fn late_success_after_deadline_becomes_deterministic_timeout_fallback() {
+        let late_response = success(0.94, "asset.a");
+        let adapter = JevAdapter::with_transport(
+            JevAdapterConfig {
+                deadline: Duration::from_millis(5),
+                initial_backoff: Duration::ZERO,
+                ..JevAdapterConfig::default()
+            },
+            JevApiKey::new("test-key").expect("key"),
+            Arc::new(LateSuccessTransport {
+                delay: Duration::from_millis(20),
+                body: late_response.body,
+            }),
+        )
+        .expect("adapter");
+        let pipeline =
+            ReflexPipeline::new(index(), adapter, PolicyConfig::default(), 2).expect("pipeline");
+
+        let record = pipeline
+            .run(ReflexPipelineInput {
+                request: request(),
+                query_embedding: vec![1.0, 0.0],
+            })
+            .expect("late provider success becomes deterministic fallback");
+
+        assert_eq!(
+            record.evidence.normalized.fallback_reason,
+            FallbackReason::Timeout
+        );
+        assert_eq!(record.policy.fallback_reason, FallbackReason::Timeout);
+        assert_eq!(record.executed.action, ExecutedAction::Fallback);
+        assert!(record.evidence.model.returned_model.is_none());
+        assert!(record.evidence.selected_candidate_id.is_none());
+        assert!(record.evidence.model.answers.is_empty());
     }
 
     #[test]
