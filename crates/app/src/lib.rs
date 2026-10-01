@@ -692,6 +692,13 @@ where
     telemetry: TelemetryCollector,
     causal_traces: CausalTraceCollector,
     comparison_mode: ComparisonMode,
+    /// Live composition identity for operator diagnostics/support bundles
+    /// (#167): the active profile name (e.g. `cached`) and the #55
+    /// non-secret config fingerprint. Defaults to `unknown` until the
+    /// composition root wires the real values through
+    /// [`ProductionApp::with_composition_identity`].
+    composition_profile: String,
+    config_fingerprint: String,
 }
 
 impl<R> ProductionApp<R>
@@ -728,7 +735,24 @@ where
             telemetry: TelemetryCollector::default(),
             causal_traces: CausalTraceCollector::default(),
             comparison_mode: ComparisonMode::DeterministicOnly,
+            composition_profile: "unknown".to_owned(),
+            config_fingerprint: "unknown".to_owned(),
         }
+    }
+
+    /// Wire the live composition identity (#167) so `aivtuberctl diagnose`
+    /// reports the actual profile and config fingerprint instead of
+    /// placeholders. The daemon passes the same values it prints in its
+    /// startup `composition profile:` line.
+    pub fn with_composition_identity(mut self, profile: &str, config_fingerprint: &str) -> Self {
+        self.composition_profile = profile.to_owned();
+        self.config_fingerprint = config_fingerprint.to_owned();
+        self
+    }
+
+    /// Non-secret composition identity for diagnostics/support bundles.
+    pub fn composition_identity(&self) -> (&str, &str) {
+        (&self.composition_profile, &self.config_fingerprint)
     }
 
     pub fn with_generation(mut self, generative: GenerativeRuntime) -> Self {
@@ -5133,6 +5157,51 @@ mod tests {
         let serialized = serde_json::to_string(&response).expect("serialize");
         assert!(!serialized.contains("5a5a"));
         assert!(!serialized.contains("secret"));
+    }
+
+    #[test]
+    fn operator_diagnose_reports_live_composition_identity_not_placeholders() {
+        use operator_control_helpers::*;
+        let ingress = operator_ingress();
+        let build = || {
+            app(
+                FixedSilentRoute,
+                Box::new(RecordingAudio::default()),
+                Box::new(RecordingAvatar::default()),
+                Box::new(NoopStreamOutput),
+            )
+        };
+
+        // The daemon wires the same profile/fingerprint its startup summary
+        // prints (issue #167), so an attached bundle is attributable.
+        let mut wired = build().with_composition_identity("cached", "profile-v1-live-test");
+        wired.startup().expect("startup");
+        let diagnose = dispatched(request("diagnose", &SECRET));
+        let response = apply_dispatched_request(&ingress, &mut wired, &diagnose, 100);
+        assert!(response.ok, "diagnose must succeed: {}", response.detail);
+        // The bundle is consumed as the wire artifact an operator attaches to
+        // an incident, so assert on the serialized JSON identity section.
+        let bundle: serde_json::Value =
+            serde_json::from_str(&response.detail).expect("bundle json");
+        assert_eq!(bundle["identity"]["composition_profile"], "cached");
+        assert_eq!(
+            bundle["identity"]["config_fingerprint"],
+            "profile-v1-live-test"
+        );
+        assert_ne!(bundle["identity"]["composition_profile"], "daemon");
+        assert_ne!(bundle["identity"]["config_fingerprint"], "daemon-runtime");
+
+        // An app the composition root never wired reports the explicit
+        // `unknown` sentinel instead of the old placeholders.
+        let mut unwired = build();
+        unwired.startup().expect("startup");
+        let diagnose = dispatched(request("diagnose", &SECRET));
+        let response = apply_dispatched_request(&ingress, &mut unwired, &diagnose, 100);
+        assert!(response.ok, "diagnose must succeed: {}", response.detail);
+        let bundle: serde_json::Value =
+            serde_json::from_str(&response.detail).expect("bundle json");
+        assert_eq!(bundle["identity"]["composition_profile"], "unknown");
+        assert_eq!(bundle["identity"]["config_fingerprint"], "unknown");
     }
 
     #[test]

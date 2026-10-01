@@ -421,9 +421,12 @@ pub fn apply_dispatched_request<R: RoutePlanner>(
         // Issue #68: capture the bounded support bundle. Generation is
         // synchronous local work over already-retained state (no provider
         // calls, no scheduler mutation) so emergency control stays live.
+        // Identity reports the daemon's live composition (#167), not
+        // placeholders, so an attached bundle is comparable across incidents.
+        let (profile, fingerprint) = app.composition_identity();
         let builder = SupportBundleBuilder::new(
-            "daemon",
-            "daemon-runtime",
+            profile,
+            fingerprint,
             SupportBundleProvenance::from_build_env(),
         );
         let bundle: SupportBundle = builder.generate(app, wall_unix_millis());

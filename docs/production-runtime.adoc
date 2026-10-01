@@ -231,6 +231,18 @@ The bundle is a single versioned JSON document (`schema_version` in the manifest
 * bounded redacted audit summaries (category + decision codes only, newest last);
 * a manifest with generation timestamp and a SHA-256 of the bundle body for integrity comparison.
 
+Identity sources (issue #167):
+
+* `composition_profile` and `config_fingerprint` are the daemon's live values — the same ones printed by the startup `composition profile:` line — so an attached bundle is attributable to the composition that produced it. An app composed outside the daemon reports `unknown` for both.
+* `git_revision` and `rustc_version` are best-effort compile-time values read from `AIVTUBER_GIT_REVISION` and `AIVTUBER_RUSTC_VERSION` when the binary is built. The default build path does not set them, so they report `unknown` unless the builder provides them. To build an attributable release binary:
+
+[source,shell]
+----
+AIVTUBER_GIT_REVISION="$(git rev-parse HEAD)" \
+AIVTUBER_RUSTC_VERSION="$(rustc --version)" \
+cargo build --locked --release
+----
+
 Privacy model — the exporter is allowlist-based:
 
 * it serializes explicit typed fields only; it never dumps environment variables, configuration files, payloads, transcripts, durable memory, or viewer identifiers;
