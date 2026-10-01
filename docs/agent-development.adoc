@@ -259,16 +259,34 @@ Do not make live billable providers a normal CI prerequisite.
 
 == 11. Evidence-driven changes
 
-For optimization, routing, threshold, moderation, naturalness, and other uncertain behavior:
+Scale the procedure to uncertainty, reversibility, external impact, and failure cost.
 
-* state the hypothesis or expected direction;
-* identify baseline/evidence;
-* name guardrails that must not regress;
-* identify evidence that would change the decision;
-* prefer replay/shadow evaluation before risky activation;
-* record actual results rather than describing the implementation itself as proof of improvement.
+Routine::
+Obvious/reproduced bug fixes, small behavior-preserving refactors, test-only additions, and ordinary docs corrections normally use the existing issue/PR workflow. The PR experiment fields may say +Not applicable+ with a short reason.
+
+Investigative::
+Performance optimization, routing/threshold/cache-policy changes, dependency choices with meaningful uncertainty, and new quality heuristics should record the lightweight evidence loop in the PR.
+
+High-consequence / high-uncertainty::
+Security/trust, persistent memory/privacy, scheduler semantics, public network exposure, breaking schemas/protocols, destructive migrations, and evaluation-method changes need the lightweight evidence loop plus the durable decision/assumption/staging mechanics required by +docs/maintenance.adoc+.
+
+For applicable work, record:
+
+* the decision question or expected direction;
+* baseline/evidence;
+* guardrails that must not regress;
+* decision-changing evidence;
+* the cheapest reliable observation/replay/prototype that could change the decision before a large implementation;
+* actual results rather than describing the implementation itself as proof of improvement;
+* the difference between expected and actual, including benchmark noise or missing evidence;
+* the resulting decision: +Keep+, +Expand+, +Narrow+, +Revert+, +Defer+, or +Stop+.
+
+Prefer offline/replay evidence, then side-effect-free shadow evaluation where available, before risky activation.
+If a confirmatory criterion changes after results are visible, preserve the original criterion and record the new criterion, reason, and effective point. Do not silently redefine success after observing the outcome.
+A disconfirmed hypothesis may still be a successful engineering result when it prevents low-value implementation or causes a justified narrow/revert/defer/stop decision.
 
 Use the measurement/evaluation issues and +docs/metrics.adoc+ rather than inventing a private benchmark format.
+Use a durable experiment artifact only when the evidence must outlive the PR or requires a larger reproducible record; #153 owns that reusable format.
 
 == 12. Dependency changes
 
@@ -312,6 +330,7 @@ A complete PR should:
 * list exact local verification;
 * describe architecture/security impact;
 * describe failure mode and rollback;
+* for evidence-sensitive work, retain the expected/baseline/guardrail/decision-changing evidence and the actual/difference/decision result;
 * contain no accidental lockfile/generated/secret changes;
 * be rebased/merged with current +main+ as required by branch protection;
 * have required CI green on the final head.

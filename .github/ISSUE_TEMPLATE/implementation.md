@@ -40,7 +40,7 @@ assignees: ''
 
 ## Expected outcome / guardrails
 
-<!-- For uncertain/optimization work: expected direction and what must not regress. -->
+<!-- For uncertain/optimization work: expected direction, baseline if known, and what must not regress. Routine work may say Not applicable with a reason. -->
 
 ## Decision-changing evidence
 

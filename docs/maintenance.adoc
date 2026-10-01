@@ -112,6 +112,26 @@ Prefer one issue-sized, testable vertical slice per PR. Split work when independ
 
 
 
+== Hypothesis-driven change evidence
+
+Do not make every change carry the same process weight.
+
+Routine::
+Use the normal issue/PR/check workflow. Obvious reproduced bug fixes, behavior-preserving refactors, test-only changes, and ordinary docs corrections may mark the PR evidence loop +Not applicable+ with a short reason.
+
+Investigative::
+For optimizations, routing/cache/threshold policy, dependency choices with meaningful uncertainty, and quality heuristics, use the PR template to retain +Expected+, +Baseline / evidence+, +Guardrails+, +Decision-changing evidence+, then +Actual+, +Difference / interpretation+, and a decision.
+
+High-consequence / high-uncertainty::
+For security/trust, persistent memory/privacy, scheduler semantics, public network exposure, breaking schemas/protocols, destructive migration, and evaluation-method changes, use the same evidence loop and also apply the durable ADR/assumption/staging requirements below.
+
+The valid evidence-driven outcomes are +Keep+, +Expand+, +Narrow+, +Revert+, +Defer+, and +Stop+.
+Completing the implementation is not itself evidence that the product improved, and prior implementation effort is not a reason to keep a direction whose current evidence no longer supports it.
+
+For confirmatory comparisons, define important success/guardrail criteria before reading the result where practical. If genuinely new evidence requires changing a criterion after results are visible, preserve the old criterion and record the new criterion, reason, and effective point. Never silently rewrite the original criterion to make a result pass.
+
+Prefer the cheapest reliable decision-changing test before expensive implementation. For risky policy changes, prefer offline/replay and then side-effect-free shadow evidence before active public behavior when those modes are available.
+
 == Risk-proportional decisions and assumptions
 
 Routine low-risk changes do not require an ADR.
