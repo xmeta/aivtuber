@@ -7,7 +7,7 @@ Optimization must not reduce cost by making the performer feel slow, repetitive,
 
 Measure efficiency and perceptual quality together. Comparative claims about cache reuse, semantic retrieval, Jev, or generative fallback require measurements from the same replay dataset boundary; a single demo is not evidence of benefit.
 
-The product objective and hard guardrails are defined separately in link:product-objectives.adoc[Product Objectives and Guardrails]. A metric improvement is evidence about that metric, not by itself proof that the product objective improved.
+The product objective and hard guardrails are defined separately in link:product-objectives.adoc[Product Objectives and Guardrails]. The offline quality-scenario boundary is defined in link:reaction-quality-evaluation.adoc[Reaction-Quality Evaluation Dataset]. A metric improvement is evidence about that metric, not by itself proof that the product objective improved.
 
 == 2. Production observation model
 

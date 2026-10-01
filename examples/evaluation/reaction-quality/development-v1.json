@@ -1,0 +1,151 @@
+{
+  "schema_version": "1",
+  "dataset_id": "reaction-quality-stage2",
+  "dataset_version": "2026-10-01.1",
+  "partition": "development",
+  "partition_revision": 1,
+  "provenance": {
+    "source_kind": "synthetic",
+    "authored_at": "2026-10-01",
+    "contains_private_production_content": false,
+    "source_reference": null,
+    "notes": "Hand-authored synthetic Stage 2 routing/reaction scenarios."
+  },
+  "compatibility": {
+    "event_schema_version": "0.2.0",
+    "runtime_profile": "stage2-routing-eval-v1",
+    "config_version": "quality-eval-v1",
+    "persona_version": "neutral-demo-v1",
+    "route_policy_version": "stage2-routing-v1"
+  },
+  "cases": [
+    {
+      "case_id": "dev-common-chat-greeting",
+      "leakage_group": "greeting-first-arrival",
+      "category": "common_chat",
+      "stimulus": {
+        "event_kind": "chat.message",
+        "synthetic_summary": "A returning viewer says hello near the start of the stream after no prior acknowledgement.",
+        "context_tags": ["returning-viewer", "stream-start", "low-pressure"]
+      },
+      "quality_dimensions": ["appropriateness", "personality_consistency", "generation_necessity"],
+      "reference": {
+        "ambiguity": "intentional",
+        "acceptable_route_classes": ["deterministic", "semantic_reuse", "jev"],
+        "known_unacceptable_traits": ["overreaction", "unnecessary_generation"]
+      }
+    },
+    {
+      "case_id": "dev-question-current-game-rule",
+      "leakage_group": "question-current-game-rule",
+      "category": "question",
+      "stimulus": {
+        "event_kind": "chat.message",
+        "synthetic_summary": "A viewer asks a concrete question about a game rule that depends on the current game context.",
+        "context_tags": ["question", "game-context", "specific-answer"]
+      },
+      "quality_dimensions": ["appropriateness", "semantic_correctness", "generation_necessity"],
+      "reference": {
+        "ambiguity": "low",
+        "acceptable_route_classes": ["jev", "generated"],
+        "known_unacceptable_traits": ["semantic_mismatch", "stale_context"]
+      }
+    },
+    {
+      "case_id": "dev-donation-small-thanks",
+      "leakage_group": "donation-small-thanks",
+      "category": "donation",
+      "stimulus": {
+        "event_kind": "chat.donation",
+        "synthetic_summary": "A viewer sends a small donation with a brief supportive note during normal gameplay.",
+        "context_tags": ["donation", "supportive", "normal-flow"]
+      },
+      "quality_dimensions": ["appropriateness", "timing", "personality_consistency"],
+      "reference": {
+        "ambiguity": "intentional",
+        "acceptable_route_classes": ["deterministic", "semantic_reuse", "jev"],
+        "known_unacceptable_traits": ["underreaction", "overreaction"]
+      }
+    },
+    {
+      "case_id": "dev-near-miss-hardware-advice",
+      "leakage_group": "near-miss-hardware-advice",
+      "category": "semantic_near_miss",
+      "stimulus": {
+        "event_kind": "chat.message",
+        "synthetic_summary": "A viewer asks whether a specific hardware setting caused an issue; a cached generic troubleshooting reply is topically similar but does not answer the causal question.",
+        "context_tags": ["near-miss", "hardware", "causal-question"]
+      },
+      "quality_dimensions": ["semantic_correctness", "appropriateness", "generation_necessity"],
+      "reference": {
+        "ambiguity": "low",
+        "acceptable_route_classes": ["jev", "generated"],
+        "known_unacceptable_traits": ["semantic_mismatch", "stale_context"]
+      }
+    },
+    {
+      "case_id": "dev-repetition-third-greeting",
+      "leakage_group": "repetition-third-greeting",
+      "category": "repetition_pressure",
+      "stimulus": {
+        "event_kind": "chat.message",
+        "synthetic_summary": "Several viewers have been greeted with similar phrasing in the last minute; another greeting arrives.",
+        "context_tags": ["repetition", "recent-similar-output", "greeting"]
+      },
+      "quality_dimensions": ["repetition", "appropriateness", "personality_consistency"],
+      "reference": {
+        "ambiguity": "intentional",
+        "acceptable_route_classes": ["semantic_reuse", "jev", "generated", "non_verbal"],
+        "known_unacceptable_traits": ["repetitive_response", "overreaction"]
+      }
+    },
+    {
+      "case_id": "dev-fallback-novel-story-question",
+      "leakage_group": "novel-story-question",
+      "category": "fallback_generation",
+      "stimulus": {
+        "event_kind": "chat.message",
+        "synthetic_summary": "A viewer asks an open-ended question about a novel hypothetical situation not represented by cached assets.",
+        "context_tags": ["novel", "open-ended", "no-cache-match"]
+      },
+      "quality_dimensions": ["appropriateness", "semantic_correctness", "generation_necessity"],
+      "reference": {
+        "ambiguity": "low",
+        "acceptable_route_classes": ["generated"],
+        "known_unacceptable_traits": ["semantic_mismatch", "inappropriate_silence"]
+      }
+    },
+    {
+      "case_id": "dev-silence-low-signal-emote",
+      "leakage_group": "low-signal-single-emote",
+      "category": "silence_or_nonverbal",
+      "stimulus": {
+        "event_kind": "chat.message",
+        "synthetic_summary": "A single low-information celebratory emote appears while the performer is already reacting to a higher-value event.",
+        "context_tags": ["low-information", "concurrent-reaction", "emote"]
+      },
+      "quality_dimensions": ["silence_choice", "interruption_quality", "appropriateness"],
+      "reference": {
+        "ambiguity": "intentional",
+        "acceptable_route_classes": ["non_verbal", "silent"],
+        "known_unacceptable_traits": ["interrupts_higher_priority_action", "overreaction"]
+      }
+    },
+    {
+      "case_id": "dev-interruption-during-spoken-answer",
+      "leakage_group": "interruption-during-answer",
+      "category": "interruption_context",
+      "stimulus": {
+        "event_kind": "chat.donation",
+        "synthetic_summary": "A donation arrives while the performer is midway through a useful spoken answer to another viewer.",
+        "context_tags": ["concurrent-audio", "donation", "priority-choice"]
+      },
+      "quality_dimensions": ["interruption_quality", "timing", "appropriateness"],
+      "reference": {
+        "ambiguity": "intentional",
+        "acceptable_route_classes": ["deterministic", "jev", "non_verbal"],
+        "known_unacceptable_traits": ["interrupts_higher_priority_action", "underreaction"]
+      }
+    }
+  ]
+}

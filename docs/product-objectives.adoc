@@ -103,7 +103,7 @@ Important qualities that require offline or human-reviewed evidence include, as 
 * semantic near-miss and wrong-reuse severity;
 * whether silence, deferral, or non-verbal acknowledgement was preferable to a spoken response.
 
-Issue #59 owns the versioned reaction-quality evaluation path.
+link:reaction-quality-evaluation.adoc[Reaction-Quality Evaluation Dataset] defines the versioned scenario/holdout boundary owned by #59.
 Until reviewed evidence exists for a dimension, do not claim that a timing/cost/reuse improvement proves that dimension improved.
 
 == 6. Relationship to measurement
