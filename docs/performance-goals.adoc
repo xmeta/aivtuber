@@ -6,6 +6,8 @@
 
 Keep these apart; conflating them is how proxy metrics become targets.
 
+The canonical product objective and proxy-to-guardrail relationships live in link:product-objectives.adoc[Product Objectives and Guardrails]. This document owns measured baselines and performance-target methodology, not the definition of product quality.
+
 Regression budget::
 Used by CI (`benchmark-compare` + `benchmarks/budgets.json` and
 `benchmarks/budgets-resource-soak.json`) to answer:

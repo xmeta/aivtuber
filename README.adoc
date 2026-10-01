@@ -38,6 +38,7 @@ The core design separates three time scales:
 * link:docs/release-v0.1.adoc[v0.1 release checklist and evidence record]
 * link:docs/assumptions.adoc[Assumption register]
 * link:docs/adr/template.adoc[Architecture decision record template]
+* link:docs/product-objectives.adoc[Product objectives and proxy guardrails]
 * link:docs/metrics.adoc[Metrics and evaluation]
 * link:docs/audio-backend-spike.adoc[Native audio backend evidence spike]
 * link:docs/roadmap.adoc[Roadmap]
