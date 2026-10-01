@@ -1,0 +1,170 @@
+= Shadow Policy Evaluation
+:toc:
+
+This document defines the first side-effect-free shadow-policy boundary for #64.
+The implementation slice is #163. Bounded production orchestration is #164 and
+benchmark/reaction-quality export is #165.
+
+== 1. Purpose
+
+Shadow evaluation compares the active routing policy with a hypothetical policy
+without allowing the hypothetical decision to become executable output.
+
+The core invariant is:
+
+[source,text]
+----
+event
+  -> active RoutePlanner -> PlaybackRoute -> ProductionApp execution
+  -> shadow policy       -> ShadowDecision -> comparison record only
+----
+
+Only the active +PlaybackRoute+ is returned to +ProductionApp+.
+
+== 2. Authority boundary
+
++ShadowPolicy+ receives only +ShadowPolicyInput+:
+
+* a borrowed +EventEnvelope+;
+* the remaining routing budget observation.
+
+It does not receive:
+
+* scheduler handles;
+* audio/avatar/OBS outputs;
+* authenticated control capabilities;
+* +SecurityRuntime+ publication authority;
+* durable-memory/adaptation handles;
+* the generative runtime;
+* the production asset-store promotion path.
+
+A shadow policy returns +ShadowDecision+, not +PlaybackRoute+.
+Therefore the shadow result is not an executable production command.
+
+The initial repository implementation is +IntentShadowPolicy+.
+It is deterministic and provider-free. Live/offline provider orchestration is
+outside #163 and must remain disabled by default when introduced under #164.
+
+== 3. Active-route equivalence
+
++ShadowingRoutePlanner<Active, Shadow>+ wraps an existing active +RoutePlanner+.
+
+For each event it:
+
+. computes the active route;
+. snapshots only safe active decision metadata;
+. evaluates the non-executable shadow policy;
+. stores a +ShadowComparisonRecord+;
+. returns the original active route unchanged.
+
+Shadow failure is observational. A shadow planner error is converted to the
+typed +planner_error+ outcome and does not turn a successful active route into
+an application error.
+
++decision_record()+ and +template_fallback()+ continue to delegate to the active
+planner so existing production telemetry semantics do not switch to shadow
+state.
+
+== 4. Comparison record
+
++ShadowComparisonRecord+ is versioned by
++SHADOW_COMPARISON_SCHEMA_VERSION+ and records:
+
+* event ID and correlation ID;
+* active and shadow policy ID/version;
+* config fingerprint;
+* runtime profile;
+* optional evaluation dataset ID;
+* active +ShadowDecision+;
+* shadow evaluated/failed outcome;
+* route divergence;
+* safe-target divergence when comparable;
+* fallback divergence.
+
++ShadowDecision+ route classes are deliberately non-executable:
+
+* +silent+
+* +deterministic+
+* +semantic_reuse+
+* +template+
+* +generated+
+
+Safe target identity is retained only for validated internal asset/template
+identities. Intent values, generated text, template rendered text, prompts, and
+event payload text are not copied into the comparison record.
+
+Fallback reasons are a closed enum rather than an arbitrary string so a policy
+cannot accidentally place free-form payload/provider text in that field.
+
+== 5. Privacy properties
+
+The comparison record is designed for evidence, not transcript capture.
+
+The checked tests verify that:
+
+* public event text does not appear in serialized comparison evidence;
+* intent values do not appear in serialized shadow decisions;
+* shadow planner error detail is reduced to +planner_error+;
+* rendered template text is excluded while template ID/version remain;
+* generated routes retain no generated/prompt text.
+
+This does not authorize logging an arbitrary +EventEnvelope+ elsewhere.
+#165 must preserve the same evidence-minimization boundary when exporting
+aggregate or review-sampling data.
+
+== 6. Policy identity and compatibility
+
+Each side records a +ShadowPolicyIdentity+ containing:
+
+* +policy_id+
+* +policy_version+
+* +config_fingerprint+
+* +runtime_profile+
+* optional +dataset_id+
+
+Empty identity components are rejected before the wrapper can run. These fields
+define the minimum compatibility boundary needed to interpret a divergence
+without guessing which policy/config/profile produced it.
+
+#165 may add stronger compatibility grouping, but must not silently aggregate
+records across incompatible identities.
+
+== 7. Evidence and tests
+
+#163 is considered successful only when shadow enablement is observational.
+
+The test suite proves:
+
+* the wrapper returns the exact active +PlaybackRoute+ even when shadow differs;
+* a shadow error cannot fail an otherwise successful active route;
+* the same provider-free policy/input is deterministic;
+* private payload/error/rendered text is absent from serialized evidence;
+* invalid policy identity is rejected;
+* two +ProductionApp+ instances with identical active routing, event and RNG
+  seed produce identical playback outcomes and identical audio/avatar commands
+  when one instance has shadow evaluation enabled.
+
+The final equivalence test intentionally uses a divergent shadow decision.
+Equality therefore demonstrates that comparison itself does not change active
+execution.
+
+== 8. Follow-up boundaries
+
+#164 owns production-compatible orchestration:
+
+* deterministic sampling and event-kind filters;
+* concurrency bounds;
+* shadow deadlines;
+* cancellation and shutdown joining;
+* optional provider evaluation, disabled by default;
+* shadow-specific budget accounting.
+
+#165 owns evidence integration:
+
+* stable divergence-category aggregation;
+* #58 benchmark-compatible metrics;
+* #151 reaction-quality review sampling;
+* policy/config/profile compatibility grouping.
+
+Neither follow-up may automatically promote a shadow policy to active behavior.
+Promotion remains an explicit reviewed decision under the experiment workflow.
