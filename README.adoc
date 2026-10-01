@@ -54,6 +54,7 @@ The core design separates three time scales:
 * link:schemas/reflex-decision.schema.json[Reflex Decision JSON Schema]
 * link:schemas/security-regression-case.schema.json[Security Regression Case JSON Schema]
 * link:schemas/reaction-quality-dataset.schema.json[Reaction Quality Dataset JSON Schema]
+* link:schemas/reaction-quality-review.schema.json[Reaction Quality Review JSON Schema]
 
 == Rust workspace
 

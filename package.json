@@ -7,6 +7,7 @@
     "validate": "bun scripts/validate.mjs",
     "validate:rust-parity": "bun scripts/validate-rust-schema-parity.mjs",
     "validate:toolchains": "bun scripts/validate-toolchain-pins.mjs",
+    "quality:review": "bun scripts/reaction-quality-review.mjs",
     "test": "bun test"
   },
   "dependencies": {},

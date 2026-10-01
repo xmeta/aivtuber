@@ -106,8 +106,8 @@ Each case records:
 +intentional+ means multiple reactions or routes may reasonably be acceptable.
 +unknown+ means the project does not yet have enough evidence to claim a narrow reference.
 
-#151 owns the pairwise human-review result format.
-That result must preserve tie, both-unacceptable, and reviewer disagreement instead of converting disagreement into fabricated ground truth.
+The pairwise human-review contract is link:../schemas/reaction-quality-review.schema.json[reaction-quality-review.schema.json].
+It preserves tie, both-unacceptable, per-dimension labels, and reviewer disagreement instead of converting disagreement into fabricated ground truth.
 
 == 8. Stage 2 categories
 
@@ -146,7 +146,83 @@ The validator prints per-partition category counts and fails when the same datas
 Do not use these small seed counts as a claim of production representativeness.
 Expand or rotate the dataset based on decision-changing evidence, #70 representative workload work, and #59/#151 reviewer evidence.
 
-== 10. Compatibility with benchmark and review results
+== 10. Pairwise human review workflow
+
+Pairwise review is an offline evidence path. It never authorizes runtime control,
+memory writes, publication, or automatic policy promotion.
+The machine-readable result therefore fixes +authority_effect+ to
++offline_evidence_only+ and rejects private production content.
+
+A review session records the dataset partition and compatibility identity,
+base/candidate revision and policy identity, protocol version, a deterministic
+randomization seed, candidate reaction summaries, and the individual reviewer
+labels. Policy identity is retained in the session artifact for reproducibility
+but must not be exposed in the reviewer packet.
+
+Prepare a blinded packet with:
+
+[source,shell]
+----
+bun run quality:review -- prepare \
+  examples/evaluation/reaction-quality-review/development-example.json \
+  target/reaction-quality-review/reviewer-packet.json
+----
+
+The tool derives A/B order from +SHA-256(seed:case_id)+ and verifies the stored
+mapping before export. The reviewer packet contains candidate A/B reaction
+material but omits route class, base/candidate policy names, revisions, and the
+hidden A/B role mapping. If +output_reference+ is used for audio/video material,
+it must be an opaque reference that does not encode those identities.
+
+Reviewers choose one of:
+
+* +a_better+
+* +b_better+
+* +tie+
+* +both_unacceptable+
+
+Structured reason labels and per-dimension preferences remain separate from the
+overall choice. Reviewer identifiers are opaque identifiers used only to retain
+independent votes and disagreement; they are not reviewer-performance scores.
+
+After review collection, retain the individual votes in the session, set
++status=complete+, and record an explicit +quality_guardrail+ interpretation
+(+pass+, +regression+, or +inconclusive+) plus a Keep/Expand/Narrow/Revert/Defer/Stop
+decision. Generate the machine-readable and Markdown summaries with:
+
+[source,shell]
+----
+bun run quality:review -- report \
+  examples/evaluation/reaction-quality-review/development-example.json \
+  target/benchmark-gate/gate-report.json \
+  target/reaction-quality-review
+----
+
+The #58 gate report argument is optional. When present, its quantitative deltas
+are rendered beside the quality evidence, not merged into a scalar quality
+score. A +quality_guardrail=regression+ result marks the product-improvement
+claim as blocked even when latency, cost, reuse, or provider-call proxies
+improve. +inconclusive+ evidence likewise does not support an unqualified
+product-improvement claim.
+
+Human review is expected when the decision materially changes reaction/routing
+behavior and the affected quality is not established by deterministic tests,
+including major routing or threshold changes, cache/template/generative
+selection changes, release-candidate quality claims, confirmatory holdout use,
+or a proxy improvement that may trade off reaction quality.
+
+Human review is normally unnecessary for documentation-only changes,
+deterministic correctness fixes with a direct regression test, behavior-preserving
+refactors, and changes that do not affect reaction/routing quality. Security,
+authorization, boundedness, and other hard invariants remain deterministic
+gates rather than human-review questions.
+
+The repository validator checks checked-in review examples against both the
+review schema and their referenced #150 dataset partition. It rejects unknown
+cases, category or compatibility drift, undeclared quality dimensions, duplicate
+reviewers/dimensions, and A/B mappings that do not match the declared seed.
+
+== 11. Compatibility with benchmark and review results
 
 Evaluation output should carry at least:
 
@@ -160,7 +236,7 @@ This permits #58 benchmark evidence and #151 human quality evidence to be shown 
 
 A latency/cost/reuse improvement may be described as an overall product improvement only when the relevant quality guardrails do not regress.
 
-== 11. Updating the dataset
+== 12. Updating the dataset
 
 For a development-only addition that does not alter existing case meaning:
 

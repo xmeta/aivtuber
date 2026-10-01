@@ -191,7 +191,35 @@ machine-readable comparator. Baseline/target methodology, budget rationale,
 and the regression-investigation procedure live in
 link:performance-goals.adoc[Performance Goals and Baselines].
 
-== 7. Verification
+== 7. Reaction-quality companion evidence
+
+The #58 comparator remains the quantitative benchmark/invariant gate.
+When a routing, reuse, generation, or other reaction-policy change also needs
+human quality evidence, #151 provides a separate companion report rather than
+adding subjective labels to the benchmark metric contract.
+
+After +benchmark-compare+ writes +gate-report.json+, a completed pairwise review
+session can render both evidence classes together:
+
+[source,shell]
+----
+bun run quality:review -- report examples/evaluation/reaction-quality-review/development-example.json target/benchmark-gate/gate-report.json target/reaction-quality-review
+----
+
+The resulting +quality-summary.json+ retains the review dataset/protocol and
+base/candidate identities, individual-evidence aggregates, the explicit quality
+guardrail interpretation, and the selected Keep/Expand/Narrow/Revert/Defer/Stop
+decision. +quality-summary.md+ shows the same quality evidence beside the #58
+metric deltas.
+
+This composition is intentionally not a new scalar gate. Benchmark invariants
+remain hard deterministic constraints, quantitative proxy budgets retain their
+existing comparator semantics, and human quality labels remain offline evidence.
+If the review interpretation is +regression+, the companion report explicitly
+blocks an unqualified product-improvement claim even if the #58 proxy verdict
+passes. No report output can promote a candidate policy or mint runtime authority.
+
+== 8. Verification
 
 * telemetry unit tests (12): improvement/ok/warning/fail paths,
   higher-is-better, absolute thresholds on small denominators,
@@ -202,6 +230,10 @@ link:performance-goals.adoc[Performance Goals and Baselines].
   contract mapping — clean soaks map to zero invariants, growth findings map
   to non-zero invariants with details, results round-trip through the
   comparator's parser.
+* reaction-quality bun tests (8): deterministic A/B assignment, reviewer-packet
+  identity blinding, tamper rejection, base/candidate normalization,
+  disagreement preservation, both-unacceptable retention, quality-regression
+  claim blocking, and benchmark companion rendering.
 * recorder bun tests (18): run-id identity keying (attempt excluded), retry
   idempotence vs repeated-observation accumulation, stable ordering,
   compatibility-series splitting (dataset/config_version/seed/mode

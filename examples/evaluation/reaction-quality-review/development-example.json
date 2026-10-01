@@ -1,0 +1,213 @@
+{
+  "schema_version": "1",
+  "review_session_id": "stage2-routing-review-example",
+  "status": "complete",
+  "dataset": {
+    "dataset_id": "reaction-quality-stage2",
+    "dataset_version": "2026-10-01.1",
+    "partition": "development",
+    "partition_revision": 1,
+    "compatibility": {
+      "event_schema_version": "0.2.0",
+      "runtime_profile": "stage2-routing-eval-v1",
+      "config_version": "quality-eval-v1",
+      "persona_version": "neutral-demo-v1",
+      "route_policy_version": "stage2-routing-v1"
+    }
+  },
+  "comparison": {
+    "base": {
+      "revision": "base-example-sha",
+      "policy_id": "stage2-routing-base",
+      "config_version": "routing-config-v1"
+    },
+    "candidate": {
+      "revision": "candidate-example-sha",
+      "policy_id": "stage2-routing-candidate",
+      "config_version": "routing-config-v2"
+    }
+  },
+  "protocol": {
+    "protocol_id": "pairwise-reaction-quality",
+    "protocol_version": "1",
+    "instructions_version": "1",
+    "identity_hidden_during_review": true,
+    "randomization": "seeded_per_case",
+    "randomization_seed": 151
+  },
+  "authority_effect": "offline_evidence_only",
+  "contains_private_production_content": false,
+  "cases": [
+    {
+      "case_id": "dev-near-miss-hardware-advice",
+      "category": "semantic_near_miss",
+      "presentation": {
+        "a_role": "candidate",
+        "b_role": "base"
+      },
+      "candidates": {
+        "base": {
+          "route_class": "semantic_reuse",
+          "reaction_summary": "Reuses a generic troubleshooting response that is topically related but does not answer the causal hardware-setting question.",
+          "timing_note": "Fast cached response."
+        },
+        "candidate": {
+          "route_class": "jev",
+          "reaction_summary": "Avoids the near-miss cached asset and selects a route that can address the concrete causal question.",
+          "timing_note": "Slightly slower route decision, still within the offline comparison budget."
+        }
+      },
+      "reviews": [
+        {
+          "reviewer_id": "reviewer-01",
+          "choice": "a_better",
+          "reason_labels": ["appropriateness", "semantic_error"],
+          "dimension_labels": [
+            {
+              "dimension": "appropriateness",
+              "preference": "a_better"
+            },
+            {
+              "dimension": "semantic_correctness",
+              "preference": "a_better"
+            },
+            {
+              "dimension": "generation_necessity",
+              "preference": "tie"
+            }
+          ]
+        },
+        {
+          "reviewer_id": "reviewer-02",
+          "choice": "a_better",
+          "reason_labels": ["semantic_error"],
+          "dimension_labels": [
+            {
+              "dimension": "appropriateness",
+              "preference": "a_better"
+            },
+            {
+              "dimension": "semantic_correctness",
+              "preference": "a_better"
+            }
+          ],
+          "notes": "The base route is faster but answers the wrong question."
+        }
+      ]
+    },
+    {
+      "case_id": "dev-repetition-third-greeting",
+      "category": "repetition_pressure",
+      "presentation": {
+        "a_role": "base",
+        "b_role": "candidate"
+      },
+      "candidates": {
+        "base": {
+          "route_class": "semantic_reuse",
+          "reaction_summary": "Selects another spoken greeting closely matching several greetings used during the last minute."
+        },
+        "candidate": {
+          "route_class": "non_verbal",
+          "reaction_summary": "Uses a brief non-verbal acknowledgement instead of repeating nearly identical greeting language."
+        }
+      },
+      "reviews": [
+        {
+          "reviewer_id": "reviewer-01",
+          "choice": "b_better",
+          "reason_labels": ["appropriateness", "repetition"],
+          "dimension_labels": [
+            {
+              "dimension": "repetition",
+              "preference": "b_better"
+            },
+            {
+              "dimension": "appropriateness",
+              "preference": "b_better"
+            },
+            {
+              "dimension": "personality_consistency",
+              "preference": "tie"
+            }
+          ]
+        },
+        {
+          "reviewer_id": "reviewer-02",
+          "choice": "tie",
+          "reason_labels": ["repetition"],
+          "dimension_labels": [
+            {
+              "dimension": "repetition",
+              "preference": "b_better"
+            },
+            {
+              "dimension": "appropriateness",
+              "preference": "tie"
+            }
+          ],
+          "notes": "Both are acceptable, but the candidate is less repetitive."
+        }
+      ]
+    },
+    {
+      "case_id": "dev-silence-low-signal-emote",
+      "category": "silence_or_nonverbal",
+      "presentation": {
+        "a_role": "candidate",
+        "b_role": "base"
+      },
+      "candidates": {
+        "base": {
+          "route_class": "generated",
+          "reaction_summary": "Starts a spoken response to a low-information emote while a higher-value reaction is already active."
+        },
+        "candidate": {
+          "route_class": "silent",
+          "reaction_summary": "Leaves the low-information emote intentionally silent so the active higher-value reaction is not interrupted."
+        }
+      },
+      "reviews": [
+        {
+          "reviewer_id": "reviewer-01",
+          "choice": "a_better",
+          "reason_labels": ["appropriateness", "interruption_quality", "silence_choice"],
+          "dimension_labels": [
+            {
+              "dimension": "silence_choice",
+              "preference": "a_better"
+            },
+            {
+              "dimension": "interruption_quality",
+              "preference": "a_better"
+            },
+            {
+              "dimension": "appropriateness",
+              "preference": "a_better"
+            }
+          ]
+        },
+        {
+          "reviewer_id": "reviewer-02",
+          "choice": "a_better",
+          "reason_labels": ["interruption_quality", "silence_choice"],
+          "dimension_labels": [
+            {
+              "dimension": "silence_choice",
+              "preference": "a_better"
+            },
+            {
+              "dimension": "interruption_quality",
+              "preference": "a_better"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "interpretation": {
+    "quality_guardrail": "pass",
+    "rationale": "The candidate avoids a semantic near miss and unnecessary interruption while reducing repetition. One repetition-pressure case remains ambiguous, so the evidence is preserved rather than collapsed into a scalar score.",
+    "decision": "keep"
+  }
+}
