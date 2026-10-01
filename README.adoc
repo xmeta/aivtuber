@@ -30,6 +30,7 @@ The core design separates three time scales:
 * link:docs/memory-adaptation.adoc[Bounded memory and deterministic adaptation]
 * link:docs/production-runtime.adoc[Production Rust composition runtime (incl. composition profiles: cached / reflex / full, authenticated operator control endpoint, privacy-safe support bundle)]
 * link:docs/maintenance.adoc[Maintenance and merge policy]
+* link:docs/after-action-review.adoc[After-action review and incident-to-regression learning]
 * link:AGENTS.md[AI coding-agent development contract]
 * link:docs/agent-development.adoc[AI agent development playbook]
 * link:docs/reuse-first.adoc[Reuse-first library and reference-implementation matrix]

@@ -240,7 +240,7 @@ Privacy model — the exporter is allowlist-based:
 
 Bounds: causal timelines default to 8 and audit summaries to 32; both are clamped to 256 and configurable via `SupportBundleBuilder`. The correlation registry on `SecurityRuntime` retains at most 128 references.
 
-Reproducibility workflow (#62 AAR): attach the bundle JSON to the incident issue. The correlation ids inside map 1:1 to `trace_for_correlation` lookups in a replay; the identity section decides whether two bundles are comparable (same profile fingerprint and compiler version) before comparing counters.
+Reproducibility workflow: follow link:after-action-review.adoc[After-Action Review and Regression Learning]. Attach the bounded bundle JSON to the incident issue when appropriate. The correlation ids inside map 1:1 to `trace_for_correlation` lookups in a replay; the identity section decides whether two bundles are comparable (same profile fingerprint and compiler version) before comparing counters.
 
 Limitations: the bundle is evidence, not a replay artifact. It does not include private conversation text by design, so some behavioral incidents will need a separate minimal reproduction case.
 

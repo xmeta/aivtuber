@@ -1,0 +1,176 @@
+= After-Action Review and Regression Learning
+:toc:
+:toclevels: 2
+
+This document defines the lightweight after-action review (AAR) used for significant aivtuber incidents, escaped regressions, and materially surprising experiment results.
+
+The purpose is not blame or paperwork.
+The purpose is to convert important prediction errors and failures into durable tests, fixtures, assumptions, observability, or decisions so the project does not relearn the same lesson manually.
+
+== 1. When to use an AAR
+
+Use an AAR when the event can materially change future engineering or operational decisions, including:
+
+* security/authorization or privacy/memory incidents;
+* production crash, hang, or required-path freeze;
+* stale action escaping cancellation/reconnect/shutdown fencing;
+* operator stop/mute failure or loss of independent control;
+* unbounded or unexpected retained-state growth;
+* significant escaped/repeated regression;
+* major or persistent benchmark/quality regression;
+* external-provider failure exposing a missing or misleading degradation path;
+* an evidence-sensitive change whose actual result materially differs from the recorded expectation;
+* a load-bearing architecture or provider assumption invalidated by new evidence.
+
+Ordinary typos, routine low-impact bugs, and already-understood local failures do not need a separate AAR unless repetition shows that the systemic learning path is failing.
+
+== 2. AAR record
+
+The incident issue, experiment record, or other durable linked artifact may contain the AAR.
+Do not create a duplicate standalone document when an existing issue is the better canonical record.
+
+Use the following compact structure:
+
+[source,text]
+----
+AAR ID / issue:
+Date:
+Relevant commit/profile/config:
+Correlation/support-bundle reference:
+
+Expected:
+Observed:
+Impact:
+Detection:
+
+Decision/process quality:
+Using the information available before the event, what part of the prior decision was reasonable or unreasonable?
+
+Wrong/incomplete assumption:
+What model, workload, dependency, or expectation was false or incomplete?
+
+What worked:
+What guardrail, fallback, diagnostic, replay, or operator mechanism limited impact?
+
+What did not work:
+What safeguard, metric, fixture, ownership, assumption, or observation was missing/misleading?
+
+Systemic change:
+What durable test/fixture/schema/runtime safeguard/observability/doc/assumption/evaluation asset changes?
+
+Decision:
+Keep | Modify | Revert | Narrow | Defer | Stop | Redesign
+
+Follow-up / owning issues:
+Revisit condition:
+----
+
+A good outcome does not prove the prior decision process was good, and a bad outcome does not prove it was unreasonable.
+Review the decision using the information available at the time, then separately review execution and stochastic/external effects.
+
+== 3. Expected versus observed
+
+For an experiment or optimization, reuse the pre-result expectation recorded by the #60 workflow.
+Do not reconstruct a more convenient prediction after seeing the outcome.
+
+When the difference is material, classify likely contributors where useful:
+
+* wrong bottleneck or causal assumption;
+* intervention did not implement the intended mechanism;
+* workload/dataset was not representative;
+* external-provider/platform variance;
+* benchmark noise or incompatible comparison boundary;
+* interaction with another subsystem;
+* expected magnitude was too optimistic/pessimistic;
+* success/guardrail criterion was poorly chosen;
+* missing observability prevents attribution.
+
+These categories are project-learning aids, not developer performance scores.
+
+== 4. Incident to executable knowledge
+
+For a reproducible runtime incident or escaped regression, prefer:
+
+[source,text]
+----
+incident / escaped regression
+        |
+privacy-safe minimal reproduction
+        |
+deterministic replay trace or focused fixture
+        |
+regression test
+        |
+normal CI coverage
+----
+
+The regression should reproduce the invariant that failed, not preserve unnecessary private content or an entire production session.
+
+Examples include:
+
+* provider timeout + late TTS completion + operator stop -> no post-stop dispatch;
+* reconnect after failed adapter command -> no stale replay;
+* saturation + emergency control -> operator bypass remains responsive;
+* generated/cache churn -> retained state plateaus at configured bounds.
+
+If deterministic reproduction is not possible, record exactly what prevents it:
+
+* missing stage/correlation telemetry;
+* wall-clock/provider nondeterminism;
+* unavailable provider/version identity;
+* missing workload/event ordering;
+* private input that needs a synthetic equivalent;
+* hardware/device behavior not represented by current fixtures.
+
+That missing evidence becomes a focused observability/testability follow-up rather than a vague "could not reproduce".
+
+== 5. Evidence handling and privacy
+
+For live/runtime incidents, prefer the bounded support bundle described in link:production-runtime.adoc[Production Runtime] and the causal trace contract in link:causal-trace.adoc[Causal Trace].
+
+Support bundles and correlation IDs are evidence references, not authority.
+Do not attach secrets, API keys, raw private conversations, or unnecessary user content to an issue.
+
+When the incident requires content semantics to reproduce, minimize and synthesize a privacy-safe fixture that preserves the failing structure rather than copying production text.
+
+== 6. Where durable learning belongs
+
+Write the systemic lesson into the artifact that owns it:
+
+* replay/regression fixture for deterministic behavior;
+* security fixture/threat model for authority/trust failures;
+* JSON Schema/domain contract for wire-contract failures;
+* link:assumptions.adoc[Assumption Register] for invalidated provider/runtime expectations;
+* ADR for a substantial decision superseded by new evidence;
+* metrics/benchmark dataset or workload for measurement gaps;
+* link:product-objectives.adoc[Product Objectives and Guardrails] when a missing quality/guardrail was exposed;
+* adapter/runtime docs for stable operational constraints.
+
+Avoid maintaining a second generic "lessons learned" archive that can drift away from executable/canonical sources.
+
+== 7. Reprioritization connection
+
+An AAR may change the tactical current constraint, but not every incident should reorder the roadmap.
+
+Use link:current-constraint.adoc[Current Measured Constraint] when:
+
+* the incident exposes a repeatable, material limiting failure mode;
+* a significant prediction miss shows the previous bottleneck model was wrong;
+* persistent benchmark/quality/SLO evidence supports a different actionable constraint.
+
+A single noisy run or one-off recovered incident is not sufficient by itself.
+Hard security/privacy/operator/boundedness guardrails remain binding independent of the tactical bottleneck.
+
+== 8. Closure standard
+
+An AAR is complete when the project can answer:
+
+* what was expected and what actually happened;
+* impact and detection path;
+* which assumption/model was wrong or remains uncertain;
+* what worked and what failed;
+* what durable artifact changed, or why no change is justified;
+* what decision follows;
+* whether the result changes what the project should measure or prioritize next.
+
+A well-run investigation that concludes +Stop+, +Defer+, or +Narrow+ can be a successful outcome when it prevents low-value or unsafe continuation.
