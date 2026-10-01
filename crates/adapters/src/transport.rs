@@ -1,19 +1,47 @@
 use std::error::Error;
 use std::fmt;
-use std::net::TcpStream;
+use std::io::ErrorKind;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::time::{Duration, Instant};
+use tungstenite::client::IntoClientRequest;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
+
+/// Upper bound for a single request/response exchange with VTube Studio or OBS.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Per-read timeout while waiting for the next websocket message.
+const READ_TIMEOUT: Duration = Duration::from_millis(250);
+/// Upper bound for a single websocket write.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upper bound for the TCP connect attempt.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upper bound for the websocket handshake exchange.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportError {
     message: String,
+    timed_out: bool,
 }
 
 impl TransportError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            timed_out: false,
         }
+    }
+
+    /// Mark the error as a read timeout so callers can retry within their deadline.
+    pub fn timed_out(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            timed_out: true,
+        }
+    }
+
+    pub fn is_timed_out(&self) -> bool {
+        self.timed_out
     }
 }
 
@@ -40,9 +68,80 @@ pub struct TungsteniteConnector;
 
 impl WebSocketConnector for TungsteniteConnector {
     fn connect(&self, endpoint: &str) -> Result<Box<dyn WebSocketTransport>, TransportError> {
-        let (socket, _) = tungstenite::connect(endpoint)
-            .map_err(|error| TransportError::new(format!("websocket connect failed: {error}")))?;
+        let request = endpoint.into_client_request().map_err(|error| {
+            TransportError::new(format!("invalid websocket endpoint: {error}"))
+        })?;
+        let uri = request.uri();
+        let host = uri.host().ok_or_else(|| {
+            TransportError::new(format!("websocket endpoint has no host: {endpoint}"))
+        })?;
+        let default_port = if uri.scheme_str() == Some("wss") {
+            443
+        } else {
+            80
+        };
+        let port = uri.port_u16().unwrap_or(default_port);
+        let address = format!("{host}:{port}")
+            .to_socket_addrs()
+            .map_err(|error| {
+                TransportError::new(format!("websocket endpoint failed to resolve: {error}"))
+            })?
+            .next()
+            .ok_or_else(|| {
+                TransportError::new(format!("websocket endpoint did not resolve: {endpoint}"))
+            })?;
+        let tcp = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT).map_err(|error| {
+            TransportError::new(format!("websocket connect failed: {error}"))
+        })?;
+        tcp.set_read_timeout(Some(HANDSHAKE_TIMEOUT))
+            .map_err(|error| {
+                TransportError::new(format!("failed to set handshake read timeout: {error}"))
+            })?;
+        let (mut socket, _) = tungstenite::client(request, MaybeTlsStream::Plain(tcp))
+            .map_err(|error| TransportError::new(format!("websocket handshake failed: {error}")))?;
+        set_stream_timeouts(socket.get_mut())?;
         Ok(Box::new(TungsteniteTransport { socket }))
+    }
+}
+
+/// Bound every read and write on the established session so a silent peer can never
+/// block the caller forever. `receive_text` reports read timeouts via
+/// [`TransportError::is_timed_out`] so callers can retry within their own deadline.
+fn set_stream_timeouts(stream: &mut MaybeTlsStream<TcpStream>) -> Result<(), TransportError> {
+    if let MaybeTlsStream::Plain(tcp) = stream {
+        tcp.set_read_timeout(Some(READ_TIMEOUT))
+            .map_err(|error| {
+                TransportError::new(format!("failed to set read timeout: {error}"))
+            })?;
+        tcp.set_write_timeout(Some(WRITE_TIMEOUT))
+            .map_err(|error| {
+                TransportError::new(format!("failed to set write timeout: {error}"))
+            })?;
+    }
+    Ok(())
+}
+
+/// Receive the next text message, treating transient read timeouts as "nothing yet"
+/// until `timeout` has elapsed. The returned error has [`TransportError::is_timed_out`]
+/// set once the deadline passes, so callers can distinguish a silent peer from a
+/// hard failure.
+pub fn receive_text_with_deadline(
+    transport: &mut dyn WebSocketTransport,
+    timeout: Duration,
+) -> Result<String, TransportError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match transport.receive_text() {
+            Ok(text) => return Ok(text),
+            Err(error) if error.is_timed_out() => {
+                if Instant::now() >= deadline {
+                    return Err(TransportError::timed_out(
+                        "websocket peer did not send a message within the deadline",
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -59,9 +158,10 @@ impl WebSocketTransport for TungsteniteTransport {
 
     fn receive_text(&mut self) -> Result<String, TransportError> {
         loop {
-            let message = self.socket.read().map_err(|error| {
-                TransportError::new(format!("websocket receive failed: {error}"))
-            })?;
+            let message = self
+                .socket
+                .read()
+                .map_err(|error| classify_read_error(&error))?;
             match message {
                 Message::Text(text) => return Ok(text.to_string()),
                 Message::Binary(bytes) => {
@@ -85,6 +185,46 @@ impl WebSocketTransport for TungsteniteTransport {
 
     fn close(&mut self) {
         let _ = self.socket.close(None);
+    }
+}
+
+/// A read timeout is reported as a distinct error kind: the peer may simply have
+/// nothing to say yet, and partial frames stay buffered inside the websocket, so
+/// retrying the read is always safe.
+fn classify_read_error(error: &tungstenite::Error) -> TransportError {
+    if let tungstenite::Error::Io(io_error) = error {
+        if io_error.kind() == ErrorKind::TimedOut || io_error.kind() == ErrorKind::WouldBlock {
+            return TransportError::timed_out(format!("websocket receive timed out: {io_error}"));
+        }
+    }
+    TransportError::new(format!("websocket receive failed: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct StallingTransport;
+
+    impl WebSocketTransport for StallingTransport {
+        fn send_text(&mut self, _text: &str) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn receive_text(&mut self) -> Result<String, TransportError> {
+            Err(TransportError::timed_out("stall"))
+        }
+
+        fn close(&mut self) {}
+    }
+
+    #[test]
+    fn receive_text_with_deadline_enforces_the_deadline() {
+        let started = Instant::now();
+        let error = receive_text_with_deadline(&mut StallingTransport, Duration::from_millis(100))
+            .expect_err("a stalling peer must hit the deadline");
+        assert!(error.is_timed_out());
+        assert!(started.elapsed() < Duration::from_secs(30));
     }
 }
 

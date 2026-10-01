@@ -1,6 +1,7 @@
 use crate::{
     AdapterClock, AdapterEvent, ReconnectPolicy, ReconnectState, SecretString,
-    TungsteniteConnector, WebSocketConnector, WebSocketTransport, default_clock,
+    TransportError, TungsteniteConnector, WebSocketConnector, WebSocketTransport,
+    default_clock, receive_text_with_deadline, REQUEST_TIMEOUT,
 };
 use aivtuber_domain::{
     AuthorizedStreamAction, EngineError, EngineErrorKind, EngineFuture, StreamAdapter,
@@ -12,6 +13,7 @@ use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 #[derive(Clone)]
 pub struct ObsWebSocketConfig {
@@ -164,10 +166,16 @@ impl ObsWebSocketAdapter {
         }
         self.ensure_connected(&mut state)?;
 
-        let text = receive_from_state(&mut state).map_err(|message| {
-            self.disconnect(&mut state);
-            engine_error(EngineErrorKind::Unavailable, message)
-        })?;
+        let text = match receive_from_state(&mut state) {
+            Ok(text) => text,
+            // A read timeout only means no event is pending yet; the
+            // session stays healthy and the next poll picks the event up.
+            Err(error) if error.is_timed_out() => return Ok(None),
+            Err(error) => {
+                self.disconnect(&mut state);
+                return Err(engine_error(EngineErrorKind::Unavailable, error.to_string()));
+            }
+        };
         let message: Value = serde_json::from_str(&text).map_err(|error| {
             engine_error(
                 EngineErrorKind::Backend,
@@ -233,9 +241,18 @@ impl ObsWebSocketAdapter {
         state: &mut ObsState,
         transport: &mut dyn WebSocketTransport,
     ) -> Result<(), EngineError> {
-        let hello_text = transport
-            .receive_text()
-            .map_err(|error| engine_error(EngineErrorKind::Unavailable, error.to_string()))?;
+        let hello_text = match receive_text_with_deadline(transport, REQUEST_TIMEOUT) {
+            Ok(text) => text,
+            Err(error) if error.is_timed_out() => {
+                return Err(engine_error(
+                    EngineErrorKind::Timeout,
+                    "OBS websocket did not send Hello before the deadline",
+                ));
+            }
+            Err(error) => {
+                return Err(engine_error(EngineErrorKind::Unavailable, error.to_string()));
+            }
+        };
         let hello: Value = serde_json::from_str(&hello_text).map_err(|error| {
             engine_error(
                 EngineErrorKind::Backend,
@@ -317,10 +334,23 @@ impl ObsWebSocketAdapter {
             .send_text(&identify)
             .map_err(|error| engine_error(EngineErrorKind::Unavailable, error.to_string()))?;
 
-        for _ in 0..16 {
-            let text = transport
-                .receive_text()
-                .map_err(|error| engine_error(EngineErrorKind::Unavailable, error.to_string()))?;
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        loop {
+            let text = match transport.receive_text() {
+                Ok(text) => text,
+                Err(error) if error.is_timed_out() => {
+                    if Instant::now() >= deadline {
+                        return Err(engine_error(
+                            EngineErrorKind::Timeout,
+                            "OBS did not send Identified before the deadline",
+                        ));
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    return Err(engine_error(EngineErrorKind::Unavailable, error.to_string()));
+                }
+            };
             let message: Value = serde_json::from_str(&text).map_err(|error| {
                 engine_error(
                     EngineErrorKind::Backend,
@@ -337,11 +367,6 @@ impl ObsWebSocketAdapter {
                 _ => {}
             }
         }
-
-        Err(engine_error(
-            EngineErrorKind::Backend,
-            "OBS Identified response was not received",
-        ))
     }
 
     fn request(
@@ -413,10 +438,23 @@ fn request_with_transport(
         .send_text(&text)
         .map_err(|error| engine_error(EngineErrorKind::Unavailable, error.to_string()))?;
 
-    for _ in 0..64 {
-        let text = transport
-            .receive_text()
-            .map_err(|error| engine_error(EngineErrorKind::Unavailable, error.to_string()))?;
+    let deadline = Instant::now() + REQUEST_TIMEOUT;
+    loop {
+        let text = match transport.receive_text() {
+            Ok(text) => text,
+            Err(error) if error.is_timed_out() => {
+                if Instant::now() >= deadline {
+                    return Err(engine_error(
+                        EngineErrorKind::Timeout,
+                        "OBS did not respond before the request deadline",
+                    ));
+                }
+                continue;
+            }
+            Err(error) => {
+                return Err(engine_error(EngineErrorKind::Unavailable, error.to_string()));
+            }
+        };
         let response: Value = serde_json::from_str(&text).map_err(|error| {
             engine_error(
                 EngineErrorKind::Backend,
@@ -463,11 +501,6 @@ fn request_with_transport(
             .cloned()
             .unwrap_or(Value::Null));
     }
-
-    Err(engine_error(
-        EngineErrorKind::Backend,
-        "OBS response limit exceeded while waiting for request",
-    ))
 }
 fn map_stream_action(
     action: &AuthorizedStreamAction,
@@ -597,13 +630,12 @@ fn parse_obs_event(message: &Value) -> Option<AdapterEvent> {
     })
 }
 
-fn receive_from_state(state: &mut ObsState) -> Result<String, String> {
+fn receive_from_state(state: &mut ObsState) -> Result<String, TransportError> {
     state
         .transport
         .as_mut()
-        .ok_or_else(|| "OBS websocket is not connected".to_owned())?
+        .ok_or_else(|| TransportError::new("OBS websocket is not connected".to_owned()))?
         .receive_text()
-        .map_err(|error| error.to_string())
 }
 
 fn engine_error(kind: EngineErrorKind, message: impl Into<String>) -> EngineError {
@@ -775,6 +807,33 @@ mod tests {
                 .and_then(Value::as_str),
             Some("Live")
         );
+    }
+
+    #[test]
+    fn request_survives_read_timeouts_until_the_peer_responds() {
+        let challenge = "challenge";
+        let salt = "salt";
+        let script = Script::new(vec![
+            Ok(hello(Some((challenge, salt)))),
+            Ok(identified()),
+            Err(TransportError::timed_out("stream start stall")),
+            Err(TransportError::timed_out("stream start stall")),
+            Ok(request_ok("aivtuber-obs-1", "SetCurrentProgramScene")),
+        ]);
+        let handle = script.handle.clone();
+        let connector = Arc::new(ScriptedConnector::new(vec![Ok(script)]));
+        let clock = Arc::new(TestClock::new(0));
+        let adapter =
+            ObsWebSocketAdapter::with_dependencies(config(), connector, clock).expect("adapter");
+
+        adapter
+            .execute_sync(&authorized_stream(
+                "scene.set",
+                BTreeMap::from([("scene_name".to_owned(), Value::String("Live".to_owned()))]),
+            ))
+            .expect("scene set survives read stalls");
+
+        assert_eq!(handle.sent().len(), 2);
     }
 
     #[test]

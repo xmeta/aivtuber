@@ -1,6 +1,7 @@
 use crate::{
     AdapterClock, AdapterEvent, ReconnectPolicy, ReconnectState, SecretString,
-    TungsteniteConnector, WebSocketConnector, WebSocketTransport, default_clock,
+    TransportError, TungsteniteConnector, WebSocketConnector, WebSocketTransport,
+    default_clock, REQUEST_TIMEOUT,
 };
 use aivtuber_domain::{
     AuthorizedAvatarAction, AvatarAdapter, EngineError, EngineErrorKind, EngineFuture,
@@ -9,6 +10,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 const VTS_API_NAME: &str = "VTubeStudioPublicAPI";
 const VTS_API_VERSION: &str = "1.0";
@@ -194,10 +196,16 @@ impl VTubeStudioAdapter {
             return Ok(Some(event));
         }
         self.ensure_connected(&mut state)?;
-        let text = receive_from_state(&mut state).map_err(|error| {
-            self.disconnect(&mut state);
-            engine_error(EngineErrorKind::Unavailable, error)
-        })?;
+        let text = match receive_from_state(&mut state) {
+            Ok(text) => text,
+            // A read timeout only means no event is pending yet; the session
+            // stays healthy and the next poll picks the event up.
+            Err(error) if error.is_timed_out() => return Ok(None),
+            Err(error) => {
+                self.disconnect(&mut state);
+                return Err(engine_error(EngineErrorKind::Unavailable, error.to_string()));
+            }
+        };
         let message: Value = serde_json::from_str(&text).map_err(|error| {
             engine_error(
                 EngineErrorKind::Backend,
@@ -402,10 +410,23 @@ fn request_with_transport(
         .send_text(&text)
         .map_err(|error| engine_error(EngineErrorKind::Unavailable, error.to_string()))?;
 
-    for _ in 0..64 {
-        let text = transport
-            .receive_text()
-            .map_err(|error| engine_error(EngineErrorKind::Unavailable, error.to_string()))?;
+    let deadline = Instant::now() + REQUEST_TIMEOUT;
+    loop {
+        let text = match transport.receive_text() {
+            Ok(text) => text,
+            Err(error) if error.is_timed_out() => {
+                if Instant::now() >= deadline {
+                    return Err(engine_error(
+                        EngineErrorKind::Timeout,
+                        "VTube Studio did not respond before the request deadline",
+                    ));
+                }
+                continue;
+            }
+            Err(error) => {
+                return Err(engine_error(EngineErrorKind::Unavailable, error.to_string()));
+            }
+        };
         let response: Value = serde_json::from_str(&text).map_err(|error| {
             engine_error(
                 EngineErrorKind::Backend,
@@ -441,11 +462,6 @@ fn request_with_transport(
 
         return Ok(response.get("data").cloned().unwrap_or(Value::Null));
     }
-
-    Err(engine_error(
-        EngineErrorKind::Backend,
-        "VTube Studio response limit exceeded while waiting for request",
-    ))
 }
 
 fn parse_vts_event(message: &Value) -> Option<AdapterEvent> {
@@ -460,13 +476,12 @@ fn parse_vts_event(message: &Value) -> Option<AdapterEvent> {
     })
 }
 
-fn receive_from_state(state: &mut VtsState) -> Result<String, String> {
+fn receive_from_state(state: &mut VtsState) -> Result<String, TransportError> {
     state
         .transport
         .as_mut()
-        .ok_or_else(|| "VTube Studio is not connected".to_owned())?
+        .ok_or_else(|| TransportError::new("VTube Studio is not connected".to_owned()))?
         .receive_text()
-        .map_err(|error| error.to_string())
 }
 
 fn validate_vts_config(config: &VTubeStudioConfig) -> Result<(), EngineError> {
@@ -618,6 +633,31 @@ mod tests {
             sent[2].pointer("/data/hotkeyID").and_then(Value::as_str),
             Some("Wave")
         );
+    }
+
+    #[test]
+    fn request_survives_read_timeouts_until_the_peer_responds() {
+        let script = Script::new(vec![
+            Ok(auth_response("aivtuber-vts-1")),
+            Ok(ok_response("aivtuber-vts-2", "EventSubscriptionResponse")),
+            Err(TransportError::timed_out("model load stall")),
+            Err(TransportError::timed_out("model load stall")),
+            Ok(ok_response("aivtuber-vts-3", "HotkeyTriggerResponse")),
+        ]);
+        let handle = script.handle.clone();
+        let connector = Arc::new(ScriptedConnector::new(vec![Ok(script)]));
+        let clock = Arc::new(TestClock::new(0));
+        let adapter =
+            VTubeStudioAdapter::with_dependencies(config(), connector, clock).expect("adapter");
+
+        adapter
+            .subscribe_event("ModelLoadedEvent")
+            .expect("subscribe");
+        adapter
+            .execute_sync(&authorized_avatar("hotkey.trigger:Wave"))
+            .expect("hotkey survives read stalls");
+
+        assert_eq!(handle.sent().len(), 3);
     }
 
     #[test]
