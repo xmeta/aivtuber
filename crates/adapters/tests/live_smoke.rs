@@ -130,10 +130,7 @@ fn obs_live_smoke() {
             &authority,
             StreamAction {
                 action: "scene.set".to_owned(),
-                arguments: BTreeMap::from([(
-                    "scene_name".to_owned(),
-                    Value::String(scene),
-                )]),
+                arguments: BTreeMap::from([("scene_name".to_owned(), Value::String(scene))]),
             },
         )
         .expect("authorize OBS scene restore");
