@@ -189,10 +189,10 @@ impl WebSocketTransport for TungsteniteTransport {
 /// nothing to say yet, and partial frames stay buffered inside the websocket, so
 /// retrying the read is always safe.
 fn classify_read_error(error: &tungstenite::Error) -> TransportError {
-    if let tungstenite::Error::Io(io_error) = error {
-        if io_error.kind() == ErrorKind::TimedOut || io_error.kind() == ErrorKind::WouldBlock {
-            return TransportError::timed_out(format!("websocket receive timed out: {io_error}"));
-        }
+    if let tungstenite::Error::Io(io_error) = error
+        && (io_error.kind() == ErrorKind::TimedOut || io_error.kind() == ErrorKind::WouldBlock)
+    {
+        return TransportError::timed_out(format!("websocket receive timed out: {io_error}"));
     }
     TransportError::new(format!("websocket receive failed: {error}"))
 }
