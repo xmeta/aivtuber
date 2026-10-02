@@ -833,3 +833,85 @@ Live VTS/OBS adapter conformance: PASS (real VTube Studio + OBS websocket; 27 ca
 
 Decision rationale: GO per section 8. All #97 checklist criteria for the cached profile are met (36 ticked / 0 unticked), required CI/replay/failure-soak evidence is green, no unresolved release-blocking security/operator/boundedness issue remains, and the live smoke completed against real VTube Studio and OBS without unexplained release-blocking incidents -- the one defect it uncovered was fixed before this decision and verified live. A second, non-release-blocking robustness defect it surfaced (application-level APIError/requestStatus responses tearing down the healthy websocket session, #176) was root-caused, fixed, and regression-tested immediately after the smoke, then re-verified live with a short 3-minute run against the real providers (repeated APIError 202 dispatches, avatar_error=None at every checkpoint, zero reconnect-backoff signatures); it degraded dispatch availability explicitly and recovered, so no gate criterion was affected. Documented limitations: the live smoke exercised the cached profile only (semantic/template/reflex-Jev/generative routes are disabled in this profile and remain covered by the automated gate in sections 4.3-4.5); audible audio output is not machine-verifiable in this environment (audio_error=None proves dispatch, not audibility); VTS hotkey availability depends on the loaded model (APIError 202 observed for smile_soft); the live-smoke debug binary lacked compile-time revision stamping, so its diagnose bundle reports git/rustc provenance as unknown (the identity wiring itself was verified end-to-end on the stamped fresh-clone RC binary).
 ----
+
+== 13. Post-decision main stability -- replay-benchmark quiescence flake (#177) RESOLVED
+
+The GO decision in section 12 stands and is not reopened here. This section records a
+regression that appeared on `main` *after* that decision was taken, was release-gate
+relevant while it was open, and is now fixed.
+
+=== What happened
+
+After the RC-20261001-3 decision, `main` turned red in the `Replay benchmark smoke` step of
+`Rust checks` (run 36888486710 at `d5c181a`) with:
+
+[source,text]
+----
+replay-benchmark: full-generative replay did not record event bench-novel before the bounded worker quiesced
+##[error]Process completed with exit code 1.
+----
+
+The same commit had passed every `pull_request` run, so the failure was intermittent and
+load-dependent rather than a deterministic regression. This violates the section 4.9/4.10
+criterion ("replay/benchmark and failure/soak checks remain green") on `main` itself, which
+is the branch the release is cut from.
+
+=== Root cause and fix
+
+The bounded generation worker released `in_flight` before publishing its completion to the
+composition thread, so `pending == 0 && in_flight == 0` was observable while a finished
+result was still unpublished or undrained. The benchmark's wait loop consumed exactly that
+predicate and stopped waiting too early. A first fix attempt was rejected in review for
+leaving two further holes (the `pending -> in_flight` dequeue gap, and source ordering across
+separate relaxed atomics), both of which are now closed.
+
+`crates/app/src/lib.rs` now models outstanding generation work as a three-state machine
+(queued -> in-flight -> awaiting drain) where each transition claims the new state before
+releasing the old one, and the state counters plus the snapshot loads are `SeqCst` so
+claim-before-release is a real ordering guarantee rather than an accident of source order.
+`GenerationExecutionSnapshot::is_quiescent()` is the single predicate shared by operator
+health, retention, the support bundle, the benchmark wait, and tests. The benchmark wait
+additionally searches the whole observation log instead of only its tail, and waits on a
+wall-clock budget with yield-then-backoff polling.
+
+Fixed by #179 (`c23b8a7` + `977b19f`), merged as `60b99bc`. Tracked as #177; the follow-up
+gate-calibration finding is #180.
+
+=== Automated evidence at the merged commit
+
+[source,text]
+----
+Commit SHA: 60b99bc7ad52a24e0dd62437dd5653d0b4d5965a (merge of #179 into main)
+CI run: 37064699252 (push to main) -- Rust checks, Validate schemas and fixtures,
+        Schema and security fixtures, Supply chain (cargo-deny): all success
+cargo test --locked --workspace: 31 targets, 329 tests passed, 0 failed
+Replay benchmark smoke: 01-deterministic first_audio_p95_ms=112; 02-semantic 122;
+        03-semantic-jev 122; 04-full-generative 122 (llm_calls=1 tts_calls=1,
+        semantic_accept=2, fallbacks=0) -- identical to the section 12 values
+Failure / soak: green (report emitted, bounded counters, no limit exceeded)
+Flake resistance, local stress on the merged code:
+        12 sequential replay-benchmark runs: 0 failures
+        8-way concurrent x 4 rounds (32 runs): 0 failures
+        widened-window experiment: 50 ms pause inserted between the claim and the
+        release half of both handoffs in a production build, 6/6 runs pass
+----
+
+The widened-window experiment is the direct answer to the reviewer's reproduction: widening
+the handoff used to make the failure deterministic, and with overlapping handoffs it no
+longer does, at 250x the original window.
+
+=== Effect on the release criteria
+
+* Section 4.9 (replay benchmark) and 4.10 (failure/soak): green on `main` again.
+* No release-blocking defect is open on `main` at `60b99bc`.
+* The GO decision and its evidence in section 12 are unchanged.
+
+=== Known limitation carried forward
+
+The `Replay base vs head` gate in `.github/workflows/benchmark-gate.yml` failed once during
+this work on `routing.route_decision.p95_us` (`base=3.0, head=5.0`) and passed on a re-run of
+the identical commit pair (`base=3.0, head=3.0`). That metric is a 3-sample p95 in
+single-digit microseconds with a +-20/40% budget, so its noise band is wider than its budget;
+base and head sample distributions overlap (7-16 us vs 7-14 us over 12 local runs each).
+`benchmarks/budgets.json` was deliberately not relaxed to make a PR green; the calibration
+gap is tracked as #180.
