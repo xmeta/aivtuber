@@ -111,7 +111,11 @@ jobs:
               rm -rf "$out"
               "results/bin/replay-benchmark-${side}" \
                 examples/benchmarks/replay-comparison.json "$out"
-              cp "$out"/*-result.json "results/${side}/${run}-"
+              # Prefix each result with its run index so the comparator sees
+              # one distinct file per run per side.
+              for result in "$out"/*-result.json; do
+                cp "$result" "results/${side}/${run}-$(basename "$result")"
+              done
             done
           done
 
@@ -119,14 +123,20 @@ jobs:
       # Hard invariants gate strictly; noisy timing metrics are warning-only
       # until calibrated (benchmarks/budgets.json, issue #58). Repeated runs
       # per side are aggregated by median (metrics) / maximum (invariants),
-      # issue #180.
+      # issue #180. Only the deterministic mode is gated (its result carries
+      # the budgets in benchmarks/budgets.json); the other modes are uploaded
+      # as artifacts but never compared against each other.
       - name: Compare base vs head
         id: gate
         run: |
           set +e
           args=()
-          for result in results/base/*-result.json; do args+=(--base "$result"); done
-          for result in results/head/*-result.json; do args+=(--head "$result"); done
+          for result in results/base/*-01-deterministic-result.json; do
+            args+=(--base "$result")
+          done
+          for result in results/head/*-01-deterministic-result.json; do
+            args+=(--head "$result")
+          done
           cargo run --locked -p aivtuber-app --bin benchmark-compare -- \
             "${args[@]}" \
             benchmarks/budgets.json \
