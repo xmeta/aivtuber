@@ -166,6 +166,9 @@ impl Default for GenerationExecutionConfig {
 pub struct GenerationExecutionSnapshot {
     pub pending: usize,
     pub in_flight: usize,
+    /// Completed results that are published to (or still blocked on) the completion
+    /// mailbox and not yet taken by the composition thread. Issue #177.
+    pub awaiting_drain: usize,
     pub pending_high_water: usize,
     pub in_flight_high_water: usize,
     pub saturated: u64,
@@ -178,10 +181,25 @@ pub struct GenerationExecutionSnapshot {
     pub worker_running: bool,
 }
 
+impl GenerationExecutionSnapshot {
+    /// True when no generation work is outstanding anywhere: not queued, not
+    /// executing in the provider worker, and not published-but-undrained on the
+    /// completion mailbox (issue #177).
+    ///
+    /// Callers that treat `pending == 0 && in_flight == 0` as "everything is
+    /// accounted for" can still observe a false quiescent state, because the
+    /// worker publishes its completion after leaving in-flight. Drain-window
+    /// accounting lives here so every caller shares one sound predicate.
+    pub fn is_quiescent(&self) -> bool {
+        self.pending == 0 && self.in_flight == 0 && self.awaiting_drain == 0
+    }
+}
+
 #[derive(Debug, Default)]
 struct GenerationExecutionCounters {
     pending: AtomicUsize,
     in_flight: AtomicUsize,
+    awaiting_drain: AtomicUsize,
     pending_high_water: AtomicUsize,
     in_flight_high_water: AtomicUsize,
     saturated: AtomicU64,
@@ -199,6 +217,7 @@ impl GenerationExecutionCounters {
         GenerationExecutionSnapshot {
             pending: self.pending.load(Ordering::Relaxed),
             in_flight: self.in_flight.load(Ordering::Relaxed),
+            awaiting_drain: self.awaiting_drain.load(Ordering::Relaxed),
             pending_high_water: self.pending_high_water.load(Ordering::Relaxed),
             in_flight_high_water: self.in_flight_high_water.load(Ordering::Relaxed),
             saturated: self.saturated.load(Ordering::Relaxed),
@@ -211,6 +230,19 @@ impl GenerationExecutionCounters {
             worker_running: false,
         }
     }
+}
+
+/// Issue #177: move a finished provider job out of in-flight and into the
+/// drain window as one observable step.
+///
+/// The drain counter is claimed **before** in-flight is released, so a snapshot
+/// taken between the two atomic updates reports outstanding work (`in_flight`)
+/// rather than false quiescence. Releasing in-flight first would leave a window
+/// in which `pending == 0 && in_flight == 0` while the result is still
+/// unpublished, which is exactly the race that made the replay benchmark flake.
+fn note_ready_to_publish(counters: &GenerationExecutionCounters) {
+    counters.awaiting_drain.fetch_add(1, Ordering::Relaxed);
+    counters.in_flight.fetch_sub(1, Ordering::Relaxed);
 }
 
 fn update_high_water(counter: &AtomicUsize, value: usize) {
@@ -349,7 +381,7 @@ impl GenerationExecutor {
 
                     let provider_latency_us = elapsed_us(provider_started);
                     let completed_at = Instant::now();
-                    worker_counters.in_flight.fetch_sub(1, Ordering::Relaxed);
+                    note_ready_to_publish(&worker_counters);
                     let completion = GenerationCompletion {
                         generation_id: work.generation_id,
                         request: work.request,
@@ -365,10 +397,19 @@ impl GenerationExecutor {
                         context: work.context,
                     };
 
+                    // Issue #177: the drain window is claimed by
+                    // `note_ready_to_publish` above, before the completion is handed
+                    // to the composition thread.
+                    //
                     // Blocking here is safe: only the provider worker can block, while
                     // the composition/control thread remains responsive. The bounded
                     // mailbox prevents unbounded completed-result retention.
                     if completion_tx.send(completion).is_err() {
+                        // The mailbox receiver is gone, so nothing will ever drain
+                        // this result; release the drain window before stopping.
+                        worker_counters
+                            .awaiting_drain
+                            .fetch_sub(1, Ordering::Relaxed);
                         break;
                     }
                     worker_counters.completed.fetch_add(1, Ordering::Relaxed);
@@ -413,7 +454,13 @@ impl GenerationExecutor {
     }
 
     fn try_recv(&self) -> Option<GenerationCompletion> {
-        self.completion_rx.try_recv().ok()
+        let completion = self.completion_rx.try_recv().ok()?;
+        // The composition thread owns the completion from here on. The remaining
+        // stale/cancelled, failure, and commit paths all record their observation
+        // within the same tick, so draining here is enough for quiescence to mean
+        // "no undrained result" (issue #177).
+        self.counters.awaiting_drain.fetch_sub(1, Ordering::Relaxed);
+        Some(completion)
     }
 
     fn snapshot(&self) -> GenerationExecutionSnapshot {
@@ -3221,7 +3268,7 @@ mod tests {
             let snapshot = app
                 .generation_execution_snapshot()
                 .expect("generation execution snapshot");
-            if active.is_none() && snapshot.pending == 0 && snapshot.in_flight == 0 {
+            if active.is_none() && snapshot.is_quiescent() {
                 app.tick(now_ms);
                 return;
             }
@@ -4111,6 +4158,136 @@ mod tests {
         assert_eq!(settled.pending, 0);
         assert_eq!(settled.in_flight, 0);
         assert!(settled.cancelled_or_stale >= 1);
+    }
+
+    /// Issue #177: an app with one generation parked inside the provider, so the
+    /// test controls exactly when the worker publishes and the composition
+    /// thread drains the completion.
+    fn app_with_parked_generation() -> (ProductionApp<FixedGenerateRoute>, Arc<BlockingGate>) {
+        let gate = Arc::new(BlockingGate::default());
+        let runtime = generative_runtime(
+            BlockingThinking {
+                gate: Arc::clone(&gate),
+                reply: "published but undrained".to_owned(),
+            },
+            MockTts::default(),
+        );
+        let mut app = app(
+            FixedGenerateRoute {
+                reply_context: ReflexContext::default(),
+                fallback_variant_group: Some("reaction.agree".to_owned()),
+            },
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        )
+        .with_generation(runtime);
+        app.startup().expect("startup");
+
+        let raw = serde_json::to_vec(&chat_event(201)).expect("event json");
+        app.process_content_bytes(&raw, 0, 201)
+            .expect("generation submission");
+        gate.wait_until_entered();
+        (app, gate)
+    }
+
+    fn wait_until<R>(
+        app: &ProductionApp<R>,
+        condition: impl Fn(GenerationExecutionSnapshot) -> bool,
+    ) where
+        R: RoutePlanner,
+    {
+        for _ in 0..10_000 {
+            if app.generation_execution_snapshot().is_some_and(&condition) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!(
+            "generation condition never held: {:?}",
+            app.generation_execution_snapshot()
+        );
+    }
+
+    #[test]
+    fn publish_accounting_moves_work_from_in_flight_into_the_drain_window() {
+        // Issue #177: the worker must claim the drain window before it releases
+        // in-flight, otherwise `pending == 0 && in_flight == 0` is observable
+        // while the completed result is still unpublished. This is the exact
+        // state the replay benchmark mistook for quiescence.
+        let counters = GenerationExecutionCounters::default();
+        counters.in_flight.store(1, Ordering::Relaxed);
+        let config = GenerationExecutionConfig::default();
+
+        note_ready_to_publish(&counters);
+
+        let published = counters.snapshot(config, false);
+        assert_eq!(published.pending, 0);
+        assert_eq!(published.in_flight, 0);
+        assert_eq!(published.awaiting_drain, 1);
+        assert!(!published.is_quiescent());
+
+        counters.awaiting_drain.fetch_sub(1, Ordering::Relaxed);
+        assert!(counters.snapshot(config, false).is_quiescent());
+    }
+
+    #[test]
+    fn published_generation_completion_is_not_quiescent_until_drained() {
+        let (app, gate) = app_with_parked_generation();
+        gate.release();
+
+        // Published but not yet drained: the composition thread has not ticked
+        // since the worker handed the result over.
+        wait_until(&app, |snapshot| {
+            snapshot.completed == 1 && snapshot.in_flight == 0
+        });
+        let undrained = app
+            .generation_execution_snapshot()
+            .expect("generation snapshot");
+        assert_eq!(undrained.pending, 0);
+        assert_eq!(undrained.awaiting_drain, 1);
+        assert!(
+            !undrained.is_quiescent(),
+            "an undrained completion must keep the runtime non-quiescent"
+        );
+        assert!(
+            OperatorStatusSnapshot::from_app(&app).generation_active,
+            "an undrained completion must not report an idle runtime"
+        );
+        assert!(
+            !app.telemetry()
+                .events()
+                .iter()
+                .any(|observation| observation.event_id == "evt-201"),
+            "the observation cannot exist before the completion is drained"
+        );
+    }
+
+    #[test]
+    fn drained_generation_completion_records_the_observation_and_settles() {
+        let (mut app, gate) = app_with_parked_generation();
+        gate.release();
+        wait_until(&app, |snapshot| {
+            snapshot.completed == 1 && snapshot.in_flight == 0
+        });
+
+        // The completion is waiting in the mailbox; one tick must both drain it
+        // and record the observation, which is what the benchmark's wait helper
+        // relies on instead of stopping early.
+        app.tick(0);
+
+        let drained = app
+            .generation_execution_snapshot()
+            .expect("generation snapshot");
+        assert_eq!(drained.awaiting_drain, 0);
+        assert!(drained.is_quiescent());
+        assert!(
+            app.telemetry()
+                .events()
+                .iter()
+                .any(|observation| observation.event_id == "evt-201"),
+            "the drained completion must record its observation"
+        );
     }
 
     #[test]

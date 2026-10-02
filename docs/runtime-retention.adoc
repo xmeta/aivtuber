@@ -86,7 +86,7 @@ Deterministic survivors therefore depend on recorded input order, logical timest
 * hot static/dynamic asset and promotion-metadata counters;
 * cached-playback recent-group counters;
 * working-memory and adaptation current/high-water/evicted counters;
-* generation pending/in-flight/high-water/saturation/cancellation counters.
+* generation pending/in-flight/awaiting-drain/high-water/saturation/cancellation counters.
 
 These are bounded aggregate counters; observability does not retain an unbounded per-event history.
 

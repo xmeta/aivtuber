@@ -22,8 +22,8 @@ use aivtuber_runtime::{
 use aivtuber_scheduler::{Scheduler, SchedulerConfig};
 use aivtuber_telemetry::{
     BenchmarkConfiguration, BenchmarkEnvironment, BenchmarkGit, BenchmarkReport, BenchmarkResult,
-    ComparisonMode, ComparisonSuite, InvariantValue, MetricValue, RESULT_SCHEMA_VERSION,
-    ReproducibilityMetadata, SecretRedactor,
+    ComparisonMode, ComparisonSuite, EventObservation, InvariantValue, MetricValue,
+    RESULT_SCHEMA_VERSION, ReproducibilityMetadata, SecretRedactor,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const CONFIG_VERSION: &str = "replay-benchmark-v1";
 const RETRIEVER_VERSION: &str = "benchmark-semantic-v1";
@@ -528,39 +528,112 @@ fn wait_for_generation_observation<R>(
 where
     R: RoutePlanner,
 {
-    for _ in 0..1_000 {
+    let mut probe = || {
         app.tick(at_ms);
-        if app
-            .telemetry()
-            .events()
-            .last()
-            .is_some_and(|observation| observation.event_id == event_id)
-        {
-            return Ok(());
+        if observation_recorded(app.telemetry().events(), event_id) {
+            return GenerationWaitState::Observed;
         }
+        match app.generation_execution_snapshot() {
+            // No generation runtime at all: nothing can record the event later.
+            None => GenerationWaitState::Quiescent,
+            // Issue #177: quiescence covers published-but-undrained completions,
+            // so the worker cannot look idle while its result is still in flight
+            // to this thread.
+            Some(snapshot) if snapshot.is_quiescent() => GenerationWaitState::Quiescent,
+            Some(_) => GenerationWaitState::Busy,
+        }
+    };
+    let mut pace = pace_generation_wait;
 
-        let Some(snapshot) = app.generation_execution_snapshot() else {
-            break;
-        };
-        if snapshot.pending == 0 && snapshot.in_flight == 0 {
-            app.tick(at_ms);
-            if app
-                .telemetry()
-                .events()
-                .last()
-                .is_some_and(|observation| observation.event_id == event_id)
-            {
-                return Ok(());
-            }
-            break;
-        }
-        thread::sleep(Duration::from_millis(1));
+    match wait_until_observed(&mut probe, &mut pace, GENERATION_WAIT_BUDGET) {
+        Ok(_) => Ok(()),
+        Err(GenerationWaitError::Quiescent) => Err(io::Error::other(format!(
+            "full-generative replay did not record event {event_id} before the bounded worker quiesced"
+        ))
+        .into()),
+        Err(GenerationWaitError::TimedOut) => Err(io::Error::other(format!(
+            "full-generative replay did not record event {event_id} within {GENERATION_WAIT_BUDGET:?}: {:?}",
+            app.generation_execution_snapshot()
+        ))
+        .into()),
     }
+}
 
-    Err(io::Error::other(format!(
-        "full-generative replay did not record event {event_id} before the bounded worker quiesced"
-    ))
-    .into())
+/// Issue #177: the tail-only `.last()` comparison reported a false failure when
+/// any observation landed after the expected one (a late completion of an earlier
+/// fixture event, a queue observation, ...), even though `event_id` *was*
+/// recorded. Search the bounded log instead.
+fn observation_recorded(events: &[EventObservation], event_id: &str) -> bool {
+    events
+        .iter()
+        .any(|observation| observation.event_id == event_id)
+}
+
+/// Condition state of one poll of the generation wait loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenerationWaitState {
+    /// The expected observation is recorded.
+    Observed,
+    /// Generation work is still queued, executing, or awaiting drain.
+    Busy,
+    /// All generation work is accounted for and the event is still missing.
+    Quiescent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenerationWaitError {
+    /// The worker quiesced without recording the expected observation.
+    Quiescent,
+    /// The wall-clock budget expired while work was still outstanding.
+    TimedOut,
+}
+
+/// Wall-clock budget for one generation observation to settle. The replay
+/// simulation clock is virtual, so only the provider worker consumes real time;
+/// issue #177 showed that a short fixed iteration budget could expire on a
+/// loaded runner while the worker was still healthy.
+const GENERATION_WAIT_BUDGET: Duration = Duration::from_secs(30);
+/// Cheap polls (yield, no sleep) before falling back to a fixed backoff, so the
+/// success path does not pay a millisecond of latency per poll.
+const GENERATION_WAIT_SPIN_POLLS: usize = 256;
+const GENERATION_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+/// Backoff for the given poll: `None` means yield instead of sleeping, so a
+/// healthy worker is observed without paying a millisecond of latency per poll.
+fn generation_wait_poll_interval(polls: usize) -> Option<Duration> {
+    (polls > GENERATION_WAIT_SPIN_POLLS).then_some(GENERATION_WAIT_POLL_INTERVAL)
+}
+
+fn pace_generation_wait(polls: usize) {
+    if let Some(interval) = generation_wait_poll_interval(polls) {
+        thread::sleep(interval);
+    } else {
+        thread::yield_now();
+    }
+}
+
+/// Poll `probe` until it observes the expected event, the worker quiesces
+/// without it, or the wall-clock `budget` expires. `pace` performs the per-iteration
+/// backoff and is injected so the loop is testable without real sleeping.
+fn wait_until_observed(
+    probe: &mut impl FnMut() -> GenerationWaitState,
+    pace: &mut impl FnMut(usize),
+    budget: Duration,
+) -> Result<usize, GenerationWaitError> {
+    let started = Instant::now();
+    let mut polls = 0_usize;
+    loop {
+        polls = polls.saturating_add(1);
+        match probe() {
+            GenerationWaitState::Observed => return Ok(polls),
+            GenerationWaitState::Quiescent => return Err(GenerationWaitError::Quiescent),
+            GenerationWaitState::Busy => {}
+        }
+        if started.elapsed() >= budget {
+            return Err(GenerationWaitError::TimedOut);
+        }
+        pace(polls);
+    }
 }
 
 fn benchmark_app<R>(
@@ -953,4 +1026,84 @@ fn default_pack_root() -> PathBuf {
 
 fn default_fixture_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/benchmarks/replay-comparison.json")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aivtuber_telemetry::RouteClass;
+    use std::cell::RefCell;
+
+    fn observation(event_id: &str) -> EventObservation {
+        EventObservation::new(
+            event_id,
+            ComparisonMode::FullGenerative,
+            RouteClass::Generated,
+        )
+    }
+
+    #[test]
+    fn observation_search_matches_a_recorded_event_with_later_events_appended() {
+        // Issue #177 regression: the wait loop used to compare only the log tail,
+        // so any observation recorded after the expected one looked like a miss.
+        let events = vec![
+            observation("bench-novel"),
+            observation("late-completion-of-an-earlier-fixture-event"),
+        ];
+        assert!(observation_recorded(&events, "bench-novel"));
+        assert!(!observation_recorded(&events, "bench-unknown"));
+    }
+
+    #[test]
+    fn generation_wait_reports_quiescence_without_the_expected_observation() {
+        let mut probe = || GenerationWaitState::Quiescent;
+        let mut pace = |_: usize| panic!("quiescence must not be paced");
+        assert_eq!(
+            wait_until_observed(&mut probe, &mut pace, Duration::from_secs(1)),
+            Err(GenerationWaitError::Quiescent)
+        );
+    }
+
+    #[test]
+    fn generation_wait_succeeds_once_the_observation_arrives() {
+        let steps = RefCell::new(vec![
+            GenerationWaitState::Busy,
+            GenerationWaitState::Busy,
+            GenerationWaitState::Observed,
+        ]);
+        let mut probe = || steps.borrow_mut().remove(0);
+        let mut paced = 0_usize;
+        let mut pace = |_: usize| paced = paced.saturating_add(1);
+        assert_eq!(
+            wait_until_observed(&mut probe, &mut pace, Duration::from_secs(1)),
+            Ok(3)
+        );
+        assert_eq!(paced, 2);
+    }
+
+    #[test]
+    fn generation_wait_times_out_instead_of_looping_forever_under_load() {
+        // Issue #177: a fixed iteration budget could expire while the provider
+        // worker was still healthy; the wall-clock budget must report the
+        // difference between "quiesced without the event" and "still working".
+        let mut probe = || GenerationWaitState::Busy;
+        let mut pace = |_: usize| {};
+        assert_eq!(
+            wait_until_observed(&mut probe, &mut pace, Duration::ZERO),
+            Err(GenerationWaitError::TimedOut)
+        );
+    }
+
+    #[test]
+    fn generation_wait_yields_before_backing_off() {
+        assert_eq!(generation_wait_poll_interval(1), None);
+        assert_eq!(
+            generation_wait_poll_interval(GENERATION_WAIT_SPIN_POLLS),
+            None
+        );
+        assert_eq!(
+            generation_wait_poll_interval(GENERATION_WAIT_SPIN_POLLS + 1),
+            Some(Duration::from_millis(1))
+        );
+    }
 }

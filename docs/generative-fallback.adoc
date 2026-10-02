@@ -19,7 +19,9 @@ The production-target implementation is split across:
 
 Before submission, the composition thread selects the deterministic cached/non-verbal fallback and snapshots the side-effect-free public-output policy. The worker may perform provider waits and evaluate generated text before TTS, but it has no Scheduler, AssetStore mutation, authenticated control, or audit authority. Completed results return as immutable data and are committed only from `ProductionApp::tick()` after generation identity, cancellation, shutdown, and output-policy fencing pass.
 
-If the submission queue is saturated, production immediately chooses the already-selected deterministic fallback and increments the saturation counter. `GenerationExecutionSnapshot` exposes pending/in-flight counts, high-water marks, saturation, completed, failed, cancelled/stale, queue capacity, shutdown state, and worker liveness without retaining per-request history.
+If the submission queue is saturated, production immediately chooses the already-selected deterministic fallback and increments the saturation counter. `GenerationExecutionSnapshot` exposes pending/in-flight counts, the awaiting-drain count, high-water marks, saturation, completed, failed, cancelled/stale, queue capacity, shutdown state, and worker liveness without retaining per-request history.
+
+A finished provider job is not observable until its immutable result reaches the composition thread, so the worker claims the drain window (awaiting-drain) *before* it releases in-flight and the composition thread releases it when it takes the completion. `GenerationExecutionSnapshot::is_quiescent()` is therefore true only when nothing is queued, nothing is executing, and no completed result is published-but-undrained; callers that treat `pending == 0 && in_flight == 0` as "all generation work is accounted for" would otherwise observe a false idle state (issue #177).
 
 For one event the buffered provider pipeline is:
 

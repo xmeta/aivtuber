@@ -91,9 +91,11 @@ impl OperatorStatusSnapshot {
             stream_error: health.stream_error.clone(),
             content_queue: app.content_queue_len(),
             scheduler_items: app.scheduler_item_count(),
+            // `!is_quiescent()` also covers published-but-undrained completions
+            // (issue #177), so status never reports idle mid drain window.
             generation_active: generation
                 .as_ref()
-                .is_some_and(|snapshot| snapshot.in_flight > 0 || snapshot.pending > 0),
+                .is_some_and(|snapshot| !snapshot.is_quiescent()),
         }
     }
 }
