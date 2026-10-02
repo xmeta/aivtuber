@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 use std::io::ErrorKind;
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::stream::MaybeTlsStream;
@@ -77,35 +77,80 @@ impl WebSocketConnector for TungsteniteConnector {
             .into_client_request()
             .map_err(|error| TransportError::new(format!("invalid websocket endpoint: {error}")))?;
         let uri = request.uri();
-        // `tungstenite` is built without a TLS feature here, so this connector
-        // can only ever produce a plaintext stream. Reject `wss://` outright
-        // instead of completing an unencrypted handshake against port 443.
-        if uri.scheme_str() == Some("wss") {
-            return Err(TransportError::new(format!(
-                "wss:// websocket endpoints require a TLS-enabled tungstenite build: {endpoint}"
-            )));
+        // Only `ws://` can be honored here: `tungstenite` is built without a TLS
+        // feature, so this connector can only ever produce a plaintext stream.
+        // Rejecting every other scheme up front closes the downgrade route where
+        // `https://host:443/...` would complete an *unencrypted* handshake.
+        match uri.scheme_str() {
+            Some("ws") => {}
+            Some("wss") => {
+                return Err(TransportError::new(format!(
+                    "wss:// websocket endpoints require a TLS-enabled tungstenite build: {endpoint}"
+                )));
+            }
+            scheme => {
+                return Err(TransportError::new(format!(
+                    "websocket endpoint must use ws:// (or wss:// with TLS enabled), got {:?}: {endpoint}",
+                    scheme.unwrap_or("no scheme")
+                )));
+            }
         }
         let host = uri.host().ok_or_else(|| {
             TransportError::new(format!("websocket endpoint has no host: {endpoint}"))
         })?;
         let port = uri.port_u16().unwrap_or(80);
-        let address = format!("{host}:{port}")
+        let addresses: Vec<SocketAddr> = format!("{host}:{port}")
             .to_socket_addrs()
             .map_err(|error| {
                 TransportError::new(format!("websocket endpoint failed to resolve: {error}"))
             })?
-            .next()
-            .ok_or_else(|| {
-                TransportError::new(format!("websocket endpoint did not resolve: {endpoint}"))
-            })?;
-        let tcp = TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)
-            .map_err(|error| TransportError::new(format!("websocket connect failed: {error}")))?;
-        tcp.set_read_timeout(Some(HANDSHAKE_TIMEOUT))
-            .map_err(|error| {
-                TransportError::new(format!("failed to set handshake read timeout: {error}"))
-            })?;
-        let (mut socket, _) = tungstenite::client(request, MaybeTlsStream::Plain(tcp))
-            .map_err(|error| TransportError::new(format!("websocket handshake failed: {error}")))?;
+            .collect();
+        if addresses.is_empty() {
+            return Err(TransportError::new(format!(
+                "websocket endpoint did not resolve: {endpoint}"
+            )));
+        }
+
+        // Try every resolved address rather than only the first. A host that
+        // resolves to several addresses -- notably `localhost` as ::1 followed
+        // by 127.0.0.1 -- must still connect when only one of them is
+        // listening. This restores the behavior of `tungstenite::connect`,
+        // which attempted each resolved address in turn.
+        let mut last_error: Option<std::io::Error> = None;
+        let mut socket = None;
+        for address in addresses {
+            let tcp = match TcpStream::connect_timeout(&address, CONNECT_TIMEOUT) {
+                Ok(tcp) => tcp,
+                Err(error) => {
+                    last_error = Some(error);
+                    continue;
+                }
+            };
+            if let Err(error) = tcp.set_read_timeout(Some(HANDSHAKE_TIMEOUT)) {
+                return Err(TransportError::new(format!(
+                    "failed to set handshake read timeout: {error}"
+                )));
+            }
+            // A handshake failure is not an address-selection problem, so it is
+            // reported immediately instead of silently retrying another host.
+            match tungstenite::client(request.clone(), MaybeTlsStream::Plain(tcp)) {
+                Ok(established) => {
+                    socket = Some(established);
+                    break;
+                }
+                Err(error) => {
+                    return Err(TransportError::new(format!(
+                        "websocket handshake failed: {error}"
+                    )));
+                }
+            }
+        }
+        let (mut socket, _) = socket.ok_or_else(|| {
+            let detail = last_error
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "no resolved address accepted the connection".to_owned());
+            TransportError::new(format!("websocket connect failed: {detail}"))
+        })?;
         set_stream_timeouts(socket.get_mut())?;
         Ok(Box::new(TungsteniteTransport { socket }))
     }
@@ -238,6 +283,41 @@ mod tests {
         assert!(
             message.contains("TLS"),
             "expected an explicit TLS error, got: {message}"
+        );
+    }
+
+    #[test]
+    fn non_websocket_schemes_are_rejected_before_any_connection() {
+        // This build has no TLS feature, so `https://` must not reach a
+        // plaintext handshake against port 443 -- it has to fail up front.
+        for endpoint in [
+            "https://example.invalid:443/v1",
+            "http://example.invalid:80/v1",
+        ] {
+            let error = TungsteniteConnector
+                .connect(endpoint)
+                .err()
+                .unwrap_or_else(|| panic!("{endpoint} must be rejected as a non-websocket scheme"));
+            let message = error.to_string();
+            assert!(
+                message.contains("must use ws://"),
+                "expected an explicit scheme error for {endpoint}, got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn connect_reports_a_single_error_when_no_address_is_reachable() {
+        // Port 1 on the discard service is not expected to have a websocket
+        // listener; every resolved address is tried and the failures aggregate
+        // into one error rather than short-circuiting on the first.
+        let error = TungsteniteConnector
+            .connect("ws://127.0.0.1:1/v1")
+            .err()
+            .expect("connecting to a closed port must fail");
+        assert!(
+            error.to_string().contains("websocket connect failed"),
+            "unexpected error: {error}"
         );
     }
 
