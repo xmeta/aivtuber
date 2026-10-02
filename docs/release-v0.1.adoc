@@ -834,16 +834,23 @@ Live VTS/OBS adapter conformance: PASS (real VTube Studio + OBS websocket; 27 ca
 Decision rationale: GO per section 8. All #97 checklist criteria for the cached profile are met (36 ticked / 0 unticked), required CI/replay/failure-soak evidence is green, no unresolved release-blocking security/operator/boundedness issue remains, and the live smoke completed against real VTube Studio and OBS without unexplained release-blocking incidents -- the one defect it uncovered was fixed before this decision and verified live. A second, non-release-blocking robustness defect it surfaced (application-level APIError/requestStatus responses tearing down the healthy websocket session, #176) was root-caused, fixed, and regression-tested immediately after the smoke, then re-verified live with a short 3-minute run against the real providers (repeated APIError 202 dispatches, avatar_error=None at every checkpoint, zero reconnect-backoff signatures); it degraded dispatch availability explicitly and recovered, so no gate criterion was affected. Documented limitations: the live smoke exercised the cached profile only (semantic/template/reflex-Jev/generative routes are disabled in this profile and remain covered by the automated gate in sections 4.3-4.5); audible audio output is not machine-verifiable in this environment (audio_error=None proves dispatch, not audibility); VTS hotkey availability depends on the loaded model (APIError 202 observed for smile_soft); the live-smoke debug binary lacked compile-time revision stamping, so its diagnose bundle reports git/rustc provenance as unknown (the identity wiring itself was verified end-to-end on the stamped fresh-clone RC binary).
 ----
 
-== 13. Post-decision main stability -- replay-benchmark quiescence flake (#177) RESOLVED
+== 13. Latent defect in RC-20261001-3 -- replay-benchmark quiescence flake (#177) RESOLVED
 
 The GO decision in section 12 stands and is not reopened here. This section records a
-regression that appeared on `main` *after* that decision was taken, was release-gate
-relevant while it was open, and is now fixed.
+defect that was **already present in the section-12 GO commit** `a97983b`, was discovered
+and reproduced after that decision was taken, and is now fixed.
 
 === What happened
 
-After the RC-20261001-3 decision, `main` turned red in the `Replay benchmark smoke` step of
-`Rust checks` (run 36888486710 at `d5c181a`) with:
+`crates/app/src/lib.rs` at the GO commit `a97983b975e85958cfab249d0b17c63eedc5119b` already
+contains the root-cause sequence: `worker_counters.in_flight.fetch_sub(1, Ordering::Relaxed)`
+at line 352 precedes `completion_tx.send(completion)` at line 371. The section-12 replay
+evidence was therefore collected against code with this defect. That run passed, so the
+GO candidate's single recorded replay result does not establish that the section 4.9
+criterion was reliably reproducible: it was not, until #179.
+
+The defect was found afterwards, on `main`, in the `Replay benchmark smoke` step of
+`Rust checks` (run 36888486710 at `d5c181a`, the squash-merge commit of PR #172):
 
 [source,text]
 ----
@@ -851,10 +858,17 @@ replay-benchmark: full-generative replay did not record event bench-novel before
 ##[error]Process completed with exit code 1.
 ----
 
-The same commit had passed every `pull_request` run, so the failure was intermittent and
-load-dependent rather than a deterministic regression. This violates the section 4.9/4.10
-criterion ("replay/benchmark and failure/soak checks remain green") on `main` itself, which
-is the branch the release is cut from.
+`d5c181a` itself had no `pull_request` runs: it is the squash merge of PR #172, whose final
+head was `5cf4bc1`. That head passed its PR CI (run 36888235154, `pull_request`, success),
+and the changed `docs/release-v0.1.adoc` blob is byte-identical between `5cf4bc1` and
+`d5c181a` (`cab9af9efe80c43292b4e6a1119c0e105f56a853`). So the same PR tree passed PR CI and
+the same code then failed on a `main` push: the failure is intermittent and load-dependent,
+which is why the section-4.9 criterion could not be treated as reliably satisfied by one
+green run.
+
+Re-deciding the historical GO verdict is out of scope for this record; the open question
+(noted, not decided here) is whether a single passing replay run is sufficient evidence for
+section 4.9 when the underlying defect was latent.
 
 === Root cause and fix
 
@@ -896,15 +910,20 @@ Flake resistance, local stress on the merged code:
         release half of both handoffs in a production build, 6/6 runs pass
 ----
 
-The widened-window experiment is the direct answer to the reviewer's reproduction: widening
-the handoff used to make the failure deterministic, and with overlapping handoffs it no
-longer does, at 250x the original window.
+The widened-window experiment is the direct answer to the reviewer's reproduction: a 50 ms
+artificial pause between the claim and release halves made the old ordering fail
+deterministically, and with overlapping handoffs the same pause passes. The natural handoff
+window was not measured, so no multiplier is claimed here.
 
 === Effect on the release criteria
 
-* Section 4.9 (replay benchmark) and 4.10 (failure/soak): green on `main` again.
+* Section 4.9 (replay benchmark) and 4.10 (failure/soak): green on `main` again, and the
+  quiescence predicate the benchmark depends on is now sound rather than incidentally
+  passing.
+* The section-12 evidence remains valid as recorded, with the correction above: it was
+  collected against code that contained this latent defect, and its single passing replay
+  run did not demonstrate reproducibility.
 * No release-blocking defect is open on `main` at `60b99bc`.
-* The GO decision and its evidence in section 12 are unchanged.
 
 === Known limitation carried forward
 
