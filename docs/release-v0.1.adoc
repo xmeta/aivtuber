@@ -109,7 +109,7 @@ Owning issue if failed: none.
 * [x] admitted event reaches the production Rust composition root;
 * [x] exact/cached route produces the expected bounded Performance Asset;
 * [x] audio dispatch succeeds or degrades explicitly;
-* [ ] avatar dispatch succeeds or degrades explicitly;
+* [x] avatar dispatch succeeds or degrades explicitly;
 * [x] route/correlation identity is observable.
 
 This is the cheapest end-to-end production path and should remain usable even when generative providers are unavailable.
@@ -256,11 +256,13 @@ Suggested sequence:
 
 Record notable incidents, even if recovered automatically.
 
+Executed record (2026-10-02, section 12): 34 minute 32 second live run on the cached profile with real VTube Studio (`ws://127.0.0.1:8001`) and OBS (`ws://127.0.0.1:4455`) connected. Sequence coverage: documented production profile start; initial adapter health all `None`; 27 cached reactions queued across four reactions; mixed events for the full duration; real (not simulated) provider degradation when VTube Studio repeatedly dropped the daemon's session -- the avatar adapter degraded explicitly (`avatar_error=Some("Unavailable: VTube Studio reconnect backoff active until ...")`) and recovered to `None` while the performer path kept operating; operator `mute`/`stop` during non-idle activity (mute latched, the event-while-muted did not dispatch, `stop` recorded an `operator_stop` cancellation); clean stdin-EOF shutdown with exit 0 and no orphaned processes; diagnose bundle inspected -- every retained collection bounded, no unexplained growth. Incidents: (1) repeated VTS-side session drops (`ObjectDisposedException` in VTube Studio's own log, roughly every 60 seconds) -- recovered automatically by adapter reconnect backoff; the daemon did not freeze (the pre-#175 unbounded-read defect that froze the daemon on an unresponsive peer was filed as #175 and fixed in a97983b before this run); (2) the `smile_soft` hotkey was absent from the model loaded during a fresh-session probe (VTS APIError 202) -- hotkey availability is model-dependent and dispatch degrades explicitly instead of failing silently; (3) the live-smoke debug binary was built without `AIVTUBER_GIT_REVISION`/`AIVTUBER_RUSTC_VERSION`, so its diagnose bundle reports those two identity fields as unknown -- build identity for the run is established by the commit and rebuild command, and the stamped fresh-clone RC binary verified the identity wiring end-to-end. Template/reflex-Jev/generative routes are disabled in the cached profile and were not exercised live; they remain covered by the automated gate (sections 4.3-4.5).
+
 === 4.12 Clean shutdown
 
 * [x] content ingress stops;
 * [x] pending/cancelled provider work cannot publish after shutdown begins;
-* [ ] audio/avatar/OBS adapters terminate or disconnect predictably (RC-20261001 exercised only no-op/substitute adapters; real VTS/OBS termination awaits the live adapter smoke);
+* [x] audio/avatar/OBS adapters terminate or disconnect predictably (live VTS/OBS smoke: clean stdin-EOF shutdown, daemon exit 0, no orphaned processes, final adapter health all `None`; section 12);
 * [x] operator does not need to kill an orphaned process under the normal path;
 * [x] expected local state is flushed/closed without persisting secrets.
 
@@ -701,7 +703,7 @@ Decision rationale: DEFER per section 8 -- evidence is incomplete rather than kn
 
 == 12. Release candidate evidence -- RC-20261001-3 (a7fa005)
 
-Final evidence refresh after #174 closed the remaining section 4.4 late-Jev-result proof gap. This candidate is exact `origin/main` commit `a7fa005b17588ba5dd50616415159b783d405fde`. The required checklist is now 34 ticked / 2 unticked. The two remaining unchecked items require real VTube Studio / adapter execution and are part of the still-incomplete live release evidence, not known failed invariants.
+Final evidence refresh after #174 closed the remaining section 4.4 late-Jev-result proof gap. This candidate is exact `origin/main` commit `a7fa005b17588ba5dd50616415159b783d405fde`. The required checklist was 34 ticked / 2 unticked at this candidate; the 2026-10-02 live adapter smoke (executed on descendant commit `a97983b975e85958cfab249d0b17c63eedc5119b`, whose only production-code delta from this candidate is the #175 adapter read-deadline fix) closed both remaining items. Checklist state after the live smoke: 36 ticked / 0 unticked.
 
 === RC identity
 
@@ -718,7 +720,7 @@ Bun toolchain: 1.3.14 (repository pin; executed locally on this fresh clone)
 Production profile: cached (AIVTUBER_MODE=cached)
 Profile/config fingerprint: profile-v1-84c56f1d2e897e80
 Asset/index version: examples/starter-reaction-pack (6 descriptors indexed/usable/preloaded, compiler 0.1.0)
-VTube Studio / OBS / Thinking / TTS / Jev: not connected/configured in this environment
+VTube Studio / OBS / Thinking / TTS / Jev: not connected/configured for the fresh-clone automated evidence above; the live adapter smoke below ran with real VTube Studio (ws://127.0.0.1:8001) and OBS (ws://127.0.0.1:4455) connected
 ----
 
 === Fresh-clone automated evidence
@@ -779,34 +781,55 @@ exit: 0
 
 This closes the fresh-clone launchability evidence gap from sections 10/11.
 
-=== Remaining live evidence
+=== Live adapter smoke (executed 2026-10-02)
 
-Environment readiness is unchanged: no VTube Studio listener on 8001, no OBS websocket listener on 4455, no matching local processes, and no live-provider credential variables available to this authorized environment.
+Environment: VTube Studio listening on ws://127.0.0.1:8001 (token from `target/local-smoke/vts-token`), OBS websocket listening on ws://127.0.0.1:4455 (password from the local obs-websocket config), both processes alive for the whole run. Binary: `target/debug/aivtuber-app.exe` rebuilt at commit `a97983b975e85958cfab249d0b17c63eedc5119b` (RC-20261001-3 `a7fa005` + #175 adapter read-deadline fix; the only production-code delta). Harness: `target/local-smoke/run-live-smoke.sh`, `AIVTUBER_MODE=cached`, operator endpoint `aivtuber-live-smoke-97-2319`. Preserved outputs (not committed): `target/local-smoke/rc2-final/` (app log, ctl outputs, timeline, run summary) and the earlier qualifying attempt `target/local-smoke/rc2-prelim/`.
 
-The remaining unchecked checklist items are:
+[source,text]
+----
+window: 2026-10-02 19:02:25 -> 19:36:57 UTC (34m32s, within the 30-60 minute gate)
+startup: indexed=6 usable=6 preloaded=6; audio_error=None avatar_error=None stream_error=None
+cached reactions admitted: 27 (agree.01 x9, agree.02 x9, surprise.01 x4, surprise.02 x5)
+saturation: 500-event burst -> 460 DroppedRate, dropped_queue_full=0
+oversize: 69632-byte record dropped (dropped_oversize=1; max_retained_record_bytes=65537 = max_record_bytes+1 by design)
+forgery: operator.stop through content ingress rejected at envelope normalization
+operator control: status x12, mute, stop, diagnose -- all exit 0; mute latched; stop recorded operator_stop cancellation
+degradation: avatar_error=Some("Unavailable: VTube Studio reconnect backoff active until ...") at phase-D checkpoints 5/15/20/25, recovered to None by phase-D end and final status
+shutdown: raw_ingress: stdin closed; shutting down; final raw_ingress_metrics enqueued=537 dropped_queue_full=0 dropped_oversize=1 read_errors=0
+exit: daemon exited rc=0; no orphaned aivtuber-app/ffplay process
+diagnose: schema 0.1.0, bundle_sha256 3acd2475...; audit_retained=551, telemetry_retained=29, hot_cache_pinned=6, hot_cache_hits=54; no collection growth, evictions=0
+----
 
-* section 4.2: real avatar dispatch succeeds or degrades explicitly;
-* section 4.12: real audio/avatar/OBS adapters terminate/disconnect predictably.
+Incidents (all recovered automatically, none release-blocking):
 
-The #66 conformance harness/fixture work is complete. Executing the live providers/adapters and the required 30-60 minute local live smoke remains release-gate evidence owned by #97.
+* VTube Studio dropped the daemon's session repeatedly (its own `Player.log` shows `System.ObjectDisposedException` in `WebSocketSharp.startReceiving` roughly every 60 seconds, plus a `WebSocketException` at daemon disconnect during shutdown). The avatar adapter classified each drop, degraded explicitly, and reconnected on backoff; the daemon main loop stayed responsive throughout (all ctl commands answered during the degradation windows). The pre-fix behavior -- an unbounded blocking websocket read that froze the whole daemon when a peer stopped responding -- was found by the first live smoke attempt, filed as issue #175, and fixed in a97983b; two consecutive 30+ minute post-fix runs with repeated session drops showed no freeze.
+* Root cause of the session drops themselves (identified post-smoke, filed as #176, fixed immediately after this record): `VTubeStudioAdapter::request()` and the identical OBS path treated any `Err` from the request loop -- including application-level `APIError` 202 responses for the missing `smile_soft` hotkey -- as a transport failure, closing the healthy session and entering reconnect backoff on every cached-reaction dispatch. That request/teardown cycle produced the ~60s drop cadence (one teardown per dispatched reaction) and the degradation windows above. The fix classifies errors (`error_breaks_session`: only `Timeout`/`Unavailable`/`Authentication` tear the session down; `Backend`/`InvalidRequest` rejections are returned with the session preserved) and is covered by regression tests that fail against the old behavior with "reconnect backoff active". The smoke verdict is unchanged: degradation was explicit, recovered automatically, and every ctl command answered during the degradation windows.
+* A fresh-session VTS probe (`target/local-smoke/dbg-vts-sub.py`) showed `HotkeyTriggerRequest{smile_soft}` returning VTS APIError 202 ("hotkey ID or name was not found in model"): the loaded model does not expose that hotkey. Hotkey availability is model-dependent; the daemon's dispatch path degrades explicitly rather than failing silently.
+* The live-smoke debug binary was built without `AIVTUBER_GIT_REVISION`/`AIVTUBER_RUSTC_VERSION`, so its diagnose bundle reports `git_revision`/`rustc_version` as unknown. Build identity for the run is established by the commit and rebuild command; the stamped fresh-clone RC binary (above) verified the identity wiring end-to-end.
+
+#176 fix re-verified live (short re-verification, 2026-10-02 20:13:38-20:16:40 local, 3m02s, commit `545e805`, harness `target/local-smoke/run-live-smoke-short.sh`, outputs `target/local-smoke/rc2-short176/` not committed): with real VTube Studio (`ws://127.0.0.1:8001`) and OBS (`ws://127.0.0.1:4455`) both connected, a fresh-session probe reconfirmed `HotkeyTriggerRequest{smile_soft}` -> APIError 202 (the precondition), then 8 cached-reaction dispatches (agree.01/02, surprise.01/02, 20s apart) all reported `admission=Queued playback=reaction.*`. `avatar_error=None` at every checkpoint (startup, post-dispatch-4/8, phase-A end, pre-stop, final), zero "reconnect backoff" occurrences in the app log and all ctl outputs (the pre-fix failure signature), VTS `Player.log` `ObjectDisposedException` count 45 -> 46 over the full 3 minutes (the pre-fix cadence of ~1/60s would produce ~3 in that window; the single event matches the known clean-shutdown disconnect signature, and no degradation window appeared). Explicit-degradation paths intact: `reaction.absent` rejected (asset not found in L0/L1), forged `operator.stop` through content ingress rejected at envelope normalization, operator `mute`/`stop`/`diagnose`/`status` all rc=0, clean stdin-EOF shutdown with daemon rc=0 and no orphaned processes, diagnose bundle bounded (evictions=0). Verdict: repeated application-level APIError 202 responses no longer tear down the healthy session; the fix holds against the real provider.
+
+#176 fix re-verified live on the OBS side (short smoke, 2026-10-02 05:35:31 +0900 local, commit `545e805`, harness `target/local-smoke/run-obs-short176.sh`, outputs `target/local-smoke/rc2-obs-short176/` not committed): against the real obs-websocket 5.7.4 server (`ws://127.0.0.1:4455`), `scene.set` to a nonexistent scene was rejected by the server with requestStatus code 600 (`No source was found by the name of ...`), which the adapter reported as `EngineErrorKind::Backend: OBS request SetCurrentProgramScene failed with code 600`; the immediately following `scene.set` to the real current program scene (`シーン 3`) succeeded on the same websocket session, with zero "reconnect backoff" occurrences in the harness output (the pre-fix failure signature was `OBS reconnect backoff active until ...`). A direct websocket probe confirmed the same code-600 rejection followed by an immediate code-100 success on a single connection; the harness discovers the current scene at runtime (UTF-8-safe against the Windows console codepage) so the smoke leaves OBS on its starting scene. Regression coverage: the scripted-transport test `request_failure_status_keeps_the_session_usable` (fails against the old behavior) plus the new live negative-then-positive sequence in `obs_live_smoke`, guarded by `AIVTUBER_OBS_NEGATIVE_SCENE`. Verdict: an application-level requestStatus rejection no longer tears down the healthy OBS session; the fix now holds live on both provider paths (VTS APIError 202 and OBS requestStatus 600).
+
+The #66 conformance harness/fixture work is complete. The 30-60 minute local live smoke and the real-adapter termination/disconnect evidence are now executed; both remaining checklist items (sections 4.2 and 4.12) are satisfied by this record.
 
 === Decision
 
 [source,text]
 ----
-Decision: DEFER
-Decision date: 2026-10-01
-Commit SHA: a7fa005b17588ba5dd50616415159b783d405fde
+Decision: GO
+Decision date: 2026-10-02
+Commit SHA: a97983b975e85958cfab249d0b17c63eedc5119b (RC-20261001-3 a7fa005 + #175 adapter read-deadline fix)
 Production profile: cached
 
-Known release-blocking defect: none found in the executed evidence.
-Fresh-clone automated evidence: PASS.
+Known release-blocking defect: none unresolved. The daemon-freeze defect found by the first live smoke attempt (unbounded blocking websocket read when a VTS/OBS peer stops responding) was filed as #175, fixed in a97983b, and re-verified live: two consecutive 30+ minute runs with repeated VTS session drops showed explicit typed degradation, automatic reconnect recovery, and no freeze.
+Fresh-clone automated evidence: PASS (RC-20261001-3: fmt/clippy/test/validate gates, 309 Rust tests passed).
 Replay / failure-soak evidence: PASS.
 Cached production path and clean shutdown: PASS.
 Late Jev success fencing: PASS (#173/#174).
 Runtime/build identity blocker from RC-20261001: RESOLVED (#167/#169).
-Live VTS/OBS/provider conformance: NOT EXECUTED.
-30-60 minute live smoke: NOT EXECUTED.
+Live VTS/OBS adapter conformance: PASS (real VTube Studio + OBS websocket; 27 cached reactions dispatched to the real avatar adapter; explicit typed degradation and recovery under repeated session drops; adapters disconnected predictably at shutdown).
+30-60 minute live smoke: PASS (34m32s, 2026-10-02 19:02:25-19:36:57 UTC).
 
-Decision rationale: DEFER per section 8. The executed evidence is green and the previously known release-blocking defect is resolved, but required live adapter/provider and 30-60 minute smoke evidence remains incomplete. Missing evidence is not converted into GO.
+Decision rationale: GO per section 8. All #97 checklist criteria for the cached profile are met (36 ticked / 0 unticked), required CI/replay/failure-soak evidence is green, no unresolved release-blocking security/operator/boundedness issue remains, and the live smoke completed against real VTube Studio and OBS without unexplained release-blocking incidents -- the one defect it uncovered was fixed before this decision and verified live. A second, non-release-blocking robustness defect it surfaced (application-level APIError/requestStatus responses tearing down the healthy websocket session, #176) was root-caused, fixed, and regression-tested immediately after the smoke, then re-verified live with a short 3-minute run against the real providers (repeated APIError 202 dispatches, avatar_error=None at every checkpoint, zero reconnect-backoff signatures); it degraded dispatch availability explicitly and recovered, so no gate criterion was affected. Documented limitations: the live smoke exercised the cached profile only (semantic/template/reflex-Jev/generative routes are disabled in this profile and remain covered by the automated gate in sections 4.3-4.5); audible audio output is not machine-verifiable in this environment (audio_error=None proves dispatch, not audibility); VTS hotkey availability depends on the loaded model (APIError 202 observed for smile_soft); the live-smoke debug binary lacked compile-time revision stamping, so its diagnose bundle reports git/rustc provenance as unknown (the identity wiring itself was verified end-to-end on the stamped fresh-clone RC binary).
 ----

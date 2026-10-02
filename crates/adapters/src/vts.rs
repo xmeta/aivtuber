@@ -1,6 +1,7 @@
 use crate::{
-    AdapterClock, AdapterEvent, ReconnectPolicy, ReconnectState, SecretString,
-    TungsteniteConnector, WebSocketConnector, WebSocketTransport, default_clock,
+    AdapterClock, AdapterEvent, MAX_RESPONSE_MESSAGES, REQUEST_TIMEOUT, ReconnectPolicy,
+    ReconnectState, SecretString, TransportError, TungsteniteConnector, WebSocketConnector,
+    WebSocketTransport, default_clock, error_breaks_session,
 };
 use aivtuber_domain::{
     AuthorizedAvatarAction, AvatarAdapter, EngineError, EngineErrorKind, EngineFuture,
@@ -9,6 +10,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 const VTS_API_NAME: &str = "VTubeStudioPublicAPI";
 const VTS_API_VERSION: &str = "1.0";
@@ -194,10 +196,19 @@ impl VTubeStudioAdapter {
             return Ok(Some(event));
         }
         self.ensure_connected(&mut state)?;
-        let text = receive_from_state(&mut state).map_err(|error| {
-            self.disconnect(&mut state);
-            engine_error(EngineErrorKind::Unavailable, error)
-        })?;
+        let text = match receive_from_state(&mut state) {
+            Ok(text) => text,
+            // A read timeout only means no event is pending yet; the session
+            // stays healthy and the next poll picks the event up.
+            Err(error) if error.is_timed_out() => return Ok(None),
+            Err(error) => {
+                self.disconnect(&mut state);
+                return Err(engine_error(
+                    EngineErrorKind::Unavailable,
+                    error.to_string(),
+                ));
+            }
+        };
         let message: Value = serde_json::from_str(&text).map_err(|error| {
             engine_error(
                 EngineErrorKind::Backend,
@@ -352,10 +363,19 @@ impl VTubeStudioAdapter {
                 Ok(value)
             }
             Err(error) => {
-                transport.close();
-                state
-                    .reconnect
-                    .failed(self.clock.now_ms(), self.config.reconnect);
+                if error_breaks_session(&error) {
+                    transport.close();
+                    state
+                        .reconnect
+                        .failed(self.clock.now_ms(), self.config.reconnect);
+                } else {
+                    // The peer answered with an application-level rejection,
+                    // for example a VTS APIError for a hotkey the loaded model
+                    // does not define; the session is still healthy, so keep
+                    // it for the next request instead of cycling through
+                    // reconnect backoff.
+                    state.transport = Some(transport);
+                }
                 Err(error)
             }
         }
@@ -402,10 +422,29 @@ fn request_with_transport(
         .send_text(&text)
         .map_err(|error| engine_error(EngineErrorKind::Unavailable, error.to_string()))?;
 
-    for _ in 0..64 {
-        let text = transport
-            .receive_text()
-            .map_err(|error| engine_error(EngineErrorKind::Unavailable, error.to_string()))?;
+    let deadline = Instant::now() + REQUEST_TIMEOUT;
+    // The deadline bounds a silent peer; the message budget bounds a peer that
+    // keeps sending frames that never match this request id.
+    for _received in 0..MAX_RESPONSE_MESSAGES {
+        let text = match transport.receive_text() {
+            Ok(text) => text,
+            Err(error) if error.is_timed_out() => {
+                if Instant::now() >= deadline {
+                    return Err(engine_error(
+                        EngineErrorKind::Timeout,
+                        "VTube Studio did not respond before the request deadline",
+                    ));
+                }
+                std::thread::yield_now();
+                continue;
+            }
+            Err(error) => {
+                return Err(engine_error(
+                    EngineErrorKind::Unavailable,
+                    error.to_string(),
+                ));
+            }
+        };
         let response: Value = serde_json::from_str(&text).map_err(|error| {
             engine_error(
                 EngineErrorKind::Backend,
@@ -460,13 +499,12 @@ fn parse_vts_event(message: &Value) -> Option<AdapterEvent> {
     })
 }
 
-fn receive_from_state(state: &mut VtsState) -> Result<String, String> {
+fn receive_from_state(state: &mut VtsState) -> Result<String, TransportError> {
     state
         .transport
         .as_mut()
-        .ok_or_else(|| "VTube Studio is not connected".to_owned())?
+        .ok_or_else(|| TransportError::new("VTube Studio is not connected".to_owned()))?
         .receive_text()
-        .map_err(|error| error.to_string())
 }
 
 fn validate_vts_config(config: &VTubeStudioConfig) -> Result<(), EngineError> {
@@ -617,6 +655,112 @@ mod tests {
         assert_eq!(
             sent[2].pointer("/data/hotkeyID").and_then(Value::as_str),
             Some("Wave")
+        );
+    }
+
+    #[test]
+    fn request_survives_read_timeouts_until_the_peer_responds() {
+        let script = Script::new(vec![
+            Ok(auth_response("aivtuber-vts-1")),
+            Ok(ok_response("aivtuber-vts-2", "EventSubscriptionResponse")),
+            Err(TransportError::timed_out("model load stall")),
+            Err(TransportError::timed_out("model load stall")),
+            Ok(ok_response("aivtuber-vts-3", "HotkeyTriggerResponse")),
+        ]);
+        let handle = script.handle.clone();
+        let connector = Arc::new(ScriptedConnector::new(vec![Ok(script)]));
+        let clock = Arc::new(TestClock::new(0));
+        let adapter =
+            VTubeStudioAdapter::with_dependencies(config(), connector, clock).expect("adapter");
+
+        adapter
+            .subscribe_event("ModelLoadedEvent")
+            .expect("subscribe");
+        adapter
+            .execute_sync(&authorized_avatar("hotkey.trigger:Wave"))
+            .expect("hotkey survives read stalls");
+
+        assert_eq!(handle.sent().len(), 3);
+    }
+
+    #[test]
+    fn api_error_response_keeps_the_session_usable() {
+        let script = Script::new(vec![
+            Ok(auth_response("aivtuber-vts-1")),
+            Ok(ok_response("aivtuber-vts-2", "EventSubscriptionResponse")),
+            Ok(json!({
+                "apiName": VTS_API_NAME,
+                "apiVersion": VTS_API_VERSION,
+                "requestID": "aivtuber-vts-3",
+                "messageType": "APIError",
+                "data": {
+                    "errorID": 202,
+                    "message": "hotkey ID or name was not found in model"
+                }
+            })
+            .to_string()),
+            Ok(ok_response("aivtuber-vts-4", "HotkeyTriggerResponse")),
+        ]);
+        let handle = script.handle.clone();
+        let connector = Arc::new(ScriptedConnector::new(vec![Ok(script)]));
+        let clock = Arc::new(TestClock::new(0));
+        let adapter =
+            VTubeStudioAdapter::with_dependencies(config(), connector, clock).expect("adapter");
+
+        adapter
+            .subscribe_event("ModelLoadedEvent")
+            .expect("subscribe");
+
+        let rejected = adapter.execute_sync(&authorized_avatar("hotkey.trigger:smile_soft"));
+        assert_eq!(
+            rejected
+                .expect_err("missing hotkey is an application-level rejection")
+                .kind,
+            EngineErrorKind::Backend
+        );
+
+        adapter
+            .execute_sync(&authorized_avatar("hotkey.trigger:Wave"))
+            .expect("session survives an APIError response");
+
+        assert_eq!(handle.closed_count(), 0, "session must stay open");
+        assert_eq!(handle.sent().len(), 4);
+    }
+
+    #[test]
+    fn request_gives_up_after_the_message_budget_is_spent() {
+        // A peer that answers with responses addressed to other request ids must
+        // not hang the adapter: the message budget bounds the wait.
+        let mut responses: Vec<Result<String, TransportError>> = vec![
+            Ok(auth_response("aivtuber-vts-1")),
+            Ok(ok_response("aivtuber-vts-2", "EventSubscriptionResponse")),
+        ];
+        // Deliberately a fixed count far above the production budget so raising
+        // `MAX_RESPONSE_MESSAGES` cannot make this test pass by construction.
+        for index in 0..200 {
+            responses.push(Ok(ok_response(
+                &format!("aivtuber-vts-other-{index}"),
+                "APIResponse",
+            )));
+        }
+        let script = Script::new(responses);
+        let connector = Arc::new(ScriptedConnector::new(vec![Ok(script)]));
+        let clock = Arc::new(TestClock::new(0));
+        let adapter =
+            VTubeStudioAdapter::with_dependencies(config(), connector, clock).expect("adapter");
+
+        adapter
+            .subscribe_event("ModelLoadedEvent")
+            .expect("subscribe");
+
+        let error = adapter
+            .execute_sync(&authorized_avatar("hotkey.trigger:Wave"))
+            .expect_err("a peer that never answers must not hang the request loop");
+
+        assert_eq!(error.kind, EngineErrorKind::Backend);
+        assert!(
+            error.to_string().contains("response limit exceeded"),
+            "unexpected error: {error}"
         );
     }
 

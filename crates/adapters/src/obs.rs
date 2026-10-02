@@ -1,6 +1,7 @@
 use crate::{
-    AdapterClock, AdapterEvent, ReconnectPolicy, ReconnectState, SecretString,
-    TungsteniteConnector, WebSocketConnector, WebSocketTransport, default_clock,
+    AdapterClock, AdapterEvent, MAX_RESPONSE_MESSAGES, REQUEST_TIMEOUT, ReconnectPolicy,
+    ReconnectState, SecretString, TransportError, TungsteniteConnector, WebSocketConnector,
+    WebSocketTransport, default_clock, error_breaks_session, receive_text_with_deadline,
 };
 use aivtuber_domain::{
     AuthorizedStreamAction, EngineError, EngineErrorKind, EngineFuture, StreamAdapter,
@@ -12,6 +13,7 @@ use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 #[derive(Clone)]
 pub struct ObsWebSocketConfig {
@@ -164,10 +166,19 @@ impl ObsWebSocketAdapter {
         }
         self.ensure_connected(&mut state)?;
 
-        let text = receive_from_state(&mut state).map_err(|message| {
-            self.disconnect(&mut state);
-            engine_error(EngineErrorKind::Unavailable, message)
-        })?;
+        let text = match receive_from_state(&mut state) {
+            Ok(text) => text,
+            // A read timeout only means no event is pending yet; the
+            // session stays healthy and the next poll picks the event up.
+            Err(error) if error.is_timed_out() => return Ok(None),
+            Err(error) => {
+                self.disconnect(&mut state);
+                return Err(engine_error(
+                    EngineErrorKind::Unavailable,
+                    error.to_string(),
+                ));
+            }
+        };
         let message: Value = serde_json::from_str(&text).map_err(|error| {
             engine_error(
                 EngineErrorKind::Backend,
@@ -233,9 +244,21 @@ impl ObsWebSocketAdapter {
         state: &mut ObsState,
         transport: &mut dyn WebSocketTransport,
     ) -> Result<(), EngineError> {
-        let hello_text = transport
-            .receive_text()
-            .map_err(|error| engine_error(EngineErrorKind::Unavailable, error.to_string()))?;
+        let hello_text = match receive_text_with_deadline(transport, REQUEST_TIMEOUT) {
+            Ok(text) => text,
+            Err(error) if error.is_timed_out() => {
+                return Err(engine_error(
+                    EngineErrorKind::Timeout,
+                    "OBS websocket did not send Hello before the deadline",
+                ));
+            }
+            Err(error) => {
+                return Err(engine_error(
+                    EngineErrorKind::Unavailable,
+                    error.to_string(),
+                ));
+            }
+        };
         let hello: Value = serde_json::from_str(&hello_text).map_err(|error| {
             engine_error(
                 EngineErrorKind::Backend,
@@ -317,10 +340,30 @@ impl ObsWebSocketAdapter {
             .send_text(&identify)
             .map_err(|error| engine_error(EngineErrorKind::Unavailable, error.to_string()))?;
 
-        for _ in 0..16 {
-            let text = transport
-                .receive_text()
-                .map_err(|error| engine_error(EngineErrorKind::Unavailable, error.to_string()))?;
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        // Both bounds are required: the deadline stops a silent peer, and the
+        // message budget stops a peer that keeps sending well-formed but
+        // non-identifying frames (which never trips the deadline).
+        for _received in 0..MAX_RESPONSE_MESSAGES {
+            let text = match transport.receive_text() {
+                Ok(text) => text,
+                Err(error) if error.is_timed_out() => {
+                    if Instant::now() >= deadline {
+                        return Err(engine_error(
+                            EngineErrorKind::Timeout,
+                            "OBS did not send Identified before the deadline",
+                        ));
+                    }
+                    std::thread::yield_now();
+                    continue;
+                }
+                Err(error) => {
+                    return Err(engine_error(
+                        EngineErrorKind::Unavailable,
+                        error.to_string(),
+                    ));
+                }
+            };
             let message: Value = serde_json::from_str(&text).map_err(|error| {
                 engine_error(
                     EngineErrorKind::Backend,
@@ -364,10 +407,19 @@ impl ObsWebSocketAdapter {
                 Ok(value)
             }
             Err(error) => {
-                transport.close();
-                state
-                    .reconnect
-                    .failed(self.clock.now_ms(), self.config.reconnect);
+                if error_breaks_session(&error) {
+                    transport.close();
+                    state
+                        .reconnect
+                        .failed(self.clock.now_ms(), self.config.reconnect);
+                } else {
+                    // The peer answered with an application-level rejection,
+                    // for example an OBS requestStatus failure for a request
+                    // the session cannot serve; the session is still healthy,
+                    // so keep it for the next request instead of cycling
+                    // through reconnect backoff.
+                    state.transport = Some(transport);
+                }
                 Err(error)
             }
         }
@@ -413,10 +465,29 @@ fn request_with_transport(
         .send_text(&text)
         .map_err(|error| engine_error(EngineErrorKind::Unavailable, error.to_string()))?;
 
-    for _ in 0..64 {
-        let text = transport
-            .receive_text()
-            .map_err(|error| engine_error(EngineErrorKind::Unavailable, error.to_string()))?;
+    let deadline = Instant::now() + REQUEST_TIMEOUT;
+    // The deadline bounds a silent peer; the message budget bounds a peer that
+    // keeps sending frames that never match this request id.
+    for _received in 0..MAX_RESPONSE_MESSAGES {
+        let text = match transport.receive_text() {
+            Ok(text) => text,
+            Err(error) if error.is_timed_out() => {
+                if Instant::now() >= deadline {
+                    return Err(engine_error(
+                        EngineErrorKind::Timeout,
+                        "OBS did not respond before the request deadline",
+                    ));
+                }
+                std::thread::yield_now();
+                continue;
+            }
+            Err(error) => {
+                return Err(engine_error(
+                    EngineErrorKind::Unavailable,
+                    error.to_string(),
+                ));
+            }
+        };
         let response: Value = serde_json::from_str(&text).map_err(|error| {
             engine_error(
                 EngineErrorKind::Backend,
@@ -469,6 +540,7 @@ fn request_with_transport(
         "OBS response limit exceeded while waiting for request",
     ))
 }
+
 fn map_stream_action(
     action: &AuthorizedStreamAction,
 ) -> Result<(&'static str, Value), EngineError> {
@@ -597,13 +669,12 @@ fn parse_obs_event(message: &Value) -> Option<AdapterEvent> {
     })
 }
 
-fn receive_from_state(state: &mut ObsState) -> Result<String, String> {
+fn receive_from_state(state: &mut ObsState) -> Result<String, TransportError> {
     state
         .transport
         .as_mut()
-        .ok_or_else(|| "OBS websocket is not connected".to_owned())?
+        .ok_or_else(|| TransportError::new("OBS websocket is not connected".to_owned()))?
         .receive_text()
-        .map_err(|error| error.to_string())
 }
 
 fn engine_error(kind: EngineErrorKind, message: impl Into<String>) -> EngineError {
@@ -693,6 +764,32 @@ mod tests {
         .to_string()
     }
 
+    fn request_failed(id: &str, request_type: &str, code: u64, comment: &str) -> String {
+        json!({
+            "op": 7,
+            "d": {
+                "requestType": request_type,
+                "requestId": id,
+                "requestStatus": { "result": false, "code": code, "comment": comment }
+            }
+        })
+        .to_string()
+    }
+
+    /// A well-formed `op 7` response addressed to a different request id: the
+    /// request loop must keep waiting rather than accept it as its own answer.
+    fn request_ok_for_other(id: &str) -> String {
+        json!({
+            "op": 7,
+            "d": {
+                "requestType": "SetCurrentProgramScene",
+                "requestId": id,
+                "requestStatus": { "result": true, "code": 100 }
+            }
+        })
+        .to_string()
+    }
+
     fn config() -> ObsWebSocketConfig {
         ObsWebSocketConfig {
             password: Some(SecretString::new("obs-password-secret")),
@@ -774,6 +871,112 @@ mod tests {
                 .pointer("/d/requestData/sceneName")
                 .and_then(Value::as_str),
             Some("Live")
+        );
+    }
+
+    #[test]
+    fn request_survives_read_timeouts_until_the_peer_responds() {
+        let challenge = "challenge";
+        let salt = "salt";
+        let script = Script::new(vec![
+            Ok(hello(Some((challenge, salt)))),
+            Ok(identified()),
+            Err(TransportError::timed_out("stream start stall")),
+            Err(TransportError::timed_out("stream start stall")),
+            Ok(request_ok("aivtuber-obs-1", "SetCurrentProgramScene")),
+        ]);
+        let handle = script.handle.clone();
+        let connector = Arc::new(ScriptedConnector::new(vec![Ok(script)]));
+        let clock = Arc::new(TestClock::new(0));
+        let adapter =
+            ObsWebSocketAdapter::with_dependencies(config(), connector, clock).expect("adapter");
+
+        adapter
+            .execute_sync(&authorized_stream(
+                "scene.set",
+                BTreeMap::from([("scene_name".to_owned(), Value::String("Live".to_owned()))]),
+            ))
+            .expect("scene set survives read stalls");
+
+        assert_eq!(handle.sent().len(), 2);
+    }
+
+    #[test]
+    fn request_failure_status_keeps_the_session_usable() {
+        let challenge = "challenge";
+        let salt = "salt";
+        let script = Script::new(vec![
+            Ok(hello(Some((challenge, salt)))),
+            Ok(identified()),
+            Ok(request_failed(
+                "aivtuber-obs-1",
+                "SetCurrentProgramScene",
+                103,
+                "request type not found",
+            )),
+            Ok(request_ok("aivtuber-obs-2", "SetCurrentProgramScene")),
+        ]);
+        let handle = script.handle.clone();
+        let connector = Arc::new(ScriptedConnector::new(vec![Ok(script)]));
+        let clock = Arc::new(TestClock::new(0));
+        let adapter =
+            ObsWebSocketAdapter::with_dependencies(config(), connector, clock).expect("adapter");
+
+        let scene = || {
+            authorized_stream(
+                "scene.set",
+                BTreeMap::from([("scene_name".to_owned(), Value::String("Live".to_owned()))]),
+            )
+        };
+
+        let rejected = adapter.execute_sync(&scene());
+        assert_eq!(
+            rejected
+                .expect_err("failed request status is an application-level rejection")
+                .kind,
+            EngineErrorKind::Backend
+        );
+
+        adapter
+            .execute_sync(&scene())
+            .expect("session survives a failed request status");
+
+        assert_eq!(handle.closed_count(), 0, "session must stay open");
+        assert_eq!(handle.sent().len(), 3);
+    }
+
+    #[test]
+    fn request_gives_up_after_the_message_budget_is_spent() {
+        // A peer that floods well-formed responses for other request ids must
+        // not hang the adapter: the message budget bounds the wait.
+        let challenge = "challenge";
+        let salt = "salt";
+        let mut responses: Vec<Result<String, TransportError>> =
+            vec![Ok(hello(Some((challenge, salt)))), Ok(identified())];
+        // Deliberately a fixed count far above the production budget so raising
+        // `MAX_RESPONSE_MESSAGES` cannot make this test pass by construction.
+        for index in 0..200 {
+            responses.push(Ok(request_ok_for_other(&format!(
+                "aivtuber-obs-other-{index}"
+            ))));
+        }
+        let script = Script::new(responses);
+        let connector = Arc::new(ScriptedConnector::new(vec![Ok(script)]));
+        let clock = Arc::new(TestClock::new(0));
+        let adapter =
+            ObsWebSocketAdapter::with_dependencies(config(), connector, clock).expect("adapter");
+
+        let error = adapter
+            .execute_sync(&authorized_stream(
+                "scene.set",
+                BTreeMap::from([("scene_name".to_owned(), Value::String("Live".to_owned()))]),
+            ))
+            .expect_err("a peer that never answers must not hang the request loop");
+
+        assert_eq!(error.kind, EngineErrorKind::Backend);
+        assert!(
+            error.to_string().contains("response limit exceeded"),
+            "unexpected error: {error}"
         );
     }
 

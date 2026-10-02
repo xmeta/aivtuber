@@ -2,8 +2,9 @@ use aivtuber_adapters::{
     ObsWebSocketAdapter, ObsWebSocketConfig, SecretString, VTubeStudioAdapter, VTubeStudioConfig,
 };
 use aivtuber_domain::{
-    AuthorizationMethod, AvatarAction, Capability, ControlSecret, LocalControlIngress,
-    OperatorCommandInput, StreamAction, authorize_avatar_action, authorize_stream_action,
+    AuthorizationMethod, AvatarAction, Capability, ControlSecret, EngineErrorKind,
+    LocalControlIngress, OperatorCommandInput, StreamAction, authorize_avatar_action,
+    authorize_stream_action,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -90,8 +91,56 @@ fn obs_live_smoke() {
 
     adapter.connect().expect("connect/authenticate OBS");
 
-    if let Ok(scene) = std::env::var("AIVTUBER_OBS_SCENE") {
-        let authority = authority(Capability::ObsControl, "obs.control");
+    let authority = authority(Capability::ObsControl, "obs.control");
+
+    // The negative path already restores the real scene, so it is an
+    // alternative to -- not a prefix of -- the simple scene.set path below.
+    if let Ok(negative_scene) = std::env::var("AIVTUBER_OBS_NEGATIVE_SCENE") {
+        // An obs-websocket requestStatus rejection (a scene that does
+        // not exist answers with code 600) is an application-level
+        // error: the adapter reports it as a Backend error and keeps
+        // the websocket session open instead of entering reconnect
+        // backoff.
+        let rejected = authorize_stream_action(
+            &authority,
+            StreamAction {
+                action: "scene.set".to_owned(),
+                arguments: BTreeMap::from([(
+                    "scene_name".to_owned(),
+                    Value::String(negative_scene),
+                )]),
+            },
+        )
+        .expect("authorize OBS negative scene change");
+        let error = adapter
+            .execute_sync(&rejected)
+            .expect_err("a nonexistent scene must fail at the requestStatus level");
+        assert_eq!(error.kind, EngineErrorKind::Backend);
+        let message = error.to_string();
+        assert!(
+            message.contains("failed with code"),
+            "unexpected rejection: {message}"
+        );
+        println!("negative scene.set rejected as expected: {message}");
+
+        // The very next request must reuse the still-open session;
+        // the pre-#176 behavior failed here with
+        // "OBS reconnect backoff active until ...".
+        let scene = std::env::var("AIVTUBER_OBS_SCENE")
+            .expect("AIVTUBER_OBS_SCENE is required alongside AIVTUBER_OBS_NEGATIVE_SCENE");
+        let restore = authorize_stream_action(
+            &authority,
+            StreamAction {
+                action: "scene.set".to_owned(),
+                arguments: BTreeMap::from([("scene_name".to_owned(), Value::String(scene))]),
+            },
+        )
+        .expect("authorize OBS scene restore");
+        adapter
+            .execute_sync(&restore)
+            .expect("session survives a failed request status");
+        println!("session kept: scene.set to the real scene succeeded right after the rejection");
+    } else if let Ok(scene) = std::env::var("AIVTUBER_OBS_SCENE") {
         let action = authorize_stream_action(
             &authority,
             StreamAction {
