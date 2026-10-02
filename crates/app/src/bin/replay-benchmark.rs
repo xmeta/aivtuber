@@ -285,6 +285,7 @@ fn write_gate_results(output_dir: &Path, suite: &ComparisonSuite) -> Result<(), 
                     MetricValue {
                         value: value as f64,
                         sample_count: Some(count as u64),
+                        run_range: None,
                     },
                 );
             };
@@ -346,6 +347,7 @@ fn write_gate_results(output_dir: &Path, suite: &ComparisonSuite) -> Result<(), 
             MetricValue {
                 value: llm_rate,
                 sample_count: Some(summary.events as u64),
+                run_range: None,
             },
         );
         let wrong_reuse_rate = if summary.wrong_reuse_labels > 0 {
@@ -358,6 +360,7 @@ fn write_gate_results(output_dir: &Path, suite: &ComparisonSuite) -> Result<(), 
             MetricValue {
                 value: (wrong_reuse_rate * 100.0).round() / 100.0,
                 sample_count: Some(summary.wrong_reuse_labels),
+                run_range: None,
             },
         );
 
@@ -981,6 +984,14 @@ fn gate_runtime_profile(mode: ComparisonMode) -> &'static str {
     }
 }
 
+/// Revision this result was measured from: `git rev-parse HEAD` of the
+/// *current working directory*.
+///
+/// The gate workflow runs each revision's binary with its working directory
+/// set to a worktree checked out at that revision, so this resolves to the
+/// revision actually under test even for a base revision predating this
+/// code. Results are written outside those worktrees so the revision stays
+/// clean and the `+dirty` marker means what it says (issue #180 review).
 fn git_revision() -> String {
     let revision =
         command_output("git", &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_owned());

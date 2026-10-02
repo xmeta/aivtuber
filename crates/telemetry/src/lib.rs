@@ -11,8 +11,8 @@ mod causal_trace;
 pub use benchmark_gate::{
     BenchmarkConfiguration, BenchmarkEnvironment, BenchmarkGateError, BenchmarkGit,
     BenchmarkResult, BudgetDirection, Budgets, GateReport, GateVerdict, InvariantBudget,
-    InvariantComparison, InvariantValue, MetricBudget, MetricComparison, MetricStatus, MetricValue,
-    RESULT_SCHEMA_VERSION, compare,
+    InvariantComparison, InvariantValue, MetricBudget, MetricComparison, MetricRange, MetricStatus,
+    MetricValue, RESULT_SCHEMA_VERSION, compare, compare_runs,
 };
 pub use causal_trace::{
     CausalTrace, CausalTraceCollector, CausalTraceError, CausalTraceRetentionConfig,

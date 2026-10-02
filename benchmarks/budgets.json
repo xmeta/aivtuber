@@ -1,6 +1,6 @@
 {
   "schema_version": "1",
-  "description": "Benchmark regression budgets (issue #58). Percent thresholds are relative to the base value; absolute thresholds are in the metric's own unit. Metrics without an entry are reported ungated (warning-only) until calibrated. Changes to this file are reviewed like code: accepting a regression intentionally requires editing it.",
+  "description": "Benchmark regression budgets (issue #58). Percent thresholds are relative to the base value; absolute thresholds are in the metric's own unit. Metrics without an entry are reported ungated (warning-only) until calibrated. Changes to this file are reviewed like code: accepting a regression intentionally requires editing it. Issue #180: routing.route_decision.p95_us is gated in absolute microseconds, not percent, because its base value is single-digit microseconds — a percent budget there is smaller than one timer tick of run-to-run noise. Its min_samples floor is set above one 3-event fixture pass, so the gate only decides this metric from repeated runs (benchmarks/budgets.json evidence in docs/benchmark-gate.adoc).",
   "metrics": {
     "cached.first_audio.p95_ms": {
       "direction": "lower",
@@ -22,9 +22,9 @@
     },
     "routing.route_decision.p95_us": {
       "direction": "lower",
-      "warn_regression_percent": 20,
-      "fail_regression_percent": 40,
-      "min_samples": 3
+      "warn_absolute_change": 3,
+      "fail_absolute_change": 6,
+      "min_samples": 15
     },
     "routing.llm_calls_per_100_events": {
       "direction": "lower",

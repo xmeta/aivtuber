@@ -13,6 +13,10 @@
 //! * performance metrics support lower-is-better and higher-is-better
 //!   directions with percentage and absolute warn/fail thresholds plus a
 //!   minimum sample count;
+//! * each side may be measured by repeated runs (issue #180): metric values
+//!   are aggregated by their median across runs, hard invariants by their
+//!   maximum, so a single noisy run cannot decide the verdict and the
+//!   reported sample count is the pooled sample count;
 //! * hard invariants (`stale_dispatch_count == 0`, ...) fail on any single
 //!   violation regardless of latency improvements;
 //! * incompatible datasets/config versions are detected instead of silently
@@ -29,11 +33,22 @@ use std::fmt;
 pub const RESULT_SCHEMA_VERSION: &str = "1";
 
 /// One measured value with optional sample count.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct MetricValue {
     pub value: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample_count: Option<u64>,
+    /// Observed spread across repeated runs of the same revision, when the
+    /// comparator aggregated more than one run (issue #180). Diagnostic: it
+    /// shows the noise band a verdict was taken in and never gates by itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_range: Option<MetricRange>,
+}
+
+impl MetricValue {
+    fn range(&self) -> Option<MetricRange> {
+        self.run_range
+    }
 }
 
 /// One hard-invariant observation.
@@ -271,6 +286,15 @@ pub enum MetricStatus {
     Ungated,
 }
 
+impl MetricRange {
+    fn of(values: &[f64]) -> Option<Self> {
+        (values.len() > 1).then(|| Self {
+            min: values.iter().copied().fold(f64::INFINITY, f64::min),
+            max: values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        })
+    }
+}
+
 impl MetricStatus {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -283,6 +307,15 @@ impl MetricStatus {
     }
 }
 
+/// Observed spread of one aggregated metric across the runs of a side.
+/// Reported so reviewers can see the measurement noise the verdict was taken
+/// in (issue #180) instead of trusting a single run.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MetricRange {
+    pub min: f64,
+    pub max: f64,
+}
+
 /// One metric row for the PR job summary.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetricComparison {
@@ -291,6 +324,12 @@ pub struct MetricComparison {
     pub head: f64,
     pub delta_percent: Option<f64>,
     pub status: MetricStatus,
+    /// Per-run spread behind the aggregated `base`/`head` values; absent for
+    /// a single-run comparison.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_range: Option<MetricRange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_range: Option<MetricRange>,
 }
 
 /// Outcome of an invariant check.
@@ -316,6 +355,9 @@ pub enum GateVerdict {
 pub struct GateReport {
     pub base_commit: String,
     pub head_commit: String,
+    /// Number of runs aggregated per side.
+    pub base_runs: usize,
+    pub head_runs: usize,
     pub metrics: Vec<MetricComparison>,
     pub invariants: Vec<InvariantComparison>,
     pub warnings: Vec<String>,
@@ -326,8 +368,9 @@ impl GateReport {
     /// Compact human-readable table for the PR job summary. Reviewers must
     /// not need to download artifacts to see deltas.
     pub fn markdown_summary(&self) -> String {
-        let mut out =
-            String::from("| Metric | Base | Head | Delta | Status |\n|---|---|---|---|---|\n");
+        let mut out = String::from(
+            "| Metric | Base | Head | Delta | Base run range | Head run range | Status |\n|---|---|---|---|---|---|---|\n",
+        );
         for metric in &self.metrics {
             let base = metric
                 .base
@@ -338,17 +381,19 @@ impl GateReport {
                 .map(|value| format!("{value:+.1}%"))
                 .unwrap_or_else(|| "-".to_owned());
             out.push_str(&format!(
-                "| {} | {} | {:.4} | {} | {} |\n",
+                "| {} | {} | {:.4} | {} | {} | {} | {} |\n",
                 metric.name,
                 base,
                 metric.head,
                 delta,
+                format_range(metric.base_range),
+                format_range(metric.head_range),
                 metric.status.as_str()
             ));
         }
         for invariant in &self.invariants {
             out.push_str(&format!(
-                "| {} | {} | {} | max={} | {} |\n",
+                "| {} | {} | {} | max={} | - | - | {} |\n",
                 invariant.name,
                 invariant.base,
                 invariant.head,
@@ -377,9 +422,29 @@ pub fn compare(
     head: &BenchmarkResult,
     budgets: &Budgets,
 ) -> Result<GateReport, BenchmarkGateError> {
-    base.validate()?;
-    head.validate()?;
-    base.ensure_comparable(head)?;
+    compare_runs(
+        std::slice::from_ref(base),
+        std::slice::from_ref(head),
+        budgets,
+    )
+}
+
+/// Compare repeated runs of base and head under the configured budgets
+/// (issue #180).
+///
+/// Each side may contribute one or more results measured under identical
+/// fixture/config boundaries. Metric values are aggregated by their median
+/// across runs and hard invariants by their maximum, so one noisy run cannot
+/// decide a verdict; the reported `sample_count` is the pooled sample count
+/// across the side's runs.
+pub fn compare_runs(
+    base_runs: &[BenchmarkResult],
+    head_runs: &[BenchmarkResult],
+    budgets: &Budgets,
+) -> Result<GateReport, BenchmarkGateError> {
+    let base = aggregate_runs("base", base_runs)?;
+    let head = aggregate_runs("head", head_runs)?;
+    base.ensure_comparable(&head)?;
 
     let mut metrics = Vec::new();
     let mut warnings = Vec::new();
@@ -404,12 +469,29 @@ pub fn compare(
         };
 
         let status = match (base_value, budget) {
-            (Some(base_value), Some(budget)) => evaluate_metric(
-                base_value,
-                head_metric.value,
-                head_metric.sample_count,
-                budget,
-            ),
+            (Some(base_value), Some(budget)) => {
+                let status = evaluate_metric(
+                    base_value,
+                    head_metric.value,
+                    head_metric.sample_count,
+                    budget,
+                );
+                // Say *why* a budgeted metric did not gate, so an ungated row
+                // is never mistaken for a passing one (issue #180).
+                if status == MetricStatus::Ungated
+                    && let Some(min_samples) = budget.min_samples
+                {
+                    warnings.push(format!(
+                        "metric {name:?} pools {} sample(s) over {} head run(s), below its min_samples floor of {min_samples}; reported ungated (raise the repeat count, or lower the floor only with recorded evidence, #180)",
+                        head_metric
+                            .sample_count
+                            .map(|count| count.to_string())
+                            .unwrap_or_else(|| "an unknown number of".to_owned()),
+                        head_runs.len()
+                    ));
+                }
+                status
+            }
             (Some(_), None) if budgets.ungated_metrics_warning_only => {
                 warnings.push(format!(
                     "metric {name:?} has no budget entry; reported ungated (calibrate before gating, #58)"
@@ -426,6 +508,8 @@ pub fn compare(
             head: head_metric.value,
             delta_percent,
             status,
+            base_range: base_metric.and_then(MetricValue::range),
+            head_range: head_metric.range(),
         });
     }
 
@@ -503,11 +587,147 @@ pub fn compare(
     Ok(GateReport {
         base_commit: base.git.commit.clone(),
         head_commit: head.git.commit.clone(),
+        base_runs: base_runs.len(),
+        head_runs: head_runs.len(),
         metrics,
         invariants,
         warnings,
         verdict,
     })
+}
+
+/// Collapse the runs of one side into a single comparable result.
+///
+/// * metrics: median value across runs, observed min/max retained as the
+///   noise band, sample counts summed (so a pooled measurement satisfies a
+///   `min_samples` floor that no single run could);
+/// * invariants: maximum value across runs, so a violation observed in any
+///   run fails the gate;
+/// * identity/config: taken from the first run, which every other run must
+///   match (otherwise the runs are not a repetition of one measurement).
+///
+/// Runs must agree on the metric and invariant key *sets* in both directions
+/// and on the revision they claim to measure: dropping a key would silently
+/// ungate it, and averaging two revisions together would report one
+/// revision's measurements under the other's identity.
+fn aggregate_runs(
+    side: &str,
+    runs: &[BenchmarkResult],
+) -> Result<BenchmarkResult, BenchmarkGateError> {
+    let Some((first, rest)) = runs.split_first() else {
+        return Err(BenchmarkGateError::new(format!(
+            "{side} comparison needs at least one benchmark result"
+        )));
+    };
+    first.validate()?;
+    for run in rest {
+        run.validate()?;
+        first.ensure_comparable(run).map_err(|error| {
+            BenchmarkGateError::new(format!("{side} runs are not comparable: {error}"))
+        })?;
+        // `ensure_comparable` deliberately ignores `git.commit` because base
+        // and head *must* differ. Within one side they must not: these runs
+        // are repeated measurements of one revision (issue #180 review).
+        if run.git.commit != first.git.commit {
+            return Err(BenchmarkGateError::new(format!(
+                "{side} runs disagree on git.commit: {:?} vs {:?}; one side must be repeated measurements of a single revision",
+                first.git.commit, run.git.commit
+            )));
+        }
+        for (kind, mismatched) in [
+            (
+                "metric",
+                first.metrics.keys().ne(run.metrics.keys())
+                    || first
+                        .metrics
+                        .keys()
+                        .any(|key| !run.metrics.contains_key(key))
+                    || run
+                        .metrics
+                        .keys()
+                        .any(|key| !first.metrics.contains_key(key)),
+            ),
+            (
+                "invariant",
+                first.invariants.keys().ne(run.invariants.keys())
+                    || first
+                        .invariants
+                        .keys()
+                        .any(|key| !run.invariants.contains_key(key))
+                    || run
+                        .invariants
+                        .keys()
+                        .any(|key| !first.invariants.contains_key(key)),
+            ),
+        ] {
+            if mismatched {
+                return Err(BenchmarkGateError::new(format!(
+                    "{side} runs disagree on {kind} keys: the first run and a later run must measure exactly the same {kind} set, so no metric is silently ungated and no invariant violation is silently dropped"
+                )));
+            }
+        }
+    }
+
+    let mut aggregated = first.clone();
+    aggregated.recording = None;
+    aggregated.metrics.clear();
+    aggregated.invariants.clear();
+
+    for name in first.metrics.keys() {
+        // Key sets are proven identical above, so every lookup is total.
+        let values = runs
+            .iter()
+            .map(|run| run.metrics[name].value)
+            .collect::<Vec<_>>();
+        // Sample counts pool across runs, so a repeated measurement can meet a
+        // `min_samples` floor that no single run reaches. A run without a
+        // recorded count makes the pooled count unknown (`None`), which keeps
+        // the floor binding instead of inventing one.
+        let sample_count = runs
+            .iter()
+            .map(|run| run.metrics.get(name).and_then(|metric| metric.sample_count))
+            .collect::<Option<Vec<_>>>()
+            .map(|counts| counts.into_iter().fold(0_u64, u64::saturating_add));
+        aggregated.metrics.insert(
+            name.clone(),
+            MetricValue {
+                value: median(&values),
+                sample_count,
+                run_range: MetricRange::of(&values),
+            },
+        );
+    }
+
+    for (name, invariant) in &first.invariants {
+        let value = runs
+            .iter()
+            .map(|run| run.invariants[name].value)
+            .collect::<Vec<_>>();
+        aggregated.invariants.insert(
+            name.clone(),
+            InvariantValue {
+                value: value.iter().copied().max().unwrap_or(0),
+                detail: invariant.detail.clone(),
+            },
+        );
+    }
+
+    Ok(aggregated)
+}
+
+/// Median of a non-empty sample: the middle order statistic, or the mean of
+/// the two middle values for an even count. Deterministic and outlier
+/// resistant, unlike a mean (issue #180).
+fn median(values: &[f64]) -> f64 {
+    debug_assert!(!values.is_empty());
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    let middle = sorted.len() / 2;
+    if sorted.len().is_multiple_of(2) {
+        (sorted[middle - 1] + sorted[middle]) / 2.0
+    } else {
+        sorted[middle]
+    }
 }
 
 /// Evaluate one metric against its budget. `delta` is improvement-positive:
@@ -518,8 +738,11 @@ fn evaluate_metric(
     sample_count: Option<u64>,
     budget: &MetricBudget,
 ) -> MetricStatus {
+    // An *unknown* pooled count must keep the floor binding: `sample_count`
+    // is optional in the schema, so treating "no count" as "enough samples"
+    // would let a missing count fail open (issue #180 review).
     if let Some(min_samples) = budget.min_samples
-        && sample_count.is_some_and(|count| count < min_samples)
+        && sample_count.is_none_or(|count| count < min_samples)
     {
         return MetricStatus::Ungated;
     }
@@ -573,6 +796,13 @@ pub struct BenchmarkGateError {
     message: String,
 }
 
+fn format_range(range: Option<MetricRange>) -> String {
+    match range {
+        Some(range) => format!("{:.4}–{:.4}", range.min, range.max),
+        None => "-".to_owned(),
+    }
+}
+
 impl BenchmarkGateError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
@@ -602,6 +832,7 @@ mod tests {
                     MetricValue {
                         value: *value,
                         sample_count: *count,
+                        run_range: None,
                     },
                 )
             })
@@ -920,6 +1151,320 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("some.new.metric_us"))
         );
+    }
+
+    #[test]
+    fn repeated_runs_are_aggregated_by_median_and_invariant_maximum() {
+        // Issue #180: a single run of a single-digit-microsecond metric must
+        // not decide the verdict; the median of repeated runs does.
+        let budgets = Budgets {
+            metrics: BTreeMap::from([(
+                "routing.route_decision.p95_us".to_owned(),
+                MetricBudget {
+                    direction: BudgetDirection::Lower,
+                    warn_regression_percent: None,
+                    fail_regression_percent: None,
+                    warn_absolute_change: Some(3.0),
+                    fail_absolute_change: Some(6.0),
+                    min_samples: Some(15),
+                },
+            )]),
+            ..Budgets::default()
+        };
+        let runs = |values: &[f64]| -> Vec<BenchmarkResult> {
+            values
+                .iter()
+                .map(|value| {
+                    result(
+                        "run",
+                        metric_map(&[("routing.route_decision.p95_us", *value, Some(3))]),
+                    )
+                })
+                .collect()
+        };
+        // One 5µs outlier among quiet 10µs runs must not move the median.
+        let base = runs(&[10.0, 10.0, 11.0, 10.0, 12.0, 5.0, 10.0]);
+        let head = runs(&[14.0, 14.0, 14.0, 15.0, 14.0, 14.0, 15.0]);
+
+        let report = compare_runs(&base, &head, &budgets).expect("compare");
+        let routing = &report.metrics[0];
+        assert_eq!(routing.name, "routing.route_decision.p95_us");
+        assert_eq!(routing.base, Some(10.0));
+        assert_eq!(routing.head, 14.0);
+        assert_eq!(routing.status, MetricStatus::Warning);
+        assert_eq!(
+            routing.base_range,
+            Some(MetricRange {
+                min: 5.0,
+                max: 12.0
+            })
+        );
+        assert_eq!(
+            routing.head_range,
+            Some(MetricRange {
+                min: 14.0,
+                max: 15.0
+            })
+        );
+        assert_eq!(report.base_runs, 7);
+        assert_eq!(report.head_runs, 7);
+        assert_eq!(report.verdict, GateVerdict::Warning);
+    }
+
+    #[test]
+    fn pooled_sample_counts_satisfy_a_floor_one_run_cannot_meet() {
+        // Issue #180: min_samples must bind the *pooled* measurement, and a
+        // too-small pooled sample count must report ungated with a reason
+        // rather than a silent coin flip.
+        let budgets = Budgets {
+            metrics: BTreeMap::from([(
+                "routing.route_decision.p95_us".to_owned(),
+                MetricBudget {
+                    direction: BudgetDirection::Lower,
+                    warn_regression_percent: None,
+                    fail_regression_percent: None,
+                    warn_absolute_change: Some(3.0),
+                    fail_absolute_change: Some(6.0),
+                    min_samples: Some(15),
+                },
+            )]),
+            ..Budgets::default()
+        };
+        let one_run = |value: f64| {
+            vec![result(
+                "run",
+                metric_map(&[("routing.route_decision.p95_us", value, Some(3))]),
+            )]
+        };
+
+        let report = compare_runs(&one_run(10.0), &one_run(90.0), &budgets).expect("compare");
+        assert_eq!(report.metrics[0].status, MetricStatus::Ungated);
+        assert_eq!(report.verdict, GateVerdict::Pass);
+        assert!(
+            report.warnings.iter().any(
+                |warning| warning.contains("min_samples") && warning.contains("route_decision")
+            )
+        );
+
+        let seven = |value: f64| -> Vec<BenchmarkResult> {
+            (0..7)
+                .map(|_| {
+                    result(
+                        "run",
+                        metric_map(&[("routing.route_decision.p95_us", value, Some(3))]),
+                    )
+                })
+                .collect()
+        };
+        let report = compare_runs(&seven(10.0), &seven(90.0), &budgets).expect("compare");
+        assert_eq!(report.metrics[0].status, MetricStatus::Failed);
+        assert_eq!(report.verdict, GateVerdict::Fail);
+    }
+
+    #[test]
+    fn a_clean_repeated_comparison_keeps_the_same_verdict_across_noise() {
+        // Issue #180 acceptance: repeating a base-vs-base comparison must not
+        // flip between pass and fail on run-to-run noise alone.
+        let budgets = Budgets {
+            metrics: BTreeMap::from([(
+                "routing.route_decision.p95_us".to_owned(),
+                MetricBudget {
+                    direction: BudgetDirection::Lower,
+                    warn_regression_percent: None,
+                    fail_regression_percent: None,
+                    warn_absolute_change: Some(3.0),
+                    fail_absolute_change: Some(6.0),
+                    min_samples: Some(15),
+                },
+            )]),
+            ..Budgets::default()
+        };
+        let runs = |values: &[f64]| -> Vec<BenchmarkResult> {
+            values
+                .iter()
+                .map(|value| {
+                    result(
+                        "run",
+                        metric_map(&[("routing.route_decision.p95_us", *value, Some(3))]),
+                    )
+                })
+                .collect()
+        };
+        // Observed noise for this metric on one runner, one build (#180).
+        let base = runs(&[9.0, 10.0, 12.0, 9.0, 15.0, 9.0, 10.0]);
+        let head = runs(&[9.0, 10.0, 11.0, 12.0, 14.0, 9.0, 11.0]);
+
+        for _ in 0..8 {
+            let report = compare_runs(&base, &head, &budgets).expect("compare");
+            assert_eq!(report.verdict, GateVerdict::Pass);
+        }
+    }
+
+    #[test]
+    fn runs_with_inconsistent_metric_sets_are_rejected() {
+        let base = vec![result(
+            "base",
+            metric_map(&[("routing.route_decision.p95_us", 10.0, Some(3))]),
+        )];
+        let head = vec![
+            result(
+                "head",
+                metric_map(&[("routing.route_decision.p95_us", 10.0, Some(3))]),
+            ),
+            result("head", metric_map(&[])),
+        ];
+
+        let error = compare_runs(&base, &head, &Budgets::default()).expect_err("metric mismatch");
+        assert!(error.to_string().contains("disagree"));
+    }
+
+    #[test]
+    fn runs_across_different_config_versions_are_rejected() {
+        let mut second = result(
+            "base",
+            metric_map(&[("routing.route_decision.p95_us", 10.0, Some(3))]),
+        );
+        second.configuration.seed = 7;
+        let base = vec![
+            result(
+                "base",
+                metric_map(&[("routing.route_decision.p95_us", 10.0, Some(3))]),
+            ),
+            second,
+        ];
+        let head = vec![result(
+            "head",
+            metric_map(&[("routing.route_decision.p95_us", 10.0, Some(3))]),
+        )];
+
+        let error = compare_runs(&base, &head, &Budgets::default()).expect_err("seed mismatch");
+        assert!(error.to_string().contains("not comparable"));
+    }
+
+    #[test]
+    fn empty_run_lists_are_rejected() {
+        let error = compare_runs(&[], &[], &Budgets::default()).expect_err("no runs");
+        assert!(error.to_string().contains("at least one"));
+    }
+
+    #[test]
+    fn runs_measuring_different_revisions_are_rejected() {
+        // Issue #180 review: `ensure_comparable` ignores `git.commit` because
+        // base and head must differ, so one side must enforce it separately —
+        // otherwise two revisions get medianed and reported as one.
+        let base = vec![
+            result(
+                "base-rev",
+                metric_map(&[("routing.route_decision.p95_us", 10.0, Some(3))]),
+            ),
+            result(
+                "other-base-rev",
+                metric_map(&[("routing.route_decision.p95_us", 12.0, Some(3))]),
+            ),
+        ];
+        let head = vec![result(
+            "head-rev",
+            metric_map(&[("routing.route_decision.p95_us", 10.0, Some(3))]),
+        )];
+
+        let error = compare_runs(&base, &head, &Budgets::default()).expect_err("mixed commits");
+        assert!(error.to_string().contains("git.commit"));
+    }
+
+    #[test]
+    fn an_unknown_pooled_sample_count_keeps_the_floor_binding() {
+        // Issue #180 review: `sample_count` is optional in the schema, so a
+        // missing count must not fail open through a configured `min_samples`.
+        let budgets = Budgets {
+            metrics: BTreeMap::from([(
+                "routing.route_decision.p95_us".to_owned(),
+                MetricBudget {
+                    direction: BudgetDirection::Lower,
+                    warn_regression_percent: None,
+                    fail_regression_percent: None,
+                    warn_absolute_change: Some(3.0),
+                    fail_absolute_change: Some(6.0),
+                    min_samples: Some(3),
+                },
+            )]),
+            ..Budgets::default()
+        };
+        let uncounted = |value: f64| {
+            vec![result(
+                "rev",
+                metric_map(&[("routing.route_decision.p95_us", value, None)]),
+            )]
+        };
+
+        let report = compare_runs(&uncounted(10.0), &uncounted(90.0), &budgets).expect("compare");
+        assert_eq!(report.metrics[0].status, MetricStatus::Ungated);
+        assert_eq!(report.verdict, GateVerdict::Pass);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("min_samples")),
+            "an ungated row must say why: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn keys_present_only_in_a_later_run_are_rejected() {
+        // Issue #180 review: comparing only the first run's key sets would
+        // silently ignore a later-only metric, and a later-only *invariant*
+        // would drop a violation entirely.
+        let run_with = |commit: &str, extra_metric: bool, extra_invariant: bool| {
+            let mut run = result(
+                commit,
+                metric_map(&[("routing.route_decision.p95_us", 10.0, Some(3))]),
+            );
+            if extra_metric {
+                run.metrics.insert(
+                    "semantic.wrong_reuse_rate_pct".to_owned(),
+                    MetricValue {
+                        value: 4.0,
+                        sample_count: Some(3),
+                        run_range: None,
+                    },
+                );
+            }
+            if extra_invariant {
+                run.invariants.insert(
+                    "resource.invalid_route_transition_count".to_owned(),
+                    InvariantValue {
+                        value: 7,
+                        detail: None,
+                    },
+                );
+            }
+            run
+        };
+        let base = vec![run_with("base-rev", false, false)];
+
+        let error = compare_runs(
+            &base,
+            &[
+                run_with("head-rev", false, false),
+                run_with("head-rev", true, false),
+            ],
+            &Budgets::default(),
+        )
+        .expect_err("later-only metric");
+        assert!(error.to_string().contains("metric keys"), "{error}");
+
+        // The same must hold when only an *invariant* appears later: dropping
+        // it would hide the violation the gate exists to catch.
+        let error = compare_runs(
+            &base,
+            &[
+                run_with("head-rev", false, false),
+                run_with("head-rev", false, true),
+            ],
+            &Budgets::default(),
+        )
+        .expect_err("later-only invariant");
+        assert!(error.to_string().contains("invariant keys"), "{error}");
     }
 
     #[test]

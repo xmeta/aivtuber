@@ -126,7 +126,17 @@
         "additionalProperties": false,
         "properties": {
           "value": { "type": "number" },
-          "sample_count": { "type": "integer", "minimum": 0 }
+          "sample_count": { "type": "integer", "minimum": 0, "description": "Number of observations behind the value. Producers record one run's sample count; the comparator pools counts across repeated runs of the same revision (issue #180)." },
+          "run_range": {
+            "type": "object",
+            "required": ["min", "max"],
+            "additionalProperties": false,
+            "description": "Observed min/max across the repeated runs aggregated into this value (issue #180). Diagnostic only: it shows the measurement noise the verdict was taken in and never gates by itself. Absent for a single-run comparison.",
+            "properties": {
+              "min": { "type": "number" },
+              "max": { "type": "number" }
+            }
+          }
         }
       }
     },

@@ -48,8 +48,14 @@ Do not invent absolute targets without baseline data. The process is:
 
 Replay comparison suite (`benchmarks/budgets.json`):
 
-* timing metrics (first-audio p50/p95, first-visible p95, route p95) are
-  warning-gated at 10–20% relative regression, fail at 25–40%;
+* timing metrics (first-audio p50/p95, first-visible p95) are warning-gated
+  at 10–20% relative regression, fail at 25–40%;
+* `routing.route_decision.p95_us` warns at +3µs absolute, fails at +6µs,
+  and only gates from repeated runs (its `min_samples` floor of 15 exceeds
+  one 3-event fixture pass) — its values are single-digit microseconds, so a
+  percent budget there would be smaller than run-to-run noise. Evidence and
+  the controlled regression experiment: link:benchmark-gate.adoc[benchmark-gate.adoc]
+  ("Issue #180 — routing-decision calibration");
 * `routing.llm_calls_per_100_events` fails at +15 calls absolute;
 * `semantic.wrong_reuse_rate_pct` fails at +2.0pp absolute;
 * hard invariants (`stale_dispatch`, `unauthorized_privileged_action`,
@@ -66,7 +72,9 @@ Resource soak suite (`benchmarks/budgets-resource-soak.json`):
 * `resource.peak_rss_kib` is diagnostic only — never a gate.
 
 Timing thresholds intentionally stay warning-only until noise calibration
-(issue #58): correctness/state invariants are strict from day one.
+(issue #58): correctness/state invariants are strict from day one. Where a
+metric's own noise band was measured (issue #180), it is aggregated over
+repeated interleaved runs and compared in absolute units instead of percent.
 
 == 4. Candidate product targets (to be baselined)
 

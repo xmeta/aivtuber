@@ -56,7 +56,10 @@ schema job.
 
 == 3. Comparator and budgets
 
-`benchmark-compare <base.json> <head.json> [budgets.json] [out-dir]`:
+`benchmark-compare <base.json> <head.json> [budgets.json] [out-dir]`, or with
+repeated runs per side (issue #180):
+
+`benchmark-compare --base <base.json>... --head <head.json>... [budgets.json] [out-dir]`:
 
 1. loads and validates both results (schema version, identity metadata);
 2. refuses to compare across differing `benchmark_suite`, `mode`,
@@ -70,11 +73,24 @@ schema job.
    * `direction` `lower`/`higher`,
    * `warn_regression_percent` / `fail_regression_percent`,
    * `warn_absolute_change` / `fail_absolute_change`,
-   * `min_samples` — below it the metric reports `ungated`;
-5. enforces exact hard invariants (any value above `max` fails the gate);
-6. prints a Markdown table (metric / base / head / delta / status) for the
-   PR job summary and writes `gate-report.json` + `gate-summary.md`;
-7. exits non-zero on `fail`.
+   * `min_samples` — the floor applies to the *pooled* sample count of the
+     side being judged; below it the metric reports `ungated` with a warning
+     naming the pooled count and the floor (issue #180);
+5. when a side contributes repeated runs (issue #180), aggregates them first:
+   metrics by the **median** value across runs (outlier resistant), hard
+   invariants by the **maximum** (a violation in any run fails), sample counts
+   summed, and the observed per-side min/max recorded as a diagnostic
+   `run_range` in the table and report. Aggregation refuses — rather than
+   silently averaging — when the runs of one side disagree on the measured
+   `git.commit`, on the exact metric/invariant key set (checked in both
+   directions), or on the comparison boundaries; and an *unknown* pooled
+   `sample_count` keeps a `min_samples` floor binding instead of failing
+   open;
+6. enforces exact hard invariants (any value above `max` fails the gate);
+7. prints a Markdown table (metric / base / head / delta / base run range /
+   head run range / status) for the PR job summary and writes
+   `gate-report.json` + `gate-summary.md`;
+8. exits non-zero on `fail`.
 
 Verdicts:
 
@@ -94,10 +110,13 @@ the lockfile, or benchmark inputs:
 
 ```text
 resolve base SHA (GitHub API)
-→ checkout exact PR head SHA → replay-benchmark → results/head
-→ checkout base SHA → replay-benchmark → results/base
-→ re-checkout exact PR head SHA (comparator + budgets from the PR)
-→ benchmark-compare base head → Job Summary + artifacts
+→ checkout exact PR head SHA → build head replay-benchmark binary
+→ checkout base SHA → build base replay-benchmark binary
+→ re-checkout exact PR head SHA (comparator + budgets + fixture from the PR)
+→ add clean worktrees at the base and head SHAs (result provenance)
+→ REPEATS interleaved runs, each side in its own worktree → results/{head,base}/
+→ benchmark-compare --base ... --head ... → Job Summary + artifacts
+→ assert measured revisions == resolved base/head SHAs
 → enforce verdict (exit status)
 ```
 
@@ -107,6 +126,24 @@ resolve base SHA (GitHub API)
   from a second head checkout so a PR's own budget changes gate itself —
   intentional regressions therefore require the reviewed budgets edit
   (issue #58 Phase C acceptance).
+* Each revision is measured by its own prebuilt binary so base and head can
+  be run *interleaved* on one runner (issue #180). Sequential
+  base-then-head runs let runner drift land entirely on one side of the
+  comparison; A/B/A/B interleaving shares that drift between both sides.
+* Both revisions run the *reviewed* fixture and comparator, so a PR that
+  edits the fixture or the budgets compares like-for-like under its own
+  reviewed measurement definition.
+* Each side runs in **its own clean git worktree** checked out at the
+  revision it was built from, so the producer's `git rev-parse HEAD`
+  resolves to the revision actually under test and results carry that exact
+  SHA with no `+dirty`. Doing it by working directory rather than by an
+  environment override matters: the base binary is built from the base
+  revision, so any producer-side flag introduced by this change would not
+  exist in the binary it is meant to identify. Benchmarks are written outside
+  the worktrees, which keeps them clean. The `Assert measured revisions match
+  the resolved SHAs` step fails the job unless `gate-report.json` carries the
+  exact base and head SHAs the job resolved, so this provenance cannot
+  silently regress again.
 * Both revisions are measured on the same runner under the identical
   fixture/seed/config boundaries, so latency deltas are relative to the
   base measured moments earlier — not to a stale cross-runner history
@@ -219,13 +256,110 @@ If the review interpretation is +regression+, the companion report explicitly
 blocks an unqualified product-improvement claim even if the #58 proxy verdict
 passes. No report output can promote a candidate policy or mint runtime authority.
 
-== 8. Verification
+== 8. Issue #180 — routing-decision calibration
 
-* telemetry unit tests (12): improvement/ok/warning/fail paths,
+`routing.route_decision.p95_us` used to be gated at `warn 20%` /
+`fail 40%` over a p95 of 3 fixture events whose absolute values are
+single-digit microseconds. The noise band of that measurement is wider than
+the entire failure budget, so the required check failed on unrelated PRs
+(PR #179: `base=3.0000 | head=5.0000 | -66.7% | failed` on a comparator
+that executed none of that PR's code).
+
+Measured on one machine, same fixture, same lockfile, debug profile — the
+run-to-run spread of a *single* run of one unchanged build:
+
+[source,text]
+----
+24 sequential runs, routing.route_decision.p95_us (µs):
+7 6 6 6 7 5 7 6 6 8 5 6 5 7 7 12 5 5 6 5 8 8 5 7      (median 6, range 5–12)
+40 sequential runs, same build:
+7 6 9 5 7 5 5 7 5 8 9 8 6 6 7 6 7 6 9 7 6 6 10 6 8 5 6 5 7 5 6 6 6 5 6 6 7 7 5 5  (median 6, range 5–10)
+----
+
+A 2x range inside one build.
+
+*Why this metric and not the others.* Across 64 runs of one build, every
+other gated metric was bit-identical run to run
+(`cached.first_audio.p50_ms` = 83, `p95` = 112, `p99` = 112,
+`cached.first_visible.p95_ms` = 33, `routing.llm_calls_per_100_events` = 0,
+`semantic.wrong_reuse_rate_pct` = 0) — they are replay-clock measurements
+(`at_ms` differences in `crates/runtime/src/cached_playback.rs`), so their
+run-to-run noise is zero and their percent budgets are meaningful.
+`routing.route_decision.p95_us` is the one gated metric measured against the
+**wall clock** (`Instant::elapsed()` in `crates/app/src/lib.rs`), which is
+exactly why it — and only it — was gated on uncalibrated noise.
+
+Two changes follow from that evidence:
+
+* *The gate no longer decides this metric from one run.* The workflow
+  benchmarks both revisions 7 times, interleaved, and the comparator takes
+  the **median** across runs with the observed min/max reported as
+  `run_range`. Measured over 8 independent interleaved batches of 7 runs per
+  side with byte-identical binaries, every batch produced the same verdict
+  (`PASS`, exit 0); the largest base↔head median delta observed was 2 µs,
+  against a 3 µs warn budget and 6 µs fail budget.
+* *The budget is absolute, and the sample floor binds the pooled
+  measurement.* `routing.route_decision.p95_us` is now
+  `warn_absolute_change: 3` / `fail_absolute_change: 6` (µs) with
+  `min_samples: 15`. 15 samples is more than one 3-event fixture pass
+  produces (3), so a single-run comparison reports `ungated` with a warning
+  instead of deciding on three samples; the workflow's 7 runs pool 21. A
+  percent budget is not expressible at this magnitude — 20% of 6 µs is
+  1.2 µs, less than the spread of one unchanged build.
+
+Controlled regression experiment (not a code guess): a deliberate ~120 µs
+busy-wait added to `IntentRoutePlanner::route`, binary rebuilt, same
+interleaved 7-run protocol:
+
+[source,text]
+----
+base median 12 µs (run range 9–15)  head median 133 µs (run range 130–142)  → failed, exit 1
+base median 12 µs (run range 9–15)  head median 132 µs (run range 129–137)  → failed, exit 1
+base median 12 µs (run range 9–15)  head median 133 µs (run range 130–137)  → failed, exit 1
+----
+
+A deliberately *small* regression (a 10 µs busy-wait, below the 2x noise
+range of a single run) also fails every batch: `12 → 21 µs`, `12 → 21 µs`,
+`12 → 22 µs` → `failed`, exit 1. The gate still catches a real routing
+regression; it just no longer fails on noise.
+
+Hard invariants were never affected by any of this: they aggregate by
+maximum, so a violation in any run still fails the gate.
+
+*Provenance.* Each side is measured in its own clean worktree at the revision
+under test. Without that, a runtime `git rev-parse HEAD` stamped both sides
+with the PR head (and `+dirty`), which the first CI run of this branch
+actually did — `base=3a59ae97...+dirty head=3a59ae97...+dirty` while the
+resolved base was `91c4a7e4...`. An environment override was rejected as the
+fix: the base binary is built from the base revision and therefore cannot
+contain a flag introduced by this change (the assertion caught exactly that
+bootstrap failure on the next run). The workflow now asserts that
+`gate-report.json` carries the exact resolved base and head SHAs, so
+misattributed evidence fails the job instead of being uploaded.
+
+*Unchanged consumers.* The other suites still work through the same CLI:
+`resource-bench` results compared with `benchmarks/budgets-resource-soak.json`
+PASS with exit 0 in the single-run positional form, and
+`bun run quality:review` still renders the #180 gate report (its `metrics`
+array only gained the diagnostic `base_range`/`head_range` fields).
+
+== 9. Verification
+
+* telemetry unit tests (20): improvement/ok/warning/fail paths,
   higher-is-better, absolute thresholds on small denominators,
   min_samples gating, invariant violation overrides improvements,
   incompatible dataset/schema detection, ungated reporting, markdown
-  summary, JSON round-trip.
+  summary, JSON round-trip, plus the #180 repeated-run cases — median/max
+  aggregation, pooled sample counts meeting a floor one run cannot,
+  an ungated-with-reason warning below the floor, repeated identical runs
+  keeping one verdict, inconsistent metric sets and config boundaries
+  rejected, empty run lists rejected — plus runs measuring different
+  revisions rejected, an unknown pooled sample count keeping the floor
+  binding, and later-only metric or invariant keys rejected in both
+  directions.
+* comparator CLI unit tests (4): the original positional form is unchanged,
+  default budgets/output paths, the repeated `--base`/`--head` form collects
+  every run, and incomplete/unknown argument forms are rejected.
 * hardening unit tests (10): soak plateau detection, plus the Phase D
   contract mapping — clean soaks map to zero invariants, growth findings map
   to non-zero invariants with details, results round-trip through the
@@ -242,6 +376,10 @@ passes. No report output can promote a candidate policy or mint runtime authorit
 * end-to-end: `replay-benchmark` emits contract results; comparator PASSes
   identical results (exit 0) and FAILs an artificially regressed result
   (first-audio p95 +78%, stale dispatch 3) with exit 1.
+* end-to-end (#180): 8 independent interleaved batches of 7 runs per side
+  with identical binaries all return the same verdict (PASS, exit 0); the
+  same protocol FAILs (exit 1) on injected routing regressions of +10 µs and
+  +120 µs. See section 8.
 * end-to-end (Phase D): `resource-bench` emits `resource_soak` contract
   results; comparator PASSes identical results with the resource budgets and
   FAILs an artificially non-plateauing head with exit 1.
