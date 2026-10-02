@@ -100,26 +100,39 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           clean: false
 
-      # Each binary runs after the worktree is checked back out to the PR head,
-      # so the producer cannot discover its own revision from the checkout.
-      # Pass the revision that was actually built, otherwise every result
-      # would claim the head SHA and the result contract's identity would be
-      # wrong (issue #180 review).
+      # Provenance, revision-agnostic: give each side its own clean worktree at the
+      # revision it was built from and run its binary with that worktree as
+      # the working directory. `git rev-parse HEAD` then resolves to the
+      # revision under test even for a base revision that predates this
+      # workflow, and nothing is written inside the worktrees so they stay
+      # clean (issue #180 review). Results and binaries are addressed by
+      # absolute path because the process runs elsewhere.
+      - name: Prepare per-revision worktrees
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/bench-head" "$HEAD_SHA"
+          git worktree add --detach "$RUNNER_TEMP/bench-base" "$BASE_SHA"
+          for side in head base; do
+            echo "bench-${side} HEAD: $(git -C "$RUNNER_TEMP/bench-${side}" rev-parse HEAD)"
+          done
+
       - name: Benchmark base and head, interleaved
         env:
           REPEATS: "7"
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          BASE_SHA: ${{ steps.base.outputs.sha }}
         run: |
           mkdir -p results/head results/base
           for run in $(seq 1 "$REPEATS"); do
             for side in head base; do
-              out="target/bench-${side}-${run}"
+              out="$GITHUB_WORKSPACE/target/bench-${side}-${run}"
               rm -rf "$out"
-              if [ "$side" = head ]; then revision="$HEAD_SHA"; else revision="$BASE_SHA"; fi
-              AIVTUBER_BENCH_REVISION="$revision" \
-                "results/bin/replay-benchmark-${side}" \
-                examples/benchmarks/replay-comparison.json "$out"
+              (
+                cd "$RUNNER_TEMP/bench-${side}"
+                "$GITHUB_WORKSPACE/results/bin/replay-benchmark-${side}" \
+                  "$GITHUB_WORKSPACE/examples/benchmarks/replay-comparison.json" \
+                  "$out"
+              )
               # Prefix each result with its run index so the comparator sees
               # one distinct file per run per side.
               for result in "$out"/*-result.json; do

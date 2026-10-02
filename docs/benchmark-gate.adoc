@@ -113,7 +113,8 @@ resolve base SHA (GitHub API)
 → checkout exact PR head SHA → build head replay-benchmark binary
 → checkout base SHA → build base replay-benchmark binary
 → re-checkout exact PR head SHA (comparator + budgets + fixture from the PR)
-→ REPEATS interleaved runs: head, base, head, base, ... → results/{head,base}/
+→ add clean worktrees at the base and head SHAs (result provenance)
+→ REPEATS interleaved runs, each side in its own worktree → results/{head,base}/
 → benchmark-compare --base ... --head ... → Job Summary + artifacts
 → assert measured revisions == resolved base/head SHAs
 → enforce verdict (exit status)
@@ -132,14 +133,17 @@ resolve base SHA (GitHub API)
 * Both revisions run the *reviewed* fixture and comparator, so a PR that
   edits the fixture or the budgets compares like-for-like under its own
   reviewed measurement definition.
-* Each binary runs with `AIVTUBER_BENCH_REVISION` set to the revision it was
-  built from. Both binaries execute after the worktree is checked back out to
-  the PR head, so a runtime `git rev-parse HEAD` would stamp *both* sides
-  with the head SHA (plus `+dirty`, because the run's own results dirty the
-  tree) and misattribute base measurements. The `Assert measured revisions
-  match the resolved SHAs` step fails the job unless `gate-report.json`
-  carries the exact base and head SHAs the job resolved, so this provenance
-  cannot silently regress again.
+* Each side runs in **its own clean git worktree** checked out at the
+  revision it was built from, so the producer's `git rev-parse HEAD`
+  resolves to the revision actually under test and results carry that exact
+  SHA with no `+dirty`. Doing it by working directory rather than by an
+  environment override matters: the base binary is built from the base
+  revision, so any producer-side flag introduced by this change would not
+  exist in the binary it is meant to identify. Benchmarks are written outside
+  the worktrees, which keeps them clean. The `Assert measured revisions match
+  the resolved SHAs` step fails the job unless `gate-report.json` carries the
+  exact base and head SHAs the job resolved, so this provenance cannot
+  silently regress again.
 * Both revisions are measured on the same runner under the identical
   fixture/seed/config boundaries, so latency deltas are relative to the
   base measured moments earlier — not to a stale cross-runner history
@@ -322,11 +326,14 @@ regression; it just no longer fails on noise.
 Hard invariants were never affected by any of this: they aggregate by
 maximum, so a violation in any run still fails the gate.
 
-*Provenance.* Each binary runs with `AIVTUBER_BENCH_REVISION` naming the
-revision it was built from. Without it, a runtime `git rev-parse HEAD` would
-stamp both sides with the PR head (and `+dirty`), which the first CI run of
-this branch actually did — `base=3a59ae97...+dirty head=3a59ae97...+dirty`
-while the resolved base was `91c4a7e4...`. The workflow now asserts that
+*Provenance.* Each side is measured in its own clean worktree at the revision
+under test. Without that, a runtime `git rev-parse HEAD` stamped both sides
+with the PR head (and `+dirty`), which the first CI run of this branch
+actually did — `base=3a59ae97...+dirty head=3a59ae97...+dirty` while the
+resolved base was `91c4a7e4...`. An environment override was rejected as the
+fix: the base binary is built from the base revision and therefore cannot
+contain a flag introduced by this change (the assertion caught exactly that
+bootstrap failure on the next run). The workflow now asserts that
 `gate-report.json` carries the exact resolved base and head SHAs, so
 misattributed evidence fails the job instead of being uploaded.
 

@@ -984,25 +984,15 @@ fn gate_runtime_profile(mode: ComparisonMode) -> &'static str {
     }
 }
 
-/// Environment override for the measured revision.
+/// Revision this result was measured from: `git rev-parse HEAD` of the
+/// *current working directory*.
 ///
-/// The gate workflow builds one binary per revision and runs both after
-/// checking the worktree back out to the PR head, so `git rev-parse HEAD`
-/// resolved at *runtime* would stamp both sides with the head revision (and
-/// with `+dirty`, because the workflow's own result files dirty the tree).
-/// The workflow therefore passes the revision it actually built, and the
-/// result contract's `git.commit` stays true (issue #180 review).
-const REVISION_ENV: &str = "AIVTUBER_BENCH_REVISION";
-
+/// The gate workflow runs each revision's binary with its working directory
+/// set to a worktree checked out at that revision, so this resolves to the
+/// revision actually under test even for a base revision predating this
+/// code. Results are written outside those worktrees so the revision stays
+/// clean and the `+dirty` marker means what it says (issue #180 review).
 fn git_revision() -> String {
-    if let Some(revision) = env::var(REVISION_ENV)
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-    {
-        return revision;
-    }
-
     let revision =
         command_output("git", &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_owned());
     let dirty = Command::new("git")
