@@ -122,6 +122,10 @@ pub struct SupportResourceCounters {
     pub hot_cache_evictions: u64,
     pub generation_pending: usize,
     pub generation_in_flight: usize,
+    /// Completed results published to the mailbox but not yet drained by the
+    /// composition thread (issue #177).
+    #[serde(default)]
+    pub generation_awaiting_drain: usize,
     pub generation_saturated: u64,
     pub generation_completed: u64,
     pub generation_failed: u64,
@@ -358,6 +362,7 @@ impl SupportBundleBuilder {
             hot_cache_evictions: retention.hot_cache.evictions,
             generation_pending: generation.pending,
             generation_in_flight: generation.in_flight,
+            generation_awaiting_drain: generation.awaiting_drain,
             generation_saturated: generation.saturated,
             generation_completed: generation.completed,
             generation_failed: generation.failed,

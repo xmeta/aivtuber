@@ -166,6 +166,9 @@ impl Default for GenerationExecutionConfig {
 pub struct GenerationExecutionSnapshot {
     pub pending: usize,
     pub in_flight: usize,
+    /// Completed results that are published to (or still blocked on) the completion
+    /// mailbox and not yet taken by the composition thread. Issue #177.
+    pub awaiting_drain: usize,
     pub pending_high_water: usize,
     pub in_flight_high_water: usize,
     pub saturated: u64,
@@ -178,10 +181,29 @@ pub struct GenerationExecutionSnapshot {
     pub worker_running: bool,
 }
 
+impl GenerationExecutionSnapshot {
+    /// True when no generation work is outstanding anywhere: not queued, not
+    /// executing in the provider worker, and not published-but-undrained on the
+    /// completion mailbox (issue #177).
+    ///
+    /// Callers that treat `pending == 0 && in_flight == 0` as "everything is
+    /// accounted for" can still observe a false quiescent state, because the
+    /// worker publishes its completion after leaving in-flight. Drain-window
+    /// accounting lives here so every caller shares one sound predicate.
+    pub fn is_quiescent(&self) -> bool {
+        self.pending == 0 && self.in_flight == 0 && self.awaiting_drain == 0
+    }
+}
+
 #[derive(Debug, Default)]
 struct GenerationExecutionCounters {
     pending: AtomicUsize,
     in_flight: AtomicUsize,
+    awaiting_drain: AtomicUsize,
+    /// Test seam: widens the claim/release window of both handoffs so the
+    /// intermediate snapshot state can be asserted deterministically.
+    #[cfg(test)]
+    handoff_pause_nanos: AtomicU64,
     pending_high_water: AtomicUsize,
     in_flight_high_water: AtomicUsize,
     saturated: AtomicU64,
@@ -197,8 +219,9 @@ impl GenerationExecutionCounters {
         shutting_down: bool,
     ) -> GenerationExecutionSnapshot {
         GenerationExecutionSnapshot {
-            pending: self.pending.load(Ordering::Relaxed),
-            in_flight: self.in_flight.load(Ordering::Relaxed),
+            pending: self.pending.load(Ordering::SeqCst),
+            in_flight: self.in_flight.load(Ordering::SeqCst),
+            awaiting_drain: self.awaiting_drain.load(Ordering::SeqCst),
             pending_high_water: self.pending_high_water.load(Ordering::Relaxed),
             in_flight_high_water: self.in_flight_high_water.load(Ordering::Relaxed),
             saturated: self.saturated.load(Ordering::Relaxed),
@@ -210,6 +233,69 @@ impl GenerationExecutionCounters {
             shutting_down,
             worker_running: false,
         }
+    }
+}
+
+/// Outstanding generation work is a state machine with three states (queued,
+/// in-flight, awaiting drain) and two transitions. Both transitions claim the
+/// new state **before** releasing the old one, so a job is always counted in at
+/// least one counter.
+///
+/// The three state counters and the loads that read them in
+/// `GenerationExecutionCounters::snapshot` are `SeqCst`. Source ordering alone
+/// would not be enough: with `Relaxed` there is no ordering between writes to
+/// different atomics, so a snapshot could observe the released counter (0) while
+/// still reading the pre-claim value of the claimed counter (0). `SeqCst` places
+/// the writer's claim/release pair and the reader's loads in one total order, and
+/// the reader reads the counters in transition order (pending, in_flight,
+/// awaiting_drain). Observing a released counter therefore places every load
+/// after the release in that order, which is after the corresponding claim — so
+/// the claimed counter cannot still read its old value. `is_quiescent()` is
+/// consequently sound for any interleaving (issue #177).
+///
+/// Issue #177: dequeue handoff, pending -> in_flight.
+fn note_taken_into_flight(counters: &GenerationExecutionCounters) {
+    claim_in_flight(counters);
+    pause_handoff(counters);
+    release_pending(counters);
+}
+
+fn claim_in_flight(counters: &GenerationExecutionCounters) -> usize {
+    let in_flight = counters.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+    update_high_water(&counters.in_flight_high_water, in_flight);
+    in_flight
+}
+
+fn release_pending(counters: &GenerationExecutionCounters) {
+    counters.pending.fetch_sub(1, Ordering::SeqCst);
+}
+
+/// Issue #177: publish handoff, in_flight -> awaiting drain. See
+/// `note_taken_into_flight` for why the claim precedes the release.
+fn note_ready_to_publish(counters: &GenerationExecutionCounters) {
+    claim_drain_window(counters);
+    pause_handoff(counters);
+    release_in_flight(counters);
+}
+
+fn claim_drain_window(counters: &GenerationExecutionCounters) {
+    counters.awaiting_drain.fetch_add(1, Ordering::SeqCst);
+}
+
+fn release_in_flight(counters: &GenerationExecutionCounters) {
+    counters.in_flight.fetch_sub(1, Ordering::SeqCst);
+}
+
+/// Widens the handoff window between claim and release. Production builds never
+/// pause; only tests use it to observe the intermediate state deterministically.
+#[cfg(not(test))]
+fn pause_handoff(_counters: &GenerationExecutionCounters) {}
+
+#[cfg(test)]
+fn pause_handoff(counters: &GenerationExecutionCounters) {
+    let nanos = counters.handoff_pause_nanos.load(Ordering::Relaxed);
+    if nanos > 0 {
+        std::thread::sleep(Duration::from_nanos(nanos));
     }
 }
 
@@ -307,16 +393,22 @@ impl GenerationExecutor {
             .name("aivtuber-generation-worker".to_owned())
             .spawn(move || {
                 while let Ok(work) = work_rx.recv() {
-                    worker_counters.pending.fetch_sub(1, Ordering::Relaxed);
+                    // Issue #177: the dequeue handoff must overlap. Claiming
+                    // in-flight before releasing pending keeps the two states
+                    // summing to at least one for a job that is dequeued but not
+                    // yet started, which is otherwise observable as a false
+                    // quiescent snapshot.
+                    note_taken_into_flight(&worker_counters);
                     if worker_shutdown.load(Ordering::Acquire) {
+                        // The job was claimed and then dropped without producing
+                        // a completion, so in-flight is released on its own.
+                        release_in_flight(&worker_counters);
                         worker_counters
                             .cancelled_or_stale
                             .fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
 
-                    let in_flight = worker_counters.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-                    update_high_water(&worker_counters.in_flight_high_water, in_flight);
                     let provider_started = Instant::now();
                     let queue_wait_us = elapsed_us(work.submitted_at);
 
@@ -349,7 +441,7 @@ impl GenerationExecutor {
 
                     let provider_latency_us = elapsed_us(provider_started);
                     let completed_at = Instant::now();
-                    worker_counters.in_flight.fetch_sub(1, Ordering::Relaxed);
+                    note_ready_to_publish(&worker_counters);
                     let completion = GenerationCompletion {
                         generation_id: work.generation_id,
                         request: work.request,
@@ -365,10 +457,19 @@ impl GenerationExecutor {
                         context: work.context,
                     };
 
+                    // Issue #177: the drain window is claimed by
+                    // `note_ready_to_publish` above, before the completion is handed
+                    // to the composition thread.
+                    //
                     // Blocking here is safe: only the provider worker can block, while
                     // the composition/control thread remains responsive. The bounded
                     // mailbox prevents unbounded completed-result retention.
                     if completion_tx.send(completion).is_err() {
+                        // The mailbox receiver is gone, so nothing will ever drain
+                        // this result; release the drain window before stopping.
+                        worker_counters
+                            .awaiting_drain
+                            .fetch_sub(1, Ordering::SeqCst);
                         break;
                     }
                     worker_counters.completed.fetch_add(1, Ordering::Relaxed);
@@ -394,26 +495,32 @@ impl GenerationExecutor {
             return Err(GenerationSubmitError::ShuttingDown);
         };
 
-        let pending = self.counters.pending.fetch_add(1, Ordering::Relaxed) + 1;
+        let pending = self.counters.pending.fetch_add(1, Ordering::SeqCst) + 1;
         match sender.try_send(work) {
             Ok(()) => {
                 update_high_water(&self.counters.pending_high_water, pending);
                 Ok(())
             }
             Err(TrySendError::Full(_)) => {
-                self.counters.pending.fetch_sub(1, Ordering::Relaxed);
+                self.counters.pending.fetch_sub(1, Ordering::SeqCst);
                 self.counters.saturated.fetch_add(1, Ordering::Relaxed);
                 Err(GenerationSubmitError::Saturated)
             }
             Err(TrySendError::Disconnected(_)) => {
-                self.counters.pending.fetch_sub(1, Ordering::Relaxed);
+                self.counters.pending.fetch_sub(1, Ordering::SeqCst);
                 Err(GenerationSubmitError::Disconnected)
             }
         }
     }
 
     fn try_recv(&self) -> Option<GenerationCompletion> {
-        self.completion_rx.try_recv().ok()
+        let completion = self.completion_rx.try_recv().ok()?;
+        // The composition thread owns the completion from here on. The remaining
+        // stale/cancelled, failure, and commit paths all record their observation
+        // within the same tick, so draining here is enough for quiescence to mean
+        // "no undrained result" (issue #177).
+        self.counters.awaiting_drain.fetch_sub(1, Ordering::SeqCst);
+        Some(completion)
     }
 
     fn snapshot(&self) -> GenerationExecutionSnapshot {
@@ -492,6 +599,17 @@ impl GenerativeRuntime {
 
     pub fn execution_snapshot(&self) -> GenerationExecutionSnapshot {
         self.executor.snapshot()
+    }
+
+    /// Test seam for issue #177: hold each handoff window open for `pause` so a
+    /// test can assert the intermediate snapshot state. Not compiled in
+    /// production builds.
+    #[cfg(test)]
+    pub fn set_test_handoff_pause(&self, pause: Duration) {
+        self.executor
+            .counters
+            .handoff_pause_nanos
+            .store(pause.as_nanos() as u64, Ordering::Relaxed);
     }
 
     fn submit(
@@ -3221,7 +3339,7 @@ mod tests {
             let snapshot = app
                 .generation_execution_snapshot()
                 .expect("generation execution snapshot");
-            if active.is_none() && snapshot.pending == 0 && snapshot.in_flight == 0 {
+            if active.is_none() && snapshot.is_quiescent() {
                 app.tick(now_ms);
                 return;
             }
@@ -4111,6 +4229,238 @@ mod tests {
         assert_eq!(settled.pending, 0);
         assert_eq!(settled.in_flight, 0);
         assert!(settled.cancelled_or_stale >= 1);
+    }
+
+    /// Issue #177: an app with one generation parked inside the provider, so the
+    /// test controls exactly when the worker publishes and the composition
+    /// thread drains the completion.
+    fn app_with_parked_generation() -> (ProductionApp<FixedGenerateRoute>, Arc<BlockingGate>) {
+        let (app, gate) = submitted_parked_generation(None);
+        gate.wait_until_entered();
+        (app, gate)
+    }
+
+    /// Issue #177: `pause` widens each handoff window (see
+    /// `GenerationExecutionCounters::handoff_pause_nanos`) so the intermediate
+    /// snapshot state between claim and release is observable. Returns as soon
+    /// as the submission is accepted so the caller can drive the gate itself.
+    fn submitted_parked_generation(
+        pause: Option<Duration>,
+    ) -> (ProductionApp<FixedGenerateRoute>, Arc<BlockingGate>) {
+        let gate = Arc::new(BlockingGate::default());
+        let runtime = generative_runtime(
+            BlockingThinking {
+                gate: Arc::clone(&gate),
+                reply: "published but undrained".to_owned(),
+            },
+            MockTts::default(),
+        );
+        if let Some(pause) = pause {
+            runtime.set_test_handoff_pause(pause);
+        }
+        let mut app = app(
+            FixedGenerateRoute {
+                reply_context: ReflexContext::default(),
+                fallback_variant_group: Some("reaction.agree".to_owned()),
+            },
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        )
+        .with_generation(runtime);
+        app.startup().expect("startup");
+
+        let raw = serde_json::to_vec(&chat_event(201)).expect("event json");
+        app.process_content_bytes(&raw, 0, 201)
+            .expect("generation submission");
+        (app, gate)
+    }
+
+    fn wait_until<R>(
+        app: &ProductionApp<R>,
+        condition: impl Fn(GenerationExecutionSnapshot) -> bool,
+    ) where
+        R: RoutePlanner,
+    {
+        for _ in 0..10_000 {
+            if app.generation_execution_snapshot().is_some_and(&condition) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!(
+            "generation condition never held: {:?}",
+            app.generation_execution_snapshot()
+        );
+    }
+
+    #[test]
+    fn generation_work_stays_counted_across_both_handoffs() {
+        // Issue #177: every state transition must claim the new state before
+        // releasing the old one, otherwise a snapshot observes
+        // `pending == 0 && in_flight == 0 && awaiting_drain == 0` while a job is
+        // dequeued-but-not-started or published-but-undrained. Those are exactly
+        // the states the replay benchmark mistook for quiescence.
+        let counters = GenerationExecutionCounters::default();
+        let config = GenerationExecutionConfig::default();
+
+        counters.pending.fetch_add(1, Ordering::SeqCst);
+        note_taken_into_flight(&counters);
+        let claimed = counters.snapshot(config, false);
+        assert_eq!(claimed.pending, 0);
+        assert_eq!(claimed.in_flight, 1);
+        assert!(
+            !claimed.is_quiescent(),
+            "a dequeued job must never read as quiescent before it starts"
+        );
+
+        note_ready_to_publish(&counters);
+        let published = counters.snapshot(config, false);
+        assert_eq!(published.pending, 0);
+        assert_eq!(published.in_flight, 0);
+        assert_eq!(published.awaiting_drain, 1);
+        assert!(
+            !published.is_quiescent(),
+            "an unpublished result must never read as quiescent"
+        );
+
+        counters.awaiting_drain.fetch_sub(1, Ordering::SeqCst);
+        assert!(counters.snapshot(config, false).is_quiescent());
+    }
+
+    #[test]
+    fn widened_handoff_windows_report_the_job_in_both_states() {
+        // Issue #177 review: the dequeue and publish handoffs must claim before
+        // they release. Both halves are held open here, so the assertions below
+        // observe the real worker mid-transition instead of sampling by luck.
+        let (app, gate) = submitted_parked_generation(Some(Duration::from_millis(200)));
+
+        // Dequeue handoff: in-flight is claimed while the job is still pending.
+        wait_until(&app, |snapshot| {
+            snapshot.pending == 1 && snapshot.in_flight == 1
+        });
+        assert!(
+            !app.generation_execution_snapshot()
+                .expect("generation snapshot")
+                .is_quiescent(),
+            "a job claimed into in-flight but still pending must not read as quiescent"
+        );
+        gate.wait_until_entered();
+
+        // Publish handoff: the drain window is claimed while the job is still
+        // in flight.
+        gate.release();
+        wait_until(&app, |snapshot| {
+            snapshot.in_flight == 1 && snapshot.awaiting_drain == 1
+        });
+        assert!(
+            !app.generation_execution_snapshot()
+                .expect("generation snapshot")
+                .is_quiescent(),
+            "a job claimed into the drain window but still in flight must not read as quiescent"
+        );
+        assert_eq!(
+            app.generation_execution_snapshot()
+                .expect("generation snapshot")
+                .completed,
+            0,
+            "the paused publish handoff must not have published yet"
+        );
+
+        // The result is published but never drained (this thread never ticks),
+        // so quiescence stays false for the rest of the lifecycle.
+        wait_until(&app, |snapshot| snapshot.completed == 1);
+        assert!(
+            !app.generation_execution_snapshot()
+                .expect("generation snapshot")
+                .is_quiescent()
+        );
+    }
+
+    #[test]
+    fn snapshot_never_reports_quiescence_while_generation_is_outstanding() {
+        // Issue #177 review: sampling the snapshot hard across the dequeue and
+        // publish handoffs must never observe quiescence before the composition
+        // thread drains the result. The app never ticks here, so any quiescent
+        // observation is a false idle regardless of timing.
+        let (app, gate) = app_with_parked_generation();
+        gate.release();
+
+        let mut polls = 0_usize;
+        loop {
+            let snapshot = app
+                .generation_execution_snapshot()
+                .expect("generation snapshot");
+            polls = polls.saturating_add(1);
+            assert!(
+                !snapshot.is_quiescent(),
+                "false quiescence after {polls} polls: {snapshot:?}"
+            );
+            if snapshot.completed == 1 && snapshot.in_flight == 0 {
+                break;
+            }
+            assert!(polls < 10_000_000, "worker never published: {snapshot:?}");
+            std::hint::spin_loop();
+        }
+    }
+
+    #[test]
+    fn published_generation_completion_is_not_quiescent_until_drained() {
+        let (app, gate) = app_with_parked_generation();
+        gate.release();
+
+        // Published but not yet drained: the composition thread has not ticked
+        // since the worker handed the result over.
+        wait_until(&app, |snapshot| {
+            snapshot.completed == 1 && snapshot.in_flight == 0
+        });
+        let undrained = app
+            .generation_execution_snapshot()
+            .expect("generation snapshot");
+        assert_eq!(undrained.pending, 0);
+        assert_eq!(undrained.awaiting_drain, 1);
+        assert!(
+            !undrained.is_quiescent(),
+            "an undrained completion must keep the runtime non-quiescent"
+        );
+        assert!(
+            OperatorStatusSnapshot::from_app(&app).generation_active,
+            "an undrained completion must not report an idle runtime"
+        );
+        assert!(
+            !app.telemetry()
+                .events()
+                .iter()
+                .any(|observation| observation.event_id == "evt-201"),
+            "the observation cannot exist before the completion is drained"
+        );
+    }
+
+    #[test]
+    fn drained_generation_completion_records_the_observation_and_settles() {
+        let (mut app, gate) = app_with_parked_generation();
+        gate.release();
+        wait_until(&app, |snapshot| {
+            snapshot.completed == 1 && snapshot.in_flight == 0
+        });
+
+        // The completion is waiting in the mailbox; one tick must both drain it
+        // and record the observation, which is what the benchmark's wait helper
+        // relies on instead of stopping early.
+        app.tick(0);
+
+        let drained = app
+            .generation_execution_snapshot()
+            .expect("generation snapshot");
+        assert_eq!(drained.awaiting_drain, 0);
+        assert!(drained.is_quiescent());
+        assert!(
+            app.telemetry()
+                .events()
+                .iter()
+                .any(|observation| observation.event_id == "evt-201"),
+            "the drained completion must record its observation"
+        );
     }
 
     #[test]
