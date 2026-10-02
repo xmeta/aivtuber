@@ -606,8 +606,10 @@ pub fn compare_runs(
 /// * identity/config: taken from the first run, which every other run must
 ///   match (otherwise the runs are not a repetition of one measurement).
 ///
-/// Runs must agree on the metric and invariant sets: a metric missing from one
-/// run is not silently dropped, because dropping it would silently ungate it.
+/// Runs must agree on the metric and invariant key *sets* in both directions
+/// and on the revision they claim to measure: dropping a key would silently
+/// ungate it, and averaging two revisions together would report one
+/// revision's measurements under the other's identity.
 fn aggregate_runs(
     side: &str,
     runs: &[BenchmarkResult],
@@ -623,6 +625,47 @@ fn aggregate_runs(
         first.ensure_comparable(run).map_err(|error| {
             BenchmarkGateError::new(format!("{side} runs are not comparable: {error}"))
         })?;
+        // `ensure_comparable` deliberately ignores `git.commit` because base
+        // and head *must* differ. Within one side they must not: these runs
+        // are repeated measurements of one revision (issue #180 review).
+        if run.git.commit != first.git.commit {
+            return Err(BenchmarkGateError::new(format!(
+                "{side} runs disagree on git.commit: {:?} vs {:?}; one side must be repeated measurements of a single revision",
+                first.git.commit, run.git.commit
+            )));
+        }
+        for (kind, mismatched) in [
+            (
+                "metric",
+                first.metrics.keys().ne(run.metrics.keys())
+                    || first
+                        .metrics
+                        .keys()
+                        .any(|key| !run.metrics.contains_key(key))
+                    || run
+                        .metrics
+                        .keys()
+                        .any(|key| !first.metrics.contains_key(key)),
+            ),
+            (
+                "invariant",
+                first.invariants.keys().ne(run.invariants.keys())
+                    || first
+                        .invariants
+                        .keys()
+                        .any(|key| !run.invariants.contains_key(key))
+                    || run
+                        .invariants
+                        .keys()
+                        .any(|key| !first.invariants.contains_key(key)),
+            ),
+        ] {
+            if mismatched {
+                return Err(BenchmarkGateError::new(format!(
+                    "{side} runs disagree on {kind} keys: the first run and a later run must measure exactly the same {kind} set, so no metric is silently ungated and no invariant violation is silently dropped"
+                )));
+            }
+        }
     }
 
     let mut aggregated = first.clone();
@@ -631,19 +674,11 @@ fn aggregate_runs(
     aggregated.invariants.clear();
 
     for name in first.metrics.keys() {
+        // Key sets are proven identical above, so every lookup is total.
         let values = runs
             .iter()
-            .map(|run| {
-                run.metrics
-                    .get(name)
-                    .map(|metric| metric.value)
-                    .ok_or_else(|| {
-                        BenchmarkGateError::new(format!(
-                            "{side} runs disagree: run without metric {name:?}"
-                        ))
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|run| run.metrics[name].value)
+            .collect::<Vec<_>>();
         // Sample counts pool across runs, so a repeated measurement can meet a
         // `min_samples` floor that no single run reaches. A run without a
         // recorded count makes the pooled count unknown (`None`), which keeps
@@ -666,17 +701,8 @@ fn aggregate_runs(
     for (name, invariant) in &first.invariants {
         let value = runs
             .iter()
-            .map(|run| {
-                run.invariants
-                    .get(name)
-                    .map(|present| present.value)
-                    .ok_or_else(|| {
-                        BenchmarkGateError::new(format!(
-                            "{side} runs disagree: run without invariant {name:?}"
-                        ))
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|run| run.invariants[name].value)
+            .collect::<Vec<_>>();
         aggregated.invariants.insert(
             name.clone(),
             InvariantValue {
@@ -712,8 +738,11 @@ fn evaluate_metric(
     sample_count: Option<u64>,
     budget: &MetricBudget,
 ) -> MetricStatus {
+    // An *unknown* pooled count must keep the floor binding: `sample_count`
+    // is optional in the schema, so treating "no count" as "enough samples"
+    // would let a missing count fail open (issue #180 review).
     if let Some(min_samples) = budget.min_samples
-        && sample_count.is_some_and(|count| count < min_samples)
+        && sample_count.is_none_or(|count| count < min_samples)
     {
         return MetricStatus::Ungated;
     }
@@ -1316,6 +1345,126 @@ mod tests {
     fn empty_run_lists_are_rejected() {
         let error = compare_runs(&[], &[], &Budgets::default()).expect_err("no runs");
         assert!(error.to_string().contains("at least one"));
+    }
+
+    #[test]
+    fn runs_measuring_different_revisions_are_rejected() {
+        // Issue #180 review: `ensure_comparable` ignores `git.commit` because
+        // base and head must differ, so one side must enforce it separately —
+        // otherwise two revisions get medianed and reported as one.
+        let base = vec![
+            result(
+                "base-rev",
+                metric_map(&[("routing.route_decision.p95_us", 10.0, Some(3))]),
+            ),
+            result(
+                "other-base-rev",
+                metric_map(&[("routing.route_decision.p95_us", 12.0, Some(3))]),
+            ),
+        ];
+        let head = vec![result(
+            "head-rev",
+            metric_map(&[("routing.route_decision.p95_us", 10.0, Some(3))]),
+        )];
+
+        let error = compare_runs(&base, &head, &Budgets::default()).expect_err("mixed commits");
+        assert!(error.to_string().contains("git.commit"));
+    }
+
+    #[test]
+    fn an_unknown_pooled_sample_count_keeps_the_floor_binding() {
+        // Issue #180 review: `sample_count` is optional in the schema, so a
+        // missing count must not fail open through a configured `min_samples`.
+        let budgets = Budgets {
+            metrics: BTreeMap::from([(
+                "routing.route_decision.p95_us".to_owned(),
+                MetricBudget {
+                    direction: BudgetDirection::Lower,
+                    warn_regression_percent: None,
+                    fail_regression_percent: None,
+                    warn_absolute_change: Some(3.0),
+                    fail_absolute_change: Some(6.0),
+                    min_samples: Some(3),
+                },
+            )]),
+            ..Budgets::default()
+        };
+        let uncounted = |value: f64| {
+            vec![result(
+                "rev",
+                metric_map(&[("routing.route_decision.p95_us", value, None)]),
+            )]
+        };
+
+        let report = compare_runs(&uncounted(10.0), &uncounted(90.0), &budgets).expect("compare");
+        assert_eq!(report.metrics[0].status, MetricStatus::Ungated);
+        assert_eq!(report.verdict, GateVerdict::Pass);
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("min_samples")),
+            "an ungated row must say why: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn keys_present_only_in_a_later_run_are_rejected() {
+        // Issue #180 review: comparing only the first run's key sets would
+        // silently ignore a later-only metric, and a later-only *invariant*
+        // would drop a violation entirely.
+        let run_with = |commit: &str, extra_metric: bool, extra_invariant: bool| {
+            let mut run = result(
+                commit,
+                metric_map(&[("routing.route_decision.p95_us", 10.0, Some(3))]),
+            );
+            if extra_metric {
+                run.metrics.insert(
+                    "semantic.wrong_reuse_rate_pct".to_owned(),
+                    MetricValue {
+                        value: 4.0,
+                        sample_count: Some(3),
+                        run_range: None,
+                    },
+                );
+            }
+            if extra_invariant {
+                run.invariants.insert(
+                    "resource.invalid_route_transition_count".to_owned(),
+                    InvariantValue {
+                        value: 7,
+                        detail: None,
+                    },
+                );
+            }
+            run
+        };
+        let base = vec![run_with("base-rev", false, false)];
+
+        let error = compare_runs(
+            &base,
+            &[
+                run_with("head-rev", false, false),
+                run_with("head-rev", true, false),
+            ],
+            &Budgets::default(),
+        )
+        .expect_err("later-only metric");
+        assert!(error.to_string().contains("metric keys"), "{error}");
+
+        // The same must hold when only an *invariant* appears later: dropping
+        // it would hide the violation the gate exists to catch.
+        let error = compare_runs(
+            &base,
+            &[
+                run_with("head-rev", false, false),
+                run_with("head-rev", false, true),
+            ],
+            &Budgets::default(),
+        )
+        .expect_err("later-only invariant");
+        assert!(error.to_string().contains("invariant keys"), "{error}");
     }
 
     #[test]

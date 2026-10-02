@@ -80,7 +80,12 @@ repeated runs per side (issue #180):
    metrics by the **median** value across runs (outlier resistant), hard
    invariants by the **maximum** (a violation in any run fails), sample counts
    summed, and the observed per-side min/max recorded as a diagnostic
-   `run_range` in the table and report;
+   `run_range` in the table and report. Aggregation refuses — rather than
+   silently averaging — when the runs of one side disagree on the measured
+   `git.commit`, on the exact metric/invariant key set (checked in both
+   directions), or on the comparison boundaries; and an *unknown* pooled
+   `sample_count` keeps a `min_samples` floor binding instead of failing
+   open;
 6. enforces exact hard invariants (any value above `max` fails the gate);
 7. prints a Markdown table (metric / base / head / delta / base run range /
    head run range / status) for the PR job summary and writes
@@ -110,6 +115,7 @@ resolve base SHA (GitHub API)
 → re-checkout exact PR head SHA (comparator + budgets + fixture from the PR)
 → REPEATS interleaved runs: head, base, head, base, ... → results/{head,base}/
 → benchmark-compare --base ... --head ... → Job Summary + artifacts
+→ assert measured revisions == resolved base/head SHAs
 → enforce verdict (exit status)
 ```
 
@@ -126,6 +132,14 @@ resolve base SHA (GitHub API)
 * Both revisions run the *reviewed* fixture and comparator, so a PR that
   edits the fixture or the budgets compares like-for-like under its own
   reviewed measurement definition.
+* Each binary runs with `AIVTUBER_BENCH_REVISION` set to the revision it was
+  built from. Both binaries execute after the worktree is checked back out to
+  the PR head, so a runtime `git rev-parse HEAD` would stamp *both* sides
+  with the head SHA (plus `+dirty`, because the run's own results dirty the
+  tree) and misattribute base measurements. The `Assert measured revisions
+  match the resolved SHAs` step fails the job unless `gate-report.json`
+  carries the exact base and head SHAs the job resolved, so this provenance
+  cannot silently regress again.
 * Both revisions are measured on the same runner under the identical
   fixture/seed/config boundaries, so latency deltas are relative to the
   base measured moments earlier — not to a stale cross-runner history
@@ -308,6 +322,14 @@ regression; it just no longer fails on noise.
 Hard invariants were never affected by any of this: they aggregate by
 maximum, so a violation in any run still fails the gate.
 
+*Provenance.* Each binary runs with `AIVTUBER_BENCH_REVISION` naming the
+revision it was built from. Without it, a runtime `git rev-parse HEAD` would
+stamp both sides with the PR head (and `+dirty`), which the first CI run of
+this branch actually did — `base=3a59ae97...+dirty head=3a59ae97...+dirty`
+while the resolved base was `91c4a7e4...`. The workflow now asserts that
+`gate-report.json` carries the exact resolved base and head SHAs, so
+misattributed evidence fails the job instead of being uploaded.
+
 *Unchanged consumers.* The other suites still work through the same CLI:
 `resource-bench` results compared with `benchmarks/budgets-resource-soak.json`
 PASS with exit 0 in the single-run positional form, and
@@ -316,7 +338,7 @@ array only gained the diagnostic `base_range`/`head_range` fields).
 
 == 9. Verification
 
-* telemetry unit tests (17): improvement/ok/warning/fail paths,
+* telemetry unit tests (20): improvement/ok/warning/fail paths,
   higher-is-better, absolute thresholds on small denominators,
   min_samples gating, invariant violation overrides improvements,
   incompatible dataset/schema detection, ungated reporting, markdown
@@ -324,7 +346,10 @@ array only gained the diagnostic `base_range`/`head_range` fields).
   aggregation, pooled sample counts meeting a floor one run cannot,
   an ungated-with-reason warning below the floor, repeated identical runs
   keeping one verdict, inconsistent metric sets and config boundaries
-  rejected, empty run lists rejected.
+  rejected, empty run lists rejected — plus runs measuring different
+  revisions rejected, an unknown pooled sample count keeping the floor
+  binding, and later-only metric or invariant keys rejected in both
+  directions.
 * comparator CLI unit tests (4): the original positional form is unchanged,
   default budgets/output paths, the repeated `--base`/`--head` form collects
   every run, and incomplete/unknown argument forms are rejected.

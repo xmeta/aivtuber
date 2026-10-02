@@ -100,16 +100,25 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           clean: false
 
+      # Each binary runs after the worktree is checked back out to the PR head,
+      # so the producer cannot discover its own revision from the checkout.
+      # Pass the revision that was actually built, otherwise every result
+      # would claim the head SHA and the result contract's identity would be
+      # wrong (issue #180 review).
       - name: Benchmark base and head, interleaved
         env:
           REPEATS: "7"
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ steps.base.outputs.sha }}
         run: |
           mkdir -p results/head results/base
           for run in $(seq 1 "$REPEATS"); do
             for side in head base; do
               out="target/bench-${side}-${run}"
               rm -rf "$out"
-              "results/bin/replay-benchmark-${side}" \
+              if [ "$side" = head ]; then revision="$HEAD_SHA"; else revision="$BASE_SHA"; fi
+              AIVTUBER_BENCH_REVISION="$revision" \
+                "results/bin/replay-benchmark-${side}" \
                 examples/benchmarks/replay-comparison.json "$out"
               # Prefix each result with its run index so the comparator sees
               # one distinct file per run per side.
@@ -144,6 +153,28 @@ jobs:
           status=$?
           echo "status=${status}" >> "$GITHUB_OUTPUT"
           exit 0
+
+      # Provenance assertion: the aggregated report must carry the two
+      # revisions the job actually resolved, not whatever HEAD happened to
+      # be when the binaries ran (issue #180 review).
+      - name: Assert measured revisions match the resolved SHAs
+        if: always()
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          if [ ! -f results/gate/gate-report.json ]; then
+            echo "no gate report to verify (the comparator did not run)"
+            exit 0
+          fi
+          report_base="$(python3 -c 'import json;print(json.load(open("results/gate/gate-report.json"))["base_commit"])')"
+          report_head="$(python3 -c 'import json;print(json.load(open("results/gate/gate-report.json"))["head_commit"])')"
+          echo "reported base=$report_base head=$report_head"
+          echo "expected base=$BASE_SHA head=$HEAD_SHA"
+          if [ "$report_base" != "$BASE_SHA" ] || [ "$report_head" != "$HEAD_SHA" ]; then
+            echo "Benchmark provenance mismatch: results do not carry the revisions under test."
+            exit 1
+          fi
 
       - name: Publish job summary
         if: always()
