@@ -83,6 +83,7 @@ pub fn resource_bench_result(
     let metric = |value: usize| MetricValue {
         value: value as f64,
         sample_count: Some(events),
+        run_range: None,
     };
     let mut metrics = BTreeMap::from([
         (
@@ -90,6 +91,7 @@ pub fn resource_bench_result(
             MetricValue {
                 value: (throughput * 100.0).round() / 100.0,
                 sample_count: Some(events),
+                run_range: None,
             },
         ),
         (
@@ -135,6 +137,7 @@ pub fn resource_bench_result(
             MetricValue {
                 value: peak_rss_kib as f64,
                 sample_count: Some(1),
+                run_range: None,
             },
         );
     }

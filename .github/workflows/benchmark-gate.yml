@@ -62,12 +62,17 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Benchmark head
+      # Issue #180: one benchmark run is not a measurement of a metric whose
+      # values are single-digit microseconds — its run-to-run spread is wider
+      # than the whole failure budget, so a gate on one run fails on noise.
+      # Both revisions are therefore built into their own binary and run
+      # REPEATS times, interleaved (A/B/A/B) so runner drift does not land
+      # entirely on one side of the comparison.
+      - name: Build head benchmark binary
         run: |
-          cargo run --locked -p aivtuber-app --bin replay-benchmark -- \
-            examples/benchmarks/replay-comparison.json target/bench-head
-          mkdir -p results/head
-          cp target/bench-head/*-result.json results/head/
+          cargo build --locked -p aivtuber-app --bin replay-benchmark
+          mkdir -p results/bin
+          cp target/debug/replay-benchmark results/bin/replay-benchmark-head
 
       # Base checkout second so post-steps and artifacts describe the PR.
       - uses: actions/checkout@v4
@@ -75,35 +80,55 @@ jobs:
           ref: ${{ steps.base.outputs.sha }}
           clean: false
 
-      - name: Benchmark base
+      - name: Build base benchmark binary
         run: |
-          cargo run --locked -p aivtuber-app --bin replay-benchmark -- \
-            examples/benchmarks/replay-comparison.json target/bench-base
-          mkdir -p results/base
-          cp target/bench-base/*-result.json results/base/
+          cargo build --locked -p aivtuber-app --bin replay-benchmark
+          cp target/debug/replay-benchmark results/bin/replay-benchmark-base
 
-      # Return to the exact PR head revision before comparing: the
-      # comparator, the budgets it loads (benchmarks/budgets.json), and the
-      # binary that runs them must be exactly what the PR reviewed — a
-      # `git checkout -- .` after the base benchmark would only re-expand the
-      # base index and silently gate with base-side semantics. Benchmark
-      # results survive in results/ (checkout leaves untracked files alone);
-      # target/ carries the head-built binaries, so no rebuild is needed.
+      # Return to the exact PR head revision before measuring: the comparator,
+      # the budgets it loads (benchmarks/budgets.json), the fixture, and the
+      # comparator binary must all be exactly what the PR reviewed — a
+      # `git checkout -- .` after the base build would only re-expand the base
+      # index and silently gate with base-side semantics. Both sides then run
+      # the *same* reviewed fixture and asset pack, so a PR that edits them
+      # compares like-for-like instead of hitting the dataset_id mismatch
+      # guard; the measured unit is "this code against the reviewed
+      # configuration", not "each revision against its own assets".
+      # Results survive in results/ (checkout leaves untracked files alone).
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           clean: false
 
+      - name: Benchmark base and head, interleaved
+        env:
+          REPEATS: "7"
+        run: |
+          mkdir -p results/head results/base
+          for run in $(seq 1 "$REPEATS"); do
+            for side in head base; do
+              out="target/bench-${side}-${run}"
+              rm -rf "$out"
+              "results/bin/replay-benchmark-${side}" \
+                examples/benchmarks/replay-comparison.json "$out"
+              cp "$out"/*-result.json "results/${side}/${run}-"
+            done
+          done
+
       # Deterministic comparator: same inputs always yield the same verdict.
       # Hard invariants gate strictly; noisy timing metrics are warning-only
-      # until calibrated (benchmarks/budgets.json, issue #58).
+      # until calibrated (benchmarks/budgets.json, issue #58). Repeated runs
+      # per side are aggregated by median (metrics) / maximum (invariants),
+      # issue #180.
       - name: Compare base vs head
         id: gate
         run: |
           set +e
+          args=()
+          for result in results/base/*-result.json; do args+=(--base "$result"); done
+          for result in results/head/*-result.json; do args+=(--head "$result"); done
           cargo run --locked -p aivtuber-app --bin benchmark-compare -- \
-            results/base/01-deterministic-result.json \
-            results/head/01-deterministic-result.json \
+            "${args[@]}" \
             benchmarks/budgets.json \
             results/gate
           status=$?

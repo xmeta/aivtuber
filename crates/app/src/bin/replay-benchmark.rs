@@ -285,6 +285,7 @@ fn write_gate_results(output_dir: &Path, suite: &ComparisonSuite) -> Result<(), 
                     MetricValue {
                         value: value as f64,
                         sample_count: Some(count as u64),
+                        run_range: None,
                     },
                 );
             };
@@ -346,6 +347,7 @@ fn write_gate_results(output_dir: &Path, suite: &ComparisonSuite) -> Result<(), 
             MetricValue {
                 value: llm_rate,
                 sample_count: Some(summary.events as u64),
+                run_range: None,
             },
         );
         let wrong_reuse_rate = if summary.wrong_reuse_labels > 0 {
@@ -358,6 +360,7 @@ fn write_gate_results(output_dir: &Path, suite: &ComparisonSuite) -> Result<(), 
             MetricValue {
                 value: (wrong_reuse_rate * 100.0).round() / 100.0,
                 sample_count: Some(summary.wrong_reuse_labels),
+                run_range: None,
             },
         );
 
