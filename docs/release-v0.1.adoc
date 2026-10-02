@@ -933,4 +933,133 @@ the identical commit pair (`base=3.0, head=3.0`). That metric is a 3-sample p95 
 single-digit microseconds with a +-20/40% budget, so its noise band is wider than its budget;
 base and head sample distributions overlap (7-16 us vs 7-14 us over 12 local runs each).
 `benchmarks/budgets.json` was deliberately not relaxed to make a PR green; the calibration
-gap is tracked as #180.
+gap is tracked as #180 and is resolved by #182 -- see section 14.
+
+== 14. Benchmark gate calibration gap -- routing.route_decision.p95_us (#180) RESOLVED
+
+The section-13 carried-forward limitation is closed. This section records the defect, the
+fix, the review findings it went through, and the automated evidence at the merged commit.
+No release criterion is reopened by it.
+
+=== What happened
+
+`routing.route_decision.p95_us` was gated in `benchmarks/budgets.json` at
+`warn 20%` / `fail 40%` on top of a p95 over three fixture events whose absolute values are
+single-digit microseconds. One timer tick is therefore a large fraction of the metric, and
+the run-to-run noise band of that measurement is wider than the entire failure budget. The
+required `Replay base vs head` check therefore failed on unrelated pull requests and
+carried no signal in either direction: it failed on noise, and would not have reliably
+caught a real routing regression either.
+
+Measured on one machine, one unchanged build, same fixture and lockfile:
+
+[source,text]
+----
+24 sequential runs (us): 7 6 6 6 7 5 7 6 6 8 5 6 5 7 7 12 5 5 6 5 8 8 5 7   (median 6, range 5-12)
+40 sequential runs (us): 7 6 9 5 7 5 5 7 5 8 9 8 6 6 7 6 7 6 9 7 6 6 10 6 ...  (median 6, range 5-10)
+----
+
+Across 64 runs of that build every *other* gated metric was bit-identical run to run
+(`first_audio.p50=83`, `p95=112`, `p99=112`, `first_visible.p95=33`, `llm_calls=0`,
+`wrong_reuse=0`). The code explains the asymmetry: those are replay-clock measurements
+(`at_ms` differences in `crates/runtime/src/cached_playback.rs`), while
+`routing.route_decision.p95_us` comes from `Instant::elapsed()` in `crates/app/src/lib.rs`.
+It was the only gated metric judged on uncalibrated wall-clock noise.
+
+=== Root cause and fix
+
+* *The gate no longer decides a noisy metric from one run.* `compare_runs` in
+  `crates/telemetry/src/benchmark_gate.rs` aggregates repeated runs per side: metrics by
+  **median**, hard invariants by **maximum**, sample counts pooled, observed min/max kept
+  as a diagnostic `run_range` in the job summary. Aggregation refuses rather than guessing
+  when the runs of one side disagree on `git.commit`, on the exact metric/invariant key set
+  (checked in both directions), or on the comparison boundaries, and an *unknown* pooled
+  sample count keeps a `min_samples` floor binding instead of failing open.
+* *Runs are interleaved and carry correct provenance.* The workflow builds each revision
+  into its own binary and runs both 7 times A/B/A/B on one runner, each in its own clean
+  worktree at the revision it was built from. Interleaving stops runner drift from landing
+  entirely on one side; the worktree makes `git rev-parse HEAD` resolve to the revision
+  under test for *any* revision, including a base revision predating this code. A new
+  assertion step fails the job unless `gate-report.json` carries the exact base and head
+  SHAs the job resolved.
+* *The budget matches the measurement.* `routing.route_decision.p95_us` is now
+  `warn_absolute_change: 3` / `fail_absolute_change: 6` (us) with `min_samples: 15`, above
+  the three samples of one fixture pass, so a single-run comparison reports `ungated` with
+  a stated reason instead of deciding on three samples. 20% of 6 us is 1.2 us -- less than
+  the spread of one unchanged build -- which is why a percent budget is not expressible at
+  this magnitude.
+
+Hard invariants were never affected: they aggregate by maximum, so a violation in any run
+still fails the gate.
+
+=== Review findings and CI findings
+
+Four review findings were addressed before merge: misattributed `git.commit` provenance
+(both sides were stamped with the head SHA plus `+dirty`), mixed commits inside one side,
+an unknown pooled sample count that disabled `min_samples`, and one-directional key-set
+comparison that could drop a later-only invariant violation. Two further defects were
+caught by the branch's own CI rather than by review: a `cp` destination that could not
+exist, and a comparison set that mixed all four comparison modes. A third was caught by the
+new provenance assertion itself: the first attempt used a producer-side environment
+override, which the base binary -- built from the base revision -- cannot contain. That is
+why provenance is carried by the working directory instead.
+
+=== Automated evidence at the merged commit
+
+[source,text]
+----
+Merge commit: c8e545decd0b90a765ba99915cdfba3470550427 (merge of #182 into main)
+PR runs at final head 4b3b85e:
+        CI 37078103624 (pull_request) -- success
+        Benchmark gate 37078103629 (pull_request) -- success
+        gate output: base=91c4a7e4a011a99608cb16248c53e1f5dc462948
+                     head=4b3b85eb07e5c0cd73b5140fc5eb4daf1503854d (7 base run(s), 7 head run(s))
+                     routing.route_decision.p95_us 3.0000 -> 3.0000, run ranges 3.0000-3.0000
+                     and 2.0000-3.0000, verdict PASS
+        provenance assertion: reported base/head == resolved base/head
+main push runs:
+        CI 37079054904 (push) -- success
+        Benchmark gate 37079054894 (push) -- success
+        Record main benchmark history: success; Replay base vs head: skipped (PR-only by design)
+benchmark-data commit f35e88ec58c4cf3471be66cc67eedc5119b, run_id run-37079054894:
+        recorded git.commit c8e545d (the merged commit), all invariants 0,
+        routing.route_decision.p95_us value 3, sample_count 3 (single-run history record)
+cargo test --locked --workspace at c8e545d: 342 passed, 0 failed
+Local gate stability at the merged commit (debug profile, 7 interleaved runs per side):
+        identical binaries, batch 1: PASS  base 11 us (range 9-14)  head 11 us (range 10-16)
+        identical binaries, batch 2: PASS  base 13 us (range 9-31)  head 13 us (range 8-14)
+        identical binaries, batch 3: PASS  base 13 us (range 9-18)  head 13 us (range 12-14)
+Injected routing regression at the merged commit (10 us busy-wait in
+IntentRoutePlanner::route, binary rebuilt, injection reverted afterwards):
+        batch 1: FAIL exit 1  base 11 us -> head 23 us
+        batch 2: FAIL exit 1  base 11 us -> head 21 us
+        batch 3: FAIL exit 1  base 11 us -> head 22 us
+----
+
+Batch 2 is the point of the change: one side's seven runs spanned 9-31 us, a range wider
+than the entire budget, and the median verdict was still the same PASS. Under the previous
+single-run gate that spread is exactly the input that produced the `-66.7%` failure in
+section 13.
+
+=== Effect on the release criteria
+
+* Sections 4.9 (replay benchmark) and 4.10 (failure/soak) remain green on `main` at
+  `c8e545d`, and the gate now has signal in both directions: identical code passes
+  deterministically, and a deliberate routing regression still fails it.
+* No budget was weakened to make a pull request green. The routing budget changed units
+  because the measurement is in single-digit microseconds, and the absolute thresholds were
+  calibrated against measured noise, not against a failing run; `benchmarks/budgets.json`
+  remains reviewed like code.
+* The `--base`/`--head` comparison and the aggregation rules are covered by 20 telemetry
+  unit tests and 4 comparator CLI tests, including the review findings above.
+
+=== Known limitation carried forward
+
+* A single-run comparison deliberately does not decide `routing.route_decision.p95_us`:
+  its `min_samples` floor of 15 requires at least five 3-event passes. Local two-file
+  comparisons therefore report the metric `ungated` with a warning naming the pooled count.
+  Lowering the floor would reintroduce the noise failure recorded in section 13.
+* Runner calibration is still a per-runner property. The absolute thresholds were measured
+  on a developer machine and on the GitHub runner, where the same unchanged build reported
+  3 us rather than 6-13 us; a materially slower hosted runner would need its own
+  measurement before these microsecond thresholds are trusted as a regression signal.
