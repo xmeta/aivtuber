@@ -17,6 +17,11 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Upper bound for the websocket handshake exchange.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Ceiling on messages consumed while waiting for a single response. The read
+/// deadline alone does not bound a peer that keeps sending well-formed but
+/// non-matching frames, so the request loops keep an explicit message budget as
+/// well and report the old "response limit exceeded" error when it is spent.
+pub const MAX_RESPONSE_MESSAGES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportError {
@@ -72,15 +77,18 @@ impl WebSocketConnector for TungsteniteConnector {
             .into_client_request()
             .map_err(|error| TransportError::new(format!("invalid websocket endpoint: {error}")))?;
         let uri = request.uri();
+        // `tungstenite` is built without a TLS feature here, so this connector
+        // can only ever produce a plaintext stream. Reject `wss://` outright
+        // instead of completing an unencrypted handshake against port 443.
+        if uri.scheme_str() == Some("wss") {
+            return Err(TransportError::new(format!(
+                "wss:// websocket endpoints require a TLS-enabled tungstenite build: {endpoint}"
+            )));
+        }
         let host = uri.host().ok_or_else(|| {
             TransportError::new(format!("websocket endpoint has no host: {endpoint}"))
         })?;
-        let default_port = if uri.scheme_str() == Some("wss") {
-            443
-        } else {
-            80
-        };
-        let port = uri.port_u16().unwrap_or(default_port);
+        let port = uri.port_u16().unwrap_or(80);
         let address = format!("{host}:{port}")
             .to_socket_addrs()
             .map_err(|error| {
@@ -136,6 +144,9 @@ pub fn receive_text_with_deadline(
                         "websocket peer did not send a message within the deadline",
                     ));
                 }
+                // A transport that reports timeouts immediately would otherwise
+                // spin this loop hot for the whole deadline.
+                std::thread::yield_now();
             }
             Err(error) => return Err(error),
         }
@@ -213,6 +224,21 @@ mod tests {
         }
 
         fn close(&mut self) {}
+    }
+
+    #[test]
+    fn wss_endpoints_are_rejected_instead_of_downgraded_to_plaintext() {
+        // This build has no TLS feature, so a `wss://` endpoint must fail loudly
+        // rather than complete an unencrypted handshake against port 443.
+        let error = TungsteniteConnector
+            .connect("wss://example.invalid:443/v1")
+            .err()
+            .expect("wss:// must be rejected without a TLS-enabled build");
+        let message = error.to_string();
+        assert!(
+            message.contains("TLS"),
+            "expected an explicit TLS error, got: {message}"
+        );
     }
 
     #[test]

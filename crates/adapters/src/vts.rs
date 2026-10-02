@@ -1,7 +1,7 @@
 use crate::{
-    AdapterClock, AdapterEvent, REQUEST_TIMEOUT, ReconnectPolicy, ReconnectState, SecretString,
-    TransportError, TungsteniteConnector, WebSocketConnector, WebSocketTransport, default_clock,
-    error_breaks_session,
+    AdapterClock, AdapterEvent, MAX_RESPONSE_MESSAGES, REQUEST_TIMEOUT, ReconnectPolicy,
+    ReconnectState, SecretString, TransportError, TungsteniteConnector, WebSocketConnector,
+    WebSocketTransport, default_clock, error_breaks_session,
 };
 use aivtuber_domain::{
     AuthorizedAvatarAction, AvatarAdapter, EngineError, EngineErrorKind, EngineFuture,
@@ -423,7 +423,9 @@ fn request_with_transport(
         .map_err(|error| engine_error(EngineErrorKind::Unavailable, error.to_string()))?;
 
     let deadline = Instant::now() + REQUEST_TIMEOUT;
-    loop {
+    // The deadline bounds a silent peer; the message budget bounds a peer that
+    // keeps sending frames that never match this request id.
+    for _received in 0..MAX_RESPONSE_MESSAGES {
         let text = match transport.receive_text() {
             Ok(text) => text,
             Err(error) if error.is_timed_out() => {
@@ -433,6 +435,7 @@ fn request_with_transport(
                         "VTube Studio did not respond before the request deadline",
                     ));
                 }
+                std::thread::yield_now();
                 continue;
             }
             Err(error) => {
@@ -477,6 +480,11 @@ fn request_with_transport(
 
         return Ok(response.get("data").cloned().unwrap_or(Value::Null));
     }
+
+    Err(engine_error(
+        EngineErrorKind::Backend,
+        "VTube Studio response limit exceeded while waiting for request",
+    ))
 }
 
 fn parse_vts_event(message: &Value) -> Option<AdapterEvent> {
@@ -717,6 +725,43 @@ mod tests {
 
         assert_eq!(handle.closed_count(), 0, "session must stay open");
         assert_eq!(handle.sent().len(), 4);
+    }
+
+    #[test]
+    fn request_gives_up_after_the_message_budget_is_spent() {
+        // A peer that answers with responses addressed to other request ids must
+        // not hang the adapter: the message budget bounds the wait.
+        let mut responses: Vec<Result<String, TransportError>> = vec![
+            Ok(auth_response("aivtuber-vts-1")),
+            Ok(ok_response("aivtuber-vts-2", "EventSubscriptionResponse")),
+        ];
+        // Deliberately a fixed count far above the production budget so raising
+        // `MAX_RESPONSE_MESSAGES` cannot make this test pass by construction.
+        for index in 0..200 {
+            responses.push(Ok(ok_response(
+                &format!("aivtuber-vts-other-{index}"),
+                "APIResponse",
+            )));
+        }
+        let script = Script::new(responses);
+        let connector = Arc::new(ScriptedConnector::new(vec![Ok(script)]));
+        let clock = Arc::new(TestClock::new(0));
+        let adapter =
+            VTubeStudioAdapter::with_dependencies(config(), connector, clock).expect("adapter");
+
+        adapter
+            .subscribe_event("ModelLoadedEvent")
+            .expect("subscribe");
+
+        let error = adapter
+            .execute_sync(&authorized_avatar("hotkey.trigger:Wave"))
+            .expect_err("a peer that never answers must not hang the request loop");
+
+        assert_eq!(error.kind, EngineErrorKind::Backend);
+        assert!(
+            error.to_string().contains("response limit exceeded"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

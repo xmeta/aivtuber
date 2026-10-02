@@ -1,7 +1,7 @@
 use crate::{
-    AdapterClock, AdapterEvent, REQUEST_TIMEOUT, ReconnectPolicy, ReconnectState, SecretString,
-    TransportError, TungsteniteConnector, WebSocketConnector, WebSocketTransport, default_clock,
-    error_breaks_session, receive_text_with_deadline,
+    AdapterClock, AdapterEvent, MAX_RESPONSE_MESSAGES, REQUEST_TIMEOUT, ReconnectPolicy,
+    ReconnectState, SecretString, TransportError, TungsteniteConnector, WebSocketConnector,
+    WebSocketTransport, default_clock, error_breaks_session, receive_text_with_deadline,
 };
 use aivtuber_domain::{
     AuthorizedStreamAction, EngineError, EngineErrorKind, EngineFuture, StreamAdapter,
@@ -341,7 +341,10 @@ impl ObsWebSocketAdapter {
             .map_err(|error| engine_error(EngineErrorKind::Unavailable, error.to_string()))?;
 
         let deadline = Instant::now() + REQUEST_TIMEOUT;
-        loop {
+        // Both bounds are required: the deadline stops a silent peer, and the
+        // message budget stops a peer that keeps sending well-formed but
+        // non-identifying frames (which never trips the deadline).
+        for _received in 0..MAX_RESPONSE_MESSAGES {
             let text = match transport.receive_text() {
                 Ok(text) => text,
                 Err(error) if error.is_timed_out() => {
@@ -351,6 +354,7 @@ impl ObsWebSocketAdapter {
                             "OBS did not send Identified before the deadline",
                         ));
                     }
+                    std::thread::yield_now();
                     continue;
                 }
                 Err(error) => {
@@ -376,6 +380,11 @@ impl ObsWebSocketAdapter {
                 _ => {}
             }
         }
+
+        Err(engine_error(
+            EngineErrorKind::Backend,
+            "OBS Identified response was not received",
+        ))
     }
 
     fn request(
@@ -457,7 +466,9 @@ fn request_with_transport(
         .map_err(|error| engine_error(EngineErrorKind::Unavailable, error.to_string()))?;
 
     let deadline = Instant::now() + REQUEST_TIMEOUT;
-    loop {
+    // The deadline bounds a silent peer; the message budget bounds a peer that
+    // keeps sending frames that never match this request id.
+    for _received in 0..MAX_RESPONSE_MESSAGES {
         let text = match transport.receive_text() {
             Ok(text) => text,
             Err(error) if error.is_timed_out() => {
@@ -467,6 +478,7 @@ fn request_with_transport(
                         "OBS did not respond before the request deadline",
                     ));
                 }
+                std::thread::yield_now();
                 continue;
             }
             Err(error) => {
@@ -522,7 +534,13 @@ fn request_with_transport(
             .cloned()
             .unwrap_or(Value::Null));
     }
+
+    Err(engine_error(
+        EngineErrorKind::Backend,
+        "OBS response limit exceeded while waiting for request",
+    ))
 }
+
 fn map_stream_action(
     action: &AuthorizedStreamAction,
 ) -> Result<(&'static str, Value), EngineError> {
@@ -758,6 +776,20 @@ mod tests {
         .to_string()
     }
 
+    /// A well-formed `op 7` response addressed to a different request id: the
+    /// request loop must keep waiting rather than accept it as its own answer.
+    fn request_ok_for_other(id: &str) -> String {
+        json!({
+            "op": 7,
+            "d": {
+                "requestType": "SetCurrentProgramScene",
+                "requestId": id,
+                "requestStatus": { "result": true, "code": 100 }
+            }
+        })
+        .to_string()
+    }
+
     fn config() -> ObsWebSocketConfig {
         ObsWebSocketConfig {
             password: Some(SecretString::new("obs-password-secret")),
@@ -911,6 +943,41 @@ mod tests {
 
         assert_eq!(handle.closed_count(), 0, "session must stay open");
         assert_eq!(handle.sent().len(), 3);
+    }
+
+    #[test]
+    fn request_gives_up_after_the_message_budget_is_spent() {
+        // A peer that floods well-formed responses for other request ids must
+        // not hang the adapter: the message budget bounds the wait.
+        let challenge = "challenge";
+        let salt = "salt";
+        let mut responses: Vec<Result<String, TransportError>> =
+            vec![Ok(hello(Some((challenge, salt)))), Ok(identified())];
+        // Deliberately a fixed count far above the production budget so raising
+        // `MAX_RESPONSE_MESSAGES` cannot make this test pass by construction.
+        for index in 0..200 {
+            responses.push(Ok(request_ok_for_other(&format!(
+                "aivtuber-obs-other-{index}"
+            ))));
+        }
+        let script = Script::new(responses);
+        let connector = Arc::new(ScriptedConnector::new(vec![Ok(script)]));
+        let clock = Arc::new(TestClock::new(0));
+        let adapter =
+            ObsWebSocketAdapter::with_dependencies(config(), connector, clock).expect("adapter");
+
+        let error = adapter
+            .execute_sync(&authorized_stream(
+                "scene.set",
+                BTreeMap::from([("scene_name".to_owned(), Value::String("Live".to_owned()))]),
+            ))
+            .expect_err("a peer that never answers must not hang the request loop");
+
+        assert_eq!(error.kind, EngineErrorKind::Backend);
+        assert!(
+            error.to_string().contains("response limit exceeded"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

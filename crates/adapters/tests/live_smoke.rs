@@ -93,6 +93,8 @@ fn obs_live_smoke() {
 
     let authority = authority(Capability::ObsControl, "obs.control");
 
+    // The negative path already restores the real scene, so it is an
+    // alternative to -- not a prefix of -- the simple scene.set path below.
     if let Ok(negative_scene) = std::env::var("AIVTUBER_OBS_NEGATIVE_SCENE") {
         // An obs-websocket requestStatus rejection (a scene that does
         // not exist answers with code 600) is an application-level
@@ -138,10 +140,7 @@ fn obs_live_smoke() {
             .execute_sync(&restore)
             .expect("session survives a failed request status");
         println!("session kept: scene.set to the real scene succeeded right after the rejection");
-        return;
-    }
-
-    if let Ok(scene) = std::env::var("AIVTUBER_OBS_SCENE") {
+    } else if let Ok(scene) = std::env::var("AIVTUBER_OBS_SCENE") {
         let action = authorize_stream_action(
             &authority,
             StreamAction {
