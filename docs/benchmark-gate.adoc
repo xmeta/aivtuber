@@ -345,7 +345,7 @@ array only gained the diagnostic `base_range`/`head_range` fields).
 
 == 9. Verification
 
-* telemetry unit tests (20): improvement/ok/warning/fail paths,
+* telemetry unit tests (21): improvement/ok/warning/fail paths,
   higher-is-better, absolute thresholds on small denominators,
   min_samples gating, invariant violation overrides improvements,
   incompatible dataset/schema detection, ungated reporting, markdown
@@ -360,7 +360,8 @@ array only gained the diagnostic `base_range`/`head_range` fields).
 * comparator CLI unit tests (4): the original positional form is unchanged,
   default budgets/output paths, the repeated `--base`/`--head` form collects
   every run, and incomplete/unknown argument forms are rejected.
-* hardening unit tests (10): soak plateau detection, plus the Phase D
+* hardening tests (11 run in normal CI, 13 defined including 2 credential-gated
+  live conformance): soak plateau detection, plus the Phase D
   contract mapping — clean soaks map to zero invariants, growth findings map
   to non-zero invariants with details, results round-trip through the
   comparator's parser.
