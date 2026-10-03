@@ -513,6 +513,19 @@ where
         }
     }
 
+    /// Invalidate this event's supersession chain without starting new shadow
+    /// work (#164).
+    ///
+    /// Called once the active route has succeeded, independently of whether the
+    /// event itself produces shadow work: supersession is a property of source
+    /// work, so a filtered, unsampled, saturated, or budget-denied revision
+    /// still supersedes the one before it.
+    pub fn supersede_shadow_source(&mut self, event: &EventEnvelope) {
+        if let ShadowExecution::Bounded(orchestrator) = &mut self.shadow {
+            orchestrator.supersede_source(event);
+        }
+    }
+
     /// Whether a staged shadow job is waiting for the budget authority (#164).
     pub fn shadow_submission_staged(&self) -> bool {
         match &self.shadow {
@@ -573,10 +586,13 @@ where
         // No composition-thread budget step exists on this path, so the staged
         // job is committed here. `ProductionApp::handle_event` uses
         // `route_with_budget` and does the staging/commit itself.
-        if let ShadowExecution::Bounded(orchestrator) = &mut self.shadow
-            && orchestrator.has_staged()
-        {
-            orchestrator.commit();
+        if let ShadowExecution::Bounded(orchestrator) = &mut self.shadow {
+            // Same order as `ProductionApp::handle_event`: supersede the source
+            // chain first, then decide whether new shadow work starts.
+            orchestrator.supersede_source(event);
+            if orchestrator.has_staged() {
+                orchestrator.commit();
+            }
         }
         Ok(route)
     }
@@ -675,6 +691,10 @@ where
 
     fn shadow_charges_budget(&self) -> bool {
         self.shadow_charges_budget()
+    }
+
+    fn supersede_shadow_source(&mut self, event: &EventEnvelope) {
+        self.supersede_shadow_source(event);
     }
 
     fn shadow_submission_staged(&self) -> bool {
@@ -2094,6 +2114,128 @@ mod tests {
         );
         let snapshot = planner.shadow_execution_snapshot().expect("snapshot");
         assert_eq!(snapshot.cancelled_or_stale, 1);
+        planner.shutdown_shadow();
+    }
+
+    /// #164 review: registration must not lag enqueue. A policy that returns
+    /// immediately used to let a worker pop, evaluate, and retire *before* the
+    /// commit registered the token, leaving one leaked registry entry per
+    /// distinct correlation.
+    #[test]
+    fn the_token_registry_does_not_leak_under_immediate_return() {
+        let mut planner = ShadowingRoutePlanner::with_orchestrator(
+            FixedActive(PlaybackRoute::Silent),
+            FixedShadow(Ok(ShadowDecision::silent())),
+            identity("active"),
+            identity("shadow"),
+            None,
+            ShadowOrchestratorConfig {
+                max_concurrent: 4,
+                // Large enough that neither the work queue nor the completion
+                // mailbox drops anything, so this isolates the registry rather
+                // than the bounded-drop behaviour.
+                queue_capacity: 256,
+                deadline_ms: 30_000,
+                ..bounded_config()
+            },
+        )
+        .expect("planner");
+
+        // Many distinct chains, each with its own correlation, returning
+        // instantly: the worst case for the registration/enqueue window.
+        //
+        // Repeated over several rounds because the defect is an interleaving,
+        // not a value: each round uses fresh correlation ids so a leaked entry
+        // from an earlier round cannot mask a later one.
+        for index in 0..200 {
+            planner
+                .route(&event_in_chain(
+                    &format!("evt-fast-{index}"),
+                    &format!("corr-fast-{index}"),
+                ))
+                .expect("route");
+            // Give workers a chance to pop, evaluate, and retire mid-loop, which
+            // is exactly the window where a late registration would leak.
+            if index % 8 == 0 {
+                std::thread::yield_now();
+                let _ = planner.drain_shadow_comparisons();
+            }
+        }
+
+        let drained = drain_with_spy(&mut planner);
+        let snapshot = planner.shadow_execution_snapshot().expect("snapshot");
+        assert_eq!(
+            snapshot.live_chains, 0,
+            "every finished chain must retire its own entry"
+        );
+        assert_eq!(snapshot.completed, 200, "all jobs must have completed");
+        assert_eq!(
+            snapshot.dropped_completion_mailbox_full, 0,
+            "this test isolates the registry, not the bounded mailbox"
+        );
+        assert_eq!(
+            snapshot.cancelled_or_stale, 0,
+            "distinct chains must never cancel each other"
+        );
+        let mut kept: Vec<&str> = drained
+            .iter()
+            .filter_map(|completion| completion.record.as_ref())
+            .map(|record| record.event_id.as_str())
+            .collect();
+        kept.sort_unstable();
+        assert_eq!(
+            kept.len(),
+            drained.len(),
+            "every completion must carry evidence: a discarded one would mean \
+             a distinct chain was cancelled by another"
+        );
+        assert!(snapshot.is_quiescent());
+        planner.shutdown_shadow();
+    }
+
+    /// #164 review: supersession belongs to source work, not to shadow
+    /// admission. A newer revision that the governor denies must still make the
+    /// older revision stale, or the older evaluation publishes evidence for
+    /// work the runtime already replaced.
+    #[test]
+    fn a_budget_denied_revision_still_supersedes_the_older_one() {
+        let gate = EvalGate::new();
+        let mut planner = gated_planner(&gate, gated_deadline());
+
+        // rev1 is evaluating.
+        planner
+            .route_with_budget(&event_in_chain("evt-rev-1", "corr-chain"), None)
+            .expect("route");
+        planner.commit_shadow_submission(true);
+        gate.wait_for_arrivals(1);
+
+        // rev2 arrives on the same chain: its active route succeeds and it
+        // supersedes rev1, but the governor denies it, so no new job starts.
+        planner
+            .route_with_budget(&event_in_chain("evt-rev-2", "corr-chain"), None)
+            .expect("route");
+        planner.supersede_shadow_source(&event_in_chain("evt-rev-2", "corr-chain"));
+        planner.commit_shadow_submission(false);
+        assert_eq!(
+            planner.last_shadow_submission(),
+            Some(&ShadowSubmission::Skipped {
+                reason: ShadowSkipReason::BudgetDenied
+            })
+        );
+        gate.release();
+
+        let drained = drain_until_quiescent(&mut planner);
+        assert!(
+            !drained
+                .iter()
+                .filter_map(|completion| completion.record.as_ref())
+                .any(|record| record.event_id == "evt-rev-1"),
+            "a superseded revision must not publish evidence even when its \
+             successor was budget-denied"
+        );
+        let snapshot = planner.shadow_execution_snapshot().expect("snapshot");
+        assert_eq!(snapshot.cancelled_or_stale, 1);
+        assert_eq!(snapshot.live_chains, 0);
         planner.shutdown_shadow();
     }
 

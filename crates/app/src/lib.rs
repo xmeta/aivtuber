@@ -1254,9 +1254,13 @@ where
                 return Err(error);
             }
         };
-        // The active route succeeded, so the staged shadow job is now real: the
-        // #69 governor decides whether it is queued. A refusal can never fail
-        // an active event.
+        // The active route succeeded, so this revision supersedes whatever the
+        // same source chain was evaluating — independently of whether this event
+        // produces shadow work at all. A filtered, unsampled, saturated, or
+        // budget-denied revision still makes the previous one stale.
+        self.router.supersede_shadow_source(&event);
+        // The staged shadow job is now real: the #69 governor decides whether it
+        // is queued. A refusal can never fail an active event.
         self.commit_shadow_budget(at_ms);
         let routing_latency_us = elapsed_us(route_started);
         let decision = self.router.decision_record().cloned();

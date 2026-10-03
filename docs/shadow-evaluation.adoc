@@ -286,7 +286,25 @@ The registry is an `Arc<Mutex<HashMap<..>>>` shared with the workers, so a
 finished job retires its own entry instead of letting the map grow with every
 event. That retirement is guarded by `ShadowCancellationToken::is_same_work`:
 when a newer job of the same chain has already replaced the entry, the older
-worker must not evict it.
+worker must not evict it. `ShadowExecutionSnapshot::live_chains` reports the
+registry size, which must return to 0 once everything drains.
+
+Registration happens *inside* the queue lock, together with the enqueue
+(`capacity check -> token swap/cancel -> enqueue -> unlock/notify`), and the
+token lock is always taken after the queue lock. Registering after the push
+would leave a window in which a fast policy could pop, evaluate, and retire
+before its entry existed: the retire would find nothing, the commit would then
+insert a finished token that nothing ever removes (one leaked entry per distinct
+correlation), and an older same-chain worker could publish evidence for a
+revision that was already superseded.
+
+Supersession is notified by the composition thread through
+`supersede_shadow_source` once the active route has succeeded, and it does
+*not* depend on whether the new revision produces shadow work. Sampling and
+budget only decide whether *new* shadow work starts. A newer revision that is
+filtered, unsampled, saturated, or budget-denied still supersedes the one before
+it — otherwise that older evaluation runs to completion and publishes evidence
+for work the runtime already replaced.
 
 Every admitted job produces exactly one `ShadowCompletion`, carrying `None` when
 it was superseded, so a per-job resource such as a budget reservation is never

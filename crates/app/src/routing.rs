@@ -283,6 +283,14 @@ pub trait RoutePlanner: Send {
         false
     }
 
+    /// Invalidate the live shadow evaluation of this event's supersession chain
+    /// without starting new shadow work (#164).
+    ///
+    /// Called once the active route has succeeded. Supersession is a property
+    /// of source work, so it applies whether or not this event itself produces
+    /// shadow work.
+    fn supersede_shadow_source(&mut self, _event: &EventEnvelope) {}
+
     /// Whether a shadow job is staged and waiting for the #69 budget
     /// authority (#164).
     fn shadow_submission_staged(&self) -> bool {
@@ -340,6 +348,10 @@ impl RoutePlanner for Box<dyn RoutePlanner> {
 
     fn shadow_charges_budget(&self) -> bool {
         (**self).shadow_charges_budget()
+    }
+
+    fn supersede_shadow_source(&mut self, event: &EventEnvelope) {
+        (**self).supersede_shadow_source(event);
     }
 
     fn shadow_submission_staged(&self) -> bool {

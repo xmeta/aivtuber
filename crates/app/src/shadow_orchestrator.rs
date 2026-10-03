@@ -62,6 +62,12 @@ pub struct ShadowExecutionSnapshot {
     /// authority. It holds a cloned `EventEnvelope`, so it is outstanding work
     /// even though no worker owns it yet.
     pub staged: usize,
+    /// Supersession chains with a live cancellation token, i.e. evaluations
+    /// that have been enqueued and have not yet finished or been superseded.
+    ///
+    /// Must return to 0 once everything drains: a leaked entry is a retained
+    /// `EventEnvelope` and an unbounded registry.
+    pub live_chains: usize,
     pub pending_high_water: usize,
     pub in_flight_high_water: usize,
     pub submitted: u64,
@@ -158,12 +164,14 @@ impl ShadowCounters {
         shutting_down: bool,
         workers_running: usize,
         staged: bool,
+        live_chains: usize,
     ) -> ShadowExecutionSnapshot {
         ShadowExecutionSnapshot {
             pending: self.pending.load(Ordering::SeqCst),
             in_flight: self.in_flight.load(Ordering::SeqCst),
             awaiting_drain: self.awaiting_drain.load(Ordering::SeqCst),
             staged: usize::from(staged),
+            live_chains,
             pending_high_water: self.pending_high_water.load(Ordering::Relaxed),
             in_flight_high_water: self.in_flight_high_water.load(Ordering::Relaxed),
             submitted: self.submitted.load(Ordering::SeqCst),
@@ -252,7 +260,24 @@ impl ShadowQueue {
     /// every worker has been joined, so a job pushed then would sit in the
     /// queue forever with nothing to run it. #164 requires that shutdown
     /// leaves no shadow work outstanding, so a closed queue must refuse.
-    fn try_push(&self, job: ShadowJob) -> Result<(), PushRefusal> {
+    /// Non-blocking admission, with supersession bookkeeping made atomic with
+    /// the enqueue (#164).
+    ///
+    /// The queue lock is held across `capacity check -> token swap/cancel ->
+    /// enqueue`, and workers pop under the same lock, so a worker can never
+    /// observe the job before its supersession entry is registered. Doing the
+    /// registry update after the push left a window where a fast policy could
+    /// pop, evaluate, and retire before the entry existed: the retire then found
+    /// nothing and the commit inserted a stale token afterwards, leaking one
+    /// entry per distinct correlation, while an older same-chain worker could
+    /// publish evidence for a revision that was already superseded.
+    ///
+    /// `live` is locked *inside* the queue lock, never the other way round.
+    fn try_push_superseding(
+        &self,
+        job: ShadowJob,
+        live: &Mutex<HashMap<String, ShadowCancellationToken>>,
+    ) -> Result<(), PushRefusal> {
         if self.closed.load(Ordering::Acquire) {
             return Err(PushRefusal::Closed);
         }
@@ -265,10 +290,32 @@ impl ShadowQueue {
         if queue.len() >= self.capacity {
             return Err(PushRefusal::Saturated);
         }
+        let key = supersession_key(&job.event);
+        let cancellation = job.cancellation.clone();
+        let mut live = live.lock().expect("shadow token lock");
+        if let Some(previous) = live.insert(key, cancellation) {
+            previous.cancel();
+        }
+        drop(live);
         queue.push_back(job);
         drop(queue);
         self.available.notify_one();
         Ok(())
+    }
+
+    /// Cancel the live token of one supersession chain without starting any
+    /// new work (#164).
+    ///
+    /// Supersession is a property of *source work*, not of shadow admission: a
+    /// newer revision that is filtered, unsampled, saturated, or budget-denied
+    /// still supersedes the revision before it, whose evaluation is now stale.
+    /// Locked under the queue lock so a worker cannot slip a pop between the
+    /// check and the cancel.
+    fn supersede(&self, key: &str, live: &Mutex<HashMap<String, ShadowCancellationToken>>) {
+        let _queue = self.state.lock().expect("shadow queue lock");
+        if let Some(previous) = live.lock().expect("shadow token lock").remove(key) {
+            previous.cancel();
+        }
     }
 
     /// Block until a job is available, returning `None` once the queue is
@@ -625,15 +672,15 @@ where
                 });
         };
         let job_id = job.job_id;
-        // The token is shared with the queued job, so clone it out first: the
-        // registry keeps it to cancel this job when newer work of the same
-        // chain arrives.
-        let cancellation = job.cancellation.clone();
-        let key = supersession_key(&job.event);
         // `note_queued` is reverted on every refusal, so a refused push never
         // inflates the pending gauge.
         self.counters.note_queued();
-        if let Err(refusal) = self.work.try_push(job) {
+        // Enqueue and supersession registration happen together under the queue
+        // lock, so no worker can see the job before its registry entry exists.
+        if let Err(refusal) = self
+            .work
+            .try_push_superseding(job, self.live_tokens.as_ref())
+        {
             self.counters.pending.fetch_sub(1, Ordering::SeqCst);
             return self.skip(match refusal {
                 PushRefusal::Saturated => ShadowSkipReason::Saturated,
@@ -642,13 +689,6 @@ where
                 PushRefusal::Closed => ShadowSkipReason::ShuttingDown,
             });
         }
-        // Supersede the previous evaluation of *this* chain only. An unrelated
-        // event's comparison is worth keeping just as much as this one's.
-        let mut live = self.live_tokens.lock().expect("shadow token lock");
-        if let Some(previous) = live.insert(key, cancellation) {
-            previous.cancel();
-        }
-        drop(live);
         self.counters.submitted.fetch_add(1, Ordering::Relaxed);
         let submission = ShadowSubmission::Admitted { job_id };
         self.last_submission = Some(submission.clone());
@@ -688,6 +728,19 @@ where
         submission
     }
 
+    /// Invalidate the live evaluation of this event's supersession chain
+    /// without starting any new shadow work (#164).
+    ///
+    /// #164 scopes cancellation to superseded *source work*, so it must not
+    /// depend on whether the new revision produces shadow work. A newer
+    /// revision that is filtered, unsampled, saturated, or budget-denied still
+    /// supersedes the one before it; otherwise that older evaluation runs to
+    /// completion and publishes evidence the runtime no longer wants.
+    pub fn supersede_source(&mut self, event: &EventEnvelope) {
+        self.work
+            .supersede(&supersession_key(event), self.live_tokens.as_ref());
+    }
+
     /// Whether a job is staged and waiting for the budget authority.
     ///
     /// Lets the composition thread skip the #69 probe entirely when there is
@@ -710,11 +763,13 @@ where
             .iter()
             .filter(|worker| !worker.is_finished())
             .count();
+        let live_chains = self.live_tokens.lock().expect("shadow token lock").len();
         self.counters.snapshot(
             &self.config,
             self.shutting_down.load(Ordering::Acquire),
             workers_running,
             self.staged.is_some(),
+            live_chains,
         )
     }
 
