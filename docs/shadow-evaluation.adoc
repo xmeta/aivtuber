@@ -326,6 +326,27 @@ down — the commit step is a no-op and no budget is consumed, because there is
 no work to pay for. `shadow_submission_staged` lets the composition thread skip
 the #69 probe entirely in that case.
 
+=== 8.6.1 The staged/shutdown boundary
+
+Staging holds a cloned `EventEnvelope`, so a staged job is outstanding work
+even though no worker owns it yet. Three properties keep that honest:
+
+* `is_quiescent()` counts a staged job, alongside pending, in-flight, and
+  undrained. A runtime with staged work is not idle, and the snapshot reports
+  `staged` so the state is visible rather than implied.
+* `shutdown()` and `Drop` discard the stage. A staged job was never queued, so
+  nothing else would ever release it, and without this its envelope would
+  outlive shutdown while `is_quiescent()` still reported idle.
+* `ShadowQueue::push` refuses a closed queue, reporting `ShuttingDown` rather
+  than `Saturated`. After shutdown every worker has been joined, so a job
+  pushed then would sit in the queue forever with nothing to run it. The closed
+  check is repeated under the queue lock, because `close()` can land between the
+  first load and the push.
+
+The staged lifecycle therefore permits the `stage → shutdown → commit` order
+without stranding work: shutdown drops the stage, and the late commit finds
+nothing staged and never touches the queue.
+
 === 8.7 Active-output invariance
 
 `ShadowingRoutePlanner::with_orchestrator` returns the active planner's route

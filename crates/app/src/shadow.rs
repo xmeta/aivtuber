@@ -1892,6 +1892,91 @@ mod tests {
         assert!(!inline.shadow_submission_staged());
     }
 
+    /// #164 review: `shutdown` must discard a staged job, and a commit after
+    /// shutdown must be refused. Otherwise the staged `EventEnvelope` outlives
+    /// shutdown while `is_quiescent()` still claims the runtime is idle, and a
+    /// late commit lands a job in a closed queue whose workers are already
+    /// joined, leaving `pending == 1` forever.
+    #[test]
+    fn shutdown_discards_staged_work_and_a_late_commit_is_refused() {
+        let gate = EvalGate::new();
+        let mut planner = gated_planner(&gate, gated_deadline());
+
+        planner
+            .route_with_budget(&event_with_id("evt-staged"), None)
+            .expect("route");
+        assert!(planner.shadow_submission_staged());
+
+        planner.shutdown_shadow();
+
+        // Shutdown released the stage: nothing is left holding the envelope.
+        assert!(
+            !planner.shadow_submission_staged(),
+            "shutdown must discard the staged job"
+        );
+        let after_shutdown = planner.shadow_execution_snapshot().expect("snapshot");
+        assert_eq!(after_shutdown.staged, 0);
+        assert!(after_shutdown.is_quiescent());
+        assert_eq!(after_shutdown.pending, 0);
+
+        // A commit that arrives after shutdown must be refused rather than
+        // queued into a closed queue with no workers left to drain it.
+        planner.commit_shadow_submission(true);
+        let after_late_commit = planner.shadow_execution_snapshot().expect("snapshot");
+        assert_eq!(
+            after_late_commit.pending, 0,
+            "a commit after shutdown must not grow the queue"
+        );
+        assert_eq!(after_late_commit.in_flight, 0);
+        assert_eq!(
+            after_late_commit.submitted, 0,
+            "a refused commit must not count as submitted"
+        );
+        assert!(
+            after_late_commit.is_quiescent(),
+            "the runtime must not claim quiescence while work is stranded"
+        );
+
+        // Nothing may ever run, and no evidence may be produced.
+        let drained = planner.drain_shadow_comparisons();
+        assert!(drained.is_empty());
+        assert_eq!(gate.arrivals(), 0);
+    }
+
+    /// #164 review: a staged job is outstanding work — it holds a cloned
+    /// `EventEnvelope` — so `is_quiescent()` must not report idle while one is
+    /// waiting for the budget authority.
+    #[test]
+    fn a_staged_job_is_not_quiescent() {
+        let gate = EvalGate::new();
+        let mut planner = gated_planner(&gate, gated_deadline());
+
+        planner
+            .route_with_budget(&event_with_id("evt-staged"), None)
+            .expect("route");
+        let staged = planner.shadow_execution_snapshot().expect("snapshot");
+        assert_eq!(staged.staged, 1);
+        assert!(
+            !staged.is_quiescent(),
+            "a staged envelope is outstanding work, not an idle runtime"
+        );
+
+        // Committing it makes it queued rather than staged, which is also not
+        // quiescent until the worker finishes.
+        planner.commit_shadow_submission(true);
+        let queued = planner.shadow_execution_snapshot().expect("snapshot");
+        assert_eq!(queued.staged, 0);
+        assert!(!queued.is_quiescent());
+
+        gate.release();
+        planner.shutdown_shadow();
+        // The comparison published before shutdown is undrained evidence, which
+        // `is_quiescent()` deliberately counts as outstanding; take it first.
+        let _ = drain_until_quiescent(&mut planner);
+        let done = planner.shadow_execution_snapshot().expect("snapshot");
+        assert!(done.is_quiescent());
+    }
+
     fn drain_until_abort<P>(
         planner: &mut ShadowingRoutePlanner<P, DeadlineAwareShadowPolicy>,
     ) -> Vec<ShadowCompletion> {

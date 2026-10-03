@@ -41,6 +41,10 @@ pub struct ShadowExecutionSnapshot {
     /// Completed records published to (or blocked on) the completion mailbox and
     /// not yet taken by the composition thread.
     pub awaiting_drain: usize,
+    /// A job that passed the deterministic gates and is waiting for the budget
+    /// authority. It holds a cloned `EventEnvelope`, so it is outstanding work
+    /// even though no worker owns it yet.
+    pub staged: usize,
     pub pending_high_water: usize,
     pub in_flight_high_water: usize,
     pub submitted: u64,
@@ -64,11 +68,11 @@ pub struct ShadowExecutionSnapshot {
 }
 
 impl ShadowExecutionSnapshot {
-    /// True when no shadow work is outstanding anywhere: not queued, not
-    /// executing in a worker, and published-but-undrained on the completion
-    /// mailbox. Same false-quiescent trap #177 fixed for generations.
+    /// True when no shadow work is outstanding anywhere: not staged, not
+    /// queued, not executing in a worker, and published-but-undrained on the
+    /// completion mailbox. Same false-quiescent trap #177 fixed for generations.
     pub fn is_quiescent(&self) -> bool {
-        self.pending == 0 && self.in_flight == 0 && self.awaiting_drain == 0
+        self.pending == 0 && self.in_flight == 0 && self.awaiting_drain == 0 && self.staged == 0
     }
 }
 
@@ -136,11 +140,13 @@ impl ShadowCounters {
         config: &ShadowOrchestratorConfig,
         shutting_down: bool,
         workers_running: usize,
+        staged: bool,
     ) -> ShadowExecutionSnapshot {
         ShadowExecutionSnapshot {
             pending: self.pending.load(Ordering::SeqCst),
             in_flight: self.in_flight.load(Ordering::SeqCst),
             awaiting_drain: self.awaiting_drain.load(Ordering::SeqCst),
+            staged: usize::from(staged),
             pending_high_water: self.pending_high_water.load(Ordering::Relaxed),
             in_flight_high_water: self.in_flight_high_water.load(Ordering::Relaxed),
             submitted: self.submitted.load(Ordering::SeqCst),
@@ -197,6 +203,15 @@ enum JobOutcome {
 /// pool: one idle worker would prevent every other worker from taking a job,
 /// which would make `max_concurrent` unobservable. A mutex + condvar queue
 /// admits waiters without blocking any of them.
+/// Why a non-blocking admission did not take the job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PushRefusal {
+    /// The bounded queue is at capacity; the work is dropped, not backpressured.
+    Saturated,
+    /// The queue is closed because shutdown began; nothing will ever run it.
+    Closed,
+}
+
 struct ShadowQueue {
     state: Mutex<VecDeque<ShadowJob>>,
     available: Condvar,
@@ -214,16 +229,29 @@ impl ShadowQueue {
         }
     }
 
-    /// Non-blocking admission. `None` means the bounded queue is full.
-    fn push(&self, job: ShadowJob) -> Option<()> {
+    /// Non-blocking admission, distinguishing *why* it failed.
+    ///
+    /// A closed queue is a separate outcome from a full one: after shutdown
+    /// every worker has been joined, so a job pushed then would sit in the
+    /// queue forever with nothing to run it. #164 requires that shutdown
+    /// leaves no shadow work outstanding, so a closed queue must refuse.
+    fn try_push(&self, job: ShadowJob) -> Result<(), PushRefusal> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(PushRefusal::Closed);
+        }
         let mut queue = self.state.lock().expect("shadow queue lock");
+        // Re-check under the lock: `close()` can land between the load above
+        // and this point.
+        if self.closed.load(Ordering::Acquire) {
+            return Err(PushRefusal::Closed);
+        }
         if queue.len() >= self.capacity {
-            return None;
+            return Err(PushRefusal::Saturated);
         }
         queue.push_back(job);
         drop(queue);
         self.available.notify_one();
-        Some(())
+        Ok(())
     }
 
     /// Block until a job is available, returning `None` once the queue is
@@ -556,10 +584,17 @@ where
         // The token is shared with the queued job, so clone it out first: the
         // orchestrator keeps it to cancel this job when newer work arrives.
         let cancellation = job.cancellation.clone();
+        // `note_queued` is reverted on every refusal, so a refused push never
+        // inflates the pending gauge.
         self.counters.note_queued();
-        if self.work.push(job).is_none() {
+        if let Err(refusal) = self.work.try_push(job) {
             self.counters.pending.fetch_sub(1, Ordering::SeqCst);
-            return self.skip(ShadowSkipReason::Saturated);
+            return self.skip(match refusal {
+                PushRefusal::Saturated => ShadowSkipReason::Saturated,
+                // Every worker has been joined, so queueing now would leave the
+                // job outstanding forever.
+                PushRefusal::Closed => ShadowSkipReason::ShuttingDown,
+            });
         }
         // Supersede the previous in-flight evaluation: the newest event is the
         // one whose comparison is worth keeping, so its token becomes the
@@ -632,6 +667,7 @@ where
             &self.config,
             self.shutting_down.load(Ordering::Acquire),
             workers_running,
+            self.staged.is_some(),
         )
     }
 
@@ -643,6 +679,10 @@ where
     pub fn shutdown(&mut self) {
         self.shutting_down.store(true, Ordering::Release);
         self.work.close();
+        // A staged job was never queued, so nothing else would release it. Its
+        // `EventEnvelope` would otherwise outlive shutdown and stay invisible
+        // to the snapshot, leaving `is_quiescent()` lying about the runtime.
+        self.staged = None;
         if let Some(token) = self.active_token.take() {
             token.cancel();
         }
@@ -663,6 +703,9 @@ where
     fn drop(&mut self) {
         self.shutting_down.store(true, Ordering::Release);
         self.work.close();
+        // Same reason as `shutdown`: never let a staged envelope outlive the
+        // orchestrator.
+        self.staged = None;
         if let Some(token) = self.active_token.take() {
             token.cancel();
         }
