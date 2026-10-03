@@ -6,7 +6,7 @@ use crate::shadow::{
 };
 use aivtuber_domain::EventEnvelope;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
@@ -30,6 +30,23 @@ impl ShadowCancellationToken {
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }
+
+    /// Whether two handles cancel the same unit of work.
+    ///
+    /// A worker uses this to retire its own entry from the supersession
+    /// registry without evicting a newer job that replaced it.
+    pub fn is_same_work(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.cancelled, &other.cancelled)
+    }
+}
+
+/// Identity of the source work a shadow job belongs to.
+///
+/// Two events with the same key are the *same* revision chain, so a newer one
+/// supersedes an older one. Different keys are independent source work and must
+/// never cancel each other.
+fn supersession_key(event: &EventEnvelope) -> String {
+    event.correlation_id.clone()
 }
 
 /// Bounded view of outstanding shadow work, mirroring the #177 generation
@@ -341,7 +358,18 @@ where
     last_comparison: Option<ShadowComparisonRecord>,
     /// Token of the most recently admitted job. Superseded when a newer job is
     /// admitted so a stale evaluation cannot outlive the work it compares.
-    active_token: Option<ShadowCancellationToken>,
+    /// Live cancellation token per supersession chain (#164).
+    ///
+    /// Keyed by `correlation_id`, not a single global slot: #164 scopes
+    /// cancellation to *superseded source work*, so admitting a job cancels the
+    /// previous job of the same chain and nothing else. A global latest-wins
+    /// slot would make unrelated events destroy each other's evidence under
+    /// sustained traffic, biasing sampling results toward arrival order.
+    ///
+    /// Shared with the workers so a finished job retires its own entry; the
+    /// map is therefore bounded by the number of in-flight chains rather than
+    /// growing with every event.
+    live_tokens: Arc<Mutex<HashMap<String, ShadowCancellationToken>>>,
 }
 
 impl<S> ShadowOrchestrator<S>
@@ -362,6 +390,7 @@ where
             mpsc::sync_channel::<ShadowCompletion>(completion_capacity);
         let counters = Arc::new(ShadowCounters::default());
         let shutting_down = Arc::new(AtomicBool::new(false));
+        let live_tokens = Arc::new(Mutex::new(HashMap::<String, ShadowCancellationToken>::new()));
 
         let mut workers = Vec::with_capacity(config.max_concurrent);
         for index in 0..config.max_concurrent {
@@ -374,11 +403,14 @@ where
             let worker_shutdown = Arc::clone(&shutting_down);
             let worker_queue = Arc::clone(&work);
             let worker_completion_tx = completion_tx.clone();
+            let worker_live_tokens = Arc::clone(&live_tokens);
             let handle = thread::Builder::new()
                 .name(format!("aivtuber-shadow-worker-{index}"))
                 .spawn(move || {
                     while let Some(job) = worker_queue.pop() {
                         let job_id = job.job_id;
+                        let finished_key = supersession_key(&job.event);
+                        let finished_token = job.cancellation.clone();
                         worker_counters.note_claimed();
                         let outcome = run_job(
                             &mut worker_policy,
@@ -388,6 +420,18 @@ where
                             worker_shutdown.as_ref(),
                             job,
                         );
+                        // Retire this chain's entry so the registry stays
+                        // bounded by in-flight chains. Guarded by token
+                        // identity: a newer job of the same chain has already
+                        // replaced the entry, and must not be evicted.
+                        let mut live = worker_live_tokens.lock().expect("shadow token lock");
+                        if live
+                            .get(&finished_key)
+                            .is_some_and(|current| current.is_same_work(&finished_token))
+                        {
+                            live.remove(&finished_key);
+                        }
+                        drop(live);
                         let completion = match outcome {
                             JobOutcome::Discarded => {
                                 worker_counters
@@ -437,7 +481,7 @@ where
             staged: None,
             last_submission: None,
             last_comparison: None,
-            active_token: None,
+            live_tokens: Arc::clone(&live_tokens),
         })
     }
 
@@ -582,8 +626,10 @@ where
         };
         let job_id = job.job_id;
         // The token is shared with the queued job, so clone it out first: the
-        // orchestrator keeps it to cancel this job when newer work arrives.
+        // registry keeps it to cancel this job when newer work of the same
+        // chain arrives.
         let cancellation = job.cancellation.clone();
+        let key = supersession_key(&job.event);
         // `note_queued` is reverted on every refusal, so a refused push never
         // inflates the pending gauge.
         self.counters.note_queued();
@@ -596,12 +642,13 @@ where
                 PushRefusal::Closed => ShadowSkipReason::ShuttingDown,
             });
         }
-        // Supersede the previous in-flight evaluation: the newest event is the
-        // one whose comparison is worth keeping, so its token becomes the
-        // active one and the previous token is cancelled.
-        if let Some(previous) = self.active_token.replace(cancellation) {
+        // Supersede the previous evaluation of *this* chain only. An unrelated
+        // event's comparison is worth keeping just as much as this one's.
+        let mut live = self.live_tokens.lock().expect("shadow token lock");
+        if let Some(previous) = live.insert(key, cancellation) {
             previous.cancel();
         }
+        drop(live);
         self.counters.submitted.fetch_add(1, Ordering::Relaxed);
         let submission = ShadowSubmission::Admitted { job_id };
         self.last_submission = Some(submission.clone());
@@ -683,7 +730,9 @@ where
         // `EventEnvelope` would otherwise outlive shutdown and stay invisible
         // to the snapshot, leaving `is_quiescent()` lying about the runtime.
         self.staged = None;
-        if let Some(token) = self.active_token.take() {
+        // Every chain must stop, not just one: shutdown is global.
+        for (_, token) in std::mem::take(&mut *self.live_tokens.lock().expect("shadow token lock"))
+        {
             token.cancel();
         }
         for worker in std::mem::take(&mut self.workers) {
@@ -706,7 +755,8 @@ where
         // Same reason as `shutdown`: never let a staged envelope outlive the
         // orchestrator.
         self.staged = None;
-        if let Some(token) = self.active_token.take() {
+        for (_, token) in std::mem::take(&mut *self.live_tokens.lock().expect("shadow token lock"))
+        {
             token.cancel();
         }
         // A policy that ignores its cancellation token cannot be joined safely

@@ -1002,6 +1002,14 @@ mod tests {
         event
     }
 
+    /// Same revision chain: a different revision of one source work.
+    fn event_in_chain(event_id: &str, correlation_id: &str) -> EventEnvelope {
+        let mut event = event();
+        event.event_id = event_id.to_owned();
+        event.correlation_id = correlation_id.to_owned();
+        event
+    }
+
     /// Test gate that lets a test observe how many shadow evaluations are
     /// executing and then releases them on demand.
     ///
@@ -1975,6 +1983,124 @@ mod tests {
         let _ = drain_until_quiescent(&mut planner);
         let done = planner.shadow_execution_snapshot().expect("snapshot");
         assert!(done.is_quiescent());
+    }
+
+    /// #164 review: cancellation is scoped to *superseded source work*. Two
+    /// independent chains must not cancel each other, or sustained traffic
+    /// would leave evidence for only the most recent arrival and bias sampling
+    /// results toward arrival order.
+    #[test]
+    fn independent_source_chains_do_not_cancel_each_other() {
+        let gate = EvalGate::new();
+        let mut planner = ShadowingRoutePlanner::with_orchestrator(
+            FixedActive(PlaybackRoute::Silent),
+            GatedShadowPolicy {
+                decision: ShadowDecision::silent(),
+                gate: Arc::clone(&gate),
+            },
+            identity("active"),
+            identity("shadow"),
+            None,
+            ShadowOrchestratorConfig {
+                max_concurrent: 2,
+                ..gated_deadline()
+            },
+        )
+        .expect("planner");
+
+        planner
+            .route_with_budget(&event_in_chain("evt-a", "corr-a"), None)
+            .expect("route");
+        planner.commit_shadow_submission(true);
+        planner
+            .route_with_budget(&event_in_chain("evt-b", "corr-b"), None)
+            .expect("route");
+        planner.commit_shadow_submission(true);
+
+        // Both chains are executing concurrently: neither superseded the other.
+        gate.wait_for_arrivals(2);
+        gate.release();
+
+        let drained = drain_until_abort_compatible(&mut planner);
+        let records: Vec<&ShadowComparisonRecord> = drained
+            .iter()
+            .filter_map(|completion| completion.record.as_ref())
+            .collect();
+        assert_eq!(
+            records.len(),
+            2,
+            "unrelated chains must both produce evidence: got {:?}",
+            records
+                .iter()
+                .map(|record| record.event_id.as_str())
+                .collect::<Vec<_>>()
+        );
+        let mut ids: Vec<&str> = records
+            .iter()
+            .map(|record| record.event_id.as_str())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["evt-a", "evt-b"]);
+
+        let snapshot = planner.shadow_execution_snapshot().expect("snapshot");
+        assert_eq!(snapshot.cancelled_or_stale, 0);
+        assert_eq!(snapshot.deadline_exceeded, 0);
+        assert_eq!(snapshot.submitted, 2);
+        planner.shutdown_shadow();
+    }
+
+    /// #164 review: supersession is what cancellation means, so a newer
+    /// revision of the *same* chain must still discard the older comparison.
+    #[test]
+    fn a_newer_revision_of_the_same_chain_supersedes_the_older_one() {
+        let gate = EvalGate::new();
+        let mut planner = gated_planner(&gate, gated_deadline());
+
+        planner
+            .route_with_budget(&event_in_chain("evt-rev-1", "corr-chain"), None)
+            .expect("route");
+        planner.commit_shadow_submission(true);
+        gate.wait_for_arrivals(1);
+
+        // Same correlation_id: a newer revision of the same source work.
+        planner
+            .route_with_budget(&event_in_chain("evt-rev-2", "corr-chain"), None)
+            .expect("route");
+        planner.commit_shadow_submission(true);
+        gate.release();
+
+        let drained = drain_until_abort_compatible(&mut planner);
+        assert!(
+            drained.iter().any(|completion| completion.record.is_none()),
+            "the superseded revision must finish without evidence"
+        );
+        let current = drained
+            .iter()
+            .filter_map(|completion| completion.record.as_ref())
+            .find(|record| record.event_id == "evt-rev-2")
+            .expect("current comparison");
+        assert_eq!(
+            current.shadow,
+            ShadowEvaluationOutcome::Evaluated {
+                decision: ShadowDecision::silent()
+            }
+        );
+        assert!(
+            !drained
+                .iter()
+                .filter_map(|completion| completion.record.as_ref())
+                .any(|record| record.event_id == "evt-rev-1"),
+            "the superseded revision must not publish evidence"
+        );
+        let snapshot = planner.shadow_execution_snapshot().expect("snapshot");
+        assert_eq!(snapshot.cancelled_or_stale, 1);
+        planner.shutdown_shadow();
+    }
+
+    fn drain_until_abort_compatible<P>(
+        planner: &mut ShadowingRoutePlanner<P, GatedShadowPolicy>,
+    ) -> Vec<ShadowCompletion> {
+        drain_until_quiescent(planner)
     }
 
     fn drain_until_abort<P>(

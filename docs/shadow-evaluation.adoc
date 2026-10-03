@@ -265,9 +265,31 @@ The synchronous #163 path has no orchestrator and therefore no per-event
 shadow deadline: it hands the policy the caller's remaining budget as its
 horizon, so `abort_reason()` remains meaningful there too.
 
-Admitting newer work supersedes the previous in-flight evaluation. Every
-admitted job produces exactly one `ShadowCompletion`, carrying `None` when it
-was superseded, so a per-job resource such as a budget reservation is never
+=== 8.4.2 Cancellation is scoped to superseded source work
+
+Cancellation means *this source work was superseded*, not *a newer event
+arrived*. The orchestrator therefore keys live tokens by the event's
+`correlation_id`: admitting a job cancels the previous job of the same revision
+chain and nothing else.
+
+A single global latest-wins slot would satisfy "the newest comparison wins"
+while quietly destroying the rest. Under sustained traffic — and `max_concurrent`
+above 1 — every unrelated event would cancel the previous one, so only the most
+recent arrival would leave evidence and the sample would be biased toward
+arrival order rather than toward the configured sampling. Independent chains are
+independent, and their comparisons are all worth keeping.
+
+Shutdown remains global: `shutdown` and `Drop` cancel *every* live chain, not
+just one, because a process-wide stop supersedes everything.
+
+The registry is an `Arc<Mutex<HashMap<..>>>` shared with the workers, so a
+finished job retires its own entry instead of letting the map grow with every
+event. That retirement is guarded by `ShadowCancellationToken::is_same_work`:
+when a newer job of the same chain has already replaced the entry, the older
+worker must not evict it.
+
+Every admitted job produces exactly one `ShadowCompletion`, carrying `None` when
+it was superseded, so a per-job resource such as a budget reservation is never
 leaked by a discarded job.
 
 `ProductionApp::shutdown` calls `shutdown_shadow()`, which cancels outstanding
