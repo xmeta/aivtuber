@@ -135,8 +135,10 @@ tgrep.exe --version   # must report 1.0.11
 ~~~
 
 From source (needs a Rust toolchain; use this when no pre-built asset matches
-your platform, e.g. aarch64 Linux). Pin to the same tag so the build matches the
-binary path:
+your platform). v1.0.11 ships assets for x86_64 and aarch64 on `apple-darwin`,
+`pc-windows-msvc`, and `unknown-linux-musl` only, so a platform outside that set
+(32-bit x86/armv7, a non-musl-specific Linux target, FreeBSD) needs the source
+path. Pin to the same tag so the build matches the binary path:
 
 ~~~sh
 git clone --branch v1.0.11 --depth 1 https://github.com/microsoft/tgrep.git
