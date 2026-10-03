@@ -37,9 +37,9 @@ The core v0.1 implementation issues named in the #97 release gate are complete:
 - The #97 end-to-end release gate passed: recorded evidence in `docs/release-v0.1.adoc` shows **36/36** criteria satisfied and the decision is **GO**. Issue #97 was closed as completed on 2026-10-03, so the gate is a finished checkpoint, not a pending closeable item.
 - Release evidence for the calibration gap in the replay benchmark is recorded in `docs/release-v0.1.adoc` section 14; the #183/#184 evidence/doc corrections are merged into `main`.
 
-The remaining Stage 1 implementation slices tracked under #57 are:
+The remaining Stage 1 hardening and process work is:
 
-- tracking parent #57, with implementation slices #145 (property tests), #146 (fuzz targets), and #147 (bounded CI / corpus integration; blocked on #145/#146);
+- verification toolchain, tracked by parent #57, with implementation slices #145 (property tests), #146 (fuzz targets), and #147 (bounded CI / corpus integration; blocked on #145/#146);
 - #70 realistic workload scenarios;
 - #71 operational SLOs, blocked on #70;
 - #125 tgrep provisioning documentation.
