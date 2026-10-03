@@ -2,8 +2,8 @@
 :toc:
 
 This document defines the first side-effect-free shadow-policy boundary for #64.
-The implementation slice is #163. Bounded production orchestration is #164 and
-benchmark/reaction-quality export is #165.
+The policy core is #163 (section 3-7). Bounded production orchestration is #164
+(section 8) and benchmark/reaction-quality export is #165 (section 9).
 
 == 1. Purpose
 
@@ -148,16 +148,329 @@ The final equivalence test intentionally uses a divergent shadow decision.
 Equality therefore demonstrates that comparison itself does not change active
 execution.
 
-== 8. Follow-up boundaries
+== 8. Bounded orchestration (#164, implemented)
 
-#164 owns production-compatible orchestration:
+`ShadowOrchestrator` runs the shadow half under production-compatible bounds
+without changing anything the shadow half cannot see.
 
-* deterministic sampling and event-kind filters;
-* concurrency bounds;
-* shadow deadlines;
-* cancellation and shutdown joining;
-* optional provider evaluation, disabled by default;
-* shadow-specific budget accounting.
+=== 8.1 Versioned configuration
+
+`ShadowOrchestratorConfig` carries `SHADOW_ORCHESTRATOR_SCHEMA_VERSION`
+(`0.1.0`). A comparison record is only interpretable alongside the config that
+produced it, so the version travels with the config and an unknown version is
+rejected by `validate()` rather than interpreted loosely.
+
+[cols="1,1,2"]
+|===
+|Field |Default |Meaning
+
+|`enabled`
+|`false`
+|Admission master switch. Nothing is admitted while false.
+
+|`sample_rate_per_10k`
+|`1000`
+|Deterministic admission rate, parts per 10,000.
+
+|`seed`
+|`0`
+|Seed for admission sampling.
+
+|`event_kinds`
+|empty
+|Eligible event kinds. Empty means every kind.
+
+|`max_concurrent`
+|`1`
+|Maximum shadow evaluations executing at once.
+
+|`queue_capacity`
+|`8`
+|Maximum shadow jobs waiting behind the workers.
+
+|`deadline_ms`
+|`250`
+|Per-event shadow deadline.
+
+|`allow_provider_calls`
+|`false`
+|Whether an optional provider bridge may be consulted at all.
+
+|`charge_shadow_to_budget`
+|`false`
+|Whether admitted shadow work is offered to the #69 ledger.
+|===
+
+Every bound is validated; none is clamped. There is no unbounded default.
+
+=== 8.2 Deterministic admission
+
+Admission is `FNV-1a(seed, event_id) mod 10000 < sample_rate_per_10k`, gated by
+the kind filter. It depends on no wall clock, thread identity, or evaluation
+order, so the same trace and seed admit exactly the same events on every run.
+A sample taken under one config cannot be silently re-interpreted under another.
+
+`ShadowSubmission` distinguishes admission outcomes from evaluation outcomes:
+`Skipped { disabled | filtered | not_sampled | saturated | shutting_down |
+budget_denied }` means the event never produced shadow work, which is a
+different claim from a shadow policy that ran and failed.
+
+=== 8.3 Bounded work
+
+* The composition thread hands work off with a non-blocking push. A full queue
+  returns `Skipped { saturated }`; it never applies backpressure to active
+  routing.
+* The worker pool is `max_concurrent` threads, each owning its own `Clone` of
+  the policy, so the bound is observable rather than serialized behind a lock.
+* Work admission uses a bounded mutex/condvar queue. `std::sync::mpsc` cannot
+  share a receiver across workers without a lock, and blocking in `recv()`
+  while holding that lock would let one idle worker prevent every other worker
+  from taking a job.
+* The completion mailbox is bounded to `queue_capacity + max_concurrent` and is
+  published with `try_send`; a worker never waits on the composition thread.
+* `ShadowExecutionSnapshot::is_quiescent()` treats a published-but-undrained
+  completion as outstanding, reusing the #177 drain-window reasoning.
+
+=== 8.4 Deadlines, cancellation, shutdown
+
+Every job carries its own deadline and `ShadowCancellationToken`. The token is
+deliberately not `GenerationCancellationToken`: shadow work is not a
+generation and must not be able to cancel, or be cancelled by, active
+generation state.
+
+A result produced after the deadline is discarded and reported as
+`Failed { deadline_exceeded }`; a decision that was already stale when it
+finished must not be published as evidence.
+
+=== 8.4.1 The deadline is enforced by the implementation
+
+The deadline and the `ShadowCancellationToken` are carried *inside*
+`ShadowPolicyInput`, which is handed to both `ShadowPolicy::evaluate` and
+`ShadowProvider::evaluate`. This is the only way the bound actually bounds
+runtime: a check taken before and after `evaluate` can discard a late result
+but cannot stop work that is already running, so a provider that blocked for
+30s would keep its worker for 30s and `shutdown` would join for 30s.
+
+An implementation is therefore required to:
+
+* poll `input.abort_reason()` before each blocking step, and
+* use `input.remaining()` as the timeout of any call it makes.
+
+`abort_reason()` reports `cancelled` ahead of `deadline_exceeded`, so a
+superseded evaluation reports why it stopped rather than blaming its deadline.
+The orchestrator still re-checks both after `evaluate` returns, so a late or
+stale decision can never be published even if an implementation is imperfect.
+
+The synchronous #163 path has no orchestrator and therefore no per-event
+shadow deadline: it hands the policy the caller's remaining budget as its
+horizon, so `abort_reason()` remains meaningful there too.
+
+=== 8.4.2 Cancellation is scoped to superseded source work
+
+Cancellation means *this source work was superseded*, not *a newer event
+arrived*. The orchestrator therefore keys live tokens by the event's
+`correlation_id`: admitting a job cancels the previous job of the same revision
+chain and nothing else.
+
+A single global latest-wins slot would satisfy "the newest comparison wins"
+while quietly destroying the rest. Under sustained traffic — and `max_concurrent`
+above 1 — every unrelated event would cancel the previous one, so only the most
+recent arrival would leave evidence and the sample would be biased toward
+arrival order rather than toward the configured sampling. Independent chains are
+independent, and their comparisons are all worth keeping.
+
+Shutdown remains global: `shutdown` and `Drop` cancel *every* live chain, not
+just one, because a process-wide stop supersedes everything.
+
+The registry is an `Arc<Mutex<HashMap<..>>>` shared with the workers, so a
+finished job retires its own entry instead of letting the map grow with every
+event. That retirement is guarded by `ShadowCancellationToken::is_same_work`:
+when a newer job of the same chain has already replaced the entry, the older
+worker must not evict it. `ShadowExecutionSnapshot::live_chains` reports the
+registry size, which must return to 0 once everything drains.
+
+Registration happens *inside* the queue lock, together with the enqueue
+(`capacity check -> token swap/cancel -> enqueue -> unlock/notify`), and the
+token lock is always taken after the queue lock. Registering after the push
+would leave a window in which a fast policy could pop, evaluate, and retire
+before its entry existed: the retire would find nothing, the commit would then
+insert a finished token that nothing ever removes (one leaked entry per distinct
+correlation), and an older same-chain worker could publish evidence for a
+revision that was already superseded.
+
+Supersession is notified by the composition thread through
+`supersede_shadow_source` once the active route has succeeded, and it does
+*not* depend on whether the new revision produces shadow work. Sampling and
+budget only decide whether *new* shadow work starts. A newer revision that is
+filtered, unsampled, saturated, or budget-denied still supersedes the one before
+it — otherwise that older evaluation runs to completion and publishes evidence
+for work the runtime already replaced.
+
+Every admitted job produces exactly one `ShadowCompletion`, carrying `None` when
+it was superseded, so a per-job resource such as a budget reservation is never
+leaked by a discarded job.
+
+==== 8.4.3 Supersession also fences publication
+
+Cancelling an evaluation is not sufficient. Between the moment `run_job` decides
+to publish and the moment the completion reaches the mailbox there is a window in
+which a newer revision can supersede, and a worker that does not look again will
+publish a comparison for work the runtime already replaced. Two orderings were
+wrong on their own:
+
+* Checking cancellation and then retiring the chain entry left a gap *after* the
+  check: a supersession landing there found nothing to cancel, and the worker
+  published regardless.
+* Retiring the chain entry *before* publishing was worse. Once the entry was
+  gone, a supersession landing in the gap had no token to cancel at all, so the
+  older revision could not be invalidated by any later revision.
+
+Publication is therefore one critical section under the queue lock — the same
+lock `supersede` takes — that re-checks whether the job is still the chain's
+current revision, downgrades the completion to discarded if it is not, publishes
+it, and retires the entry. Supersession and publication are serialised: a
+supersession either happens entirely before the fence, in which case the record
+is dropped, or entirely after it, in which case the record was already
+legitimately current. The publish stays non-blocking, so a worker never waits on
+the composition thread and shutdown can still join it.
+
+This is an interleaving, not a value, so it is pinned with a test-only hook that
+parks a worker between evaluation and publication. `a_revision_superseded_after_
+evaluation_publishes_no_evidence` supersedes a same-chain revision inside that
+window and asserts the older revision completes with no record. The hook is
+compiled out of non-test builds; without it the only available check would be a
+retry loop that stresses the scheduler and hopes, which is why an earlier
+registry guard could not demonstrate the defect it was written for.
+
+`ProductionApp::shutdown` calls `shutdown_shadow()`, which cancels outstanding
+work and **joins** every worker. Blocking is intentional: "no shadow work
+running after shutdown" cannot be proven about a detached worker. `Drop` is
+deliberately weaker — it closes the queue and cancels, but only joins workers
+that have already finished, because a policy that ignores its token must not
+deadlock a drop. The join is bounded by `deadline_ms` for any implementation
+that honours the contract in 8.4.1.
+
+=== 8.5 Provider calls are off by default
+
+`allow_provider_calls` is `false` by default. With a provider configured and
+calls disabled, the provider is never consulted and the
+`provider_calls_blocked` counter records the suppression; the local
+`ShadowPolicy` produces the decision instead. The daemon constructs no
+provider bridge at all, so enabling shadow never creates a billable provider
+dependency and PR CI performs no network call from the shadow path.
+
+=== 8.6 Budget compatibility (#69)
+
+Shadow work is free by default. Admission offers
+`BudgetAdmission::shadow()` to the existing governor only when
+`charge_shadow_to_budget` is enabled in the orchestrator config *and* in the
+governor policy; the governor remains the authority, and its default short
+-circuit leaves the active ledger untouched. No parallel ledger was added.
+
+Admission is decided *between* the active route and the shadow queue, not after
+the job is submitted. The composition thread makes three calls:
+
+. `route_with_budget` runs the active route and *stages* the shadow job.
+   Staging is entirely inert: no queue slot is taken, no counter moves, no
+   worker is occupied, and no budget is spent.
+. If the active route returned `Err`, `discard_shadow_submission` drops the
+   staged job. The comparison would describe a decision the runtime never made,
+   and neither the ledger nor a denial is touched.
+. If the active route succeeded, `commit_shadow_submission` asks the #69
+   governor. An admission queues the job and settles the reservation; a refusal
+   reports `Skipped { budget_denied }` without ever touching the queue.
+
+Both orders that do not work are worth naming. Probing *after* queueing could
+only relabel work that was already queued and possibly already running, which
+would let denied work execute anyway and leave the recorded submission
+describing something that never happened. Probing *before* the active route —
+the shape an earlier revision of this PR used — fixes that but leaks: if the
+active route then fails, an armed one-shot denial survives into the next,
+unrelated event, and the call ledger has already been charged for shadow work
+that never ran. Staging is what makes neither possible.
+
+Because the refusal precedes queueing, a denied event produces no job, no
+worker occupancy, no completion, and no evidence, and `last_submission`
+describes exactly that.
+
+When nothing was staged — disabled, filtered, unsampled, saturated, or shutting
+down — the commit step is a no-op and no budget is consumed, because there is
+no work to pay for. `shadow_submission_staged` lets the composition thread skip
+the #69 probe entirely in that case.
+
+=== 8.6.1 The staged/shutdown boundary
+
+Staging holds a cloned `EventEnvelope`, so a staged job is outstanding work
+even though no worker owns it yet. Three properties keep that honest:
+
+* `is_quiescent()` counts a staged job, alongside pending, in-flight, and
+  undrained. A runtime with staged work is not idle, and the snapshot reports
+  `staged` so the state is visible rather than implied.
+* `shutdown()` and `Drop` discard the stage. A staged job was never queued, so
+  nothing else would ever release it, and without this its envelope would
+  outlive shutdown while `is_quiescent()` still reported idle.
+* `ShadowQueue::push` refuses a closed queue, reporting `ShuttingDown` rather
+  than `Saturated`. After shutdown every worker has been joined, so a job
+  pushed then would sit in the queue forever with nothing to run it. The closed
+  check is repeated under the queue lock, because `close()` can land between the
+  first load and the push.
+
+The staged lifecycle therefore permits the `stage → shutdown → commit` order
+without stranding work: shutdown drops the stage, and the late commit finds
+nothing staged and never touches the queue.
+
+=== 8.7 Active-output invariance
+
+`ShadowingRoutePlanner::with_orchestrator` returns the active planner's route
+unchanged and never waits for the shadow side. Two tests pin this: the #163
+synchronous equivalence test is unchanged, and a new bounded-mode test proves
+that with a deliberately divergent shadow policy, drained evidence present,
+playback outcomes and audio/avatar command sequences are still identical to a
+shadow-free baseline.
+
+=== 8.8 Configuration surface
+
+[cols="1,2"]
+|===
+|`AIVTUBER_SHADOW_ENABLED`
+|Master switch. Unset or false leaves the active planner untouched.
+
+|`AIVTUBER_SHADOW_SAMPLE_RATE`
+|Sample rate per 10,000.
+
+|`AIVTUBER_SHADOW_SEED`
+|Admission sampling seed.
+
+|`AIVTUBER_SHADOW_EVENT_KINDS`
+|Comma-separated kind filter. Unknown kinds are rejected at startup.
+
+|`AIVTUBER_SHADOW_MAX_CONCURRENT`
+|Worker count.
+
+|`AIVTUBER_SHADOW_QUEUE_CAPACITY`
+|Bounded queue depth.
+
+|`AIVTUBER_SHADOW_DEADLINE_MS`
+|Per-event deadline.
+
+|`AIVTUBER_SHADOW_ALLOW_PROVIDER`
+|Default false.
+
+|`AIVTUBER_SHADOW_CHARGE_BUDGET`
+|Default false.
+
+|`AIVTUBER_SHADOW_POLICY_ID` / `_POLICY_VERSION` / `_CONFIG_FINGERPRINT` / `_DATASET_ID`
+|Shadow policy identity recorded with each comparison.
+
+|`AIVTUBER_SHADOW_ACTIVE_VERSION`
+|Active policy version recorded with each comparison.
+|===
+
+When enabled, startup prints one non-secret `shadow_orchestration:` line with
+the configured bounds. Rollback is setting
+`AIVTUBER_SHADOW_ENABLED=false`, which restores the exact #163 behavior.
+
+== 9. Follow-up boundaries
 
 #165 owns evidence integration:
 
@@ -165,6 +478,11 @@ execution.
 * #58 benchmark-compatible metrics;
 * #151 reaction-quality review sampling;
 * policy/config/profile compatibility grouping.
+
+#165 must preserve the evidence-minimization boundary in section 5: aggregate
+evidence, not transcripts. It must also read `ShadowComparisonRecord`
+`schema_version` together with `ShadowOrchestratorConfig` `schema_version`
+before combining samples.
 
 Neither follow-up may automatically promote a shadow policy to active behavior.
 Promotion remains an explicit reviewed decision under the experiment workflow.

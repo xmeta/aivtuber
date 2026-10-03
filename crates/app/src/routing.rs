@@ -1,4 +1,6 @@
 use crate::AppError;
+use crate::shadow::ShadowSubmission;
+use crate::shadow_orchestrator::{ShadowCompletion, ShadowExecutionSnapshot};
 use aivtuber_domain::{
     EventEnvelope, EventKind, MAX_THINKING_TEXT_BYTES, PrivacyClass, ReflexContext, ReflexRequest,
     RetrievalCandidateContext, RetrievalSnapshot, SourceClass, ThinkingRequest,
@@ -262,6 +264,51 @@ pub trait RoutePlanner: Send {
     fn template_fallback(&self) -> Option<TemplateFallback> {
         None
     }
+
+    /// #164 bounded shadow orchestration. Every hook defaults to "no shadow
+    /// orchestration", so an ordinary planner is unaffected.
+    fn drain_shadow_comparisons(&mut self) -> Vec<ShadowCompletion> {
+        Vec::new()
+    }
+
+    fn shadow_execution_snapshot(&self) -> Option<ShadowExecutionSnapshot> {
+        None
+    }
+
+    fn last_shadow_submission(&self) -> Option<&ShadowSubmission> {
+        None
+    }
+
+    fn shadow_charges_budget(&self) -> bool {
+        false
+    }
+
+    /// Invalidate the live shadow evaluation of this event's supersession chain
+    /// without starting new shadow work (#164).
+    ///
+    /// Called once the active route has succeeded. Supersession is a property
+    /// of source work, so it applies whether or not this event itself produces
+    /// shadow work.
+    fn supersede_shadow_source(&mut self, _event: &EventEnvelope) {}
+
+    /// Whether a shadow job is staged and waiting for the #69 budget
+    /// authority (#164).
+    fn shadow_submission_staged(&self) -> bool {
+        false
+    }
+
+    /// Queue the staged shadow job, or refuse it when the #69 governor denied
+    /// it (#164). Called only after the active route has succeeded.
+    fn commit_shadow_submission(&mut self, _budget_admitted: bool) {}
+
+    /// Drop the staged shadow job because the active route failed (#164).
+    ///
+    /// Must leave no denial, charge, or queued work behind: the next event
+    /// starts from a clean slate.
+    fn discard_shadow_submission(&mut self) {}
+
+    /// Cancel outstanding shadow work and join every shadow worker.
+    fn shutdown_shadow(&mut self) {}
 }
 
 /// Object-safe forwarding impl so executables can compose either planner
@@ -285,6 +332,42 @@ impl RoutePlanner for Box<dyn RoutePlanner> {
 
     fn template_fallback(&self) -> Option<TemplateFallback> {
         (**self).template_fallback()
+    }
+
+    fn drain_shadow_comparisons(&mut self) -> Vec<ShadowCompletion> {
+        (**self).drain_shadow_comparisons()
+    }
+
+    fn shadow_execution_snapshot(&self) -> Option<ShadowExecutionSnapshot> {
+        (**self).shadow_execution_snapshot()
+    }
+
+    fn last_shadow_submission(&self) -> Option<&ShadowSubmission> {
+        (**self).last_shadow_submission()
+    }
+
+    fn shadow_charges_budget(&self) -> bool {
+        (**self).shadow_charges_budget()
+    }
+
+    fn supersede_shadow_source(&mut self, event: &EventEnvelope) {
+        (**self).supersede_shadow_source(event);
+    }
+
+    fn shadow_submission_staged(&self) -> bool {
+        (**self).shadow_submission_staged()
+    }
+
+    fn commit_shadow_submission(&mut self, budget_admitted: bool) {
+        (**self).commit_shadow_submission(budget_admitted);
+    }
+
+    fn discard_shadow_submission(&mut self) {
+        (**self).discard_shadow_submission();
+    }
+
+    fn shutdown_shadow(&mut self) {
+        (**self).shutdown_shadow();
     }
 }
 
