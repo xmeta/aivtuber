@@ -310,6 +310,38 @@ Every admitted job produces exactly one `ShadowCompletion`, carrying `None` when
 it was superseded, so a per-job resource such as a budget reservation is never
 leaked by a discarded job.
 
+==== 8.4.3 Supersession also fences publication
+
+Cancelling an evaluation is not sufficient. Between the moment `run_job` decides
+to publish and the moment the completion reaches the mailbox there is a window in
+which a newer revision can supersede, and a worker that does not look again will
+publish a comparison for work the runtime already replaced. Two orderings were
+wrong on their own:
+
+* Checking cancellation and then retiring the chain entry left a gap *after* the
+  check: a supersession landing there found nothing to cancel, and the worker
+  published regardless.
+* Retiring the chain entry *before* publishing was worse. Once the entry was
+  gone, a supersession landing in the gap had no token to cancel at all, so the
+  older revision could not be invalidated by any later revision.
+
+Publication is therefore one critical section under the queue lock — the same
+lock `supersede` takes — that re-checks whether the job is still the chain's
+current revision, downgrades the completion to discarded if it is not, publishes
+it, and retires the entry. Supersession and publication are serialised: a
+supersession either happens entirely before the fence, in which case the record
+is dropped, or entirely after it, in which case the record was already
+legitimately current. The publish stays non-blocking, so a worker never waits on
+the composition thread and shutdown can still join it.
+
+This is an interleaving, not a value, so it is pinned with a test-only hook that
+parks a worker between evaluation and publication. `a_revision_superseded_after_
+evaluation_publishes_no_evidence` supersedes a same-chain revision inside that
+window and asserts the older revision completes with no record. The hook is
+compiled out of non-test builds; without it the only available check would be a
+retry loop that stresses the scheduler and hopes, which is why an earlier
+registry guard could not demonstrate the defect it was written for.
+
 `ProductionApp::shutdown` calls `shutdown_shadow()`, which cancels outstanding
 work and **joins** every worker. Blocking is intentional: "no shadow work
 running after shutdown" cannot be proven about a detached worker. `Drop` is

@@ -818,6 +818,7 @@ fn template_fallback_reason(reason: crate::TemplateFallback) -> ShadowFallbackRe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shadow_orchestrator::arm_publish_hook;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex};
@@ -2232,6 +2233,86 @@ mod tests {
                 .any(|record| record.event_id == "evt-rev-1"),
             "a superseded revision must not publish evidence even when its \
              successor was budget-denied"
+        );
+        let snapshot = planner.shadow_execution_snapshot().expect("snapshot");
+        assert_eq!(snapshot.cancelled_or_stale, 1);
+        assert_eq!(snapshot.live_chains, 0);
+        planner.shutdown_shadow();
+    }
+
+    /// #164 review: supersession must fence evidence *publication*, not just
+    /// evaluation.
+    ///
+    /// The gap this pins is the window between `run_job` deciding to publish and
+    /// the completion reaching the mailbox. The test hook parks the worker
+    /// inside that window so a same-chain supersession can be placed there
+    /// deterministically; a retry loop could only have stressed the scheduler
+    /// and hoped, which is why the earlier registry guard was non-deterministic.
+    ///
+    /// Before the fence, the supersession found no chain entry to cancel (or
+    /// cancelled too late for the worker to recheck) and rev1's stale
+    /// comparison reached the mailbox.
+    #[test]
+    fn a_revision_superseded_after_evaluation_publishes_no_evidence() {
+        let mut planner = ShadowingRoutePlanner::with_orchestrator(
+            FixedActive(PlaybackRoute::Silent),
+            // Returns immediately, so the worker reaches the publication hook
+            // without any test gate having to release it.
+            FixedShadow(Ok(ShadowDecision::silent())),
+            identity("active"),
+            identity("shadow"),
+            None,
+            ShadowOrchestratorConfig {
+                // One worker: the parked worker is the only one, so the second
+                // revision waits in the queue instead of pausing a second thread
+                // on the same hook.
+                max_concurrent: 1,
+                queue_capacity: 8,
+                deadline_ms: 30_000,
+                ..bounded_config()
+            },
+        )
+        .expect("planner");
+
+        let hook = arm_publish_hook();
+        // rev1 is evaluated and parks immediately before publishing.
+        planner
+            .route(&event_in_chain("evt-rev-1", "corr-fence"))
+            .expect("route rev1");
+        hook.wait_until_worker_paused();
+
+        // rev2 of the same chain supersedes rev1 while it sits in the
+        // publication window. Its own job is queued behind the parked worker.
+        planner
+            .route(&event_in_chain("evt-rev-2", "corr-fence"))
+            .expect("route rev2");
+
+        // Release the worker so it enters the fence with the supersession
+        // already in place.
+        drop(hook);
+
+        let drained = drain_with_spy(&mut planner);
+        let rev1 = drained.iter().find(|completion| {
+            completion
+                .record
+                .as_ref()
+                .is_some_and(|record| record.event_id == "evt-rev-1")
+        });
+        assert!(
+            rev1.is_none(),
+            "a revision superseded between evaluation and publication must not \
+             publish evidence"
+        );
+        assert!(
+            drained.iter().any(|completion| completion.record.is_none()),
+            "the superseded revision must still complete, as discarded work"
+        );
+        assert!(
+            drained
+                .iter()
+                .filter_map(|completion| completion.record.as_ref())
+                .any(|record| record.event_id == "evt-rev-2"),
+            "the surviving revision must still publish its comparison"
         );
         let snapshot = planner.shadow_execution_snapshot().expect("snapshot");
         assert_eq!(snapshot.cancelled_or_stale, 1);

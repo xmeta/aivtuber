@@ -49,6 +49,116 @@ fn supersession_key(event: &EventEnvelope) -> String {
     event.correlation_id.clone()
 }
 
+/// Test-only barrier that pauses a worker after `run_job` returns and before it
+/// enters the publication fence (#164).
+///
+/// The defect this exists for is an interleaving, not a value: without a hook,
+/// a test cannot force a supersession to land in that window, so it can only
+/// stress the scheduler and hope. Compiled out of non-test builds entirely.
+#[cfg(test)]
+mod publish_hook {
+    use super::{Arc, Condvar, Mutex};
+
+    /// `(reached, reached_signal, open, open_signal)` — `reached` is signalled
+    /// when a worker pauses, `open` is what lets the test let it proceed.
+    pub type Pause = Arc<(Mutex<bool>, Condvar, Mutex<bool>, Condvar)>;
+
+    /// Armed by the test, read by every worker thread. A global rather than a
+    /// thread-local: the pause happens on a worker, the arming happens on the
+    /// composition thread.
+    pub static ARMED: Mutex<Option<Pause>> = Mutex::new(None);
+
+    pub fn new_pause() -> Pause {
+        Arc::new((
+            Mutex::new(false),
+            Condvar::new(),
+            Mutex::new(false),
+            Condvar::new(),
+        ))
+    }
+
+    /// Wait until a worker has paused, bounded so a missing arrival fails the
+    /// test loudly instead of hanging the worker threads of every later test.
+    pub fn wait_until_paused(pause: &Pause) {
+        let (reached, reached_signal, _, _) = &**pause;
+        let mut seen = reached.lock().expect("publish hook reached");
+        for _ in 0..2_000 {
+            if *seen {
+                return;
+            }
+            let (guard, timeout) = reached_signal
+                .wait_timeout(seen, std::time::Duration::from_millis(5))
+                .expect("publish hook wait");
+            seen = guard;
+            if timeout.timed_out() {
+                panic!("no shadow worker reached the publication hook within 10s");
+            }
+        }
+    }
+
+    pub fn release(pause: &Pause) {
+        let (_, _, open, open_signal) = &**pause;
+        *open.lock().expect("publish hook open") = true;
+        open_signal.notify_all();
+    }
+
+    /// Called by every worker between `run_job` and the publication fence.
+    pub fn pause_if_armed() {
+        let armed = ARMED.lock().expect("publish hook arm lock").clone();
+        let Some(pause) = armed else { return };
+        let (reached, reached_signal, open, open_signal) = &*pause;
+        {
+            let mut seen = reached.lock().expect("publish hook reached");
+            *seen = true;
+            reached_signal.notify_all();
+        }
+        let mut open = open.lock().expect("publish hook open");
+        while !*open {
+            open = open_signal.wait(open).expect("publish hook wait");
+        }
+    }
+}
+
+#[cfg(test)]
+fn publish_hook_pause() {
+    publish_hook::pause_if_armed();
+}
+
+/// Opaque handle for an armed publication hook.
+///
+/// Deliberately opaque: the underlying `Pause` stays private to this module, so
+/// a test can only wait for the arrival and release it, not forge a barrier.
+#[cfg(test)]
+pub(crate) struct ArmedPublishHook {
+    pause: publish_hook::Pause,
+}
+
+#[cfg(test)]
+impl ArmedPublishHook {
+    /// Block until a shadow worker parks between evaluation and publication.
+    pub(crate) fn wait_until_worker_paused(&self) {
+        publish_hook::wait_until_paused(&self.pause);
+    }
+}
+
+#[cfg(test)]
+impl Drop for ArmedPublishHook {
+    /// Always release and disarm, even on panic, so a failing test cannot wedge
+    /// the worker threads of every later test in the suite.
+    fn drop(&mut self) {
+        publish_hook::release(&self.pause);
+        *publish_hook::ARMED.lock().expect("publish hook arm lock") = None;
+    }
+}
+
+/// Arm the publication hook until the returned handle is dropped (#164).
+#[cfg(test)]
+pub(crate) fn arm_publish_hook() -> ArmedPublishHook {
+    let pause = publish_hook::new_pause();
+    *publish_hook::ARMED.lock().expect("publish hook arm lock") = Some(pause.clone());
+    ArmedPublishHook { pause }
+}
+
 /// Bounded view of outstanding shadow work, mirroring the #177 generation
 /// execution snapshot so operators and tests read both subsystems the same way.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -303,6 +413,64 @@ impl ShadowQueue {
         Ok(())
     }
 
+    /// Publication fence for one finished job (#164).
+    ///
+    /// Runs under the queue lock — the same lock `supersede` takes — so
+    /// supersession and evidence publication are serialised. In one critical
+    /// section it re-checks whether this job is still the chain's current
+    /// revision, downgrades the completion to discarded if it is not, publishes
+    /// it, and retires the chain's entry.
+    ///
+    /// Checking outside this section was not enough: `run_job`'s last
+    /// cancellation check, the token retirement, and the publish were three
+    /// separate steps, so a newer revision could supersede in the gap and a
+    /// stale comparison would still reach the mailbox. Retiring first was
+    /// worse still — supersession then found no entry to cancel.
+    ///
+    /// The publish stays non-blocking: a worker must never wait on the
+    /// composition thread, or shutdown could not join it.
+    #[allow(clippy::too_many_arguments)]
+    fn publish_fenced(
+        &self,
+        live: &Mutex<HashMap<String, ShadowCancellationToken>>,
+        key: &str,
+        token: &ShadowCancellationToken,
+        shutting_down: &AtomicBool,
+        tx: &mpsc::SyncSender<ShadowCompletion>,
+        mut completion: ShadowCompletion,
+        counters: &ShadowCounters,
+    ) {
+        let _queue = self.state.lock().expect("shadow queue lock");
+        let mut live = live.lock().expect("shadow token lock");
+        let still_current = !token.is_cancelled()
+            && !shutting_down.load(Ordering::Acquire)
+            && live
+                .get(key)
+                .is_some_and(|current| current.is_same_work(token));
+        if !still_current && completion.record.is_some() {
+            // Superseded (or shutting down) after `run_job` decided: the record
+            // describes work the runtime no longer wants, so drop the evidence.
+            completion.record = None;
+            counters.cancelled_or_stale.fetch_add(1, Ordering::Relaxed);
+        }
+        // Retire this chain's entry so the registry stays bounded by in-flight
+        // chains. Guarded by token identity: a newer job of the same chain has
+        // already replaced the entry and must not be evicted.
+        if live
+            .get(key)
+            .is_some_and(|current| current.is_same_work(token))
+        {
+            live.remove(key);
+        }
+        drop(live);
+        if tx.try_send(completion).is_err() {
+            counters.awaiting_drain.fetch_sub(1, Ordering::SeqCst);
+            counters
+                .dropped_completion_mailbox_full
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Cancel the live token of one supersession chain without starting any
     /// new work (#164).
     ///
@@ -403,8 +571,6 @@ where
     staged: Option<ShadowJob>,
     last_submission: Option<ShadowSubmission>,
     last_comparison: Option<ShadowComparisonRecord>,
-    /// Token of the most recently admitted job. Superseded when a newer job is
-    /// admitted so a stale evaluation cannot outlive the work it compares.
     /// Live cancellation token per supersession chain (#164).
     ///
     /// Keyed by `correlation_id`, not a single global slot: #164 scopes
@@ -467,18 +633,6 @@ where
                             worker_shutdown.as_ref(),
                             job,
                         );
-                        // Retire this chain's entry so the registry stays
-                        // bounded by in-flight chains. Guarded by token
-                        // identity: a newer job of the same chain has already
-                        // replaced the entry, and must not be evicted.
-                        let mut live = worker_live_tokens.lock().expect("shadow token lock");
-                        if live
-                            .get(&finished_key)
-                            .is_some_and(|current| current.is_same_work(&finished_token))
-                        {
-                            live.remove(&finished_key);
-                        }
-                        drop(live);
                         let completion = match outcome {
                             JobOutcome::Discarded => {
                                 worker_counters
@@ -491,20 +645,27 @@ where
                                 record: Some(*record),
                             },
                         };
+                        #[cfg(test)]
+                        publish_hook_pause();
                         // Claim the drain window before publishing so a
                         // quiescence check cannot miss a completion that is
                         // already on its way to the mailbox.
                         worker_counters.note_published();
-                        // Non-blocking publish: a worker must never wait on the
-                        // composition thread, or shutdown could not join it.
-                        if worker_completion_tx.try_send(completion).is_err() {
-                            worker_counters
-                                .awaiting_drain
-                                .fetch_sub(1, Ordering::SeqCst);
-                            worker_counters
-                                .dropped_completion_mailbox_full
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
+                        // The publication fence. Re-checking cancellation here
+                        // and retiring the chain happen inside one critical
+                        // section that `supersede` also takes, so a supersession
+                        // can never land between the check and the publish: a
+                        // revision that was superseded in that window publishes
+                        // as discarded instead of as stale evidence.
+                        worker_queue.publish_fenced(
+                            worker_live_tokens.as_ref(),
+                            &finished_key,
+                            &finished_token,
+                            worker_shutdown.as_ref(),
+                            &worker_completion_tx,
+                            completion,
+                            worker_counters.as_ref(),
+                        );
                     }
                 })
                 .map_err(|error| {
