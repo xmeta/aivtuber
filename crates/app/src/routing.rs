@@ -1,4 +1,6 @@
 use crate::AppError;
+use crate::shadow::ShadowSubmission;
+use crate::shadow_orchestrator::{ShadowCompletion, ShadowExecutionSnapshot};
 use aivtuber_domain::{
     EventEnvelope, EventKind, MAX_THINKING_TEXT_BYTES, PrivacyClass, ReflexContext, ReflexRequest,
     RetrievalCandidateContext, RetrievalSnapshot, SourceClass, ThinkingRequest,
@@ -262,6 +264,29 @@ pub trait RoutePlanner: Send {
     fn template_fallback(&self) -> Option<TemplateFallback> {
         None
     }
+
+    /// #164 bounded shadow orchestration. Every hook defaults to "no shadow
+    /// orchestration", so an ordinary planner is unaffected.
+    fn drain_shadow_comparisons(&mut self) -> Vec<ShadowCompletion> {
+        Vec::new()
+    }
+
+    fn shadow_execution_snapshot(&self) -> Option<ShadowExecutionSnapshot> {
+        None
+    }
+
+    fn last_shadow_submission(&self) -> Option<&ShadowSubmission> {
+        None
+    }
+
+    fn shadow_charges_budget(&self) -> bool {
+        false
+    }
+
+    fn note_shadow_budget_denied(&mut self) {}
+
+    /// Cancel outstanding shadow work and join every shadow worker.
+    fn shutdown_shadow(&mut self) {}
 }
 
 /// Object-safe forwarding impl so executables can compose either planner
@@ -285,6 +310,30 @@ impl RoutePlanner for Box<dyn RoutePlanner> {
 
     fn template_fallback(&self) -> Option<TemplateFallback> {
         (**self).template_fallback()
+    }
+
+    fn drain_shadow_comparisons(&mut self) -> Vec<ShadowCompletion> {
+        (**self).drain_shadow_comparisons()
+    }
+
+    fn shadow_execution_snapshot(&self) -> Option<ShadowExecutionSnapshot> {
+        (**self).shadow_execution_snapshot()
+    }
+
+    fn last_shadow_submission(&self) -> Option<&ShadowSubmission> {
+        (**self).last_shadow_submission()
+    }
+
+    fn shadow_charges_budget(&self) -> bool {
+        (**self).shadow_charges_budget()
+    }
+
+    fn note_shadow_budget_denied(&mut self) {
+        (**self).note_shadow_budget_denied();
+    }
+
+    fn shutdown_shadow(&mut self) {
+        (**self).shutdown_shadow();
     }
 }
 

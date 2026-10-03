@@ -8,15 +8,17 @@ use aivtuber_adapters::{
 };
 use aivtuber_app::{
     AdaptationRuntime, AdapterHealth, AvatarOutput, CompositionProfile, GenerativeBudgetPolicy,
-    GenerativeRuntime, IntentRoutePlanner, NoopAvatarOutput, NoopStreamOutput, ObsStreamOutput,
-    OperatorControlServer, OperatorRateLimiter, ProductionApp, ProfileSummary, RawIngressConfig,
-    RawIngressMetrics, RawIngressMetricsSnapshot, RoutePlanner, RuntimeRetentionPolicy,
-    StreamOutput, VtsAvatarOutput, VtsPlaybackConfig, apply_dispatched_request,
-    pump_bounded_records,
+    GenerativeRuntime, IntentRoutePlanner, IntentShadowPolicy, NoopAvatarOutput, NoopStreamOutput,
+    ObsStreamOutput, OperatorControlServer, OperatorRateLimiter, ProductionApp, ProfileSummary,
+    RawIngressConfig, RawIngressMetrics, RawIngressMetricsSnapshot, RoutePlanner,
+    RuntimeRetentionPolicy, SHADOW_ORCHESTRATOR_SCHEMA_VERSION, ShadowOrchestratorConfig,
+    ShadowPolicyIdentity, ShadowingRoutePlanner, StreamOutput, VtsAvatarOutput, VtsPlaybackConfig,
+    apply_dispatched_request, pump_bounded_records,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
-    AuthorizationMethod, Capability, ControlSecret, LocalControlIngress, OperatorCommandInput,
+    AuthorizationMethod, Capability, ControlSecret, EventKind, LocalControlIngress,
+    OperatorCommandInput,
 };
 use aivtuber_generative::{GenerativePipeline, PerformanceCompiler, PerformanceCompilerConfig};
 use aivtuber_reflex::{JevAdapter, JevAdapterConfig, JevApiKey, PolicyConfig, ReflexPipeline};
@@ -110,27 +112,17 @@ fn run() -> Result<(), Box<dyn Error>> {
     let stream = build_stream_output()?;
     let max_lateness_ms = env_u64("AIVTUBER_MAX_DISPATCH_LATENESS_MS", 250)?;
 
-    // Compose the planner from the selected profile (issue #55): the mode
-    // unambiguously determines the routing stack.
-    let startup_summary;
-    let mut app = match profile {
-        CompositionProfile::Cached => {
-            startup_summary = ProfileSummary::for_profile(
-                profile,
-                generative.is_some(),
-                aivtuber_app::config_fingerprint(profile, generative.is_some()),
-            );
-            ProductionApp::new(
-                security,
-                performer,
-                visemes,
-                Box::new(IntentRoutePlanner) as Box<dyn RoutePlanner>,
-                Box::new(audio),
-                avatar,
-                stream,
-                max_lateness_ms,
-            )
-        }
+    // Compose the active planner from the selected profile (issue #55): the
+    // mode unambiguously determines the routing stack. The planner is built
+    // first so #164 can optionally wrap it in bounded shadow orchestration
+    // before the app is constructed.
+    let startup_summary = ProfileSummary::for_profile(
+        profile,
+        generative.is_some(),
+        aivtuber_app::config_fingerprint(profile, generative.is_some()),
+    );
+    let active_planner: Box<dyn RoutePlanner> = match profile {
+        CompositionProfile::Cached => Box::new(IntentRoutePlanner) as Box<dyn RoutePlanner>,
         CompositionProfile::Reflex | CompositionProfile::Full => {
             let semantic_pack_root = env_path("AIVTUBER_PACK_ROOT")
                 .unwrap_or_else(|| PathBuf::from("examples/starter-reaction-pack"));
@@ -162,26 +154,26 @@ fn run() -> Result<(), Box<dyn Error>> {
             )?;
             let pipeline =
                 ReflexPipeline::new(semantic_index, jev_adapter, PolicyConfig::default(), 2)?;
-            startup_summary = ProfileSummary::for_profile(
-                profile,
-                generative.is_some(),
-                aivtuber_app::config_fingerprint(profile, generative.is_some()),
-            );
-            ProductionApp::new(
-                security,
-                performer,
-                visemes,
-                Box::new(
-                    aivtuber_app::ReflexRoutePlanner::new(pipeline, embedding_provider)
-                        .with_template_pack(aivtuber_app::starter_template_pack()),
-                ) as Box<dyn RoutePlanner>,
-                Box::new(audio),
-                avatar,
-                stream,
-                max_lateness_ms,
-            )
+            Box::new(
+                aivtuber_app::ReflexRoutePlanner::new(pipeline, embedding_provider)
+                    .with_template_pack(aivtuber_app::starter_template_pack()),
+            ) as Box<dyn RoutePlanner>
         }
     };
+    // #164: bounded shadow orchestration. Disabled by default; the shadow half
+    // can never become executable output and never changes the active route.
+    let (active_planner, shadow_summary) =
+        wrap_with_shadow_orchestration(active_planner, &startup_summary)?;
+    let mut app = ProductionApp::new(
+        security,
+        performer,
+        visemes,
+        active_planner,
+        Box::new(audio),
+        avatar,
+        stream,
+        max_lateness_ms,
+    );
     app = app
         .with_adaptation(adaptation)
         .with_telemetry_retention(retention.telemetry_config())
@@ -250,6 +242,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     // Issue #55 acceptance: startup states the active routing capabilities
     // without leaking secrets.
     eprintln!("{}", startup_summary.log_line());
+    if let Some(line) = shadow_summary {
+        eprintln!("{line}");
+    }
     let preload = app.startup()?;
     eprintln!(
         "aivtuber-app ready: indexed={} usable={} preloaded={}",
@@ -712,6 +707,122 @@ fn required_env(name: &str) -> Result<String, Box<dyn Error>> {
         )
         .into()
     })
+}
+
+/// The planner to install plus a non-secret startup line describing the
+/// configured shadow bounds.
+type ShadowWrappedPlanner = (Box<dyn RoutePlanner>, Option<String>);
+
+/// #164: optionally wrap the active planner in bounded shadow orchestration.
+///
+/// Returns the planner to install plus a non-secret startup line describing the
+/// configured bounds. With `AIVTUBER_SHADOW_ENABLED` unset or false the active
+/// planner is returned unchanged, so a default deployment is unaffected.
+fn wrap_with_shadow_orchestration(
+    active: Box<dyn RoutePlanner>,
+    startup_summary: &ProfileSummary,
+) -> Result<ShadowWrappedPlanner, Box<dyn Error>> {
+    let enabled = env_bool("AIVTUBER_SHADOW_ENABLED", false)?;
+    if !enabled {
+        return Ok((active, None));
+    }
+
+    let defaults = ShadowOrchestratorConfig::default();
+    let config = ShadowOrchestratorConfig {
+        schema_version: SHADOW_ORCHESTRATOR_SCHEMA_VERSION.to_owned(),
+        enabled: true,
+        sample_rate_per_10k: env_u64(
+            "AIVTUBER_SHADOW_SAMPLE_RATE",
+            defaults.sample_rate_per_10k as u64,
+        )? as u32,
+        seed: env_u64("AIVTUBER_SHADOW_SEED", 0)?,
+        event_kinds: parse_shadow_event_kinds()?,
+        max_concurrent: env_u64(
+            "AIVTUBER_SHADOW_MAX_CONCURRENT",
+            defaults.max_concurrent as u64,
+        )? as usize,
+        queue_capacity: env_u64(
+            "AIVTUBER_SHADOW_QUEUE_CAPACITY",
+            defaults.queue_capacity as u64,
+        )? as usize,
+        deadline_ms: env_u64("AIVTUBER_SHADOW_DEADLINE_MS", defaults.deadline_ms)?,
+        allow_provider_calls: env_bool("AIVTUBER_SHADOW_ALLOW_PROVIDER", false)?,
+        charge_shadow_to_budget: env_bool("AIVTUBER_SHADOW_CHARGE_BUDGET", false)?,
+    };
+    config.validate().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("AIVTUBER_SHADOW_* configuration invalid: {error}"),
+        )
+    })?;
+
+    let policy_id = env_string("AIVTUBER_SHADOW_POLICY_ID", "intent-shadow");
+    let active_identity = ShadowPolicyIdentity {
+        policy_id: "active-production".to_owned(),
+        policy_version: env_string("AIVTUBER_SHADOW_ACTIVE_VERSION", "v1"),
+        config_fingerprint: startup_summary.config_fingerprint.clone(),
+        runtime_profile: startup_summary.profile.clone(),
+        dataset_id: None,
+    };
+    let shadow_identity = ShadowPolicyIdentity {
+        policy_id: policy_id.clone(),
+        policy_version: env_string("AIVTUBER_SHADOW_POLICY_VERSION", "v1"),
+        config_fingerprint: env_string(
+            "AIVTUBER_SHADOW_CONFIG_FINGERPRINT",
+            &startup_summary.config_fingerprint,
+        ),
+        runtime_profile: startup_summary.profile.clone(),
+        dataset_id: env_optional("AIVTUBER_SHADOW_DATASET_ID"),
+    };
+
+    // No production provider bridge is constructed here. Live provider
+    // evaluation stays disabled by default and is not reachable from the
+    // daemon; enabling the flag alone still performs no network call because
+    // `provider` is `None`.
+    let planner = ShadowingRoutePlanner::with_orchestrator(
+        active,
+        IntentShadowPolicy,
+        active_identity,
+        shadow_identity,
+        None,
+        config.clone(),
+    )?;
+
+    let summary = format!(
+        "shadow_orchestration: enabled=true policy={policy_id} schema={} sample_rate_per_10k={} max_concurrent={} queue_capacity={} deadline_ms={} provider_calls={} charge_budget={}",
+        config.schema_version,
+        config.sample_rate_per_10k,
+        config.max_concurrent,
+        config.queue_capacity,
+        config.deadline_ms,
+        config.allow_provider_calls,
+        config.charge_shadow_to_budget,
+    );
+    Ok((Box::new(planner) as Box<dyn RoutePlanner>, Some(summary)))
+}
+
+/// Parse the optional `AIVTUBER_SHADOW_EVENT_KINDS` comma-separated filter.
+/// An empty or unset value means every kind is eligible.
+fn parse_shadow_event_kinds() -> Result<Vec<EventKind>, Box<dyn Error>> {
+    let Some(raw) = env_optional("AIVTUBER_SHADOW_EVENT_KINDS") else {
+        return Ok(Vec::new());
+    };
+    let mut kinds = Vec::new();
+    for token in raw.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let kind: EventKind = serde_json::from_value(serde_json::Value::String(token.to_owned()))
+            .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("AIVTUBER_SHADOW_EVENT_KINDS contains unknown event kind: {token}"),
+            )
+        })?;
+        kinds.push(kind);
+    }
+    Ok(kinds)
 }
 
 fn env_optional(name: &str) -> Option<String> {

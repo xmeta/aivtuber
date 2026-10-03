@@ -10,6 +10,7 @@ mod retention;
 mod routing;
 mod semantic;
 mod shadow;
+mod shadow_orchestrator;
 mod support_bundle;
 
 pub use budget::*;
@@ -22,6 +23,7 @@ pub use retention::*;
 pub use routing::*;
 pub use semantic::*;
 pub use shadow::*;
+pub use shadow_orchestrator::*;
 pub use support_bundle::*;
 
 use aivtuber_adaptation::{AdaptationEngine, AppliedAdaptation, MemoryEntry, WorkingMemory};
@@ -810,6 +812,9 @@ where
     telemetry: TelemetryCollector,
     causal_traces: CausalTraceCollector,
     comparison_mode: ComparisonMode,
+    /// Bounded #164 shadow evidence drained from the orchestrator. Retained for
+    /// operator diagnostics; never a production output path.
+    shadow_comparisons: Vec<ShadowComparisonRecord>,
     /// Live composition identity for operator diagnostics/support bundles
     /// (#167): the active profile name (e.g. `cached`) and the #55
     /// non-secret config fingerprint. Defaults to `unknown` until the
@@ -853,6 +858,7 @@ where
             telemetry: TelemetryCollector::default(),
             causal_traces: CausalTraceCollector::default(),
             comparison_mode: ComparisonMode::DeterministicOnly,
+            shadow_comparisons: Vec::new(),
             composition_profile: "unknown".to_owned(),
             config_fingerprint: "unknown".to_owned(),
         }
@@ -1041,6 +1047,63 @@ where
             .map(GenerativeRuntime::execution_snapshot)
     }
 
+    /// Bounded shadow orchestration snapshot (#164), or `None` when the router
+    /// has no shadow orchestration attached.
+    pub fn shadow_execution_snapshot(&self) -> Option<ShadowExecutionSnapshot> {
+        self.router.shadow_execution_snapshot()
+    }
+
+    /// Comparison records most recently drained from the bounded shadow pool
+    /// (#164). Evidence only: never a production output.
+    pub fn shadow_comparisons(&self) -> &[ShadowComparisonRecord] {
+        &self.shadow_comparisons
+    }
+
+    fn drain_shadow_completions(&mut self) {
+        let completions = self.router.drain_shadow_comparisons();
+        if completions.is_empty() {
+            return;
+        }
+        // Bounded by the orchestrator's completion mailbox, but re-clamp here so
+        // a caller that never drains the router cannot grow this record list.
+        const MAX_RETAINED_SHADOW_COMPARISONS: usize = 256;
+        for completion in completions {
+            let Some(record) = completion.record else {
+                continue;
+            };
+            if self.shadow_comparisons.len() == MAX_RETAINED_SHADOW_COMPARISONS {
+                self.shadow_comparisons.remove(0);
+            }
+            self.shadow_comparisons.push(record);
+        }
+    }
+
+    /// Charge #164 shadow work to the #69 ledger when explicitly enabled.
+    fn account_shadow_budget(&mut self, at_ms: u64) {
+        if !self.router.shadow_charges_budget() {
+            return;
+        }
+        let admitted = matches!(
+            self.router.last_shadow_submission(),
+            Some(ShadowSubmission::Admitted { .. })
+        );
+        if !admitted {
+            return;
+        }
+        let Some(governor) = self.budget.as_mut() else {
+            return;
+        };
+        match governor.try_admit(BudgetAdmission::shadow(), at_ms) {
+            Ok(mut reservation) => {
+                // Shadow evaluation performs no TTS character spend of its own;
+                // settle immediately so the concurrency slot is returned rather
+                // than held for a job the ledger never measures.
+                reservation.settle(governor, 0, 0);
+            }
+            Err(_) => self.router.note_shadow_budget_denied(),
+        }
+    }
+
     pub fn retention_snapshot(&self) -> RuntimeRetentionSnapshot {
         RuntimeRetentionSnapshot {
             telemetry: self.telemetry.retention_metrics(),
@@ -1170,6 +1233,11 @@ where
         let route_budget = remaining_instant(provider_deadline).unwrap_or(Duration::ZERO);
         let route = self.router.route_with_budget(&event, Some(route_budget))?;
         let routing_latency_us = elapsed_us(route_started);
+        // #164: shadow work that was actually admitted is charged to the #69
+        // ledger only when the operator explicitly enabled it. A denial is
+        // recorded against the orchestrator rather than the active path, so a
+        // shadow budget refusal can never fail an active event.
+        self.account_shadow_budget(at_ms);
         let decision = self.router.decision_record().cloned();
         let template_fallback = self
             .router
@@ -2158,6 +2226,7 @@ where
 
     pub fn tick(&mut self, now_ms: u64) {
         self.drain_generation_completions(now_ms);
+        self.drain_shadow_completions();
         if let Some(governor) = self.budget.as_mut() {
             governor.tick(now_ms);
         }
@@ -2349,6 +2418,10 @@ where
         if let Some(generative) = self.generative.as_mut() {
             generative.shutdown();
         }
+        // #164: join every shadow worker before returning. Shutdown that leaves
+        // a shadow worker running cannot satisfy "no shadow work running after
+        // shutdown", so this blocks until the pool has actually stopped.
+        self.router.shutdown_shadow();
         self.performer.scheduler_mut().stop_all(at_ms);
         self.purge_cancelled_pending();
         self.tick(at_ms);
@@ -5816,6 +5889,184 @@ mod tests {
             ShadowEvaluationOutcome::Evaluated {
                 decision: ShadowDecision::silent()
             }
+        );
+    }
+
+    /// #164: the bounded pool must not change active output either. The shadow
+    /// decision deliberately diverges, and the comparison only becomes visible
+    /// after a drain, so equality proves the orchestrator is observational.
+    #[test]
+    fn bounded_shadow_orchestration_keeps_active_playback_and_adapter_commands_equivalent() {
+        let baseline_audio = RecordingAudio::default();
+        let baseline_avatar = RecordingAvatar::default();
+        let shadow_audio = RecordingAudio::default();
+        let shadow_avatar = RecordingAvatar::default();
+
+        let mut baseline = app(
+            FixedAssetRoute("reaction.agree.01"),
+            Box::new(baseline_audio.clone()),
+            Box::new(baseline_avatar.clone()),
+            Box::new(NoopStreamOutput),
+        );
+        let identity = |policy_id: &str| ShadowPolicyIdentity {
+            policy_id: policy_id.to_owned(),
+            policy_version: "v1".to_owned(),
+            config_fingerprint: format!("{policy_id}-cfg"),
+            runtime_profile: "cached".to_owned(),
+            dataset_id: Some("reaction-quality-stage2".to_owned()),
+        };
+        let shadow_router = ShadowingRoutePlanner::with_orchestrator(
+            FixedAssetRoute("reaction.agree.01"),
+            FixedShadowDecision(ShadowDecision::silent()),
+            identity("active"),
+            identity("shadow"),
+            None,
+            ShadowOrchestratorConfig {
+                enabled: true,
+                sample_rate_per_10k: 10_000,
+                deadline_ms: 30_000,
+                ..ShadowOrchestratorConfig::default()
+            },
+        )
+        .expect("bounded shadow router");
+        let mut shadowed = app(
+            shadow_router,
+            Box::new(shadow_audio.clone()),
+            Box::new(shadow_avatar.clone()),
+            Box::new(NoopStreamOutput),
+        );
+
+        baseline.startup().expect("baseline startup");
+        shadowed.startup().expect("shadow startup");
+        let raw = serde_json::to_vec(&chat_event(1)).expect("event json");
+        let baseline_outcome = baseline
+            .process_content_bytes(&raw, 10, 7)
+            .expect("baseline content");
+        let shadow_outcome = shadowed
+            .process_content_bytes(&raw, 10, 7)
+            .expect("shadow content");
+
+        assert_eq!(shadow_outcome, baseline_outcome);
+        assert_eq!(
+            *shadow_audio.commands.lock().expect("shadow audio"),
+            *baseline_audio.commands.lock().expect("baseline audio")
+        );
+        assert_eq!(
+            *shadow_avatar.commands.lock().expect("shadow avatar"),
+            *baseline_avatar.commands.lock().expect("baseline avatar")
+        );
+
+        // A diverging comparison arrives asynchronously; poll the bounded drain
+        // rather than assuming it has already published.
+        let mut comparison = None;
+        for _ in 0..2_000 {
+            shadowed.tick(11);
+            if let Some(record) = shadowed.shadow_comparisons().last() {
+                comparison = Some(record.clone());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let comparison = comparison.expect("bounded shadow comparison");
+        assert_eq!(comparison.route_diverged, Some(true));
+        assert_eq!(comparison.active.route, ShadowRouteClass::SemanticReuse);
+        assert_eq!(
+            comparison.shadow,
+            ShadowEvaluationOutcome::Evaluated {
+                decision: ShadowDecision::silent()
+            }
+        );
+
+        let snapshot = shadowed.shadow_execution_snapshot().expect("snapshot");
+        assert!(snapshot.is_quiescent());
+        shadowed.shutdown(20);
+        let after = shadowed.shadow_execution_snapshot().expect("snapshot");
+        assert_eq!(after.worker_running, 0);
+        assert!(after.shutting_down);
+    }
+
+    /// #164: shadow work is free in the #69 ledger unless explicitly charged.
+    #[test]
+    fn shadow_budget_admission_follows_the_orchestrator_charge_flag() {
+        let identity = |policy_id: &str| ShadowPolicyIdentity {
+            policy_id: policy_id.to_owned(),
+            policy_version: "v1".to_owned(),
+            config_fingerprint: format!("{policy_id}-cfg"),
+            runtime_profile: "cached".to_owned(),
+            dataset_id: None,
+        };
+        let mut free = app(
+            ShadowingRoutePlanner::with_orchestrator(
+                FixedAssetRoute("reaction.agree.01"),
+                FixedShadowDecision(ShadowDecision::silent()),
+                identity("active"),
+                identity("shadow"),
+                None,
+                ShadowOrchestratorConfig {
+                    enabled: true,
+                    sample_rate_per_10k: 10_000,
+                    deadline_ms: 30_000,
+                    ..ShadowOrchestratorConfig::default()
+                },
+            )
+            .expect("free router"),
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        );
+        free = free.with_generative_budget_policy(GenerativeBudgetPolicy {
+            enabled: true,
+            max_llm_calls_per_interval: Some(1),
+            interval_ms: 60_000,
+            ..GenerativeBudgetPolicy::default()
+        });
+        free.startup().expect("startup");
+        let raw = serde_json::to_vec(&chat_event(1)).expect("event json");
+
+        // Default: shadow work is admitted without touching the ledger, so the
+        // single-call budget is still available to active traffic afterwards.
+        free.process_content_bytes(&raw, 10, 7).expect("content");
+        assert!(!free.router.shadow_charges_budget());
+        let governor = free.budget.as_mut().expect("budget governor");
+        assert!(governor.try_admit(BudgetAdmission::ordinary(), 10).is_ok());
+
+        let mut charged = app(
+            ShadowingRoutePlanner::with_orchestrator(
+                FixedAssetRoute("reaction.agree.01"),
+                FixedShadowDecision(ShadowDecision::silent()),
+                identity("active"),
+                identity("shadow"),
+                None,
+                ShadowOrchestratorConfig {
+                    enabled: true,
+                    sample_rate_per_10k: 10_000,
+                    deadline_ms: 30_000,
+                    charge_shadow_to_budget: true,
+                    ..ShadowOrchestratorConfig::default()
+                },
+            )
+            .expect("charged router"),
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        );
+        charged = charged.with_generative_budget_policy(GenerativeBudgetPolicy {
+            enabled: true,
+            max_llm_calls_per_interval: Some(1),
+            interval_ms: 60_000,
+            // The #69 governor policy is the authority on charging; the
+            // orchestrator config only decides whether shadow work is offered
+            // to it. Both must opt in.
+            charge_shadow_to_budget: true,
+            ..GenerativeBudgetPolicy::default()
+        });
+        charged.startup().expect("startup");
+        charged.process_content_bytes(&raw, 10, 7).expect("content");
+        assert!(charged.router.shadow_charges_budget());
+        let governor = charged.budget.as_mut().expect("budget governor");
+        assert!(
+            governor.try_admit(BudgetAdmission::ordinary(), 10).is_err(),
+            "explicitly charged shadow work must be visible in the same ledger"
         );
     }
 
