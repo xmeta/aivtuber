@@ -104,38 +104,45 @@ into a directory on `PATH`. Do not drop the executable into the repository root:
 a bare `tgrep` will not resolve without a leading `./`, so every documented
 command below would fail while looking like it should work.
 
+Always pass the tag explicitly (`v1.0.11`). Omitting it makes `gh release download`
+and `git clone` resolve the *latest* release at run time, so a future upstream tag
+would silently install something other than the version this section documents and
+verified.
+
 Linux / WSL x86_64 (the `x86_64-unknown-linux-musl` asset is statically linked,
 so it runs on any glibc or musl distro):
 
 ~~~sh
 tmpdir="$(mktemp -d)"
-gh release download --repo microsoft/tgrep -p '*x86_64-unknown-linux-musl.tar.gz' -D "$tmpdir"
-tar xzf "$tmpdir"/tgrep-*-x86_64-unknown-linux-musl.tar.gz -C "$tmpdir"
+gh release download v1.0.11 --repo microsoft/tgrep -p '*x86_64-unknown-linux-musl.tar.gz' -D "$tmpdir"
+tar xzf "$tmpdir"/tgrep-v1.0.11-x86_64-unknown-linux-musl.tar.gz -C "$tmpdir"
 mkdir -p "$HOME/.local/bin"
 install -m755 "$tmpdir/tgrep" "$HOME/.local/bin/tgrep"
 rm -rf "$tmpdir"
 hash -r
-tgrep --version
+tgrep --version   # must report 1.0.11
 ~~~
 
 If `~/.local/bin` is not on your `PATH`, use `~/.cargo/bin` (the destination
 `cargo install` uses) or `/usr/local/bin` instead.
 
-Windows x86_64 (download `tgrep-v1.0.11-x86_64-pc-windows-msvc.zip`, extract
-`tgrep.exe`, and put it in a directory on `PATH`, e.g. `C:\Users\<you>\bin`):
+Windows x86_64 (download `tgrep-v1.0.11-x86_64-pc-windows-msvc.zip` from the
+v1.0.11 release page above, extract `tgrep.exe`, and put it in a directory on
+`PATH`, e.g. `C:\Users\<you>\bin`):
 
 ~~~powershell
-tgrep.exe --version
+tgrep.exe --version   # must report 1.0.11
 ~~~
 
 From source (needs a Rust toolchain; use this when no pre-built asset matches
-your platform, e.g. aarch64 Linux):
+your platform, e.g. aarch64 Linux). Pin to the same tag so the build matches the
+binary path:
 
 ~~~sh
-git clone https://github.com/microsoft/tgrep.git
+git clone --branch v1.0.11 --depth 1 https://github.com/microsoft/tgrep.git
 cd tgrep
 cargo install --path tgrep-cli --locked
-tgrep --version
+tgrep --version   # must report 1.0.11
 ~~~
 
 After installing, index the checkout once so searches resolve:
@@ -144,7 +151,7 @@ After installing, index the checkout once so searches resolve:
 cd /path/to/this/repository
 tgrep index .
 tgrep status .
-tgrep --version
+tgrep --version   # must report 1.0.11
 ~~~
 
 ### If tgrep is not installed or not indexed for this checkout
