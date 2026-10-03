@@ -1078,30 +1078,43 @@ where
         }
     }
 
-    /// Consult the #69 governor for #164 shadow work *before* it is submitted.
+    /// Consult the #69 governor for #164 shadow work and queue the staged job.
     ///
-    /// Order matters: probing after `route_with_budget` would let the job be
-    /// queued and executed while only the bookkeeping claimed it was denied.
-    /// Instead a refusal arms `deny_next_shadow_submission`, so the very next
-    /// `submit` skips the event without queueing it. When nothing would be
-    /// admitted anyway (disabled, filtered, unsampled, saturated) no budget is
-    /// consumed, because there is no work to pay for.
-    fn account_shadow_budget(&mut self, event: &EventEnvelope, at_ms: u64) {
-        if !self.router.shadow_charges_budget() || !self.router.would_admit_shadow(event) {
+    /// Called only after the active route succeeded. `route_with_budget`
+    /// staged the job without queueing or charging anything, so this is the
+    /// first moment at which shadow work becomes real: a refusal here means the
+    /// job is never queued, and an admitted job is charged exactly once. If the
+    /// active route fails instead, `discard_shadow_submission` drops the staged
+    /// job and neither the ledger nor a one-shot denial is touched.
+    ///
+    /// When nothing was staged (disabled, filtered, unsampled, saturated,
+    /// shutting down) no budget is consumed, because there is no work to pay
+    /// for.
+    fn commit_shadow_budget(&mut self, at_ms: u64) {
+        if !self.router.shadow_submission_staged() {
             return;
         }
-        let Some(governor) = self.budget.as_mut() else {
-            return;
-        };
-        match governor.try_admit(BudgetAdmission::shadow(), at_ms) {
-            Ok(mut reservation) => {
-                // Shadow evaluation performs no TTS character spend of its own;
-                // settle immediately so the concurrency slot is returned rather
-                // than held for a job the ledger never measures.
-                reservation.settle(governor, 0, 0);
+        let admitted = if !self.router.shadow_charges_budget() {
+            true
+        } else {
+            match self.budget.as_mut() {
+                Some(governor) => match governor.try_admit(BudgetAdmission::shadow(), at_ms) {
+                    Ok(mut reservation) => {
+                        // Shadow evaluation performs no TTS character spend of
+                        // its own; settle immediately so the concurrency slot is
+                        // returned rather than held for a job the ledger never
+                        // measures.
+                        reservation.settle(governor, 0, 0);
+                        true
+                    }
+                    Err(_) => false,
+                },
+                // No governor configured: nothing is charged, so nothing can
+                // deny the work.
+                None => true,
             }
-            Err(_) => self.router.deny_next_shadow_submission(),
-        }
+        };
+        self.router.commit_shadow_submission(admitted);
     }
 
     pub fn retention_snapshot(&self) -> RuntimeRetentionSnapshot {
@@ -1231,12 +1244,20 @@ where
         let causal_correlation_id = event.correlation_id.clone();
         let route_started = Instant::now();
         let route_budget = remaining_instant(provider_deadline).unwrap_or(Duration::ZERO);
-        // #164: budget admission is decided before routing, so a #69 refusal
-        // prevents the shadow job from being queued rather than cancelling it
-        // afterwards. It only ever arms a denial, so a shadow budget refusal
-        // can never fail an active event.
-        self.account_shadow_budget(&event, at_ms);
-        let route = self.router.route_with_budget(&event, Some(route_budget))?;
+        // #164: `route_with_budget` only *stages* the shadow job. If the active
+        // route fails, the stage is dropped below so no denial and no charge
+        // can leak into the next, unrelated event.
+        let route = match self.router.route_with_budget(&event, Some(route_budget)) {
+            Ok(route) => route,
+            Err(error) => {
+                self.router.discard_shadow_submission();
+                return Err(error);
+            }
+        };
+        // The active route succeeded, so the staged shadow job is now real: the
+        // #69 governor decides whether it is queued. A refusal can never fail
+        // an active event.
+        self.commit_shadow_budget(at_ms);
         let routing_latency_us = elapsed_us(route_started);
         let decision = self.router.decision_record().cloned();
         let template_fallback = self
@@ -6139,9 +6160,9 @@ mod tests {
             "only the admitted event may ever be queued"
         );
         assert_eq!(snapshot.dropped_budget_denied, 1);
-        assert_eq!(
-            snapshot.pending, 0,
-            "a denied job must not sit in the queue"
+        assert!(
+            snapshot.pending + snapshot.in_flight <= 1,
+            "the denied job must not occupy the queue or a worker"
         );
         app.tick(2_100);
         let denied_records = app
@@ -6153,6 +6174,158 @@ mod tests {
             denied_records, 0,
             "denied work must not produce shadow evidence"
         );
+    }
+
+    /// An active planner that fails for a designated event, so the staged
+    /// shadow job is stranded and must be discarded.
+    #[derive(Clone)]
+    struct FlakyActiveRoute {
+        asset_id: &'static str,
+        fail_sequence: u64,
+    }
+
+    impl RoutePlanner for FlakyActiveRoute {
+        fn route(&mut self, event: &EventEnvelope) -> Result<PlaybackRoute, AppError> {
+            if event.sequence == self.fail_sequence {
+                return Err(AppError::Routing("active route failed".to_owned()));
+            }
+            Ok(PlaybackRoute::AssetId(self.asset_id.to_owned()))
+        }
+    }
+
+    fn charged_shadow_app(
+        fail_sequence: u64,
+    ) -> ProductionApp<ShadowingRoutePlanner<FlakyActiveRoute, FixedShadowDecision>> {
+        let identity = |policy_id: &str| ShadowPolicyIdentity {
+            policy_id: policy_id.to_owned(),
+            policy_version: "v1".to_owned(),
+            config_fingerprint: format!("{policy_id}-cfg"),
+            runtime_profile: "cached".to_owned(),
+            dataset_id: None,
+        };
+        let app = app(
+            ShadowingRoutePlanner::with_orchestrator(
+                FlakyActiveRoute {
+                    asset_id: "reaction.agree.01",
+                    fail_sequence,
+                },
+                FixedShadowDecision(ShadowDecision::silent()),
+                identity("active"),
+                identity("shadow"),
+                None,
+                ShadowOrchestratorConfig {
+                    enabled: true,
+                    sample_rate_per_10k: 10_000,
+                    deadline_ms: 30_000,
+                    charge_shadow_to_budget: true,
+                    ..ShadowOrchestratorConfig::default()
+                },
+            )
+            .expect("charged router"),
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        );
+        app.with_generative_budget_policy(GenerativeBudgetPolicy {
+            enabled: true,
+            max_llm_calls_per_interval: Some(1),
+            interval_ms: 60_000,
+            charge_shadow_to_budget: true,
+            ..GenerativeBudgetPolicy::default()
+        })
+    }
+
+    /// #164 review (required regression): a denied event whose *active route*
+    /// fails must not leave a one-shot denial behind. The next, unrelated
+    /// successful event has to be admitted normally.
+    #[test]
+    fn denied_shadow_event_with_a_failed_active_route_does_not_leak_into_the_next_event() {
+        let mut app = charged_shadow_app(1);
+        app.startup().expect("startup");
+
+        // Exhaust the single-call ledger so both later events *would* be
+        // denied by the governor. The reservation is dropped immediately; the
+        // call-ledger entry it recorded is what makes the budget tight.
+        {
+            let governor = app.budget.as_mut().expect("budget governor");
+            governor
+                .try_admit(BudgetAdmission::ordinary(), 10)
+                .expect("seed the exhausted ledger");
+        }
+
+        // Event 1 would be denied, but its active route fails first.
+        let error = app
+            .process_content_bytes(&serde_json::to_vec(&chat_event(1)).expect("json"), 20, 7)
+            .expect_err("the active route fails for sequence 1");
+        assert!(matches!(error, AppError::Routing(_)));
+
+        let after_failure = app.router.shadow_execution_snapshot().expect("snapshot");
+        assert_eq!(
+            after_failure.dropped_budget_denied, 0,
+            "no denial may be recorded for an event that never committed"
+        );
+        assert!(
+            !app.router.shadow_submission_staged(),
+            "a failed active route must discard the staged job"
+        );
+
+        // Event 2 routes successfully and is denied by the governor, exactly
+        // once.
+        app.process_content_bytes(&serde_json::to_vec(&chat_event(2)).expect("json"), 2_000, 8)
+            .expect("content");
+        assert_eq!(
+            app.router.last_shadow_submission(),
+            Some(&ShadowSubmission::Skipped {
+                reason: ShadowSkipReason::BudgetDenied
+            })
+        );
+        assert_eq!(
+            app.router
+                .shadow_execution_snapshot()
+                .expect("snapshot")
+                .dropped_budget_denied,
+            1,
+            "only the committed denial may be counted"
+        );
+
+        // Event 3 must be admitted normally: a one-shot denial armed by the
+        // failed event 1 would wrongly deny this one.
+        let mut later = app;
+        later.budget = None;
+        later
+            .process_content_bytes(&serde_json::to_vec(&chat_event(3)).expect("json"), 4_000, 9)
+            .expect("content");
+        assert!(
+            matches!(
+                later.router.last_shadow_submission(),
+                Some(ShadowSubmission::Admitted { .. })
+            ),
+            "a leaked one-shot denial from a failed route would deny this event"
+        );
+    }
+
+    /// #164 review (required regression): when the active route fails, the
+    /// #69 ledger must not be charged for shadow work that never ran.
+    #[test]
+    fn a_failed_active_route_charges_no_budget_for_staged_shadow_work() {
+        let mut app = charged_shadow_app(1);
+        app.startup().expect("startup");
+
+        app.process_content_bytes(&serde_json::to_vec(&chat_event(1)).expect("json"), 10, 7)
+            .expect_err("the active route fails for sequence 1");
+
+        // The whole single-call budget must still be available to active work.
+        let governor = app.budget.as_mut().expect("budget governor");
+        assert!(
+            governor.try_admit(BudgetAdmission::ordinary(), 20).is_ok(),
+            "shadow work that never ran must not have consumed the call ledger"
+        );
+
+        let snapshot = app.router.shadow_execution_snapshot().expect("snapshot");
+        assert_eq!(snapshot.submitted, 0, "nothing may have been queued");
+        assert_eq!(snapshot.pending, 0);
+        assert_eq!(snapshot.in_flight, 0);
+        assert!(snapshot.is_quiescent());
     }
 
     fn plain_app() -> ProductionApp<FixedSilentRoute> {

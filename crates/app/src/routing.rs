@@ -283,15 +283,21 @@ pub trait RoutePlanner: Send {
         false
     }
 
-    /// Whether shadow orchestration would admit this event right now, judged
-    /// without queueing anything (#164). The composition thread uses it to
-    /// consult the #69 governor *before* the job is submitted.
-    fn would_admit_shadow(&mut self, _event: &EventEnvelope) -> bool {
+    /// Whether a shadow job is staged and waiting for the #69 budget
+    /// authority (#164).
+    fn shadow_submission_staged(&self) -> bool {
         false
     }
 
-    /// Refuse the next shadow submission before it is queued (#164).
-    fn deny_next_shadow_submission(&mut self) {}
+    /// Queue the staged shadow job, or refuse it when the #69 governor denied
+    /// it (#164). Called only after the active route has succeeded.
+    fn commit_shadow_submission(&mut self, _budget_admitted: bool) {}
+
+    /// Drop the staged shadow job because the active route failed (#164).
+    ///
+    /// Must leave no denial, charge, or queued work behind: the next event
+    /// starts from a clean slate.
+    fn discard_shadow_submission(&mut self) {}
 
     /// Cancel outstanding shadow work and join every shadow worker.
     fn shutdown_shadow(&mut self) {}
@@ -336,12 +342,16 @@ impl RoutePlanner for Box<dyn RoutePlanner> {
         (**self).shadow_charges_budget()
     }
 
-    fn would_admit_shadow(&mut self, event: &EventEnvelope) -> bool {
-        (**self).would_admit_shadow(event)
+    fn shadow_submission_staged(&self) -> bool {
+        (**self).shadow_submission_staged()
     }
 
-    fn deny_next_shadow_submission(&mut self) {
-        (**self).deny_next_shadow_submission();
+    fn commit_shadow_submission(&mut self, budget_admitted: bool) {
+        (**self).commit_shadow_submission(budget_admitted);
+    }
+
+    fn discard_shadow_submission(&mut self) {
+        (**self).discard_shadow_submission();
     }
 
     fn shutdown_shadow(&mut self) {

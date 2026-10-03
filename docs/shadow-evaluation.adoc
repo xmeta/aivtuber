@@ -295,23 +295,36 @@ Shadow work is free by default. Admission offers
 governor policy; the governor remains the authority, and its default short
 -circuit leaves the active ledger untouched. No parallel ledger was added.
 
-Admission is decided *before* the job is submitted, not after. The composition
-thread calls `would_admit_shadow` — a side-effect-free preview of what
-`submit` would decide, taking no queue slot and no job id — and only then asks
-the governor. A refusal arms `deny_next_shadow_submission`, so the next
-`submit` reports `Skipped { budget_denied }` without ever touching the queue.
+Admission is decided *between* the active route and the shadow queue, not after
+the job is submitted. The composition thread makes three calls:
 
-This ordering is the point: probing afterwards could only relabel work that was
-already queued and possibly already running, which would let denied work
-execute anyway and leave the recorded submission describing something that
-never happened. Because the refusal precedes queueing, a denied event produces
-no job, no worker occupancy, no completion, and no evidence, and
-`last_submission` describes exactly that. The refusal is one-shot: the next
-event is admitted normally.
+. `route_with_budget` runs the active route and *stages* the shadow job.
+   Staging is entirely inert: no queue slot is taken, no counter moves, no
+   worker is occupied, and no budget is spent.
+. If the active route returned `Err`, `discard_shadow_submission` drops the
+   staged job. The comparison would describe a decision the runtime never made,
+   and neither the ledger nor a denial is touched.
+. If the active route succeeded, `commit_shadow_submission` asks the #69
+   governor. An admission queues the job and settles the reservation; a refusal
+   reports `Skipped { budget_denied }` without ever touching the queue.
 
-When the orchestrator would not admit the event anyway — disabled, filtered,
-unsampled, or saturated — no budget is consumed, because there is no work to
-pay for.
+Both orders that do not work are worth naming. Probing *after* queueing could
+only relabel work that was already queued and possibly already running, which
+would let denied work execute anyway and leave the recorded submission
+describing something that never happened. Probing *before* the active route —
+the shape an earlier revision of this PR used — fixes that but leaks: if the
+active route then fails, an armed one-shot denial survives into the next,
+unrelated event, and the call ledger has already been charged for shadow work
+that never ran. Staging is what makes neither possible.
+
+Because the refusal precedes queueing, a denied event produces no job, no
+worker occupancy, no completion, and no evidence, and `last_submission`
+describes exactly that.
+
+When nothing was staged — disabled, filtered, unsampled, saturated, or shutting
+down — the commit step is a no-op and no budget is consumed, because there is
+no work to pay for. `shadow_submission_staged` lets the composition thread skip
+the #69 probe entirely in that case.
 
 === 8.7 Active-output invariance
 

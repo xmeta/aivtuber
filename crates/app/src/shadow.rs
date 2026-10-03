@@ -487,18 +487,51 @@ where
         matches!(&self.shadow, ShadowExecution::Bounded(orchestrator) if orchestrator.charges_budget())
     }
 
-    /// Whether shadow orchestration would admit this event right now (#164).
-    pub fn would_admit_shadow(&mut self, event: &EventEnvelope) -> bool {
-        match &self.shadow {
+    /// Stage a shadow job without queueing it yet (#164).
+    ///
+    /// The composition thread stages during routing, asks the #69 governor
+    /// once the active route has succeeded, then commits. Nothing is queued,
+    /// counted, or charged until that commit, so a failed active route leaves
+    /// nothing behind.
+    pub fn stage_shadow_submission(
+        &mut self,
+        event: &EventEnvelope,
+        remaining_budget: Option<Duration>,
+        active_identity: &ShadowPolicyIdentity,
+        shadow_identity: &ShadowPolicyIdentity,
+        active: ShadowDecision,
+    ) -> bool {
+        match &mut self.shadow {
             ShadowExecution::Inline(_) => false,
-            ShadowExecution::Bounded(orchestrator) => orchestrator.would_admit(event),
+            ShadowExecution::Bounded(orchestrator) => orchestrator.stage(
+                event,
+                remaining_budget,
+                active_identity,
+                shadow_identity,
+                active,
+            ),
         }
     }
 
-    /// Refuse the next shadow submission before it is queued (#164).
-    pub fn deny_next_shadow_submission(&mut self) {
+    /// Whether a staged shadow job is waiting for the budget authority (#164).
+    pub fn shadow_submission_staged(&self) -> bool {
+        match &self.shadow {
+            ShadowExecution::Inline(_) => false,
+            ShadowExecution::Bounded(orchestrator) => orchestrator.has_staged(),
+        }
+    }
+
+    /// Queue the staged job, or refuse it when the #69 governor denied it.
+    pub fn commit_shadow_submission(&mut self, budget_admitted: bool) {
         if let ShadowExecution::Bounded(orchestrator) = &mut self.shadow {
-            orchestrator.deny_next_submission();
+            orchestrator.commit_with_budget(budget_admitted);
+        }
+    }
+
+    /// Drop the staged job because the active route failed (#164).
+    pub fn discard_shadow_submission(&mut self) {
+        if let ShadowExecution::Bounded(orchestrator) = &mut self.shadow {
+            orchestrator.discard_staged();
         }
     }
 
@@ -536,7 +569,16 @@ where
     S: ShadowPolicy + 'static,
 {
     fn route(&mut self, event: &EventEnvelope) -> Result<PlaybackRoute, AppError> {
-        self.route_with_budget(event, None)
+        let route = self.route_with_budget(event, None)?;
+        // No composition-thread budget step exists on this path, so the staged
+        // job is committed here. `ProductionApp::handle_event` uses
+        // `route_with_budget` and does the staging/commit itself.
+        if let ShadowExecution::Bounded(orchestrator) = &mut self.shadow
+            && orchestrator.has_staged()
+        {
+            orchestrator.commit();
+        }
+        Ok(route)
     }
 
     fn route_with_budget(
@@ -552,7 +594,12 @@ where
             // off. Nothing about this call depends on the shadow outcome, so the
             // active route is returned without waiting for it.
             ShadowExecution::Bounded(orchestrator) => {
-                orchestrator.submit(
+                // Stage only. The #69 budget authority sits between the active
+                // route succeeding and the job being queued, so this call is
+                // not observable: it is committed by
+                // `commit_shadow_submission` or dropped by
+                // `discard_shadow_submission`.
+                let _ = orchestrator.stage(
                     event,
                     remaining_budget,
                     &self.active_identity,
@@ -630,12 +677,16 @@ where
         self.shadow_charges_budget()
     }
 
-    fn would_admit_shadow(&mut self, event: &EventEnvelope) -> bool {
-        self.would_admit_shadow(event)
+    fn shadow_submission_staged(&self) -> bool {
+        self.shadow_submission_staged()
     }
 
-    fn deny_next_shadow_submission(&mut self) {
-        self.deny_next_shadow_submission();
+    fn commit_shadow_submission(&mut self, budget_admitted: bool) {
+        self.commit_shadow_submission(budget_admitted);
+    }
+
+    fn discard_shadow_submission(&mut self) {
+        self.discard_shadow_submission();
     }
 
     fn shutdown_shadow(&mut self) {
@@ -990,13 +1041,13 @@ mod tests {
             }
         }
 
-        fn release(&self) {
-            let mut open = self.open.lock().expect("gate open lock");
-            *open = true;
-            self.open_signal.notify_all();
+        /// How many evaluations have started. Read without blocking so a test
+        /// can assert that staging alone runs nothing.
+        fn arrivals(&self) -> usize {
+            *self.entered.lock().expect("gate entered lock")
         }
 
-        fn try_release(&self) {
+        fn release(&self) {
             let mut open = self.open.lock().expect("gate open lock");
             *open = true;
             self.open_signal.notify_all();
@@ -1056,7 +1107,7 @@ mod tests {
                 }
                 std::thread::sleep(Duration::from_millis(1));
             }
-            self.gate.try_release();
+            self.gate.release();
             Ok(self.decision.clone())
         }
     }
@@ -1688,13 +1739,17 @@ mod tests {
     fn a_budget_denial_prevents_the_job_from_being_queued_at_all() {
         let gate = EvalGate::new();
         let mut planner = gated_planner(&gate, gated_deadline());
-        planner.deny_next_shadow_submission();
 
-        assert_eq!(
-            planner.route(&event_with_id("evt-denied")).expect("route"),
-            PlaybackRoute::Silent,
-            "a budget denial must never affect the active route"
+        // Route first: this stages the job without queueing anything.
+        planner
+            .route_with_budget(&event_with_id("evt-denied"), None)
+            .expect("route");
+        assert!(
+            planner.shadow_submission_staged(),
+            "the job is staged, waiting for the budget authority"
         );
+        planner.commit_shadow_submission(false);
+
         assert_eq!(
             planner.last_shadow_submission(),
             Some(&ShadowSubmission::Skipped {
@@ -1713,7 +1768,7 @@ mod tests {
         assert_eq!(snapshot.dropped_budget_denied, 1);
         assert!(snapshot.is_quiescent());
 
-        // The refusal is one-shot: the next event is admitted normally.
+        // The next event is admitted normally: nothing leaked from the denial.
         planner
             .route(&event_with_id("evt-after-denial"))
             .expect("route");
@@ -1725,37 +1780,92 @@ mod tests {
         planner.shutdown_shadow();
     }
 
-    /// #164 review: `would_admit` must be a faithful, side-effect-free preview
-    /// of what `submit` would decide, so probing the governor beforehand
-    /// cannot desynchronise the recorded outcome from the real one.
+    /// #164 review: staging must be entirely inert. Nothing may be queued,
+    /// counted, or occupy a worker until `commit_shadow_submission`, so a
+    /// failed active route can discard the stage without side effects.
     #[test]
-    fn would_admit_predicts_submit_without_consuming_capacity() {
+    fn staging_is_inert_until_commit_and_discard_leaves_nothing_behind() {
+        let gate = EvalGate::new();
+        let mut planner = gated_planner(&gate, gated_deadline());
+
+        planner
+            .route_with_budget(&event_with_id("evt-staged"), None)
+            .expect("route");
+        assert!(planner.shadow_submission_staged());
+        let staged_snapshot = planner.shadow_execution_snapshot().expect("snapshot");
+        assert_eq!(staged_snapshot.submitted, 0, "staging submits nothing");
+        assert_eq!(staged_snapshot.pending, 0, "staging queues nothing");
+        assert_eq!(staged_snapshot.in_flight, 0, "staging occupies no worker");
+        assert!(
+            gate.arrivals() == 0,
+            "no policy may run before the budget authority commits"
+        );
+        assert!(
+            planner.last_shadow_submission().is_none()
+                || matches!(
+                    planner.last_shadow_submission(),
+                    Some(ShadowSubmission::Skipped { .. })
+                ),
+            "a staged job has no submission outcome yet"
+        );
+
+        // Discard: the active route failed, so nothing may remain.
+        planner.discard_shadow_submission();
+        assert!(!planner.shadow_submission_staged());
+        let discarded = planner.shadow_execution_snapshot().expect("snapshot");
+        assert_eq!(discarded.submitted, 0);
+        assert_eq!(discarded.pending, 0);
+        assert_eq!(
+            discarded.dropped_budget_denied, 0,
+            "a discard is not a denial"
+        );
+        assert!(discarded.is_quiescent());
+
+        // The very next event must be admitted normally.
+        planner
+            .route(&event_with_id("evt-after-discard"))
+            .expect("route");
+        assert!(matches!(
+            planner.last_shadow_submission(),
+            Some(ShadowSubmission::Admitted { .. })
+        ));
+        gate.release();
+        planner.shutdown_shadow();
+    }
+
+    /// #164 review: a config that cannot admit anything must not claim to
+    /// have staged a job, so the composition thread never pays for a #69 probe
+    /// it could not have used.
+    #[test]
+    fn only_an_admitting_config_stages_a_job() {
+        let shadow_identity = identity("shadow");
+        let active = || FixedActive(PlaybackRoute::Silent);
+        let shadow = || FixedShadow(Ok(ShadowDecision::silent()));
+
         let mut enabled = ShadowingRoutePlanner::with_orchestrator(
-            FixedActive(PlaybackRoute::Silent),
-            FixedShadow(Ok(ShadowDecision::silent())),
+            active(),
+            shadow(),
             identity("active"),
-            identity("shadow"),
+            shadow_identity.clone(),
             None,
             bounded_config(),
         )
         .expect("planner");
-        assert!(enabled.would_admit_shadow(&event()));
-        // Probing repeatedly must not reserve queue capacity or job ids.
-        for _ in 0..100 {
-            assert!(enabled.would_admit_shadow(&event()));
-        }
-        enabled.route(&event()).expect("route");
+        enabled.route_with_budget(&event(), None).expect("route");
+        assert!(enabled.shadow_submission_staged());
+        enabled.commit_shadow_submission(true);
         assert_eq!(
             enabled.last_shadow_submission(),
-            Some(&ShadowSubmission::Admitted { job_id: 1 })
+            Some(&ShadowSubmission::Admitted { job_id: 1 }),
+            "one staged job consumes exactly one job id"
         );
         enabled.shutdown_shadow();
 
         let mut disabled = ShadowingRoutePlanner::with_orchestrator(
-            FixedActive(PlaybackRoute::Silent),
-            FixedShadow(Ok(ShadowDecision::silent())),
+            active(),
+            shadow(),
             identity("active"),
-            identity("shadow"),
+            shadow_identity.clone(),
             None,
             ShadowOrchestratorConfig {
                 enabled: false,
@@ -1763,21 +1873,23 @@ mod tests {
             },
         )
         .expect("planner");
+        disabled.route_with_budget(&event(), None).expect("route");
         assert!(
-            !disabled.would_admit_shadow(&event()),
-            "a disabled config must never claim it would admit"
+            !disabled.shadow_submission_staged(),
+            "a disabled config must never stage a job"
         );
         disabled.shutdown_shadow();
 
-        // The synchronous #163 path has no orchestrator to admit work.
+        // The synchronous #163 path has no orchestrator to stage work.
         let mut inline = ShadowingRoutePlanner::new(
-            FixedActive(PlaybackRoute::Silent),
-            FixedShadow(Ok(ShadowDecision::silent())),
+            active(),
+            shadow(),
             identity("active"),
-            identity("shadow"),
+            shadow_identity.clone(),
         )
         .expect("planner");
-        assert!(!inline.would_admit_shadow(&event()));
+        inline.route(&event()).expect("route");
+        assert!(!inline.shadow_submission_staged());
     }
 
     fn drain_until_abort<P>(

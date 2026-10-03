@@ -300,12 +300,15 @@ where
     shutting_down: Arc<AtomicBool>,
     workers: Vec<JoinHandle<()>>,
     next_job_id: u64,
-    /// One-shot #69 budget refusal for the next submission (#164).
+    /// A job that passed every deterministic gate and is waiting for the #69
+    /// budget authority before it is queued (#164).
     ///
-    /// Armed by the composition thread *before* it routes, so the governor is
-    /// the admission authority: a refused event is never queued, never
-    /// executed, and never needs cancelling after the fact.
-    pending_budget_denial: bool,
+    /// Staging rather than queueing is what makes the governor a real admission
+    /// authority without leaking: nothing is queued, no worker is occupied and
+    /// no budget is spent until the composition thread confirms the active
+    /// route succeeded, so a failed route cannot leave a denial or a charge
+    /// behind for an unrelated later event.
+    staged: Option<ShadowJob>,
     last_submission: Option<ShadowSubmission>,
     last_comparison: Option<ShadowComparisonRecord>,
     /// Token of the most recently admitted job. Superseded when a newer job is
@@ -403,7 +406,7 @@ where
             shutting_down,
             workers,
             next_job_id: 0,
-            pending_budget_denial: false,
+            staged: None,
             last_submission: None,
             last_comparison: None,
             active_token: None,
@@ -475,39 +478,92 @@ where
         shadow_identity: &ShadowPolicyIdentity,
         active: ShadowDecision,
     ) -> ShadowSubmission {
-        if self.pending_budget_denial {
-            // Consume the refusal: this attempt is denied, and it was never
-            // queued, so nothing needs cancelling or unwinding.
-            self.pending_budget_denial = false;
-            return self.skip(ShadowSkipReason::BudgetDenied);
+        if !self.stage(
+            event,
+            remaining_budget,
+            active_identity,
+            shadow_identity,
+            active,
+        ) {
+            return self
+                .last_submission
+                .clone()
+                .expect("a rejected stage records its own skip");
         }
+        self.commit()
+    }
+
+    /// Phase 1 of admission: run the deterministic gates and build the job,
+    /// but queue nothing yet.
+    ///
+    /// Returns whether a job was staged. When it was not, the skip reason is
+    /// already recorded in `last_submission`. Nothing observable has happened:
+    /// no queue slot is taken, no counter moves, and no budget can be spent,
+    /// so the caller may discard the stage freely if the active route fails.
+    pub fn stage(
+        &mut self,
+        event: &EventEnvelope,
+        remaining_budget: Option<Duration>,
+        active_identity: &ShadowPolicyIdentity,
+        shadow_identity: &ShadowPolicyIdentity,
+        active: ShadowDecision,
+    ) -> bool {
+        // Only one job can be staged at a time: staging is always followed by
+        // a commit or a discard on the same thread, before the next event.
+        self.staged = None;
         if let Some(reason) = self.config.skip_reason(event) {
-            return self.skip(reason);
+            self.skip(reason);
+            return false;
         }
         if self.shutting_down.load(Ordering::Acquire) {
-            return self.skip(ShadowSkipReason::ShuttingDown);
+            self.skip(ShadowSkipReason::ShuttingDown);
+            return false;
+        }
+        if !self.work.has_room() {
+            self.skip(ShadowSkipReason::Saturated);
+            return false;
         }
         self.next_job_id = self.next_job_id.saturating_add(1);
-        let job_id = self.next_job_id;
-        let cancellation = ShadowCancellationToken::default();
-        let job = ShadowJob {
-            job_id,
+        self.staged = Some(ShadowJob {
+            job_id: self.next_job_id,
             event: event.clone(),
             remaining_budget,
             deadline: Instant::now() + Duration::from_millis(self.config.deadline_ms),
-            cancellation: cancellation.clone(),
+            cancellation: ShadowCancellationToken::default(),
             active_identity: active_identity.clone(),
             shadow_identity: shadow_identity.clone(),
             active,
-        };
+        });
+        true
+    }
 
+    /// Phase 2 of admission: queue the staged job.
+    ///
+    /// `budget_admitted` is the #69 governor's decision. The job is only ever
+    /// queued when the governor admitted it, so denied work is never executed,
+    /// and `last_submission` is written by the same attempt that skipped, so
+    /// it cannot describe something that never happened.
+    pub fn commit(&mut self) -> ShadowSubmission {
+        let Some(job) = self.staged.take() else {
+            return self
+                .last_submission
+                .clone()
+                .unwrap_or(ShadowSubmission::Skipped {
+                    reason: ShadowSkipReason::Disabled,
+                });
+        };
+        let job_id = job.job_id;
+        // The token is shared with the queued job, so clone it out first: the
+        // orchestrator keeps it to cancel this job when newer work arrives.
+        let cancellation = job.cancellation.clone();
         self.counters.note_queued();
         if self.work.push(job).is_none() {
             self.counters.pending.fetch_sub(1, Ordering::SeqCst);
             return self.skip(ShadowSkipReason::Saturated);
         }
         // Supersede the previous in-flight evaluation: the newest event is the
-        // one whose comparison is worth keeping.
+        // one whose comparison is worth keeping, so its token becomes the
+        // active one and the previous token is cancelled.
         if let Some(previous) = self.active_token.replace(cancellation) {
             previous.cancel();
         }
@@ -515,6 +571,24 @@ where
         let submission = ShadowSubmission::Admitted { job_id };
         self.last_submission = Some(submission.clone());
         submission
+    }
+
+    /// Refuse the staged job: the #69 governor denied it.
+    ///
+    /// The job was never queued, so nothing needs cancelling or unwinding, and
+    /// no worker is occupied at any point.
+    pub fn commit_denied(&mut self) -> ShadowSubmission {
+        self.staged = None;
+        self.skip(ShadowSkipReason::BudgetDenied)
+    }
+
+    /// Phase 2 driven by the #69 governor's verdict.
+    pub fn commit_with_budget(&mut self, budget_admitted: bool) -> ShadowSubmission {
+        if budget_admitted {
+            self.commit()
+        } else {
+            self.commit_denied()
+        }
     }
 
     fn skip(&mut self, reason: ShadowSkipReason) -> ShadowSubmission {
@@ -532,26 +606,20 @@ where
         submission
     }
 
-    /// Whether the deterministic admission gates (enabled, kind filter, sample)
-    /// and the queue capacity would admit this event right now.
+    /// Whether a job is staged and waiting for the budget authority.
     ///
-    /// Read-only: it takes no slot, moves no counter, and cannot queue work. The
-    /// composition thread uses it to ask the #69 governor first, so a budget
-    /// denial stops the job from being queued at all.
-    pub fn would_admit(&self, event: &EventEnvelope) -> bool {
-        !self.shutting_down.load(Ordering::Acquire)
-            && self.config.skip_reason(event).is_none()
-            && self.work.has_room()
+    /// Lets the composition thread skip the #69 probe entirely when there is
+    /// nothing to pay for.
+    pub fn has_staged(&self) -> bool {
+        self.staged.is_some()
     }
 
-    /// Refuse the next admission attempt, before it is queued (#164).
+    /// Drop a staged job without queueing it.
     ///
-    /// Called by the composition thread after the #69 governor denies the
-    /// event. The next `submit` reports `Skipped { BudgetDenied }` without
-    /// touching the queue, so denied work is never executed and the recorded
-    /// submission matches what actually happened.
-    pub fn deny_next_submission(&mut self) {
-        self.pending_budget_denial = true;
+    /// Used when the active route fails after staging: the comparison would
+    /// describe a decision the runtime never made, and no budget was charged.
+    pub fn discard_staged(&mut self) {
+        self.staged = None;
     }
 
     pub fn snapshot(&self) -> ShadowExecutionSnapshot {
