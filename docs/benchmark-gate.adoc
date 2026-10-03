@@ -345,9 +345,11 @@ array only gained the diagnostic `base_range`/`head_range` fields).
 
 == 9. Verification
 
-* telemetry unit tests (21): improvement/ok/warning/fail paths,
-  higher-is-better, absolute thresholds on small denominators,
-  min_samples gating, invariant violation overrides improvements,
+* `benchmark_gate` telemetry unit tests (21 in
+  `crates/telemetry/src/benchmark_gate.rs`; 39 in the `aivtuber-telemetry`
+  crate as a whole): improvement/ok/warning/fail paths, higher-is-better,
+  absolute thresholds on small denominators, min_samples gating,
+  invariant violation overrides improvements,
   incompatible dataset/schema detection, ungated reporting, markdown
   summary, JSON round-trip, plus the #180 repeated-run cases — median/max
   aggregation, pooled sample counts meeting a floor one run cannot,
@@ -360,10 +362,10 @@ array only gained the diagnostic `base_range`/`head_range` fields).
 * comparator CLI unit tests (4): the original positional form is unchanged,
   default budgets/output paths, the repeated `--base`/`--head` form collects
   every run, and incomplete/unknown argument forms are rejected.
-* hardening tests (11 run in normal CI, 13 defined including 2 credential-gated
-  live conformance): soak plateau detection, plus the Phase D
-  contract mapping — clean soaks map to zero invariants, growth findings map
-  to non-zero invariants with details, results round-trip through the
+* hardening tests (11 run in normal CI; 13 defined, 2 credential-gated
+  live conformance): soak plateau detection, plus the Phase D contract
+  mapping — clean soaks map to zero invariants, growth findings map to
+  non-zero invariants with details, results round-trip through the
   comparator's parser.
 * reaction-quality bun tests (8): deterministic A/B assignment, reviewer-packet
   identity blinding, tamper rejection, base/candidate normalization,
