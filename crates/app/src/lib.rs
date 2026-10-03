@@ -1078,16 +1078,16 @@ where
         }
     }
 
-    /// Charge #164 shadow work to the #69 ledger when explicitly enabled.
-    fn account_shadow_budget(&mut self, at_ms: u64) {
-        if !self.router.shadow_charges_budget() {
-            return;
-        }
-        let admitted = matches!(
-            self.router.last_shadow_submission(),
-            Some(ShadowSubmission::Admitted { .. })
-        );
-        if !admitted {
+    /// Consult the #69 governor for #164 shadow work *before* it is submitted.
+    ///
+    /// Order matters: probing after `route_with_budget` would let the job be
+    /// queued and executed while only the bookkeeping claimed it was denied.
+    /// Instead a refusal arms `deny_next_shadow_submission`, so the very next
+    /// `submit` skips the event without queueing it. When nothing would be
+    /// admitted anyway (disabled, filtered, unsampled, saturated) no budget is
+    /// consumed, because there is no work to pay for.
+    fn account_shadow_budget(&mut self, event: &EventEnvelope, at_ms: u64) {
+        if !self.router.shadow_charges_budget() || !self.router.would_admit_shadow(event) {
             return;
         }
         let Some(governor) = self.budget.as_mut() else {
@@ -1100,7 +1100,7 @@ where
                 // than held for a job the ledger never measures.
                 reservation.settle(governor, 0, 0);
             }
-            Err(_) => self.router.note_shadow_budget_denied(),
+            Err(_) => self.router.deny_next_shadow_submission(),
         }
     }
 
@@ -1231,13 +1231,13 @@ where
         let causal_correlation_id = event.correlation_id.clone();
         let route_started = Instant::now();
         let route_budget = remaining_instant(provider_deadline).unwrap_or(Duration::ZERO);
+        // #164: budget admission is decided before routing, so a #69 refusal
+        // prevents the shadow job from being queued rather than cancelling it
+        // afterwards. It only ever arms a denial, so a shadow budget refusal
+        // can never fail an active event.
+        self.account_shadow_budget(&event, at_ms);
         let route = self.router.route_with_budget(&event, Some(route_budget))?;
         let routing_latency_us = elapsed_us(route_started);
-        // #164: shadow work that was actually admitted is charged to the #69
-        // ledger only when the operator explicitly enabled it. A denial is
-        // recorded against the orchestrator rather than the active path, so a
-        // shadow budget refusal can never fail an active event.
-        self.account_shadow_budget(at_ms);
         let decision = self.router.decision_record().cloned();
         let template_fallback = self
             .router
@@ -6067,6 +6067,91 @@ mod tests {
         assert!(
             governor.try_admit(BudgetAdmission::ordinary(), 10).is_err(),
             "explicitly charged shadow work must be visible in the same ledger"
+        );
+    }
+
+    /// #164 review: the #69 governor must be the admission authority. Once the
+    /// ledger is exhausted, a shadow event must be refused *before* it is
+    /// queued: nothing runs, no completion is ever published for it, and the
+    /// recorded submission describes exactly that.
+    #[test]
+    fn budget_denied_shadow_work_is_never_queued_or_executed() {
+        let identity = |policy_id: &str| ShadowPolicyIdentity {
+            policy_id: policy_id.to_owned(),
+            policy_version: "v1".to_owned(),
+            config_fingerprint: format!("{policy_id}-cfg"),
+            runtime_profile: "cached".to_owned(),
+            dataset_id: None,
+        };
+        let mut app = app(
+            ShadowingRoutePlanner::with_orchestrator(
+                FixedAssetRoute("reaction.agree.01"),
+                FixedShadowDecision(ShadowDecision::silent()),
+                identity("active"),
+                identity("shadow"),
+                None,
+                ShadowOrchestratorConfig {
+                    enabled: true,
+                    sample_rate_per_10k: 10_000,
+                    deadline_ms: 30_000,
+                    charge_shadow_to_budget: true,
+                    ..ShadowOrchestratorConfig::default()
+                },
+            )
+            .expect("charged router"),
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        );
+        app = app.with_generative_budget_policy(GenerativeBudgetPolicy {
+            enabled: true,
+            // One shadow admission only; the second event is over budget.
+            max_llm_calls_per_interval: Some(1),
+            interval_ms: 60_000,
+            charge_shadow_to_budget: true,
+            ..GenerativeBudgetPolicy::default()
+        });
+        app.startup().expect("startup");
+
+        // First event: admitted, charged, and queued.
+        app.process_content_bytes(&serde_json::to_vec(&chat_event(1)).expect("json"), 10, 7)
+            .expect("content");
+        assert!(matches!(
+            app.router.last_shadow_submission(),
+            Some(ShadowSubmission::Admitted { .. })
+        ));
+
+        // Second event: the governor refuses before routing, so the job is
+        // never queued. The active route is unaffected either way. Spaced past
+        // the scheduler's per-asset cooldown so the runtime itself admits it.
+        app.process_content_bytes(&serde_json::to_vec(&chat_event(2)).expect("json"), 2_000, 8)
+            .expect("content");
+        assert_eq!(
+            app.router.last_shadow_submission(),
+            Some(&ShadowSubmission::Skipped {
+                reason: ShadowSkipReason::BudgetDenied
+            }),
+            "a denied event must be reported as denied, not as admitted"
+        );
+        let snapshot = app.router.shadow_execution_snapshot().expect("snapshot");
+        assert_eq!(
+            snapshot.submitted, 1,
+            "only the admitted event may ever be queued"
+        );
+        assert_eq!(snapshot.dropped_budget_denied, 1);
+        assert_eq!(
+            snapshot.pending, 0,
+            "a denied job must not sit in the queue"
+        );
+        app.tick(2_100);
+        let denied_records = app
+            .shadow_comparisons()
+            .iter()
+            .filter(|record| record.event_id == chat_event(2).event_id)
+            .count();
+        assert_eq!(
+            denied_records, 0,
+            "denied work must not produce shadow evidence"
         );
     }
 

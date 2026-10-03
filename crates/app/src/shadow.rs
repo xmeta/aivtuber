@@ -1,9 +1,11 @@
-use crate::shadow_orchestrator::{ShadowCompletion, ShadowExecutionSnapshot, ShadowOrchestrator};
+use crate::shadow_orchestrator::{
+    ShadowCancellationToken, ShadowCompletion, ShadowExecutionSnapshot, ShadowOrchestrator,
+};
 use crate::{AppError, PlaybackRoute, RoutePlanner};
 use aivtuber_domain::{EventEnvelope, EventKind, FallbackReason};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const SHADOW_COMPARISON_SCHEMA_VERSION: &str = "0.1.0";
 
@@ -164,6 +166,15 @@ pub enum ShadowSubmission {
 /// Deliberately narrower than the production provider interfaces: a shadow
 /// provider can only be asked for a non-executable `ShadowDecision`, and it is
 /// never consulted while `allow_provider_calls` is false.
+///
+/// #164 contract: an implementation MUST honour the authority in
+/// `ShadowPolicyInput` — `input.abort_reason()` before each blocking step and
+/// `input.remaining()` as the timeout of any call it makes. The orchestrator
+/// checks the deadline *after* `evaluate` returns as well, but that check can
+/// only discard a result; it cannot stop work already in progress. A provider
+/// that ignores the deadline keeps its worker occupied for as long as it runs,
+/// and `shutdown` joins for that long, so the bound has to be enforced by the
+/// implementation.
 pub trait ShadowProvider: Send + Sync {
     fn evaluate(&self, input: &ShadowPolicyInput<'_>) -> Result<ShadowDecision, AppError>;
 }
@@ -207,6 +218,44 @@ impl ShadowPolicyIdentity {
 pub struct ShadowPolicyInput<'a> {
     pub event: &'a EventEnvelope,
     pub remaining_budget: Option<Duration>,
+    /// Wall-clock instant this evaluation must be finished by (#164).
+    ///
+    /// Carried in the input rather than only checked around `evaluate`,
+    /// because only the implementation can actually stop its own work.
+    pub deadline: Instant,
+    /// Shadow-scoped cancellation (#164), independent of any generation token.
+    /// Cancelled when a newer event supersedes this one or shutdown begins.
+    pub cancellation: ShadowCancellationToken,
+}
+
+impl ShadowPolicyInput<'_> {
+    /// Time left before the deadline, or `None` once it has elapsed.
+    pub fn remaining(&self) -> Option<Duration> {
+        self.deadline.checked_duration_since(Instant::now())
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+
+    /// Why an implementation must abandon the evaluation now, if it must.
+    ///
+    /// Cancellation is reported ahead of the deadline so a superseded
+    /// evaluation reports why it stopped rather than blaming its deadline.
+    pub fn abort_reason(&self) -> Option<ShadowEvaluationFailure> {
+        if self.cancellation.is_cancelled() {
+            Some(ShadowEvaluationFailure::Cancelled)
+        } else if self.deadline <= Instant::now() {
+            Some(ShadowEvaluationFailure::DeadlineExceeded)
+        } else {
+            None
+        }
+    }
+
+    /// Whether this evaluation must stop before doing more work.
+    pub fn is_aborted(&self) -> bool {
+        self.abort_reason().is_some()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,6 +326,12 @@ impl ShadowDecision {
     }
 }
 
+/// A shadow policy run against one event.
+///
+/// Same #164 contract as `ShadowProvider`: an implementation MUST honour
+/// `input.abort_reason()` and `input.remaining()`. The orchestrator's
+/// before/after deadline checks discard unusable results; they cannot
+/// interrupt a policy that is already blocked.
 pub trait ShadowPolicy: Send {
     fn evaluate(&mut self, input: &ShadowPolicyInput<'_>) -> Result<ShadowDecision, AppError>;
 }
@@ -432,10 +487,18 @@ where
         matches!(&self.shadow, ShadowExecution::Bounded(orchestrator) if orchestrator.charges_budget())
     }
 
-    /// Record that the #69 budget governor refused a submitted shadow job.
-    pub fn note_shadow_budget_denied(&mut self) {
+    /// Whether shadow orchestration would admit this event right now (#164).
+    pub fn would_admit_shadow(&mut self, event: &EventEnvelope) -> bool {
+        match &self.shadow {
+            ShadowExecution::Inline(_) => false,
+            ShadowExecution::Bounded(orchestrator) => orchestrator.would_admit(event),
+        }
+    }
+
+    /// Refuse the next shadow submission before it is queued (#164).
+    pub fn deny_next_shadow_submission(&mut self) {
         if let ShadowExecution::Bounded(orchestrator) = &mut self.shadow {
-            orchestrator.note_budget_denied();
+            orchestrator.deny_next_submission();
         }
     }
 
@@ -499,9 +562,16 @@ where
                 return Ok(active_route);
             }
             ShadowExecution::Inline(shadow) => {
+                // #163 has no orchestrator and therefore no per-event shadow
+                // deadline: the composition thread is already inside the
+                // active event's own bound. The policy is still handed the
+                // authority so `abort_reason()` means something here instead
+                // of firing unconditionally.
                 let shadow_outcome = match shadow.evaluate(&ShadowPolicyInput {
                     event,
                     remaining_budget,
+                    deadline: inline_shadow_deadline(remaining_budget),
+                    cancellation: ShadowCancellationToken::default(),
                 }) {
                     Ok(decision) => ShadowEvaluationOutcome::Evaluated { decision },
                     Err(_) => ShadowEvaluationOutcome::Failed {
@@ -560,13 +630,31 @@ where
         self.shadow_charges_budget()
     }
 
-    fn note_shadow_budget_denied(&mut self) {
-        self.note_shadow_budget_denied();
+    fn would_admit_shadow(&mut self, event: &EventEnvelope) -> bool {
+        self.would_admit_shadow(event)
+    }
+
+    fn deny_next_shadow_submission(&mut self) {
+        self.deny_next_shadow_submission();
     }
 
     fn shutdown_shadow(&mut self) {
         self.shutdown_shadow();
     }
+}
+
+/// Horizon handed to a synchronous (#163) shadow evaluation.
+///
+/// #164 bounds only the orchestrated path; the synchronous path has no
+/// orchestrator, so it reports the caller's remaining budget when there is one
+/// and an explicitly far horizon otherwise.
+fn inline_shadow_deadline(remaining_budget: Option<Duration>) -> Instant {
+    const UNBOUNDED_HORIZON: Duration = Duration::from_secs(24 * 60 * 60);
+    let now = Instant::now();
+    remaining_budget
+        .and_then(|budget| now.checked_add(budget))
+        .or_else(|| now.checked_add(UNBOUNDED_HORIZON))
+        .unwrap_or(now)
 }
 
 pub(crate) fn compare_target(active: &ShadowDecision, shadow: &ShadowDecision) -> Option<bool> {
@@ -787,6 +875,8 @@ mod tests {
             .evaluate(&ShadowPolicyInput {
                 event: &input_event,
                 remaining_budget: Some(Duration::from_millis(10)),
+                deadline: inline_shadow_deadline(Some(Duration::from_millis(10))),
+                cancellation: ShadowCancellationToken::default(),
             })
             .expect("decision");
 
@@ -906,6 +996,12 @@ mod tests {
             self.open_signal.notify_all();
         }
 
+        fn try_release(&self) {
+            let mut open = self.open.lock().expect("gate open lock");
+            *open = true;
+            self.open_signal.notify_all();
+        }
+
         fn await_release(&self) {
             let mut open = self.open.lock().expect("gate open lock");
             while !*open {
@@ -930,6 +1026,37 @@ mod tests {
             let _ = input.event.kind;
             self.gate.arrive();
             self.gate.await_release();
+            Ok(self.decision.clone())
+        }
+    }
+
+    /// Honours the #164 contract properly: waits on the gate but gives up as
+    /// soon as the orchestrator cancels the token or the deadline elapses, the
+    /// way a real provider must apply its own request timeout.
+    #[derive(Clone)]
+    struct DeadlineAwareShadowPolicy {
+        decision: ShadowDecision,
+        gate: Arc<EvalGate>,
+        aborts: Arc<AtomicUsize>,
+    }
+
+    impl ShadowPolicy for DeadlineAwareShadowPolicy {
+        fn evaluate(&mut self, input: &ShadowPolicyInput<'_>) -> Result<ShadowDecision, AppError> {
+            let _ = input.event.kind;
+            self.gate.arrive();
+            let wait_ms = input.remaining().map_or(10, |left| left.as_millis() as u64) + 10;
+            let deadline = Instant::now() + Duration::from_millis(wait_ms);
+            loop {
+                if input.is_aborted() {
+                    self.aborts.fetch_add(1, Ordering::SeqCst);
+                    return Err(AppError::Routing("shadow aborted".to_owned()));
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.gate.try_release();
             Ok(self.decision.clone())
         }
     }
@@ -1462,5 +1589,210 @@ mod tests {
         )
         .expect("planner");
         assert!(charged.shadow_charges_budget());
+    }
+
+    /// #164 review: the deadline must reach the policy so it can bound its own
+    /// runtime, and a policy that honours it must let the worker be reclaimed
+    /// and `shutdown` return promptly.
+    #[test]
+    fn deadline_and_cancellation_reach_the_policy_so_it_can_bound_its_own_runtime() {
+        let gate = EvalGate::new();
+        let aborts = Arc::new(AtomicUsize::new(0));
+        let mut planner = ShadowingRoutePlanner::with_orchestrator(
+            FixedActive(PlaybackRoute::Silent),
+            DeadlineAwareShadowPolicy {
+                decision: ShadowDecision::deterministic(),
+                gate: Arc::clone(&gate),
+                aborts: Arc::clone(&aborts),
+            },
+            identity("active"),
+            identity("shadow"),
+            None,
+            ShadowOrchestratorConfig {
+                deadline_ms: 50,
+                ..bounded_config()
+            },
+        )
+        .expect("planner");
+
+        assert_eq!(
+            planner.route(&event_with_id("evt-bounded")).expect("route"),
+            PlaybackRoute::Silent
+        );
+        let drained = drain_until_abort(&mut planner);
+        assert_eq!(
+            aborts.load(Ordering::SeqCst),
+            1,
+            "the policy must be able to observe its own deadline"
+        );
+        let record = drained
+            .into_iter()
+            .find_map(|completion| completion.record)
+            .expect("deadline record");
+        assert_eq!(
+            record.shadow,
+            ShadowEvaluationOutcome::Failed {
+                reason: ShadowEvaluationFailure::DeadlineExceeded
+            }
+        );
+        // The worker was released at the deadline rather than at the policy's
+        // own convenience, so shutdown is not held by the evaluation.
+        let started = Instant::now();
+        planner.shutdown_shadow();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "shutdown must not wait out a policy that already observed its deadline"
+        );
+    }
+
+    /// #164 review: `ShadowPolicyInput` must carry the authority, and
+    /// `abort_reason` must report cancellation ahead of the deadline.
+    #[test]
+    fn policy_input_reports_cancellation_before_the_deadline() {
+        let input_event = event();
+        let cancellation = ShadowCancellationToken::default();
+        let live = ShadowPolicyInput {
+            event: &input_event,
+            remaining_budget: None,
+            deadline: Instant::now() + Duration::from_secs(30),
+            cancellation: cancellation.clone(),
+        };
+        assert!(!live.is_aborted());
+        assert!(live.remaining().is_some());
+        assert!(live.remaining().unwrap() <= Duration::from_secs(30));
+
+        cancellation.cancel();
+        assert_eq!(
+            live.abort_reason(),
+            Some(ShadowEvaluationFailure::Cancelled),
+            "a superseded evaluation must report why it stopped"
+        );
+
+        let expired = ShadowPolicyInput {
+            event: &input_event,
+            remaining_budget: None,
+            deadline: Instant::now() - Duration::from_secs(1),
+            cancellation: ShadowCancellationToken::default(),
+        };
+        assert_eq!(
+            expired.abort_reason(),
+            Some(ShadowEvaluationFailure::DeadlineExceeded)
+        );
+        assert!(expired.remaining().is_none());
+    }
+
+    /// #164 review: the #69 governor must be the admission authority. A denial
+    /// must mean the job was never queued, never executed, and that the
+    /// recorded submission describes exactly that.
+    #[test]
+    fn a_budget_denial_prevents_the_job_from_being_queued_at_all() {
+        let gate = EvalGate::new();
+        let mut planner = gated_planner(&gate, gated_deadline());
+        planner.deny_next_shadow_submission();
+
+        assert_eq!(
+            planner.route(&event_with_id("evt-denied")).expect("route"),
+            PlaybackRoute::Silent,
+            "a budget denial must never affect the active route"
+        );
+        assert_eq!(
+            planner.last_shadow_submission(),
+            Some(&ShadowSubmission::Skipped {
+                reason: ShadowSkipReason::BudgetDenied
+            })
+        );
+        // Nothing was queued, so no evaluation ever ran and no completion is
+        // ever published for a denied job.
+        let drained = drain_until_quiescent(&mut planner);
+        assert!(
+            drained.is_empty(),
+            "a denied job must not produce a completion: it was never queued"
+        );
+        let snapshot = planner.shadow_execution_snapshot().expect("snapshot");
+        assert_eq!(snapshot.submitted, 0);
+        assert_eq!(snapshot.dropped_budget_denied, 1);
+        assert!(snapshot.is_quiescent());
+
+        // The refusal is one-shot: the next event is admitted normally.
+        planner
+            .route(&event_with_id("evt-after-denial"))
+            .expect("route");
+        assert!(matches!(
+            planner.last_shadow_submission(),
+            Some(ShadowSubmission::Admitted { .. })
+        ));
+        gate.release();
+        planner.shutdown_shadow();
+    }
+
+    /// #164 review: `would_admit` must be a faithful, side-effect-free preview
+    /// of what `submit` would decide, so probing the governor beforehand
+    /// cannot desynchronise the recorded outcome from the real one.
+    #[test]
+    fn would_admit_predicts_submit_without_consuming_capacity() {
+        let mut enabled = ShadowingRoutePlanner::with_orchestrator(
+            FixedActive(PlaybackRoute::Silent),
+            FixedShadow(Ok(ShadowDecision::silent())),
+            identity("active"),
+            identity("shadow"),
+            None,
+            bounded_config(),
+        )
+        .expect("planner");
+        assert!(enabled.would_admit_shadow(&event()));
+        // Probing repeatedly must not reserve queue capacity or job ids.
+        for _ in 0..100 {
+            assert!(enabled.would_admit_shadow(&event()));
+        }
+        enabled.route(&event()).expect("route");
+        assert_eq!(
+            enabled.last_shadow_submission(),
+            Some(&ShadowSubmission::Admitted { job_id: 1 })
+        );
+        enabled.shutdown_shadow();
+
+        let mut disabled = ShadowingRoutePlanner::with_orchestrator(
+            FixedActive(PlaybackRoute::Silent),
+            FixedShadow(Ok(ShadowDecision::silent())),
+            identity("active"),
+            identity("shadow"),
+            None,
+            ShadowOrchestratorConfig {
+                enabled: false,
+                ..bounded_config()
+            },
+        )
+        .expect("planner");
+        assert!(
+            !disabled.would_admit_shadow(&event()),
+            "a disabled config must never claim it would admit"
+        );
+        disabled.shutdown_shadow();
+
+        // The synchronous #163 path has no orchestrator to admit work.
+        let mut inline = ShadowingRoutePlanner::new(
+            FixedActive(PlaybackRoute::Silent),
+            FixedShadow(Ok(ShadowDecision::silent())),
+            identity("active"),
+            identity("shadow"),
+        )
+        .expect("planner");
+        assert!(!inline.would_admit_shadow(&event()));
+    }
+
+    fn drain_until_abort<P>(
+        planner: &mut ShadowingRoutePlanner<P, DeadlineAwareShadowPolicy>,
+    ) -> Vec<ShadowCompletion> {
+        let mut collected = Vec::new();
+        for _ in 0..2_000 {
+            collected.extend(planner.drain_shadow_comparisons());
+            if let Some(snapshot) = planner.shadow_execution_snapshot()
+                && snapshot.is_quiescent()
+            {
+                return collected;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        collected
     }
 }

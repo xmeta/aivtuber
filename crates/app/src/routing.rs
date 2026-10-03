@@ -283,7 +283,15 @@ pub trait RoutePlanner: Send {
         false
     }
 
-    fn note_shadow_budget_denied(&mut self) {}
+    /// Whether shadow orchestration would admit this event right now, judged
+    /// without queueing anything (#164). The composition thread uses it to
+    /// consult the #69 governor *before* the job is submitted.
+    fn would_admit_shadow(&mut self, _event: &EventEnvelope) -> bool {
+        false
+    }
+
+    /// Refuse the next shadow submission before it is queued (#164).
+    fn deny_next_shadow_submission(&mut self) {}
 
     /// Cancel outstanding shadow work and join every shadow worker.
     fn shutdown_shadow(&mut self) {}
@@ -328,8 +336,12 @@ impl RoutePlanner for Box<dyn RoutePlanner> {
         (**self).shadow_charges_budget()
     }
 
-    fn note_shadow_budget_denied(&mut self) {
-        (**self).note_shadow_budget_denied();
+    fn would_admit_shadow(&mut self, event: &EventEnvelope) -> bool {
+        (**self).would_admit_shadow(event)
+    }
+
+    fn deny_next_shadow_submission(&mut self) {
+        (**self).deny_next_shadow_submission();
     }
 
     fn shutdown_shadow(&mut self) {

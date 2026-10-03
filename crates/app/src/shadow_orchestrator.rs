@@ -245,6 +245,15 @@ impl ShadowQueue {
         self.closed.store(true, Ordering::Release);
         self.available.notify_all();
     }
+
+    /// Whether a job could be admitted right now, without taking one.
+    ///
+    /// Lets the composition thread consult the #69 governor *before* a job is
+    /// queued, so a denial is a real admission decision rather than a
+    /// bookkeeping edit applied to work that is already running.
+    fn has_room(&self) -> bool {
+        self.state.lock().expect("shadow queue lock").len() < self.capacity
+    }
 }
 
 /// One finished shadow job.
@@ -291,6 +300,12 @@ where
     shutting_down: Arc<AtomicBool>,
     workers: Vec<JoinHandle<()>>,
     next_job_id: u64,
+    /// One-shot #69 budget refusal for the next submission (#164).
+    ///
+    /// Armed by the composition thread *before* it routes, so the governor is
+    /// the admission authority: a refused event is never queued, never
+    /// executed, and never needs cancelling after the fact.
+    pending_budget_denial: bool,
     last_submission: Option<ShadowSubmission>,
     last_comparison: Option<ShadowComparisonRecord>,
     /// Token of the most recently admitted job. Superseded when a newer job is
@@ -388,6 +403,7 @@ where
             shutting_down,
             workers,
             next_job_id: 0,
+            pending_budget_denial: false,
             last_submission: None,
             last_comparison: None,
             active_token: None,
@@ -459,6 +475,12 @@ where
         shadow_identity: &ShadowPolicyIdentity,
         active: ShadowDecision,
     ) -> ShadowSubmission {
+        if self.pending_budget_denial {
+            // Consume the refusal: this attempt is denied, and it was never
+            // queued, so nothing needs cancelling or unwinding.
+            self.pending_budget_denial = false;
+            return self.skip(ShadowSkipReason::BudgetDenied);
+        }
         if let Some(reason) = self.config.skip_reason(event) {
             return self.skip(reason);
         }
@@ -510,15 +532,26 @@ where
         submission
     }
 
-    /// Record that the #69 budget ledger refused a submitted shadow job.
-    pub fn note_budget_denied(&mut self) {
-        self.counters
-            .dropped_budget_denied
-            .fetch_add(1, Ordering::Relaxed);
-        let submission = ShadowSubmission::Skipped {
-            reason: ShadowSkipReason::BudgetDenied,
-        };
-        self.last_submission = Some(submission);
+    /// Whether the deterministic admission gates (enabled, kind filter, sample)
+    /// and the queue capacity would admit this event right now.
+    ///
+    /// Read-only: it takes no slot, moves no counter, and cannot queue work. The
+    /// composition thread uses it to ask the #69 governor first, so a budget
+    /// denial stops the job from being queued at all.
+    pub fn would_admit(&self, event: &EventEnvelope) -> bool {
+        !self.shutting_down.load(Ordering::Acquire)
+            && self.config.skip_reason(event).is_none()
+            && self.work.has_room()
+    }
+
+    /// Refuse the next admission attempt, before it is queued (#164).
+    ///
+    /// Called by the composition thread after the #69 governor denies the
+    /// event. The next `submit` reports `Skipped { BudgetDenied }` without
+    /// touching the queue, so denied work is never executed and the recorded
+    /// submission matches what actually happened.
+    pub fn deny_next_submission(&mut self) {
+        self.pending_budget_denial = true;
     }
 
     pub fn snapshot(&self) -> ShadowExecutionSnapshot {
@@ -599,23 +632,27 @@ fn run_job<S: ShadowPolicy>(
     let input = ShadowPolicyInput {
         event: &event,
         remaining_budget,
+        deadline,
+        cancellation: cancellation.clone(),
     };
 
     // A job that is already stale when it starts, or that starts after
     // shutdown began, must not produce evidence: the record would describe a
     // comparison the runtime no longer cares about.
-    if shutting_down.load(Ordering::Acquire) || cancellation.is_cancelled() {
+    if shutting_down.load(Ordering::Acquire) || input.is_cancelled() {
         return JobOutcome::Discarded;
     }
-    if Instant::now() >= deadline {
-        counters.deadline_exceeded.fetch_add(1, Ordering::Relaxed);
+    if let Some(reason) = input.abort_reason() {
+        if reason == ShadowEvaluationFailure::DeadlineExceeded {
+            counters.deadline_exceeded.fetch_add(1, Ordering::Relaxed);
+        }
         return JobOutcome::Record(Box::new(failed_record(
             &event_id,
             &correlation_id,
             &active_identity,
             &shadow_identity,
             &active,
-            ShadowEvaluationFailure::DeadlineExceeded,
+            reason,
         )));
     }
     let evaluated = if config.allow_provider_calls {
@@ -636,18 +673,23 @@ fn run_job<S: ShadowPolicy>(
         policy.evaluate(&input)
     };
 
-    if shutting_down.load(Ordering::Acquire) || cancellation.is_cancelled() {
+    // Re-checked after `evaluate` returns: the policy was handed this same
+    // deadline and token so it could stop itself, but only this check can
+    // guarantee a late decision is never published as evidence.
+    if shutting_down.load(Ordering::Acquire) || input.is_cancelled() {
         return JobOutcome::Discarded;
     }
-    if Instant::now() >= deadline {
-        counters.deadline_exceeded.fetch_add(1, Ordering::Relaxed);
+    if let Some(reason) = input.abort_reason() {
+        if reason == ShadowEvaluationFailure::DeadlineExceeded {
+            counters.deadline_exceeded.fetch_add(1, Ordering::Relaxed);
+        }
         return JobOutcome::Record(Box::new(failed_record(
             &event_id,
             &correlation_id,
             &active_identity,
             &shadow_identity,
             &active,
-            ShadowEvaluationFailure::DeadlineExceeded,
+            reason,
         )));
     }
 

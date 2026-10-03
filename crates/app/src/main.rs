@@ -731,20 +731,11 @@ fn wrap_with_shadow_orchestration(
     let config = ShadowOrchestratorConfig {
         schema_version: SHADOW_ORCHESTRATOR_SCHEMA_VERSION.to_owned(),
         enabled: true,
-        sample_rate_per_10k: env_u64(
-            "AIVTUBER_SHADOW_SAMPLE_RATE",
-            defaults.sample_rate_per_10k as u64,
-        )? as u32,
+        sample_rate_per_10k: env_u32("AIVTUBER_SHADOW_SAMPLE_RATE", defaults.sample_rate_per_10k)?,
         seed: env_u64("AIVTUBER_SHADOW_SEED", 0)?,
         event_kinds: parse_shadow_event_kinds()?,
-        max_concurrent: env_u64(
-            "AIVTUBER_SHADOW_MAX_CONCURRENT",
-            defaults.max_concurrent as u64,
-        )? as usize,
-        queue_capacity: env_u64(
-            "AIVTUBER_SHADOW_QUEUE_CAPACITY",
-            defaults.queue_capacity as u64,
-        )? as usize,
+        max_concurrent: env_usize("AIVTUBER_SHADOW_MAX_CONCURRENT", defaults.max_concurrent)?,
+        queue_capacity: env_usize("AIVTUBER_SHADOW_QUEUE_CAPACITY", defaults.queue_capacity)?,
         deadline_ms: env_u64("AIVTUBER_SHADOW_DEADLINE_MS", defaults.deadline_ms)?,
         allow_provider_calls: env_bool("AIVTUBER_SHADOW_ALLOW_PROVIDER", false)?,
         charge_shadow_to_budget: env_bool("AIVTUBER_SHADOW_CHARGE_BUDGET", false)?,
@@ -865,6 +856,24 @@ fn env_u64(name: &str, default: u64) -> Result<u64, Box<dyn Error>> {
     })
 }
 
+/// Checked `u32` environment parsing. A narrowing `as u32` would silently wrap
+/// (e.g. `4294967296` becoming `0`), which contradicts the promise that invalid
+/// shadow configuration is rejected rather than clamped.
+fn env_u32(name: &str, default: u32) -> Result<u32, Box<dyn Error>> {
+    let value = env_u64(name, u64::from(default))?;
+    narrow_u32(name, value)
+}
+
+fn narrow_u32(name: &str, value: u64) -> Result<u32, Box<dyn Error>> {
+    u32::try_from(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must fit in 32 bits: {value}"),
+        )
+        .into()
+    })
+}
+
 fn env_usize(name: &str, default: usize) -> Result<usize, Box<dyn Error>> {
     let value = env_u64(name, default as u64)?;
     usize::try_from(value).map_err(|_| {
@@ -887,4 +896,42 @@ fn env_f64(name: &str, default: f64) -> Result<f64, Box<dyn Error>> {
         )
         .into()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #164 review: shadow bounds must be rejected, never silently wrapped.
+    /// `4294967296 as u32` is `0`, which would then pass `validate()`.
+    #[test]
+    fn shadow_bounds_reject_narrowing_overflow_instead_of_wrapping() {
+        assert_eq!(
+            narrow_u32("AIVTUBER_SHADOW_SAMPLE_RATE", 10_000).expect("in range"),
+            10_000
+        );
+        assert_eq!(
+            narrow_u32("AIVTUBER_SHADOW_SAMPLE_RATE", u64::from(u32::MAX)).expect("boundary"),
+            u32::MAX
+        );
+        for overflowing in [u64::from(u32::MAX) + 1, 4_294_967_296, u64::MAX] {
+            let error = narrow_u32("AIVTUBER_SHADOW_SAMPLE_RATE", overflowing)
+                .expect_err("must reject, never wrap");
+            assert!(
+                error.to_string().contains("must fit in 32 bits"),
+                "unexpected error: {error}"
+            );
+        }
+        // The value that used to wrap to 0 would otherwise have been read as
+        // "sample nothing" rather than rejected as an invalid configuration.
+        assert_ne!(
+            narrow_u32("AIVTUBER_SHADOW_SAMPLE_RATE", 4_294_967_296).ok(),
+            Some(0)
+        );
+
+        assert!(
+            usize::try_from(u64::MAX).is_err() || usize::BITS == 64,
+            "the usize conversion must stay platform-safe"
+        );
+    }
 }

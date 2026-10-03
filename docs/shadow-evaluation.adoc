@@ -242,6 +242,29 @@ A result produced after the deadline is discarded and reported as
 `Failed { deadline_exceeded }`; a decision that was already stale when it
 finished must not be published as evidence.
 
+=== 8.4.1 The deadline is enforced by the implementation
+
+The deadline and the `ShadowCancellationToken` are carried *inside*
+`ShadowPolicyInput`, which is handed to both `ShadowPolicy::evaluate` and
+`ShadowProvider::evaluate`. This is the only way the bound actually bounds
+runtime: a check taken before and after `evaluate` can discard a late result
+but cannot stop work that is already running, so a provider that blocked for
+30s would keep its worker for 30s and `shutdown` would join for 30s.
+
+An implementation is therefore required to:
+
+* poll `input.abort_reason()` before each blocking step, and
+* use `input.remaining()` as the timeout of any call it makes.
+
+`abort_reason()` reports `cancelled` ahead of `deadline_exceeded`, so a
+superseded evaluation reports why it stopped rather than blaming its deadline.
+The orchestrator still re-checks both after `evaluate` returns, so a late or
+stale decision can never be published even if an implementation is imperfect.
+
+The synchronous #163 path has no orchestrator and therefore no per-event
+shadow deadline: it hands the policy the caller's remaining budget as its
+horizon, so `abort_reason()` remains meaningful there too.
+
 Admitting newer work supersedes the previous in-flight evaluation. Every
 admitted job produces exactly one `ShadowCompletion`, carrying `None` when it
 was superseded, so a per-job resource such as a budget reservation is never
@@ -252,7 +275,8 @@ work and **joins** every worker. Blocking is intentional: "no shadow work
 running after shutdown" cannot be proven about a detached worker. `Drop` is
 deliberately weaker — it closes the queue and cancels, but only joins workers
 that have already finished, because a policy that ignores its token must not
-deadlock a drop.
+deadlock a drop. The join is bounded by `deadline_ms` for any implementation
+that honours the contract in 8.4.1.
 
 === 8.5 Provider calls are off by default
 
@@ -270,6 +294,24 @@ Shadow work is free by default. Admission offers
 `charge_shadow_to_budget` is enabled in the orchestrator config *and* in the
 governor policy; the governor remains the authority, and its default short
 -circuit leaves the active ledger untouched. No parallel ledger was added.
+
+Admission is decided *before* the job is submitted, not after. The composition
+thread calls `would_admit_shadow` — a side-effect-free preview of what
+`submit` would decide, taking no queue slot and no job id — and only then asks
+the governor. A refusal arms `deny_next_shadow_submission`, so the next
+`submit` reports `Skipped { budget_denied }` without ever touching the queue.
+
+This ordering is the point: probing afterwards could only relabel work that was
+already queued and possibly already running, which would let denied work
+execute anyway and leave the recorded submission describing something that
+never happened. Because the refusal precedes queueing, a denied event produces
+no job, no worker occupancy, no completion, and no evidence, and
+`last_submission` describes exactly that. The refusal is one-shot: the next
+event is admitted normally.
+
+When the orchestrator would not admit the event anyway — disabled, filtered,
+unsampled, or saturated — no budget is consumed, because there is no work to
+pay for.
 
 === 8.7 Active-output invariance
 
