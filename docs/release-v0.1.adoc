@@ -1021,7 +1021,7 @@ main push runs:
         CI 37079054904 (push) -- success
         Benchmark gate 37079054894 (push) -- success
         Record main benchmark history: success; Replay base vs head: skipped (PR-only by design)
-benchmark-data commit f35e88ec58c4cf3471be66cc67eedc5119b, run_id run-37079054894:
+benchmark-data commit f35e88ec58c4cf3471be66cc67da2d07c3f58f35, run_id run-37079054894:
         recorded git.commit c8e545d (the merged commit), all invariants 0,
         routing.route_decision.p95_us value 3, sample_count 3 (single-run history record)
 cargo test --locked --workspace at c8e545d: 342 passed, 0 failed
@@ -1050,8 +1050,9 @@ section 13.
   because the measurement is in single-digit microseconds, and the absolute thresholds were
   calibrated against measured noise, not against a failing run; `benchmarks/budgets.json`
   remains reviewed like code.
-* The `--base`/`--head` comparison and the aggregation rules are covered by 20 telemetry
-  unit tests and 4 comparator CLI tests, including the review findings above.
+* The `--base`/`--head` comparison and the aggregation rules are covered by the 21 unit
+  tests in `crates/telemetry/src/benchmark_gate.rs` (39 in the `aivtuber-telemetry` crate
+  as a whole) and 4 comparator CLI tests, including the review findings above.
 
 === Known limitation carried forward
 
