@@ -29,20 +29,22 @@ The reusable execution/evidence template is link:release-v0.1.adoc[v0.1 Release 
 
 Stage 1 exit requires the core runtime to be bounded and operable, with explicit production profiles, usable template/reflex/generative routing, authenticated operator control, provider/deadline boundaries, diagnostics, and degradation behavior.
 
-=== Immediate critical path
+=== Current state
 
-Current dependency state:
+The core v0.1 implementation issues named in the #97 release gate are complete:
 
-. https://github.com/xmeta/aivtuber/issues/52[#52] scheduler active/history boundedness is *complete*.
-. https://github.com/xmeta/aivtuber/issues/53[#53] generated Performance Asset L0 deterministic eviction is *complete*.
-. Their shared blocker on https://github.com/xmeta/aivtuber/issues/51[#51] is resolved; #51 is now the next retention-integration step and is `status:agent-ready`.
-. https://github.com/xmeta/aivtuber/issues/65[#65] retained causal tracing remains implementation-blocked until #51 provides the shared retention contract, although trace vocabulary/design work is `status:design-ready`.
-. https://github.com/xmeta/aivtuber/issues/54[#54] remains independently agent-ready as the user-visible Template route defect.
+- retention integration (#51), template route (#54), retained causal tracing (#65), provider conformance (#66), E2E deadline accounting (#67), supply-chain gates (#100), native audio evidence (#101), production composition profiles (#55), operator control (#56), diagnostics (#68), generative budgets (#69) have all landed.
+- The #97 end-to-end release checklist is the only remaining release criterion: recorded evidence in `docs/release-v0.1.adoc` shows **36/36** criteria satisfied and the decision is **GO**. The tracking issue itself is closeable once the released checkpoint is recorded.
+- Release evidence for the calibration gap in the replay benchmark is recorded in `docs/release-v0.1.adoc` section 14; the #183/#184 evidence/doc corrections are merged into `main`.
 
-Other Stage 1 work may proceed in parallel when ownership is independent.
-Current independent agent-ready work includes provider conformance (#66), end-to-end deadline accounting (#67), supply-chain gates (#100), and the evidence spike for native audio (#101).
+Autonomous work now tracks live GitHub metadata, not a hard-coded list. The remaining Stage 1 implementation slices are:
 
-Production composition profiles (#55), local operator control (#56), diagnostics (#68), generative budgets (#69), workload models (#70), and operational SLO work (#71) should continue to use the shared boundedness/evidence contracts rather than creating parallel ownership.
+- #57 tracking parent, with implementation slices #145 (property tests), #146 (fuzz targets), and #147 (bounded CI / corpus integration; blocked on #145/#146);
+- #70 realistic workload scenarios;
+- #71 operational SLOs, blocked on #70;
+- #125 tgrep provisioning documentation.
+
+These carry `status:agent-ready` and remain the durable way to identify what may start next.
 
 The reusable v0.1 evidence procedure is link:release-v0.1.adoc[v0.1 Release Checklist and Evidence Record].
 
