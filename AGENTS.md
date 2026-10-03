@@ -134,11 +134,12 @@ v1.0.11 release page above, extract `tgrep.exe`, and put it in a directory on
 tgrep.exe --version   # must report 1.0.11
 ~~~
 
-From source (needs a Rust toolchain; use this when no pre-built asset matches
+From source (needs a Rust toolchain; use this when no pre-built asset covers
 your platform). v1.0.11 ships assets for x86_64 and aarch64 on `apple-darwin`,
-`pc-windows-msvc`, and `unknown-linux-musl` only, so a platform outside that set
-(32-bit x86/armv7, a non-musl-specific Linux target, FreeBSD) needs the source
-path. Pin to the same tag so the build matches the binary path:
+`pc-windows-msvc`, and `unknown-linux-musl` — the Linux assets are static-pie, so
+they are not limited to musl distributions. Architectures or operating systems
+outside that set (for example 32-bit x86 or armv7) need the source path. Pin to
+the same tag so the build matches the binary path:
 
 ~~~sh
 git clone --branch v1.0.11 --depth 1 https://github.com/microsoft/tgrep.git
