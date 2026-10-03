@@ -72,9 +72,9 @@ If a change touches one of these boundaries, read docs/security-threat-model.ado
 
 Use tgrep for repository-content searches.
 
-Recommended install (repo scope): place `tgrep.exe` for `x86_64-pc-windows-msvc`
-(v1.0.11, released 2026-10-03) on `PATH` or in the repository root and use it
-directly. The upstream project is microsoft/tgrep (public GitHub release).
+The upstream project is microsoft/tgrep (public GitHub release). Install it on
+`PATH` for the platform you are actually working on, then use it directly. See
+"Installing tgrep" below for the Linux/WSL, Windows, and source paths.
 
 Recommended setup from the repository root:
 
@@ -96,17 +96,61 @@ tgrep uses -g/--glob; it does not use ripgrep's --include option.
 Search with PATH . from the repository root so one root index is reused; narrow scope with -g/--glob or -t/--type rather than changing the search root.
 The index is a snapshot: rebuild with tgrep index . after edits when you need searches to include changed files, or use --no-index for a one-off live scan.
 
+### Installing tgrep
+
+Upstream release: https://github.com/microsoft/tgrep/releases/tag/v1.0.11
+(released 2026-09-26). Pick the asset that matches your platform and install it
+into a directory on `PATH`. Do not drop the executable into the repository root:
+a bare `tgrep` will not resolve without a leading `./`, so every documented
+command below would fail while looking like it should work.
+
+Linux / WSL x86_64 (the `x86_64-unknown-linux-musl` asset is statically linked,
+so it runs on any glibc or musl distro):
+
+~~~sh
+tmpdir="$(mktemp -d)"
+gh release download --repo microsoft/tgrep -p '*x86_64-unknown-linux-musl.tar.gz' -D "$tmpdir"
+tar xzf "$tmpdir"/tgrep-*-x86_64-unknown-linux-musl.tar.gz -C "$tmpdir"
+mkdir -p "$HOME/.local/bin"
+install -m755 "$tmpdir/tgrep" "$HOME/.local/bin/tgrep"
+rm -rf "$tmpdir"
+hash -r
+tgrep --version
+~~~
+
+If `~/.local/bin` is not on your `PATH`, use `~/.cargo/bin` (the destination
+`cargo install` uses) or `/usr/local/bin` instead.
+
+Windows x86_64 (download `tgrep-v1.0.11-x86_64-pc-windows-msvc.zip`, extract
+`tgrep.exe`, and put it in a directory on `PATH`, e.g. `C:\Users\<you>\bin`):
+
+~~~powershell
+tgrep.exe --version
+~~~
+
+From source (needs a Rust toolchain; use this when no pre-built asset matches
+your platform, e.g. aarch64 Linux):
+
+~~~sh
+git clone https://github.com/microsoft/tgrep.git
+cd tgrep
+cargo install --path tgrep-cli --locked
+tgrep --version
+~~~
+
+After installing, index the checkout once so searches resolve:
+
+~~~sh
+cd /path/to/this/repository
+tgrep index .
+tgrep status .
+tgrep --version
+~~~
+
 ### If tgrep is not installed or not indexed for this checkout
 
-Confirm availability before relying on it (`tgrep status .`; run `tgrep index .` first if that fails).
-
-- If it is not installed, provision the v1.0.11 Windows binary (`tgrep.exe`) from
-  https://github.com/microsoft/tgrep/releases/tag/v1.0.11 and put it on `PATH` or
-  in the repository root.
-- If it cannot be installed or run in the current environment, state this explicitly
-  and do not proceed as if tgrep were used.
-
-Confirm tgrep before relying on it (tgrep status .; run tgrep index . first if that fails).
+Confirm availability before relying on it (`tgrep --version`; `tgrep status .`;
+run `tgrep index .` first if that fails).
 
 If tgrep cannot be installed or run in the current environment:
 
