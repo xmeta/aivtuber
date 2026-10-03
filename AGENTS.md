@@ -72,6 +72,10 @@ If a change touches one of these boundaries, read docs/security-threat-model.ado
 
 Use tgrep for repository-content searches.
 
+Recommended install (repo scope): place `tgrep.exe` for `x86_64-pc-windows-msvc`
+(v1.0.11, released 2026-10-03) on `PATH` or in the repository root and use it
+directly. The upstream project is microsoft/tgrep (public GitHub release).
+
 Recommended setup from the repository root:
 
 ~~~sh
@@ -92,7 +96,15 @@ tgrep uses -g/--glob; it does not use ripgrep's --include option.
 Search with PATH . from the repository root so one root index is reused; narrow scope with -g/--glob or -t/--type rather than changing the search root.
 The index is a snapshot: rebuild with tgrep index . after edits when you need searches to include changed files, or use --no-index for a one-off live scan.
 
-### When tgrep is unavailable
+### If tgrep is not installed or not indexed for this checkout
+
+Confirm availability before relying on it (`tgrep status .`; run `tgrep index .` first if that fails).
+
+- If it is not installed, provision the v1.0.11 Windows binary (`tgrep.exe`) from
+  https://github.com/microsoft/tgrep/releases/tag/v1.0.11 and put it on `PATH` or
+  in the repository root.
+- If it cannot be installed or run in the current environment, state this explicitly
+  and do not proceed as if tgrep were used.
 
 Confirm tgrep before relying on it (tgrep status .; run tgrep index . first if that fails).
 
