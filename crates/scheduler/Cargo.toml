@@ -9,3 +9,11 @@ publish.workspace = true
 aivtuber-domain = { path = "../domain" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# Generated property coverage for scheduler/cancellation/replay invariants
+# (issue #145). `default-features = false` keeps the fork/tempfile-based
+# process-isolation and persistence machinery out of the graph: shrinking runs
+# in-process and failing cases are reproduced by the checked-in
+# `proptest-regressions` files instead.
+[dev-dependencies]
+proptest = { version = "1.7", default-features = false, features = ["std", "bit-set"] }

@@ -36,6 +36,7 @@ The core design separates three time scales:
 * link:docs/reuse-first.adoc[Reuse-first library and reference-implementation matrix]
 * link:docs/supply-chain.adoc[Supply-chain policy (cargo-deny gate and advisory exceptions)]
 * link:docs/fuzzing.adoc[Parser and bounded-text fuzzing (libFuzzer targets and deterministic byte-bound properties)]
+* link:docs/property-testing.adoc[Generated property coverage for scheduler/replay invariants (#145)]
 * link:docs/research-register.adoc[Research and design register]
 * link:docs/release-v0.1.adoc[v0.1 release checklist and evidence record]
 * link:docs/assumptions.adoc[Assumption register]
