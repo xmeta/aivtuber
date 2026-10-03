@@ -24,7 +24,7 @@ It describes how the architecture was bootstrapped; it is not a second active PM
 
 Goal: a bounded, secure, operable production runtime that can be exercised as a minimum usable live stream.
 
-The product-level release gate is tracked by https://github.com/xmeta/aivtuber/issues/97[#97, v0.1 minimum usable live-stream release gate].
+The product-level release gate is https://github.com/xmeta/aivtuber/issues/97[#97, v0.1 minimum usable live-stream release gate], which was closed as completed on 2026-10-03.
 The reusable execution/evidence template is link:release-v0.1.adoc[v0.1 Release Checklist and Evidence Record].
 
 Stage 1 exit requires the core runtime to be bounded and operable, with explicit production profiles, usable template/reflex/generative routing, authenticated operator control, provider/deadline boundaries, diagnostics, and degradation behavior.
@@ -34,21 +34,21 @@ Stage 1 exit requires the core runtime to be bounded and operable, with explicit
 The core v0.1 implementation issues named in the #97 release gate are complete:
 
 - retention integration (#51), template route (#54), retained causal tracing (#65), provider conformance (#66), E2E deadline accounting (#67), supply-chain gates (#100), native audio evidence (#101), production composition profiles (#55), operator control (#56), diagnostics (#68), generative budgets (#69) have all landed.
-- The #97 end-to-end release checklist is the only remaining release criterion: recorded evidence in `docs/release-v0.1.adoc` shows **36/36** criteria satisfied and the decision is **GO**. The tracking issue itself is closeable once the released checkpoint is recorded.
+- The #97 end-to-end release gate passed: recorded evidence in `docs/release-v0.1.adoc` shows **36/36** criteria satisfied and the decision is **GO**. Issue #97 was closed as completed on 2026-10-03, so the gate is a finished checkpoint, not a pending closeable item.
 - Release evidence for the calibration gap in the replay benchmark is recorded in `docs/release-v0.1.adoc` section 14; the #183/#184 evidence/doc corrections are merged into `main`.
 
-Autonomous work now tracks live GitHub metadata, not a hard-coded list. The remaining Stage 1 implementation slices are:
+The remaining Stage 1 hardening and process work is:
 
-- #57 tracking parent, with implementation slices #145 (property tests), #146 (fuzz targets), and #147 (bounded CI / corpus integration; blocked on #145/#146);
+- verification toolchain, tracked by parent #57, with implementation slices #145 (property tests), #146 (fuzz targets), and #147 (bounded CI / corpus integration; blocked on #145/#146);
 - #70 realistic workload scenarios;
 - #71 operational SLOs, blocked on #70;
 - #125 tgrep provisioning documentation.
 
-These carry `status:agent-ready` and remain the durable way to identify what may start next.
+The durable rule is that **live GitHub labels are the execution source of truth**: read the issue's own milestone, priority, and status labels (`tracking`, `status:agent-ready`, `status:blocked`, `status:design-ready`) to decide what may start next. The list above is orientation only and is expected to drift; never infer readiness from this document, from a branch name, or from an earlier agent note.
 
 The reusable v0.1 evidence procedure is link:release-v0.1.adoc[v0.1 Release Checklist and Evidence Record].
 
-Stage 1 is complete only when the subsystem criteria and the #97 end-to-end release checklist both pass.
+The Stage 1 subsystem criteria and the #97 end-to-end release gate both passed; the slices listed above are hardening and durability work that does not reopen the gate.
 
 == Stage 2 -- Evidence-Driven Engineering Loop
 
