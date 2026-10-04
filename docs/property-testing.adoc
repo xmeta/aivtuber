@@ -1,0 +1,133 @@
+= Generated property coverage (issue #145)
+
+== Scope
+
+Issue #145 adds `proptest`-generated coverage for the deterministic
+scheduler/replay state machines. It deliberately does *not* add parser fuzz
+targets (issue #146) or the bounded CI/corpus job (issue #147), so those remain
+separable slices of parent #57.
+
+== Where it lives
+
+`crates/scheduler/tests/properties.rs`, an integration test target in the
+scheduler crate.
+
+That is the smallest boundary that owns every invariant in scope: `Scheduler`
+holds arbitration, preemption, rejection, cancellation, operator stop and
+bounded retention, and `ReplayHarness` holds deterministic replay and sink-action
+construction. Reaching further out would either duplicate the state machine or
+test through a layer that cannot observe the invariant.
+
+Two consequences follow from using an integration target rather than a
+`#[cfg(test)]` module:
+
+* the properties exercise the crate's public surface exactly as a consumer sees
+  it, so a private helper cannot accidentally become load-bearing;
+* `proptest` is a `[dev-dependencies]` entry and never reaches a production
+  build. `cargo tree --edges normal` contains no `proptest` node for any
+  workspace member; only `--edges dev` does.
+
+`proptest` is declared with `default-features = false, features = ["std",
+"bit-set"]`. That keeps the `fork`/`rusty-fork`/`tempfile` process-isolation
+machinery out of the dependency graph: shrinking runs in-process, and failing
+cases are reproduced from the checked-in regression file instead.
+
+== Invariants covered
+
+Each property is a whole-sequence invariant, so a failure reports the minimal
+operation sequence that broke it.
+
+`generated_operation_sequences_preserve_scheduler_invariants` drives up to 40
+generated operations (schedule, advance, operator stop, complete-all) against a
+generated `SchedulerConfig` and checks, after every single step:
+
+* *Resource exclusivity.* Two plans that conflict — exclusive work against
+  anything, otherwise intersecting channel sets — never occupy the same instant.
+  The conflict predicate is restated in the test rather than imported, so the
+  property asserts the arbitration rule instead of restating the implementation.
+* *Rejection atomicity.* A refused schedule leaves the live collection, history,
+  metrics, generation counter and logical clock byte-identical. `last_rejection`
+  is asserted separately, because reporting the rejection is the documented
+  output of a rejection rather than a leaked reservation.
+* *Stale-action suppression.* Every live item is reachable through both public
+  liveness indexes, and nothing in terminal history remains reachable through
+  either. This is what makes a cancelled or stopped audio/avatar action
+  undispatchable.
+* *Terminal classification.* Completed work has no interior cancellation
+  boundary; cancelled work always has one; nothing non-terminal appears in
+  history.
+* *Bounded retention.* Metrics agree with the actual history, and the ring
+  policy never retains more than its configured capacity. `RetainAll` is
+  documented to grow without bound, so the capacity bound applies only to the
+  ring.
+
+`a_live_event_cannot_be_scheduled_twice` covered the same stale-action concern
+from the request side. It has been removed: it asserted that re-requesting a
+live event cannot produce a second live generation, but that is not the
+scheduler's contract. `Scheduler::schedule_at` accepts a second request for an
+`event_id` that is already live and overwrites the event liveness index with the
+newer generation. The property's assertion
+(`live.plan.generation != accepted.generation`) was therefore trivially true in
+exactly the case it was written to catch, so it passed without checking
+anything. Asserting the invariant would have meant first making it true, which
+is a contract change rather than a test change; until that decision is made the
+claim is recorded here instead of being asserted.
+
+Known gap, stated so it is not mistaken for covered: scheduling an `event_id`
+that is already live produces two live items sharing one id. The newer one owns
+the entry in the event liveness index, and `retire()` removes that entry
+unconditionally, so the older item stays reachable by generation but not by
+event id. `check_liveness_index_consistency` does not catch this because it
+asserts the event key is *present*, not that it resolves to the same item.
+`live_item_by_event` has no consumer outside the scheduler's own tests today,
+which is why this is recorded rather than treated as a live defect.
+
+`stale_actions_are_never_dispatchable` works at the sink boundary instead of the
+scheduler boundary. It asserts that every start action corresponds to an item
+that was not cancelled before its logical start, that no generation starts
+twice, and that every stop is preceded by a start for the same generation.
+
+`identical_trace_seed_and_config_are_byte_identical`,
+`the_seed_actually_varies_the_replay`, and
+`replay_is_independent_of_input_order` cover replay determinism. The first is
+the determinism requirement itself; the other two exist because a determinism
+property is trivially satisfied by a harness that ignores its inputs. The seed
+property sweeps 64 seeds rather than comparing a pair, because two seeds can
+coincidentally round to the same millisecond start delay.
+
+== Reproducing and shrinking a failure
+
+Failing cases are persisted to `crates/scheduler/proptest-regressions/properties.txt`
+and replayed on every later run, so a regression becomes a checked-in input
+rather than something that has to be rediscovered.
+
+To replay only the persisted cases:
+
+[source,shell]
+----
+PROPTEST_CASES=1 cargo test --locked -p aivtuber-scheduler --test properties
+----
+
+To widen the search while investigating:
+
+[source,shell]
+----
+PROPTEST_CASES=10000 cargo test --locked -p aivtuber-scheduler --test properties
+----
+
+The default is 96 cases per property, which keeps the whole target inside the
+normal `cargo test --locked --workspace` gate in a couple of seconds. Widening
+is an investigation step, not the committed default.
+
+== What the properties do not guarantee
+
+These properties explore operation sequences against the *current*
+implementation. They cannot prove an invariant holds for every possible
+schedule, and they say nothing about the interleavings inside the concurrent
+shadow orchestration of issue #164, which needs a different mechanism (an FSM
+explorer or explicit test hooks) because its ordering properties are about
+thread interleaving rather than about reachable scheduler states.
+
+Every property here was verified to be non-vacuous by mutating the scheduler and
+confirmating the corresponding failure, including the cases where a mutation
+correctly did *not* fail because the property does not claim that behaviour.
