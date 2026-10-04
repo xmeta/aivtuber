@@ -36,9 +36,8 @@ fuzz_target!(|data: &[u8]| {
 
     // validate() takes &self and must be idempotent, because it is called again
     // on the hot path and on every cache refresh.
-    assert_eq!(
+    assert!(
         asset.validate().is_ok(),
-        true,
         "validate() is not idempotent for {}",
         asset.id
     );

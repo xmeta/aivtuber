@@ -145,6 +145,22 @@ Because the crate is outside the workspace it cannot inherit
 `[workspace.package]`, so `edition` and `rust-version` are restated literally
 and the same contract test fails if they drift from the root manifest.
 
+The exclusion has a second cost worth naming: `cargo fmt --all` and
+`cargo clippy --workspace` skip an excluded crate, so the fuzz targets were
+unformatted and unlinted while both commands still reported success. CI
+therefore runs them against the fuzz manifest directly:
+
+[source,text]
+----
+cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+----
+
+Both use the pinned stable toolchain; nightly is needed only to *run* a
+campaign, not to format or lint it. Adding these two steps is what caught a
+`bool_assert_comparison` lint in two targets, and three missing trailing
+newlines, on the first run.
+
 == 8. Running a target
 
 Prerequisites (local only; not a repository CI dependency):

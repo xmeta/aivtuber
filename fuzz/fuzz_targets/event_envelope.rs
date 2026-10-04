@@ -43,9 +43,8 @@ fuzz_target!(|data: &[u8]| {
 
         // Re-validation must be idempotent: validation is called on the hot
         // path and must not mutate what a second call would judge.
-        assert_eq!(
+        assert!(
             envelope.validate().is_ok(),
-            true,
             "validate() is not idempotent for {envelope:?}"
         );
     }
