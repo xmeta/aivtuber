@@ -11,6 +11,9 @@
 //   and development/holdout partitions must not share case IDs or leakage groups.
 // - examples/evaluation/reaction-quality-review/*.json must conform to the pairwise-review schema
 //   and match the referenced dataset partition, case categories, quality dimensions, and seeded A/B mapping.
+// - examples/evaluation/moderation-evaluation/*.json must conform to the moderation-evaluation schema,
+//   invalid/ must REJECT against it, and inconsistent/ must pass the schema while tripping a
+//   cross-field check (#77).
 //
 // Usage: bun scripts/validate.mjs  (or: node scripts/validate.mjs)
 
@@ -75,6 +78,7 @@ const asset = validators["schemas/performance-asset.schema.json"];
 const reactionQuality = validators["schemas/reaction-quality-dataset.schema.json"];
 const reactionQualityReview = validators["schemas/reaction-quality-review.schema.json"];
 const shadowDivergence = validators["schemas/shadow-divergence-report.schema.json"];
+const moderationEvaluation = validators["schemas/moderation-evaluation.schema.json"];
 
 function report(ok, label, validator) {
   if (ok) {
@@ -439,6 +443,421 @@ for (const file of listJson("examples/evaluation/shadow-divergence/inconsistent"
   }
 }
 
+
+// ---------------------------------------------------------------------------
+// Issue #77: shadow moderation evaluation must be measurable offline, with no
+// path from a label to an automatic destructive action.
+// ---------------------------------------------------------------------------
+const MODERATION_CATEGORIES = [
+  "none",
+  "spam",
+  "flood",
+  "harassment",
+  "scam",
+  "hate_speech",
+  "threat",
+  "sexual_content",
+  "impersonation",
+];
+// Destructive in the sense of #77: acting removes or restricts something the
+// author can observe. `human_review` is deliberately absent, because escalating
+// to a human is the escape hatch that keeps `ban` human-approved.
+const MODERATION_DESTRUCTIVE = ["delete", "timeout", "ban"];
+const MODERATION_DESTRUCTIVE_METRICS = new Set(
+  MODERATION_DESTRUCTIVE.map((action) => action),
+);
+
+const moderationEvaluationDocuments = [];
+for (const file of listJson("examples/evaluation/moderation-evaluation")) {
+  if (!moderationEvaluation) break;
+  const doc = loadJson(join(root, file));
+  const valid = moderationEvaluation(doc);
+  report(valid, file, moderationEvaluation);
+  if (valid) moderationEvaluationDocuments.push({ file, doc });
+}
+
+for (const file of listJson("examples/evaluation/moderation-evaluation/invalid")) {
+  if (!moderationEvaluation) break;
+  const valid = moderationEvaluation(loadJson(join(root, file)));
+  if (valid) {
+    failures += 1;
+    console.error(`FAIL      ${file} (expected rejection, but it validated)`);
+  } else {
+    passes += 1;
+    console.log(`ok        ${file} (rejected as intended)`);
+  }
+}
+
+// Cross-field checks a JSON Schema cannot express, returned as messages. The
+// same predicate serves the valid corpus (expected clean) and the
+// `inconsistent/` corpus (expected to trip at least one), so the two cannot
+// drift apart.
+// Mirror of `classify_moderation_case` and the harm counters in
+// `summarize_moderation_divergence`. Kept in step with the Rust by
+// `moderation_reported_benign_suppressed` below: the validator recomputes the
+// outcome and harm counters from the cases and requires an exact match.
+//
+// Bounding them with `<=` was not enough. An upper bound says a counter is
+// plausible; it does not say the counter is true. A report could erase the two
+// harms #77 exists to surface - reviewer ambiguity and benign suppression -
+// and still validate, which is the same failure as publishing a fabricated
+// number, only quieter.
+function moderationScoreCase(testCase) {
+  const reviews = testCase.reviews ?? [];
+  const action = testCase.recommendation.action;
+  const overrode = reviews.some(
+    (review) => !review.acceptable_actions.includes(action),
+  );
+
+  let disagrees = false;
+  for (let i = 0; i < reviews.length && !disagrees; i += 1) {
+    for (let j = i + 1; j < reviews.length; j += 1) {
+      const left = reviews[i];
+      const right = reviews[j];
+      const mutual =
+        left.acceptable_actions.includes(right.label) &&
+        right.acceptable_actions.includes(left.label);
+      if (!mutual || left.category !== right.category) {
+        disagrees = true;
+        break;
+      }
+    }
+  }
+
+  const benign =
+    reviews.length > 0 && reviews.every((review) => review.category === "none");
+
+  let outcome = "agreed";
+  if (overrode) {
+    outcome = "overridden";
+  } else if (disagrees) {
+    outcome = "reviewer_disagreement";
+  }
+
+  return { overrode, disagrees, outcome, benign, action };
+}
+
+function moderationEvaluationCrossFieldProblems(doc) {
+  const problems = [];
+  const aggregate = doc.aggregate ?? {};
+  const cases = doc.cases ?? [];
+  const metrics = aggregate.metrics ?? {};
+
+  const scored = cases.map((testCase) => moderationScoreCase(testCase));
+  const byOutcome = { agreed: 0, overridden: 0, reviewer_disagreement: 0 };
+  for (const entry of scored) {
+    byOutcome[entry.outcome] += 1;
+  }
+  // The outcome buckets and the disagreement flag are independent, exactly as
+  // in Rust: `agreed` and `overridden` come from the exclusive outcome, while
+  // `reviewer_disagreement_cases` counts every case whose reviewers were split,
+  // including one that was also overridden.
+  const agreed = byOutcome.agreed;
+  const overridden = byOutcome.overridden;
+  const disagreed = scored.filter((s) => s.disagrees).length;
+  const benignSuppressed = scored.filter(
+    (s) => s.overrode && s.action !== "allow" && s.benign,
+  ).length;
+  const destructiveOverridden = scored.filter(
+    (s) => s.overrode && MODERATION_DESTRUCTIVE_METRICS.has(s.action),
+  ).length;
+
+  // Exact, not bounded. Each counter is derived here from the cases, so a
+  // report cannot under-report the harms it is meant to expose.
+  const expected = [
+    ["total_cases", cases.length],
+    ["comparable_cases", cases.length],
+    ["agreed_cases", agreed],
+    ["overridden_cases", overridden],
+    ["reviewer_disagreement_cases", disagreed],
+    ["benign_suppressed_cases", benignSuppressed],
+    ["destructive_overridden_cases", destructiveOverridden],
+    ["diverged_cases", overridden],
+  ];
+  for (const [key, want] of expected) {
+    if (aggregate[key] !== want) {
+      problems.push(
+        `aggregate.${key} is ${aggregate[key]}, but the ${cases.length} case(s) imply ${want}`,
+      );
+    }
+  }
+
+  // Every case needs at least one reviewer. An unreviewed case cannot be
+  // scored, so counting it is reporting evidence nobody gave.
+  for (const testCase of cases) {
+    if ((testCase.reviews ?? []).length === 0) {
+      problems.push(`${testCase.case_id} has no reviewer label`);
+    }
+  }
+
+  // A review's own label must appear in its acceptable set, and a review that
+  // declares several acceptable outcomes must list more than one. Without this,
+  // "the policy legitimately allows multiple answers" becomes a claim nobody has
+  // to honour.
+  for (const testCase of cases) {
+    for (const review of testCase.reviews ?? []) {
+      if (!review.acceptable_actions.includes(review.label)) {
+        problems.push(
+          `${testCase.case_id}: ${review.reviewer_id} labels ${review.label} but does not list it as acceptable`,
+        );
+      }
+      if (
+        review.ambiguity === "multiple_acceptable" &&
+        review.acceptable_actions.length < 2
+      ) {
+        problems.push(
+          `${testCase.case_id}: ${review.reviewer_id} marks multiple_acceptable but lists only ${review.acceptable_actions.length} acceptable action(s)`,
+        );
+      }
+    }
+  }
+
+  // The headline totals must follow from the cases: a moderation rate is read
+  // as "how often the policy was wrong", so a stale count reads as a measured
+  // fact it is not.
+  if (aggregate.total_cases !== cases.length) {
+    problems.push(
+      `total_cases is ${aggregate.total_cases}, but the corpus holds ${cases.length} case(s)`,
+    );
+  }
+
+  const recommendationCounts = {};
+  for (const testCase of cases) {
+    const key = `${testCase.recommendation.category}/${testCase.recommendation.action}`;
+    recommendationCounts[key] = (recommendationCounts[key] ?? 0) + 1;
+  }
+  for (const category of MODERATION_CATEGORIES) {
+    const expected = cases.filter(
+      (testCase) => testCase.recommendation.category === category,
+    ).length;
+    const stated = aggregate.category_counts?.[category];
+    if (stated !== undefined && stated !== expected) {
+      problems.push(
+        `category_counts.${category} is ${stated}, but ${expected} case(s) recommend that category`,
+      );
+    }
+  }
+  for (const [key, count] of Object.entries(aggregate.outcome_counts ?? {})) {
+    const expected = recommendationCounts[key];
+    if (expected === undefined) {
+      problems.push(
+        `outcome_counts.${key} counts a recommendation no case made`,
+      );
+    } else if (count !== expected) {
+      problems.push(
+        `outcome_counts.${key} is ${count}, but ${expected} case(s) recommend it`,
+      );
+    }
+  }
+  for (const [key, count] of Object.entries(recommendationCounts)) {
+    if ((aggregate.outcome_counts ?? {})[key] === undefined) {
+      problems.push(
+        `outcome_counts is missing ${key}, which ${count} case(s) recommend`,
+      );
+    }
+  }
+
+  // #58 reads the flat metric map rather than the counts, so a metric that
+  // disagrees with the count it came from publishes a false number while every
+  // headline total still looks right.
+  for (const [name, metric] of Object.entries(metrics)) {
+    if (!name.startsWith("shadow.moderation.")) continue;
+    if (metric.sample_count !== aggregate.total_cases) {
+      problems.push(
+        `${name} is measured over ${metric.sample_count} samples, but total_cases is ${aggregate.total_cases}`,
+      );
+    }
+  }
+  for (const category of MODERATION_CATEGORIES) {
+    const metric = metrics[`shadow.moderation.${category}_count`];
+    if (!metric) continue;
+    const expected = aggregate.category_counts?.[category] ?? 0;
+    if (metric.value !== expected) {
+      problems.push(
+        `shadow.moderation.${category}_count is ${metric.value}, but category_counts.${category} is ${expected}`,
+      );
+    }
+  }
+  for (const [name, key] of [
+    ["agreed", "agreed_cases"],
+    ["overridden", "overridden_cases"],
+    ["reviewer_disagreement", "reviewer_disagreement_cases"],
+    ["benign_suppressed", "benign_suppressed_cases"],
+    ["destructive_overridden", "destructive_overridden_cases"],
+    ["total", "total_cases"],
+  ]) {
+    const metric = metrics[`shadow.moderation.${name}_count`];
+    if (!metric) continue;
+    if (metric.value !== aggregate[key]) {
+      problems.push(
+        `shadow.moderation.${name}_count is ${metric.value}, but ${key} is ${aggregate[key]}`,
+      );
+    }
+  }
+  const rate = metrics["shadow.moderation.override_rate_pct"];
+  if (rate) {
+    const expected =
+      aggregate.total_cases === 0
+        ? 0
+        : (aggregate.overridden_cases / aggregate.total_cases) * 100;
+    if (
+      Math.abs(rate.value - expected) >= 1e-9 ||
+      rate.sample_count !== aggregate.total_cases
+    ) {
+      problems.push(
+        `override_rate_pct is ${rate.value} over ${rate.sample_count} samples, but overridden/total is ${expected} over ${aggregate.total_cases}`,
+      );
+    }
+  }
+
+  // Suppressing a benign case is the asymmetric harm, so it can never exceed
+  // the number of overridden cases. Counting it as anything else would let a
+  // classifier look clean by mislabelling its own errors.
+  if (aggregate.benign_suppressed_cases > aggregate.overridden_cases) {
+    problems.push(
+      `benign_suppressed_cases is ${aggregate.benign_suppressed_cases}, but only ${aggregate.overridden_cases} case(s) were overridden`,
+    );
+  }
+  if (aggregate.destructive_overridden_cases > aggregate.overridden_cases) {
+    problems.push(
+      `destructive_overridden_cases is ${aggregate.destructive_overridden_cases}, but only ${aggregate.overridden_cases} case(s) were overridden`,
+    );
+  }
+  // Reviewer disagreement is independent of the outcome, so it overlaps both
+  // counters rather than forming a third bucket: a case may be overridden *and*
+  // split between reviewers. What may never happen is a case being counted as
+  // agreed and as a disagreement at the same time, or the two outcome counters
+  // exceeding the corpus.
+  if (aggregate.agreed_cases + aggregate.overridden_cases > aggregate.total_cases) {
+    problems.push(
+      `agreed_cases + overridden_cases is ${aggregate.agreed_cases + aggregate.overridden_cases}, more than total_cases ${aggregate.total_cases}`,
+    );
+  }
+  if (aggregate.agreed_cases + aggregate.reviewer_disagreement_cases > aggregate.total_cases) {
+    problems.push(
+      `agreed_cases + reviewer_disagreement_cases is ${aggregate.agreed_cases + aggregate.reviewer_disagreement_cases}, more than total_cases ${aggregate.total_cases}`,
+    );
+  }
+  if (aggregate.reviewer_disagreement_cases > aggregate.total_cases) {
+    problems.push(
+      `reviewer_disagreement_cases is ${aggregate.reviewer_disagreement_cases}, but the corpus holds only ${aggregate.total_cases} case(s)`,
+    );
+  }
+
+  // Both counters are bounded by what the cases can actually support, so a
+  // report cannot be flattered by inflating them.
+  const destructive = cases.filter((testCase) =>
+    MODERATION_DESTRUCTIVE_METRICS.has(testCase.recommendation.action),
+  ).length;
+  if (aggregate.destructive_overridden_cases > destructive) {
+    problems.push(
+      `destructive_overridden_cases is ${aggregate.destructive_overridden_cases}, but only ${destructive} case(s) recommend a destructive action`,
+    );
+  }
+  // Benign-ness is the *reviewers'* call, not the policy's: a policy that
+  // labels criticism as harassment would otherwise never be counted as
+  // suppressing benign content, which is the harm this metric exists to show.
+  const suppressibleBenign = cases.filter(
+    (testCase) =>
+      testCase.recommendation.action !== "allow" &&
+      (testCase.reviews ?? []).length > 0 &&
+      testCase.reviews.every((review) => review.category === "none"),
+  ).length;
+  if (aggregate.benign_suppressed_cases > suppressibleBenign) {
+    problems.push(
+      `benign_suppressed_cases is ${aggregate.benign_suppressed_cases}, but only ${suppressibleBenign} reviewer-benign case(s) received a suppressive recommendation`,
+    );
+  }
+
+  // The retained reference list is what a reviewer actually opens, so it must
+  // describe the report it claims to summarise: only divergences, each of them
+  // a real override in this corpus, and a truncation flag that means what it
+  // says. #77 review round 1: an agreement retained as a reference could fill
+  // the case limit and displace a real divergence while reporting
+  // `truncated=false`.
+  if (aggregate.diverged_cases !== aggregate.overridden_cases) {
+    problems.push(
+      `diverged_cases is ${aggregate.diverged_cases}, but overridden_cases is ${aggregate.overridden_cases}`,
+    );
+  }
+  if (aggregate.comparable_cases > aggregate.total_cases) {
+    problems.push(
+      `comparable_cases is ${aggregate.comparable_cases}, but the corpus holds only ${aggregate.total_cases} case(s)`,
+    );
+  }
+
+  const overriddenIds = new Set();
+  for (const testCase of cases) {
+    const rejected = (testCase.reviews ?? []).some(
+      (review) => !review.acceptable_actions.includes(testCase.recommendation.action),
+    );
+    if (rejected) {
+      overriddenIds.add(testCase.case_id);
+    }
+  }
+  const refs = aggregate.divergent_cases ?? [];
+  for (const reference of refs) {
+    if (reference.outcome !== "overridden") {
+      problems.push(
+        `divergent_cases references ${reference.case_id} with outcome ${reference.outcome}, but a reference is only ever retained for an override`,
+      );
+    }
+    if (!overriddenIds.has(reference.case_id)) {
+      problems.push(
+        `divergent_cases references ${reference.case_id}, but no reviewer rejected it`,
+      );
+    }
+  }
+  if (refs.length > aggregate.diverged_cases) {
+    problems.push(
+      `divergent_cases holds ${refs.length} reference(s), more than the ${aggregate.diverged_cases} divergence(s) in the corpus`,
+    );
+  }
+  const expectedTruncated = refs.length < aggregate.diverged_cases;
+  if (aggregate.divergent_cases_truncated !== expectedTruncated) {
+    problems.push(
+      `divergent_cases_truncated is ${aggregate.divergent_cases_truncated}, but ${refs.length} of ${aggregate.diverged_cases} divergence(s) were retained`,
+    );
+  }
+
+  return problems;
+}
+
+for (const { file, doc } of moderationEvaluationDocuments) {
+  const problems = moderationEvaluationCrossFieldProblems(doc);
+  if (problems.length === 0) {
+    passes += 1;
+    console.log(`ok        ${file}: cross-field evidence is self-consistent`);
+  } else {
+    failures += problems.length;
+    for (const problem of problems) {
+      console.error(`FAIL      ${file}: ${problem}`);
+    }
+  }
+}
+
+// Schema-valid but self-contradictory documents. A contradictory evaluation is
+// structurally fine and simply untrustworthy, which is exactly what these
+// cross-field checks exist to catch.
+for (const file of listJson("examples/evaluation/moderation-evaluation/inconsistent")) {
+  if (!moderationEvaluation) break;
+  const doc = loadJson(join(root, file));
+  if (!moderationEvaluation(doc)) {
+    failures += 1;
+    console.error(
+      `FAIL      ${file} (expected to pass the schema so the cross-field checks can judge it)`,
+    );
+    continue;
+  }
+  const problems = moderationEvaluationCrossFieldProblems(doc);
+  if (problems.length === 0) {
+    failures += 1;
+    console.error(`FAIL      ${file} (expected a contradiction, but every check passed)`);
+  } else {
+    passes += 1;
+    console.log(`ok        ${file} (rejected as intended: ${problems.join("; ")})`);
+  }
+}
 
 function reviewPresentation(caseId, seed) {
   const firstByte = createHash("sha256").update(`${seed}:${caseId}`).digest()[0];

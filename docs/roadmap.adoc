@@ -94,6 +94,7 @@ Exit condition:
 * after-action review feeds measured bottlenecks back into prioritization;
 * shadow evaluation can compare policies without causing production side effects;
 * shadow comparisons aggregate into evidence that benchmarking and human review can consume, without any scalar that would make promotion automatic.
+* shadow moderation recommendations can be scored offline against reviewer labels as evidence, with benign suppression reported separately and no label able to authorize an action or a promotion. This is the evidence layer only: #77's promotion thresholds, drift monitoring, latency budget and side-effect-free live-run proof are still open;
 
 Stage 2 should turn benchmark and quality evidence into a repeatable improvement loop rather than treating implementation completion as proof of improvement.
 

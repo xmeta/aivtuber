@@ -600,3 +600,186 @@ spanning an orchestrator restart, used to produce a plausible `provider calls =
 so the delta is only ever computed from an ordered pair.
 
 #165 does not replace #108 causal trace attribution.
+
+== 10. Shadow moderation evaluation (#77, evidence slice implemented)
+
+=== 10.1 A recommendation is not an action
+
+`ModerationRecommendation` is a value a *shadow* policy returns. Nothing in
+`crates/app/src/moderation_evidence.rs` executes it, and no function in the
+module can reach the active route. `delete`, `timeout` and `ban` are
+recommendations with a severity rank, not operations.
+
+The lifecycle order and the severity order are deliberately different.
+`ModerationAction`'s declaration order is the automation lifecycle #77 permits,
+cheapest and safest first:
+
+....
+allow -> ignore -> delete -> timeout -> ban
+....
+
+`ModerationAction::is_destructive` ranks destructiveness instead, and
+`human_review` is excluded from it: escalating to a human is not itself a
+destructive act, it is the escape hatch that keeps `ban` human-approved by
+default. A single ordering cannot express both, so the module keeps two.
+
+=== 10.2 Evidence, never promotion
+
+`AuthorityEffect` is a one-variant enum that serializes as
+`offline_evidence_only`, and the schema pins it as a `const`. A report carries
+no scalar that ranks a policy, no field naming a policy to switch to, and no
+severity threshold. That last omission is a decision, not an oversight: #77
+requires thresholds to be calibrated from measured evidence rather than invented
+in the issue, so a number here would be a fabricated fact.
+
+Policy confidence is retained as `confidence_micros` for analysis and is never
+thresholded. #77 forbids enabling destructive automation from model confidence
+alone, and clamping it into `0.0..=1.0` is the only thing done to it.
+
+=== 10.3 Suppression is the asymmetric harm
+
+`benign_suppressed_cases` counts overrides in which the recommendation
+suppressed the case and **every reviewer** called it benign. Benign-ness is the
+reviewers' call, never the policy's own category: a policy that labels criticism
+as harassment would otherwise never appear in this counter, which is exactly
+the failure the metric exists to surface. Unanimity rather than a majority,
+because with one reviewer "the reviewers think this is benign" and "nobody
+objected" are the same claim.
+
+`ModerationCategory::None` is a first-class bucket holding benign criticism,
+sarcasm, teasing, disagreement and repeated-but-benign messages. Suppressing one
+is not an ordinary error, and folding it into an aggregate accuracy figure is
+what makes an imbalanced moderation dataset unreadable.
+
+=== 10.4 Disagreement is the evidence
+
+`ModerationReview::acceptable_actions` is a *set*. A reviewer may say "ignore or
+delete are both fine" without the layer forcing a consensus the policy does not
+have, and `ModerationAmbiguity` makes `multiple_acceptable` and
+`insufficient_context` first-class rather than an unknown bucket lumped in with
+disagreement. `classify_moderation_case` reports three outcomes — `agreed`,
+`overridden`, `reviewer_disagreement` — and reviewer disagreement is tracked
+independently, because a policy can be "right" and still unusable if reviewers
+cannot agree on what right means.
+
+The pair test is symmetric on purpose. `reviews` preserves submission order and
+nothing about scoring may depend on it, so a pair disagrees when *either*
+reviewer's acceptable set fails to cover the other's label, or when the two
+assign different violation categories. Checking one direction only made the
+verdict a property of who happened to submit first: a reviewer who labels
+`allow` but tolerates `ignore`, paired with one who labels `ignore` and
+tolerates only `ignore`, was an agreement in one order and a disagreement in
+the other. Category splits count because two reviewers who agree an action is
+acceptable but cannot agree on whether it is a violation have not settled what
+the label means. `reviewer_disagreement_cases` therefore overlaps
+`overridden_cases` on purpose, and `agreed_cases` counts only cases the
+reviewers actually settled — a report may not claim to be agreed and split at
+the same time. `agreed_cases + overridden_cases` is bounded by `total_cases`
+rather than equal to it, because a disagreement-only case belongs to neither
+outcome bucket. `reviewer-disagreement.json` pins both disagreement shapes.
+
+=== 10.5 Outliers survive aggregation
+
+#77 requires that a dangerous outlier stay independently reviewable even when
+the surrounding traffic is benign, because #79's crowd aggregation is lossy.
+`category_counts` and `outcome_counts` are keyed per category and per
+`<category>/<action>` pair, so 99 benign messages plus one threat leaves the
+threat countable on its own. `outlier-in-crowd.json` and
+`one_threat_among_many_benign_messages_stays_independently_countable` pin it.
+
+=== 10.6 Refuse rather than merge, and bounds on the record
+
+`summarize_moderation_divergence(records, config, case_limit)` refuses an empty
+batch, an invalid config, an unstamped record, a record whose
+`ModerationOrchestrationIdentity` differs from the one `config` describes, a
+different comparison `schema_version`, and a different policy identity — which
+includes the reviewer protocol version, since rates scored under different
+instructions are not comparable.
+
+The stamp travels on the record for the same reason as in #165: the report is
+built long after the batch was drained, so an identity supplied at report time
+describes the caller's memory of the run rather than the run itself.
+`ModerationOrchestrationIdentity::from_config` reuses the #164 fingerprint
+construction so a moderation report and a divergence report describe the same
+run identically.
+
+An unreviewed case is refused rather than counted as agreement: it has no
+evidence behind it either way.
+
+The policy identity carries `runtime_profile` as well, because the same policy
+and config fingerprint produce different evidence on different profiles.
+Validating the field and then dropping it would let two records from different
+runtime conditions collapse into one identity and be reported as a single
+batch; `a_different_runtime_profile_cannot_collapse_into_one_identity` and
+`records_from_different_runtime_profiles_cannot_be_reported_as_one_batch` pin
+it.
+
+`divergent_cases` retains references to *overrides only*. An agreement is not a
+reviewable divergence, so retaining one would let a batch of agreements fill
+`case_limit` and displace the overrides that actually need review while still
+reporting `divergent_cases_truncated: false`. The flag answers "was a
+divergence dropped" — retained references against `overridden_cases` — rather
+than "did the list fill up", and counts themselves are never truncated.
+
+=== 10.7 What the validator refuses
+
+`schemas/moderation-evaluation.schema.json` closes the boundaries structurally:
+`authority_effect` and `contains_private_production_content` are `const`,
+`protocol.identity_hidden_during_review` is `const true` (blind review),
+`additionalProperties: false` everywhere, and `reviews` has `minItems: 1`.
+
+`scripts/validate.mjs` adds `moderationEvaluationCrossFieldProblems`, one
+predicate shared by the valid corpus (expected clean) and the `inconsistent/`
+corpus (expected to trip), which checks that every case is reviewed, that a
+review's label appears in its own acceptable set, that `multiple_acceptable`
+lists more than one action, that the totals follow from the cases, that every
+`shadow.moderation.*` metric matches the count it came from and is measured over
+the batch, that `override_rate_pct` agrees with `overridden/total`, and that
+neither `benign_suppressed_cases` nor `destructive_overridden_cases` exceeds
+what the cases can support.
+
+The outcome and harm counters are recomputed from the cases and required to
+match *exactly*, not merely to stay within a bound. An upper bound says a
+counter is plausible; it does not say it is true, and that distinction is the
+whole point for two counters in particular. `reviewer_disagreement_cases` and
+`benign_suppressed_cases` exist to make reviewer ambiguity and suppressed benign
+criticism visible, so a report that lowered them to zero would erase exactly
+what #77 was opened to see — and an upper-bound check would have accepted it.
+`under-reported-disagreement.json` and `under-reported-benign-suppression.json`
+pin that failure, each carrying one contradiction with its metric map lowered to
+match, so the exact recompute is the only rule that can catch either.
+
+That recompute is a JavaScript mirror of `classify_moderation_case`, so the two
+implementations could drift apart. They are pinned to the same objects:
+`every_valid_fixture_states_exactly_what_the_summarizer_computes` runs the Rust
+summarizer over the `cases` of every valid fixture and asserts it produces the
+counters that fixture states, while the validator requires the stated counters
+to equal the JavaScript recompute. A disagreement between the implementations
+breaks one of the two checks, and `the_under_reported_fixtures_disagree_with_the_summarizer`
+confirms the Rust side computes the numbers those two fixtures erase.
+
+Case references hold `case_id`, `correlation_id`, the recommended action and
+category, the outcome and a severity byte. There is no field that can hold
+message content, and every struct in the module is `deny_unknown_fields`, so
+one cannot be added from outside.
+
+=== 10.8 Not in this slice
+
+This section implements the *evidence* half of #77: the report, its schema, the
+offline fixtures and the summarizer. It does not implement #77's acceptance
+criteria as a whole, and nothing here should be read as satisfying them. Still
+open, tracked in the #77 slice issue:
+
+* precision, recall, false-positive rate and false-negative rate against a
+  labelled holdout;
+* severity upgrade and downgrade rates;
+* Jev routing and moderation decision latency;
+* severity-specific promotion stages, drift monitoring, and rollback on
+  quality degradation;
+* running a shadow moderation recommendation against live traffic to *prove*
+  active output is unchanged (side-effect-free execution).
+
+Severity-specific promotion thresholds and drift monitoring are deliberately
+absent from this slice: thresholds need measured evidence, and automation is not
+enabled, so there is nothing to drift or to time. Execution authority is #76 and
+must stay separate from this evidence layer.
