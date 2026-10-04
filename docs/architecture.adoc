@@ -16,6 +16,7 @@ The system treats frequent speech and motion as reusable assets and separates de
 . *Graceful degradation.* Jev, LLM, TTS, avatar, or stream adapters may fail independently without freezing the performer.
 . *Measure every route.* Latency and quality decisions are observable and replayable.
 . *Adapters over lock-in.* Jev is the first reflex engine, not a hard dependency of the domain model.
+. *Separate interaction from durable task completion.* Natural acknowledgement/performance may happen immediately, while a long-running AgentTask owns tool execution, verification, cancellation, and terminal outcome independently. See link:dual-role-agent-architecture.adoc[Dual-Role Agent and Performer Architecture].
 
 == 3. Three time scales
 

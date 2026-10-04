@@ -133,8 +133,38 @@ Letta
 |official MCP Rust SDK (+rmcp+);
 Rig / +rig-rmcp+
 |Reuse protocol lifecycle, tool discovery/schema plumbing, provider-neutral tool-loop mechanics, and dynamic tool registration; keep action authority, approval/risk, bounded execution, result verification, and replay in aivtuber
-|#193
+|#193, #201, #202
 |Dependency/runtime footprint; tool timeout/cancellation; dynamic tool-list behavior; forged-authority rejection; whether tool results can be verified without framework-owned task semantics
+
+|MCP service ecosystem
+|GitHub official MCP server;
+Microsoft Playwright MCP;
+provider-maintained Google Workspace / Notion MCP servers where available
+|Prefer reviewed connector profiles and existing servers before native service adapters; pin server identity/version/tool allowlist and put local policy above server annotations
+|#202, #204
+|Credential scope; server update/schema drift; read-only/default toolset; subprocess/network failure; whether connector removal leaves core runtime unaffected
+
+|Agent-task evaluation
+|MCPMark-style post-condition verifiers;
+ComplexMCP-style tool-selection/recovery scenarios;
+schema/tool-evolution robustness benchmarks
+|Evaluate user-task completion separately from tool-call success; make false-success, skipped precondition verification, recovery failure, and schema drift explicit
+|#203
+|Verifier reproducibility; task/tool version identity; false-success rate; recovery after first error; large-tool-space behavior; no live-account requirement in normal CI
+
+|External agent delegation
+|Agent Client Protocol (ACP);
+ACP-capable agent runtimes such as Goose
+|Future TaskBackend-style delegation after local AgentTask, approval, and evaluation contracts are stable; use external agents for specialized work rather than rebuilding coding-agent stacks
+|#200
+|Protocol stability/version negotiation; cancellation/resume; capability isolation; result verification; external agent cannot self-authorize or self-declare task completion
+
+|Desktop product shell
+|Tauri v2;
+maintained first-party desktop plugins
+|Reuse desktop packaging/process/updater/autostart/single-instance primitives; keep business logic and authority in the Rust runtime
+|#205
+|Windows/WSL packaging path; sidecar process supervision; secret handling; signed update/release path; UI cannot mint capability
 
 |LLM routing / adaptive compute
 |RouteLLM;

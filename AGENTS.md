@@ -187,10 +187,11 @@ Do not create a second implicit wire contract in an adapter or prototype.
 
 Before writing generic infrastructure, check docs/reuse-first.adoc and search maintained crates/reference implementations.
 For open roadmap work, also check docs/implementation-accelerator.adoc for issue-oriented local start points, concrete upstream file references, and the cheapest suggested falsifier; the live issue still owns readiness and acceptance criteria.
+For dependable-agent, RoleBlend, desktop onboarding, or external-tool work, read docs/dual-role-agent-architecture.adoc before designing new task/tool/UI abstractions. Preserve its Interaction Plane vs Task Plane split and do not replace project-owned authority or verified-completion semantics with framework defaults.
 
 - Reuse generic mechanisms when they fit.
 - Keep aivtuber-specific policy, authority, replay, determinism, and bounded-state semantics project-owned.
-- Record adopt / wrap / partial reuse / reference only / benchmark first / reject with a short reason in the issue or PR.
+- Record adopt / wrap / sidecar / partial reuse / reference only / benchmark first / reject / custom with a short reason in the issue or PR; `custom` must explain why earlier reuse modes do not fit.
 - Do not add a dependency without checking license, maintenance status, transitive/runtime impact, security advisories, determinism/replay effects, and bounded-state behavior.
 - Do not repeatedly revisit a rejected candidate unless new evidence changes the trade-off.
 - Any dependency-affecting PR must pass the supply-chain gate (`cargo deny --locked check`; policy in deny.toml, procedure in docs/supply-chain.adoc).

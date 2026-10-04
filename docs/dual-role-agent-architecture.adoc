@@ -1,0 +1,446 @@
+= Dual-Role Agent and Performer Architecture
+:toc:
+:toclevels: 3
+
+This document defines the product/runtime boundary for using the same aivtuber persona as both a dependable agent and an autonomous entertainer.
+
+It complements link:architecture.adoc[Architecture], link:security-threat-model.adoc[Security Threat Model], and link:roadmap.adoc[Roadmap].
+GitHub issue metadata remains the live execution source of truth.
+
+== 1. Product invariant
+
+The product is one runtime and one persistent persona, not two unrelated assistants.
+
+[source,text]
+----
+same Persona
+    +
+RoleBlend
+    +
+Situation
+    =
+effective behavior
+----
+
+Persona answers "who is this character?"
+
+RoleBlend answers "how task-focused versus entertainment-focused should the character behave right now?"
+
+Situation supplies bounded context such as casual conversation, focused work, high-risk work, emergency, or live performance.
+
+None of these fields grant authority.
+
+A high entertainment setting must not weaken verification, privacy, approval, operator control, or tool permissions.
+
+== 2. Two planes
+
+Separate natural interaction from durable task execution.
+
+[source,text]
+----
+User / Environment
+        |
+   +----+-----------------------------+
+   |                                  |
+   v                                  v
+Interaction Plane                 Task Plane
+   |                                  |
+Jev / Floor / Routing              AgentTask
+   |                                  |
+Semantic response                 TaskDirector
+   |                                  |
+PerformanceIntent             ActionProposal
+   |                                  |
+Scheduler                    ToolPolicy / Approval
+   |                                  |
+Avatar / Audio              AuthorizedToolAction
+                                      |
+                                Tool executor
+                                MCP / native
+                                      |
+                               ToolObservation
+                                      |
+                                  Verifier
+                                      |
+                                 TaskOutcome
+                                      |
+                                      +----> Interaction Plane
+                                             natural status/report
+----
+
+=== Interaction Plane
+
+Owns short-timescale behavior:
+
+* response/react/defer/ignore;
+* conversational floor and backchannels;
+* Persona-conditioned language style;
+* RoleBlend-conditioned presentation;
+* PerformanceIntent;
+* gaze/expression/gesture/audio scheduling;
+* proactive performance within bounded initiative budgets.
+
+It must stay useful even when no Task Plane capability is configured.
+
+=== Task Plane
+
+Owns durable user intent and work completion:
+
+* accepted task/request;
+* bounded plan/step state;
+* waiting dependency/approval;
+* authorized external actions;
+* observed execution results;
+* explicit verification;
+* terminal task outcome;
+* bounded commitment/pending-task state.
+
+Task state is not security authority.
+
+The Task Plane may request an authorized action, but only the existing authenticated capability boundary can authorize privileged execution.
+
+== 3. Tool result versus verified completion
+
+The current tool boundary was originally suitable for privileged fire-and-forget actions.
+Dependable-agent work requires an observable result.
+
+Target boundary:
+
+[source,text]
+----
+AuthorizedToolAction
+      |
+      v
+ToolAdapter / rmcp
+      |
+      v
+ToolExecutionResult
+      |
+      v
+ToolObservation
+      |
+      v
+Verifier
+      |
+      +-- Verified
+      +-- NotVerified
+      +-- Failed
+      +-- Stale/Cancelled
+----
+
+The names are illustrative; #193 owns the exact contract.
+
+Important rule:
+
+[source,text]
+----
+tool execution success != task completion
+----
+
+Examples:
+
+* a file-write tool reports success, but the expected content is absent: not complete;
+* a merge call succeeds, but the PR remains open: not complete;
+* a browser action clicks a button, but the expected resulting state is not observed: not complete.
+
+#201 owns the user-level task lifecycle above this execution boundary.
+
+== 4. AgentTask lifecycle
+
+#201 owns the production contract.
+
+Candidate bounded state:
+
+[source,text]
+----
+Accepted
+  -> Planning
+  -> Ready
+  -> WaitingApproval
+  -> Executing
+  -> Verifying
+  -> Completed
+       | Failed
+       | Cancelled
+----
+
+External MCP long-running-task state, when available, represents one execution step under AgentTask.
+It does not replace the user-level lifecycle.
+
+Task retention must be bounded by count, lifetime, retained observations, and retry/replan limits.
+
+The first task memory should store only what is required to resume and prove task outcome.
+Rich long-term episodic/graph memory (#105) is not on the critical path.
+
+== 5. Tool governance
+
+#202 owns local tool catalog, trust, risk, and approval policy.
+
+MCP metadata and server-provided annotations are discovery inputs, not authorization.
+
+Preferred flow:
+
+[source,text]
+----
+discovered MCP servers/tools
+        |
+reviewed server/profile allowlist
+        |
+local trust/risk classification
+        |
+task-relevant bounded subset
+        |
+model or deterministic selector
+        |
+ActionProposal
+        |
+approval / capability policy
+        |
+AuthorizedToolAction
+----
+
+Unknown tools fail closed.
+
+Do not expose every installed tool schema to the model by default.
+Start with explicit profiles and bounded subsets.
+Only add semantic/learned tool retrieval after measurements show it is necessary.
+
+== 6. Reuse boundary
+
+=== Reuse directly or through a thin wrapper
+
+Prefer maintained mechanisms for generic infrastructure:
+
+* official Rust MCP SDK (+rmcp+) for MCP protocol/client behavior;
+* Rig / +rig-rmcp+ when its agent/tool mechanics fit below aivtuber authority;
+* official or maintained MCP servers for service-specific APIs;
+* Tauri v2 and maintained plugins for desktop shell concerns;
+* LiveKit/Pipecat/sherpa-onnx for later voice/media mechanics where measured useful.
+
+=== Keep project-owned
+
+Do not outsource:
+
+* authenticated capability minting;
+* risk/approval policy;
+* irreversible publication boundaries;
+* stale/cancellation fencing;
+* verified task completion semantics;
+* scheduler priority and safe interruption;
+* Persona and RoleBlend semantics;
+* FloorPolicy and PerformanceIntent;
+* replay/evaluation meaning;
+* memory-write authority and privacy policy.
+
+== 7. Connector strategy
+
+#204 owns curated MCP connector profiles.
+
+Prefer:
+
+[source,text]
+----
+existing maintained MCP server
+        +
+aivtuber tool policy
+        +
+aivtuber verification
+----
+
+over:
+
+[source,text]
+----
+new service-specific aivtuber API adapter
+----
+
+Initial candidate profiles:
+
+=== Developer profile
+
+* GitHub official MCP server;
+* Playwright MCP for browser automation;
+* a reviewed local filesystem/resource MCP server.
+
+=== Personal-agent profile
+
+After the Developer profile is stable:
+
+* Google Workspace MCP where available/appropriate;
+* Notion MCP;
+* browser;
+* other reviewed provider servers.
+
+External connector failure must not prevent the deterministic performer runtime from operating.
+
+== 8. RoleBlend delivery
+
+#191 is delivered in two slices.
+
+=== Manual contract
+
+The first slice is independent of the full Task Plane:
+
+[source,text]
+----
+manual 0..100 baseline
+      ->
+versioned bounded behavior profile
+      ->
+one behavior consumer
+      ->
+replay/evaluation identity
+----
+
+It changes presentation and interaction policy only.
+
+=== Automatic task-aware modulation
+
+After #201, typed task state may temporarily move effective behavior toward task focus.
+
+Examples:
+
+* casual/live performance: closer to entertainment baseline;
+* focused task: quieter and more concise;
+* waiting approval: clear status without repeated banter;
+* high-risk operation: strongly task-focused;
+* task terminal: return toward baseline with bounded transition/hysteresis.
+
+Do not infer authority from task criticality.
+
+== 9. Desktop product surface
+
+#205 owns the first desktop MVP.
+
+The desktop shell is a configuration/onboarding/control surface, not a second runtime.
+
+Preferred first evaluation target is Tauri v2 because the core runtime is Rust and common desktop concerns can be reused rather than rebuilt.
+
+Minimum product path:
+
+[source,text]
+----
+Install
+  -> Persona
+  -> RoleBlend
+  -> VTube Studio / OBS status
+  -> LLM / TTS configuration
+  -> reviewed MCP connector profile
+  -> permission summary
+  -> Start
+  -> task/runtime health and approvals
+----
+
+The UI cannot mint privileged capability by serializing a flag.
+
+== 10. Evidence and evaluation
+
+#203 owns task-level evaluation.
+
+Primary product metric for the dependable-agent path is verified task success, not tool-call success.
+
+Treat false success as a first-class failure:
+
+[source,text]
+----
+assistant reports completion
+        but
+requested post-condition is not verified
+----
+
+Evaluate selection, parameterization, execution, environment/precondition checking, verification, recovery, cancellation, approval usage, and schema/tool drift separately.
+
+Reuse #58/#59/#165 evidence formats where possible.
+
+== 11. Delivery workstreams
+
+The Stage 1-5 milestone hierarchy remains the delivery hierarchy.
+The workstreams below show dependency flow across milestones.
+
+=== Dependable Agent
+
+[source,text]
+----
+#193 MCP/tool result vertical slice
+  ->
+#201 AgentTask + verified completion
+  ->
+#202 Tool catalog / trust / approval
+  +----------------------+
+  |                      |
+  v                      v
+#203 Agent evaluation   #204 Connector profiles
+  |                      |
+  +----------+-----------+
+             |
+       #72 + #191
+      Persona/RoleBlend
+             |
+          #205
+       Desktop MVP
+----
+
+#105 richer episodic/temporal memory follows the minimum task/commitment state unless evidence shows it is needed earlier.
+
+=== Natural Performer
+
+#94 remains the tracker.
+
+[source,text]
+----
+#84 PerformanceIntent
+  -> #91 gaze
+  -> #89 naturalness
+
+#81 conversational floor
+  -> #82 pre-response
+  -> #85 repair
+
+#88 scene/game context
+  -> #86 affect
+  -> #87 initiative
+
+#83 phrase streaming
+
+optional later:
+#90 perception
+  -> #92 speech/turn observations
+  -> #93 multi-party
+----
+
+Voice/multimodal work must not become a prerequisite for the first dependable-agent MVP.
+
+== 12. Future external-agent delegation
+
+Agent Client Protocol (ACP) and ACP-capable agent runtimes such as Goose are useful future research for delegating specialized work, for example coding tasks.
+
+Do not make ACP a core dependency yet.
+
+Revisit after:
+
+* #193 establishes the tool observation boundary;
+* #201 establishes AgentTask and verified completion;
+* #202 establishes trust/approval policy;
+* #203 establishes task-level evaluation.
+
+A future external agent should implement a bounded backend below AgentTask, not replace aivtuber task state, authority, or completion verification.
+
+== 13. Current implementation order
+
+Prefer work that closes foundations or unlocks the most downstream work.
+
+Near-term order:
+
+. #147 complete bounded property/fuzz regression workflow and close tracking parent #57 when satisfied.
+. #198 implement the decided duplicate-live-event contract; this may proceed in parallel and does not block #147.
+. #165 finish the Stage 2 shadow evidence path.
+. #70 then #71 establish representative workload and measured SLOs.
+. #193 establish MCP/tool result vertical slice.
+. #201 establish AgentTask/verification.
+. #202 and #203 establish governance and evaluation.
+. #204 add existing-server connector profiles.
+. #72 / #191 establish stable identity plus manual dual-role control.
+. #205 deliver the first product-shaped desktop shell.
+. Advance #84/#81-led natural-performance work without pulling Stage 5 into the critical path.
+
+This order is guidance; live issue labels/milestones remain authoritative.
