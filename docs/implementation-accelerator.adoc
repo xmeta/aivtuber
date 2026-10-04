@@ -203,10 +203,40 @@ tgrep -n -t rust 'ShadowComparisonRecord|TraceStage' .
 |Changing RoleBlend cannot alter tool capability, approval, privacy, or verification
 
 |#193 agent-tool vertical slice
-|+crates/domain/src/interfaces.rs+ ToolAction/AuthorizedToolAction, +crates/generative+, +crates/app+
+|+crates/domain/src/interfaces.rs+ ToolAction/AuthorizedToolAction/ToolAdapter, +crates/generative+, +crates/app+
 |official +rmcp+; Rig +rig-rmcp+; Rig +AgentRun+ and approval-hook examples
-|Read-only local MCP tool -> authorized execution -> structured observation -> deterministic verification
-|Rig/rmcp spike must demonstrate that a forged request cannot bypass aivtuber authority and a failed verification is not reported as complete
+|Change the fire-and-forget +ToolAdapter -> ()+ boundary into a bounded provider-neutral ToolExecutionResult/Observation; invoke one read-only local MCP tool; verify one post-condition
+|Reject the design if rmcp/provider DTOs leak into domain contracts, output is unbounded, forged authority crosses the gate, or a failed verifier can be reported complete
+
+|#201 AgentTask lifecycle
+|new bounded types in +crates/domain+; composition/state owner in +crates/app+; reuse existing retention/deadline/telemetry boundaries
+|Project-owned small state machine first; MCP Tasks only for one long-running external step; ACP agent backends deferred
+|Accepted task -> one #193 tool step -> Verifying -> explicit Completed/Failed with bounded pending commitment state
+|A tool returning success while the requested post-condition is absent must never produce Completed
+
+|#202 MCP tool governance
+|#193 tool identity/result contracts, +crates/domain/src/control.rs+, +docs/security-threat-model.adoc+
+|MCP metadata/annotations as untrusted hints; reuse official MCP schemas/Registry only for discovery; simple local allowlist before semantic tool retrieval
+|One discovered tool -> local catalog -> explicit risk class -> task-relevant allowlist -> bound approval -> AuthorizedToolAction
+|A server that labels a destructive/network tool as safe/read-only cannot lower the local risk class or bypass approval
+
+|#203 verified agent evaluation
+|#201 TaskOutcome/VerificationResult, #58 benchmark artifacts, #59/#151 review formats, #165 shadow evidence
+|MCPMark verifier pattern; ComplexMCP failure taxonomy; schema-evolution fixtures; reuse existing result artifacts
+|One deterministic task fixture where tool success and verified task success intentionally disagree; emit machine-readable false-success reason
+|A model/prose claim of completion cannot change the evaluator result when the post-condition verifier fails
+
+|#204 MCP connector profiles
+|#193 MCP boundary, #202 catalog/policy, provider config/health patterns in +crates/adapters+ and composition root
+|GitHub official MCP server; Playwright MCP; reviewed filesystem/resource server; later Google Workspace/Notion MCP
+|Developer profile with one maintained MCP server, pinned identity, explicit tool allowlist, scoped credential, health/failure path
+|Removing/unavailable external connector must not change domain contracts or stop the deterministic performer runtime
+
+|#205 desktop MVP
+|+crates/app+ composition/operator status, #191 RoleBlend, #201 task state, #204 connector profile
+|Tauri v2 + maintained first-party plugins for generic desktop shell/updater/autostart/single-instance/process concerns
+|Clean-config desktop shell starts fixture runtime, shows Persona/RoleBlend, connector permissions, active task state, approval, and verified outcome
+|UI/IPC data that claims extra permission cannot mint an AuthenticatedControl capability; optional sidecar failure cannot remove operator stop
 |===
 
 == 5. Stage 4 natural live performance

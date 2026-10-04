@@ -20,6 +20,36 @@ This allows non-implementation work to progress without changing the active mile
 The older Phase 0-6 sequence is retained at the end of this document as implementation history.
 It describes how the architecture was bootstrapped; it is not a second active PM hierarchy.
 
+== Cross-stage product workstreams
+
+The Stage 1-5 milestones remain the delivery hierarchy. The following workstreams make cross-stage dependency flow explicit without creating a second milestone system.
+
+=== Dependable Agent
+
+https://github.com/xmeta/aivtuber/issues/200[#200] is the tracking issue.
+See link:dual-role-agent-architecture.adoc[Dual-Role Agent and Performer Architecture] for the durable design.
+
+Preferred dependency flow:
+
+[source,text]
+----
+#193 MCP/tool result vertical slice
+  -> #201 AgentTask + verified completion
+  -> #202 Tool catalog / trust / approval
+       +-> #203 agent-task evaluation
+       +-> #204 curated MCP connector profiles
+  -> #72 + #191 Persona / RoleBlend
+  -> #205 Tauri desktop MVP
+----
+
+Rich long-term memory (#105) is not a prerequisite for the first dependable-agent slice; bounded task/commitment state comes first.
+Voice/multimodal work remains optional and must not enter this critical path merely because an external framework offers it.
+
+=== Natural Performer
+
+https://github.com/xmeta/aivtuber/issues/94[#94] remains the Stage 4 tracker.
+The preferred shape is #84 PerformanceIntent and #81 floor control first, then pre-response/naturalness/gaze/repair/scene/affect/initiative, with #83 phrase streaming and Stage 5 voice/multimodal work layered after the bounded interaction contracts are stable.
+
 == Stage 1 -- Production Runtime Foundation
 
 Goal: a bounded, secure, operable production runtime that can be exercised as a minimum usable live stream.
@@ -39,7 +69,8 @@ The core v0.1 implementation issues named in the #97 release gate are complete:
 
 The remaining Stage 1 hardening and process work is:
 
-- verification toolchain, tracked by parent #57, with implementation slices #145 (property tests), #146 (fuzz targets), and #147 (bounded CI / corpus integration; blocked on #145/#146);
+- verification toolchain, tracked by parent #57: #145 property tests and #146 fuzz targets are complete; #147 bounded CI/corpus integration is implementation-ready;
+- #198 is a separate scheduler-contract follow-up discovered by the property suite; it does not block #147 or the testing-workflow parent closure;
 - #70 realistic workload scenarios;
 - #71 operational SLOs, blocked on #70;
 - #125 tgrep provisioning documentation.
@@ -65,9 +96,9 @@ Exit condition:
 
 Stage 2 should turn benchmark and quality evidence into a repeatable improvement loop rather than treating implementation completion as proof of improvement.
 
-== Stage 3 -- Engagement & Community Intelligence
+== Stage 3 -- Engagement & Agent Foundation
 
-Goal: let the performer decide what, when, and how to engage instead of assuming every admitted comment deserves an immediate spoken response.
+Goal: let the performer decide what, when, and how to engage while also establishing the smallest dependable-agent Task/Tool foundation for the same persistent persona.
 
 Exit condition:
 
@@ -76,9 +107,16 @@ Exit condition:
 * delayed responses have explicit expiry and bounded storage;
 * chat bursts can be micro-batched without losing explicit outcomes;
 * audience-level signals reduce redundant work while preserving important outliers;
-* conversation/topic context remains bounded.
+* conversation/topic context remains bounded;
+* an AgentTask lifecycle distinguishes interaction from durable task execution;
+* external tool execution returns bounded observations and task completion requires explicit verification;
+* tool discovery/trust/risk/approval remain local policy above MCP rather than model/server authority;
+* at least one maintained MCP-backed connector profile can be used without a service-specific aivtuber wire implementation;
+* Persona and RoleBlend can support an agent-oriented presentation without changing authority;
+* a minimal desktop onboarding surface can configure the dual-role runtime and expose task/approval/health state without duplicating runtime authority.
 
-Stage 3 must build on Stage 1 boundedness and Stage 2 measurement rather than creating independent queues, histories, or quality metrics.
+Stage 3 must build on Stage 1 boundedness and Stage 2 measurement rather than creating independent queues, histories, quality metrics, or a second generic agent framework.
+See link:dual-role-agent-architecture.adoc[Dual-Role Agent and Performer Architecture] and tracking issue #200.
 
 == Stage 4 -- Natural Live Performance
 
