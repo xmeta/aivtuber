@@ -61,9 +61,26 @@ generated `SchedulerConfig` and checks, after every single step:
   documented to grow without bound, so the capacity bound applies only to the
   ring.
 
-`a_live_event_cannot_be_scheduled_twice` covers the same stale-action concern
-from the request side: re-requesting an event while it is still live must not
-produce a second live generation for that event.
+`a_live_event_cannot_be_scheduled_twice` covered the same stale-action concern
+from the request side. It has been removed: it asserted that re-requesting a
+live event cannot produce a second live generation, but that is not the
+scheduler's contract. `Scheduler::schedule_at` accepts a second request for an
+`event_id` that is already live and overwrites the event liveness index with the
+newer generation. The property's assertion
+(`live.plan.generation != accepted.generation`) was therefore trivially true in
+exactly the case it was written to catch, so it passed without checking
+anything. Asserting the invariant would have meant first making it true, which
+is a contract change rather than a test change; until that decision is made the
+claim is recorded here instead of being asserted.
+
+Known gap, stated so it is not mistaken for covered: scheduling an `event_id`
+that is already live produces two live items sharing one id. The newer one owns
+the entry in the event liveness index, and `retire()` removes that entry
+unconditionally, so the older item stays reachable by generation but not by
+event id. `check_liveness_index_consistency` does not catch this because it
+asserts the event key is *present*, not that it resolves to the same item.
+`live_item_by_event` has no consumer outside the scheduler's own tests today,
+which is why this is recorded rather than treated as a live defect.
 
 `stale_actions_are_never_dispatchable` works at the sink boundary instead of the
 scheduler boundary. It asserts that every start action corresponds to an item
