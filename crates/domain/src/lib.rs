@@ -33,9 +33,11 @@ pub use event::{
 pub use interfaces::{
     Authorized, AuthorizedAvatarAction, AuthorizedStreamAction, AuthorizedToolAction, AvatarAction,
     AvatarAdapter, DecisionEngine, EngineError, EngineErrorKind, EngineFuture, GeneratedReply,
-    SpeechArtifact, SpeechProgress, SpeechProgressSink, SpeechRequest, StreamAction, StreamAdapter,
-    ThinkingEngine, ToolAction, ToolAdapter, TtsBackendIdentity, TtsEngine,
-    authorize_avatar_action, authorize_stream_action, authorize_tool_action,
+    MAX_TOOL_DESCRIPTOR_BYTES, MAX_TOOL_OBSERVATION_BYTES, SpeechArtifact, SpeechProgress,
+    SpeechProgressSink, SpeechRequest, StreamAction, StreamAdapter, ThinkingEngine, ToolAction,
+    ToolAdapter, ToolCommitFence, ToolDescriptor, ToolExecutionResult, ToolResultClass,
+    ToolVerificationOutcome, ToolVerificationRule, TtsBackendIdentity, TtsEngine,
+    authorize_avatar_action, authorize_stream_action, authorize_tool_action, verify_tool_result,
 };
 pub use reflex::{
     AttentionTarget, BackendIdentity, FallbackReason, REFLEX_SCHEMA_VERSION, ReflexDecision,

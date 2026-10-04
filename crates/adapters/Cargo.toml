@@ -18,12 +18,15 @@ sha2 = "0.11.0"
 tungstenite = "0.30.0"
 ureq = { version = "3.4", features = ["json"] }
 rodio = { version = "0.22.2", default-features = false, features = ["wav"], optional = true }
+rmcp = { version = "3.5.0", default-features = false, features = ["client", "server", "macros", "transport-async-rw"] }
+tokio = { version = "1.53.1", features = ["time"] }
 
 [target.'cfg(windows)'.dependencies]
 rodio = { version = "0.22.2", default-features = false, features = ["wav", "playback"], optional = true }
 
 [dev-dependencies]
 aivtuber-scheduler = { path = "../scheduler" }
+tokio = { version = "1.53.1", features = ["rt", "macros", "time", "io-util"] }
 
 [[bin]]
 name = "audio-backend-benchmark"
