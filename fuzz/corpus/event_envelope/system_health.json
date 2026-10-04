@@ -1,0 +1,1 @@
+{"schema_version": "0.2.0", "event_id": "seed-health", "correlation_id": "seed-corr", "sequence": 1, "observed_at": "2026-09-24T00:00:00Z", "source": "system", "source_class": "system", "plane": "system", "trust_level": "trusted", "kind": "system.health", "payload": {}}

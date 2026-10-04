@@ -85,8 +85,8 @@ Record the result as one of:
 |Fuzzing
 |+cargo-fuzz+ / libFuzzer
 |Adopt
-|Use for parser/wire/security boundaries. Longer campaigns belong in scheduled/manual Linux jobs; normal PR CI keeps deterministic reduced regressions.
-|#57
+|Use for parser/wire/security boundaries. Longer campaigns belong in scheduled/manual Linux jobs; normal PR CI keeps deterministic reduced regressions. See link:fuzzing.adoc[docs/fuzzing.adoc].
+|#57, #146
 
 |Phrase/sentence boundary primitives
 |+unicode-segmentation+

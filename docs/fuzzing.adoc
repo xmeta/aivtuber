@@ -1,0 +1,184 @@
+= Parser and Bounded-Text Fuzzing (issue #146)
+:status: Implemented (three libFuzzer targets + deterministic byte-bound properties)
+:date: 2026-10-04
+
+== 1. Scope
+
+Issue #146 asks for coverage of the runtime trust boundaries that parse bytes
+from outside the process. Three boundaries qualify: an `EventEnvelope` arriving
+from a provider, a socket or stdin; a Jev / System One response body arriving
+from a remote engine; and a Performance Asset descriptor loaded from disk or
+from generated output.
+
+This is split deliberately in two, because the two halves have different
+guarantees:
+
+* *Deterministic properties* (`crates/app/tests/bounded_text.rs`) cover the
+  UTF-8 byte-bound and encoded-size arithmetic. They run on the pinned stable
+  toolchain inside the ordinary `cargo test --locked --workspace` gate.
+* *libFuzzer targets* (`fuzz/`) cover the three parser boundaries. They need a
+  nightly compiler and are a local activity; see section 6 for why they are not
+  in CI.
+
+== 2. What each target asserts
+
+A fuzz target that only checks "did not panic" is weak: a panic-free parser that
+silently accepts forged authority is the more dangerous failure. Each target
+therefore asserts a property about anything the boundary *accepts*.
+
+`fuzz/fuzz_targets/event_envelope.rs`
+: Deserializes arbitrary bytes as `EventEnvelope` and calls `validate()`. For
+  every envelope that validates, asserts that (a) a content-plane envelope
+  carries no `authorization`, (b) an operator command is only accepted on the
+  control plane, and (c) `validate()` is idempotent. This directly guards
+  `validate_unprivileged` in `crates/domain/src/event.rs`.
+
+`fuzz/fuzz_targets/jev_response.rs`
+: Feeds arbitrary bytes to `parse_jev_response_body`, then drives
+  `normalize_answers` against a bounded candidate list. Asserts that the
+  normalized selection is always a member of the requested candidates, and that
+  two calls on identical input produce identical decisions — the property that
+  keeps reflex routing deterministic. This guards the membership check in
+  `crates/reflex/src/jev.rs`.
+
+`fuzz/fuzz_targets/performance_asset.rs`
+: Deserializes and validates asset descriptors. Asserts that a descriptor which
+  validates has a non-blank `id` and a non-empty timeline, since a descriptor
+  failing either would be dispatched as work the runtime cannot address or
+  replay.
+
+Validation is not weakened anywhere to make an input pass. If a target's
+assertion fires, that is a finding about the runtime, not about the harness.
+
+== 3. Non-vacuity
+
+A fuzz target that never reaches its assertions verifies nothing. Each of the
+three was checked by temporarily breaking the corresponding runtime check and
+confirming the target panics, then reverting:
+
+| Mutation | Runs before failure | Result |
+| --- | --- | --- |
+| `event.rs`: accept `authorization` unconditionally | 300k | panics on `accepted a content-plane envelope carrying authorization` |
+| `jev.rs`: skip the candidate-membership check | 300k | panics on `normalized selected an unrequested candidate "asset.a"` |
+| `asset-store`: skip the blank-`id` check | 100k | panics on `validated asset has a blank id` |
+
+Each mutation also established which seed is load-bearing. The `event_envelope`
+target needs a valid seed for every event kind before the fuzzer can compose an
+envelope itself, and `jev_response` needs a real `choice` answer — hand-written
+seeds parse as `Err` and never reach normalization. Both are covered by the
+checked-in corpus (section 5).
+
+== 4. Campaign results
+
+Run without mutations on the pinned toolchain, against the checked-in corpus:
+
+| Target | Runs | Exec/s | Coverage features | Crashes |
+| --- | --- | --- | --- | --- |
+| `event_envelope` | 50k | 8333 | — | 0 |
+| `jev_response` | 100k | — | 1379 | 0 |
+| `performance_asset` | 100k | — | 2231 | 0 |
+
+**No crashes were found.** The targets currently prove the absence of the
+failures they assert, over the inputs this corpus reaches — not that these
+boundaries are bug-free. Longer campaigns are cheap to run locally via
+`fuzz/run-fuzz.sh`.
+
+== 5. Corpus policy
+
+Checked-in seeds are named after what they exercise, and are reviewable:
+
+* `fuzz/corpus/event_envelope/` — one valid seed per event kind, plus
+  `forged_authorization_on_chat.json`, which is the seed that makes the
+  authorization assertion reachable.
+* `fuzz/corpus/jev_response/` — two seeds generated from the
+  `cases[].transport.body` entries in `examples/conformance/jev-system-one.json`,
+  so the wire shape stays pinned to the conformance fixture.
+* `fuzz/corpus/performance_asset/` — copied from `examples/performance-assets/valid/`.
+
+Everything libFuzzer *discovers* is written under a content-hash filename, and
+one short campaign produces well over a thousand such files. Those are
+run-local search state rather than reviewable input, so `fuzz/.gitignore` excludes
+them. Checking in a minimized regression corpus once a finding has been reduced
+to a reproducible test is issue #147's work.
+
+== 6. Why nightly is not in CI
+
+Fuzzing needs a nightly compiler, and `nightly` is deliberately absent from
+`.github/workflows/ci.yml`. `scripts/validate-toolchain-pins.mjs` requires every
+`toolchain:` in CI to equal the single channel in `rust-toolchain.toml`, so
+adding a nightly job would fail the validator until that script learns about a
+second channel. That change belongs to issue #147, which owns bounded CI
+execution — not here, where a validator change would be an unrelated blocker on
+this issue.
+
+The verification guarantee of issue #146 is therefore delivered by the
+deterministic properties in `crates/app/tests/bounded_text.rs`, which run in the
+normal gate on every push.
+
+== 7. Why the fuzz crate is excluded from the workspace
+
+`fuzz/` is listed in `exclude` in the root `Cargo.toml`. As a workspace member it
+would be resolved by `cargo test --workspace`, `cargo clippy --all-targets`,
+`cargo deny check` and `cargo build --workspace`, which would put the
+`libfuzzer-sys` C++ toolchain into the workspace lock file and the
+supply-chain gate — and would break stable-channel CI outright, since libFuzzer
+requires nightly. Excluded, it resolves its own `fuzz/Cargo.lock` and nothing
+else sees it.
+
+`crates/scheduler/tests/workspace_contract.rs` asserts this as a machine-checked
+invariant: `fuzz` stays in `exclude` and out of `members`, and neither
+`libfuzzer-sys` nor `arbitrary` appears in the workspace `Cargo.lock`. Verified
+by temporarily adding `fuzz` to `members`, which makes three of those tests fail.
+
+Because the crate is outside the workspace it cannot inherit
+`[workspace.package]`, so `edition` and `rust-version` are restated literally
+and the same contract test fails if they drift from the root manifest.
+
+== 8. Running a target
+
+Prerequisites (local only; not a repository CI dependency):
+
+[source,text]
+----
+rustup toolchain install nightly
+cargo +nightly install cargo-fuzz --locked
+----
+
+Then:
+
+[source,text]
+----
+bash fuzz/run-fuzz.sh event_envelope
+bash fuzz/run-fuzz.sh jev_response -runs=500000 -max_total_time=300
+----
+
+Build a target without running it with `cargo +nightly fuzz build <target>`.
+Note that plain `cargo +nightly build --release` *fails* here with `LNK1561`:
+that is expected, because the release profile builds the crate as a normal binary
+and there is no libFuzzer entry point without `cargo fuzz`.
+
+=== Windows / MSVC hosts
+
+The libFuzzer binary links the AddressSanitizer runtime dynamically
+(`clang_rt.asan_dynamic-x86_64.dll`), which ships with the Visual Studio
+toolset rather than next to the executable. Without it on `PATH` the process
+fails at load time with `STATUS_DLL_NOT_FOUND (0xC0000135)`, which looks like a
+broken target rather than a missing runtime. `fuzz/run-fuzz.sh` locates that DLL
+under the MSVC toolset and puts it on `PATH` before handing over to cargo-fuzz.
+Calling `cargo +nightly fuzz run` directly on Windows skips that step.
+
+=== Reducing a finding to a regression test
+
+A libFuzzer crash artifact is not yet a regression test. To land a fix:
+
+1. Reproduce from the artifact: `bash fuzz/run-fuzz.sh <target> fuzz/artifacts/<target>/<hash>`.
+2. Minimize with `-min_len_len` / `-runs`, or `cargo +nightly fuzz tmin <artifact>`
+   for a byte-minimal input.
+3. Add a deterministic test with that exact input as a fixture — in the crate
+   that owns the boundary, not in `fuzz/`. `fuzz/` has `test = false` on every
+   `[[bin]]`, so it contributes no coverage to the normal gate.
+4. Fix the runtime, then add the minimized input to `fuzz/corpus/<target>/` under
+   a descriptive name, since it is now a regression seed and reviewable.
+
+Steps 1–2 were exercised for all three targets via the mutation campaign in
+section 3; the reduced inputs became the named seeds listed in section 5.

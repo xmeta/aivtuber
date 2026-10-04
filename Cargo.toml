@@ -12,6 +12,13 @@ members = [
     "crates/hardening",
     "crates/app",
 ]
+# The fuzz crate is intentionally NOT a member (issue #146). It needs a nightly
+# compiler and `libfuzzer-sys`; as a member it would be resolved by
+# `cargo test --workspace`, `cargo clippy --all-targets` and `cargo deny check`,
+# putting the fuzzer toolchain into the workspace lock file and the supply-chain
+# gate. Excluded, it resolves its own lock file and no production build can reach
+# it. Verified by `crates/scheduler/tests/workspace_contract.rs`.
+exclude = ["fuzz"]
 resolver = "3"
 
 [workspace.package]
