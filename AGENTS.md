@@ -186,6 +186,7 @@ Do not create a second implicit wire contract in an adapter or prototype.
 ## Reuse-first rule
 
 Before writing generic infrastructure, check docs/reuse-first.adoc and search maintained crates/reference implementations.
+For open roadmap work, also check docs/implementation-accelerator.adoc for issue-oriented local start points, concrete upstream file references, and the cheapest suggested falsifier; the live issue still owns readiness and acceptance criteria.
 
 - Reuse generic mechanisms when they fit.
 - Keep aivtuber-specific policy, authority, replay, determinism, and bounded-state semantics project-owned.
