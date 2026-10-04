@@ -1,37 +1,45 @@
 {
   "schema_version": "1",
-  "orchestrator_schema_version": "0.1.0",
+  "orchestration": {
+    "orchestrator_schema_version": "0.1.0",
+    "bounds_fingerprint": "5ab1c0de9f7a3b21"
+  },
   "compatibility": {
     "comparison_schema_version": "0.1.0",
     "active_policy_id": "intent-routing",
     "active_policy_version": "1.0.0",
     "active_config_fingerprint": "cfg-9f2a",
     "active_runtime_profile": "default",
+    "active_dataset_id": "stream-replay-2026-10",
     "shadow_policy_id": "semantic-reuse-proposal",
     "shadow_policy_version": "0.3.0",
     "shadow_config_fingerprint": "cfg-9f2a",
     "shadow_runtime_profile": "default",
-    "dataset_id": "stream-replay-2026-10"
+    "shadow_dataset_id": "stream-replay-2026-10"
   },
-  "total_comparisons": 8,
-  "comparable_comparisons": 7,
-  "diverged_comparisons": 5,
+  "total_comparisons": 10,
+  "comparable_comparisons": 8,
+  "diverged_comparisons": 6,
   "category_counts": {
     "same_route_same_target": 2,
     "same_route_different_target": 1,
     "route_transition": 2,
     "response_vs_silent": 1,
     "fallback_vs_success": 1,
-    "shadow_unusable": 1
+    "fallback_reason_mismatch": 1,
+    "shadow_unusable": 1,
+    "target_incomparable": 1
   },
   "metrics": {
-    "shadow.divergence.fallback_vs_success_count": { "value": 1, "sample_count": 8 },
-    "shadow.divergence.rate_pct": { "value": 71.42857142857143, "sample_count": 7 },
-    "shadow.divergence.response_vs_silent_count": { "value": 1, "sample_count": 8 },
-    "shadow.divergence.route_transition_count": { "value": 2, "sample_count": 8 },
-    "shadow.divergence.same_route_different_target_count": { "value": 1, "sample_count": 8 },
-    "shadow.divergence.same_route_same_target_count": { "value": 2, "sample_count": 8 },
-    "shadow.divergence.shadow_unusable_count": { "value": 1, "sample_count": 8 }
+    "shadow.divergence.fallback_reason_mismatch_count": { "value": 1, "sample_count": 10 },
+    "shadow.divergence.fallback_vs_success_count": { "value": 1, "sample_count": 10 },
+    "shadow.divergence.rate_pct": { "value": 75, "sample_count": 8 },
+    "shadow.divergence.response_vs_silent_count": { "value": 1, "sample_count": 10 },
+    "shadow.divergence.route_transition_count": { "value": 2, "sample_count": 10 },
+    "shadow.divergence.same_route_different_target_count": { "value": 1, "sample_count": 10 },
+    "shadow.divergence.same_route_same_target_count": { "value": 2, "sample_count": 10 },
+    "shadow.divergence.shadow_unusable_count": { "value": 1, "sample_count": 10 },
+    "shadow.divergence.target_incomparable_count": { "value": 1, "sample_count": 10 }
   },
   "divergent_cases": [
     {
@@ -64,20 +72,29 @@
     {
       "event_id": "evt-1004",
       "correlation_id": "corr-1004",
-      "category": "route_transition",
-      "active_route": "generated",
-      "shadow_route": "template",
-      "active_fallback_reason": null,
+      "category": "fallback_vs_success",
+      "active_route": "deterministic",
+      "shadow_route": "deterministic",
+      "active_fallback_reason": "timeout",
       "shadow_fallback_reason": null
     },
     {
       "event_id": "evt-1005",
       "correlation_id": "corr-1005",
-      "category": "fallback_vs_success",
-      "active_route": "deterministic",
-      "shadow_route": "deterministic",
+      "category": "fallback_reason_mismatch",
+      "active_route": "template",
+      "shadow_route": "template",
+      "active_fallback_reason": "timeout",
+      "shadow_fallback_reason": "unavailable"
+    },
+    {
+      "event_id": "evt-1006",
+      "correlation_id": "corr-1006",
+      "category": "route_transition",
+      "active_route": "generated",
+      "shadow_route": "template",
       "active_fallback_reason": null,
-      "shadow_fallback_reason": "timeout"
+      "shadow_fallback_reason": null
     }
   ],
   "divergent_cases_truncated": false

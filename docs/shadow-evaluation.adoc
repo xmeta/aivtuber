@@ -488,18 +488,27 @@ anything in that module.
 | `same_route_different_target` | same route class, different comparable target |
 | `route_transition` | different route class on both sides, neither silent |
 | `response_vs_silent` | one side responded, the other stayed silent |
-| `fallback_vs_success` | the fallback reason differs, so one side degraded |
+| `fallback_vs_success` | *exactly one* side carries a fallback reason; the other is a clean success |
+| `fallback_reason_mismatch` | *both* sides carry a fallback reason and the reasons differ (`Timeout` vs `Unavailable`) |
 | `shadow_unusable` | the shadow half produced no usable decision |
+| `target_incomparable` | route classes matched, but the runtime declined to compare the targets |
 
-Two ordering decisions are the contract:
+Three ordering rules are the contract, and each exists because the looser
+reading would misstate the report:
 
-* A fallback disagreement is reported as `fallback_vs_success` *even when* the
-  route classes also differ, because the degradation is the operationally
-  interesting half.
-* `shadow_unusable` is a *failure to compare*, not an agreement. It is counted
-  separately and excluded from the divergence rate's denominator, so a broken
-  or timing-out shadow policy cannot depress its own divergence rate and look
-  like a good one.
+* A fallback difference outranks a route difference, because the degradation is
+  the operationally interesting half.
+* `fallback_vs_success` means *one* side degraded. `build_record` sets
+  `fallback_diverged` from `active.fallback_reason != shadow.fallback_reason`,
+  which is also true when **both** sides failed for different reasons — that is
+  `fallback_reason_mismatch`, and folding it into `fallback_vs_success` would
+  claim a clean success that never happened.
+* `shadow_unusable` and `target_incomparable` are *failures to compare*, not
+  agreements. `compare_target` returns `None` for pairs such as `Generated` vs
+  `Generated`, whose content the runtime deliberately does not retain, so
+  agreement there is unevidenced. Both are excluded from the divergence rate's
+  denominator: counting either as agreement would let a policy that produces
+  unusable or uncompareable evidence look better than one that disagrees.
 
 === 9.2 Compatibility is explicit, not implicit
 
@@ -507,14 +516,20 @@ Two ordering decisions are the contract:
 when it is empty (an empty report would read as "no divergence"), when any
 record carries a `ShadowComparisonRecord` `schema_version` other than the
 current one, or when any record's `ShadowCompatibilityKey` differs from the
-first record's — that key holds both policy identities, the config
-fingerprint, the runtime profile and the dataset id, so it is exactly the
-boundary section 6 described. An aggregated number across two identities could
-not be interpreted, so the aggregator refuses instead of producing one.
+first record's — that key holds both policy identities field by field, so the
+`dataset_id` of *each* side is compared separately (an active/shadow dataset
+mismatch cannot hide behind a matching shadow dataset), plus the config
+fingerprint and the runtime profile.
 
-The report itself carries `orchestrator_schema_version` beside its own
-`schema_version`, so a stored sample is never re-interpreted under different
-bounds.
+The report also carries an `orchestration` block: the bounded-orchestration
+identity the caller supplied *and the summarizer validated*, never a version
+back-filled at summarize time. A `ShadowComparisonRecord` does not carry it,
+and reconstructing it afterwards would claim bounds the report cannot vouch
+for — `ShadowOrchestratorConfig` fixes the sample rate, deadline, concurrency,
+queue capacity and whether provider calls or budget charging were permitted, so
+two batches differing only in those bounds are not comparable even under an
+identical policy identity. `ShadowOrchestrationIdentity::from_config` derives a
+16-hex `bounds_fingerprint` over exactly those fields.
 
 === 9.3 What a report contains
 
@@ -540,7 +555,15 @@ switch to; the only policy identities in a report are the two that were already
 compared. Promotion remains an explicit, reviewed decision under the experiment
 workflow. `a_report_cannot_promote_a_shadow_policy` pins this, and
 `scripts/validate.mjs` independently rejects a fixture that references a
-non-diverging category, reports an empty batch, or smuggles a text field into a
-case reference.
+non-diverging category, reports an empty batch, smuggles a text field into a
+case reference, omits the bounds fingerprint, or publishes a `rate_pct` that
+disagrees with its own counts.
+
+Operational evidence (#165 scope: provider-call counts "when available") is
+supplied by the caller as a `ShadowOperationalEvidence` delta taken from
+`ShadowExecutionSnapshot` counters around the batch, via
+`ShadowOperationalEvidence::from_snapshot_delta`. The snapshot is cumulative for
+the life of the orchestrator and the records alone cannot say what the shadow
+path cost, so it is the *delta* — never a raw snapshot — that a report may carry.
 
 #165 does not replace #108 causal trace attribution.

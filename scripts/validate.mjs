@@ -244,9 +244,19 @@ const SHADOW_DIVERGENCE_CATEGORIES = [
   "route_transition",
   "response_vs_silent",
   "fallback_vs_success",
+  "fallback_reason_mismatch",
   "shadow_unusable",
+  "target_incomparable",
 ];
-const SHADOW_NON_DIVERGING = ["same_route_same_target", "shadow_unusable"];
+// Agreement, plus the two categories that are failures to compare rather than
+// disagreements. None of them may be retained as a reviewable reference.
+const SHADOW_NON_DIVERGING = [
+  "same_route_same_target",
+  "shadow_unusable",
+  "target_incomparable",
+];
+// Categories kept out of the divergence-rate denominator.
+const SHADOW_NON_COMPARABLE = ["shadow_unusable", "target_incomparable"];
 
 const shadowDivergenceDocuments = [];
 for (const file of listJson("examples/evaluation/shadow-divergence")) {
@@ -287,13 +297,18 @@ for (const { file, doc } of shadowDivergenceDocuments) {
   }
 
   // The divergence rate has comparable comparisons as its denominator, so
-  // unusable shadow evaluations cannot make a broken policy look good.
+  // neither a broken shadow policy nor an unevidenced target pair can make a
+  // policy look good by producing evidence nobody could compare.
   const comparable =
-    doc.total_comparisons - (doc.category_counts.shadow_unusable ?? 0);
+    doc.total_comparisons -
+    SHADOW_NON_COMPARABLE.reduce(
+      (sum, category) => sum + (doc.category_counts[category] ?? 0),
+      0,
+    );
   if (comparable !== doc.comparable_comparisons) {
     failures += 1;
     console.error(
-      `FAIL      ${file}: comparable_comparisons is ${doc.comparable_comparisons}, but total minus shadow_unusable is ${comparable}`,
+      `FAIL      ${file}: comparable_comparisons is ${doc.comparable_comparisons}, but total minus ${SHADOW_NON_COMPARABLE.join("/")} is ${comparable}`,
     );
   } else if (doc.diverged_comparisons > doc.comparable_comparisons) {
     failures += 1;
@@ -302,7 +317,35 @@ for (const { file, doc } of shadowDivergenceDocuments) {
     );
   } else {
     passes += 1;
-    console.log(`ok        ${file}: divergence denominator excludes unusable evaluations`);
+    console.log(`ok        ${file}: divergence denominator excludes non-comparable evaluations`);
+  }
+
+  // The bounded-orchestration identity and both per-side dataset ids are
+  // schema-enforced (`required` plus the 16-hex `bounds_fingerprint` pattern),
+  // so repeating them here would be a check the fixtures can never trip. What a
+  // schema cannot express is that the published rate agrees with the counts it
+  // was derived from — a stale or hand-edited metric would otherwise let a
+  // consumer believe a divergence rate the counts contradict.
+  const rate = doc.metrics?.["shadow.divergence.rate_pct"];
+  if (!rate) {
+    passes += 1;
+    console.log(`ok        ${file}: no rate_pct metric published`);
+  } else {
+    const expected =
+      doc.comparable_comparisons === 0
+        ? 0
+        : (doc.diverged_comparisons / doc.comparable_comparisons) * 100;
+    const rateMatches =
+      Math.abs(rate.value - expected) < 1e-9 && rate.sample_count === doc.comparable_comparisons;
+    if (!rateMatches) {
+      failures += 1;
+      console.error(
+        `FAIL      ${file}: rate_pct is ${rate.value} over ${rate.sample_count} samples, but diverged/comparable is ${expected} over ${doc.comparable_comparisons}`,
+      );
+    } else {
+      passes += 1;
+      console.log(`ok        ${file}: rate_pct agrees with diverged/comparable`);
+    }
   }
 
   // Evidence may reference divergent cases, never agreeing or unusable ones.

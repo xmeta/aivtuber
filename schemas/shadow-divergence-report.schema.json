@@ -6,7 +6,7 @@
   "type": "object",
   "required": [
     "schema_version",
-    "orchestrator_schema_version",
+    "orchestration",
     "compatibility",
     "total_comparisons",
     "comparable_comparisons",
@@ -21,10 +21,9 @@
     "schema_version": {
       "const": "1"
     },
-    "orchestrator_schema_version": {
-      "type": "string",
-      "minLength": 1,
-      "description": "Bounded-orchestration config version these samples ran under (#164). Present so a stored sample is never re-interpreted under different bounds."
+    "orchestration": {
+      "$ref": "#/$defs/orchestration",
+      "description": "The bounded-orchestration identity the caller supplied and the aggregator validated. Copied verbatim from the input; never reconstructed from a current constant, because a report must not claim bounds it cannot vouch for."
     },
     "compatibility": {
       "$ref": "#/$defs/compatibility"
@@ -32,12 +31,12 @@
     "total_comparisons": {
       "type": "integer",
       "minimum": 1,
-      "description": "Every record in the batch, including shadow evaluations that produced no usable decision. An empty batch is refused rather than reported as zero divergence."
+      "description": "Every record in the batch, including records whose shadow evaluation produced nothing or whose target pair was not comparable. An empty batch is refused rather than reported as zero divergence."
     },
     "comparable_comparisons": {
       "type": "integer",
       "minimum": 0,
-      "description": "Records that could actually be compared. This is the divergence-rate denominator; unusable shadow evaluations are excluded so a broken shadow policy cannot depress the rate."
+      "description": "Records that could actually be compared. This is the divergence-rate denominator; `shadow_unusable` and `target_incomparable` are excluded so neither a broken nor an unevidenced shadow policy can depress the rate."
     },
     "diverged_comparisons": {
       "type": "integer",
@@ -53,7 +52,9 @@
         "route_transition",
         "response_vs_silent",
         "fallback_vs_success",
-        "shadow_unusable"
+        "fallback_reason_mismatch",
+        "shadow_unusable",
+        "target_incomparable"
       ],
       "additionalProperties": false,
       "properties": {
@@ -61,11 +62,25 @@
         "same_route_different_target": { "type": "integer", "minimum": 0 },
         "route_transition": { "type": "integer", "minimum": 0 },
         "response_vs_silent": { "type": "integer", "minimum": 0 },
-        "fallback_vs_success": { "type": "integer", "minimum": 0 },
+        "fallback_vs_success": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Exactly one side carries a fallback reason; the other is a clean success."
+        },
+        "fallback_reason_mismatch": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Both sides carry a fallback reason and the reasons differ (Timeout vs Unavailable). Distinct from fallback_vs_success, where only one side degraded."
+        },
         "shadow_unusable": {
           "type": "integer",
           "minimum": 0,
           "description": "Shadow evaluations with no usable decision. A failure to compare, never an agreement."
+        },
+        "target_incomparable": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Route classes matched but the runtime declined to compare the targets (for example two Generated routes, whose content is not retained). An absent comparison, never an agreement."
         }
       }
     },
@@ -93,20 +108,35 @@
     }
   },
   "$defs": {
+    "orchestration": {
+      "type": "object",
+      "description": "Bounded-orchestration identity the batch was produced under (#164). Two batches differing only in deadline, sample rate, concurrency, queue capacity or provider-call/budget flags are not comparable even under an identical policy identity.",
+      "required": ["orchestrator_schema_version", "bounds_fingerprint"],
+      "additionalProperties": false,
+      "properties": {
+        "orchestrator_schema_version": { "type": "string", "minLength": 1 },
+        "bounds_fingerprint": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{16}$",
+          "description": "Stable fingerprint over the orchestration bounds, so two batches can be compared only when they were collected the same way."
+        }
+      }
+    },
     "compatibility": {
       "type": "object",
-      "description": "The identity every record in this report shares. Records from different policy/config/profile identities or comparison schema versions are refused by the aggregator rather than merged.",
+      "description": "The identity every record in this report shares. `ShadowPolicyIdentity` defines a dataset id per side, so both are held separately: two batches whose active datasets differ are incompatible even when the shadow dataset matches.",
       "required": [
         "comparison_schema_version",
         "active_policy_id",
         "active_policy_version",
         "active_config_fingerprint",
         "active_runtime_profile",
+        "active_dataset_id",
         "shadow_policy_id",
         "shadow_policy_version",
         "shadow_config_fingerprint",
         "shadow_runtime_profile",
-        "dataset_id"
+        "shadow_dataset_id"
       ],
       "additionalProperties": false,
       "properties": {
@@ -115,11 +145,12 @@
         "active_policy_version": { "type": "string", "minLength": 1 },
         "active_config_fingerprint": { "type": "string", "minLength": 1 },
         "active_runtime_profile": { "type": "string", "minLength": 1 },
+        "active_dataset_id": { "type": ["string", "null"] },
         "shadow_policy_id": { "type": "string", "minLength": 1 },
         "shadow_policy_version": { "type": "string", "minLength": 1 },
         "shadow_config_fingerprint": { "type": "string", "minLength": 1 },
         "shadow_runtime_profile": { "type": "string", "minLength": 1 },
-        "dataset_id": { "type": ["string", "null"] }
+        "shadow_dataset_id": { "type": ["string", "null"] }
       }
     },
     "route_class": {
@@ -155,7 +186,9 @@
         "route_transition",
         "response_vs_silent",
         "fallback_vs_success",
-        "shadow_unusable"
+        "fallback_reason_mismatch",
+        "shadow_unusable",
+        "target_incomparable"
       ]
     },
     "case_ref": {
@@ -176,7 +209,7 @@
         "correlation_id": { "type": "string", "minLength": 1 },
         "category": {
           "$ref": "#/$defs/category",
-          "description": "Only diverging categories appear here; `same_route_same_target` and `shadow_unusable` are aggregations, not reviewable divergences."
+          "description": "Only diverging categories appear here; agreement and the two non-comparable categories are aggregations, not reviewable divergences."
         },
         "active_route": { "$ref": "#/$defs/route_class" },
         "shadow_route": { "$ref": "#/$defs/route_class" },
@@ -185,10 +218,16 @@
       },
       "allOf": [
         {
-          "description": "A reviewable reference is always a disagreement, so it is never agreement or an unusable evaluation.",
+          "description": "A reviewable reference is always a disagreement, so it is never agreement nor one of the two non-comparable categories.",
           "not": {
             "properties": {
-              "category": { "enum": ["same_route_same_target", "shadow_unusable"] }
+              "category": {
+                "enum": [
+                  "same_route_same_target",
+                  "shadow_unusable",
+                  "target_incomparable"
+                ]
+              }
             },
             "required": ["category"]
           }
