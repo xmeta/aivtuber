@@ -1,0 +1,557 @@
+= Implementation Accelerator
+:toc:
+:toclevels: 3
+
+This document reduces repeated discovery work for open aivtuber issues.
+It is a start-here map, not a second roadmap and not an implementation authorization source.
+
+Snapshot date: 2026-10-04.
+
+Live GitHub issue milestone, priority, blockers, and status labels remain authoritative.
+Before implementation, read the complete issue, +AGENTS.md+, the smallest relevant authoritative docs, and link:reuse-first.adoc[the reuse-first matrix].
+
+== 1. How to use this document
+
+For an implementation issue:
+
+. confirm +status:agent-ready+ on GitHub;
+. start from current +origin/main+;
+. run +tgrep+ from the repository root;
+. inspect the local start-here files below before designing a new module;
+. inspect the named OSS/reference implementation before writing generic infrastructure;
+. implement the smallest vertical slice listed here unless newer issue evidence narrows it;
+. run the cheapest falsifier early;
+. record adopt / wrap / sidecar / partial reuse / reference only / benchmark first / reject for external mechanisms.
+
+A row is intentionally compact. The issue body owns acceptance criteria and security constraints.
+
+== 2. Shared local landmarks
+
+[cols="2,4"]
+|===
+|Concern |Start here
+
+|Domain contracts
+|+crates/domain/src/context.rs+, +crates/domain/src/interfaces.rs+, +crates/domain/src/reflex.rs+, +docs/domain-contract.adoc+
+
+|Authority / trust / publication
+|+crates/runtime/src/lib.rs+, +docs/security-threat-model.adoc+
+
+|Routing / Jev
+|+crates/app/src/routing.rs+, +crates/reflex/src/pipeline.rs+, +crates/reflex/src/jev.rs+
+
+|Scheduler / interruption
+|+crates/scheduler/src/lib.rs+, +crates/scheduler/src/replay.rs+
+
+|Generation / cancellation / TTS compilation
+|+crates/generative/src/lib.rs+, +crates/app/src/lib.rs+, +crates/adapters/src/openai.rs+
+
+|Memory / adaptation
+|+crates/adaptation/src/lib.rs+, +docs/memory-adaptation.adoc+
+
+|Telemetry / retained causal trace
+|+crates/telemetry/src/lib.rs+, +crates/telemetry/src/causal_trace.rs+, +docs/causal-trace.adoc+
+
+|Shadow evaluation
+|+crates/app/src/shadow.rs+, +crates/app/src/shadow_orchestrator.rs+, +docs/shadow-evaluation.adoc+
+
+|Benchmark / quality evidence
+|+crates/app/src/bin/replay-benchmark.rs+, +docs/metrics.adoc+, +docs/reaction-quality-evaluation.adoc+, +scripts/benchmark-record.mjs+
+
+|Provider adapters
+|+crates/adapters/src/+; keep provider DTOs out of +crates/domain+
+
+|Performance Assets
+|+crates/asset-store/src/lib.rs+, +docs/performance-assets.adoc+, +schemas/performance-asset.schema.json+
+|===
+
+Useful discovery commands:
+
+[source,shell]
+----
+tgrep -n -t rust 'ThinkingRequest|ToolAction|AuthorizedToolAction' .
+tgrep -n -t rust 'AttentionTarget|interrupt_points_ms|Priority::Conversation' .
+tgrep -n -t rust 'WorkingMemory|MemoryWrite|topic' .
+tgrep -n -t rust 'ShadowComparisonRecord|TraceStage' .
+----
+
+== 3. Stage 1-2 evidence and hardening
+
+[cols="1,3,3,3,3"]
+|===
+|Issue |Local start-here |Reuse/reference |Smallest vertical slice |Cheapest falsifier
+
+|#59 reaction quality
+|+docs/product-objectives.adoc+, +docs/reaction-quality-evaluation.adoc+, reaction-quality schemas/examples
+|Existing pairwise/human-review workflow; Full-Duplex-Bench classes only as scenario inspiration
+|One new quality dimension/case family with reviewer schema compatibility
+|Blind pairwise fixture demonstrates that the new label distinguishes a real failure without a scalar quality score
+
+|#64 shadow policy
+|+crates/app/src/shadow.rs+, +shadow_orchestrator.rs+
+|Existing shadow machinery; do not add an external experiment framework to the runtime
+|One candidate policy produces a comparison record with zero active side effects
+|Byte/plan-equivalence with shadow disabled versus enabled
+
+|#70 realistic workloads
+|+crates/app/src/bin/replay-benchmark.rs+, +crates/hardening+, +examples/benchmarks/+
+|Full-Duplex-Bench-v3 for disfluency/tool-use scenario classes; do not import its thresholds
+|Versioned seeded normal/burst/idle scenario generator used by benchmark and soak
+|Same seed/config produces byte-identical ordered events twice
+
+|#71 operational SLOs
+|+docs/performance-goals.adoc+, +docs/benchmark-gate.adoc+, +docs/metrics.adoc+
+|SRE error-budget patterns; keep aivtuber indicators and zero-tolerance invariants project-owned
+|Generate one session/scenario SLI report from #70 baseline evidence before setting targets
+|If the denominator/window cannot be reproduced from a benchmark artifact, do not define the SLO
+
+|#145 property tests
+|+crates/scheduler/src/lib.rs+, +crates/runtime/src/lib.rs+
+|+proptest+
+|Generate bounded scheduler/cancellation sequences around one invariant
+|Shrunk failure can be converted into a deterministic regression test
+
+|#146 fuzz targets
+|Input parsers in +crates/reflex+, +crates/adapters+, runtime ingress
+|+cargo-fuzz+ / libFuzzer
+|One parser/trust-boundary target with bounded corpus and no network
+|Seed corpus finds no panic/unbounded allocation under bounded CI duration
+
+|#147 fuzz CI
+|+.github/workflows/ci.yml+, #145/#146 outputs
+|cargo-fuzz corpus/artifact conventions
+|Persist discovered seeds as deterministic regressions; short PR job plus longer scheduled job
+|PR job has stable time bound and a discovered crash is reproducible outside the fuzzer
+
+|#165 shadow evidence export
+|+shadow.rs+, +shadow_orchestrator.rs+, telemetry, benchmark/reaction-quality schemas
+|Reuse repository benchmark/review formats instead of another analytics store
+|Export stable divergence category + privacy-safe case reference
+|Compatibility mismatch is rejected instead of aggregated
+|===
+
+== 4. Stage 3 engagement, memory, and embodied-agent foundation
+
+[cols="1,3,3,3,3"]
+|===
+|Issue |Local start-here |Reuse/reference |Smallest vertical slice |Cheapest falsifier
+
+|#72 Persona
+|+crates/domain/src/context.rs+, +generative+, reaction-quality evaluation
+|Keep typed persona project-owned; study AIRI/Letta only for configuration UX
+|Versioned bounded persona subset reaches one generated request and replay identity
+|Malformed/out-of-range persona cannot widen authority or change security policy
+
+|#74 engagement triage
+|+crates/reflex/src/pipeline.rs+, +crates/app/src/routing.rs+
+|Jev for recommendation; moderation/community research in research register
+|Respond / react / defer / ignore decision for one bounded chat fixture
+|Same fixture cannot force privileged moderation or unbounded context
+
+|#75 deferred response
+|+crates/app/src/lib.rs+, runtime retention, #80 contracts
+|Reuse existing bounded queues/retention before introducing a workflow engine
+|One deferred item with expiry, revalidation, and explicit terminal outcome
+|Expired/cancelled item cannot dispatch
+
+|#76 moderation adapters
+|+crates/domain/src/interfaces.rs+, +crates/runtime+, +crates/adapters+
+|+twitch_api+, +google-youtube3+
+|One non-destructive or test-fixture moderation operation behind authenticated capability
+|Forged serialized authorization cannot execute the adapter
+
+|#77 moderation evaluation
+|#64 shadow types, #59 review formats
+|Reuse shadow/reviewer infrastructure
+|One moderation recommendation comparison sampled into human review
+|No shadow recommendation can execute provider side effects
+
+|#78 burst selection
+|+crates/reflex+, bounded ingress in +crates/runtime+, #70 scenarios
+|Reuse current bounded queues; generic batching crates add little unless measurements justify them
+|One deterministic micro-batch with Top-K outcomes for every admitted event
+|100x synthetic burst remains bounded and no admitted event loses terminal accounting
+
+|#79 audience aggregation
+|+crates/adaptation+, +crates/reflex+, #80 thread/topic contract
+|Prefer explicit/deterministic grouping before ANN or learned clustering
+|Aggregate one repeated-topic cluster while preserving one important outlier
+|Conflicting explicit threads prevent a false merge
+
+|#80 conversation context
+|+crates/adaptation/src/lib.rs+ WorkingMemory, +crates/domain/src/context.rs+
+|Reuse existing bounded retention; do not add a second memory service
+|Explicit reply relation + one inferred topic relation with TTL
+|Reply linkage cannot propagate trust/capability and expires deterministically
+
+|#104 marginal-value routing
+|+crates/app/src/routing.rs+, +crates/reflex+, benchmark/quality evidence
+|RouteLLM as algorithm/evaluation reference only
+|Offline deterministic threshold/table using #59 pairwise labels
+|Deadline/budget veto always defeats a high predicted quality gain
+
+|#105 temporal/episodic memory
+|+crates/adaptation/src/lib.rs+, +docs/memory-adaptation.adoc+
+|Hindsight first benchmark candidate; Graphiti optional temporal-graph/MCP sidecar; Letta reference
+|Compare current simple retrieval against one external sidecar on synthetic update/supersession cases
+|Deletion/expiry test proves external memory cannot preserve removed private content or bypass MemoryWriteGate
+
+|#191 RoleBlend
+|new bounded type in +crates/domain+; then one policy consumer in reflex/app
+|AIRI behavior/config UX as reference; keep RoleBlend semantics project-owned
+|0..100 baseline -> versioned derived profile -> one initiative/response-style decision
+|Changing RoleBlend cannot alter tool capability, approval, privacy, or verification
+
+|#193 agent-tool vertical slice
+|+crates/domain/src/interfaces.rs+ ToolAction/AuthorizedToolAction, +crates/generative+, +crates/app+
+|official +rmcp+; Rig +rig-rmcp+; Rig +AgentRun+ and approval-hook examples
+|Read-only local MCP tool -> authorized execution -> structured observation -> deterministic verification
+|Rig/rmcp spike must demonstrate that a forged request cannot bypass aivtuber authority and a failed verification is not reported as complete
+|===
+
+== 5. Stage 4 natural live performance
+
+[cols="1,3,3,3,3"]
+|===
+|Issue |Local start-here |Reuse/reference |Smallest vertical slice |Cheapest falsifier
+
+|#81 conversational floor
+|+crates/domain/src/reflex.rs+ AttentionTarget, +crates/scheduler+, app routing
+|LiveKit false-interruption recovery; Pipecat Smart Turn v3; turn-taking papers
+|Typed Hold/Yield/Backchannel/TakeTurn over replayed speaking state, no microphone required
+|Short hesitation versus true turn-end fixtures produce different floor actions
+
+|#82 pre-response behavior
+|Performance Assets, +crates/app+, #81 floor inputs
+|AIRI listening/thinking behavior as UX reference
+|Visual-only semantic-neutral thinking asset after calibrated delay
+|Fast response path proves no unnecessary filler; cancellation ends masking without marking answer complete
+
+|#83 phrase streaming
+|+crates/generative/src/lib.rs+, +crates/scheduler+, Performance Asset schema
+|+unicode-segmentation+ primitive; Open-LLM-VTuber +sentence_divider.py+ reference
+|Phrase 1 complete/gated/TTS'd and committed while phrase 2 remains pending
+|Phrase 2 failure cannot replay or invalidate already spoken phrase 1
+
+|#84 PerformanceIntent
+|new bounded domain type, +crates/generative+, adapters, scheduler
+|AIRI motion/gaze behavior and EMAGE sparse-anchor principle as references
+|One intent field set compiles deterministically into existing expression/gaze/gesture references
+|Unsupported/incompatible hint clamps to neutral without provider DTO leakage
+
+|#85 clarification/repair
+|+crates/app/src/routing.rs+, bounded +ThinkingRequest+, #80 context
+|ReCoVERR/selective-prediction pattern
+|One bounded evidence probe before ask/answer decision
+|Missing/deleted antecedent cannot be reconstructed from unbounded/private history
+
+|#86 affect continuity
+|bounded state near adaptation/performance policy; #84 intent
+|Use ordinary deterministic decay/hysteresis; no external affect engine required
+|One affect state decays and is interrupted by a new event
+|Replay produces identical state trajectory and emergency/task focus can clamp presentation
+
+|#87 initiative
+|timer/system events, app routing, #88 scene context, #89 budget
+|Open-LLM-VTuber proactive speaking and AIRI behavior only as references
+|One idle-safe proactive comment with cooldown and immediate viewer-event cancellation
+|Proactive action never displaces a higher-priority direct response
+
+|#88 scene/game context
+|+crates/domain/src/context.rs+, event normalization, adapter boundary
+|Prefer structured game telemetry / OBS state; use vision only when structured state is unavailable
+|One provider adapter normalizes boss/menu/unknown into bounded snapshot
+|Public chat cannot self-assert trusted busy/interruptibility state
+
+|#89 naturalness budgets
+|+crates/adaptation+ recent bounded history, #84/#81/#82 outputs
+|Project policy; reuse explicit behavior-family tags rather than learned novelty first
+|One cooldown/budget suppresses repeated filler/gesture across two routes
+|Diversity never overrides semantic/PerformanceIntent compatibility
+
+|#91 gaze continuity
+|existing +AttentionTarget+ in +crates/domain/src/reflex.rs+, scheduler/avatar adapter
+|AIRI MMD gaze controller / idle-saccade behavior reference
+|Chat -> camera transition with dwell/cooldown and high-priority game override
+|Rapid competing events do not cause unbounded gaze oscillation
+
+|#106 preemptive generation
+|+crates/generative+, app generation submission/cancellation, scheduler generation fencing
+|LiveKit preemptive generation state/lifecycle reference
+|Start disposable Thinking work before turn commitment; publish nothing until commit barrier
+|Changed/corrected transcript discards speculative result and stale completion cannot schedule
+
+|#107 listening prior
+|#84 intent, #89 budget, scheduler/avatar behavior
+|AIRI idle/listening motion reference
+|Low-amplitude listening prior suppressed by foreground performance then smoothly resumed
+|Suppressed idle actions do not accumulate/catch up after foreground completion
+
+|#108 failure attribution
+|+crates/telemetry/src/causal_trace.rs+, benchmark artifacts, #59 labels
+|OpenTelemetry GenAI agent/tool span conventions; Phoenix optional offline exporter/evaluator
+|Map one retained aivtuber trace into deterministic attribution categories plus optional OTel export
+|Exporter/evaluator absence cannot break CI or change retained internal trace meaning
+|===
+
+#94 remains the tracking issue; use its dependency order plus live labels rather than implementing it as one module.
+
+== 6. Stage 5 optional multimodal / full-duplex / multi-party
+
+[cols="1,3,3,3,3"]
+|===
+|Issue |Local start-here |Reuse/reference |Smallest vertical slice |Cheapest falsifier
+
+|#90 perception plane
+|+crates/domain/src/context.rs+, adapter boundary, security threat model
+|Narrow task-specific models first; #92 turn cues before general screen understanding
+|Replay one bounded derived observation with confidence/TTL/provenance
+|Prompt/tool-like text inside perceived content cannot mint authority
+
+|#92 speech/turn observations
+|new domain observations, adapters/sidecar boundary, #81 consumer
+|sherpa-onnx Rust Japanese ReazonSpeech+VAD example; Pipecat LocalSmartTurnAnalyzerV3; LiveKit turn detector
+|Sidecar/fixture emits SpeechActivity + TurnEndLikelihood; #81 consumes replayed observation
+|Unsupported language/provider degrades to deterministic silence/phrase heuristic without frame-loop blocking
+
+|#93 multi-party
+|#80 conversation context, #81 floor, #91 attention, #92 speaker observations
+|LiveKit/WebRTC for tracks/reconnect/jitter/media plumbing; sherpa-onnx diarization where measured useful
+|Two normalized speakers + deterministic floor/attention arbitration using recorded observations
+|Speaker identity never implies authorization; participant disappearance cleans bounded state
+|===
+
+== 7. Concrete upstream reference map
+=== 7.1 MCP and Rust agent orchestration
+
+Official MCP Rust SDK: https://github.com/modelcontextprotocol/rust-sdk
+
+As of this snapshot, +rmcp+ implements the current stable MCP 2026-07-28 protocol while retaining compatibility with earlier releases.
+It already covers tool discovery/invocation, resources/prompts, OAuth features, subscriptions, long-running tasks, response caching, and multiple transports.
+For #193, prefer +client+ plus only the transport/auth features the vertical slice actually needs; avoid enabling a broad feature set by default.
+
+Useful upstream files:
+
+* +README.md+
+* +crates/rmcp/README.md+
+* +ROADMAP.md+ for conformance/health claims
+* +docs/OAUTH_SUPPORT.md+ when remote authenticated MCP becomes necessary
+
+Rig: https://github.com/0xPlaygrounds/rig
+
+Useful upstream files for #193:
+
+* +crates/rig-agent/README.md+ -- +AgentRun+ is a steppable serializable sans-IO state machine;
+* +examples/agent_run_stepping/src/main.rs+ -- demonstrates host-controlled IO/tool execution between agent steps;
+* +examples/README.md+ entry +agent_with_approval_policy+ -- useful HITL/policy reference;
+* +crates/rig-rmcp/README.md+ -- +McpTool+, +McpClientHandler+, dynamic tool-list synchronization, raw/structured MCP result preservation.
+
+This makes the preferred spike stronger than a generic "try Rig": keep Rig's run/tool mechanics below the aivtuber capability and verification gates.
+Do not add a second orchestration framework merely to gain approval/resume mechanics until this fit is disproved.
+
+=== 7.2 Realtime voice and turn handling
+
+LiveKit Agents: https://github.com/livekit/agents
+
+Useful reference implementation details:
+
+* +livekit-agents/livekit/agents/voice/turn.py+ exposes interruption options including false-interruption timeout/resume;
+* +livekit-agents/livekit/agents/voice/agent_activity.py+ contains recovery checks;
+* +livekit-agents/livekit/agents/voice/turn.py+ and voice-session code contain preemptive-generation options;
+* its documented turn layer distinguishes turn detection, endpointing, interruption, and preemptive generation.
+
+Transfer to aivtuber as state-machine/test ideas, not as scheduler authority.
+In particular, #81 can model TentativeInterrupt -> ConfirmedInterrupt / FalseInterrupt -> Resume while still honoring scheduler safe points.
+
+Pipecat: https://github.com/pipecat-ai/pipecat
+
+Useful upstream file:
+
+* +src/pipecat/audio/turn/smart_turn/local_smart_turn_v3.py+ -- local ONNX end-of-turn analyzer;
+* +src/pipecat/turns/user_turn_strategies.py+ -- integration strategy.
+
+Smart Turn v3 is a better first local turn-projection candidate than writing a custom model.
+Benchmark Japanese/multilingual behavior locally before promotion.
+
+sherpa-onnx: https://github.com/k2-fsa/sherpa-onnx
+
+Useful upstream file:
+
+* +rust-api-examples/README.md+ includes a microphone example combining Silero VAD with a Japanese ReazonSpeech Zipformer recognizer.
+
+For #92, first measure normalized observation latency and Japanese accuracy from a sidecar/wrapper.
+Do not pull raw audio/model state into the deterministic domain contract.
+
+=== 7.3 VTuber / embodiment references
+
+Open-LLM-VTuber: https://github.com/Open-LLM-VTuber/Open-LLM-VTuber
+
+Useful upstream file:
+
+* +src/open_llm_vtuber/utils/sentence_divider.py+ uses a sentence segmenter and exposes +faster_first_response+.
+
+Use it to derive #83 test cases around punctuation, first-fragment latency, per-segment TTS failure, and interruption.
+Keep aivtuber's stronger per-phrase output gate and irreversible commit horizon.
+
+AIRI: https://github.com/moeru-ai/airi
+
+Useful upstream files:
+
+* +packages/stage-ui-mmd/src/components/scenes/MMD.vue+ contains high-level gaze controller behavior including camera targeting and idle saccades;
+* +packages/stage-ui/src/stores/mcp-tool-bridge.ts+ and related desktop overlay code show a UI/runtime MCP bridge pattern.
+
+Use these as #91/#107 behavior and #191 future product-UX references.
+Do not port TypeScript/Electron runtime authority into the Rust core.
+
+=== 7.4 Long-term memory
+
+Hindsight: https://github.com/vectorize-io/hindsight
+
+The current OSS server exposes retain/recall/reflect over HTTP and has a built-in MCP endpoint.
+Useful upstream files:
+
+* +hindsight-api-slim/hindsight_api/api/mcp.py+ -- MCP tool exposure and bank scoping;
+* +hindsight-docs/docs-integrations/local-mcp.md+ -- local MCP usage.
+
+For #105, Hindsight is now a first-class benchmark/sidecar candidate, especially because #193 can supply an MCP client boundary.
+Do not use its automatic retention wrapper: aivtuber's +MemoryWriteGate+ must decide what may become durable.
+
+Graphiti: https://github.com/getzep/graphiti
+
+Useful upstream file:
+
+* +mcp_server/README.md+ -- temporal graph operations, hybrid search, episode/entity management, FalkorDB/Neo4j deployment.
+
+Its MCP server is described upstream as experimental, so prefer a benchmark/spike and explicit removal fallback rather than a mandatory baseline dependency.
+
+Letta: https://github.com/letta-ai/letta
+
+Use as a stateful-agent identity/memory-lifecycle reference.
+The active source has moved to +letta-ai/letta-code+; do not build new integration against retired V1 server code.
+
+=== 7.5 Agent tracing and evaluation
+
+OpenTelemetry GenAI semantic conventions:
+
+* https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-agent-spans.md
+* https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/gen-ai-spans.md
+
+The current development conventions include agent/workflow/plan and +execute_tool+ spans.
+For #108/#193, add an optional mapping/export layer rather than replacing +TraceStage+ or storing prompt/output content by default.
+
+Phoenix: https://github.com/Arize-ai/phoenix
+
+Phoenix is an OpenTelemetry-based OSS tracing/evaluation system with datasets, experiments, annotations, and an MCP endpoint.
+Treat it as an optional local/offline analysis sink for #108 experiments.
+Do not make it part of the production control path or required CI.
+
+=== 7.6 Full-duplex spoken-agent evaluation
+
+Full-Duplex-Bench-v3: https://arxiv.org/abs/2604.04847
+
+The 2026 v3 benchmark adds real human disfluency plus multi-step tool-use tasks.
+The transferable pattern for aivtuber is the scenario taxonomy, especially:
+
+* hesitation / false start / correction / restart;
+* interruption and turn-taking under real speech;
+* chained tool use while speech input is disfluent;
+* separate accuracy, latency, and turn-taking outcomes.
+
+Use these as #70/#92/#193 synthetic/replay scenario classes.
+Do not copy reported latency or accuracy numbers into aivtuber SLOs.
+
+== 8. Cross-issue implementation shortcuts
+
+=== 8.1 Prefer fixture-first contracts
+
+For #72/#80/#81/#84/#88/#90/#92/#191, define the smallest bounded domain fixture before live providers.
+A fixture lets replay/security tests land without waiting for UI, microphone, game, or model integration.
+
+=== 8.2 Separate recommendation, policy, authorization, and execution
+
+Use the existing project pattern:
+
+[source,text]
+----
+model / Jev / external observation
+        -> recommendation/data
+        -> deterministic project policy
+        -> authenticated capability when required
+        -> adapter/executor
+        -> observed result
+        -> verification
+----
+
+This prevents #74/#76/#81/#90/#92/#193 from each inventing their own trust model.
+
+=== 8.3 Reuse one evidence pipeline
+
+Prefer extending #58/#59/#64/#65 artifacts over introducing per-feature metrics stores.
+A new behavioral feature should normally identify:
+
+* one deterministic/replay fixture;
+* one quantitative counter/latency/resource measure;
+* one human-review label if perception/naturalness matters;
+* one promotion condition or explicit reason no promotion is needed.
+
+=== 8.4 Sidecars are acceptable when they isolate heavy runtimes
+
+Python/C++/ONNX ecosystems are not a reason to reimplement mature algorithms in Rust.
+For Graphiti/Hindsight, LiveKit/Pipecat, or speech models, a bounded sidecar is acceptable when:
+
+* input/output is typed and bounded;
+* process/network failure degrades independently;
+* deadlines and reconnect are explicit;
+* raw private media/content is not retained by default;
+* the sidecar cannot mint project authority;
+* deterministic replay uses normalized recorded observations instead of the live service.
+
+=== 8.5 Record negative reuse decisions
+
+A rejected library decision is useful future context.
+Record the exact reason and revisit trigger, for example:
+
+[source,text]
+----
+Candidate: Pipecat Smart Turn v3
+Decision: reference/sidecar only
+Why: Python/ONNX runtime is acceptable outside core; no reason to port model logic.
+Revisit: if measured IPC overhead exceeds the #92 observation deadline.
+----
+
+This avoids repeatedly re-running the same research.
+
+== 9. Revalidation
+
+External OSS details above were checked on 2026-10-04.
+Revalidate before dependency adoption when:
+
+* the upstream repository has materially changed;
+* the referenced file/path disappeared;
+* license or model-weight terms changed;
+* the project is archived/unmaintained;
+* the issue becomes implementation-ready substantially later;
+* a local benchmark disproves the assumed fit.
+
+GitHub issue metadata remains the execution source of truth even when this document names an implementation order.
+
+== 10. Issue-start checklist
+
+Copy this mental checklist rather than creating a new planning document for every issue:
+
+[source,text]
+----
+1. git status --short --branch
+2. read complete issue + milestone/labels
+3. git fetch origin; branch from origin/main
+4. tgrep the named local start-here symbols/files
+5. read authoritative security/domain/architecture docs touched by the change
+6. inspect the named upstream candidate at the current revision
+7. record reuse decision
+8. write the smallest failing/replay/security fixture
+9. implement one vertical slice
+10. run targeted checks, then full relevant validation
+11. update this accelerator only when new evidence would save future work
+----
+
+When a row conflicts with a later issue decision, the issue wins and this document should be updated in the same or a follow-up PR.

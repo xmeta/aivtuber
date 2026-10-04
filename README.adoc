@@ -33,6 +33,7 @@ The core design separates three time scales:
 * link:docs/after-action-review.adoc[After-action review and incident-to-regression learning]
 * link:AGENTS.md[AI coding-agent development contract]
 * link:docs/agent-development.adoc[AI agent development playbook]
+* link:docs/implementation-accelerator.adoc[Issue-oriented implementation accelerator and upstream start-here map]
 * link:docs/reuse-first.adoc[Reuse-first library and reference-implementation matrix]
 * link:docs/supply-chain.adoc[Supply-chain policy (cargo-deny gate and advisory exceptions)]
 * link:docs/research-register.adoc[Research and design register]

@@ -29,10 +29,12 @@ Record the result as one of:
 
 * +adopt+
 * +wrap+
+* +sidecar+
 * +partial reuse+
 * +reference only+
 * +benchmark first+
 * +reject+
+* +custom+ (only with a short reason why earlier reuse modes do not fit)
 
 == 2. Candidate matrix
 
@@ -89,10 +91,10 @@ Record the result as one of:
 |#193
 
 |Realtime conversational voice pipeline
-|LiveKit Agents / Pipecat
+|LiveKit Agents / Pipecat Smart Turn v3
 |Sidecar / reference first
-|Reuse VAD/turn/media/interruption/preemptive-generation mechanics where useful instead of rebuilding generic realtime media plumbing. Normalize observations into aivtuber-owned floor/commit policy; external frameworks must not directly own scheduler cancellation or irreversible publication.
-|#81, #92, #93
+|Reuse turn detection, false-interruption recovery, preemptive-generation, and media mechanics where useful instead of rebuilding generic realtime plumbing. Pipecat's local Smart Turn v3 ONNX analyzer is a concrete turn-end candidate. Normalize observations into aivtuber-owned floor/commit policy; external frameworks must not directly own scheduler cancellation or irreversible publication.
+|#81, #92, #93, #106
 
 |Local speech inference
 |sherpa-onnx
@@ -100,17 +102,23 @@ Record the result as one of:
 |Reuse maintained local VAD/ASR/TTS/diarization primitives and platform bindings. Keep provider-neutral speech observations, deadlines, privacy, turn policy, replay identity, and model/license compatibility decisions in aivtuber.
 |#92
 
-|Temporal / graph memory mechanics
-|Graphiti
+|Agent long-term memory service
+|Hindsight; Graphiti
 |Optional sidecar / MCP; benchmark first
-|Reuse temporal facts, provenance, graph relationships, and hybrid retrieval only for memories that already passed aivtuber write authority. Retention/deletion, epistemic class, bounds, provenance authority, replay, and privacy remain project-owned. Avoid making a graph service mandatory for the minimal profile.
-|#105
+|Hindsight exposes retain/recall/reflect through a built-in MCP endpoint and is a strong first benchmark candidate; Graphiti remains useful when explicit temporal graph relationships are the requirement. Only memories that passed aivtuber write authority may enter either service. Retention/deletion, epistemic class, bounds, provenance authority, replay, and privacy remain project-owned. Avoid mandatory external memory in the minimal profile.
+|#105, #193
 
 |Stateful-agent memory/runtime reference
 |Letta
 |Reference only / optional external backend
 |Study memory lifecycle, identity, continuity, and channel patterns. Do not introduce a second authoritative agent runtime when aivtuber already owns task authority, verification, persona, scheduler, and memory-write policy.
 |#105, #193
+
+|Agent trace interoperability
+|OpenTelemetry GenAI semantic conventions; Phoenix
+|Map/export only; optional analysis sidecar
+|Map aivtuber retained trace stages to standard agent/workflow/tool spans where useful. Phoenix may consume exported OpenTelemetry traces and run offline evaluation, but neither external convention nor evaluator defines aivtuber causal meaning, retention/privacy policy, runtime authority, or required CI.
+|#108, #193
 
 |Property-based tests
 |+proptest+
@@ -227,7 +235,7 @@ For a new dependency or custom replacement, record at least:
 ----
 Problem:
 Candidate(s):
-Decision: adopt | wrap | partial reuse | reference only | benchmark first | reject
+Decision: adopt | wrap | sidecar | partial reuse | reference only | benchmark first | reject | custom
 Why:
 License:
 Maintenance / release status:
