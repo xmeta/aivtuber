@@ -16,14 +16,74 @@
 //!    that could promote a shadow policy to active behaviour.
 
 use aivtuber_app::{
-    SHADOW_COMPARISON_SCHEMA_VERSION, SHADOW_DIVERGENCE_REPORT_SCHEMA_VERSION,
-    SHADOW_ORCHESTRATOR_SCHEMA_VERSION, ShadowComparisonRecord, ShadowCompatibilityKey,
-    ShadowDecision, ShadowDivergenceCategory, ShadowDivergenceReport, ShadowEvaluationFailure,
-    ShadowEvaluationOutcome, ShadowFallbackReason, ShadowOperationalEvidence,
-    ShadowOrchestrationIdentity, ShadowOrchestratorConfig, ShadowPolicyIdentity, ShadowRouteClass,
-    ShadowTargetIdentity, SnapshotCounters, classify_shadow_divergence,
-    summarize_shadow_divergence, summarize_shadow_divergence_default,
+    IntentRoutePlanner, IntentShadowPolicy, RoutePlanner, SHADOW_COMPARISON_SCHEMA_VERSION,
+    SHADOW_DIVERGENCE_REPORT_SCHEMA_VERSION, SHADOW_ORCHESTRATOR_SCHEMA_VERSION,
+    ShadowComparisonRecord, ShadowCompatibilityKey, ShadowDecision, ShadowDivergenceCategory,
+    ShadowDivergenceReport, ShadowEvaluationFailure, ShadowEvaluationOutcome, ShadowFallbackReason,
+    ShadowOperationalEvidence, ShadowOrchestrationIdentity, ShadowOrchestratorConfig,
+    ShadowPolicyIdentity, ShadowRouteClass, ShadowTargetIdentity, ShadowingRoutePlanner,
+    SnapshotCounters, classify_shadow_divergence, summarize_shadow_divergence,
+    summarize_shadow_divergence_default,
 };
+use aivtuber_domain::{
+    EVENT_SCHEMA_VERSION, EventEnvelope, EventKind, SecurityPlane, SourceClass, TrustLevel,
+};
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
+
+fn event(event_id: &str) -> EventEnvelope {
+    EventEnvelope {
+        schema_version: EVENT_SCHEMA_VERSION.to_owned(),
+        event_id: event_id.to_owned(),
+        correlation_id: format!("corr-{event_id}"),
+        sequence: 1,
+        observed_at: "2026-10-04T00:00:00Z".to_owned(),
+        source: "chat".to_owned(),
+        source_class: SourceClass::PublicChat,
+        plane: SecurityPlane::Content,
+        trust_level: TrustLevel::Untrusted,
+        kind: EventKind::ChatMessage,
+        actor_id: None,
+        priority_hint: None,
+        authorization: None,
+        payload: BTreeMap::from([(
+            "intent".to_owned(),
+            serde_json::Value::String("greet".to_owned()),
+        )]),
+    }
+}
+
+/// A config whose admission gates actually admit the fixture event, so the
+/// drained-batch tests exercise the pool rather than the sampler.
+fn admitted_config() -> ShadowOrchestratorConfig {
+    ShadowOrchestratorConfig {
+        enabled: true,
+        sample_rate_per_10k: 10_000,
+        deadline_ms: 300,
+        ..ShadowOrchestratorConfig::default()
+    }
+}
+
+/// Drain the pool until it publishes one record. Bounded work runs on its own
+/// threads, so the mailbox is polled with a deadline rather than read once.
+fn drain_one_record<A, S>(planner: &mut ShadowingRoutePlanner<A, S>) -> ShadowComparisonRecord
+where
+    A: RoutePlanner,
+    S: aivtuber_app::ShadowPolicy + Clone + 'static,
+{
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let drained = planner.drain_shadow_comparisons();
+        if let Some(record) = drained.into_iter().find_map(|completion| completion.record) {
+            return record;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the bounded pool published no comparison record"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
 
 fn identity(
     policy_id: &str,
@@ -64,6 +124,12 @@ fn record(
 ) -> ShadowComparisonRecord {
     ShadowComparisonRecord {
         schema_version: SHADOW_COMPARISON_SCHEMA_VERSION.to_owned(),
+        // Stamped the way the orchestrator stamps it, from the config the
+        // batch is summarised under.
+        orchestration: Some(
+            ShadowOrchestrationIdentity::from_config(&ShadowOrchestratorConfig::default())
+                .expect("the default config is valid"),
+        ),
         event_id: event_id.to_owned(),
         correlation_id: format!("corr-{event_id}"),
         active_policy: identity("intent-routing", "1.0.0", "cfg-1", "default"),
@@ -100,6 +166,17 @@ fn active(route: ShadowRouteClass, target: Option<ShadowTargetIdentity>) -> Shad
 /// The config a test batch claims to have run under.
 fn config() -> ShadowOrchestratorConfig {
     ShadowOrchestratorConfig::default()
+}
+
+/// Re-stamp a record with the identity of some other config, the way a batch
+/// collected under different bounds would arrive.
+fn under(
+    mut record: ShadowComparisonRecord,
+    config: &ShadowOrchestratorConfig,
+) -> ShadowComparisonRecord {
+    record.orchestration =
+        Some(ShadowOrchestrationIdentity::from_config(config).expect("valid config"));
+    record
 }
 
 fn agreeing(event_id: &str) -> ShadowComparisonRecord {
@@ -485,8 +562,8 @@ fn the_report_copies_the_orchestration_identity_it_was_given() {
         ..ShadowOrchestratorConfig::default()
     };
 
-    let report =
-        summarize_shadow_divergence_default(&[agreeing("evt-1")], &config).expect("summary");
+    let report = summarize_shadow_divergence_default(&[under(agreeing("evt-1"), &config)], &config)
+        .expect("summary");
 
     assert_eq!(
         report.orchestration,
@@ -539,6 +616,120 @@ fn different_orchestration_bounds_produce_different_identities() {
     assert_eq!(fingerprint(&base), fingerprint(&base.clone()));
 }
 
+/// P1 review (round 3): the report's bounds fingerprint used to come from the
+/// config alone, so records collected under two different bounds could be
+/// concatenated and reported under one of them. Each record now carries the
+/// identity of the pool that produced it, so that concatenation is refused.
+#[test]
+fn records_from_two_different_bounds_cannot_be_reported_as_one_batch() {
+    let slower = ShadowOrchestratorConfig {
+        deadline_ms: 900,
+        ..ShadowOrchestratorConfig::default()
+    };
+    let records = vec![agreeing("evt-1"), under(agreeing("evt-2"), &slower)];
+
+    let error = summarize(&records)
+        .expect_err("a mixed-bounds batch must not be summarised under one config");
+    let message = error.to_string();
+    assert!(
+        message.contains("different bounds") || message.contains("orchestration bounds"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        message.contains("evt-2"),
+        "the offending record must be named: {message}"
+    );
+}
+
+/// The converse: the right config with records from another pool is still a
+/// mismatch, so the check cannot be satisfied by picking whichever config
+/// happens to match the first record.
+#[test]
+fn a_config_that_matches_only_some_of_the_records_is_refused() {
+    let slower = ShadowOrchestratorConfig {
+        deadline_ms: 900,
+        ..ShadowOrchestratorConfig::default()
+    };
+    let records = vec![under(agreeing("evt-1"), &slower), agreeing("evt-2")];
+
+    summarize(&records).expect_err("bounds must agree across the whole batch");
+    summarize_shadow_divergence_default(
+        &records,
+        &ShadowOrchestratorConfig {
+            deadline_ms: 900,
+            ..ShadowOrchestratorConfig::default()
+        },
+    )
+    .expect_err("and the same batch under the other config is refused too");
+}
+
+/// A record with no stamp cannot say which bounds produced it, so it is not
+/// summarised under someone else's.
+#[test]
+fn an_unstamped_record_is_refused() {
+    let mut record = agreeing("evt-1");
+    record.orchestration = None;
+    let error = summarize(&[record]).expect_err("unattributed evidence must be refused");
+    assert!(
+        error.to_string().contains("no orchestration identity"),
+        "unexpected error: {error}"
+    );
+}
+
+/// Records the bounded pool actually produced are stamped with that pool's
+/// identity, so the ordinary path needs no caller bookkeeping.
+#[test]
+fn a_bounded_pool_stamps_its_own_identity_onto_every_record() {
+    let config = admitted_config();
+    let expected = ShadowOrchestrationIdentity::from_config(&config).expect("valid config");
+    let mut planner = ShadowingRoutePlanner::with_orchestrator(
+        IntentRoutePlanner,
+        IntentShadowPolicy,
+        identity("intent-routing", "1.0.0", "cfg-1", "default"),
+        identity("semantic-reuse", "0.3.0", "cfg-1", "default"),
+        None,
+        config,
+    )
+    .expect("planner");
+
+    planner.route(&event("evt-stamped")).expect("routes");
+    let record = drain_one_record(&mut planner);
+    assert_eq!(
+        record.orchestration.as_ref(),
+        Some(&expected),
+        "a record must carry the identity of the pool that produced it"
+    );
+    planner.shutdown_shadow();
+}
+
+/// And such a batch summarises under that pool's own config, with no stamping
+/// on the caller's side.
+#[test]
+fn a_drained_batch_summarises_under_the_config_that_produced_it() {
+    let config = admitted_config();
+    let mut planner = ShadowingRoutePlanner::with_orchestrator(
+        IntentRoutePlanner,
+        IntentShadowPolicy,
+        identity("intent-routing", "1.0.0", "cfg-1", "default"),
+        identity("semantic-reuse", "0.3.0", "cfg-1", "default"),
+        None,
+        config.clone(),
+    )
+    .expect("planner");
+
+    planner.route(&event("evt-drained")).expect("routes");
+    let record = drain_one_record(&mut planner);
+    let report = summarize_shadow_divergence_default(&[record], &config).expect("summary");
+    assert_eq!(
+        report.orchestration.bounds_fingerprint(),
+        ShadowOrchestrationIdentity::from_config(&config)
+            .expect("valid config")
+            .bounds_fingerprint()
+    );
+    assert_eq!(report.total_comparisons, 1);
+    planner.shutdown_shadow();
+}
+
 #[test]
 fn a_config_from_another_schema_version_is_refused() {
     let config = ShadowOrchestratorConfig {
@@ -583,15 +774,19 @@ fn provider_call_counters_are_derived_from_a_snapshot_delta() {
         deadline_exceeded: 2,
     };
 
-    let delta = ShadowOperationalEvidence::from_snapshot_delta(&before, &after);
+    let delta = ShadowOperationalEvidence::from_snapshot_delta(&before, &after)
+        .expect("an ordered pair yields a delta");
     assert_eq!(delta.provider_calls, 3);
     assert_eq!(delta.provider_calls_blocked, 0);
     assert_eq!(delta.evaluations_completed, 6);
     assert_eq!(delta.evaluations_deadline_exceeded, 0);
 }
 
+/// P2 review: a counter that goes backwards means the snapshots were taken out
+/// of order, or span an orchestrator restart. Reporting zeroes there would
+/// silently under-count the very cost #165 retains.
 #[test]
-fn a_snapshot_delta_saturates_instead_of_wrapping() {
+fn an_out_of_order_snapshot_pair_is_refused_rather_than_clamped() {
     let later = SnapshotCounters {
         provider_calls: 9,
         provider_calls_blocked: 5,
@@ -605,12 +800,46 @@ fn a_snapshot_delta_saturates_instead_of_wrapping() {
         deadline_exceeded: 0,
     };
 
-    let delta = ShadowOperationalEvidence::from_snapshot_delta(&later, &earlier);
-    assert_eq!(
-        delta.provider_calls, 0,
-        "out-of-order snapshots must not wrap"
+    let error = ShadowOperationalEvidence::from_snapshot_delta(&later, &earlier)
+        .expect_err("out-of-order snapshots must not become a zero delta");
+    let message = error.to_string();
+    assert!(
+        message.contains("provider_calls") && message.contains("went backwards"),
+        "unexpected error: {message}"
     );
-    assert_eq!(delta.evaluations_completed, 0);
+}
+
+#[test]
+fn a_restarted_orchestrator_snapshot_is_refused() {
+    let before = SnapshotCounters {
+        provider_calls: 12,
+        provider_calls_blocked: 0,
+        completed: 12,
+        deadline_exceeded: 3,
+    };
+    // Counters reset, as they do when the orchestrator is replaced.
+    let after = SnapshotCounters {
+        provider_calls: 1,
+        provider_calls_blocked: 0,
+        completed: 1,
+        deadline_exceeded: 0,
+    };
+
+    ShadowOperationalEvidence::from_snapshot_delta(&before, &after)
+        .expect_err("a delta across a restart is not a delta");
+}
+
+#[test]
+fn an_ordered_pair_with_no_change_is_a_zero_delta() {
+    let counters = SnapshotCounters {
+        provider_calls: 4,
+        provider_calls_blocked: 1,
+        completed: 4,
+        deadline_exceeded: 0,
+    };
+    let delta = ShadowOperationalEvidence::from_snapshot_delta(&counters, &counters)
+        .expect("equal snapshots are ordered");
+    assert_eq!(delta, ShadowOperationalEvidence::default());
 }
 
 #[test]

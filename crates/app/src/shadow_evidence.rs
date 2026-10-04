@@ -13,7 +13,10 @@
 //! 3. **Only combine like with like.** Records from different policy/config/
 //!    profile identities, dataset ids, comparison schema versions or bounded
 //!    orchestration bounds are refused rather than silently merged: a merged
-//!    number across identities cannot be interpreted.
+//!    number across identities cannot be interpreted. Orchestration bounds are
+//!    checked against the *records*, not against the caller's word: each record
+//!    is stamped by the orchestrator that produced it, so two batches run
+//!    under different bounds cannot be concatenated into one report.
 //! 4. **An absent comparison is not agreement.** A target pair the runtime
 //!    declines to compare, and a shadow evaluation that produced nothing, are
 //!    both counted as *not comparable*. Neither may be folded into agreement,
@@ -22,8 +25,8 @@
 
 use crate::AppError;
 use crate::shadow::{
-    SHADOW_COMPARISON_SCHEMA_VERSION, SHADOW_ORCHESTRATOR_SCHEMA_VERSION, ShadowComparisonRecord,
-    ShadowEvaluationOutcome, ShadowFallbackReason, ShadowOrchestratorConfig, ShadowRouteClass,
+    SHADOW_COMPARISON_SCHEMA_VERSION, ShadowComparisonRecord, ShadowEvaluationOutcome,
+    ShadowFallbackReason, ShadowOrchestrationIdentity, ShadowOrchestratorConfig, ShadowRouteClass,
 };
 use crate::shadow_orchestrator::ShadowExecutionSnapshot;
 use serde::{Deserialize, Serialize};
@@ -238,109 +241,6 @@ impl ShadowCompatibilityKey {
     }
 }
 
-/// The bounded-orchestration identity a batch of records was produced under.
-///
-/// A `ShadowComparisonRecord` does not carry this, and it must not be
-/// reconstructed afterwards: `ShadowOrchestratorConfig` fixes the sample rate,
-/// deadline, concurrency, queue capacity and whether provider calls or budget
-/// charging were permitted, and two batches differing only in those bounds are
-/// not comparable even under an identical policy identity.
-///
-/// The fields are private on purpose. A caller-supplied identity with public
-/// fields could be hand-written, which would restore exactly the gap this type
-/// closes: a report would then carry bounds nobody verified. The only way to
-/// obtain one is [`Self::from_config`], so the fingerprint always describes a
-/// real, validated `ShadowOrchestratorConfig`. It reaches a report because
-/// [`summarize_shadow_divergence`] accepts that config and derives the identity
-/// internally.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ShadowOrchestrationIdentity {
-    orchestrator_schema_version: String,
-    /// Stable fingerprint of the orchestration bounds (sample rate, seed,
-    /// event kinds, max concurrent, queue capacity, deadline, provider-call and
-    /// budget flags). Two batches may only be combined when this matches.
-    bounds_fingerprint: String,
-}
-
-impl ShadowOrchestrationIdentity {
-    /// The orchestration schema version these records were produced under.
-    pub fn orchestrator_schema_version(&self) -> &str {
-        &self.orchestrator_schema_version
-    }
-
-    /// Fingerprint over every bound that changes which events are admitted and
-    /// how long an evaluation may run.
-    pub fn bounds_fingerprint(&self) -> &str {
-        &self.bounds_fingerprint
-    }
-
-    /// Derive the identity from the config the records were actually produced
-    /// under.
-    ///
-    /// The config is validated first, so an identity cannot be derived from a
-    /// config the runtime would have rejected.
-    pub fn from_config(config: &ShadowOrchestratorConfig) -> Result<Self, AppError> {
-        config.validate()?;
-        // FNV-1a over a canonical, field-ordered rendering. Deterministic and
-        // dependency-free, matching `ShadowOrchestratorConfig::sample_bucket`.
-        const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-        fn absorb(mut hash: u64, text: &str) -> u64 {
-            for byte in text.as_bytes() {
-                hash ^= u64::from(*byte);
-                hash = hash.wrapping_mul(FNV_PRIME);
-            }
-            hash
-        }
-
-        let kinds: Vec<String> = config
-            .event_kinds
-            .iter()
-            .map(|kind| format!("{kind:?}"))
-            .collect();
-        let canonical = format!(
-            "enabled={}|sample_rate_per_10k={}|seed={}|event_kinds={}|max_concurrent={}|queue_capacity={}|deadline_ms={}|allow_provider_calls={}|charge_shadow_to_budget={}",
-            config.enabled,
-            config.sample_rate_per_10k,
-            config.seed,
-            kinds.join(","),
-            config.max_concurrent,
-            config.queue_capacity,
-            config.deadline_ms,
-            config.allow_provider_calls,
-            config.charge_shadow_to_budget,
-        );
-        let hash = absorb(FNV_OFFSET_BASIS, &canonical);
-
-        Ok(Self {
-            orchestrator_schema_version: config.schema_version.clone(),
-            bounds_fingerprint: format!("{hash:016x}"),
-        })
-    }
-
-    /// Reject an identity that does not describe the orchestrator this build
-    /// actually runs. A report must never claim bounds it cannot vouch for.
-    ///
-    /// Private-path helper: only reachable from a value built by
-    /// [`Self::from_config`], so the version it checks is the config's own.
-    fn validate(&self) -> Result<(), AppError> {
-        if self.orchestrator_schema_version != SHADOW_ORCHESTRATOR_SCHEMA_VERSION {
-            return Err(AppError::Routing(format!(
-                "shadow divergence refused: orchestration schema_version {:?} is not the current {:?} (#165)",
-                self.orchestrator_schema_version, SHADOW_ORCHESTRATOR_SCHEMA_VERSION
-            )));
-        }
-        if self.bounds_fingerprint.trim().is_empty() {
-            return Err(AppError::Routing(
-                "shadow divergence refused: orchestration bounds_fingerprint must not be empty (#165)"
-                    .to_owned(),
-            ));
-        }
-        Ok(())
-    }
-}
-
 /// Optional operational evidence for a batch (#165 scope: provider-call counts
 /// and latency attribution "when available").
 ///
@@ -359,19 +259,48 @@ pub struct ShadowOperationalEvidence {
 }
 
 impl ShadowOperationalEvidence {
-    /// Read a cumulative snapshot delta. Saturating subtraction, so a caller
-    /// that passes snapshots out of order yields zeroes rather than a wrap.
-    pub fn from_snapshot_delta(before: &SnapshotCounters, after: &SnapshotCounters) -> Self {
-        Self {
-            provider_calls: after.provider_calls.saturating_sub(before.provider_calls),
-            provider_calls_blocked: after
-                .provider_calls_blocked
-                .saturating_sub(before.provider_calls_blocked),
-            evaluations_completed: after.completed.saturating_sub(before.completed),
-            evaluations_deadline_exceeded: after
-                .deadline_exceeded
-                .saturating_sub(before.deadline_exceeded),
-        }
+    /// Read a cumulative snapshot delta.
+    ///
+    /// The counters are cumulative for the life of the orchestrator, so a
+    /// delta is only meaningful when `after` really is later. Saturating
+    /// subtraction would hide a caller that passed the snapshots in the wrong
+    /// order, or that spanned an orchestrator restart, as a plausible
+    /// "provider calls = 0" — under-reporting the cost of the shadow path,
+    /// which is exactly the number #165 exists to retain. A decrease in any
+    /// counter is therefore refused rather than clamped.
+    pub fn from_snapshot_delta(
+        before: &SnapshotCounters,
+        after: &SnapshotCounters,
+    ) -> Result<Self, AppError> {
+        let delta = |name: &str, from: u64, to: u64| -> Result<u64, AppError> {
+            to.checked_sub(from).ok_or_else(|| {
+                AppError::Routing(format!(
+                    "shadow operational evidence refused: {name} went backwards ({from} -> {to}); the snapshots are out of order or span an orchestrator restart (#165)"
+                ))
+            })
+        };
+        Ok(Self {
+            provider_calls: delta(
+                "provider_calls",
+                before.provider_calls,
+                after.provider_calls,
+            )?,
+            provider_calls_blocked: delta(
+                "provider_calls_blocked",
+                before.provider_calls_blocked,
+                after.provider_calls_blocked,
+            )?,
+            evaluations_completed: delta(
+                "evaluations_completed",
+                before.completed,
+                after.completed,
+            )?,
+            evaluations_deadline_exceeded: delta(
+                "evaluations_deadline_exceeded",
+                before.deadline_exceeded,
+                after.deadline_exceeded,
+            )?,
+        })
     }
 }
 
@@ -434,8 +363,11 @@ pub struct ShadowReportMetric {
 #[serde(deny_unknown_fields)]
 pub struct ShadowDivergenceReport {
     pub schema_version: String,
-    /// The bounded-orchestration identity the caller supplied and this
-    /// summarizer validated, copied verbatim. Never reconstructed here.
+    /// The bounded-orchestration identity shared by every record in the batch,
+    /// verified against the config the caller supplied. Never reconstructed
+    /// from a current constant, and never taken on the caller's word alone: a
+    /// report's fingerprint describes the bounds its records were produced
+    /// under.
     pub orchestration: ShadowOrchestrationIdentity,
     pub compatibility: ShadowCompatibilityKey,
     pub total_comparisons: u64,
@@ -466,6 +398,13 @@ pub const DEFAULT_DIVERGENT_CASE_LIMIT: usize = 64;
 /// identity the caller hand-wrote: a config the runtime would have rejected is
 /// rejected here too, before any value reaches the report.
 ///
+/// The records are the cross-check. Every `ShadowComparisonRecord` is stamped
+/// by the orchestrator that produced it, and each stamp must equal the identity
+/// derived from `config`. Without that, concatenating the records of two
+/// batches run under different bounds and handing them over with one config
+/// would produce a single confident report whose fingerprint describes neither
+/// batch.
+///
 /// `operational` is optional. When supplied, its provider-call counters are
 /// published as batch-level metrics under `shadow.operations.*`. They are
 /// deliberately not folded into `divergence.rate_pct`: they describe what the
@@ -473,9 +412,10 @@ pub const DEFAULT_DIVERGENT_CASE_LIMIT: usize = 64;
 ///
 /// Refuses, rather than merges, when the batch is empty (an empty report would
 /// read as "no divergence"), the config is invalid, a record carries a
-/// different comparison `schema_version`, or any record's identity differs from
-/// the first record's. `case_limit` bounds retained references only, never
-/// counts.
+/// different comparison `schema_version`, a record's stamped orchestration
+/// identity is absent or differs from the one `config` describes, or any
+/// record's policy identity differs from the first record's. `case_limit`
+/// bounds retained references only, never counts.
 pub fn summarize_shadow_divergence(
     records: &[ShadowComparisonRecord],
     config: &ShadowOrchestratorConfig,
@@ -498,6 +438,28 @@ pub fn summarize_shadow_divergence(
                 "shadow divergence refused: record {} carries comparison schema_version {:?}, current is {:?}; samples from different comparison versions must not be combined (#165)",
                 record.event_id, record.schema_version, SHADOW_COMPARISON_SCHEMA_VERSION
             )));
+        }
+        match &record.orchestration {
+            // A record with no stamp is either the synchronous (#163) inline
+            // path or an older stored sample. Neither can say which bounds
+            // produced it, so neither may be summarised as if it could.
+            None => {
+                return Err(AppError::Routing(format!(
+                    "shadow divergence refused: record {} carries no orchestration identity; it came from the unbounded inline path or an older sample, and unattributed evidence must not be reported under someone else's bounds (#165)",
+                    record.event_id
+                )));
+            }
+            Some(stamped) if stamped != &orchestration => {
+                return Err(AppError::Routing(format!(
+                    "shadow divergence refused: record {} was produced under orchestration bounds {} ({}), but the supplied config describes {} ({}); batches from different bounds must not be combined (#165)",
+                    record.event_id,
+                    stamped.orchestrator_schema_version(),
+                    stamped.bounds_fingerprint(),
+                    orchestration.orchestrator_schema_version(),
+                    orchestration.bounds_fingerprint(),
+                )));
+            }
+            Some(_) => {}
         }
         let key = ShadowCompatibilityKey::from_record(record);
         if key != compatibility {

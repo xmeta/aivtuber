@@ -279,13 +279,6 @@ for (const file of listJson("examples/evaluation/shadow-divergence/invalid")) {
   }
 }
 
-// Cross-field checks a JSON Schema cannot express. Returned as messages so the
-// same predicate serves both the valid corpus (expected to be clean) and the
-// `inconsistent/` corpus (expected to trip at least one).
-// Cross-field checks a JSON Schema cannot express, returned as messages. The
-// same predicate serves the valid corpus (expected clean) and the
-// `inconsistent/` corpus (expected to trip at least one), so the two cannot
-// drift apart.
 function shadowDivergenceCrossFieldProblems(doc) {
   const problems = [];
 
@@ -349,6 +342,39 @@ function shadowDivergenceCrossFieldProblems(doc) {
     if (!matches) {
       problems.push(
         `rate_pct is ${rate.value} over ${rate.sample_count} samples, but diverged/comparable is ${expected} over ${doc.comparable_comparisons}`,
+      );
+    }
+  }
+
+  // #58 reads the per-category metrics, not `category_counts`, so a metric that
+  // disagrees with the counts it was derived from publishes a false number
+  // while every headline total still looks right. Both halves are pinned:
+  // `value` must equal the category count, and `sample_count` must be the
+  // number of records that count was taken over.
+  for (const category of SHADOW_DIVERGENCE_CATEGORIES) {
+    const metric = doc.metrics?.[`shadow.divergence.${category}_count`];
+    if (!metric) continue;
+    const expected = doc.category_counts[category] ?? 0;
+    if (metric.value !== expected) {
+      problems.push(
+        `shadow.divergence.${category}_count is ${metric.value}, but category_counts.${category} is ${expected}`,
+      );
+    }
+    if (metric.sample_count !== doc.total_comparisons) {
+      problems.push(
+        `shadow.divergence.${category}_count is measured over ${metric.sample_count} samples, but total_comparisons is ${doc.total_comparisons}`,
+      );
+    }
+  }
+
+  // The operational counters describe the same batch, so their sample_count is
+  // the batch size too. Their values are measured rather than derived from the
+  // records, so there is nothing here to compare them against.
+  for (const [name, metric] of Object.entries(doc.metrics ?? {})) {
+    if (!name.startsWith("shadow.operations.")) continue;
+    if (metric.sample_count !== doc.total_comparisons) {
+      problems.push(
+        `${name} is measured over ${metric.sample_count} samples, but total_comparisons is ${doc.total_comparisons}`,
       );
     }
   }

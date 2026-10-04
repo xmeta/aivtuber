@@ -138,6 +138,108 @@ impl ShadowOrchestratorConfig {
     }
 }
 
+/// The bounded-orchestration identity a batch of records was produced under.
+///
+/// The identity lives next to [`ShadowOrchestratorConfig`] because that is the
+/// only thing it can be derived from, and it travels *on the record* rather
+/// than beside the report: a report is built long after the batch was drained,
+/// so an identity supplied at report time describes the caller's memory of the
+/// run, not the run itself. `None` on a record means the synchronous (#163)
+/// inline path, which has no bounded orchestration to describe.
+///
+/// The fields are private on purpose. A caller-supplied identity with public
+/// fields could be hand-written, which would restore exactly the gap this type
+/// closes: evidence would then carry bounds nobody verified. The only way to
+/// obtain one is [`Self::from_config`], so the fingerprint always describes a
+/// real, validated `ShadowOrchestratorConfig`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShadowOrchestrationIdentity {
+    orchestrator_schema_version: String,
+    /// Stable fingerprint of the orchestration bounds (sample rate, seed,
+    /// event kinds, max concurrent, queue capacity, deadline, provider-call and
+    /// budget flags). Two batches may only be combined when this matches.
+    bounds_fingerprint: String,
+}
+
+impl ShadowOrchestrationIdentity {
+    /// The orchestration schema version these records were produced under.
+    pub fn orchestrator_schema_version(&self) -> &str {
+        &self.orchestrator_schema_version
+    }
+
+    /// Fingerprint over every bound that changes which events are admitted and
+    /// how long an evaluation may run.
+    pub fn bounds_fingerprint(&self) -> &str {
+        &self.bounds_fingerprint
+    }
+
+    /// Derive the identity from the config the records were actually produced
+    /// under.
+    ///
+    /// The config is validated first, so an identity cannot be derived from a
+    /// config the runtime would have rejected.
+    pub fn from_config(config: &ShadowOrchestratorConfig) -> Result<Self, AppError> {
+        config.validate()?;
+        // FNV-1a over a canonical, field-ordered rendering. Deterministic and
+        // dependency-free, matching `ShadowOrchestratorConfig::sample_bucket`.
+        const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        fn absorb(mut hash: u64, text: &str) -> u64 {
+            for byte in text.as_bytes() {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(FNV_PRIME);
+            }
+            hash
+        }
+
+        let kinds: Vec<String> = config
+            .event_kinds
+            .iter()
+            .map(|kind| format!("{kind:?}"))
+            .collect();
+        let canonical = format!(
+            "enabled={}|sample_rate_per_10k={}|seed={}|event_kinds={}|max_concurrent={}|queue_capacity={}|deadline_ms={}|allow_provider_calls={}|charge_shadow_to_budget={}",
+            config.enabled,
+            config.sample_rate_per_10k,
+            config.seed,
+            kinds.join(","),
+            config.max_concurrent,
+            config.queue_capacity,
+            config.deadline_ms,
+            config.allow_provider_calls,
+            config.charge_shadow_to_budget,
+        );
+        let hash = absorb(FNV_OFFSET_BASIS, &canonical);
+
+        Ok(Self {
+            orchestrator_schema_version: config.schema_version.clone(),
+            bounds_fingerprint: format!("{hash:016x}"),
+        })
+    }
+
+    /// Reject an identity that does not describe the orchestrator this build
+    /// actually runs. A report must never claim bounds it cannot vouch for.
+    ///
+    /// Private-path helper: only reachable from a value built by
+    /// [`Self::from_config`], so the version it checks is the config's own.
+    pub(crate) fn validate(&self) -> Result<(), AppError> {
+        if self.orchestrator_schema_version != SHADOW_ORCHESTRATOR_SCHEMA_VERSION {
+            return Err(AppError::Routing(format!(
+                "shadow divergence refused: orchestration schema_version {:?} is not the current {:?} (#165)",
+                self.orchestrator_schema_version, SHADOW_ORCHESTRATOR_SCHEMA_VERSION
+            )));
+        }
+        if self.bounds_fingerprint.trim().is_empty() {
+            return Err(AppError::Routing(
+                "shadow divergence refused: orchestration bounds_fingerprint must not be empty (#165)"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Why an event produced no shadow work.
 ///
 /// These are admission outcomes, not evaluation outcomes: a skipped event was
@@ -378,6 +480,19 @@ pub enum ShadowEvaluationOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShadowComparisonRecord {
     pub schema_version: String,
+    /// The bounds this record was actually produced under, stamped by the
+    /// orchestrator from the config it was built with. `None` marks the
+    /// synchronous (#163) inline path, which is unbounded and therefore has no
+    /// orchestration identity to state.
+    ///
+    /// #165 aggregates records long after they were drained, so provenance has
+    /// to travel with the record: an identity supplied at report time cannot
+    /// distinguish a batch produced under one config from two batches produced
+    /// under two and concatenated. `#[serde(default)]` keeps an older stored
+    /// record readable, and such a record is refused rather than summarised —
+    /// unattributed evidence is not evidence of anything.
+    #[serde(default)]
+    pub orchestration: Option<ShadowOrchestrationIdentity>,
     pub event_id: String,
     pub correlation_id: String,
     pub active_policy: ShadowPolicyIdentity,
@@ -653,6 +768,9 @@ where
 
                 self.last_comparison = Some(ShadowComparisonRecord {
                     schema_version: SHADOW_COMPARISON_SCHEMA_VERSION.to_owned(),
+                    // The inline path has no orchestrator, so there are no
+                    // bounds to stamp.
+                    orchestration: None,
                     event_id: event.event_id.clone(),
                     correlation_id: event.correlation_id.clone(),
                     active_policy: self.active_identity.clone(),

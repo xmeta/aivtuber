@@ -522,25 +522,42 @@ mismatch cannot hide behind a matching shadow dataset), plus the config
 fingerprint and the runtime profile.
 
 The report also carries an `orchestration` block, and it is the *only* way
-bounds reach a report. A `ShadowComparisonRecord` does not carry orchestration
-identity, so `summarize_shadow_divergence` accepts the
-`ShadowOrchestratorConfig` the caller actually ran with and derives the identity
-itself. `ShadowOrchestrationIdentity`'s fields are private for the same reason:
-a caller-supplied identity with public fields could be hand-written, which would
-reopen exactly the gap the block exists to close. `from_config` validates the
-config first — a config the runtime would reject cannot produce an identity — and
-folds every bound that changes which events are admitted and how long an
-evaluation may run into a 16-hex `bounds_fingerprint`. Two batches differing only
-in deadline, sample rate, concurrency, queue capacity, provider-call permission
-or budget charging are therefore never reported as one sample, even under an
-identical policy identity.
+bounds reach a report. Bounds reach it from two directions that must agree.
+
+`ShadowOrchestrationIdentity` is derived, never written. Its fields are private
+and the only constructor is `from_config`, which validates the config first — a
+config the runtime would reject cannot produce an identity — and folds every
+bound that changes which events are admitted and how long an evaluation may run
+into a 16-hex `bounds_fingerprint`. A caller-supplied identity with public fields
+could be hand-written, which would reopen exactly the gap the block exists to
+close.
+
+The identity travels *on the record*. `ShadowOrchestrator::new` derives it once
+from the config it just validated, and every record the pool builds carries it;
+`ShadowOrchestrator::orchestration()` hands the same value to a caller draining
+records. `summarize_shadow_divergence` derives the identity from the config it is
+given and refuses unless **every** record's stamp equals it, refusing an unstamped
+record outright. That is what makes the guarantee mechanical rather than a
+promise: concatenating the records of two batches run under different bounds and
+handing them over with one config no longer yields a confident report whose
+fingerprint describes neither batch — it is refused, naming the offending record
+and both fingerprints. An absent stamp means the synchronous (#163) inline path
+or an older stored sample; neither can say which bounds produced it, so neither is
+reported under someone else's. Two batches differing only in deadline, sample
+rate, concurrency, queue capacity, provider-call permission or budget charging are
+therefore never reported as one sample, even under an identical policy identity.
 
 === 9.3 What a report contains
 
 * every category key, including zeroes, so two reports compare field by field;
 * `shadow.divergence.<category>_count` plus `shadow.divergence.rate_pct`, a
   flat map shaped like a `benchmark-result` metric entry (#58) and ready to
-  merge into its `metrics` map without translation;
+  merge into its `metrics` map without translation. #58 reads these metrics
+  rather than `category_counts`, so `scripts/validate.mjs` pins each one to the
+  count it was derived from (`value == category_counts.<category>`) and to the
+  batch it was measured over (`sample_count == total_comparisons`): a report
+  whose headline totals are right while a benchmark metric is invented is
+  rejected rather than published;
 * `ShadowDivergentCaseRef` entries — `event_id`, `correlation_id`, category,
   both route classes and both fallback reasons — for #151 offline sampling.
 
@@ -560,8 +577,10 @@ compared. Promotion remains an explicit, reviewed decision under the experiment
 workflow. `a_report_cannot_promote_a_shadow_policy` pins this, and
 `scripts/validate.mjs` independently rejects a fixture that references a
 non-diverging category, reports an empty batch, smuggles a text field into a
-case reference, omits the bounds fingerprint, or publishes a `rate_pct` that
-disagrees with its own counts.
+case reference, omits the bounds fingerprint, publishes a `rate_pct` that
+disagrees with its own counts, sums its diverging categories to something other
+than `diverged_comparisons`, or publishes a category metric whose value or
+sample count contradicts `category_counts` and `total_comparisons`.
 
 Operational evidence (#165 scope: provider-call counts "when available") is
 supplied by the caller as a `ShadowOperationalEvidence` delta taken from
@@ -573,5 +592,11 @@ what the shadow path cost, so it is the *delta* — never a raw snapshot — tha
 report may carry. The counters are published under `shadow.operations.*`,
 deliberately outside `shadow.divergence.*`: they describe what comparing cost,
 not how often the policies disagreed, so they never move `rate_pct`.
+
+`from_snapshot_delta` returns a `Result` and **refuses** a counter that went
+backwards rather than clamping it to zero. Snapshots taken out of order, or
+spanning an orchestrator restart, used to produce a plausible `provider calls =
+0` — a silent under-count of exactly the cost this evidence exists to retain —
+so the delta is only ever computed from an ordered pair.
 
 #165 does not replace #108 causal trace attribution.
