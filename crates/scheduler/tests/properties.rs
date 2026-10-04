@@ -16,9 +16,9 @@ use aivtuber_domain::{
     EventKind, FallbackReason, SecurityPlane, SourceClass, TrustLevel,
 };
 use aivtuber_scheduler::{
-    BlendChannel, HistoryPolicy, PlannedPerformance, Priority, ReplayAsset, ReplayDirective,
-    ReplayEvent, ReplayHarness, ReplayHarnessConfig, ReplayResult, ScheduledItem, Scheduler,
-    SchedulerConfig, SchedulerMetrics, SinkActionKind, Status, VariationSpec,
+    BlendChannel, HistoryPolicy, PlannedPerformance, Priority, Rejection, ReplayAsset,
+    ReplayDirective, ReplayEvent, ReplayHarness, ReplayHarnessConfig, ReplayResult, ScheduledItem,
+    Scheduler, SchedulerConfig, SchedulerMetrics, SinkActionKind, Status, VariationSpec,
 };
 use proptest::prelude::*;
 use proptest::test_runner::FileFailurePersistence;
@@ -214,7 +214,9 @@ fn plan_for(op: &Op, sequence: usize) -> PlannedPerformance {
 ///
 /// `items()` is the live collection and terminal items live in history, so both
 /// are captured. Generations are recorded explicitly because a stale liveness
-/// entry could hide behind an equal item count.
+/// entry could hide behind an equal item count. Cooldown reservations belong to
+/// the same contract: a refusal that pushed a cooldown later would still be
+/// state left behind (issue #198).
 #[derive(Debug, PartialEq, Eq)]
 struct SchedulerState {
     items: Vec<(String, String, Status, Option<u64>, u64, u64)>,
@@ -222,6 +224,7 @@ struct SchedulerState {
     metrics: SchedulerMetrics,
     current_generation: u64,
     now_ms: u64,
+    cooldowns: Vec<(String, u64)>,
 }
 
 fn snapshot(scheduler: &Scheduler) -> SchedulerState {
@@ -253,6 +256,11 @@ fn snapshot(scheduler: &Scheduler) -> SchedulerState {
         metrics: scheduler.metrics(),
         current_generation: scheduler.current_generation(),
         now_ms: scheduler.now_ms(),
+        cooldowns: scheduler
+            .cooldowns()
+            .iter()
+            .map(|(asset_id, until_ms)| (asset_id.clone(), *until_ms))
+            .collect(),
     }
 }
 
@@ -345,6 +353,22 @@ fn check_liveness_index_consistency(
     ops: &[Op],
     sequence: usize,
 ) -> Result<(), String> {
+    // Issue #198: `event_id` is the logical event identity, so the live
+    // collection may hold at most one item carrying a given id. Stated before
+    // the index checks because a duplicate would also make the event index
+    // ambiguous, and the failure would otherwise look like an index bug.
+    let mut live_ids: BTreeMap<&str, u64> = BTreeMap::new();
+    for item in scheduler.items() {
+        if let Some(previous) = live_ids.insert(item.plan.event_id.as_str(), item.plan.generation) {
+            return Err(format!(
+                "event {} carries two live items (generations {previous} and {})\n\
+                 failing step: {sequence}\n\
+                 generated sequence: {ops:?}",
+                item.plan.event_id, item.plan.generation
+            ));
+        }
+    }
+
     let mut seen_generations = BTreeSet::new();
     for item in scheduler.items() {
         let generation = item.plan.generation;
@@ -370,9 +394,16 @@ fn check_liveness_index_consistency(
                  generated sequence: {ops:?}"
             ));
         }
-        if scheduler.live_item_by_event(&item.plan.event_id).is_none() {
+        // Identity, not presence: the event index has to resolve the id to
+        // *this* live item. A bare existence check would let a stale entry that
+        // happens to land on some other live slot pass (issue #198).
+        let indexed_generation = scheduler
+            .live_item_by_event(&item.plan.event_id)
+            .map(|live| live.plan.generation);
+        if indexed_generation != Some(generation) {
             return Err(format!(
-                "event {} is live but missing from the event liveness index\n\
+                "event {} is live with generation {generation} but the event \
+                 liveness index resolves to {indexed_generation:?}\n\
                  failing step: {sequence}\n\
                  generated sequence: {ops:?}",
                 item.plan.event_id
@@ -390,16 +421,35 @@ fn check_liveness_index_consistency(
                 entry.item.plan.event_id, entry.item.status
             ));
         }
-        if scheduler
-            .live_item_by_event(&entry.item.plan.event_id)
-            .is_some()
-        {
-            return Err(format!(
-                "terminal item {} is still reachable by event id\n\
-                 failing step: {sequence}\n\
-                 generated sequence: {ops:?}",
-                entry.item.plan.event_id
-            ));
+        // The id itself may be live again: scheduling a terminal `event_id`
+        // later is part of the contract, and the index then legitimately
+        // resolves to the newer item. What must never happen is the terminal
+        // item staying reachable, so two cases fail: the entry still resolving
+        // to this very item, and a stale entry left pointing into an
+        // unrelated live slot (issue #198).
+        match scheduler.live_item_by_event(&entry.item.plan.event_id) {
+            None => {}
+            Some(live) if live.plan.event_id == entry.item.plan.event_id => {
+                if live.plan.generation == generation {
+                    return Err(format!(
+                        "terminal item {} (generation {generation}) is still \
+                         reachable by event id\n\
+                         failing step: {sequence}\n\
+                         generated sequence: {ops:?}",
+                        entry.item.plan.event_id
+                    ));
+                }
+                // Legal terminal reuse: a newer live item owns the id now.
+            }
+            Some(live) => {
+                return Err(format!(
+                    "terminal item {} is still reachable by event id\n\
+                     the index resolves to a live item carrying {}\n\
+                     failing step: {sequence}\n\
+                     generated sequence: {ops:?}",
+                    entry.item.plan.event_id, live.plan.event_id
+                ));
+            }
         }
     }
     Ok(())
@@ -886,5 +936,180 @@ proptest! {
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Duplicate event_id contract (issue #198)
+// ---------------------------------------------------------------------------
+
+/// Event ids drawn from a pool of three, so a second request for an id whose
+/// item has not retired yet is the common case rather than an accident. The
+/// generated invariant suite cannot reach that state at all: `plan_for`
+/// derives `evt-{sequence}` and a sequence never repeats a step, which is why
+/// the duplicate contract needed a property of its own.
+fn pooled_steps_strategy() -> impl Strategy<Value = Vec<(usize, Op)>> {
+    prop::collection::vec((0_usize..3, op_strategy()), 1..40)
+}
+
+/// The usual plan with a caller-chosen `event_id`, so ids repeat while the
+/// generated operation stays exactly what the other properties generate.
+fn pooled_plan(op: &Op, event_id: &str) -> PlannedPerformance {
+    let mut plan = plan_for(op, 0);
+    plan.event_id = event_id.to_owned();
+    plan
+}
+
+/// Drives a generated sequence whose event ids come from
+/// [`pooled_steps_strategy`] and asserts the #198 contract at every schedule
+/// attempt, on top of the shared invariant checks.
+fn run_pooled_steps(steps: &[(usize, Op)], config: SchedulerConfig) -> Result<(), String> {
+    let ops: Vec<Op> = steps.iter().map(|(_, op)| op.clone()).collect();
+    let mut scheduler = Scheduler::new(config);
+    // The last accepted generation per id, so reusing a terminal id has to
+    // advance past it instead of silently replaying an earlier attempt.
+    let mut accepted: BTreeMap<String, u64> = BTreeMap::new();
+
+    for (sequence, (pool, op)) in steps.iter().enumerate() {
+        if matches!(op, Op::Schedule { .. }) {
+            let Op::Schedule {
+                start_offset_ms, ..
+            } = op
+            else {
+                unreachable!("matches! just selected a Schedule operation");
+            };
+            let event_id = format!("evt-{pool}");
+            let request_at_ms = scheduler.now_ms().saturating_add(*start_offset_ms);
+            scheduler.advance_to(request_at_ms);
+
+            // The contract is judged on post-advance state: an item that
+            // retired when time advanced is no longer live, so its id is free
+            // again. `schedule_at` advances to the same instant itself, so the
+            // snapshot below already reflects everything it will observe.
+            let live_duplicate = scheduler
+                .items()
+                .iter()
+                .any(|item| item.plan.event_id == event_id);
+            let before = snapshot(&scheduler);
+
+            match scheduler.schedule_at(request_at_ms, pooled_plan(op, &event_id)) {
+                Ok(plan) => {
+                    if live_duplicate {
+                        return Err(format!(
+                            "live event {event_id} was scheduled again as generation {}\n\
+                             failing step: {sequence}\n\
+                             generated sequence: {ops:?}",
+                            plan.generation
+                        ));
+                    }
+                    match accepted.insert(event_id.clone(), plan.generation) {
+                        Some(previous) if plan.generation <= previous => {
+                            return Err(format!(
+                                "reusing terminal event {event_id} produced generation {}, \
+                                 which does not advance past {previous}\n\
+                                 failing step: {sequence}\n\
+                                 generated sequence: {ops:?}",
+                                plan.generation
+                            ));
+                        }
+                        _ => {}
+                    }
+                    let live_count = scheduler
+                        .items()
+                        .iter()
+                        .filter(|item| item.plan.event_id == event_id)
+                        .count();
+                    if live_count != 1 {
+                        return Err(format!(
+                            "accepted event {event_id} is live in {live_count} items\n\
+                             failing step: {sequence}\n\
+                             generated sequence: {ops:?}"
+                        ));
+                    }
+                }
+                Err(rejection) => {
+                    if scheduler.last_rejection() != Some(rejection) {
+                        return Err(format!(
+                            "rejection {rejection:?} was not reported through last_rejection \
+                             (got {:?})\n\
+                             failing step: {sequence}\n\
+                             generated sequence: {ops:?}",
+                            scheduler.last_rejection()
+                        ));
+                    }
+                    let after = snapshot(&scheduler);
+                    if after != before {
+                        return Err(format!(
+                            "rejected schedule ({rejection:?}) left state behind\n\
+                             failing step: {sequence}\n\
+                             before: {before:?}\n\
+                             after:  {after:?}\n\
+                             generated sequence: {ops:?}"
+                        ));
+                    }
+                    match (live_duplicate, rejection) {
+                        (true, Rejection::DuplicateEvent) => {}
+                        (true, other) => {
+                            return Err(format!(
+                                "live event {event_id} was rejected as {other:?} instead of \
+                                 DuplicateEvent\n\
+                                 failing step: {sequence}\n\
+                                 generated sequence: {ops:?}"
+                            ));
+                        }
+                        (false, Rejection::DuplicateEvent) => {
+                            return Err(format!(
+                                "event {event_id} has no live item yet was rejected as a \
+                                 duplicate\n\
+                                 failing step: {sequence}\n\
+                                 generated sequence: {ops:?}"
+                            ));
+                        }
+                        // An ordinary arbitration refusal (cooldown, priority)
+                        // against a free id: atomicity is all that applies.
+                        (false, _) => {}
+                    }
+                }
+            }
+        } else {
+            let live_before = live_generations(&scheduler);
+            apply_non_schedule(&mut scheduler, op);
+            if matches!(op, Op::StopAll) {
+                check_stop_invalidated_everything(&scheduler, &live_before, &ops, sequence)?;
+            }
+        }
+
+        check_exclusive_safety(&scheduler, &ops, sequence)?;
+        check_liveness_index_consistency(&scheduler, &ops, sequence)?;
+        check_terminal_classification(&scheduler, &ops, sequence)?;
+        check_retention_bounds(&scheduler, &config, &ops, sequence)?;
+    }
+
+    Ok(())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 96,
+        max_shrink_iters: 4096,
+        // Its own persistence file: this property generates different values
+        // than the main suite, and replaying a seed under the wrong strategy
+        // would regenerate an input the case was never persisted for.
+        failure_persistence: Some(Box::new(FileFailurePersistence::Direct(
+            "proptest-regressions/duplicate-event.txt",
+        ))),
+        ..ProptestConfig::default()
+    })]
+
+    /// #198: `event_id` is the logical event identity. At most one live item
+    /// may carry it, a duplicate request made while the prior item is still
+    /// live is refused atomically, and the id becomes schedulable again once
+    /// that item is terminal, under a generation that advances.
+    #[test]
+    fn duplicate_live_event_id_is_rejected_atomically(
+        steps in pooled_steps_strategy(),
+        config in config_strategy(),
+    ) {
+        run_pooled_steps(&steps, config).map_err(InvariantViolated::from)?;
     }
 }

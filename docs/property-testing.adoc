@@ -73,19 +73,42 @@ anything. Asserting the invariant would have meant first making it true, which
 is a contract change rather than a test change; until that decision is made the
 claim is recorded here instead of being asserted.
 
-Known gap, stated so it is not mistaken for covered: scheduling an `event_id`
-that is already live produces two live items sharing one id. The newer one owns
-the entry in the event liveness index, and `retire()` removes that entry
-unconditionally, so the older item stays reachable by generation but not by
-event id. `check_liveness_index_consistency` does not catch this because it
-asserts the event key is *present*, not that it resolves to the same item.
-`live_item_by_event` has no consumer outside the scheduler's own tests today,
-which is why this is recorded rather than treated as a live defect.
+Duplicate-`event_id` contract (issue #198), decided and enforced rather than
+recorded as a gap:
+
+[source,text]
+----
+event_id   = logical event identity, at most one live (Queued/Playing) item
+generation = scheduling-attempt identity, unique per accepted schedule
+----
+
+`Scheduler::schedule_at` refuses a second request for an id that is still live
+with `Rejection::DuplicateEvent`. The check runs after logical time has
+advanced — which is what retires an already-terminal item and frees its id —
+and before any reservation, cooldown or generation is touched, so a rejected
+duplicate changes nothing. The id becomes schedulable again once the prior item
+is terminal, and that accepted request receives a fresh generation. The check
+reads the live collection rather than the event liveness index, so a stale index
+entry can never widen the accepted set. `check_liveness_index_consistency`
+consequently asserts identity rather than presence: the index has to resolve a
+live item's id to *that* item, a terminal entry may only be reachable through a
+stale pointer, and a terminal id that legitimately reappeared must resolve to
+the newer live item.
 
 `stale_actions_are_never_dispatchable` works at the sink boundary instead of the
 scheduler boundary. It asserts that every start action corresponds to an item
 that was not cancelled before its logical start, that no generation starts
 twice, and that every stop is preceded by a start for the same generation.
+
+`duplicate_live_event_id_is_rejected_atomically` covers the issue #198 contract
+above. Its generated steps draw event ids from a pool of three, because the
+main suite cannot produce a duplicate at all: `plan_for` derives
+`evt-{sequence}` and a sequence never repeats a step, which is exactly why the
+contract needed a property of its own. It asserts that a live duplicate is
+refused atomically — the refusal moves no generation, reservation or cooldown —
+that an id whose item retired becomes schedulable again under a generation that
+advances, that no two live items ever share an id, and that the event liveness
+index resolves each id to *that* item rather than merely to *something*.
 
 `identical_trace_seed_and_config_are_byte_identical`,
 `the_seed_actually_varies_the_replay`, and
