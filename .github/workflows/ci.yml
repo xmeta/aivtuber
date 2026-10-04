@@ -117,6 +117,92 @@ jobs:
       - name: Resource benchmark smoke
         run: cargo run --locked -p aivtuber-hardening --bin resource-bench -- target/ci-resource-bench 5000
 
+      # Issue #147: the same seeded property subset the `regressions` job runs,
+      # but here it is a step inside a REQUIRED status check. The standalone job
+      # is not in main's branch protection, so on its own a regression failure
+      # would leave the three required contexts green and the PR would still be
+      # mergeable. Running it here makes the failure actually block the merge,
+      # without needing a branch-protection change.
+      #
+      # Both steps carry the same pinned environment; scripts/validate.mjs
+      # asserts the values appear in this job so the two copies cannot drift.
+      - name: Bounded property regression subset (gating)
+        run: cargo test --locked -p aivtuber-scheduler --test properties
+        env:
+          PROPTEST_CASES: "64"
+          PROPTEST_RNG_SEED: "20261004"
+          PROPTEST_MAX_SHRINK_ITERS: "4096"
+
+      # `if: always()` for the same reason as the standalone job: the artifact
+      # matters most when the run above has just failed and persisted a new case.
+      - name: Persist any newly discovered regression case (gating)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proptest-regressions-rust-checks
+          path: crates/scheduler/proptest-regressions/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  regressions:
+    name: Bounded property regressions
+    # Issue #147. `cargo test --workspace` runs the proptest suite with
+    # proptest's defaults, so every PR explores a *different* random space and
+    # the same code path is never replayed twice. This job pins the RNG seed and
+    # the case count, so the PR-time subset is the same on every run and any
+    # failure is reproducible from the command below.
+    #
+    # Deliberately stable-only and free of fuzz tooling (#146): libFuzzer needs
+    # nightly, which would mean a second channel in
+    # scripts/validate-toolchain-pins.mjs and an unpinned cargo-fuzz install in
+    # the PR path. Bounded fuzz campaigns live in .github/workflows/fuzz.yml,
+    # which is schedule/workflow_dispatch only and never blocks a PR.
+    #
+    # This job is NOT in main's required status checks, so a failure here does
+    # not block a merge on its own. It exists to run the bounded subset and
+    # publish any new shrunk case; the step that actually gates merges is the
+    # identical seeded run inside the required `Rust checks` job, which shares
+    # this checkout and therefore this proptest-regressions/ directory.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+
+      # PROPTEST_RNG_SEED fixes the generated space; PROPTEST_CASES bounds it.
+      # Both values are asserted by scripts/validate.mjs so they cannot drift
+      # away from the documented command in docs/property-testing.adoc.
+      #
+      # Any persisted proptest-regressions/ case replays regardless of the seed,
+      # so checked-in regressions still run here even though exploration is
+      # fixed.
+      - name: Bounded property regression subset
+        run: cargo test --locked -p aivtuber-scheduler --test properties
+        env:
+          PROPTEST_CASES: "64"
+          PROPTEST_RNG_SEED: "20261004"
+          PROPTEST_MAX_SHRINK_ITERS: "4096"
+
+      - name: Persist any newly discovered regression case
+        # proptest resolves persistence relative to the *crate root*, not the
+        # test file, so the file lands at crates/scheduler/proptest-regressions/.
+        #
+        # `if: always()` is required. Without it the default `success()` condition
+        # skips this step whenever the step above exits non-zero -- which is
+        # exactly the case where proptest has just shrunk and persisted a NEW
+        # failing case. The artifact would then be lost with the runner, which is
+        # the opposite of what this step exists for.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proptest-regressions
+          path: crates/scheduler/proptest-regressions/
+          if-no-files-found: ignore
+          retention-days: 14
+
   schema:
     name: Schema and security fixtures
     runs-on: ubuntu-latest

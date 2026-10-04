@@ -3,11 +3,13 @@
 #
 # Usage:
 #   ./fuzz/run-fuzz.sh <target> [extra libFuzzer args...]
+#   ./fuzz/run-fuzz.sh min <target> <artifact>   # minimize one failing input
 #
 # Examples:
 #   ./fuzz/run-fuzz.sh event_envelope
 #   ./fuzz/run-fuzz.sh event_envelope -runs=100000 -max_len=8192
 #   ./fuzz/run-fuzz.sh jev_response -runs=500000 -max_total_time=300
+#   ./fuzz/run-fuzz.sh min performance_asset fuzz/artifacts/performance_asset/crash-ab12
 #
 # Why this wrapper exists instead of calling `cargo fuzz run` directly:
 #
@@ -31,7 +33,21 @@ set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
   echo "usage: $0 <target> [libFuzzer args...]" >&2
+  echo "       $0 min <target> <artifact>" >&2
   exit 2
+fi
+
+# `min` is a cargo-fuzz subcommand that re-invokes the target binary. Calling
+# `cargo fuzz tmin` directly therefore SKIPS the ASan PATH setup below and dies
+# with STATUS_DLL_NOT_FOUND on Windows, so it is routed through the wrapper too.
+mode="run"
+if [[ $1 == "min" ]]; then
+  mode="min"
+  shift
+  if [[ $# -lt 2 ]]; then
+    echo "usage: $0 min <target> <artifact>" >&2
+    exit 2
+  fi
 fi
 
 target=$1
@@ -57,4 +73,7 @@ esac
 # The fuzz crate is excluded from the workspace, so cargo needs to be told where
 # it lives rather than discovering it from the root manifest.
 cd "$repo_root"
+if [[ "$mode" == "min" ]]; then
+  exec cargo +nightly fuzz tmin "$target" "$@"
+fi
 exec cargo +nightly fuzz run "$target" -- "$@"
