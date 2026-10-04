@@ -1,0 +1,63 @@
+# Fuzz targets for pure parser and bounded-text boundaries (issue #146).
+#
+# This crate is deliberately OUTSIDE the workspace (see the root Cargo.toml
+# `exclude`). That is what keeps `libfuzzer-sys` out of every production
+# dependency graph: a workspace member would be resolved by `cargo test
+# --workspace`, `cargo clippy --all-targets` and `cargo deny check`, so the
+# fuzzer toolchain would land in the workspace lock file and in the supply-chain
+# gate. Excluded, it has its own `Cargo.lock` and nothing else sees it.
+#
+# Fuzzing needs a nightly compiler (libFuzzer support). Nightly is a local
+# prerequisite only and is deliberately absent from `.github/workflows/ci.yml`:
+# `scripts/validate-toolchain-pins.mjs` requires every `toolchain:` in CI to
+# equal the single channel in `rust-toolchain.toml`. Adding a nightly job needs a
+# validator change, which belongs to issue #147 (bounded CI execution) rather
+# than here. See docs/fuzzing.adoc.
+#
+# `edition` and `rust-version` are stated literally because this crate cannot
+# inherit `workspace = true` from outside the workspace. The values are pinned
+# by `crates/scheduler/tests/workspace_contract.rs`, which fails if they drift
+# from the root manifest.
+[package]
+name = "aivtuber-fuzz"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1.0"
+
+[dependencies.aivtuber-asset-store]
+path = "../crates/asset-store"
+
+[dependencies.aivtuber-domain]
+path = "../crates/domain"
+
+[dependencies.aivtuber-reflex]
+path = "../crates/reflex"
+
+[[bin]]
+name = "event_envelope"
+path = "fuzz_targets/event_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jev_response"
+path = "fuzz_targets/jev_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "performance_asset"
+path = "fuzz_targets/performance_asset.rs"
+test = false
+doc = false
+bench = false

@@ -535,10 +535,10 @@ impl JevAdapter {
         started: Instant,
         deadline: Instant,
     ) -> Result<JevCallEvidence, JevCallFailure> {
-        let response: SystemOneResponse = serde_json::from_slice(body).map_err(|error| {
+        let response = parse_jev_response_body(body).map_err(|message| {
             JevCallFailure::new(
                 EngineErrorKind::InvalidRequest,
-                format!("invalid Jev response JSON: {error}"),
+                message,
                 &self.config.model_alias,
                 attempts,
                 started,
@@ -612,11 +612,16 @@ struct SystemOneRequest {
     questions: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Deserialize)]
-struct SystemOneResponse {
-    model: String,
-    answers: BTreeMap<String, Value>,
-    usage: JevUsage,
+/// Wire shape of a System One (Jev) response.
+///
+/// `Deserialize` and public so the untrusted provider boundary can be fuzzed
+/// directly (issue #146). Constructing one is not a supported way to drive the
+/// adapter: use [`parse_jev_response_body`] so the error contract matches.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SystemOneResponse {
+    pub model: String,
+    pub answers: BTreeMap<String, Value>,
+    pub usage: JevUsage,
 }
 
 fn compact_state(request: &ReflexRequest, candidates: &[String]) -> Value {
@@ -776,12 +781,38 @@ fn score_question(instructions: &str, criteria: &[&str]) -> Value {
     })
 }
 
-struct NormalizedResponse {
-    decision: ReflexDecision,
-    selected_candidate_id: Option<String>,
-    answers: BTreeMap<String, NormalizedAnswer>,
+/// Normalized form of one Jev response.
+///
+/// Public so the parser boundary can be exercised directly (issue #146); the
+/// adapter itself continues to use it unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NormalizedResponse {
+    pub decision: ReflexDecision,
+    pub selected_candidate_id: Option<String>,
+    pub answers: BTreeMap<String, NormalizedAnswer>,
 }
-fn normalize_answers(
+
+/// Parse one Jev/System One response body.
+///
+/// The wire shape the adapter sends and receives is untrusted provider input, so
+/// this is the deserialization boundary fuzzed by issue #146. Split out from
+/// [`JevAdapter::normalize_response`] so the parse step is reachable without a
+/// transport, a deadline, or a wall clock: the adapter keeps its own deadline
+/// check between parsing and normalization, and this function keeps no clock of
+/// its own.
+///
+/// Returns a message rather than a typed error so the adapter can wrap it in a
+/// `JevCallFailure` with its retry/latency context unchanged.
+pub fn parse_jev_response_body(body: &[u8]) -> Result<SystemOneResponse, String> {
+    serde_json::from_slice(body).map_err(|error| format!("invalid Jev response JSON: {error}"))
+}
+
+/// Normalize the answers of a parsed Jev response into a decision.
+///
+/// Pure: no clock, no transport, no I/O. `latency_ms` is supplied by the caller
+/// rather than measured here so the result depends only on its arguments, which
+/// is what makes the boundary reproducible under fuzzing (issue #146).
+pub fn normalize_answers(
     answers: &BTreeMap<String, Value>,
     candidates: &[String],
     requested_model: &str,
