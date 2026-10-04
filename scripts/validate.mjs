@@ -474,6 +474,41 @@ for (const file of trackedFiles) {
       passes += 1;
       console.log("ok        .github/workflows/fuzz.yml: campaign budget is plumbed through");
     }
+
+    // The default (blank target) input runs every fuzz target sequentially in
+    // ONE job, so the per-target -max_total_time caps plus a reserve for
+    // checkout, the nightly toolchain, the cargo-fuzz install, one build per
+    // target and the artifact upload must fit inside timeout-minutes. When
+    // they do not, the job is killed mid-campaign and the last target never
+    // runs — the bounded-campaign guarantee silently degrades (review on
+    // PR #199). The reserve is the non-fuzz overhead allowance; raise it
+    // deliberately, not by accident.
+    const fuzzTimeout = fuzz.match(/^\s*timeout-minutes:\s*(\d+)/m);
+    const fuzzCap = fuzz.match(/-max_total_time=(\d+)/);
+    const fuzzTargets = fuzz.match(/^\s*targets="([a-z_ ]+)"/m);
+    const FUZZ_SETUP_RESERVE_SECONDS = 960;
+    if (!fuzzTimeout || !fuzzCap || !fuzzTargets) {
+      failures += 1;
+      console.error(
+        "FAIL      .github/workflows/fuzz.yml: cannot read timeout-minutes, -max_total_time or the default target list to bound the campaign (issue #147)",
+      );
+    } else {
+      const fuzzTargetCount = fuzzTargets[1].trim().split(/\s+/).length;
+      const fuzzCampaignSeconds = fuzzTargetCount * Number(fuzzCap[1]);
+      const fuzzNeededSeconds = fuzzCampaignSeconds + FUZZ_SETUP_RESERVE_SECONDS;
+      const fuzzBudgetSeconds = Number(fuzzTimeout[1]) * 60;
+      if (fuzzNeededSeconds > fuzzBudgetSeconds) {
+        failures += 1;
+        console.error(
+          `FAIL      .github/workflows/fuzz.yml: ${fuzzTargetCount} targets x -max_total_time=${fuzzCap[1]}s + ${FUZZ_SETUP_RESERVE_SECONDS}s setup reserve = ${fuzzNeededSeconds}s exceeds timeout-minutes ${fuzzTimeout[1]} (${fuzzBudgetSeconds}s); the job would be killed before the last target finishes (issue #147)`,
+        );
+      } else {
+        passes += 1;
+        console.log(
+          `ok        .github/workflows/fuzz.yml: campaign fits the job budget (${fuzzNeededSeconds}s <= ${fuzzBudgetSeconds}s)`,
+        );
+      }
+    }
   }
 
   // The PR-time property gate must be deterministic: a fixed RNG seed and a

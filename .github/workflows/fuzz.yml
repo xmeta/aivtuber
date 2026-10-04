@@ -88,6 +88,17 @@ jobs:
       # Linux hosts have no AddressSanitizer DLL problem; fuzz/run-fuzz.sh
       # locates the MSVC runtime only on Windows and is a no-op elsewhere, so
       # the same entry point works here and on a developer machine.
+      #
+      # Budget: the blank-input path fuzzes all three targets sequentially in
+      # this one job, so (targets x per-target time cap) plus a reserve for
+      # checkout, nightly, the cargo-fuzz install, one build per target and
+      # the artifact upload must fit inside timeout-minutes above — here
+      # 3 x 480s + a 960s reserve = 2400s <= 45 min. Without that the job is
+      # killed mid-campaign and the last target never runs (the cap used to
+      # be 1500s, i.e. 75 min against a 45 min job). The cap is a backstop:
+      # the default -runs budget usually binds first. scripts/validate.mjs
+      # asserts the arithmetic, so changing the cap, the target count or the
+      # timeout without rebalancing fails validation.
       - name: Campaign
         env:
           RUNS: ${{ steps.budget.outputs.runs }}
@@ -100,7 +111,7 @@ jobs:
           fi
           for target in $targets; do
             echo "::group::fuzz $target (-runs=$RUNS)"
-            bash fuzz/run-fuzz.sh "$target" "-runs=$RUNS" -max_total_time=1500
+            bash fuzz/run-fuzz.sh "$target" "-runs=$RUNS" -max_total_time=480
             echo "::endgroup::"
           done
 

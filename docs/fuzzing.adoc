@@ -266,7 +266,16 @@ Issue #147 wires this up:
 * `.github/workflows/fuzz.yml` runs bounded campaigns on a `schedule` and on
   `workflow_dispatch` only. It never triggers on `pull_request`, so fuzzing
   cannot become an unbounded PR gate, and it carries both an explicit `-runs`
-  budget and a `timeout-minutes` bound.
+  budget and a `timeout-minutes` bound. The default (blank `target`) input
+  runs all three targets *sequentially in one job*, so those two bounds have
+  to agree: every target's `-max_total_time` plus a reserve for checkout, the
+  nightly toolchain, the `cargo-fuzz` install, one build per target and the
+  artifact upload fits inside the job timeout (3 x 480s + 960s = 2400s within
+  45 minutes). Otherwise the job would be killed mid-campaign and the last
+  target would never run — which is what the previous 1500s cap did at a
+  worst case of 75 minutes. `scripts/validate.mjs` asserts that arithmetic, so
+  raising the cap, adding a target or shortening the timeout without
+  rebalancing fails validation.
 * `.github/workflows/ci.yml` runs a seeded, bounded property subset twice on the
   pinned stable toolchain with a fixed `PROPTEST_RNG_SEED` and a bounded
   `PROPTEST_CASES`, so the subset is reproducible on every PR. Checked-in
