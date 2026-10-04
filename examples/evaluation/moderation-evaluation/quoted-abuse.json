@@ -1,0 +1,162 @@
+{
+  "schema_version": "1",
+  "review_session_id": "mod-quoted-abuse",
+  "policy": {
+    "policy_id": "moderation-shadow",
+    "policy_version": "0.4.0",
+    "config_fingerprint": "cfg-mod-1",
+    "reviewer_protocol_version": "protocol-1",
+    "dataset_id": "mod-dataset-2026-10"
+  },
+  "orchestration": {
+    "orchestrator_schema_version": "0.1.0",
+    "bounds_fingerprint": "5ab1c0de9f7a3b21"
+  },
+  "protocol": {
+    "protocol_id": "mod-protocol",
+    "protocol_version": "1",
+    "instructions_version": "2026-10-01",
+    "identity_hidden_during_review": true,
+    "randomization": "seeded_per_case",
+    "randomization_seed": 20261004
+  },
+  "authority_effect": "offline_evidence_only",
+  "contains_private_production_content": false,
+  "cases": [
+    {
+      "case_id": "case-quoted-01",
+      "correlation_id": "corr-quoted-01",
+      "recommendation": {
+        "action": "delete",
+        "category": "harassment",
+        "confidence_micros": 810000,
+        "reason_code": "abusive_lexicon_hit"
+      },
+      "reviews": [
+        {
+          "reviewer_id": "rev-a",
+          "label": "allow",
+          "category": "none",
+          "ambiguity": "insufficient_context",
+          "acceptable_actions": [
+            "allow",
+            "human_review"
+          ],
+          "requires_human_review": false
+        }
+      ]
+    },
+    {
+      "case_id": "case-direct-threat",
+      "correlation_id": "corr-direct-threat",
+      "recommendation": {
+        "action": "ban",
+        "category": "threat",
+        "confidence_micros": 960000,
+        "reason_code": "targeted_threat_lexicon_hit"
+      },
+      "reviews": [
+        {
+          "reviewer_id": "rev-a",
+          "label": "ban",
+          "category": "threat",
+          "ambiguity": "low",
+          "acceptable_actions": [
+            "ban"
+          ],
+          "requires_human_review": true
+        }
+      ]
+    }
+  ],
+  "aggregate": {
+    "total_cases": 2,
+    "agreed_cases": 1,
+    "overridden_cases": 1,
+    "reviewer_disagreement_cases": 0,
+    "benign_suppressed_cases": 1,
+    "destructive_overridden_cases": 1,
+    "category_counts": {
+      "none": 0,
+      "spam": 0,
+      "flood": 0,
+      "harassment": 1,
+      "scam": 0,
+      "hate_speech": 0,
+      "threat": 1,
+      "sexual_content": 0,
+      "impersonation": 0
+    },
+    "outcome_counts": {
+      "harassment/delete": 1,
+      "threat/ban": 1
+    },
+    "metrics": {
+      "shadow.moderation.none_count": {
+        "value": 0,
+        "sample_count": 2
+      },
+      "shadow.moderation.spam_count": {
+        "value": 0,
+        "sample_count": 2
+      },
+      "shadow.moderation.flood_count": {
+        "value": 0,
+        "sample_count": 2
+      },
+      "shadow.moderation.harassment_count": {
+        "value": 1,
+        "sample_count": 2
+      },
+      "shadow.moderation.scam_count": {
+        "value": 0,
+        "sample_count": 2
+      },
+      "shadow.moderation.hate_speech_count": {
+        "value": 0,
+        "sample_count": 2
+      },
+      "shadow.moderation.threat_count": {
+        "value": 1,
+        "sample_count": 2
+      },
+      "shadow.moderation.sexual_content_count": {
+        "value": 0,
+        "sample_count": 2
+      },
+      "shadow.moderation.impersonation_count": {
+        "value": 0,
+        "sample_count": 2
+      },
+      "shadow.moderation.agreed_count": {
+        "value": 1,
+        "sample_count": 2
+      },
+      "shadow.moderation.overridden_count": {
+        "value": 1,
+        "sample_count": 2
+      },
+      "shadow.moderation.reviewer_disagreement_count": {
+        "value": 0,
+        "sample_count": 2
+      },
+      "shadow.moderation.benign_suppressed_count": {
+        "value": 1,
+        "sample_count": 2
+      },
+      "shadow.moderation.destructive_overridden_count": {
+        "value": 1,
+        "sample_count": 2
+      },
+      "shadow.moderation.total_count": {
+        "value": 2,
+        "sample_count": 2
+      },
+      "shadow.moderation.override_rate_pct": {
+        "value": 50,
+        "sample_count": 2
+      }
+    },
+    "divergent_cases_truncated": false
+  }
+}

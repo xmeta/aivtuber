@@ -254,3 +254,12 @@ For holdout rotation:
 . retain old result artifacts so historical decisions remain interpretable.
 
 Never silently move a case from development into the active holdout and call it independent evidence.
+
+== Related
+
+Shadow moderation evaluation (#77) reuses this document's reviewer-protocol
+pattern — blinded review, retained disagreement, `authority_effect` pinned to
+offline evidence only — and adds a destructive-action label model on top of it.
+See <<Shadow moderation evaluation (#77, implemented)>> in
+link:shadow-evaluation.adoc[shadow-evaluation.adoc] for the label model, the
+suppression metric and the cross-field checks.

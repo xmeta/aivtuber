@@ -1,0 +1,288 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xmeta/aivtuber/schemas/moderation-evaluation.schema.json",
+  "title": "AIVTuber Shadow Moderation Evaluation",
+  "description": "Offline evaluation of a shadow moderation policy against reviewer labels (issue #77). Evidence only: it records how often a recommendation was accepted, overridden or left ambiguous, and it carries no field that could authorize a destructive action, a promotion, or any runtime control. Cases are opaque identifiers and labels; message content is never present.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "review_session_id",
+    "policy",
+    "orchestration",
+    "protocol",
+    "authority_effect",
+    "contains_private_production_content",
+    "cases",
+    "aggregate"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": "1" },
+    "review_session_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{2,95}$",
+      "description": "Opaque session identifier. Must not encode a reviewer, a community, or a promotion decision."
+    },
+    "policy": { "$ref": "#/$defs/policyIdentity" },
+    "orchestration": { "$ref": "#/$defs/orchestration" },
+    "protocol": { "$ref": "#/$defs/protocol" },
+    "authority_effect": {
+      "const": "offline_evidence_only",
+      "description": "Evaluation labels are evidence only. They cannot authorize a delete, timeout or ban, a promotion stage, or any runtime control. #77 requires destructive automation to remain gated on calibrated evidence, so a document claiming otherwise is rejected structurally."
+    },
+    "contains_private_production_content": {
+      "const": false,
+      "description": "Checked-in fixtures must be synthetic or public-curated; private production transcripts are never required."
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/case" }
+    },
+    "aggregate": { "$ref": "#/$defs/aggregate" }
+  },
+  "$defs": {
+    "policyIdentity": {
+      "type": "object",
+      "description": "The shadow moderation policy under evaluation. Rates are only comparable within one policy identity, one config fingerprint, one reviewer protocol and one dataset.",
+      "required": [
+        "policy_id",
+        "policy_version",
+        "config_fingerprint",
+        "reviewer_protocol_version",
+        "dataset_id"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "policy_id": { "type": "string", "minLength": 1 },
+        "policy_version": { "type": "string", "minLength": 1 },
+        "config_fingerprint": { "type": "string", "minLength": 1 },
+        "reviewer_protocol_version": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Reviewer instructions version. Two runs scored under different protocols are not comparable."
+        },
+        "dataset_id": { "type": ["string", "null"] }
+      }
+    },
+    "orchestration": {
+      "type": "object",
+      "description": "Bounded-orchestration identity the batch was collected under (#164). Two batches differing only in deadline, sample rate, concurrency, queue capacity or provider-call/budget flags are not comparable even under an identical policy identity.",
+      "required": ["orchestrator_schema_version", "bounds_fingerprint"],
+      "additionalProperties": false,
+      "properties": {
+        "orchestrator_schema_version": { "type": "string", "minLength": 1 },
+        "bounds_fingerprint": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{16}$",
+          "description": "Stable fingerprint over the orchestration bounds, so two batches can be compared only when they were collected the same way."
+        }
+      }
+    },
+    "protocol": {
+      "type": "object",
+      "required": [
+        "protocol_id",
+        "protocol_version",
+        "instructions_version",
+        "identity_hidden_during_review",
+        "randomization",
+        "randomization_seed"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "protocol_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{2,63}$" },
+        "protocol_version": { "type": "string", "minLength": 1 },
+        "instructions_version": { "type": "string", "minLength": 1 },
+        "identity_hidden_during_review": {
+          "const": true,
+          "description": "Which policy produced a recommendation is hidden from the reviewer, so the label is not anchored on the model's own confidence."
+        },
+        "randomization": { "const": "seeded_per_case" },
+        "randomization_seed": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "action": {
+      "type": "string",
+      "enum": ["allow", "ignore", "delete", "timeout", "ban", "human_review"],
+      "description": "Declared in automation-lifecycle order, cheapest and safest first. `human_review` is the escape hatch that keeps `ban` human-approved by default."
+    },
+    "category": {
+      "type": "string",
+      "enum": [
+        "none",
+        "spam",
+        "flood",
+        "harassment",
+        "scam",
+        "hate_speech",
+        "threat",
+        "sexual_content",
+        "impersonation"
+      ],
+      "description": "`none` is the protected-benign bucket: criticism, sarcasm, teasing, disagreement and repeated-but-benign messages are not violations, and suppressing one is counted as `benign_suppressed` rather than as an ordinary error."
+    },
+    "ambiguity": {
+      "type": "string",
+      "enum": ["low", "multiple_acceptable", "insufficient_context"],
+      "description": "A policy may legitimately allow several outcomes, so ambiguity is a first-class label rather than a bucket lumped in with disagreement."
+    },
+    "outcome": {
+      "type": "string",
+      "enum": ["agreed", "overridden", "reviewer_disagreement"]
+    },
+    "review": {
+      "type": "object",
+      "description": "One reviewer's label. Disagreement between reviewers is retained, never collapsed into a consensus.",
+      "required": [
+        "reviewer_id",
+        "label",
+        "category",
+        "ambiguity",
+        "acceptable_actions",
+        "requires_human_review"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "reviewer_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{2,63}$",
+          "description": "Opaque reviewer identifier used only to preserve disagreement; it must not encode a reviewer performance score."
+        },
+        "label": { "$ref": "#/$defs/action" },
+        "category": { "$ref": "#/$defs/category" },
+        "ambiguity": { "$ref": "#/$defs/ambiguity" },
+        "acceptable_actions": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/action" },
+          "description": "Every action this reviewer considered acceptable. Always contains `label`, and holds more than one entry whenever the policy legitimately allows several outcomes."
+        },
+        "requires_human_review": { "type": "boolean" }
+      }
+    },
+    "case": {
+      "type": "object",
+      "description": "One reviewed case. Identifiers and labels only; there is no field that can hold message content.",
+      "required": ["case_id", "correlation_id", "recommendation", "reviews"],
+      "additionalProperties": false,
+      "properties": {
+        "case_id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{2,95}$" },
+        "correlation_id": { "type": "string", "minLength": 1 },
+        "recommendation": {
+          "type": "object",
+          "required": ["action", "category", "confidence_micros", "reason_code"],
+          "additionalProperties": false,
+          "properties": {
+            "action": { "$ref": "#/$defs/action" },
+            "category": { "$ref": "#/$defs/category" },
+            "confidence_micros": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000000,
+              "description": "Policy confidence in micro-units, retained for analysis. Never used as a decision basis and never thresholded here: #77 forbids enabling destructive automation from model confidence alone."
+            },
+            "reason_code": { "type": "string", "minLength": 1, "maxLength": 64 }
+          }
+        },
+        "reviews": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/review" },
+          "description": "Every review of this case, in submission order. An unreviewed case cannot be scored."
+        }
+      }
+    },
+    "metric": {
+      "type": "object",
+      "required": ["value", "sample_count"],
+      "additionalProperties": false,
+      "properties": {
+        "value": { "type": "number", "minimum": 0 },
+        "sample_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Reported with every rate so a consumer can see how thin the denominator is. Highly imbalanced moderation data must never be read as a bare accuracy figure."
+        }
+      }
+    },
+    "aggregate": {
+      "type": "object",
+      "required": [
+        "total_cases",
+        "agreed_cases",
+        "overridden_cases",
+        "reviewer_disagreement_cases",
+        "benign_suppressed_cases",
+        "destructive_overridden_cases",
+        "category_counts",
+        "outcome_counts",
+        "metrics",
+        "divergent_cases_truncated"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "total_cases": { "type": "integer", "minimum": 1 },
+        "agreed_cases": { "type": "integer", "minimum": 0 },
+        "overridden_cases": { "type": "integer", "minimum": 0 },
+        "reviewer_disagreement_cases": { "type": "integer", "minimum": 0 },
+        "benign_suppressed_cases": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Cases labelled benign that the policy recommended suppressing. Counted on its own because benign criticism wrongly suppressed is the harm a recall-only metric hides."
+        },
+        "destructive_overridden_cases": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Destructive recommendations at least one reviewer rejected."
+        },
+        "category_counts": {
+          "type": "object",
+          "description": "Recommendation count per category. Every category present, including zeroes, so two reports compare field by field.",
+          "required": [
+            "none",
+            "spam",
+            "flood",
+            "harassment",
+            "scam",
+            "hate_speech",
+            "threat",
+            "sexual_content",
+            "impersonation"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "none": { "type": "integer", "minimum": 0 },
+            "spam": { "type": "integer", "minimum": 0 },
+            "flood": { "type": "integer", "minimum": 0 },
+            "harassment": { "type": "integer", "minimum": 0 },
+            "scam": { "type": "integer", "minimum": 0 },
+            "hate_speech": { "type": "integer", "minimum": 0 },
+            "threat": { "type": "integer", "minimum": 0 },
+            "sexual_content": { "type": "integer", "minimum": 0 },
+            "impersonation": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "outcome_counts": {
+          "type": "object",
+          "description": "Count per `<category>/<action>` recommendation pair.",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "propertyNames": { "pattern": "^(none|spam|flood|harassment|scam|hate_speech|threat|sexual_content|impersonation)/(allow|ignore|delete|timeout|ban|human_review)$" }
+        },
+        "metrics": {
+          "type": "object",
+          "description": "Flat #58-shaped metric map: `shadow.moderation.<category>_count`, the outcome counters, and `shadow.moderation.override_rate_pct`.",
+          "additionalProperties": { "$ref": "#/$defs/metric" }
+        },
+        "divergent_cases_truncated": {
+          "type": "boolean",
+          "description": "True when the retained reference list holds fewer entries than `overridden_cases`. Counts are never truncated, so totals stay honest."
+        }
+      }
+    }
+  }
+}

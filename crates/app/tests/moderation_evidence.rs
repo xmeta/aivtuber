@@ -1,0 +1,914 @@
+//! Issue #77: shadow moderation evidence integration.
+//!
+//! The properties under test are the ones where a moderation evidence layer
+//! typically goes wrong:
+//!
+//! 1. **Protected benign cases.** Criticism, teasing and disagreement are not
+//!    harassment. A classifier that suppresses them is the harm a recall-only
+//!    metric hides, so `benign_suppressed` is counted on its own.
+//! 2. **Outliers survive aggregation.** 99 benign messages plus one threat must
+//!    leave the threat independently countable — the case #77 calls out
+//!    explicitly for #79's lossy crowd aggregation.
+//! 3. **Severity and lifecycle are different orderings.** `ban` is the most
+//!    destructive action and simultaneously the one that stays human-approved.
+//! 4. **Disagreement is retained.** Reviewers who disagree are evidence, so
+//!    neither the module nor the schema may collapse them into a consensus.
+//! 5. **Evidence never becomes authority.** Nothing here executes a
+//!    recommendation, and a report carries no scalar that would rank a policy.
+
+use aivtuber_app::{
+    AuthorityEffect, MODERATION_COMPARISON_SCHEMA_VERSION,
+    MODERATION_DIVERGENCE_REPORT_SCHEMA_VERSION, ModerationAction, ModerationAmbiguity,
+    ModerationCategory, ModerationComparisonRecord, ModerationDivergenceReport,
+    ModerationOrchestrationIdentity, ModerationOutcome, ModerationPolicyIdentity,
+    ModerationRecommendation, ModerationReview, ShadowOrchestratorConfig, ShadowPolicyIdentity,
+    classify_moderation_case, summarize_moderation_divergence,
+    summarize_moderation_divergence_default,
+};
+
+fn shadow_identity() -> ShadowPolicyIdentity {
+    ShadowPolicyIdentity {
+        policy_id: "moderation-shadow".to_owned(),
+        policy_version: "0.4.0".to_owned(),
+        config_fingerprint: "cfg-mod-1".to_owned(),
+        runtime_profile: "default".to_owned(),
+        dataset_id: Some("mod-dataset-2026-10".to_owned()),
+    }
+}
+
+fn policy() -> ModerationPolicyIdentity {
+    ModerationPolicyIdentity::from_policy(&shadow_identity(), "protocol-1")
+        .expect("the fixture policy identity is complete")
+}
+
+fn config() -> ShadowOrchestratorConfig {
+    ShadowOrchestratorConfig::default()
+}
+
+fn review(
+    reviewer: &str,
+    label: ModerationAction,
+    acceptable: &[ModerationAction],
+    category: ModerationCategory,
+    ambiguity: ModerationAmbiguity,
+) -> ModerationReview {
+    let mut acceptable_actions = acceptable.to_vec();
+    if !acceptable_actions.contains(&label) {
+        acceptable_actions.push(label);
+    }
+    acceptable_actions.sort();
+    acceptable_actions.dedup();
+    ModerationReview {
+        reviewer_id: reviewer.to_owned(),
+        label,
+        category,
+        ambiguity,
+        acceptable_actions,
+        requires_human_review: matches!(label, ModerationAction::HumanReview),
+    }
+}
+
+fn record(
+    case_id: &str,
+    action: ModerationAction,
+    category: ModerationCategory,
+    reviews: Vec<ModerationReview>,
+) -> ModerationComparisonRecord {
+    ModerationComparisonRecord {
+        schema_version: MODERATION_COMPARISON_SCHEMA_VERSION.to_owned(),
+        orchestration: Some(
+            ModerationOrchestrationIdentity::from_config(&config()).expect("valid config"),
+        ),
+        case_id: case_id.to_owned(),
+        correlation_id: format!("corr-{case_id}"),
+        policy: policy(),
+        recommendation: ModerationRecommendation::with_confidence(action, category, 0.82),
+        reviews,
+    }
+}
+
+fn benign_agreement(case_id: &str) -> ModerationComparisonRecord {
+    record(
+        case_id,
+        ModerationAction::Allow,
+        ModerationCategory::None,
+        vec![review(
+            "rev-a",
+            ModerationAction::Allow,
+            &[ModerationAction::Allow],
+            ModerationCategory::None,
+            ModerationAmbiguity::Low,
+        )],
+    )
+}
+
+fn summarize(
+    records: &[ModerationComparisonRecord],
+) -> Result<ModerationDivergenceReport, aivtuber_app::AppError> {
+    summarize_moderation_divergence_default(records, &config())
+}
+
+// ---------------------------------------------------------------------------
+// 1. Protected benign cases
+// ---------------------------------------------------------------------------
+
+#[test]
+fn criticism_sarcasm_and_disagreement_are_not_violations() {
+    // #77's protected cases: the module must be able to *represent* "allow" as
+    // a first-class labelled outcome rather than as an absence of a decision.
+    assert!(!ModerationCategory::None.is_violation());
+    for category in ModerationCategory::ALL {
+        if category != ModerationCategory::None {
+            assert!(category.is_violation(), "{category:?} must be a violation");
+        }
+    }
+}
+
+#[test]
+fn suppressing_a_benign_case_is_counted_as_benign_suppressed() {
+    // A reviewer says the case is benign; the policy recommended `ignore`.
+    let records = vec![record(
+        "evt-criticism",
+        ModerationAction::Ignore,
+        ModerationCategory::None,
+        vec![review(
+            "rev-a",
+            ModerationAction::Allow,
+            &[ModerationAction::Allow],
+            ModerationCategory::None,
+            ModerationAmbiguity::Low,
+        )],
+    )];
+
+    let report = summarize(&records).expect("summary");
+
+    assert_eq!(report.benign_suppressed_cases, 1);
+    assert_eq!(report.overridden_cases, 1);
+    assert_eq!(
+        report.metrics["shadow.moderation.benign_suppressed_count"].value, 1.0,
+        "benign suppression must be visible as its own metric, not folded into accuracy"
+    );
+}
+
+/// The policy's own category is *what is being evaluated*, so it cannot decide
+/// whether its own error was benign. A policy that labels criticism as
+/// harassment would otherwise never appear in `benign_suppressed`.
+#[test]
+fn benign_suppression_follows_the_reviewer_not_the_policy_category() {
+    // The policy says harassment; both reviewers say the case is not abuse.
+    let records = vec![record(
+        "evt-mislabelled",
+        ModerationAction::Delete,
+        ModerationCategory::Harassment,
+        vec![
+            review(
+                "rev-a",
+                ModerationAction::Allow,
+                &[ModerationAction::Allow],
+                ModerationCategory::None,
+                ModerationAmbiguity::Low,
+            ),
+            review(
+                "rev-b",
+                ModerationAction::Allow,
+                &[ModerationAction::Allow],
+                ModerationCategory::None,
+                ModerationAmbiguity::Low,
+            ),
+        ],
+    )];
+
+    let report = summarize(&records).expect("summary");
+
+    assert_eq!(
+        report.benign_suppressed_cases, 1,
+        "the reviewer's label, not the policy's, decides benign suppression"
+    );
+    assert_eq!(report.category_counts["harassment"], 1);
+}
+
+/// One reviewer considering a case benign is not enough when another calls it a
+/// real violation: the case is not unambiguously benign, so it is not counted
+/// as benign suppression.
+#[test]
+fn a_split_review_is_not_counted_as_benign_suppression() {
+    let records = vec![record(
+        "evt-split",
+        ModerationAction::Delete,
+        ModerationCategory::None,
+        vec![
+            review(
+                "rev-a",
+                ModerationAction::Allow,
+                &[ModerationAction::Allow],
+                ModerationCategory::None,
+                ModerationAmbiguity::MultipleAcceptable,
+            ),
+            review(
+                "rev-b",
+                ModerationAction::Delete,
+                &[ModerationAction::Delete],
+                ModerationCategory::Harassment,
+                ModerationAmbiguity::Low,
+            ),
+        ],
+    )];
+
+    let report = summarize(&records).expect("summary");
+    assert_eq!(
+        report.benign_suppressed_cases, 0,
+        "unanimity is required: a split review is not a benign case"
+    );
+    assert_eq!(report.reviewer_disagreement_cases, 1);
+}
+
+#[test]
+fn an_allowed_benign_case_is_never_a_suppression() {
+    let records = vec![benign_agreement("evt-allowed")];
+    let report = summarize(&records).expect("summary");
+    assert_eq!(report.benign_suppressed_cases, 0);
+    assert_eq!(report.agreed_cases, 1);
+}
+
+#[test]
+fn a_suppressed_violation_is_not_counted_as_benign_suppression() {
+    let records = vec![record(
+        "evt-spam",
+        ModerationAction::Delete,
+        ModerationCategory::Spam,
+        vec![review(
+            "rev-a",
+            ModerationAction::Allow,
+            &[ModerationAction::Allow],
+            ModerationCategory::Spam,
+            ModerationAmbiguity::Low,
+        )],
+    )];
+
+    let report = summarize(&records).expect("summary");
+    assert_eq!(
+        report.benign_suppressed_cases, 0,
+        "a missed spam case is a false negative, not benign suppression"
+    );
+    assert_eq!(report.overridden_cases, 1);
+}
+
+// ---------------------------------------------------------------------------
+// 2. Outliers survive aggregation (#77's explicit #79 protection case)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn one_threat_among_many_benign_messages_stays_independently_countable() {
+    let mut records = vec![benign_agreement("evt-bench")];
+    for index in 0..98 {
+        records.push(benign_agreement(&format!("evt-benign-{index}")));
+    }
+    // The single outlier: an explicit threat the reviewer agrees should be
+    // escalated. It must remain visible even though 99 neighbours are benign.
+    records.push(record(
+        "evt-threat",
+        ModerationAction::HumanReview,
+        ModerationCategory::Threat,
+        vec![review(
+            "rev-a",
+            ModerationAction::HumanReview,
+            &[ModerationAction::HumanReview, ModerationAction::Ban],
+            ModerationCategory::Threat,
+            ModerationAmbiguity::Low,
+        )],
+    ));
+
+    let report = summarize(&records).expect("summary");
+
+    assert_eq!(report.total_cases, 100);
+    assert_eq!(
+        report.category_counts["threat"], 1,
+        "the outlier must survive aggregation as its own countable category"
+    );
+    assert_eq!(
+        report.outcome_counts["threat/human_review"], 1,
+        "and it must remain addressable by category and action"
+    );
+    assert_eq!(report.overridden_cases, 0);
+    // 99 benign agreements plus the agreed escalation.
+    assert_eq!(report.agreed_cases, 100);
+}
+
+#[test]
+fn a_benign_crowd_cannot_dilute_a_rejected_outlier() {
+    // The converse: if the policy *suppressed* the benign crowd, those are
+    // suppressed-benign cases, and the report must say so rather than reporting
+    // a clean aggregate.
+    let mut records = Vec::new();
+    for index in 0..50 {
+        records.push(record(
+            &format!("evt-crowd-{index}"),
+            ModerationAction::Ignore,
+            ModerationCategory::None,
+            vec![review(
+                "rev-a",
+                ModerationAction::Allow,
+                &[ModerationAction::Allow],
+                ModerationCategory::None,
+                ModerationAmbiguity::Low,
+            )],
+        ));
+    }
+    records.push(record(
+        "evt-scam",
+        ModerationAction::Allow,
+        ModerationCategory::Scam,
+        vec![review(
+            "rev-a",
+            ModerationAction::HumanReview,
+            &[ModerationAction::HumanReview],
+            ModerationCategory::Scam,
+            ModerationAmbiguity::Low,
+        )],
+    ));
+
+    let report = summarize(&records).expect("summary");
+
+    assert_eq!(report.benign_suppressed_cases, 50);
+    assert_eq!(report.overridden_cases, 51);
+    assert_eq!(
+        report.metrics["shadow.moderation.benign_suppressed_count"].value,
+        50.0
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 3. Severity vs lifecycle ordering
+// ---------------------------------------------------------------------------
+
+#[test]
+fn severity_and_lifecycle_are_independent_orderings() {
+    // Declaration order is the automation lifecycle: allow -> ignore -> delete
+    // -> timeout -> ban, with human review alongside. Destructiveness is
+    // ranked separately, and `human_review` is *not* destructive because it is
+    // the escape hatch that keeps `ban` human-approved.
+    let lifecycle = [
+        ModerationAction::Allow,
+        ModerationAction::Ignore,
+        ModerationAction::Delete,
+        ModerationAction::Timeout,
+        ModerationAction::Ban,
+    ];
+    assert!(ModerationAction::Allow < ModerationAction::Ignore);
+    assert!(ModerationAction::Ignore < ModerationAction::Delete);
+    assert!(ModerationAction::Delete < ModerationAction::Timeout);
+    assert!(ModerationAction::Timeout < ModerationAction::Ban);
+    assert_eq!(lifecycle.len(), 5);
+
+    assert!(!ModerationAction::Allow.is_destructive());
+    assert!(!ModerationAction::Ignore.is_destructive());
+    assert!(ModerationAction::Delete.is_destructive());
+    assert!(ModerationAction::Timeout.is_destructive());
+    assert!(ModerationAction::Ban.is_destructive());
+    assert!(
+        !ModerationAction::HumanReview.is_destructive(),
+        "escalating to a human is not itself a destructive act"
+    );
+}
+
+#[test]
+fn a_rejected_destructive_recommendation_is_counted_separately() {
+    let records = vec![record(
+        "evt-ban",
+        ModerationAction::Ban,
+        ModerationCategory::Harassment,
+        vec![review(
+            "rev-a",
+            ModerationAction::Ignore,
+            &[ModerationAction::Ignore, ModerationAction::Delete],
+            ModerationCategory::Harassment,
+            ModerationAmbiguity::Low,
+        )],
+    )];
+
+    let report = summarize(&records).expect("summary");
+    assert_eq!(report.destructive_overridden_cases, 1);
+    assert_eq!(report.overridden_cases, 1);
+}
+
+// ---------------------------------------------------------------------------
+// 4. Disagreement and ambiguity are retained
+// ---------------------------------------------------------------------------
+
+#[test]
+fn reviewer_disagreement_is_retained_not_collapsed() {
+    // rev-a accepts ignore, rev-b insists on delete. The policy recommended
+    // delete: rev-a overrode, and the two reviewers also disagree with each
+    // other. Both facts must survive.
+    let records = vec![record(
+        "evt-disagree",
+        ModerationAction::Delete,
+        ModerationCategory::Spam,
+        vec![
+            review(
+                "rev-a",
+                ModerationAction::Ignore,
+                &[ModerationAction::Ignore],
+                ModerationCategory::Spam,
+                ModerationAmbiguity::MultipleAcceptable,
+            ),
+            review(
+                "rev-b",
+                ModerationAction::Delete,
+                &[ModerationAction::Delete],
+                ModerationCategory::Spam,
+                ModerationAmbiguity::Low,
+            ),
+        ],
+    )];
+
+    let report = summarize(&records).expect("summary");
+    assert_eq!(report.reviewer_disagreement_cases, 1);
+    assert_eq!(report.overridden_cases, 1);
+    assert_eq!(
+        report.divergent_cases[0].outcome,
+        ModerationOutcome::Overridden
+    );
+}
+
+#[test]
+fn a_case_with_multiple_acceptable_actions_is_not_scored_as_an_error() {
+    // The policy recommended `ignore`, which the reviewer listed as acceptable
+    // even though their own label was `delete`.
+    let records = vec![record(
+        "evt-ambiguous",
+        ModerationAction::Ignore,
+        ModerationCategory::Spam,
+        vec![review(
+            "rev-a",
+            ModerationAction::Delete,
+            &[ModerationAction::Delete, ModerationAction::Ignore],
+            ModerationCategory::Spam,
+            ModerationAmbiguity::MultipleAcceptable,
+        )],
+    )];
+
+    let (outcome, disagreement) = classify_moderation_case(&records[0]);
+    assert_eq!(
+        outcome,
+        ModerationOutcome::Agreed,
+        "an action inside the acceptable set is not an override"
+    );
+    assert!(!disagreement);
+
+    let report = summarize(&records).expect("summary");
+    assert_eq!(report.overridden_cases, 0);
+    assert_eq!(report.agreed_cases, 1);
+}
+
+#[test]
+fn insufficient_context_is_a_first_class_ambiguity_not_disagreement() {
+    for ambiguity in [
+        ModerationAmbiguity::Low,
+        ModerationAmbiguity::MultipleAcceptable,
+        ModerationAmbiguity::InsufficientContext,
+    ] {
+        let one = record(
+            "evt-amb",
+            ModerationAction::Allow,
+            ModerationCategory::None,
+            vec![review(
+                "rev-a",
+                ModerationAction::Allow,
+                &[ModerationAction::Allow],
+                ModerationCategory::None,
+                ambiguity,
+            )],
+        );
+        let (_, disagreement) = classify_moderation_case(&one);
+        assert!(!disagreement, "one reviewer cannot disagree with itself");
+    }
+}
+
+#[test]
+fn an_unreviewed_case_is_refused_rather_than_scored_as_agreement() {
+    let mut unreviewed = benign_agreement("evt-unreviewed");
+    unreviewed.reviews.clear();
+    let error = summarize(&[unreviewed]).expect_err("an unreviewed case has no evidence");
+    assert!(
+        error.to_string().contains("no reviewer label"),
+        "unexpected error: {error}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 5. Refuse rather than merge
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_empty_batch_is_refused_rather_than_reported_as_no_disagreement() {
+    summarize(&[]).expect_err("an empty report would read as 'no problems'");
+}
+
+#[test]
+fn records_from_different_bounds_cannot_be_reported_as_one_batch() {
+    let slower = ShadowOrchestratorConfig {
+        deadline_ms: 900,
+        ..ShadowOrchestratorConfig::default()
+    };
+    let mut other = benign_agreement("evt-other-bounds");
+    other.orchestration =
+        Some(ModerationOrchestrationIdentity::from_config(&slower).expect("valid config"));
+
+    let error = summarize(&[benign_agreement("evt-1"), other])
+        .expect_err("a mixed-bounds batch must not be summarised under one config");
+    let message = error.to_string();
+    assert!(
+        message.contains("different bounds"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        message.contains("evt-other-bounds"),
+        "the offending case must be named: {message}"
+    );
+}
+
+#[test]
+fn a_config_that_matches_only_some_records_is_refused() {
+    let slower = ShadowOrchestratorConfig {
+        deadline_ms: 900,
+        ..ShadowOrchestratorConfig::default()
+    };
+    let mut other = benign_agreement("evt-2");
+    other.orchestration =
+        Some(ModerationOrchestrationIdentity::from_config(&slower).expect("valid config"));
+    let records = vec![benign_agreement("evt-1"), other];
+
+    summarize(&records).expect_err("bounds must agree across the whole batch");
+    summarize_moderation_divergence_default(&records, &slower)
+        .expect_err("and the other config is refused too");
+}
+
+#[test]
+fn an_unstamped_record_is_refused() {
+    let mut record = benign_agreement("evt-1");
+    record.orchestration = None;
+    let error = summarize(&[record]).expect_err("unattributed evidence must be refused");
+    assert!(
+        error.to_string().contains("no orchestration identity"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn records_from_a_different_reviewer_protocol_are_refused() {
+    let mut other = benign_agreement("evt-2");
+    other.policy =
+        ModerationPolicyIdentity::from_policy(&shadow_identity(), "protocol-2").expect("valid");
+    let error = summarize(&[benign_agreement("evt-1"), other])
+        .expect_err("rates across reviewer protocols cannot be compared");
+    assert!(
+        error.to_string().contains("reviewer protocols"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn records_from_a_different_policy_version_are_refused() {
+    let mut other = benign_agreement("evt-2");
+    other.policy = ModerationPolicyIdentity::from_policy(
+        &ShadowPolicyIdentity {
+            policy_version: "0.5.0".to_owned(),
+            ..shadow_identity()
+        },
+        "protocol-1",
+    )
+    .expect("valid");
+    summarize(&[benign_agreement("evt-1"), other])
+        .expect_err("rates across policy versions cannot be compared");
+}
+
+#[test]
+fn records_from_a_different_comparison_schema_version_are_refused() {
+    let mut other = benign_agreement("evt-2");
+    other.schema_version = "0.0.9".to_owned();
+    let error = summarize(&[benign_agreement("evt-1"), other])
+        .expect_err("samples from different comparison versions must not combine");
+    assert!(
+        error.to_string().contains("different comparison versions"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn an_incomplete_policy_identity_is_refused_before_any_report() {
+    let error = ModerationPolicyIdentity::from_policy(
+        &ShadowPolicyIdentity {
+            policy_id: "  ".to_owned(),
+            ..shadow_identity()
+        },
+        "protocol-1",
+    )
+    .expect_err("a blank policy id is not an identity");
+    assert!(
+        error.to_string().contains("policy_id"),
+        "unexpected error: {error}"
+    );
+
+    ModerationPolicyIdentity::from_policy(&shadow_identity(), " ")
+        .expect_err("a blank reviewer protocol version is not an identity");
+}
+
+#[test]
+fn an_invalid_config_is_refused_before_any_report_is_built() {
+    let invalid = ShadowOrchestratorConfig {
+        deadline_ms: 0,
+        ..ShadowOrchestratorConfig::default()
+    };
+    let error = summarize_moderation_divergence_default(&[benign_agreement("evt-1")], &invalid)
+        .expect_err("a config the runtime would reject must be refused");
+    assert!(
+        error.to_string().contains("deadline_ms"),
+        "unexpected error: {error}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6. Evidence never becomes authority
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_report_carries_no_authority_and_no_ranking_scalar() {
+    let report = summarize(&[benign_agreement("evt-1")]).expect("summary");
+    assert_eq!(
+        report.authority_effect,
+        AuthorityEffect::OfflineEvidenceOnly
+    );
+
+    let encoded = serde_json::to_string(&report).expect("serializes");
+    for forbidden in [
+        "promote",
+        "promotion",
+        "auto_apply",
+        "active_policy",
+        "toxicity_score",
+        "trust_score",
+        "threshold",
+    ] {
+        assert!(
+            !encoded.to_lowercase().contains(forbidden),
+            "a moderation report must not carry {forbidden}: {encoded}"
+        );
+    }
+}
+
+#[test]
+fn recommendations_cannot_execute_anything() {
+    // The recommendation is a value. Aggregating or serializing it must not
+    // reach the runtime, and its severity is never used as a gate.
+    let recommendation = ModerationRecommendation::with_confidence(
+        ModerationAction::Ban,
+        ModerationCategory::Threat,
+        0.99,
+    );
+    let encoded = serde_json::to_string(&recommendation).expect("serializes");
+    assert!(encoded.contains("\"ban\""));
+    assert!(encoded.contains("\"threat\""));
+    // Confidence is retained for analysis and is deliberately not a threshold.
+    assert!((recommendation.confidence() - 0.99).abs() < 1e-9);
+}
+
+#[test]
+fn confidence_is_clamped_rather_than_trusted() {
+    let over = ModerationRecommendation::with_confidence(
+        ModerationAction::Delete,
+        ModerationCategory::Spam,
+        4.2,
+    );
+    assert!(over.confidence() <= 1.0);
+    let under = ModerationRecommendation::with_confidence(
+        ModerationAction::Delete,
+        ModerationCategory::Spam,
+        -1.0,
+    );
+    assert!(under.confidence() >= 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// 7. Aggregation semantics and the privacy boundary
+// ---------------------------------------------------------------------------
+
+#[test]
+fn aggregation_counts_every_category_even_when_absent() {
+    let report = summarize(&[benign_agreement("evt-1")]).expect("summary");
+    for category in ModerationCategory::ALL {
+        assert!(
+            report.category_counts.contains_key(category.as_str()),
+            "missing category {}",
+            category.as_str()
+        );
+    }
+    assert_eq!(report.total_cases, 1);
+    assert_eq!(report.comparable_cases, 1);
+    assert_eq!(report.category_counts["none"], 1);
+}
+
+#[test]
+fn the_override_rate_uses_comparable_cases_as_its_denominator() {
+    let records = vec![
+        benign_agreement("evt-1"),
+        record(
+            "evt-2",
+            ModerationAction::Delete,
+            ModerationCategory::Spam,
+            vec![review(
+                "rev-a",
+                ModerationAction::Allow,
+                &[ModerationAction::Allow],
+                ModerationCategory::Spam,
+                ModerationAmbiguity::Low,
+            )],
+        ),
+    ];
+    let report = summarize(&records).expect("summary");
+
+    assert_eq!(report.overridden_cases, 1);
+    assert_eq!(report.comparable_cases, 2);
+    let rate = report.metrics["shadow.moderation.override_rate_pct"];
+    assert!((rate.value - 50.0).abs() < 1e-9);
+    assert_eq!(
+        rate.sample_count, 2,
+        "a rate without its denominator is not interpretable"
+    );
+}
+
+#[test]
+fn truncating_references_never_truncates_counts() {
+    let records: Vec<ModerationComparisonRecord> = (0..5)
+        .map(|index| {
+            record(
+                &format!("evt-{index}"),
+                ModerationAction::Delete,
+                ModerationCategory::Spam,
+                vec![review(
+                    "rev-a",
+                    ModerationAction::Allow,
+                    &[ModerationAction::Allow],
+                    ModerationCategory::Spam,
+                    ModerationAmbiguity::Low,
+                )],
+            )
+        })
+        .collect();
+
+    let report = summarize_moderation_divergence(&records, &config(), 2).expect("summary");
+
+    assert_eq!(report.divergent_cases.len(), 2, "references are capped");
+    assert_eq!(report.overridden_cases, 5, "counts stay complete");
+    assert_eq!(report.total_cases, 5);
+    assert!(report.divergent_cases_truncated);
+
+    let full = summarize_moderation_divergence_default(&records, &config()).expect("summary");
+    assert!(!full.divergent_cases_truncated);
+    assert_eq!(full.divergent_cases.len(), 5);
+}
+
+#[test]
+fn serialized_evidence_never_contains_message_text() {
+    let records = vec![record(
+        "evt-1",
+        ModerationAction::Delete,
+        ModerationCategory::Spam,
+        vec![review(
+            "rev-a",
+            ModerationAction::Allow,
+            &[ModerationAction::Allow],
+            ModerationCategory::Spam,
+            ModerationAmbiguity::Low,
+        )],
+    )];
+    let report = summarize(&records).expect("summary");
+    let encoded = serde_json::to_string(&report).expect("serializes");
+    assert_no_content_fields(&serde_json::from_str(&encoded).expect("re-parses"));
+}
+
+/// Assert that no object key in the encoded evidence can name message content.
+///
+/// Structural rather than a substring scan: `authority_effect` contains
+/// "author", so only the actual field names are inspected. A content leak would
+/// arrive as an extra key, and `deny_unknown_fields` on every struct in the
+/// module is what prevents one from being added from outside.
+fn assert_no_content_fields(value: &serde_json::Value) {
+    const FORBIDDEN: [&str; 9] = [
+        "message",
+        "message_text",
+        "body",
+        "text",
+        "transcript",
+        "payload",
+        "author",
+        "author_id",
+        "username",
+    ];
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                assert!(
+                    !FORBIDDEN.contains(&key.as_str()),
+                    "moderation evidence must not carry a {key} field"
+                );
+                assert_no_content_fields(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                assert_no_content_fields(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn a_case_reference_carries_identifiers_and_labels_only() {
+    let records = vec![record(
+        "evt-1",
+        ModerationAction::Delete,
+        ModerationCategory::Spam,
+        vec![review(
+            "rev-a",
+            ModerationAction::Allow,
+            &[ModerationAction::Allow],
+            ModerationCategory::Spam,
+            ModerationAmbiguity::Low,
+        )],
+    )];
+    let report = summarize(&records).expect("summary");
+    let reference = &report.divergent_cases[0];
+
+    assert_eq!(reference.case_id, "evt-1");
+    assert_eq!(reference.correlation_id, "corr-evt-1");
+    assert_eq!(reference.recommended_action, ModerationAction::Delete);
+    assert_eq!(reference.recommended_category, ModerationCategory::Spam);
+    assert_eq!(reference.outcome, ModerationOutcome::Overridden);
+    assert!(
+        reference.severity >= 3,
+        "delete must rank above the non-destructive actions"
+    );
+}
+
+#[test]
+fn a_report_round_trips_through_json() {
+    let records = vec![
+        benign_agreement("evt-1"),
+        record(
+            "evt-2",
+            ModerationAction::Delete,
+            ModerationCategory::Spam,
+            vec![review(
+                "rev-a",
+                ModerationAction::Allow,
+                &[ModerationAction::Allow],
+                ModerationCategory::Spam,
+                ModerationAmbiguity::Low,
+            )],
+        ),
+    ];
+    let report = summarize(&records).expect("summary");
+    let encoded = serde_json::to_string(&report).expect("serializes");
+    let decoded: ModerationDivergenceReport = serde_json::from_str(&encoded).expect("deserializes");
+    assert_eq!(decoded, report);
+}
+
+#[test]
+fn a_report_carries_the_versions_a_stored_sample_needs() {
+    let report = summarize(&[benign_agreement("evt-1")]).expect("summary");
+    assert_eq!(
+        report.schema_version,
+        MODERATION_DIVERGENCE_REPORT_SCHEMA_VERSION
+    );
+    assert_eq!(report.policy, policy());
+    assert_eq!(report.policy.policy_id(), "moderation-shadow");
+    assert_eq!(report.policy.policy_version(), "0.4.0");
+    assert_eq!(
+        report.orchestration,
+        ModerationOrchestrationIdentity::from_config(&config()).expect("valid config")
+    );
+}
+
+#[test]
+fn different_bounds_produce_different_moderation_identities() {
+    let base = config();
+    let fingerprint = |config: &ShadowOrchestratorConfig| {
+        ModerationOrchestrationIdentity::from_config(config)
+            .expect("valid config")
+            .bounds_fingerprint()
+            .to_owned()
+    };
+
+    let busier = ShadowOrchestratorConfig {
+        max_concurrent: base.max_concurrent + 1,
+        ..base.clone()
+    };
+    assert_ne!(
+        fingerprint(&base),
+        fingerprint(&busier),
+        "a different bound changes which evidence a run produces"
+    );
+    assert_eq!(fingerprint(&base), fingerprint(&base.clone()));
+}

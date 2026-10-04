@@ -2,6 +2,7 @@
 
 mod budget;
 mod deadline;
+mod moderation_evidence;
 mod operator_control;
 mod outputs;
 mod profile;
@@ -16,6 +17,7 @@ mod support_bundle;
 
 pub use budget::*;
 pub use deadline::*;
+pub use moderation_evidence::*;
 pub use operator_control::*;
 pub use outputs::*;
 pub use profile::*;
