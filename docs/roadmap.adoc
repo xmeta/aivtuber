@@ -112,7 +112,8 @@ Exit condition:
 * external tool execution returns bounded observations and task completion requires explicit verification;
 * tool discovery/trust/risk/approval remain local policy above MCP rather than model/server authority;
 * at least one maintained MCP-backed connector profile can be used without a service-specific aivtuber wire implementation;
-* Persona and RoleBlend can support an agent-oriented presentation without changing authority.
+* Persona and RoleBlend can support an agent-oriented presentation without changing authority;
+* a minimal desktop onboarding surface can configure the dual-role runtime and expose task/approval/health state without duplicating runtime authority.
 
 Stage 3 must build on Stage 1 boundedness and Stage 2 measurement rather than creating independent queues, histories, quality metrics, or a second generic agent framework.
 See link:dual-role-agent-architecture.adoc[Dual-Role Agent and Performer Architecture] and tracking issue #200.
