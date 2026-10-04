@@ -585,6 +585,30 @@ fn phase_seed(scenario: &StreamScenario, phase_index: usize) -> u64 {
     SplitMix64::new(mixed).next_u64()
 }
 
+/// Whether event `ordinal` of a `count`-event phase is one of the phase's
+/// `quota` repeated-viewer slots.
+///
+/// Spreading the quota evenly rather than drawing it at random is what makes the
+/// count exact: `floor((i+1) * quota / count) - floor(i * quota / count)` sums to
+/// exactly `quota` over the phase, for any `quota`. The first event can never be a
+/// repeat, because there is nobody to repeat yet.
+fn repeats_at(ordinal: usize, count: u64, quota: u64) -> bool {
+    if quota == 0 || count == 0 {
+        return false;
+    }
+    let ordinal = ordinal as u64;
+    (ordinal + 1) * quota / count > ordinal * quota / count
+}
+
+/// How many events in a `count`-event phase repeat their previous viewer.
+///
+/// `floor(count * p)`, which is the same arithmetic `scripts/validate.mjs` uses
+/// to compute a phase's fresh draws. Both sides must agree exactly, or the
+/// predicate is again predicting rather than guaranteeing.
+fn repeat_quota(count: u64, probability: f64) -> u64 {
+    (count as f64 * probability).floor() as u64
+}
+
 fn pick_weighted<T: Ord + Copy>(rng: &mut SplitMix64, weights: &BTreeMap<T, f64>) -> T {
     let total: f64 = weights.values().sum();
     let mut threshold = rng.unit() * total;
@@ -623,6 +647,21 @@ pub fn generate_scenario_trace(scenario: &StreamScenario) -> Result<Vec<Scenario
         let count = phase.event_count()?;
         let mut rng = SplitMix64::new(phase_seed(scenario, index));
         let mut previous_actor: Option<u32> = None;
+        let quota = repeat_quota(count, phase.repeat_viewer_probability);
+        // Actor ids share one `u32` namespace across the whole stream, so a
+        // scenario whose phases' pools do not fit in it is unrepresentable. That
+        // is a property of the document, and the loader reads untrusted JSON, so
+        // it is refused with a reason rather than allowed to wrap or panic.
+        let phase_actor_end = actor_base.checked_add(phase.distinct_actors).ok_or_else(|| {
+            AppError::Routing(format!(
+                "scenario {:?} phase {index} ({}) declares {} distinct actors, which overflows the {} actor ids already assigned to earlier phases; a scenario cannot name more than {} viewers in total",
+                scenario.scenario_id,
+                phase.name,
+                phase.distinct_actors,
+                actor_base,
+                u32::MAX
+            ))
+        })?;
         // Next unvisited viewer in this phase's pool, offset into the stream-wide
         // actor namespace so phases never reissue an id.
         let mut next_actor: u32 = actor_base;
@@ -663,27 +702,38 @@ pub fn generate_scenario_trace(scenario: &StreamScenario) -> Result<Vec<Scenario
             // so a long stream over a small pool still repeats viewers rather
             // than looping deterministically forever.
             let pool = u64::from(phase.distinct_actors);
+            // Repeats are an exact quota, not independent coin flips.
+            //
+            // `repeat_viewer_probability` used to be resolved per event with
+            // `rng.unit() < p`, so the realised number of repeats varied with the
+            // seed. A document-level check can then only know the *expected*
+            // fresh count, and at the boundary the trace lands below it: a pool
+            // of 500 over 556 events at p=0.1 passes the predicate on
+            // `floor(556 * 0.9)` yet materialises 486 distinct viewers on some
+            // seeds. Quotas are computed once per phase and spread evenly, so
+            // `fresh = events - repeats` is an identity the validator can
+            // evaluate exactly rather than an estimate.
+            // Every event consumes exactly two values from the stream, whatever the repeat
+            // policy decides and whichever branch supplies the actor. Actor
+            // assignment sits between the draws that choose an event's kind,
+            // intent and topic, so consumption that varied with the policy would
+            // reshuffle everything after it - and that is how a benchmark fixture
+            // that used to play stopped playing. Tying it to the event count makes
+            // the stream independent of the policy entirely.
+            let _ = rng.unit();
+            let sampled = actor_base + rng.below(pool) as u32;
             let actor_index = match previous_actor {
-                Some(previous) if rng.unit() < phase.repeat_viewer_probability => previous,
-                _ => {
-                    // The draw is always taken, even when the walk supplies the
-                    // actor, because every draw consumes the same number of
-                    // values from the stream. Skipping it would reshuffle the
-                    // intents and topics that follow and change an unrelated
-                    // scenario's trace - which is how a benchmark fixture that
-                    // used to play stopped playing.
-                    let sampled = actor_base + rng.below(pool) as u32;
-                    let drawn = if next_actor < actor_base + phase.distinct_actors {
-                        let drawn = next_actor;
-                        next_actor += 1;
-                        drawn
-                    } else {
-                        sampled
-                    };
-                    previous_actor = Some(drawn);
+                // A repeat can only reuse an actor from an earlier event; the
+                // first event of a phase therefore always arrives fresh.
+                Some(previous) if repeats_at(ordinal, count, quota) => previous,
+                _ if next_actor < phase_actor_end => {
+                    let drawn = next_actor;
+                    next_actor += 1;
                     drawn
                 }
+                _ => sampled,
             };
+            previous_actor = Some(actor_index);
             let topic_index = rng.below(u64::from(phase.distinct_topics));
             let intents = SemanticBand::axis_intents();
             let intent = intents[rng.below(intents.len() as u64) as usize];
@@ -733,7 +783,7 @@ pub fn generate_scenario_trace(scenario: &StreamScenario) -> Result<Vec<Scenario
         }
 
         phase_start_ms += phase.duration_ms;
-        actor_base += phase.distinct_actors;
+        actor_base = phase_actor_end;
     }
 
     Ok(trace)

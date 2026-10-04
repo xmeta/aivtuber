@@ -210,7 +210,7 @@ then reach exactly N distinct viewers, and the document-level rule is sound:
 | `distinct_actors >= 500`
 | The pool has to be able to hold the crowd.
 
-| `min(pool, non-repeated events) >= 500`
+| `min(pool, events - floor(events * repeat_viewer_probability)) >= 500`
 | One phase has to be able to put that many viewers on the timeline.
 |===
 
@@ -219,7 +219,16 @@ share one namespace across the whole stream, so a large pool spread thinly over
 several phases is a different workload from one dense phase, and summing the
 phases would claim cardinality the trace does not carry.
 
-`every_accepted_high_cardinality_document_reaches_its_claimed_cardinality`
+`repeat_viewer_probability` is resolved as an exact quota per phase rather than an
+independent coin flip per event. That is what makes the expression above exact
+instead of an expectation: with a coin flip, a pool of 500 over 556 events at
+`p = 0.1` satisfies `floor(556 * 0.9) = 500` while the realised trace lands below
+it on most seeds - 13 of 40 seeds materialised fewer than 500 distinct viewers. A
+quota sums to exactly `floor(events * p)` however it is spread, so `fresh = events
+- repeats` is an identity the validator can evaluate mechanically.
+
+`a_repeated_viewer_rate_is_an_exact_quota_not_a_coin_flip` walks that exact
+boundary across 24 seeds, and `every_accepted_high_cardinality_document_reaches_its_claimed_cardinality`
 asserts the property directly against generated traces, including the boundary
 case the earlier rule let through (a pool of exactly 500, exactly 500 events, no
 repeats), so the JS predicate and the Rust generator cannot drift apart into

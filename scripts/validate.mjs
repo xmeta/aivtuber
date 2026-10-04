@@ -987,6 +987,12 @@ const SCENARIO_CLASS_PREDICATES = {
     //    The generator therefore walks each phase's pool in order, so a phase
     //    reaches min(pool, fresh draws) distinct viewers exactly, and this
     //    predicate uses that same bound rather than assuming one.
+    // 3. Expected fresh draws are not fresh draws. The generator resolves
+    //    `repeat_viewer_probability` as an exact quota per phase rather than an
+    //    independent coin flip per event, precisely so this number is exact
+    //    rather than an expectation. It has to be computed the same way here -
+    //    `events - floor(events * p)` - or the predicate predicts a workload the
+    //    trace does not produce.
     //
     // Per phase, and then the best single phase: actor ids share one namespace
     // across the stream, so a large pool spread thinly across several phases is
@@ -996,8 +1002,9 @@ const SCENARIO_CLASS_PREDICATES = {
       0,
       ...phases.map((phase) => {
         const pool = phase.distinct_actors ?? 0;
-        const fresh = phaseEventCount(phase) * (1 - (phase.repeat_viewer_probability ?? 0));
-        return Math.min(pool, Math.floor(fresh));
+        const events = phaseEventCount(phase);
+        const repeats = Math.floor(events * (phase.repeat_viewer_probability ?? 0));
+        return Math.min(pool, events - repeats);
       }),
     );
     return reachable >= HIGH_CARDINALITY_MIN_ACTORS

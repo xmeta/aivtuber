@@ -817,13 +817,13 @@ fn the_trace_is_stable_against_unrelated_generation_changes() {
     for (name, expected_first, expected_last) in [
         (
             "idle-to-burst.json",
-            "idle-to-burst:000001|2026-10-01T00:00:06.758Z|ChatMessage|reaction.agree|topic-0000|viewer:0000",
-            "idle-to-burst:000011|2026-10-01T00:02:57.653Z|ChatMessage|reaction.surprise|topic-0013|viewer:0013",
+            "idle-to-burst:000001|2026-10-01T00:00:06.758Z|ChatMessage|filler.thinking|topic-0000|viewer:0000",
+            "idle-to-burst:000011|2026-10-01T00:02:54.943Z|GameEvent|reaction.surprise|topic-0002|viewer:0011",
         ),
         (
             "chat-burst-10x.json",
-            "chat-burst-10x:000001|2026-10-01T00:00:25.312Z|ChatMessage|reaction.agree|topic-0007|viewer:0000",
-            "chat-burst-10x:000011|2026-10-01T00:01:54.741Z|GameEvent|reaction.agree|topic-0024|viewer:0018",
+            "chat-burst-10x:000001|2026-10-01T00:00:25.312Z|ChatMessage|reaction.surprise|topic-0000|viewer:0000",
+            "chat-burst-10x:000011|2026-10-01T00:01:57.078Z|GameEvent|filler.thinking|topic-0014|viewer:0017",
         ),
     ] {
         let digest = digests(&shipped(name));
@@ -849,6 +849,93 @@ fn the_trace_is_stable_against_unrelated_generation_changes() {
         digests(&original),
         digests(&reseeded),
         "the seed must still decide the trace"
+    );
+}
+
+#[test]
+fn a_repeated_viewer_rate_is_an_exact_quota_not_a_coin_flip() {
+    // The boundary that broke the estimate version of this rule: pool 500, 556
+    // events, p = 0.1. `floor(556 * 0.9) = 500` accepts the document, but with
+    // per-event Bernoulli repeats the realised fresh count varied with the seed
+    // and 13 of 40 seeds materialised fewer than 500 distinct viewers.
+    //
+    // Repeats are now an exact quota, so the count is an identity rather than an
+    // expectation - checked across a spread of seeds so a return to a probabilistic
+    // decision cannot pass by landing favourably on the seed it happens to use.
+    let mut phase = steady_phase("crowd", 3_336_000, 10.0);
+    phase.distinct_actors = 500;
+    phase.repeat_viewer_probability = 0.1;
+
+    for seed in 0..24u64 {
+        let scenario = StreamScenario {
+            scenario_id: format!("quota-p{}-seed{seed}", seed),
+            seed,
+            phases: vec![phase.clone()],
+            stream_duration_ms: phase.duration_ms,
+            ..shipped("high-cardinality-actors.json")
+        };
+        let events = scenario.total_event_count().unwrap();
+        let repeats = (events as f64 * phase.repeat_viewer_probability).floor() as u64;
+        let predicted = (phase.distinct_actors as usize).min((events - repeats) as usize);
+
+        let trace = trace_of(&scenario);
+        let mut actors: Vec<&str> = trace
+            .iter()
+            .filter_map(|entry| entry.event.actor_id.as_deref())
+            .collect();
+        actors.sort_unstable();
+        actors.dedup();
+
+        assert_eq!(
+            actors.len(),
+            predicted,
+            "seed {seed}: distinct viewers must be min(pool, events - repeats) exactly; \
+             the validator evaluates the same expression, so any other number means the \
+             two disagree about what this document produces"
+        );
+        assert!(
+            actors.len() >= HIGH_CARDINALITY_MIN_ACTORS,
+            "seed {seed}: a document accepted as high_cardinality reached only {} viewers",
+            actors.len()
+        );
+    }
+}
+
+#[test]
+fn a_well_formed_scenario_never_panics_on_large_actor_pools() {
+    // `distinct_actors` is a `u32` from external JSON and actor ids share one
+    // namespace across phases, so a scenario whose pools do not fit in that
+    // namespace is unrepresentable. It has to be refused with a reason, not wrap
+    // or panic - the loader reads untrusted documents.
+    let phase = |name: &str, actors: u32| ScenarioPhase {
+        distinct_actors: actors,
+        ..steady_phase(name, 600_000, 1.0)
+    };
+
+    let overflows = StreamScenario {
+        scenario_id: "actor-namespace-overflow".to_owned(),
+        phases: vec![phase("first", u32::MAX), phase("second", 2)],
+        stream_duration_ms: 1_200_000,
+        ..shipped("high-cardinality-actors.json")
+    };
+    let error = generate_scenario_trace(&overflows)
+        .expect_err("a namespace that cannot be represented must be refused");
+    assert!(
+        error.to_string().contains("overflows"),
+        "the refusal must name the reason, got: {error}"
+    );
+
+    // And the boundary just below it still generates: the guard must not reject
+    // a large-but-valid namespace.
+    let largest_valid = StreamScenario {
+        scenario_id: "actor-namespace-largest".to_owned(),
+        phases: vec![phase("only", u32::MAX)],
+        stream_duration_ms: 600_000,
+        ..shipped("high-cardinality-actors.json")
+    };
+    assert!(
+        generate_scenario_trace(&largest_valid).is_ok(),
+        "a single phase declaring u32::MAX actors is representable and must generate"
     );
 }
 
