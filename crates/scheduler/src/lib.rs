@@ -121,6 +121,15 @@ impl ScheduledItem {
 pub enum Rejection {
     Cooldown,
     Priority,
+    /// An item carrying the same `event_id` is still live.
+    ///
+    /// `event_id` is the identity of the logical event and admits at most one
+    /// live (queued or playing) scheduler item at a time. `generation` is the
+    /// identity of a scheduling attempt and stays unique per accepted
+    /// schedule, so rejecting a duplicate changes no attempt accounting. Once
+    /// the prior item is terminal the same `event_id` may be scheduled again
+    /// and receives a new generation.
+    DuplicateEvent,
 }
 
 /// How terminal (completed/cancelled) items are retained for replay/debugging.
@@ -315,6 +324,14 @@ impl Scheduler {
         self.generation
     }
 
+    /// Per-asset cooldown deadlines, read-only.
+    ///
+    /// Exposed so callers can assert that a rejected schedule left reservation
+    /// state untouched; it is a diagnostic view, not an input.
+    pub fn cooldowns(&self) -> &BTreeMap<String, u64> {
+        &self.cooldowns
+    }
+
     pub fn last_rejection(&self) -> Option<Rejection> {
         self.last_rejection
     }
@@ -444,6 +461,19 @@ impl Scheduler {
     }
 
     /// Schedule a plan whose source event arrived at request_at_ms.
+    ///
+    /// # Duplicate `event_id` contract (issue #198)
+    ///
+    /// ```text
+    /// event_id   = logical event identity, at most one live item at a time
+    /// generation = scheduling-attempt identity, unique per accepted schedule
+    /// ```
+    ///
+    /// Scheduling an `event_id` whose item is still queued or playing fails
+    /// with [`Rejection::DuplicateEvent`] and changes nothing else: no
+    /// generation is consumed and no reservation or cooldown moves. The same
+    /// `event_id` may be scheduled again once the prior item is terminal, and
+    /// that accepted request receives a fresh generation.
     pub fn schedule_at(
         &mut self,
         request_at_ms: u64,
@@ -451,6 +481,23 @@ impl Scheduler {
     ) -> Result<PlannedPerformance, Rejection> {
         self.last_rejection = None;
         self.advance_to(request_at_ms);
+
+        // Issue #198: `event_id` is the logical event identity, so a second
+        // request for an id whose item is still queued or playing is refused.
+        // The check runs after logical time has advanced (which is what
+        // retires an already-terminal item with that id, making later reuse
+        // legal) and before any arbitration state is touched, so a rejected
+        // duplicate moves no generation, reservation or cooldown. `items` is
+        // the source of truth here rather than the event liveness index, so a
+        // stale index can never widen the accepted set.
+        if self
+            .items
+            .iter()
+            .any(|item| item.plan.event_id == plan.event_id)
+        {
+            self.last_rejection = Some(Rejection::DuplicateEvent);
+            return Err(Rejection::DuplicateEvent);
+        }
 
         plan.start_at_ms = plan.start_at_ms.max(request_at_ms).max(self.now_ms);
         normalize_interrupt_points(&mut plan);
