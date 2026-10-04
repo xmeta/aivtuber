@@ -4,7 +4,7 @@
   "scenario_version": 1,
   "scenario_class": "high_cardinality",
   "provenance": "synthetic_design_assumption",
-  "provenance_note": "Eighty minutes of logical time drawing from four thousand declared viewers, to exercise per-actor state and cache cardinality bounds (#51-#53). The duration is part of the claim: 692 events at 10/minute is what puts roughly 650 distinct actors on the timeline, which is the cardinality under test. A shorter version of this scenario declares a large pool it never visits, and a test counts distinct actor_id in the generated trace so that cannot pass as a crowd again. Synthetic: the actor count is chosen to be hostile, not observed.",
+  "provenance_note": "Eighty minutes of logical time drawing from four thousand declared viewers, to exercise per-actor state and cache cardinality bounds (#51-#53). The duration is part of the claim: 792 events at 10/minute put 758 distinct actors on the timeline, which is the cardinality under test. A shorter version of this scenario declares a large pool it never visits, and a test counts distinct actor_id in the generated trace so that cannot pass as a crowd again. Synthetic: the actor count is chosen to be hostile, not observed.",
   "seed": 31337,
   "logical_start": "2026-10-01T00:00:00Z",
   "stream_duration_ms": 4800000,

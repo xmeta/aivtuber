@@ -975,21 +975,34 @@ const SCENARIO_CLASS_PREDICATES = {
       : "high_generative_miss needs miss to dominate a phase's semantic mix";
   },
   high_cardinality: (phases) => {
-    // The declared pool alone is not the claim. A pool of four thousand drawn
-    // from twenty events produces twenty viewer states, so the workload it
-    // describes has no cardinality to exercise at all. Both halves have to hold:
-    // a pool big enough to hold the crowd, and enough non-repeated draws for the
-    // trace to actually visit that many distinct actors.
-    const pool = Math.max(0, ...phases.map((phase) => phase.distinct_actors ?? 0));
-    const freshDraws = phases.reduce(
-      (sum, phase) =>
-        sum +
-        phaseEventCount(phase) * (1 - (phase.repeat_viewer_probability ?? 0)),
+    // The declared pool alone is not the claim, and neither is a raw count of
+    // draws. Two corrections matter, both learned from documents that passed a
+    // looser version of this check while producing no crowd at all:
+    //
+    // 1. A pool is a ceiling, not evidence. Distinct viewers are bounded by the
+    //    number of events, so twenty events over a pool of four thousand reaches
+    //    twenty viewers.
+    // 2. Draws collide. Uniform sampling with replacement over a pool of 500 for
+    //    500 draws reaches roughly 300 distinct viewers - the birthday problem.
+    //    The generator therefore walks each phase's pool in order, so a phase
+    //    reaches min(pool, fresh draws) distinct viewers exactly, and this
+    //    predicate uses that same bound rather than assuming one.
+    //
+    // Per phase, and then the best single phase: actor ids share one namespace
+    // across the stream, so a large pool spread thinly across several phases is
+    // not the same workload as one dense phase, and summing phases would claim
+    // cardinality the trace does not have.
+    const reachable = Math.max(
       0,
+      ...phases.map((phase) => {
+        const pool = phase.distinct_actors ?? 0;
+        const fresh = phaseEventCount(phase) * (1 - (phase.repeat_viewer_probability ?? 0));
+        return Math.min(pool, Math.floor(fresh));
+      }),
     );
-    return pool >= HIGH_CARDINALITY_MIN_ACTORS && freshDraws >= HIGH_CARDINALITY_MIN_ACTORS
+    return reachable >= HIGH_CARDINALITY_MIN_ACTORS
       ? false
-      : `high_cardinality needs a viewer pool of at least ${HIGH_CARDINALITY_MIN_ACTORS} distinct actors and at least ${HIGH_CARDINALITY_MIN_ACTORS} non-repeated draws to reach them; declared ${pool} actors and ${Math.floor(freshDraws)} reachable`;
+      : `high_cardinality needs one phase able to put at least ${HIGH_CARDINALITY_MIN_ACTORS} distinct viewers on its timeline: a pool of at least ${HIGH_CARDINALITY_MIN_ACTORS} drawn from at least ${HIGH_CARDINALITY_MIN_ACTORS} non-repeated events; best phase reaches ${reachable}`;
   },
 };
 

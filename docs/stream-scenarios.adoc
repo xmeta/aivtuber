@@ -192,12 +192,43 @@ minutes at 10 events/minute, generate twenty events touching eighteen distinct
 viewers. The declaration is then true and the workload is not: per-actor state
 and cache cardinality bounds (#51-#53) would be measured against no crowd.
 
-The threshold is therefore checked against what the trace will contain - both a
-pool of at least 500 and at least 500 non-repeated draws to reach it - and the
-Rust suite independently counts distinct `actor_id` in a generated trace from the
-checked-in corpus. `high-cardinality-actors.json` is 80 minutes of logical time
-for exactly this reason; `inconsistent/sparse-crowd.json` is the same parameters
-over two minutes, which is the shape that used to pass.
+The threshold is therefore checked against what the trace will contain, not
+against what the document declares.
+
+Counting draws is not enough, because drawing a viewer uniformly *with
+replacement* collides: 500 draws from a pool of 500 reach roughly 300 distinct
+viewers, by the birthday problem. A document could therefore satisfy a
+"500 draws" rule and still put three hundred actors on the timeline. So the
+generator assigns viewers by walking each phase's pool in order, and a fresh
+draw visits the next unvisited viewer. N fresh draws over a pool of at least N
+then reach exactly N distinct viewers, and the document-level rule is sound:
+
+[cols="1,3"]
+|===
+| Rule | Meaning
+
+| `distinct_actors >= 500`
+| The pool has to be able to hold the crowd.
+
+| `min(pool, non-repeated events) >= 500`
+| One phase has to be able to put that many viewers on the timeline.
+|===
+
+Both are evaluated *per phase*, and the best single phase decides. Actor ids
+share one namespace across the whole stream, so a large pool spread thinly over
+several phases is a different workload from one dense phase, and summing the
+phases would claim cardinality the trace does not carry.
+
+`every_accepted_high_cardinality_document_reaches_its_claimed_cardinality`
+asserts the property directly against generated traces, including the boundary
+case the earlier rule let through (a pool of exactly 500, exactly 500 events, no
+repeats), so the JS predicate and the Rust generator cannot drift apart into
+disagreeing about what a document produces.
+
+`high-cardinality-actors.json` is 80 minutes of logical time for exactly this
+reason - 792 events, 758 distinct actors. `inconsistent/sparse-crowd.json` is the
+same parameters over two minutes, and `inconsistent/narrow-pool.json` is a long
+stream over a pool of 40; between them, neither bound can be dropped unnoticed.
 
 === Classes that are declared but not yet benchmarkable
 

@@ -668,23 +668,18 @@ fn a_declared_actor_pool_is_not_the_claim_the_class_makes() {
                 <= scenario
                     .phases
                     .iter()
-                    .map(|phase| phase.distinct_actors)
-                    .max()
-                    .unwrap_or(0) as usize,
-            "distinct actors can never exceed the widest declared pool"
+                    .map(|phase| phase.distinct_actors as usize)
+                    .sum::<usize>(),
+            "distinct actors can never exceed the sum of the declared pools, because \
+             actor ids come from a pool and no id is invented"
         );
         actors.len()
     };
 
     let crowd = shipped("high-cardinality-actors.json");
-    assert_eq!(
-        distinct_actors(&crowd),
-        686,
-        "the shipped high-cardinality workload must actually put hundreds of distinct actors on its timeline, or it does not test cardinality; generation is deterministic, so a change here means the workload changed and its provenance_note has to change with it"
-    );
     assert!(
         distinct_actors(&crowd) >= HIGH_CARDINALITY_MIN_ACTORS,
-        "and that count must clear the {HIGH_CARDINALITY_MIN_ACTORS}-actor threshold the validator applies, with room to spare so the two sides cannot drift into disagreeing"
+        "the shipped high-cardinality workload must actually put {HIGH_CARDINALITY_MIN_ACTORS} distinct actors on its timeline, or it does not test cardinality"
     );
 
     // The same parameters over a shorter stream reach a fraction of the pool, and
@@ -714,6 +709,262 @@ fn a_declared_actor_pool_is_not_the_claim_the_class_makes() {
     assert!(
         distinct_actors(&narrow) < HIGH_CARDINALITY_MIN_ACTORS,
         "a pool of 40 cannot produce 500 distinct viewers however long the stream runs"
+    );
+}
+
+/// The property the `high_cardinality` predicate exists to guarantee, asserted
+/// directly against generated traces rather than against a pinned number.
+///
+/// A hardcoded count only proves the corpus did not change. This proves the
+/// *rule* holds: for any document the validator accepts, the trace it generates
+/// really does put at least `HIGH_CARDINALITY_MIN_ACTORS` distinct viewers on the
+/// timeline. The bound `min(pool, non-repeated events)` is what
+/// `SCENARIO_CLASS_PREDICATES.high_cardinality` applies to a document, so the two
+/// implementations of the same rule cannot drift apart without this failing.
+#[test]
+fn an_exhausted_pool_repeats_viewers_instead_of_inventing_new_ones() {
+    // Once a phase has walked its whole pool there is nobody left to arrive, so
+    // further draws have to fall back to sampling *within* the pool. That branch
+    // is the only place actor ids can leave the pool, and it is what keeps a long
+    // stream over a small crowd from silently widening the crowd.
+    let mut phase = steady_phase("long", 1_200_000, 10.0);
+    phase.distinct_actors = 20;
+    phase.repeat_viewer_probability = 0.0;
+    // A second phase with a *different* pool size, so its fallback draw lands at a
+    // non-zero actor offset. With two equal-sized pools, dropping that offset
+    // would reuse the first phase's ids and the distinct count would still come
+    // out right, which is exactly the bug this shape has to catch.
+    let mut later = steady_phase("later", 1_200_000, 10.0);
+    later.distinct_actors = 30;
+    later.repeat_viewer_probability = 0.0;
+    let scenario = StreamScenario {
+        phases: vec![phase.clone(), later.clone()],
+        stream_duration_ms: phase.duration_ms + later.duration_ms,
+        ..shipped("high-cardinality-actors.json")
+    };
+
+    let events = scenario.total_event_count().unwrap();
+    assert!(
+        events > 50,
+        "this case must outlast both pools, or the fallback branch is never reached: {events} events"
+    );
+
+    let trace = trace_of(&scenario);
+    let mut actors: Vec<&str> = trace
+        .iter()
+        .filter_map(|entry| entry.event.actor_id.as_deref())
+        .collect();
+    let total = actors.len();
+    actors.sort_unstable();
+    actors.dedup();
+
+    assert_eq!(
+        actors.len(),
+        50,
+        "every viewer must come from a declared pool, however long the stream runs"
+    );
+    assert!(
+        total > actors.len(),
+        "the pools must actually have been exhausted ({total} events, {} distinct), \
+         otherwise this case does not exercise the fallback",
+        actors.len()
+    );
+}
+
+/// The actor walk must not consume a different number of values from the PRNG.
+///
+/// Actor assignment sits between the draws that pick an event's kind, semantic
+/// band, priority and intent. Consuming a different number of values there
+/// reshuffles everything after it, which silently changes an unrelated
+/// scenario's trace - and that is how `idle-to-burst`, a fixture that benchmarks
+/// end to end, stopped playing after an unrelated change to cardinality. These
+/// digests pin the traces so that failure is loud.
+#[test]
+fn the_trace_is_stable_against_unrelated_generation_changes() {
+    let digests = |scenario: &StreamScenario| -> Vec<String> {
+        trace_of(scenario)
+            .iter()
+            .map(|entry| {
+                let payload = |key: &str| {
+                    entry
+                        .event
+                        .payload
+                        .get(key)
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_owned()
+                };
+                format!(
+                    "{}|{}|{:?}|{}|{}|{}",
+                    entry.event.event_id,
+                    entry.event.observed_at,
+                    entry.event.kind,
+                    payload("intent"),
+                    payload("topic_id"),
+                    entry.event.actor_id.as_deref().unwrap_or_default(),
+                )
+            })
+            .collect()
+    };
+
+    // Both fixtures the benchmark is expected to run. A change to any of these
+    // means the workload changed and the measured numbers are no longer
+    // comparable, so it has to be a deliberate act with a version bump.
+    // Pinned field-by-field. Generated, not guessed: run once on a correct tree and
+    // keep the values. The point is that any change to the number of values the
+    // actor draw takes from the PRNG moves these, because that draw sits between
+    // the ones choosing each event's intent and topic.
+    for (name, expected_first, expected_last) in [
+        (
+            "idle-to-burst.json",
+            "idle-to-burst:000001|2026-10-01T00:00:06.758Z|ChatMessage|reaction.agree|topic-0000|viewer:0000",
+            "idle-to-burst:000011|2026-10-01T00:02:57.653Z|ChatMessage|reaction.surprise|topic-0013|viewer:0013",
+        ),
+        (
+            "chat-burst-10x.json",
+            "chat-burst-10x:000001|2026-10-01T00:00:25.312Z|ChatMessage|reaction.agree|topic-0007|viewer:0000",
+            "chat-burst-10x:000011|2026-10-01T00:01:54.741Z|GameEvent|reaction.agree|topic-0024|viewer:0018",
+        ),
+    ] {
+        let digest = digests(&shipped(name));
+        assert_eq!(digest.len(), 11, "{name}: trace length changed");
+        assert_eq!(
+            digest[0], expected_first,
+            "{name}: the first event moved, so the actor draw is consuming a \
+             different number of values from the stream and every later draw shifted"
+        );
+        assert_eq!(
+            *digest.last().unwrap(),
+            expected_last,
+            "{name}: the last event moved, so the trace no longer matches the \
+             recorded baseline"
+        );
+    }
+
+    // Re-seeding is the one thing that legitimately moves the trace.
+    let original = shipped("idle-to-burst.json");
+    let mut reseeded = original.clone();
+    reseeded.seed = original.seed.wrapping_add(1);
+    assert_ne!(
+        digests(&original),
+        digests(&reseeded),
+        "the seed must still decide the trace"
+    );
+}
+
+#[test]
+fn every_accepted_high_cardinality_document_reaches_its_claimed_cardinality() {
+    let distinct_actors = |scenario: &StreamScenario| {
+        let trace = trace_of(scenario);
+        let mut actors: Vec<&str> = trace
+            .iter()
+            .filter_map(|entry| entry.event.actor_id.as_deref())
+            .collect();
+        actors.sort_unstable();
+        actors.dedup();
+        actors.len()
+    };
+
+    // The boundary the review found: a pool exactly at the threshold, exactly
+    // threshold-many events, and no repeats. Sampling viewers uniformly with
+    // replacement reaches only about 300 distinct actors here (the birthday
+    // problem), which is why the generator walks the pool in order instead.
+    // Each case is sized from the rate so `min(pool, non-repeated events)` clears
+    // the threshold with room to spare: a phase must run long enough for the rule
+    // to hold, otherwise the case asserts nothing about accepted documents.
+    for (pool, events_per_minute, repeats) in [
+        (500u32, 10.0, 0.0),
+        (500, 10.0, 0.02),
+        (500, 20.0, 0.0),
+        (1000, 5.0, 0.0),
+        (4000, 10.0, 0.05),
+        (500, 10.0, 0.1),
+        // A pool far larger than the event count, so the realised count sits well
+        // above the threshold. Uniform sampling with replacement would still clear
+        // 500 here - which is exactly why this case exists: it is the one the
+        // threshold assertion alone cannot catch, and only the exact
+        // `min(pool, events)` check can.
+        (4000, 20.0, 0.0),
+    ] {
+        let target_events = (HIGH_CARDINALITY_MIN_ACTORS as f64 / (1.0 - repeats) * 1.5) as u64;
+        let duration_ms = (target_events as f64 * 60_000.0 / events_per_minute).ceil() as u64;
+        let mut phase = steady_phase("crowd", duration_ms, events_per_minute);
+        phase.distinct_actors = pool;
+        phase.repeat_viewer_probability = repeats;
+        let candidate = StreamScenario {
+            scenario_id: format!(
+                "cardinality-{pool}-p{}-r{}",
+                (events_per_minute * 100.0) as u32,
+                (repeats * 100.0) as u32
+            ),
+            phases: vec![phase.clone()],
+            stream_duration_ms: phase.duration_ms,
+            ..shipped("high-cardinality-actors.json")
+        };
+
+        let events = candidate.total_event_count().unwrap();
+        let expected_fresh = (events as f64 * (1.0 - repeats)).floor() as usize;
+        let predicted = (pool as usize).min(expected_fresh);
+        assert!(
+            predicted >= HIGH_CARDINALITY_MIN_ACTORS,
+            "this case must satisfy the validator's rule, or it proves nothing: \
+             pool={pool} events={events} repeats={repeats} predicts {predicted}"
+        );
+
+        let actual = distinct_actors(&candidate);
+        if repeats == 0.0 {
+            // With no repeats every event draws a fresh viewer, so the count is
+            // exactly min(pool, events) - a hard guarantee, and the case that
+            // fails if actor assignment ever goes back to sampling with
+            // replacement. Uniform sampling over a pool of 500 for 500 draws
+            // reaches only about 300.
+            assert_eq!(
+                actual, predicted,
+                "every draw is fresh here, so distinct viewers must be exactly \
+                 min(pool, events) = {predicted}, got {actual}"
+            );
+        }
+        assert!(
+            actual >= HIGH_CARDINALITY_MIN_ACTORS,
+            "a document accepted as high_cardinality must reach {HIGH_CARDINALITY_MIN_ACTORS} \
+             distinct viewers; pool={pool} events={events} repeats={repeats} reached only \
+             {actual}, so the validator's bound is not a guarantee it can keep"
+        );
+    }
+}
+
+/// Actor ids share one namespace across the whole stream, so cardinality has to
+/// accumulate across phases rather than restart in each one.
+#[test]
+fn distinct_viewers_accumulate_across_phases() {
+    let mut first = steady_phase("first", 1_200_000, 10.0);
+    first.distinct_actors = 300;
+    first.repeat_viewer_probability = 0.0;
+    let mut second = steady_phase("second", 1_200_000, 10.0);
+    second.distinct_actors = 300;
+    second.repeat_viewer_probability = 0.0;
+
+    let trace = generate_scenario_trace(&StreamScenario {
+        phases: vec![first, second],
+        stream_duration_ms: 2_400_000,
+        ..shipped("high-cardinality-actors.json")
+    })
+    .expect("valid");
+    let mut actors: Vec<&str> = trace
+        .iter()
+        .filter_map(|entry| entry.event.actor_id.as_deref())
+        .collect();
+    actors.sort_unstable();
+    actors.dedup();
+
+    // 200 events per phase, 300-viewer pools. If the second phase restarted its
+    // walk it would reissue viewer:0000..viewer:0199 and the stream would show 200
+    // distinct viewers instead of 400.
+    assert_eq!(
+        actors.len(),
+        400,
+        "each phase must continue into fresh ids; a shared namespace that restarts per \
+         phase would quietly halve the cardinality the stream actually carries"
     );
 }
 

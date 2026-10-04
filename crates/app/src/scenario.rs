@@ -613,11 +613,19 @@ pub fn generate_scenario_trace(scenario: &StreamScenario) -> Result<Vec<Scenario
     let mut trace: Vec<ScenarioEvent> = Vec::new();
     let mut sequence = 0u64;
     let mut phase_start_ms = 0u64;
+    // Actor ids share one namespace across the whole stream, so each phase
+    // continues where the previous one stopped. Restarting the walk per phase
+    // would have later phases reuse `viewer:0000` and quietly undo the
+    // cardinality the earlier phases earned.
+    let mut actor_base: u32 = 0;
 
     for (index, phase) in scenario.phases.iter().enumerate() {
         let count = phase.event_count()?;
         let mut rng = SplitMix64::new(phase_seed(scenario, index));
         let mut previous_actor: Option<u32> = None;
+        // Next unvisited viewer in this phase's pool, offset into the stream-wide
+        // actor namespace so phases never reissue an id.
+        let mut next_actor: u32 = actor_base;
 
         // Integer base offsets, at least one millisecond apart because the rate
         // ceiling keeps `count <= duration_ms`.
@@ -640,12 +648,40 @@ pub fn generate_scenario_trace(scenario: &StreamScenario) -> Result<Vec<Scenario
             let offset_ms = base + rng.below(slot);
             sequence += 1;
 
+            // Actor assignment prefers viewers this phase has not reached yet.
+            //
+            // Drawing uniformly with replacement makes distinct cardinality a
+            // birthday problem: a pool of 500 over 500 draws materialises roughly
+            // 300 distinct viewers, so a declared pool is an upper bound and never
+            // evidence that the crowd reached the timeline. Walking the pool in
+            // order means N fresh draws over a pool of at least N visit exactly N
+            // distinct actors, which is what lets a document-level check predict
+            // the trace - and it matches the workload being modelled, where a
+            // high-cardinality stream is about *arriving* viewers.
+            //
+            // Once the pool is exhausted the draw falls back to uniform sampling,
+            // so a long stream over a small pool still repeats viewers rather
+            // than looping deterministically forever.
+            let pool = u64::from(phase.distinct_actors);
             let actor_index = match previous_actor {
                 Some(previous) if rng.unit() < phase.repeat_viewer_probability => previous,
                 _ => {
-                    let drawn = rng.below(u64::from(phase.distinct_actors));
-                    previous_actor = Some(drawn as u32);
-                    drawn as u32
+                    // The draw is always taken, even when the walk supplies the
+                    // actor, because every draw consumes the same number of
+                    // values from the stream. Skipping it would reshuffle the
+                    // intents and topics that follow and change an unrelated
+                    // scenario's trace - which is how a benchmark fixture that
+                    // used to play stopped playing.
+                    let sampled = actor_base + rng.below(pool) as u32;
+                    let drawn = if next_actor < actor_base + phase.distinct_actors {
+                        let drawn = next_actor;
+                        next_actor += 1;
+                        drawn
+                    } else {
+                        sampled
+                    };
+                    previous_actor = Some(drawn);
+                    drawn
                 }
             };
             let topic_index = rng.below(u64::from(phase.distinct_topics));
@@ -697,6 +733,7 @@ pub fn generate_scenario_trace(scenario: &StreamScenario) -> Result<Vec<Scenario
         }
 
         phase_start_ms += phase.duration_ms;
+        actor_base += phase.distinct_actors;
     }
 
     Ok(trace)
