@@ -76,6 +76,42 @@ Record the result as one of:
 |Reuse counter/gauge/histogram facade. Keep the #58 reproducible benchmark/result schema, comparison semantics, dataset/config identity, and budgets project-owned.
 |#58
 
+|Agent tool protocol / MCP plumbing
+|official +rmcp+ (modelcontextprotocol/rust-sdk)
+|Adopt / thin wrapper
+|Reuse MCP lifecycle/version negotiation, tool discovery/invocation, schemas, and transports. Keep +ToolAction+ -> +AuthorizedToolAction+, capability minting, risk/approval policy, freshness/cancellation, verification, replay/audit, and privacy in aivtuber. Do not build a second MCP wire stack without a recorded incompatibility.
+|#193
+
+|Rust LLM/tool orchestration
+|Rig / +rig-rmcp+
+|Benchmark/conformance spike first; adopt if fit
+|Reuse provider/tool-loop plumbing, dynamic tool registration, lifecycle hooks, and MCP adaptation when they reduce project code. Rig must remain below aivtuber authority and result-verification boundaries; reject/narrow it if it weakens deterministic replay, bounded execution, cancellation, or capability enforcement.
+|#193
+
+|Realtime conversational voice pipeline
+|LiveKit Agents / Pipecat
+|Sidecar / reference first
+|Reuse VAD/turn/media/interruption/preemptive-generation mechanics where useful instead of rebuilding generic realtime media plumbing. Normalize observations into aivtuber-owned floor/commit policy; external frameworks must not directly own scheduler cancellation or irreversible publication.
+|#81, #92, #93
+
+|Local speech inference
+|sherpa-onnx
+|Wrap or sidecar; conformance/benchmark first
+|Reuse maintained local VAD/ASR/TTS/diarization primitives and platform bindings. Keep provider-neutral speech observations, deadlines, privacy, turn policy, replay identity, and model/license compatibility decisions in aivtuber.
+|#92
+
+|Temporal / graph memory mechanics
+|Graphiti
+|Optional sidecar / MCP; benchmark first
+|Reuse temporal facts, provenance, graph relationships, and hybrid retrieval only for memories that already passed aivtuber write authority. Retention/deletion, epistemic class, bounds, provenance authority, replay, and privacy remain project-owned. Avoid making a graph service mandatory for the minimal profile.
+|#105
+
+|Stateful-agent memory/runtime reference
+|Letta
+|Reference only / optional external backend
+|Study memory lifecycle, identity, continuity, and channel patterns. Do not introduce a second authoritative agent runtime when aivtuber already owns task authority, verification, persona, scheduler, and memory-write policy.
+|#105, #193
+
 |Property-based tests
 |+proptest+
 |Adopt

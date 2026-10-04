@@ -129,6 +129,13 @@ Letta
 |#105
 |Whether extra retrieval arms beat exact/simple retrieval at current scale; provenance-aware wording; dependency/runtime cost
 
+|Agent tool execution / MCP
+|official MCP Rust SDK (+rmcp+);
+Rig / +rig-rmcp+
+|Reuse protocol lifecycle, tool discovery/schema plumbing, provider-neutral tool-loop mechanics, and dynamic tool registration; keep action authority, approval/risk, bounded execution, result verification, and replay in aivtuber
+|#193
+|Dependency/runtime footprint; tool timeout/cancellation; dynamic tool-list behavior; forged-authority rejection; whether tool results can be verified without framework-owned task semantics
+
 |LLM routing / adaptive compute
 |RouteLLM;
 adaptive budget-constrained routing research;
