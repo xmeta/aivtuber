@@ -885,6 +885,7 @@ for (const file of listJson("examples/evaluation/moderation-evaluation/inconsist
 // the checked-in corpus by counting distinct `actor_id` in a generated trace,
 // which is the property the label actually claims.
 const HIGH_CARDINALITY_MIN_ACTORS = 500;
+const MAX_ACTOR_NAMESPACE = 0xffff_ffff;
 
 // What separates a quiet conversational stream from a normal one. A workload
 // definition, not a runtime limit: no runtime refuses a rate, it either schedules
@@ -1043,11 +1044,24 @@ function streamScenarioProblems(doc) {
   }
 
   const names = new Set();
-  for (const phase of phases) {
+  let actorNamespaceEnd = 0;
+  let actorNamespaceOverflowed = false;
+  for (const [index, phase] of phases.entries()) {
     if (names.has(phase.name)) {
       problems.push(`phase name ${phase.name} is used more than once`);
     }
     names.add(phase.name);
+    if (!actorNamespaceOverflowed) {
+      const nextActorNamespaceEnd = actorNamespaceEnd + (phase.distinct_actors ?? 0);
+      if (nextActorNamespaceEnd > MAX_ACTOR_NAMESPACE) {
+        problems.push(
+          `phase ${index} (${phase.name}) declares ${phase.distinct_actors} distinct actors, which overflows the ${actorNamespaceEnd} actor ids already assigned to earlier phases; a scenario cannot name more than ${MAX_ACTOR_NAMESPACE} viewers in total`,
+        );
+        actorNamespaceOverflowed = true;
+      } else {
+        actorNamespaceEnd = nextActorNamespaceEnd;
+      }
+    }
     for (const mixName of ["kind_mix", "semantic_mix", "priority_mix"]) {
       const mix = phase[mixName] ?? {};
       const total = Object.values(mix).reduce((sum, value) => sum + value, 0);

@@ -902,27 +902,31 @@ fn a_repeated_viewer_rate_is_an_exact_quota_not_a_coin_flip() {
 }
 
 #[test]
-fn a_well_formed_scenario_never_panics_on_large_actor_pools() {
+fn actor_namespace_overflow_is_a_format_error_before_generation() {
     // `distinct_actors` is a `u32` from external JSON and actor ids share one
     // namespace across phases, so a scenario whose pools do not fit in that
-    // namespace is unrepresentable. It has to be refused with a reason, not wrap
-    // or panic - the loader reads untrusted documents.
+    // namespace is unrepresentable. The format validator and generator must
+    // reject the same document with the same reason, rather than letting a
+    // schema-valid document fail only after generation begins.
     let phase = |name: &str, actors: u32| ScenarioPhase {
         distinct_actors: actors,
         ..steady_phase(name, 600_000, 1.0)
     };
 
-    let overflows = StreamScenario {
-        scenario_id: "actor-namespace-overflow".to_owned(),
-        phases: vec![phase("first", u32::MAX), phase("second", 2)],
-        stream_duration_ms: 1_200_000,
-        ..shipped("high-cardinality-actors.json")
-    };
-    let error = generate_scenario_trace(&overflows)
-        .expect_err("a namespace that cannot be represented must be refused");
+    let overflows = shipped("inconsistent/actor-namespace-overflow.json");
+    let validation_error = overflows
+        .validate()
+        .expect_err("the format must refuse an actor namespace it cannot represent");
     assert!(
-        error.to_string().contains("overflows"),
-        "the refusal must name the reason, got: {error}"
+        validation_error.to_string().contains("overflows"),
+        "the format refusal must name the reason, got: {validation_error}"
+    );
+    let generation_error = generate_scenario_trace(&overflows)
+        .expect_err("a namespace that cannot be represented must be refused");
+    assert_eq!(
+        generation_error.to_string(),
+        validation_error.to_string(),
+        "format validation and generation must agree on representability"
     );
 
     // And the boundary just below it still generates: the guard must not reject

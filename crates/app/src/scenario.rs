@@ -355,6 +355,23 @@ fn validate_weights<T: Ord + std::fmt::Debug>(
     Ok(())
 }
 
+fn checked_actor_namespace_end(
+    scenario_id: &str,
+    index: usize,
+    phase: &ScenarioPhase,
+    actor_base: u32,
+) -> Result<u32, AppError> {
+    actor_base.checked_add(phase.distinct_actors).ok_or_else(|| {
+        AppError::Routing(format!(
+            "scenario {scenario_id:?} phase {index} ({}) declares {} distinct actors, which overflows the {} actor ids already assigned to earlier phases; a scenario cannot name more than {} viewers in total",
+            phase.name,
+            phase.distinct_actors,
+            actor_base,
+            u32::MAX
+        ))
+    })
+}
+
 /// A versioned stream workload definition.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -462,8 +479,11 @@ impl StreamScenario {
 
         let mut seen_names = BTreeMap::new();
         let mut duration_total = 0u64;
+        let mut actor_namespace_end = 0u32;
         for (index, phase) in self.phases.iter().enumerate() {
             phase.validate(index)?;
+            actor_namespace_end =
+                checked_actor_namespace_end(&self.scenario_id, index, phase, actor_namespace_end)?;
             if seen_names.insert(phase.name.as_str(), index).is_some() {
                 return Err(AppError::Routing(format!(
                     "scenario {:?} reuses phase name {:?}",
@@ -652,16 +672,8 @@ pub fn generate_scenario_trace(scenario: &StreamScenario) -> Result<Vec<Scenario
         // scenario whose phases' pools do not fit in it is unrepresentable. That
         // is a property of the document, and the loader reads untrusted JSON, so
         // it is refused with a reason rather than allowed to wrap or panic.
-        let phase_actor_end = actor_base.checked_add(phase.distinct_actors).ok_or_else(|| {
-            AppError::Routing(format!(
-                "scenario {:?} phase {index} ({}) declares {} distinct actors, which overflows the {} actor ids already assigned to earlier phases; a scenario cannot name more than {} viewers in total",
-                scenario.scenario_id,
-                phase.name,
-                phase.distinct_actors,
-                actor_base,
-                u32::MAX
-            ))
-        })?;
+        let phase_actor_end =
+            checked_actor_namespace_end(&scenario.scenario_id, index, phase, actor_base)?;
         // Next unvisited viewer in this phase's pool, offset into the stream-wide
         // actor namespace so phases never reissue an id.
         let mut next_actor: u32 = actor_base;

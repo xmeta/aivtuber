@@ -1,0 +1,47 @@
+{
+  "schema_version": "1",
+  "scenario_id": "actor-namespace-overflow",
+  "scenario_version": 1,
+  "scenario_class": "low_traffic",
+  "provenance": "synthetic_design_assumption",
+  "provenance_note": "Each phase is individually representable, but their actor pools overflow the shared u32 namespace.",
+  "seed": 20261005,
+  "logical_start": "2026-10-01T00:00:00Z",
+  "stream_duration_ms": 1200000,
+  "phases": [
+    {
+      "name": "first",
+      "duration_ms": 600000,
+      "events_per_minute": 1.0,
+      "kind_mix": {
+        "chat.message": 1.0
+      },
+      "semantic_mix": {
+        "hit": 1.0
+      },
+      "priority_mix": {
+        "normal": 1.0
+      },
+      "distinct_actors": 4294967295,
+      "distinct_topics": 1,
+      "repeat_viewer_probability": 0.0
+    },
+    {
+      "name": "second",
+      "duration_ms": 600000,
+      "events_per_minute": 1.0,
+      "kind_mix": {
+        "chat.message": 1.0
+      },
+      "semantic_mix": {
+        "hit": 1.0
+      },
+      "priority_mix": {
+        "normal": 1.0
+      },
+      "distinct_actors": 2,
+      "distinct_topics": 1,
+      "repeat_viewer_probability": 0.0
+    }
+  ]
+}
