@@ -144,8 +144,9 @@ Two mechanisms make failures durable:
   file is committed, and proptest replays those cases **before** generating any
   novel input — so they run regardless of the seed. The directory resolves
   relative to the crate root, not the test file.
-* *A seeded bounded subset in PR CI.* The `regressions` job in
-  `.github/workflows/ci.yml` runs:
+* *A seeded bounded subset in PR CI.* This command runs twice in
+  `.github/workflows/ci.yml`, once as a step inside the required `Rust checks`
+  job and once as a standalone `regressions` job:
 
 [source,text]
 ----
@@ -153,6 +154,27 @@ PROPTEST_CASES=64 PROPTEST_RNG_SEED=20261004 \
 PROPTEST_MAX_SHRINK_ITERS=4096 \
 cargo test --locked -p aivtuber-scheduler --test properties
 ----
+
+The *gating* copy is the one inside `Rust checks`. `main`'s branch protection
+requires exactly three contexts — `Validate schemas and fixtures`,
+`Rust checks`, and `Schema and security fixtures` — and the standalone
+`regressions` job is not one of them, so a regression failure there would leave
+all three green and the pull request mergeable. Duplicating the run inside a
+required job makes the failure actually stop the merge without needing a branch
+protection change; both jobs share a checkout, so they share
+`proptest-regressions/`.
+
+Both copies carry `if: always()` on their `upload-artifact` step. Without it,
+Actions' default `success()` condition skips the upload exactly when `cargo
+test` exits non-zero — which is precisely when proptest has just shrunk and
+persisted a *new* case. The artifact would be reclaimed with the runner.
+
+`scripts/validate.mjs` asserts that the seeded step lives inside a job whose
+context name is one of the required checks (it parses the `jobs:` blocks rather
+than the whole file, so moving the step back into the non-required job fails
+the check), and that at least one real `cc <seed>` persistence line is present
+in `crates/scheduler/proptest-regressions/` — a file that exists but is empty or
+comments-only does not count as a corpus.
 
 Stable-only and fuzz-free by design. libFuzzer needs nightly, and a second
 toolchain channel in `ci.yml` would contradict

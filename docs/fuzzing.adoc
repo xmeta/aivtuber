@@ -267,10 +267,17 @@ Issue #147 wires this up:
   `workflow_dispatch` only. It never triggers on `pull_request`, so fuzzing
   cannot become an unbounded PR gate, and it carries both an explicit `-runs`
   budget and a `timeout-minutes` bound.
-* `.github/workflows/ci.yml` runs a `regressions` job on the pinned stable
-  toolchain with a fixed `PROPTEST_RNG_SEED` and a bounded `PROPTEST_CASES`, so
-  the property subset is reproducible on every PR. Checked-in
+* `.github/workflows/ci.yml` runs a seeded, bounded property subset twice on the
+  pinned stable toolchain with a fixed `PROPTEST_RNG_SEED` and a bounded
+  `PROPTEST_CASES`, so the subset is reproducible on every PR. Checked-in
   `crates/scheduler/proptest-regressions/` cases replay regardless of the seed.
-* `scripts/validate.mjs` asserts all of the above, and
+  One copy is a step inside the *required* `Rust checks` job — the standalone
+  `regressions` job is not in `main`'s required status checks, so only the copy
+  inside a required job actually blocks a merge. Both upload steps use
+  `if: always()` so a freshly shrunk case is captured even though the test step
+  failed.
+* `scripts/validate.mjs` asserts all of the above, including that the seeded
+  step is inside a required context and that the corpus holds a real `cc <seed>`
+  line rather than just a `.txt` file, and
   `crates/scheduler/tests/workspace_contract.rs` continues to keep
   `libfuzzer-sys` out of the workspace lock and the production graph.

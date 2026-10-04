@@ -500,22 +500,109 @@ for (const file of trackedFiles) {
 
   // The checked-in regression corpus is what makes the seeded run replayable.
   // Without it the gate would silently degrade to random search.
+  //
+  // Existence alone is not enough: proptest writes a header of `#` comments, so
+  // a truncated or hand-emptied file still exists and still contains no case.
+  // Require at least one real persistence line, which is `cc <seed> ...`.
   const regressionDir = join(root, "crates/scheduler/proptest-regressions");
   if (!existsSync(regressionDir)) {
     failures += 1;
     console.error(
       "FAIL      crates/scheduler/proptest-regressions: missing (issue #147)",
     );
-  } else if (
-    readdirSync(regressionDir).filter((f) => f.endsWith(".txt")).length === 0
-  ) {
+  } else {
+    const caseFiles = readdirSync(regressionDir).filter((f) => f.endsWith(".txt"));
+    const seeds = caseFiles.flatMap((file) =>
+      readFileSync(join(regressionDir, file), "utf8")
+        .split("\n")
+        .map((line) => line.trim())
+        // proptest persistence lines start with `cc `; `#` is a comment.
+        .filter((line) => line.startsWith("cc ")),
+    );
+    if (seeds.length === 0) {
+      failures += 1;
+      console.error(
+        `FAIL      crates/scheduler/proptest-regressions: no persisted proptest case found in ${caseFiles.length || 0} file(s) (issue #147)`,
+      );
+    } else {
+      passes += 1;
+      console.log(
+        `ok        crates/scheduler/proptest-regressions: ${seeds.length} persisted case(s) present`,
+      );
+    }
+  }
+
+// A regression failure only blocks a merge if it runs inside a REQUIRED status
+  // check. main's branch protection requires the three contexts below; the
+  // standalone `regressions` job is not one of them, so a failure there leaves
+  // the PR mergeable. The seeded subset therefore has to run as a step inside a
+  // job whose reported context name IS one of these.
+  //
+  // The list mirrors the repository settings rather than a file on main, so the
+  // assertion works on any branch carrying validate.mjs. Refresh it with
+  // `gh api repos/xmeta/aivtuber/branches/main/protection/required_status_checks`
+  // when branch protection changes; the last branch below fails if a listed
+  // context no longer names a job in ci.yml, which is the staleness signal.
+  const REQUIRED_STATUS_CONTEXTS = [
+    "Validate schemas and fixtures",
+    "Rust checks",
+    "Schema and security fixtures",
+  ];
+
+  // Split the workflow into its `jobs:` blocks so "which job holds this step"
+  // is answerable. A regex over the whole file would happily match the
+  // non-gating standalone job, which is exactly the mistake this guards.
+  const jobBlocks = [];
+  const ciLines = ciWorkflow.split("\n");
+  let inJobs = false;
+  let currentJob = null;
+  for (const line of ciLines) {
+    if (line === "jobs:") {
+      inJobs = true;
+      continue;
+    }
+    if (!inJobs) continue;
+    const header = line.match(/^ {2}([A-Za-z0-9_-]+):\s*$/);
+    if (header) {
+      currentJob = { id: header[1], lines: [] };
+      jobBlocks.push(currentJob);
+    } else if (currentJob) {
+      currentJob.lines.push(line);
+    }
+  }
+  const jobBody = (job) => job.lines.join("\n");
+  // Job keys sit at four spaces; step names are `- name:` at six, so this
+  // cannot pick up a step by accident.
+  const jobContextName = (job) => jobBody(job).match(/^ {4}name:\s*(.+)$/m)?.[1]?.trim();
+
+  const gatingJob = jobBlocks.find((job) =>
+    jobBody(job).includes("- name: Bounded property regression subset (gating)"),
+  );
+  const gatingSeed = gatingJob && jobBody(gatingJob).match(/PROPTEST_RNG_SEED:\s*"(\d+)"/);
+  const missingContexts = REQUIRED_STATUS_CONTEXTS.filter(
+    (name) => !jobBlocks.some((job) => jobContextName(job) === name),
+  );
+
+  if (!gatingJob || !gatingSeed) {
     failures += 1;
     console.error(
-      "FAIL      crates/scheduler/proptest-regressions: contains no checked-in cases (issue #147)",
+      "FAIL      .github/workflows/ci.yml: missing the seeded property step inside the required `Rust checks` job (issue #147)",
+    );
+  } else if (!REQUIRED_STATUS_CONTEXTS.includes(jobContextName(gatingJob))) {
+    failures += 1;
+    console.error(
+      `FAIL      .github/workflows/ci.yml: the seeded property step sits in job "${gatingJob.id}", whose context name is not a required status check (${JSON.stringify(REQUIRED_STATUS_CONTEXTS)}), so a failure there will not block a merge (issue #147)`,
+    );
+  } else if (missingContexts.length > 0) {
+    failures += 1;
+    console.error(
+      `FAIL      .github/workflows/ci.yml: required status checks ${JSON.stringify(missingContexts)} name no job in ci.yml; refresh REQUIRED_STATUS_CONTEXTS in validate.mjs from the branch protection settings (issue #147)`,
     );
   } else {
     passes += 1;
-    console.log("ok        crates/scheduler/proptest-regressions: checked-in cases present");
+    console.log(
+      `ok        .github/workflows/ci.yml: seeded property subset (seed=${gatingSeed[1]}) runs inside required context "${jobContextName(gatingJob)}"`,
+    );
   }
 }
 
