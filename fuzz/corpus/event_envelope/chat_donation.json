@@ -1,0 +1,1 @@
+{"schema_version": "0.2.0", "event_id": "seed-donation", "correlation_id": "seed-corr", "sequence": 1, "observed_at": "2026-09-24T00:00:00Z", "source": "donation", "source_class": "donation", "plane": "content", "trust_level": "semi_trusted", "kind": "chat.donation", "payload": {}}

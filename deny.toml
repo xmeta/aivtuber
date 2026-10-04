@@ -20,6 +20,11 @@ version = 2
 # Permissive licenses only. Copyleft (GPL/AGPL) is not allowed; LGPL-2.1 in
 # r-efi and CDLA-Permissive-2.0 in webpki-roots are documented exceptions
 # below until the crates drop out of the graph.
+#
+# NCSA arrives only via libfuzzer-sys, which is reachable solely from the
+# excluded fuzz/ crate (issue #146). It is OSI-approved and required by the
+# libFuzzer runtime, so there is no action to take; the entry exists so the
+# fuzz lock file can pass the same license gate as the workspace lock file.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -33,6 +38,7 @@ allow = [
     "Unicode-3.0",
     "CDLA-Permissive-2.0",
     "LGPL-2.1-or-later",
+    "NCSA",
 ]
 confidence-threshold = 0.8
 

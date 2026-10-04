@@ -32,6 +32,14 @@ jobs:
       - name: cargo deny check
         run: cargo deny --locked check
 
+      # fuzz/ is excluded from the workspace, so it has its own fuzz/Cargo.lock
+      # and the command above never resolves it. Without this step CI would
+      # compile libfuzzer-sys and its transitive graph in every job while that
+      # separate lock file stayed outside the supply-chain gate. Same policy,
+      # both lock files.
+      - name: cargo deny check (fuzz lock)
+        run: cargo deny --manifest-path fuzz/Cargo.toml --locked check
+
   validate:
     name: Validate schemas and fixtures
     runs-on: ubuntu-latest
@@ -75,6 +83,19 @@ jobs:
 
       - name: Format
         run: cargo fmt --all -- --check
+
+      # `fuzz/` is excluded from the workspace (issue #146), so `cargo fmt --all`
+      # and `cargo clippy --workspace` never see it. These two commands would
+      # otherwise pass on unformatted or unlinted fuzz targets, because the
+      # exclusion that keeps libfuzzer-sys out of the workspace lock file also
+      # removes it from these gates. Stable is sufficient: the crate needs
+      # nightly only to *run* a campaign, not to format or lint.
+      - name: Format fuzz crate
+        run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+
+      # --locked keeps CI from silently rewriting the reviewed fuzz/Cargo.lock.
+      - name: Clippy fuzz crate
+        run: cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
 
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings

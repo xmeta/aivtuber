@@ -9,8 +9,8 @@ mod retrieval;
 
 pub use jev::{
     HttpResponse, HttpTransport, JevAdapter, JevAdapterConfig, JevApiKey, JevCallEvidence,
-    JevCallFailure, JevCancellationToken, JevUsage, NormalizedAnswer, TransportError,
-    UreqTransport,
+    JevCallFailure, JevCancellationToken, JevUsage, NormalizedAnswer, NormalizedResponse,
+    SystemOneResponse, TransportError, UreqTransport, normalize_answers, parse_jev_response_body,
 };
 pub use pipeline::{
     DecisionEvidence, DecisionReplayRecord, ExecutedAction, ExecutedDecision, ModelEvidence,

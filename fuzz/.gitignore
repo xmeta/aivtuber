@@ -1,0 +1,20 @@
+# Build output and machine-generated fuzz state (issue #146).
+#
+# `target/` is libFuzzer's build directory.
+#
+# Corpus handling: the *curated* seeds checked in under `corpus/<target>/` are
+# real files named after what they exercise, and they are reviewed. Everything
+# libFuzzer discovers while running is written with a content hash as its
+# filename, and a single short campaign produces well over a thousand of them.
+# Those are run-local search state, not reviewable input, so they are ignored
+# here. Issue #147 owns checking in a small minimized regression corpus once a
+# failure has been reduced to a reproducible test.
+target/
+
+# libFuzzer's own directory format and crash artifacts.
+corpus/**/[0-9a-f][0-9a-f]*
+artifacts/
+coverage/
+
+# A dictionary libFuzzer derived from the seeds. Useful locally, not checked in.
+*.dict
