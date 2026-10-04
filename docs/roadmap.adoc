@@ -71,7 +71,7 @@ The remaining Stage 1 hardening and process work is:
 
 - verification toolchain, tracked by parent #57: #145 property tests and #146 fuzz targets are complete; #147 bounded CI/corpus integration is implementation-ready;
 - #198 is a separate scheduler-contract follow-up discovered by the property suite; it does not block #147 or the testing-workflow parent closure;
-- #70 realistic workload scenarios;
+- #70 realistic workload scenarios: the evidence slice (versioned seeded normal/burst/idle generator, schema, fixtures, #58 `--scenario` entry point) is in link:stream-scenarios.adoc[Stream Scenarios]. Still open: the #40 fault overlays, and the three scenario shapes the cached path cannot yet play;
 - #71 operational SLOs, blocked on #70;
 - #125 tgrep provisioning documentation.
 
