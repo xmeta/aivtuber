@@ -1,0 +1,84 @@
+{
+  "schema_version": "1",
+  "orchestrator_schema_version": "0.1.0",
+  "compatibility": {
+    "comparison_schema_version": "0.1.0",
+    "active_policy_id": "intent-routing",
+    "active_policy_version": "1.0.0",
+    "active_config_fingerprint": "cfg-9f2a",
+    "active_runtime_profile": "default",
+    "shadow_policy_id": "semantic-reuse-proposal",
+    "shadow_policy_version": "0.3.0",
+    "shadow_config_fingerprint": "cfg-9f2a",
+    "shadow_runtime_profile": "default",
+    "dataset_id": "stream-replay-2026-10"
+  },
+  "total_comparisons": 8,
+  "comparable_comparisons": 7,
+  "diverged_comparisons": 5,
+  "category_counts": {
+    "same_route_same_target": 2,
+    "same_route_different_target": 1,
+    "route_transition": 2,
+    "response_vs_silent": 1,
+    "fallback_vs_success": 1,
+    "shadow_unusable": 1
+  },
+  "metrics": {
+    "shadow.divergence.fallback_vs_success_count": { "value": 1, "sample_count": 8 },
+    "shadow.divergence.rate_pct": { "value": 71.42857142857143, "sample_count": 7 },
+    "shadow.divergence.response_vs_silent_count": { "value": 1, "sample_count": 8 },
+    "shadow.divergence.route_transition_count": { "value": 2, "sample_count": 8 },
+    "shadow.divergence.same_route_different_target_count": { "value": 1, "sample_count": 8 },
+    "shadow.divergence.same_route_same_target_count": { "value": 2, "sample_count": 8 },
+    "shadow.divergence.shadow_unusable_count": { "value": 1, "sample_count": 8 }
+  },
+  "divergent_cases": [
+    {
+      "event_id": "evt-1001",
+      "correlation_id": "corr-1001",
+      "category": "same_route_different_target",
+      "active_route": "semantic_reuse",
+      "shadow_route": "semantic_reuse",
+      "active_fallback_reason": null,
+      "shadow_fallback_reason": null
+    },
+    {
+      "event_id": "evt-1002",
+      "correlation_id": "corr-1002",
+      "category": "route_transition",
+      "active_route": "template",
+      "shadow_route": "generated",
+      "active_fallback_reason": null,
+      "shadow_fallback_reason": null
+    },
+    {
+      "event_id": "evt-1003",
+      "correlation_id": "corr-1003",
+      "category": "response_vs_silent",
+      "active_route": "silent",
+      "shadow_route": "generated",
+      "active_fallback_reason": null,
+      "shadow_fallback_reason": null
+    },
+    {
+      "event_id": "evt-1004",
+      "correlation_id": "corr-1004",
+      "category": "route_transition",
+      "active_route": "generated",
+      "shadow_route": "template",
+      "active_fallback_reason": null,
+      "shadow_fallback_reason": null
+    },
+    {
+      "event_id": "evt-1005",
+      "correlation_id": "corr-1005",
+      "category": "fallback_vs_success",
+      "active_route": "deterministic",
+      "shadow_route": "deterministic",
+      "active_fallback_reason": null,
+      "shadow_fallback_reason": "timeout"
+    }
+  ],
+  "divergent_cases_truncated": false
+}

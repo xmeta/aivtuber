@@ -1,0 +1,32 @@
+{
+  "schema_version": "1",
+  "orchestrator_schema_version": "0.1.0",
+  "compatibility": {
+    "comparison_schema_version": "0.1.0",
+    "active_policy_id": "intent-routing",
+    "active_policy_version": "1.0.0",
+    "active_config_fingerprint": "cfg-9f2a",
+    "active_runtime_profile": "default",
+    "shadow_policy_id": "semantic-reuse-proposal",
+    "shadow_policy_version": "0.3.0",
+    "shadow_config_fingerprint": "cfg-9f2a",
+    "shadow_runtime_profile": "default",
+    "dataset_id": null
+  },
+  "total_comparisons": 0,
+  "comparable_comparisons": 0,
+  "diverged_comparisons": 0,
+  "category_counts": {
+    "same_route_same_target": 0,
+    "same_route_different_target": 0,
+    "route_transition": 0,
+    "response_vs_silent": 0,
+    "fallback_vs_success": 0,
+    "shadow_unusable": 0
+  },
+  "metrics": {
+    "shadow.divergence.rate_pct": { "value": 0, "sample_count": 0 }
+  },
+  "divergent_cases": [],
+  "divergent_cases_truncated": false
+}

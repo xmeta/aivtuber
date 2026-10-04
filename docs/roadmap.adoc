@@ -92,7 +92,8 @@ Exit condition:
 * hypothesis-driven experiments record expected versus actual outcomes;
 * risk-proportional decisions/assumptions are durable;
 * after-action review feeds measured bottlenecks back into prioritization;
-* shadow evaluation can compare policies without causing production side effects.
+* shadow evaluation can compare policies without causing production side effects;
+* shadow comparisons aggregate into evidence that benchmarking and human review can consume, without any scalar that would make promotion automatic.
 
 Stage 2 should turn benchmark and quality evidence into a repeatable improvement loop rather than treating implementation completion as proof of improvement.
 

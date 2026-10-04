@@ -74,6 +74,7 @@ const regression = validators["schemas/security-regression-case.schema.json"];
 const asset = validators["schemas/performance-asset.schema.json"];
 const reactionQuality = validators["schemas/reaction-quality-dataset.schema.json"];
 const reactionQualityReview = validators["schemas/reaction-quality-review.schema.json"];
+const shadowDivergence = validators["schemas/shadow-divergence-report.schema.json"];
 
 function report(ok, label, validator) {
   if (ok) {
@@ -230,6 +231,105 @@ for (const [identity, group] of reactionGroups) {
       .map(([category, count]) => `${category}=${count}`)
       .join(", ");
     console.log(`coverage  ${identity} ${partition}: ${summary}`);
+  }
+}
+
+// Issue #165: an aggregated shadow divergence report must stay evidence, not a
+// promotion mechanism. The schema already refuses extra fields and non-diverging
+// case references; these checks pin the two invariants that a schema alone
+// cannot express.
+const SHADOW_DIVERGENCE_CATEGORIES = [
+  "same_route_same_target",
+  "same_route_different_target",
+  "route_transition",
+  "response_vs_silent",
+  "fallback_vs_success",
+  "shadow_unusable",
+];
+const SHADOW_NON_DIVERGING = ["same_route_same_target", "shadow_unusable"];
+
+const shadowDivergenceDocuments = [];
+for (const file of listJson("examples/evaluation/shadow-divergence")) {
+  if (!shadowDivergence) break;
+  const doc = loadJson(join(root, file));
+  const valid = shadowDivergence(doc);
+  report(valid, file, shadowDivergence);
+  if (valid) shadowDivergenceDocuments.push({ file, doc });
+}
+
+for (const file of listJson("examples/evaluation/shadow-divergence/invalid")) {
+  if (!shadowDivergence) break;
+  const valid = shadowDivergence(loadJson(join(root, file)));
+  if (valid) {
+    failures += 1;
+    console.error(`FAIL      ${file} (expected rejection, but it validated)`);
+  } else {
+    passes += 1;
+    console.log(`ok        ${file} (rejected as intended)`);
+  }
+}
+
+for (const { file, doc } of shadowDivergenceDocuments) {
+  // Counts must add up. A report whose categories do not sum to the total
+  // cannot be consumed by #58 as a metric.
+  const counted = SHADOW_DIVERGENCE_CATEGORIES.reduce(
+    (sum, category) => sum + (doc.category_counts[category] ?? 0),
+    0,
+  );
+  if (counted !== doc.total_comparisons) {
+    failures += 1;
+    console.error(
+      `FAIL      ${file}: category counts sum to ${counted}, not total_comparisons ${doc.total_comparisons}`,
+    );
+  } else {
+    passes += 1;
+    console.log(`ok        ${file}: category counts sum to total_comparisons`);
+  }
+
+  // The divergence rate has comparable comparisons as its denominator, so
+  // unusable shadow evaluations cannot make a broken policy look good.
+  const comparable =
+    doc.total_comparisons - (doc.category_counts.shadow_unusable ?? 0);
+  if (comparable !== doc.comparable_comparisons) {
+    failures += 1;
+    console.error(
+      `FAIL      ${file}: comparable_comparisons is ${doc.comparable_comparisons}, but total minus shadow_unusable is ${comparable}`,
+    );
+  } else if (doc.diverged_comparisons > doc.comparable_comparisons) {
+    failures += 1;
+    console.error(
+      `FAIL      ${file}: diverged_comparisons ${doc.diverged_comparisons} exceeds comparable_comparisons ${doc.comparable_comparisons}`,
+    );
+  } else {
+    passes += 1;
+    console.log(`ok        ${file}: divergence denominator excludes unusable evaluations`);
+  }
+
+  // Evidence may reference divergent cases, never agreeing or unusable ones.
+  const badRef = (doc.divergent_cases ?? []).find((reference) =>
+    SHADOW_NON_DIVERGING.includes(reference.category),
+  );
+  if (badRef) {
+    failures += 1;
+    console.error(
+      `FAIL      ${file}: divergent_cases references ${badRef.event_id} with non-diverging category ${badRef.category}`,
+    );
+  } else {
+    passes += 1;
+    console.log("ok        " + `${file}: case references are divergences only`);
+  }
+
+  // The truncation flag must agree with the retained references, otherwise a
+  // partial report reads as a complete one.
+  const truncated = (doc.divergent_cases ?? []).length < doc.diverged_comparisons;
+  if (truncated !== doc.divergent_cases_truncated) {
+    failures += 1;
+    console.error(
+      `FAIL      ${file}: divergent_cases_truncated is ${doc.divergent_cases_truncated} but retained ${doc.divergent_cases?.length ?? 0} of ${doc.diverged_comparisons}`,
+    );
+  } else {
+    passes += 1;
+    console.log(`ok        ${file}: truncation flag matches retained references`);
   }
 }
 

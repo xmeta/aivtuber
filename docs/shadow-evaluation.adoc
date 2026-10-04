@@ -3,7 +3,7 @@
 
 This document defines the first side-effect-free shadow-policy boundary for #64.
 The policy core is #163 (section 3-7). Bounded production orchestration is #164
-(section 8) and benchmark/reaction-quality export is #165 (section 9).
+(section 8) and benchmark/reaction-quality export is #165 (section 9, implemented).
 
 == 1. Purpose
 
@@ -470,19 +470,77 @@ When enabled, startup prints one non-secret `shadow_orchestration:` line with
 the configured bounds. Rollback is setting
 `AIVTUBER_SHADOW_ENABLED=false`, which restores the exact #163 behavior.
 
-== 9. Follow-up boundaries
+== 9. Evidence integration (#165, implemented)
 
-#165 owns evidence integration:
+#165 turns comparison records into evidence that #58 benchmarking and #59/#151
+human review can consume. It adds `crates/app/src/shadow_evidence.rs` and
+nothing else: no runtime path changes, and the active route is untouched by
+anything in that module.
 
-* stable divergence-category aggregation;
-* #58 benchmark-compatible metrics;
-* #151 reaction-quality review sampling;
-* policy/config/profile compatibility grouping.
+=== 9.1 Divergence categories
 
-#165 must preserve the evidence-minimization boundary in section 5: aggregate
-evidence, not transcripts. It must also read `ShadowComparisonRecord`
-`schema_version` together with `ShadowOrchestratorConfig` `schema_version`
-before combining samples.
+`classify_shadow_divergence` assigns every comparison to exactly one stable
+`snake_case` category, which is what makes the output machine-readable:
 
-Neither follow-up may automatically promote a shadow policy to active behavior.
-Promotion remains an explicit reviewed decision under the experiment workflow.
+| Category | Meaning |
+| --- | --- |
+| `same_route_same_target` | the two policies agreed |
+| `same_route_different_target` | same route class, different comparable target |
+| `route_transition` | different route class on both sides, neither silent |
+| `response_vs_silent` | one side responded, the other stayed silent |
+| `fallback_vs_success` | the fallback reason differs, so one side degraded |
+| `shadow_unusable` | the shadow half produced no usable decision |
+
+Two ordering decisions are the contract:
+
+* A fallback disagreement is reported as `fallback_vs_success` *even when* the
+  route classes also differ, because the degradation is the operationally
+  interesting half.
+* `shadow_unusable` is a *failure to compare*, not an agreement. It is counted
+  separately and excluded from the divergence rate's denominator, so a broken
+  or timing-out shadow policy cannot depress its own divergence rate and look
+  like a good one.
+
+=== 9.2 Compatibility is explicit, not implicit
+
+`summarize_shadow_divergence` refuses rather than merges. A batch is rejected
+when it is empty (an empty report would read as "no divergence"), when any
+record carries a `ShadowComparisonRecord` `schema_version` other than the
+current one, or when any record's `ShadowCompatibilityKey` differs from the
+first record's — that key holds both policy identities, the config
+fingerprint, the runtime profile and the dataset id, so it is exactly the
+boundary section 6 described. An aggregated number across two identities could
+not be interpreted, so the aggregator refuses instead of producing one.
+
+The report itself carries `orchestrator_schema_version` beside its own
+`schema_version`, so a stored sample is never re-interpreted under different
+bounds.
+
+=== 9.3 What a report contains
+
+* every category key, including zeroes, so two reports compare field by field;
+* `shadow.divergence.<category>_count` plus `shadow.divergence.rate_pct`, a
+  flat map shaped like a `benchmark-result` metric entry (#58) and ready to
+  merge into its `metrics` map without translation;
+* `ShadowDivergentCaseRef` entries — `event_id`, `correlation_id`, category,
+  both route classes and both fallback reasons — for #151 offline sampling.
+
+The boundary from section 5 holds: the reference struct has *no field* that can
+hold payload, rendered text or a provider response, and
+`schemas/shadow-divergence-report.schema.json` sets
+`additionalProperties: false` so one cannot be added from outside. Retained
+references are capped by `case_limit`; **counts are never truncated**, and
+`divergent_cases_truncated` says whether the reference list is complete, so a
+partial report never reads as a whole one.
+
+=== 9.4 Evidence never promotes
+
+There is no scalar that ranks a policy and no field naming an active policy to
+switch to; the only policy identities in a report are the two that were already
+compared. Promotion remains an explicit, reviewed decision under the experiment
+workflow. `a_report_cannot_promote_a_shadow_policy` pins this, and
+`scripts/validate.mjs` independently rejects a fixture that references a
+non-diverging category, reports an empty batch, or smuggles a text field into a
+case reference.
+
+#165 does not replace #108 causal trace attribution.
