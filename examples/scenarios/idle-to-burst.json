@@ -1,0 +1,79 @@
+{
+  "schema_version": "1",
+  "scenario_id": "idle-to-burst",
+  "scenario_version": 1,
+  "scenario_class": "idle_to_burst",
+  "provenance": "synthetic_design_assumption",
+  "provenance_note": "A quiet room that goes silent and then spikes, modelling the phased shape the issue describes rather than a flat average.",
+  "seed": 777,
+  "logical_start": "2026-10-01T00:00:00Z",
+  "stream_duration_ms": 180000,
+  "phases": [
+    {
+      "name": "quiet",
+      "duration_ms": 60000,
+      "events_per_minute": 0.5,
+      "kind_mix": {
+        "chat.message": 9.0,
+        "game.event": 1.0
+      },
+      "semantic_mix": {
+        "hit": 0.6,
+        "near_miss": 0.3,
+        "miss": 0.1
+      },
+      "priority_mix": {
+        "low": 4.0,
+        "normal": 2.0,
+        "high": 1.0
+      },
+      "distinct_actors": 3,
+      "distinct_topics": 3,
+      "repeat_viewer_probability": 0.4
+    },
+    {
+      "name": "silent",
+      "duration_ms": 60000,
+      "events_per_minute": 0.0,
+      "kind_mix": {
+        "chat.message": 9.0,
+        "game.event": 1.0
+      },
+      "semantic_mix": {
+        "hit": 0.6,
+        "near_miss": 0.3,
+        "miss": 0.1
+      },
+      "priority_mix": {
+        "low": 4.0,
+        "normal": 2.0,
+        "high": 1.0
+      },
+      "distinct_actors": 3,
+      "distinct_topics": 3,
+      "repeat_viewer_probability": 0.4
+    },
+    {
+      "name": "spike",
+      "duration_ms": 60000,
+      "events_per_minute": 10.0,
+      "kind_mix": {
+        "chat.message": 9.0,
+        "game.event": 1.0
+      },
+      "semantic_mix": {
+        "hit": 0.6,
+        "near_miss": 0.3,
+        "miss": 0.1
+      },
+      "priority_mix": {
+        "low": 4.0,
+        "normal": 2.0,
+        "high": 1.0
+      },
+      "distinct_actors": 60,
+      "distinct_topics": 30,
+      "repeat_viewer_probability": 0.4
+    }
+  ]
+}

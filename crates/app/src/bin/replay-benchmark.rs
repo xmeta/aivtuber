@@ -3,7 +3,8 @@
 use aivtuber_app::{
     AppError, AssetSemanticIndexConfig, AudioOutput, GenerativeRuntime, IntentRoutePlanner,
     NoopAvatarOutput, NoopStreamOutput, PlaybackRoute, ProductionApp, QueryEmbeddingProvider,
-    ReflexRoutePlanner, RoutePlanner, build_semantic_index_from_asset_store,
+    ReflexRoutePlanner, RoutePlanner, StreamScenario, build_semantic_index_from_asset_store,
+    scenario_to_benchmark_fixture,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
@@ -188,16 +189,38 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
-    let fixture_path = env::args_os()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(default_fixture_path);
-    let output_dir = env::args_os()
-        .nth(2)
-        .map(PathBuf::from)
+    // Issue #70: `--scenario <path>` generates the workload from a versioned,
+    // seeded scenario instead of loading a checked-in event trace. The two paths
+    // converge on the same `Fixture`, so a scenario and a recorded fixture are
+    // benchmarked by exactly the same pipeline.
+    let arguments: Vec<std::ffi::OsString> = env::args_os().skip(1).collect();
+    let mut scenario_path: Option<PathBuf> = None;
+    let mut positional: Vec<PathBuf> = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        if arguments[index] == "--scenario" {
+            let value = arguments.get(index + 1).ok_or_else(|| {
+                invalid_data("--scenario requires a path to a stream scenario document")
+            })?;
+            scenario_path = Some(PathBuf::from(value));
+            index += 2;
+        } else {
+            positional.push(PathBuf::from(&arguments[index]));
+            index += 1;
+        }
+    }
+
+    let fixture_path = positional.first().cloned();
+    let output_dir = positional
+        .get(1)
+        .cloned()
         .unwrap_or_else(|| PathBuf::from("target/aivtuber-benchmarks"));
 
-    let fixture = load_fixture(&fixture_path)?;
+    let fixture = match (&scenario_path, &fixture_path) {
+        (Some(path), _) => load_scenario_fixture(path)?,
+        (None, Some(path)) => load_fixture(path)?,
+        (None, None) => load_fixture(&default_fixture_path())?,
+    };
     let pack_root = default_pack_root();
     let compatibility = compatibility();
     let semantic_index = semantic_index(&pack_root, &compatibility)?;
@@ -856,8 +879,22 @@ fn metadata(
     }
 }
 
-fn load_fixture(path: &Path) -> Result<Fixture, Box<dyn Error>> {
+/// Build a benchmark fixture from a versioned scenario document.
+///
+/// The scenario is generated into the same shape a checked-in fixture uses, so
+/// this is the only place the two workload sources meet.
+fn load_scenario_fixture(path: &Path) -> Result<Fixture, Box<dyn Error>> {
     let value: Value = serde_json::from_slice(&fs::read(path)?)?;
+    let scenario: StreamScenario = serde_json::from_value(value)
+        .map_err(|error| invalid_data(format!("scenario is not a valid document: {error}")))?;
+    fixture_from_value(scenario_to_benchmark_fixture(&scenario)?)
+}
+
+fn load_fixture(path: &Path) -> Result<Fixture, Box<dyn Error>> {
+    fixture_from_value(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn fixture_from_value(value: Value) -> Result<Fixture, Box<dyn Error>> {
     let dataset_id = value
         .get("dataset_id")
         .and_then(Value::as_str)

@@ -1,0 +1,36 @@
+{
+  "schema_version": "1",
+  "scenario_id": "high-generative-miss",
+  "scenario_version": 1,
+  "scenario_class": "high_generative_miss",
+  "provenance": "synthetic_design_assumption",
+  "provenance_note": "Mostly semantic misses, so the generative path (#69) is the thing under measurement rather than the cache. A design assumption about the worst case for reuse.",
+  "seed": 9001,
+  "logical_start": "2026-10-01T00:00:00Z",
+  "stream_duration_ms": 120000,
+  "phases": [
+    {
+      "name": "miss-heavy",
+      "duration_ms": 120000,
+      "events_per_minute": 10.0,
+      "kind_mix": {
+        "chat.message": 8.0,
+        "game.event": 1.0,
+        "chat.donation": 1.0
+      },
+      "semantic_mix": {
+        "hit": 0.05,
+        "near_miss": 0.15,
+        "miss": 0.8
+      },
+      "priority_mix": {
+        "low": 4.0,
+        "normal": 2.0,
+        "high": 1.0
+      },
+      "distinct_actors": 12,
+      "distinct_topics": 300,
+      "repeat_viewer_probability": 0.4
+    }
+  ]
+}

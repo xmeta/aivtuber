@@ -1,0 +1,164 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xmeta/aivtuber/schemas/stream-scenario.schema.json",
+  "title": "AIVTuber Stream Scenario",
+  "description": "Versioned, seeded stream workload definition (issue #70). A scenario describes temporal phases - idle, normal, burst - so the benchmark, soak, retention and quality suites share one realistic workload instead of each inventing its own. Generation is deterministic: scenario identity, scenario_version and seed fully determine the ordered event trace, and logical_start is a declared constant rather than the wall clock. Scenarios carry no message content and no privileged events.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "scenario_id",
+    "scenario_version",
+    "scenario_class",
+    "provenance",
+    "provenance_note",
+    "seed",
+    "logical_start",
+    "stream_duration_ms",
+    "phases"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "1",
+      "description": "Scenario document contract version. An incompatible version is refused rather than reinterpreted, and starts a new comparison baseline."
+    },
+    "scenario_id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{2,63}$",
+      "description": "Stable scenario identity. Combined with scenario_version it forms the benchmark dataset id."
+    },
+    "scenario_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Bumped when the workload changes in a way that makes older traces incomparable. The version is mixed into the generation seed, so a bump reshuffles the trace instead of silently reusing a previous baseline."
+    },
+    "scenario_class": {
+      "type": "string",
+      "enum": [
+        "low_traffic",
+        "normal_mixed",
+        "burst",
+        "donation_burst",
+        "event_heavy",
+        "idle_to_burst",
+        "high_semantic_reuse",
+        "high_generative_miss",
+        "high_cardinality"
+      ],
+      "description": "Workload family. The validator refuses a scenario whose parameters contradict its class, so coverage is checkable rather than asserted. `asset_churn` and `repeated_cancellation` are deliberately absent until the #40 fault overlays can express them."
+    },
+    "provenance": {
+      "type": "string",
+      "enum": ["synthetic_design_assumption", "measured_aggregate", "stress_only"],
+      "description": "What kind of claim these parameters support. Synthetic distributions must never be presented as measured production facts."
+    },
+    "provenance_note": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Required human statement of the scenario's basis. A workload that cannot say where its numbers came from should not be checked in."
+    },
+    "seed": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Deterministic generation seed. The trace is a pure function of scenario identity, version, seed and phases."
+    },
+    "logical_start": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$",
+      "description": "Declared UTC start instant, second resolution, no zone offset. A constant rather than the wall clock, so a trace reproduces anywhere. Fractional seconds are refused: two documents declaring the same instant must generate the same trace."
+    },
+    "stream_duration_ms": {
+      "type": "integer",
+      "minimum": 1000,
+      "description": "Represented stream duration. Must equal the sum of phase durations; an unrepresented tail would make the trace unaccountable."
+    },
+    "phases": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Logical-time phases, in order.",
+      "items": { "$ref": "#/$defs/phase" }
+    }
+  },
+  "$defs": {
+    "phase": {
+      "type": "object",
+      "required": [
+        "name",
+        "duration_ms",
+        "events_per_minute",
+        "kind_mix",
+        "semantic_mix",
+        "priority_mix",
+        "distinct_actors",
+        "distinct_topics",
+        "repeat_viewer_probability"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Phase name, unique within the scenario, so assertions can name the phase they mean."
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Phase duration. Capped at 60000 events per minute so an event can always be given its own millisecond."
+        },
+        "events_per_minute": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 10,
+          "description": "Mean event rate across the phase. 0 is a genuine idle phase and contributes no events. Capped at 10 events/minute, which is what the starter pack can actually play: measured against cached playback, a chat-only workload completes at 15 but mixing a higher-priority kind fails at 15 with Rejection::Priority, and 20 trips the per-asset cooldown. A denser workload aborts a benchmark run instead of producing a measurement, so it is refused here."
+        },
+        "kind_mix": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {
+            "enum": [
+              "chat.message",
+              "chat.donation",
+              "speech.input",
+              "game.event",
+              "stream.event",
+              "timer.tick",
+              "system.health"
+            ]
+          },
+          "additionalProperties": { "type": "number", "exclusiveMinimum": 0 },
+          "description": "Relative weight per event kind. `operator.command` is absent by construction: a synthetic privileged event would have to fabricate its authorization, so operator and failure overlays belong to the #40 fault slice."
+        },
+        "semantic_mix": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": { "enum": ["hit", "near_miss", "miss"] },
+          "additionalProperties": { "type": "number", "exclusiveMinimum": 0 },
+          "description": "Relative weight per semantic band. A hit names an axis the starter index is built from, a near_miss names an off-axis qualified intent, and a miss names no axis at all."
+        },
+        "priority_mix": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": { "enum": ["low", "normal", "high", "critical"] },
+          "additionalProperties": { "type": "number", "exclusiveMinimum": 0 },
+          "description": "Relative weight per priority bucket. Buckets, not raw floats, so a scenario states intent."
+        },
+        "distinct_actors": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Viewer pool size. Repeated-viewer behaviour is drawn from this pool."
+        },
+        "distinct_topics": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Topic pool size, which drives semantic reuse."
+        },
+        "repeat_viewer_probability": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Chance an event reuses the previous viewer, modelling someone who keeps talking rather than a fresh arrival each time."
+        }
+      }
+    }
+  }
+}

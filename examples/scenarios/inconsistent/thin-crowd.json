@@ -1,0 +1,35 @@
+{
+  "schema_version": "1",
+  "scenario_id": "thin-crowd",
+  "scenario_version": 1,
+  "scenario_class": "high_cardinality",
+  "provenance": "synthetic_design_assumption",
+  "provenance_note": "Claims high cardinality while declaring three viewers.",
+  "seed": 20261004,
+  "logical_start": "2026-10-01T00:00:00Z",
+  "stream_duration_ms": 60000,
+  "phases": [
+    {
+      "name": "crowd",
+      "duration_ms": 60000,
+      "events_per_minute": 6.0,
+      "kind_mix": {
+        "chat.message": 9.0,
+        "game.event": 1.0
+      },
+      "semantic_mix": {
+        "hit": 0.6,
+        "near_miss": 0.3,
+        "miss": 0.1
+      },
+      "priority_mix": {
+        "low": 4.0,
+        "normal": 2.0,
+        "high": 1.0
+      },
+      "distinct_actors": 3,
+      "distinct_topics": 2,
+      "repeat_viewer_probability": 0.4
+    }
+  ]
+}

@@ -2,6 +2,12 @@
 :status: Implemented (result contract + comparator + budgets + PR CI gate + scheduled resource tier + history/trends)
 :date: 2026-09-30
 
+The workload the gate measures comes from link:stream-scenarios.adoc[versioned
+stream scenarios (#70)]. `replay-benchmark --scenario <path>` generates the
+stream from a seeded scenario instead of loading a checked-in event trace, and
+the scenario id and version become the result's `dataset_id`, so an incompatible
+scenario change starts a new comparison baseline rather than reusing an old one.
+
 == 1. Scope
 
 This note documents the continuous benchmark loop from issue #58:

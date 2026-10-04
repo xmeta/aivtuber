@@ -79,6 +79,7 @@ const reactionQuality = validators["schemas/reaction-quality-dataset.schema.json
 const reactionQualityReview = validators["schemas/reaction-quality-review.schema.json"];
 const shadowDivergence = validators["schemas/shadow-divergence-report.schema.json"];
 const moderationEvaluation = validators["schemas/moderation-evaluation.schema.json"];
+const streamScenario = validators["schemas/stream-scenario.schema.json"];
 
 function report(ok, label, validator) {
   if (ok) {
@@ -850,6 +851,214 @@ for (const file of listJson("examples/evaluation/moderation-evaluation/inconsist
     continue;
   }
   const problems = moderationEvaluationCrossFieldProblems(doc);
+  if (problems.length === 0) {
+    failures += 1;
+    console.error(`FAIL      ${file} (expected a contradiction, but every check passed)`);
+  } else {
+    passes += 1;
+    console.log(`ok        ${file} (rejected as intended: ${problems.join("; ")})`);
+  }
+}
+
+// The playable-cadence ceiling (10 events/minute, measured) is enforced by
+// `maximum` on `events_per_minute` in the schema and by
+// `MAX_PLAYABLE_EVENTS_PER_MINUTE` in the generator. It is deliberately not
+// restated here: a third copy of that number is how the validator and the
+// generator drift apart and a scenario passes validation only to abort its
+// own benchmark.
+// Issue #70: a scenario declares its `scenario_class`, and the parameters have
+// to agree with that declaration.
+//
+// The class exists so coverage is checkable rather than asserted: without it, a
+// scenario labelled `high_cardinality` can ship three viewers, the benchmark runs
+// it, and the resulting number is quoted as if it described a crowd. Every
+// predicate below returns `false` when the class is satisfied and the reason it
+// is not otherwise, so a class can never "pass" by returning a truthy value.
+const SCENARIO_CLASS_PREDICATES = {
+  low_traffic: (phases) =>
+    phases.every((phase) => phase.events_per_minute < 4)
+      ? false
+      : "low_traffic must stay below 4 events/minute in every phase",
+  normal_mixed: (phases) =>
+    phases.some(
+      (phase) => phase.events_per_minute >= 4 && phase.events_per_minute <= 10,
+    )
+      ? false
+      : "normal_mixed needs at least one phase between 4 and 15 events/minute",
+  burst: (phases) => {
+    const active = phases.filter((phase) => phase.events_per_minute > 0);
+    if (active.length < 2) return "burst needs at least two active phases to ramp between";
+    const peak = Math.max(...active.map((phase) => phase.events_per_minute));
+    const trough = Math.min(...active.map((phase) => phase.events_per_minute));
+    return trough > 0 && peak / trough >= 10
+      ? false
+      : "burst needs a tenfold ramp between phases; the absolute rate stays within what the starter pack can play";
+  },
+  donation_burst: (phases) =>
+    phases.some((phase) => (phase.kind_mix?.["chat.donation"] ?? 0) > 0)
+      ? false
+      : "donation_burst must weigh chat.donation in at least one phase",
+  event_heavy: (phases) => {
+    const dominant = phases.some((phase) => {
+      const mix = phase.kind_mix ?? {};
+      const total = Object.values(mix).reduce((sum, value) => sum + value, 0);
+      const events = (mix["game.event"] ?? 0) + (mix["timer.tick"] ?? 0);
+      return total > 0 && events / total >= 0.5;
+    });
+    return dominant
+      ? false
+      : "event_heavy needs game.event or timer.tick to dominate a phase's kind mix";
+  },
+  idle_to_burst: (phases) => {
+    const idle = phases.findIndex((phase) => phase.events_per_minute === 0);
+    if (idle === -1) return "idle_to_burst needs a phase that genuinely goes silent";
+    const before = phases
+      .slice(0, idle)
+      .filter((phase) => phase.events_per_minute > 0)
+      .map((phase) => phase.events_per_minute);
+    const later = phases.slice(idle + 1).map((phase) => phase.events_per_minute);
+    const quiet = before.length ? Math.max(...before) : 0;
+    const spike = later.length ? Math.max(...later) : 0;
+    return spike >= 10 && (quiet === 0 || spike / quiet >= 10)
+      ? false
+      : "idle_to_burst needs a later phase at least ten times the pre-idle rate";
+  },
+  high_semantic_reuse: (phases) => {
+    const reuse = phases.some((phase) => {
+      const mix = phase.semantic_mix ?? {};
+      const total = Object.values(mix).reduce((sum, value) => sum + value, 0);
+      return total > 0 && (mix.hit ?? 0) / total >= 0.7;
+    });
+    return reuse
+      ? false
+      : "high_semantic_reuse needs hit to dominate a phase's semantic mix";
+  },
+  high_generative_miss: (phases) => {
+    const misses = phases.some((phase) => {
+      const mix = phase.semantic_mix ?? {};
+      const total = Object.values(mix).reduce((sum, value) => sum + value, 0);
+      return total > 0 && (mix.miss ?? 0) / total >= 0.5;
+    });
+    return misses
+      ? false
+      : "high_generative_miss needs miss to dominate a phase's semantic mix";
+  },
+  high_cardinality: (phases) =>
+    phases.some((phase) => phase.distinct_actors >= 500)
+      ? false
+      : "high_cardinality needs a phase with at least 500 distinct actors",
+};
+
+// Cross-field checks for a schema-valid scenario document. The schema can hold a
+// shape; only these can say the document means what it claims.
+function streamScenarioProblems(doc) {
+  const problems = [];
+  const phases = doc.phases ?? [];
+
+  const durationTotal = phases.reduce((sum, phase) => sum + phase.duration_ms, 0);
+  if (durationTotal !== doc.stream_duration_ms) {
+    problems.push(
+      `phase durations sum to ${durationTotal} ms but stream_duration_ms is ${doc.stream_duration_ms} ms`,
+    );
+  }
+
+  const names = new Set();
+  for (const phase of phases) {
+    if (names.has(phase.name)) {
+      problems.push(`phase name ${phase.name} is used more than once`);
+    }
+    names.add(phase.name);
+    for (const mixName of ["kind_mix", "semantic_mix", "priority_mix"]) {
+      const mix = phase[mixName] ?? {};
+      const total = Object.values(mix).reduce((sum, value) => sum + value, 0);
+      if (total <= 0) {
+        problems.push(`${phase.name}: ${mixName} weights must sum above zero`);
+      }
+    }
+    // The generator refuses to place more events on the timeline than it has
+    // milliseconds, so a document that promises them is unrepresentable.
+    const promised = Math.round((phase.events_per_minute * phase.duration_ms) / 60000);
+    if (promised > phase.duration_ms) {
+      problems.push(
+        `${phase.name}: ${promised} events cannot each own a millisecond of ${phase.duration_ms} ms`,
+      );
+    }
+  }
+
+  let totalEvents = 0;
+  for (const phase of phases) {
+    totalEvents += Math.round((phase.events_per_minute * phase.duration_ms) / 60000);
+  }
+  if (totalEvents === 0) {
+    problems.push("the scenario generates no events, which would benchmark nothing");
+  }
+
+  const predicate = SCENARIO_CLASS_PREDICATES[doc.scenario_class];
+  if (!predicate) {
+    problems.push(`scenario_class ${doc.scenario_class} has no defined predicate`);
+  } else {
+    const failure = predicate(phases);
+    if (failure !== false) problems.push(failure);
+  }
+
+  // Provenance that claims measurement must say what was measured.
+  if (
+    doc.provenance === "measured_aggregate" &&
+    (doc.provenance_note ?? "").trim().length < 20
+  ) {
+    problems.push(
+      "measured_aggregate scenarios must state in provenance_note what was measured",
+    );
+  }
+
+  return problems;
+}
+
+const scenarioDocuments = [];
+for (const file of listJson("examples/scenarios")) {
+  if (!streamScenario) break;
+  const doc = loadJson(join(root, file));
+  const valid = streamScenario(doc);
+  report(valid, file, streamScenario);
+  if (valid) scenarioDocuments.push({ file, doc });
+}
+
+for (const file of listJson("examples/scenarios/invalid")) {
+  if (!streamScenario) break;
+  const valid = streamScenario(loadJson(join(root, file)));
+  if (valid) {
+    failures += 1;
+    console.error(`FAIL      ${file} (expected rejection, but it validated)`);
+  } else {
+    passes += 1;
+    console.log(`ok        ${file} (rejected as intended)`);
+  }
+}
+
+for (const { file, doc } of scenarioDocuments) {
+  const problems = streamScenarioProblems(doc);
+  if (problems.length === 0) {
+    passes += 1;
+    console.log(`ok        ${file}: scenario parameters match its declared class`);
+  } else {
+    failures += problems.length;
+    for (const problem of problems) {
+      console.error(`FAIL      ${file}: ${problem}`);
+    }
+  }
+}
+
+for (const file of listJson("examples/scenarios/inconsistent")) {
+  if (!streamScenario) break;
+  const doc = loadJson(join(root, file));
+  if (!streamScenario(doc)) {
+    failures += 1;
+    console.error(
+      `FAIL      ${file} (expected to pass the schema so the cross-field checks can judge it)`,
+    );
+    continue;
+  }
+  const problems = streamScenarioProblems(doc);
   if (problems.length === 0) {
     failures += 1;
     console.error(`FAIL      ${file} (expected a contradiction, but every check passed)`);

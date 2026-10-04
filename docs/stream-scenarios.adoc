@@ -1,0 +1,177 @@
+= Stream Scenarios (issue #70)
+:toc: left
+
+Versioned, seeded stream workload models shared by the benchmark, soak,
+retention and quality suites.
+
+A checked-in replay fixture answers "did this revision change the number?" for
+one temporal pattern. It cannot answer "is this number right for a bursty
+stream?", because the shape it encodes is one flat run. Real streams are phased:
+quiet, conversational, a donation spike, silence again. Resource growth,
+backpressure, cache behaviour and generative budgets all depend on that shape,
+so the shape itself has to be a shared, versioned artefact rather than something
+each suite improvises.
+
+This document defines the format, the determinism contract, and - importantly -
+the limits of what the current runtime can actually *play*, measured rather than
+assumed.
+
+== The format
+
+`schemas/stream-scenario.schema.json`, version `schema_version` "1".
+
+[cols="1,3"]
+|===
+| Field | Meaning
+
+| `scenario_id`
+| Stable slug. Combined with `scenario_version` it forms the benchmark dataset id.
+
+| `scenario_version`
+| Bumped when the workload changes incompatibly. The version is mixed into the
+generation seed, so a bump reshuffles the trace instead of quietly reusing an
+old baseline. `benchmark_gate` already refuses to compare results whose
+`dataset_id` differs, so a version bump starts a new baseline with no extra
+machinery.
+
+| `scenario_class`
+| The workload family. Checked against the parameters by
+`streamScenarioProblems` in `scripts/validate.mjs`, so coverage is verifiable
+rather than asserted.
+
+| `provenance` / `provenance_note`
+| Required. Whether the parameters are a synthetic design assumption, derived
+from approved aggregates, or stress-only. The note is mandatory because the
+issue is explicit that synthetic distributions must never be presented as
+measured production facts.
+
+| `seed`
+| Generation seed. The trace is a pure function of scenario identity, version,
+seed and phases.
+
+| `logical_start`
+| A declared UTC instant, second resolution, no offset. Never the wall clock.
+
+| `phases[]`
+| `duration_ms`, `events_per_minute`, `kind_mix`, `semantic_mix`, `priority_mix`,
+`distinct_actors`, `distinct_topics`, `repeat_viewer_probability`.
+|===
+
+Phase durations must sum to `stream_duration_ms`. An unrepresented tail would
+make the trace unaccountable, so a scenario that declares more or less duration
+than its phases cover is refused.
+
+=== What a scenario may not contain
+
+* **Viewer prose.** Events carry a fixed payload key set - `intent`,
+  `semantic_band`, `topic_id`, `scenario_phase` - so a checked-in workload can
+  never require a real transcript. `examples/scenarios/invalid/prose-carrying.json`
+  is rejected structurally.
+* **Privileged events.** `kind_mix` excludes `operator.command`: a synthetic
+  privileged event would have to fabricate its authorization. Operator actions,
+  provider failures and cancellations belong to the #40 fault overlays.
+* **Invented intents.** `payload.intent` is used *directly* as a variant group by
+cached playback, so an intent that names no asset fails the whole run rather
+than degrading. A scenario chooses among the variant groups the pack actually
+contains.
+
+== Determinism
+
+Given scenario id, `scenario_version`, `seed` and phases, the ordered event
+trace is reproducible. Generation uses an in-repo SplitMix64 rather than a
+dependency, so a dependency bump cannot reshuffle a recorded workload under an
+unchanged scenario.
+
+* Sequence numbers are contiguous from 1, so a consumer can detect a dropped
+event.
+* `observed_at` increases strictly and is written with millisecond precision. The
+milliseconds are load-bearing: slots are one millisecond apart, and rounding to
+whole seconds would give a burst of events the same timestamp string.
+* Nothing reads the wall clock. Wall-clock and live-provider overlays are a
+  separate concern from deterministic event generation, and stay outside it.
+
+`scenario_to_benchmark_fixture` renders the trace in the same shape a
+checked-in benchmark fixture uses, so `replay-benchmark --scenario <path>` and
+`replay-benchmark <fixture.json>` run the identical pipeline.
+
+== Measured limits: what the runtime can actually play
+
+These were measured by sweeping the shipped runtime, not assumed. A scenario
+that exceeds them is refused at generation time rather than discovered when a
+benchmark job aborts.
+
+[cols="2,1,3"]
+|===
+| Workload | Outcome | Reason
+
+| chat only, 15 events/min
+| completes
+| within the per-asset cooldown.
+
+| chat only, 20 events/min
+| fails
+| `Rejection::Cooldown`: the same variant group is selected again inside its cooldown window.
+
+| chat + `game.event` or `chat.donation`, 10 events/min
+| completes
+| mixed-priority workload stays inside the arbitration budget.
+
+| chat + higher-priority kind, 15 events/min
+| fails
+| `Rejection::Priority`: the scheduler does not preempt a playing item for a higher-ranked one.
+
+| `timer.tick` / `stream.event` in the mix
+| fails
+| background-plane events never reach the generative replay's event accounting.
+|===
+
+`MAX_PLAYABLE_EVENTS_PER_MINUTE` is therefore `10`, and
+`ScenarioPhase::validate` refuses anything denser with a message naming the
+limit. This is a property of the starter pack and the scheduler, not of the
+scenario format: raising it is a runtime change with a measured justification,
+and that constant is where the justification is recorded.
+
+=== Classes that are declared but not yet benchmarkable
+
+`normal-mixed-stream`, `high-cardinality-actors` and `high-generative-miss` are
+valid, validated scenario documents whose *shapes* the current cached path
+rejects: sustained mixed-priority density, and high semantic reuse resolving to
+one asset inside its cooldown.
+
+They are checked in unchanged rather than tuned down until they pass. A workload
+that has been quietly thinned to suit the runtime it is supposed to measure is
+worse than one that is visibly not yet playable, and tuning it would report
+numbers for a shape nobody asked for. Relaxing the limits belongs to #51-#53
+(bounded state and cache) and #79 (crowd signals); until then these three are
+documents, and `chat-burst-10x` and `idle-to-burst` are the ones the benchmark
+can run end to end.
+
+== Adding a scenario
+
+Add one when a *workload shape* is missing, not when a number looks wrong.
+
+. Pick the class that describes the shape you need. If none fits, add the class
+to the enum in both `scenario.rs` and the schema, and add its predicate to
+`SCENARIO_CLASS_PREDICATES` - a class with no predicate is decoration.
+. Write the file under `examples/scenarios/`. Set `provenance` honestly and
+write a `provenance_note` that says what the numbers are.
+. Add an `invalid/` case for whatever boundary it depends on, and an
+  `inconsistent/` case for each cross-field rule it exercises, each carrying
+  exactly one contradiction so a mutation of one rule trips one fixture.
+. Run `cargo run -p aivtuber-app --bin replay-benchmark -- --scenario
+  examples/scenarios/<id>.json` and keep the file only if the benchmark
+  completes. If it does not, that is a runtime limit worth reporting, not a
+  reason to lower the rate until it passes.
+. Run `bun run validate`.
+
+The non-goals in #70 still apply: a scenario is shared by benchmark, soak,
+retention and quality suites precisely so those suites stop each inventing a
+different unrealistic workload. Adding one per benchmark defeats that.
+
+== Related
+
+* link:benchmark-gate.adoc[Benchmark Gate]
+* link:runtime-retention.adoc[Runtime Retention]
+* link:property-testing.adoc[Property Testing]
+* #40 failure/soak overlays, #51-#53 bounded state, #58 benchmark, #69
+  generative budgets, #79 crowd signals
