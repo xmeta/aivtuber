@@ -992,8 +992,8 @@ const SCENARIO_CLASS_PREDICATES = {
     //    `repeat_viewer_probability` as an exact quota per phase rather than an
     //    independent coin flip per event, precisely so this number is exact
     //    rather than an expectation. It has to be computed the same way here -
-    //    `events - floor(events * p)` - or the predicate predicts a workload the
-    //    trace does not produce.
+    //    `events - min(floor(events * p), max(events - 1, 0))` - the first event
+    //    must be fresh, including at p = 1 and for single-event phases.
     //
     // Per phase, and then the best single phase: actor ids share one namespace
     // across the stream, so a large pool spread thinly across several phases is
@@ -1004,7 +1004,10 @@ const SCENARIO_CLASS_PREDICATES = {
       ...phases.map((phase) => {
         const pool = phase.distinct_actors ?? 0;
         const events = phaseEventCount(phase);
-        const repeats = Math.floor(events * (phase.repeat_viewer_probability ?? 0));
+        const repeats = Math.min(
+          Math.floor(events * (phase.repeat_viewer_probability ?? 0)),
+          Math.max(events - 1, 0),
+        );
         return Math.min(pool, events - repeats);
       }),
     );

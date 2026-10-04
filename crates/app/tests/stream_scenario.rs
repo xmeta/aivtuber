@@ -875,7 +875,8 @@ fn a_repeated_viewer_rate_is_an_exact_quota_not_a_coin_flip() {
             ..shipped("high-cardinality-actors.json")
         };
         let events = scenario.total_event_count().unwrap();
-        let repeats = (events as f64 * phase.repeat_viewer_probability).floor() as u64;
+        let repeats = ((events as f64 * phase.repeat_viewer_probability).floor() as u64)
+            .min(events.saturating_sub(1));
         let predicted = (phase.distinct_actors as usize).min((events - repeats) as usize);
 
         let trace = trace_of(&scenario);
@@ -899,6 +900,37 @@ fn a_repeated_viewer_rate_is_an_exact_quota_not_a_coin_flip() {
             actors.len()
         );
     }
+}
+
+#[test]
+fn fully_repeated_phases_start_with_one_fresh_viewer() {
+    let phases: Vec<_> = [0.0, 1.0, 10.0]
+        .into_iter()
+        .enumerate()
+        .map(|(index, rate)| ScenarioPhase {
+            distinct_actors: 20,
+            repeat_viewer_probability: 1.0,
+            ..steady_phase(&format!("phase-{index}"), 60_000, rate)
+        })
+        .collect();
+    let trace = trace_of(&StreamScenario {
+        phases,
+        stream_duration_ms: 180_000,
+        ..scenario()
+    });
+    let actors: Vec<_> = trace
+        .iter()
+        .map(|entry| entry.event.actor_id.as_deref().unwrap())
+        .collect();
+
+    assert_eq!(actors.len(), 11, "idle phases contribute no events");
+    assert_ne!(actors[0], actors[1], "each non-empty phase starts fresh");
+    assert!(actors[1..].iter().all(|actor| *actor == actors[1]));
+    assert_eq!(
+        actors.windows(2).filter(|pair| pair[0] == pair[1]).count(),
+        9,
+        "the single-event phase has zero repeats; the ten-event phase has nine"
+    );
 }
 
 #[test]
@@ -994,7 +1026,8 @@ fn every_accepted_high_cardinality_document_reaches_its_claimed_cardinality() {
         };
 
         let events = candidate.total_event_count().unwrap();
-        let expected_fresh = (events as f64 * (1.0 - repeats)).floor() as usize;
+        let repeat_count = ((events as f64 * repeats).floor() as u64).min(events.saturating_sub(1));
+        let expected_fresh = (events - repeat_count) as usize;
         let predicted = (pool as usize).min(expected_fresh);
         assert!(
             predicted >= HIGH_CARDINALITY_MIN_ACTORS,

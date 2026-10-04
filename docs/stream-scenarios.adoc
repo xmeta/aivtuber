@@ -210,7 +210,7 @@ then reach exactly N distinct viewers, and the document-level rule is sound:
 | `distinct_actors >= 500`
 | The pool has to be able to hold the crowd.
 
-| `min(pool, events - floor(events * repeat_viewer_probability)) >= 500`
+| `min(pool, events - repeats) >= 500`
 | One phase has to be able to put that many viewers on the timeline.
 |===
 
@@ -224,8 +224,12 @@ independent coin flip per event. That is what makes the expression above exact
 instead of an expectation: with a coin flip, a pool of 500 over 556 events at
 `p = 0.1` satisfies `floor(556 * 0.9) = 500` while the realised trace lands below
 it on most seeds - 13 of 40 seeds materialised fewer than 500 distinct viewers. A
-quota sums to exactly `floor(events * p)` however it is spread, so `fresh = events
-- repeats` is an identity the validator can evaluate mechanically.
+quota is `repeats = min(floor(events * p), max(events - 1, 0))`: the first event
+of each non-empty phase must be fresh, because there is no previous viewer yet.
+Idle phases have zero repeats; at `p = 1.0`, a non-empty phase has one fresh
+event and `events - 1` repeats. The quota sums to exactly that count however it
+is spread, so `fresh = events - repeats` is an identity the validator can
+evaluate mechanically.
 
 `a_repeated_viewer_rate_is_an_exact_quota_not_a_coin_flip` walks that exact
 boundary across 24 seeds, and `every_accepted_high_cardinality_document_reaches_its_claimed_cardinality`

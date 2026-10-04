@@ -156,7 +156,7 @@
           "type": "number",
           "minimum": 0,
           "maximum": 1,
-          "description": "Share of events that reuse the previous viewer, modelling someone who keeps talking rather than a fresh arrival each time. Resolved as an exact quota per phase - floor(events * this value) repeated events, spread evenly - not an independent coin flip per event, so the number of fresh viewers a document produces is exact rather than an expectation that varies with the seed."
+          "description": "Share of events that reuse the previous viewer, modelling someone who keeps talking rather than a fresh arrival each time. Resolved as an exact quota per phase - min(floor(events * this value), max(events - 1, 0)) repeated events, spread evenly - because the first event of each non-empty phase must be fresh. An idle phase has quota 0; at this value 1.0, a non-empty phase has 1 fresh event and events - 1 repeats. This is not an independent coin flip per event, so the number of fresh viewers a document produces is exact rather than an expectation that varies with the seed."
         }
       }
     }

@@ -610,8 +610,8 @@ fn phase_seed(scenario: &StreamScenario, phase_index: usize) -> u64 {
 ///
 /// Spreading the quota evenly rather than drawing it at random is what makes the
 /// count exact: `floor((i+1) * quota / count) - floor(i * quota / count)` sums to
-/// exactly `quota` over the phase, for any `quota`. The first event can never be a
-/// repeat, because there is nobody to repeat yet.
+/// exactly `quota` over the phase. `repeat_quota` keeps `quota < count` for a
+/// non-empty phase, so the first slot is fresh: there is nobody to repeat yet.
 fn repeats_at(ordinal: usize, count: u64, quota: u64) -> bool {
     if quota == 0 || count == 0 {
         return false;
@@ -622,11 +622,10 @@ fn repeats_at(ordinal: usize, count: u64, quota: u64) -> bool {
 
 /// How many events in a `count`-event phase repeat their previous viewer.
 ///
-/// `floor(count * p)`, which is the same arithmetic `scripts/validate.mjs` uses
-/// to compute a phase's fresh draws. Both sides must agree exactly, or the
-/// predicate is again predicting rather than guaranteeing.
+/// `min(floor(count * p), count.saturating_sub(1))`: the first event must be
+/// fresh. `scripts/validate.mjs` uses the same arithmetic to compute fresh draws.
 fn repeat_quota(count: u64, probability: f64) -> u64 {
-    (count as f64 * probability).floor() as u64
+    ((count as f64 * probability).floor() as u64).min(count.saturating_sub(1))
 }
 
 fn pick_weighted<T: Ord + Copy>(rng: &mut SplitMix64, weights: &BTreeMap<T, f64>) -> T {
@@ -978,5 +977,30 @@ fn format_rfc3339(epoch_ms: u64) -> String {
 impl fmt::Display for ScenarioClass {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{repeat_quota, repeats_at};
+
+    #[test]
+    fn repeat_quota_reserves_the_first_event_for_a_fresh_viewer() {
+        for count in [0u64, 1, 10, 556] {
+            for probability in [0.0, 0.1, 0.5, 0.99, 1.0] {
+                let expected =
+                    ((count as f64 * probability).floor() as u64).min(count.saturating_sub(1));
+                let quota = repeat_quota(count, probability);
+                assert_eq!(quota, expected, "count={count}, p={probability}");
+                assert!(!repeats_at(0, count, quota));
+                assert_eq!(
+                    (0..count as usize)
+                        .filter(|&ordinal| repeats_at(ordinal, count, quota))
+                        .count() as u64,
+                    expected,
+                    "the scheduled repeat count must equal the quota"
+                );
+            }
+        }
     }
 }
