@@ -1457,4 +1457,66 @@ mod tests {
         assert_eq!(selected_first.id, selected_second.id);
         assert_eq!(selected_first.id, "dynamic.variant.b");
     }
+
+    // Issue #146: the adaptation-side byte-cap truncation applied to memory
+    // claims and topics, which come from untrusted input. This is a separate
+    // implementation from `crates/app/src/routing.rs::truncate_utf8` (it
+    // clamps with `.min(value.len())` and guards `end > 0`), so it gets its own
+    // property coverage rather than assuming the other one behaves the same.
+    #[test]
+    fn truncate_utf8_respects_the_byte_cap_across_unicode_widths() {
+        for value in [
+            "abcdef",
+            "aあいう",
+            "a\u{0301}bc",
+            "a🎉🎊bc",
+            "a\u{10FFFF}b",
+        ] {
+            for cap in 0..=(value.len() + 3) {
+                let truncated = truncate_utf8(value, cap);
+                assert!(
+                    truncated.len() <= cap,
+                    "cap {cap} produced {} bytes from a {}-byte input",
+                    truncated.len(),
+                    value.len()
+                );
+                assert!(
+                    std::str::from_utf8(truncated.as_bytes()).is_ok(),
+                    "cap {cap} produced invalid UTF-8 for {value:?}"
+                );
+                assert!(
+                    value.starts_with(&truncated),
+                    "cap {cap} returned {truncated:?}, which is not a prefix of {value:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn truncate_utf8_returns_short_inputs_verbatim() {
+        for value in ["", "a", "hello", "こんにちは", "🎉"] {
+            // Only caps that admit the whole input; a cap below the byte length
+            // must still truncate, including cap 0.
+            for cap in value.len()..=(value.len() + 2) {
+                assert_eq!(truncate_utf8(value, cap), value, "cap {cap} for {value:?}");
+            }
+        }
+    }
+
+    /// Keeps the longest valid prefix rather than merely *a* valid prefix, and
+    /// pins the `cap == 0` case that the `end > 0` guard exists to handle.
+    #[test]
+    fn truncate_utf8_keeps_the_longest_valid_prefix() {
+        let value = "aあい";
+        assert_eq!(value.len(), 7);
+        assert_eq!(truncate_utf8(value, 0), "");
+        assert_eq!(truncate_utf8(value, 1), "a");
+        assert_eq!(truncate_utf8(value, 2), "a");
+        assert_eq!(truncate_utf8(value, 3), "a");
+        assert_eq!(truncate_utf8(value, 4), "aあ");
+        assert_eq!(truncate_utf8(value, 5), "aあ");
+        assert_eq!(truncate_utf8(value, 6), "aあ");
+        assert_eq!(truncate_utf8(value, 7), value);
+        assert_eq!(truncate_utf8(value, 99), value);
+    }
 }

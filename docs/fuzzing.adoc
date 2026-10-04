@@ -13,9 +13,19 @@ from generated output.
 This is split deliberately in two, because the two halves have different
 guarantees:
 
-* *Deterministic properties* (`crates/app/tests/bounded_text.rs`) cover the
-  UTF-8 byte-bound and encoded-size arithmetic. They run on the pinned stable
-  toolchain inside the ordinary `cargo test --locked --workspace` gate.
+* *Deterministic properties* cover the UTF-8 byte-bound and encoded-size
+  arithmetic. They run on the pinned stable toolchain inside the ordinary
+  `cargo test --locked --workspace` gate:
+** `crates/app/tests/bounded_text.rs` — oversize records are dropped whole
+  rather than delivered truncated, and the domain byte budgets are measured in
+  UTF-8 bytes rather than characters.
+** `truncate_utf8` in `crates/app/src/routing.rs` and `crates/adaptation/src/lib.rs`
+  — the two byte-cap truncation helpers applied to untrusted provider text and
+  memory claims. Each is a separate implementation, so each is property-tested
+  in its own module: for arbitrary Unicode widths and every byte cap from 0
+  past the input length, the result stays within the cap, stays valid UTF-8,
+  stays a prefix of the input, and keeps the *longest* valid prefix rather than
+  merely some prefix.
 * *libFuzzer targets* (`fuzz/`) cover the three parser boundaries. They need a
   nightly compiler and are a local activity; see section 6 for why they are not
   in CI.
@@ -43,12 +53,20 @@ therefore asserts a property about anything the boundary *accepts*.
 
 `fuzz/fuzz_targets/performance_asset.rs`
 : Deserializes and validates asset descriptors. Asserts that a descriptor which
-  validates has a non-blank `id` and a non-empty timeline, since a descriptor
-  failing either would be dispatched as work the runtime cannot address or
-  replay.
+  validates has a non-blank `id`, since `validate()` rejects a blank one via
+  `is_valid_asset_id` and a descriptor failing that would be dispatched as work
+  the runtime cannot address or replay.
 
-Validation is not weakened anywhere to make an input pass. If a target's
-assertion fires, that is a finding about the runtime, not about the harness.
+Each target asserts **no more than the production contract states**. An oracle
+stricter than the runtime turns correct inputs into reported crashes, which
+trains the reader to ignore findings. This was caught in review: an earlier
+version of `performance_asset` also asserted a non-empty `timeline`, but
+`schemas/performance-asset.schema.json` gives `timeline` no `minItems` and
+`validate()` only inspects each entry, so `"timeline": []` passes both the
+schema and Rust validation. That assertion was removed rather than made true,
+because requiring a non-empty timeline is a real contract change belonging in
+schema + validation + fixtures together. Validation is likewise not weakened
+anywhere to make an input pass.
 
 == 3. Non-vacuity
 
@@ -82,9 +100,9 @@ Reproduce with `bash fuzz/run-fuzz.sh <target> -runs=50000` (exit 0, no crash):
 
 | Target | Runs | Edges covered | Features | Crashes |
 | --- | --- | --- | --- | --- |
-| `event_envelope` | 50k | 1299 | 2207 | 0 |
-| `jev_response` | 50k | 1608 | 4040 | 0 |
-| `performance_asset` | 50k | 2854 | 6511 | 0 |
+| `event_envelope` | 50k | 1401 | 2517 | 0 |
+| `jev_response` | 50k | 1694 | 4575 | 0 |
+| `performance_asset` | 50k | 2867 | 6560 | 0 |
 
 **No crashes were found.** The targets currently prove the absence of the
 failures they assert, over the inputs this corpus reaches — not that these
@@ -153,13 +171,21 @@ therefore runs them against the fuzz manifest directly:
 [source,text]
 ----
 cargo fmt --manifest-path fuzz/Cargo.toml -- --check
-cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+cargo deny --manifest-path fuzz/Cargo.toml --locked check
 ----
 
-Both use the pinned stable toolchain; nightly is needed only to *run* a
-campaign, not to format or lint it. Adding these two steps is what caught a
-`bool_assert_comparison` lint in two targets, and three missing trailing
-newlines, on the first run.
+All three use the pinned stable toolchain; nightly is needed only to *run* a
+campaign, not to format, lint or audit it. Adding these steps is what caught a
+`bool_assert_comparison` lint in two targets, three missing trailing newlines,
+and — for `cargo deny` — the `NCSA` license that `libfuzzer-sys` requires,
+now recorded as a documented entry in `deny.toml`.
+
+The `cargo deny` step matters because the exclusion has a supply-chain cost
+too. `fuzz/Cargo.lock` is a second lock file, and without this step every CI job
+would compile `libfuzzer-sys` and its transitive graph while that graph stayed
+outside the `cargo deny --locked check` gate that `docs/supply-chain.adoc`
+promises. `deny.toml` is shared by both invocations, so the policy is identical.
 
 == 8. Running a target
 

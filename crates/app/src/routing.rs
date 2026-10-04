@@ -817,4 +817,82 @@ mod tests {
             .expect("second");
         assert_eq!(first, second);
     }
+
+    // Issue #146: `truncate_utf8` is a byte-cap truncation applied to untrusted
+    // provider text, so the guarantee it has to keep is that the result is
+    // still valid UTF-8 and still a prefix of the input.
+    //
+    // The cap is a *byte* count landing at an arbitrary offset inside a
+    // multi-byte character. A naive `&value[..max_bytes]` panics there; this
+    // walks back to a char boundary. Both halves matter, so the table below
+    // puts a cap inside the first character, exactly on a boundary, and past
+    // the end, at every width the fixtures can produce.
+    #[test]
+    fn truncate_utf8_respects_the_byte_cap_across_unicode_widths() {
+        // 1-byte, 2-byte, 3-byte, and 4-byte code points, including a combining
+        // mark (U+0301) that can sit mid-grapheme but is still its own char.
+        for value in [
+            "abcdef",
+            "aあいう",
+            "a\u{0301}bc",
+            "a🎉🎊bc",
+            "a\u{10FFFF}b",
+        ] {
+            for cap in 0..=(value.len() + 3) {
+                let truncated = truncate_utf8(value, cap);
+
+                assert!(
+                    truncated.len() <= cap,
+                    "cap {cap} produced {} bytes from a {}-byte input",
+                    truncated.len(),
+                    value.len()
+                );
+                // A `&str` is UTF-8 by construction, but assert it explicitly so
+                // the property is stated rather than implied by the type.
+                assert!(
+                    std::str::from_utf8(truncated.as_bytes()).is_ok(),
+                    "cap {cap} produced invalid UTF-8 for {value:?}"
+                );
+                assert!(
+                    value.starts_with(truncated),
+                    "cap {cap} returned {:?}, which is not a prefix of {value:?}",
+                    truncated
+                );
+            }
+        }
+    }
+
+    /// An input already inside the cap is returned unchanged, not re-encoded or
+    /// trimmed. Without this, a "truncate" that always cut one byte would still
+    /// satisfy the length and prefix assertions above.
+    #[test]
+    fn truncate_utf8_returns_short_inputs_verbatim() {
+        for value in ["", "a", "hello", "こんにちは", "🎉"] {
+            // Only caps that actually admit the whole input: a cap below the
+            // byte length must still truncate, including cap 0.
+            for cap in value.len()..=(value.len() + 2) {
+                assert_eq!(truncate_utf8(value, cap), value, "cap {cap} for {value:?}");
+            }
+        }
+    }
+
+    /// The cap must cut at the widest character boundary that fits, not merely
+    /// at *some* boundary. An implementation that always cut at zero would pass
+    /// the invariants above while destroying all content.
+    #[test]
+    fn truncate_utf8_keeps_the_longest_valid_prefix() {
+        // "a" + two 3-byte chars: caps 1..=7 must keep every whole character
+        // that fits, and drop only the partial remainder.
+        let value = "aあい";
+        assert_eq!(value.len(), 7);
+        assert_eq!(truncate_utf8(value, 0), "");
+        assert_eq!(truncate_utf8(value, 1), "a");
+        assert_eq!(truncate_utf8(value, 2), "a");
+        assert_eq!(truncate_utf8(value, 3), "a");
+        assert_eq!(truncate_utf8(value, 4), "aあ");
+        assert_eq!(truncate_utf8(value, 5), "aあ");
+        assert_eq!(truncate_utf8(value, 6), "aあ");
+        assert_eq!(truncate_utf8(value, 7), value);
+        assert_eq!(truncate_utf8(value, 99), value);
+    }
 }
