@@ -883,10 +883,17 @@ fn metadata(
 ///
 /// The scenario is generated into the same shape a checked-in fixture uses, so
 /// this is the only place the two workload sources meet.
+///
+/// The playability ceiling is checked here rather than in the scenario contract:
+/// it is a property of this consumer's starter pack and scheduler, and a soak or
+/// retention consumer has a different one. A scenario the format accepts but this
+/// path cannot play is therefore refused here by name, before any work happens,
+/// rather than aborting a benchmark job partway through.
 fn load_scenario_fixture(path: &Path) -> Result<Fixture, Box<dyn Error>> {
     let value: Value = serde_json::from_slice(&fs::read(path)?)?;
     let scenario: StreamScenario = serde_json::from_value(value)
         .map_err(|error| invalid_data(format!("scenario is not a valid document: {error}")))?;
+    scenario.validate_playability_for_cached_replay()?;
     fixture_from_value(scenario_to_benchmark_fixture(&scenario)?)
 }
 

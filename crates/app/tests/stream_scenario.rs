@@ -23,6 +23,15 @@ use aivtuber_app::{
 use aivtuber_domain::{EventEnvelope, EventKind};
 use std::collections::BTreeMap;
 
+/// Unique actors a `high_cardinality` scenario has to materialise for its label to
+/// mean anything.
+///
+/// Declared here rather than read from `scripts/validate.mjs`, which holds the
+/// same number for the same reason: a scenario that declares a large pool over too
+/// short a stream reaches a fraction of it, so both sides judge the workload the
+/// trace will contain rather than the rates on paper.
+const HIGH_CARDINALITY_MIN_ACTORS: usize = 500;
+
 fn mix<T: Ord + Copy>(entries: &[(T, f64)]) -> BTreeMap<T, f64> {
     entries.iter().copied().collect()
 }
@@ -422,6 +431,7 @@ fn an_injection_style_start_time_is_refused() {
         "2026-10-01T00:00:00+09:00",
         "2026-10-01 00:00:00Z",
         "2026-13-01T00:00:00Z",
+        "2026-00-01T00:00:00Z",
     ] {
         let mut sloppy = scenario();
         sloppy.logical_start = start.to_owned();
@@ -474,18 +484,284 @@ fn every_shipped_scenario_loads_validates_and_generates() {
 }
 
 #[test]
-fn a_workload_denser_than_the_runtime_can_play_is_refused() {
+fn a_workload_denser_than_the_runtime_can_play_is_a_consumer_refusal_not_a_format_error() {
     // Measured, not assumed: the starter pack completes a mixed workload at 10
-    // events/minute and rejects the overlap at 15. Shipping a denser scenario
-    // would mean a benchmark job that aborts instead of a scenario that says so.
+    // events/minute and rejects the overlap at 15. The scenario contract must not
+    // encode that number, because #70 exists so soak, retention and stress
+    // consumers share this format and they do not share this ceiling - so a dense
+    // scenario has to be a perfectly good document that only the replay path
+    // refuses.
     let mut dense = scenario();
     dense.phases[0].events_per_minute = aivtuber_app::MAX_PLAYABLE_EVENTS_PER_MINUTE + 1.0;
 
-    let error = generate_scenario_trace(&dense).expect_err("unplayable density");
+    dense
+        .validate()
+        .unwrap_or_else(|error| panic!("the format must accept a dense workload: {error}"));
+    let trace = generate_scenario_trace(&dense).expect("the generator must accept it too");
     assert!(
-        error.to_string().contains("the starter pack can play"),
-        "the refusal names the measured limit, got: {error}"
+        trace.len() > 1,
+        "a dense scenario still describes a stream, so a consumer with a higher ceiling can run it"
     );
+
+    let error = dense
+        .validate_playability_for_cached_replay()
+        .expect_err("the cached replay path cannot play it");
+    let message = error.to_string();
+    assert!(
+        message.contains("the cached replay path can play"),
+        "the refusal names the measured limit and which consumer it belongs to, got: {message}"
+    );
+    assert!(
+        message.contains("may still run it"),
+        "the refusal must make clear the document is not defective, got: {message}"
+    );
+}
+
+#[test]
+fn a_playable_scenario_passes_the_cached_replay_check() {
+    let playable = scenario();
+    playable
+        .validate_playability_for_cached_replay()
+        .unwrap_or_else(|error| panic!("the shipped corpus must be playable: {error}"));
+}
+
+#[test]
+fn the_cached_replay_check_still_refuses_a_malformed_scenario() {
+    // `replay-benchmark` calls the consumer check and nothing else, so it has to
+    // run the format contract itself. Otherwise a malformed document would pass
+    // the consumer's gate and fail later, in the middle of a benchmark job.
+    let mut malformed = scenario();
+    malformed.phases[0].kind_mix = mix(&[(EventKind::OperatorCommand, 1.0)]);
+    malformed.phases[0].events_per_minute = aivtuber_app::MAX_PLAYABLE_EVENTS_PER_MINUTE + 1.0;
+
+    let error = malformed
+        .validate_playability_for_cached_replay()
+        .expect_err("the format defect must be reported, not skipped");
+    assert!(
+        error.to_string().contains("operator.command"),
+        "the consumer check must surface the format error rather than the rate, got: {error}"
+    );
+}
+
+#[test]
+fn a_consumer_refused_scenario_is_still_a_valid_scenario_document() {
+    // `examples/scenarios/consumer-refused/` exists to pin the boundary between
+    // the shared format and one consumer's ceiling. Each case must be schema-clean
+    // and field-clean, and refused *only* by the consumer check - otherwise
+    // "we separated the concerns" would just mean the corpus moved the problem.
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/scenarios/consumer-refused");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&directory)
+        .unwrap_or_else(|error| panic!("reading the consumer-refused corpus: {error}"))
+    {
+        let path = entry.expect("a readable directory entry").path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("a readable fixture");
+        let scenario: StreamScenario =
+            serde_json::from_str(&text).unwrap_or_else(|error| panic!("{path:?}: {error}"));
+        let label = path.file_name().unwrap().to_string_lossy().to_string();
+
+        scenario.validate().unwrap_or_else(|error| {
+            panic!("{label}: a consumer refusal is not a format defect, got: {error}")
+        });
+        generate_scenario_trace(&scenario).unwrap_or_else(|error| {
+            panic!("{label}: the generator must accept what the format accepts: {error}")
+        });
+        let error = scenario
+            .validate_playability_for_cached_replay()
+            .err()
+            .unwrap_or_else(|| {
+                panic!("{label}: this corpus exists to be refused by the consumer, but it passed")
+            });
+        assert!(
+            error
+                .to_string()
+                .contains("the cached replay path can play"),
+            "{label}: the refusal must name the consumer's measured limit, got: {error}"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked > 0,
+        "the consumer-refused corpus must not be empty, or the separation is untested"
+    );
+}
+
+#[test]
+fn an_impossible_calendar_date_is_refused_rather_than_normalised() {
+    // `days_from_civil` accepts any day up to 31, so `2026-02-31` used to validate
+    // and silently generate a trace starting 2026-03-03. The document would then
+    // disagree with the workload it produced, which is the whole reason the start
+    // instant is declared rather than read from the clock.
+    for impossible in [
+        "2026-02-31T00:00:00Z",
+        "2026-04-31T00:00:00Z",
+        "2026-02-29T00:00:00Z",
+        "2026-06-31T00:00:00Z",
+        "2025-02-29T00:00:00Z",
+    ] {
+        let mut sloppy = scenario();
+        sloppy.logical_start = impossible.to_owned();
+        let error = generate_scenario_trace(&sloppy)
+            .expect_err("a date the calendar does not have must not be accepted");
+        assert!(
+            error.to_string().contains("calendar does not have"),
+            "{impossible} must be refused by name, got: {error}"
+        );
+    }
+
+    // Leap days that really exist still work, so the check is not simply
+    // "reject anything interesting".
+    // Every one of these is load-bearing: each is asserted against the generated
+    // trace, so a check that over-rejects (a leap year refused, or December 31st
+    // treated as out of range) fails here rather than quietly narrowing what a
+    // scenario is allowed to declare.
+    for real in [
+        "2024-02-29T00:00:00Z",
+        "2000-02-29T00:00:00Z",
+        "2026-12-31T00:00:00Z",
+        "2026-03-01T00:00:00Z",
+    ] {
+        let mut fine = scenario();
+        fine.logical_start = real.to_owned();
+        let trace = generate_scenario_trace(&fine).unwrap_or_else(|error| {
+            panic!("{real} is a real instant and must be accepted: {error}")
+        });
+        assert!(
+            trace[0].event.observed_at.starts_with(&real[..10]),
+            "{real}: the trace must start on the declared date, got {}",
+            trace[0].event.observed_at
+        );
+        // And the whole stream must stay inside the declared day, so a
+        // mis-parsed start cannot drift into the next one either.
+        assert!(
+            trace[trace.len() - 1]
+                .event
+                .observed_at
+                .starts_with(&real[..10]),
+            "{real}: the last event must still be on the declared date, got {}",
+            trace[trace.len() - 1].event.observed_at
+        );
+    }
+}
+
+#[test]
+fn a_declared_actor_pool_is_not_the_claim_the_class_makes() {
+    // The generator draws viewers from the declared pool, so the cardinality a
+    // `high_cardinality` workload actually exercises is the number of *distinct*
+    // actors on its timeline - bounded by the event count, not by the pool size.
+    // A short scenario with a huge pool produces a trace with no crowd in it, and
+    // a count measured on that trace would describe nothing.
+    let distinct_actors = |scenario: &StreamScenario| {
+        let trace = trace_of(scenario);
+        let mut actors: Vec<&str> = trace
+            .iter()
+            .filter_map(|entry| entry.event.actor_id.as_deref())
+            .collect();
+        actors.sort_unstable();
+        actors.dedup();
+        assert!(
+            actors.len()
+                <= scenario
+                    .phases
+                    .iter()
+                    .map(|phase| phase.distinct_actors)
+                    .max()
+                    .unwrap_or(0) as usize,
+            "distinct actors can never exceed the widest declared pool"
+        );
+        actors.len()
+    };
+
+    let crowd = shipped("high-cardinality-actors.json");
+    assert_eq!(
+        distinct_actors(&crowd),
+        686,
+        "the shipped high-cardinality workload must actually put hundreds of distinct actors on its timeline, or it does not test cardinality; generation is deterministic, so a change here means the workload changed and its provenance_note has to change with it"
+    );
+    assert!(
+        distinct_actors(&crowd) >= HIGH_CARDINALITY_MIN_ACTORS,
+        "and that count must clear the {HIGH_CARDINALITY_MIN_ACTORS}-actor threshold the validator applies, with room to spare so the two sides cannot drift into disagreeing"
+    );
+
+    // The same parameters over a shorter stream reach a fraction of the pool, and
+    // the pool alone would have hidden it.
+    let mut truncated = shipped("high-cardinality-actors.json");
+    truncated.phases.truncate(1);
+    truncated.phases[0].duration_ms = 120_000;
+    truncated.stream_duration_ms = 120_000;
+    assert!(
+        distinct_actors(&truncated) < HIGH_CARDINALITY_MIN_ACTORS,
+        "two minutes of the same pool cannot reach the cardinality eighty minutes does; this is why the duration is part of the claim"
+    );
+
+    // And the mirror image: a long stream drawn from a tiny pool repeats the same
+    // dozen actors no matter how many events it produces. Without a case that
+    // isolates this, a check on the pool bound could be dropped unnoticed while the
+    // event-count check kept passing.
+    let mut narrow = shipped("high-cardinality-actors.json");
+    for phase in &mut narrow.phases {
+        phase.distinct_actors = 40;
+        phase.repeat_viewer_probability = 0.0;
+    }
+    assert!(
+        narrow.total_event_count().unwrap() >= HIGH_CARDINALITY_MIN_ACTORS as u64,
+        "this case must supply plenty of events, so only the pool bound can reject it"
+    );
+    assert!(
+        distinct_actors(&narrow) < HIGH_CARDINALITY_MIN_ACTORS,
+        "a pool of 40 cannot produce 500 distinct viewers however long the stream runs"
+    );
+}
+
+#[test]
+fn every_shipped_scenario_class_means_what_it_claims() {
+    // A class label that the parameters do not support is decoration, so each
+    // shipped scenario is held to its own class and to the corpus-level contract
+    // that a consumer refusal stays a valid document.
+    for name in [
+        "normal-mixed-stream.json",
+        "chat-burst-10x.json",
+        "idle-to-burst.json",
+        "high-cardinality-actors.json",
+        "high-generative-miss.json",
+    ] {
+        let scenario = shipped(name);
+        match scenario.scenario_class {
+            ScenarioClass::IdleToBurst => assert!(
+                scenario
+                    .phases
+                    .iter()
+                    .any(|phase| phase.events_per_minute == 0.0),
+                "{name} claims an idle phase and declares none"
+            ),
+            ScenarioClass::HighCardinality => assert!(
+                scenario
+                    .phases
+                    .iter()
+                    .any(|phase| phase.distinct_actors as usize >= HIGH_CARDINALITY_MIN_ACTORS),
+                "{name} claims cardinality and declares no pool big enough to hold it"
+            ),
+            _ => {}
+        }
+    }
+
+    // Every shipped scenario must be one the cached replay path can run, because
+    // these are the ones the benchmark is expected to consume.
+    for name in [
+        "normal-mixed-stream.json",
+        "chat-burst-10x.json",
+        "idle-to-burst.json",
+        "high-cardinality-actors.json",
+        "high-generative-miss.json",
+    ] {
+        shipped(name)
+            .validate_playability_for_cached_replay()
+            .unwrap_or_else(|error| panic!("{name} must be playable by the benchmark: {error}"));
+    }
 }
 
 #[test]

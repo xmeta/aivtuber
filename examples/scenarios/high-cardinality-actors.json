@@ -4,14 +4,58 @@
   "scenario_version": 1,
   "scenario_class": "high_cardinality",
   "provenance": "synthetic_design_assumption",
-  "provenance_note": "Four thousand distinct viewers over two minutes, to exercise per-actor state and cache cardinality bounds (#51-#53). Synthetic: the actor count is chosen to be hostile, not observed.",
+  "provenance_note": "Eighty minutes of logical time drawing from four thousand declared viewers, to exercise per-actor state and cache cardinality bounds (#51-#53). The duration is part of the claim: 692 events at 10/minute is what puts roughly 650 distinct actors on the timeline, which is the cardinality under test. A shorter version of this scenario declares a large pool it never visits, and a test counts distinct actor_id in the generated trace so that cannot pass as a crowd again. Synthetic: the actor count is chosen to be hostile, not observed.",
   "seed": 31337,
   "logical_start": "2026-10-01T00:00:00Z",
-  "stream_duration_ms": 120000,
+  "stream_duration_ms": 4800000,
   "phases": [
     {
+      "name": "settle",
+      "duration_ms": 60000,
+      "events_per_minute": 2.0,
+      "kind_mix": {
+        "chat.message": 9.0,
+        "game.event": 1.0
+      },
+      "semantic_mix": {
+        "hit": 0.6,
+        "near_miss": 0.3,
+        "miss": 0.1
+      },
+      "priority_mix": {
+        "low": 4.0,
+        "normal": 2.0,
+        "high": 1.0
+      },
+      "distinct_actors": 400,
+      "distinct_topics": 40,
+      "repeat_viewer_probability": 0.05
+    },
+    {
       "name": "crowd",
-      "duration_ms": 120000,
+      "duration_ms": 4200000,
+      "events_per_minute": 10.0,
+      "kind_mix": {
+        "chat.message": 9.0,
+        "game.event": 1.0
+      },
+      "semantic_mix": {
+        "hit": 0.6,
+        "near_miss": 0.3,
+        "miss": 0.1
+      },
+      "priority_mix": {
+        "low": 4.0,
+        "normal": 2.0,
+        "high": 1.0
+      },
+      "distinct_actors": 4000,
+      "distinct_topics": 500,
+      "repeat_viewer_probability": 0.05
+    },
+    {
+      "name": "peak",
+      "duration_ms": 540000,
       "events_per_minute": 10.0,
       "kind_mix": {
         "chat.message": 9.0,

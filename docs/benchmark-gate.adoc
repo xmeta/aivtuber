@@ -8,6 +8,13 @@ stream from a seeded scenario instead of loading a checked-in event trace, and
 the scenario id and version become the result's `dataset_id`, so an incompatible
 scenario change starts a new comparison baseline rather than reusing an old one.
 
+The scenario format is shared with the soak, retention and quality suites, so it
+carries only its own representability ceiling. The 10 events/minute that the
+cached replay path can actually play is a property of *this* consumer, measured
+against the starter pack and scheduler; `replay-benchmark` checks it up front
+(`validate_playability_for_cached_replay`) and refuses a denser scenario by name
+before any work happens, rather than aborting mid-run with `Rejection::Cooldown`.
+
 == 1. Scope
 
 This note documents the continuous benchmark loop from issue #58:

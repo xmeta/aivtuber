@@ -46,7 +46,16 @@ pub const SCENARIO_EMBEDDING_DIMENSION: usize = 3;
 /// every event can own a distinct millisecond.
 pub const MAX_EVENTS_PER_MINUTE: f64 = 60_000.0;
 
-/// Highest event rate the runtime can actually *play*, in events per minute.
+/// Highest event rate the *current replay consumer* can play, in events per
+/// minute.
+///
+/// This is emphatically **not** part of the scenario format. #70 exists so the
+/// benchmark, soak, retention and quality suites share one workload; a #40 soak
+/// or stress consumer, and any future consumer that queues rather than
+/// preempts, has a different ceiling and must not have this one imposed on it by
+/// the document contract. So this constant lives here next to the measurement
+/// that justifies it, is consulted only by `replay-benchmark`, and is not part
+/// of [`StreamScenario::validate`].
 ///
 /// Measured against the starter pack, not guessed. Sweeping the shipped runtime
 /// through cached playback:
@@ -58,14 +67,9 @@ pub const MAX_EVENTS_PER_MINUTE: f64 = 60_000.0;
 /// * `timer.tick` and `stream.event` do not reach the generative replay's event
 ///   accounting at all, at any rate.
 ///
-/// 10 is therefore the ceiling for a mixed workload, and this slice keeps its
-/// scenarios at or below it. A scenario denser than this is refused here rather
-/// than discovered when a benchmark job aborts, because "the workload was
-/// unrepresentable" is a far worse finding than "the scenario is too dense".
-///
-/// This is a property of the starter pack and the scheduler, not of the scenario
-/// format. Raising it is a runtime change with a measured justification, and
-/// this constant is where that gets recorded.
+/// 10 is therefore the ceiling for this consumer's mixed workload. Raising it is
+/// a runtime change with a measured justification, and this constant is where
+/// that gets recorded.
 pub const MAX_PLAYABLE_EVENTS_PER_MINUTE: f64 = 10.0;
 
 /// Refuse to materialise an unreasonably large trace. Logical-time scenarios are
@@ -288,12 +292,6 @@ impl ScenarioPhase {
                 self.events_per_minute
             )));
         }
-        if self.events_per_minute > MAX_PLAYABLE_EVENTS_PER_MINUTE {
-            return Err(AppError::Routing(format!(
-                "scenario {label} runs at {} events/minute, above the {MAX_PLAYABLE_EVENTS_PER_MINUTE} events/minute the starter pack can play; cached playback rejects the overlap instead of queueing it, so a denser workload aborts the run rather than producing a measurement. Raise the runtime limit with evidence, or model the burst as a ramp",
-                self.events_per_minute
-            )));
-        }
         if !(0.0..=1.0).contains(&self.repeat_viewer_probability) {
             return Err(AppError::Routing(format!(
                 "scenario {label} repeat_viewer_probability must be within 0..=1, got {}",
@@ -377,6 +375,32 @@ pub struct StreamScenario {
 }
 
 impl StreamScenario {
+    /// Whether *this* consumer - the cached replay path behind `replay-benchmark` -
+    /// can play the scenario.
+    ///
+    /// Deliberately **not** part of [`StreamScenario::validate`]. The format's own
+    /// ceiling is representability ([`MAX_EVENTS_PER_MINUTE`]); this ceiling is a
+    /// property of the starter pack and the scheduler. Keeping them separate is
+    /// what lets a #40 soak or stress consumer, which queues rather than
+    /// preempts, load a workload this one refuses - and it is why the scenario
+    /// corpus can describe a burst the benchmark cannot yet run.
+    ///
+    /// Reported as an ordinary error so the refusal names the limit and where it
+    /// comes from, rather than surfacing as a benchmark job that aborts halfway
+    /// with `Rejection::Cooldown`.
+    pub fn validate_playability_for_cached_replay(&self) -> Result<(), AppError> {
+        self.validate()?;
+        for (index, phase) in self.phases.iter().enumerate() {
+            if phase.events_per_minute > MAX_PLAYABLE_EVENTS_PER_MINUTE {
+                return Err(AppError::Routing(format!(
+                    "scenario {:?} phase {index} ({}) runs at {} events/minute, above the {MAX_PLAYABLE_EVENTS_PER_MINUTE} events/minute the cached replay path can play; cached playback rejects the overlap instead of queueing it, so a denser workload aborts the run rather than producing a measurement. The scenario itself is well-formed, so a consumer with a different ceiling may still run it. Raise the runtime limit with evidence, or model the burst as a ramp",
+                    self.scenario_id, phase.name, phase.events_per_minute
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Dataset identity for the #58 benchmark result.
     ///
     /// Carries the scenario version so `benchmark_gate` refuses to compare a
@@ -784,6 +808,11 @@ fn parse_logical_start(value: &str) -> Result<u64, AppError> {
             "logical_start {value:?} must be UTC as YYYY-MM-DDTHH:MM:SSZ"
         ))
     };
+    let impossible_date = || {
+        AppError::Routing(format!(
+            "logical_start {value:?} names a date the calendar does not have; refusing to normalise it, because the generated trace would then start at an instant this document does not declare"
+        ))
+    };
     let bytes = value.as_bytes();
     if bytes.len() != 20 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
         return Err(invalid());
@@ -805,12 +834,20 @@ fn parse_logical_start(value: &str) -> Result<u64, AppError> {
     let minute = number(14..16)?;
     let second = number(17..19)?;
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return Err(invalid());
+        return Err(impossible_date());
     }
     if hour > 23 || minute > 59 || second > 59 {
         return Err(invalid());
     }
     let days = days_from_civil(year, month, day);
+    // `days_from_civil` happily normalises an impossible date, so
+    // `2026-02-31` would silently become 2026-03-03 and the generated trace
+    // would disagree with the instant the document declares. Round-tripping
+    // catches every day the calendar does not actually have, leap days
+    // included, without a calendar table or a dependency.
+    if civil_from_days(days) != (year, month, day) {
+        return Err(impossible_date());
+    }
     let seconds = days
         .checked_mul(86_400)
         .and_then(|value| value.checked_add(hour * 3600 + minute * 60 + second))

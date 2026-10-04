@@ -1,18 +1,18 @@
 {
   "schema_version": "1",
-  "scenario_id": "unplayable-density",
+  "scenario_id": "impossible-calendar-date",
   "scenario_version": 1,
   "scenario_class": "normal_mixed",
   "provenance": "synthetic_design_assumption",
-  "provenance_note": "A workload denser than the starter pack can play; the schema refuses it because the benchmark would abort rather than measure.",
+  "provenance_note": "February 31st does not exist. The document shape is valid, so only the cross-field calendar check can catch it, and the generator must refuse it rather than silently generating a trace dated 2026-03-03.",
   "seed": 20261004,
-  "logical_start": "2026-10-01T00:00:00Z",
+  "logical_start": "2026-02-31T00:00:00Z",
   "stream_duration_ms": 60000,
   "phases": [
     {
       "name": "steady",
       "duration_ms": 60000,
-      "events_per_minute": 30,
+      "events_per_minute": 6.0,
       "kind_mix": {
         "chat.message": 9.0,
         "game.event": 1.0

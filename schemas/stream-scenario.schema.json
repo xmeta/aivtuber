@@ -103,13 +103,13 @@
         "duration_ms": {
           "type": "integer",
           "minimum": 1,
-          "description": "Phase duration. Capped at 60000 events per minute so an event can always be given its own millisecond."
+          "description": "Phase duration. The events_per_minute ceiling is set so an event can always be given its own millisecond."
         },
         "events_per_minute": {
           "type": "number",
           "minimum": 0,
-          "maximum": 10,
-          "description": "Mean event rate across the phase. 0 is a genuine idle phase and contributes no events. Capped at 10 events/minute, which is what the starter pack can actually play: measured against cached playback, a chat-only workload completes at 15 but mixing a higher-priority kind fails at 15 with Rejection::Priority, and 20 trips the per-asset cooldown. A denser workload aborts a benchmark run instead of producing a measurement, so it is refused here."
+          "maximum": 60000,
+          "description": "Mean event rate across the phase. 0 is a genuine idle phase and contributes no events. Capped at 60000 events/minute, which is the format's own representability ceiling: one event per millisecond, so observed_at can stay strictly increasing and a consumer can tell two events apart. This is NOT a statement about what any runtime can play. Whether a workload is playable is a consumer property, so it is checked by the consumer that has to run it (the cached replay path behind replay-benchmark refuses a denser mixed workload) and not by this document contract, which stays shared by the benchmark, soak, retention and quality suites."
         },
         "kind_mix": {
           "type": "object",

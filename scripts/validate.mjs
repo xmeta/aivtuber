@@ -860,12 +860,6 @@ for (const file of listJson("examples/evaluation/moderation-evaluation/inconsist
   }
 }
 
-// The playable-cadence ceiling (10 events/minute, measured) is enforced by
-// `maximum` on `events_per_minute` in the schema and by
-// `MAX_PLAYABLE_EVENTS_PER_MINUTE` in the generator. It is deliberately not
-// restated here: a third copy of that number is how the validator and the
-// generator drift apart and a scenario passes validation only to abort its
-// own benchmark.
 // Issue #70: a scenario declares its `scenario_class`, and the parameters have
 // to agree with that declaration.
 //
@@ -874,17 +868,54 @@ for (const file of listJson("examples/evaluation/moderation-evaluation/inconsist
 // it, and the resulting number is quoted as if it described a crowd. Every
 // predicate below returns `false` when the class is satisfied and the reason it
 // is not otherwise, so a class can never "pass" by returning a truthy value.
+//
+// Two ceilings are deliberately absent from this file:
+//
+// * The format's own ceiling, 60000 events/minute (one event per millisecond, so
+//   `observed_at` can stay strictly increasing), lives in the schema. It is about
+//   representability, not about load.
+// * The 10 events/minute the cached replay path can actually play is a *consumer*
+//   property, measured against the starter pack. It is checked by
+//   `StreamScenario::validate_playability_for_cached_replay` in Rust, by the
+//   consumer that has to run the workload, so that the soak and retention
+//   consumers are not held to this consumer's ceiling. Restating either number
+//   here is how the validator and the generator drift apart.
+// Unique actors a `high_cardinality` scenario has to materialise for its label to
+// mean anything. Declared once here; the Rust suite pins the same number against
+// the checked-in corpus by counting distinct `actor_id` in a generated trace,
+// which is the property the label actually claims.
+const HIGH_CARDINALITY_MIN_ACTORS = 500;
+
+// What separates a quiet conversational stream from a normal one. A workload
+// definition, not a runtime limit: no runtime refuses a rate, it either schedules
+// it or falls behind, and which of those happens is the consumer's own finding.
+const LOW_TRAFFIC_CEILING = 4;
+const CONVERSATIONAL_CEILING = 30;
+
+// Events a phase contributes. The same rounding the generator uses, so the
+// predicates below judge the workload that will be materialised rather than the
+// rates on paper.
+function phaseEventCount(phase) {
+  return Math.round(((phase.events_per_minute ?? 0) * phase.duration_ms) / 60000);
+}
+
 const SCENARIO_CLASS_PREDICATES = {
   low_traffic: (phases) =>
-    phases.every((phase) => phase.events_per_minute < 4)
+    phases.every((phase) => phase.events_per_minute < LOW_TRAFFIC_CEILING)
       ? false
-      : "low_traffic must stay below 4 events/minute in every phase",
+      : `low_traffic must stay below ${LOW_TRAFFIC_CEILING} events/minute in every phase`,
+  // These predicates describe workload *shape*, never what a particular runtime
+  // can play. A ceiling that belongs to one consumer must not appear here, or a
+  // scenario shaped for the soak suite would be refused for the benchmark's
+  // reasons while claiming nothing false.
   normal_mixed: (phases) =>
     phases.some(
-      (phase) => phase.events_per_minute >= 4 && phase.events_per_minute <= 10,
+      (phase) =>
+        phase.events_per_minute >= LOW_TRAFFIC_CEILING &&
+        phase.events_per_minute <= CONVERSATIONAL_CEILING,
     )
       ? false
-      : "normal_mixed needs at least one phase between 4 and 15 events/minute",
+      : `normal_mixed needs at least one sustained phase between ${LOW_TRAFFIC_CEILING} and ${CONVERSATIONAL_CEILING} events/minute`,
   burst: (phases) => {
     const active = phases.filter((phase) => phase.events_per_minute > 0);
     if (active.length < 2) return "burst needs at least two active phases to ramp between";
@@ -892,7 +923,7 @@ const SCENARIO_CLASS_PREDICATES = {
     const trough = Math.min(...active.map((phase) => phase.events_per_minute));
     return trough > 0 && peak / trough >= 10
       ? false
-      : "burst needs a tenfold ramp between phases; the absolute rate stays within what the starter pack can play";
+      : "burst needs a tenfold ramp between phases";
   },
   donation_burst: (phases) =>
     phases.some((phase) => (phase.kind_mix?.["chat.donation"] ?? 0) > 0)
@@ -919,9 +950,9 @@ const SCENARIO_CLASS_PREDICATES = {
     const later = phases.slice(idle + 1).map((phase) => phase.events_per_minute);
     const quiet = before.length ? Math.max(...before) : 0;
     const spike = later.length ? Math.max(...later) : 0;
-    return spike >= 10 && (quiet === 0 || spike / quiet >= 10)
+    return spike >= LOW_TRAFFIC_CEILING * 2.5 && (quiet === 0 || spike / quiet >= 10)
       ? false
-      : "idle_to_burst needs a later phase at least ten times the pre-idle rate";
+      : `idle_to_burst needs a later phase at ${LOW_TRAFFIC_CEILING * 2.5} events/minute or more, and at least ten times the pre-idle rate`;
   },
   high_semantic_reuse: (phases) => {
     const reuse = phases.some((phase) => {
@@ -943,14 +974,43 @@ const SCENARIO_CLASS_PREDICATES = {
       ? false
       : "high_generative_miss needs miss to dominate a phase's semantic mix";
   },
-  high_cardinality: (phases) =>
-    phases.some((phase) => phase.distinct_actors >= 500)
+  high_cardinality: (phases) => {
+    // The declared pool alone is not the claim. A pool of four thousand drawn
+    // from twenty events produces twenty viewer states, so the workload it
+    // describes has no cardinality to exercise at all. Both halves have to hold:
+    // a pool big enough to hold the crowd, and enough non-repeated draws for the
+    // trace to actually visit that many distinct actors.
+    const pool = Math.max(0, ...phases.map((phase) => phase.distinct_actors ?? 0));
+    const freshDraws = phases.reduce(
+      (sum, phase) =>
+        sum +
+        phaseEventCount(phase) * (1 - (phase.repeat_viewer_probability ?? 0)),
+      0,
+    );
+    return pool >= HIGH_CARDINALITY_MIN_ACTORS && freshDraws >= HIGH_CARDINALITY_MIN_ACTORS
       ? false
-      : "high_cardinality needs a phase with at least 500 distinct actors",
+      : `high_cardinality needs a viewer pool of at least ${HIGH_CARDINALITY_MIN_ACTORS} distinct actors and at least ${HIGH_CARDINALITY_MIN_ACTORS} non-repeated draws to reach them; declared ${pool} actors and ${Math.floor(freshDraws)} reachable`;
+  },
 };
 
 // Cross-field checks for a schema-valid scenario document. The schema can hold a
 // shape; only these can say the document means what it claims.
+// Whether a `YYYY-MM-DDTHH:MM:SSZ` string is an instant that exists.
+//
+// `Date.UTC` rolls an impossible day forward, which is exactly the silent
+// normalisation to avoid, so the round-tripped date has to match the declared one.
+function isRealCalendarInstant(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z$/.exec(value ?? "");
+  if (!match) return false;
+  const [, year, month, day, hour, minute, second] = match.map(Number);
+  const instant = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+  return (
+    instant.getUTCFullYear() === year &&
+    instant.getUTCMonth() + 1 === month &&
+    instant.getUTCDate() === day
+  );
+}
+
 function streamScenarioProblems(doc) {
   const problems = [];
   const phases = doc.phases ?? [];
@@ -1001,6 +1061,16 @@ function streamScenarioProblems(doc) {
     if (failure !== false) problems.push(failure);
   }
 
+  // A declared instant the calendar does not have. The schema's pattern can hold
+  // the shape of a date but not the length of each month, and the generator
+  // normalises an impossible date silently, which would leave the document
+  // disagreeing with the trace it produces.
+  if (!isRealCalendarInstant(doc.logical_start)) {
+    problems.push(
+      `logical_start ${doc.logical_start} names a date the calendar does not have`,
+    );
+  }
+
   // Provenance that claims measurement must say what was measured.
   if (
     doc.provenance === "measured_aggregate" &&
@@ -1045,6 +1115,48 @@ for (const { file, doc } of scenarioDocuments) {
     for (const problem of problems) {
       console.error(`FAIL      ${file}: ${problem}`);
     }
+  }
+}
+
+// A consumer refusal is not a format defect. These documents are schema-valid
+// and cross-field clean, so the shared contract stays usable by the soak and
+// retention suites; only the consumer that measured a lower ceiling rejects them.
+// The refusal itself is checked in Rust, by the consumer that raises it.
+for (const file of listJson("examples/scenarios/consumer-refused")) {
+  if (!streamScenario) break;
+  const doc = loadJson(join(root, file));
+  const problems = streamScenario(doc) ? streamScenarioProblems(doc) : ["schema"];
+  if (problems.length === 0) {
+    passes += 1;
+    console.log(`ok        ${file}: a well-formed scenario the consumer refuses, not the format`);
+  } else {
+    failures += problems.length;
+    for (const problem of problems) {
+      console.error(
+        `FAIL      ${file}: a consumer refusal must still be a valid scenario (${problem})`,
+      );
+    }
+  }
+}
+
+// The same separation, from the other side: a document can be refused by the
+// consumer *and* be a defective scenario. Without a case like this the check
+// above would pass just as well if it stopped running cross-field checks at all,
+// which is exactly the confusion this corpus exists to prevent.
+for (const file of listJson("examples/scenarios/consumer-refused/inconsistent")) {
+  if (!streamScenario) break;
+  const doc = loadJson(join(root, file));
+  const problems = streamScenario(doc) ? streamScenarioProblems(doc) : ["schema"];
+  if (problems.length === 0) {
+    failures += 1;
+    console.error(
+      `FAIL      ${file}: (expected a contradiction, but every check passed)`,
+    );
+  } else {
+    passes += 1;
+    console.log(
+      `ok        ${file} (rejected as intended: ${problems.join("; ")})`,
+    );
   }
 }
 
