@@ -1,8 +1,8 @@
 use crate::AppError;
 use crate::shadow::{
     ShadowComparisonRecord, ShadowDecision, ShadowEvaluationFailure, ShadowEvaluationOutcome,
-    ShadowOrchestratorConfig, ShadowPolicy, ShadowPolicyIdentity, ShadowPolicyInput,
-    ShadowProvider, ShadowSkipReason, ShadowSubmission, compare_target,
+    ShadowOrchestrationIdentity, ShadowOrchestratorConfig, ShadowPolicy, ShadowPolicyIdentity,
+    ShadowPolicyInput, ShadowProvider, ShadowSkipReason, ShadowSubmission, compare_target,
 };
 use aivtuber_domain::EventEnvelope;
 use serde::{Deserialize, Serialize};
@@ -548,6 +548,10 @@ where
     S: ShadowPolicy,
 {
     config: ShadowOrchestratorConfig,
+    /// The identity of those exact bounds, stamped onto every record this pool
+    /// produces (#165). Derived once here, from the config `new` just
+    /// validated, so no record can claim bounds the pool was not running under.
+    orchestration: ShadowOrchestrationIdentity,
     /// The configured policy instance. Workers each own a `Clone` of it, so
     /// evaluation genuinely runs concurrently rather than serializing behind a
     /// shared lock; this field is the template and the diagnostic identity of
@@ -595,6 +599,7 @@ where
         config: ShadowOrchestratorConfig,
     ) -> Result<Self, AppError> {
         config.validate()?;
+        let orchestration = ShadowOrchestrationIdentity::from_config(&config)?;
         let work = Arc::new(ShadowQueue::new(config.queue_capacity));
         // Every queued job plus every executing job can publish before the
         // composition thread drains the mailbox. Bound it to that maximum.
@@ -612,6 +617,7 @@ where
             let mut worker_policy = policy.clone();
             let worker_provider = provider.clone();
             let worker_config = config.clone();
+            let worker_orchestration = orchestration.clone();
             let worker_counters = Arc::clone(&counters);
             let worker_shutdown = Arc::clone(&shutting_down);
             let worker_queue = Arc::clone(&work);
@@ -629,6 +635,7 @@ where
                             &mut worker_policy,
                             worker_provider.as_deref(),
                             &worker_config,
+                            &worker_orchestration,
                             worker_counters.as_ref(),
                             worker_shutdown.as_ref(),
                             job,
@@ -678,6 +685,7 @@ where
 
         Ok(Self {
             config,
+            orchestration,
             policy,
             provider,
             work,
@@ -697,6 +705,13 @@ where
     /// a `Clone`, so this is the template rather than the instance doing work.
     pub fn policy(&self) -> &S {
         &self.policy
+    }
+
+    /// The identity of the bounds this pool runs under (#165) — the same stamp
+    /// every record it produces carries, so a caller draining records can pair
+    /// them with the config they were collected under instead of assuming one.
+    pub fn orchestration(&self) -> &ShadowOrchestrationIdentity {
+        &self.orchestration
     }
 }
 
@@ -990,6 +1005,7 @@ fn run_job<S: ShadowPolicy>(
     policy: &mut S,
     provider: Option<&dyn ShadowProvider>,
     config: &ShadowOrchestratorConfig,
+    orchestration: &ShadowOrchestrationIdentity,
     counters: &ShadowCounters,
     shutting_down: &AtomicBool,
     job: ShadowJob,
@@ -1030,6 +1046,7 @@ fn run_job<S: ShadowPolicy>(
             &shadow_identity,
             &active,
             reason,
+            orchestration,
         )));
     }
     let evaluated = if config.allow_provider_calls {
@@ -1067,6 +1084,7 @@ fn run_job<S: ShadowPolicy>(
             &shadow_identity,
             &active,
             reason,
+            orchestration,
         )));
     }
 
@@ -1087,6 +1105,7 @@ fn run_job<S: ShadowPolicy>(
         &shadow_identity,
         &active,
         outcome,
+        orchestration,
     )))
 }
 
@@ -1097,6 +1116,7 @@ fn failed_record(
     shadow_identity: &ShadowPolicyIdentity,
     active: &ShadowDecision,
     reason: ShadowEvaluationFailure,
+    orchestration: &ShadowOrchestrationIdentity,
 ) -> ShadowComparisonRecord {
     build_record(
         event_id,
@@ -1105,6 +1125,7 @@ fn failed_record(
         shadow_identity,
         active,
         ShadowEvaluationOutcome::Failed { reason },
+        orchestration,
     )
 }
 
@@ -1115,6 +1136,7 @@ fn build_record(
     shadow_identity: &ShadowPolicyIdentity,
     active: &ShadowDecision,
     shadow: ShadowEvaluationOutcome,
+    orchestration: &ShadowOrchestrationIdentity,
 ) -> ShadowComparisonRecord {
     let (route_diverged, target_diverged, fallback_diverged) = match &shadow {
         ShadowEvaluationOutcome::Evaluated { decision } => (
@@ -1126,6 +1148,9 @@ fn build_record(
     };
     ShadowComparisonRecord {
         schema_version: crate::SHADOW_COMPARISON_SCHEMA_VERSION.to_owned(),
+        // Stamped here, where the bounds are known, rather than reconstructed
+        // later from a config the caller happens to still hold (#165).
+        orchestration: Some(orchestration.clone()),
         event_id: event_id.to_owned(),
         correlation_id: correlation_id.to_owned(),
         active_policy: active_identity.clone(),

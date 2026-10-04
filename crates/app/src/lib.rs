@@ -10,6 +10,7 @@ mod retention;
 mod routing;
 mod semantic;
 mod shadow;
+mod shadow_evidence;
 mod shadow_orchestrator;
 mod support_bundle;
 
@@ -23,6 +24,7 @@ pub use retention::*;
 pub use routing::*;
 pub use semantic::*;
 pub use shadow::*;
+pub use shadow_evidence::*;
 pub use shadow_orchestrator::*;
 pub use support_bundle::*;
 

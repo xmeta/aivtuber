@@ -1,0 +1,39 @@
+{
+  "schema_version": "1",
+  "orchestration": {
+    "orchestrator_schema_version": "0.1.0",
+    "bounds_fingerprint": "5ab1c0de9f7a3b21"
+  },
+  "compatibility": {
+    "comparison_schema_version": "0.1.0",
+    "active_policy_id": "intent-routing",
+    "active_policy_version": "1.0.0",
+    "active_config_fingerprint": "cfg-9f2a",
+    "active_runtime_profile": "default",
+    "active_dataset_id": null,
+    "shadow_policy_id": "semantic-reuse-proposal",
+    "shadow_policy_version": "0.3.0",
+    "shadow_config_fingerprint": "cfg-9f2a",
+    "shadow_runtime_profile": "default",
+    "shadow_dataset_id": null
+  },
+  "total_comparisons": 6,
+  "comparable_comparisons": 6,
+  "diverged_comparisons": 0,
+  "category_counts": {
+    "same_route_same_target": 1,
+    "same_route_different_target": 0,
+    "route_transition": 5,
+    "response_vs_silent": 0,
+    "fallback_vs_success": 0,
+    "fallback_reason_mismatch": 0,
+    "shadow_unusable": 0,
+    "target_incomparable": 0
+  },
+  "metrics": {
+    "shadow.divergence.rate_pct": { "value": 0, "sample_count": 6 },
+    "shadow.divergence.route_transition_count": { "value": 5, "sample_count": 6 }
+  },
+  "divergent_cases": [],
+  "divergent_cases_truncated": false
+}

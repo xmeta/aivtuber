@@ -1,0 +1,47 @@
+{
+  "schema_version": "1",
+  "orchestration": {
+    "orchestrator_schema_version": "0.1.0"
+  },
+  "compatibility": {
+    "comparison_schema_version": "0.1.0",
+    "active_policy_id": "intent-routing",
+    "active_policy_version": "1.0.0",
+    "active_config_fingerprint": "cfg-9f2a",
+    "active_runtime_profile": "default",
+    "active_dataset_id": null,
+    "shadow_policy_id": "semantic-reuse-proposal",
+    "shadow_policy_version": "0.3.0",
+    "shadow_config_fingerprint": "cfg-9f2a",
+    "shadow_runtime_profile": "default",
+    "shadow_dataset_id": null
+  },
+  "total_comparisons": 2,
+  "comparable_comparisons": 2,
+  "diverged_comparisons": 1,
+  "category_counts": {
+    "same_route_same_target": 1,
+    "same_route_different_target": 0,
+    "route_transition": 1,
+    "response_vs_silent": 0,
+    "fallback_vs_success": 0,
+    "fallback_reason_mismatch": 0,
+    "shadow_unusable": 0,
+    "target_incomparable": 0
+  },
+  "metrics": {
+    "shadow.divergence.rate_pct": { "value": 50, "sample_count": 2 }
+  },
+  "divergent_cases": [
+    {
+      "event_id": "evt-2003",
+      "correlation_id": "corr-2003",
+      "category": "route_transition",
+      "active_route": "template",
+      "shadow_route": "generated",
+      "active_fallback_reason": null,
+      "shadow_fallback_reason": null
+    }
+  ],
+  "divergent_cases_truncated": false
+}

@@ -1,0 +1,56 @@
+{
+  "schema_version": "1",
+  "orchestration": {
+    "orchestrator_schema_version": "0.1.0",
+    "bounds_fingerprint": "5ab1c0de9f7a3b21"
+  },
+  "compatibility": {
+    "comparison_schema_version": "0.1.0",
+    "active_policy_id": "intent-routing",
+    "active_policy_version": "1.0.0",
+    "active_config_fingerprint": "cfg-9f2a",
+    "active_runtime_profile": "default",
+    "active_dataset_id": "stream-replay-2026-10",
+    "shadow_policy_id": "semantic-reuse-proposal",
+    "shadow_policy_version": "0.3.0",
+    "shadow_config_fingerprint": "cfg-9f2a",
+    "shadow_runtime_profile": "default",
+    "shadow_dataset_id": "stream-replay-2026-10"
+  },
+  "total_comparisons": 4,
+  "comparable_comparisons": 4,
+  "diverged_comparisons": 1,
+  "category_counts": {
+    "same_route_same_target": 3,
+    "same_route_different_target": 0,
+    "route_transition": 1,
+    "response_vs_silent": 0,
+    "fallback_vs_success": 0,
+    "fallback_reason_mismatch": 0,
+    "shadow_unusable": 0,
+    "target_incomparable": 0
+  },
+  "metrics": {
+    "shadow.divergence.fallback_reason_mismatch_count": { "value": 0, "sample_count": 4 },
+    "shadow.divergence.fallback_vs_success_count": { "value": 0, "sample_count": 4 },
+    "shadow.divergence.rate_pct": { "value": 25, "sample_count": 4 },
+    "shadow.divergence.response_vs_silent_count": { "value": 0, "sample_count": 4 },
+    "shadow.divergence.route_transition_count": { "value": 1, "sample_count": 40 },
+    "shadow.divergence.same_route_different_target_count": { "value": 0, "sample_count": 4 },
+    "shadow.divergence.same_route_same_target_count": { "value": 3, "sample_count": 4 },
+    "shadow.divergence.shadow_unusable_count": { "value": 0, "sample_count": 4 },
+    "shadow.divergence.target_incomparable_count": { "value": 0, "sample_count": 4 }
+  },
+  "divergent_cases": [
+    {
+      "event_id": "evt-2001",
+      "correlation_id": "corr-2001",
+      "category": "route_transition",
+      "active_route": "template",
+      "shadow_route": "generated",
+      "active_fallback_reason": null,
+      "shadow_fallback_reason": null
+    }
+  ],
+  "divergent_cases_truncated": false
+}

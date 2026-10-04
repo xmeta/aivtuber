@@ -74,6 +74,7 @@ const regression = validators["schemas/security-regression-case.schema.json"];
 const asset = validators["schemas/performance-asset.schema.json"];
 const reactionQuality = validators["schemas/reaction-quality-dataset.schema.json"];
 const reactionQualityReview = validators["schemas/reaction-quality-review.schema.json"];
+const shadowDivergence = validators["schemas/shadow-divergence-report.schema.json"];
 
 function report(ok, label, validator) {
   if (ok) {
@@ -232,6 +233,212 @@ for (const [identity, group] of reactionGroups) {
     console.log(`coverage  ${identity} ${partition}: ${summary}`);
   }
 }
+
+// Issue #165: an aggregated shadow divergence report must stay evidence, not a
+// promotion mechanism. The schema already refuses extra fields and non-diverging
+// case references; these checks pin the two invariants that a schema alone
+// cannot express.
+const SHADOW_DIVERGENCE_CATEGORIES = [
+  "same_route_same_target",
+  "same_route_different_target",
+  "route_transition",
+  "response_vs_silent",
+  "fallback_vs_success",
+  "fallback_reason_mismatch",
+  "shadow_unusable",
+  "target_incomparable",
+];
+// Agreement, plus the two categories that are failures to compare rather than
+// disagreements. None of them may be retained as a reviewable reference.
+const SHADOW_NON_DIVERGING = [
+  "same_route_same_target",
+  "shadow_unusable",
+  "target_incomparable",
+];
+// Categories kept out of the divergence-rate denominator.
+const SHADOW_NON_COMPARABLE = ["shadow_unusable", "target_incomparable"];
+
+const shadowDivergenceDocuments = [];
+for (const file of listJson("examples/evaluation/shadow-divergence")) {
+  if (!shadowDivergence) break;
+  const doc = loadJson(join(root, file));
+  const valid = shadowDivergence(doc);
+  report(valid, file, shadowDivergence);
+  if (valid) shadowDivergenceDocuments.push({ file, doc });
+}
+
+for (const file of listJson("examples/evaluation/shadow-divergence/invalid")) {
+  if (!shadowDivergence) break;
+  const valid = shadowDivergence(loadJson(join(root, file)));
+  if (valid) {
+    failures += 1;
+    console.error(`FAIL      ${file} (expected rejection, but it validated)`);
+  } else {
+    passes += 1;
+    console.log(`ok        ${file} (rejected as intended)`);
+  }
+}
+
+function shadowDivergenceCrossFieldProblems(doc) {
+  const problems = [];
+
+  // Counts must add up. A report whose categories do not sum to the total
+  // cannot be consumed by #58 as a metric.
+  const counted = SHADOW_DIVERGENCE_CATEGORIES.reduce(
+    (sum, category) => sum + (doc.category_counts[category] ?? 0),
+    0,
+  );
+  if (counted !== doc.total_comparisons) {
+    problems.push(
+      `category counts sum to ${counted}, not total_comparisons ${doc.total_comparisons}`,
+    );
+  }
+
+  // The divergence rate has comparable comparisons as its denominator, so
+  // neither a broken shadow policy nor an unevidenced target pair can make a
+  // policy look good by producing evidence nobody could compare.
+  const comparable =
+    doc.total_comparisons -
+    SHADOW_NON_COMPARABLE.reduce(
+      (sum, category) => sum + (doc.category_counts[category] ?? 0),
+      0,
+    );
+  if (comparable !== doc.comparable_comparisons) {
+    problems.push(
+      `comparable_comparisons is ${doc.comparable_comparisons}, but total minus ${SHADOW_NON_COMPARABLE.join("/")} is ${comparable}`,
+    );
+  }
+  if (doc.diverged_comparisons > doc.comparable_comparisons) {
+    problems.push(
+      `diverged_comparisons ${doc.diverged_comparisons} exceeds comparable_comparisons ${doc.comparable_comparisons}`,
+    );
+  }
+
+  // #58 reads `diverged_comparisons` as the headline number, so the diverging
+  // category counts must sum to it. Without this, `route_transition: 5` beside
+  // `diverged_comparisons: 0` and `rate_pct: 0` passes every other check while
+  // publishing a self-contradictory report.
+  const divergingSum = SHADOW_DIVERGENCE_CATEGORIES.filter(
+    (category) => !SHADOW_NON_DIVERGING.includes(category),
+  ).reduce((sum, category) => sum + (doc.category_counts[category] ?? 0), 0);
+  if (divergingSum !== doc.diverged_comparisons) {
+    problems.push(
+      `diverging categories sum to ${divergingSum}, but diverged_comparisons is ${doc.diverged_comparisons}`,
+    );
+  }
+
+  // A published rate must agree with the counts it was derived from; a stale or
+  // hand-edited metric would otherwise let a consumer believe a rate the
+  // categories contradict.
+  const rate = doc.metrics?.["shadow.divergence.rate_pct"];
+  if (rate) {
+    const expected =
+      doc.comparable_comparisons === 0
+        ? 0
+        : (doc.diverged_comparisons / doc.comparable_comparisons) * 100;
+    const matches =
+      Math.abs(rate.value - expected) < 1e-9 &&
+      rate.sample_count === doc.comparable_comparisons;
+    if (!matches) {
+      problems.push(
+        `rate_pct is ${rate.value} over ${rate.sample_count} samples, but diverged/comparable is ${expected} over ${doc.comparable_comparisons}`,
+      );
+    }
+  }
+
+  // #58 reads the per-category metrics, not `category_counts`, so a metric that
+  // disagrees with the counts it was derived from publishes a false number
+  // while every headline total still looks right. Both halves are pinned:
+  // `value` must equal the category count, and `sample_count` must be the
+  // number of records that count was taken over.
+  for (const category of SHADOW_DIVERGENCE_CATEGORIES) {
+    const metric = doc.metrics?.[`shadow.divergence.${category}_count`];
+    if (!metric) continue;
+    const expected = doc.category_counts[category] ?? 0;
+    if (metric.value !== expected) {
+      problems.push(
+        `shadow.divergence.${category}_count is ${metric.value}, but category_counts.${category} is ${expected}`,
+      );
+    }
+    if (metric.sample_count !== doc.total_comparisons) {
+      problems.push(
+        `shadow.divergence.${category}_count is measured over ${metric.sample_count} samples, but total_comparisons is ${doc.total_comparisons}`,
+      );
+    }
+  }
+
+  // The operational counters describe the same batch, so their sample_count is
+  // the batch size too. Their values are measured rather than derived from the
+  // records, so there is nothing here to compare them against.
+  for (const [name, metric] of Object.entries(doc.metrics ?? {})) {
+    if (!name.startsWith("shadow.operations.")) continue;
+    if (metric.sample_count !== doc.total_comparisons) {
+      problems.push(
+        `${name} is measured over ${metric.sample_count} samples, but total_comparisons is ${doc.total_comparisons}`,
+      );
+    }
+  }
+
+  // Evidence may reference divergent cases, never agreement or a comparison
+  // that could not be made.
+  const badRef = (doc.divergent_cases ?? []).find((reference) =>
+    SHADOW_NON_DIVERGING.includes(reference.category),
+  );
+  if (badRef) {
+    problems.push(
+      `divergent_cases references ${badRef.event_id} with non-diverging category ${badRef.category}`,
+    );
+  }
+
+  // The truncation flag must agree with the retained references, otherwise a
+  // partial report reads as a complete one.
+  const retained = (doc.divergent_cases ?? []).length;
+  if ((retained < doc.diverged_comparisons) !== doc.divergent_cases_truncated) {
+    problems.push(
+      `divergent_cases_truncated is ${doc.divergent_cases_truncated} but retained ${retained} of ${doc.diverged_comparisons}`,
+    );
+  }
+
+  return problems;
+}
+
+for (const { file, doc } of shadowDivergenceDocuments) {
+  const problems = shadowDivergenceCrossFieldProblems(doc);
+  if (problems.length === 0) {
+    passes += 1;
+    console.log(`ok        ${file}: cross-field evidence is self-consistent`);
+  } else {
+    failures += problems.length;
+    for (const problem of problems) {
+      console.error(`FAIL      ${file}: ${problem}`);
+    }
+  }
+}
+
+// Documents that satisfy the schema but contradict themselves. These are not in
+// `invalid/`, which is the schema-rejection corpus: a self-contradictory report
+// *is* structurally valid, it is simply untrustworthy, which is exactly what
+// these cross-field checks exist to catch.
+for (const file of listJson("examples/evaluation/shadow-divergence/inconsistent")) {
+  if (!shadowDivergence) break;
+  const doc = loadJson(join(root, file));
+  if (!shadowDivergence(doc)) {
+    failures += 1;
+    console.error(
+      `FAIL      ${file} (expected to pass the schema so the cross-field checks can judge it)`,
+    );
+    continue;
+  }
+  const problems = shadowDivergenceCrossFieldProblems(doc);
+  if (problems.length === 0) {
+    failures += 1;
+    console.error(`FAIL      ${file} (expected a contradiction, but every check passed)`);
+  } else {
+    passes += 1;
+    console.log(`ok        ${file} (rejected as intended: ${problems.join("; ")})`);
+  }
+}
+
 
 function reviewPresentation(caseId, seed) {
   const firstByte = createHash("sha256").update(`${seed}:${caseId}`).digest()[0];

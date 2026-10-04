@@ -3,7 +3,7 @@
 
 This document defines the first side-effect-free shadow-policy boundary for #64.
 The policy core is #163 (section 3-7). Bounded production orchestration is #164
-(section 8) and benchmark/reaction-quality export is #165 (section 9).
+(section 8) and benchmark/reaction-quality export is #165 (section 9, implemented).
 
 == 1. Purpose
 
@@ -470,19 +470,133 @@ When enabled, startup prints one non-secret `shadow_orchestration:` line with
 the configured bounds. Rollback is setting
 `AIVTUBER_SHADOW_ENABLED=false`, which restores the exact #163 behavior.
 
-== 9. Follow-up boundaries
+== 9. Evidence integration (#165, implemented)
 
-#165 owns evidence integration:
+#165 turns comparison records into evidence that #58 benchmarking and #59/#151
+human review can consume. It adds `crates/app/src/shadow_evidence.rs` and
+nothing else: no runtime path changes, and the active route is untouched by
+anything in that module.
 
-* stable divergence-category aggregation;
-* #58 benchmark-compatible metrics;
-* #151 reaction-quality review sampling;
-* policy/config/profile compatibility grouping.
+=== 9.1 Divergence categories
 
-#165 must preserve the evidence-minimization boundary in section 5: aggregate
-evidence, not transcripts. It must also read `ShadowComparisonRecord`
-`schema_version` together with `ShadowOrchestratorConfig` `schema_version`
-before combining samples.
+`classify_shadow_divergence` assigns every comparison to exactly one stable
+`snake_case` category, which is what makes the output machine-readable:
 
-Neither follow-up may automatically promote a shadow policy to active behavior.
-Promotion remains an explicit reviewed decision under the experiment workflow.
+| Category | Meaning |
+| --- | --- |
+| `same_route_same_target` | the two policies agreed |
+| `same_route_different_target` | same route class, different comparable target |
+| `route_transition` | different route class on both sides, neither silent |
+| `response_vs_silent` | one side responded, the other stayed silent |
+| `fallback_vs_success` | *exactly one* side carries a fallback reason; the other is a clean success |
+| `fallback_reason_mismatch` | *both* sides carry a fallback reason and the reasons differ (`Timeout` vs `Unavailable`) |
+| `shadow_unusable` | the shadow half produced no usable decision |
+| `target_incomparable` | route classes matched, but the runtime declined to compare the targets |
+
+Three ordering rules are the contract, and each exists because the looser
+reading would misstate the report:
+
+* A fallback difference outranks a route difference, because the degradation is
+  the operationally interesting half.
+* `fallback_vs_success` means *one* side degraded. `build_record` sets
+  `fallback_diverged` from `active.fallback_reason != shadow.fallback_reason`,
+  which is also true when **both** sides failed for different reasons — that is
+  `fallback_reason_mismatch`, and folding it into `fallback_vs_success` would
+  claim a clean success that never happened.
+* `shadow_unusable` and `target_incomparable` are *failures to compare*, not
+  agreements. `compare_target` returns `None` for pairs such as `Generated` vs
+  `Generated`, whose content the runtime deliberately does not retain, so
+  agreement there is unevidenced. Both are excluded from the divergence rate's
+  denominator: counting either as agreement would let a policy that produces
+  unusable or uncompareable evidence look better than one that disagrees.
+
+=== 9.2 Compatibility is explicit, not implicit
+
+`summarize_shadow_divergence` refuses rather than merges. A batch is rejected
+when it is empty (an empty report would read as "no divergence"), when any
+record carries a `ShadowComparisonRecord` `schema_version` other than the
+current one, or when any record's `ShadowCompatibilityKey` differs from the
+first record's — that key holds both policy identities field by field, so the
+`dataset_id` of *each* side is compared separately (an active/shadow dataset
+mismatch cannot hide behind a matching shadow dataset), plus the config
+fingerprint and the runtime profile.
+
+The report also carries an `orchestration` block, and it is the *only* way
+bounds reach a report. Bounds reach it from two directions that must agree.
+
+`ShadowOrchestrationIdentity` is derived, never written. Its fields are private
+and the only constructor is `from_config`, which validates the config first — a
+config the runtime would reject cannot produce an identity — and folds every
+bound that changes which events are admitted and how long an evaluation may run
+into a 16-hex `bounds_fingerprint`. A caller-supplied identity with public fields
+could be hand-written, which would reopen exactly the gap the block exists to
+close.
+
+The identity travels *on the record*. `ShadowOrchestrator::new` derives it once
+from the config it just validated, and every record the pool builds carries it;
+`ShadowOrchestrator::orchestration()` hands the same value to a caller draining
+records. `summarize_shadow_divergence` derives the identity from the config it is
+given and refuses unless **every** record's stamp equals it, refusing an unstamped
+record outright. That is what makes the guarantee mechanical rather than a
+promise: concatenating the records of two batches run under different bounds and
+handing them over with one config no longer yields a confident report whose
+fingerprint describes neither batch — it is refused, naming the offending record
+and both fingerprints. An absent stamp means the synchronous (#163) inline path
+or an older stored sample; neither can say which bounds produced it, so neither is
+reported under someone else's. Two batches differing only in deadline, sample
+rate, concurrency, queue capacity, provider-call permission or budget charging are
+therefore never reported as one sample, even under an identical policy identity.
+
+=== 9.3 What a report contains
+
+* every category key, including zeroes, so two reports compare field by field;
+* `shadow.divergence.<category>_count` plus `shadow.divergence.rate_pct`, a
+  flat map shaped like a `benchmark-result` metric entry (#58) and ready to
+  merge into its `metrics` map without translation. #58 reads these metrics
+  rather than `category_counts`, so `scripts/validate.mjs` pins each one to the
+  count it was derived from (`value == category_counts.<category>`) and to the
+  batch it was measured over (`sample_count == total_comparisons`): a report
+  whose headline totals are right while a benchmark metric is invented is
+  rejected rather than published;
+* `ShadowDivergentCaseRef` entries — `event_id`, `correlation_id`, category,
+  both route classes and both fallback reasons — for #151 offline sampling.
+
+The boundary from section 5 holds: the reference struct has *no field* that can
+hold payload, rendered text or a provider response, and
+`schemas/shadow-divergence-report.schema.json` sets
+`additionalProperties: false` so one cannot be added from outside. Retained
+references are capped by `case_limit`; **counts are never truncated**, and
+`divergent_cases_truncated` says whether the reference list is complete, so a
+partial report never reads as a whole one.
+
+=== 9.4 Evidence never promotes
+
+There is no scalar that ranks a policy and no field naming an active policy to
+switch to; the only policy identities in a report are the two that were already
+compared. Promotion remains an explicit, reviewed decision under the experiment
+workflow. `a_report_cannot_promote_a_shadow_policy` pins this, and
+`scripts/validate.mjs` independently rejects a fixture that references a
+non-diverging category, reports an empty batch, smuggles a text field into a
+case reference, omits the bounds fingerprint, publishes a `rate_pct` that
+disagrees with its own counts, sums its diverging categories to something other
+than `diverged_comparisons`, or publishes a category metric whose value or
+sample count contradicts `category_counts` and `total_comparisons`.
+
+Operational evidence (#165 scope: provider-call counts "when available") is
+supplied by the caller as a `ShadowOperationalEvidence` delta taken from
+`ShadowExecutionSnapshot` counters around the batch, via
+`ShadowOperationalEvidence::from_snapshot_delta`, and passed to
+`summarize_shadow_divergence` as its `operational` argument. The snapshot is
+cumulative for the life of the orchestrator and the records alone cannot say
+what the shadow path cost, so it is the *delta* — never a raw snapshot — that a
+report may carry. The counters are published under `shadow.operations.*`,
+deliberately outside `shadow.divergence.*`: they describe what comparing cost,
+not how often the policies disagreed, so they never move `rate_pct`.
+
+`from_snapshot_delta` returns a `Result` and **refuses** a counter that went
+backwards rather than clamping it to zero. Snapshots taken out of order, or
+spanning an orchestrator restart, used to produce a plausible `provider calls =
+0` — a silent under-count of exactly the cost this evidence exists to retain —
+so the delta is only ever computed from an ordered pair.
+
+#165 does not replace #108 causal trace attribution.
