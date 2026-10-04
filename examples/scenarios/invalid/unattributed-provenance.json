@@ -1,0 +1,35 @@
+{
+  "schema_version": "1",
+  "scenario_id": "unattributed",
+  "scenario_version": 1,
+  "scenario_class": "normal_mixed",
+  "provenance": "synthetic_design_assumption",
+  "provenance_note": "",
+  "seed": 20261004,
+  "logical_start": "2026-10-01T00:00:00Z",
+  "stream_duration_ms": 60000,
+  "phases": [
+    {
+      "name": "steady",
+      "duration_ms": 60000,
+      "events_per_minute": 6.0,
+      "kind_mix": {
+        "chat.message": 9.0,
+        "game.event": 1.0
+      },
+      "semantic_mix": {
+        "hit": 0.6,
+        "near_miss": 0.3,
+        "miss": 0.1
+      },
+      "priority_mix": {
+        "low": 4.0,
+        "normal": 2.0,
+        "high": 1.0
+      },
+      "distinct_actors": 12,
+      "distinct_topics": 8,
+      "repeat_viewer_probability": 0.4
+    }
+  ]
+}

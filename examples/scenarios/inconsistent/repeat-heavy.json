@@ -1,0 +1,35 @@
+{
+  "schema_version": "1",
+  "scenario_id": "repeat-heavy",
+  "scenario_version": 1,
+  "scenario_class": "high_cardinality",
+  "provenance": "synthetic_design_assumption",
+  "provenance_note": "Four thousand declared viewers and 600 events, which is comfortably enough on its own. The repeat quota is the only thing that pushes it under: floor(600 * 0.2) = 120 repeated events leave 480 fresh draws, short of the 500 distinct viewers the class requires. This isolates the repeat term of the rule from the pool and event-count terms, so dropping it cannot go unnoticed.",
+  "seed": 20261004,
+  "logical_start": "2026-10-01T00:00:00Z",
+  "stream_duration_ms": 3600000,
+  "phases": [
+    {
+      "name": "crowd",
+      "duration_ms": 3600000,
+      "events_per_minute": 10.0,
+      "kind_mix": {
+        "chat.message": 9.0,
+        "game.event": 1.0
+      },
+      "semantic_mix": {
+        "hit": 0.6,
+        "near_miss": 0.3,
+        "miss": 0.1
+      },
+      "priority_mix": {
+        "low": 4.0,
+        "normal": 2.0,
+        "high": 1.0
+      },
+      "distinct_actors": 4000,
+      "distinct_topics": 500,
+      "repeat_viewer_probability": 0.2
+    }
+  ]
+}

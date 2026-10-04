@@ -96,7 +96,7 @@ tgrep -n -t rust 'ShadowComparisonRecord|TraceStage' .
 |#70 realistic workloads
 |+crates/app/src/bin/replay-benchmark.rs+, +crates/hardening+, +examples/benchmarks/+
 |Full-Duplex-Bench-v3 for disfluency/tool-use scenario classes; do not import its thresholds
-|Versioned seeded normal/burst/idle scenario generator used by benchmark and soak
+|Versioned seeded normal/burst/idle scenario generator used by benchmark and soak (delivered in link:stream-scenarios.adoc[Stream Scenarios])
 |Same seed/config produces byte-identical ordered events twice
 
 |#71 operational SLOs

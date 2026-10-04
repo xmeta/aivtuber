@@ -53,6 +53,7 @@ The core design separates three time scales:
 * link:docs/causal-trace.adoc[Causal trace design (#65)]
 * link:docs/shadow-evaluation.adoc[Side-effect-free shadow policy evaluation (#64/#163)]
 * link:docs/benchmark-gate.adoc[Continuous benchmark gate (#58)]
+* link:docs/stream-scenarios.adoc[Versioned stream scenarios (#70)]
 * link:docs/performance-goals.adoc[Performance goals and baselines (#58)]
 * link:schemas/performance-asset.schema.json[Performance Asset JSON Schema]
 * link:schemas/event-envelope.schema.json[Event Envelope JSON Schema]

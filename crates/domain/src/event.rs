@@ -33,7 +33,7 @@ pub enum TrustLevel {
     Trusted,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum EventKind {
     #[serde(rename = "chat.message")]
     ChatMessage,

@@ -79,6 +79,7 @@ const reactionQuality = validators["schemas/reaction-quality-dataset.schema.json
 const reactionQualityReview = validators["schemas/reaction-quality-review.schema.json"];
 const shadowDivergence = validators["schemas/shadow-divergence-report.schema.json"];
 const moderationEvaluation = validators["schemas/moderation-evaluation.schema.json"];
+const streamScenario = validators["schemas/stream-scenario.schema.json"];
 
 function report(ok, label, validator) {
   if (ok) {
@@ -850,6 +851,363 @@ for (const file of listJson("examples/evaluation/moderation-evaluation/inconsist
     continue;
   }
   const problems = moderationEvaluationCrossFieldProblems(doc);
+  if (problems.length === 0) {
+    failures += 1;
+    console.error(`FAIL      ${file} (expected a contradiction, but every check passed)`);
+  } else {
+    passes += 1;
+    console.log(`ok        ${file} (rejected as intended: ${problems.join("; ")})`);
+  }
+}
+
+// Issue #70: a scenario declares its `scenario_class`, and the parameters have
+// to agree with that declaration.
+//
+// The class exists so coverage is checkable rather than asserted: without it, a
+// scenario labelled `high_cardinality` can ship three viewers, the benchmark runs
+// it, and the resulting number is quoted as if it described a crowd. Every
+// predicate below returns `false` when the class is satisfied and the reason it
+// is not otherwise, so a class can never "pass" by returning a truthy value.
+//
+// Two ceilings are deliberately absent from this file:
+//
+// * The format's own ceiling, 60000 events/minute (one event per millisecond, so
+//   `observed_at` can stay strictly increasing), lives in the schema. It is about
+//   representability, not about load.
+// * The 10 events/minute the cached replay path can actually play is a *consumer*
+//   property, measured against the starter pack. It is checked by
+//   `StreamScenario::validate_playability_for_cached_replay` in Rust, by the
+//   consumer that has to run the workload, so that the soak and retention
+//   consumers are not held to this consumer's ceiling. Restating either number
+//   here is how the validator and the generator drift apart.
+// Unique actors a `high_cardinality` scenario has to materialise for its label to
+// mean anything. Declared once here; the Rust suite pins the same number against
+// the checked-in corpus by counting distinct `actor_id` in a generated trace,
+// which is the property the label actually claims.
+const HIGH_CARDINALITY_MIN_ACTORS = 500;
+const MAX_ACTOR_NAMESPACE = 0xffff_ffff;
+
+// What separates a quiet conversational stream from a normal one. A workload
+// definition, not a runtime limit: no runtime refuses a rate, it either schedules
+// it or falls behind, and which of those happens is the consumer's own finding.
+const LOW_TRAFFIC_CEILING = 4;
+const CONVERSATIONAL_CEILING = 30;
+
+// Events a phase contributes. The same rounding the generator uses, so the
+// predicates below judge the workload that will be materialised rather than the
+// rates on paper.
+function phaseEventCount(phase) {
+  return Math.round(((phase.events_per_minute ?? 0) * phase.duration_ms) / 60000);
+}
+
+const SCENARIO_CLASS_PREDICATES = {
+  low_traffic: (phases) =>
+    phases.every((phase) => phase.events_per_minute < LOW_TRAFFIC_CEILING)
+      ? false
+      : `low_traffic must stay below ${LOW_TRAFFIC_CEILING} events/minute in every phase`,
+  // These predicates describe workload *shape*, never what a particular runtime
+  // can play. A ceiling that belongs to one consumer must not appear here, or a
+  // scenario shaped for the soak suite would be refused for the benchmark's
+  // reasons while claiming nothing false.
+  normal_mixed: (phases) =>
+    phases.some(
+      (phase) =>
+        phase.events_per_minute >= LOW_TRAFFIC_CEILING &&
+        phase.events_per_minute <= CONVERSATIONAL_CEILING,
+    )
+      ? false
+      : `normal_mixed needs at least one sustained phase between ${LOW_TRAFFIC_CEILING} and ${CONVERSATIONAL_CEILING} events/minute`,
+  burst: (phases) => {
+    const active = phases.filter((phase) => phase.events_per_minute > 0);
+    if (active.length < 2) return "burst needs at least two active phases to ramp between";
+    const peak = Math.max(...active.map((phase) => phase.events_per_minute));
+    const trough = Math.min(...active.map((phase) => phase.events_per_minute));
+    return trough > 0 && peak / trough >= 10
+      ? false
+      : "burst needs a tenfold ramp between phases";
+  },
+  donation_burst: (phases) =>
+    phases.some((phase) => (phase.kind_mix?.["chat.donation"] ?? 0) > 0)
+      ? false
+      : "donation_burst must weigh chat.donation in at least one phase",
+  event_heavy: (phases) => {
+    const dominant = phases.some((phase) => {
+      const mix = phase.kind_mix ?? {};
+      const total = Object.values(mix).reduce((sum, value) => sum + value, 0);
+      const events = (mix["game.event"] ?? 0) + (mix["timer.tick"] ?? 0);
+      return total > 0 && events / total >= 0.5;
+    });
+    return dominant
+      ? false
+      : "event_heavy needs game.event or timer.tick to dominate a phase's kind mix";
+  },
+  idle_to_burst: (phases) => {
+    const idle = phases.findIndex((phase) => phase.events_per_minute === 0);
+    if (idle === -1) return "idle_to_burst needs a phase that genuinely goes silent";
+    const before = phases
+      .slice(0, idle)
+      .filter((phase) => phase.events_per_minute > 0)
+      .map((phase) => phase.events_per_minute);
+    const later = phases.slice(idle + 1).map((phase) => phase.events_per_minute);
+    const quiet = before.length ? Math.max(...before) : 0;
+    const spike = later.length ? Math.max(...later) : 0;
+    return spike >= LOW_TRAFFIC_CEILING * 2.5 && (quiet === 0 || spike / quiet >= 10)
+      ? false
+      : `idle_to_burst needs a later phase at ${LOW_TRAFFIC_CEILING * 2.5} events/minute or more, and at least ten times the pre-idle rate`;
+  },
+  high_semantic_reuse: (phases) => {
+    const reuse = phases.some((phase) => {
+      const mix = phase.semantic_mix ?? {};
+      const total = Object.values(mix).reduce((sum, value) => sum + value, 0);
+      return total > 0 && (mix.hit ?? 0) / total >= 0.7;
+    });
+    return reuse
+      ? false
+      : "high_semantic_reuse needs hit to dominate a phase's semantic mix";
+  },
+  high_generative_miss: (phases) => {
+    const misses = phases.some((phase) => {
+      const mix = phase.semantic_mix ?? {};
+      const total = Object.values(mix).reduce((sum, value) => sum + value, 0);
+      return total > 0 && (mix.miss ?? 0) / total >= 0.5;
+    });
+    return misses
+      ? false
+      : "high_generative_miss needs miss to dominate a phase's semantic mix";
+  },
+  high_cardinality: (phases) => {
+    // The declared pool alone is not the claim, and neither is a raw count of
+    // draws. Two corrections matter, both learned from documents that passed a
+    // looser version of this check while producing no crowd at all:
+    //
+    // 1. A pool is a ceiling, not evidence. Distinct viewers are bounded by the
+    //    number of events, so twenty events over a pool of four thousand reaches
+    //    twenty viewers.
+    // 2. Draws collide. Uniform sampling with replacement over a pool of 500 for
+    //    500 draws reaches roughly 300 distinct viewers - the birthday problem.
+    //    The generator therefore walks each phase's pool in order, so a phase
+    //    reaches min(pool, fresh draws) distinct viewers exactly, and this
+    //    predicate uses that same bound rather than assuming one.
+    // 3. Expected fresh draws are not fresh draws. The generator resolves
+    //    `repeat_viewer_probability` as an exact quota per phase rather than an
+    //    independent coin flip per event, precisely so this number is exact
+    //    rather than an expectation. It has to be computed the same way here -
+    //    `events - min(floor(events * p), max(events - 1, 0))` - the first event
+    //    must be fresh, including at p = 1 and for single-event phases.
+    //
+    // Per phase, and then the best single phase: actor ids share one namespace
+    // across the stream, so a large pool spread thinly across several phases is
+    // not the same workload as one dense phase, and summing phases would claim
+    // cardinality the trace does not have.
+    const reachable = Math.max(
+      0,
+      ...phases.map((phase) => {
+        const pool = phase.distinct_actors ?? 0;
+        const events = phaseEventCount(phase);
+        const repeats = Math.min(
+          Math.floor(events * (phase.repeat_viewer_probability ?? 0)),
+          Math.max(events - 1, 0),
+        );
+        return Math.min(pool, events - repeats);
+      }),
+    );
+    return reachable >= HIGH_CARDINALITY_MIN_ACTORS
+      ? false
+      : `high_cardinality needs one phase able to put at least ${HIGH_CARDINALITY_MIN_ACTORS} distinct viewers on its timeline: a pool of at least ${HIGH_CARDINALITY_MIN_ACTORS} drawn from at least ${HIGH_CARDINALITY_MIN_ACTORS} non-repeated events; best phase reaches ${reachable}`;
+  },
+};
+
+// Cross-field checks for a schema-valid scenario document. The schema can hold a
+// shape; only these can say the document means what it claims.
+// Whether a `YYYY-MM-DDTHH:MM:SSZ` string is an instant that exists.
+//
+// `Date.UTC` rolls an impossible day forward, which is exactly the silent
+// normalisation to avoid, so the round-tripped date has to match the declared one.
+function isRealCalendarInstant(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z$/.exec(value ?? "");
+  if (!match) return false;
+  const [, year, month, day, hour, minute, second] = match.map(Number);
+  const instant = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+  return (
+    instant.getUTCFullYear() === year &&
+    instant.getUTCMonth() + 1 === month &&
+    instant.getUTCDate() === day
+  );
+}
+
+function streamScenarioProblems(doc) {
+  const problems = [];
+  const phases = doc.phases ?? [];
+
+  const durationTotal = phases.reduce((sum, phase) => sum + phase.duration_ms, 0);
+  if (durationTotal !== doc.stream_duration_ms) {
+    problems.push(
+      `phase durations sum to ${durationTotal} ms but stream_duration_ms is ${doc.stream_duration_ms} ms`,
+    );
+  }
+
+  const names = new Set();
+  let actorNamespaceEnd = 0;
+  let actorNamespaceOverflowed = false;
+  for (const [index, phase] of phases.entries()) {
+    if (names.has(phase.name)) {
+      problems.push(`phase name ${phase.name} is used more than once`);
+    }
+    names.add(phase.name);
+    if (!actorNamespaceOverflowed) {
+      const nextActorNamespaceEnd = actorNamespaceEnd + (phase.distinct_actors ?? 0);
+      if (nextActorNamespaceEnd > MAX_ACTOR_NAMESPACE) {
+        problems.push(
+          `phase ${index} (${phase.name}) declares ${phase.distinct_actors} distinct actors, which overflows the ${actorNamespaceEnd} actor ids already assigned to earlier phases; a scenario cannot name more than ${MAX_ACTOR_NAMESPACE} viewers in total`,
+        );
+        actorNamespaceOverflowed = true;
+      } else {
+        actorNamespaceEnd = nextActorNamespaceEnd;
+      }
+    }
+    for (const mixName of ["kind_mix", "semantic_mix", "priority_mix"]) {
+      const mix = phase[mixName] ?? {};
+      const total = Object.values(mix).reduce((sum, value) => sum + value, 0);
+      if (total <= 0) {
+        problems.push(`${phase.name}: ${mixName} weights must sum above zero`);
+      }
+    }
+    // The generator refuses to place more events on the timeline than it has
+    // milliseconds, so a document that promises them is unrepresentable.
+    const promised = Math.round((phase.events_per_minute * phase.duration_ms) / 60000);
+    if (promised > phase.duration_ms) {
+      problems.push(
+        `${phase.name}: ${promised} events cannot each own a millisecond of ${phase.duration_ms} ms`,
+      );
+    }
+  }
+
+  let totalEvents = 0;
+  for (const phase of phases) {
+    totalEvents += Math.round((phase.events_per_minute * phase.duration_ms) / 60000);
+  }
+  if (totalEvents === 0) {
+    problems.push("the scenario generates no events, which would benchmark nothing");
+  }
+
+  const predicate = SCENARIO_CLASS_PREDICATES[doc.scenario_class];
+  if (!predicate) {
+    problems.push(`scenario_class ${doc.scenario_class} has no defined predicate`);
+  } else {
+    const failure = predicate(phases);
+    if (failure !== false) problems.push(failure);
+  }
+
+  // A declared instant the calendar does not have. The schema's pattern can hold
+  // the shape of a date but not the length of each month, and the generator
+  // normalises an impossible date silently, which would leave the document
+  // disagreeing with the trace it produces.
+  if (!isRealCalendarInstant(doc.logical_start)) {
+    problems.push(
+      `logical_start ${doc.logical_start} names a date the calendar does not have`,
+    );
+  }
+
+  // Provenance that claims measurement must say what was measured.
+  if (
+    doc.provenance === "measured_aggregate" &&
+    (doc.provenance_note ?? "").trim().length < 20
+  ) {
+    problems.push(
+      "measured_aggregate scenarios must state in provenance_note what was measured",
+    );
+  }
+
+  return problems;
+}
+
+const scenarioDocuments = [];
+for (const file of listJson("examples/scenarios")) {
+  if (!streamScenario) break;
+  const doc = loadJson(join(root, file));
+  const valid = streamScenario(doc);
+  report(valid, file, streamScenario);
+  if (valid) scenarioDocuments.push({ file, doc });
+}
+
+for (const file of listJson("examples/scenarios/invalid")) {
+  if (!streamScenario) break;
+  const valid = streamScenario(loadJson(join(root, file)));
+  if (valid) {
+    failures += 1;
+    console.error(`FAIL      ${file} (expected rejection, but it validated)`);
+  } else {
+    passes += 1;
+    console.log(`ok        ${file} (rejected as intended)`);
+  }
+}
+
+for (const { file, doc } of scenarioDocuments) {
+  const problems = streamScenarioProblems(doc);
+  if (problems.length === 0) {
+    passes += 1;
+    console.log(`ok        ${file}: scenario parameters match its declared class`);
+  } else {
+    failures += problems.length;
+    for (const problem of problems) {
+      console.error(`FAIL      ${file}: ${problem}`);
+    }
+  }
+}
+
+// A consumer refusal is not a format defect. These documents are schema-valid
+// and cross-field clean, so the shared contract stays usable by the soak and
+// retention suites; only the consumer that measured a lower ceiling rejects them.
+// The refusal itself is checked in Rust, by the consumer that raises it.
+for (const file of listJson("examples/scenarios/consumer-refused")) {
+  if (!streamScenario) break;
+  const doc = loadJson(join(root, file));
+  const problems = streamScenario(doc) ? streamScenarioProblems(doc) : ["schema"];
+  if (problems.length === 0) {
+    passes += 1;
+    console.log(`ok        ${file}: a well-formed scenario the consumer refuses, not the format`);
+  } else {
+    failures += problems.length;
+    for (const problem of problems) {
+      console.error(
+        `FAIL      ${file}: a consumer refusal must still be a valid scenario (${problem})`,
+      );
+    }
+  }
+}
+
+// The same separation, from the other side: a document can be refused by the
+// consumer *and* be a defective scenario. Without a case like this the check
+// above would pass just as well if it stopped running cross-field checks at all,
+// which is exactly the confusion this corpus exists to prevent.
+for (const file of listJson("examples/scenarios/consumer-refused/inconsistent")) {
+  if (!streamScenario) break;
+  const doc = loadJson(join(root, file));
+  const problems = streamScenario(doc) ? streamScenarioProblems(doc) : ["schema"];
+  if (problems.length === 0) {
+    failures += 1;
+    console.error(
+      `FAIL      ${file}: (expected a contradiction, but every check passed)`,
+    );
+  } else {
+    passes += 1;
+    console.log(
+      `ok        ${file} (rejected as intended: ${problems.join("; ")})`,
+    );
+  }
+}
+
+for (const file of listJson("examples/scenarios/inconsistent")) {
+  if (!streamScenario) break;
+  const doc = loadJson(join(root, file));
+  if (!streamScenario(doc)) {
+    failures += 1;
+    console.error(
+      `FAIL      ${file} (expected to pass the schema so the cross-field checks can judge it)`,
+    );
+    continue;
+  }
+  const problems = streamScenarioProblems(doc);
   if (problems.length === 0) {
     failures += 1;
     console.error(`FAIL      ${file} (expected a contradiction, but every check passed)`);
