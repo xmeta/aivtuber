@@ -643,6 +643,111 @@ for (const file of trackedFiles) {
       );
     }
   }
+
+  // The replay instructions in docs/property-testing.adoc have to match what
+  // proptest 1.11.0 actually does, not what is tempting to assume: `cases`
+  // counts only newly generated inputs, persisted seeds replay first and are
+  // not counted towards it, so PROPTEST_CASES=1 runs the stored case PLUS one
+  // new one and only PROPTEST_CASES=0 is replay-only. A doc claiming anything
+  // else sends the reader after a proof that cannot hold.
+  const propDoc = readFileSync(
+    join(root, "docs/property-testing.adoc"),
+    "utf8",
+  );
+  const propSource = readFileSync(
+    join(root, "crates/scheduler/tests/properties.rs"),
+    "utf8",
+  );
+
+  // The documented default must be the case count the suite pins in its
+  // ProptestConfig, so a change there cannot leave the doc claiming the
+  // proptest default of 256.
+  const casesKey = "cases:";
+  const casesAt = propSource.indexOf(casesKey);
+  const commaAt = casesAt === -1 ? -1 : propSource.indexOf(",", casesAt);
+  const pinnedValue =
+    casesAt === -1
+      ? ""
+      : propSource.slice(
+          casesAt + casesKey.length,
+          commaAt === -1 ? undefined : commaAt,
+        ).trim();
+  const marker = " cases per property";
+  const markerAt = propDoc.indexOf(marker);
+  let docStart = markerAt;
+  while (
+    docStart > 0 &&
+    propDoc[docStart - 1] >= "0" &&
+    propDoc[docStart - 1] <= "9"
+  ) {
+    docStart -= 1;
+  }
+  const documentedValue =
+    markerAt === -1 || docStart === markerAt
+      ? ""
+      : propDoc.slice(docStart, markerAt);
+  if (!/^[0-9]+$/.test(pinnedValue)) {
+    failures += 1;
+    console.error(
+      "FAIL      crates/scheduler/tests/properties.rs: no numeric cases: in ProptestConfig (issue #147)",
+    );
+  } else if (documentedValue !== pinnedValue) {
+    failures += 1;
+    console.error(
+      "FAIL      docs/property-testing.adoc: documents " +
+        (documentedValue || "no") +
+        " cases per property, but properties.rs pins cases: " +
+        pinnedValue +
+        " (issue #147)",
+    );
+  } else {
+    passes += 1;
+    console.log(
+      "ok        docs/property-testing.adoc: default case count matches pinned cases: " +
+        pinnedValue,
+    );
+  }
+
+  // A replay-only command has to exist in the docs, and it has to be CASES=0.
+  if (!propDoc.includes("PROPTEST_CASES=0 cargo test")) {
+    failures += 1;
+    console.error(
+      "FAIL      docs/property-testing.adoc: missing the PROPTEST_CASES=0 replay-only command (issue #147)",
+    );
+  } else {
+    passes += 1;
+    console.log(
+      "ok        docs/property-testing.adoc: replay-only command uses PROPTEST_CASES=0",
+    );
+  }
+
+  // Any other PROPTEST_CASES=1 in the doc (the PROPTEST_CASES=10000 widening
+  // command excluded) is the replay-only claim review caught: at cases: 1
+  // proptest still generates one input after replaying persisted seeds.
+  const oneAssign = "PROPTEST_CASES=1";
+  let claimsReplayOnly = false;
+  for (
+    let at = propDoc.indexOf(oneAssign);
+    at !== -1;
+    at = propDoc.indexOf(oneAssign, at + 1)
+  ) {
+    const next = propDoc[at + oneAssign.length];
+    if (next === undefined || next < "0" || next > "9") {
+      claimsReplayOnly = true;
+      break;
+    }
+  }
+  if (claimsReplayOnly) {
+    failures += 1;
+    console.error(
+      "FAIL      docs/property-testing.adoc: PROPTEST_CASES=1 is presented as a replay-only run; proptest generates one new case after replaying persisted seeds (issue #147)",
+    );
+  } else {
+    passes += 1;
+    console.log(
+      "ok        docs/property-testing.adoc: no PROPTEST_CASES=1 replay instruction",
+    );
+  }
 }
 
 console.log(`\n${passes} passed, ${failures} failed`);

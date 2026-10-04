@@ -101,12 +101,24 @@ Failing cases are persisted to `crates/scheduler/proptest-regressions/properties
 and replayed on every later run, so a regression becomes a checked-in input
 rather than something that has to be rediscovered.
 
-To replay only the persisted cases:
+To replay *only* the persisted cases:
 
 [source,shell]
 ----
-PROPTEST_CASES=1 cargo test --locked -p aivtuber-scheduler --test properties
+PROPTEST_CASES=0 cargo test --locked -p aivtuber-scheduler --test properties
 ----
+
+`cases` counts only *newly generated* inputs: proptest replays every persisted
+seed first, those replays are not counted towards `cases`, and only then does
+it generate inputs while `successes < cases`. Zero therefore stops the run
+after the stored cases and nothing else. Setting `PROPTEST_CASES` to 1 is *not*
+replay-only: it replays the stored case and then generates one more. proptest
+pins that itself in `persisted_cases_do_not_count_towards_total_cases`, which
+asserts that two inputs run at `cases: 1`; an instrumented run of this target
+measured 1 input at `PROPTEST_CASES=0` and 2 when it is set to 1. The caveat is
+an empty corpus: `PROPTEST_CASES=0` would then generate nothing and pass
+vacuously, which is why `scripts/validate.mjs` requires a real `cc <seed>` line
+in `crates/scheduler/proptest-regressions/`.
 
 To widen the search while investigating:
 
@@ -133,9 +145,13 @@ confirmating the corresponding failure, including the cases where a mutation
 correctly did *not* fail because the property does not claim that behaviour.
 == Regression workflow (issue #147)
 
-By default `cargo test --workspace` runs each property with proptest's defaults:
-a random seed and 256 generated cases, so **every PR explores a different
-space** and no run is reproducible from the previous one.
+By default `cargo test --workspace` runs each property with a random seed and
+the case count the suite pins itself: `cases: 96` in the `ProptestConfig` of
+`crates/scheduler/tests/properties.rs`, so the default is 96 cases per
+property rather than proptest's own 256 (`PROPTEST_CASES` overrides that in
+turn, which is how CI narrows the run to 64). The seed is *not* pinned outside
+CI, so **every PR explores a different space** and no run is reproducible from
+the previous one.
 
 Two mechanisms make failures durable:
 
@@ -194,7 +210,8 @@ bound, and that the fuzz workflow has no `pull_request` trigger.
    ----
 
 2. Read the `failing step` / `generated sequence` in the failure message, or run
-   the property alone with `PROPTEST_CASES=1` to replay only stored cases.
+   the property alone with `PROPTEST_CASES=0` to replay stored cases only,
+   without generating a single new input.
 3. Fix the runtime. Do not edit `proptest-regressions/*.txt` to make the suite
    green — those files are evidence, and deleting a line silently un-arms the
    regression.
@@ -211,11 +228,20 @@ This workflow was exercised end to end rather than described from theory:
   the failing sequence to three `Schedule` operations and wrote it to
   `crates/scheduler/proptest-regressions/properties.txt`.
 * The mutation was reverted and the stored case re-run with
-  `PROPTEST_CASES=1`: it passes, confirming the fix and that replay is not
-  dependent on generating new cases.
-* The mutation was re-applied and re-run with `PROPTEST_CASES=1`: it fails
-  again. With only one case possible, that failure can only come from the
-  checked-in regression, so the file genuinely pins the behaviour.
+  `PROPTEST_CASES=0`: it passes — persisted replay only, zero generated
+  inputs, so the pass does not depend on a lucky fresh case.
+* The mutation was re-applied and re-run with `PROPTEST_CASES=0`: it fails
+  again with `terminal item evt-0 is still reachable by event id`. At
+  `PROPTEST_CASES=0` the generated-case loop body runs zero times, so no fresh
+  input existed that could have failed — the failure can only come from the
+  checked-in regression, and the file genuinely pins the behaviour.
+* The zero-generation claim was measured rather than inferred: an instrumented
+  run of `generated_operation_sequences_preserve_scheduler_invariants` counted
+  **1** input at `PROPTEST_CASES=0` (the persisted seed) and **2** when
+  `PROPTEST_CASES` is set to 1 (persisted plus one generated), matching
+  proptest's own `persisted_cases_do_not_count_towards_total_cases`
+  assertion. The instrumentation was removed afterwards and the target is
+  unchanged.
 
 `crates/scheduler/src/lib.rs` is byte-identical to `main`; the mutation existed
 only during those runs.
