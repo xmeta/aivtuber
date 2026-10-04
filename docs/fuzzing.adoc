@@ -225,19 +225,52 @@ Calling `cargo +nightly fuzz run` directly on Windows skips that step.
 A libFuzzer crash artifact is not yet a regression test. To land a fix:
 
 1. Reproduce from the artifact: `bash fuzz/run-fuzz.sh <target> fuzz/artifacts/<target>/<hash>`.
-2. Minimize. Run the target with `-minimize_crash=1 -max_len=<n>` to have
-   libFuzzer shrink the artifact in place, or use
-   `cargo +nightly fuzz tmin <target> <artifact>` for a standalone byte-minimal
-   copy. `bash fuzz/run-fuzz.sh <target> -help=1` lists the flags this build
-   accepts; libFuzzer requires the strict `-flag=value` form and silently ignores
-   an unrecognised one, so a typo produces a run that looks successful.
+2. Minimize. Use the wrapper, not cargo-fuzz directly:
+   `./fuzz/run-fuzz.sh min <target> <artifact>`. Calling
+   `cargo +nightly fuzz tmin` on a Windows/MSVC host starts the minimizer
+   outside this script, so the AddressSanitizer DLL is not on `PATH` and it
+   dies with `STATUS_DLL_NOT_FOUND` before analyzing anything. The `min` mode
+   exists for that reason. `bash fuzz/run-fuzz.sh <target> -help=1` lists the
+   flags this build accepts; libFuzzer requires the strict `-flag=value` form
+   and silently ignores an unrecognised one, so a typo produces a run that looks
+   successful.
 3. Add a deterministic test with that exact input as a fixture — in the crate
    that owns the boundary, not in `fuzz/`. `fuzz/` has `test = false` on every
    `[[bin]]`, so it contributes no coverage to the normal gate.
 4. Fix the runtime, then add the minimized input to `fuzz/corpus/<target>/` under
    a descriptive name, since it is now a regression seed and reviewable.
 
-Reproducing a finding was exercised for all three targets via the mutation
-campaign in section 3; that campaign used hand-authored seeds rather than
-reduced artifacts, so `tmin`/`-minimize_crash` remain unexercised here and are
-listed as the procedure to follow, not as a result.
+=== What was actually observed
+
+Reproducing and minimizing were both exercised, and the results are worth
+recording because one of them is surprising.
+
+* If the failing input is *already a checked-in seed*, libFuzzer crashes during
+  corpus load and writes **no** crash artifact — the seed is the reproducer and
+  there is nothing to minimize. Observed with
+  `performance_asset` and `blank-id-otherwise-valid.json`: the run aborted with
+  `STATUS_STACK_BUFFER_OVERRUN` and `fuzz/artifacts/` stayed empty.
+* `./fuzz/run-fuzz.sh min performance_asset fuzz/corpus/performance_asset/blank-id-otherwise-valid.json`
+  does reach the minimizer (`CRASH_MIN: ... caused a crash. Will try to minimize
+  it further`), and reports that it could not reduce the input further. That is
+  expected for a hand-minimized seed rather than a fuzzer-found input, and it is
+  the reason step 3 asks for a *deterministic test* in the owning crate: that is
+  what actually pins the behaviour, with the corpus seed replaying it.
+* Novel inputs found *by fuzzing* do produce artifacts under
+  `fuzz/artifacts/<target>/`, which the scheduled workflow uploads.
+
+== 9. Regression workflow in CI
+
+Issue #147 wires this up:
+
+* `.github/workflows/fuzz.yml` runs bounded campaigns on a `schedule` and on
+  `workflow_dispatch` only. It never triggers on `pull_request`, so fuzzing
+  cannot become an unbounded PR gate, and it carries both an explicit `-runs`
+  budget and a `timeout-minutes` bound.
+* `.github/workflows/ci.yml` runs a `regressions` job on the pinned stable
+  toolchain with a fixed `PROPTEST_RNG_SEED` and a bounded `PROPTEST_CASES`, so
+  the property subset is reproducible on every PR. Checked-in
+  `crates/scheduler/proptest-regressions/` cases replay regardless of the seed.
+* `scripts/validate.mjs` asserts all of the above, and
+  `crates/scheduler/tests/workspace_contract.rs` continues to keep
+  `libfuzzer-sys` out of the workspace lock and the production graph.

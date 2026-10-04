@@ -131,3 +131,69 @@ thread interleaving rather than about reachable scheduler states.
 Every property here was verified to be non-vacuous by mutating the scheduler and
 confirmating the corresponding failure, including the cases where a mutation
 correctly did *not* fail because the property does not claim that behaviour.
+== Regression workflow (issue #147)
+
+By default `cargo test --workspace` runs each property with proptest's defaults:
+a random seed and 256 generated cases, so **every PR explores a different
+space** and no run is reproducible from the previous one.
+
+Two mechanisms make failures durable:
+
+* *Checked-in regressions.* When a property fails, proptest shrinks the input
+  and appends it to `crates/scheduler/proptest-regressions/properties.txt`. That
+  file is committed, and proptest replays those cases **before** generating any
+  novel input — so they run regardless of the seed. The directory resolves
+  relative to the crate root, not the test file.
+* *A seeded bounded subset in PR CI.* The `regressions` job in
+  `.github/workflows/ci.yml` runs:
+
+[source,text]
+----
+PROPTEST_CASES=64 PROPTEST_RNG_SEED=20261004 \
+PROPTEST_MAX_SHRINK_ITERS=4096 \
+cargo test --locked -p aivtuber-scheduler --test properties
+----
+
+Stable-only and fuzz-free by design. libFuzzer needs nightly, and a second
+toolchain channel in `ci.yml` would contradict
+`scripts/validate-toolchain-pins.mjs`; the bounded fuzz campaigns live in
+`.github/workflows/fuzz.yml`, which is schedule/`workflow_dispatch` only and
+never blocks a pull request. `scripts/validate.mjs` asserts the seed, the case
+bound, and that the fuzz workflow has no `pull_request` trigger.
+
+=== Bringing a failure back as a regression
+
+1. Reproduce from the recorded seed rather than from memory:
+
+   [source,text]
+   ----
+   PROPTEST_CASES=64 PROPTEST_RNG_SEED=20261004 \
+     cargo test --locked -p aivtuber-scheduler --test properties
+   ----
+
+2. Read the `failing step` / `generated sequence` in the failure message, or run
+   the property alone with `PROPTEST_CASES=1` to replay only stored cases.
+3. Fix the runtime. Do not edit `proptest-regressions/*.txt` to make the suite
+   green — those files are evidence, and deleting a line silently un-arms the
+   regression.
+4. Commit the regenerated regression file with the fix, so the failing case
+   replays on every future run.
+
+=== Verified round
+
+This workflow was exercised end to end rather than described from theory:
+
+* `retire()` was temporarily changed to skip
+  `self.live_by_event.remove(&item.plan.event_id)`. The property suite failed
+  with `terminal item evt-0 is still reachable by event id`, and proptest shrank
+  the failing sequence to three `Schedule` operations and wrote it to
+  `crates/scheduler/proptest-regressions/properties.txt`.
+* The mutation was reverted and the stored case re-run with
+  `PROPTEST_CASES=1`: it passes, confirming the fix and that replay is not
+  dependent on generating new cases.
+* The mutation was re-applied and re-run with `PROPTEST_CASES=1`: it fails
+  again. With only one case possible, that failure can only come from the
+  checked-in regression, so the file genuinely pins the behaviour.
+
+`crates/scheduler/src/lib.rs` is byte-identical to `main`; the mutation existed
+only during those runs.

@@ -1,0 +1,117 @@
+name: Fuzz campaigns
+
+# Issue #147: bounded libFuzzer campaigns for the parser trust boundaries
+# introduced in #146.
+#
+# This workflow is deliberately NOT part of the pull-request gate. #146 added
+# three libFuzzer targets under `fuzz/`, but running them needs a nightly
+# compiler and a `cargo-fuzz` install, neither of which belongs in the PR path:
+# a second toolchain channel would contradict the single-channel rule in
+# scripts/validate-toolchain-pins.mjs, and `cargo install cargo-fuzz` pulls a
+# dependency tree that is in no lock file, so `cargo deny` cannot see it.
+#
+# Relationship to #40 (failure injection and long-stream soak), now closed:
+# that harness owns wall-clock fault injection, degradation paths and bounded
+# retention under load. This workflow owns *input search* at parser boundaries —
+# how the bytes of an untrusted envelope, provider response or asset descriptor
+# are shaped. They complement each other and neither replaces the other.
+#
+# Bounded on purpose: every campaign has an explicit `-runs` budget and the job
+# has a timeout, so a run can never become an unbounded gate. See
+# docs/fuzzing.adoc for the corpus policy and the minimization-to-regression
+# workflow.
+
+on:
+  schedule:
+    # 04:20 UTC daily. Off the :00 mark on purpose — the benchmark and
+    # resource-bench jobs are also scheduled near midnight UTC.
+    - cron: "20 4 * * *"
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "Executions per fuzz target"
+        required: false
+        default: "200000"
+      target:
+        description: "Single target to run (blank = all three)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-campaign
+  cancel-in-progress: false
+
+jobs:
+  fuzz:
+    name: Bounded parser-boundary campaigns
+    runs-on: ubuntu-latest
+    # Hard stop independent of -runs, so a pathological target cannot hold a
+    # runner for hours.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly
+
+      # Pinned deliberately: cargo-fuzz is not in any Cargo.lock in this repo,
+      # so nothing else constrains which version a CI run compiles. The pin is
+      # documented in docs/supply-chain.adoc and asserted by
+      # scripts/validate.mjs.
+      - name: Install cargo-fuzz
+        run: cargo +nightly install cargo-fuzz --version 0.13.2 --locked
+
+      - name: Resolve campaign budget
+        id: budget
+        env:
+          INPUT_RUNS: ${{ inputs.runs }}
+          INPUT_TARGET: ${{ inputs.target }}
+        run: |
+          runs="${INPUT_RUNS:-200000}"
+          target="${INPUT_TARGET:-}"
+          if ! printf '%s' "$runs" | grep -Eq '^[0-9]+$'; then
+            echo "::error::runs must be a positive integer, got '$runs'"
+            exit 2
+          fi
+          if [ "$runs" -lt 1 ]; then
+            echo "::error::runs must be >= 1, got '$runs'"
+            exit 2
+          fi
+          echo "runs=$runs" >> "$GITHUB_OUTPUT"
+          echo "target=$target" >> "$GITHUB_OUTPUT"
+
+      # Linux hosts have no AddressSanitizer DLL problem; fuzz/run-fuzz.sh
+      # locates the MSVC runtime only on Windows and is a no-op elsewhere, so
+      # the same entry point works here and on a developer machine.
+      - name: Campaign
+        env:
+          RUNS: ${{ steps.budget.outputs.runs }}
+          TARGET: ${{ steps.budget.outputs.target }}
+        run: |
+          if [ -n "$TARGET" ]; then
+            targets="$TARGET"
+          else
+            targets="event_envelope jev_response performance_asset"
+          fi
+          for target in $targets; do
+            echo "::group::fuzz $target (-runs=$RUNS)"
+            bash fuzz/run-fuzz.sh "$target" "-runs=$RUNS" -max_total_time=1500
+            echo "::endgroup::"
+          done
+
+      # A crash writes here. Upload it so a discovery is recoverable without
+      # re-running the campaign; the workflow in docs/fuzzing.adoc then takes it
+      # through minimize -> deterministic test -> corpus seed.
+      - name: Collect crash artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 30

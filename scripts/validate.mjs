@@ -403,5 +403,121 @@ for (const file of trackedFiles) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Issue #147: the property/fuzz regression workflow must stay bounded and out
+// of the pull-request gate.
+//
+// `scripts/validate-toolchain-pins.mjs` deliberately enforces a single Rust
+// channel across ci.yml, so the nightly fuzz campaign lives in its own
+// workflow file. That puts it outside the toolchain validator's reach, so
+// these assertions stand in for it. They are cheap text checks because the
+// failure they prevent is a silently unbounded, or PR-gating, fuzz job.
+// ---------------------------------------------------------------------------
+{
+  const fuzzWorkflow = join(root, ".github/workflows/fuzz.yml");
+  const ciWorkflow = readFileSync(join(root, ".github/workflows/ci.yml"), "utf8");
+
+  if (!existsSync(fuzzWorkflow)) {
+    failures += 1;
+    console.error("FAIL      .github/workflows/fuzz.yml: missing (issue #147)");
+  } else {
+    const fuzz = readFileSync(fuzzWorkflow, "utf8");
+
+    // A PR-gating fuzz campaign would put nightly plus a cargo-fuzz install in
+    // every pull request, which is exactly what #147 decided against.
+    if (/^\s*pull_request:/m.test(fuzz)) {
+      failures += 1;
+      console.error(
+        "FAIL      .github/workflows/fuzz.yml: must not trigger on pull_request (issue #147)",
+      );
+    } else {
+      passes += 1;
+      console.log("ok        .github/workflows/fuzz.yml: no pull_request trigger");
+    }
+
+    // cargo-fuzz is in no Cargo.lock, so the explicit version is the only thing
+    // making the CI install reproducible. See docs/supply-chain.adoc section 7.
+    const install = fuzz.match(/^\s*run:.*install cargo-fuzz[^\n]*/m);
+    if (!install) {
+      failures += 1;
+      console.error(
+        "FAIL      .github/workflows/fuzz.yml: cargo-fuzz install not found (issue #147)",
+      );
+    } else if (!/--version\s+\S+/.test(install[0])) {
+      failures += 1;
+      console.error(
+        `FAIL      .github/workflows/fuzz.yml: cargo-fuzz install is not version-pinned: ${install[0]}`,
+      );
+    } else {
+      passes += 1;
+      console.log("ok        .github/workflows/fuzz.yml: cargo-fuzz install is version-pinned");
+    }
+
+    // An explicit budget and a job timeout are what stop a long campaign from
+    // degrading into an open-ended gate.
+    if (!/timeout-minutes:/.test(fuzz)) {
+      failures += 1;
+      console.error(
+        "FAIL      .github/workflows/fuzz.yml: missing timeout-minutes on the fuzz job (issue #147)",
+      );
+    } else {
+      passes += 1;
+      console.log("ok        .github/workflows/fuzz.yml: fuzz job has a timeout");
+    }
+
+    if (!/RUNS:/.test(fuzz)) {
+      failures += 1;
+      console.error(
+        "FAIL      .github/workflows/fuzz.yml: campaign budget is not plumbed through (issue #147)",
+      );
+    } else {
+      passes += 1;
+      console.log("ok        .github/workflows/fuzz.yml: campaign budget is plumbed through");
+    }
+  }
+
+  // The PR-time property gate must be deterministic: a fixed RNG seed and a
+  // bounded case count. Without both, every run explores a different space and
+  // no failure can be reproduced from the documented command.
+  const regressionSeed = ciWorkflow.match(/PROPTEST_RNG_SEED:\s*"(\d+)"/);
+  const regressionCases = ciWorkflow.match(/PROPTEST_CASES:\s*"(\d+)"/);
+  if (!regressionSeed || !regressionCases) {
+    failures += 1;
+    console.error(
+      "FAIL      .github/workflows/ci.yml: bounded property regressions job must pin PROPTEST_RNG_SEED and PROPTEST_CASES (issue #147)",
+    );
+  } else if (Number(regressionCases[1]) > 256) {
+    failures += 1;
+    console.error(
+      `FAIL      .github/workflows/ci.yml: PR-time PROPTEST_CASES=${regressionCases[1]} exceeds the 256-case bound (issue #147)`,
+    );
+  } else {
+    passes += 1;
+    console.log(
+      `ok        .github/workflows/ci.yml: bounded property regressions seed=${regressionSeed[1]} cases=${regressionCases[1]}`,
+    );
+  }
+
+  // The checked-in regression corpus is what makes the seeded run replayable.
+  // Without it the gate would silently degrade to random search.
+  const regressionDir = join(root, "crates/scheduler/proptest-regressions");
+  if (!existsSync(regressionDir)) {
+    failures += 1;
+    console.error(
+      "FAIL      crates/scheduler/proptest-regressions: missing (issue #147)",
+    );
+  } else if (
+    readdirSync(regressionDir).filter((f) => f.endsWith(".txt")).length === 0
+  ) {
+    failures += 1;
+    console.error(
+      "FAIL      crates/scheduler/proptest-regressions: contains no checked-in cases (issue #147)",
+    );
+  } else {
+    passes += 1;
+    console.log("ok        crates/scheduler/proptest-regressions: checked-in cases present");
+  }
+}
+
 console.log(`\n${passes} passed, ${failures} failed`);
 process.exit(failures > 0 ? 1 : 0);

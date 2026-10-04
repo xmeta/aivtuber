@@ -66,3 +66,34 @@ A PR that changes `Cargo.lock` must:
 == 6. Current policy validation (2026-09)
 
 The initial graph was validated with cargo-deny 0.20.2: advisories ok, bans ok (duplicates at warn), licenses ok, sources ok. No exceptions are currently active. Licenses in `allow` that exist in the current graph include MIT, Apache-2.0, BSD-3-Clause, ISC, 0BSD, Zlib, Unlicense, Unicode-3.0, CDLA-Permissive-2.0 (webpki-roots), and LGPL-2.1-or-later (r-efi). When either crate drops out of the graph, remove the corresponding license from the allow list.
+
+`NCSA` is allowed for `libfuzzer-sys`, reachable only from the excluded `fuzz/` crate (#146). The same `deny.toml` gates `fuzz/Cargo.lock` via `cargo deny --manifest-path fuzz/Cargo.toml --locked check`, so the fuzz graph is audited under the identical policy rather than exempt from it.
+
+== 7. Tooling installed by CI but absent from every lock file
+
+`cargo deny` audits resolved graphs. It cannot see a binary that CI installs at
+runtime, because nothing in the repository records it.
+
+* *`cargo-fuzz` 0.13.2* — installed in `.github/workflows/fuzz.yml` with
+  `cargo +nightly install cargo-fuzz --version 0.13.2 --locked`. It is a
+  build-time driver, not a runtime dependency, and never links into a
+  production binary: it only invokes the targets under `fuzz/`, which
+  `crates/scheduler/tests/workspace_contract.rs` keeps out of the workspace
+  graph and the workspace lock.
+* *owner* — the property/fuzz workstream (#146, #147).
+* *reason for the pin* — an unpinned `cargo install cargo-fuzz` would let a CI
+  run compile a different toolchain version each week, with no lock file to
+  diff against. The explicit `--version` plus `--locked` makes the install
+  reproducible in the same spirit as `--locked` in cargo-deny.
+* *revisit condition* — if `fuzz/` is removed, or the workflow moves to a
+  prebuilt binary with a checksum, or `cargo-fuzz` enters a lock file, revisit
+  this entry and either drop the pin or promote it into `deny.toml` scope.
+* *assertion* — `scripts/validate.mjs` fails if `fuzz.yml` installs cargo-fuzz
+  without an explicit `--version`, so this pin cannot be quietly removed.
+
+The nightly channel used by that workflow is intentionally outside
+`scripts/validate-toolchain-pins.mjs`, which enforces a single Rust channel
+across `ci.yml`. That validator is deliberately unmodified: the pull-request
+gate stays stable-only, and the scheduled workflow is asserted separately by
+`scripts/validate.mjs` (nightly declared explicitly, no `pull_request`
+trigger).

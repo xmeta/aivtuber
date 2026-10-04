@@ -117,6 +117,54 @@ jobs:
       - name: Resource benchmark smoke
         run: cargo run --locked -p aivtuber-hardening --bin resource-bench -- target/ci-resource-bench 5000
 
+  regressions:
+    name: Bounded property regressions
+    # Issue #147. `cargo test --workspace` above runs the proptest suite with
+    # proptest's defaults, so every PR explores a *different* random space and
+    # the same code path is never replayed twice. This job pins the RNG seed and
+    # the case count, so the PR-time subset is the same on every run and any
+    # failure is reproducible from the command below.
+    #
+    # Deliberately stable-only and free of fuzz tooling (#146): libFuzzer needs
+    # nightly, which would mean a second channel in
+    # scripts/validate-toolchain-pins.mjs and an unpinned cargo-fuzz install in
+    # the PR path. Bounded fuzz campaigns live in .github/workflows/fuzz.yml,
+    # which is schedule/workflow_dispatch only and never blocks a PR.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+
+      # PROPTEST_RNG_SEED fixes the generated space; PROPTEST_CASES bounds it.
+      # Both values are asserted by scripts/validate.mjs so they cannot drift
+      # away from the documented command in docs/property-testing.adoc.
+      #
+      # Any persisted proptest-regressions/ case replays regardless of the seed,
+      # so checked-in regressions still run here even though exploration is
+      # fixed.
+      - name: Bounded property regression subset
+        run: cargo test --locked -p aivtuber-scheduler --test properties
+        env:
+          PROPTEST_CASES: "64"
+          PROPTEST_RNG_SEED: "20261004"
+          PROPTEST_MAX_SHRINK_ITERS: "4096"
+
+      - name: Persist any newly discovered regression case
+        # proptest resolves persistence relative to the *crate root*, not the
+        # test file, so the file lands at crates/scheduler/proptest-regressions/.
+        # Uploading it means a shrink found in CI is downloadable and committable
+        # rather than lost when the runner is reclaimed.
+        uses: actions/upload-artifact@v4
+        with:
+          name: proptest-regressions
+          path: crates/scheduler/proptest-regressions/
+          if-no-files-found: ignore
+          retention-days: 14
+
   schema:
     name: Schema and security fixtures
     runs-on: ubuntu-latest
