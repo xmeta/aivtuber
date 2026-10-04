@@ -75,9 +75,9 @@ LiveKit Agents / Pipecat
 
 |Full-duplex evaluation
 |Full-Duplex-Bench v1/v1.5/v3
-|Evaluate pause handling, backchannels, interruption, overlap, side speech, disfluency, and self-correction
-|#59, #70, #81
-|Synthetic/replay scenarios that reflect VTuber/Japanese use rather than copying benchmark thresholds
+|Evaluate pause handling, backchannels, interruption, overlap, side speech, disfluency, self-correction, and v3 multi-step tool use
+|#59, #70, #81, #92, #193
+|Synthetic/replay scenarios that reflect VTuber/Japanese use; tool-use verification under disfluency; never copy benchmark thresholds into SLOs
 
 |Preemptive generation
 |LiveKit Agents preemptive generation;
@@ -122,12 +122,12 @@ Reflective Memory Management (ACL 2025)
 |Retention plateau; stale-fact reduction; deterministic deletion/edge cleanup; privacy
 
 |Hybrid / epistemic memory
-|Hindsight;
-Graphiti;
+|Hindsight (built-in MCP retain/recall/reflect);
+Graphiti (temporal graph + experimental MCP server);
 Letta
-|Combine semantic/keyword/temporal/graph retrieval; distinguish VerifiedFact, ViewerClaim, Observation, Experience, Opinion
-|#105
-|Whether extra retrieval arms beat exact/simple retrieval at current scale; provenance-aware wording; dependency/runtime cost
+|Benchmark an external memory sidecar before custom graph infrastructure; combine semantic/keyword/temporal/graph retrieval only after MemoryWriteGate; distinguish VerifiedFact, ViewerClaim, Observation, Experience, Opinion
+|#105, #193
+|Whether external memory beats exact/simple retrieval at current scale; deletion/privacy enforcement; provenance-aware wording; sidecar/MCP latency and dependency/runtime cost
 
 |Agent tool execution / MCP
 |official MCP Rust SDK (+rmcp+);
@@ -151,12 +151,13 @@ provider cache-capability documentation
 |#58, #66, #69
 |Provider-specific semantics; cache hit behavior with persona/policy versions; whether layout harms dynamic-context quality
 
-|Trace evaluation
-|Recent multi-level agent evaluation / trace-attribution research;
-Langfuse/TensorZero observability patterns
-|Evaluate system outcome, trace path, and stage/node separately; deterministic attribution before optional LLM judge
-|#58, #59, #62, #65, #108
-|Agreement with human attribution; privacy-safe evidence; unknown/ambiguous rate; false causal claims
+|Trace evaluation / interoperability
+|OpenTelemetry GenAI agent/tool semantic conventions;
+Phoenix;
+recent multi-level agent evaluation research
+|Evaluate system outcome, trace path, and stage/node separately; deterministic attribution before optional LLM judge; optionally map retained aivtuber stages to standard agent/workflow/tool spans
+|#58, #59, #62, #65, #108, #193
+|Agreement with human attribution; privacy-safe export; unknown/ambiguous rate; false causal claims; ensure external span conventions never replace aivtuber causal semantics
 
 |Local Japanese speech
 |sherpa-onnx;

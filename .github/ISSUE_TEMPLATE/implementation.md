@@ -24,7 +24,7 @@ assignees: ''
 
 ## Reuse-first assessment
 
-<!-- Before designing generic infrastructure, check docs/reuse-first.adoc and maintained OSS/crates. Record candidate(s), license/maintenance/runtime fit, and a decision: adopt | wrap | sidecar | partial reuse | reference only | benchmark first | reject | custom. If custom, state why earlier reuse options do not fit. -->
+<!-- Before designing generic infrastructure, check docs/reuse-first.adoc, docs/implementation-accelerator.adoc, and maintained OSS/crates. Record candidate(s), license/maintenance/runtime fit, and a decision: adopt | wrap | sidecar | partial reuse | reference only | benchmark first | reject | custom. If custom, state why earlier reuse options do not fit. -->
 
 ## Scope
 
