@@ -244,24 +244,44 @@ impl ShadowCompatibilityKey {
 /// reconstructed afterwards: `ShadowOrchestratorConfig` fixes the sample rate,
 /// deadline, concurrency, queue capacity and whether provider calls or budget
 /// charging were permitted, and two batches differing only in those bounds are
-/// not comparable even under an identical policy identity. The caller therefore
-/// supplies the config it actually ran with, and the summarizer validates it
-/// before copying anything into a report.
+/// not comparable even under an identical policy identity.
+///
+/// The fields are private on purpose. A caller-supplied identity with public
+/// fields could be hand-written, which would restore exactly the gap this type
+/// closes: a report would then carry bounds nobody verified. The only way to
+/// obtain one is [`Self::from_config`], so the fingerprint always describes a
+/// real, validated `ShadowOrchestratorConfig`. It reaches a report because
+/// [`summarize_shadow_divergence`] accepts that config and derives the identity
+/// internally.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShadowOrchestrationIdentity {
-    pub orchestrator_schema_version: String,
+    orchestrator_schema_version: String,
     /// Stable fingerprint of the orchestration bounds (sample rate, seed,
     /// event kinds, max concurrent, queue capacity, deadline, provider-call and
     /// budget flags). Two batches may only be combined when this matches.
-    pub bounds_fingerprint: String,
+    bounds_fingerprint: String,
 }
 
 impl ShadowOrchestrationIdentity {
+    /// The orchestration schema version these records were produced under.
+    pub fn orchestrator_schema_version(&self) -> &str {
+        &self.orchestrator_schema_version
+    }
+
+    /// Fingerprint over every bound that changes which events are admitted and
+    /// how long an evaluation may run.
+    pub fn bounds_fingerprint(&self) -> &str {
+        &self.bounds_fingerprint
+    }
+
     /// Derive the identity from the config the records were actually produced
-    /// under. The fingerprint covers every bound that changes which events are
-    /// admitted and how long an evaluation may run.
-    pub fn from_config(config: &ShadowOrchestratorConfig) -> Self {
+    /// under.
+    ///
+    /// The config is validated first, so an identity cannot be derived from a
+    /// config the runtime would have rejected.
+    pub fn from_config(config: &ShadowOrchestratorConfig) -> Result<Self, AppError> {
+        config.validate()?;
         // FNV-1a over a canonical, field-ordered rendering. Deterministic and
         // dependency-free, matching `ShadowOrchestratorConfig::sample_bucket`.
         const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -293,14 +313,17 @@ impl ShadowOrchestrationIdentity {
         );
         let hash = absorb(FNV_OFFSET_BASIS, &canonical);
 
-        Self {
+        Ok(Self {
             orchestrator_schema_version: config.schema_version.clone(),
             bounds_fingerprint: format!("{hash:016x}"),
-        }
+        })
     }
 
     /// Reject an identity that does not describe the orchestrator this build
     /// actually runs. A report must never claim bounds it cannot vouch for.
+    ///
+    /// Private-path helper: only reachable from a value built by
+    /// [`Self::from_config`], so the version it checks is the config's own.
     fn validate(&self) -> Result<(), AppError> {
         if self.orchestrator_schema_version != SHADOW_ORCHESTRATOR_SCHEMA_VERSION {
             return Err(AppError::Routing(format!(
@@ -437,21 +460,29 @@ pub const DEFAULT_DIVERGENT_CASE_LIMIT: usize = 64;
 
 /// Aggregate comparison records into one report.
 ///
-/// `orchestration` must describe the config these records were actually
-/// produced under, and is validated before anything is copied into the report.
-/// `operational` is optional and adds provider-call counters as batch-level
-/// metrics.
+/// `config` is the `ShadowOrchestratorConfig` these records were actually
+/// produced under. The orchestration identity and its bounds fingerprint are
+/// derived from it *inside* this function, so a report can never carry an
+/// identity the caller hand-wrote: a config the runtime would have rejected is
+/// rejected here too, before any value reaches the report.
+///
+/// `operational` is optional. When supplied, its provider-call counters are
+/// published as batch-level metrics under `shadow.operations.*`. They are
+/// deliberately not folded into `divergence.rate_pct`: they describe what the
+/// shadow path cost, not how often the policies disagreed.
 ///
 /// Refuses, rather than merges, when the batch is empty (an empty report would
-/// read as "no divergence"), the orchestration identity is not the current one,
-/// a record carries a different comparison `schema_version`, or any record's
-/// identity differs from the first record's. `case_limit` bounds retained
-/// references only, never counts.
+/// read as "no divergence"), the config is invalid, a record carries a
+/// different comparison `schema_version`, or any record's identity differs from
+/// the first record's. `case_limit` bounds retained references only, never
+/// counts.
 pub fn summarize_shadow_divergence(
     records: &[ShadowComparisonRecord],
-    orchestration: &ShadowOrchestrationIdentity,
+    config: &ShadowOrchestratorConfig,
+    operational: Option<ShadowOperationalEvidence>,
     case_limit: usize,
 ) -> Result<ShadowDivergenceReport, AppError> {
+    let orchestration = ShadowOrchestrationIdentity::from_config(config)?;
     orchestration.validate()?;
 
     let Some(first) = records.first() else {
@@ -536,6 +567,30 @@ pub fn summarize_shadow_divergence(
         },
     );
 
+    // Batch-level operational counters, when the caller measured them. Kept in
+    // their own namespace so #58 can tell "how often did they disagree" apart
+    // from "what did comparing them cost".
+    if let Some(operational) = operational {
+        for (name, value) in [
+            ("provider_calls", operational.provider_calls),
+            ("provider_calls_blocked", operational.provider_calls_blocked),
+            ("evaluations_completed", operational.evaluations_completed),
+            (
+                "evaluations_deadline_exceeded",
+                operational.evaluations_deadline_exceeded,
+            ),
+        ] {
+            metrics.insert(
+                format!("shadow.operations.{name}_count"),
+                ShadowReportMetric {
+                    value: value as f64,
+                    // Measured over the same batch the records describe.
+                    sample_count,
+                },
+            );
+        }
+    }
+
     Ok(ShadowDivergenceReport {
         schema_version: SHADOW_DIVERGENCE_REPORT_SCHEMA_VERSION.to_owned(),
         orchestration: orchestration.clone(),
@@ -554,9 +609,9 @@ pub fn summarize_shadow_divergence(
 /// operational evidence.
 pub fn summarize_shadow_divergence_default(
     records: &[ShadowComparisonRecord],
-    orchestration: &ShadowOrchestrationIdentity,
+    config: &ShadowOrchestratorConfig,
 ) -> Result<ShadowDivergenceReport, AppError> {
-    summarize_shadow_divergence(records, orchestration, DEFAULT_DIVERGENT_CASE_LIMIT)
+    summarize_shadow_divergence(records, config, None, DEFAULT_DIVERGENT_CASE_LIMIT)
 }
 
 fn divergent_case_ref(

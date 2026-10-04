@@ -279,7 +279,16 @@ for (const file of listJson("examples/evaluation/shadow-divergence/invalid")) {
   }
 }
 
-for (const { file, doc } of shadowDivergenceDocuments) {
+// Cross-field checks a JSON Schema cannot express. Returned as messages so the
+// same predicate serves both the valid corpus (expected to be clean) and the
+// `inconsistent/` corpus (expected to trip at least one).
+// Cross-field checks a JSON Schema cannot express, returned as messages. The
+// same predicate serves the valid corpus (expected clean) and the
+// `inconsistent/` corpus (expected to trip at least one), so the two cannot
+// drift apart.
+function shadowDivergenceCrossFieldProblems(doc) {
+  const problems = [];
+
   // Counts must add up. A report whose categories do not sum to the total
   // cannot be consumed by #58 as a metric.
   const counted = SHADOW_DIVERGENCE_CATEGORIES.reduce(
@@ -287,13 +296,9 @@ for (const { file, doc } of shadowDivergenceDocuments) {
     0,
   );
   if (counted !== doc.total_comparisons) {
-    failures += 1;
-    console.error(
-      `FAIL      ${file}: category counts sum to ${counted}, not total_comparisons ${doc.total_comparisons}`,
+    problems.push(
+      `category counts sum to ${counted}, not total_comparisons ${doc.total_comparisons}`,
     );
-  } else {
-    passes += 1;
-    console.log(`ok        ${file}: category counts sum to total_comparisons`);
   }
 
   // The divergence rate has comparable comparisons as its denominator, so
@@ -306,75 +311,108 @@ for (const { file, doc } of shadowDivergenceDocuments) {
       0,
     );
   if (comparable !== doc.comparable_comparisons) {
-    failures += 1;
-    console.error(
-      `FAIL      ${file}: comparable_comparisons is ${doc.comparable_comparisons}, but total minus ${SHADOW_NON_COMPARABLE.join("/")} is ${comparable}`,
+    problems.push(
+      `comparable_comparisons is ${doc.comparable_comparisons}, but total minus ${SHADOW_NON_COMPARABLE.join("/")} is ${comparable}`,
     );
-  } else if (doc.diverged_comparisons > doc.comparable_comparisons) {
-    failures += 1;
-    console.error(
-      `FAIL      ${file}: diverged_comparisons ${doc.diverged_comparisons} exceeds comparable_comparisons ${doc.comparable_comparisons}`,
+  }
+  if (doc.diverged_comparisons > doc.comparable_comparisons) {
+    problems.push(
+      `diverged_comparisons ${doc.diverged_comparisons} exceeds comparable_comparisons ${doc.comparable_comparisons}`,
     );
-  } else {
-    passes += 1;
-    console.log(`ok        ${file}: divergence denominator excludes non-comparable evaluations`);
   }
 
-  // The bounded-orchestration identity and both per-side dataset ids are
-  // schema-enforced (`required` plus the 16-hex `bounds_fingerprint` pattern),
-  // so repeating them here would be a check the fixtures can never trip. What a
-  // schema cannot express is that the published rate agrees with the counts it
-  // was derived from — a stale or hand-edited metric would otherwise let a
-  // consumer believe a divergence rate the counts contradict.
+  // #58 reads `diverged_comparisons` as the headline number, so the diverging
+  // category counts must sum to it. Without this, `route_transition: 5` beside
+  // `diverged_comparisons: 0` and `rate_pct: 0` passes every other check while
+  // publishing a self-contradictory report.
+  const divergingSum = SHADOW_DIVERGENCE_CATEGORIES.filter(
+    (category) => !SHADOW_NON_DIVERGING.includes(category),
+  ).reduce((sum, category) => sum + (doc.category_counts[category] ?? 0), 0);
+  if (divergingSum !== doc.diverged_comparisons) {
+    problems.push(
+      `diverging categories sum to ${divergingSum}, but diverged_comparisons is ${doc.diverged_comparisons}`,
+    );
+  }
+
+  // A published rate must agree with the counts it was derived from; a stale or
+  // hand-edited metric would otherwise let a consumer believe a rate the
+  // categories contradict.
   const rate = doc.metrics?.["shadow.divergence.rate_pct"];
-  if (!rate) {
-    passes += 1;
-    console.log(`ok        ${file}: no rate_pct metric published`);
-  } else {
+  if (rate) {
     const expected =
       doc.comparable_comparisons === 0
         ? 0
         : (doc.diverged_comparisons / doc.comparable_comparisons) * 100;
-    const rateMatches =
-      Math.abs(rate.value - expected) < 1e-9 && rate.sample_count === doc.comparable_comparisons;
-    if (!rateMatches) {
-      failures += 1;
-      console.error(
-        `FAIL      ${file}: rate_pct is ${rate.value} over ${rate.sample_count} samples, but diverged/comparable is ${expected} over ${doc.comparable_comparisons}`,
+    const matches =
+      Math.abs(rate.value - expected) < 1e-9 &&
+      rate.sample_count === doc.comparable_comparisons;
+    if (!matches) {
+      problems.push(
+        `rate_pct is ${rate.value} over ${rate.sample_count} samples, but diverged/comparable is ${expected} over ${doc.comparable_comparisons}`,
       );
-    } else {
-      passes += 1;
-      console.log(`ok        ${file}: rate_pct agrees with diverged/comparable`);
     }
   }
 
-  // Evidence may reference divergent cases, never agreeing or unusable ones.
+  // Evidence may reference divergent cases, never agreement or a comparison
+  // that could not be made.
   const badRef = (doc.divergent_cases ?? []).find((reference) =>
     SHADOW_NON_DIVERGING.includes(reference.category),
   );
   if (badRef) {
-    failures += 1;
-    console.error(
-      `FAIL      ${file}: divergent_cases references ${badRef.event_id} with non-diverging category ${badRef.category}`,
+    problems.push(
+      `divergent_cases references ${badRef.event_id} with non-diverging category ${badRef.category}`,
     );
-  } else {
-    passes += 1;
-    console.log("ok        " + `${file}: case references are divergences only`);
   }
 
   // The truncation flag must agree with the retained references, otherwise a
   // partial report reads as a complete one.
-  const truncated = (doc.divergent_cases ?? []).length < doc.diverged_comparisons;
-  if (truncated !== doc.divergent_cases_truncated) {
-    failures += 1;
-    console.error(
-      `FAIL      ${file}: divergent_cases_truncated is ${doc.divergent_cases_truncated} but retained ${doc.divergent_cases?.length ?? 0} of ${doc.diverged_comparisons}`,
+  const retained = (doc.divergent_cases ?? []).length;
+  if ((retained < doc.diverged_comparisons) !== doc.divergent_cases_truncated) {
+    problems.push(
+      `divergent_cases_truncated is ${doc.divergent_cases_truncated} but retained ${retained} of ${doc.diverged_comparisons}`,
     );
-  } else {
+  }
+
+  return problems;
+}
+
+for (const { file, doc } of shadowDivergenceDocuments) {
+  const problems = shadowDivergenceCrossFieldProblems(doc);
+  if (problems.length === 0) {
     passes += 1;
-    console.log(`ok        ${file}: truncation flag matches retained references`);
+    console.log(`ok        ${file}: cross-field evidence is self-consistent`);
+  } else {
+    failures += problems.length;
+    for (const problem of problems) {
+      console.error(`FAIL      ${file}: ${problem}`);
+    }
   }
 }
+
+// Documents that satisfy the schema but contradict themselves. These are not in
+// `invalid/`, which is the schema-rejection corpus: a self-contradictory report
+// *is* structurally valid, it is simply untrustworthy, which is exactly what
+// these cross-field checks exist to catch.
+for (const file of listJson("examples/evaluation/shadow-divergence/inconsistent")) {
+  if (!shadowDivergence) break;
+  const doc = loadJson(join(root, file));
+  if (!shadowDivergence(doc)) {
+    failures += 1;
+    console.error(
+      `FAIL      ${file} (expected to pass the schema so the cross-field checks can judge it)`,
+    );
+    continue;
+  }
+  const problems = shadowDivergenceCrossFieldProblems(doc);
+  if (problems.length === 0) {
+    failures += 1;
+    console.error(`FAIL      ${file} (expected a contradiction, but every check passed)`);
+  } else {
+    passes += 1;
+    console.log(`ok        ${file} (rejected as intended: ${problems.join("; ")})`);
+  }
+}
+
 
 function reviewPresentation(caseId, seed) {
   const firstByte = createHash("sha256").update(`${seed}:${caseId}`).digest()[0];

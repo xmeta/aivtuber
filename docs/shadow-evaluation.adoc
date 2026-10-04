@@ -521,15 +521,19 @@ first record's — that key holds both policy identities field by field, so the
 mismatch cannot hide behind a matching shadow dataset), plus the config
 fingerprint and the runtime profile.
 
-The report also carries an `orchestration` block: the bounded-orchestration
-identity the caller supplied *and the summarizer validated*, never a version
-back-filled at summarize time. A `ShadowComparisonRecord` does not carry it,
-and reconstructing it afterwards would claim bounds the report cannot vouch
-for — `ShadowOrchestratorConfig` fixes the sample rate, deadline, concurrency,
-queue capacity and whether provider calls or budget charging were permitted, so
-two batches differing only in those bounds are not comparable even under an
-identical policy identity. `ShadowOrchestrationIdentity::from_config` derives a
-16-hex `bounds_fingerprint` over exactly those fields.
+The report also carries an `orchestration` block, and it is the *only* way
+bounds reach a report. A `ShadowComparisonRecord` does not carry orchestration
+identity, so `summarize_shadow_divergence` accepts the
+`ShadowOrchestratorConfig` the caller actually ran with and derives the identity
+itself. `ShadowOrchestrationIdentity`'s fields are private for the same reason:
+a caller-supplied identity with public fields could be hand-written, which would
+reopen exactly the gap the block exists to close. `from_config` validates the
+config first — a config the runtime would reject cannot produce an identity — and
+folds every bound that changes which events are admitted and how long an
+evaluation may run into a 16-hex `bounds_fingerprint`. Two batches differing only
+in deadline, sample rate, concurrency, queue capacity, provider-call permission
+or budget charging are therefore never reported as one sample, even under an
+identical policy identity.
 
 === 9.3 What a report contains
 
@@ -562,8 +566,12 @@ disagrees with its own counts.
 Operational evidence (#165 scope: provider-call counts "when available") is
 supplied by the caller as a `ShadowOperationalEvidence` delta taken from
 `ShadowExecutionSnapshot` counters around the batch, via
-`ShadowOperationalEvidence::from_snapshot_delta`. The snapshot is cumulative for
-the life of the orchestrator and the records alone cannot say what the shadow
-path cost, so it is the *delta* — never a raw snapshot — that a report may carry.
+`ShadowOperationalEvidence::from_snapshot_delta`, and passed to
+`summarize_shadow_divergence` as its `operational` argument. The snapshot is
+cumulative for the life of the orchestrator and the records alone cannot say
+what the shadow path cost, so it is the *delta* — never a raw snapshot — that a
+report may carry. The counters are published under `shadow.operations.*`,
+deliberately outside `shadow.divergence.*`: they describe what comparing cost,
+not how often the policies disagreed, so they never move `rate_pct`.
 
 #165 does not replace #108 causal trace attribution.

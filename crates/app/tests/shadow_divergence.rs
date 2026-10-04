@@ -97,9 +97,9 @@ fn active(route: ShadowRouteClass, target: Option<ShadowTargetIdentity>) -> Shad
     }
 }
 
-/// The orchestration identity a test batch claims to have run under.
-fn orchestration() -> ShadowOrchestrationIdentity {
-    ShadowOrchestrationIdentity::from_config(&ShadowOrchestratorConfig::default())
+/// The config a test batch claims to have run under.
+fn config() -> ShadowOrchestratorConfig {
+    ShadowOrchestratorConfig::default()
 }
 
 fn agreeing(event_id: &str) -> ShadowComparisonRecord {
@@ -127,7 +127,7 @@ fn route_transition(event_id: &str) -> ShadowComparisonRecord {
 fn summarize(
     records: &[ShadowComparisonRecord],
 ) -> Result<ShadowDivergenceReport, aivtuber_app::AppError> {
-    summarize_shadow_divergence_default(records, &orchestration())
+    summarize_shadow_divergence_default(records, &config())
 }
 
 #[test]
@@ -484,17 +484,17 @@ fn the_report_copies_the_orchestration_identity_it_was_given() {
         deadline_ms: 400,
         ..ShadowOrchestratorConfig::default()
     };
-    let supplied = ShadowOrchestrationIdentity::from_config(&config);
 
     let report =
-        summarize_shadow_divergence_default(&[agreeing("evt-1")], &supplied).expect("summary");
+        summarize_shadow_divergence_default(&[agreeing("evt-1")], &config).expect("summary");
 
     assert_eq!(
-        report.orchestration, supplied,
-        "the report must echo the verified input, not a current constant"
+        report.orchestration,
+        ShadowOrchestrationIdentity::from_config(&config).expect("identity"),
+        "the report must echo the identity derived from the supplied config"
     );
     assert_eq!(
-        report.orchestration.orchestrator_schema_version,
+        report.orchestration.orchestrator_schema_version(),
         SHADOW_ORCHESTRATOR_SCHEMA_VERSION
     );
 }
@@ -502,61 +502,67 @@ fn the_report_copies_the_orchestration_identity_it_was_given() {
 #[test]
 fn different_orchestration_bounds_produce_different_identities() {
     let base = ShadowOrchestratorConfig::default();
+    let fingerprint = |config: &ShadowOrchestratorConfig| {
+        ShadowOrchestrationIdentity::from_config(config)
+            .expect("valid config")
+            .bounds_fingerprint()
+            .to_owned()
+    };
 
-    let mut slower = base.clone();
-    slower.deadline_ms = base.deadline_ms + 1;
+    let slower = ShadowOrchestratorConfig {
+        deadline_ms: base.deadline_ms + 1,
+        ..base.clone()
+    };
     assert_ne!(
-        ShadowOrchestrationIdentity::from_config(&base).bounds_fingerprint,
-        ShadowOrchestrationIdentity::from_config(&slower).bounds_fingerprint,
+        fingerprint(&base),
+        fingerprint(&slower),
         "a different deadline changes which evidence a run produces"
     );
 
-    let mut busier = base.clone();
-    busier.max_concurrent = base.max_concurrent + 1;
-    assert_ne!(
-        ShadowOrchestrationIdentity::from_config(&base).bounds_fingerprint,
-        ShadowOrchestrationIdentity::from_config(&busier).bounds_fingerprint
-    );
+    let busier = ShadowOrchestratorConfig {
+        max_concurrent: base.max_concurrent + 1,
+        ..base.clone()
+    };
+    assert_ne!(fingerprint(&base), fingerprint(&busier));
 
-    let mut billing = base.clone();
-    billing.allow_provider_calls = true;
+    let billing = ShadowOrchestratorConfig {
+        allow_provider_calls: true,
+        ..base.clone()
+    };
     assert_ne!(
-        ShadowOrchestrationIdentity::from_config(&base).bounds_fingerprint,
-        ShadowOrchestrationIdentity::from_config(&billing).bounds_fingerprint,
+        fingerprint(&base),
+        fingerprint(&billing),
         "enabling billable provider calls must change the bounds fingerprint"
     );
 
     // Identical configs must agree, or stored evidence becomes unreproducible.
-    assert_eq!(
-        ShadowOrchestrationIdentity::from_config(&base).bounds_fingerprint,
-        ShadowOrchestrationIdentity::from_config(&base.clone()).bounds_fingerprint
-    );
+    assert_eq!(fingerprint(&base), fingerprint(&base.clone()));
 }
 
 #[test]
-fn an_orchestration_identity_from_another_schema_version_is_refused() {
-    let supplied = ShadowOrchestrationIdentity {
-        orchestrator_schema_version: "0.0.9".to_owned(),
-        bounds_fingerprint: "0123456789abcdef".to_owned(),
+fn a_config_from_another_schema_version_is_refused() {
+    let config = ShadowOrchestratorConfig {
+        schema_version: "0.0.9".to_owned(),
+        ..ShadowOrchestratorConfig::default()
     };
-    let error = summarize_shadow_divergence_default(&[agreeing("evt-1")], &supplied)
+    let error = summarize_shadow_divergence_default(&[agreeing("evt-1")], &config)
         .expect_err("a foreign orchestration version must be refused");
     assert!(
-        error.to_string().contains("orchestration schema_version"),
+        error.to_string().contains("schema_version"),
         "unexpected error: {error}"
     );
 }
 
 #[test]
-fn an_empty_bounds_fingerprint_is_refused() {
-    let supplied = ShadowOrchestrationIdentity {
-        orchestrator_schema_version: SHADOW_ORCHESTRATOR_SCHEMA_VERSION.to_owned(),
-        bounds_fingerprint: "  ".to_owned(),
+fn an_invalid_config_is_refused_before_any_report_is_built() {
+    let config = ShadowOrchestratorConfig {
+        deadline_ms: 0,
+        ..ShadowOrchestratorConfig::default()
     };
-    let error = summarize_shadow_divergence_default(&[agreeing("evt-1")], &supplied)
-        .expect_err("an unverifiable bounds fingerprint must be refused");
+    let error = summarize_shadow_divergence_default(&[agreeing("evt-1")], &config)
+        .expect_err("a config the runtime would reject must be refused");
     assert!(
-        error.to_string().contains("bounds_fingerprint"),
+        error.to_string().contains("deadline_ms"),
         "unexpected error: {error}"
     );
 }
@@ -656,7 +662,7 @@ fn truncating_references_never_truncates_counts() {
         route_transition("evt-2"),
         route_transition("evt-3"),
     ];
-    let report = summarize_shadow_divergence(&records, &orchestration(), 1).expect("summary");
+    let report = summarize_shadow_divergence(&records, &config(), None, 1).expect("summary");
 
     assert_eq!(report.diverged_comparisons, 3);
     assert_eq!(report.category_counts["route_transition"], 3);
@@ -681,7 +687,7 @@ fn metrics_follow_the_benchmark_flat_naming_convention() {
     let report = summarize(&records).expect("summary");
     for (name, metric) in &report.metrics {
         assert!(
-            name.starts_with("shadow.divergence."),
+            name.starts_with("shadow.divergence.") || name.starts_with("shadow.operations."),
             "unexpected metric name {name}"
         );
         assert!(
@@ -707,7 +713,7 @@ fn a_report_carries_the_versions_a_stored_sample_needs() {
         SHADOW_DIVERGENCE_REPORT_SCHEMA_VERSION
     );
     assert_eq!(
-        report.orchestration.orchestrator_schema_version,
+        report.orchestration.orchestrator_schema_version(),
         SHADOW_ORCHESTRATOR_SCHEMA_VERSION
     );
 }
@@ -763,4 +769,100 @@ fn a_report_round_trips_through_json() {
     let encoded = serde_json::to_string(&report).expect("serializes");
     let decoded: ShadowDivergenceReport = serde_json::from_str(&encoded).expect("deserializes");
     assert_eq!(decoded, report);
+}
+
+/// P2: the scope asks for provider-call counts "when available". The type
+/// existing without being reachable from the report API is not an export.
+#[test]
+fn operational_evidence_reaches_the_report_metrics() {
+    let records = vec![route_transition("evt-1"), agreeing("evt-2")];
+    let operational = ShadowOperationalEvidence {
+        provider_calls: 5,
+        provider_calls_blocked: 2,
+        evaluations_completed: 7,
+        evaluations_deadline_exceeded: 1,
+    };
+
+    let report =
+        summarize_shadow_divergence(&records, &config(), Some(operational), 8).expect("summary");
+
+    assert_eq!(
+        report.metrics["shadow.operations.provider_calls_count"].value,
+        5.0
+    );
+    assert_eq!(
+        report.metrics["shadow.operations.provider_calls_blocked_count"].value,
+        2.0
+    );
+    assert_eq!(
+        report.metrics["shadow.operations.evaluations_completed_count"].value,
+        7.0
+    );
+    assert_eq!(
+        report.metrics["shadow.operations.evaluations_deadline_exceeded_count"].value,
+        1.0
+    );
+    assert_eq!(
+        report.metrics["shadow.operations.provider_calls_count"].sample_count, 2,
+        "operational counters are measured over the same batch"
+    );
+}
+
+/// Operational cost must not be confused with disagreement.
+#[test]
+fn operational_evidence_does_not_distort_the_divergence_rate() {
+    let records = vec![route_transition("evt-1"), agreeing("evt-2")];
+    let with = summarize_shadow_divergence(
+        &records,
+        &config(),
+        Some(ShadowOperationalEvidence {
+            provider_calls: 99,
+            ..ShadowOperationalEvidence::default()
+        }),
+        8,
+    )
+    .expect("summary");
+    let without = summarize(&records).expect("summary");
+
+    assert_eq!(
+        with.metrics["shadow.divergence.rate_pct"].value,
+        without.metrics["shadow.divergence.rate_pct"].value
+    );
+    assert_eq!(
+        with.diverged_comparisons, without.diverged_comparisons,
+        "provider calls describe cost, not disagreement"
+    );
+}
+
+#[test]
+fn no_operational_evidence_means_no_operational_metrics() {
+    let report = summarize(&[agreeing("evt-1")]).expect("summary");
+    assert!(
+        !report
+            .metrics
+            .keys()
+            .any(|name| name.starts_with("shadow.operations.")),
+        "callers must opt in to operational counters"
+    );
+}
+
+/// The aggregation the report publishes must be internally consistent: the
+/// diverging categories sum to `diverged_comparisons`, which is what #58 reads.
+#[test]
+fn diverging_category_counts_sum_to_the_diverged_total() {
+    let records = vec![
+        route_transition("evt-1"),
+        route_transition("evt-2"),
+        route_transition("evt-3"),
+        agreeing("evt-4"),
+    ];
+    let report = summarize(&records).expect("summary");
+
+    let diverging_sum: u64 = ShadowDivergenceCategory::ALL
+        .iter()
+        .filter(|category| category.is_divergence())
+        .map(|category| report.category_counts[category.as_str()])
+        .sum();
+    assert_eq!(diverging_sum, report.diverged_comparisons);
+    assert_eq!(report.diverged_comparisons, 3);
 }
