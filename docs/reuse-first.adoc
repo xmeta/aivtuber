@@ -90,6 +90,24 @@ Record the result as one of:
 |Reuse provider/tool-loop plumbing, dynamic tool registration, lifecycle hooks, and MCP adaptation when they reduce project code. Rig must remain below aivtuber authority and result-verification boundaries; reject/narrow it if it weakens deterministic replay, bounded execution, cancellation, or capability enforcement.
 |#193
 
+|External service connectors
+|GitHub official MCP server; Microsoft Playwright MCP; reviewed provider MCP servers for Google Workspace / Notion where available
+|Profile / sidecar before native adapter
+|Reuse maintained service-specific tool schemas, authentication flows, and API mechanics. Keep server allowlist, credential scope, local risk classification, approval, task verification, health limits, and graceful removal in aivtuber. Do not auto-trust public-registry entries or add one native adapter per SaaS by default.
+|#202, #204
+
+|Desktop shell
+|Tauri v2 + maintained first-party plugins
+|Evaluate / likely adopt
+|Reuse window/process shell and generic desktop concerns such as updater, autostart, single-instance behavior, and dialogs where needed. Keep runtime/domain logic, authenticated control, task state, Persona/RoleBlend semantics, and connector policy in the Rust core rather than duplicating them in UI code.
+|#205
+
+|External specialized agent delegation
+|Agent Client Protocol (ACP); ACP-capable runtimes such as Goose
+|Future reference / spike only
+|Potentially delegate specialized long-running work such as coding after #193/#201/#202/#203 are stable. An external agent must sit below AgentTask as a bounded backend; it must not own capability minting, task completion truth, memory policy, or Persona. Do not add ACP to the critical path while the protocol/runtime fit is still evolving.
+|#200
+
 |Realtime conversational voice pipeline
 |LiveKit Agents / Pipecat Smart Turn v3
 |Sidecar / reference first
