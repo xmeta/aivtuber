@@ -1,6 +1,6 @@
 {
   "schema_version": "1",
-  "review_session_id": "mod-benign-criticism",
+  "review_session_id": "mod-truncation-contradiction",
   "policy": {
     "policy_id": "moderation-shadow",
     "policy_version": "0.4.0",
@@ -189,6 +189,6 @@
         "severity": 3
       }
     ],
-    "divergent_cases_truncated": false
+    "divergent_cases_truncated": true
   }
 }

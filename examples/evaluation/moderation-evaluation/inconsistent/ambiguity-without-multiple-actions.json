@@ -5,6 +5,7 @@
     "policy_id": "moderation-shadow",
     "policy_version": "0.4.0",
     "config_fingerprint": "cfg-mod-1",
+    "runtime_profile": "default",
     "reviewer_protocol_version": "protocol-1",
     "dataset_id": "mod-dataset-2026-10"
   },
@@ -48,6 +49,8 @@
   ],
   "aggregate": {
     "total_cases": 1,
+    "comparable_cases": 1,
+    "diverged_cases": 0,
     "agreed_cases": 1,
     "overridden_cases": 0,
     "reviewer_disagreement_cases": 0,
@@ -67,6 +70,8 @@
     "outcome_counts": {
       "none/allow": 1
     },
+    "divergent_cases": [],
+    "divergent_cases_truncated": false,
     "metrics": {
       "shadow.moderation.none_count": {
         "value": 1,
@@ -132,7 +137,6 @@
         "value": 0,
         "sample_count": 1
       }
-    },
-    "divergent_cases_truncated": false
+    }
   }
 }

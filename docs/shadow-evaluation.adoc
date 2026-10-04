@@ -601,7 +601,7 @@ so the delta is only ever computed from an ordered pair.
 
 #165 does not replace #108 causal trace attribution.
 
-== 10. Shadow moderation evaluation (#77, implemented)
+== 10. Shadow moderation evaluation (#77, evidence slice implemented)
 
 === 10.1 A recommendation is not an action
 
@@ -662,6 +662,22 @@ disagreement. `classify_moderation_case` reports three outcomes — `agreed`,
 independently, because a policy can be "right" and still unusable if reviewers
 cannot agree on what right means.
 
+The pair test is symmetric on purpose. `reviews` preserves submission order and
+nothing about scoring may depend on it, so a pair disagrees when *either*
+reviewer's acceptable set fails to cover the other's label, or when the two
+assign different violation categories. Checking one direction only made the
+verdict a property of who happened to submit first: a reviewer who labels
+`allow` but tolerates `ignore`, paired with one who labels `ignore` and
+tolerates only `ignore`, was an agreement in one order and a disagreement in
+the other. Category splits count because two reviewers who agree an action is
+acceptable but cannot agree on whether it is a violation have not settled what
+the label means. `reviewer_disagreement_cases` therefore overlaps
+`overridden_cases` on purpose, and `agreed_cases` counts only cases the
+reviewers actually settled — a report may not claim to be agreed and split at
+the same time. `agreed_cases + overridden_cases` is bounded by `total_cases`
+rather than equal to it, because a disagreement-only case belongs to neither
+outcome bucket. `reviewer-disagreement.json` pins both disagreement shapes.
+
 === 10.5 Outliers survive aggregation
 
 #77 requires that a dangerous outlier stay independently reviewable even when
@@ -690,6 +706,21 @@ run identically.
 An unreviewed case is refused rather than counted as agreement: it has no
 evidence behind it either way.
 
+The policy identity carries `runtime_profile` as well, because the same policy
+and config fingerprint produce different evidence on different profiles.
+Validating the field and then dropping it would let two records from different
+runtime conditions collapse into one identity and be reported as a single
+batch; `a_different_runtime_profile_cannot_collapse_into_one_identity` and
+`records_from_different_runtime_profiles_cannot_be_reported_as_one_batch` pin
+it.
+
+`divergent_cases` retains references to *overrides only*. An agreement is not a
+reviewable divergence, so retaining one would let a batch of agreements fill
+`case_limit` and displace the overrides that actually need review while still
+reporting `divergent_cases_truncated: false`. The flag answers "was a
+divergence dropped" — retained references against `overridden_cases` — rather
+than "did the list fill up", and counts themselves are never truncated.
+
 === 10.7 What the validator refuses
 
 `schemas/moderation-evaluation.schema.json` closes the boundaries structurally:
@@ -714,7 +745,21 @@ one cannot be added from outside.
 
 === 10.8 Not in this slice
 
-Severity-specific promotion thresholds, drift monitoring and decision-latency
-measurement are deliberately absent: thresholds need measured evidence, and
-automation is not enabled, so there is nothing to drift or to time. Execution
-authority is #76 and must stay separate from this evidence layer.
+This section implements the *evidence* half of #77: the report, its schema, the
+offline fixtures and the summarizer. It does not implement #77's acceptance
+criteria as a whole, and nothing here should be read as satisfying them. Still
+open, tracked in the #77 slice issue:
+
+* precision, recall, false-positive rate and false-negative rate against a
+  labelled holdout;
+* severity upgrade and downgrade rates;
+* Jev routing and moderation decision latency;
+* severity-specific promotion stages, drift monitoring, and rollback on
+  quality degradation;
+* running a shadow moderation recommendation against live traffic to *prove*
+  active output is unchanged (side-effect-free execution).
+
+Severity-specific promotion thresholds and drift monitoring are deliberately
+absent from this slice: thresholds need measured evidence, and automation is not
+enabled, so there is nothing to drift or to time. Execution authority is #76 and
+must stay separate from this evidence layer.

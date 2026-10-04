@@ -224,6 +224,12 @@ pub struct ModerationPolicyIdentity {
     policy_id: String,
     policy_version: String,
     config_fingerprint: String,
+    /// The runtime profile the samples were collected under.
+    ///
+    /// Part of the identity, not metadata: the same policy and config produce
+    /// different evidence on different profiles, so two records from different
+    /// profiles are not comparable and must not share one report.
+    runtime_profile: String,
     reviewer_protocol_version: String,
     dataset_id: Option<String>,
 }
@@ -239,6 +245,10 @@ impl ModerationPolicyIdentity {
 
     pub fn config_fingerprint(&self) -> &str {
         &self.config_fingerprint
+    }
+
+    pub fn runtime_profile(&self) -> &str {
+        &self.runtime_profile
     }
 
     pub fn reviewer_protocol_version(&self) -> &str {
@@ -279,6 +289,7 @@ impl ModerationPolicyIdentity {
             policy_id: policy.policy_id.clone(),
             policy_version: policy.policy_version.clone(),
             config_fingerprint: policy.config_fingerprint.clone(),
+            runtime_profile: policy.runtime_profile.clone(),
             reviewer_protocol_version: reviewer_protocol_version.to_owned(),
             dataset_id: policy.dataset_id.clone(),
         })
@@ -466,6 +477,15 @@ pub enum AuthorityEffect {
 /// two-way agreement metric would be: reviewer disagreement is reported
 /// independently, because a policy can be "right" and still be unusable if
 /// reviewers cannot agree on what right means.
+///
+/// A pair of reviewers disagrees when *either* reviewer's acceptable set fails
+/// to cover the other's label, or when they assign different violation
+/// categories. The check is symmetric on purpose: `reviews` preserves
+/// submission order and nothing about scoring may depend on it, so a
+/// left-to-right scan of one-sided checks would call the pair in the review's
+/// reproduction (allow/tolerates-ignore paired with ignore/tolerates-only-ignore)
+/// an agreement in one order and a disagreement in the other. Requiring both
+/// directions to be satisfied makes the verdict a property of the pair.
 pub fn classify_moderation_case(record: &ModerationComparisonRecord) -> (ModerationOutcome, bool) {
     let rejected: Vec<&ModerationReview> = record
         .reviews
@@ -474,15 +494,14 @@ pub fn classify_moderation_case(record: &ModerationComparisonRecord) -> (Moderat
         .collect();
 
     let mut reviewer_disagreement = false;
-    for (index, left) in record.reviews.iter().enumerate() {
+    'pairs: for (index, left) in record.reviews.iter().enumerate() {
         for right in record.reviews.iter().skip(index + 1) {
-            if !left.accepts(right.label) {
+            let mutual_acceptance = left.accepts(right.label) && right.accepts(left.label);
+            let category_split = left.category != right.category;
+            if !mutual_acceptance || category_split {
                 reviewer_disagreement = true;
-                break;
+                break 'pairs;
             }
-        }
-        if reviewer_disagreement {
-            break;
         }
     }
 
@@ -607,11 +626,18 @@ pub fn summarize_moderation_divergence(
             if action != ModerationAction::Allow && reviewed_as_benign(record) {
                 benign_suppressed_cases += 1;
             }
-        } else {
+        } else if !reviewer_disagreement {
+            // "Agreed" means the reviewers settled: no reviewer rejected the
+            // recommendation *and* they did not disagree among themselves.
+            // Counting a disagreement case here would let one report claim
+            // `agreed_cases: 2` alongside `reviewer_disagreement_cases: 2`.
             agreed_cases += 1;
         }
 
-        if divergent_cases.len() < case_limit {
+        // Only overrides are retained as reviewable references. An agreement is
+        // not a divergence: publishing one would let a batch of agreements fill
+        // `case_limit` and displace the overrides that actually need review.
+        if overrode && divergent_cases.len() < case_limit {
             divergent_cases.push(ModerationDivergentCaseRef {
                 case_id: record.case_id.clone(),
                 correlation_id: record.correlation_id.clone(),
@@ -623,7 +649,9 @@ pub fn summarize_moderation_divergence(
         }
     }
 
-    let truncated = diverged_cases > divergent_cases.len() as u64;
+    // Compare the retained references against the divergence count, so the flag
+    // answers "was a divergence dropped" rather than "did the list fill up".
+    let truncated = overridden_cases > divergent_cases.len() as u64;
     let sample_count = total_cases;
 
     let mut metrics: BTreeMap<String, ModerationReportMetric> = category_counts

@@ -5,6 +5,7 @@
     "policy_id": "moderation-shadow",
     "policy_version": "0.4.0",
     "config_fingerprint": "cfg-mod-1",
+    "runtime_profile": "default",
     "reviewer_protocol_version": "protocol-1",
     "dataset_id": "mod-dataset-2026-10"
   },
@@ -71,6 +72,8 @@
   ],
   "aggregate": {
     "total_cases": 2,
+    "comparable_cases": 2,
+    "diverged_cases": 1,
     "agreed_cases": 1,
     "overridden_cases": 1,
     "reviewer_disagreement_cases": 0,
@@ -153,10 +156,20 @@
         "sample_count": 2
       },
       "shadow.moderation.override_rate_pct": {
-        "value": 50,
+        "value": 50.0,
         "sample_count": 2
       }
     },
+    "divergent_cases": [
+      {
+        "case_id": "case-quoted-01",
+        "correlation_id": "corr-quoted-01",
+        "recommended_action": "delete",
+        "recommended_category": "harassment",
+        "outcome": "overridden",
+        "severity": 3
+      }
+    ],
     "divergent_cases_truncated": false
   }
 }

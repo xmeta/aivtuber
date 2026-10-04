@@ -1,6 +1,6 @@
 {
   "schema_version": "1",
-  "review_session_id": "mod-benign-criticism",
+  "review_session_id": "mod-retention-contradiction",
   "policy": {
     "policy_id": "moderation-shadow",
     "policy_version": "0.4.0",
@@ -177,7 +177,7 @@
         "correlation_id": "corr-criticism-01",
         "recommended_action": "ignore",
         "recommended_category": "none",
-        "outcome": "overridden",
+        "outcome": "agreed",
         "severity": 1
       },
       {

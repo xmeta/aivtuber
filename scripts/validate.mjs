@@ -639,9 +639,19 @@ function moderationEvaluationCrossFieldProblems(doc) {
       `destructive_overridden_cases is ${aggregate.destructive_overridden_cases}, but only ${aggregate.overridden_cases} case(s) were overridden`,
     );
   }
-  if (aggregate.agreed_cases + aggregate.overridden_cases !== aggregate.total_cases) {
+  // Reviewer disagreement is independent of the outcome, so it overlaps both
+  // counters rather than forming a third bucket: a case may be overridden *and*
+  // split between reviewers. What may never happen is a case being counted as
+  // agreed and as a disagreement at the same time, or the two outcome counters
+  // exceeding the corpus.
+  if (aggregate.agreed_cases + aggregate.overridden_cases > aggregate.total_cases) {
     problems.push(
-      `agreed_cases + overridden_cases is ${aggregate.agreed_cases + aggregate.overridden_cases}, not total_cases ${aggregate.total_cases}`,
+      `agreed_cases + overridden_cases is ${aggregate.agreed_cases + aggregate.overridden_cases}, more than total_cases ${aggregate.total_cases}`,
+    );
+  }
+  if (aggregate.agreed_cases + aggregate.reviewer_disagreement_cases > aggregate.total_cases) {
+    problems.push(
+      `agreed_cases + reviewer_disagreement_cases is ${aggregate.agreed_cases + aggregate.reviewer_disagreement_cases}, more than total_cases ${aggregate.total_cases}`,
     );
   }
   if (aggregate.reviewer_disagreement_cases > aggregate.total_cases) {
@@ -672,6 +682,57 @@ function moderationEvaluationCrossFieldProblems(doc) {
   if (aggregate.benign_suppressed_cases > suppressibleBenign) {
     problems.push(
       `benign_suppressed_cases is ${aggregate.benign_suppressed_cases}, but only ${suppressibleBenign} reviewer-benign case(s) received a suppressive recommendation`,
+    );
+  }
+
+  // The retained reference list is what a reviewer actually opens, so it must
+  // describe the report it claims to summarise: only divergences, each of them
+  // a real override in this corpus, and a truncation flag that means what it
+  // says. #77 review round 1: an agreement retained as a reference could fill
+  // the case limit and displace a real divergence while reporting
+  // `truncated=false`.
+  if (aggregate.diverged_cases !== aggregate.overridden_cases) {
+    problems.push(
+      `diverged_cases is ${aggregate.diverged_cases}, but overridden_cases is ${aggregate.overridden_cases}`,
+    );
+  }
+  if (aggregate.comparable_cases > aggregate.total_cases) {
+    problems.push(
+      `comparable_cases is ${aggregate.comparable_cases}, but the corpus holds only ${aggregate.total_cases} case(s)`,
+    );
+  }
+
+  const overriddenIds = new Set();
+  for (const testCase of cases) {
+    const rejected = (testCase.reviews ?? []).some(
+      (review) => !review.acceptable_actions.includes(testCase.recommendation.action),
+    );
+    if (rejected) {
+      overriddenIds.add(testCase.case_id);
+    }
+  }
+  const refs = aggregate.divergent_cases ?? [];
+  for (const reference of refs) {
+    if (reference.outcome !== "overridden") {
+      problems.push(
+        `divergent_cases references ${reference.case_id} with outcome ${reference.outcome}, but a reference is only ever retained for an override`,
+      );
+    }
+    if (!overriddenIds.has(reference.case_id)) {
+      problems.push(
+        `divergent_cases references ${reference.case_id}, but no reviewer rejected it`,
+      );
+    }
+  }
+  if (refs.length > aggregate.diverged_cases) {
+    problems.push(
+      `divergent_cases holds ${refs.length} reference(s), more than the ${aggregate.diverged_cases} divergence(s) in the corpus`,
+    );
+  }
+  const expectedTruncated = refs.length < aggregate.diverged_cases;
+  if (aggregate.divergent_cases_truncated !== expectedTruncated) {
+    problems.push(
+      `divergent_cases_truncated is ${aggregate.divergent_cases_truncated}, but ${refs.length} of ${aggregate.diverged_cases} divergence(s) were retained`,
     );
   }
 

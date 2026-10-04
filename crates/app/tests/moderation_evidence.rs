@@ -912,3 +912,293 @@ fn different_bounds_produce_different_moderation_identities() {
     );
     assert_eq!(fingerprint(&base), fingerprint(&base.clone()));
 }
+
+#[test]
+fn a_different_runtime_profile_cannot_collapse_into_one_identity() {
+    let profile_a = ShadowPolicyIdentity {
+        runtime_profile: "profile-a".to_owned(),
+        ..shadow_identity()
+    };
+    let profile_b = ShadowPolicyIdentity {
+        runtime_profile: "profile-b".to_owned(),
+        ..shadow_identity()
+    };
+
+    let a = ModerationPolicyIdentity::from_policy(&profile_a, "protocol-1").expect("identity");
+    let b = ModerationPolicyIdentity::from_policy(&profile_b, "protocol-1").expect("identity");
+
+    assert_ne!(
+        a, b,
+        "a runtime profile changes which evidence a run produces, so it is part of the identity"
+    );
+    assert_eq!(
+        a.runtime_profile(),
+        "profile-a",
+        "the identity records the profile it was derived from"
+    );
+}
+
+#[test]
+fn records_from_different_runtime_profiles_cannot_be_reported_as_one_batch() {
+    let other_profile = record(
+        "case-other-profile",
+        ModerationAction::Allow,
+        ModerationCategory::None,
+        vec![review(
+            "rev-a",
+            ModerationAction::Allow,
+            &[ModerationAction::Allow],
+            ModerationCategory::None,
+            ModerationAmbiguity::Low,
+        )],
+    );
+    let mut foreign = other_profile.clone();
+    foreign.policy = ModerationPolicyIdentity::from_policy(
+        &ShadowPolicyIdentity {
+            runtime_profile: "profile-b".to_owned(),
+            ..shadow_identity()
+        },
+        "protocol-1",
+    )
+    .expect("identity");
+
+    let records = vec![benign_agreement("case-a"), foreign];
+    let error = summarize(&records).expect_err("a foreign runtime profile must be refused");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("runtime_profile") || message.contains("policy"),
+        "the refusal names the identity that differs, got: {message}"
+    );
+}
+
+#[test]
+fn reviewer_disagreement_does_not_depend_on_submission_order() {
+    // The reviewer pair the review used: A labels allow but tolerates ignore,
+    // B labels ignore and tolerates only ignore. Only A's view is satisfied by
+    // B, so the pair disagrees - but a left-to-right scan sees only A's view
+    // and would call it agreement.
+    let build = |order: [&str; 2]| {
+        vec![
+            review(
+                order[0],
+                ModerationAction::Allow,
+                &[ModerationAction::Allow, ModerationAction::Ignore],
+                ModerationCategory::None,
+                ModerationAmbiguity::Low,
+            ),
+            review(
+                order[1],
+                ModerationAction::Ignore,
+                &[ModerationAction::Ignore],
+                ModerationCategory::None,
+                ModerationAmbiguity::Low,
+            ),
+        ]
+    };
+
+    let forward = record(
+        "case-order-a",
+        ModerationAction::Allow,
+        ModerationCategory::None,
+        build(["rev-a", "rev-b"]),
+    );
+    let reversed = record(
+        "case-order-a",
+        ModerationAction::Allow,
+        ModerationCategory::None,
+        build(["rev-b", "rev-a"]),
+    );
+
+    let (_, forward_disagrees) = classify_moderation_case(&forward);
+    let (_, reversed_disagrees) = classify_moderation_case(&reversed);
+    assert!(
+        forward_disagrees,
+        "B never accepts A's label, so they disagree"
+    );
+    assert_eq!(
+        forward_disagrees, reversed_disagrees,
+        "submission order must not decide whether reviewers disagree"
+    );
+
+    let summarized = summarize(&[forward, reversed]).expect("summary");
+    assert_eq!(
+        summarized.reviewer_disagreement_cases, 2,
+        "both permutations are counted as disagreement"
+    );
+}
+
+#[test]
+fn reviewers_who_disagree_on_category_disagree_even_when_they_agree_on_action() {
+    let reviews = vec![
+        review(
+            "rev-a",
+            ModerationAction::Allow,
+            &[ModerationAction::Allow],
+            ModerationCategory::None,
+            ModerationAmbiguity::Low,
+        ),
+        review(
+            "rev-b",
+            ModerationAction::Allow,
+            &[ModerationAction::Allow],
+            ModerationCategory::Harassment,
+            ModerationAmbiguity::Low,
+        ),
+    ];
+    let disagreement = record(
+        "case-category-split",
+        ModerationAction::Allow,
+        ModerationCategory::None,
+        reviews,
+    );
+
+    let (_, disagrees) = classify_moderation_case(&disagreement);
+    assert!(
+        disagrees,
+        "two reviewers who call the same action acceptable but cannot agree on \
+         whether it is a violation have not settled what the label means"
+    );
+}
+
+#[test]
+fn an_agreement_is_never_retained_as_a_divergent_reference() {
+    let records = vec![benign_agreement("case-agreed-01")];
+
+    let report = summarize(&records).expect("summary");
+
+    assert_eq!(report.agreed_cases, 1);
+    assert_eq!(report.overridden_cases, 0);
+    assert!(
+        report.divergent_cases.is_empty(),
+        "an agreement is not a divergence and must not be published as a reference, got {:?}",
+        report.divergent_cases
+    );
+    assert!(
+        !report.divergent_cases_truncated,
+        "nothing diverged, so nothing was truncated"
+    );
+}
+
+#[test]
+fn agreements_cannot_displace_a_real_divergence_from_the_reference_list() {
+    // `case_limit` bounds retained references. If agreements also occupied
+    // slots, a batch of agreements ahead of the divergence would report
+    // `truncated=false` while quietly dropping the only case worth review.
+    let mut records = Vec::new();
+    for index in 0..4 {
+        records.push(benign_agreement(&format!("case-agreed-{index}")));
+    }
+    records.push(record(
+        "case-real-divergence",
+        ModerationAction::Delete,
+        ModerationCategory::Spam,
+        vec![review(
+            "rev-a",
+            ModerationAction::Allow,
+            &[ModerationAction::Allow],
+            ModerationCategory::Spam,
+            ModerationAmbiguity::Low,
+        )],
+    ));
+
+    let report = summarize_moderation_divergence(&records, &config(), 2).expect("summary");
+
+    assert_eq!(
+        report.overridden_cases, 1,
+        "the one override is still counted"
+    );
+    assert_eq!(
+        report.divergent_cases.len(),
+        1,
+        "only the divergence takes a reference slot"
+    );
+    assert_eq!(report.divergent_cases[0].case_id, "case-real-divergence");
+    assert!(
+        !report.divergent_cases_truncated,
+        "the single divergence was retained, so nothing was truncated"
+    );
+}
+
+#[test]
+fn a_disagreement_case_is_never_counted_as_agreed() {
+    let override_only = record(
+        "case-override-only",
+        ModerationAction::Delete,
+        ModerationCategory::Spam,
+        vec![review(
+            "rev-a",
+            ModerationAction::Allow,
+            &[ModerationAction::Allow],
+            ModerationCategory::Spam,
+            ModerationAmbiguity::Low,
+        )],
+    );
+    let disagreement_only = record(
+        "case-disagreement-only",
+        ModerationAction::Ignore,
+        ModerationCategory::None,
+        vec![
+            review(
+                "rev-a",
+                ModerationAction::Allow,
+                &[ModerationAction::Allow, ModerationAction::Ignore],
+                ModerationCategory::None,
+                ModerationAmbiguity::Low,
+            ),
+            review(
+                "rev-b",
+                ModerationAction::Ignore,
+                &[ModerationAction::Ignore],
+                ModerationCategory::None,
+                ModerationAmbiguity::Low,
+            ),
+        ],
+    );
+    // Overridden *and* split between reviewers: the worst case, and the one
+    // that must appear in both counters rather than being folded into either.
+    let override_and_disagreement = record(
+        "case-override-and-disagreement",
+        ModerationAction::Delete,
+        ModerationCategory::Spam,
+        vec![
+            review(
+                "rev-a",
+                ModerationAction::Allow,
+                &[ModerationAction::Allow],
+                ModerationCategory::None,
+                ModerationAmbiguity::Low,
+            ),
+            review(
+                "rev-b",
+                ModerationAction::Allow,
+                &[ModerationAction::Allow],
+                ModerationCategory::Harassment,
+                ModerationAmbiguity::Low,
+            ),
+        ],
+    );
+
+    let report = summarize(&[
+        override_only,
+        disagreement_only,
+        override_and_disagreement,
+        benign_agreement("case-settled"),
+    ])
+    .expect("summary");
+
+    assert_eq!(report.total_cases, 4);
+    assert_eq!(
+        report.agreed_cases, 1,
+        "only the case the reviewers settled is agreed"
+    );
+    assert_eq!(report.overridden_cases, 2);
+    assert_eq!(report.reviewer_disagreement_cases, 2);
+    assert_eq!(
+        report.divergent_cases.len(),
+        2,
+        "both overrides are retained as references, and neither agreement nor \
+         disagreement takes a slot"
+    );
+    assert!(!report.divergent_cases_truncated);
+}

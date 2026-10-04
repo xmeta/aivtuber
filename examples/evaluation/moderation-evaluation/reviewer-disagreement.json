@@ -1,6 +1,6 @@
 {
   "schema_version": "1",
-  "review_session_id": "mod-unblinded-review",
+  "review_session_id": "mod-reviewer-disagreement",
   "policy": {
     "policy_id": "moderation-shadow",
     "policy_version": "0.4.0",
@@ -17,7 +17,7 @@
     "protocol_id": "mod-protocol",
     "protocol_version": "1",
     "instructions_version": "2026-10-01",
-    "identity_hidden_during_review": false,
+    "identity_hidden_during_review": true,
     "randomization": "seeded_per_case",
     "randomization_seed": 20261004
   },
@@ -25,13 +25,46 @@
   "contains_private_production_content": false,
   "cases": [
     {
-      "case_id": "case-unblinded-01",
-      "correlation_id": "corr-unblinded-01",
+      "case_id": "case-one-sided-tolerance-01",
+      "correlation_id": "corr-one-sided-01",
+      "recommendation": {
+        "action": "ignore",
+        "category": "none",
+        "confidence_micros": 540000,
+        "reason_code": "borderline_tone"
+      },
+      "reviews": [
+        {
+          "reviewer_id": "rev-a",
+          "label": "allow",
+          "category": "none",
+          "ambiguity": "low",
+          "acceptable_actions": [
+            "allow",
+            "ignore"
+          ],
+          "requires_human_review": false
+        },
+        {
+          "reviewer_id": "rev-b",
+          "label": "ignore",
+          "category": "none",
+          "ambiguity": "low",
+          "acceptable_actions": [
+            "ignore"
+          ],
+          "requires_human_review": false
+        }
+      ]
+    },
+    {
+      "case_id": "case-category-split-02",
+      "correlation_id": "corr-category-split-02",
       "recommendation": {
         "action": "allow",
         "category": "none",
-        "confidence_micros": 900000,
-        "reason_code": "benign_chat"
+        "confidence_micros": 610000,
+        "reason_code": "label_semantics_unsettled"
       },
       "reviews": [
         {
@@ -43,21 +76,31 @@
             "allow"
           ],
           "requires_human_review": false
+        },
+        {
+          "reviewer_id": "rev-b",
+          "label": "allow",
+          "category": "harassment",
+          "ambiguity": "low",
+          "acceptable_actions": [
+            "allow"
+          ],
+          "requires_human_review": false
         }
       ]
     }
   ],
   "aggregate": {
-    "total_cases": 1,
-    "comparable_cases": 1,
+    "total_cases": 2,
+    "comparable_cases": 2,
     "diverged_cases": 0,
-    "agreed_cases": 1,
+    "agreed_cases": 0,
     "overridden_cases": 0,
-    "reviewer_disagreement_cases": 0,
+    "reviewer_disagreement_cases": 2,
     "benign_suppressed_cases": 0,
     "destructive_overridden_cases": 0,
     "category_counts": {
-      "none": 1,
+      "none": 2,
       "spam": 0,
       "flood": 0,
       "harassment": 0,
@@ -68,75 +111,76 @@
       "impersonation": 0
     },
     "outcome_counts": {
+      "none/ignore": 1,
       "none/allow": 1
     },
-    "divergent_cases": [],
-    "divergent_cases_truncated": false,
     "metrics": {
       "shadow.moderation.none_count": {
-        "value": 1,
-        "sample_count": 1
+        "value": 2,
+        "sample_count": 2
       },
       "shadow.moderation.spam_count": {
         "value": 0,
-        "sample_count": 1
+        "sample_count": 2
       },
       "shadow.moderation.flood_count": {
         "value": 0,
-        "sample_count": 1
+        "sample_count": 2
       },
       "shadow.moderation.harassment_count": {
         "value": 0,
-        "sample_count": 1
+        "sample_count": 2
       },
       "shadow.moderation.scam_count": {
         "value": 0,
-        "sample_count": 1
+        "sample_count": 2
       },
       "shadow.moderation.hate_speech_count": {
         "value": 0,
-        "sample_count": 1
+        "sample_count": 2
       },
       "shadow.moderation.threat_count": {
         "value": 0,
-        "sample_count": 1
+        "sample_count": 2
       },
       "shadow.moderation.sexual_content_count": {
         "value": 0,
-        "sample_count": 1
+        "sample_count": 2
       },
       "shadow.moderation.impersonation_count": {
         "value": 0,
-        "sample_count": 1
+        "sample_count": 2
       },
       "shadow.moderation.agreed_count": {
-        "value": 1,
-        "sample_count": 1
+        "value": 0,
+        "sample_count": 2
       },
       "shadow.moderation.overridden_count": {
         "value": 0,
-        "sample_count": 1
+        "sample_count": 2
       },
       "shadow.moderation.reviewer_disagreement_count": {
-        "value": 0,
-        "sample_count": 1
+        "value": 2,
+        "sample_count": 2
       },
       "shadow.moderation.benign_suppressed_count": {
         "value": 0,
-        "sample_count": 1
+        "sample_count": 2
       },
       "shadow.moderation.destructive_overridden_count": {
         "value": 0,
-        "sample_count": 1
+        "sample_count": 2
       },
       "shadow.moderation.total_count": {
-        "value": 1,
-        "sample_count": 1
+        "value": 2,
+        "sample_count": 2
       },
       "shadow.moderation.override_rate_pct": {
-        "value": 0,
-        "sample_count": 1
+        "value": 0.0,
+        "sample_count": 2
       }
-    }
+    },
+    "divergent_cases": [],
+    "divergent_cases_truncated": false
   }
 }
