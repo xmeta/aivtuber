@@ -479,6 +479,11 @@ for (const file of trackedFiles) {
   // The PR-time property gate must be deterministic: a fixed RNG seed and a
   // bounded case count. Without both, every run explores a different space and
   // no failure can be reproduced from the documented command.
+  //
+  // These two file-wide matches see the FIRST occurrence, which is the copy
+  // inside the required `rust` job. The drift check further down pins the
+  // standalone `regressions` copy to the same values, so the bound below holds
+  // for both.
   const regressionSeed = ciWorkflow.match(/PROPTEST_RNG_SEED:\s*"(\d+)"/);
   const regressionCases = ciWorkflow.match(/PROPTEST_CASES:\s*"(\d+)"/);
   if (!regressionSeed || !regressionCases) {
@@ -603,6 +608,40 @@ for (const file of trackedFiles) {
     console.log(
       `ok        .github/workflows/ci.yml: seeded property subset (seed=${gatingSeed[1]}) runs inside required context "${jobContextName(gatingJob)}"`,
     );
+  }
+
+  // The gating step is a duplicate of the standalone job's step, so the two
+  // must explore the same space. A plain /PROPTEST_RNG_SEED:/ match over the
+  // file only sees the first occurrence, so a change to the second copy would
+  // pass unnoticed; compare the two job bodies explicitly instead.
+  const envOf = (body) => ({
+    seed: body.match(/PROPTEST_RNG_SEED:\s*"(\d+)"/)?.[1],
+    cases: body.match(/PROPTEST_CASES:\s*"(\d+)"/)?.[1],
+    shrinks: body.match(/PROPTEST_MAX_SHRINK_ITERS:\s*"(\d+)"/)?.[1],
+  });
+  const standaloneJob = jobBlocks.find((job) => job.id === "regressions");
+  if (!gatingJob || !standaloneJob) {
+    failures += 1;
+    console.error(
+      "FAIL      .github/workflows/ci.yml: expected both the `rust` and `regressions` jobs to carry the seeded property subset (issue #147)",
+    );
+  } else {
+    const gatingEnv = envOf(jobBody(gatingJob));
+    const standaloneEnv = envOf(jobBody(standaloneJob));
+    const drifted = ["seed", "cases", "shrinks"].filter(
+      (key) => gatingEnv[key] !== standaloneEnv[key],
+    );
+    if (drifted.length > 0) {
+      failures += 1;
+      console.error(
+        `FAIL      .github/workflows/ci.yml: the gating step and the standalone regressions job disagree on ${drifted.join(", ")} (gating=${JSON.stringify(gatingEnv)} standalone=${JSON.stringify(standaloneEnv)}); a regression CI catches must be the same one the merge gate replays (issue #147)`,
+      );
+    } else {
+      passes += 1;
+      console.log(
+        `ok        .github/workflows/ci.yml: gating step and standalone job share seed=${gatingEnv.seed} cases=${gatingEnv.cases} shrink_iters=${gatingEnv.shrinks}`,
+      );
+    }
   }
 }
 
