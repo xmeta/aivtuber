@@ -738,6 +738,26 @@ the batch, that `override_rate_pct` agrees with `overridden/total`, and that
 neither `benign_suppressed_cases` nor `destructive_overridden_cases` exceeds
 what the cases can support.
 
+The outcome and harm counters are recomputed from the cases and required to
+match *exactly*, not merely to stay within a bound. An upper bound says a
+counter is plausible; it does not say it is true, and that distinction is the
+whole point for two counters in particular. `reviewer_disagreement_cases` and
+`benign_suppressed_cases` exist to make reviewer ambiguity and suppressed benign
+criticism visible, so a report that lowered them to zero would erase exactly
+what #77 was opened to see — and an upper-bound check would have accepted it.
+`under-reported-disagreement.json` and `under-reported-benign-suppression.json`
+pin that failure, each carrying one contradiction with its metric map lowered to
+match, so the exact recompute is the only rule that can catch either.
+
+That recompute is a JavaScript mirror of `classify_moderation_case`, so the two
+implementations could drift apart. They are pinned to the same objects:
+`every_valid_fixture_states_exactly_what_the_summarizer_computes` runs the Rust
+summarizer over the `cases` of every valid fixture and asserts it produces the
+counters that fixture states, while the validator requires the stated counters
+to equal the JavaScript recompute. A disagreement between the implementations
+breaks one of the two checks, and `the_under_reported_fixtures_disagree_with_the_summarizer`
+confirms the Rust side computes the numbers those two fixtures erase.
+
 Case references hold `case_id`, `correlation_id`, the recommended action and
 category, the outcome and a severity byte. There is no field that can hold
 message content, and every struct in the module is `deny_unknown_fields`, so

@@ -1202,3 +1202,140 @@ fn a_disagreement_case_is_never_counted_as_agreed() {
     );
     assert!(!report.divergent_cases_truncated);
 }
+
+/// Load a checked-in fixture and rebuild comparison records from its cases.
+fn records_from_fixture(
+    doc: &serde_json::Value,
+    config: &ShadowOrchestratorConfig,
+) -> Vec<ModerationComparisonRecord> {
+    let orchestration = ModerationOrchestrationIdentity::from_config(config).expect("valid config");
+    let policy = doc["policy"].clone();
+    doc["cases"]
+        .as_array()
+        .expect("a fixture carries cases")
+        .iter()
+        .map(|case| {
+            let mut case = case.clone();
+            case["schema_version"] = serde_json::json!(MODERATION_COMPARISON_SCHEMA_VERSION);
+            case["orchestration"] = serde_json::to_value(&orchestration).expect("serializable");
+            case["policy"] = policy.clone();
+            serde_json::from_value(case).expect("a valid fixture case deserializes")
+        })
+        .collect()
+}
+
+fn fixture(name: &str) -> serde_json::Value {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/evaluation/moderation-evaluation")
+        .join(name);
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("reading {name}: {error}"));
+    serde_json::from_str(&text).unwrap_or_else(|error| panic!("parsing {name}: {error}"))
+}
+
+/// Counters the summarizer derives, paired with the fixture field that claims
+/// them. Kept as a list so a new counter cannot be added to one side alone.
+fn counters(report: &ModerationDivergenceReport) -> Vec<(&'static str, u64)> {
+    vec![
+        ("total_cases", report.total_cases),
+        ("comparable_cases", report.comparable_cases),
+        ("diverged_cases", report.diverged_cases),
+        ("agreed_cases", report.agreed_cases),
+        ("overridden_cases", report.overridden_cases),
+        (
+            "reviewer_disagreement_cases",
+            report.reviewer_disagreement_cases,
+        ),
+        ("benign_suppressed_cases", report.benign_suppressed_cases),
+        (
+            "destructive_overridden_cases",
+            report.destructive_overridden_cases,
+        ),
+    ]
+}
+
+#[test]
+fn every_valid_fixture_states_exactly_what_the_summarizer_computes() {
+    // `scripts/validate.mjs` recomputes these counters in JavaScript. That
+    // mirror is only trustworthy if it agrees with the Rust that produces the
+    // report, so the checked-in fixtures are held to both: the summarizer runs
+    // over the same cases here, and the validator requires the stated numbers
+    // to equal the recomputed ones. Drift between the two implementations
+    // breaks one of them.
+    for name in [
+        "benign-criticism.json",
+        "outlier-in-crowd.json",
+        "quoted-abuse.json",
+        "reviewer-disagreement.json",
+    ] {
+        let doc = fixture(name);
+        let records = records_from_fixture(&doc, &config());
+        let report = summarize(&records).expect("summary");
+
+        for (field, computed) in counters(&report) {
+            let stated = doc["aggregate"][field]
+                .as_u64()
+                .unwrap_or_else(|| panic!("{name}: aggregate.{field} is not a count"));
+            assert_eq!(
+                stated, computed,
+                "{name}: aggregate.{field} disagrees with the summarizer"
+            );
+        }
+
+        let refs = doc["aggregate"]["divergent_cases"]
+            .as_array()
+            .expect("the fixture lists retained references");
+        assert_eq!(
+            refs.len(),
+            report.divergent_cases.len(),
+            "{name}: the retained reference count disagrees with the summarizer"
+        );
+        for (reference, expected) in refs.iter().zip(&report.divergent_cases) {
+            assert_eq!(reference["case_id"], serde_json::json!(expected.case_id));
+            assert_eq!(
+                reference["outcome"],
+                serde_json::to_value(expected.outcome).expect("outcome serializes"),
+            );
+        }
+    }
+}
+
+#[test]
+fn the_under_reported_fixtures_disagree_with_the_summarizer() {
+    // These two are rejected by the validator because they erase exactly the
+    // harms #77 exists to expose. Assert the Rust side computes the other
+    // number, so the corpus is not merely asserting a rule nobody implements.
+    for (name, field, erased) in [
+        (
+            "inconsistent/under-reported-disagreement.json",
+            "reviewer_disagreement_cases",
+            2u64,
+        ),
+        (
+            "inconsistent/under-reported-benign-suppression.json",
+            "benign_suppressed_cases",
+            2u64,
+        ),
+    ] {
+        let doc = fixture(name);
+        let records = records_from_fixture(&doc, &config());
+        let report = summarize(&records).expect("summary");
+        let computed = counters(&report)
+            .into_iter()
+            .find(|(key, _)| *key == field)
+            .map(|(_, value)| value)
+            .expect("the counter exists");
+        let stated = doc["aggregate"][field]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{name}: aggregate.{field} is not a count"));
+
+        assert_eq!(
+            computed, erased,
+            "{name}: the cases imply {erased}, so the fixture is not under-reporting"
+        );
+        assert_ne!(
+            stated, computed,
+            "{name}: the fixture claims {stated} where the summarizer computes {computed}"
+        );
+    }
+}

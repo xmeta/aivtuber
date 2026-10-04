@@ -492,11 +492,95 @@ for (const file of listJson("examples/evaluation/moderation-evaluation/invalid")
 // same predicate serves the valid corpus (expected clean) and the
 // `inconsistent/` corpus (expected to trip at least one), so the two cannot
 // drift apart.
+// Mirror of `classify_moderation_case` and the harm counters in
+// `summarize_moderation_divergence`. Kept in step with the Rust by
+// `moderation_reported_benign_suppressed` below: the validator recomputes the
+// outcome and harm counters from the cases and requires an exact match.
+//
+// Bounding them with `<=` was not enough. An upper bound says a counter is
+// plausible; it does not say the counter is true. A report could erase the two
+// harms #77 exists to surface - reviewer ambiguity and benign suppression -
+// and still validate, which is the same failure as publishing a fabricated
+// number, only quieter.
+function moderationScoreCase(testCase) {
+  const reviews = testCase.reviews ?? [];
+  const action = testCase.recommendation.action;
+  const overrode = reviews.some(
+    (review) => !review.acceptable_actions.includes(action),
+  );
+
+  let disagrees = false;
+  for (let i = 0; i < reviews.length && !disagrees; i += 1) {
+    for (let j = i + 1; j < reviews.length; j += 1) {
+      const left = reviews[i];
+      const right = reviews[j];
+      const mutual =
+        left.acceptable_actions.includes(right.label) &&
+        right.acceptable_actions.includes(left.label);
+      if (!mutual || left.category !== right.category) {
+        disagrees = true;
+        break;
+      }
+    }
+  }
+
+  const benign =
+    reviews.length > 0 && reviews.every((review) => review.category === "none");
+
+  let outcome = "agreed";
+  if (overrode) {
+    outcome = "overridden";
+  } else if (disagrees) {
+    outcome = "reviewer_disagreement";
+  }
+
+  return { overrode, disagrees, outcome, benign, action };
+}
+
 function moderationEvaluationCrossFieldProblems(doc) {
   const problems = [];
   const aggregate = doc.aggregate ?? {};
   const cases = doc.cases ?? [];
   const metrics = aggregate.metrics ?? {};
+
+  const scored = cases.map((testCase) => moderationScoreCase(testCase));
+  const byOutcome = { agreed: 0, overridden: 0, reviewer_disagreement: 0 };
+  for (const entry of scored) {
+    byOutcome[entry.outcome] += 1;
+  }
+  // The outcome buckets and the disagreement flag are independent, exactly as
+  // in Rust: `agreed` and `overridden` come from the exclusive outcome, while
+  // `reviewer_disagreement_cases` counts every case whose reviewers were split,
+  // including one that was also overridden.
+  const agreed = byOutcome.agreed;
+  const overridden = byOutcome.overridden;
+  const disagreed = scored.filter((s) => s.disagrees).length;
+  const benignSuppressed = scored.filter(
+    (s) => s.overrode && s.action !== "allow" && s.benign,
+  ).length;
+  const destructiveOverridden = scored.filter(
+    (s) => s.overrode && MODERATION_DESTRUCTIVE_METRICS.has(s.action),
+  ).length;
+
+  // Exact, not bounded. Each counter is derived here from the cases, so a
+  // report cannot under-report the harms it is meant to expose.
+  const expected = [
+    ["total_cases", cases.length],
+    ["comparable_cases", cases.length],
+    ["agreed_cases", agreed],
+    ["overridden_cases", overridden],
+    ["reviewer_disagreement_cases", disagreed],
+    ["benign_suppressed_cases", benignSuppressed],
+    ["destructive_overridden_cases", destructiveOverridden],
+    ["diverged_cases", overridden],
+  ];
+  for (const [key, want] of expected) {
+    if (aggregate[key] !== want) {
+      problems.push(
+        `aggregate.${key} is ${aggregate[key]}, but the ${cases.length} case(s) imply ${want}`,
+      );
+    }
+  }
 
   // Every case needs at least one reviewer. An unreviewed case cannot be
   // scored, so counting it is reporting evidence nobody gave.
