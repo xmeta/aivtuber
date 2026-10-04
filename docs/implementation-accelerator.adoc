@@ -191,7 +191,7 @@ tgrep -n -t rust 'ShadowComparisonRecord|TraceStage' .
 |Deadline/budget veto always defeats a high predicted quality gain
 
 |#105 temporal/episodic memory
-|+crates/adaptation/src/lib.rs+, +docs/memory-adaptation.adoc+
+|+crates/adaptation/src/lib.rs+, +docs/memory-adaptation.adoc+; the original #51 retention blocker is complete and live readiness was corrected to +status:agent-ready+ on 2026-10-04
 |Hindsight first benchmark candidate; Graphiti optional temporal-graph/MCP sidecar; Letta reference
 |Compare current simple retrieval against one external sidecar on synthetic update/supersession cases
 |Deletion/expiry test proves external memory cannot preserve removed private content or bypass MemoryWriteGate
