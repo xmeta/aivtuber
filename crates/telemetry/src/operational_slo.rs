@@ -233,6 +233,15 @@ pub struct AttributionSummary {
     pub runtime_handled: u64,
     /// External failure with no user-visible outcome: degradation failed.
     pub runtime_handling_failures: u64,
+    /// A deliberate runtime decision (operator override, budget denial, ...).
+    /// Recorded rather than dropped: a reason the runtime chose is not an
+    /// unexplained failure, but the tally must still be complete.
+    pub runtime_policy_decisions: u64,
+    /// A declared reason outside the known slug set. Counted, not discarded —
+    /// an unknown reason is the one case where the project genuinely cannot say
+    /// whose failure this was. An event with *no* declared reason at all is
+    /// not counted here: that is an ordinary unexplained miss, visible through
+    /// the ratio and the miss count, not a reason to attribute.
     pub unattributed: u64,
 }
 
@@ -240,14 +249,26 @@ impl AttributionSummary {
     pub fn of<'a>(events: impl IntoIterator<Item = &'a EventObservation>) -> Self {
         let mut summary = Self::default();
         for event in events {
-            if !external_failure(event) {
-                continue;
-            }
-            summary.external_provider_failures += 1;
-            match attribution_of(event) {
-                MissAttribution::ExternalProvider => summary.runtime_handled += 1,
-                MissAttribution::RuntimeHandling => summary.runtime_handling_failures += 1,
-                MissAttribution::Unattributed => summary.unattributed += 1,
+            match event
+                .fallback_reason
+                .as_deref()
+                .map(failure_origin)
+                .unwrap_or(FailureOrigin::Unknown)
+            {
+                FailureOrigin::ExternalProvider => {
+                    summary.external_provider_failures += 1;
+                    match attribution_of(event) {
+                        MissAttribution::ExternalProvider => summary.runtime_handled += 1,
+                        MissAttribution::RuntimeHandling => summary.runtime_handling_failures += 1,
+                        MissAttribution::Unattributed => summary.unattributed += 1,
+                    }
+                }
+                FailureOrigin::RuntimePolicy => summary.runtime_policy_decisions += 1,
+                FailureOrigin::Unknown => {
+                    if event.fallback_reason.is_some() {
+                        summary.unattributed += 1;
+                    }
+                }
             }
         }
         summary
@@ -305,28 +326,52 @@ pub struct SloMeasurement {
 }
 
 impl SloMeasurement {
-    pub fn ratio(conforming: u64, eligible: u64) -> Self {
-        Self {
-            conforming,
-            eligible,
-            value: (eligible > 0).then(|| conforming as f64 / eligible as f64),
-        }
-    }
-
-    /// The eligible set exists but the objective cannot be scored without a
-    /// threshold. Reported as evidence, never as a zero-percent result.
-    pub fn pending(eligible: u64) -> Self {
-        Self {
-            conforming: 0,
-            eligible,
-            value: None,
-        }
-    }
-
     /// Misses are always `eligible - conforming`, so the error budget and the
     /// indicator can never disagree about what was spent.
     pub fn misses(&self) -> u64 {
         self.eligible.saturating_sub(self.conforming)
+    }
+}
+
+/// How one event relates to one indicator.
+///
+/// Every indicator declares exactly one classifier, and the report uses that
+/// single definition for three things: the measured ratio, the miss set used
+/// for attribution, and the error-budget spend. An event that is outside an
+/// indicator's denominator is neither conforming nor a miss — it is simply not
+/// that indicator's business, and counting it as a miss would let an unrelated
+/// failure show up in an objective that actually met its target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventVerdict {
+    Outside,
+    Conforms,
+    Misses,
+}
+
+/// Raw counts produced by one indicator over one window.
+fn measure(
+    indicator: &SloIndicator,
+    events: &[&EventObservation],
+    target: Option<&SloTarget>,
+) -> SloMeasurement {
+    let eligible = events
+        .iter()
+        .filter(|event| (indicator.classify)(event, target) != EventVerdict::Outside)
+        .count() as u64;
+    let conforming = events
+        .iter()
+        .filter(|event| (indicator.classify)(event, target) == EventVerdict::Conforms)
+        .count() as u64;
+    // A latency objective with no calibrated threshold has an eligible set but
+    // no defined miss, so it reports the sample count as calibration evidence
+    // and no ratio at all. That is deliberately different from 0%.
+    let unscorable =
+        indicator.latency_thresholded && target.and_then(|target| target.threshold_ms).is_none();
+    let value = (!unscorable && eligible > 0).then(|| conforming as f64 / eligible as f64);
+    SloMeasurement {
+        conforming,
+        eligible,
+        value,
     }
 }
 
@@ -351,7 +396,10 @@ pub struct SloIndicator {
     pub missing_evidence: Option<&'static str>,
     /// Documented action path when the objective is missed.
     pub actions: &'static [SloAction],
-    pub evaluate: fn(&[&EventObservation], Option<&SloTarget>) -> SloMeasurement,
+    /// Single per-event definition of "does this indicator apply to this event,
+    /// and did it conform". The report derives the ratio, the miss set, and the
+    /// attribution from this one function so they cannot disagree.
+    pub classify: fn(&EventObservation, Option<&SloTarget>) -> EventVerdict,
 }
 
 /// Repository-owned indicator catalog.
@@ -377,16 +425,7 @@ pub fn catalog() -> Vec<SloIndicator> {
                 SloAction::OpenOptimizationIssue,
                 SloAction::SwitchConservativeProfile,
             ],
-            evaluate: |events, target| {
-                let eligible = visible_samples(events, |_| true);
-                match target.and_then(|target| target.threshold_ms) {
-                    Some(threshold) => SloMeasurement::ratio(
-                        visible_samples(events, |value| value <= threshold),
-                        eligible,
-                    ),
-                    None => SloMeasurement::pending(eligible),
-                }
-            },
+            classify: classify_first_visible_latency,
         },
         SloIndicator {
             id: "availability.event_to_first_audio_within_target",
@@ -403,25 +442,20 @@ pub fn catalog() -> Vec<SloIndicator> {
                 SloAction::OpenOptimizationIssue,
                 SloAction::SwitchConservativeProfile,
             ],
-            evaluate: |events, target| {
-                let eligible = audio_samples(events, |_| true);
-                match target.and_then(|target| target.threshold_ms) {
-                    Some(threshold) => SloMeasurement::ratio(
-                        audio_samples(events, |value| value <= threshold),
-                        eligible,
-                    ),
-                    None => SloMeasurement::pending(eligible),
-                }
-            },
+            classify: classify_first_audio_latency,
         },
+        // Named and described as the conforming rate, not as a failure rate.
+        // `SloTarget::target` is a *minimum* conforming ratio, so an indicator
+        // whose id and numerator described failures while its value was a
+        // success ratio would make any configured target ambiguous.
         SloIndicator {
-            id: "availability.unintended_silence_rate",
+            id: "availability.speech_presence_rate",
             kind: ObjectiveKind::Slo,
             unit: IndicatorUnit::Ratio,
             evidence: EvidenceSource::Measured,
             denominator: "admitted events that were not cancelled",
-            numerator: "those that produced no user-visible output without a declared cause (no operator \
-                 override, no deadline exhaustion, no generative-budget denial)",
+            numerator: "those that produced a user-visible output, or stayed silent for a declared reason \
+                 (operator override, deadline exhaustion, generative-budget denial)",
             latency_thresholded: false,
             sample_floor: 15,
             missing_evidence: None,
@@ -430,14 +464,7 @@ pub fn catalog() -> Vec<SloIndicator> {
                 SloAction::OpenOptimizationIssue,
                 SloAction::SwitchConservativeProfile,
             ],
-            evaluate: |events, _target| {
-                let eligible = events.iter().filter(|event| !event.cancelled).count() as u64;
-                let conforming = events
-                    .iter()
-                    .filter(|event| !event.cancelled && !unintended_silence(event))
-                    .count() as u64;
-                SloMeasurement::ratio(conforming, eligible)
-            },
+            classify: classify_speech_presence,
         },
         SloIndicator {
             id: "reliability.fallback_delivery_rate",
@@ -454,48 +481,28 @@ pub fn catalog() -> Vec<SloIndicator> {
                 SloAction::OpenOptimizationIssue,
                 SloAction::BlockPromotion,
             ],
-            evaluate: |events, _target| {
-                let eligible = events
-                    .iter()
-                    .filter(|event| external_failure(event))
-                    .count() as u64;
-                let conforming = events
-                    .iter()
-                    .filter(|event| external_failure(event) && produced_visible_output(event))
-                    .count() as u64;
-                SloMeasurement::ratio(conforming, eligible)
-            },
+            classify: classify_fallback_delivery,
         },
         SloIndicator {
-            id: "reliability.deadline_exhaustion_rate",
+            id: "reliability.deadline_adherence_rate",
             kind: ObjectiveKind::Slo,
             unit: IndicatorUnit::Ratio,
             evidence: EvidenceSource::Measured,
             denominator: "admitted events carrying a trusted interaction deadline class",
-            numerator: "those whose trusted deadline was exhausted",
+            numerator: "those whose trusted deadline was not exhausted",
             latency_thresholded: false,
             sample_floor: 15,
             missing_evidence: None,
             actions: &[SloAction::OpenOptimizationIssue, SloAction::RaiseIncident],
-            evaluate: |events, _target| {
-                let eligible = events
-                    .iter()
-                    .filter(|event| event.deadline_class.is_some())
-                    .count() as u64;
-                let exhausted = events
-                    .iter()
-                    .filter(|event| event.deadline_exhaustion_stage.is_some())
-                    .count() as u64;
-                SloMeasurement::ratio(eligible.saturating_sub(exhausted), eligible)
-            },
+            classify: classify_deadline_adherence,
         },
         SloIndicator {
-            id: "reliability.generative_budget_denial_rate",
+            id: "reliability.generative_budget_admission_rate",
             kind: ObjectiveKind::Slo,
             unit: IndicatorUnit::Ratio,
             evidence: EvidenceSource::Measured,
             denominator: "all admitted events",
-            numerator: "those denied admission into the generative budget",
+            numerator: "those admitted into the generative budget rather than denied",
             latency_thresholded: false,
             sample_floor: 15,
             missing_evidence: None,
@@ -503,14 +510,7 @@ pub fn catalog() -> Vec<SloIndicator> {
                 SloAction::OpenOptimizationIssue,
                 SloAction::SwitchConservativeProfile,
             ],
-            evaluate: |events, _target| {
-                let eligible = events.len() as u64;
-                let denied = events
-                    .iter()
-                    .filter(|event| event.budget_denial_reason.is_some())
-                    .count() as u64;
-                SloMeasurement::ratio(eligible.saturating_sub(denied), eligible)
-            },
+            classify: classify_generative_budget_admission,
         },
         SloIndicator {
             id: "quality.semantic_reuse_correctness",
@@ -523,17 +523,7 @@ pub fn catalog() -> Vec<SloIndicator> {
             sample_floor: 1,
             missing_evidence: None,
             actions: &[SloAction::OpenOptimizationIssue, SloAction::BlockPromotion],
-            evaluate: |events, _target| {
-                let eligible = events
-                    .iter()
-                    .filter(|event| event.wrong_reuse.is_some())
-                    .count() as u64;
-                let conforming = events
-                    .iter()
-                    .filter(|event| event.wrong_reuse == Some(false))
-                    .count() as u64;
-                SloMeasurement::ratio(conforming, eligible)
-            },
+            classify: classify_semantic_reuse_correctness,
         },
         SloIndicator {
             id: "operability.operator_stop_responsiveness_within_target",
@@ -549,7 +539,7 @@ pub fn catalog() -> Vec<SloIndicator> {
                  (issued commands) is not in the artifact",
             ),
             actions: &[SloAction::RaiseIncident],
-            evaluate: |_events, _target| SloMeasurement::default(),
+            classify: classify_never,
         },
         SloIndicator {
             id: "availability.event_admission_success_rate",
@@ -565,7 +555,7 @@ pub fn catalog() -> Vec<SloIndicator> {
                  carried by the artifact, so the denominator cannot be reconstructed",
             ),
             actions: &[SloAction::OpenOptimizationIssue],
-            evaluate: |_events, _target| SloMeasurement::default(),
+            classify: classify_never,
         },
         SloIndicator {
             id: "safety.stale_dispatch_count",
@@ -581,7 +571,7 @@ pub fn catalog() -> Vec<SloIndicator> {
                  benchmark-result invariant map asserts zero rather than measuring it",
             ),
             actions: &[SloAction::RaiseIncident],
-            evaluate: |_events, _target| SloMeasurement::default(),
+            classify: classify_never,
         },
         SloIndicator {
             id: "safety.unauthorized_privileged_action_count",
@@ -597,7 +587,7 @@ pub fn catalog() -> Vec<SloIndicator> {
                  the benchmark artifact",
             ),
             actions: &[SloAction::RaiseIncident],
-            evaluate: |_events, _target| SloMeasurement::default(),
+            classify: classify_never,
         },
         SloIndicator {
             id: "resource.retention_bound_violation_count",
@@ -613,9 +603,103 @@ pub fn catalog() -> Vec<SloIndicator> {
                  only the bounded observation set, not the retention snapshot",
             ),
             actions: &[SloAction::RaiseIncident],
-            evaluate: |_events, _target| SloMeasurement::default(),
+            classify: classify_never,
         },
     ]
+}
+
+fn classify_never(_event: &EventObservation, _target: Option<&SloTarget>) -> EventVerdict {
+    EventVerdict::Outside
+}
+
+fn classify_first_visible_latency(
+    event: &EventObservation,
+    target: Option<&SloTarget>,
+) -> EventVerdict {
+    classify_latency(event.event_to_first_visible_reaction_ms, target)
+}
+
+fn classify_first_audio_latency(
+    event: &EventObservation,
+    target: Option<&SloTarget>,
+) -> EventVerdict {
+    classify_latency(event.event_to_first_audio_ms, target)
+}
+
+/// An event with no measured latency is outside the denominator, not a miss.
+/// With a sample but no calibrated threshold there is no defined miss either,
+/// so the event is eligible and counted as not-conforming — which is what
+/// makes the ratio `None` rather than a misleading zero.
+fn classify_latency(latency: Option<u64>, target: Option<&SloTarget>) -> EventVerdict {
+    let Some(latency) = latency else {
+        return EventVerdict::Outside;
+    };
+    match target.and_then(|target| target.threshold_ms) {
+        Some(threshold) if latency <= threshold => EventVerdict::Conforms,
+        Some(_) => EventVerdict::Misses,
+        None => EventVerdict::Misses,
+    }
+}
+
+fn classify_speech_presence(event: &EventObservation, _target: Option<&SloTarget>) -> EventVerdict {
+    if event.cancelled {
+        return EventVerdict::Outside;
+    }
+    if unintended_silence(event) {
+        EventVerdict::Misses
+    } else {
+        EventVerdict::Conforms
+    }
+}
+
+fn classify_fallback_delivery(
+    event: &EventObservation,
+    _target: Option<&SloTarget>,
+) -> EventVerdict {
+    if !external_failure(event) {
+        return EventVerdict::Outside;
+    }
+    if produced_visible_output(event) {
+        EventVerdict::Conforms
+    } else {
+        EventVerdict::Misses
+    }
+}
+
+fn classify_deadline_adherence(
+    event: &EventObservation,
+    _target: Option<&SloTarget>,
+) -> EventVerdict {
+    if event.deadline_class.is_none() {
+        return EventVerdict::Outside;
+    }
+    if event.deadline_exhaustion_stage.is_some() {
+        EventVerdict::Misses
+    } else {
+        EventVerdict::Conforms
+    }
+}
+
+fn classify_generative_budget_admission(
+    event: &EventObservation,
+    _target: Option<&SloTarget>,
+) -> EventVerdict {
+    if event.budget_denial_reason.is_some() {
+        EventVerdict::Misses
+    } else {
+        EventVerdict::Conforms
+    }
+}
+
+fn classify_semantic_reuse_correctness(
+    event: &EventObservation,
+    _target: Option<&SloTarget>,
+) -> EventVerdict {
+    match event.wrong_reuse {
+        None => EventVerdict::Outside,
+        Some(false) => EventVerdict::Conforms,
+        Some(true) => EventVerdict::Misses,
+    }
 }
 
 fn unintended_silence(event: &EventObservation) -> bool {
@@ -623,22 +707,6 @@ fn unintended_silence(event: &EventObservation) -> bool {
         && !event.operator_override
         && event.deadline_exhaustion_stage.is_none()
         && event.budget_denial_reason.is_none()
-}
-
-fn audio_samples(events: &[&EventObservation], within: impl Fn(u64) -> bool) -> u64 {
-    events
-        .iter()
-        .filter_map(|event| event.event_to_first_audio_ms)
-        .filter(|value| within(*value))
-        .count() as u64
-}
-
-fn visible_samples(events: &[&EventObservation], within: impl Fn(u64) -> bool) -> u64 {
-    events
-        .iter()
-        .filter_map(|event| event.event_to_first_visible_reaction_ms)
-        .filter(|value| within(*value))
-        .count() as u64
 }
 
 /// Target-free latency evidence for one window: the percentiles a threshold is
@@ -880,12 +948,18 @@ pub struct AarCandidate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SloVerdict {
-    /// Every decided objective met its target.
+    /// Every objective was decided, or had legitimately nothing to say, and
+    /// every decided objective met its target.
     Ok,
     /// At least one decided objective missed.
     Breach,
-    /// Nothing was decided: no target is calibrated, or no window had enough
-    /// data. This is not a pass.
+    /// Nothing breached, but at least one objective's evidence is still
+    /// unresolved — uncalibrated, or not measurable from this artifact. This is
+    /// explicitly not a pass: an unmeasured invariant must never be readable as
+    /// a satisfied one.
+    Incomplete,
+    /// Nothing was decided and nothing is outstanding either: no target is
+    /// calibrated and no window carried data. This is not a pass.
     Uncalibrated,
 }
 
@@ -997,6 +1071,7 @@ impl SloReport {
         let verdict = match self.verdict {
             SloVerdict::Ok => "OK",
             SloVerdict::Breach => "BREACH",
+            SloVerdict::Incomplete => "INCOMPLETE",
             SloVerdict::Uncalibrated => "UNCALIBRATED",
         };
         out.push_str(&format!("\nVerdict: **{verdict}**\n"));
@@ -1062,7 +1137,7 @@ pub fn evaluate(
         let target = targets.get(indicator.id);
         for window in &windows {
             let scoped = window_events(events, window);
-            let measurement = (indicator.evaluate)(&scoped, target);
+            let measurement = measure(indicator, &scoped, target);
             let status = status_for(indicator, &measurement, target);
             if status == SloStatus::Uncalibrated {
                 uncalibrated.push(indicator.id.to_owned());
@@ -1071,10 +1146,14 @@ pub fn evaluate(
             {
                 error_budgets.push(budget);
             }
+            // Attribution is drawn from the *same* classifier that produced the
+            // ratio, restricted to the events that are actually in this
+            // indicator's denominator. An event outside the denominator can
+            // neither conform nor miss, so it cannot appear here.
             let misses = scoped
                 .iter()
                 .copied()
-                .filter(|event| !conforms(indicator, event, target));
+                .filter(|event| (indicator.classify)(event, target) == EventVerdict::Misses);
             indicators.push(SloIndicatorResult {
                 id: indicator.id.to_owned(),
                 kind: indicator.kind,
@@ -1101,16 +1180,7 @@ pub fn evaluate(
     uncalibrated.dedup();
     not_yet_measured.sort();
 
-    let verdict = if indicators
-        .iter()
-        .any(|result| result.status == SloStatus::Missed)
-    {
-        SloVerdict::Breach
-    } else if indicators.iter().any(|result| result.status.is_decided()) {
-        SloVerdict::Ok
-    } else {
-        SloVerdict::Uncalibrated
-    };
+    let verdict = overall_verdict(&indicators);
 
     let aar_candidates = aar_candidates(&indicators, config.persistent_miss_windows);
     let limitations = limitations(report, &windows);
@@ -1142,45 +1212,34 @@ pub fn evaluate(
     })
 }
 
-/// Whether one event contributes to the indicator's conforming count.
+/// Aggregate verdict for the whole report.
 ///
-/// Used only to attribute misses, so it mirrors each evaluator's numerator
-/// rather than re-deriving it: a miss is an event the numerator did not count.
-fn conforms(
-    indicator: &SloIndicator,
-    event: &EventObservation,
-    target: Option<&SloTarget>,
-) -> bool {
-    match indicator.id {
-        "availability.event_to_first_visible_within_target" => {
-            within_eligible(target, event.event_to_first_visible_reaction_ms)
-        }
-        "availability.event_to_first_audio_within_target" => {
-            within_eligible(target, event.event_to_first_audio_ms)
-        }
-        "availability.unintended_silence_rate" => !event.cancelled && !unintended_silence(event),
-        "reliability.fallback_delivery_rate" => {
-            external_failure(event) && produced_visible_output(event)
-        }
-        "reliability.deadline_exhaustion_rate" => {
-            event.deadline_class.is_some() && event.deadline_exhaustion_stage.is_none()
-        }
-        "reliability.generative_budget_denial_rate" => event.budget_denial_reason.is_none(),
-        "quality.semantic_reuse_correctness" => event.wrong_reuse == Some(false),
-        _ => true,
+/// `Ok` is only reachable when every objective in the catalog has been decided
+/// or has legitimately nothing to say. An objective whose evidence is still
+/// unresolved — uncalibrated, or not measurable from the artifact at all —
+/// makes the report `Incomplete`, never `Ok`, so a dashboard cannot read
+/// "every calibrated objective passed" as "the runtime is operating within its
+/// objectives" while the zero-tolerance invariants are still unmeasured.
+fn overall_verdict(indicators: &[SloIndicatorResult]) -> SloVerdict {
+    if indicators
+        .iter()
+        .any(|result| result.status == SloStatus::Missed)
+    {
+        return SloVerdict::Breach;
     }
-}
-
-/// Latency conformance for one event.
-///
-/// An event with no measured latency is outside the denominator, so it is not
-/// a miss. An event with a sample but no calibrated threshold is a miss by the
-/// same "uncalibrated is not passing" position its status reports.
-fn within_eligible(target: Option<&SloTarget>, latency: Option<u64>) -> bool {
-    match (latency, target.and_then(|target| target.threshold_ms)) {
-        (None, _) => true,
-        (Some(_), None) => false,
-        (Some(value), Some(threshold)) => value <= threshold,
+    let unresolved = indicators.iter().any(|result| {
+        matches!(
+            result.status,
+            SloStatus::Uncalibrated | SloStatus::NotYetMeasured
+        )
+    });
+    if unresolved {
+        return SloVerdict::Incomplete;
+    }
+    if indicators.iter().any(|result| result.status.is_decided()) {
+        SloVerdict::Ok
+    } else {
+        SloVerdict::Uncalibrated
     }
 }
 
@@ -1249,15 +1308,24 @@ fn error_budget_for(
 /// streak to wait for.
 fn aar_candidates(indicators: &[SloIndicatorResult], threshold: u64) -> Vec<AarCandidate> {
     let mut candidates = Vec::new();
-    let mut ids: Vec<&str> = indicators.iter().map(|result| result.id.as_str()).collect();
-    ids.sort_unstable();
-    ids.dedup();
+    let mut series_keys: Vec<(&str, WindowKind)> = indicators
+        .iter()
+        .map(|result| (result.id.as_str(), result.window_kind))
+        .collect();
+    series_keys.sort_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.as_str().cmp(b.1.as_str())));
+    series_keys.dedup();
 
-    for id in ids {
-        // `indicators` is built indicator-outer/window-inner, so filtering by
-        // id preserves window order and the run below is a real streak.
-        let series: Vec<&SloIndicatorResult> =
-            indicators.iter().filter(|result| result.id == id).collect();
+    for (id, window_kind) in series_keys {
+        // Persistence is a property of one window *series*, not of the whole
+        // indicator row. A session aggregate, an hourly bucket and a rolling
+        // bucket are different observations of the same runtime, and letting
+        // their misses flow into one counter would let a two-hour run
+        // manufacture a three-hour streak. Rolling windows are keyed by their
+        // span, so a 3h and a 6h window never share a streak either.
+        let series: Vec<&SloIndicatorResult> = indicators
+            .iter()
+            .filter(|result| result.id == id && result.window_kind == window_kind)
+            .collect();
         let windows = series.len() as u64;
         let mut run = 0_u64;
         let mut total = 0_u64;
@@ -1274,20 +1342,23 @@ fn aar_candidates(indicators: &[SloIndicatorResult], threshold: u64) -> Vec<AarC
             }
             let rationale = if zero_tolerance {
                 format!(
-                    "zero-tolerance invariant missed in {} of {} window(s); no error budget applies",
-                    total, windows
+                    "zero-tolerance invariant missed in {} of {} {} window(s); no error budget applies",
+                    total,
+                    windows,
+                    window_kind.as_str(),
                 )
             } else {
                 format!(
-                    "missed {} consecutive {} window(s) ({} missed in total)",
+                    "missed {} consecutive {} window(s) ({} of {} missed in total)",
                     run,
-                    result.window_kind.as_str(),
-                    total
+                    window_kind.as_str(),
+                    total,
+                    windows
                 )
             };
             candidates.push(AarCandidate {
                 indicator: id.to_owned(),
-                window_kind: result.window_kind,
+                window_kind,
                 windows_missed: total,
                 consecutive_miss_windows: run,
                 recommended_action: result
@@ -1328,10 +1399,15 @@ fn build_windows(report: &BenchmarkReport, config: SloEvaluationConfig) -> Vec<S
     if events.is_empty() || events.iter().any(|event| event.stream_offset_ms.is_none()) {
         return windows;
     }
-    let max_hour = observed_end.saturating_sub(1) / STREAM_HOUR_MS;
-    if observed_end <= STREAM_HOUR_MS {
+    // The represented stream is at least as long as the workload declares, even
+    // if its last event arrived earlier. Bucketing on the last observation
+    // alone would quietly truncate the tail of a long run and under-report how
+    // many stream hours it actually stood for.
+    let represented_ms = observed_end.max(report.metadata.stream_duration_ms.unwrap_or(0));
+    if represented_ms <= STREAM_HOUR_MS {
         return windows;
     }
+    let max_hour = represented_ms.saturating_sub(1) / STREAM_HOUR_MS;
 
     for hour in 0..=max_hour {
         let start = hour * STREAM_HOUR_MS;

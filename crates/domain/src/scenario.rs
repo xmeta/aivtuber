@@ -821,19 +821,28 @@ pub fn generate_scenario_trace(
 ///
 /// The generator and the benchmark therefore share one workload definition
 /// rather than one definition plus a copy of it.
+///
+/// Each entry also carries `stream_offset_ms`: the event's own position on the
+/// scenario's logical timeline, relative to `logical_start`. The benchmark
+/// runner paces the *runtime* on its own clock, so without this field a long
+/// scenario would be compressed to one virtual second per event and any
+/// consumer reporting represented stream time (issue #71's windowing) would be
+/// reading the pacer's cadence instead of the workload it was handed.
 pub fn scenario_to_benchmark_fixture(
     scenario: &StreamScenario,
 ) -> Result<serde_json::Value, ScenarioError> {
     let trace = generate_scenario_trace(scenario)?;
-    let events: Vec<serde_json::Value> = trace
-        .iter()
-        .map(|entry| {
-            serde_json::json!({
-                "event": entry.event,
-                "query_embedding": entry.query_embedding,
-            })
-        })
-        .collect();
+    let origin = scenario.logical_start_ms()?;
+    let mut events: Vec<serde_json::Value> = Vec::with_capacity(trace.len());
+    for entry in &trace {
+        let stream_offset_ms =
+            scenario_instant_ms(&entry.event.observed_at)?.saturating_sub(origin);
+        events.push(serde_json::json!({
+            "event": entry.event,
+            "query_embedding": entry.query_embedding,
+            "stream_offset_ms": stream_offset_ms,
+        }));
+    }
     Ok(serde_json::json!({
         "dataset_id": scenario.dataset_id(),
         "seed": scenario.seed,

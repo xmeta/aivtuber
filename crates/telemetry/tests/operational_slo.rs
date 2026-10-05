@@ -111,9 +111,11 @@ fn an_empty_denominator_reports_no_data_and_never_a_pass() {
     // say. It must not be reported as a satisfied fallback objective.
     let fallback = result(&evaluated, "reliability.fallback_delivery_rate", "session");
     assert_eq!(fallback.status, SloStatus::NoData);
+    // Non-passing: uncalibrated objectives and unmeasured invariants are both
+    // outstanding, so the aggregate says so instead of reporting a clean run.
     assert_eq!(
         evaluated.verdict,
-        aivtuber_telemetry::SloVerdict::Uncalibrated
+        aivtuber_telemetry::SloVerdict::Incomplete
     );
 }
 
@@ -282,7 +284,12 @@ fn a_met_objective_leaves_error_budget_remaining() {
     assert_eq!(budget.observed_misses, 0);
     assert_eq!(budget.allowed_misses, 1);
     assert!(!budget.exhausted);
-    assert_eq!(evaluated.verdict, aivtuber_telemetry::SloVerdict::Ok);
+    // The objective itself is met, but the report is not `Ok`: the
+    // zero-tolerance invariants are still not measurable from this artifact.
+    assert_eq!(
+        evaluated.verdict,
+        aivtuber_telemetry::SloVerdict::Incomplete
+    );
 }
 
 #[test]
@@ -410,7 +417,7 @@ fn stream_hour_windows_partition_the_session_denominator() {
     let evaluated = evaluate(
         &report(events, 8 * STREAM_HOUR_MS),
         &targets(&[(
-            "reliability.generative_budget_denial_rate",
+            "reliability.generative_budget_admission_rate",
             calibrated(1.0, 1.0),
         )]),
         SloEvaluationConfig {
@@ -465,10 +472,7 @@ fn a_persistent_run_of_missed_stream_hours_reaches_the_after_action_review() {
         .collect();
     let evaluated = evaluate(
         &report(events, 4 * STREAM_HOUR_MS),
-        &targets(&[(
-            "availability.unintended_silence_rate",
-            calibrated(0.99, 1.0),
-        )]),
+        &targets(&[("availability.speech_presence_rate", calibrated(0.99, 1.0))]),
         SloEvaluationConfig {
             persistent_miss_windows: 3,
             ..SloEvaluationConfig::default()
@@ -480,7 +484,7 @@ fn a_persistent_run_of_missed_stream_hours_reaches_the_after_action_review() {
     let candidate = evaluated
         .aar_candidates
         .iter()
-        .find(|candidate| candidate.indicator == "availability.unintended_silence_rate")
+        .find(|candidate| candidate.indicator == "availability.speech_presence_rate")
         .expect("AAR candidate");
     assert!(candidate.consecutive_miss_windows >= 3);
     assert_eq!(candidate.recommended_action, SloAction::RaiseIncident);
@@ -498,10 +502,7 @@ fn a_single_missed_window_is_a_breach_but_not_yet_an_incident() {
         .collect();
     let evaluated = evaluate(
         &report(events, 20 * 60_000),
-        &targets(&[(
-            "availability.unintended_silence_rate",
-            calibrated(0.99, 1.0),
-        )]),
+        &targets(&[("availability.speech_presence_rate", calibrated(0.99, 1.0))]),
         SloEvaluationConfig::default(),
     )
     .expect("SLO report");
@@ -527,7 +528,7 @@ fn an_experimental_plane_report_is_measured_but_excluded_from_the_active_slo() {
                 .collect(),
             20_000,
         ),
-        &targets(&[("reliability.deadline_exhaustion_rate", calibrated(1.0, 1.0))]),
+        &targets(&[("reliability.deadline_adherence_rate", calibrated(1.0, 1.0))]),
         SloEvaluationConfig {
             plane: TrafficPlane::Experimental,
             ..SloEvaluationConfig::default()
@@ -536,7 +537,11 @@ fn an_experimental_plane_report_is_measured_but_excluded_from_the_active_slo() {
     .expect("SLO report");
 
     assert!(!evaluated.counts_toward_active_slo);
-    assert_eq!(evaluated.verdict, aivtuber_telemetry::SloVerdict::Ok);
+    assert_eq!(
+        evaluated.verdict,
+        aivtuber_telemetry::SloVerdict::Incomplete,
+        "an experimental plane still reports unresolved evidence honestly"
+    );
     assert!(
         evaluated
             .markdown_summary()
@@ -573,7 +578,7 @@ fn insufficient_samples_do_not_decide_an_objective() {
     let evaluated = evaluate(
         &report(events, 5_000),
         &targets(&[(
-            "reliability.generative_budget_denial_rate",
+            "reliability.generative_budget_admission_rate",
             calibrated(1.0, 1.0),
         )]),
         SloEvaluationConfig::default(),
@@ -582,13 +587,13 @@ fn insufficient_samples_do_not_decide_an_objective() {
 
     let denial = result(
         &evaluated,
-        "reliability.generative_budget_denial_rate",
+        "reliability.generative_budget_admission_rate",
         "session",
     );
     assert_eq!(denial.status, SloStatus::InsufficientSamples);
     assert_eq!(
         evaluated.verdict,
-        aivtuber_telemetry::SloVerdict::Uncalibrated
+        aivtuber_telemetry::SloVerdict::Incomplete
     );
 }
 

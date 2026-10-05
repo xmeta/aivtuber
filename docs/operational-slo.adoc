@@ -58,10 +58,38 @@ calibration evidence
 reconstruct its denominator
 |===
 
-A run where nothing has been calibrated reports a verdict of `uncalibrated`,
+A run where nothing has been calibrated reports a verdict of `incomplete`,
 which is deliberately not `ok`. This matters most for the indicators nobody has
 targeted yet: an unmeasured objective must never be mistaken for a satisfied
 one in a dashboard or a release checklist.
+
+The report's own verdict is the aggregate of those statuses, and it is
+deliberately hard to read as a pass:
+
+[cols="1,3",options="header"]
+|===
+|Verdict |Meaning
+
+|`ok`
+|every objective was decided (or had legitimately nothing to say) and every
+decided objective met its target
+
+|`breach`
+|at least one decided objective missed
+
+|`incomplete`
+|nothing breached, but at least one objective's evidence is still unresolved —
+uncalibrated, or not measurable from this artifact
+
+|`uncalibrated`
+|nothing was decided and nothing is outstanding either
+|===
+
+`ok` requires the *whole* catalog to be resolved. One met objective while
+`safety.stale_dispatch_count` is still `not_yet_measured` is `incomplete`, not
+`ok`: otherwise a dashboard would read "every calibrated objective passed" as
+"the runtime is operating within its objectives" at exactly the moment the
+zero-tolerance evidence is missing.
 
 === Zero-tolerance invariants are not SLOs
 
@@ -90,6 +118,45 @@ The checked-in `examples/slo/slo-targets.json` therefore ships with an empty
 `targets` map, and a test fails if a numeric target is added without its
 evidence. That is the current honest state of the project, not an oversight.
 
+=== One direction, stated once
+
+`SloTarget::target` is always a **minimum conforming ratio**: `conforming /
+eligible`, higher is better. Indicators are therefore named and described as the
+conforming rate, not as a failure rate.
+
+[cols="1,1",options="header"]
+|===
+|Indicator |Numerator
+
+|`availability.event_to_first_visible_within_target`
+|events whose first-visible latency was within the configured threshold
+
+|`availability.event_to_first_audio_within_target`
+|events whose first-audio latency was within the configured threshold
+
+|`availability.speech_presence_rate`
+|events that produced a user-visible output, or stayed silent for a declared
+reason
+
+|`reliability.fallback_delivery_rate`
+|provider-failure events that still delivered a user-visible outcome
+
+|`reliability.deadline_adherence_rate`
+|deadline-bearing events whose deadline was not exhausted
+
+|`reliability.generative_budget_admission_rate`
+|events admitted into the generative budget rather than denied
+
+|`quality.semantic_reuse_correctness`
+|reviewed events labelled correct
+|===
+
+An earlier draft called three of these `*_rate` while their `numerator` text
+described the failures, which made a target such as `0.99` ambiguous: the same
+number meant "at most 1% bad" to the reader and "at least 99% good" to the
+evaluator. One direction removes the ambiguity, and a test asserts that no
+measured indicator publishes failure phrasing.
+
 == Windows
 
 Windowing is over the *logical* stream timeline. `EventObservation` records the
@@ -97,6 +164,19 @@ Windowing is over the *logical* stream timeline. `EventObservation` records the
 the wall clock, so the same fixture produces the same windows on a slower
 machine. That also keeps replay-relevant reporting on the monotonic/logical
 ordering rule the rest of the runtime already follows.
+
+Two clocks exist in a replay, and conflating them is a trap:
+
+* the *replay pacer*, which drives the runtime one virtual second per event so a
+  benchmark finishes quickly;
+* the *workload timeline*, which is the scenario's own declared phase timing.
+
+`replay-benchmark --scenario` therefore carries each event's position on the
+workload timeline through the fixture as `stream_offset_ms`, and records *that*
+in the observation. A checked-in fixture that predates the field falls back to
+the pacer. Without this, an 80-minute scenario collapses to roughly the event
+count in seconds and the report silently under-reports how many stream hours it
+stood for.
 
 [cols="1,3",options="header"]
 |===
@@ -116,10 +196,14 @@ logical stream offset
 
 The hour buckets partition the session: every retained observation falls in
 exactly one, and the test that pins it asserts the buckets sum back to the
-session count. An artifact with no recorded offsets degrades to a single session
-window and says so in `limitations` rather than inventing hour boundaries from
-the event index. A run shorter than one stream hour reports one window and says
-*that* instead. Those are different problems and the report distinguishes them.
+session count. The bucket count is derived from the workload's declared
+duration as well as its last observation, so a run whose last event arrives
+early still reports every stream hour it represented.
+
+An artifact with no recorded offsets degrades to a single session window and
+says so in `limitations` rather than inventing hour boundaries from the event
+index. A run shorter than one stream hour reports one window and says *that*
+instead. Those are different problems and the report distinguishes them.
 
 Rolling windows only exist when the run is long enough to contain them. An
 80-minute scenario produces rolling windows only at `--rolling-window-hours 1`,
@@ -143,14 +227,26 @@ outcome. The cached/non-verbal fallback did its job
 This is the runtime's own failure
 
 |`unattributed`
-|no declared cause on the event
+|a declared reason outside the known slug set, so the project cannot say whose
+failure this was
 |===
 
 The split uses the closed `fallback_reason` slug set the runtime already emits.
 `timeout`, `unavailable`, `rate_limited`, `overloaded` and `authentication` are
 provider-side; `low_confidence`, `policy_override`, `operator_override`,
-`budget_exhausted` and `invalid_request` are deliberate runtime decisions.
-Anything outside the set is `unattributed`, not an optimistic guess.
+`budget_exhausted` and `invalid_request` are deliberate runtime decisions, which
+the tally records separately as `runtime_policy_decisions` so nothing silently
+disappears. Anything outside the set is counted as `unattributed`, not dropped
+and not optimistically reclassified.
+
+Attribution is scoped to the indicator's own denominator. Each indicator declares
+one classifier that decides whether an event is outside its denominator, conforms,
+or misses, and the report uses that single definition for the ratio, the miss set
+and the budget spend. An event outside an indicator's denominator therefore
+cannot appear in its miss attribution: an unrelated provider failure cannot be
+credited to `reliability.deadline_adherence_rate` just because that event
+happened during the same window. It is still attributed at the run level, where
+it belongs.
 
 This is what lets `reliability.fallback_delivery_rate` be the objective it
 should be. A provider outage with a working fallback keeps that objective
@@ -181,12 +277,18 @@ Every indicator in the catalog declares its action path:
 
 Alerting on every noisy single sample is explicitly not the policy. A missed
 window is a `breach`; it becomes an `aar_candidates` entry only after
-`persistent_miss_windows` consecutive misses in the same window series
-(default 3), which is the shape
+`persistent_miss_windows` consecutive misses *within one window series* (default
+3), which is the shape
 link:after-action-review.adoc[After-Action Review] and
 link:current-constraint.adoc[Current Measured Constraint] consume when they
 reprioritise. Zero-tolerance invariants bypass the persistence threshold, since
 there is no acceptable streak to wait for.
+
+"Within one series" is load-bearing. A session aggregate, an hourly bucket and a
+rolling bucket are different observations of the same runtime; counting their
+misses in one streak would let a two-hour run manufacture a three-hour streak
+out of `session + hour 0 + hour 1`. Rolling windows are keyed by their span, so
+a 3-hour and a 6-hour window never share a streak either.
 
 == Experimental traffic
 
@@ -217,7 +319,7 @@ cargo run --locked -p aivtuber-app --bin slo-report -- \
 ----
 
 Without `--targets` the report publishes measured values and target-free latency
-percentiles, and the verdict stays `uncalibrated`. `--fail-on-breach` makes a
+percentiles, and the verdict stays `incomplete`. `--fail-on-breach` makes a
 breach exit non-zero for a pipeline that wants to gate on it; it is off by
 default, because an operational objective is not a PR gate.
 

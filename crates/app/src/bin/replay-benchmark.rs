@@ -51,6 +51,10 @@ struct FixtureEvent {
     event: EventEnvelope,
     query_embedding: Vec<f32>,
     wrong_reuse: Option<bool>,
+    /// The workload's own position on its logical timeline (issue #70 scenario
+    /// offset). `None` for a checked-in fixture that predates the field, in
+    /// which case the observation falls back to the replay pacing clock.
+    stream_offset_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -517,9 +521,13 @@ where
         }
 
         if let Some(metric) = app.telemetry_mut().events_mut().last_mut() {
-            // Issue #71: the replay clock is a logical stream timeline, so it
-            // is the windowing axis operational SLO reports bucket by.
-            metric.stream_offset_ms = Some(at_ms);
+            // Issue #71: the windowing axis is the *workload's* logical
+            // timeline, not the replay pacer. `at_ms` paces the runtime one
+            // virtual second per event; a #70 scenario declares its own phase
+            // timing, and reporting the pacer's cadence as represented stream
+            // time would compress an 80-minute scenario into minutes. A
+            // fixture that predates the field keeps the pacing offset.
+            metric.stream_offset_ms = Some(fixture_event.stream_offset_ms.unwrap_or(at_ms));
             let cost = u64::from(metric.llm_calls)
                 .saturating_mul(llm_cost)
                 .saturating_add(u64::from(metric.tts_calls).saturating_mul(tts_cost));
@@ -954,10 +962,17 @@ fn fixture_from_value(value: Value) -> Result<Fixture, Box<dyn Error>> {
                     .ok_or_else(|| invalid_data("wrong_reuse must be boolean or null"))?,
             ),
         };
+        let stream_offset_ms = match raw.get("stream_offset_ms") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(value.as_u64().ok_or_else(|| {
+                invalid_data("stream_offset_ms must be an unsigned integer or null")
+            })?),
+        };
         events.push(FixtureEvent {
             event,
             query_embedding,
             wrong_reuse,
+            stream_offset_ms,
         });
     }
 
