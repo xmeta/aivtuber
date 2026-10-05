@@ -76,7 +76,7 @@ Authoritative/spec evidence::
 Repository executable evidence::
 
 * local in-memory MCP client/server tests exercise tool discovery, invocation, timeout, transport closure, tool-level failure, malformed content, oversized observation rejection, deterministic verification, and stale/cancelled fences;
-* +execute_verified_tool+ performs authorization before adapter execution and computes verification only from the bounded provider-neutral result.
+* +execute_verified_tool+ performs authorization before adapter execution, fixes the expected task generation at dispatch, re-reads authoritative generation/cancellation state after the adapter await completes, and computes verification only from that post-execution fence plus the bounded provider-neutral result.
 
 Observed external package evidence::
 
