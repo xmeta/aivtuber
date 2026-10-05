@@ -7,6 +7,7 @@
 
 mod benchmark_gate;
 mod causal_trace;
+mod task_transition;
 
 pub use benchmark_gate::{
     BenchmarkConfiguration, BenchmarkEnvironment, BenchmarkGateError, BenchmarkGit,
@@ -17,6 +18,10 @@ pub use benchmark_gate::{
 pub use causal_trace::{
     CausalTrace, CausalTraceCollector, CausalTraceError, CausalTraceRetentionConfig,
     CausalTraceRetentionMetrics, StageOutcome, StageReason, TraceSpan, TraceStage,
+};
+pub use task_transition::{
+    TaskTransitionCollector, TaskTransitionObservation, TaskTransitionRetentionConfig,
+    TaskTransitionRetentionMetrics,
 };
 
 use aivtuber_domain::{DeadlineExhaustionReason, DeadlineStage, InteractionDeadlineClass};
