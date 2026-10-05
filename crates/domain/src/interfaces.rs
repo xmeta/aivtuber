@@ -99,6 +99,234 @@ pub struct ToolAction {
     pub arguments: BTreeMap<String, serde_json::Value>,
 }
 
+pub const MAX_TOOL_OBSERVATION_BYTES: usize = 32 * 1024;
+pub const MAX_TOOL_DESCRIPTOR_BYTES: usize = 16 * 1024;
+pub const MAX_TOOL_DISCOVERY_ITEMS: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ToolDescriptor {
+    name: String,
+    description: Option<String>,
+    input_schema: serde_json::Value,
+    schema_fingerprint: String,
+}
+
+impl ToolDescriptor {
+    pub fn new(
+        name: impl Into<String>,
+        description: Option<String>,
+        input_schema: serde_json::Value,
+        schema_fingerprint: impl Into<String>,
+    ) -> Result<Self, EngineError> {
+        let name = name.into();
+        let schema_fingerprint = schema_fingerprint.into();
+        if name.is_empty() || schema_fingerprint.is_empty() {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidRequest,
+                "tool descriptor identity must be non-empty",
+            ));
+        }
+        let bytes = serde_json::to_vec(&(&name, &description, &input_schema, &schema_fingerprint))
+            .map_err(|error| {
+                EngineError::new(
+                    EngineErrorKind::InvalidRequest,
+                    format!("tool descriptor is not serializable: {error}"),
+                )
+            })?;
+        if bytes.len() > MAX_TOOL_DESCRIPTOR_BYTES {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidRequest,
+                "tool descriptor exceeds the bounded descriptor limit",
+            ));
+        }
+        Ok(Self {
+            name,
+            description,
+            input_schema,
+            schema_fingerprint,
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    pub fn input_schema(&self) -> &serde_json::Value {
+        &self.input_schema
+    }
+
+    pub fn schema_fingerprint(&self) -> &str {
+        &self.schema_fingerprint
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolResultClass {
+    Success,
+    ToolError,
+    Malformed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ToolExecutionResult {
+    server: String,
+    tool: String,
+    operation: String,
+    class: ToolResultClass,
+    content: Option<serde_json::Value>,
+    schema_fingerprint: Option<String>,
+    latency_ms: u64,
+}
+
+impl ToolExecutionResult {
+    pub fn new(
+        server: impl Into<String>,
+        tool: impl Into<String>,
+        operation: impl Into<String>,
+        class: ToolResultClass,
+        content: Option<serde_json::Value>,
+        schema_fingerprint: Option<String>,
+        latency_ms: u64,
+    ) -> Result<Self, EngineError> {
+        let server = server.into();
+        let tool = tool.into();
+        let operation = operation.into();
+        if server.is_empty() || tool.is_empty() || operation.is_empty() {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidRequest,
+                "tool observation identity must be non-empty",
+            ));
+        }
+        let bytes = serde_json::to_vec(&(
+            &server,
+            &tool,
+            &operation,
+            class,
+            &content,
+            &schema_fingerprint,
+            latency_ms,
+        ))
+        .map_err(|error| {
+            EngineError::new(
+                EngineErrorKind::InvalidRequest,
+                format!("tool observation is not serializable: {error}"),
+            )
+        })?;
+        if bytes.len() > MAX_TOOL_OBSERVATION_BYTES {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidRequest,
+                "tool observation exceeds the bounded result limit",
+            ));
+        }
+        Ok(Self {
+            server,
+            tool,
+            operation,
+            class,
+            content,
+            schema_fingerprint,
+            latency_ms,
+        })
+    }
+
+    pub fn server(&self) -> &str {
+        &self.server
+    }
+
+    pub fn tool(&self) -> &str {
+        &self.tool
+    }
+
+    pub fn operation(&self) -> &str {
+        &self.operation
+    }
+
+    pub fn class(&self) -> ToolResultClass {
+        self.class
+    }
+
+    pub fn content(&self) -> Option<&serde_json::Value> {
+        self.content.as_ref()
+    }
+
+    pub fn schema_fingerprint(&self) -> Option<&str> {
+        self.schema_fingerprint.as_deref()
+    }
+
+    pub fn latency_ms(&self) -> u64 {
+        self.latency_ms
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolVerificationOutcome {
+    Verified,
+    Failed,
+    NotProven,
+    Cancelled,
+    Stale,
+}
+
+impl ToolVerificationOutcome {
+    pub fn is_verified(self) -> bool {
+        matches!(self, Self::Verified)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolCommitFence {
+    pub expected_generation: u64,
+    pub observed_generation: u64,
+    pub cancelled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToolVerificationRule {
+    JsonEquals {
+        pointer: String,
+        expected: serde_json::Value,
+    },
+}
+
+pub fn verify_tool_result(
+    result: &ToolExecutionResult,
+    expected_tool: &str,
+    expected_operation: &str,
+    fence: ToolCommitFence,
+    rule: &ToolVerificationRule,
+) -> ToolVerificationOutcome {
+    if fence.cancelled {
+        return ToolVerificationOutcome::Cancelled;
+    }
+    if fence.expected_generation != fence.observed_generation {
+        return ToolVerificationOutcome::Stale;
+    }
+    if result.tool() != expected_tool || result.operation() != expected_operation {
+        return ToolVerificationOutcome::Failed;
+    }
+    if result.class() != ToolResultClass::Success {
+        return ToolVerificationOutcome::Failed;
+    }
+    let Some(content) = result.content() else {
+        return ToolVerificationOutcome::NotProven;
+    };
+    match rule {
+        ToolVerificationRule::JsonEquals { pointer, expected } => {
+            if content.pointer(pointer) == Some(expected) {
+                ToolVerificationOutcome::Verified
+            } else {
+                ToolVerificationOutcome::NotProven
+            }
+        }
+    }
+}
+
 /// Privileged action that has passed authenticated ingress and deterministic
 /// capability authorization.
 ///
@@ -230,7 +458,11 @@ pub trait StreamAdapter: Send + Sync {
 }
 
 pub trait ToolAdapter: Send + Sync {
-    fn execute<'a>(&'a self, action: &'a AuthorizedToolAction) -> EngineFuture<'a, ()>;
+    fn discover<'a>(&'a self) -> EngineFuture<'a, Vec<ToolDescriptor>>;
+    fn execute<'a>(
+        &'a self,
+        action: &'a AuthorizedToolAction,
+    ) -> EngineFuture<'a, ToolExecutionResult>;
 }
 
 #[cfg(test)]
@@ -308,5 +540,34 @@ mod tests {
         };
         let authority = authenticated(Capability::AvatarControl);
         assert!(authorize_tool_action(&authority, action).is_err());
+    }
+
+    #[test]
+    fn tool_descriptor_bounds_identity_and_description_with_schema() {
+        let error = ToolDescriptor::new(
+            "x".repeat(MAX_TOOL_DESCRIPTOR_BYTES),
+            Some("description".to_owned()),
+            serde_json::json!({"type": "object"}),
+            "fingerprint",
+        )
+        .expect_err("descriptor identity must be bounded");
+
+        assert_eq!(error.kind, EngineErrorKind::InvalidRequest);
+    }
+
+    #[test]
+    fn tool_execution_result_bounds_identity_with_content() {
+        let error = ToolExecutionResult::new(
+            "server",
+            "x".repeat(MAX_TOOL_OBSERVATION_BYTES),
+            "read",
+            ToolResultClass::Success,
+            Some(serde_json::json!({"value": 42})),
+            None,
+            1,
+        )
+        .expect_err("observation identity must be bounded");
+
+        assert_eq!(error.kind, EngineErrorKind::InvalidRequest);
     }
 }

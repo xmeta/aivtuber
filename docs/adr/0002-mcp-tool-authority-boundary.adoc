@@ -1,0 +1,138 @@
+= ADR-0002: Keep MCP transport below aivtuber tool authority and verification
+:status: Accepted
+:date: 2026-10-05
+
+== Context
+
+Issue #193 introduces the first MCP-backed agent-tool vertical slice. The repository already owns capability minting through +ToolAction -> AuthorizedToolAction+ and requires task completion to be proven separately from tool transport success. The implementation also needed to evaluate whether Rig / +rig-rmcp+ should own the generic tool loop.
+
+This decision is security-relevant because an external tool framework must not become a second authority or completion oracle.
+
+== Hard constraints
+
+* model, MCP server, and generated metadata are data, not runtime authority;
+* only authenticated local ingress may mint the non-serializable +ToolGrant+ capability;
+* provider DTOs stay outside +aivtuber-domain+;
+* tool observations and tool descriptors are explicitly bounded before entering core state;
+* tool-call success and verified requested outcome are separate;
+* cancelled or stale generations cannot verify as successful;
+* deterministic fixtures must run in normal CI without live third-party accounts.
+
+== Assumptions
+
+No new long-lived provider assumption is required. The direct dependency is pinned by +Cargo.lock+ and is reconsidered under the normal dependency-update and supply-chain policy.
+
+== Alternatives considered
+
+. Keep the existing fire-and-forget +ToolAdapter -> ()+ contract.
+. Adopt official +rmcp+ behind an aivtuber-owned thin adapter.
+. Adopt Rig / +rig-rmcp+ as the runtime tool abstraction.
+. Build a custom MCP wire/client implementation.
+
+== Reuse / Adapt / Build comparison
+
+[cols="2,1,1,1"]
+|===
+|Dimension |Direct +rmcp+ wrapper |Rig / +rig-rmcp+ |Custom MCP
+
+|Authority fit
+|Preserves existing +AuthorizedToolAction+ boundary
+|Requires mapping through Rig +DynamicTool+ / +ToolContext+
+|Project-owned, but duplicates protocol machinery
+
+|Result verification
+|Normalized directly into +ToolExecutionResult+
+|Requires a second result abstraction before aivtuber verification
+|Must be designed and maintained locally
+
+|MCP version fit on 2026-10-05
+|+rmcp 3.5.0+
+|Released +rig-rmcp 0.43.0+ resolves +rmcp 2.2.0+
+|Would need ongoing protocol maintenance
+
+|Bounded state
+|Explicit 16 KiB descriptor and 32 KiB observation limits
+|Rig state/tool context requires additional project bounds
+|Possible, with more custom code
+
+|Removal cost
+|Thin adapter is replaceable
+|Larger orchestration surface
+|Highest maintenance burden
+
+|License / project health
+|Apache-2.0 / MIT-compatible ecosystem, current official SDK
+|MIT, active project
+|N/A
+|===
+
+== Evidence
+
+Authoritative/spec evidence::
+
+* official MCP Rust SDK release +rmcp-v3.5.0+ was current when this decision was made;
+* +rig-rmcp 0.43.0+ exposes MCP tools as Rig +DynamicTool+ values and publishes MCP results through Rig +ToolContext+.
+
+Repository executable evidence::
+
+* local in-memory MCP client/server tests exercise tool discovery, invocation, timeout, transport closure, tool-level failure, malformed content, oversized observation rejection, deterministic verification, and stale/cancelled fences;
+* +execute_verified_tool+ performs authorization before adapter execution and computes verification only from the bounded provider-neutral result.
+
+Observed external package evidence::
+
+* a standalone Cargo spike with +rig-core = 0.43.0+ and +rig-rmcp = 0.43.0+ compiled the +McpTool -> DynamicTool+ conversion;
+* that released package graph resolved +rmcp 2.2.0+, while the direct official SDK used by this issue is +rmcp 3.5.0+.
+
+== Decision
+
+Adopt official +rmcp 3.5.0+ through a thin +RmcpToolAdapter+.
+
+Keep +ToolAction -> AuthorizedToolAction -> ToolAdapter -> ToolExecutionResult -> deterministic verification+ as the project-owned production boundary.
+
+Do not add Rig to the production dependency graph for #193. Treat the successful Rig spike as conformance/reference evidence only.
+
+== Consequences
+
+=== Positive
+
+* MCP lifecycle and wire behavior are reused instead of reimplemented.
+* Capability enforcement remains independent of MCP server/model metadata.
+* #201 can consume a provider-neutral bounded observation without importing +rmcp+ or Rig types.
+* Tool success cannot by itself become task completion.
+
+=== Costs / trade-offs
+
+* aivtuber owns the normalization layer and verification contract;
+* future MCP SDK upgrades require adapter conformance tests;
+* Rig agent-loop features are deferred.
+
+=== Known limitations
+
+* the first slice uses one bounded JSON verification rule; #201 may add task-specific verifier composition without weakening the result boundary;
+* the first adapter normalizes structured JSON and text content. Unsupported rich content is classified as malformed until a bounded representation is deliberately added;
+* the 32 KiB bound is enforced before tool output enters provider-neutral core state. The upstream MCP transport may receive a larger provider payload before normalization, so connector/process transport limits remain a #204 hardening responsibility.
+
+== Staging and rollback
+
+The change is isolated behind +ToolAdapter+. Removing the MCP adapter and dependency restores the prior runtime surface; no persistent schema or migration is introduced.
+
+#201 and later work must consume the provider-neutral domain contract rather than depending directly on +rmcp+.
+
+== Revisit conditions
+
+Revisit Rig adoption when all of the following are observable:
+
+* released +rig-rmcp+ supports the same current MCP SDK generation used by aivtuber;
+* it can sit below +AuthorizedToolAction+ without becoming an authority;
+* its result path can be bounded and normalized before retained state;
+* its cancellation/replay behavior passes the same deterministic verification and stale-result tests;
+* measured implementation or maintenance cost justifies the additional framework.
+
+Also revisit on a major MCP protocol/SDK change, a security advisory, or evidence that the thin adapter has become a material maintenance burden.
+
+== Related
+
+* Issue: #193
+* PR: this ADR lands with the #193 implementation PR.
+* Architecture: link:../dual-role-agent-architecture.adoc[Dual-Role Agent and Performer Architecture]
+* Reuse policy: link:../reuse-first.adoc[Reuse-First Library and Reference-Implementation Matrix]

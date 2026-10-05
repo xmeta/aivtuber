@@ -86,8 +86,8 @@ Record the result as one of:
 
 |Rust LLM/tool orchestration
 |Rig / +rig-rmcp+
-|Benchmark/conformance spike first; adopt if fit
-|Reuse provider/tool-loop plumbing, dynamic tool registration, lifecycle hooks, and MCP adaptation when they reduce project code. Rig must remain below aivtuber authority and result-verification boundaries; reject/narrow it if it weakens deterministic replay, bounded execution, cancellation, or capability enforcement.
+|Reference only / defer after #193 conformance spike
+|The 2026-10-05 +rig-rmcp 0.43.0+ release successfully compiled its +McpTool -> DynamicTool+ boundary, but its published graph resolved +rmcp 2.2.0+ while aivtuber adopted the current official +rmcp 3.5.0+. Keep Rig out of the production graph until it can sit below +AuthorizedToolAction+ and bounded result verification without introducing a second MCP SDK generation or authoritative tool/result contract. See link:adr/0002-mcp-tool-authority-boundary.adoc[ADR-0002].
 |#193
 
 |External service connectors
