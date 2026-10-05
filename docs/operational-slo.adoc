@@ -405,11 +405,14 @@ assumed:
   revision produce byte-identical reports and still count as two measurements
   of runner variance; a retry of one run is one measurement however its numbers
   came out. A report with no run identity is refused, because content cannot be
-  used to infer one. Inputs repeating a run identity collapse to a single run —
-  the last artifact supplied wins, exactly as a #58 re-run replaces its row,
-  and a conflict between them is counted and stated in `limitations`. Fewer
-  than two distinct runs (`MIN_BASELINE_RUNS`) produce no proposals at all —
-  one run calibrates nothing.
+  used to infer one. Repeated artifacts for one run identity collapse to a
+  single run when they agree (a double-passed file is not a second
+  measurement); when they *disagree* the history fails closed rather than
+  picking one. `run_id` names the run, but not which attempt is newer, and the
+  order the files happen to be passed in is not provenance — so the operator
+  pools exactly one artifact per run identity instead. Fewer than two distinct
+  runs (`MIN_BASELINE_RUNS`) produce no proposals at all — one run calibrates
+  nothing.
 * **Exact time.** Represented stream time is summed exactly; a partial hour
   never rounds up to one. Two-second runs are two seconds of evidence, and
   sub-hour histories omit `stream_hours` rather than claiming a full hour.

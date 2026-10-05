@@ -1536,16 +1536,12 @@ pub struct BaselineProposalSet {
     pub catalog_version: String,
     pub reports: u64,
     pub contributing_reports: u64,
-    /// Input reports that repeated a run identity already in the history: a
-    /// retry, or the same artifact passed twice. They are not further runs.
+    /// Input reports that repeated a run identity already in the history with
+    /// identical content: the same artifact passed twice, or a byte-identical
+    /// retry. They carry no second measurement. A repeat of a run identity with
+    /// *different* content is refused instead of pooled.
     #[serde(default)]
     pub duplicate_reports: u64,
-    /// Subset of [`Self::duplicate_reports`] whose payload differed from the
-    /// artifact it superseded. A #58 re-run replaces its earlier row, so the
-    /// last artifact supplied for a run identity wins; the conflict is counted
-    /// and stated rather than silently resolved.
-    #[serde(default)]
-    pub superseded_reports: u64,
     pub excluded_experimental_reports: u64,
     /// The #58 compatibility series every contributing run belongs to:
     /// `mode|dataset_id|config_version|seed`. Pooled evidence is only valid
@@ -1583,10 +1579,11 @@ impl BaselineProposalSet {
     ///   reports and are two measurements, while a retry of one run is one
     ///   measurement however its numbers came out. A report with no run
     ///   identity is refused, because content cannot be used to infer one.
-    ///   Inputs repeating a run identity collapse to one run, the last artifact
-    ///   supplied winning as a #58 re-run replaces its row; fewer than
-    ///   [`MIN_BASELINE_RUNS`] distinct runs produce no proposals at all, since
-    ///   one run calibrates nothing.
+    ///   Repeated artifacts for one run identity collapse to that run when they
+    ///   agree; when they *disagree* the history fails closed, because `run_id`
+    ///   names the run but not which attempt is newer, and argument order is not
+    ///   provenance. Fewer than [`MIN_BASELINE_RUNS`] distinct runs produce no
+    ///   proposals at all, since one run calibrates nothing.
     /// * **Exact time.** Represented stream time is summed exactly; a partial
     ///   hour never rounds up to one. Sub-hour evidence omits `stream_hours`
     ///   instead of claiming an hour it did not stand for.
@@ -1658,18 +1655,17 @@ impl BaselineProposalSet {
         // Distinct-run detection is by run identity, never by payload. Two
         // independent deterministic runs of one revision produce identical
         // reports, and a retry of one run can produce a different one, so
-        // content decides neither question. The canonical form is still used,
-        // but only to notice that a superseding artifact disagrees with the one
-        // it replaced: that is reported, not silently resolved.
+        // content decides neither question. Content equality is used only to
+        // recognise an identical repeat of one run; a *conflicting* repeat is
+        // refused, never resolved (see below).
         let canonical_json = |report: &SloReport| -> Result<String, SloError> {
             serde_json::to_string(report)
                 .map_err(|error| SloError::new(format!("canonicalize report: {error}")))
         };
-        // run identity -> (index in `distinct`, canonical payload)
-        let mut by_run: BTreeMap<String, (usize, String)> = BTreeMap::new();
+        // run identity -> canonical payload of the artifact accepted for it
+        let mut accepted: BTreeMap<String, String> = BTreeMap::new();
         let mut distinct: Vec<&SloReport> = Vec::new();
         let mut duplicate_reports = 0_u64;
-        let mut superseded_reports = 0_u64;
         let mut excluded_experimental = 0_u64;
         for report in reports {
             if !report.counts_toward_active_slo {
@@ -1684,21 +1680,33 @@ impl BaselineProposalSet {
                 .trim()
                 .to_owned();
             let canonical = canonical_json(report)?;
-            match by_run.entry(run_id) {
-                Entry::Occupied(mut occupied) => {
-                    duplicate_reports += 1;
-                    let (index, previous) = occupied.get_mut();
-                    // A #58 re-run of one workflow run replaces its earlier row,
-                    // so the last artifact supplied for a run identity wins and
-                    // a directory glob stays usable.
-                    if *previous != canonical {
-                        superseded_reports += 1;
-                        distinct[*index] = report;
-                        *previous = canonical;
+            match accepted.entry(run_id) {
+                Entry::Occupied(occupied) => {
+                    // The same run identity with identical content is one run
+                    // measured twice: a double-passed file or a byte-identical
+                    // retry, which carries no second measurement.
+                    if *occupied.get() == canonical {
+                        duplicate_reports += 1;
+                        continue;
                     }
+                    // Two attempts of one run disagree. `run_id` says they are
+                    // the same logical run; it does not say which attempt is
+                    // newer, and the order in which paths reach this function is
+                    // not provenance. Choosing the last one would make durable
+                    // calibration evidence a function of filesystem/glob/argv
+                    // ordering, so pooling fails closed instead: the operator
+                    // names the authoritative artifact explicitly.
+                    return Err(SloError::new(format!(
+                        "run identity {:?} appears twice with different measurements; the two \
+                         artifacts are attempts of one run and carry no authoritative ordering, so \
+                         choosing one would make the baseline depend on the order the files were \
+                         passed — pool exactly one artifact per run identity, or give each attempt \
+                         its own --run-id",
+                        occupied.key()
+                    )));
                 }
                 Entry::Vacant(vacant) => {
-                    vacant.insert((distinct.len(), canonical));
+                    vacant.insert(canonical);
                     distinct.push(report);
                 }
             }
@@ -1729,14 +1737,8 @@ impl BaselineProposalSet {
         ];
         if duplicate_reports > 0 {
             limitations.push(format!(
-                "{duplicate_reports} report(s) repeated a run identity already in the history and \
-                 were not counted as further runs"
-            ));
-        }
-        if superseded_reports > 0 {
-            limitations.push(format!(
-                "{superseded_reports} of those repeated a run identity with different content; the \
-                 last artifact supplied for a run identity wins, as a #58 re-run replaces its row"
+                "{duplicate_reports} report(s) repeated a run identity already in the history with \
+                 identical content and were not counted as further runs"
             ));
         }
         if (distinct.len() as u64) < MIN_BASELINE_RUNS {
@@ -1751,7 +1753,6 @@ impl BaselineProposalSet {
                 reports: reports.len() as u64,
                 contributing_reports: distinct.len() as u64,
                 duplicate_reports,
-                superseded_reports,
                 excluded_experimental_reports: excluded_experimental,
                 revisions: distinct
                     .iter()
@@ -2005,7 +2006,6 @@ impl BaselineProposalSet {
             reports: reports.len() as u64,
             contributing_reports: distinct.len() as u64,
             duplicate_reports,
-            superseded_reports,
             excluded_experimental_reports: excluded_experimental,
             revisions: revisions.into_iter().map(ToOwned::to_owned).collect(),
             datasets: datasets.into_iter().map(ToOwned::to_owned).collect(),
@@ -2025,11 +2025,10 @@ impl BaselineProposalSet {
     pub fn markdown_summary(&self) -> String {
         let mut out = format!(
             "Operational SLO baseline proposal — {} report(s) pooled ({} contributing distinct, {} \
-             duplicate, {} superseding, {} experimental excluded)\n\n",
+             duplicate, {} experimental excluded)\n\n",
             self.reports,
             self.contributing_reports,
             self.duplicate_reports,
-            self.superseded_reports,
             self.excluded_experimental_reports
         );
         if let Some(series) = &self.series {

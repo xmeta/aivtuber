@@ -13,8 +13,10 @@
 //! * every input must carry a run identity (`slo-report --run-id`): runs are
 //!   counted by identity, never by report content, because two independent
 //!   deterministic runs produce identical reports and a retry may not;
-//! * inputs repeating a run identity are one run — the last artifact supplied
-//!   wins, as a #58 re-run replaces its row;
+//! * inputs repeating a run identity with identical content are one run; a
+//!   repeat with *different* content fails closed, because `run_id` names the
+//!   run but not which attempt is newer, and the order files are passed in is
+//!   not provenance;
 //! * fewer than [`MIN_BASELINE_RUNS`] distinct runs produce no proposals;
 //! * represented stream time is summed exactly (no per-run ceil).
 //!

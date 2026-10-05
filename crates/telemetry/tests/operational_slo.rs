@@ -814,7 +814,6 @@ fn a_repeated_run_identity_is_one_run_not_repeated_evidence() {
     assert_eq!(pooled.reports, 3);
     assert_eq!(pooled.contributing_reports, 1);
     assert_eq!(pooled.duplicate_reports, 2);
-    assert_eq!(pooled.superseded_reports, 0);
     assert_eq!(pooled.contributing_runs.len(), 1);
     assert!(
         pooled.proposals.is_empty(),
@@ -842,7 +841,6 @@ fn two_independent_runs_with_identical_payloads_are_two_runs() {
     let pooled = BaselineProposalSet::from_reports(&[run_a, run_b]).expect("proposal set");
     assert_eq!(pooled.contributing_reports, 2);
     assert_eq!(pooled.duplicate_reports, 0);
-    assert_eq!(pooled.superseded_reports, 0);
     let presence = pooled
         .proposals
         .get("availability.speech_presence_rate")
@@ -864,42 +862,46 @@ fn a_report_without_a_run_identity_is_refused_rather_than_guessed() {
 }
 
 #[test]
-fn a_superseding_retry_replaces_the_earlier_artifact_instead_of_doubling_evidence() {
-    // The same run identity, re-run, with a different measurement: #58 replaces
-    // the earlier row. It must not be counted twice, and the conflict must not
-    // be hidden either.
-    let run_a = evaluate_run(
+fn a_conflicting_retry_is_refused_identically_in_both_argument_orders() {
+    // Two attempts of one run disagree. `run_id` says they are the same logical
+    // run; it does not say which attempt is newer, and the order the files are
+    // handed over is not provenance. Selecting "the last one supplied" would
+    // make durable calibration evidence a function of argv/glob order, so the
+    // history fails closed instead — and both orders must fail the same way.
+    let original = evaluate_run(
         &report(detection_with_latency(20), STREAM_HOUR_MS),
         "nightly-1",
     );
-    let superseding = evaluate_run(&report(silence(20), STREAM_HOUR_MS), "nightly-1");
-    let run_b = evaluate_run(
+    let retried = evaluate_run(&report(silence(20), STREAM_HOUR_MS), "nightly-1");
+    let independent = evaluate_run(
         &report(detection_with_latency(20), STREAM_HOUR_MS),
         "nightly-2",
     );
 
-    let pooled =
-        BaselineProposalSet::from_reports(&[run_a, superseding, run_b]).expect("proposal set");
-    assert_eq!(pooled.contributing_reports, 2);
-    assert_eq!(pooled.duplicate_reports, 1);
-    assert_eq!(pooled.superseded_reports, 1);
-    let presence = pooled
-        .proposals
-        .get("availability.speech_presence_rate")
-        .expect("two distinct run identities remain");
+    // The two attempts really do carry different measurements.
+    assert_ne!(original.indicators, retried.indicators);
+
+    let forward = BaselineProposalSet::from_reports(&[
+        original.clone(),
+        retried.clone(),
+        independent.clone(),
+    ])
+    .expect_err("a conflicting retry is not poolable");
+    let reversed = BaselineProposalSet::from_reports(&[retried, original, independent])
+        .expect_err("the same conflict must fail the same way when reversed");
     assert_eq!(
-        presence.conforming,
-        Some(20),
-        "the superseding artifact is counted, not the artifact it replaced"
+        forward.to_string(),
+        reversed.to_string(),
+        "the outcome must not depend on argument order"
     );
-    assert_eq!(presence.eligible, Some(40));
+    assert_eq!(
+        forward.to_string().matches("nightly-1").count(),
+        1,
+        "the refusal names the ambiguous run: {forward}"
+    );
     assert!(
-        pooled
-            .limitations
-            .iter()
-            .any(|limitation| limitation.contains("last artifact supplied")),
-        "the conflicting retry is stated, not silently resolved: {:?}",
-        pooled.limitations
+        forward.to_string().contains("different measurements"),
+        "{forward}"
     );
 }
 
