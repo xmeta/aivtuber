@@ -40,7 +40,7 @@
 //! runtime still produced no user-visible output). See [`attribution_of`].
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::{BenchmarkReport, ComparisonMode, EventObservation, RouteClass, TelemetryError};
@@ -1347,6 +1347,336 @@ pub fn overall_verdict(indicators: &[SloIndicatorResult]) -> SloVerdict {
         SloVerdict::Ok
     } else {
         SloVerdict::Uncalibrated
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Baseline selection from a run history (#58 metrics -> #71 targets)
+// ---------------------------------------------------------------------------
+
+/// Target-free latency evidence pooled across a run history.
+///
+/// The artifact carries per-run percentiles, not raw samples, so a pooled
+/// percentile cannot be reconstructed. A threshold chosen for a latency
+/// objective has to hold for *every* run in the history, so the worst observed
+/// percentile is the conservative evidence rather than the median run's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BaselineLatency {
+    pub field: String,
+    pub runs: u64,
+    pub samples: u64,
+    pub p95_ms: u64,
+    pub p99_ms: u64,
+    pub max_ms: u64,
+}
+
+/// Pooled calibration evidence for one indicator over a history of runs.
+///
+/// This is deliberately *not* a target. It publishes the measured evidence a
+/// target is chosen from, in the `BaselineEvidence` shape a target entry has to
+/// cite, so choosing a target is a documented product decision above the
+/// measurement rather than a number the fixture happened to produce.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BaselineProposal {
+    pub indicator: String,
+    /// Window series pooled. Always `session`: stream-hour and rolling windows
+    /// partition the same run, so pooling them would count every event once per
+    /// window it appears in.
+    pub window: String,
+    /// Number of contributing runs that carried eligible evidence.
+    pub runs: u64,
+    /// Pooled session denominator (ratio objectives only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligible: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conforming: Option<u64>,
+    /// Pooled measured ratio, ready to paste into a target entry as its
+    /// `baseline`. The target ratio itself remains a product decision made
+    /// *above* this value, not equal to it by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<BaselineEvidence>,
+    /// Target-free latency percentiles; a `threshold_ms` is chosen from these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency: Option<BaselineLatency>,
+}
+
+/// Internal accumulator for pooled latency percentiles across contributing runs.
+#[derive(Default)]
+struct LatencyPool {
+    runs: u64,
+    samples: u64,
+    p95_ms: u64,
+    p99_ms: u64,
+    max_ms: u64,
+}
+
+/// Calibration evidence pooled from a history of SLO reports (#58 history).
+///
+/// This is the missing link the issue names: repeated measured runs, not a
+/// single one, are what turn a measurement into a baseline. It reads the
+/// per-run SLO reports the project already produces and pools them, so a target
+/// can be chosen from evidence instead of invented.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BaselineProposalSet {
+    pub schema_version: String,
+    pub catalog_version: String,
+    pub reports: u64,
+    pub contributing_reports: u64,
+    pub excluded_experimental_reports: u64,
+    pub revisions: Vec<String>,
+    pub datasets: Vec<String>,
+    pub proposals: BTreeMap<String, BaselineProposal>,
+    /// Objectives with no eligible evidence in any contributing run.
+    pub not_measured: Vec<String>,
+    pub limitations: Vec<String>,
+}
+
+impl BaselineProposalSet {
+    /// Pool a history of SLO reports into per-indicator calibration evidence.
+    ///
+    /// Only `active`-plane reports contribute: an experimental route must not
+    /// move the active baseline any more than it may move the active SLO.
+    pub fn from_reports(reports: &[SloReport]) -> Result<Self, SloError> {
+        for report in reports {
+            if report.catalog_version != SLO_CATALOG_VERSION {
+                return Err(SloError::new(format!(
+                    "report for dataset {:?} was evaluated against catalog {:?} but this build \
+                     implements {:?}; pooling values written against different indicator \
+                     definitions is not comparable",
+                    report.source.dataset_id, report.catalog_version, SLO_CATALOG_VERSION
+                )));
+            }
+        }
+
+        let catalog = catalog();
+        let latency_ids: BTreeSet<&str> = catalog
+            .iter()
+            .filter(|indicator| indicator.latency_thresholded)
+            .map(|indicator| indicator.id)
+            .collect();
+
+        let mut contributing = 0_u64;
+        let mut excluded_experimental = 0_u64;
+        let mut datasets: BTreeSet<&str> = BTreeSet::new();
+        let mut revisions: BTreeSet<&str> = BTreeSet::new();
+        let mut stream_hours = 0_u64;
+        let mut reports_without_duration = 0_u64;
+
+        // indicator -> (runs, eligible, conforming)
+        let mut pools: BTreeMap<&str, (u64, u64, u64)> = BTreeMap::new();
+        // (indicator, field) -> pooled percentile evidence
+        let mut latency: BTreeMap<(&str, &str), LatencyPool> = BTreeMap::new();
+
+        for report in reports {
+            if !report.counts_toward_active_slo {
+                excluded_experimental += 1;
+                continue;
+            }
+            contributing += 1;
+            datasets.insert(report.source.dataset_id.as_str());
+            revisions.insert(report.source.git_commit.as_str());
+            match report.source.stream_duration_ms.filter(|ms| *ms > 0) {
+                Some(ms) => stream_hours += ms.div_ceil(STREAM_HOUR_MS),
+                None => reports_without_duration += 1,
+            }
+
+            for row in report
+                .indicators
+                .iter()
+                .filter(|row| row.window == "session")
+            {
+                // Invariants are not probabilistic and never carry a ratio.
+                if row.kind != ObjectiveKind::Slo || row.unit != IndicatorUnit::Ratio {
+                    continue;
+                }
+                // A latency objective's ratio depends on a threshold that does
+                // not exist yet, so its evidence is the percentile, not a ratio.
+                if latency_ids.contains(row.id.as_str()) || row.eligible == 0 {
+                    continue;
+                }
+                let pool = pools.entry(row.id.as_str()).or_insert((0, 0, 0));
+                pool.0 += 1;
+                pool.1 += row.eligible;
+                pool.2 += row.conforming;
+            }
+
+            for point in report
+                .latency_calibration
+                .iter()
+                .filter(|point| point.window == "session" && point.samples > 0)
+            {
+                let entry = latency
+                    .entry((point.indicator.as_str(), point.field.as_str()))
+                    .or_default();
+                entry.runs += 1;
+                entry.samples += point.samples;
+                entry.p95_ms = entry.p95_ms.max(point.p95_ms);
+                entry.p99_ms = entry.p99_ms.max(point.p99_ms);
+                entry.max_ms = entry.max_ms.max(point.max_ms);
+            }
+        }
+
+        let stream_hours = (stream_hours > 0).then_some(stream_hours);
+        let mut proposals: BTreeMap<String, BaselineProposal> = BTreeMap::new();
+        for (id, (runs, eligible, conforming)) in &pools {
+            proposals.insert(
+                (*id).to_owned(),
+                BaselineProposal {
+                    indicator: (*id).to_owned(),
+                    window: "session".to_owned(),
+                    runs: *runs,
+                    eligible: Some(*eligible),
+                    conforming: Some(*conforming),
+                    baseline: Some(BaselineEvidence {
+                        value: *conforming as f64 / *eligible as f64,
+                        source: format!(
+                            "slo-baseline: {runs} session run(s) over {} dataset(s) and {} \
+                             revision(s)",
+                            datasets.len(),
+                            revisions.len()
+                        ),
+                        stream_hours,
+                    }),
+                    latency: None,
+                },
+            );
+        }
+        for ((id, field), pool) in &latency {
+            let proposal = proposals
+                .entry((*id).to_owned())
+                .or_insert_with(|| BaselineProposal {
+                    indicator: (*id).to_owned(),
+                    window: "session".to_owned(),
+                    runs: 0,
+                    eligible: None,
+                    conforming: None,
+                    baseline: None,
+                    latency: None,
+                });
+            proposal.runs = proposal.runs.max(pool.runs);
+            proposal.latency = Some(BaselineLatency {
+                field: (*field).to_owned(),
+                runs: pool.runs,
+                samples: pool.samples,
+                p95_ms: pool.p95_ms,
+                p99_ms: pool.p99_ms,
+                max_ms: pool.max_ms,
+            });
+        }
+
+        let not_measured: Vec<String> = catalog
+            .iter()
+            .filter(|indicator| {
+                indicator.kind == ObjectiveKind::Slo
+                    && indicator.evidence == EvidenceSource::Measured
+            })
+            .filter(|indicator| !proposals.contains_key(indicator.id))
+            .map(|indicator| indicator.id.to_owned())
+            .collect();
+
+        let mut limitations = vec![
+            "baselines pool the `session` window only: stream-hour and rolling windows partition \
+             the same run, so pooling them would count each event once per window"
+                .to_owned(),
+            "latency percentiles are the worst observed across contributing runs, not a pooled \
+             percentile, because the artifact carries per-run percentiles rather than raw samples"
+                .to_owned(),
+        ];
+        if reports_without_duration > 0 {
+            limitations.push(format!(
+                "{reports_without_duration} contributing report(s) recorded no stream duration, so \
+                 `stream_hours` may under-count the represented time"
+            ));
+        }
+        if excluded_experimental > 0 {
+            limitations.push(format!(
+                "{excluded_experimental} experimental-plane report(s) were excluded from the \
+                 active baseline"
+            ));
+        }
+
+        Ok(Self {
+            schema_version: SLO_REPORT_SCHEMA_VERSION.to_owned(),
+            catalog_version: SLO_CATALOG_VERSION.to_owned(),
+            reports: reports.len() as u64,
+            contributing_reports: contributing,
+            excluded_experimental_reports: excluded_experimental,
+            revisions: revisions.into_iter().map(ToOwned::to_owned).collect(),
+            datasets: datasets.into_iter().map(ToOwned::to_owned).collect(),
+            proposals,
+            not_measured,
+            limitations,
+        })
+    }
+
+    pub fn to_json_pretty(&self) -> Result<Vec<u8>, SloError> {
+        serde_json::to_vec_pretty(self)
+            .map_err(|error| SloError::new(format!("serialize baseline proposal: {error}")))
+    }
+
+    pub fn markdown_summary(&self) -> String {
+        let mut out = format!(
+            "Operational SLO baseline proposal — {} report(s) pooled ({} contributing, {} \
+             experimental excluded)\n\n",
+            self.reports, self.contributing_reports, self.excluded_experimental_reports
+        );
+        out.push_str(
+            "| Indicator | Runs | Eligible | Conforming | Value | Stream hours | Latency p95/p99/max |\n\
+             |---|---|---|---|---|---|---|\n",
+        );
+        for proposal in self.proposals.values() {
+            let value = proposal
+                .baseline
+                .as_ref()
+                .map(|baseline| format!("{:.4}", baseline.value))
+                .unwrap_or_else(|| "-".to_owned());
+            let stream_hours = proposal
+                .baseline
+                .as_ref()
+                .and_then(|baseline| baseline.stream_hours)
+                .map(|hours| hours.to_string())
+                .unwrap_or_else(|| "-".to_owned());
+            let latency = proposal
+                .latency
+                .as_ref()
+                .map(|latency| {
+                    format!(
+                        "{} / {} / {}",
+                        latency.p95_ms, latency.p99_ms, latency.max_ms
+                    )
+                })
+                .unwrap_or_else(|| "-".to_owned());
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} |\n",
+                proposal.indicator,
+                proposal.runs,
+                proposal
+                    .eligible
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                proposal
+                    .conforming
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                value,
+                stream_hours,
+                latency,
+            ));
+        }
+        if !self.not_measured.is_empty() {
+            out.push_str(&format!(
+                "\nNot measured in any contributing run: {}\n",
+                self.not_measured.join("; ")
+            ));
+        }
+        for limitation in &self.limitations {
+            out.push_str(&format!("\n> {limitation}\n"));
+        }
+        out.push_str(
+            "\nThis is measured evidence, not a target. A target ratio is a product decision \
+             made above the value shown, and the chosen `baseline` block is copied from here.\n",
+        );
+        out
     }
 }
 

@@ -7,8 +7,8 @@
 
 use aivtuber_domain::InteractionDeadlineClass;
 use aivtuber_telemetry::{
-    AttributionSummary, BaselineEvidence, BenchmarkReport, CacheLevel, ComparisonMode,
-    EventObservation, EvidenceSource, FailureOrigin, MissAttribution,
+    AttributionSummary, BaselineEvidence, BaselineProposalSet, BenchmarkReport, CacheLevel,
+    ComparisonMode, EventObservation, EvidenceSource, FailureOrigin, MissAttribution,
     MissAttribution as Attribution, ObjectiveKind, ReproducibilityMetadata, RouteClass,
     STREAM_HOUR_MS, SloAction, SloError, SloEvaluationConfig, SloIndicatorResult, SloProvenance,
     SloReport, SloStatus, SloTarget, SloTargets, SloWindow, TrafficPlane, WindowKind,
@@ -651,4 +651,180 @@ fn a_miss_attribution_type_is_exported_for_consumers() {
     let _: MissAttribution = attribution_of(&observation(RouteClass::Silent));
     let error = SloError::new("boom");
     assert_eq!(error.to_string(), "boom");
+}
+
+// ---------------------------------------------------------------------------
+// Baseline selection from a run history (#58 metrics -> #71 targets)
+// ---------------------------------------------------------------------------
+
+fn detection_with_latency(count: u64) -> Vec<EventObservation> {
+    (1..=count)
+        .map(|index| {
+            let mut event = observation(RouteClass::Deterministic);
+            event.stream_offset_ms = Some(index * 1_000);
+            event.event_to_first_visible_reaction_ms = Some(index);
+            event.event_to_first_audio_ms = Some(index + 1);
+            event
+        })
+        .collect()
+}
+
+fn silence(count: u64) -> Vec<EventObservation> {
+    (0..count)
+        .map(|_| observation(RouteClass::Silent))
+        .collect()
+}
+
+#[test]
+fn a_baseline_pools_the_session_denominator_across_runs() {
+    // Run A: 20 conforming. Run B: 10 conforming and 10 unintended silences.
+    let run_a = evaluate_default(&report(
+        (0..20)
+            .map(|_| observation(RouteClass::Deterministic))
+            .collect(),
+        2 * STREAM_HOUR_MS,
+    ));
+    let mut run_b_events = (0..10)
+        .map(|_| observation(RouteClass::Deterministic))
+        .collect::<Vec<_>>();
+    run_b_events.extend(silence(10));
+    let run_b = evaluate_default(&report(run_b_events, 2 * STREAM_HOUR_MS));
+
+    let pooled = BaselineProposalSet::from_reports(&[run_a, run_b]).expect("proposal set");
+    assert_eq!(pooled.contributing_reports, 2);
+    assert_eq!(pooled.revisions, vec!["deadbeef".to_owned()]);
+
+    let presence = pooled
+        .proposals
+        .get("availability.speech_presence_rate")
+        .expect("presence proposal");
+    assert_eq!(presence.runs, 2);
+    assert_eq!(presence.eligible, Some(40));
+    assert_eq!(presence.conforming, Some(30));
+    let baseline = presence.baseline.as_ref().expect("baseline evidence");
+    assert!((baseline.value - 0.75).abs() < 1e-9, "{}", baseline.value);
+    assert_eq!(baseline.stream_hours, Some(4));
+    assert!(baseline.source.contains("slo-baseline"));
+}
+
+#[test]
+fn a_pooled_baseline_can_justify_a_target_without_being_invented() {
+    let run = evaluate_default(&report(
+        (0..20)
+            .map(|_| observation(RouteClass::Deterministic))
+            .collect(),
+        STREAM_HOUR_MS,
+    ));
+    let pooled = BaselineProposalSet::from_reports(&[run]).expect("proposal set");
+    let baseline = pooled
+        .proposals
+        .get("availability.speech_presence_rate")
+        .and_then(|proposal| proposal.baseline.clone())
+        .expect("measured baseline");
+
+    // The measured value is 1.0, but the product decision is a *lower* target
+    // the runtime must keep holding; the proposal only supplies the evidence.
+    let file = targets(&[(
+        "availability.speech_presence_rate",
+        SloTarget {
+            target: 0.95,
+            threshold_ms: None,
+            baseline,
+        },
+    )]);
+    file.validate(&catalog())
+        .expect("a measured baseline is exactly what a target must cite");
+}
+
+#[test]
+fn an_experimental_report_does_not_move_the_active_baseline() {
+    let active = evaluate_default(&report(detection_with_latency(20), STREAM_HOUR_MS));
+    let experimental = evaluate(
+        &report(detection_with_latency(20), STREAM_HOUR_MS),
+        &SloTargets::default(),
+        SloEvaluationConfig {
+            plane: TrafficPlane::Experimental,
+            ..SloEvaluationConfig::default()
+        },
+    )
+    .expect("SLO report");
+
+    let pooled = BaselineProposalSet::from_reports(&[active, experimental]).expect("proposal set");
+    assert_eq!(pooled.contributing_reports, 1);
+    assert_eq!(pooled.excluded_experimental_reports, 1);
+    let presence = pooled
+        .proposals
+        .get("availability.speech_presence_rate")
+        .expect("presence proposal");
+    assert_eq!(
+        presence.eligible,
+        Some(20),
+        "the shadow run must not be pooled"
+    );
+    assert!(
+        pooled
+            .limitations
+            .iter()
+            .any(|limitation| limitation.contains("experimental-plane"))
+    );
+}
+
+#[test]
+fn a_history_of_mixed_catalog_versions_is_refused() {
+    let mut stale = evaluate_default(&report(detection_with_latency(5), STREAM_HOUR_MS));
+    stale.catalog_version = "slo-catalog-v0".to_owned();
+    let error = BaselineProposalSet::from_reports(&[stale])
+        .expect_err("mixed definitions are not comparable");
+    assert!(error.to_string().contains("not comparable"), "{error}");
+}
+
+#[test]
+fn a_latency_objective_publishes_percentiles_and_never_a_zero_ratio() {
+    let run = evaluate_default(&report(detection_with_latency(40), STREAM_HOUR_MS));
+    let pooled = BaselineProposalSet::from_reports(&[run]).expect("proposal set");
+
+    let audio = pooled
+        .proposals
+        .get("availability.event_to_first_audio_within_target")
+        .expect("latency proposal");
+    assert!(
+        audio.baseline.is_none(),
+        "a latency ratio depends on a threshold that does not exist yet"
+    );
+    let latency = audio.latency.as_ref().expect("percentiles");
+    assert_eq!(latency.samples, 40);
+    assert_eq!(latency.field, "event_to_first_audio_ms");
+    assert!(latency.p95_ms > 0 && latency.max_ms >= latency.p99_ms);
+}
+
+#[test]
+fn no_evidence_in_the_history_leaves_an_objective_not_measured() {
+    let run = evaluate_default(&report(silence(5), 60_000));
+    let pooled = BaselineProposalSet::from_reports(&[run]).expect("proposal set");
+
+    assert!(
+        pooled
+            .not_measured
+            .contains(&"availability.event_to_first_visible_within_target".to_owned()),
+        "a latency objective with zero samples is unmeasured, not a 0% baseline"
+    );
+    assert!(
+        !pooled
+            .proposals
+            .contains_key("availability.event_to_first_visible_within_target")
+    );
+}
+
+#[test]
+fn a_baseline_proposal_set_round_trips_through_json() {
+    let run = evaluate_default(&report(detection_with_latency(20), STREAM_HOUR_MS));
+    let pooled = BaselineProposalSet::from_reports(&[run]).expect("proposal set");
+    let bytes = pooled.to_json_pretty().expect("json");
+    let parsed: BaselineProposalSet = serde_json::from_slice(&bytes).expect("round trip");
+    assert_eq!(parsed, pooled);
+    assert!(
+        pooled
+            .markdown_summary()
+            .contains("measured evidence, not a target")
+    );
 }

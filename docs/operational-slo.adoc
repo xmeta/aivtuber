@@ -350,6 +350,14 @@ cargo run --locked -p aivtuber-app --bin slo-report -- \
   --out target/aivtuber-slo/slo-report.json \
   --markdown target/aivtuber-slo/slo-summary.md \
   --provenance scenario-replay
+
+# pool a history of reports into calibration evidence (no targets)
+cargo run --locked -p aivtuber-app --bin slo-baseline -- \
+  target/aivtuber-slo/2026-10-01/slo-report.json \
+  target/aivtuber-slo/2026-10-02/slo-report.json \
+  target/aivtuber-slo/2026-10-03/slo-report.json \
+  --out target/aivtuber-slo/baseline-proposal.json \
+  --markdown target/aivtuber-slo/baseline-proposal.md
 ----
 
 Without `--targets` the report publishes measured values and target-free latency
@@ -359,10 +367,32 @@ default, because an operational objective is not a PR gate.
 
 == Choosing a target
 
+A single run is a data point, not a baseline. `slo-baseline` is the tool that
+closes that gap: it reads a *history* of `slo-report` outputs — the #58
+measured runs — and pools them into per-indicator calibration evidence. It
+emits evidence, never a target. For a ratio objective the proposal carries the
+pooled `conforming / eligible` value in exactly the `BaselineEvidence` shape a
+target entry must cite, so the target is copied from a measurement instead of
+improvised; for a latency objective it carries the worst-observed percentiles a
+`threshold_ms` is chosen from, because a threshold has to hold for every run in
+the history, not the median one.
+
+The pooling is deliberately conservative. Only `active`-plane reports
+contribute — an experimental route cannot move the active baseline any more
+than it may move the active SLO — and only the `session` window is pooled,
+because the stream-hour and rolling windows partition the same run and pooling
+them would count every event once per window it appears in. A history that
+mixes catalog versions is refused outright: values written against different
+indicator definitions are not comparable, the same rule a target file is held
+to. An objective with no eligible evidence in any run is reported as
+`not_measured`, never as a `0.0` baseline.
+
 The procedure is deliberately boring:
 
 . Run the benchmark over a #70 scenario workload (and, when it exists, the #40
   fault overlay) and produce an SLO report with no targets.
+. Repeat it, and pool the runs with `slo-baseline`. One run calibrates
+  nothing; repeated runs are what turn a measurement into a baseline.
 . Read `latency_calibration` for the target-free p50/p95/p99/max, and the
   indicator table for the measured ratios.
 . Choose `threshold_ms` from the calibration evidence for latency objectives,
@@ -373,9 +403,12 @@ The procedure is deliberately boring:
 . Re-run and confirm the verdict. A target that is immediately red is a
   measurement problem, not a reason to loosen the target.
 
+The `baseline` block in a target entry is copied from an `slo-baseline`
+proposal rather than written by hand, and the target ratio is a product
+decision made *above* the measured value — the proposal never prescribes it.
 Repeated nightly runs of the same revision are what turn one measurement into a
-baseline; a single run is a data point, exactly as link:performance-goals.adoc[
-Performance Goals and Baselines] requires for #58.
+baseline, exactly as link:performance-goals.adoc[Performance Goals and
+Baselines] requires for #58.
 
 == What this does not cover yet
 
