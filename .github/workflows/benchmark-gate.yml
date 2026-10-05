@@ -269,3 +269,32 @@ jobs:
       - name: Push benchmark history
         if: success()
         run: git push origin benchmark-data
+
+      # Issue #71: the SLO baseline selector needs a *persisted* history, not
+      # reports that only ever existed on a laptop. Record the target-free SLO
+      # measurement of the same revision under the same re-run-invariant run
+      # identity the benchmark history uses, so a re-run replaces its rows
+      # while distinct runs accumulate into a calibratable series.
+      - name: Record SLO calibration history
+        if: success()
+        run: |
+          mkdir -p results/slo
+          # `slo-report` reads the mode reports (`<slug>.json`), not the
+          # `BenchmarkResult` aggregates (`<slug>-result.json`) the benchmark
+          # history stores: the aggregate keeps selected metrics but not the
+          # per-event denominators the operational indicators are defined on.
+          for report in target/bench-main/*.json; do
+            case "$report" in
+              *-result.json|*comparison-suite.json) continue ;;
+            esac
+            stem="$(basename "$report" .json)"
+            cargo run --locked -p aivtuber-app --bin slo-report -- \
+              --report "$report" \
+              --run-id "run-${{ github.run_id }}" \
+              --out "results/slo/${stem}.json"
+          done
+          bun scripts/slo-record.mjs --files results/slo/*.json
+
+      - name: Push SLO calibration history
+        if: success()
+        run: git push origin slo-data

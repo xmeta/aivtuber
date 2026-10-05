@@ -17,6 +17,29 @@ use aivtuber_telemetry::{
 
 const CALIBRATION_SOURCE: &str = "04-full-generative.json (dataset=slo-fixture, commit=deadbeef)";
 
+/// The #58 compatibility series the fixture runs belong to.
+const CALIBRATION_SERIES: &str = "deterministic_semantic|slo-fixture|bench-v1|7";
+
+/// Real-looking calibration evidence for a target that only needs *a* valid
+/// baseline to exercise some other rule.
+///
+/// It deliberately carries the compatibility series and two named runs with
+/// revisions: a target has to be able to prove which repeated runs formed its
+/// baseline, so a helper that left the manifest empty would exercise exactly
+/// the bypass `SloTargets::validate` is supposed to close.
+fn calibration_manifest() -> Vec<BaselineRun> {
+    vec![
+        BaselineRun {
+            run_id: "run-a".to_owned(),
+            git_commit: "deadbeef".to_owned(),
+        },
+        BaselineRun {
+            run_id: "run-b".to_owned(),
+            git_commit: "deadbeef".to_owned(),
+        },
+    ]
+}
+
 fn metadata(dataset: &str, stream_duration_ms: u64) -> ReproducibilityMetadata {
     ReproducibilityMetadata {
         dataset_id: dataset.to_owned(),
@@ -78,8 +101,8 @@ fn calibrated(target: f64, baseline: f64) -> SloTarget {
             value: baseline,
             source: CALIBRATION_SOURCE.to_owned(),
             stream_hours: Some(1),
-            series: None,
-            runs: Vec::new(),
+            series: Some(CALIBRATION_SERIES.to_owned()),
+            runs: calibration_manifest(),
         },
     }
 }
@@ -947,6 +970,82 @@ fn a_baseline_citing_an_unnamed_run_is_refused() {
         .validate(&catalog())
         .expect_err("a run that cannot be named is not evidence");
     assert!(error.to_string().contains("empty run identity"), "{error}");
+}
+
+/// The bypass the review reproduced: a target whose `baseline` is a
+/// hand-written prose string, with no series and no measured runs, used to
+/// validate cleanly — a direct route around the whole evidence chain this
+/// contract exists to build.
+#[test]
+fn a_handwritten_target_without_a_run_manifest_is_refused() {
+    let bytes = br#"{
+        "target": 0.95,
+        "baseline": {
+            "value": 0.95,
+            "source": "handwritten, not a measured artifact",
+            "stream_hours": 1
+        }
+    }"#;
+    let mut file = SloTargets::default();
+    file.targets.insert(
+        "availability.speech_presence_rate".to_owned(),
+        serde_json::from_slice(bytes).expect("target"),
+    );
+    let error = file
+        .validate(&catalog())
+        .expect_err("a target must prove which measured runs formed its baseline");
+    assert!(
+        error.to_string().contains("compatibility series"),
+        "a baseline outside a known series is not evidence about a workload: {error}"
+    );
+}
+
+#[test]
+fn a_target_with_no_compatibility_series_is_refused() {
+    let mut target = calibrated(0.9, 0.95);
+    target.baseline.series = None;
+    let file = targets(&[("availability.speech_presence_rate", target)]);
+    let error = file
+        .validate(&catalog())
+        .expect_err("the series is part of the evidence");
+    assert!(
+        error.to_string().contains("compatibility series"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_target_that_names_no_measured_runs_is_refused() {
+    let mut target = calibrated(0.9, 0.95);
+    target.baseline.runs.clear();
+    let file = targets(&[("availability.speech_presence_rate", target)]);
+    let error = file
+        .validate(&catalog())
+        .expect_err("no named run is no calibration evidence");
+    assert!(error.to_string().contains("at least 2"), "{error}");
+}
+
+#[test]
+fn a_target_whose_run_has_no_revision_is_refused() {
+    let mut target = calibrated(0.9, 0.95);
+    target.baseline.runs[0].git_commit = "  ".to_owned();
+    let file = targets(&[("availability.speech_presence_rate", target)]);
+    let error = file
+        .validate(&catalog())
+        .expect_err("evidence whose revision is unknown is not auditable");
+    assert!(error.to_string().contains("without a revision"), "{error}");
+}
+
+#[test]
+fn a_target_counting_one_run_twice_is_refused() {
+    let mut target = calibrated(0.9, 0.95);
+    let first = target.baseline.runs[0].run_id.clone();
+    target.baseline.runs[1].run_id = first;
+    let file = targets(&[("availability.speech_presence_rate", target)]);
+    let error = file
+        .validate(&catalog())
+        .expect_err("a run identity counts one contribution");
+    assert!(error.to_string().contains("more than once"), "{error}");
 }
 
 #[test]

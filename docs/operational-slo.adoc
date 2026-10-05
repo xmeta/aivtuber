@@ -347,7 +347,7 @@ cargo run --locked -p aivtuber-app --bin replay-benchmark -- \
 cargo run --locked -p aivtuber-app --bin slo-report -- \
   --report target/aivtuber-benchmarks/04-full-generative.json \
   --targets examples/slo/slo-targets.json \
-  --run-id "$GITHUB_RUN_ID" \
+  --run-id "run-$GITHUB_RUN_ID" \
   --out target/aivtuber-slo/slo-report.json \
   --markdown target/aivtuber-slo/slo-summary.md \
   --provenance scenario-replay
@@ -360,10 +360,9 @@ cargo run --locked -p aivtuber-app --bin slo-baseline -- \
   --out target/aivtuber-slo/baseline-proposal.json \
   --markdown target/aivtuber-slo/baseline-proposal.md
 
-# latency probe step: measure a candidate boundary over each run, then pool
-cargo run --locked -p aivtuber-app --bin slo-report -- \
+# latency probe step: measure a candidate boundary over each run, then pool  cargo run --locked -p aivtuber-app --bin slo-report -- \
   --report target/aivtuber-benchmarks/04-full-generative.json \
-  --run-id "$GITHUB_RUN_ID" \
+  --run-id "run-$GITHUB_RUN_ID" \
   --probe-latency availability.event_to_first_audio_within_target=250 \
   --out target/aivtuber-slo/probed-run.json
 cargo run --locked -p aivtuber-app --bin slo-baseline -- \
@@ -377,8 +376,9 @@ default, because an operational objective is not a PR gate.
 
 `--run-id` is required. It is the stable identity of the run the report
 measured, with the same semantics as #58's `recording.run_id`: stable across
-retries of one run, distinct across distinct runs (`$GITHUB_RUN_ID` is
-therefore the natural value in CI, and a date or session label is one locally).
+retries of one run, distinct across distinct runs (`run-$GITHUB_RUN_ID` is
+therefore the natural value in CI — it is exactly what the persisted history
+uses — and a date or session label is one locally).
 `slo-baseline` counts runs by this identity alone, so a report produced without
 it is a measurement that can never join a calibration history.
 
@@ -391,6 +391,10 @@ emits evidence, never a target. For a ratio objective the proposal carries the
 pooled `conforming / eligible` value in exactly the `BaselineEvidence` shape a
 target entry must cite, so the target is copied from a measurement instead of
 improvised.
+
+That history is a repository artifact, not a local one: the trusted
+push-to-main job records and persists it, so the runs behind a target can be
+retrieved and audited later (see *Where the history lives* below).
 
 The pooling is deliberately conservative, and each rule is enforced, not
 assumed:
@@ -420,6 +424,41 @@ assumed:
   excluded from the active SLO.
 * **One report contract.** A `schema_version` or catalog version this build
   does not implement fails closed.
+
+=== Where the history lives
+
+`slo-baseline` is only useful if a history actually exists, so the measurement
+is persisted rather than left on whichever machine happened to run it. The
+trusted `record-main` job (the push-to-main half of
+link:benchmark-gate.adoc[the benchmark gate]) records the target-free SLO report
+for each mode of every main revision and appends it to the `slo-data` branch via
+`scripts/slo-record.mjs`, under the same re-run-invariant identity the benchmark
+history uses (`run-<github.run_id>`): a re-run of one workflow run replaces its
+own artifacts, while distinct runs accumulate into a calibratable series.
+
+The SLO history is deliberately *separate* from `benchmark-data` rather than a
+new column in it. That branch stores `BenchmarkResult` aggregates, which retain
+selected #58 metrics but not the per-event denominators and classifications the
+operational indicators are defined on, so an SLO cannot be reconstructed from
+it after the fact. Both histories are written from the same measured run and
+keyed on the same compatibility series, which is what makes the trend history
+and the calibration history comparable.
+
+Retrieve it the way any branch is retrieved, then pool one series directory:
+
+[source,shell]
+----
+git fetch origin slo-data
+git worktree add target/slo-history origin/slo-data
+
+cargo run --locked -p aivtuber-app --bin slo-baseline -- \
+  target/slo-history/reports/<series>/*.json \
+  --out target/aivtuber-slo/baseline-proposal.json
+----
+
+On the branch, one document lives at `reports/<series>/<run>.json`. Pool one
+`<series>` directory at a time: the directory *is* the compatibility boundary,
+and `slo-baseline` refuses a history that spans two.
 
 === The latency calibration cycle
 
@@ -462,6 +501,12 @@ The procedure is deliberately boring:
 The `baseline` block in a target entry is copied from an `slo-baseline`
 proposal rather than written by hand, and the target ratio is a product
 decision made *above* the measured value — the proposal never prescribes it.
+Validation enforces this rather than trusting it: a calibrated target whose
+`baseline` names no compatibility `series`, fewer than `MIN_BASELINE_RUNS`
+contributing runs, a run without a revision, or the same run identity twice is
+refused, so a target cannot cite a hand-written `source` string and no measured
+history at all. Only a latency probe is exempt, and only on the measurement
+path — `SloTargets::validate` still refuses to let one into a targets file.
 The provenance is durable and structured, because the evidence block is the
 only part that survives the copy: `series` names the #58 compatibility series
 (`mode|dataset_id|config_version|seed`) and `runs` lists every contributing

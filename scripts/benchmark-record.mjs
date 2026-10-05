@@ -435,6 +435,12 @@ if (invokedDirectly) {
   main();
 }
 
+// The #58 compatibility boundary (`compatKey`, `seriesFileStem`) is shared
+// with scripts/slo-record.mjs: the SLO calibration history is keyed on the same
+// series, so both histories must derive one identical series identity rather
+// than two that can drift apart.
+export { compatKey, seriesFileStem, seriesLabel, stableHash };
+
 // Exported for tests (tests/benchmark-record.test.mjs).
 export const __testables = {
   identityOf,

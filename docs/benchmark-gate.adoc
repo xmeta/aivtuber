@@ -236,6 +236,17 @@ Recording jobs pass `--run-id "run-${{ github.run_id }}"` (re-run-invariant;
 only), and the recorder refuses to run without a run identity so retries and
 repeated observations can always be told apart.
 
+The same job also records the *SLO calibration history* (issue #71) to the
+separate orphan `slo-data` branch through `scripts/slo-record.mjs`: the
+target-free `slo-report` of each replay mode, at
+`reports/<series>/<run>.json`, keyed on the same compatibility series and the
+same re-run-invariant run id. It is a separate branch because `benchmark-data`
+stores `BenchmarkResult` aggregates, which retain selected metrics but not the
+per-event denominators and classifications the operational indicators are
+defined on, so an SLO cannot be reconstructed from them after the fact.
+`slo-baseline` pools one series directory into the `BaselineEvidence` a target
+cites (link:operational-slo.adoc[Operational SLOs]).
+
 Trend views are informational. Gating decisions always come from the
 machine-readable comparator. Baseline/target methodology, budget rationale,
 and the regression-investigation procedure live in

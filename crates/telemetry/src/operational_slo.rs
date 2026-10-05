@@ -983,21 +983,70 @@ impl SloTargets {
                     "target {id:?} must cite the measured artifact it was calibrated from"
                 )));
             }
-            for run in &target.baseline.runs {
-                if run.run_id.trim().is_empty() {
-                    return Err(SloError::new(format!(
-                        "target {id:?} baseline cites a contributing run with an empty run \
-                         identity; a run that cannot be named is not evidence"
-                    )));
-                }
-            } // The probe placeholder is a measurement *tool*, never evidence: a
+            // The probe placeholder is a measurement *tool*, never evidence: a
             // targets file carrying one has skipped the measured-ratio step.
-            if !allow_probe && target.baseline.source.starts_with(PROBE_SOURCE_MARKER) {
+            let probe = target.baseline.source.starts_with(PROBE_SOURCE_MARKER);
+            if !allow_probe && probe {
                 return Err(SloError::new(format!(
                     "target {id:?} cites a latency probe, not calibration evidence; measure the \
                      candidate boundary over a run history first (slo-report with the probe target, \
                      then slo-baseline over the probed reports)"
                 )));
+            }
+            // Everything a *calibrated* target must prove about the evidence it
+            // cites. The proposal generates all of this; a probe is the tool
+            // that produces it and is the one shape exempt (it only reaches
+            // here on the measurement path, above). Without these checks a
+            // target could carry a hand-written `source` string and no measured
+            // history at all, which is a bypass around the whole evidence chain
+            // this contract exists to build: `source` merely has to be
+            // non-empty, and the runner manifest, series, and revision would
+            // all be optional.
+            if !probe {
+                let series = target
+                    .baseline
+                    .series
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or_default();
+                if series.is_empty() {
+                    return Err(SloError::new(format!(
+                        "target {id:?} baseline names no #58 compatibility series; a ratio \
+                         measured outside a known mode+dataset_id+config_version+seed series is \
+                         evidence about no particular workload"
+                    )));
+                }
+                let mut named: BTreeSet<&str> = BTreeSet::new();
+                for run in &target.baseline.runs {
+                    let run_id = run.run_id.trim();
+                    if run_id.is_empty() {
+                        return Err(SloError::new(format!(
+                            "target {id:?} baseline cites a contributing run with an empty run \
+                             identity; a run that cannot be named is not evidence"
+                        )));
+                    }
+                    if run.git_commit.trim().is_empty() {
+                        return Err(SloError::new(format!(
+                            "target {id:?} baseline cites run {run_id:?} without a revision; \
+                             evidence whose revision is unknown cannot be re-measured or audited"
+                        )));
+                    }
+                    if !named.insert(run_id) {
+                        return Err(SloError::new(format!(
+                            "target {id:?} baseline names run {run_id:?} more than once; repeated \
+                             artifacts of one run are one measurement, so a run identity counts \
+                             exactly one contribution"
+                        )));
+                    }
+                }
+                if (target.baseline.runs.len() as u64) < MIN_BASELINE_RUNS {
+                    return Err(SloError::new(format!(
+                        "target {id:?} baseline names {} contributing run(s); calibration \
+                         evidence needs at least {MIN_BASELINE_RUNS} distinct measured runs, \
+                         because one run is a data point and not a baseline",
+                        target.baseline.runs.len()
+                    )));
+                }
             }
         }
         Ok(())
