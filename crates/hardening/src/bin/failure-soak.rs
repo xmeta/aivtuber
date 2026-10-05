@@ -163,15 +163,19 @@ fn run_scenario_mode(
         .map_err(|error| invalid_input(format!("fault overlay is invalid: {error}")))?;
 
     let config = SoakConfig::default();
+    // The fault plan, not its seed, determines behaviour, so it must determine
+    // the recorded config identity too.
+    let fault_plan_id = overlay.plan_id()?;
+    let dataset_id = format!("{}/faults-{fault_plan_id}", scenario.dataset_id());
     let metadata = ReproducibilityMetadata {
-        dataset_id: scenario.dataset_id(),
+        dataset_id: dataset_id.clone(),
         git_commit: git_revision(),
         rust_toolchain: command_output("rustc", &["--version"])
             .unwrap_or_else(|| "unknown-rustc".to_owned()),
         bun_toolchain: command_output("bun", &["--version"]),
         config_version: format!(
-            "scenario-soak-v1;scenario={};version={};fault_seed={}",
-            scenario.scenario_id, scenario.scenario_version, overlay.seed
+            "scenario-soak-v1;scenario={};version={};fault_plan={fault_plan_id}",
+            scenario.scenario_id, scenario.scenario_version
         ),
         asset_version: "generated-dynamic-fixture-v1".to_owned(),
         index_version: None,
@@ -186,10 +190,11 @@ fn run_scenario_mode(
     write_report(output, &report.to_json_pretty()?)?;
 
     println!(
-        "scenario={} version={} class={} events={} faults_planned={} faults_observed={} ingress_degraded={} generative_degraded={} asset_store_degraded={}",
+        "scenario={} version={} class={} dataset={} events={} faults_planned={} faults_observed={} ingress_degraded={} generative_degraded={} asset_store_degraded={}",
         report.scenario_id,
         report.scenario_version,
         report.scenario_class,
+        report.dataset_id,
         report.trace_events,
         report.faults.planned,
         report.faults.observed(),

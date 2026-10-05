@@ -16,7 +16,23 @@ pub enum FaultSubsystem {
     ContentIngress,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+impl FaultSubsystem {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Jev => "jev",
+            Self::Thinking => "thinking",
+            Self::Tts => "tts",
+            Self::VTubeStudio => "v_tube_studio",
+            Self::Obs => "obs",
+            Self::Audio => "audio",
+            Self::AssetStore => "asset_store",
+            Self::SemanticIndex => "semantic_index",
+            Self::ContentIngress => "content_ingress",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FaultKind {
     Timeout,
@@ -26,6 +42,20 @@ pub enum FaultKind {
     Corrupted,
     Incompatible,
     Flood,
+}
+
+impl FaultKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Unavailable => "unavailable",
+            Self::RateLimited => "rate_limited",
+            Self::Disconnect => "disconnect",
+            Self::Corrupted => "corrupted",
+            Self::Incompatible => "incompatible",
+            Self::Flood => "flood",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +91,33 @@ impl FaultPlan {
             previous = Some(key);
         }
         Ok(Self { seed, faults })
+    }
+
+    /// Stable identity of the plan's behaviour, independent of `seed`.
+    ///
+    /// Injection is fully determined by the explicit `faults` list - the seed is
+    /// provenance, not a knob - so a comparison baseline must be keyed on the
+    /// plan itself. Two overlays that differ in a subsystem, occurrence or kind
+    /// produce different ids even with the same seed, and reordering the same
+    /// faults does not change it.
+    pub fn plan_id(&self) -> String {
+        let mut faults: Vec<&FaultSpec> = self.faults.iter().collect();
+        faults.sort_by_key(|fault| (fault.subsystem, fault.occurrence, fault.kind));
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for fault in faults {
+            for byte in fault.subsystem.as_str().bytes() {
+                hash = fnv1a64_step(hash, byte);
+            }
+            hash = fnv1a64_step(hash, b':');
+            for byte in fault.occurrence.to_le_bytes() {
+                hash = fnv1a64_step(hash, byte);
+            }
+            for byte in fault.kind.as_str().bytes() {
+                hash = fnv1a64_step(hash, byte);
+            }
+            hash = fnv1a64_step(hash, b';');
+        }
+        format!("{hash:016x}")
     }
 
     pub fn injector(&self) -> FaultInjector {
@@ -115,4 +172,8 @@ impl FaultInjector {
     pub fn seed(&self) -> u64 {
         self.plan.seed
     }
+}
+
+fn fnv1a64_step(hash: u64, byte: u8) -> u64 {
+    (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01B3)
 }

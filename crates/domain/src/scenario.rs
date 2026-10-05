@@ -408,6 +408,15 @@ impl StreamScenario {
         self.phases.len()
     }
 
+    /// The declared logical origin of the stream, in epoch milliseconds.
+    ///
+    /// A consumer that paces the trace on its own timeline must start here, not
+    /// at the first event: a leading idle phase is part of the declared stream,
+    /// so normalising it away would silently change the workload.
+    pub fn logical_start_ms(&self) -> Result<u64, ScenarioError> {
+        parse_logical_start(&self.logical_start)
+    }
+
     /// Total events the scenario will generate, without generating them.
     pub fn total_event_count(&self) -> Result<u64, ScenarioError> {
         let mut total = 0u64;

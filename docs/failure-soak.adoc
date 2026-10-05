@@ -96,11 +96,22 @@ mismatch is refused rather than applied to a similar workload, because a plan fo
 a different trace is not a plan for this one. Only the subsystems this path
 actually calls may be named - content ingress, the generative path a semantic
 miss takes, and hot-asset insertion - because an injected fault nobody can
-observe is decoration. Faults are counted and the deterministic performer keeps
-advancing: the soak observes degradation, never a freeze. Report identity carries
-both the scenario and the fault seed, so two overlays over the same workload are
-distinct baselines. The document contract is
-+schemas/fault-overlay.schema.json+.
+observe is decoration. Every occurrence must also be *reachable*: the soak counts
+the call points the trace will make and refuses a plan whose occurrence exceeds
+them - a provider fault on a workload with no generative misses, or an occurrence
+past the end of a short stream, is rejected rather than reported as a clean run.
+Faults are counted and the deterministic performer keeps advancing: the soak
+observes degradation, never a freeze.
+
+The soak paces the trace from the scenario's declared +logical_start+ and settles
+to its declared +stream_duration_ms+, so a leading or trailing idle phase is part
+of the measured timeline rather than silently trimmed.
+
+Report identity is derived from the *plan*, not the fault seed: the result key is
++<scenario dataset id>/faults-<hash of the fault list>+. Injection depends only on
+the explicit faults, so two overlays that change a subsystem, occurrence or kind
+are distinct comparison baselines even with an unchanged seed. The document
+contract is +schemas/fault-overlay.schema.json+.
 
 == Growth detection
 

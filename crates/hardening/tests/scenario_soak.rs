@@ -150,11 +150,71 @@ fn the_same_scenario_and_overlay_reproduce_an_identical_report() {
         "a recorded soak outcome must reproduce byte for byte"
     );
     assert_eq!(first.trace_events, scenario.total_event_count().unwrap());
-    assert_eq!(first.dataset_id, scenario.dataset_id());
+    assert_eq!(first.scenario_dataset_id, scenario.dataset_id());
     assert_eq!(
-        first.fault_dataset_id(),
-        format!("{}/fault-seed-7", scenario.dataset_id())
+        first.dataset_id,
+        format!("{}/faults-{}", scenario.dataset_id(), first.fault_plan_id)
     );
+    assert_eq!(
+        first.metadata.dataset_id, first.dataset_id,
+        "the reproducibility result key must carry the fault-plan identity, not just the seed"
+    );
+}
+
+#[test]
+fn a_different_fault_plan_changes_the_baseline_identity_even_with_the_same_seed() {
+    let scenario = burst_scenario("identity-soak");
+    let base = overlay(
+        "identity-soak",
+        1,
+        vec![FaultSpec {
+            subsystem: FaultSubsystem::ContentIngress,
+            occurrence: 1,
+            kind: FaultKind::Flood,
+        }],
+    );
+
+    let run = |overlay: &FaultOverlay| {
+        run_scenario_soak(&scenario, overlay, small_config(), metadata()).expect("soak")
+    };
+    let baseline = run(&base);
+
+    // Same seed, different fault kind.
+    let mut other_kind = base.clone();
+    other_kind.faults[0].kind = FaultKind::RateLimited;
+    let kind_report = run(&other_kind);
+    assert_eq!(baseline.fault_seed, kind_report.fault_seed);
+    assert_ne!(
+        baseline.fault_plan_id, kind_report.fault_plan_id,
+        "a different fault kind is a different plan"
+    );
+    assert_ne!(baseline.dataset_id, kind_report.dataset_id);
+
+    // Same seed, same kind, different occurrence.
+    let mut other_occurrence = base.clone();
+    other_occurrence.faults[0].occurrence = 2;
+    let occurrence_report = run(&other_occurrence);
+    assert_ne!(baseline.fault_plan_id, occurrence_report.fault_plan_id);
+
+    // Reordering the same faults must not change the identity.
+    let mut reordered = FaultOverlay {
+        faults: vec![
+            FaultSpec {
+                subsystem: FaultSubsystem::ContentIngress,
+                occurrence: 1,
+                kind: FaultKind::Flood,
+            },
+            FaultSpec {
+                subsystem: FaultSubsystem::Thinking,
+                occurrence: 1,
+                kind: FaultKind::Timeout,
+            },
+        ],
+        ..base.clone()
+    };
+    let forward = reordered.clone();
+    reordered.faults.reverse();
+    assert_eq!(forward.plan_id().unwrap(), reordered.plan_id().unwrap());
 }
 
 #[test]
@@ -211,6 +271,98 @@ fn an_unobservable_subsystem_is_refused_rather_than_recorded() {
         error.contains("never calls"),
         "the refusal explains that the fault is unobservable, got: {error}"
     );
+}
+
+#[test]
+fn a_fault_occurrence_beyond_the_workload_is_refused() {
+    let scenario = burst_scenario("short-soak");
+    let overlay = overlay(
+        "short-soak",
+        1,
+        vec![FaultSpec {
+            subsystem: FaultSubsystem::ContentIngress,
+            occurrence: 9_999,
+            kind: FaultKind::Flood,
+        }],
+    );
+
+    let error = run_scenario_soak(&scenario, &overlay, small_config(), metadata())
+        .expect_err("an out-of-range occurrence must be refused, not reported as a clean run");
+    assert!(
+        error.to_string().contains("only calls that subsystem"),
+        "the refusal names the unreachable occurrence, got: {error}"
+    );
+}
+
+#[test]
+fn a_provider_fault_on_a_workload_with_no_misses_is_refused() {
+    // A hit-only workload never takes the generative path, so a Thinking fault
+    // could never fire. Planning one anyway would make the failure test a false
+    // green.
+    let mut steady = phase("steady", 60_000, 40.0, 12);
+    steady.semantic_mix = mix(&[(SemanticBand::Hit, 1.0)]);
+    let scenario = scenario("no-miss-workload", vec![steady]);
+
+    let overlay = overlay(
+        "no-miss-workload",
+        1,
+        vec![FaultSpec {
+            subsystem: FaultSubsystem::Thinking,
+            occurrence: 1,
+            kind: FaultKind::Timeout,
+        }],
+    );
+    let error = run_scenario_soak(&scenario, &overlay, small_config(), metadata())
+        .expect_err("there is no generative call to fail");
+    assert!(
+        error.to_string().contains("0 time(s)"),
+        "the refusal states the workload never reaches the subsystem, got: {error}"
+    );
+}
+
+#[test]
+fn leading_and_trailing_idle_are_part_of_the_declared_timeline() {
+    // The soak must start at the scenario's declared logical_start and settle to
+    // the declared stream end, not normalise away the idle phases around the
+    // active one - otherwise the same event list would describe a different
+    // temporal workload.
+    let scenario = scenario(
+        "idle-burst-idle",
+        vec![
+            phase("lead-idle", 60_000, 0.0, 1),
+            phase("active", 60_000, 20.0, 12),
+            phase("trail-idle", 60_000, 0.0, 1),
+        ],
+    );
+    let report = run_scenario_soak(
+        &scenario,
+        &overlay(
+            "idle-burst-idle",
+            1,
+            vec![FaultSpec {
+                subsystem: FaultSubsystem::ContentIngress,
+                occurrence: 1,
+                kind: FaultKind::Flood,
+            }],
+        ),
+        small_config(),
+        metadata(),
+    )
+    .expect("soak");
+
+    assert_eq!(report.stream_duration_ms, 180_000);
+    assert_eq!(report.trace_events, 20);
+    assert!(
+        report.first_event_at_ms >= 60_000,
+        "the leading idle phase must be preserved, first event at {}",
+        report.first_event_at_ms
+    );
+    assert!(
+        report.last_event_at_ms <= 120_000,
+        "the trailing idle phase must not be filled with events, last event at {}",
+        report.last_event_at_ms
+    );
+    assert_eq!(report.faults.observed(), 1);
 }
 
 #[test]

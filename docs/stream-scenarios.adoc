@@ -124,9 +124,11 @@ The #40 soak path consumes the same trace: `failure-soak --scenario <path>
 (`schemas/fault-overlay.schema.json`) bound to the scenario's identity. Faults
 are limited to the call points the soak actually drives - content ingress, the
 generative path a semantic miss takes, and hot-asset insertion - so an injected
-fault that could never be observed is refused rather than recorded. Two overlays
-over the same scenario are distinct baselines, because the result identity
-carries the fault seed as well as the scenario version. See
+fault that could never be observed is refused rather than recorded, and an
+occurrence the trace can never reach is refused before the run rather than
+reported as a clean pass. Two overlays over the same scenario are distinct
+baselines, because the result identity is the scenario dataset id plus a hash of
+the fault list. See
 link:failure-soak.adoc[Failure Injection and Long-Stream Soak].
 
 == Measured limits: what the runtime can actually play

@@ -30,8 +30,8 @@ use crate::{
 use aivtuber_adaptation::{ActorPseudonymizer, WorkingMemory, WorkingMemoryConfig};
 use aivtuber_asset_store::{AssetStore, HotCacheConfig};
 use aivtuber_domain::{
-    EventEnvelope, ScenarioClass, SecurityPlane, StreamScenario, generate_scenario_trace,
-    scenario_instant_ms,
+    EventEnvelope, ScenarioClass, ScenarioEvent, SecurityPlane, StreamScenario,
+    generate_scenario_trace, scenario_instant_ms,
 };
 use aivtuber_runtime::{ContentAdmitDecision, SecurityRuntime, SecurityRuntimeConfig};
 use aivtuber_scheduler::{
@@ -42,7 +42,7 @@ use aivtuber_telemetry::{
     SecretRedactor, TelemetryCollector, TelemetryRetentionConfig,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 /// Version of the fault-overlay document contract.
@@ -126,6 +126,14 @@ impl FaultOverlay {
         self.validate()?;
         FaultPlan::new(self.seed, self.faults.clone())
     }
+
+    /// Stable identity of the behaviour this overlay describes.
+    ///
+    /// Derived from the fault plan, not from `seed`: injection depends only on
+    /// the explicit faults, so the comparison baseline must too.
+    pub fn plan_id(&self) -> Result<String, HardeningError> {
+        Ok(self.plan()?.plan_id())
+    }
 }
 
 /// What the overlay did to a scenario run.
@@ -151,12 +159,24 @@ pub struct ScenarioSoakReport {
     pub scenario_id: String,
     pub scenario_version: u32,
     pub scenario_class: ScenarioClass,
-    /// Scenario-derived dataset identity (`scenario-<id>-v<version>`), so history
-    /// storage never mixes this workload with another.
-    pub dataset_id: String,
+    /// Scenario-derived dataset identity (`scenario-<id>-v<version>`).
+    pub scenario_dataset_id: String,
+    /// Identity of the overlayed fault plan, from a canonical hash of its faults.
+    pub fault_plan_id: String,
+    /// The overlay's declared seed, recorded for provenance only; it does not
+    /// influence injection.
     pub fault_seed: u64,
+    /// Comparison identity: scenario dataset id plus fault-plan id, so history
+    /// storage never mixes a workload with another workload *or* another plan.
+    pub dataset_id: String,
     pub trace_events: u64,
     pub stream_duration_ms: u64,
+    /// Logical offset of the first generated event from the scenario's declared
+    /// `logical_start`. A leading idle phase makes this greater than zero.
+    pub first_event_at_ms: u64,
+    /// Logical offset of the last generated event; the declared stream may run
+    /// beyond it (a trailing idle phase).
+    pub last_event_at_ms: u64,
     pub config: SoakConfig,
     pub midpoint: StateSnapshot,
     pub final_state: StateSnapshot,
@@ -174,12 +194,6 @@ impl ScenarioSoakReport {
     pub fn finding(&self, metric: &str) -> Option<&GrowthFinding> {
         self.growth.iter().find(|finding| finding.metric == metric)
     }
-
-    /// Dataset identity including the fault plan, so two overlays over the same
-    /// scenario are distinct comparison baselines.
-    pub fn fault_dataset_id(&self) -> String {
-        format!("{}/fault-seed-{}", self.dataset_id, self.fault_seed)
-    }
 }
 
 /// Run the deterministic soak over a scenario trace with a fault overlay.
@@ -191,7 +205,7 @@ pub fn run_scenario_soak(
     scenario: &StreamScenario,
     overlay: &FaultOverlay,
     config: SoakConfig,
-    metadata: ReproducibilityMetadata,
+    mut metadata: ReproducibilityMetadata,
 ) -> Result<ScenarioSoakReport, HardeningError> {
     config.validate()?;
     metadata
@@ -220,6 +234,26 @@ pub fn run_scenario_soak(
             trace.len()
         )));
     }
+
+    // A plan is only meaningful if the workload can actually reach it. Count the
+    // call points this trace will make and refuse any occurrence beyond them,
+    // rather than reporting a run that silently left a planned fault unfired.
+    let reachable = reachable_call_counts(&trace, config.generated_asset_every);
+    for fault in &overlay.faults {
+        let reachable_occurrences = reachable.get(&fault.subsystem).copied().unwrap_or(0);
+        if fault.occurrence > reachable_occurrences {
+            return Err(HardeningError::InvalidScenario(format!(
+                "fault overlay plans {:?} occurrence {} but scenario {:?} only calls that subsystem {} time(s); a planned fault the workload can never reach would turn a failure test into a false green",
+                fault.subsystem, fault.occurrence, scenario.scenario_id, reachable_occurrences
+            )));
+        }
+    }
+
+    // Comparison identity is the workload *and* the fault plan, never the seed.
+    let plan = overlay.plan()?;
+    let fault_plan_id = plan.plan_id();
+    let dataset_id = format!("{}/faults-{fault_plan_id}", scenario.dataset_id());
+    metadata.dataset_id = dataset_id.clone();
 
     let scheduler_config = SchedulerConfig {
         min_reaction_spacing_ms: 0,
@@ -262,10 +296,16 @@ pub fn run_scenario_soak(
         ..HotCacheConfig::default()
     });
 
-    let mut injector = overlay.plan()?.injector();
-    let start_ms = scenario_instant_ms(&trace[0].event.observed_at)
+    let mut injector = plan.injector();
+    // Origin is the scenario's *declared* logical start, not the first event: a
+    // leading idle phase is part of the declared stream and must not be
+    // normalised away.
+    let start_ms = scenario
+        .logical_start_ms()
         .map_err(|error| HardeningError::InvalidScenario(error.to_string()))?;
     let midpoint_index = trace.len() / 2;
+    let mut first_event_at_ms: Option<u64> = None;
+    let mut last_event_at_ms = 0u64;
     let mut midpoint = None;
     let mut faults = FaultInjectionReport {
         planned: overlay.faults.len(),
@@ -280,6 +320,8 @@ pub fn run_scenario_soak(
         let at_ms = scenario_instant_ms(&event.observed_at)
             .map_err(|error| HardeningError::InvalidScenario(error.to_string()))?
             .saturating_sub(start_ms);
+        first_event_at_ms.get_or_insert(at_ms);
+        last_event_at_ms = at_ms;
 
         // 1. Content ingress: the runtime admits content-plane events through the
         //    security runtime. A system/control event does not arrive this way, so
@@ -337,8 +379,11 @@ pub fn run_scenario_soak(
             .and_then(|value| value.as_str())
             == Some("miss")
         {
+            // Consult both independently so a Thinking fault cannot change how
+            // many times Tts is called: occurrence counts must depend only on the
+            // trace, or reachability would be unprovable before the run.
             let thinking_fault = injector.next(FaultSubsystem::Thinking).is_some();
-            let tts_fault = thinking_fault || injector.next(FaultSubsystem::Tts).is_some();
+            let tts_fault = injector.next(FaultSubsystem::Tts).is_some();
             if thinking_fault || tts_fault {
                 faults.generative_degraded = faults.generative_degraded.saturating_add(1);
             }
@@ -369,6 +414,12 @@ pub fn run_scenario_soak(
         }
     }
 
+    // Advance the deterministic timeline to the scenario's declared end. A
+    // trailing idle phase still lets logical-time state (scheduler cooldowns,
+    // terminal retirement) settle, so the final snapshot reflects the declared
+    // stream rather than stopping at the last event.
+    scheduler.advance_to(scenario.stream_duration_ms.saturating_add(1));
+
     let midpoint = midpoint.ok_or_else(|| {
         HardeningError::Invariant("scenario soak midpoint was not captured".to_owned())
     })?;
@@ -376,16 +427,29 @@ pub fn run_scenario_soak(
     let telemetry_summary = telemetry.summary(metadata.stream_duration_ms);
     let growth = growth_findings(&config, &midpoint, &final_state);
     faults.consumed = injector.consumed().to_vec();
+    // Reachability was checked before the run; this guards the invariant that no
+    // planned fault can slip through as a false pass.
+    if faults.consumed.len() != faults.planned {
+        return Err(HardeningError::Invariant(format!(
+            "scenario soak planned {} faults but only {} fired; unreachable plans must be refused, not reported as a clean run",
+            faults.planned,
+            faults.consumed.len()
+        )));
+    }
 
     Ok(ScenarioSoakReport {
         metadata,
         scenario_id: scenario.scenario_id.clone(),
         scenario_version: scenario.scenario_version,
         scenario_class: scenario.scenario_class,
-        dataset_id: scenario.dataset_id(),
+        scenario_dataset_id: scenario.dataset_id(),
+        fault_plan_id,
         fault_seed: overlay.seed,
+        dataset_id,
         trace_events: trace.len() as u64,
         stream_duration_ms: scenario.stream_duration_ms,
+        first_event_at_ms: first_event_at_ms.unwrap_or(0),
+        last_event_at_ms,
         config,
         midpoint,
         final_state,
@@ -393,6 +457,44 @@ pub fn run_scenario_soak(
         growth,
         faults,
     })
+}
+
+/// How many times this trace will call each faultable subsystem.
+///
+/// Content ingress is called once per content-plane event; Thinking and Tts once
+/// per semantic miss; the asset store once per generated-asset slot. These are
+/// the exact call points the loop below consults, so an overlay occurrence can be
+/// checked for reachability before any work happens.
+fn reachable_call_counts(
+    trace: &[ScenarioEvent],
+    generated_asset_every: u64,
+) -> BTreeMap<FaultSubsystem, u64> {
+    let content = trace
+        .iter()
+        .filter(|entry| entry.event.plane == SecurityPlane::Content)
+        .count() as u64;
+    let misses = trace
+        .iter()
+        .filter(|entry| {
+            entry
+                .event
+                .payload
+                .get("semantic_band")
+                .and_then(|value| value.as_str())
+                == Some("miss")
+        })
+        .count() as u64;
+    let insertions = trace
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| (*index as u64).is_multiple_of(generated_asset_every))
+        .count() as u64;
+    BTreeMap::from([
+        (FaultSubsystem::ContentIngress, content),
+        (FaultSubsystem::Thinking, misses),
+        (FaultSubsystem::Tts, misses),
+        (FaultSubsystem::AssetStore, insertions),
+    ])
 }
 
 fn scenario_plan(event: &EventEnvelope, at_ms: u64) -> PlannedPerformance {

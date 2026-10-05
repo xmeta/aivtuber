@@ -24,12 +24,12 @@
     "seed": {
       "type": "integer",
       "minimum": 0,
-      "description": "Deterministic fault seed, recorded in the soak result identity so two overlays over the same scenario are distinct comparison baselines."
+      "description": "Fault seed, recorded for provenance only. Injection is determined entirely by the explicit faults list, so a comparison baseline is keyed on a canonical hash of that list, not on this seed; two overlays that differ only in seed describe the same behaviour."
     },
     "faults": {
       "type": "array",
       "minItems": 1,
-      "description": "Planned injected faults. A subsystem/occurrence pair may appear at most once; occurrence is one-based and counts calls to that subsystem, not events.",
+      "description": "Planned injected faults. A subsystem/occurrence pair may appear at most once; occurrence is one-based and counts calls to that subsystem, not events. Every occurrence must be reachable by the named scenario: the soak refuses a plan whose occurrence exceeds the number of times the trace calls that subsystem, because an unreachable fault would turn a failure test into a false green.",
       "items": { "$ref": "#/$defs/fault" }
     }
   },
