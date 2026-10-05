@@ -45,10 +45,25 @@ Preferred dependency flow:
 Rich long-term memory (#105) is not a prerequisite for the first dependable-agent slice; bounded task/commitment state comes first.
 Voice/multimodal work remains optional and must not enter this critical path merely because an external framework offers it.
 
+=== Local-first Product Baseline
+
+The normal product path must remain usable without paid external software or billable SaaS.
+
+Preferred dependency flow:
+
+[source,text]
+----
+#219 OSS VRM avatar renderer
+  -> #220 zero-paid-dependency local-first production profile
+  -> #205 account-free/default desktop onboarding
+----
+
+Cloud LLM/TTS, Jev, VTube Studio, and commercial connector services remain optional adapters. The baseline profile uses local/self-hosted inference, local speech, and the OSS avatar path; OBS remains an optional OSS integration.
+
 === Natural Performer
 
 https://github.com/xmeta/aivtuber/issues/94[#94] remains the Stage 4 tracker.
-The preferred shape is #84 PerformanceIntent and #81 floor control first, then pre-response/naturalness/gaze/repair/scene/affect/initiative, with #83 phrase streaming and Stage 5 voice/multimodal work layered after the bounded interaction contracts are stable.
+The preferred shape is #84 PerformanceIntent and #81 floor control first, then #222 speech lifecycle/projection, pre-response/naturalness/gaze/repair, #88 scene context -> #221 ActionWindow, affect/initiative, with #83 phrase streaming and Stage 5 voice/multimodal work layered after the bounded interaction contracts are stable.
 
 == Stage 1 -- Production Runtime Foundation
 
@@ -100,7 +115,7 @@ Stage 2 should turn benchmark and quality evidence into a repeatable improvement
 
 == Stage 3 -- Engagement & Agent Foundation
 
-Goal: let the performer decide what, when, and how to engage while also establishing the smallest dependable-agent Task/Tool foundation for the same persistent persona.
+Goal: let the performer decide what, when, and how to engage while also establishing the smallest dependable-agent Task/Tool foundation and a zero-paid-dependency local product baseline for the same persistent persona.
 
 Exit condition:
 
@@ -115,6 +130,8 @@ Exit condition:
 * tool discovery/trust/risk/approval remain local policy above MCP rather than model/server authority;
 * at least one maintained MCP-backed connector profile can be used without a service-specific aivtuber wire implementation;
 * Persona and RoleBlend can support an agent-oriented presentation without changing authority;
+* an OSS local avatar path can run without VTube Studio or another paid avatar host (#219);
+* a named local-first production profile can run without billable inference/SaaS dependencies (#220);
 * a minimal desktop onboarding surface can configure the dual-role runtime and expose task/approval/health state without duplicating runtime authority.
 
 Stage 3 must build on Stage 1 boundedness and Stage 2 measurement rather than creating independent queues, histories, quality metrics, or a second generic agent framework.
@@ -129,8 +146,11 @@ Exit condition:
 * conversational-floor/backchannel behavior is explicit;
 * visible acknowledgement can mask useful latency without extending deadlines;
 * generated speech can commit/play at phrase-safe boundaries;
+* provider-neutral speech lifecycle distinguishes synthesis, commit, audible start/finish, and cancellation (#222);
+* display text can project to bounded local speech/pronunciation text without a paid pronunciation service (#222);
 * speech, gaze, gesture, and expression share a provider-neutral PerformanceIntent;
 * clarification/repair behavior exists for uncertainty and misunderstanding;
+* scene context can expose a bounded epoch-scoped high-level ActionWindow without granting authority (#221);
 * affect, initiative, scene context, repetition control, and gaze state are bounded and measurable.
 
 https://github.com/xmeta/aivtuber/issues/94[#94] is the Stage 4 tracking issue.
@@ -139,16 +159,18 @@ Naturalness work must retain deterministic fallbacks, bounded state, and human-e
 
 == Stage 5 -- Multimodal Voice & Multi-party Expansion
 
-Goal: add optional perception, full-duplex speech observations, and multi-party/co-host routing without making them baseline runtime dependencies.
+Goal: add optional perception, full-duplex speech observations, and multi-party/co-host routing through a bounded realtime media/data plane without requiring paid hosted media or speech services.
 
 Exit condition:
 
+* high-rate PCM/video uses a bounded media/data plane separate from control/decision queues (#90);
 * multimodal observations are provider-neutral and bounded;
-* speech activity / turn-end observations can drive full-duplex interaction;
+* speech activity / turn-end observations can drive full-duplex interaction with bounded pre-roll and local/self-hosted speech support (#92);
 * multiple speakers/co-hosts can be routed with explicit attention arbitration;
+* remote media can use a self-hosted OSS transport when needed, while same-machine use does not require an SFU (#93);
 * perception or speaker-model failure cannot gain control authority or freeze the deterministic performer.
 
-These capabilities remain optional until the earlier stages provide the boundedness, evaluation, and operator controls needed to deploy them safely.
+These capabilities remain optional until the earlier stages provide the boundedness, evaluation, and operator controls needed to deploy them safely. Hosted cloud implementations may be offered as optional adapters, never as the only supported path.
 
 == Implementation history -- Phase 0-6
 

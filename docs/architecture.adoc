@@ -16,6 +16,7 @@ The system treats frequent speech and motion as reusable assets and separates de
 . *Graceful degradation.* Jev, LLM, TTS, avatar, or stream adapters may fail independently without freezing the performer.
 . *Measure every route.* Latency and quality decisions are observable and replayable.
 . *Adapters over lock-in.* Jev is the first reflex engine, not a hard dependency of the domain model.
+. *Local-first baseline.* The core product path MUST remain usable without paid third-party software or billable SaaS. Commercial/cloud providers are optional adapters; local/self-hosted inference, speech, and avatar paths define the baseline composition.
 . *Separate interaction from durable task completion.* Natural acknowledgement/performance may happen immediately, while a long-running AgentTask owns tool execution, verification, cancellation, and terminal outcome independently. See link:dual-role-agent-architecture.adoc[Dual-Role Agent and Performer Architecture].
 
 == 3. Three time scales
@@ -74,7 +75,8 @@ Chat / STT / Game / Donation / OBS / Timers
              /          \
           Audio       AvatarAdapter
                          |
-                    VTube Studio
+              local OSS VRM renderer
+              (VTube Studio optional)
                   |
                OBSAdapter
 ----
@@ -268,16 +270,16 @@ Variation MUST be deterministic under a recorded random seed so sessions can be 
 
 == 10. Adapters
 
-Initial adapters:
+Initial/provider adapters:
 
-* `DecisionEngine`: Jev
-* `ThinkingEngine`: OpenAI-compatible API first
-* `TtsEngine`: local/API implementations
-* `AvatarAdapter`: VTube Studio Public API
+* `DecisionEngine`: deterministic fallback plus Jev-compatible adapters; Jev is optional
+* `ThinkingEngine`: OpenAI-compatible API, including local/self-hosted endpoints
+* `TtsEngine`: local/self-hosted implementation first; remote APIs optional
+* `AvatarAdapter`: local OSS VRM renderer baseline; VTube Studio Public API remains optional
 * `StreamAdapter`: obs-websocket 5.x
 * `VectorIndex`: local implementation first
 
-VTube Studio exposes a public WebSocket API and supports hotkeys, tracking parameter input, items, model state, and events. Its default endpoint is `ws://localhost:8001`.
+The zero-paid-dependency product path is tracked by #219 and #220. The local avatar renderer should reuse a maintained VRM implementation such as `@pixiv/three-vrm` rather than requiring an external paid avatar host. VTube Studio remains an interchangeable adapter for users who choose it; its default endpoint is `ws://localhost:8001`.
 
 OBS control targets obs-websocket 5.x and must keep authentication enabled in normal operation.
 
@@ -299,7 +301,9 @@ crates/
   telemetry/
 ----
 
-External inference services remain process/network boundaries when practical. This avoids forcing GPU-heavy dependencies into the scheduler process.
+External or local inference services remain process/network boundaries when practical. This avoids forcing GPU-heavy dependencies into the scheduler process.
+
+High-rate realtime media is a separate bounded data plane from the control/decision plane. Raw PCM/video should remain in local media/sidecar transport; only validated, timestamped observations cross into the core event/context model. #90 and #92 own this future boundary.
 
 == 12. Security and privacy
 

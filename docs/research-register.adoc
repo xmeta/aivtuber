@@ -166,6 +166,42 @@ maintained first-party desktop plugins
 |#205
 |Windows/WSL packaging path; sidecar process supervision; secret handling; signed update/release path; UI cannot mint capability
 
+|Local OSS avatar runtime
+|`@pixiv/three-vrm`;
+V-Sekai `godot-vrm`;
+AIRI behavior/runtime patterns
+|Use VRM 1.0/MToon as the zero-paid baseline avatar path; keep provider-neutral PerformanceIntent/AvatarAdapter and replay semantics above the renderer
+|#84, #91, #219, #205
+|Transparent capture quality; viseme/expression/look-at coverage; WebGL/WebGPU portability; renderer crash/reconnect; model asset licensing; no CDN/runtime paid-host requirement
+
+|Local generative baseline
+|`llama.cpp` / `llama-server` Responses API;
+local model ecosystems
+|Reuse a local OpenAI-compatible process boundary before creating another inference protocol; separate loopback no-auth policy from remote authenticated providers
+|#220
+|Responses compatibility used by aivtuber; cancellation/streaming; Windows/WSL GPU path; model license/VRAM; offline smoke; remote endpoint security regression
+
+|Dynamic context-valid actions
+|VedalAI Neuro SDK dynamic action registration / ActionWindow patterns
+|Expose only epoch/TTL-bounded high-level actions that are valid now; keep #202 risk/approval and aivtuber verification authoritative
+|#88, #202, #221
+|Stale-window rejection; action-set size; schema drift; scene transition races; dispatch-success vs verified-outcome false positives; avoid frame-level LLM control
+
+|Speech lifecycle and pronunciation projection
+|AIRI display-vs-speech pronunciation proposal;
+Neuro SDK speech lifecycle events
+|Separate display text from bounded deterministic speech text, and expose scheduler-owned audible lifecycle instead of inferring it from TTS completion
+|#81, #83, #222
+|Japanese names/game terms; chunk-boundary pronunciation; semantic-preservation gate; cancel-before/after-commit; provider event normalization
+
+|Realtime media/data plane
+|AIRI plugin control/data-plane design;
+Neuro SDK separate voice transport;
+local VAD pre-roll failure patterns
+|Keep high-rate PCM/video off control queues; use bounded local side-channel/IPC with normalized observations crossing into core
+|#90, #92, #93
+|Backpressure/drop behavior; queue isolation; pre-roll duration; clipped utterance starts; reconnect; raw-media privacy/retention; no paid hosted transport requirement
+
 |LLM routing / adaptive compute
 |RouteLLM;
 adaptive budget-constrained routing research;
@@ -191,10 +227,10 @@ recent multi-level agent evaluation research
 
 |Local Japanese speech
 |sherpa-onnx;
-current Japanese-capable VAD/ASR ecosystems
-|Prefer a sidecar boundary for local VAD/ASR/diarization rather than embedding a heavy model runtime into deterministic Rust core
-|#66, #92
-|Japanese accuracy/latency; CPU/GPU footprint; IPC/reconnect; model/license suitability at implementation time
+current Japanese-capable VAD/ASR/TTS ecosystems
+|Prefer a sidecar boundary for local VAD/ASR/TTS/diarization rather than embedding a heavy model runtime into deterministic Rust core; retain bounded pre-roll before VAD-triggered utterance extraction
+|#66, #92, #220
+|Japanese accuracy/latency; clipped-prefix rate; pre-roll memory/latency; CPU/GPU footprint; IPC/reconnect; model/license suitability at implementation time
 
 |Modern TTS
 |GPT-SoVITS;
@@ -206,11 +242,11 @@ VoxCPM family or successors
 |Japanese quality; first-audio latency; phrase streaming/cancellation; emotion/prosody; RTF; memory/VRAM; license
 
 |Remote voice / co-host transport
-|LiveKit;
+|self-hosted LiveKit server;
 WebRTC ecosystem
-|Reuse media transport, participant tracks, reconnect, jitter/media plumbing; keep aivtuber decision/control core separate
-|#93
-|Deployment complexity; latency; identity/trust normalization; optional-profile boundaries
+|Reuse media transport, participant tracks, reconnect, jitter/media plumbing only when remote multi-party transport is needed; same-machine voice should not require an SFU and hosted cloud is optional
+|#90, #93
+|Self-host deployment complexity; latency; identity/trust normalization; optional-profile boundaries; confirm no paid hosted dependency
 
 |Provider gateway / experiments
 |TensorZero
@@ -228,6 +264,8 @@ The following groups are suitable for architecture/research progress even when i
 * #106 -- speculative preparation and commit-barrier contract;
 * #107 -- continuous listening-performance state and evaluation;
 * #108 -- failure-attribution result schema and evaluator ordering;
+* #219/#220 -- OSS avatar and zero-paid local-first product baseline;
+* #221/#222 -- dynamic ActionWindow and provider-neutral speech lifecycle/pronunciation contracts;
 * #90/#92/#93 -- future perception, speech-turn observations, and media/speaker boundaries.
 
 Design work should produce bounded types, ownership boundaries, acceptance criteria, scenario/evaluation definitions, or assumption records.
