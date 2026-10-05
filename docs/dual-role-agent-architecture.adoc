@@ -149,25 +149,35 @@ Examples:
 
 #201 owns the production contract.
 
-Candidate bounded state:
+The bounded production state machine is:
 
 [source,text]
 ----
 Accepted
   -> Planning
   -> Ready
-  -> WaitingApproval
-  -> Executing
-  -> Verifying
-  -> Completed
-       | Failed
-       | Cancelled
+       -> WaitingApproval -----> Ready
+       -> WaitingDependency ---> Ready
+       -> Executing
+            -> Ready            (more steps / retry)
+            -> Verifying
+                 -> Completed
+                 -> Failed
+                 -> NotVerified
+
+Any non-terminal task may be Cancelled.
+Task lifetime expiry transitions to Expired; an expired pending commitment transitions to NotVerified.
 ----
+
+Each execution, retry, replan, cancellation, or expiry advances the task generation as applicable.
+Tool observations are generation-bound, and terminal verification commits re-check the current task generation.
+A stale generation therefore cannot attach evidence to a newer execution or resurrect a cancelled/replanned task.
 
 External MCP long-running-task state, when available, represents one execution step under AgentTask.
 It does not replace the user-level lifecycle.
 
-Task retention must be bounded by count, lifetime, retained observations, and retry/replan limits.
+Task retention is bounded by active-task count, retained-task count, lifetime, pending commitment TTL,
+steps, retained observations, retry/replan limits, and transition-history count.
 
 The first task memory should store only what is required to resume and prove task outcome.
 Rich long-term episodic/graph memory (#105) is not on the critical path.
