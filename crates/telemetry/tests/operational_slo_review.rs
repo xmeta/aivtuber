@@ -9,9 +9,9 @@
 use aivtuber_domain::InteractionDeadlineClass;
 use aivtuber_telemetry::{
     AttributionSummary, BaselineEvidence, BenchmarkReport, ComparisonMode, EventObservation,
-    EvidenceSource, IndicatorUnit, ReproducibilityMetadata, RouteClass, STREAM_HOUR_MS,
-    SloEvaluationConfig, SloIndicatorResult, SloReport, SloStatus, SloTarget, SloTargets,
-    SloVerdict, WindowKind, attribution_of, catalog, evaluate,
+    EventVerdict, EvidenceSource, IndicatorUnit, ReproducibilityMetadata, RouteClass,
+    STREAM_HOUR_MS, SloEvaluationConfig, SloIndicatorResult, SloReport, SloStatus, SloTarget,
+    SloTargets, SloVerdict, WindowKind, attribution_of, catalog, evaluate,
 };
 
 fn observation(route: RouteClass) -> EventObservation {
@@ -489,4 +489,242 @@ fn finding_5_every_declared_reason_lands_in_exactly_one_bucket() {
             "{reason}"
         );
     }
+}
+
+// ---------------------------------------------------------------- finding 6
+
+/// A latency sample with no calibrated `threshold_ms` is eligible but not
+/// scoreable, so it must not enter the miss set — even when it carries a
+/// declared external-provider reason, which is exactly the case that used to
+/// report `Uncalibrated` in one field and `external_provider_failures: 1` in
+/// the next.
+#[test]
+fn finding_6_an_uncalibrated_latency_sample_is_not_an_slo_miss() {
+    let mut event = observation(RouteClass::CachedFallback);
+    event.stream_offset_ms = Some(0);
+    event.fallback_reason = Some("unavailable".to_owned());
+    event.event_to_first_audio_ms = Some(50);
+
+    let evaluated = evaluate(
+        &report(vec![event], 1_000),
+        &SloTargets::default(),
+        SloEvaluationConfig::default(),
+    )
+    .expect("report");
+
+    let audio = result(
+        &evaluated,
+        "availability.event_to_first_audio_within_target",
+        "session",
+    );
+    assert_eq!(audio.status, SloStatus::Uncalibrated);
+    assert_eq!(audio.value, None, "an unscored indicator has no ratio");
+    assert_eq!(
+        (audio.conforming, audio.eligible, audio.unscored),
+        (0, 1, 1),
+        "the sample is calibration evidence, not a conformance and not a miss"
+    );
+    assert_eq!(
+        audio.miss_attribution.external_provider_failures, 0,
+        "an uncalibrated objective has no defined miss to attribute"
+    );
+    assert_eq!(audio.miss_attribution.runtime_handled, 0);
+    assert_eq!(audio.miss_attribution.runtime_handling_failures, 0);
+    assert_eq!(audio.miss_attribution.unattributed, 0);
+    assert!(
+        evaluated
+            .error_budgets
+            .iter()
+            .all(|budget| budget.indicator != audio.id),
+        "an undecided objective must not carry a budget"
+    );
+}
+
+/// The same fixture, calibrated. Once a threshold exists the samples are scored
+/// and the miss is real, so the fix must not have disarmed attribution. The
+/// window carries enough samples to clear the indicator's sample floor, because
+/// an under-sampled window is legitimately undecided and would hide the point.
+#[test]
+fn finding_6_a_calibrated_threshold_turns_the_same_samples_into_real_misses() {
+    let events: Vec<EventObservation> = (0..20_u64)
+        .map(|index| {
+            let mut event = observation(RouteClass::CachedFallback);
+            event.stream_offset_ms = Some(index * 1_000);
+            event.fallback_reason = Some("unavailable".to_owned());
+            event.event_to_first_audio_ms = Some(50);
+            event
+        })
+        .collect();
+
+    let evaluated = evaluate(
+        &report(events, 20_000),
+        &targets(&[(
+            "availability.event_to_first_audio_within_target",
+            latency_target(0.95, 10),
+        )]),
+        SloEvaluationConfig::default(),
+    )
+    .expect("report");
+
+    let audio = result(
+        &evaluated,
+        "availability.event_to_first_audio_within_target",
+        "session",
+    );
+    assert_eq!(audio.status, SloStatus::Missed);
+    assert_eq!(
+        (audio.conforming, audio.eligible, audio.unscored),
+        (0, 20, 0)
+    );
+    assert_eq!(audio.miss_attribution.external_provider_failures, 20);
+    assert_eq!(audio.miss_attribution.runtime_handled, 20);
+    let budget = evaluated
+        .error_budgets
+        .iter()
+        .find(|budget| budget.indicator == audio.id && budget.window == "session")
+        .expect("error budget");
+    assert_eq!(
+        budget.observed_misses, 20,
+        "unscored samples are never spent"
+    );
+    assert_eq!(
+        evaluated.verdict,
+        SloVerdict::Breach,
+        "a scored miss is a breach, which is the state the fix must not erase"
+    );
+}
+
+/// `misses()` is what the error budget spends, so it has to exclude unscored
+/// samples too — otherwise the indicator and the budget disagree about the same
+/// window.
+#[test]
+fn finding_6_unscored_samples_are_never_charged_as_a_spend() {
+    // Half the window is measured latency, half carries no latency sample at
+    // all. The unscored half must be visible in the denominator and absent
+    // from the miss count and the budget.
+    let events: Vec<EventObservation> = (0..20_u64)
+        .map(|index| {
+            let mut event = observation(RouteClass::Deterministic);
+            event.stream_offset_ms = Some(index * 1_000);
+            if index % 2 == 0 {
+                event.event_to_first_audio_ms = Some(index + 1);
+            }
+            event
+        })
+        .collect();
+    let evaluated = evaluate(
+        &report(events, 20_000),
+        &SloTargets::default(),
+        SloEvaluationConfig::default(),
+    )
+    .expect("report");
+
+    let audio = result(
+        &evaluated,
+        "availability.event_to_first_audio_within_target",
+        "session",
+    );
+    assert_eq!(audio.eligible, 10, "only measured samples are eligible");
+    assert_eq!(audio.unscored, 10);
+    assert!(
+        audio.miss_attribution.external_provider_failures == 0,
+        "no window budget is published for an uncalibrated objective"
+    );
+}
+
+/// Every classifier's four states have to stay distinct. A regression here
+/// means a future indicator quietly collapsed "unscoreable" into "miss" again.
+#[test]
+fn finding_6_the_four_event_verdict_states_are_distinct() {
+    assert!(!EventVerdict::Outside.is_eligible());
+    assert!(!EventVerdict::Conforms.is_miss());
+    assert!(EventVerdict::Misses.is_eligible() && EventVerdict::Misses.is_miss());
+
+    let unscored = EventVerdict::Unscored;
+    assert!(
+        unscored.is_eligible(),
+        "an uncalibrated sample is still denominator evidence"
+    );
+    assert!(
+        !unscored.is_miss(),
+        "an uncalibrated sample must never enter the miss set"
+    );
+}
+
+// ------------------------------------------------------- contract hardening
+
+/// Baseline evidence is the only justification a target ever has, so it is held
+/// to the same standard as the target itself.
+#[test]
+fn hardening_an_impossible_baseline_is_refused() {
+    for (value, expected) in [(2.0, "baseline value"), (f64::NAN, "baseline value")] {
+        let file = SloTargets {
+            targets: [(
+                "availability.speech_presence_rate".to_owned(),
+                SloTarget {
+                    target: 0.99,
+                    threshold_ms: None,
+                    baseline: BaselineEvidence {
+                        value,
+                        source: "hardening-fixture".to_owned(),
+                        stream_hours: Some(1),
+                    },
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..SloTargets::default()
+        };
+        let error = file.validate(&catalog()).expect_err("baseline ratio");
+        assert!(
+            error.to_string().contains(expected),
+            "value {value}: {error}"
+        );
+    }
+}
+
+#[test]
+fn hardening_a_baseline_covering_no_time_is_refused() {
+    let file = SloTargets {
+        targets: [(
+            "availability.speech_presence_rate".to_owned(),
+            SloTarget {
+                target: 0.99,
+                threshold_ms: None,
+                baseline: BaselineEvidence {
+                    value: 0.98,
+                    source: "hardening-fixture".to_owned(),
+                    stream_hours: Some(0),
+                },
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..SloTargets::default()
+    };
+    let error = file.validate(&catalog()).expect_err("no stream hours");
+    assert!(error.to_string().contains("stream hours"), "{error}");
+}
+
+#[test]
+fn hardening_a_target_file_from_another_report_contract_is_refused() {
+    let file = SloTargets {
+        schema_version: Some("99".to_owned()),
+        ..SloTargets::default()
+    };
+    let error = file
+        .validate(&catalog())
+        .expect_err("unknown report schema");
+    assert!(error.to_string().contains("report schema"), "{error}");
+}
+
+/// An absent `schema_version` is an unversioned draft and stays accepted, so
+/// the hardening does not break the checked-in empty target file.
+#[test]
+fn hardening_an_unversioned_target_file_is_still_accepted() {
+    let file = SloTargets {
+        schema_version: None,
+        ..SloTargets::default()
+    };
+    file.validate(&catalog()).expect("unversioned draft");
 }

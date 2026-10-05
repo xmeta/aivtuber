@@ -109,11 +109,17 @@ pub enum DegradedSubsystem {
 pub struct EventObservation {
     pub event_id: String,
     pub mode: ComparisonMode,
-    /// Logical stream offset at which the runtime admitted the event, relative
-    /// to the start of the evaluated run. This is the replay clock, never the
-    /// wall clock: issue #71 needs a time axis to bucket operational SLO
-    /// windows by represented stream hour, and a wall-clock stamp would make
-    /// the same fixture produce different windows on a faster machine.
+    /// Logical position of this event on the workload timeline, relative to the
+    /// start of the evaluated run — never the wall clock. In scenario mode this
+    /// is the scenario's own declared phase timing; in plain replay it is the
+    /// pacer's offset, because that is the only timeline the fixture carries.
+    ///
+    /// Issue #71 buckets operational SLO windows by represented stream hour, so
+    /// a wall-clock stamp would make the same fixture produce different windows
+    /// on a faster machine. The two timelines are deliberately not the same
+    /// field: a pacer that runs one virtual second per event would compress an
+    /// 80-minute scenario into a few minutes of "stream" and silently
+    /// under-report how many stream hours the run stood for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_offset_ms: Option<u64>,
     pub route: RouteClass,

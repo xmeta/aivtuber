@@ -114,6 +114,13 @@ changing an indicator's numerator or denominator without bumping
 `SLO_CATALOG_VERSION` would silently reinterpret every threshold ever written
 against the previous definition.
 
+The baseline itself is held to the same standard, because a target file is only
+as trustworthy as the measurement it cites. `baseline.value` must be a finite
+ratio in `[0, 1]`, `stream_hours` may not be `0`, and a `schema_version` that is
+present must match the report contract this build emits. An impossible baseline
+would not fail any later evaluation; it would simply be quoted forever as the
+justification for the number.
+
 The checked-in `examples/slo/slo-targets.json` therefore ships with an empty
 `targets` map, and a test fails if a numeric target is added without its
 evidence. That is the current honest state of the project, not an oversight.
@@ -160,10 +167,11 @@ measured indicator publishes failure phrasing.
 == Windows
 
 Windowing is over the *logical* stream timeline. `EventObservation` records the
-`stream_offset_ms` at which the runtime admitted the event; nothing here reads
-the wall clock, so the same fixture produces the same windows on a slower
-machine. That also keeps replay-relevant reporting on the monotonic/logical
-ordering rule the rest of the runtime already follows.
+event's `stream_offset_ms` — its position on the workload timeline, relative to
+the start of the evaluated run; nothing here reads the wall clock, so the same
+fixture produces the same windows on a slower machine. That also keeps
+replay-relevant reporting on the monotonic/logical ordering rule the rest of the
+runtime already follows.
 
 Two clocks exist in a replay, and conflating them is a trap:
 
@@ -241,12 +249,12 @@ and not optimistically reclassified.
 
 Attribution is scoped to the indicator's own denominator. Each indicator declares
 one classifier that decides whether an event is outside its denominator, conforms,
-or misses, and the report uses that single definition for the ratio, the miss set
-and the budget spend. An event outside an indicator's denominator therefore
-cannot appear in its miss attribution: an unrelated provider failure cannot be
-credited to `reliability.deadline_adherence_rate` just because that event
-happened during the same window. It is still attributed at the run level, where
-it belongs.
+misses, or is merely *unscored*, and the report uses that single definition for
+the ratio, the miss set and the budget spend. An event outside an indicator's
+denominator therefore cannot appear in its miss attribution: an unrelated
+provider failure cannot be credited to
+`reliability.deadline_adherence_rate` just because that event happened during
+the same window. It is still attributed at the run level, where it belongs.
 
 This is what lets `reliability.fallback_delivery_rate` be the objective it
 should be. A provider outage with a working fallback keeps that objective
@@ -254,13 +262,30 @@ green, so an outage the runtime handled does not manufacture a breach. An
 outage the runtime did *not* survive is a miss attributed to the runtime, which
 is the signal worth paging on.
 
+=== Unscored is not Missed
+
+A latency sample measured before any `threshold_ms` has been calibrated is
+*eligible but unscored*. It counts toward the denominator — that is the evidence
+the threshold is chosen from — and it is reported in the `unscored` column, but
+it is not a conformance and not a miss. The report therefore says
+`status: uncalibrated`, `value: null` and an empty `miss_attribution` for that
+row, instead of attributing the sample to a provider failure it may have nothing
+to do with.
+
+This is why the classifier has four states rather than three. "No threshold yet"
+is neither "passed" nor "failed", and collapsing it into either one corrupts the
+contract in a different direction each time: as `Conforms` it invents a pass, as
+`Misses` it invades a miss set and the error budget. `SloMeasurement::misses()`
+is `eligible - conforming - unscored` for the same reason.
+
 == Error budgets and their limits
 
 A budget exists only for a probabilistic objective that was actually decided.
 `allowed_misses = floor((1 - target) * eligible)`, and misses are always
-`eligible - conforming`, so the indicator and the budget can never disagree
-about what was spent. Uncalibrated, empty, and under-sampled windows produce no
-budget rather than a budget of zero.
+`eligible - conforming - unscored`, so the indicator and the budget can never
+disagree about what was spent and an uncalibrated sample is never charged as a
+spend. Uncalibrated, empty, and under-sampled windows produce no budget rather
+than a budget of zero.
 
 Error-budget thinking does not apply to the zero-tolerance invariants. That is
 enforced in code, not by convention: see above.

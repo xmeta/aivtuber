@@ -20,11 +20,14 @@
 //!    target without [`BaselineEvidence`] and refuses a target file whose
 //!    catalog version does not match the code evaluating it, so a threshold
 //!    cannot outlive the indicator definition it was calibrated against.
-//! 2. **Absence of evidence is never a pass.** An indicator whose eligible
-//!    denominator is empty reports [`SloStatus::NoData`], and an indicator the
-//!    benchmark artifact cannot reproduce at all reports
-//!    [`SloStatus::NotYetMeasured`] together with the evidence that is missing.
-//!    Neither counts as [`SloStatus::Met`].
+//! 2. **Absence of evidence is never a pass, and never a miss.** An indicator
+//!    whose eligible denominator is empty reports [`SloStatus::NoData`], an
+//!    indicator the benchmark artifact cannot reproduce at all reports
+//!    [`SloStatus::NotYetMeasured`] together with the evidence that is missing,
+//!    and a sample the objective has no calibrated boundary for is
+//!    [`EventVerdict::Unscored`]. None of the three counts as
+//!    [`SloStatus::Met`], and none of them enters a miss set, an attribution
+//!    tally, or an error budget.
 //! 3. **Zero-tolerance invariants are not SLOs.** Security, authorization and
 //!    bounded-state invariants carry no ratio target and no error budget;
 //!    [`SloTargets::validate`] rejects a target that would give one.
@@ -318,18 +321,23 @@ impl SloStatus {
 pub struct SloMeasurement {
     /// Events that conformed to the objective.
     pub conforming: u64,
-    /// Events the objective applies to.
+    /// Events the objective applies to, including [`SloMeasurement::unscored`].
     pub eligible: u64,
+    /// Eligible events the objective has no calibrated boundary to judge yet.
+    pub unscored: u64,
     /// Reported value in the indicator's unit. `None` means "not measured",
     /// which is never 0 and never 1.
     pub value: Option<f64>,
 }
 
 impl SloMeasurement {
-    /// Misses are always `eligible - conforming`, so the error budget and the
-    /// indicator can never disagree about what was spent.
+    /// Misses are always `eligible - conforming - unscored`, so the error
+    /// budget and the indicator can never disagree about what was spent, and an
+    /// uncalibrated sample is never charged as a spend.
     pub fn misses(&self) -> u64 {
-        self.eligible.saturating_sub(self.conforming)
+        self.eligible
+            .saturating_sub(self.conforming)
+            .saturating_sub(self.unscored)
     }
 }
 
@@ -343,9 +351,35 @@ impl SloMeasurement {
 /// failure show up in an objective that actually met its target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventVerdict {
+    /// Not this indicator's business.
     Outside,
+    /// Eligible, measured, and inside the objective.
     Conforms,
+    /// Eligible, measured, and outside the objective.
     Misses,
+    /// Eligible and measured, but the objective has no calibrated boundary yet,
+    /// so there is no defined pass or fail.
+    ///
+    /// This is the state a latency sample lands in while no `threshold_ms` has
+    /// been calibrated. It is deliberately distinct from [`EventVerdict::Misses`]:
+    /// without a threshold there is no miss to attribute, and a three-state enum
+    /// would force an uncalibrated objective either to claim conformance or to
+    /// invent a failure. The sample still counts toward the eligible
+    /// denominator — that is the calibration evidence — but it never enters the
+    /// miss set, the error budget, or the attribution.
+    Unscored,
+}
+
+impl EventVerdict {
+    /// Whether the event belongs to this indicator's denominator.
+    pub fn is_eligible(self) -> bool {
+        !matches!(self, Self::Outside)
+    }
+
+    /// Whether the event is a defined failure of this objective.
+    pub fn is_miss(self) -> bool {
+        matches!(self, Self::Misses)
+    }
 }
 
 /// Raw counts produced by one indicator over one window.
@@ -354,23 +388,31 @@ fn measure(
     events: &[&EventObservation],
     target: Option<&SloTarget>,
 ) -> SloMeasurement {
-    let eligible = events
-        .iter()
-        .filter(|event| (indicator.classify)(event, target) != EventVerdict::Outside)
-        .count() as u64;
-    let conforming = events
-        .iter()
-        .filter(|event| (indicator.classify)(event, target) == EventVerdict::Conforms)
-        .count() as u64;
-    // A latency objective with no calibrated threshold has an eligible set but
-    // no defined miss, so it reports the sample count as calibration evidence
-    // and no ratio at all. That is deliberately different from 0%.
-    let unscorable =
-        indicator.latency_thresholded && target.and_then(|target| target.threshold_ms).is_none();
-    let value = (!unscorable && eligible > 0).then(|| conforming as f64 / eligible as f64);
+    let mut eligible = 0_u64;
+    let mut conforming = 0_u64;
+    let mut unscored = 0_u64;
+    for event in events {
+        let verdict = (indicator.classify)(event, target);
+        if !verdict.is_eligible() {
+            continue;
+        }
+        eligible += 1;
+        match verdict {
+            EventVerdict::Conforms => conforming += 1,
+            EventVerdict::Unscored => unscored += 1,
+            EventVerdict::Outside | EventVerdict::Misses => {}
+        }
+    }
+    // An indicator with unscored samples has no defined ratio: dividing
+    // `conforming` by `eligible` would report every uncalibrated sample as a
+    // failure, which is the inversion this module exists to prevent. The value
+    // stays `None` and the samples are reported as calibration evidence
+    // instead — deliberately different from 0%.
+    let value = (unscored == 0 && eligible > 0).then(|| conforming as f64 / eligible as f64);
     SloMeasurement {
         conforming,
         eligible,
+        unscored,
         value,
     }
 }
@@ -388,7 +430,13 @@ pub struct SloIndicator {
     pub denominator: &'static str,
     /// Exact description of what counts in the numerator.
     pub numerator: &'static str,
-    /// Latency objectives need a configured `threshold_ms` to have a miss at all.
+    /// Declares that this objective is judged against a `threshold_ms`.
+    ///
+    /// This is a *declaration*, not the scoring rule: it drives target
+    /// validation (a latency target without a threshold is refused) and it
+    /// selects which indicators publish target-free percentiles. The scoring
+    /// itself belongs to [`SloIndicator::classify`], so the two cannot disagree
+    /// about what a sample means.
     pub latency_thresholded: bool,
     /// Minimum eligible events before a target may decide the objective.
     pub sample_floor: u64,
@@ -628,8 +676,8 @@ fn classify_first_audio_latency(
 
 /// An event with no measured latency is outside the denominator, not a miss.
 /// With a sample but no calibrated threshold there is no defined miss either,
-/// so the event is eligible and counted as not-conforming — which is what
-/// makes the ratio `None` rather than a misleading zero.
+/// so the event is eligible and unscored: it counts as the evidence a
+/// threshold is calibrated from, and never as a failure.
 fn classify_latency(latency: Option<u64>, target: Option<&SloTarget>) -> EventVerdict {
     let Some(latency) = latency else {
         return EventVerdict::Outside;
@@ -637,7 +685,7 @@ fn classify_latency(latency: Option<u64>, target: Option<&SloTarget>) -> EventVe
     match target.and_then(|target| target.threshold_ms) {
         Some(threshold) if latency <= threshold => EventVerdict::Conforms,
         Some(_) => EventVerdict::Misses,
-        None => EventVerdict::Misses,
+        None => EventVerdict::Unscored,
     }
 }
 
@@ -792,6 +840,17 @@ impl SloTargets {
                 self.catalog_version, SLO_CATALOG_VERSION
             )));
         }
+        // An absent `schema_version` means "unversioned draft"; a *present* one
+        // that this build does not implement is a file written for a different
+        // report contract, which must not be silently reinterpreted.
+        if let Some(schema_version) = &self.schema_version
+            && schema_version != SLO_REPORT_SCHEMA_VERSION
+        {
+            return Err(SloError::new(format!(
+                "target file declares report schema {schema_version:?} but this build \
+                 emits {SLO_REPORT_SCHEMA_VERSION:?}"
+            )));
+        }
         for (id, target) in &self.targets {
             let Some(indicator) = catalog.iter().find(|entry| entry.id == id) else {
                 return Err(SloError::new(format!(
@@ -804,10 +863,26 @@ impl SloTargets {
                      target or an error budget"
                 )));
             }
-            if !(0.0..=1.0).contains(&target.target) {
+            if !target.target.is_finite() || !(0.0..=1.0).contains(&target.target) {
                 return Err(SloError::new(format!(
-                    "target {id:?} must be a ratio in [0, 1], got {}",
+                    "target {id:?} must be a finite ratio in [0, 1], got {}",
                     target.target
+                )));
+            }
+            // The baseline is the measured evidence the target was chosen from.
+            // An impossible or non-finite value there would not be caught by
+            // any later evaluation — it would just be cited forever as the
+            // justification for the number, so it is refused up front.
+            if !target.baseline.value.is_finite() || !(0.0..=1.0).contains(&target.baseline.value) {
+                return Err(SloError::new(format!(
+                    "target {id:?} baseline value must be a finite ratio in [0, 1], got {}",
+                    target.baseline.value
+                )));
+            }
+            if target.baseline.stream_hours == Some(0) {
+                return Err(SloError::new(format!(
+                    "target {id:?} baseline cites 0 represented stream hours; calibration \
+                     evidence that covers no time is not evidence"
                 )));
             }
             if indicator.latency_thresholded && target.threshold_ms.is_none() {
@@ -907,7 +982,14 @@ pub struct SloIndicatorResult {
     pub denominator: String,
     pub numerator: String,
     pub conforming: u64,
+    /// Includes `unscored`: a sample the objective has no calibrated boundary
+    /// for is part of the denominator, it is just not yet a pass or a failure.
     pub eligible: u64,
+    /// Eligible events with no calibrated boundary to judge them against. These
+    /// are the samples a threshold is calibrated from, never an SLO miss, so
+    /// they never appear in `miss_attribution` or spend an error budget.
+    #[serde(default)]
+    pub unscored: u64,
     /// `None` means "not measured", never zero and never one.
     pub value: Option<f64>,
     pub target: Option<f64>,
@@ -1013,8 +1095,8 @@ impl SloReport {
             self.source.provenance.as_str(),
         );
         out.push_str(
-            "| Indicator | Window | Conforming | Eligible | Value | Target | Status |\n\
-             |---|---|---|---|---|---|---|\n",
+            "| Indicator | Window | Conforming | Eligible | Unscored | Value | Target | Status |\n\
+             |---|---|---|---|---|---|---|---|\n",
         );
         for result in &self.indicators {
             let value = result
@@ -1026,11 +1108,12 @@ impl SloReport {
                 .map(|target| format!("{target:.4}"))
                 .unwrap_or_else(|| "-".to_owned());
             out.push_str(&format!(
-                "| {} | {} | {} | {} | {} | {} | {} |\n",
+                "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
                 result.id,
                 result.window,
                 result.conforming,
                 result.eligible,
+                result.unscored,
                 value,
                 target,
                 result.status.as_str(),
@@ -1117,6 +1200,7 @@ pub fn evaluate(
                     numerator: indicator.numerator.to_owned(),
                     conforming: 0,
                     eligible: 0,
+                    unscored: 0,
                     value: None,
                     target: None,
                     threshold_ms: None,
@@ -1149,11 +1233,13 @@ pub fn evaluate(
             // Attribution is drawn from the *same* classifier that produced the
             // ratio, restricted to the events that are actually in this
             // indicator's denominator. An event outside the denominator can
-            // neither conform nor miss, so it cannot appear here.
+            // neither conform nor miss, and an event the objective has no
+            // calibrated boundary for is `Unscored` rather than a miss, so
+            // neither can appear here.
             let misses = scoped
                 .iter()
                 .copied()
-                .filter(|event| (indicator.classify)(event, target) == EventVerdict::Misses);
+                .filter(|event| (indicator.classify)(event, target).is_miss());
             indicators.push(SloIndicatorResult {
                 id: indicator.id.to_owned(),
                 kind: indicator.kind,
@@ -1164,6 +1250,7 @@ pub fn evaluate(
                 numerator: indicator.numerator.to_owned(),
                 conforming: measurement.conforming,
                 eligible: measurement.eligible,
+                unscored: measurement.unscored,
                 value: measurement.value,
                 target: target.map(|target| target.target),
                 threshold_ms: target.and_then(|target| target.threshold_ms),
@@ -1263,12 +1350,23 @@ fn status_for(
     let Some(target) = target else {
         return SloStatus::Uncalibrated;
     };
+    // A target alone is not a calibrated objective: if the classifier could not
+    // score any sample, the objective is still unresolved. This is defensive —
+    // `validate` already refuses a thresholdless latency target — but the rule
+    // that an unscoreable objective is never a breach is enforced here rather
+    // than inferred from catalog metadata elsewhere.
+    if measurement.unscored > 0 {
+        return SloStatus::Uncalibrated;
+    }
     if measurement.eligible < indicator.sample_floor {
         return SloStatus::InsufficientSamples;
     }
     match measurement.value {
         Some(value) if value >= target.target => SloStatus::Met,
-        _ => SloStatus::Missed,
+        Some(_) => SloStatus::Missed,
+        // `value` is `None` only when nothing was eligible, already handled
+        // above; treating it as a miss would make "unmeasured" mean "failed".
+        None => SloStatus::Uncalibrated,
     }
 }
 

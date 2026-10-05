@@ -140,6 +140,10 @@ fn an_uncalibrated_latency_indicator_reports_evidence_but_no_value() {
     assert_eq!(visible.status, SloStatus::Uncalibrated);
     assert_eq!(visible.value, None);
     assert_eq!(visible.eligible, 40);
+    assert_eq!(
+        visible.unscored, 40,
+        "with no calibrated threshold every sample is calibration evidence, not a miss"
+    );
 
     // The target-free percentiles are the evidence a threshold is chosen from,
     // so a reviewer never has to invent the number.

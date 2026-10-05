@@ -12,8 +12,9 @@
 //!
 //! With no target file the report is still useful: it publishes the measured
 //! values and target-free latency percentiles that a target is calibrated
-//! from, and the verdict stays `UNCALIBRATED` because nothing has been decided
-//! yet. That is the honest state of #71 today.
+//! from, and the verdict stays `INCOMPLETE` because the catalog also contains
+//! zero-tolerance invariants this artifact cannot measure. That is the honest
+//! state of #71 today.
 //!
 //! Usage:
 //! ```text
