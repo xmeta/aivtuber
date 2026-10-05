@@ -15,6 +15,7 @@ mod shadow;
 mod shadow_evidence;
 mod shadow_orchestrator;
 mod support_bundle;
+mod tool_execution;
 
 pub use budget::*;
 pub use deadline::*;
@@ -31,6 +32,7 @@ pub use shadow::*;
 pub use shadow_evidence::*;
 pub use shadow_orchestrator::*;
 pub use support_bundle::*;
+pub use tool_execution::*;
 
 use aivtuber_adaptation::{AdaptationEngine, AppliedAdaptation, MemoryEntry, WorkingMemory};
 use aivtuber_asset_store::CacheTier;

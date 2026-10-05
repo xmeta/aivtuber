@@ -8,6 +8,7 @@
 
 mod audio;
 mod http;
+mod mcp;
 mod obs;
 mod openai;
 mod transport;
@@ -16,6 +17,7 @@ mod vts;
 
 pub use audio::*;
 pub use http::*;
+pub use mcp::*;
 pub use obs::*;
 pub use openai::*;
 pub use transport::*;
