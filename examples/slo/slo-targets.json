@@ -1,0 +1,6 @@
+{
+  "schema_version": "1",
+  "catalog_version": "slo-catalog-v1",
+  "description": "Operational SLO targets (issue #71). Intentionally empty: no numeric target is checked in until one is calibrated from measured baseline evidence produced by `cargo run --locked -p aivtuber-app --bin slo-report`. A target entry must name the artifact it was calibrated from, and a zero-tolerance invariant must never appear here. This file is deliberately NOT benchmarks/budgets.json: those are per-pull-request regression budgets, these are absolute operational objectives.",
+  "targets": {}
+}

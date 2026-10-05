@@ -183,3 +183,8 @@ The following still require domain-specific or human labels beyond the initial r
 A change affecting routing thresholds, cache policy, Jev usage, or generative fallback should be compared on a replayable event dataset with fixed seed/config metadata.
 
 Do not accept statements such as "Jev reduces LLM usage" or "semantic reuse improves latency" unless the corresponding reports show that difference for an identified dataset and configuration.
+
+== 12. Operational SLOs
+
+The observations in this document are the raw material; they are not objectives.
+link:operational-slo.adoc[Operational SLOs and Error Budgets] (#71) turns them into session and represented-stream-hour service indicators, distinguishes an external provider failure from a runtime degradation failure, and keeps the result separate from the #58 per-PR regression budget: a report that improved relative to base can still miss its operational objective, and both statements are true at once.

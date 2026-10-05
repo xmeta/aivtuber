@@ -7,6 +7,7 @@
 
 mod benchmark_gate;
 mod causal_trace;
+mod operational_slo;
 mod task_transition;
 
 pub use benchmark_gate::{
@@ -18,6 +19,14 @@ pub use benchmark_gate::{
 pub use causal_trace::{
     CausalTrace, CausalTraceCollector, CausalTraceError, CausalTraceRetentionConfig,
     CausalTraceRetentionMetrics, StageOutcome, StageReason, TraceSpan, TraceStage,
+};
+pub use operational_slo::{
+    AarCandidate, AttributionSummary, BaselineEvidence, ErrorBudget, EvidenceSource, FailureOrigin,
+    LatencyCalibration, MissAttribution, ObjectiveKind, SLO_CATALOG_VERSION,
+    SLO_REPORT_SCHEMA_VERSION, STREAM_HOUR_MS, SloAction, SloError, SloEvaluationConfig,
+    SloIndicator, SloIndicatorResult, SloProvenance, SloReport, SloStatus, SloTarget, SloTargets,
+    SloVerdict, SloWindow, TrafficPlane, WindowKind, attribution_of, catalog, evaluate,
+    failure_origin,
 };
 pub use task_transition::{
     TaskTransitionCollector, TaskTransitionObservation, TaskTransitionRetentionConfig,
@@ -100,6 +109,13 @@ pub enum DegradedSubsystem {
 pub struct EventObservation {
     pub event_id: String,
     pub mode: ComparisonMode,
+    /// Logical stream offset at which the runtime admitted the event, relative
+    /// to the start of the evaluated run. This is the replay clock, never the
+    /// wall clock: issue #71 needs a time axis to bucket operational SLO
+    /// windows by represented stream hour, and a wall-clock stamp would make
+    /// the same fixture produce different windows on a faster machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_offset_ms: Option<u64>,
     pub route: RouteClass,
     pub routing_latency_us: u64,
     pub jev_latency_us: Option<u64>,
@@ -142,6 +158,7 @@ impl EventObservation {
         Self {
             event_id: event_id.into(),
             mode,
+            stream_offset_ms: None,
             route,
             routing_latency_us: 0,
             jev_latency_us: None,

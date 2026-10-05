@@ -90,7 +90,7 @@ Revisit the current constraint when one or more of these occur:
 * a compatible #58 benchmark trend changes materially beyond expected variance;
 * #40 fault/soak evidence exposes a different limiting failure mode;
 * #59 quality evaluation identifies a dominant quality regression;
-* #71 shows a persistent operational SLO miss;
+* a persistent operational SLO miss is reported by `slo-report` (#71, link:operational-slo.adoc[Operational SLOs and Error Budgets]);
 * a provider/platform/dependency change invalidates a load-bearing assumption;
 * the current intervention reaches its target/plateau or shows low marginal value.
 

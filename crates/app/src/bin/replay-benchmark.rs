@@ -517,6 +517,9 @@ where
         }
 
         if let Some(metric) = app.telemetry_mut().events_mut().last_mut() {
+            // Issue #71: the replay clock is a logical stream timeline, so it
+            // is the windowing axis operational SLO reports bucket by.
+            metric.stream_offset_ms = Some(at_ms);
             let cost = u64::from(metric.llm_calls)
                 .saturating_mul(llm_cost)
                 .saturating_add(u64::from(metric.tts_calls).saturating_mul(tts_cost));
