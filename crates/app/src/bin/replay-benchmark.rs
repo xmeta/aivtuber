@@ -1,10 +1,10 @@
 #![forbid(unsafe_code)]
 
 use aivtuber_app::{
-    AppError, AssetSemanticIndexConfig, AudioOutput, GenerativeRuntime, IntentRoutePlanner,
-    NoopAvatarOutput, NoopStreamOutput, PlaybackRoute, ProductionApp, QueryEmbeddingProvider,
-    ReflexRoutePlanner, RoutePlanner, StreamScenario, build_semantic_index_from_asset_store,
-    scenario_to_benchmark_fixture,
+    AppError, AssetSemanticIndexConfig, AudioOutput, CachedReplayPlayability, GenerativeRuntime,
+    IntentRoutePlanner, NoopAvatarOutput, NoopStreamOutput, PlaybackRoute, ProductionApp,
+    QueryEmbeddingProvider, ReflexRoutePlanner, RoutePlanner, StreamScenario,
+    build_semantic_index_from_asset_store, scenario_to_benchmark_fixture,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{

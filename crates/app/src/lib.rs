@@ -18,6 +18,7 @@ mod support_bundle;
 mod task_plane;
 mod tool_execution;
 
+pub use aivtuber_domain::scenario::*;
 pub use budget::*;
 pub use deadline::*;
 pub use moderation_evidence::*;
@@ -106,6 +107,7 @@ pub enum AppError {
     Routing(String),
     Generation(String),
     Adaptation(String),
+    Scenario(aivtuber_domain::ScenarioError),
 }
 
 impl fmt::Display for AppError {
@@ -116,6 +118,7 @@ impl fmt::Display for AppError {
             Self::Routing(message) => write!(f, "routing failed: {message}"),
             Self::Generation(message) => write!(f, "generation failed: {message}"),
             Self::Adaptation(message) => write!(f, "adaptation failed: {message}"),
+            Self::Scenario(error) => write!(f, "scenario refused: {error}"),
         }
     }
 }
@@ -131,6 +134,12 @@ impl From<RuntimeError> for AppError {
 impl From<CachedPlaybackError> for AppError {
     fn from(value: CachedPlaybackError) -> Self {
         Self::Playback(value)
+    }
+}
+
+impl From<aivtuber_domain::ScenarioError> for AppError {
+    fn from(value: aivtuber_domain::ScenarioError) -> Self {
+        Self::Scenario(value)
     }
 }
 

@@ -9,6 +9,7 @@ mod error;
 mod event;
 mod interfaces;
 mod reflex;
+pub mod scenario;
 mod task;
 
 pub use context::{
@@ -44,6 +45,7 @@ pub use reflex::{
     AttentionTarget, BackendIdentity, FallbackReason, REFLEX_SCHEMA_VERSION, ReflexDecision,
     ResponseRoute, RouteDecision,
 };
+pub use scenario::*;
 pub use task::{
     AgentTask, MAX_TASK_ID_BYTES, MAX_TASK_LIFETIME_MS_HARD, MAX_TASK_OBSERVATIONS_HARD,
     MAX_TASK_PENDING_TTL_MS_HARD, MAX_TASK_REASON_BYTES, MAX_TASK_REPLANS_HARD,

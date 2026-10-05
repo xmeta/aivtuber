@@ -77,6 +77,31 @@ A smaller explicit run is:
 cargo run --locked -p aivtuber-hardening --bin failure-soak -- target/hardening-smoke.json 5000
 ----
 
+== Scenario-driven soak with a fault overlay (issue #70)
+
+The synthetic workload above is one flat pattern. The same versioned scenario the
+#58 benchmark plays can instead drive the soak path, with a fault overlay bound
+to that scenario's identity:
+
+[source,shell]
+----
+cargo run --locked -p aivtuber-hardening --bin failure-soak -- \
+  --scenario examples/scenarios/chat-burst-10x.json \
+  --overlay examples/scenarios/fault-overlays/chat-burst-content-and-provider-faults.json \
+  target/scenario-soak.json
+----
+
++FaultOverlay+ names the +scenario_id+ and +scenario_version+ it applies to; a
+mismatch is refused rather than applied to a similar workload, because a plan for
+a different trace is not a plan for this one. Only the subsystems this path
+actually calls may be named - content ingress, the generative path a semantic
+miss takes, and hot-asset insertion - because an injected fault nobody can
+observe is decoration. Faults are counted and the deterministic performer keeps
+advancing: the soak observes degradation, never a freeze. Report identity carries
+both the scenario and the fault seed, so two overlays over the same workload are
+distinct baselines. The document contract is
++schemas/fault-overlay.schema.json+.
+
 == Growth detection
 
 The soak records midpoint and final retained-state counts for:

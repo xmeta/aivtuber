@@ -478,7 +478,7 @@ pub fn run_core_soak(
     })
 }
 
-fn snapshot(
+pub(crate) fn snapshot(
     scheduler: &Scheduler,
     security: &SecurityRuntime,
     memory: &WorkingMemory,
@@ -520,7 +520,7 @@ fn snapshot(
     }
 }
 
-fn growth_findings(
+pub(crate) fn growth_findings(
     config: &SoakConfig,
     midpoint: &StateSnapshot,
     final_state: &StateSnapshot,
@@ -778,7 +778,7 @@ fn operator_input(sequence: u64, action: &str) -> OperatorCommandInput {
     }
 }
 
-fn generated_fixture() -> Result<PerformanceAsset, HardeningError> {
+pub(crate) fn generated_fixture() -> Result<PerformanceAsset, HardeningError> {
     load_asset_file(
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples/performance-assets/valid/generated-dynamic.json"),
@@ -786,7 +786,7 @@ fn generated_fixture() -> Result<PerformanceAsset, HardeningError> {
     .map_err(|error| HardeningError::AssetStore(error.to_string()))
 }
 
-fn generated_runtime() -> RuntimeCompatibility {
+pub(crate) fn generated_runtime() -> RuntimeCompatibility {
     RuntimeCompatibility {
         compiler_version: "0.1.0".to_owned(),
         voice_model: Some("voice-ja-v2".to_owned()),
