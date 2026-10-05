@@ -16,9 +16,9 @@
 //!    carries an authorization claim or viewer prose.
 
 use aivtuber_app::{
-    MAX_EVENTS_PER_MINUTE, PriorityBucket, SCENARIO_SCHEMA_VERSION, ScenarioClass, ScenarioEvent,
-    ScenarioPhase, ScenarioProvenance, SemanticBand, StreamScenario, generate_scenario_trace,
-    scenario_to_benchmark_fixture,
+    CachedReplayPlayability, MAX_EVENTS_PER_MINUTE, PriorityBucket, SCENARIO_SCHEMA_VERSION,
+    ScenarioClass, ScenarioEvent, ScenarioPhase, ScenarioProvenance, SemanticBand, StreamScenario,
+    generate_scenario_trace, scenario_to_benchmark_fixture,
 };
 use aivtuber_domain::{EventEnvelope, EventKind};
 use std::collections::BTreeMap;

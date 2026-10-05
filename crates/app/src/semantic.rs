@@ -23,25 +23,6 @@ impl PayloadIntentEmbedding {
     pub fn new(dimension: usize) -> Self {
         Self { dimension }
     }
-
-    /// Project a known intent family into its dominant axis.
-    fn intent_vector(&self, family: &str) -> Vec<f32> {
-        let mut vector = vec![0.0_f32; self.dimension];
-        match family {
-            "agree" if self.dimension > 0 => vector[0] = 1.0,
-            "surprise" if self.dimension > 1 => vector[1] = 1.0,
-            "thinking" if self.dimension > 2 => vector[2] = 1.0,
-            _ => {
-                // Unknown family: deterministic mild projection spread over
-                // all axes so retrieval still ranks curated assets.
-                if self.dimension > 0 {
-                    let weight = 1.0 / self.dimension as f32;
-                    vector.fill(weight);
-                }
-            }
-        }
-        vector
-    }
 }
 
 impl super::QueryEmbeddingProvider for PayloadIntentEmbedding {
@@ -54,11 +35,12 @@ impl super::QueryEmbeddingProvider for PayloadIntentEmbedding {
             .get("intent")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        let family = intent
-            .strip_prefix("reaction.")
-            .or_else(|| intent.strip_prefix("filler."))
-            .unwrap_or_default();
-        let vector = self.intent_vector(family);
+        // The intent -> axis mapping is provider-neutral, so it lives in the
+        // domain crate: the scenario generator and the live runtime share it,
+        // which is what keeps generated query embeddings on the same axes the
+        // semantic index was built against. Unknown families still spread over
+        // every axis so retrieval ranks curated assets.
+        let vector = aivtuber_domain::payload_intent_axis(intent, self.dimension);
         if vector.len() != self.dimension {
             return Err(super::AppError::Routing(format!(
                 "intent embedding dimension mismatch: expected {}, produced {}",

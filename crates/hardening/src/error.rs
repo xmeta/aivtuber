@@ -4,6 +4,7 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HardeningError {
     InvalidConfiguration(&'static str),
+    InvalidScenario(String),
     InvalidMetadata(String),
     Runtime(String),
     Adaptation(String),
@@ -19,6 +20,7 @@ impl fmt::Display for HardeningError {
             Self::InvalidConfiguration(message) => {
                 write!(f, "invalid hardening configuration: {message}")
             }
+            Self::InvalidScenario(message) => write!(f, "invalid scenario: {message}"),
             Self::InvalidMetadata(message) => write!(f, "invalid metadata: {message}"),
             Self::Runtime(message) => write!(f, "runtime failure: {message}"),
             Self::Adaptation(message) => write!(f, "adaptation failure: {message}"),

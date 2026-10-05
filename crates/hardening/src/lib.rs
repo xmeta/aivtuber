@@ -7,11 +7,13 @@
 mod conformance;
 mod error;
 mod fault;
+mod scenario_soak;
 mod soak;
 
 pub use conformance::*;
 pub use error::*;
 pub use fault::*;
+pub use scenario_soak::*;
 pub use soak::*;
 
 #[cfg(test)]

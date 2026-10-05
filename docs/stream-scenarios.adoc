@@ -119,6 +119,18 @@ whole seconds would give a burst of events the same timestamp string.
 checked-in benchmark fixture uses, so `replay-benchmark --scenario <path>` and
 `replay-benchmark <fixture.json>` run the identical pipeline.
 
+The #40 soak path consumes the same trace: `failure-soak --scenario <path>
+--overlay <path>` generates the trace and overlays a versioned fault plan
+(`schemas/fault-overlay.schema.json`) bound to the scenario's identity. Faults
+are limited to the call points the soak actually drives - content ingress, the
+generative path a semantic miss takes, and hot-asset insertion - so an injected
+fault that could never be observed is refused rather than recorded, and an
+occurrence the trace can never reach is refused before the run rather than
+reported as a clean pass. Two overlays over the same scenario are distinct
+baselines, because the result identity is the scenario dataset id plus a hash of
+the fault list. See
+link:failure-soak.adoc[Failure Injection and Long-Stream Soak].
+
 == Measured limits: what the runtime can actually play
 
 These were measured by sweeping the shipped runtime, not assumed. They are limits
@@ -260,8 +272,12 @@ can run end to end.
 
 == Adding a scenario
 
-Add one when a *workload shape* is missing, not when a number looks wrong.. Pick the class that describes the shape you need. If none fits, add the class
-to the enum in both `scenario.rs` and the schema, and add its predicate to
+Add one when a *workload shape* is missing, not when a number looks wrong. An
+overlay is separate: add one under `examples/scenarios/fault-overlays/` when a
+failure shape is missing, naming the scenario identity it applies to.
+
+. Pick the class that describes the shape you need. If none fits, add the class
+to the enum in both `crates/domain/src/scenario.rs` and the schema, and add its predicate to
 `SCENARIO_CLASS_PREDICATES` - a class with no predicate is decoration. Predicates
 describe *shape*. A predicate that encodes what one runtime can play is the same
 mistake as putting the ceiling in the schema.
@@ -290,5 +306,5 @@ different unrealistic workload. Adding one per benchmark defeats that.
 * link:benchmark-gate.adoc[Benchmark Gate]
 * link:runtime-retention.adoc[Runtime Retention]
 * link:property-testing.adoc[Property Testing]
-* #40 failure/soak overlays, #51-#53 bounded state, #58 benchmark, #69
-  generative budgets, #79 crowd signals
+* #40 failure/soak overlays (`schemas/fault-overlay.schema.json`), #51-#53
+  bounded state, #58 benchmark, #69 generative budgets, #79 crowd signals

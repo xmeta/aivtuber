@@ -1,0 +1,12 @@
+{
+  "schema_version": "1",
+  "scenario_id": "chat-burst-10x",
+  "scenario_version": 1,
+  "seed": 70,
+  "faults": [
+    { "subsystem": "content_ingress", "occurrence": 2, "kind": "flood" },
+    { "subsystem": "thinking", "occurrence": 1, "kind": "timeout" },
+    { "subsystem": "tts", "occurrence": 1, "kind": "unavailable" },
+    { "subsystem": "asset_store", "occurrence": 1, "kind": "corrupted" }
+  ]
+}

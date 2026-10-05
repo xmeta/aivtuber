@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xmeta/aivtuber/schemas/fault-overlay.schema.json",
+  "title": "AIVTuber Fault Overlay",
+  "description": "A versioned fault plan bound to one stream scenario identity (issue #40, consumed by the #70 soak slice). The overlay is a separate document from the scenario on purpose: the scenario format stays consumer-neutral and free of privileged/provider machinery, while provider failures belong to the fault slice. Only subsystems the soak path actually calls may be named, because an injected fault nobody can observe is decoration.",
+  "type": "object",
+  "required": ["schema_version", "scenario_id", "scenario_version", "seed", "faults"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "1",
+      "description": "Fault-overlay document contract version. An incompatible version is refused rather than reinterpreted."
+    },
+    "scenario_id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{2,63}$",
+      "description": "The scenario identity this plan was written for. It must match a checked-in scenario exactly; a plan for a similar workload is not a plan for this one."
+    },
+    "scenario_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "The scenario version this plan was written for. A version bump reshuffles the trace, so an overlay for the old version must not silently apply."
+    },
+    "seed": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Fault seed, recorded for provenance only. Injection is determined entirely by the explicit faults list, so a comparison baseline is keyed on a canonical hash of that list, not on this seed; two overlays that differ only in seed describe the same behaviour."
+    },
+    "faults": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Planned injected faults. A subsystem/occurrence pair may appear at most once; occurrence is one-based and counts calls to that subsystem, not events. Every occurrence must be reachable by the named scenario: the soak refuses a plan whose occurrence exceeds the number of times the trace calls that subsystem, because an unreachable fault would turn a failure test into a false green.",
+      "items": { "$ref": "#/$defs/fault" }
+    }
+  },
+  "$defs": {
+    "fault": {
+      "type": "object",
+      "required": ["subsystem", "occurrence", "kind"],
+      "additionalProperties": false,
+      "properties": {
+        "subsystem": {
+          "type": "string",
+          "enum": ["content_ingress", "asset_store", "thinking", "tts"],
+          "description": "Call point to fail. Only the subsystems the scenario soak actually drives are allowed: content_ingress at each content event's admission, thinking/tts on the generative path a semantic miss would take, and asset_store at each hot-asset insertion."
+        },
+        "occurrence": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "One-based call occurrence for this subsystem. The Nth call fails, whatever event index it falls on."
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "timeout",
+            "unavailable",
+            "rate_limited",
+            "disconnect",
+            "corrupted",
+            "incompatible",
+            "flood"
+          ],
+          "description": "Failure mode. The soak degrades the failed step and keeps the deterministic performer advancing; it never freezes."
+        }
+      }
+    }
+  }
+}

@@ -80,6 +80,7 @@ const reactionQualityReview = validators["schemas/reaction-quality-review.schema
 const shadowDivergence = validators["schemas/shadow-divergence-report.schema.json"];
 const moderationEvaluation = validators["schemas/moderation-evaluation.schema.json"];
 const streamScenario = validators["schemas/stream-scenario.schema.json"];
+const faultOverlay = validators["schemas/fault-overlay.schema.json"];
 
 function report(ok, label, validator) {
   if (ok) {
@@ -1139,6 +1140,47 @@ for (const file of listJson("examples/scenarios/invalid")) {
   } else {
     passes += 1;
     console.log(`ok        ${file} (rejected as intended)`);
+  }
+}
+
+// Issue #40/#70: a fault overlay is bound to a scenario identity. The schema
+// holds the shape; these checks hold the binding. An overlay whose subsystem the
+// soak never calls, or whose scenario is not checked in, would be decoration.
+for (const file of listJson("examples/scenarios/fault-overlays")) {
+  if (!faultOverlay) break;
+  const doc = loadJson(join(root, file));
+  const valid = faultOverlay(doc);
+  report(valid, file, faultOverlay);
+  if (!valid) continue;
+
+  const target = scenarioDocuments.find(
+    (entry) =>
+      entry.doc.scenario_id === doc.scenario_id &&
+      entry.doc.scenario_version === doc.scenario_version,
+  );
+  if (!target) {
+    failures += 1;
+    console.error(
+      `FAIL      ${file}: fault overlay targets ${doc.scenario_id} v${doc.scenario_version}, which is not a checked-in scenario; a fault plan must name a workload the suites can run`,
+    );
+    continue;
+  }
+
+  const seen = new Set();
+  let duplicates = 0;
+  for (const fault of doc.faults) {
+    const key = `${fault.subsystem}:${fault.occurrence}`;
+    if (seen.has(key)) {
+      duplicates += 1;
+      console.error(`FAIL      ${file}: duplicate fault ${key}`);
+    }
+    seen.add(key);
+  }
+  if (duplicates > 0) {
+    failures += duplicates;
+  } else {
+    passes += 1;
+    console.log(`ok        ${file}: fault overlay targets ${target.file}`);
   }
 }
 
