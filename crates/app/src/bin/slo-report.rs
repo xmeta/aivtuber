@@ -16,6 +16,13 @@
 //! zero-tolerance invariants this artifact cannot measure. That is the honest
 //! state of #71 today.
 //!
+//! `--probe-latency <indicator-id>=<threshold-ms>` drives the *measurement*
+//! step of latency calibration: it evaluates the objective at a candidate
+//! boundary chosen from those percentiles, so `slo-baseline` can pool the
+//! measured conforming ratio into a valid `BaselineEvidence`. The probe is a
+//! measurement tool and is refused in a targets file — a target still has to
+//! cite pooled measured evidence.
+//!
 //! Usage:
 //! ```text
 //! slo-report <benchmark-report.json> [targets.json] [output.json]
@@ -24,6 +31,7 @@
 //!            [--provenance scenario-replay|replay-fixture|live-session]
 //!            [--plane active|experimental]
 //!            [--rolling-window-hours N] [--persistent-miss-windows N]
+//!            [--probe-latency <indicator>=<threshold-ms>]...
 //!            [--fail-on-breach]
 //! ```
 
@@ -31,14 +39,14 @@
 
 use aivtuber_telemetry::{
     BenchmarkReport, SloError, SloEvaluationConfig, SloProvenance, SloTargets, SloVerdict,
-    TrafficPlane, evaluate,
+    TrafficPlane, catalog, evaluate,
 };
 use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: slo-report <benchmark-report.json> [targets.json] [output.json]\n       or: slo-report --report <benchmark-report.json> [--targets <targets.json>] [--out <output.json>] [--markdown <summary.md>] [--provenance <provenance>] [--plane <plane>] [--rolling-window-hours N] [--persistent-miss-windows N] [--fail-on-breach]";
+const USAGE: &str = "usage: slo-report <benchmark-report.json> [targets.json] [output.json]\n       or: slo-report --report <benchmark-report.json> [--targets <targets.json>] [--out <output.json>] [--markdown <summary.md>] [--provenance <provenance>] [--plane <plane>] [--rolling-window-hours N] [--persistent-miss-windows N] [--probe-latency <indicator>=<threshold-ms>] [--fail-on-breach]";
 
 fn main() -> ExitCode {
     match run() {
@@ -61,10 +69,34 @@ fn run() -> Result<ExitCode, Box<dyn Error>> {
         ))
     })?;
 
-    let targets = match &arguments.targets {
-        Some(path) => SloTargets::from_json(&fs::read(path)?)?,
+    let mut targets = match &arguments.targets {
+        Some(path) => {
+            // A targets *file* is validated strictly: a probe placeholder is a
+            // measurement tool synthesized by --probe-latency, never something
+            // a reviewer writes down as calibration evidence.
+            let file_targets = SloTargets::from_json(&fs::read(path)?)?;
+            file_targets
+                .validate(&catalog())
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            file_targets
+        }
         None => SloTargets::default(),
     };
+    // The probe step: evaluate latency objectives at a candidate boundary so
+    // the measured ratio can be pooled by `slo-baseline`. Probes never come
+    // from a targets file — they are synthesized here and validated as a
+    // measurement tool, not as calibration evidence.
+    for (indicator, threshold_ms) in &arguments.probes {
+        targets.targets.insert(
+            indicator.clone(),
+            aivtuber_telemetry::SloTarget::threshold_probe(*threshold_ms),
+        );
+    }
+    if !arguments.probes.is_empty() {
+        targets
+            .validate_for_evaluation(&catalog())
+            .map_err(|error| format!("--probe-latency: {error}"))?;
+    }
 
     let slo_report = evaluate(&report, &targets, arguments.config)?;
 
@@ -102,6 +134,7 @@ struct Arguments {
     output: Option<PathBuf>,
     markdown: Option<PathBuf>,
     config: SloEvaluationConfig,
+    probes: Vec<(String, u64)>,
     fail_on_breach: bool,
 }
 
@@ -114,6 +147,7 @@ fn parse_args(args: Vec<String>) -> Result<Arguments, Box<dyn Error>> {
     let mut plane: Option<TrafficPlane> = None;
     let mut rolling_window_hours: Option<u32> = None;
     let mut persistent_miss_windows: Option<u64> = None;
+    let mut probes: Vec<(String, u64)> = Vec::new();
     let mut fail_on_breach = false;
     let mut positional: Vec<PathBuf> = Vec::new();
 
@@ -172,6 +206,22 @@ fn parse_args(args: Vec<String>) -> Result<Arguments, Box<dyn Error>> {
                 })?);
                 index += 2;
             }
+            "--probe-latency" => {
+                let raw = next()?.clone();
+                let (indicator, threshold) = raw.split_once('=').ok_or_else(|| {
+                    format!("--probe-latency expects <indicator-id>=<threshold-ms>, got {raw:?}")
+                })?;
+                let threshold_ms: u64 = threshold.parse().map_err(|_| {
+                    format!("--probe-latency expects a positive threshold in ms, got {threshold:?}")
+                })?;
+                if threshold_ms == 0 {
+                    return Err("--probe-latency threshold must be positive, got 0"
+                        .to_owned()
+                        .into());
+                }
+                probes.push((indicator.to_owned(), threshold_ms));
+                index += 2;
+            }
             "--fail-on-breach" => {
                 fail_on_breach = true;
                 index += 1;
@@ -218,6 +268,7 @@ fn parse_args(args: Vec<String>) -> Result<Arguments, Box<dyn Error>> {
             persistent_miss_windows: persistent_miss_windows
                 .unwrap_or(defaults.persistent_miss_windows),
         },
+        probes,
         fail_on_breach,
     })
 }

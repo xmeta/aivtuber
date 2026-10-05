@@ -6,6 +6,24 @@
 //! [`BaselineProposal`] evidence, never a target: the target ratio stays a
 //! product decision made above the measured value.
 //!
+//! Rules enforced here (see `docs/operational-slo.adoc`):
+//!
+//! * every input must belong to one #58 compatibility series
+//!   (`mode + dataset_id + config_version + seed`);
+//! * byte-identical reports count once — a duplicated file is not repeated
+//!   evidence;
+//! * fewer than [`MIN_BASELINE_RUNS`] distinct runs produce no proposals;
+//! * represented stream time is summed exactly (no per-run ceil).
+//!
+//! Latency calibration is a two-step cycle, so the first latency target is
+//! constructible entirely from measured artifacts:
+//!
+//! 1. `slo-report --probe-latency availability.event_to_first_audio_within_target=250`
+//!    over each run, choosing the candidate boundary from the target-free
+//!    percentiles;
+//! 2. `slo-baseline` over the probed reports, which publishes the *measured*
+//!    conforming ratio at that boundary as valid `BaselineEvidence`.
+//!
 //! Usage:
 //! ```text
 //! slo-baseline <slo-report.json>... [--out <proposals.json>] [--markdown <summary.md>]
@@ -16,7 +34,7 @@
 use aivtuber_telemetry::{BaselineProposalSet, SloError, SloReport};
 use std::error::Error;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const USAGE: &str =
@@ -47,10 +65,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let mut history = Vec::with_capacity(reports.len());
     for path in &reports {
-        let report: SloReport = serde_json::from_slice(&fs::read(path)?).map_err(|error| {
-            SloError::new(format!("{} is not an SLO report: {error}", path.display()))
-        })?;
-        history.push(report);
+        history.push(read_report(path)?);
     }
 
     let proposals = BaselineProposalSet::from_reports(&history)?;
@@ -66,7 +81,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn write(path: &PathBuf, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
+fn read_report(path: &Path) -> Result<SloReport, Box<dyn Error>> {
+    serde_json::from_slice(&fs::read(path)?).map_err(|error| {
+        SloError::new(format!("{} is not an SLO report: {error}", path.display())).into()
+    })
+}
+
+fn write(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())

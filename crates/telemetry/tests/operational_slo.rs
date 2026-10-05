@@ -8,11 +8,11 @@
 use aivtuber_domain::InteractionDeadlineClass;
 use aivtuber_telemetry::{
     AttributionSummary, BaselineEvidence, BaselineProposalSet, BenchmarkReport, CacheLevel,
-    ComparisonMode, EventObservation, EvidenceSource, FailureOrigin, MissAttribution,
-    MissAttribution as Attribution, ObjectiveKind, ReproducibilityMetadata, RouteClass,
-    STREAM_HOUR_MS, SloAction, SloError, SloEvaluationConfig, SloIndicatorResult, SloProvenance,
-    SloReport, SloStatus, SloTarget, SloTargets, SloWindow, TrafficPlane, WindowKind,
-    attribution_of, catalog, evaluate,
+    ComparisonMode, EventObservation, EvidenceSource, FailureOrigin, MIN_BASELINE_RUNS,
+    MissAttribution, MissAttribution as Attribution, ObjectiveKind, ReproducibilityMetadata,
+    RouteClass, STREAM_HOUR_MS, SloAction, SloError, SloEvaluationConfig, SloIndicatorResult,
+    SloProvenance, SloReport, SloStatus, SloTarget, SloTargets, SloWindow, TrafficPlane,
+    WindowKind, attribution_of, catalog, evaluate,
 };
 
 const CALIBRATION_SOURCE: &str = "04-full-generative.json (dataset=slo-fixture, commit=deadbeef)";
@@ -669,15 +669,9 @@ fn detection_with_latency(count: u64) -> Vec<EventObservation> {
         .collect()
 }
 
-fn silence(count: u64) -> Vec<EventObservation> {
-    (0..count)
-        .map(|_| observation(RouteClass::Silent))
-        .collect()
-}
-
-#[test]
-fn a_baseline_pools_the_session_denominator_across_runs() {
-    // Run A: 20 conforming. Run B: 10 conforming and 10 unintended silences.
+/// Two structurally different runs of the *same* compatibility series: the
+/// smallest history that may produce baseline evidence.
+fn two_run_history() -> (SloReport, SloReport) {
     let run_a = evaluate_default(&report(
         (0..20)
             .map(|_| observation(RouteClass::Deterministic))
@@ -689,10 +683,28 @@ fn a_baseline_pools_the_session_denominator_across_runs() {
         .collect::<Vec<_>>();
     run_b_events.extend(silence(10));
     let run_b = evaluate_default(&report(run_b_events, 2 * STREAM_HOUR_MS));
+    (run_a, run_b)
+}
+
+fn silence(count: u64) -> Vec<EventObservation> {
+    (0..count)
+        .map(|_| observation(RouteClass::Silent))
+        .collect()
+}
+
+#[test]
+fn a_baseline_pools_the_session_denominator_across_runs() {
+    // Run A: 20 conforming. Run B: 10 conforming and 10 unintended silences.
+    let (run_a, run_b) = two_run_history();
 
     let pooled = BaselineProposalSet::from_reports(&[run_a, run_b]).expect("proposal set");
     assert_eq!(pooled.contributing_reports, 2);
     assert_eq!(pooled.revisions, vec!["deadbeef".to_owned()]);
+    assert_eq!(
+        pooled.series.as_deref(),
+        Some("deterministic_semantic|slo-fixture|bench-v1|7"),
+        "the #58 compatibility series is named so the boundary is auditable"
+    );
 
     let presence = pooled
         .proposals
@@ -704,36 +716,159 @@ fn a_baseline_pools_the_session_denominator_across_runs() {
     let baseline = presence.baseline.as_ref().expect("baseline evidence");
     assert!((baseline.value - 0.75).abs() < 1e-9, "{}", baseline.value);
     assert_eq!(baseline.stream_hours, Some(4));
+    // Provenance survives the copy into a target: identities, not counts.
     assert!(baseline.source.contains("slo-baseline"));
+    assert!(baseline.source.contains("datasets=slo-fixture"));
+    assert!(baseline.source.contains("revisions=deadbeef"));
+    assert!(baseline.source.contains("config=bench-v1"));
+    assert!(baseline.source.contains("seed=7"));
+    assert!(baseline.source.contains("mode=deterministic_semantic"));
+    assert!(
+        baseline
+            .source
+            .contains("series=deterministic_semantic|slo-fixture|bench-v1|7")
+    );
 }
 
 #[test]
 fn a_pooled_baseline_can_justify_a_target_without_being_invented() {
-    let run = evaluate_default(&report(
-        (0..20)
-            .map(|_| observation(RouteClass::Deterministic))
-            .collect(),
-        STREAM_HOUR_MS,
-    ));
-    let pooled = BaselineProposalSet::from_reports(&[run]).expect("proposal set");
+    let (run_a, run_b) = two_run_history();
+    let pooled = BaselineProposalSet::from_reports(&[run_a, run_b]).expect("proposal set");
     let baseline = pooled
         .proposals
         .get("availability.speech_presence_rate")
         .and_then(|proposal| proposal.baseline.clone())
         .expect("measured baseline");
 
-    // The measured value is 1.0, but the product decision is a *lower* target
+    // The measured value is 0.75, but the product decision is a *higher* target
     // the runtime must keep holding; the proposal only supplies the evidence.
     let file = targets(&[(
         "availability.speech_presence_rate",
         SloTarget {
-            target: 0.95,
+            target: 0.7,
             threshold_ms: None,
             baseline,
         },
     )]);
     file.validate(&catalog())
         .expect("a measured baseline is exactly what a target must cite");
+}
+
+#[test]
+fn a_single_run_calibrates_nothing() {
+    let (run_a, _) = two_run_history();
+    let pooled = BaselineProposalSet::from_reports(&[run_a]).expect("proposal set");
+    assert_eq!(pooled.contributing_reports, 1);
+    assert!(
+        pooled.proposals.is_empty(),
+        "one run is a data point, not a baseline: {:?}",
+        pooled.proposals
+    );
+    assert!(
+        pooled
+            .limitations
+            .iter()
+            .any(|limitation| limitation.contains("at least 2"))
+    );
+}
+
+#[test]
+fn a_duplicated_report_is_one_run_not_repeated_evidence() {
+    let (run_a, _) = two_run_history();
+    let pooled = BaselineProposalSet::from_reports(&[run_a.clone(), run_a.clone(), run_a])
+        .expect("proposal set");
+    assert_eq!(pooled.reports, 3);
+    assert_eq!(pooled.contributing_reports, 1);
+    assert_eq!(pooled.duplicate_reports, 2);
+    assert!(
+        pooled.proposals.is_empty(),
+        "a file passed three times is still one run"
+    );
+}
+
+#[test]
+fn a_history_spanning_two_compatibility_series_is_refused() {
+    // Each boundary field of the #58 series key restarts the series.
+    let mut broken_on_config = run_a().clone();
+    broken_on_config.source.config_version = "bench-v2".to_owned();
+    let error = BaselineProposalSet::from_reports(&[run_a(), broken_on_config])
+        .expect_err("different config_version is a #58 series boundary");
+    assert!(
+        error
+            .to_string()
+            .contains("more than one compatibility series"),
+        "{error}"
+    );
+
+    let mut broken_on_seed = run_a().clone();
+    broken_on_seed.source.seed = 8;
+    assert!(
+        BaselineProposalSet::from_reports(&[run_a(), broken_on_seed]).is_err(),
+        "a different seed is also a series boundary"
+    );
+
+    let mut broken_on_dataset = run_a().clone();
+    broken_on_dataset.source.dataset_id = "other-dataset".to_owned();
+    assert!(
+        BaselineProposalSet::from_reports(&[run_a(), broken_on_dataset]).is_err(),
+        "a different dataset is also a series boundary"
+    );
+
+    let mut broken_on_mode = run_a().clone();
+    broken_on_mode.source.mode = ComparisonMode::DeterministicOnly;
+    assert!(
+        BaselineProposalSet::from_reports(&[run_a(), broken_on_mode]).is_err(),
+        "a different mode is also a series boundary"
+    );
+}
+
+/// One fresh active run per call, so a test never pools the same value twice.
+fn run_a() -> SloReport {
+    let (run, _) = two_run_history();
+    run
+}
+
+#[test]
+fn a_report_for_another_schema_version_fails_closed() {
+    let (run_a, _) = two_run_history();
+    let mut future = run_a;
+    future.schema_version = "future-schema-v999".to_owned();
+    let error = BaselineProposalSet::from_reports(&[future])
+        .expect_err("a foreign report contract must not pool");
+    assert!(error.to_string().contains("fails closed"), "{error}");
+}
+
+#[test]
+fn sub_hour_evidence_omits_stream_hours_instead_of_claiming_one() {
+    let run_a = evaluate_default(&report(
+        (0..20)
+            .map(|_| observation(RouteClass::Deterministic))
+            .collect(),
+        2_000,
+    ));
+    let run_b = evaluate_default(&report(silence(20), 2_000));
+    let pooled = BaselineProposalSet::from_reports(&[run_a, run_b]).expect("proposal set");
+    let baseline = pooled
+        .proposals
+        .get("availability.speech_presence_rate")
+        .and_then(|proposal| proposal.baseline.clone())
+        .expect("baseline");
+    assert_eq!(
+        baseline.stream_hours, None,
+        "4 seconds of represented time is not one stream hour"
+    );
+    assert!(
+        pooled
+            .limitations
+            .iter()
+            .any(|limitation| limitation.contains("less than one full stream hour"))
+    );
+}
+
+#[test]
+fn the_minimum_run_floor_is_two_and_exported() {
+    assert_eq!(MIN_BASELINE_RUNS, 2);
+    const { assert!(MIN_BASELINE_RUNS > 1, "one run must never calibrate") };
 }
 
 #[test]
@@ -748,9 +883,12 @@ fn an_experimental_report_does_not_move_the_active_baseline() {
         },
     )
     .expect("SLO report");
+    // A second active run, because one run calibrates nothing by itself.
+    let active_b = evaluate_default(&report(silence(20), STREAM_HOUR_MS));
 
-    let pooled = BaselineProposalSet::from_reports(&[active, experimental]).expect("proposal set");
-    assert_eq!(pooled.contributing_reports, 1);
+    let pooled =
+        BaselineProposalSet::from_reports(&[active, active_b, experimental]).expect("proposal set");
+    assert_eq!(pooled.contributing_reports, 2);
     assert_eq!(pooled.excluded_experimental_reports, 1);
     let presence = pooled
         .proposals
@@ -758,8 +896,8 @@ fn an_experimental_report_does_not_move_the_active_baseline() {
         .expect("presence proposal");
     assert_eq!(
         presence.eligible,
-        Some(20),
-        "the shadow run must not be pooled"
+        Some(40),
+        "the shadow run must not be pooled: only the two active runs count"
     );
     assert!(
         pooled
@@ -780,8 +918,11 @@ fn a_history_of_mixed_catalog_versions_is_refused() {
 
 #[test]
 fn a_latency_objective_publishes_percentiles_and_never_a_zero_ratio() {
-    let run = evaluate_default(&report(detection_with_latency(40), STREAM_HOUR_MS));
-    let pooled = BaselineProposalSet::from_reports(&[run]).expect("proposal set");
+    let latency_run_a = evaluate_default(&report(detection_with_latency(40), STREAM_HOUR_MS));
+    let (_, run_b) = two_run_history();
+    // Same series (same dataset/config/seed/mode) — run_b varies in content but
+    // the metadata helper keeps the series identical, so pool them together.
+    let pooled = BaselineProposalSet::from_reports(&[latency_run_a, run_b]).expect("proposal set");
 
     let audio = pooled
         .proposals
@@ -789,7 +930,7 @@ fn a_latency_objective_publishes_percentiles_and_never_a_zero_ratio() {
         .expect("latency proposal");
     assert!(
         audio.baseline.is_none(),
-        "a latency ratio depends on a threshold that does not exist yet"
+        "without a probe boundary there is no measured latency ratio"
     );
     let latency = audio.latency.as_ref().expect("percentiles");
     assert_eq!(latency.samples, 40);
@@ -798,9 +939,101 @@ fn a_latency_objective_publishes_percentiles_and_never_a_zero_ratio() {
 }
 
 #[test]
+fn the_first_latency_target_is_constructible_from_measured_artifacts_alone() {
+    // The calibration cycle: percentiles -> candidate boundary -> measured
+    // conforming ratio -> valid target. Every step is measured; nothing is
+    // invented.
+    let run_a = evaluate_default(&report(detection_with_latency(40), STREAM_HOUR_MS));
+    let run_b = evaluate_default(&report(detection_with_latency(40), STREAM_HOUR_MS + 1_000));
+    let pooled = BaselineProposalSet::from_reports(&[run_a, run_b]).expect("proposal set");
+
+    let audio = pooled
+        .proposals
+        .get("availability.event_to_first_audio_within_target")
+        .expect("latency proposal");
+    let latency = audio.latency.as_ref().expect("target-free percentiles");
+    // 1. A candidate boundary is chosen *from* the measured percentiles.
+    let threshold_ms = latency.p95_ms;
+
+    // 2. The boundary is *measured* over the same history via the probe.
+    let probe = SloTarget::threshold_probe(threshold_ms);
+    let measured_a = evaluate(
+        &BenchmarkReport::from_events(
+            metadata("slo-fixture", STREAM_HOUR_MS),
+            ComparisonMode::DeterministicSemantic,
+            detection_with_latency(40),
+        )
+        .expect("benchmark report"),
+        &targets(&[(
+            "availability.event_to_first_audio_within_target",
+            probe.clone(),
+        )]),
+        SloEvaluationConfig::default(),
+    )
+    .expect("probed SLO report");
+    let measured_b = evaluate(
+        &BenchmarkReport::from_events(
+            metadata("slo-fixture", STREAM_HOUR_MS + 1_000),
+            ComparisonMode::DeterministicSemantic,
+            detection_with_latency(40),
+        )
+        .expect("benchmark report"),
+        &targets(&[("availability.event_to_first_audio_within_target", probe)]),
+        SloEvaluationConfig::default(),
+    )
+    .expect("probed SLO report");
+    let probed = BaselineProposalSet::from_reports(&[measured_a, measured_b]).expect("probed set");
+
+    // 3. The probe result now carries a measured ratio at that boundary.
+    let probed_audio = probed
+        .proposals
+        .get("availability.event_to_first_audio_within_target")
+        .expect("probed proposal");
+    assert_eq!(probed_audio.threshold_ms, Some(threshold_ms));
+    assert_eq!(probed_audio.runs, 2);
+    let baseline = probed_audio.baseline.clone().expect("measured ratio");
+    assert!((0.0..=1.0).contains(&baseline.value));
+    assert!(baseline.source.contains("probe"), "{}", baseline.source);
+
+    // 4. A target calibrated with that measured evidence is valid. This is the
+    // step that was impossible before: no invented number anywhere.
+    let file = targets(&[(
+        "availability.event_to_first_audio_within_target",
+        SloTarget {
+            target: 0.9,
+            threshold_ms: Some(threshold_ms),
+            baseline: baseline.clone(),
+        },
+    )]);
+    file.validate(&catalog())
+        .expect("the first latency target must be constructible from measurements");
+}
+
+#[test]
+fn a_probe_target_is_never_valid_calibration_evidence() {
+    // The probe carries an unmeasured placeholder baseline; the validator must
+    // never accept it in a targets file, so a probed ratio cannot be skipped.
+    let file = targets(&[(
+        "availability.event_to_first_audio_within_target",
+        SloTarget::threshold_probe(250),
+    )]);
+    let error = file
+        .validate(&catalog())
+        .expect_err("a probe is not calibration evidence");
+    assert!(
+        error.to_string().contains("latency probe"),
+        "the probe's placeholder source is refused: {error}"
+    );
+    // But the evaluation path may use it: that is how the boundary is measured.
+    file.validate_for_evaluation(&catalog())
+        .expect("a probe drives the measuring evaluation");
+}
+
+#[test]
 fn no_evidence_in_the_history_leaves_an_objective_not_measured() {
-    let run = evaluate_default(&report(silence(5), 60_000));
-    let pooled = BaselineProposalSet::from_reports(&[run]).expect("proposal set");
+    let run_a = evaluate_default(&report(silence(5), 60_000));
+    let run_b = evaluate_default(&report(silence(6), 60_000));
+    let pooled = BaselineProposalSet::from_reports(&[run_a, run_b]).expect("proposal set");
 
     assert!(
         pooled
@@ -817,14 +1050,12 @@ fn no_evidence_in_the_history_leaves_an_objective_not_measured() {
 
 #[test]
 fn a_baseline_proposal_set_round_trips_through_json() {
-    let run = evaluate_default(&report(detection_with_latency(20), STREAM_HOUR_MS));
-    let pooled = BaselineProposalSet::from_reports(&[run]).expect("proposal set");
+    let (run_a, run_b) = two_run_history();
+    let pooled = BaselineProposalSet::from_reports(&[run_a, run_b]).expect("proposal set");
     let bytes = pooled.to_json_pretty().expect("json");
     let parsed: BaselineProposalSet = serde_json::from_slice(&bytes).expect("round trip");
     assert_eq!(parsed, pooled);
-    assert!(
-        pooled
-            .markdown_summary()
-            .contains("measured evidence, not a target")
-    );
+    let summary = pooled.markdown_summary();
+    assert!(summary.contains("measured evidence, not a target"));
+    assert!(summary.contains("Series:"), "series is shown for audit");
 }
