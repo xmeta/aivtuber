@@ -6,7 +6,14 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { __testables as benchmark } from "../scripts/benchmark-record.mjs";
-import { reportPathOf, requireRecordable, runFileStem, seriesKeyOf } from "../scripts/slo-record.mjs";
+import {
+  contractSegmentsOf,
+  reportPathOf,
+  requireRecordable,
+  runFileStem,
+  seriesKeyOf,
+  versionFileStem,
+} from "../scripts/slo-record.mjs";
 
 const script = join(dirname(fileURLToPath(import.meta.url)), "..", "scripts", "slo-record.mjs");
 
@@ -65,12 +72,12 @@ describe("slo-record series identity", () => {
 });
 
 describe("slo-record paths", () => {
-  test("one path per series and run identity", () => {
+  test("one path per contract, series, and run identity", () => {
     const path = reportPathOf(sloReport());
     expect(path).toBe(reportPathOf(sloReport({ git_commit: "cafebabe" })));
-    expect(path.startsWith("reports/")).toBe(true);
+    expect(path.startsWith("reports/1/slo-catalog-v1/")).toBe(true);
     expect(path.endsWith(".json")).toBe(true);
-    // A different run id in the same series is a different artifact.
+    // A different run id in the same partition is a different artifact.
     expect(reportPathOf(sloReport({ run_id: "run-1002" }))).not.toBe(path);
   });
 
@@ -81,6 +88,56 @@ describe("slo-record paths", () => {
     expect(runFileStem("run-1001")).not.toBe(stem);
     // Sanitizing two distinct ids to one slug must not collapse them.
     expect(runFileStem("run/a")).not.toBe(runFileStem("run-a"));
+  });
+
+  test("version segments stay readable, and never become a path traversal", () => {
+    expect(versionFileStem("1")).toBe("1");
+    expect(versionFileStem("slo-catalog-v1")).toBe("slo-catalog-v1");
+    // A document-declared version must not escape the history worktree.
+    for (const hostile of ["..", ".", "../../etc", "a/b", "x".repeat(200)]) {
+      const stem = versionFileStem(hostile);
+      expect(stem).not.toBe("..");
+      expect(stem).not.toBe(".");
+      expect(stem).not.toContain("/");
+      expect(stem).not.toContain("\\");
+    }
+    // Distinct versions that sanitize to one slug must not collapse.
+    expect(versionFileStem("a/b")).not.toBe(versionFileStem("a-b"));
+  });
+});
+
+describe("slo-record partitions the history by SLO contract", () => {
+  test("the contract segments are the two versions slo-baseline refuses to pool", () => {
+    expect(contractSegmentsOf(sloReport())).toEqual({
+      schema: "1",
+      catalog: "slo-catalog-v1",
+    });
+  });
+
+  // A catalog or schema bump is a normal, contractually-required evolution.
+  // If it did not move the document to a new partition, the documented
+  // per-directory wildcard retrieval would become permanently unpoolable.
+  test("same #58 series, different catalog version, lands in distinct partitions", () => {
+    const v1 = sloReport();
+    const v2 = sloReport({}, { catalog_version: "slo-catalog-v2" });
+    const pathV1 = reportPathOf(v1);
+    const pathV2 = reportPathOf(v2);
+
+    expect(pathV1).not.toBe(pathV2);
+    // The #58 workload series is identical: it is the SLO contract that
+    // splits, not the workload boundary.
+    expect(seriesKeyOf(v1)).toBe(seriesKeyOf(v2));
+    expect(pathV1.split("/").at(-2)).toBe(pathV2.split("/").at(-2));
+    expect(pathV1).toContain("/1/slo-catalog-v1/");
+    expect(pathV2).toContain("/1/slo-catalog-v2/");
+  });
+
+  test("same #58 series, different report schema, lands in distinct partitions", () => {
+    const v1 = sloReport();
+    const v2 = sloReport({}, { schema_version: "2" });
+    expect(seriesKeyOf(v1)).toBe(seriesKeyOf(v2));
+    expect(reportPathOf(v1)).not.toBe(reportPathOf(v2));
+    expect(reportPathOf(v2)).toContain("/2/slo-catalog-v1/");
   });
 });
 
@@ -134,19 +191,35 @@ describe("slo-record persists a retrievable history", () => {
     });
   }
 
-  test("records, replaces a re-run idempotently, and accumulates distinct runs", () => {
-    const root = mkdtempSync(join(tmpdir(), "slo-record-"));
-    try {
-      git(["init", "--quiet", "--initial-branch=main"], root);
-      git(["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "--quiet", "--allow-empty", "-m", "init"], root);
-      const origin = join(root, "origin.git");
-      git(["init", "--bare", "--quiet", origin], root);
-      git(["remote", "add", "origin", origin], root);
+  /// A throwaway repo plus a bare `origin`, i.e. the shape the trusted
+  /// push-to-main job sees.
+  function scratchRepo(label) {
+    const root = mkdtempSync(join(tmpdir(), `slo-record-${label}-`));
+    git(["init", "--quiet", "--initial-branch=main"], root);
+    git(
+      ["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "--quiet", "--allow-empty", "-m", "init"],
+      root,
+    );
+    const origin = join(root, "origin.git");
+    git(["init", "--bare", "--quiet", origin], root);
+    git(["remote", "add", "origin", origin], root);
+    return { root, origin };
+  }
 
+  /// Write a report document into the scratch repo's input directory.
+  function inputFile(root, name, report) {
+    const dir = join(root, "in");
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, name);
+    writeFileSync(path, `${JSON.stringify(report, null, 2)}\n`);
+    return path;
+  }
+
+  test("records, replaces a re-run idempotently, and accumulates distinct runs", () => {
+    const { root, origin } = scratchRepo("history");
+    try {
       const inputDir = join(root, "in");
-      mkdirSync(inputDir, { recursive: true });
-      const first = join(inputDir, "run-1001.json");
-      writeFileSync(first, `${JSON.stringify(sloReport(), null, 2)}\n`);
+      const first = inputFile(root, "run-1001.json", sloReport());
 
       record(root, [first]);
       git(["push", "--quiet", "origin", "slo-data"], root);
@@ -186,17 +259,50 @@ describe("slo-record persists a retrievable history", () => {
     }
   });
 
-  test("an unrecordable input fails closed and writes nothing", () => {
-    const root = mkdtempSync(join(tmpdir(), "slo-record-refuse-"));
+  // The reported defect: a catalog bump is a normal, contractually-required
+  // evolution. Sharing one series directory with the old contract made the
+  // documented per-directory wildcard retrieval permanently unpoolable.
+  test("a catalog bump partitions the history instead of poisoning the series", () => {
+    const { root, origin } = scratchRepo("bump");
     try {
-      git(["init", "--quiet", "--initial-branch=main"], root);
-      git(["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "--quiet", "--allow-empty", "-m", "init"], root);
-      const origin = join(root, "origin.git");
-      git(["init", "--bare", "--quiet", origin], root);
-      git(["remote", "add", "origin", origin], root);
+      const old = inputFile(root, "run-1001.json", sloReport());
+      const bumped = inputFile(
+        root,
+        "run-1002.json",
+        sloReport({ run_id: "run-1002" }, { catalog_version: "slo-catalog-v2" }),
+      );
+      record(root, [old, bumped]);
+      git(["push", "--quiet", "origin", "slo-data"], root);
 
-      const input = join(root, "anonymous.json");
-      writeFileSync(input, JSON.stringify(sloReport({ run_id: undefined })));
+      const files = git(["ls-tree", "-r", "--name-only", "slo-data", "reports"], origin)
+        .split("\n")
+        .filter(Boolean);
+      expect(files).toHaveLength(2);
+      expect(files).toContain(reportPathOf(sloReport()));
+      expect(files).toContain(reportPathOf(sloReport({ run_id: "run-1002" }, { catalog_version: "slo-catalog-v2" })));
+
+      // Each leaf directory holds exactly one contract, which is the property
+      // `slo-baseline` needs: the wildcard over one of them pools cleanly, and
+      // the old history stays retrievable under its own partition.
+      const leafOf = (path) => path.split("/").slice(0, -1).join("/");
+      const leaves = new Set(files.map(leafOf));
+      expect(leaves.size).toBe(2);
+      for (const leaf of leaves) {
+        expect(files.filter((file) => leafOf(file) === leaf)).toHaveLength(1);
+      }
+      // Same #58 workload series on both sides; only the contract moved them.
+      expect(leafOf(reportPathOf(sloReport())).split("/").at(-1)).toBe(
+        leafOf(reportPathOf(sloReport({}, { catalog_version: "slo-catalog-v2" }))).split("/").at(-1),
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("an unrecordable input fails closed and writes nothing", () => {
+    const { root } = scratchRepo("refuse");
+    try {
+      const input = inputFile(root, "anonymous.json", sloReport({ run_id: undefined }));
 
       let status = 0;
       let stderr = "";

@@ -14,14 +14,23 @@
 // Usage:
 //   bun scripts/slo-record.mjs --files <slo-report.json>... [--root <dir>]
 //
-// Layout on the branch — one document per logical run, grouped by the #58
-// compatibility series:
-//   reports/<series>/<run>.json
+// Layout on the branch — one document per logical run, partitioned by the SLO
+// contract it was written for and then by the #58 compatibility series:
+//   reports/<schema-version>/<catalog-version>/<series>/<run>.json
 //
-// `<series>` encodes the same compatibility boundary the benchmark history
-// uses (mode + dataset_id + config_version + seed), through the *same* helper,
-// so the two histories cannot disagree about what a series is. `<run>` is
-// derived from the report's `source.run_id`.
+// Two compatibility boundaries, both enforced rather than assumed:
+//   - `<schema-version>` / `<catalog-version>` are the SLO report contract.
+//     `slo-baseline` fails closed on a history that spans two, because
+//     indicator definitions from two contracts are not poolable. Partitioning
+//     here is what lets an intentional catalog bump accumulate new calibration
+//     history without making the existing one unretrievable, and keeps the
+//     documented per-directory wildcard pooling to a single contract.
+//   - `<series>` encodes the same #58 compatibility boundary the benchmark
+//     history uses (mode + dataset_id + config_version + seed), through the
+//     *same* helper, so the two histories cannot disagree about what a series
+//     is.
+//
+// `<run>` is derived from the report's `source.run_id`.
 //
 // Identity, mirroring #58's `recording.run_id`:
 //   - re-recording a run id REPLACES that run's artifact, so a re-run of one
@@ -92,11 +101,44 @@ export function runFileStem(runId) {
   return `${slug}-${stableHash(String(runId))}`;
 }
 
+/// Filesystem-safe, collision-free segment for a contract version.
+///
+/// A well-formed short version (`1`, `slo-catalog-v1`) is used verbatim, so the
+/// partition stays readable to whoever retrieves the history by hand. Anything
+/// else is slugified and given the same stable hash suffix the series stem
+/// uses, so two distinct versions can never collapse onto one directory.
+///
+/// The verbatim path requires a leading alphanumeric or `_`, which keeps a
+/// document-declared version from ever becoming a `.` or `..` path segment and
+/// walking the write out of the history worktree.
+export function versionFileStem(version) {
+  const raw = String(version).trim();
+  if (/^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,63}$/.test(raw)) {
+    return raw;
+  }
+  const slug =
+    raw.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "version";
+  return `${slug}-${stableHash(raw)}`;
+}
+
+/// The SLO contract a report was written for: the two fields
+/// `BaselineProposalSet::from_reports` refuses to pool across. Partitioning the
+/// history on them is what makes the documented per-directory retrieval stay
+/// valid across an intentional catalog or schema bump.
+export function contractSegmentsOf(report) {
+  return {
+    schema: versionFileStem(report?.schema_version),
+    catalog: versionFileStem(report?.catalog_version),
+  };
+}
+
 /// The single path a report occupies on the history branch. One path per
-/// (series, run identity) is the whole point: it is what makes a re-record
-/// idempotent and leaves `slo-baseline` nothing to disambiguate.
+/// (contract, series, run identity) is the whole point: it makes a re-record
+/// idempotent, leaves `slo-baseline` nothing to disambiguate, and keeps every
+/// directory poolable to exactly one contract.
 export function reportPathOf(report) {
-  return `reports/${seriesFileStem(seriesKeyOf(report))}/${runFileStem(runIdOf(report))}.json`;
+  const contract = contractSegmentsOf(report);
+  return `reports/${contract.schema}/${contract.catalog}/${seriesFileStem(seriesKeyOf(report))}/${runFileStem(runIdOf(report))}.json`;
 }
 
 export function runIdOf(report) {
@@ -188,12 +230,20 @@ const README = [
   "",
   "## Layout",
   "",
-  "- `reports/<series>/<run>.json` — one `slo-report` document per logical run.",
-  "  `<series>` encodes the #58 compatibility boundary",
-  "  (`mode + dataset_id + config_version + seed`) through the same helper the",
-  "  `benchmark-data` history uses, and `<run>` is derived from the report's",
-  "  `source.run_id`. Re-recording a run id replaces that run's artifact, so a",
-  "  re-run of one workflow run is idempotent while distinct runs accumulate.",
+  "- `reports/<schema-version>/<catalog-version>/<series>/<run>.json` — one",
+  "  `slo-report` document per logical run. Two compatibility boundaries",
+  "  are partitioned here:",
+  "  - `<schema-version>` and `<catalog-version>` are the SLO report contract.",
+  "    `slo-baseline` fails closed on a history that spans two, so one",
+  "    directory holds exactly one contract. An intentional catalog bump",
+  "    therefore starts a new partition instead of making this one",
+  "    unretrievable, and the old history stays auditable.",
+  "  - `<series>` encodes the #58 compatibility boundary",
+  "    (`mode + dataset_id + config_version + seed`) through the same helper",
+  "    the `benchmark-data` history uses.",
+  "- `<run>` is derived from the report's `source.run_id`. Re-recording a run",
+  "  id replaces that run's artifact, so a re-run of one workflow run is",
+  "  idempotent while distinct runs accumulate.",
   "",
   "## Retrieval",
   "",
@@ -201,15 +251,14 @@ const README = [
   "git fetch origin slo-data",
   "git worktree add target/slo-history origin/slo-data",
   "cargo run --locked -p aivtuber-app --bin slo-baseline -- \\",
-  "  target/slo-history/reports/<series>/*.json \\",
+  "  target/slo-history/reports/<schema>/<catalog>/<series>/*.json \\",
   "  --out target/aivtuber-slo/baseline-proposal.json",
   "```",
   "",
-  "Pool one `reports/<series>/` directory at a time: a baseline is only valid",
-  "within one compatibility series, and `slo-baseline` refuses a history that",
-  "spans two.",
-  "",
-].join("\n");
+  "Pool one leaf directory at a time: it is exactly one report contract in",
+  "exactly one compatibility series, which is the history `slo-baseline` will",
+  "accept.",
+  "",].join("\n");
 
 function main() {
   const { files, root: rootArg } = parseArgs(process.argv.slice(2));

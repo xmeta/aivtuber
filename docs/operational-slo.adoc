@@ -454,7 +454,7 @@ it after the fact. Both histories are written from the same measured run and
 keyed on the same compatibility series, which is what makes the trend history
 and the calibration history comparable.
 
-Retrieve it the way any branch is retrieved, then pool one series directory:
+Retrieve it the way any branch is retrieved, then pool one leaf directory:
 
 [source,shell]
 ----
@@ -462,13 +462,20 @@ git fetch origin slo-data
 git worktree add target/slo-history origin/slo-data
 
 cargo run --locked -p aivtuber-app --bin slo-baseline -- \
-  target/slo-history/reports/<series>/*.json \
+  target/slo-history/reports/<schema>/<catalog>/<series>/*.json \
   --out target/aivtuber-slo/baseline-proposal.json
 ----
 
-On the branch, one document lives at `reports/<series>/<run>.json`. Pool one
-`<series>` directory at a time: the directory *is* the compatibility boundary,
-and `slo-baseline` refuses a history that spans two.
+On the branch, one document lives at
+`reports/<schema-version>/<catalog-version>/<series>/<run>.json`. There are two
+partition boundaries, and both are ones `slo-baseline` refuses to pool across:
+the SLO report contract (`schema_version` and `catalog_version`) and the #58
+workload series. Pool one leaf directory at a time — it is exactly one contract
+in exactly one series, which is the only history the selector accepts.
+
+Bumping the catalog therefore starts a new partition rather than poisoning the
+existing one: new calibration history accumulates alongside the old, and the
+old history stays auditable under the contract it was measured against.
 
 === The latency calibration cycle
 
