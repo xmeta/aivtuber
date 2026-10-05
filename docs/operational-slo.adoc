@@ -417,9 +417,19 @@ assumed:
   pools exactly one artifact per run identity instead. Fewer than two distinct
   runs (`MIN_BASELINE_RUNS`) produce no proposals at all — one run calibrates
   nothing.
-* **Exact time.** Represented stream time is summed exactly; a partial hour
-  never rounds up to one. Two-second runs are two seconds of evidence, and
-  sub-hour histories omit `stream_hours` rather than claiming a full hour.
+* **Provenance per indicator, not per history.** A run with an empty
+  denominator for one indicator contributed no evidence for *that* indicator, so
+  the `series`/`runs` manifest and the `stream_hours` coverage attached to an
+  indicator's baseline name exactly the runs that produced eligible observations
+  for it. An indicator pooled from fewer than `MIN_BASELINE_RUNS` contributing
+  runs publishes no target-ready baseline at all, however many runs the history
+  contains — the same rule applies to a probed latency boundary, where only runs
+  that had eligible samples at the candidate count. Naming the whole history
+  there would let one measured run satisfy the repeated-run floor.
+* **Exact time.** Represented time is summed exactly over an indicator's
+  contributing runs; a partial hour never rounds up to one. Two-second runs are
+  two seconds of evidence, and sub-hour evidence omits `stream_hours` rather
+  than claiming a full hour.
 * **Active plane only.** An experimental report is excluded, exactly as it is
   excluded from the active SLO.
 * **One report contract.** A `schema_version` or catalog version this build
@@ -501,6 +511,9 @@ The procedure is deliberately boring:
 The `baseline` block in a target entry is copied from an `slo-baseline`
 proposal rather than written by hand, and the target ratio is a product
 decision made *above* the measured value — the proposal never prescribes it.
+An indicator the history measured too thinly has no `baseline` block to copy at
+all; `slo-baseline` names it in `limitations` instead of publishing a value
+that one run happened to measure.
 Validation enforces this rather than trusting it: a calibrated target whose
 `baseline` names no compatibility `series`, fewer than `MIN_BASELINE_RUNS`
 contributing runs, a run without a revision, or the same run identity twice is

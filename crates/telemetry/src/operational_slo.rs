@@ -1573,6 +1573,35 @@ struct LatencyPool {
     max_ms: u64,
 }
 
+/// Internal accumulator for one indicator's pooled denominators plus the
+/// provenance of exactly the runs that produced them.
+///
+/// Provenance is tracked per indicator, not per history: a run with an empty
+/// denominator for an indicator contributed no evidence for it, so listing it
+/// would let one measured run satisfy the repeated-run floor.
+#[derive(Default)]
+struct RatioPool {
+    runs: u64,
+    eligible: u64,
+    conforming: u64,
+    contributors: Vec<BaselineRun>,
+    represented_ms: u64,
+    without_duration: u64,
+}
+
+impl RatioPool {
+    fn add(&mut self, run: BaselineRun, stream_duration_ms: Option<u64>, row: &SloIndicatorResult) {
+        self.runs += 1;
+        self.eligible = self.eligible.saturating_add(row.eligible);
+        self.conforming = self.conforming.saturating_add(row.conforming);
+        match stream_duration_ms {
+            Some(ms) => self.represented_ms = self.represented_ms.saturating_add(ms),
+            None => self.without_duration += 1,
+        }
+        self.contributors.push(run);
+    }
+}
+
 /// Calibration evidence pooled from a history of SLO reports (#58 history).
 ///
 /// This is the missing link the issue names: repeated measured runs, not a
@@ -1633,9 +1662,20 @@ impl BaselineProposalSet {
     ///   names the run but not which attempt is newer, and argument order is not
     ///   provenance. Fewer than [`MIN_BASELINE_RUNS`] distinct runs produce no
     ///   proposals at all, since one run calibrates nothing.
-    /// * **Exact time.** Represented stream time is summed exactly; a partial
-    ///   hour never rounds up to one. Sub-hour evidence omits `stream_hours`
-    ///   instead of claiming an hour it did not stand for.
+    /// * **Provenance per indicator, not per history.** A run whose denominator
+    ///   is empty for one indicator contributed no evidence for it, so the
+    ///   manifest and the coverage attached to that indicator's evidence name
+    ///   exactly the runs that produced eligible observations for *it*. An
+    ///   indicator pooled from fewer than [`MIN_BASELINE_RUNS`] such runs
+    ///   publishes no [`BaselineEvidence`] at all, however many runs the
+    ///   history contains — including a probed latency boundary, where only
+    ///   runs with eligible samples at the candidate count. Publishing the
+    ///   whole history's manifest there would let one measured run satisfy the
+    ///   repeated-run floor the evidence exists to enforce.
+    /// * **Exact time.** Represented time is summed exactly over an
+    ///   indicator's contributing runs; a partial hour never rounds up to one.
+    ///   Sub-hour evidence omits `stream_hours` instead of claiming an hour it
+    ///   did not stand for.
     ///
     /// Only `active`-plane reports contribute: an experimental route must not
     /// move the active baseline any more than it may move the active SLO.
@@ -1840,8 +1880,8 @@ impl BaselineProposalSet {
         let mut represented_ms = 0_u64;
         let mut reports_without_duration = 0_u64;
 
-        // indicator -> (runs, eligible, conforming)
-        let mut pools: BTreeMap<&str, (u64, u64, u64)> = BTreeMap::new();
+        // indicator -> pooled denominators and the runs that produced them
+        let mut pools: BTreeMap<&str, RatioPool> = BTreeMap::new();
         // (indicator, field) -> pooled percentile evidence
         let mut latency: BTreeMap<(&str, &str), LatencyPool> = BTreeMap::new();
         // Latency indicator -> the single candidate boundary every contributing
@@ -1859,6 +1899,17 @@ impl BaselineProposalSet {
                 Some(ms) => represented_ms = represented_ms.saturating_add(ms),
                 None => reports_without_duration += 1,
             }
+            // The identity of the run this row came from, so evidence can be
+            // attributed to the run that actually produced it.
+            let contributor = BaselineRun {
+                run_id: report
+                    .source
+                    .run_id
+                    .clone()
+                    .expect("every report's run identity was required above"),
+                git_commit: report.source.git_commit.clone(),
+            };
+            let stream_duration_ms = report.source.stream_duration_ms;
 
             for row in report
                 .indicators
@@ -1890,20 +1941,22 @@ impl BaselineProposalSet {
                                 latency_thresholds.insert(row.id.as_str(), threshold_ms);
                             }
                         }
-                        let pool = pools.entry(row.id.as_str()).or_insert((0, 0, 0));
-                        pool.0 += 1;
-                        pool.1 += row.eligible;
-                        pool.2 += row.conforming;
+                        pools.entry(row.id.as_str()).or_default().add(
+                            contributor.clone(),
+                            stream_duration_ms,
+                            row,
+                        );
                     }
                     continue;
                 }
                 if row.eligible == 0 {
                     continue;
                 }
-                let pool = pools.entry(row.id.as_str()).or_insert((0, 0, 0));
-                pool.0 += 1;
-                pool.1 += row.eligible;
-                pool.2 += row.conforming;
+                pools.entry(row.id.as_str()).or_default().add(
+                    contributor.clone(),
+                    stream_duration_ms,
+                    row,
+                );
             }
 
             for point in report
@@ -1928,18 +1981,33 @@ impl BaselineProposalSet {
         debug_assert_eq!(config_versions.len(), 1);
         debug_assert_eq!(seeds.len(), 1);
         let series = series.expect("distinct non-empty history has a series");
-        // Provenance that survives the copy into a target entry: the evidence
-        // block is the only durable part, so it must name what was measured —
-        // which runs, over which dataset, revision, and series identity — not
-        // merely how many of them there were. The same identities are also
-        // carried structurally by [`BaselineEvidence::runs`] and
-        // [`BaselineEvidence::series`]; the prose is for a reader.
-        let provenance = |runs: u64, boundary: Option<u64>| {
+        // The evidence one indicator's pool is worth, if it is worth publishing at
+        // all. It names the runs that actually contributed eligible
+        // observations — not the whole history — because that is the set the
+        // value was measured from and the set a reviewer has to be able to
+        // re-measure. The same identities travel structurally in
+        // [`BaselineEvidence::runs`] and [`BaselineEvidence::series`]; the prose
+        // is for a reader. `datasets`/`config`/`mode`/`seed` stay series-wide
+        // because `dataset_id` is part of the series key, so they are singular
+        // for any subset of the contributing runs.
+        let evidence_for = |pool: &RatioPool, boundary: Option<u64>| -> Option<BaselineEvidence> {
+            // One run is a data point. An indicator measured in fewer than
+            // `MIN_BASELINE_RUNS` runs is one, whatever else the history
+            // measured, so it never becomes target-ready evidence.
+            if pool.runs < MIN_BASELINE_RUNS {
+                return None;
+            }
+            let revisions = pool
+                .contributors
+                .iter()
+                .map(|run| run.git_commit.as_str())
+                .collect::<BTreeSet<_>>();
             let mut source = format!(
-                "slo-baseline: {runs} distinct session run(s) [{}]; series={series}; datasets={}; \
+                "slo-baseline: {} distinct session run(s) [{}]; series={series}; datasets={}; \
                  revisions={}; config={}; mode={}; seed={}",
+                pool.runs,
                 // `join_sorted` re-sorts, which is harmless: run ids are unique.
-                join_sorted(run_manifest.iter().map(|run| run.run_id.as_str())),
+                join_sorted(pool.contributors.iter().map(|run| run.run_id.as_str())),
                 join_sorted(datasets.iter()),
                 join_sorted(revisions.iter()),
                 join_sorted(config_versions.iter()),
@@ -1949,31 +2017,34 @@ impl BaselineProposalSet {
             if let Some(threshold_ms) = boundary {
                 source.push_str(&format!("; probe_threshold_ms={threshold_ms}"));
             }
-            source
+            // Coverage is exactly the contributing runs' represented time: a
+            // partial hour is evidence of a partial hour, and evidence
+            // covering less than a full hour omits `stream_hours` rather than
+            // claiming one.
+            let whole_hours = pool.represented_ms / STREAM_HOUR_MS;
+            Some(BaselineEvidence {
+                value: pool.conforming as f64 / pool.eligible as f64,
+                source,
+                stream_hours: (whole_hours > 0).then_some(whole_hours),
+                series: Some(series.clone()),
+                runs: pool.contributors.clone(),
+            })
         };
-        // Stream coverage over the pooled history, exact: a partial hour is
-        // evidence of a partial hour, not of one. Evidence covering less than a
-        // full hour omits `stream_hours` rather than claiming one.
-        let whole_hours = represented_ms / STREAM_HOUR_MS;
-        let stream_hours = (whole_hours > 0).then_some(whole_hours);
+        // History-wide represented time, retained for the limitation below;
+        // each indicator's own coverage comes from its contributing runs.
+        let history_whole_hours = represented_ms / STREAM_HOUR_MS;
         let mut proposals: BTreeMap<String, BaselineProposal> = BTreeMap::new();
-        for (id, (runs, eligible, conforming)) in &pools {
+        for (id, pool) in &pools {
             proposals.insert(
                 (*id).to_owned(),
                 BaselineProposal {
                     indicator: (*id).to_owned(),
                     window: "session".to_owned(),
-                    runs: *runs,
+                    runs: pool.runs,
                     threshold_ms: None,
-                    eligible: Some(*eligible),
-                    conforming: Some(*conforming),
-                    baseline: Some(BaselineEvidence {
-                        value: *conforming as f64 / *eligible as f64,
-                        source: provenance(*runs, None),
-                        stream_hours,
-                        series: Some(series.clone()),
-                        runs: run_manifest.clone(),
-                    }),
+                    eligible: Some(pool.eligible),
+                    conforming: Some(pool.conforming),
+                    baseline: evidence_for(pool, None),
                     latency: None,
                 },
             );
@@ -1998,16 +2069,13 @@ impl BaselineProposalSet {
             // calibrated without inventing anything.
             if let Some(threshold_ms) = latency_thresholds.get(id) {
                 proposal.threshold_ms = Some(*threshold_ms);
-                if let Some((runs, eligible, conforming)) = pools.get(id) {
-                    proposal.eligible = Some(*eligible);
-                    proposal.conforming = Some(*conforming);
-                    proposal.baseline = Some(BaselineEvidence {
-                        value: *conforming as f64 / *eligible as f64,
-                        source: provenance(*runs, Some(*threshold_ms)),
-                        stream_hours,
-                        series: Some(series.clone()),
-                        runs: run_manifest.clone(),
-                    });
+                if let Some(pool) = pools.get(id) {
+                    // Only runs that had eligible latency samples at the
+                    // candidate boundary count toward the calibration floor,
+                    // exactly as for any other indicator.
+                    proposal.eligible = Some(pool.eligible);
+                    proposal.conforming = Some(pool.conforming);
+                    proposal.baseline = evidence_for(pool, Some(*threshold_ms));
                 }
             }
             proposal.latency = Some(BaselineLatency {
@@ -2042,10 +2110,39 @@ impl BaselineProposalSet {
                  active baseline"
             ));
         }
-        if stream_hours.is_none() {
+        if history_whole_hours == 0 {
             limitations.push(format!(
                 "the history represents {represented_ms} ms of logical stream time, less than one \
                  full stream hour, so `stream_hours` is omitted rather than rounded up"
+            ));
+        }
+        // An indicator measured in the history but pooled from too few runs is
+        // named, not silently dropped and not published as calibration
+        // evidence: the repeated-run floor is about *this* indicator.
+        let under_sampled = pools
+            .iter()
+            .filter(|(_, pool)| pool.runs < MIN_BASELINE_RUNS)
+            .map(|(id, pool)| format!("{id} ({})", pool.runs))
+            .collect::<Vec<_>>();
+        if !under_sampled.is_empty() {
+            limitations.push(format!(
+                "{} indicator(s) were measured but pooled from fewer than {MIN_BASELINE_RUNS} \
+                 contributing run(s), so no target-ready baseline is published for them: {}; a run \
+                 with an empty denominator for an indicator produced no evidence for it",
+                under_sampled.len(),
+                under_sampled.join(", ")
+            ));
+        }
+        let partial_duration = pools
+            .iter()
+            .filter(|(_, pool)| pool.without_duration > 0)
+            .map(|(id, pool)| format!("{id} ({}/{})", pool.without_duration, pool.runs))
+            .collect::<Vec<_>>();
+        if !partial_duration.is_empty() {
+            limitations.push(format!(
+                "for some indicators a contributing run recorded no stream duration, so their \
+                 coverage may be under-counted (run(s) missing a duration per indicator): {}",
+                partial_duration.join(", ")
             ));
         }
 

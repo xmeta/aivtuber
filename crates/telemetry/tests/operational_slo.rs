@@ -735,6 +735,19 @@ fn silence(count: u64) -> Vec<EventObservation> {
         .collect()
 }
 
+/// Events that each carry a *correct* reuse decision, so they sit inside
+/// `quality.semantic_reuse_correctness`'s denominator. A run without them has an
+/// empty denominator for that indicator and cannot contribute to its baseline.
+fn reuse_decisions(count: u64) -> Vec<EventObservation> {
+    (0..count)
+        .map(|_| {
+            let mut event = observation(RouteClass::Deterministic);
+            event.wrong_reuse = Some(false);
+            event
+        })
+        .collect()
+}
+
 #[test]
 fn a_baseline_pools_the_session_denominator_across_runs() {
     // Run A: 20 conforming. Run B: 10 conforming and 10 unintended silences.
@@ -809,6 +822,109 @@ fn a_pooled_baseline_can_justify_a_target_without_being_invented() {
     )]);
     file.validate(&catalog())
         .expect("a measured baseline is exactly what a target must cite");
+}
+
+/// Indicator denominators are per-run: a run with an empty denominator for one
+/// indicator produced no evidence for it. If the manifest attached to that
+/// indicator's baseline were the whole history's manifest, a single measured
+/// run could satisfy the repeated-run floor and pass as calibration evidence.
+#[test]
+fn an_indicator_measured_in_only_one_run_is_not_target_ready_evidence() {
+    // Only `quality.semantic_reuse_correctness` has a denominator that can be
+    // empty in one run and populated in another: an event with no reuse
+    // decision is outside that indicator's denominator, while a silence event
+    // is an eligible miss for speech presence.
+    let run_a = evaluate_run(&report(reuse_decisions(10), 2 * STREAM_HOUR_MS), "run-a");
+    // No event here carries a reuse decision, so this run contributed nothing
+    // to that indicator's baseline.
+    let run_b = evaluate_run(&report(silence(10), 2 * STREAM_HOUR_MS), "run-b");
+    let pooled = BaselineProposalSet::from_reports(&[run_a, run_b]).expect("proposal set");
+
+    let reuse = pooled
+        .proposals
+        .get("quality.semantic_reuse_correctness")
+        .expect("the indicator was measured in the history");
+    assert_eq!(reuse.runs, 1, "only run-a had an eligible denominator");
+    assert_eq!(reuse.eligible, Some(10));
+    assert_eq!(reuse.conforming, Some(10));
+    assert!(
+        reuse.baseline.is_none(),
+        "one measured run is a data point, not a baseline: {:?}",
+        reuse.baseline
+    );
+
+    // The history is still two runs; the shortfall is named, not hidden.
+    assert_eq!(pooled.contributing_reports, 2);
+    assert_eq!(pooled.contributing_runs.len(), 2);
+    assert!(
+        pooled.limitations.iter().any(|limitation| {
+            limitation.contains("quality.semantic_reuse_correctness")
+                && limitation.contains("fewer than 2")
+        }),
+        "the under-sampled indicator is named: {:?}",
+        pooled.limitations
+    );
+
+    // Non-vacuous: suppressing the one-run indicator did not suppress the rest
+    // of the history's calibration.
+    let still_calibrated = pooled
+        .proposals
+        .iter()
+        .filter(|(_, proposal)| {
+            proposal
+                .baseline
+                .as_ref()
+                .is_some_and(|baseline| baseline.runs.len() == 2)
+        })
+        .map(|(id, _)| id.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        !still_calibrated.is_empty(),
+        "indicators both runs measured still publish evidence: {:?}",
+        pooled.proposals.keys().collect::<Vec<_>>()
+    );
+}
+
+/// Coverage is the contributing runs' represented time, not the history's: a
+/// long run that contributed nothing to an indicator must not inflate the
+/// hours attached to that indicator's evidence.
+#[test]
+fn evidence_coverage_counts_only_contributing_runs() {
+    let run_a = evaluate_run(&report(reuse_decisions(10), 2 * STREAM_HOUR_MS), "run-a");
+    let run_b = evaluate_run(&report(reuse_decisions(10), 3 * STREAM_HOUR_MS), "run-b");
+    let run_c = evaluate_run(&report(silence(10), 5 * STREAM_HOUR_MS), "run-c");
+
+    let pooled = BaselineProposalSet::from_reports(&[run_a, run_b, run_c]).expect("proposal set");
+    let baseline = pooled
+        .proposals
+        .get("quality.semantic_reuse_correctness")
+        .and_then(|proposal| proposal.baseline.clone())
+        .expect("two contributing runs");
+
+    assert_eq!(
+        baseline
+            .runs
+            .iter()
+            .map(|run| run.run_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["run-a", "run-b"],
+        "run-c has no eligible denominator for this indicator"
+    );
+    assert_eq!(
+        baseline.stream_hours,
+        Some(5),
+        "2h + 3h of contributing runs, not the history's 10h"
+    );
+    assert!(
+        baseline.source.contains("[run-a,run-b]"),
+        "{}",
+        baseline.source
+    );
+    assert!(
+        !baseline.source.contains("run-c"),
+        "the prose names the same runs as the manifest: {}",
+        baseline.source
+    );
 }
 
 #[test]
@@ -1291,6 +1407,57 @@ fn the_first_latency_target_is_constructible_from_measured_artifacts_alone() {
     )]);
     file.validate(&catalog())
         .expect("the first latency target must be constructible from measurements");
+}
+
+/// The calibration floor is per indicator here too: a probed run with no
+/// eligible latency samples at the candidate boundary measured no ratio at that
+/// boundary, so it cannot count toward the floor.
+#[test]
+fn a_latency_boundary_measured_in_only_one_run_is_not_target_ready() {
+    let threshold_ms = 50_u64;
+    let probe = |events: Vec<EventObservation>, run_id: &str| {
+        evaluate(
+            &report(events, STREAM_HOUR_MS),
+            &targets(&[(
+                "availability.event_to_first_audio_within_target",
+                SloTarget::threshold_probe(threshold_ms),
+            )]),
+            SloEvaluationConfig {
+                run_id: Some(run_id.to_owned()),
+                ..SloEvaluationConfig::default()
+            },
+        )
+        .expect("probed SLO report")
+    };
+    let measured_a = probe(detection_with_latency(40), "probe-run-a");
+    // Silence carries no first-audio sample, so this run has no eligible
+    // observation at the candidate boundary.
+    let measured_b = probe(silence(10), "probe-run-b");
+
+    let pooled = BaselineProposalSet::from_reports(&[measured_a, measured_b]).expect("probed set");
+    let audio = pooled
+        .proposals
+        .get("availability.event_to_first_audio_within_target")
+        .expect("latency proposal");
+    assert_eq!(
+        audio.threshold_ms,
+        Some(threshold_ms),
+        "the boundary was still probed, so the candidate is published"
+    );
+    assert_eq!(audio.runs, 1, "only one run had samples at that boundary");
+    assert!(
+        audio.baseline.is_none(),
+        "a ratio measured in one run is not calibration evidence: {:?}",
+        audio.baseline
+    );
+    assert!(
+        pooled.limitations.iter().any(|limitation| {
+            limitation.contains("availability.event_to_first_audio_within_target")
+                && limitation.contains("fewer than 2")
+        }),
+        "the under-sampled indicator is named: {:?}",
+        pooled.limitations
+    );
 }
 
 #[test]
