@@ -293,7 +293,13 @@ jobs:
               --run-id "run-${{ github.run_id }}" \
               --out "results/slo/${stem}.json"
           done
-          bun scripts/slo-record.mjs --files results/slo/*.json
+          # The replay reports are paired into `benchmark-reports/` as well: the
+          # latency probe re-reads the per-event observations, which a stored
+          # SLO report does not carry, so without them a stored run could never
+          # be probed and latency calibration would stay local-only.
+          bun scripts/slo-record.mjs \
+            --files results/slo/*.json \
+            --benchmarks target/bench-main
 
       - name: Push SLO calibration history
         if: success()

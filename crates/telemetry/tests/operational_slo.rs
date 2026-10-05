@@ -1460,6 +1460,127 @@ fn a_latency_boundary_measured_in_only_one_run_is_not_target_ready() {
     );
 }
 
+/// The durable latency-calibration cycle.
+///
+/// A measured run is written to storage and later re-read as a plain artifact;
+/// nothing below uses the in-memory value. The stored `SloReport` alone can only
+/// supply the candidate boundary — it is not a benchmark report — so the probe
+/// reads the retrieved replay report. That is the step the durable history has
+/// to keep possible after the trusted main job has finished.
+#[test]
+fn a_stored_run_can_still_be_probed_and_pooled_after_it_is_retrieved() {
+    let directory = std::env::temp_dir().join(format!(
+        "aivtuber-slo-retrieval-{}-stored-run",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&directory).expect("scratch directory");
+    let run_ids = ["stored-a", "stored-b"];
+
+    // Persist each measured run, then retrieve it from storage.
+    let mut retrieved = Vec::new();
+    for index in 0..run_ids.len() {
+        let measured = report(detection_with_latency(40), 2 * STREAM_HOUR_MS);
+        let path = directory.join(format!("{index}.json"));
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&measured).expect("serialize"),
+        )
+        .expect("persist replay report");
+        let bytes = std::fs::read(&path).expect("retrieve replay report");
+        retrieved.push(serde_json::from_slice::<BenchmarkReport>(&bytes).expect("parse"));
+    }
+    let _ = std::fs::remove_dir_all(&directory);
+
+    // 1. The stored SLO report selects a candidate boundary. It cannot be the
+    // probe's input: it is not a replay benchmark report.
+    let free: Vec<SloReport> = retrieved
+        .iter()
+        .zip(run_ids)
+        .map(|(run, run_id)| {
+            evaluate(
+                run,
+                &SloTargets::default(),
+                SloEvaluationConfig {
+                    run_id: Some(run_id.to_owned()),
+                    ..SloEvaluationConfig::default()
+                },
+            )
+            .expect("target-free report")
+        })
+        .collect();
+    let audio_percentile = |report: &SloReport| {
+        report
+            .latency_calibration
+            .iter()
+            .find(|point| point.window == "session" && point.field == "event_to_first_audio_ms")
+            .map(|point| point.p95_ms)
+            .expect("target-free audio percentiles")
+    };
+    let threshold_ms = audio_percentile(&free[0]);
+    assert!(
+        serde_json::from_slice::<BenchmarkReport>(&serde_json::to_vec(&free[0]).expect("encode"))
+            .is_err(),
+        "a stored SLO report is not a replay benchmark report, which is why the raw \
+         report must be persisted for the probe step"
+    );
+
+    // 2. Probe every retrieved run at the chosen boundary.
+    let probe_targets = targets(&[(
+        "availability.event_to_first_audio_within_target",
+        SloTarget::threshold_probe(threshold_ms),
+    )]);
+    let probed: Vec<SloReport> = retrieved
+        .iter()
+        .zip(run_ids)
+        .map(|(run, run_id)| {
+            evaluate(
+                run,
+                &probe_targets,
+                SloEvaluationConfig {
+                    run_id: Some(run_id.to_owned()),
+                    ..SloEvaluationConfig::default()
+                },
+            )
+            .expect("probed report")
+        })
+        .collect();
+
+    // 3. Pool them into target-ready evidence.
+    let pooled = BaselineProposalSet::from_reports(&probed).expect("probed proposal set");
+    let audio = pooled
+        .proposals
+        .get("availability.event_to_first_audio_within_target")
+        .expect("latency proposal");
+    assert_eq!(audio.threshold_ms, Some(threshold_ms));
+    assert_eq!(
+        audio.runs, 2,
+        "both stored runs were probed at the boundary"
+    );
+    let baseline = audio
+        .baseline
+        .clone()
+        .expect("a probed boundary measured in two stored runs is target-ready");
+    assert_eq!(baseline.runs.len(), 2);
+    assert!(
+        (0.0..=1.0).contains(&baseline.value),
+        "the ratio is measured, not invented: {}",
+        baseline.value
+    );
+
+    // 4. And it loads as a target: the first latency target comes entirely from
+    // artifacts that survived the run that produced them.
+    let file = targets(&[(
+        "availability.event_to_first_audio_within_target",
+        SloTarget {
+            target: 0.9,
+            threshold_ms: Some(threshold_ms),
+            baseline,
+        },
+    )]);
+    file.validate(&catalog())
+        .expect("a latency target calibrated from retrieved stored artifacts");
+}
+
 #[test]
 fn a_probe_target_is_never_valid_calibration_evidence() {
     // The probe carries an unmeasured placeholder baseline; the validator must

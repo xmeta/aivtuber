@@ -7,8 +7,10 @@ import { fileURLToPath } from "node:url";
 
 import { __testables as benchmark } from "../scripts/benchmark-record.mjs";
 import {
+  benchmarkPathOf,
   contractSegmentsOf,
   reportPathOf,
+  requirePairable,
   requireRecordable,
   runFileStem,
   seriesKeyOf,
@@ -16,6 +18,35 @@ import {
 } from "../scripts/slo-record.mjs";
 
 const script = join(dirname(fileURLToPath(import.meta.url)), "..", "scripts", "slo-record.mjs");
+
+/// A minimal `replay-benchmark` mode report: the raw per-event source a
+/// `slo-report` is evaluated from, and the only durable artifact the latency
+/// probe step can be re-run against.
+function benchmarkReport(overrides = {}) {
+  const metadata = {
+    dataset_id: "replay-comparison-v1",
+    git_commit: "deadbeef",
+    rust_toolchain: "rustc 1.98.1",
+    bun_toolchain: null,
+    config_version: "replay-comparison-v1",
+    asset_version: "starter-v1",
+    index_version: null,
+    jev_model: null,
+    thinking_model: null,
+    tts_model: null,
+    cost_model_version: null,
+    seed: 7,
+    stream_duration_ms: 28_800_000,
+    ...(overrides.metadata ?? {}),
+  };
+  return {
+    metadata,
+    mode: "full_generative",
+    events: [{ event_id: "evt-1", event_to_first_audio_ms: 120 }],
+    summary: {},
+    ...Object.fromEntries(Object.entries(overrides).filter(([key]) => key !== "metadata")),
+  };
+}
 
 /// A minimal `slo-report` document: exactly the shape the recorder has to be
 /// able to route (schema/catalog versions, an identity block with a run id and
@@ -141,6 +172,57 @@ describe("slo-record partitions the history by SLO contract", () => {
   });
 });
 
+describe("slo-record pairs the replay report a latency probe needs", () => {
+  test("the raw report lives in a parallel tree, never in the pooled one", () => {
+    const report = sloReport();
+    const slo = reportPathOf(report);
+    const raw = benchmarkPathOf(report);
+    expect(raw.startsWith("benchmark-reports/")).toBe(true);
+    expect(slo.startsWith("reports/")).toBe(true);
+    // The documented retrieval is a wildcard over the reports/ leaf; a replay
+    // report there would be refused by `slo-baseline` as not an SLO report.
+    expect(raw).not.toContain("/reports/");
+    // Same contract, series, and run identity — one path segment apart.
+    expect(raw.replace("benchmark-reports/", "reports/")).toBe(slo);
+    expect(raw.split("/").slice(1, -1)).toEqual(slo.split("/").slice(1, -1));
+    expect(benchmarkPathOf(sloReport({ git_commit: "cafebabe" }))).toBe(raw);
+    expect(benchmarkPathOf(sloReport({ run_id: "run-1002" }))).not.toBe(raw);
+  });
+
+  test("a pair from a different workload series is refused", () => {
+    const report = sloReport();
+    expect(() => requirePairable(benchmarkReport(), report, "raw.json")).not.toThrow();
+    for (const [field, override] of [
+      ["dataset_id", { metadata: { dataset_id: "other" } }],
+      ["config_version", { metadata: { config_version: "other" } }],
+      ["seed", { metadata: { seed: 9 } }],
+      ["mode", { mode: "deterministic_only" }],
+    ]) {
+      expect(() => requirePairable(benchmarkReport(override), report, "raw.json")).toThrow(
+        /compatibility series/,
+      );
+    }
+  });
+
+  test("a document that is not a replay report is refused", () => {
+    const report = sloReport();
+    expect(() => requirePairable(sloReport(), report, "raw.json")).toThrow(/metadata/);
+    expect(() => requirePairable(null, report, "raw.json")).toThrow(/not a replay/);
+  });
+
+  // A revision is what a baseline is *attributed* to, not a compatibility
+  // boundary, so one series may legitimately span several commits.
+  test("a different revision in the same series is allowed", () => {
+    expect(() =>
+      requirePairable(
+        benchmarkReport({ metadata: { git_commit: "cafebabe" } }),
+        sloReport(),
+        "raw.json",
+      ),
+    ).not.toThrow();
+  });
+});
+
 describe("slo-record refuses anything that is not calibration history", () => {
   test("a benchmark result is not an SLO report", () => {
     const benchmarkResult = {
@@ -185,8 +267,8 @@ describe("slo-record persists a retrievable history", () => {
     return execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
   }
 
-  function record(root, files) {
-    return execFileSync(process.execPath, [script, "--root", root, "--files", ...files], {
+  function record(root, files, extra = []) {
+    return execFileSync(process.execPath, [script, "--root", root, "--files", ...files, ...extra], {
       encoding: "utf8",
     });
   }
@@ -254,6 +336,48 @@ describe("slo-record persists a retrievable history", () => {
       const files = git(["ls-tree", "-r", "--name-only", "slo-data", "reports"], origin).split("\n");
       expect(files).toHaveLength(2);
       expect(files).toContain(reportPathOf(sloReport({ run_id: "run-1002" })));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // The reported defect: latency calibration could not be finished from the
+  // durable history, because the probe step needs the raw per-event report that
+  // was never persisted.
+  test("a paired run persists both the SLO report and its probe source", () => {
+    const { root, origin } = scratchRepo("probe");
+    try {
+      const reports = join(root, "bench");
+      mkdirSync(reports, { recursive: true });
+      const slo = inputFile(root, "04-full-generative.json", sloReport());
+      writeFileSync(join(reports, "04-full-generative.json"), `${JSON.stringify(benchmarkReport(), null, 2)}\n`);
+
+      record(root, [slo], ["--benchmarks", reports]);
+      git(["push", "--quiet", "origin", "slo-data"], root);
+
+      // The pooled tree holds only SLO reports...
+      const pooled = git(["ls-tree", "-r", "--name-only", "slo-data", "reports"], origin);
+      expect(pooled).toBe(reportPathOf(sloReport()));
+      // ...and the probe source is retrievable beside it, under the same
+      // identity, so the stored run stays probeable after the job ends.
+      const raw = git(["ls-tree", "-r", "--name-only", "slo-data", "benchmark-reports"], origin);
+      expect(raw).toBe(benchmarkPathOf(sloReport()));
+      expect(JSON.parse(git(["show", `slo-data:${raw}`], origin)).events).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a run whose replay report is missing is refused, not half-recorded", () => {
+    const { root } = scratchRepo("nopair");
+    try {
+      const reports = join(root, "bench");
+      mkdirSync(reports, { recursive: true });
+      const slo = inputFile(root, "04-full-generative.json", sloReport());
+      // No `04-full-generative.json` in the benchmark directory: storing the
+      // SLO report alone would leave a run that can never be probed.
+      expect(() => record(root, [slo], ["--benchmarks", reports])).toThrow();
+      expect(git(["ls-remote", "--heads", "origin"], root)).toBe("");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

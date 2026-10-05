@@ -477,6 +477,35 @@ Bumping the catalog therefore starts a new partition rather than poisoning the
 existing one: new calibration history accumulates alongside the old, and the
 old history stays auditable under the contract it was measured against.
 
+=== The probe source is persisted too
+
+A latency objective cannot be finished from the stored `SloReport`. The probe
+step re-reads the per-event observations, and a stored report carries only the
+`latency_calibration` quantiles (p50/p95/p99/max) — which are enough to *choose*
+a boundary, but not to reconstruct the exact conforming count at it. An archived
+`SloReport` therefore cannot be probed later: `slo-report --report <stored>`
+fails with `not a replay benchmark report: missing field metadata`.
+
+The recorder stores the raw replay report alongside it, under the same contract,
+series, and run identity, in a parallel tree:
+
+[source,shell]
+----
+reports/<schema>/<catalog>/<series>/<run>.json            # the SLO report
+benchmark-reports/<schema>/<catalog>/<series>/<run>.json  # its replay source
+----
+
+They are in separate trees on purpose: the ratio retrieval above is a wildcard
+over `reports/<...>/*.json`, and a replay report in that directory would be
+refused as not an SLO report. The pair is checked on the way in — a replay
+report from a different dataset, config, seed, or mode is refused — so a stored
+run can never be probed against a different workload than the one it was pooled
+from. A run whose replay report is missing is refused outright rather than
+half-recorded.
+
+With both trees retained, the latency cycle is executable from the history after
+the trusted main job has finished — see <<The latency calibration cycle>>.
+
 === The latency calibration cycle
 
 A latency objective has a chicken-and-egg problem the ratio objectives do not:
@@ -486,12 +515,35 @@ both are measured:
 
 . Pool the target-free history with `slo-baseline` and read the worst-observed
   percentiles: they are the evidence a candidate boundary is chosen from.
-. Re-run `slo-report` over each run with
-  `--probe-latency <indicator-id>=<threshold-ms>`, which evaluates the
-  objective *at* that boundary, and pool the probed reports with
-  `slo-baseline`. The proposal now carries the measured conforming ratio at
-  that boundary as a valid `BaselineEvidence` — the first latency target is
-  constructible entirely from measured artifacts.
+. Probe every run *already in the history* — not a fresh re-run of the
+  workload — by running `slo-report --report` over each retrieved
+  `benchmark-reports/<schema>/<catalog>/<series>/<run>.json` with
+  `--probe-latency <indicator-id>=<threshold-ms>` and that run's own
+  `--run-id`. This evaluates the objective *at* the boundary over the stored
+  per-event observations:
+
+[source,shell]
+----
+raw=benchmark-reports/<schema>/<catalog>/<series>
+mkdir -p target/aivtuber-slo/probed
+for run in target/slo-history/$raw/*.json; do
+  cargo run --locked -p aivtuber-app --bin slo-report -- \
+    --report "$run" --run-id <that-run's-source.run_id> \
+    --probe-latency availability.event_to_first_audio_within_target=250 \
+    --out "target/aivtuber-slo/probed/$(basename "$run")"
+done
+cargo run --locked -p aivtuber-app --bin slo-baseline -- \
+  target/aivtuber-slo/probed/*.json
+----
+
+  The proposal now carries the measured conforming ratio at that boundary as a
+  valid `BaselineEvidence` — the first latency target is constructible entirely
+  from measured artifacts, and every one of them is an artifact that survived
+  the run that produced it.
+
+Re-running the workload later produces *new* measured runs; it does not make an
+already-recorded historical run probeable, which is why the source report is
+persisted next to the SLO report.
 
 A probe is a measurement tool, not evidence: `SloTarget::threshold_probe` is
 refused in a targets file, so a boundary can never be written down without the

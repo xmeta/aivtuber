@@ -252,6 +252,16 @@ unretrievable. `slo-baseline` pools one leaf directory into the
 `BaselineEvidence` a target cites
 (link:operational-slo.adoc[Operational SLOs]).
 
+Each stored run is paired with the replay mode report it was evaluated from,
+written under the same contract/series/run identity at
+`benchmark-reports/<schema-version>/<catalog-version>/<series>/<run>.json`.
+The pair is what makes latency calibration finish from history: the probe step
+re-reads the per-event observations, which a stored SLO report does not carry.
+A replay report from a different dataset, config, seed, or mode is refused, and
+a run whose replay report is missing is refused rather than half-recorded. The
+two trees are separate because the ratio retrieval is a wildcard over
+`reports/<...>/*.json`, and a replay report there would not be an SLO report.
+
 Trend views are informational. Gating decisions always come from the
 machine-readable comparator. Baseline/target methodology, budget rationale,
 and the regression-investigation procedure live in
