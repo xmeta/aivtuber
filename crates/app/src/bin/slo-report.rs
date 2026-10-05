@@ -23,11 +23,19 @@
 //! measurement tool and is refused in a targets file — a target still has to
 //! cite pooled measured evidence.
 //!
+//! `--run-id <stable-id>` is required: a report is calibration evidence, and a
+//! run's identity comes from the run, never from report content. It follows the
+//! #58 `recording.run_id` semantics already used by the benchmark history —
+//! stable across retries of one run, distinct across distinct runs — so a
+//! deterministic replay can be repeated nightly and the two runs still count as
+//! two measurements even though their reports are byte-identical.
+//!
 //! Usage:
 //! ```text
 //! slo-report <benchmark-report.json> [targets.json] [output.json]
 //! slo-report --report <benchmark-report.json> [--targets <targets.json>]
 //!            [--out <output.json>] [--markdown <summary.md>]
+//!            [--run-id <stable-id>]
 //!            [--provenance scenario-replay|replay-fixture|live-session]
 //!            [--plane active|experimental]
 //!            [--rolling-window-hours N] [--persistent-miss-windows N]
@@ -46,7 +54,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: slo-report <benchmark-report.json> [targets.json] [output.json]\n       or: slo-report --report <benchmark-report.json> [--targets <targets.json>] [--out <output.json>] [--markdown <summary.md>] [--provenance <provenance>] [--plane <plane>] [--rolling-window-hours N] [--persistent-miss-windows N] [--probe-latency <indicator>=<threshold-ms>] [--fail-on-breach]";
+const USAGE: &str = "usage: slo-report <benchmark-report.json> [targets.json] [output.json]\n       or: slo-report --report <benchmark-report.json> [--targets <targets.json>] [--out <output.json>] [--markdown <summary.md>] --run-id <stable-id> [--provenance <provenance>] [--plane <plane>] [--rolling-window-hours N] [--persistent-miss-windows N] [--probe-latency <indicator>=<threshold-ms>] [--fail-on-breach]";
 
 fn main() -> ExitCode {
     match run() {
@@ -143,6 +151,7 @@ fn parse_args(args: Vec<String>) -> Result<Arguments, Box<dyn Error>> {
     let mut targets: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
     let mut markdown: Option<PathBuf> = None;
+    let mut run_id: Option<String> = None;
     let mut provenance: Option<SloProvenance> = None;
     let mut plane: Option<TrafficPlane> = None;
     let mut rolling_window_hours: Option<u32> = None;
@@ -173,6 +182,14 @@ fn parse_args(args: Vec<String>) -> Result<Arguments, Box<dyn Error>> {
             }
             "--markdown" => {
                 markdown = Some(PathBuf::from(next()?));
+                index += 2;
+            }
+            "--run-id" => {
+                let raw = next()?.trim().to_owned();
+                if raw.is_empty() {
+                    return Err(format!("--run-id must not be empty\n{USAGE}").into());
+                }
+                run_id = Some(raw);
                 index += 2;
             }
             "--provenance" => {
@@ -254,6 +271,17 @@ fn parse_args(args: Vec<String>) -> Result<Arguments, Box<dyn Error>> {
     if rolling_window_hours == Some(0) {
         return Err(format!("--rolling-window-hours must be at least 1\n{USAGE}").into());
     }
+    // A report with no run identity is a measurement that can never join a
+    // calibration history, and identity cannot be inferred from content (two
+    // independent deterministic runs produce identical reports). Requiring it
+    // here means the identity is captured where it exists.
+    let Some(run_id) = run_id else {
+        return Err(format!(
+            "--run-id <stable-id> is required: it is the run identity `slo-baseline` pools by, \
+             and it cannot be inferred from report content\n{USAGE}"
+        )
+        .into());
+    };
 
     let defaults = SloEvaluationConfig::default();
     Ok(Arguments {
@@ -267,6 +295,7 @@ fn parse_args(args: Vec<String>) -> Result<Arguments, Box<dyn Error>> {
             rolling_window_hours: rolling_window_hours.unwrap_or(defaults.rolling_window_hours),
             persistent_miss_windows: persistent_miss_windows
                 .unwrap_or(defaults.persistent_miss_windows),
+            run_id: Some(run_id),
         },
         probes,
         fail_on_breach,

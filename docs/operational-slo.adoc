@@ -347,6 +347,7 @@ cargo run --locked -p aivtuber-app --bin replay-benchmark -- \
 cargo run --locked -p aivtuber-app --bin slo-report -- \
   --report target/aivtuber-benchmarks/04-full-generative.json \
   --targets examples/slo/slo-targets.json \
+  --run-id "$GITHUB_RUN_ID" \
   --out target/aivtuber-slo/slo-report.json \
   --markdown target/aivtuber-slo/slo-summary.md \
   --provenance scenario-replay
@@ -362,6 +363,7 @@ cargo run --locked -p aivtuber-app --bin slo-baseline -- \
 # latency probe step: measure a candidate boundary over each run, then pool
 cargo run --locked -p aivtuber-app --bin slo-report -- \
   --report target/aivtuber-benchmarks/04-full-generative.json \
+  --run-id "$GITHUB_RUN_ID" \
   --probe-latency availability.event_to_first_audio_within_target=250 \
   --out target/aivtuber-slo/probed-run.json
 cargo run --locked -p aivtuber-app --bin slo-baseline -- \
@@ -372,6 +374,13 @@ Without `--targets` the report publishes measured values and target-free latency
 percentiles, and the verdict stays `incomplete`. `--fail-on-breach` makes a
 breach exit non-zero for a pipeline that wants to gate on it; it is off by
 default, because an operational objective is not a PR gate.
+
+`--run-id` is required. It is the stable identity of the run the report
+measured, with the same semantics as #58's `recording.run_id`: stable across
+retries of one run, distinct across distinct runs (`$GITHUB_RUN_ID` is
+therefore the natural value in CI, and a date or session label is one locally).
+`slo-baseline` counts runs by this identity alone, so a report produced without
+it is a measurement that can never join a calibration history.
 
 == Choosing a target
 
@@ -391,10 +400,16 @@ assumed:
   link:performance-goals.adoc[Performance Goals and Baselines]. A history that
   spans two series is refused, not merged, and the report names the series it
   pooled so the boundary is auditable.
-* **Distinct runs only.** Byte-identical reports are counted as duplicates: a
-  file passed twice is a retry, not a second measurement. Fewer than two
-  distinct runs (`MIN_BASELINE_RUNS`) produce no proposals at all — one run
-  calibrates nothing.
+* **Distinct runs, by identity and never by payload.** A run is identified by
+  its `--run-id`, the #58 `recording.run_id` semantics. Two nightly runs of one
+  revision produce byte-identical reports and still count as two measurements
+  of runner variance; a retry of one run is one measurement however its numbers
+  came out. A report with no run identity is refused, because content cannot be
+  used to infer one. Inputs repeating a run identity collapse to a single run —
+  the last artifact supplied wins, exactly as a #58 re-run replaces its row,
+  and a conflict between them is counted and stated in `limitations`. Fewer
+  than two distinct runs (`MIN_BASELINE_RUNS`) produce no proposals at all —
+  one run calibrates nothing.
 * **Exact time.** Represented stream time is summed exactly; a partial hour
   never rounds up to one. Two-second runs are two seconds of evidence, and
   sub-hour histories omit `stream_hours` rather than claiming a full hour.
@@ -444,10 +459,13 @@ The procedure is deliberately boring:
 The `baseline` block in a target entry is copied from an `slo-baseline`
 proposal rather than written by hand, and the target ratio is a product
 decision made *above* the measured value — the proposal never prescribes it.
-The provenance is durable: the block itself carries the dataset, revision,
-config, mode, seed, and series identity, so a target remains auditable after
-the proposal file is gone. Repeated nightly runs of the same revision are what
-turn one measurement into a baseline, exactly as
+The provenance is durable and structured, because the evidence block is the
+only part that survives the copy: `series` names the #58 compatibility series
+(`mode|dataset_id|config_version|seed`) and `runs` lists every contributing
+run identity with the revision it measured, so a target can still name *which*
+repeated runs formed its baseline after the proposal file is gone. The `source`
+string repeats the same identities for a human reader. Repeated nightly runs of
+the same revision are what turn one measurement into a baseline, exactly as
 link:performance-goals.adoc[Performance Goals and Baselines] requires for #58.
 
 == What this does not cover yet

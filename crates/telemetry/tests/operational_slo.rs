@@ -7,8 +7,8 @@
 
 use aivtuber_domain::InteractionDeadlineClass;
 use aivtuber_telemetry::{
-    AttributionSummary, BaselineEvidence, BaselineProposalSet, BenchmarkReport, CacheLevel,
-    ComparisonMode, EventObservation, EvidenceSource, FailureOrigin, MIN_BASELINE_RUNS,
+    AttributionSummary, BaselineEvidence, BaselineProposalSet, BaselineRun, BenchmarkReport,
+    CacheLevel, ComparisonMode, EventObservation, EvidenceSource, FailureOrigin, MIN_BASELINE_RUNS,
     MissAttribution, MissAttribution as Attribution, ObjectiveKind, ReproducibilityMetadata,
     RouteClass, STREAM_HOUR_MS, SloAction, SloError, SloEvaluationConfig, SloIndicatorResult,
     SloProvenance, SloReport, SloStatus, SloTarget, SloTargets, SloWindow, TrafficPlane,
@@ -78,6 +78,8 @@ fn calibrated(target: f64, baseline: f64) -> SloTarget {
             value: baseline,
             source: CALIBRATION_SOURCE.to_owned(),
             stream_hours: Some(1),
+            series: None,
+            runs: Vec::new(),
         },
     }
 }
@@ -94,6 +96,20 @@ fn evaluate_default(report: &BenchmarkReport) -> SloReport {
         report,
         &SloTargets::default(),
         SloEvaluationConfig::default(),
+    )
+    .expect("SLO report")
+}
+
+/// Evaluate one report as an identified run. Run identity is what makes two
+/// reports two runs, so every calibratable run in these tests carries one.
+fn evaluate_run(report: &BenchmarkReport, run_id: &str) -> SloReport {
+    evaluate(
+        report,
+        &SloTargets::default(),
+        SloEvaluationConfig {
+            run_id: Some(run_id.to_owned()),
+            ..SloEvaluationConfig::default()
+        },
     )
     .expect("SLO report")
 }
@@ -670,19 +686,23 @@ fn detection_with_latency(count: u64) -> Vec<EventObservation> {
 }
 
 /// Two structurally different runs of the *same* compatibility series: the
-/// smallest history that may produce baseline evidence.
+/// smallest history that may produce baseline evidence. The two runs are
+/// distinguished by their run identity, as #58 requires.
 fn two_run_history() -> (SloReport, SloReport) {
-    let run_a = evaluate_default(&report(
-        (0..20)
-            .map(|_| observation(RouteClass::Deterministic))
-            .collect(),
-        2 * STREAM_HOUR_MS,
-    ));
+    let run_a = evaluate_run(
+        &report(
+            (0..20)
+                .map(|_| observation(RouteClass::Deterministic))
+                .collect(),
+            2 * STREAM_HOUR_MS,
+        ),
+        "run-a",
+    );
     let mut run_b_events = (0..10)
         .map(|_| observation(RouteClass::Deterministic))
         .collect::<Vec<_>>();
     run_b_events.extend(silence(10));
-    let run_b = evaluate_default(&report(run_b_events, 2 * STREAM_HOUR_MS));
+    let run_b = evaluate_run(&report(run_b_events, 2 * STREAM_HOUR_MS), "run-b");
     (run_a, run_b)
 }
 
@@ -727,6 +747,20 @@ fn a_baseline_pools_the_session_denominator_across_runs() {
         baseline
             .source
             .contains("series=deterministic_semantic|slo-fixture|bench-v1|7")
+    );
+    // ... and the identity is structured too, so the durable block names the
+    // runs and the series without a consumer parsing prose.
+    assert_eq!(
+        baseline.series.as_deref(),
+        Some("deterministic_semantic|slo-fixture|bench-v1|7")
+    );
+    assert_eq!(
+        baseline
+            .runs
+            .iter()
+            .map(|run| run.run_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["run-a", "run-b"]
     );
 }
 
@@ -773,17 +807,144 @@ fn a_single_run_calibrates_nothing() {
 }
 
 #[test]
-fn a_duplicated_report_is_one_run_not_repeated_evidence() {
+fn a_repeated_run_identity_is_one_run_not_repeated_evidence() {
     let (run_a, _) = two_run_history();
     let pooled = BaselineProposalSet::from_reports(&[run_a.clone(), run_a.clone(), run_a])
         .expect("proposal set");
     assert_eq!(pooled.reports, 3);
     assert_eq!(pooled.contributing_reports, 1);
     assert_eq!(pooled.duplicate_reports, 2);
+    assert_eq!(pooled.superseded_reports, 0);
+    assert_eq!(pooled.contributing_runs.len(), 1);
     assert!(
         pooled.proposals.is_empty(),
-        "a file passed three times is still one run"
+        "a retried run is still one run"
     );
+}
+
+#[test]
+fn two_independent_runs_with_identical_payloads_are_two_runs() {
+    // Deterministic replay makes two independent runs of one revision produce
+    // byte-identical *reports*. Only the run identity distinguishes them, and
+    // they are two measurements of runner variance (#58), so content equality
+    // must never collapse them into one.
+    let events = detection_with_latency(20);
+    let run_a = evaluate_run(&report(events.clone(), STREAM_HOUR_MS), "nightly-1");
+    let run_b = evaluate_run(&report(events, STREAM_HOUR_MS), "nightly-2");
+
+    // The measurement payload is identical; only the run identity differs.
+    let mut stripped_a = run_a.clone();
+    stripped_a.source.run_id = None;
+    let mut stripped_b = run_b.clone();
+    stripped_b.source.run_id = None;
+    assert_eq!(stripped_a, stripped_b, "the two payloads are identical");
+
+    let pooled = BaselineProposalSet::from_reports(&[run_a, run_b]).expect("proposal set");
+    assert_eq!(pooled.contributing_reports, 2);
+    assert_eq!(pooled.duplicate_reports, 0);
+    assert_eq!(pooled.superseded_reports, 0);
+    let presence = pooled
+        .proposals
+        .get("availability.speech_presence_rate")
+        .expect("two independent runs are calibration evidence");
+    assert_eq!(presence.runs, 2);
+    assert_eq!(presence.eligible, Some(40), "both runs contribute");
+    assert_eq!(
+        presence.baseline.as_ref().map(|baseline| baseline.value),
+        Some(1.0)
+    );
+}
+
+#[test]
+fn a_report_without_a_run_identity_is_refused_rather_than_guessed() {
+    let anonymous = evaluate_default(&report(detection_with_latency(20), STREAM_HOUR_MS));
+    let error = BaselineProposalSet::from_reports(&[anonymous])
+        .expect_err("identity cannot be inferred from report content");
+    assert!(error.to_string().contains("run identity"), "{error}");
+}
+
+#[test]
+fn a_superseding_retry_replaces_the_earlier_artifact_instead_of_doubling_evidence() {
+    // The same run identity, re-run, with a different measurement: #58 replaces
+    // the earlier row. It must not be counted twice, and the conflict must not
+    // be hidden either.
+    let run_a = evaluate_run(
+        &report(detection_with_latency(20), STREAM_HOUR_MS),
+        "nightly-1",
+    );
+    let superseding = evaluate_run(&report(silence(20), STREAM_HOUR_MS), "nightly-1");
+    let run_b = evaluate_run(
+        &report(detection_with_latency(20), STREAM_HOUR_MS),
+        "nightly-2",
+    );
+
+    let pooled =
+        BaselineProposalSet::from_reports(&[run_a, superseding, run_b]).expect("proposal set");
+    assert_eq!(pooled.contributing_reports, 2);
+    assert_eq!(pooled.duplicate_reports, 1);
+    assert_eq!(pooled.superseded_reports, 1);
+    let presence = pooled
+        .proposals
+        .get("availability.speech_presence_rate")
+        .expect("two distinct run identities remain");
+    assert_eq!(
+        presence.conforming,
+        Some(20),
+        "the superseding artifact is counted, not the artifact it replaced"
+    );
+    assert_eq!(presence.eligible, Some(40));
+    assert!(
+        pooled
+            .limitations
+            .iter()
+            .any(|limitation| limitation.contains("last artifact supplied")),
+        "the conflicting retry is stated, not silently resolved: {:?}",
+        pooled.limitations
+    );
+}
+
+#[test]
+fn the_pooled_baseline_names_every_run_and_revision_it_was_pooled_from() {
+    let (run_a, mut run_b) = two_run_history();
+    run_b.source.git_commit = "cafebabe".to_owned();
+    let pooled = BaselineProposalSet::from_reports(&[run_a, run_b]).expect("proposal set");
+    assert_eq!(
+        pooled.revisions,
+        vec!["cafebabe".to_owned(), "deadbeef".to_owned()]
+    );
+    assert_eq!(
+        pooled
+            .contributing_runs
+            .iter()
+            .map(|run| (run.run_id.as_str(), run.git_commit.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("run-a", "deadbeef"), ("run-b", "cafebabe")],
+        "a target has to be able to name the runs and revisions behind its baseline"
+    );
+    let baseline = pooled
+        .proposals
+        .get("availability.speech_presence_rate")
+        .and_then(|proposal| proposal.baseline.clone())
+        .expect("baseline");
+    assert_eq!(
+        baseline.runs, pooled.contributing_runs,
+        "the evidence block itself carries the manifest, so copying it out of \
+         the proposal keeps the identity"
+    );
+}
+
+#[test]
+fn a_baseline_citing_an_unnamed_run_is_refused() {
+    let mut target = calibrated(0.9, 0.95);
+    target.baseline.runs = vec![BaselineRun {
+        run_id: "  ".to_owned(),
+        git_commit: "deadbeef".to_owned(),
+    }];
+    let file = targets(&[("availability.speech_presence_rate", target)]);
+    let error = file
+        .validate(&catalog())
+        .expect_err("a run that cannot be named is not evidence");
+    assert!(error.to_string().contains("empty run identity"), "{error}");
 }
 
 #[test]
@@ -840,13 +1001,16 @@ fn a_report_for_another_schema_version_fails_closed() {
 
 #[test]
 fn sub_hour_evidence_omits_stream_hours_instead_of_claiming_one() {
-    let run_a = evaluate_default(&report(
-        (0..20)
-            .map(|_| observation(RouteClass::Deterministic))
-            .collect(),
-        2_000,
-    ));
-    let run_b = evaluate_default(&report(silence(20), 2_000));
+    let run_a = evaluate_run(
+        &report(
+            (0..20)
+                .map(|_| observation(RouteClass::Deterministic))
+                .collect(),
+            2_000,
+        ),
+        "run-a",
+    );
+    let run_b = evaluate_run(&report(silence(20), 2_000), "run-b");
     let pooled = BaselineProposalSet::from_reports(&[run_a, run_b]).expect("proposal set");
     let baseline = pooled
         .proposals
@@ -873,18 +1037,22 @@ fn the_minimum_run_floor_is_two_and_exported() {
 
 #[test]
 fn an_experimental_report_does_not_move_the_active_baseline() {
-    let active = evaluate_default(&report(detection_with_latency(20), STREAM_HOUR_MS));
+    let active = evaluate_run(
+        &report(detection_with_latency(20), STREAM_HOUR_MS),
+        "active-a",
+    );
     let experimental = evaluate(
         &report(detection_with_latency(20), STREAM_HOUR_MS),
         &SloTargets::default(),
         SloEvaluationConfig {
             plane: TrafficPlane::Experimental,
+            run_id: Some("shadow-a".to_owned()),
             ..SloEvaluationConfig::default()
         },
     )
     .expect("SLO report");
     // A second active run, because one run calibrates nothing by itself.
-    let active_b = evaluate_default(&report(silence(20), STREAM_HOUR_MS));
+    let active_b = evaluate_run(&report(silence(20), STREAM_HOUR_MS), "active-b");
 
     let pooled =
         BaselineProposalSet::from_reports(&[active, active_b, experimental]).expect("proposal set");
@@ -918,7 +1086,10 @@ fn a_history_of_mixed_catalog_versions_is_refused() {
 
 #[test]
 fn a_latency_objective_publishes_percentiles_and_never_a_zero_ratio() {
-    let latency_run_a = evaluate_default(&report(detection_with_latency(40), STREAM_HOUR_MS));
+    let latency_run_a = evaluate_run(
+        &report(detection_with_latency(40), STREAM_HOUR_MS),
+        "latency-run-a",
+    );
     let (_, run_b) = two_run_history();
     // Same series (same dataset/config/seed/mode) — run_b varies in content but
     // the metadata helper keeps the series identical, so pool them together.
@@ -943,8 +1114,14 @@ fn the_first_latency_target_is_constructible_from_measured_artifacts_alone() {
     // The calibration cycle: percentiles -> candidate boundary -> measured
     // conforming ratio -> valid target. Every step is measured; nothing is
     // invented.
-    let run_a = evaluate_default(&report(detection_with_latency(40), STREAM_HOUR_MS));
-    let run_b = evaluate_default(&report(detection_with_latency(40), STREAM_HOUR_MS + 1_000));
+    let run_a = evaluate_run(
+        &report(detection_with_latency(40), STREAM_HOUR_MS),
+        "probe-run-a",
+    );
+    let run_b = evaluate_run(
+        &report(detection_with_latency(40), STREAM_HOUR_MS + 1_000),
+        "probe-run-b",
+    );
     let pooled = BaselineProposalSet::from_reports(&[run_a, run_b]).expect("proposal set");
 
     let audio = pooled
@@ -968,7 +1145,10 @@ fn the_first_latency_target_is_constructible_from_measured_artifacts_alone() {
             "availability.event_to_first_audio_within_target",
             probe.clone(),
         )]),
-        SloEvaluationConfig::default(),
+        SloEvaluationConfig {
+            run_id: Some("probe-run-a".to_owned()),
+            ..SloEvaluationConfig::default()
+        },
     )
     .expect("probed SLO report");
     let measured_b = evaluate(
@@ -979,7 +1159,10 @@ fn the_first_latency_target_is_constructible_from_measured_artifacts_alone() {
         )
         .expect("benchmark report"),
         &targets(&[("availability.event_to_first_audio_within_target", probe)]),
-        SloEvaluationConfig::default(),
+        SloEvaluationConfig {
+            run_id: Some("probe-run-b".to_owned()),
+            ..SloEvaluationConfig::default()
+        },
     )
     .expect("probed SLO report");
     let probed = BaselineProposalSet::from_reports(&[measured_a, measured_b]).expect("probed set");
@@ -1031,8 +1214,8 @@ fn a_probe_target_is_never_valid_calibration_evidence() {
 
 #[test]
 fn no_evidence_in_the_history_leaves_an_objective_not_measured() {
-    let run_a = evaluate_default(&report(silence(5), 60_000));
-    let run_b = evaluate_default(&report(silence(6), 60_000));
+    let run_a = evaluate_run(&report(silence(5), 60_000), "run-a");
+    let run_b = evaluate_run(&report(silence(6), 60_000), "run-b");
     let pooled = BaselineProposalSet::from_reports(&[run_a, run_b]).expect("proposal set");
 
     assert!(

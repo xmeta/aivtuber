@@ -40,6 +40,7 @@
 //! runtime still produced no user-visible output). See [`attribution_of`].
 
 use serde::{Deserialize, Serialize};
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -64,8 +65,9 @@ pub const DEFAULT_ROLLING_WINDOW_HOURS: u32 = 3;
 pub const DEFAULT_PERSISTENT_MISS_WINDOWS: u64 = 3;
 
 /// Minimum number of *distinct* active-plane runs a history must contain before
-/// it may produce baseline evidence. One run calibrates nothing, and a
-/// duplicated artifact is not a second run.
+/// it may produce baseline evidence. One run calibrates nothing, and a run
+/// identity seen twice (a retry, or the same artifact passed twice) is not a
+/// second run.
 pub const MIN_BASELINE_RUNS: u64 = 2;
 
 /// Reserved prefix marking a probe placeholder in
@@ -801,6 +803,19 @@ pub struct LatencyCalibration {
     pub max_ms: u64,
 }
 
+/// Identity of one measured run a pooled baseline was computed from.
+///
+/// `run_id` carries #58's `recording.run_id` semantics: stable across retries
+/// of one run, distinct across distinct runs. The revision travels per run
+/// because one series may pool runs built from more than one commit; dataset,
+/// config, mode and seed are pinned by the series the evidence names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BaselineRun {
+    pub run_id: String,
+    pub git_commit: String,
+}
+
 /// Measured evidence a target was calibrated from.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -812,6 +827,17 @@ pub struct BaselineEvidence {
     /// Represented stream hours the calibration evidence covers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_hours: Option<u64>,
+    /// The #58 compatibility series (`mode|dataset_id|config_version|seed`) the
+    /// evidence belongs to. It is carried in the evidence itself because this
+    /// block is the part a reviewer copies into a durable target: the proposal's
+    /// top-level series is gone once the block is copied out of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub series: Option<String>,
+    /// The runs the value was pooled from. A target has to be able to prove
+    /// *which* repeated runs formed its baseline, so the identities travel with
+    /// the evidence, not merely alongside it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<BaselineRun>,
 }
 
 /// One calibrated objective.
@@ -840,6 +866,8 @@ impl SloTarget {
                 value: 0.0,
                 source: format!("{PROBE_SOURCE_MARKER} not calibration evidence"),
                 stream_hours: None,
+                series: None,
+                runs: Vec::new(),
             },
         }
     }
@@ -954,6 +982,14 @@ impl SloTargets {
                 return Err(SloError::new(format!(
                     "target {id:?} must cite the measured artifact it was calibrated from"
                 )));
+            }
+            for run in &target.baseline.runs {
+                if run.run_id.trim().is_empty() {
+                    return Err(SloError::new(format!(
+                        "target {id:?} baseline cites a contributing run with an empty run \
+                         identity; a run that cannot be named is not evidence"
+                    )));
+                }
             } // The probe placeholder is a measurement *tool*, never evidence: a
             // targets file carrying one has skipped the measured-ratio step.
             if !allow_probe && target.baseline.source.starts_with(PROBE_SOURCE_MARKER) {
@@ -994,13 +1030,18 @@ impl SloProvenance {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SloEvaluationConfig {
     pub plane: TrafficPlane,
     pub provenance: SloProvenance,
     pub rolling_window_hours: u32,
     pub persistent_miss_windows: u64,
+    /// Stable identity of the run this artifact measured, with the same
+    /// semantics as #58's `recording.run_id`: stable across retries of one run,
+    /// distinct across distinct runs ([`SloSource::run_id`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 impl Default for SloEvaluationConfig {
@@ -1010,6 +1051,7 @@ impl Default for SloEvaluationConfig {
             provenance: SloProvenance::ReplayFixture,
             rolling_window_hours: DEFAULT_ROLLING_WINDOW_HOURS,
             persistent_miss_windows: DEFAULT_PERSISTENT_MISS_WINDOWS,
+            run_id: None,
         }
     }
 }
@@ -1025,6 +1067,19 @@ pub struct SloSource {
     pub stream_duration_ms: Option<u64>,
     pub provenance: SloProvenance,
     pub plane: TrafficPlane,
+    /// Stable identity of the run this report measured, with the semantics #58
+    /// already uses for `recording.run_id`: stable across retries of one run,
+    /// distinct across distinct runs.
+    ///
+    /// It is the *only* run identity calibration pooling accepts. Report
+    /// content cannot stand in for it: two independent deterministic runs of
+    /// one revision produce byte-identical reports, so payload equality would
+    /// collapse two measurements into one, while a retry can differ in content
+    /// and would be counted twice. `None` means "a measurement, but not a
+    /// calibratable run"; [`BaselineProposalSet::from_reports`] refuses such a
+    /// report rather than guessing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 /// One reporting window and the observations that fell inside it.
@@ -1240,7 +1295,7 @@ pub fn evaluate(
     // boundary gets measured); the targets-file path does not.
     targets.validate_for_evaluation(&catalog)?;
 
-    let windows = build_windows(report, config);
+    let windows = build_windows(report, &config);
     let events = report.events.as_slice();
 
     let mut indicators = Vec::new();
@@ -1354,6 +1409,7 @@ pub fn evaluate(
             stream_duration_ms: report.metadata.stream_duration_ms,
             provenance: config.provenance,
             plane: config.plane,
+            run_id: config.run_id.clone(),
         },
         windows,
         latency_calibration,
@@ -1480,10 +1536,16 @@ pub struct BaselineProposalSet {
     pub catalog_version: String,
     pub reports: u64,
     pub contributing_reports: u64,
-    /// Input reports that were byte-identical to another and therefore carry no
-    /// second measurement. A duplicated artifact is not a repeated run.
+    /// Input reports that repeated a run identity already in the history: a
+    /// retry, or the same artifact passed twice. They are not further runs.
     #[serde(default)]
     pub duplicate_reports: u64,
+    /// Subset of [`Self::duplicate_reports`] whose payload differed from the
+    /// artifact it superseded. A #58 re-run replaces its earlier row, so the
+    /// last artifact supplied for a run identity wins; the conflict is counted
+    /// and stated rather than silently resolved.
+    #[serde(default)]
+    pub superseded_reports: u64,
     pub excluded_experimental_reports: u64,
     /// The #58 compatibility series every contributing run belongs to:
     /// `mode|dataset_id|config_version|seed`. Pooled evidence is only valid
@@ -1492,6 +1554,11 @@ pub struct BaselineProposalSet {
     pub series: Option<String>,
     pub revisions: Vec<String>,
     pub datasets: Vec<String>,
+    /// Identity of every contributing run, sorted by run id. The same manifest
+    /// is embedded in each proposal's [`BaselineEvidence`], so it survives the
+    /// copy into a target.
+    #[serde(default)]
+    pub contributing_runs: Vec<BaselineRun>,
     pub proposals: BTreeMap<String, BaselineProposal>,
     /// Objectives with no eligible evidence in any contributing run.
     pub not_measured: Vec<String>,
@@ -1510,10 +1577,16 @@ impl BaselineProposalSet {
     ///   evidence about this one.
     /// * **One report contract.** A `schema_version` this build does not emit
     ///   fails closed, exactly like a target file for another contract.
-    /// * **Distinct runs.** Byte-identical reports are one run (a retry or a
-    ///   double-passed file is not repeated evidence) and are counted as
-    ///   duplicates. Fewer than [`MIN_BASELINE_RUNS`] distinct runs produce no
-    ///   proposals at all: one run calibrates nothing.
+    /// * **Distinct runs by identity, never by payload.** A run is identified
+    ///   by [`SloSource::run_id`], the #58 `recording.run_id` semantics: two
+    ///   independent deterministic runs of one revision produce byte-identical
+    ///   reports and are two measurements, while a retry of one run is one
+    ///   measurement however its numbers came out. A report with no run
+    ///   identity is refused, because content cannot be used to infer one.
+    ///   Inputs repeating a run identity collapse to one run, the last artifact
+    ///   supplied winning as a #58 re-run replaces its row; fewer than
+    ///   [`MIN_BASELINE_RUNS`] distinct runs produce no proposals at all, since
+    ///   one run calibrates nothing.
     /// * **Exact time.** Represented stream time is summed exactly; a partial
     ///   hour never rounds up to one. Sub-hour evidence omits `stream_hours`
     ///   instead of claiming an hour it did not stand for.
@@ -1536,6 +1609,19 @@ impl BaselineProposalSet {
                      definitions is not comparable",
                     report.source.dataset_id, report.catalog_version, SLO_CATALOG_VERSION
                 )));
+            }
+            match report.source.run_id.as_deref().map(str::trim) {
+                Some(run_id) if !run_id.is_empty() => {}
+                _ => {
+                    return Err(SloError::new(format!(
+                        "report for dataset {:?} carries no run identity, so it is a measurement \
+                         but not calibration evidence; regenerate it with `slo-report --run-id \
+                         <stable-id>` (#58 `recording.run_id` semantics: stable across retries of \
+                         one run, distinct across distinct runs), because two independent runs can \
+                         produce identical reports and content can never stand in for identity",
+                        report.source.dataset_id
+                    )));
+                }
             }
         }
 
@@ -1569,28 +1655,69 @@ impl BaselineProposalSet {
             }
         }
 
-        // Distinct-run detection: a byte-identical report carries no second
-        // measurement. Hashing canonical JSON (not the raw bytes) makes this
-        // independent of whitespace and key order.
+        // Distinct-run detection is by run identity, never by payload. Two
+        // independent deterministic runs of one revision produce identical
+        // reports, and a retry of one run can produce a different one, so
+        // content decides neither question. The canonical form is still used,
+        // but only to notice that a superseding artifact disagrees with the one
+        // it replaced: that is reported, not silently resolved.
         let canonical_json = |report: &SloReport| -> Result<String, SloError> {
             serde_json::to_string(report)
                 .map_err(|error| SloError::new(format!("canonicalize report: {error}")))
         };
-        let mut seen = BTreeSet::new();
+        // run identity -> (index in `distinct`, canonical payload)
+        let mut by_run: BTreeMap<String, (usize, String)> = BTreeMap::new();
         let mut distinct: Vec<&SloReport> = Vec::new();
         let mut duplicate_reports = 0_u64;
+        let mut superseded_reports = 0_u64;
         let mut excluded_experimental = 0_u64;
         for report in reports {
             if !report.counts_toward_active_slo {
                 excluded_experimental += 1;
                 continue;
             }
-            if !seen.insert(canonical_json(report)?) {
-                duplicate_reports += 1;
-                continue;
+            let run_id = report
+                .source
+                .run_id
+                .as_deref()
+                .expect("every report's run identity was required above")
+                .trim()
+                .to_owned();
+            let canonical = canonical_json(report)?;
+            match by_run.entry(run_id) {
+                Entry::Occupied(mut occupied) => {
+                    duplicate_reports += 1;
+                    let (index, previous) = occupied.get_mut();
+                    // A #58 re-run of one workflow run replaces its earlier row,
+                    // so the last artifact supplied for a run identity wins and
+                    // a directory glob stays usable.
+                    if *previous != canonical {
+                        superseded_reports += 1;
+                        distinct[*index] = report;
+                        *previous = canonical;
+                    }
+                }
+                Entry::Vacant(vacant) => {
+                    vacant.insert((distinct.len(), canonical));
+                    distinct.push(report);
+                }
             }
-            distinct.push(report);
         }
+
+        // Identity of every contributing run, so the durable evidence can name
+        // *which* runs formed a baseline rather than merely how many were seen.
+        let mut run_manifest: Vec<BaselineRun> = distinct
+            .iter()
+            .map(|report| BaselineRun {
+                run_id: report
+                    .source
+                    .run_id
+                    .clone()
+                    .expect("run identities were required above"),
+                git_commit: report.source.git_commit.clone(),
+            })
+            .collect();
+        run_manifest.sort_by(|left, right| left.run_id.cmp(&right.run_id));
 
         let mut limitations = vec![
             "baselines pool the `session` window only: stream-hour and rolling windows partition \
@@ -1600,6 +1727,18 @@ impl BaselineProposalSet {
              percentile, because the artifact carries per-run percentiles rather than raw samples"
                 .to_owned(),
         ];
+        if duplicate_reports > 0 {
+            limitations.push(format!(
+                "{duplicate_reports} report(s) repeated a run identity already in the history and \
+                 were not counted as further runs"
+            ));
+        }
+        if superseded_reports > 0 {
+            limitations.push(format!(
+                "{superseded_reports} of those repeated a run identity with different content; the \
+                 last artifact supplied for a run identity wins, as a #58 re-run replaces its row"
+            ));
+        }
         if (distinct.len() as u64) < MIN_BASELINE_RUNS {
             limitations.push(format!(
                 "only {} distinct active run(s) in the history; at least {MIN_BASELINE_RUNS} are \
@@ -1612,6 +1751,7 @@ impl BaselineProposalSet {
                 reports: reports.len() as u64,
                 contributing_reports: distinct.len() as u64,
                 duplicate_reports,
+                superseded_reports,
                 excluded_experimental_reports: excluded_experimental,
                 revisions: distinct
                     .iter()
@@ -1626,6 +1766,7 @@ impl BaselineProposalSet {
                     .into_iter()
                     .collect(),
                 series,
+                contributing_runs: run_manifest,
                 proposals: BTreeMap::new(),
                 not_measured: Vec::new(),
                 limitations,
@@ -1739,12 +1880,16 @@ impl BaselineProposalSet {
         let series = series.expect("distinct non-empty history has a series");
         // Provenance that survives the copy into a target entry: the evidence
         // block is the only durable part, so it must name what was measured —
-        // dataset, revision, and the series identity — not merely how many of
-        // them there were.
+        // which runs, over which dataset, revision, and series identity — not
+        // merely how many of them there were. The same identities are also
+        // carried structurally by [`BaselineEvidence::runs`] and
+        // [`BaselineEvidence::series`]; the prose is for a reader.
         let provenance = |runs: u64, boundary: Option<u64>| {
             let mut source = format!(
-                "slo-baseline: {runs} distinct session run(s); series={series}; datasets={}; \
+                "slo-baseline: {runs} distinct session run(s) [{}]; series={series}; datasets={}; \
                  revisions={}; config={}; mode={}; seed={}",
+                // `join_sorted` re-sorts, which is harmless: run ids are unique.
+                join_sorted(run_manifest.iter().map(|run| run.run_id.as_str())),
                 join_sorted(datasets.iter()),
                 join_sorted(revisions.iter()),
                 join_sorted(config_versions.iter()),
@@ -1776,6 +1921,8 @@ impl BaselineProposalSet {
                         value: *conforming as f64 / *eligible as f64,
                         source: provenance(*runs, None),
                         stream_hours,
+                        series: Some(series.clone()),
+                        runs: run_manifest.clone(),
                     }),
                     latency: None,
                 },
@@ -1808,6 +1955,8 @@ impl BaselineProposalSet {
                         value: *conforming as f64 / *eligible as f64,
                         source: provenance(*runs, Some(*threshold_ms)),
                         stream_hours,
+                        series: Some(series.clone()),
+                        runs: run_manifest.clone(),
                     });
                 }
             }
@@ -1837,12 +1986,6 @@ impl BaselineProposalSet {
                  the represented time may be under-counted"
             ));
         }
-        if duplicate_reports > 0 {
-            limitations.push(format!(
-                "{duplicate_reports} byte-identical report(s) were counted as duplicates, not as \
-                 further runs"
-            ));
-        }
         if excluded_experimental > 0 {
             limitations.push(format!(
                 "{excluded_experimental} experimental-plane report(s) were excluded from the \
@@ -1862,10 +2005,12 @@ impl BaselineProposalSet {
             reports: reports.len() as u64,
             contributing_reports: distinct.len() as u64,
             duplicate_reports,
+            superseded_reports,
             excluded_experimental_reports: excluded_experimental,
             revisions: revisions.into_iter().map(ToOwned::to_owned).collect(),
             datasets: datasets.into_iter().map(ToOwned::to_owned).collect(),
             series: Some(series),
+            contributing_runs: run_manifest,
             proposals,
             not_measured,
             limitations,
@@ -1880,14 +2025,25 @@ impl BaselineProposalSet {
     pub fn markdown_summary(&self) -> String {
         let mut out = format!(
             "Operational SLO baseline proposal — {} report(s) pooled ({} contributing distinct, {} \
-             duplicate, {} experimental excluded)\n\n",
+             duplicate, {} superseding, {} experimental excluded)\n\n",
             self.reports,
             self.contributing_reports,
             self.duplicate_reports,
+            self.superseded_reports,
             self.excluded_experimental_reports
         );
         if let Some(series) = &self.series {
             out.push_str(&format!("Series: `{series}`\n\n"));
+        }
+        if !self.contributing_runs.is_empty() {
+            out.push_str(&format!(
+                "Runs: {}\n\n",
+                self.contributing_runs
+                    .iter()
+                    .map(|run| format!("`{}`@{}", run.run_id, run.git_commit))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
         }
         out.push_str(
             "| Indicator | Runs | Eligible | Conforming | Value | Threshold ms | Stream hours | Latency p95/p99/max |\n\
@@ -2112,7 +2268,7 @@ fn aar_candidates(indicators: &[SloIndicatorResult], threshold: u64) -> Vec<AarC
 /// Bucketing is over the logical stream offset recorded at admission. An
 /// artifact that carries no offsets degrades to a single session window and
 /// says so, rather than inventing hour boundaries from the event index.
-fn build_windows(report: &BenchmarkReport, config: SloEvaluationConfig) -> Vec<SloWindow> {
+fn build_windows(report: &BenchmarkReport, config: &SloEvaluationConfig) -> Vec<SloWindow> {
     let events = &report.events;
     let observed_end = events
         .iter()
