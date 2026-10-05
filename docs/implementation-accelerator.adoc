@@ -232,10 +232,22 @@ tgrep -n -t rust 'ShadowComparisonRecord|TraceStage' .
 |Developer profile with one maintained MCP server, pinned identity, explicit tool allowlist, scoped credential, health/failure path
 |Removing/unavailable external connector must not change domain contracts or stop the deterministic performer runtime
 
+|#219 OSS VRM avatar renderer
+|+AvatarAdapter+ boundary, existing VTS adapter tests, #84 intent contract, planned Tauri/web surface
+|`@pixiv/three-vrm` first; compare V-Sekai `godot-vrm` only if measured behavior justifies another runtime
+|One local VRM 1.0 model renders transparent output and accepts provider-neutral expression/look-at/viseme commands without VTube Studio
+|Renderer restart/disconnect cannot replay stale commands; no production CDN or paid avatar host is required
+
+|#220 local-first production profile
+|+crates/app/src/main.rs+ generative composition, profile selection, normalized HTTP TTS, #219 avatar path
+|`llama.cpp` Responses-compatible local server; `sherpa-onnx` local speech sidecar; existing deterministic fallback
+|One named local profile runs local Thinking + local TTS + local avatar with no billable credentials
+|With network/cloud credentials absent, the local smoke still performs; non-loopback no-auth inference fails closed
+
 |#205 desktop MVP
-|+crates/app+ composition/operator status, #191 RoleBlend, #201 task state, #204 connector profile
+|+crates/app+ composition/operator status, #191 RoleBlend, #201 task state, #204 connector profile, #219/#220 local product path
 |Tauri v2 + maintained first-party plugins for generic desktop shell/updater/autostart/single-instance/process concerns
-|Clean-config desktop shell starts fixture runtime, shows Persona/RoleBlend, connector permissions, active task state, approval, and verified outcome
+|Clean-config desktop shell starts the account-free local profile, shows Persona/RoleBlend, connector permissions, active task state, approval, and verified outcome
 |UI/IPC data that claims extra permission cannot mint an AuthenticatedControl capability; optional sidecar failure cannot remove operator stop
 |===
 
@@ -262,6 +274,12 @@ tgrep -n -t rust 'ShadowComparisonRecord|TraceStage' .
 |+unicode-segmentation+ primitive; Open-LLM-VTuber +sentence_divider.py+ reference
 |Phrase 1 complete/gated/TTS'd and committed while phrase 2 remains pending
 |Phrase 2 failure cannot replay or invalidate already spoken phrase 1
+
+|#222 speech lifecycle / text projection
+|scheduler/audio completion state, +TtsEngine+, Performance Asset text/audio identity, #81/#83 consumers
+|AIRI display-vs-speech pronunciation pattern; Neuro SDK speech-finished lifecycle as reference only
+|One Japanese display string resolves locally to pronunciation text; scheduler emits Prepared/Committed/Started/Finished or Cancelled with final identity
+|TTS synthesis success alone never emits audible Finished; projection cannot add semantic content or bypass the output gate
 
 |#84 PerformanceIntent
 |new bounded domain type, +crates/generative+, adapters, scheduler
@@ -292,6 +310,12 @@ tgrep -n -t rust 'ShadowComparisonRecord|TraceStage' .
 |Prefer structured game telemetry / OBS state; use vision only when structured state is unavailable
 |One provider adapter normalizes boss/menu/unknown into bounded snapshot
 |Public chat cannot self-assert trusted busy/interruptibility state
+
+|#221 dynamic ActionWindow
+|#202 tool catalog/policy, #193 execution observation, #88 scene epochs, task verification boundary
+|Neuro SDK dynamic action/window registration as reference; keep aivtuber authority/verification semantics
+|One scene epoch exposes two valid high-level actions; scene transition supersedes the window and a stale proposal is rejected
+|Action validation/dispatch cannot become verified task success; model never receives the full tool universe or frame-level motor controls
 
 |#89 naturalness budgets
 |+crates/adaptation+ recent bounded history, #84/#81/#82 outputs
@@ -332,17 +356,17 @@ tgrep -n -t rust 'ShadowComparisonRecord|TraceStage' .
 |===
 |Issue |Local start-here |Reuse/reference |Smallest vertical slice |Cheapest falsifier
 
-|#90 perception plane
+|#90 perception / realtime media plane
 |+crates/domain/src/context.rs+, adapter boundary, security threat model
-|Narrow task-specific models first; #92 turn cues before general screen understanding
-|Replay one bounded derived observation with confidence/TTL/provenance
-|Prompt/tool-like text inside perceived content cannot mint authority
+|Narrow task-specific models first; local sidecar transport; #92 turn cues before general screen understanding
+|Replay one bounded derived observation with confidence/TTL/provenance while raw PCM/video remains off the control queue
+|Media backpressure/drop cannot block scheduler/operator control; prompt/tool-like perceived content cannot mint authority
 
 |#92 speech/turn observations
-|new domain observations, adapters/sidecar boundary, #81 consumer
-|sherpa-onnx Rust Japanese ReazonSpeech+VAD example; Pipecat LocalSmartTurnAnalyzerV3; LiveKit turn detector
-|Sidecar/fixture emits SpeechActivity + TurnEndLikelihood; #81 consumes replayed observation
-|Unsupported language/provider degrades to deterministic silence/phrase heuristic without frame-loop blocking
+|new domain observations, bounded media sidecar, #81 consumer, #222 performer speech lifecycle
+|sherpa-onnx Japanese ReazonSpeech+VAD; Pipecat turn patterns; local/self-hosted implementations first
+|Bounded pre-roll ring buffer plus sidecar/fixture emits SpeechActivity + TurnEndLikelihood; #81 consumes replayed observation
+|Unsupported language/provider degrades to deterministic silence/phrase heuristic; clipped utterance starts and unbounded raw-audio retention are rejected
 
 |#93 multi-party
 |#80 conversation context, #81 floor, #91 attention, #92 speaker observations

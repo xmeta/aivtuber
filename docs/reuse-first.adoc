@@ -25,6 +25,8 @@ Do not outsource project-owned semantics merely because a library offers a conve
 
 Before custom infrastructure is added, check license, maintenance, transitive/runtime cost, async/runtime assumptions, security advisories, determinism/replay impact, bounded-state behavior, provider lock-in, and fallback/removal cost.
 
+For baseline product dependencies, also require a path that does not depend on paid third-party software or billable SaaS. Hosted/commercial services may be optional adapters, but a generic mechanism is not an acceptable baseline choice if the only viable deployment requires an external paid account.
+
 Record the result as one of:
 
 * +adopt+
@@ -93,8 +95,8 @@ Record the result as one of:
 |External service connectors
 |GitHub official MCP server; Microsoft Playwright MCP; reviewed provider MCP servers for Google Workspace / Notion where available
 |Profile / sidecar before native adapter
-|Reuse maintained service-specific tool schemas, authentication flows, and API mechanics. Keep server allowlist, credential scope, local risk classification, approval, task verification, health limits, and graceful removal in aivtuber. Do not auto-trust public-registry entries or add one native adapter per SaaS by default.
-|#202, #204
+|Reuse maintained service-specific tool schemas, authentication flows, and API mechanics. Keep server allowlist, credential scope, local risk classification, approval, task verification, health limits, and graceful removal in aivtuber. Do not auto-trust public-registry entries or add one native adapter per SaaS by default. Commercial/SaaS profiles are optional and must not be required by the #220 zero-paid baseline.
+|#202, #204, #220
 
 |Desktop shell
 |Tauri v2 + maintained first-party plugins
@@ -102,23 +104,35 @@ Record the result as one of:
 |Reuse window/process shell and generic desktop concerns such as updater, autostart, single-instance behavior, and dialogs where needed. Keep runtime/domain logic, authenticated control, task state, Persona/RoleBlend semantics, and connector policy in the Rust core rather than duplicating them in UI code.
 |#205
 
+|Local OSS avatar renderer
+|`@pixiv/three-vrm`; compare V-Sekai `godot-vrm`
+|Wrap / local renderer surface; conformance spike first
+|Prefer the MIT-licensed `three-vrm` path because it fits the planned Tauri/web surface and supports VRM 1.0/MToon without a paid avatar host. Bundle/pin dependencies locally rather than relying on a CDN. Keep PerformanceIntent, scheduler/replay, stale-command policy, and authority in Rust. VTube Studio remains optional.
+|#219
+
+|Local generative inference
+|`llama.cpp` / `llama-server`
+|Local sidecar / OpenAI-compatible adapter
+|Use the local Responses-compatible server before adding a second generic inference wire protocol. Explicitly distinguish loopback/self-hosted no-auth policy from remote authenticated endpoints; retain deadlines, cancellation, output gating, model identity, and replay semantics in aivtuber. Model-weight licenses remain separate.
+|#220
+
 |External specialized agent delegation
 |Agent Client Protocol (ACP); ACP-capable runtimes such as Goose
 |Future reference / spike only
 |Potentially delegate specialized long-running work such as coding after #193/#201/#202/#203 are stable. An external agent must sit below AgentTask as a bounded backend; it must not own capability minting, task completion truth, memory policy, or Persona. Do not add ACP to the critical path while the protocol/runtime fit is still evolving.
 |#200
 
-|Realtime conversational voice pipeline
-|LiveKit Agents / Pipecat Smart Turn v3
-|Sidecar / reference first
-|Reuse turn detection, false-interruption recovery, preemptive-generation, and media mechanics where useful instead of rebuilding generic realtime plumbing. Pipecat's local Smart Turn v3 ONNX analyzer is a concrete turn-end candidate. Normalize observations into aivtuber-owned floor/commit policy; external frameworks must not directly own scheduler cancellation or irreversible publication.
-|#81, #92, #93, #106
+|Realtime conversational voice / media pipeline
+|`sherpa-onnx`; Pipecat; self-hosted LiveKit server when an SFU is actually needed
+|Local sidecar / reference first
+|Use a separate bounded realtime media/data plane for PCM/video rather than the control queue. Prefer same-machine local speech first; Pipecat is reference/optional orchestration and LiveKit is only for cases that need WebRTC/SFU transport. Hosted media is never required. Normalize observations into aivtuber-owned floor/commit policy; external frameworks must not directly own scheduler cancellation or irreversible publication.
+|#90, #92, #93, #106
 
 |Local speech inference
 |sherpa-onnx
 |Wrap or sidecar; conformance/benchmark first
-|Reuse maintained local VAD/ASR/TTS/diarization primitives and platform bindings. Keep provider-neutral speech observations, deadlines, privacy, turn policy, replay identity, and model/license compatibility decisions in aivtuber.
-|#92
+|Reuse maintained local VAD/ASR/TTS/diarization primitives and platform bindings. Keep provider-neutral speech observations, bounded pre-roll, deadlines, privacy, turn policy, replay identity, and model/license compatibility decisions in aivtuber. Framework license does not imply that every voice/model has the same license.
+|#92, #220
 
 |Agent long-term memory service
 |Hindsight; Graphiti
@@ -162,6 +176,18 @@ Record the result as one of:
 |Study sentence-divider, faster-first-response, interruption, and segmented TTS behavior. Do not copy publication semantics that bypass aivtuber's stronger output-gate/atomic-commit requirements.
 |#83
 
+|Speech lifecycle / display-to-speech projection
+|AIRI pronunciation patterns; Neuro SDK speech lifecycle
+|Reference only; local deterministic implementation
+|Keep display text, resolved speech text, phrase identity, audible playback lifecycle, cancellation, and replay semantics provider-neutral. Use local lexicon/rules as the baseline; cloud pronunciation services are optional. Synthesis completion is not audible completion.
+|#222
+
+|Dynamic context-valid actions
+|Neuro SDK ActionWindow/action registration patterns
+|Reference only
+|Adopt bounded epoch/TTL-scoped high-level action exposure, not external completion semantics. #202 policy/approval remains authoritative; dispatch success and verified outcome stay distinct; low-level continuous control remains local/deterministic.
+|#221
+
 |Twitch moderation API
 |+twitch_api+
 |Wrap
@@ -176,9 +202,9 @@ Record the result as one of:
 
 |VTube Studio protocol/client
 |+vtubestudio+
-|Partial reuse / conformance spike first
-|Typed protocol/auth/multiplexing may replace hand-written wire code. Do not inherit reconnect/retry behavior that could replay stale avatar commands. Measure async/Tokio footprint.
-|#66
+|Optional adapter / partial reuse
+|Typed protocol/auth/multiplexing may replace hand-written wire code for users who choose VTube Studio. Do not inherit reconnect/retry behavior that could replay stale avatar commands. This is not the baseline avatar path after #219.
+|#66, #219
 
 |OBS WebSocket protocol/client
 |+obws+
@@ -242,8 +268,13 @@ Use it to identify tested patterns and failure cases, not as a reason to weaken 
 
 === 4.2 AIRI
 
-Study Live2D/VRM behavior, auto blink, auto look-at, idle eye movement, motion mapping, attention UX, and agent-oriented repository organization.
+Study Live2D/VRM behavior, auto blink, auto look-at, idle eye movement, motion mapping, attention UX, plugin capability negotiation, and control/data-plane separation.
 Use it primarily as behavior/UX/architecture evidence unless a package independently fits a provider-neutral Rust boundary.
+
+=== 4.3 Neuro SDK
+
+Study dynamic registration of bounded high-level actions, scene/turn-scoped action windows, context updates that do not require a reply, separate realtime voice transport, and explicit speech lifecycle events.
+Adopt those patterns only through aivtuber-owned authority and verification: an action being accepted/dispatched is never proof that the requested outcome completed.
 
 == 5. Dependency adoption record
 
