@@ -116,6 +116,7 @@ A comparable base-vs-head measurement can show that a proxy changed; it does not
 
 Numeric product targets and operational SLOs must be derived from representative evidence and measured baselines.
 Do not invent absolute thresholds in this document; #70 and #71 own representative workloads and operational SLO calibration.
+link:operational-slo.adoc[Operational SLOs and Error Budgets] owns the operational half: which events form a denominator, which failures belong to the runtime rather than to a provider, and why a security or bounded-state invariant never receives an error budget.
 
 == 7. Proxy divergence and review
 

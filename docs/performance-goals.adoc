@@ -24,6 +24,14 @@ enough — only that it is no worse than before. Optimization issues are filed
 against the gap between the measured baseline and the product target, not
 against budget headroom.
 
+The third thing is the *operational objective*: is the running system
+delivering an acceptable level of service over a session or represented stream
+hour? That is #71, documented in link:operational-slo.adoc[Operational SLOs and Error Budgets],
+and it reads the observations from link:metrics.adoc[Metrics and Evaluation] through a
+project-owned indicator catalog. Its targets file (`examples/slo/slo-targets.json`) is separate
+from `benchmarks/budgets.json` on purpose: a budget says what a change may cost, an objective
+says what the product must deliver.
+
 == 2. Baseline methodology
 
 Do not invent absolute targets without baseline data. The process is:

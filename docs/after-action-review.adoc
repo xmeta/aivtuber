@@ -18,6 +18,7 @@ Use an AAR when the event can materially change future engineering or operationa
 * unbounded or unexpected retained-state growth;
 * significant escaped/repeated regression;
 * major or persistent benchmark/quality regression;
+* a persistent operational SLO miss reported by `slo-report` (link:operational-slo.adoc[Operational SLOs and Error Budgets], #71);
 * external-provider failure exposing a missing or misleading degradation path;
 * an evidence-sensitive change whose actual result materially differs from the recorded expectation;
 * a load-bearing architecture or provider assumption invalidated by new evidence.
@@ -159,6 +160,10 @@ Use link:current-constraint.adoc[Current Measured Constraint] when:
 * persistent benchmark/quality/SLO evidence supports a different actionable constraint.
 
 A single noisy run or one-off recovered incident is not sufficient by itself.
+The `aar_candidates` array of an link:operational-slo.adoc[operational SLO report] is the
+machine-readable form of that threshold: a missed window is recorded as a breach immediately, and
+only a run of consecutive misses in one window series becomes a candidate, so a single noisy
+sample cannot generate an incident by itself.
 Hard security/privacy/operator/boundedness guardrails remain binding independent of the tactical bottleneck.
 
 == 8. Closure standard
