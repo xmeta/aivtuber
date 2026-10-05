@@ -40,17 +40,36 @@ impl ToolExecutionEvidence {
     }
 }
 
-pub async fn execute_verified_tool(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Authoritative task state sampled after a tool execution returns.
+pub struct ToolCommitStateSnapshot {
+    pub observed_generation: u64,
+    pub cancelled: bool,
+}
+
+/// Execute an authorized tool and verify its bounded result against task state
+/// re-read after the adapter await completes.
+pub async fn execute_verified_tool<F>(
     adapter: &dyn ToolAdapter,
     authority: &AuthenticatedControl,
     action: ToolAction,
-    fence: ToolCommitFence,
+    expected_generation: u64,
+    post_execution_state: F,
     rule: &ToolVerificationRule,
-) -> Result<ToolExecutionEvidence, EngineError> {
+) -> Result<ToolExecutionEvidence, EngineError>
+where
+    F: FnOnce() -> ToolCommitStateSnapshot,
+{
     let expected_tool = action.tool.clone();
     let expected_operation = action.operation.clone();
     let authorized = authorize_tool_action(authority, action)?;
     let result = adapter.execute(&authorized).await?;
+    let current = post_execution_state();
+    let fence = ToolCommitFence {
+        expected_generation,
+        observed_generation: current.observed_generation,
+        cancelled: current.cancelled,
+    };
     let verification =
         verify_tool_result(&result, &expected_tool, &expected_operation, fence, rule);
     Ok(ToolExecutionEvidence {
@@ -68,6 +87,11 @@ mod tests {
     };
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::time::Duration;
 
     struct FixtureAdapter;
 
@@ -91,6 +115,43 @@ mod tests {
                     1,
                 )
             })
+        }
+    }
+
+    struct DelayedFixtureAdapter {
+        started: Arc<AtomicBool>,
+    }
+
+    impl ToolAdapter for DelayedFixtureAdapter {
+        fn discover<'a>(&'a self) -> EngineFuture<'a, Vec<ToolDescriptor>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn execute<'a>(
+            &'a self,
+            action: &'a aivtuber_domain::AuthorizedToolAction,
+        ) -> EngineFuture<'a, ToolExecutionResult> {
+            let started = Arc::clone(&self.started);
+            Box::pin(async move {
+                started.store(true, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                ToolExecutionResult::new(
+                    action.action().tool.clone(),
+                    action.action().tool.clone(),
+                    action.action().operation.clone(),
+                    ToolResultClass::Success,
+                    Some(json!({ "value": 42 })),
+                    None,
+                    25,
+                )
+            })
+        }
+    }
+
+    fn current_state(generation: u64, cancelled: bool) -> ToolCommitStateSnapshot {
+        ToolCommitStateSnapshot {
+            observed_generation: generation,
+            cancelled,
         }
     }
 
@@ -139,11 +200,8 @@ mod tests {
                 operation: "read".to_owned(),
                 arguments: BTreeMap::new(),
             },
-            ToolCommitFence {
-                expected_generation: 3,
-                observed_generation: 3,
-                cancelled: false,
-            },
+            3,
+            || current_state(3, false),
             &ToolVerificationRule::JsonEquals {
                 pointer: "/value".to_owned(),
                 expected: json!(42),
@@ -171,11 +229,8 @@ mod tests {
                 operation: "read".to_owned(),
                 arguments: BTreeMap::new(),
             },
-            ToolCommitFence {
-                expected_generation: 3,
-                observed_generation: 3,
-                cancelled: false,
-            },
+            3,
+            || current_state(3, false),
             &ToolVerificationRule::JsonEquals {
                 pointer: "/value".to_owned(),
                 expected: json!(7),
@@ -198,11 +253,8 @@ mod tests {
                 operation: "read".to_owned(),
                 arguments: BTreeMap::new(),
             },
-            ToolCommitFence {
-                expected_generation: 1,
-                observed_generation: 1,
-                cancelled: false,
-            },
+            1,
+            || current_state(1, false),
             &ToolVerificationRule::JsonEquals {
                 pointer: "/value".to_owned(),
                 expected: json!(42),
@@ -212,5 +264,99 @@ mod tests {
         .expect_err("authorization must fail");
 
         assert_eq!(error.kind, EngineErrorKind::Unauthorized);
+    }
+
+    #[tokio::test]
+    async fn generation_change_during_execution_is_stale() {
+        let started = Arc::new(AtomicBool::new(false));
+        let adapter = DelayedFixtureAdapter {
+            started: Arc::clone(&started),
+        };
+        let authoritative_state = Arc::new(Mutex::new(current_state(7, false)));
+        let state_for_verification = Arc::clone(&authoritative_state);
+        let authority = authenticated(Capability::ToolGrant);
+        let rule = ToolVerificationRule::JsonEquals {
+            pointer: "/value".to_owned(),
+            expected: json!(42),
+        };
+
+        let execution = execute_verified_tool(
+            &adapter,
+            &authority,
+            ToolAction {
+                tool: "fixture".to_owned(),
+                operation: "read".to_owned(),
+                arguments: BTreeMap::new(),
+            },
+            7,
+            move || {
+                *state_for_verification
+                    .lock()
+                    .expect("authoritative state lock")
+            },
+            &rule,
+        );
+        let mutation = async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            authoritative_state
+                .lock()
+                .expect("authoritative state lock")
+                .observed_generation = 8;
+        };
+
+        let (evidence, ()) = tokio::join!(execution, mutation);
+        let evidence = evidence.expect("tool execution remains observable when stale");
+
+        assert_eq!(evidence.verification, ToolVerificationOutcome::Stale);
+        assert!(!evidence.is_completed());
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_execution_is_cancelled() {
+        let started = Arc::new(AtomicBool::new(false));
+        let adapter = DelayedFixtureAdapter {
+            started: Arc::clone(&started),
+        };
+        let authoritative_state = Arc::new(Mutex::new(current_state(7, false)));
+        let state_for_verification = Arc::clone(&authoritative_state);
+        let authority = authenticated(Capability::ToolGrant);
+        let rule = ToolVerificationRule::JsonEquals {
+            pointer: "/value".to_owned(),
+            expected: json!(42),
+        };
+
+        let execution = execute_verified_tool(
+            &adapter,
+            &authority,
+            ToolAction {
+                tool: "fixture".to_owned(),
+                operation: "read".to_owned(),
+                arguments: BTreeMap::new(),
+            },
+            7,
+            move || {
+                *state_for_verification
+                    .lock()
+                    .expect("authoritative state lock")
+            },
+            &rule,
+        );
+        let mutation = async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            authoritative_state
+                .lock()
+                .expect("authoritative state lock")
+                .cancelled = true;
+        };
+
+        let (evidence, ()) = tokio::join!(execution, mutation);
+        let evidence = evidence.expect("tool execution remains observable when cancelled");
+
+        assert_eq!(evidence.verification, ToolVerificationOutcome::Cancelled);
+        assert!(!evidence.is_completed());
     }
 }
