@@ -26,7 +26,7 @@ pub use operational_slo::{
     SLO_CATALOG_VERSION, SLO_REPORT_SCHEMA_VERSION, STREAM_HOUR_MS, SloAction, SloError,
     SloEvaluationConfig, SloIndicator, SloIndicatorResult, SloProvenance, SloReport, SloStatus,
     SloTarget, SloTargets, SloVerdict, SloWindow, TrafficPlane, WindowKind, attribution_of,
-    catalog, evaluate, failure_origin,
+    catalog, evaluate, failure_origin, overall_verdict,
 };
 pub use task_transition::{
     TaskTransitionCollector, TaskTransitionObservation, TaskTransitionRetentionConfig,

@@ -9,9 +9,10 @@
 use aivtuber_domain::InteractionDeadlineClass;
 use aivtuber_telemetry::{
     AttributionSummary, BaselineEvidence, BenchmarkReport, ComparisonMode, EventObservation,
-    EventVerdict, EvidenceSource, IndicatorUnit, ReproducibilityMetadata, RouteClass,
-    STREAM_HOUR_MS, SloEvaluationConfig, SloIndicatorResult, SloReport, SloStatus, SloTarget,
-    SloTargets, SloVerdict, WindowKind, attribution_of, catalog, evaluate,
+    EventVerdict, EvidenceSource, IndicatorUnit, ObjectiveKind, ReproducibilityMetadata,
+    RouteClass, STREAM_HOUR_MS, SloEvaluationConfig, SloIndicatorResult, SloReport, SloStatus,
+    SloTarget, SloTargets, SloVerdict, WindowKind, attribution_of, catalog, evaluate,
+    overall_verdict,
 };
 
 fn observation(route: RouteClass) -> EventObservation {
@@ -727,4 +728,124 @@ fn hardening_an_unversioned_target_file_is_still_accepted() {
         ..SloTargets::default()
     };
     file.validate(&catalog()).expect("unversioned draft");
+}
+
+// ---------------------------------------------------------------- round 3
+
+/// Build one indicator result so the aggregate rule can be exercised without
+/// the catalog's `not_yet_measured` rows masking it.
+fn row(id: &str, status: SloStatus) -> SloIndicatorResult {
+    SloIndicatorResult {
+        id: id.to_owned(),
+        kind: ObjectiveKind::Slo,
+        unit: IndicatorUnit::Ratio,
+        window: "session".to_owned(),
+        window_kind: WindowKind::Session,
+        denominator: "events".to_owned(),
+        numerator: "those inside the objective".to_owned(),
+        conforming: 0,
+        eligible: 0,
+        unscored: 0,
+        value: None,
+        target: None,
+        threshold_ms: None,
+        sample_floor: 0,
+        status,
+        miss_attribution: AttributionSummary::default(),
+        actions: Vec::new(),
+        missing_evidence: None,
+    }
+}
+
+/// `InsufficientSamples` is an undecided objective, so it must make the
+/// aggregate `Incomplete` rather than being quietly treated as "nothing
+/// outstanding". It is listed here explicitly because it is the status most
+/// likely to be forgotten when a new one is added.
+#[test]
+fn round_3_every_undecided_status_keeps_the_aggregate_from_passing() {
+    for status in [
+        SloStatus::Uncalibrated,
+        SloStatus::NotYetMeasured,
+        SloStatus::InsufficientSamples,
+    ] {
+        assert!(status.is_unresolved(), "{status:?} must be unresolved");
+        let verdicts = overall_verdict(&[
+            row("availability.speech_presence_rate", SloStatus::Met),
+            row("reliability.deadline_adherence_rate", status),
+        ]);
+        assert_eq!(
+            verdicts,
+            SloVerdict::Incomplete,
+            "a met objective plus {status:?} must not read as a pass"
+        );
+    }
+
+    // The decided and the legitimately-empty statuses are not outstanding.
+    for status in [SloStatus::Met, SloStatus::Missed, SloStatus::NoData] {
+        assert!(!status.is_unresolved(), "{status:?} must not be unresolved");
+    }
+    assert_eq!(
+        overall_verdict(&[
+            row("availability.speech_presence_rate", SloStatus::Met),
+            row("reliability.fallback_delivery_rate", SloStatus::NoData),
+        ]),
+        SloVerdict::Ok
+    );
+}
+
+/// Precedence is unchanged: a real breach still outranks everything.
+#[test]
+fn round_3_a_breach_still_outranks_incomplete_evidence() {
+    assert_eq!(
+        overall_verdict(&[
+            row("availability.speech_presence_rate", SloStatus::Missed),
+            row(
+                "reliability.deadline_adherence_rate",
+                SloStatus::NotYetMeasured
+            ),
+        ]),
+        SloVerdict::Breach
+    );
+    assert_eq!(
+        overall_verdict(&[row("availability.speech_presence_rate", SloStatus::NoData)]),
+        SloVerdict::Uncalibrated,
+        "a report with no data at all is not a pass either"
+    );
+}
+
+/// The same rule through the real evaluator: an under-sampled calibrated
+/// objective is not decided, is not given a budget, and cannot raise the
+/// aggregate above `Incomplete`.
+#[test]
+fn round_3_an_under_sampled_objective_is_not_decided_and_spends_nothing() {
+    let events: Vec<EventObservation> = (0..4_u64).map(|index| timed(index, 5)).collect();
+    let evaluated = evaluate(
+        &report(events, 4_000),
+        &targets(&[(
+            "availability.event_to_first_audio_within_target",
+            latency_target(0.95, 100),
+        )]),
+        SloEvaluationConfig::default(),
+    )
+    .expect("report");
+
+    let audio = result(
+        &evaluated,
+        "availability.event_to_first_audio_within_target",
+        "session",
+    );
+    assert_eq!(audio.status, SloStatus::InsufficientSamples);
+    assert!(audio.status.is_unresolved());
+    // The observed ratio is still reported — it is the evidence a reviewer
+    // needs to judge the sample floor — but it must not decide the objective.
+    assert_eq!(audio.value, Some(1.0));
+    assert!(!audio.status.is_decided());
+    assert!(
+        evaluated
+            .error_budgets
+            .iter()
+            .all(|budget| budget.indicator != audio.id),
+        "an undecided objective must not carry a budget"
+    );
+    assert_eq!(evaluated.verdict, SloVerdict::Incomplete);
 }

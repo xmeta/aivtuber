@@ -79,7 +79,7 @@ decided objective met its target
 
 |`incomplete`
 |nothing breached, but at least one objective's evidence is still unresolved —
-uncalibrated, or not measurable from this artifact
+uncalibrated, under-sampled, or not measurable from this artifact
 
 |`uncalibrated`
 |nothing was decided and nothing is outstanding either
@@ -90,6 +90,15 @@ uncalibrated, or not measurable from this artifact
 `ok`: otherwise a dashboard would read "every calibrated objective passed" as
 "the runtime is operating within its objectives" at exactly the moment the
 zero-tolerance evidence is missing.
+
+Every status that is neither a decision nor a legitimate absence of data counts
+as unresolved, and `SloStatus::is_unresolved()` lists them explicitly:
+`uncalibrated`, `not_yet_measured` and `insufficient_samples`. The last one is
+easy to forget and is the reason the list lives in one place — "fewer samples
+than the floor" is not the same as "nothing outstanding", and treating it as
+such would reopen the same hole this rule exists to close. `no_data` is *not*
+outstanding: an objective with an empty denominator has said everything it can
+say.
 
 === Zero-tolerance invariants are not SLOs
 

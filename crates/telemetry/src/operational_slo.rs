@@ -304,6 +304,22 @@ impl SloStatus {
         matches!(self, Self::Met | Self::Missed)
     }
 
+    /// Whether this objective's evidence is still outstanding.
+    ///
+    /// Every state that is not a decision and not a legitimate absence of data
+    /// belongs here, and each one is listed explicitly so a new status cannot
+    /// be added without someone deciding whether it may let a report read as a
+    /// pass. `InsufficientSamples` is included on purpose: an objective with
+    /// fewer samples than its floor has not been decided, and treating "not
+    /// enough evidence" as "nothing outstanding" is the same mistake as
+    /// treating an unmeasured invariant as a satisfied one.
+    pub fn is_unresolved(self) -> bool {
+        matches!(
+            self,
+            Self::Uncalibrated | Self::NotYetMeasured | Self::InsufficientSamples
+        )
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Met => "met",
@@ -1299,28 +1315,32 @@ pub fn evaluate(
     })
 }
 
-/// Aggregate verdict for the whole report.
+/// Aggregate verdict for a set of indicator results.
 ///
 /// `Ok` is only reachable when every objective in the catalog has been decided
 /// or has legitimately nothing to say. An objective whose evidence is still
-/// unresolved — uncalibrated, or not measurable from the artifact at all —
-/// makes the report `Incomplete`, never `Ok`, so a dashboard cannot read
-/// "every calibrated objective passed" as "the runtime is operating within its
-/// objectives" while the zero-tolerance invariants are still unmeasured.
-fn overall_verdict(indicators: &[SloIndicatorResult]) -> SloVerdict {
+/// unresolved — uncalibrated, under-sampled, or not measurable from the
+/// artifact at all — makes the report `Incomplete`, never `Ok`, so a dashboard
+/// cannot read "every calibrated objective passed" as "the runtime is
+/// operating within its objectives" while the zero-tolerance invariants are
+/// still unmeasured.
+///
+/// This is public because the rule is the part that has to be provable, and
+/// [`evaluate`] cannot prove it on its own: while the catalog still contains
+/// `not_yet_measured` objectives, every report is `Incomplete` for that reason
+/// alone, so an under-sampled objective is invisible through the CLI. Taking
+/// the results as an argument lets the aggregate contract be tested directly.
+pub fn overall_verdict(indicators: &[SloIndicatorResult]) -> SloVerdict {
     if indicators
         .iter()
         .any(|result| result.status == SloStatus::Missed)
     {
         return SloVerdict::Breach;
     }
-    let unresolved = indicators.iter().any(|result| {
-        matches!(
-            result.status,
-            SloStatus::Uncalibrated | SloStatus::NotYetMeasured
-        )
-    });
-    if unresolved {
+    if indicators
+        .iter()
+        .any(|result| result.status.is_unresolved())
+    {
         return SloVerdict::Incomplete;
     }
     if indicators.iter().any(|result| result.status.is_decided()) {
