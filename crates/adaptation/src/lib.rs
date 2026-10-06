@@ -99,12 +99,28 @@ pub struct MemoryLink {
 
 /// One retrieved memory together with its bounded link view. This is the
 /// retrieval surface the #105 long-range evaluation measures: `stale` marks a
-/// claim a retained memory explicitly supersedes, and `links` is capped at
-/// the per-memory budget so a neighborhood can never fan out unboundedly.
+/// claim a retained memory explicitly supersedes, `links` is capped at the
+/// per-memory budget so a neighborhood can never fan out unboundedly, and
+/// nodes one link away are resolved into the result within the query limit so
+/// a supersession that changed topic or actor is still consumable.
 #[derive(Debug, Clone, Serialize)]
 pub struct LinkedMemory<'a> {
     pub entry: &'a MemoryEntry,
     pub stale: bool,
+    pub links: Vec<MemoryLink>,
+    /// Edge vocabulary these links were produced under, serialized with the
+    /// view: a replay has to be able to identify which vocabulary shaped a
+    /// record instead of inferring it from field presence.
+    pub vocab_version: &'static str,
+}
+
+/// Serialized envelope for the retained edge set. The vocabulary version
+/// travels inside the artifact that carries the edges, so an older snapshot
+/// can be identified — and refused — rather than reinterpreted under a newer
+/// vocabulary.
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryLinkSnapshot {
+    pub vocab_version: &'static str,
     pub links: Vec<MemoryLink>,
 }
 
@@ -307,6 +323,17 @@ impl WorkingMemory {
         &self.links
     }
 
+    /// The versioned form of the retained edge set. Anything that persists or
+    /// replays links serializes this envelope rather than the bare list, so
+    /// [`MEMORY_LINK_VOCAB_VERSION`] can never be separated from the data it
+    /// versions.
+    pub fn link_snapshot(&self) -> MemoryLinkSnapshot {
+        MemoryLinkSnapshot {
+            vocab_version: MEMORY_LINK_VOCAB_VERSION,
+            links: self.links.iter().cloned().collect(),
+        }
+    }
+
     pub fn compactions(&self) -> &[MemoryCompactionRecord] {
         &self.compactions
     }
@@ -475,23 +502,29 @@ impl WorkingMemory {
         }
         if let Some(topic) = topic {
             let normalized = normalize(topic);
-            // Newest first (the new entry sits at the back and is filtered by
-            // node id), so the spine links to the most recent neighbors first
-            // and the budget cuts deterministically.
-            let older: Vec<u64> = self
+            // Ordered by logical record time, never by insertion order: a
+            // backfilled write may carry an earlier `created_at_ms` than one
+            // already stored, and a `TemporalBefore` edge must not contradict
+            // the record times `relevant` ranks by. A candidate recorded
+            // *after* this write is not its predecessor at all and is
+            // skipped; among the rest the newest record leads, with node id
+            // breaking ties so two same-tick writes keep insertion order and
+            // the budget still cuts deterministically.
+            let mut older: Vec<(u64, u64)> = self
                 .entries
                 .iter()
-                .rev()
                 .filter(|entry| {
                     entry.retention == RetentionClass::Durable
                         && entry.memory_id != new_id
                         && entry.topic.as_deref().map(normalize).as_deref()
                             == Some(normalized.as_str())
+                        && entry.created_at_ms <= now_ms
                 })
-                .take(budget)
-                .map(|entry| entry.memory_id)
+                .map(|entry| (entry.created_at_ms, entry.memory_id))
                 .collect();
-            for id in older {
+            older.sort_by(|left, right| right.cmp(left));
+            older.truncate(budget);
+            for (_, id) in older {
                 self.push_link(MemoryLink {
                     from: id,
                     to: new_id,
@@ -610,58 +643,126 @@ impl WorkingMemory {
     }
 
     /// The same ranking as [`Self::relevant`], each result joined with its
-    /// bounded link view. `stale` is a verdict over the **full** retained
-    /// edge set, never over the capped presentation view: a supersession
-    /// that fell past `max_links_per_memory` still marks its target stale,
-    /// and the superseder must itself still be live at `now_ms` — an expired
+    /// bounded link view, and — filling whatever the query limit still allows
+    /// — with the live nodes one link away from those results. `stale` is a
+    /// verdict over the **full** retained edge set, never over the capped
+    /// presentation view: a supersession that fell past
+    /// `max_links_per_memory` still marks its target stale, and the
+    /// superseding node must itself still be live at `now_ms` — an expired
     /// but not yet compacted memory is already deleted for retrieval, so it
-    /// cannot keep a claim marked. The view itself is deterministic and
-    /// prioritizes semantically decisive edges (supersessions before
-    /// temporal spine edges, creation order within each kind) before the
-    /// per-memory cap cuts it, so a neighborhood can never fan out.
+    /// cannot keep a claim marked. A view is only shown while *both* endpoints
+    /// are live, so an expired node leaves no dangling relation behind, and
+    /// the expansion resolves those same endpoints into results: a
+    /// supersession that changed topic or actor brings the claim it replaces
+    /// back with it, without the caller scanning the store to find it. The
+    /// whole result set stays within `query.limit`, expansion never displaces
+    /// a direct match, and both the view and the expansion are deterministic
+    /// (supersessions before temporal edges, creation order within a kind), so
+    /// a neighborhood can never fan out.
     pub fn relevant_linked(&self, query: MemoryQuery<'_>, now_ms: u64) -> Vec<LinkedMemory<'_>> {
         let cap = self.config.max_links_per_memory;
-        self.relevant(query, now_ms)
+        let limit = query.limit;
+        let live: HashSet<u64> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.expires_at_ms > now_ms)
+            .map(|entry| entry.memory_id)
+            .collect();
+
+        let matched: Vec<(&MemoryEntry, bool, Vec<MemoryLink>)> = self
+            .relevant(query, now_ms)
             .into_iter()
             .map(|entry| {
-                let id = entry.memory_id;
-                let incident: Vec<&MemoryLink> = self
-                    .links
-                    .iter()
-                    .filter(|link| link.from == id || link.to == id)
-                    .collect();
-                let stale = incident.iter().any(|link| {
-                    link.kind == MemoryLinkKind::Supersedes
-                        && link.to == id
-                        && self.entry_is_live(link.from, now_ms)
-                });
-                let mut links: Vec<MemoryLink> = Vec::with_capacity(cap.min(incident.len()));
-                for kind in [MemoryLinkKind::Supersedes, MemoryLinkKind::TemporalBefore] {
-                    for link in &incident {
-                        if links.len() >= cap {
-                            break;
-                        }
-                        if link.kind == kind {
-                            links.push((*link).clone());
-                        }
+                let (stale, links) = self.link_view(entry.memory_id, &live, cap);
+                (entry, stale, links)
+            })
+            .collect();
+
+        // One hop outward, ranked by the match that points at it: a linked
+        // node that already matched is not added twice, a dead endpoint is
+        // never resolved, and the caller's limit is the bound on how much
+        // context the hop may add.
+        let mut expanded: Vec<(&MemoryEntry, bool, Vec<MemoryLink>)> = Vec::new();
+        if matched.len() < limit {
+            let mut selected: HashSet<u64> = matched
+                .iter()
+                .map(|(entry, _, _)| entry.memory_id)
+                .collect();
+            'hop: for (entry, _, links) in &matched {
+                for link in links {
+                    let other = if link.from == entry.memory_id {
+                        link.to
+                    } else {
+                        link.from
+                    };
+                    if !live.contains(&other) || !selected.insert(other) {
+                        continue;
+                    }
+                    let Some(node) = self
+                        .entries
+                        .iter()
+                        .find(|candidate| candidate.memory_id == other)
+                    else {
+                        continue;
+                    };
+                    let (stale, node_links) = self.link_view(node.memory_id, &live, cap);
+                    expanded.push((node, stale, node_links));
+                    if matched.len() + expanded.len() >= limit {
+                        break 'hop;
                     }
                 }
-                LinkedMemory {
-                    entry,
-                    stale,
-                    links,
-                }
+            }
+        }
+
+        matched
+            .into_iter()
+            .chain(expanded)
+            .map(|(entry, stale, links)| LinkedMemory {
+                entry,
+                stale,
+                links,
+                vocab_version: MEMORY_LINK_VOCAB_VERSION,
             })
             .collect()
     }
 
-    /// A node counts as live while it is still retained *and* unexpired at
-    /// `now_ms`: retrieval already excludes expired entries, so link verdicts
-    /// must agree with retrieval about what still exists.
-    fn entry_is_live(&self, memory_id: u64, now_ms: u64) -> bool {
-        self.entries
+    /// One entry's bounded link view, with every edge required to have **both**
+    /// endpoints live at `now_ms`: retrieval already treats an expired node as
+    /// deleted, so relation metadata about it would expose a dangling edge to
+    /// a node that no longer exists. Supersessions lead, creation order breaks
+    /// ties within a kind, and the per-memory budget cuts the view.
+    fn link_view(
+        &self,
+        memory_id: u64,
+        live: &HashSet<u64>,
+        cap: usize,
+    ) -> (bool, Vec<MemoryLink>) {
+        let incident: Vec<&MemoryLink> = self
+            .links
             .iter()
-            .any(|entry| entry.memory_id == memory_id && entry.expires_at_ms > now_ms)
+            .filter(|link| {
+                (link.from == memory_id || link.to == memory_id)
+                    && live.contains(&link.from)
+                    && live.contains(&link.to)
+            })
+            .collect();
+        let stale = incident.iter().any(|link| {
+            link.kind == MemoryLinkKind::Supersedes
+                && link.to == memory_id
+                && live.contains(&link.from)
+        });
+        let mut links: Vec<MemoryLink> = Vec::with_capacity(cap.min(incident.len()));
+        for kind in [MemoryLinkKind::Supersedes, MemoryLinkKind::TemporalBefore] {
+            for link in &incident {
+                if links.len() >= cap {
+                    break;
+                }
+                if link.kind == kind {
+                    links.push((*link).clone());
+                }
+            }
+        }
+        (stale, links)
     }
 
     fn entry_from_event(
@@ -1438,6 +1539,224 @@ mod tests {
             topic: None,
             limit,
         }
+    }
+
+    fn retained_node(memory: &WorkingMemory, event_id: &str) -> u64 {
+        memory
+            .entries()
+            .iter()
+            .find(|entry| entry.source.event_id == event_id)
+            .map(|entry| entry.memory_id)
+            .expect("retained node")
+    }
+
+    #[test]
+    fn a_superseding_claim_brings_its_linked_target_back_within_the_query_limit() {
+        // The cross-topic update: the query matches only the new claim, and
+        // the single-hop timeline is only consumable if the claim it replaces
+        // comes back with it — otherwise the caller must bypass the API and
+        // scan the store for the endpoint id the view merely names.
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig::default());
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-old-topic",
+            "viewer disliked the game",
+            Some("game-x"),
+            1_000,
+        );
+        durable_write_superseding(
+            &mut memory,
+            &mut security,
+            "evt-new-topic",
+            "viewer finished the game",
+            Some("game-y"),
+            2_000,
+            &["evt-old-topic"],
+        )
+        .expect("supersession accepted");
+
+        let results = memory.relevant_linked(
+            MemoryQuery {
+                source_namespace: None,
+                actor_id: None,
+                topic: Some("game-y"),
+                limit: 10,
+            },
+            3_000,
+        );
+        assert_eq!(
+            results.len(),
+            2,
+            "the matched claim plus the retained claim it supersedes"
+        );
+        assert_eq!(results[0].entry.source.event_id, "evt-new-topic");
+        assert_eq!(results[1].entry.source.event_id, "evt-old-topic");
+        assert!(!results[0].stale, "the current claim is not stale");
+        assert!(
+            results[1].stale,
+            "the replaced claim comes back marked stale"
+        );
+
+        // The hop is bounded by the caller's limit and never displaces a
+        // direct match.
+        let bounded = memory.relevant_linked(
+            MemoryQuery {
+                source_namespace: None,
+                actor_id: None,
+                topic: Some("game-y"),
+                limit: 1,
+            },
+            3_000,
+        );
+        assert_eq!(bounded.len(), 1, "the query limit is still the bound");
+        assert_eq!(bounded[0].entry.source.event_id, "evt-new-topic");
+    }
+
+    #[test]
+    fn an_expired_endpoint_never_appears_in_a_returned_link_view() {
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig {
+            durable_ttl_ms: 1_500,
+            ..WorkingMemoryConfig::default()
+        });
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-a",
+            "claim a",
+            Some("game-x"),
+            1_000,
+        );
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-b",
+            "claim b",
+            Some("game-x"),
+            2_000,
+        );
+        assert_eq!(memory.links().len(), 1, "one temporal edge between them");
+
+        // `evt-a` expired at 2_500 while compaction has not run: retrieval
+        // already treats it as deleted, so relation metadata about it is a
+        // dangling edge to a node that no longer exists.
+        let results = memory.relevant_linked(
+            MemoryQuery {
+                source_namespace: None,
+                actor_id: None,
+                topic: Some("game-x"),
+                limit: 10,
+            },
+            3_000,
+        );
+        assert_eq!(results.len(), 1, "only the live claim is retrievable");
+        assert!(
+            results[0].links.is_empty(),
+            "no dangling relation to the expired endpoint"
+        );
+        assert!(
+            !results[0].stale,
+            "an expired node cannot keep a claim marked"
+        );
+        assert_eq!(
+            memory.links().len(),
+            1,
+            "physical removal stays compaction's job"
+        );
+    }
+
+    #[test]
+    fn serialized_link_artifacts_carry_the_vocabulary_version() {
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig::default());
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-a",
+            "claim a",
+            Some("game-x"),
+            1_000,
+        );
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-b",
+            "claim b",
+            Some("game-x"),
+            2_000,
+        );
+
+        let snapshot =
+            serde_json::to_value(memory.link_snapshot()).expect("serialize the link envelope");
+        assert_eq!(
+            snapshot["vocab_version"],
+            Value::String(MEMORY_LINK_VOCAB_VERSION.to_owned())
+        );
+        assert_eq!(snapshot["links"].as_array().map(Vec::len), Some(1));
+
+        let results = memory.relevant_linked(unfiltered_query(10), 3_000);
+        let view = serde_json::to_value(&results[0]).expect("serialize the retrieval view");
+        assert_eq!(
+            view["vocab_version"],
+            Value::String(MEMORY_LINK_VOCAB_VERSION.to_owned()),
+            "a replay can identify the vocabulary instead of inferring it: {view}"
+        );
+    }
+
+    #[test]
+    fn temporal_edges_follow_record_time_not_insertion_order() {
+        // Backfill: the second write carries an *earlier* record time than
+        // the first. Insertion order would derive `TemporalBefore` from the
+        // 2_000 record to the 1_000 one — an edge that contradicts the record
+        // times `relevant` ranks by.
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig::default());
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-2000",
+            "claim recorded at 2000",
+            Some("game-x"),
+            2_000,
+        );
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-1000",
+            "claim recorded at 1000",
+            Some("game-x"),
+            1_000,
+        );
+        assert!(
+            memory.links().is_empty(),
+            "a later record is not an earlier record's predecessor: {:?}",
+            memory.links()
+        );
+
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-1500",
+            "claim recorded at 1500",
+            Some("game-x"),
+            1_500,
+        );
+        let older = retained_node(&memory, "evt-1000");
+        let middle = retained_node(&memory, "evt-1500");
+        let newer = retained_node(&memory, "evt-2000");
+        let edges: Vec<(u64, u64)> = memory
+            .links()
+            .iter()
+            .map(|link| (link.from, link.to))
+            .collect();
+        assert_eq!(
+            edges,
+            vec![(older, middle)],
+            "only the genuinely older record is a predecessor"
+        );
+        assert!(!edges.contains(&(newer, middle)));
     }
 
     #[test]

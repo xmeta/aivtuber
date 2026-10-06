@@ -104,6 +104,7 @@ fn small_config() -> SoakConfig {
         telemetry_limit: 64,
         working_memory_limit: 32,
         memory_compaction_limit: 16,
+        memory_links_limit: 64,
         generated_asset_limit: 16,
         promotion_metadata_limit: 16,
         generated_asset_every: 25,

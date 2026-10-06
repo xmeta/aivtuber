@@ -530,7 +530,13 @@ fn deleting_a_memory_removes_every_link_that_touched_it() {
         "both edges died with their endpoint"
     );
     let store = serde_json::to_string(eval.memory.entries()).expect("serialize entries");
-    let links = serde_json::to_string(eval.memory.links()).expect("serialize links");
+    let links = serde_json::to_string(&eval.memory.link_snapshot()).expect("serialize links");
+    // The replay artifact names its own edge vocabulary, so a future
+    // vocabulary change is identifiable instead of silently reinterpreted.
+    assert!(
+        links.contains(aivtuber_adaptation::MEMORY_LINK_VOCAB_VERSION),
+        "the serialized link store carries its vocabulary version: {links}"
+    );
     for serialized in [store, links] {
         assert!(
             !serialized.contains("private old opinion"),

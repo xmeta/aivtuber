@@ -1008,6 +1008,25 @@ where
         topic: Option<&str>,
         now_ms: u64,
     ) -> Result<MemoryEntry, AppError> {
+        self.remember_durable_memory_superseding(event, authority, claim, topic, now_ms, &[])
+    }
+
+    /// A durable write that also carries the caller's update evidence (#105):
+    /// `supersedes` names the source event ids of retained durable memories
+    /// this claim replaces. It is the same non-serializable permit path as a
+    /// plain durable write — the security gate decides first, and an unknown,
+    /// ambiguous, expired, or unauthorized target refuses the whole write, so
+    /// declaring supersession can never widen the gate or store a link the
+    /// claim itself would not have earned.
+    pub fn remember_durable_memory_superseding(
+        &mut self,
+        event: &EventEnvelope,
+        authority: Option<&AuthenticatedControl>,
+        claim: &str,
+        topic: Option<&str>,
+        now_ms: u64,
+        supersedes: &[&str],
+    ) -> Result<MemoryEntry, AppError> {
         event
             .validate()
             .map_err(|error| AppError::Adaptation(error.to_string()))?;
@@ -1022,7 +1041,7 @@ where
         })?;
         adaptation
             .memory
-            .remember_durable(&permit, claim, topic, now_ms)
+            .remember_durable_superseding(&permit, claim, topic, now_ms, supersedes)
             .cloned()
             .map_err(|error| AppError::Adaptation(error.to_string()))
     }
@@ -3601,6 +3620,97 @@ mod tests {
             aivtuber_adaptation::MemoryGateDecision::AllowedMemoryAdmin
         );
         assert_eq!(app.adaptation().expect("adaptation").memory().len(), 2);
+    }
+
+    #[test]
+    fn supersession_evidence_reaches_the_link_store_through_production_app() {
+        // The #105 update path has to be reachable from the composition root,
+        // not only from the evaluation harness: a production caller that owns
+        // update evidence declares it here, through the same permit gate as
+        // the claim itself.
+        let mut app = app(
+            FixedSilentRoute,
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        )
+        .with_adaptation(adaptation_runtime(PromotionPolicy::default()));
+        app.startup().expect("startup");
+        let authority = memory_admin_authority();
+        let old = chat_event(40);
+        let new = chat_event(41);
+        let old_entry = app
+            .remember_durable_memory(
+                &old,
+                Some(&authority),
+                "viewer disliked the game",
+                Some("game-x"),
+                10,
+            )
+            .expect("first durable write");
+
+        // Without the gate no supersession evidence may reach the store: the
+        // write is denied and nothing is linked.
+        let denied = app
+            .remember_durable_memory_superseding(
+                &new,
+                None,
+                "viewer enjoyed the game",
+                Some("game-y"),
+                20,
+                &["evt-40"],
+            )
+            .expect_err("public chat without authority must not declare supersession");
+        assert!(denied.to_string().contains("security gate"));
+        assert_eq!(
+            app.adaptation().expect("adaptation").memory().links().len(),
+            0,
+            "a denied write mints no link"
+        );
+
+        let update = app
+            .remember_durable_memory_superseding(
+                &new,
+                Some(&authority),
+                "viewer enjoyed the game",
+                Some("game-y"),
+                20,
+                &["evt-40"],
+            )
+            .expect("superseding durable write");
+        assert!(
+            app.adaptation()
+                .expect("adaptation")
+                .memory()
+                .links()
+                .iter()
+                .any(|link| {
+                    link.kind == aivtuber_adaptation::MemoryLinkKind::Supersedes
+                        && link.from == update.memory_id
+                        && link.to == old_entry.memory_id
+                }),
+            "a production superseding write creates the Supersedes edge"
+        );
+
+        // An unknown target refuses the whole write: nothing stored, no link.
+        let third = chat_event(42);
+        let error = app
+            .remember_durable_memory_superseding(
+                &third,
+                Some(&authority),
+                "an unrelated claim",
+                Some("game-z"),
+                30,
+                &["evt-missing"],
+            )
+            .expect_err("an unknown supersession target refuses the write");
+        assert!(
+            error.to_string().contains("retained durable memory"),
+            "{error}"
+        );
+        let memory = app.adaptation().expect("adaptation").memory();
+        assert_eq!(memory.len(), 2, "the refused write stored nothing");
+        assert_eq!(memory.links().len(), 1, "the refused write minted nothing");
     }
 
     #[test]

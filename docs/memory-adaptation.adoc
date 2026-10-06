@@ -167,6 +167,11 @@ The Rust tests cover:
 * bounded-link creation, per-write/store caps, deletion-driven link pruning,
   supersession staleness, contradiction-without-evidence, and link
   determinism (issue #105, section 10);
+* one-hop linked-node retrieval inside the query limit, expired endpoints
+  excluded from returned link views, record-time temporal ordering, and
+  vocabulary-versioned link artifacts (issue #105 review round, section 10);
+* the permit-gated +ProductionApp+ supersession facade, including denied and
+  unknown-target writes storing nothing;
 * long-range synthetic update/supersession, record-time-vs-event-time order,
   expiry, timeline precision/bounds, and provenance survival cases (issue #105
   link-aware baseline, +tests/long_range_eval.rs+);
@@ -176,16 +181,21 @@ The Rust tests cover:
 * deterministic decision replay and anti-repetition;
 * full +ProductionApp+ generated-asset promotion/rollback flow.
 
+The hardening retention soak additionally carries the link store's current and
+high-water edge counts in every state snapshot and growth finding, so a
+long-running soak that lets links grow — or stops pruning them — fails the same
+plateau check every other bounded subsystem is held to.
+
 == 10. Bounded episodic links (issue #105)
 
 +WorkingMemory+ retains a small versioned link vocabulary, +memory-link-v1+, between retained entries. Two kinds exist today:
 
-* +temporal_before+ — derived deterministically at write time: the new entry links to the newest retained same-topic durable entry, walking older ones within the per-write budget. No model output is involved.
-* +supersedes+ — declared by the caller through +remember_durable_superseding+, the permit-gated durable path. Every declared target is resolved *before* anything is stored to exactly one still-live retained durable node; a target that is absent, unknown, working-only, expired at the write timestamp, or ambiguous (one source event id retained more than once) refuses the whole write, so nothing is stored and no link is minted.
+* +temporal_before+ — derived deterministically at write time: the new entry links to the newest retained same-topic durable entry *in logical record order* (+created_at_ms+), walking older ones within the per-write budget. Insertion order is never the basis — a backfilled write can carry an earlier record time than one already stored — and an entry recorded *after* this write is not its predecessor at all, so a temporal edge can never contradict the record times retrieval ranks by. No model output is involved.
+* +supersedes+ — declared by the caller through +remember_durable_superseding+, the permit-gated durable path, reachable from the composition root as +ProductionApp::remember_durable_memory_superseding+. Every declared target is resolved *before* anything is stored to exactly one still-live retained durable node; a target that is absent, unknown, working-only, expired at the write timestamp, or ambiguous (one source event id retained more than once) refuses the whole write, so nothing is stored and no link is minted.
 
 Causal kinds are intentionally deferred until a real evidence source exists; the vocabulary version string pins the schema so adding one is an explicit, replay-visible change.
 
-A link carries only its endpoint node ids, kind, and creation timestamp. The endpoint is +MemoryEntry::memory_id+, a monotonic per-insertion identity: a source event id is neither unique among retained entries nor durable identity (the scheduler may legitimately replay one), so it is never a link endpoint and deletion prunes by node identity — removing one of two copies that share an event id cannot keep the other copy's edges alive or inherit its staleness. The link never carries claim, topic, or actor content, so edge metadata cannot become a covert archive of deleted (or live) content (see docs/security-threat-model.adoc section 8).
+A link carries only its endpoint node ids, kind, and creation timestamp. The endpoint is +MemoryEntry::memory_id+, a monotonic per-insertion identity: a source event id is neither unique among retained entries nor durable identity (the scheduler may legitimately replay one), so it is never a link endpoint and deletion prunes by node identity — removing one of two copies that share an event id cannot keep the other copy's edges alive or inherit its staleness. The link never carries claim, topic, or actor content, so edge metadata cannot become a covert archive of deleted (or live) content (see docs/security-threat-model.adoc section 8). Serialized link artifacts — the store snapshot and each retrieval view — carry +vocab_version+, the vocabulary they were produced under, so a replay identifies which vocabulary shaped a record instead of inferring it from field presence.
 
 Bounds, both validated positive and owned by the #51 unified retention policy:
 
@@ -196,4 +206,4 @@ Both must hold +max_links >= max_links_per_memory+: the store has to be able to 
 
 Only permit-gated memory enters the graph: links are created exclusively inside the +MemoryWritePermit+ durable path, so public chat and generated/model output cannot mint links or authority.
 
-Compaction and deletion prune links by node identity: an edge survives only while both endpoint nodes are retained. Staleness is decided over the **full** retained edge set, never over the capped presentation view — a supersession that fell past the per-entry cap still marks its target stale — and the superseding node must itself still be live at the read timestamp, so an expired-but-not-yet-compacted memory can neither authorize an update relation nor keep a claim marked. The bounded view is deterministic and leads with the semantically decisive edges (supersessions before temporal spine edges, creation order within a kind) before the cap cuts it. Retrieval via +relevant_linked+ is single-hop with that per-entry cap; short-lived thread context (#80) is never persisted as links.
+Compaction and deletion prune links by node identity: an edge survives only while both endpoint nodes are retained. Staleness is decided over the **full** retained edge set, never over the capped presentation view — a supersession that fell past the per-entry cap still marks its target stale — and the superseding node must itself still be live at the read timestamp, so an expired-but-not-yet-compacted memory can neither authorize an update relation nor keep a claim marked. The same liveness rule applies to the view itself: a link is shown only while **both** endpoints are live, so an expired node leaves no dangling relation behind (physical removal remains compaction's job). The bounded view is deterministic and leads with the semantically decisive edges (supersessions before temporal spine edges, creation order within a kind) before the cap cuts it. Retrieval via +relevant_linked+ joins that view with the ranked matches and then resolves the live nodes one link away from them — a supersession that changed topic or actor brings the claim it replaces back into the result — with expansion filling only the space the query limit still leaves, never displacing a direct match, so the caller's limit stays the bound. Short-lived thread context (#80) is never persisted as links.

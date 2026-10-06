@@ -239,6 +239,11 @@ pub struct SoakConfig {
     pub telemetry_limit: usize,
     pub working_memory_limit: usize,
     pub memory_compaction_limit: usize,
+    /// Store-wide edge bound the retained link graph may reach, mirroring
+    /// `WorkingMemoryConfig::max_links` for the probe (production default is
+    /// 2,048). Watched like every other retention bound so a regression that
+    /// lets the link store grow — or stops pruning it — is visible here.
+    pub memory_links_limit: usize,
     pub generated_asset_limit: usize,
     pub promotion_metadata_limit: usize,
     pub generated_asset_every: u64,
@@ -258,6 +263,7 @@ impl Default for SoakConfig {
             telemetry_limit: 1_024,
             working_memory_limit: 256,
             memory_compaction_limit: 128,
+            memory_links_limit: 128,
             generated_asset_limit: 8,
             promotion_metadata_limit: 8,
             generated_asset_every: 200,
@@ -275,6 +281,7 @@ impl SoakConfig {
             || self.telemetry_limit == 0
             || self.working_memory_limit == 0
             || self.memory_compaction_limit == 0
+            || self.memory_links_limit == 0
             || self.generated_asset_limit == 0
             || self.promotion_metadata_limit == 0
             || self.generated_asset_every == 0
@@ -304,6 +311,8 @@ pub struct StateSnapshot {
     pub rate_limit_sources: usize,
     pub working_memory_entries: usize,
     pub memory_compaction_records: usize,
+    pub memory_links: usize,
+    pub memory_links_high_water: usize,
     pub telemetry_events: usize,
     pub hot_assets: usize,
     pub promotion_metadata: usize,
@@ -384,7 +393,12 @@ pub fn run_core_soak(
         WorkingMemoryConfig {
             max_entries: config.working_memory_limit,
             working_ttl_ms: config.logical_duration_ms().saturating_add(1),
+            // Durable targets must outlive the run: a supersession target
+            // that expired mid-soak would refuse the write instead of
+            // exercising the link store.
+            durable_ttl_ms: config.logical_duration_ms().saturating_add(1),
             max_compaction_records: config.memory_compaction_limit,
+            max_links: config.memory_links_limit,
             ..WorkingMemoryConfig::default()
         },
         ActorPseudonymizer::new("hardening-test-v1", [0x24; 32])
@@ -404,6 +418,19 @@ pub fn run_core_soak(
     });
     let midpoint_index = config.logical_events / 2;
     let mut midpoint = None;
+    // The edge store is bounded state too, so the soak has to populate it:
+    // a system-source durable claim every sixteenth node slot supersedes the
+    // previous one through the same permit gate production uses, creating
+    // supersession edges plus the deterministic same-topic temporal spine —
+    // often enough that the store actually reaches its bound and plateaus
+    // before the midpoint, which is what the growth findings watch. The gap
+    // between two durable writes stays far below the node bound, so a
+    // supersession target is always still retained when it is declared; a
+    // window too small to hold two durable writes at all declares no
+    // supersession instead of failing closed on a target it evicted itself.
+    let durable_every = ((config.working_memory_limit / 16).max(1)) as u64;
+    let supersede_targets = config.working_memory_limit >= 2;
+    let mut previous_durable: Option<String> = None;
 
     for index in 0..config.logical_events {
         let at_ms = index.saturating_mul(config.event_interval_ms);
@@ -433,6 +460,29 @@ pub fn run_core_soak(
         memory
             .remember_working(&event, "soak event", Some("soak"), at_ms)
             .map_err(|error| HardeningError::Adaptation(error.to_string()))?;
+
+        if index % durable_every == 0 {
+            let durable = system_event(index + 1);
+            let (_, permit) = security.authorize_memory_write(&durable, None);
+            let permit = permit.ok_or_else(|| {
+                HardeningError::Runtime("durable soak write denied by security gate".to_owned())
+            })?;
+            let supersedes: Vec<&str> = if supersede_targets {
+                previous_durable.as_deref().into_iter().collect()
+            } else {
+                Vec::new()
+            };
+            memory
+                .remember_durable_superseding(
+                    &permit,
+                    "soak durable claim",
+                    Some("soak-durable"),
+                    at_ms,
+                    &supersedes,
+                )
+                .map_err(|error| HardeningError::Adaptation(error.to_string()))?;
+            previous_durable = Some(durable.event_id.clone());
+        }
 
         let mut observation = EventObservation::new(
             event.event_id.clone(),
@@ -514,6 +564,8 @@ pub(crate) fn snapshot(
         rate_limit_sources: security_metrics.rate_limit_sources,
         working_memory_entries: memory_metrics.entries,
         memory_compaction_records: memory_metrics.compactions,
+        memory_links: memory_metrics.links,
+        memory_links_high_water: memory_metrics.links_high_water,
         telemetry_events: telemetry.retention_metrics().retained,
         hot_assets: hot_metrics.dynamic_resident,
         promotion_metadata: hot_metrics.promotion_metadata_retained,
@@ -587,6 +639,20 @@ pub(crate) fn growth_findings(
             midpoint.memory_compaction_records,
             final_state.memory_compaction_records,
             Some(config.memory_compaction_limit),
+            Some(51),
+        ),
+        growth(
+            "memory_links",
+            midpoint.memory_links,
+            final_state.memory_links,
+            Some(config.memory_links_limit),
+            Some(51),
+        ),
+        growth(
+            "memory_links_high_water",
+            midpoint.memory_links_high_water,
+            final_state.memory_links_high_water,
+            Some(config.memory_links_limit),
             Some(51),
         ),
         growth(
@@ -748,6 +814,31 @@ fn content_event(sequence: u64) -> EventEnvelope {
         payload: BTreeMap::from([(
             "text".to_owned(),
             Value::String("hardening event".to_owned()),
+        )]),
+    }
+}
+
+/// A trusted system-plane event: the soak's durable writes go through the
+/// same permit gate production uses, and only system-source (or
+/// memory-admin) evidence earns a durable permit — public chat never does.
+fn system_event(sequence: u64) -> EventEnvelope {
+    EventEnvelope {
+        schema_version: EVENT_SCHEMA_VERSION.to_owned(),
+        event_id: format!("evt-hardening-system-{sequence}"),
+        correlation_id: "corr-hardening".to_owned(),
+        sequence,
+        observed_at: "2026-09-25T00:00:00Z".to_owned(),
+        source: "hardening-system".to_owned(),
+        source_class: SourceClass::System,
+        plane: SecurityPlane::System,
+        trust_level: TrustLevel::Trusted,
+        kind: EventKind::SystemHealth,
+        actor_id: None,
+        priority_hint: None,
+        authorization: None,
+        payload: BTreeMap::from([(
+            "text".to_owned(),
+            Value::String("hardening system event".to_owned()),
         )]),
     }
 }

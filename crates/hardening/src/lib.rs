@@ -101,6 +101,7 @@ mod tests {
             telemetry_limit: 64,
             working_memory_limit: 32,
             memory_compaction_limit: 16,
+            memory_links_limit: 64,
             generated_asset_limit: 16,
             promotion_metadata_limit: 16,
             generated_asset_every: 25,
@@ -134,6 +135,16 @@ mod tests {
             report.final_state.promotion_metadata,
             config.promotion_metadata_limit
         );
+        assert!(
+            report.final_state.memory_links_high_water > 0,
+            "the soak must actually populate the link store it claims to bound"
+        );
+        assert!(
+            report.final_state.memory_links <= config.memory_links_limit,
+            "{} links within a bound of {}",
+            report.final_state.memory_links,
+            config.memory_links_limit
+        );
 
         for metric in [
             "scheduler_items",
@@ -144,6 +155,8 @@ mod tests {
             "rate_limit_sources",
             "working_memory_entries",
             "memory_compaction_records",
+            "memory_links",
+            "memory_links_high_water",
             "telemetry_events",
             "hot_assets",
             "promotion_metadata",
