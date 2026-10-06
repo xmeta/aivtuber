@@ -59,6 +59,7 @@ fn baseline() -> BaselineEvidence {
         source: "slo-review-fixture (dataset=slo-review-fixture, commit=deadbeef)".to_owned(),
         stream_hours: Some(1),
         series: Some("deterministic_semantic|slo-review-fixture|bench-v1|7".to_owned()),
+        eligible: 15,
         runs: vec![
             BaselineRun {
                 run_id: "run-a".to_owned(),
@@ -686,6 +687,7 @@ fn hardening_an_impossible_baseline_is_refused() {
                         stream_hours: Some(1),
                         series: None,
                         runs: Vec::new(),
+                        eligible: 0,
                     },
                 },
             )]
@@ -715,6 +717,7 @@ fn hardening_a_baseline_covering_no_time_is_refused() {
                     stream_hours: Some(0),
                     series: None,
                     runs: Vec::new(),
+                    eligible: 0,
                 },
             },
         )]

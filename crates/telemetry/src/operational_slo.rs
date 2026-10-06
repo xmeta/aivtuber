@@ -847,6 +847,13 @@ pub struct BaselineEvidence {
     /// the evidence, not merely alongside it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runs: Vec<BaselineRun>,
+    /// Pooled eligible-sample count the value was measured over. Required —
+    /// not optional — because [`SloTargets::validate`] enforces the
+    /// indicator's own sample floor against it: evidence thinner than the
+    /// contract's own decision floor can never become a target's
+    /// justification, and a denominator that is not carried can only be
+    /// trusted by faith.
+    pub eligible: u64,
 }
 
 /// One calibrated objective.
@@ -877,6 +884,7 @@ impl SloTarget {
                 stream_hours: None,
                 series: None,
                 runs: Vec::new(),
+                eligible: 0,
             },
         }
     }
@@ -1054,6 +1062,20 @@ impl SloTargets {
                          evidence needs at least {MIN_BASELINE_RUNS} distinct measured runs, \
                          because one run is a data point and not a baseline",
                         target.baseline.runs.len()
+                    )));
+                }
+                // Evidence below the indicator's own decision floor cannot
+                // justify the decision: a baseline pooled from fewer eligible
+                // samples than `sample_floor` would recreate exactly the
+                // low-sample calibration this contract refuses to evaluate
+                // with, so carrying the denominator is what lets that rule be
+                // checked instead of trusted.
+                if target.baseline.eligible < indicator.sample_floor {
+                    return Err(SloError::new(format!(
+                        "target {id:?} baseline carries {} eligible sample(s), below indicator \
+                         {id:?} sample floor of {}; evidence too thin to decide the objective \
+                         cannot justify its target",
+                        target.baseline.eligible, indicator.sample_floor
                     )));
                 }
             }
@@ -1556,6 +1578,31 @@ fn write_ecmascript_digits(digits: &[u8], exponent: i32, out: &mut String) {
 }
 
 /// Evaluate one benchmark report into an operational SLO report.
+/// One #58 compatibility series as a comparison key:
+/// `mode|dataset_id|config_version|seed`, with `%` and `|` percent-escaped in
+/// the free-text components. The escaping is what makes the key safe to
+/// *compare*: without it, dataset `alpha|beta` + config `gamma` and dataset
+/// `alpha` + config `beta|gamma` serialize to the same string, and a target
+/// calibrated for one workload would silently apply to the other. Pooling
+/// and evaluation must share this helper so the two sides can never diverge.
+fn compatibility_series_key(
+    mode: &str,
+    dataset_id: &str,
+    config_version: &str,
+    seed: u64,
+) -> String {
+    fn escape(component: &str) -> String {
+        component.replace('%', "%25").replace('|', "%7C")
+    }
+    format!(
+        "{}|{}|{}|{}",
+        mode,
+        escape(dataset_id),
+        escape(config_version),
+        seed
+    )
+}
+
 pub fn evaluate(
     report: &BenchmarkReport,
     targets: &SloTargets,
@@ -1566,17 +1613,17 @@ pub fn evaluate(
     // boundary gets measured); the targets-file path does not.
     targets.validate_for_evaluation(&catalog)?;
 
-    // The #58 compatibility series of the artifact under evaluation
-    // (`mode|dataset_id|config_version|seed` — the same key `slo-baseline`
-    // pools on). A calibrated target names the series it was measured in,
-    // and applying it to a different series would silently reuse — or
-    // silently loosen — an objective calibrated for another workload.
-    let report_series = format!(
-        "{}|{}|{}|{}",
+    // The #58 compatibility series of the artifact under evaluation — the
+    // same escaped key `slo-baseline` pools on (see
+    // `compatibility_series_key`). A calibrated target names the series it
+    // was measured in, and applying it to a different series would silently
+    // reuse — or silently loosen — an objective calibrated for another
+    // workload.
+    let report_series = compatibility_series_key(
         report.mode.as_str(),
-        report.metadata.dataset_id,
-        report.metadata.config_version,
-        report.metadata.seed
+        &report.metadata.dataset_id,
+        &report.metadata.config_version,
+        report.metadata.seed,
     );
     let mut series_mismatches: Vec<(String, String)> = Vec::new();
 
@@ -2335,12 +2382,11 @@ impl BaselineProposalSet {
         // A series is #58's compatibility boundary. Everything pooled must sit
         // inside one, or the pooled value describes no workload at all.
         let series_key = |report: &SloReport| {
-            format!(
-                "{}|{}|{}|{}",
+            compatibility_series_key(
                 report.source.mode.as_str(),
-                report.source.dataset_id,
-                report.source.config_version,
-                report.source.seed
+                &report.source.dataset_id,
+                &report.source.config_version,
+                report.source.seed,
             )
         };
         let mut series: Option<String> = None;
@@ -2693,6 +2739,7 @@ impl BaselineProposalSet {
                 stream_hours: (whole_hours > 0).then_some(whole_hours),
                 series: Some(series.clone()),
                 runs: pool.contributors.clone(),
+                eligible: pool.eligible,
             })
         };
         // History-wide represented time, retained for the limitation below;
@@ -2796,6 +2843,37 @@ impl BaselineProposalSet {
                  with an empty denominator for an indicator produced no evidence for it",
                 under_sampled.len(),
                 under_sampled.join(", ")
+            ));
+        }
+        // A pool that clears the repeated-run floor but not the indicator's
+        // sample floor still publishes its evidence — with the denominator
+        // attached — and `SloTargets::validate` refuses any target citing it.
+        // The shortfall is named here so the operator sees it before copying.
+        let under_floor = pools
+            .iter()
+            .filter(|(id, pool)| {
+                pool.runs >= MIN_BASELINE_RUNS
+                    && catalog
+                        .iter()
+                        .find(|indicator| indicator.id == **id)
+                        .is_some_and(|indicator| pool.eligible < indicator.sample_floor)
+            })
+            .map(|(id, pool)| {
+                let floor = catalog
+                    .iter()
+                    .find(|indicator| indicator.id == *id)
+                    .map(|indicator| indicator.sample_floor)
+                    .unwrap_or(0);
+                format!("{id} ({}/{floor})", pool.eligible)
+            })
+            .collect::<Vec<_>>();
+        if !under_floor.is_empty() {
+            limitations.push(format!(
+                "{} indicator(s) pooled below their sample floor, so validation refuses any \
+                 target citing them rather than calibrating from evidence too thin to decide: \
+                 {}",
+                under_floor.len(),
+                under_floor.join(", ")
             ));
         }
         let partial_duration = pools

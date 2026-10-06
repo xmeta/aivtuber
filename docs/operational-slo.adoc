@@ -605,9 +605,13 @@ proposal rather than written by hand, and the target ratio is a product
 decision made *against* the measured value — a minimum conforming ratio,
 chosen never above the measured baseline — and the proposal never prescribes
 it.
-An indicator the history measured too thinly has no `baseline` block to copy at
-all; `slo-baseline` names it in `limitations` instead of publishing a value
-that one run happened to measure.
+An indicator the history pooled from fewer than `MIN_BASELINE_RUNS` runs has
+no `baseline` block to copy at all; `slo-baseline` names it in `limitations`
+instead of publishing a value that one run happened to measure. An indicator
+measured *below its own sample floor* keeps its evidence but carries the pooled
+eligible count with it, `slo-baseline` names the shortfall in `limitations`,
+and `SloTargets::validate` refuses any target citing it — evidence too thin to
+decide the objective cannot justify its target.
 Validation enforces this rather than trusting it: a calibrated target whose
 `baseline` names no compatibility `series`, fewer than `MIN_BASELINE_RUNS`
 contributing runs, a run without a revision, or the same run identity twice is
@@ -616,7 +620,9 @@ history at all. Only a latency probe is exempt, and only on the measurement
 path — `SloTargets::validate` still refuses to let one into a targets file.
 The provenance is durable and structured, because the evidence block is the
 only part that survives the copy: `series` names the #58 compatibility series
-(`mode|dataset_id|config_version|seed`) and `runs` lists every contributing
+(`mode|dataset_id|config_version|seed`, with the free-text components
+%-escaped so two different tuples can never serialize to the same key) and
+`runs` lists every contributing
 run identity with the revision it measured, so a target can still name *which*
 repeated runs formed its baseline after the proposal file is gone. The `source`
 string repeats the same identities for a human reader. Repeated nightly runs of
@@ -625,7 +631,8 @@ link:performance-goals.adoc[Performance Goals and Baselines] requires for #58.
 
 Calibration evidence is also scoped where it is *used*, not only where it is
 recorded: `evaluate` derives the evaluated report's compatibility series
-(`mode|dataset_id|config_version|seed`) and applies a calibrated target only
+(`mode|dataset_id|config_version|seed`, through the same escaped-key helper
+`slo-baseline` pools on) and applies a calibrated target only
 when it equals `baseline.series`. A report from any other series reports the
 objective `uncalibrated` — the measured value still publishes — and says why in
 `limitations`, so a new workload re-calibrates instead of silently reusing (or

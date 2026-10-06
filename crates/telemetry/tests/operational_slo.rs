@@ -103,6 +103,10 @@ fn calibrated(target: f64, baseline: f64) -> SloTarget {
             stream_hours: Some(1),
             series: Some(CALIBRATION_SERIES.to_owned()),
             runs: calibration_manifest(),
+            // At every indicator's sample floor, so the helper represents
+            // evidence a target is allowed to cite; the floor itself is
+            // pinned by its own regression below.
+            eligible: 15,
         },
     }
 }
@@ -438,6 +442,87 @@ fn a_target_calibrated_for_another_series_is_not_applied_to_this_report() {
     )
     .expect("SLO report");
     let row = result(&same, "reliability.fallback_delivery_rate", "session");
+    assert_eq!(row.target, Some(1.0));
+    assert_eq!(row.status, SloStatus::Met);
+}
+
+#[test]
+fn a_baseline_below_the_indicator_sample_floor_is_refused() {
+    // Evidence the contract itself would call too thin to *decide* the
+    // objective must not be citable as the reason a target exists. The
+    // denominator now travels in the evidence precisely so this is checked
+    // rather than trusted.
+    let mut under_floor = calibrated(0.99, 1.0);
+    under_floor.baseline.eligible = 4; // speech presence floor is 15
+
+    let file = targets(&[("availability.speech_presence_rate", under_floor.clone())]);
+    let error = file
+        .validate(&aivtuber_telemetry::catalog())
+        .expect_err("below-floor evidence must not justify a target");
+    assert!(error.to_string().contains("sample floor"), "{error}");
+
+    // At the floor the same evidence validates, so the boundary is the floor
+    // itself and nothing else.
+    let at_floor = targets(&[("availability.speech_presence_rate", calibrated(0.99, 1.0))]);
+    at_floor
+        .validate(&aivtuber_telemetry::catalog())
+        .expect("evidence at the sample floor is citable");
+}
+
+#[test]
+fn series_keys_escape_separators_so_distinct_tuples_cannot_collide() {
+    // Under a raw `mode|dataset|config|seed` join, a report over dataset
+    // `alpha|beta` + config `gamma` and a target calibrated for dataset
+    // `alpha` + config `beta|gamma` produce the *same* key — the exact shape
+    // that would let one workload's target decide another's verdict.
+    let mut piped = report(
+        vec![{
+            let mut handled = observation(RouteClass::CachedFallback);
+            handled.fallback_reason = Some("unavailable".to_owned());
+            handled.event_to_first_audio_ms = Some(50);
+            handled
+        }],
+        1_000,
+    );
+    piped.metadata.dataset_id = "alpha|beta".to_owned();
+    piped.metadata.config_version = "gamma".to_owned();
+
+    // The key the legacy unescaped join would have produced for the *other*
+    // tuple: identical text, different workload.
+    let mut colliding = calibrated(1.0, 1.0);
+    colliding.baseline.series = Some("deterministic_semantic|alpha|beta|gamma|7".to_owned());
+    let crossed = evaluate(
+        &piped,
+        &targets(&[("reliability.fallback_delivery_rate", colliding)]),
+        SloEvaluationConfig::default(),
+    )
+    .expect("SLO report");
+    let row = result(&crossed, "reliability.fallback_delivery_rate", "session");
+    assert_eq!(
+        row.target, None,
+        "a colliding tuple must not match across the separator"
+    );
+    assert_eq!(row.status, SloStatus::Uncalibrated);
+    assert!(
+        crossed
+            .limitations
+            .iter()
+            .any(|line| line.contains("compatibility series")),
+        "the report says why: {:?}",
+        crossed.limitations
+    );
+
+    // The properly escaped key of the report's own tuple does apply, so the
+    // escaping widens nothing — it only removes the collision.
+    let mut matching = calibrated(1.0, 1.0);
+    matching.baseline.series = Some("deterministic_semantic|alpha%7Cbeta|gamma|7".to_owned());
+    let own = evaluate(
+        &piped,
+        &targets(&[("reliability.fallback_delivery_rate", matching)]),
+        SloEvaluationConfig::default(),
+    )
+    .expect("SLO report");
+    let row = result(&own, "reliability.fallback_delivery_rate", "session");
     assert_eq!(row.target, Some(1.0));
     assert_eq!(row.status, SloStatus::Met);
 }
@@ -1225,7 +1310,8 @@ fn a_handwritten_target_without_a_run_manifest_is_refused() {
         "baseline": {
             "value": 0.95,
             "source": "handwritten, not a measured artifact",
-            "stream_hours": 1
+            "stream_hours": 1,
+            "eligible": 15
         }
     }"#;
     let mut file = SloTargets::default();
