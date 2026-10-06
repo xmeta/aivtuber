@@ -1,0 +1,419 @@
+{
+  "schema_version": "1",
+  "catalog_version": "slo-catalog-v1",
+  "counts_toward_active_slo": true,
+  "source": {
+    "dataset_id": "starter-replay-comparison-v1",
+    "git_commit": "d8f277cc079d537d48982fc5f39c374626f3378e",
+    "mode": "deterministic_semantic_jev",
+    "config_version": "replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0",
+    "seed": 4242,
+    "stream_duration_ms": 180000,
+    "source_digest": "9929b5cef402d2b73f9cf4a75a42ea96115855321d321a94b9e76d32a58be41e",
+    "provenance": "replay_fixture",
+    "plane": "active",
+    "run_id": "run-37507647365"
+  },
+  "windows": [
+    {
+      "kind": "session",
+      "label": "session",
+      "start_offset_ms": 0,
+      "end_offset_ms": 180000,
+      "admitted_events": 3
+    }
+  ],
+  "indicators": [
+    {
+      "id": "availability.event_to_first_visible_within_target",
+      "kind": "slo",
+      "unit": "ratio",
+      "window": "session",
+      "window_kind": "session",
+      "denominator": "admitted events with a measured event-to-first-visible-reaction latency",
+      "numerator": "those whose latency was within the configured threshold_ms",
+      "conforming": 0,
+      "eligible": 3,
+      "unscored": 3,
+      "value": null,
+      "target": null,
+      "threshold_ms": null,
+      "sample_floor": 15,
+      "status": "uncalibrated",
+      "miss_attribution": {
+        "external_provider_failures": 0,
+        "runtime_handled": 0,
+        "runtime_handling_failures": 0,
+        "runtime_policy_decisions": 0,
+        "unattributed": 0
+      },
+      "actions": [
+        "raise_incident",
+        "open_optimization_issue",
+        "switch_conservative_profile"
+      ]
+    },
+    {
+      "id": "availability.event_to_first_audio_within_target",
+      "kind": "slo",
+      "unit": "ratio",
+      "window": "session",
+      "window_kind": "session",
+      "denominator": "admitted events with a measured event-to-first-audio latency",
+      "numerator": "those whose latency was within the configured threshold_ms",
+      "conforming": 0,
+      "eligible": 3,
+      "unscored": 3,
+      "value": null,
+      "target": null,
+      "threshold_ms": null,
+      "sample_floor": 15,
+      "status": "uncalibrated",
+      "miss_attribution": {
+        "external_provider_failures": 0,
+        "runtime_handled": 0,
+        "runtime_handling_failures": 0,
+        "runtime_policy_decisions": 0,
+        "unattributed": 0
+      },
+      "actions": [
+        "raise_incident",
+        "open_optimization_issue",
+        "switch_conservative_profile"
+      ]
+    },
+    {
+      "id": "availability.speech_presence_rate",
+      "kind": "slo",
+      "unit": "ratio",
+      "window": "session",
+      "window_kind": "session",
+      "denominator": "admitted events that were not cancelled",
+      "numerator": "those that produced a user-visible output, or stayed silent for a declared reason (operator override, deadline exhaustion, generative-budget denial)",
+      "conforming": 3,
+      "eligible": 3,
+      "unscored": 0,
+      "value": 1,
+      "target": null,
+      "threshold_ms": null,
+      "sample_floor": 15,
+      "status": "uncalibrated",
+      "miss_attribution": {
+        "external_provider_failures": 0,
+        "runtime_handled": 0,
+        "runtime_handling_failures": 0,
+        "runtime_policy_decisions": 0,
+        "unattributed": 0
+      },
+      "actions": [
+        "raise_incident",
+        "open_optimization_issue",
+        "switch_conservative_profile"
+      ]
+    },
+    {
+      "id": "reliability.fallback_delivery_rate",
+      "kind": "slo",
+      "unit": "ratio",
+      "window": "session",
+      "window_kind": "session",
+      "denominator": "admitted events that hit a declared external-provider failure",
+      "numerator": "those that still delivered a user-visible outcome (cached/non-verbal fallback)",
+      "conforming": 0,
+      "eligible": 0,
+      "unscored": 0,
+      "value": null,
+      "target": null,
+      "threshold_ms": null,
+      "sample_floor": 1,
+      "status": "no_data",
+      "miss_attribution": {
+        "external_provider_failures": 0,
+        "runtime_handled": 0,
+        "runtime_handling_failures": 0,
+        "runtime_policy_decisions": 0,
+        "unattributed": 0
+      },
+      "actions": [
+        "raise_incident",
+        "open_optimization_issue",
+        "block_promotion"
+      ]
+    },
+    {
+      "id": "reliability.deadline_adherence_rate",
+      "kind": "slo",
+      "unit": "ratio",
+      "window": "session",
+      "window_kind": "session",
+      "denominator": "admitted events carrying a trusted interaction deadline class",
+      "numerator": "those whose trusted deadline was not exhausted",
+      "conforming": 3,
+      "eligible": 3,
+      "unscored": 0,
+      "value": 1,
+      "target": null,
+      "threshold_ms": null,
+      "sample_floor": 15,
+      "status": "uncalibrated",
+      "miss_attribution": {
+        "external_provider_failures": 0,
+        "runtime_handled": 0,
+        "runtime_handling_failures": 0,
+        "runtime_policy_decisions": 0,
+        "unattributed": 0
+      },
+      "actions": [
+        "open_optimization_issue",
+        "raise_incident"
+      ]
+    },
+    {
+      "id": "reliability.generative_budget_admission_rate",
+      "kind": "slo",
+      "unit": "ratio",
+      "window": "session",
+      "window_kind": "session",
+      "denominator": "all admitted events",
+      "numerator": "those admitted into the generative budget rather than denied",
+      "conforming": 3,
+      "eligible": 3,
+      "unscored": 0,
+      "value": 1,
+      "target": null,
+      "threshold_ms": null,
+      "sample_floor": 15,
+      "status": "uncalibrated",
+      "miss_attribution": {
+        "external_provider_failures": 0,
+        "runtime_handled": 0,
+        "runtime_handling_failures": 0,
+        "runtime_policy_decisions": 0,
+        "unattributed": 0
+      },
+      "actions": [
+        "open_optimization_issue",
+        "switch_conservative_profile"
+      ]
+    },
+    {
+      "id": "quality.semantic_reuse_correctness",
+      "kind": "slo",
+      "unit": "ratio",
+      "window": "session",
+      "window_kind": "session",
+      "denominator": "admitted events carrying an offline wrong-reuse review label",
+      "numerator": "those labelled correct",
+      "conforming": 2,
+      "eligible": 2,
+      "unscored": 0,
+      "value": 1,
+      "target": null,
+      "threshold_ms": null,
+      "sample_floor": 1,
+      "status": "uncalibrated",
+      "miss_attribution": {
+        "external_provider_failures": 0,
+        "runtime_handled": 0,
+        "runtime_handling_failures": 0,
+        "runtime_policy_decisions": 0,
+        "unattributed": 0
+      },
+      "actions": [
+        "open_optimization_issue",
+        "block_promotion"
+      ]
+    },
+    {
+      "id": "operability.operator_stop_responsiveness_within_target",
+      "kind": "slo",
+      "unit": "ratio",
+      "window": "session",
+      "window_kind": "session",
+      "denominator": "operator stop/mute commands issued in the window",
+      "numerator": "those whose cancellations took effect within the configured threshold_ms",
+      "conforming": 0,
+      "eligible": 0,
+      "unscored": 0,
+      "value": null,
+      "target": null,
+      "threshold_ms": null,
+      "sample_floor": 1,
+      "status": "not_yet_measured",
+      "miss_attribution": {
+        "external_provider_failures": 0,
+        "runtime_handled": 0,
+        "runtime_handling_failures": 0,
+        "runtime_policy_decisions": 0,
+        "unattributed": 0
+      },
+      "actions": [
+        "raise_incident"
+      ],
+      "missing_evidence": "the replay benchmark drives no operator stop/mute fixture, so the denominator (issued commands) is not in the artifact"
+    },
+    {
+      "id": "availability.event_admission_success_rate",
+      "kind": "slo",
+      "unit": "ratio",
+      "window": "session",
+      "window_kind": "session",
+      "denominator": "events offered to the runtime",
+      "numerator": "those admitted",
+      "conforming": 0,
+      "eligible": 0,
+      "unscored": 0,
+      "value": null,
+      "target": null,
+      "threshold_ms": null,
+      "sample_floor": 15,
+      "status": "not_yet_measured",
+      "miss_attribution": {
+        "external_provider_failures": 0,
+        "runtime_handled": 0,
+        "runtime_handling_failures": 0,
+        "runtime_policy_decisions": 0,
+        "unattributed": 0
+      },
+      "actions": [
+        "open_optimization_issue"
+      ],
+      "missing_evidence": "EventObservation records admitted events only; the offered-event count is not carried by the artifact, so the denominator cannot be reconstructed"
+    },
+    {
+      "id": "safety.stale_dispatch_count",
+      "kind": "invariant",
+      "unit": "count",
+      "window": "session",
+      "window_kind": "session",
+      "denominator": "admitted events (context only; the invariant is the count itself)",
+      "numerator": "actions dispatched after their cancellation fence; must be 0",
+      "conforming": 0,
+      "eligible": 0,
+      "unscored": 0,
+      "value": null,
+      "target": null,
+      "threshold_ms": null,
+      "sample_floor": 0,
+      "status": "not_yet_measured",
+      "miss_attribution": {
+        "external_provider_failures": 0,
+        "runtime_handled": 0,
+        "runtime_handling_failures": 0,
+        "runtime_policy_decisions": 0,
+        "unattributed": 0
+      },
+      "actions": [
+        "raise_incident"
+      ],
+      "missing_evidence": "per-event post-fence dispatch is not recorded by EventObservation, and the benchmark-result invariant map asserts zero rather than measuring it"
+    },
+    {
+      "id": "safety.unauthorized_privileged_action_count",
+      "kind": "invariant",
+      "unit": "count",
+      "window": "session",
+      "window_kind": "session",
+      "denominator": "privileged control attempts (context only)",
+      "numerator": "privileged actions executed without authenticated local capability; must be 0",
+      "conforming": 0,
+      "eligible": 0,
+      "unscored": 0,
+      "value": null,
+      "target": null,
+      "threshold_ms": null,
+      "sample_floor": 0,
+      "status": "not_yet_measured",
+      "miss_attribution": {
+        "external_provider_failures": 0,
+        "runtime_handled": 0,
+        "runtime_handling_failures": 0,
+        "runtime_policy_decisions": 0,
+        "unattributed": 0
+      },
+      "actions": [
+        "raise_incident"
+      ],
+      "missing_evidence": "privileged attempts are recorded in the runtime audit log, which is not part of the benchmark artifact"
+    },
+    {
+      "id": "resource.retention_bound_violation_count",
+      "kind": "invariant",
+      "unit": "count",
+      "window": "session",
+      "window_kind": "session",
+      "denominator": "retained queues, histories, caches and observations (context only)",
+      "numerator": "observed bound violations; must be 0",
+      "conforming": 0,
+      "eligible": 0,
+      "unscored": 0,
+      "value": null,
+      "target": null,
+      "threshold_ms": null,
+      "sample_floor": 0,
+      "status": "not_yet_measured",
+      "miss_attribution": {
+        "external_provider_failures": 0,
+        "runtime_handled": 0,
+        "runtime_handling_failures": 0,
+        "runtime_policy_decisions": 0,
+        "unattributed": 0
+      },
+      "actions": [
+        "raise_incident"
+      ],
+      "missing_evidence": "retention metrics live on the runtime composition root; a replay report carries only the bounded observation set, not the retention snapshot"
+    }
+  ],
+  "latency_calibration": [
+    {
+      "indicator": "availability.event_to_first_visible_within_target",
+      "window": "session",
+      "field": "event_to_first_visible_reaction_ms",
+      "samples": 3,
+      "p50_ms": 15,
+      "p95_ms": 33,
+      "p99_ms": 33,
+      "max_ms": 33
+    },
+    {
+      "indicator": "availability.event_to_first_audio_within_target",
+      "window": "session",
+      "field": "event_to_first_audio_ms",
+      "samples": 3,
+      "p50_ms": 83,
+      "p95_ms": 122,
+      "p99_ms": 122,
+      "max_ms": 122
+    }
+  ],
+  "error_budgets": [],
+  "failure_attribution": {
+    "external_provider_failures": 0,
+    "runtime_handled": 0,
+    "runtime_handling_failures": 0,
+    "runtime_policy_decisions": 0,
+    "unattributed": 0
+  },
+  "aar_candidates": [],
+  "uncalibrated": [
+    "availability.event_to_first_audio_within_target",
+    "availability.event_to_first_visible_within_target",
+    "availability.speech_presence_rate",
+    "quality.semantic_reuse_correctness",
+    "reliability.deadline_adherence_rate",
+    "reliability.generative_budget_admission_rate"
+  ],
+  "not_yet_measured": [
+    "availability.event_admission_success_rate: EventObservation records admitted events only; the offered-event count is not carried by the artifact, so the denominator cannot be reconstructed",
+    "operability.operator_stop_responsiveness_within_target: the replay benchmark drives no operator stop/mute fixture, so the denominator (issued commands) is not in the artifact",
+    "resource.retention_bound_violation_count: retention metrics live on the runtime composition root; a replay report carries only the bounded observation set, not the retention snapshot",
+    "safety.stale_dispatch_count: per-event post-fence dispatch is not recorded by EventObservation, and the benchmark-result invariant map asserts zero rather than measuring it",
+    "safety.unauthorized_privileged_action_count: privileged attempts are recorded in the runtime audit log, which is not part of the benchmark artifact"
+  ],
+  "limitations": [
+    "denominators are retained observations, not offered events: telemetry retention is bounded, so a run that evicted observations reports the retained set",
+    "this run represents 2000 ms of logical stream time, less than one stream hour, so no stream-hour or rolling window exists to report"
+  ],
+  "verdict": "incomplete"
+}
