@@ -162,6 +162,9 @@ The Rust tests cover:
 * pseudonym-key redaction plus absence of raw actor ids from serialized memory records;
 * deterministic capacity compaction;
 * viewer/topic relevance;
+* long-range synthetic update/supersession, record-time-vs-event-time order,
+  expiry, timeline precision/bounds, and provenance survival cases (issue #105
+  baseline, +tests/long_range_eval.rs+);
 * frequency/quality promotion;
 * provenance and compatibility preservation across L1 persistence;
 * negative-quality rollback/invalidation;
