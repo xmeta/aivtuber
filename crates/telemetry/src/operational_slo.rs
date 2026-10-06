@@ -847,13 +847,19 @@ pub struct BaselineEvidence {
     /// the evidence, not merely alongside it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runs: Vec<BaselineRun>,
-    /// Pooled eligible-sample count the value was measured over. Required —
-    /// not optional — because [`SloTargets::validate`] enforces the
-    /// indicator's own sample floor against it: evidence thinner than the
-    /// contract's own decision floor can never become a target's
-    /// justification, and a denominator that is not carried can only be
-    /// trusted by faith.
-    pub eligible: u64,
+    /// Pooled eligible-sample count the value was measured over.
+    ///
+    /// Optional on the *wire* on purpose: an artifact written before this
+    /// denominator existed — a version-1 targets or proposal file — must still
+    /// parse, or its own `schema_version` could never be read to say what it
+    /// is, and the incompatible change would demand a version bump the shared
+    /// report contract (whose own shape did not change) cannot carry. Required
+    /// by [`SloTargets::validate`] instead: a calibrated target whose evidence
+    /// does not carry its denominator is refused there, in the contract, where
+    /// the indicator's sample floor can actually be applied to it — evidence
+    /// whose sample count is unknown can only be trusted by faith.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligible: Option<u64>,
 }
 
 /// One calibrated objective.
@@ -884,7 +890,7 @@ impl SloTarget {
                 stream_hours: None,
                 series: None,
                 runs: Vec::new(),
-                eligible: 0,
+                eligible: Some(0),
             },
         }
     }
@@ -1070,12 +1076,27 @@ impl SloTargets {
                 // low-sample calibration this contract refuses to evaluate
                 // with, so carrying the denominator is what lets that rule be
                 // checked instead of trusted.
-                if target.baseline.eligible < indicator.sample_floor {
+                //
+                // A baseline that does not carry the denominator at all is the
+                // older wire shape of this evidence. It parses — otherwise the
+                // file's own `schema_version` could never be read to say what
+                // contract it wrote — and it is refused here instead, named
+                // for what is missing rather than as a parse failure.
+                let Some(eligible) = target.baseline.eligible else {
                     return Err(SloError::new(format!(
-                        "target {id:?} baseline carries {} eligible sample(s), below indicator \
-                         {id:?} sample floor of {}; evidence too thin to decide the objective \
-                         cannot justify its target",
-                        target.baseline.eligible, indicator.sample_floor
+                        "target {id:?} baseline does not carry `eligible`, the pooled sample \
+                         denominator it was measured over; evidence whose sample count is unknown \
+                         cannot be checked against indicator {id:?} sample floor of {} and cannot \
+                         justify its target",
+                        indicator.sample_floor
+                    )));
+                };
+                if eligible < indicator.sample_floor {
+                    return Err(SloError::new(format!(
+                        "target {id:?} baseline carries {eligible} eligible sample(s), below \
+                         indicator {id:?} sample floor of {}; evidence too thin to decide the \
+                         objective cannot justify its target",
+                        indicator.sample_floor
                     )));
                 }
             }
@@ -2739,7 +2760,7 @@ impl BaselineProposalSet {
                 stream_hours: (whole_hours > 0).then_some(whole_hours),
                 series: Some(series.clone()),
                 runs: pool.contributors.clone(),
-                eligible: pool.eligible,
+                eligible: Some(pool.eligible),
             })
         };
         // History-wide represented time, retained for the limitation below;

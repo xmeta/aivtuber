@@ -106,7 +106,7 @@ fn calibrated(target: f64, baseline: f64) -> SloTarget {
             // At every indicator's sample floor, so the helper represents
             // evidence a target is allowed to cite; the floor itself is
             // pinned by its own regression below.
-            eligible: 15,
+            eligible: Some(15),
         },
     }
 }
@@ -453,7 +453,7 @@ fn a_baseline_below_the_indicator_sample_floor_is_refused() {
     // denominator now travels in the evidence precisely so this is checked
     // rather than trusted.
     let mut under_floor = calibrated(0.99, 1.0);
-    under_floor.baseline.eligible = 4; // speech presence floor is 15
+    under_floor.baseline.eligible = Some(4); // speech presence floor is 15
 
     let file = targets(&[("availability.speech_presence_rate", under_floor.clone())]);
     let error = file
@@ -467,6 +467,43 @@ fn a_baseline_below_the_indicator_sample_floor_is_refused() {
     at_floor
         .validate(&aivtuber_telemetry::catalog())
         .expect("evidence at the sample floor is citable");
+}
+
+#[test]
+fn a_version_one_target_file_without_the_eligible_denominator_is_refused_by_validation() {
+    // Compatibility is part of the contract, not a parser accident. A
+    // version-1 artifact written before the denominator existed must still
+    // load — if parsing failed first, the file's own `schema_version` could
+    // never be read to say which contract it wrote — and it is refused
+    // afterwards, in validation, named for what it lacks instead of being
+    // reported as an unreadable file.
+    let bytes = br#"{
+        "schema_version": "1",
+        "catalog_version": "slo-catalog-v1",
+        "targets": {
+            "availability.speech_presence_rate": {
+                "target": 0.95,
+                "baseline": {
+                    "value": 0.97,
+                    "source": "run-legacy (dataset=slo-fixture, commit=deadbeef)",
+                    "stream_hours": 3,
+                    "series": "deterministic_semantic|slo-fixture|bench-v1|7",
+                    "runs": [
+                        {"run_id": "run-a", "git_commit": "deadbeef"},
+                        {"run_id": "run-b", "git_commit": "deadbeef"}
+                    ]
+                }
+            }
+        }
+    }"#;
+    let file = SloTargets::from_json(bytes).expect("a version-1 target file must still parse");
+    let error = file
+        .validate(&catalog())
+        .expect_err("evidence without a denominator cannot justify a target");
+    assert!(
+        error.to_string().contains("eligible"),
+        "the refusal names the missing denominator, not a parse failure: {error}"
+    );
 }
 
 #[test]
