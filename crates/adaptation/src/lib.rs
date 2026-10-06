@@ -11,7 +11,7 @@ use aivtuber_runtime::{MemoryWriteDecision, MemoryWritePermit};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
@@ -59,6 +59,46 @@ pub struct MemoryEntry {
     pub expires_at_ms: u64,
     pub retention: RetentionClass,
     pub write_decision: MemoryGateDecision,
+}
+
+/// Versioned edge vocabulary for retained episodic memory (#105). Kept small
+/// on purpose: temporal order is derived deterministically at write time and
+/// supersession is declared by the caller that owns the update evidence;
+/// causal kinds wait for an evidence source that can actually establish them.
+pub const MEMORY_LINK_VOCAB_VERSION: &str = "memory-link-v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryLinkKind {
+    /// `from` was recorded before `to` within one topic — derived at write
+    /// time from the retained timeline, never from model output.
+    TemporalBefore,
+    /// `from` explicitly supersedes `to` — declared at write time through the
+    /// same permit path as the claim itself.
+    Supersedes,
+}
+
+/// One edge between retained memory ids. It carries no claim content — only
+/// ids, a kind, and record time — so expiry or deletion can never leave
+/// removed content reachable through link metadata (security threat model
+/// §8: an edge must not become a covert archive).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryLink {
+    pub from: String,
+    pub to: String,
+    pub kind: MemoryLinkKind,
+    pub created_at_ms: u64,
+}
+
+/// One retrieved memory together with its bounded link view. This is the
+/// retrieval surface the #105 long-range evaluation measures: `stale` marks a
+/// claim a retained memory explicitly supersedes, and `links` is capped at
+/// the per-memory budget so a neighborhood can never fan out unboundedly.
+#[derive(Debug, Clone, Serialize)]
+pub struct LinkedMemory<'a> {
+    pub entry: &'a MemoryEntry,
+    pub stale: bool,
+    pub links: Vec<MemoryLink>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -131,6 +171,14 @@ pub struct WorkingMemoryConfig {
     pub max_claim_bytes: usize,
     pub max_topic_bytes: usize,
     pub max_compaction_records: usize,
+    /// Total retained memory links. The unified retention policy (#51) owns
+    /// this bound exactly as it owns the node bound.
+    pub max_links: usize,
+    /// Per-write creation budget: how many links one durable write may
+    /// create (explicit supersessions plus the temporal neighborhood), which
+    /// keeps per-memory degree creation-bounded; the store total is
+    /// `max_links`.
+    pub max_links_per_memory: usize,
 }
 
 impl Default for WorkingMemoryConfig {
@@ -142,6 +190,8 @@ impl Default for WorkingMemoryConfig {
             max_claim_bytes: 1_024,
             max_topic_bytes: 128,
             max_compaction_records: 256,
+            max_links: 2_048,
+            max_links_per_memory: 8,
         }
     }
 }
@@ -161,6 +211,8 @@ pub struct WorkingMemoryRetentionMetrics {
     pub compactions: usize,
     pub compactions_high_water: usize,
     pub compactions_evicted: u64,
+    pub links: usize,
+    pub links_high_water: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,8 +228,10 @@ pub struct WorkingMemory {
     config: WorkingMemoryConfig,
     pseudonymizer: ActorPseudonymizer,
     entries: VecDeque<MemoryEntry>,
+    links: VecDeque<MemoryLink>,
     compactions: Vec<MemoryCompactionRecord>,
     entries_high_water: usize,
+    links_high_water: usize,
     compactions_high_water: usize,
     compactions_evicted: u64,
 }
@@ -193,6 +247,8 @@ impl WorkingMemory {
             || config.max_claim_bytes == 0
             || config.max_topic_bytes == 0
             || config.max_compaction_records == 0
+            || config.max_links == 0
+            || config.max_links_per_memory == 0
         {
             return Err(AdaptationError::InvalidConfiguration(
                 "working-memory bounds must be positive",
@@ -202,8 +258,10 @@ impl WorkingMemory {
             config,
             pseudonymizer,
             entries: VecDeque::new(),
+            links: VecDeque::new(),
             compactions: Vec::new(),
             entries_high_water: 0,
+            links_high_water: 0,
             compactions_high_water: 0,
             compactions_evicted: 0,
         })
@@ -225,6 +283,10 @@ impl WorkingMemory {
         &self.entries
     }
 
+    pub fn links(&self) -> &VecDeque<MemoryLink> {
+        &self.links
+    }
+
     pub fn compactions(&self) -> &[MemoryCompactionRecord] {
         &self.compactions
     }
@@ -236,6 +298,8 @@ impl WorkingMemory {
             compactions: self.compactions.len(),
             compactions_high_water: self.compactions_high_water,
             compactions_evicted: self.compactions_evicted,
+            links: self.links.len(),
+            links_high_water: self.links_high_water,
         }
     }
 
@@ -264,6 +328,31 @@ impl WorkingMemory {
         topic: Option<&str>,
         now_ms: u64,
     ) -> Result<&MemoryEntry, AdaptationError> {
+        self.remember_durable_superseding(permit, claim, topic, now_ms, &[])
+    }
+
+    /// A durable write that may also declare supersession: `supersedes` names
+    /// retained durable memories this claim replaces (issue #105's update
+    /// evidence, owned by the caller). Targets are validated *before* anything
+    /// is stored, links ride the same non-serializable permit path as the
+    /// claim, and `max_links_per_memory` bounds what one write may create.
+    /// A denial therefore stores nothing and mints nothing.
+    pub fn remember_durable_superseding(
+        &mut self,
+        permit: &MemoryWritePermit,
+        claim: &str,
+        topic: Option<&str>,
+        now_ms: u64,
+        supersedes: &[&str],
+    ) -> Result<&MemoryEntry, AdaptationError> {
+        if supersedes.len() > self.config.max_links_per_memory {
+            return Err(AdaptationError::InvalidInput(
+                "one write may not declare more supersessions than the per-memory link budget",
+            ));
+        }
+        for target in supersedes {
+            self.require_durable_memory(target)?;
+        }
         let retention = RetentionClass::Durable;
         let claim = bounded_nonempty(claim, self.config.max_claim_bytes, "memory claim")?;
         let topic = bounded_optional(topic, self.config.max_topic_bytes, "memory topic")?;
@@ -286,7 +375,111 @@ impl WorkingMemory {
             retention,
             write_decision: permit.decision().into(),
         };
-        self.push_bounded(entry, now_ms)
+        let event_id = entry.source.event_id.clone();
+        let topic = entry.topic.clone();
+        self.push_bounded(entry, now_ms)?;
+        self.link_new_memory(&event_id, topic.as_deref(), now_ms, supersedes);
+        self.entries.back().ok_or(AdaptationError::Invariant(
+            "inserted memory entry disappeared",
+        ))
+    }
+
+    /// Fail closed: a supersession edge may only point at a memory that is
+    /// actually retained here as durable. Working-only or unknown ids are
+    /// refused, so no phantom or cross-retention edge can exist.
+    fn require_durable_memory(&self, id: &str) -> Result<(), AdaptationError> {
+        let found = self
+            .entries
+            .iter()
+            .any(|entry| entry.source.event_id == id && entry.retention == RetentionClass::Durable);
+        found.then_some(()).ok_or(AdaptationError::InvalidInput(
+            "supersession target must be a retained durable memory",
+        ))
+    }
+
+    /// Create this write's links, deterministic by construction: explicit
+    /// supersessions first (they are the caller-owned evidence), then a
+    /// temporal spine to the most recent same-topic durable memories, all
+    /// within the per-memory budget. Same claims written twice dedupe to one
+    /// edge, and the store total is re-bounded afterwards.
+    fn link_new_memory(
+        &mut self,
+        new_id: &str,
+        topic: Option<&str>,
+        now_ms: u64,
+        supersedes: &[&str],
+    ) {
+        let mut budget = self.config.max_links_per_memory;
+        for target in supersedes {
+            if budget == 0 {
+                break;
+            }
+            self.push_link(MemoryLink {
+                from: new_id.to_owned(),
+                to: (*target).to_owned(),
+                kind: MemoryLinkKind::Supersedes,
+                created_at_ms: now_ms,
+            });
+            budget -= 1;
+        }
+        if let Some(topic) = topic {
+            let normalized = normalize(topic);
+            // Newest first (the new entry sits at the back and is filtered by
+            // id), so the spine links to the most recent neighbors first and
+            // the budget cuts deterministically.
+            let older: Vec<String> = self
+                .entries
+                .iter()
+                .rev()
+                .filter(|entry| {
+                    entry.retention == RetentionClass::Durable
+                        && entry.source.event_id != new_id
+                        && entry.topic.as_deref().map(normalize).as_deref()
+                            == Some(normalized.as_str())
+                })
+                .take(budget)
+                .map(|entry| entry.source.event_id.clone())
+                .collect();
+            for id in older {
+                self.push_link(MemoryLink {
+                    from: id,
+                    to: new_id.to_owned(),
+                    kind: MemoryLinkKind::TemporalBefore,
+                    created_at_ms: now_ms,
+                });
+            }
+        }
+        // The insert above may have compacted a linking target away (capacity
+        // or TTL), so edges are pruned against the surviving store before the
+        // bound is re-enforced: no link ever outlives either endpoint.
+        self.prune_links();
+        self.enforce_link_bound();
+    }
+
+    fn prune_links(&mut self) {
+        let alive: HashSet<&str> = self
+            .entries
+            .iter()
+            .map(|entry| entry.source.event_id.as_str())
+            .collect();
+        self.links
+            .retain(|link| alive.contains(link.from.as_str()) && alive.contains(link.to.as_str()));
+    }
+
+    fn push_link(&mut self, link: MemoryLink) {
+        let duplicate = self.links.iter().any(|existing| {
+            existing.kind == link.kind && existing.from == link.from && existing.to == link.to
+        });
+        if !duplicate {
+            self.links.push_back(link);
+        }
+    }
+
+    fn enforce_link_bound(&mut self) {
+        while self.links.len() > self.config.max_links {
+            self.links.pop_front();
+        }
+        self.links_high_water = self.links_high_water.max(self.links.len());
     }
 
     pub fn compact(&mut self, now_ms: u64) -> MemoryCompactionRecord {
@@ -298,6 +491,10 @@ impl WorkingMemory {
             self.entries.pop_front();
             capacity_removed += 1;
         }
+        // Deletion/expiry applies to relation metadata too: an edge may never
+        // outlive either endpoint, so no removed memory id — and, structurally,
+        // no removed content — stays reachable through links.
+        self.prune_links();
         self.entries_high_water = self.entries_high_water.max(self.entries.len());
         let record = MemoryCompactionRecord {
             at_ms: now_ms,
@@ -362,6 +559,36 @@ impl WorkingMemory {
             .into_iter()
             .take(query.limit)
             .map(|(_, _, entry)| entry)
+            .collect()
+    }
+
+    /// The same ranking as [`Self::relevant`], each result joined with its
+    /// bounded link view: links touching the entry (creation-order capped at
+    /// `max_links_per_memory`, so a neighborhood can never fan out) and
+    /// whether a *still-retained* memory explicitly supersedes it. Pruning
+    /// guarantees a superseder that expired or was evicted takes its edge
+    /// with it, so `stale` never cites a memory that is gone.
+    pub fn relevant_linked(&self, query: MemoryQuery<'_>, now_ms: u64) -> Vec<LinkedMemory<'_>> {
+        self.relevant(query, now_ms)
+            .into_iter()
+            .map(|entry| {
+                let id = entry.source.event_id.as_str();
+                let links: Vec<MemoryLink> = self
+                    .links
+                    .iter()
+                    .filter(|link| link.from == id || link.to == id)
+                    .take(self.config.max_links_per_memory)
+                    .cloned()
+                    .collect();
+                let stale = links
+                    .iter()
+                    .any(|link| link.kind == MemoryLinkKind::Supersedes && link.to == id);
+                LinkedMemory {
+                    entry,
+                    stale,
+                    links,
+                }
+            })
             .collect()
     }
 
@@ -1049,6 +1276,28 @@ mod tests {
 
     fn test_memory(config: WorkingMemoryConfig) -> WorkingMemory {
         WorkingMemory::new(config, test_pseudonymizer()).expect("working memory")
+    }
+
+    #[test]
+    fn link_bounds_must_be_positive() {
+        let error = WorkingMemory::new(
+            WorkingMemoryConfig {
+                max_links: 0,
+                ..WorkingMemoryConfig::default()
+            },
+            test_pseudonymizer(),
+        )
+        .expect_err("a zero link cap is no bound at all");
+        assert!(matches!(error, AdaptationError::InvalidConfiguration(_)));
+        let error = WorkingMemory::new(
+            WorkingMemoryConfig {
+                max_links_per_memory: 0,
+                ..WorkingMemoryConfig::default()
+            },
+            test_pseudonymizer(),
+        )
+        .expect_err("a zero per-write budget is no bound at all");
+        assert!(matches!(error, AdaptationError::InvalidConfiguration(_)));
     }
 
     #[test]

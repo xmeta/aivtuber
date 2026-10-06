@@ -65,7 +65,7 @@ Public content MUST NOT self-promote from claim/observation to verified fact. Mo
 
 Likewise, short-lived conversation/thread context is not automatically durable memory. Any future "crystallization" from active context into a retained atomic memory still passes the existing non-serializable +MemoryWritePermit+ gate and retention policy.
 
-If future temporal/causal links are added between retained memories, node deletion/expiry must deterministically remove or repair links without preserving deleted raw/private content inside edge metadata.
+Temporal links between retained memories follow the bounded model in section 10: node deletion/expiry deterministically removes every link that touched the node, and edge metadata never carries claim content.
 
 == 4. Generated-asset promotion
 
@@ -143,6 +143,8 @@ AIVTUBER_MEMORY_WORKING_TTL_MS=900000
 AIVTUBER_MEMORY_DURABLE_TTL_MS=86400000
 AIVTUBER_MEMORY_MAX_CLAIM_BYTES=1024
 AIVTUBER_MEMORY_MAX_TOPIC_BYTES=128
+AIVTUBER_MEMORY_MAX_LINKS=2048
+AIVTUBER_MEMORY_MAX_LINKS_PER_WRITE=8
 AIVTUBER_MEMORY_PSEUDONYM_KEY_HEX=<64 hex characters / 32 random bytes>
 AIVTUBER_MEMORY_PSEUDONYM_KEY_VERSION=v1
 
@@ -162,11 +164,34 @@ The Rust tests cover:
 * pseudonym-key redaction plus absence of raw actor ids from serialized memory records;
 * deterministic capacity compaction;
 * viewer/topic relevance;
+* bounded-link creation, per-write/store caps, deletion-driven link pruning,
+  supersession staleness, contradiction-without-evidence, and link
+  determinism (issue #105, section 10);
 * long-range synthetic update/supersession, record-time-vs-event-time order,
   expiry, timeline precision/bounds, and provenance survival cases (issue #105
-  baseline, +tests/long_range_eval.rs+);
+  link-aware baseline, +tests/long_range_eval.rs+);
 * frequency/quality promotion;
 * provenance and compatibility preservation across L1 persistence;
 * negative-quality rollback/invalidation;
 * deterministic decision replay and anti-repetition;
 * full +ProductionApp+ generated-asset promotion/rollback flow.
+
+== 10. Bounded episodic links (issue #105)
+
++WorkingMemory+ retains a small versioned link vocabulary, +memory-link-v1+, between retained entries. Two kinds exist today:
+
+* +temporal_before+ — derived deterministically at write time: the new entry links to the newest retained same-topic durable entry, walking older ones within the per-write budget. No model output is involved.
+* +supersedes+ — declared by the caller through +remember_durable_superseding+, the permit-gated durable path. Every declared target must already be a retained durable memory; a target that is absent, unknown, or working-only refuses the whole write before anything is stored.
+
+Causal kinds are intentionally deferred until a real evidence source exists; the vocabulary version string pins the schema so adding one is an explicit, replay-visible change.
+
+A link carries only its endpoint ids, kind, and creation timestamp. It never carries claim, topic, or actor content, so edge metadata cannot become a covert archive of deleted (or live) content (see docs/security-threat-model.adoc section 8).
+
+Bounds, both validated positive and owned by the #51 unified retention policy:
+
+* +max_links+ (default 2,048; +AIVTUBER_MEMORY_MAX_LINKS+) caps the store-wide edge count. Insert-compact evicts entries first, then the edge cap is enforced deterministically.
+* +max_links_per_memory+ (default 8; +AIVTUBER_MEMORY_MAX_LINKS_PER_WRITE+) is the per-write creation budget and the per-entry retrieval cap, so a single entry's neighborhood can never fan out.
+
+Only permit-gated memory enters the graph: links are created exclusively inside the +MemoryWritePermit+ durable path, so public chat and generated/model output cannot mint links or authority.
+
+Compaction and deletion prune links: an edge survives only while both endpoints are retained. Staleness is therefore defined over live edges — a retained entry is stale when a retained +supersedes+ edge points at it, and pruning guarantees no stale verdict can ever cite a deleted target. Retrieval via +relevant_linked+ is single-hop with the per-entry cap above; short-lived thread context (#80) is never persisted as links.

@@ -441,6 +441,11 @@ fn build_runtime_retention_policy() -> Result<RuntimeRetentionPolicy, Box<dyn Er
             "AIVTUBER_MEMORY_MAX_COMPACTION_RECORDS",
             defaults.max_memory_compaction_records,
         )?,
+        max_memory_links: env_usize("AIVTUBER_MEMORY_MAX_LINKS", defaults.max_memory_links)?,
+        max_memory_links_per_write: env_usize(
+            "AIVTUBER_MEMORY_MAX_LINKS_PER_WRITE",
+            defaults.max_memory_links_per_write,
+        )?,
         max_adaptation_feedback_assets: env_usize(
             "AIVTUBER_RETENTION_MAX_ADAPTATION_FEEDBACK_ASSETS",
             defaults.max_adaptation_feedback_assets,
@@ -473,6 +478,8 @@ fn build_runtime_retention_policy() -> Result<RuntimeRetentionPolicy, Box<dyn Er
         || policy.max_cached_variant_groups == 0
         || policy.max_working_memory_entries == 0
         || policy.max_memory_compaction_records == 0
+        || policy.max_memory_links == 0
+        || policy.max_memory_links_per_write == 0
         || policy.max_adaptation_feedback_assets == 0
         || policy.max_adaptation_recent_groups == 0
         || policy.max_adaptation_decisions == 0

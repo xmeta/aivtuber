@@ -8,22 +8,27 @@
 //! gate before it reaches `WorkingMemory`, and the assertions pin what current
 //! retrieval measurably does and does not provide:
 //!
-//! * an update case returns the whole timeline but no supersession signal —
-//!   the failure the temporal/causal links of #105 exist to fix;
+//! * an update case marks the superseded claim stale through an explicit
+//!   supersession link while the whole timeline stays retrievable (the #105
+//!   link structure; the original no-signal baseline flipped);
+//! * same-topic derivation never invents staleness — a contradiction without
+//!   update evidence stays current;
 //! * retrieval order follows *record* time, not *event* time — the
 //!   temporal-order error class;
-//! * expired memory never leaks while newer memory survives;
+//! * expired/evicted memory never leaks while newer memory survives, and
+//!   every link touching it is pruned with it;
 //! * the viewer's timeline ranks ahead of irrelevant same-topic memory and
 //!   results stay node/byte bounded;
 //! * provenance class survives retrieval unchanged and is never promoted,
 //!   and memory that failed the gate cannot enter at all.
 //!
-//! When bounded links land, the same cases gain link-aware expectations;
-//! these baselines are the numbers they must improve.
+//! Link creation, bounds, and determinism are measured here too: per-write
+//! budgets, the store cap owned by the unified retention policy (#51), and
+//! byte-identical links for identical inputs.
 
 use aivtuber_adaptation::{
-    ActorPseudonymizer, MemoryGateDecision, MemoryQuery, RetentionClass, WorkingMemory,
-    WorkingMemoryConfig,
+    ActorPseudonymizer, LinkedMemory, MemoryGateDecision, MemoryLinkKind, MemoryQuery,
+    RetentionClass, WorkingMemory, WorkingMemoryConfig,
 };
 use aivtuber_domain::{
     AuthenticatedControl, AuthorizationMethod, Capability, ControlSecret, EVENT_SCHEMA_VERSION,
@@ -115,6 +120,10 @@ struct Memory {
     topic: Option<&'static str>,
     recorded_at_ms: u64,
     event_at_ms: u64,
+    /// Explicit update evidence: the retained memory this claim replaces.
+    /// Declared by the case (as the future writer would), never inferred from
+    /// topic similarity alone.
+    supersedes: Option<&'static str>,
 }
 
 struct Eval {
@@ -156,9 +165,20 @@ impl Eval {
             spec.id
         );
         let permit = permit.expect("allowed write carries a permit");
-        self.memory
-            .remember_durable(&permit, spec.claim, spec.topic, spec.recorded_at_ms)
-            .expect("durable entry");
+        let written = match spec.supersedes {
+            Some(target) => self.memory.remember_durable_superseding(
+                &permit,
+                spec.claim,
+                spec.topic,
+                spec.recorded_at_ms,
+                &[target],
+            ),
+            None => {
+                self.memory
+                    .remember_durable(&permit, spec.claim, spec.topic, spec.recorded_at_ms)
+            }
+        };
+        written.expect("durable entry");
     }
 
     fn query(
@@ -169,6 +189,24 @@ impl Eval {
         now_ms: u64,
     ) -> Vec<&aivtuber_adaptation::MemoryEntry> {
         self.memory.relevant(
+            MemoryQuery {
+                source_namespace: actor.map(|_| "public-chat"),
+                actor_id: actor,
+                topic,
+                limit,
+            },
+            now_ms,
+        )
+    }
+
+    fn query_linked(
+        &self,
+        actor: Option<&str>,
+        topic: Option<&str>,
+        limit: usize,
+        now_ms: u64,
+    ) -> Vec<LinkedMemory<'_>> {
+        self.memory.relevant_linked(
             MemoryQuery {
                 source_namespace: actor.map(|_| "public-chat"),
                 actor_id: actor,
@@ -190,37 +228,58 @@ fn viewer(id: &'static str, claim: &'static str, topic: &'static str, at_ms: u64
         topic: Some(topic),
         recorded_at_ms: at_ms,
         event_at_ms: at_ms,
+        supersedes: None,
     }
 }
 
 #[test]
-fn an_update_case_returns_the_whole_timeline_but_no_supersession_signal() {
+fn an_update_case_marks_the_superseded_claim_stale_and_keeps_the_whole_timeline() {
     let mut eval = Eval::new(WorkingMemoryConfig::default());
     // The issue's important example: A — the viewer disliked game X; later,
-    // B — finished game X and enjoyed the ending.
+    // B — finished game X and enjoyed the ending. The writer declares B's
+    // update evidence through the permit path (the case owns that evidence,
+    // exactly as the future conversation writer would).
     let old = viewer("evt-dislike", "viewer disliked game x", "game-x", 1_000);
-    let new = viewer(
+    let mut new = viewer(
         "evt-enjoy",
         "viewer enjoyed the game x ending",
         "game-x",
         2_000,
     );
+    new.supersedes = Some("evt-dislike");
     eval.remember(&old);
     eval.remember(&new);
 
-    let results = eval.query(Some("viewer-1"), Some("game-x"), 10, 3_000);
-    // The whole timeline is retrievable, newest first.
+    let results = eval.query_linked(Some("viewer-1"), Some("game-x"), 10, 3_000);
+    // The whole timeline is retrievable, newest first — supersession marks a
+    // claim, it never hides it.
     assert_eq!(results.len(), 2, "both claims are part of the timeline");
-    assert!(results[0].normalized_claim.contains("enjoyed"));
-    assert!(results[1].normalized_claim.contains("disliked"));
+    assert!(results[0].entry.normalized_claim.contains("enjoyed"));
+    assert!(results[1].entry.normalized_claim.contains("disliked"));
 
-    // Detection: nothing in either result distinguishes the superseded claim
-    // from the current one. Serialize both and pin that no staleness,
-    // supersession, or relation field exists — if a link structure ever adds
-    // one, this baseline flips and the case gains link-aware expectations.
+    // The link-aware signal: the old claim is stale because a *retained*
+    // memory explicitly supersedes it, the current claim is not, and the
+    // supersession edge itself is visible in the bounded link view.
+    assert!(
+        results[1].stale,
+        "the superseded claim is marked stale, not silently dropped"
+    );
+    assert!(!results[0].stale, "the current claim is not stale");
+    assert!(
+        results[0].links.iter().any(|link| {
+            link.kind == MemoryLinkKind::Supersedes
+                && link.from == "evt-enjoy"
+                && link.to == "evt-dislike"
+        }),
+        "the supersession edge is visible: {:?}",
+        results[0].links
+    );
+
+    // Both artifacts serialize with the link-aware fields — the flip of the
+    // original baseline, which pinned their absence.
     let keys: BTreeSet<String> = results
         .iter()
-        .filter_map(|entry| serde_json::to_value(entry).ok())
+        .filter_map(|linked| serde_json::to_value(linked).ok())
         .filter_map(|value| {
             value.as_object().map(|object| {
                 object
@@ -232,18 +291,49 @@ fn an_update_case_returns_the_whole_timeline_but_no_supersession_signal() {
         .flatten()
         .collect();
     assert!(
-        keys.iter().all(|key| {
-            !key.contains("supersed")
-                && !key.contains("stale")
-                && !key.contains("update")
-                && !key.contains("relation")
-                && !key.contains("link")
-        }),
-        "current retrieval carries no supersession signal: {keys:?}"
+        keys.iter().any(|key| key.contains("stale")) && keys.iter().any(|key| key.contains("link")),
+        "link-aware retrieval carries staleness and links: {keys:?}"
     );
-    assert_eq!(results[0].retention, results[1].retention);
-    assert_eq!(results[0].write_decision, results[1].write_decision);
-    eprintln!("metric: supersession_signal=none, timeline_returned=2");
+    // Provenance is untouched by linkage (threat model §8): the edge never
+    // promotes or rewrites the claim's class.
+    assert_eq!(results[0].entry.retention, results[1].entry.retention);
+    assert_eq!(
+        results[0].entry.write_decision,
+        results[1].entry.write_decision
+    );
+    eprintln!("metric: supersession_signal=present, stale_marked=1, timeline_returned=2");
+}
+
+#[test]
+fn a_contradiction_without_update_evidence_stays_current() {
+    let mut eval = Eval::new(WorkingMemoryConfig::default());
+    // "A contradiction that is not actually an update": two same-topic
+    // claims with no declared update evidence. The deterministic same-topic
+    // spine may link them temporally, but linkage alone must never invent
+    // staleness (threat model §8: graph linkage is not authority).
+    let first = viewer("evt-claim-a", "viewer prefers game x", "game-x", 1_000);
+    let second = viewer(
+        "evt-claim-b",
+        "viewer prefers another game",
+        "game-x",
+        2_000,
+    );
+    eval.remember(&first);
+    eval.remember(&second);
+
+    let results = eval.query_linked(Some("viewer-1"), Some("game-x"), 10, 3_000);
+    assert_eq!(results.len(), 2);
+    assert!(
+        results.iter().all(|linked| !linked.stale),
+        "same-topic derivation alone never marks a claim stale"
+    );
+    assert!(
+        results.iter().all(|linked| linked
+            .links
+            .iter()
+            .any(|link| link.kind == MemoryLinkKind::TemporalBefore)),
+        "the deterministic temporal spine still links the timeline"
+    );
 }
 
 #[test]
@@ -377,6 +467,7 @@ fn provenance_class_survives_retrieval_and_gate_denied_memory_never_enters() {
         topic: Some("health"),
         recorded_at_ms: 1_100,
         event_at_ms: 1_100,
+        supersedes: None,
     };
     eval.remember(&observation);
 
@@ -415,4 +506,185 @@ fn provenance_class_survives_retrieval_and_gate_denied_memory_never_enters() {
     assert_eq!(decision, MemoryWriteDecision::Denied);
     assert!(permit.is_none(), "no permit, no durable write");
     assert_eq!(eval.memory.len(), before);
+}
+
+#[test]
+fn deleting_a_memory_removes_every_link_that_touched_it() {
+    // Capacity eviction stands in for any deletion path: the superseded
+    // memory leaves the store, and nothing about it may survive anywhere —
+    // neither its content nor its id inside an edge (threat model §8: an edge
+    // must not become a covert archive of removed content).
+    let mut eval = Eval::new(WorkingMemoryConfig {
+        max_entries: 1,
+        ..WorkingMemoryConfig::default()
+    });
+    let old = viewer("evt-superseded", "private old opinion", "game-x", 1_000);
+    eval.remember(&old);
+    let mut new = viewer("evt-current", "current opinion", "game-x", 2_000);
+    new.supersedes = Some("evt-superseded");
+    eval.remember(&new);
+
+    assert_eq!(eval.memory.len(), 1, "capacity evicted the old claim");
+    assert!(
+        eval.memory.links().is_empty(),
+        "both edges died with their endpoint"
+    );
+    let store = serde_json::to_string(eval.memory.entries()).expect("serialize entries");
+    let links = serde_json::to_string(eval.memory.links()).expect("serialize links");
+    for serialized in [store, links] {
+        assert!(
+            !serialized.contains("private old opinion"),
+            "removed content is unreachable"
+        );
+        assert!(
+            !serialized.contains("evt-superseded"),
+            "no dangling reference to the removed memory"
+        );
+    }
+    // The survivor is not stale: nothing *retained* supersedes it anymore.
+    let results = eval.query_linked(Some("viewer-1"), Some("game-x"), 10, 3_000);
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].stale);
+    assert!(results[0].links.is_empty());
+}
+
+#[test]
+fn link_creation_respects_the_per_write_budget_and_the_store_cap() {
+    let mut eval = Eval::new(WorkingMemoryConfig {
+        max_links: 3,
+        max_links_per_memory: 2,
+        ..WorkingMemoryConfig::default()
+    });
+    // Four same-topic writes: 0 + 1 + 2 + 2 links created = 5, so the store
+    // cap of 3 evicts oldest-first, deterministically.
+    eval.remember(&viewer("evt-b0", "claim b0", "game-x", 1_000));
+    eval.remember(&viewer("evt-b1", "claim b1", "game-x", 1_100));
+    eval.remember(&viewer("evt-b2", "claim b2", "game-x", 1_200));
+    eval.remember(&viewer("evt-b3", "claim b3", "game-x", 1_300));
+    assert_eq!(
+        eval.memory.links().len(),
+        3,
+        "store cap enforced: {:?}",
+        eval.memory.links()
+    );
+    let metrics = eval.memory.retention_metrics();
+    assert_eq!(metrics.links, 3);
+    assert_eq!(metrics.links_high_water, 3);
+
+    // Per-write budget: one write may not declare more supersessions than
+    // `max_links_per_memory`, and the refusal stores nothing.
+    let attempt = event(
+        "evt-overflow",
+        SourceClass::PublicChat,
+        TrustLevel::Untrusted,
+        Some("viewer-1"),
+    );
+    let (decision, permit) = eval
+        .security
+        .authorize_memory_write(&attempt, Some(&eval.admin));
+    assert_ne!(decision, MemoryWriteDecision::Denied);
+    let permit = permit.expect("allowed write carries a permit");
+    let error = eval
+        .memory
+        .remember_durable_superseding(
+            &permit,
+            "claim overflow",
+            Some("game-x"),
+            1_400,
+            &["evt-b0", "evt-b1", "evt-b2"],
+        )
+        .expect_err("the budget bounds one write's link creation");
+    assert!(
+        error.to_string().contains("per-memory link budget"),
+        "{error}"
+    );
+    assert_eq!(eval.memory.len(), 4, "a refused write stores nothing");
+    assert!(
+        eval.memory
+            .entries()
+            .iter()
+            .all(|entry| entry.source.event_id != "evt-overflow")
+    );
+}
+
+#[test]
+fn a_supersession_target_that_is_not_retained_durable_is_refused() {
+    let mut eval = Eval::new(WorkingMemoryConfig::default());
+    eval.remember(&viewer("evt-keep", "kept claim", "game-x", 1_000));
+    // Working-only state (#80 territory) never becomes a link endpoint: it is
+    // not retained episodic memory, so nothing can supersede it.
+    eval.memory
+        .remember_working(
+            &event(
+                "evt-working",
+                SourceClass::PublicChat,
+                TrustLevel::Untrusted,
+                Some("viewer-1"),
+            ),
+            "active thread claim",
+            Some("game-x"),
+            500,
+        )
+        .expect("working entry");
+    assert!(
+        eval.memory.links().is_empty(),
+        "working memory never enters the graph"
+    );
+
+    let attempt = event(
+        "evt-update",
+        SourceClass::PublicChat,
+        TrustLevel::Untrusted,
+        Some("viewer-1"),
+    );
+    for target in ["evt-working", "evt-unknown"] {
+        let (decision, permit) = eval
+            .security
+            .authorize_memory_write(&attempt, Some(&eval.admin));
+        assert_ne!(decision, MemoryWriteDecision::Denied);
+        let permit = permit.expect("allowed write carries a permit");
+        let error = eval
+            .memory
+            .remember_durable_superseding(
+                &permit,
+                "updated claim",
+                Some("game-x"),
+                2_000,
+                &[target],
+            )
+            .expect_err("only retained durable memories are link endpoints");
+        assert!(
+            error.to_string().contains("retained durable memory"),
+            "{error}"
+        );
+    }
+    // Refused writes stored nothing: the durable claim and the working entry
+    // are the only memories here.
+    assert_eq!(eval.memory.len(), 2);
+    assert!(
+        eval.memory
+            .entries()
+            .iter()
+            .all(|entry| entry.source.event_id != "evt-update")
+    );
+    assert!(eval.memory.links().is_empty());
+}
+
+#[test]
+fn identical_inputs_produce_identical_links_and_entries() {
+    fn build() -> WorkingMemory {
+        let mut eval = Eval::new(WorkingMemoryConfig::default());
+        eval.remember(&viewer("evt-d1", "claim one", "game-x", 1_000));
+        let mut update = viewer("evt-d2", "claim two", "game-x", 2_000);
+        update.supersedes = Some("evt-d1");
+        eval.remember(&update);
+        eval.remember(&viewer("evt-d3", "other topic claim", "game-y", 3_000));
+        eval.memory
+    }
+
+    let left = build();
+    let right = build();
+    assert_eq!(left.entries(), right.entries(), "replay-stable store");
+    assert_eq!(left.links(), right.links(), "replay-stable link decisions");
+    assert!(!left.links().is_empty(), "the fixture produced links");
 }
