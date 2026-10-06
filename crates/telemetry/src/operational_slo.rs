@@ -1566,6 +1566,20 @@ pub fn evaluate(
     // boundary gets measured); the targets-file path does not.
     targets.validate_for_evaluation(&catalog)?;
 
+    // The #58 compatibility series of the artifact under evaluation
+    // (`mode|dataset_id|config_version|seed` — the same key `slo-baseline`
+    // pools on). A calibrated target names the series it was measured in,
+    // and applying it to a different series would silently reuse — or
+    // silently loosen — an objective calibrated for another workload.
+    let report_series = format!(
+        "{}|{}|{}|{}",
+        report.mode.as_str(),
+        report.metadata.dataset_id,
+        report.metadata.config_version,
+        report.metadata.seed
+    );
+    let mut series_mismatches: Vec<(String, String)> = Vec::new();
+
     let windows = build_windows(report, &config);
     let events = report.events.as_slice();
 
@@ -1613,7 +1627,24 @@ pub fn evaluate(
             latency_calibration.extend(latency_calibration_for(indicator.id, events, &windows));
         }
 
-        let target = targets.get(indicator.id);
+        let target = targets.get(indicator.id).and_then(|target| {
+            // A latency probe is the measurement tool for *this* artifact and
+            // carries no series by construction; every calibrated target must
+            // match the report's series or it is not applied at all. A
+            // mismatched target leaves the objective `uncalibrated` — the
+            // measured value still publishes — and the report says why in
+            // `limitations`, so cross-series reuse fails closed instead of
+            // deciding an unrelated workload.
+            let probe = target.baseline.source.starts_with(PROBE_SOURCE_MARKER);
+            if probe || target.baseline.series.as_deref() == Some(report_series.as_str()) {
+                return Some(target);
+            }
+            series_mismatches.push((
+                indicator.id.to_owned(),
+                target.baseline.series.clone().unwrap_or_default(),
+            ));
+            None
+        });
         for window in &windows {
             let scoped = window_events(events, window);
             let measurement = measure(indicator, &scoped, target);
@@ -1665,7 +1696,14 @@ pub fn evaluate(
     let verdict = overall_verdict(&indicators);
 
     let aar_candidates = aar_candidates(&indicators, config.persistent_miss_windows);
-    let limitations = limitations(report, &windows);
+    let mut limitations = limitations(report, &windows);
+    for (id, series) in &series_mismatches {
+        limitations.push(format!(
+            "target for {id} was calibrated on compatibility series {series}, which is not this \
+             report's series ({report_series}); the objective is reported uncalibrated for this \
+             run instead of being applied across series"
+        ));
+    }
 
     Ok(SloReport {
         schema_version: SLO_REPORT_SCHEMA_VERSION.to_owned(),
@@ -2050,7 +2088,8 @@ pub struct BaselineProposal {
     pub threshold_ms: Option<u64>,
     /// Pooled measured ratio, ready to paste into a target entry as its
     /// `baseline`. The target ratio itself remains a product decision made
-    /// *above* this value, not equal to it by default.
+    /// *against* this value — a minimum conforming ratio, chosen never above
+    /// the measured baseline — not equal to it by default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline: Option<BaselineEvidence>,
     /// Target-free latency percentiles; a `threshold_ms` is chosen from these.
@@ -2876,7 +2915,8 @@ impl BaselineProposalSet {
         }
         out.push_str(
             "\nThis is measured evidence, not a target. A target ratio is a product decision \
-             made above the value shown, and the chosen `baseline` block is copied from here.\n",
+             chosen against the value shown — never above the measured conforming ratio — and \
+             the chosen `baseline` block is copied from here.\n",
         );
         out
     }

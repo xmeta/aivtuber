@@ -130,10 +130,13 @@ present must match the report contract this build emits. An impossible baseline
 would not fail any later evaluation; it would simply be quoted forever as the
 justification for the number.
 
-The checked-in `examples/slo/slo-targets.json` therefore ships every numeric
-target with the `baseline` block it was calibrated from, and a test fails if a
-target lacks its evidence. The file enforced that rule by staying empty until
-#71's calibration criterion was met; it now enforces the same rule per entry.
+The checked-in `examples/slo/slo-targets.json` therefore stays empty until a
+target can cite a `baseline` block measured on a *representative* series whose
+pooled denominators reach the indicator's sample floor: evidence the contract
+itself would refuse to decide an objective with cannot be promoted into that
+objective's durable target. When entries exist, validation enforces the
+per-entry evidence rule, and evaluation applies a target only to a report from
+the series it was calibrated on (below).
 
 === One direction, stated once
 
@@ -599,7 +602,9 @@ The procedure is deliberately boring:
 
 The `baseline` block in a target entry is copied from an `slo-baseline`
 proposal rather than written by hand, and the target ratio is a product
-decision made *above* the measured value — the proposal never prescribes it.
+decision made *against* the measured value — a minimum conforming ratio,
+chosen never above the measured baseline — and the proposal never prescribes
+it.
 An indicator the history measured too thinly has no `baseline` block to copy at
 all; `slo-baseline` names it in `limitations` instead of publishing a value
 that one run happened to measure.
@@ -618,39 +623,38 @@ string repeats the same identities for a human reader. Repeated nightly runs of
 the same revision are what turn one measurement into a baseline, exactly as
 link:performance-goals.adoc[Performance Goals and Baselines] requires for #58.
 
-=== The first calibrated targets
+Calibration evidence is also scoped where it is *used*, not only where it is
+recorded: `evaluate` derives the evaluated report's compatibility series
+(`mode|dataset_id|config_version|seed`) and applies a calibrated target only
+when it equals `baseline.series`. A report from any other series reports the
+objective `uncalibrated` — the measured value still publishes — and says why in
+`limitations`, so a new workload re-calibrates instead of silently reusing (or
+silently loosening) an old series' target. A latency probe is exempt because it
+is the measurement tool run against the very artifact it measures.
 
-`examples/slo/slo-targets.json` now carries the first calibrated numeric
-targets, produced by exactly the procedure above rather than written by hand:
+=== First calibration cycle: why the file is still empty
 
-* The evidence is three distinct recorded runs (three revisions:
-  `d8f277cc`, `4eafd2c9`, `9148c4f8`) of the `full_generative`
-  replay-comparison series, pooled from the `slo-data` history with
-  `slo-baseline`.
-* The latency thresholds sit above the worst observed percentile of that
-  history — first-audio worst p99/max was 122 ms, so the objective is
-  250 ms; first-visible was 33 ms, so 100 ms — and each boundary's
-  conforming ratio (9 of 9 at both) was measured by the probe step over the
-  same stored runs before the entry was written.
-* The ratios are product decisions *above* the measured value of 1.0, not
-  the number the fixture happened to produce: 0.99 for speech presence,
-  deadline adherence and both latency objectives; 0.95 for generative-budget
-  admission, because a budget denial under load is legitimate policy; and
-  0.90 for semantic-reuse correctness, a reviewer judgement rather than a
-  delivery guarantee.
+The full cycle above has been executed once against the persisted `slo-data`
+history — three distinct runs (three revisions: `d8f277cc`, `4eafd2c9`,
+`9148c4f8`) of the `full_generative` starter-replay series, pooled by
+`slo-baseline`, with the latency probe run over each stored
+`benchmark-reports` copy at 250 ms and 100 ms. The machinery works end to
+end; the evidence does not qualify, so nothing was checked in:
 
-Two scope statements belong with those numbers rather than in a footnote.
-The evidence is *series-scoped*: the starter replay fixture drives
-deterministic in-process provider mocks, so these thresholds are objectives
-for this workload and make no claim about hosted-provider latency — which is
-exactly why link:metrics.adoc[Metrics] forbids treating the smoke fixture as
-one. A denser recorded workload or a real-provider series starts a new #58
-series and re-calibrates there; it does not silently loosen these. And a
-target is not a decision: the smoke fixture's three-event sessions sit below
-the `15`-sample floor of most indicators, so those report
-`insufficient_samples` — honest non-decision, never a pass. Objectives whose
-evidence the artifact cannot carry (below) stay untargeted, and a
-target-free `baseline` block is how `slo-baseline` says so.
+* the pooled denominators (9 / 9 / 9 / 6) sit *below* the catalog's own
+  15-sample floor for three of the four ratio objectives — evidence the
+  contract refuses to decide an objective with cannot be promoted into that
+  objective's durable target;
+* the fixture drives deterministic in-process provider mocks, so its latency
+  (worst p99: 122 ms first-audio, 33 ms first-visible) is not an empirical
+  claim about hosted-provider latency — which is exactly why
+  link:metrics.adoc[Metrics] forbids treating the smoke fixture as one.
+
+So `examples/slo/slo-targets.json` stays empty and #71 stays open. The next
+calibration needs repeated #70-style scenario history with denominators at or
+above the floor, recorded by the trusted push-to-main job. That history starts
+a new #58 series and calibrates its own targets, and evaluation enforces the
+series boundary above, so an objective is never reused across workloads.
 
 == What this does not cover yet
 

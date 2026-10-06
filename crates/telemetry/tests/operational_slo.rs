@@ -386,6 +386,63 @@ fn an_external_provider_failure_is_attributed_away_from_the_runtime_when_a_fallb
 }
 
 #[test]
+fn a_target_calibrated_for_another_series_is_not_applied_to_this_report() {
+    // The fixture report belongs to `deterministic_semantic|slo-fixture|bench-v1|7`.
+    // A target calibrated on a different compatibility series must not decide
+    // this report: cross-series reuse would silently apply — or silently
+    // loosen — an objective calibrated for a different workload, exactly
+    // what `baseline.series` claims to scope.
+    let mut foreign = calibrated(1.0, 1.0);
+    foreign.baseline.series = Some("deterministic_semantic|other-dataset|bench-v1|7".to_owned());
+
+    let mut handled = observation(RouteClass::CachedFallback);
+    handled.fallback_reason = Some("unavailable".to_owned());
+    handled.event_to_first_audio_ms = Some(50);
+
+    let cross = evaluate(
+        &report(vec![handled.clone()], 1_000),
+        &targets(&[("reliability.fallback_delivery_rate", foreign)]),
+        SloEvaluationConfig::default(),
+    )
+    .expect("SLO report");
+    let row = result(&cross, "reliability.fallback_delivery_rate", "session");
+    assert_eq!(
+        row.target, None,
+        "a target calibrated for another series must not be applied"
+    );
+    assert_eq!(
+        row.status,
+        SloStatus::Uncalibrated,
+        "cross-series application must produce neither Met nor Missed"
+    );
+    assert_eq!(
+        row.value,
+        Some(1.0),
+        "the measured value still publishes as calibration evidence"
+    );
+    assert!(
+        cross
+            .limitations
+            .iter()
+            .any(|line| line.contains("compatibility series")),
+        "the report says why the target was not applied: {:?}",
+        cross.limitations
+    );
+
+    // Positive control: the same target on the report's own series still
+    // decides the objective, so the boundary selects on series alone.
+    let same = evaluate(
+        &report(vec![handled], 1_000),
+        &targets(&[("reliability.fallback_delivery_rate", calibrated(1.0, 1.0))]),
+        SloEvaluationConfig::default(),
+    )
+    .expect("SLO report");
+    let row = result(&same, "reliability.fallback_delivery_rate", "session");
+    assert_eq!(row.target, Some(1.0));
+    assert_eq!(row.status, SloStatus::Met);
+}
+
+#[test]
 fn a_runtime_policy_silence_is_not_attributed_to_the_provider() {
     let mut event = observation(RouteClass::Silent);
     event.budget_denial_reason = Some("budget_exhausted".to_owned());
