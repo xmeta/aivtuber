@@ -143,6 +143,7 @@ pub struct RuntimeRetentionSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aivtuber_adaptation::{ActorPseudonymizer, WorkingMemory};
 
     #[test]
     fn one_policy_derives_all_production_retention_configs() {
@@ -158,7 +159,7 @@ mod tests {
             max_cached_variant_groups: 19,
             max_working_memory_entries: 20,
             max_memory_compaction_records: 21,
-            max_memory_links: 28,
+            max_memory_links: 30,
             max_memory_links_per_write: 29,
             max_adaptation_feedback_assets: 22,
             max_adaptation_recent_groups: 23,
@@ -187,8 +188,16 @@ mod tests {
         let memory = policy.working_memory_config(WorkingMemoryConfig::default());
         assert_eq!(memory.max_entries, 20);
         assert_eq!(memory.max_compaction_records, 21);
-        assert_eq!(memory.max_links, 28);
+        assert_eq!(memory.max_links, 30);
         assert_eq!(memory.max_links_per_memory, 29);
+        // The derived config must be constructible: the store bound has to
+        // cover one maximum-size write, so the policy can never hand
+        // WorkingMemory a shape that drops an accepted write's own links.
+        WorkingMemory::new(
+            memory,
+            ActorPseudonymizer::new("test-v1", [0x42; 32]).expect("key"),
+        )
+        .expect("policy-derived link bounds are a valid working-memory config");
 
         let adaptation = policy.adaptation_config();
         assert_eq!(adaptation.max_feedback_assets, 22);

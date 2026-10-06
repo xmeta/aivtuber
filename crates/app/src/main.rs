@@ -488,6 +488,17 @@ fn build_runtime_retention_policy() -> Result<RuntimeRetentionPolicy, Box<dyn Er
     {
         return Err(io::Error::other("runtime retention limits must be positive").into());
     }
+    // The store must be able to hold one maximum-size write, or the store
+    // bound would drop an explicit supersession the same write just had
+    // accepted (WorkingMemory::new refuses this shape; fail here with the
+    // env-var names instead).
+    if policy.max_memory_links < policy.max_memory_links_per_write {
+        return Err(io::Error::other(
+            "AIVTUBER_MEMORY_MAX_LINKS must cover one maximum-size write \
+             (>= AIVTUBER_MEMORY_MAX_LINKS_PER_WRITE)",
+        )
+        .into());
+    }
     Ok(policy)
 }
 

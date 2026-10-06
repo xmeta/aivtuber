@@ -59,6 +59,12 @@ pub struct MemoryEntry {
     pub expires_at_ms: u64,
     pub retention: RetentionClass,
     pub write_decision: MemoryGateDecision,
+    /// Internal node identity, assigned when the entry is inserted. Links
+    /// reference this and never `source.event_id`: a source event id is not
+    /// unique among retained entries (the scheduler may legitimately replay
+    /// one) and is not durable identity, so it cannot name a graph node.
+    /// `0` is never assigned; it marks an entry that has not been stored yet.
+    pub memory_id: u64,
 }
 
 /// Versioned edge vocabulary for retained episodic memory (#105). Kept small
@@ -78,14 +84,15 @@ pub enum MemoryLinkKind {
     Supersedes,
 }
 
-/// One edge between retained memory ids. It carries no claim content — only
-/// ids, a kind, and record time — so expiry or deletion can never leave
-/// removed content reachable through link metadata (security threat model
-/// §8: an edge must not become a covert archive).
+/// One edge between retained memory nodes. It carries no claim content —
+/// only node ids ([`MemoryEntry::memory_id`]), a kind, and record time — so
+/// expiry or deletion can never leave removed content reachable through link
+/// metadata (security threat model §8: an edge must not become a covert
+/// archive).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryLink {
-    pub from: String,
-    pub to: String,
+    pub from: u64,
+    pub to: u64,
     pub kind: MemoryLinkKind,
     pub created_at_ms: u64,
 }
@@ -177,7 +184,9 @@ pub struct WorkingMemoryConfig {
     /// Per-write creation budget: how many links one durable write may
     /// create (explicit supersessions plus the temporal neighborhood), which
     /// keeps per-memory degree creation-bounded; the store total is
-    /// `max_links`.
+    /// `max_links`. `max_links >= max_links_per_memory` is required, so the
+    /// store bound can never drop an explicit supersession the very same
+    /// write just had accepted.
     pub max_links_per_memory: usize,
 }
 
@@ -234,6 +243,9 @@ pub struct WorkingMemory {
     links_high_water: usize,
     compactions_high_water: usize,
     compactions_evicted: u64,
+    /// Next node identity to hand out; starts at 1 so `0` stays the marker
+    /// for "not inserted yet".
+    next_memory_id: u64,
 }
 
 impl WorkingMemory {
@@ -254,6 +266,13 @@ impl WorkingMemory {
                 "working-memory bounds must be positive",
             ));
         }
+        if config.max_links < config.max_links_per_memory {
+            return Err(AdaptationError::InvalidConfiguration(
+                "max_links must cover one maximum-size write (max_links >= max_links_per_memory); \
+                 otherwise the store bound drops explicit supersessions that an accepted write \
+                 just declared",
+            ));
+        }
         Ok(Self {
             config,
             pseudonymizer,
@@ -264,6 +283,7 @@ impl WorkingMemory {
             links_high_water: 0,
             compactions_high_water: 0,
             compactions_evicted: 0,
+            next_memory_id: 1,
         })
     }
 
@@ -333,10 +353,12 @@ impl WorkingMemory {
 
     /// A durable write that may also declare supersession: `supersedes` names
     /// retained durable memories this claim replaces (issue #105's update
-    /// evidence, owned by the caller). Targets are validated *before* anything
-    /// is stored, links ride the same non-serializable permit path as the
-    /// claim, and `max_links_per_memory` bounds what one write may create.
-    /// A denial therefore stores nothing and mints nothing.
+    /// evidence, owned by the caller). Targets are resolved to exactly one
+    /// live retained durable node *before* anything is stored — unknown,
+    /// working-only, expired, or ambiguous targets refuse the whole write
+    /// ("stores nothing, mints nothing"), links ride the same
+    /// non-serializable permit path as the claim, and
+    /// `max_links_per_memory` bounds what one write may create.
     pub fn remember_durable_superseding(
         &mut self,
         permit: &MemoryWritePermit,
@@ -350,8 +372,9 @@ impl WorkingMemory {
                 "one write may not declare more supersessions than the per-memory link budget",
             ));
         }
+        let mut targets = Vec::with_capacity(supersedes.len());
         for target in supersedes {
-            self.require_durable_memory(target)?;
+            targets.push(self.resolve_supersession_target(target, now_ms)?);
         }
         let retention = RetentionClass::Durable;
         let claim = bounded_nonempty(claim, self.config.max_claim_bytes, "memory claim")?;
@@ -374,27 +397,55 @@ impl WorkingMemory {
             expires_at_ms: now_ms.saturating_add(ttl),
             retention,
             write_decision: permit.decision().into(),
+            memory_id: 0,
         };
-        let event_id = entry.source.event_id.clone();
         let topic = entry.topic.clone();
-        self.push_bounded(entry, now_ms)?;
-        self.link_new_memory(&event_id, topic.as_deref(), now_ms, supersedes);
+        let stored = self.push_bounded(entry, now_ms)?;
+        let new_id = stored.memory_id;
+        self.link_new_memory(new_id, topic.as_deref(), now_ms, &targets);
         self.entries.back().ok_or(AdaptationError::Invariant(
             "inserted memory entry disappeared",
         ))
     }
 
-    /// Fail closed: a supersession edge may only point at a memory that is
-    /// actually retained here as durable. Working-only or unknown ids are
-    /// refused, so no phantom or cross-retention edge can exist.
-    fn require_durable_memory(&self, id: &str) -> Result<(), AdaptationError> {
-        let found = self
+    /// Resolve a declared supersession target to exactly one node, failing
+    /// closed at every point identity or liveness is in doubt:
+    ///
+    /// * unknown or working-only ids are refused — no cross-retention edge;
+    /// * an id whose only durable matches are expired *at `now_ms`* is
+    ///   refused — an expired memory is already deleted for retrieval, so it
+    ///   cannot authorize an update relation just because compaction has not
+    ///   physically removed it yet;
+    /// * an id retained as more than one live durable memory is refused as
+    ///   ambiguous — a source event id is not a node identity, and the link
+    ///   must not be guessed onto one of several candidates.
+    fn resolve_supersession_target(&self, id: &str, now_ms: u64) -> Result<u64, AdaptationError> {
+        let retained: Vec<&MemoryEntry> = self
             .entries
             .iter()
-            .any(|entry| entry.source.event_id == id && entry.retention == RetentionClass::Durable);
-        found.then_some(()).ok_or(AdaptationError::InvalidInput(
-            "supersession target must be a retained durable memory",
-        ))
+            .filter(|entry| {
+                entry.source.event_id == id && entry.retention == RetentionClass::Durable
+            })
+            .collect();
+        if retained.is_empty() {
+            return Err(AdaptationError::InvalidInput(
+                "supersession target must be a retained durable memory",
+            ));
+        }
+        let mut live = retained.iter().filter(|entry| entry.expires_at_ms > now_ms);
+        let Some(target) = live.next() else {
+            return Err(AdaptationError::InvalidInput(
+                "supersession target has expired; an expired memory cannot authorize an update \
+                 relation",
+            ));
+        };
+        if live.next().is_some() {
+            return Err(AdaptationError::InvalidInput(
+                "supersession target is ambiguous: one source event id matches more than one \
+                 retained durable memory, and links must not guess which node the caller meant",
+            ));
+        }
+        Ok(target.memory_id)
     }
 
     /// Create this write's links, deterministic by construction: explicit
@@ -404,10 +455,10 @@ impl WorkingMemory {
     /// edge, and the store total is re-bounded afterwards.
     fn link_new_memory(
         &mut self,
-        new_id: &str,
+        new_id: u64,
         topic: Option<&str>,
         now_ms: u64,
-        supersedes: &[&str],
+        supersedes: &[u64],
     ) {
         let mut budget = self.config.max_links_per_memory;
         for target in supersedes {
@@ -415,8 +466,8 @@ impl WorkingMemory {
                 break;
             }
             self.push_link(MemoryLink {
-                from: new_id.to_owned(),
-                to: (*target).to_owned(),
+                from: new_id,
+                to: *target,
                 kind: MemoryLinkKind::Supersedes,
                 created_at_ms: now_ms,
             });
@@ -425,25 +476,25 @@ impl WorkingMemory {
         if let Some(topic) = topic {
             let normalized = normalize(topic);
             // Newest first (the new entry sits at the back and is filtered by
-            // id), so the spine links to the most recent neighbors first and
-            // the budget cuts deterministically.
-            let older: Vec<String> = self
+            // node id), so the spine links to the most recent neighbors first
+            // and the budget cuts deterministically.
+            let older: Vec<u64> = self
                 .entries
                 .iter()
                 .rev()
                 .filter(|entry| {
                     entry.retention == RetentionClass::Durable
-                        && entry.source.event_id != new_id
+                        && entry.memory_id != new_id
                         && entry.topic.as_deref().map(normalize).as_deref()
                             == Some(normalized.as_str())
                 })
                 .take(budget)
-                .map(|entry| entry.source.event_id.clone())
+                .map(|entry| entry.memory_id)
                 .collect();
             for id in older {
                 self.push_link(MemoryLink {
                     from: id,
-                    to: new_id.to_owned(),
+                    to: new_id,
                     kind: MemoryLinkKind::TemporalBefore,
                     created_at_ms: now_ms,
                 });
@@ -457,13 +508,9 @@ impl WorkingMemory {
     }
 
     fn prune_links(&mut self) {
-        let alive: HashSet<&str> = self
-            .entries
-            .iter()
-            .map(|entry| entry.source.event_id.as_str())
-            .collect();
+        let alive: HashSet<u64> = self.entries.iter().map(|entry| entry.memory_id).collect();
         self.links
-            .retain(|link| alive.contains(link.from.as_str()) && alive.contains(link.to.as_str()));
+            .retain(|link| alive.contains(&link.from) && alive.contains(&link.to));
     }
 
     fn push_link(&mut self, link: MemoryLink) {
@@ -563,26 +610,42 @@ impl WorkingMemory {
     }
 
     /// The same ranking as [`Self::relevant`], each result joined with its
-    /// bounded link view: links touching the entry (creation-order capped at
-    /// `max_links_per_memory`, so a neighborhood can never fan out) and
-    /// whether a *still-retained* memory explicitly supersedes it. Pruning
-    /// guarantees a superseder that expired or was evicted takes its edge
-    /// with it, so `stale` never cites a memory that is gone.
+    /// bounded link view. `stale` is a verdict over the **full** retained
+    /// edge set, never over the capped presentation view: a supersession
+    /// that fell past `max_links_per_memory` still marks its target stale,
+    /// and the superseder must itself still be live at `now_ms` — an expired
+    /// but not yet compacted memory is already deleted for retrieval, so it
+    /// cannot keep a claim marked. The view itself is deterministic and
+    /// prioritizes semantically decisive edges (supersessions before
+    /// temporal spine edges, creation order within each kind) before the
+    /// per-memory cap cuts it, so a neighborhood can never fan out.
     pub fn relevant_linked(&self, query: MemoryQuery<'_>, now_ms: u64) -> Vec<LinkedMemory<'_>> {
+        let cap = self.config.max_links_per_memory;
         self.relevant(query, now_ms)
             .into_iter()
             .map(|entry| {
-                let id = entry.source.event_id.as_str();
-                let links: Vec<MemoryLink> = self
+                let id = entry.memory_id;
+                let incident: Vec<&MemoryLink> = self
                     .links
                     .iter()
                     .filter(|link| link.from == id || link.to == id)
-                    .take(self.config.max_links_per_memory)
-                    .cloned()
                     .collect();
-                let stale = links
-                    .iter()
-                    .any(|link| link.kind == MemoryLinkKind::Supersedes && link.to == id);
+                let stale = incident.iter().any(|link| {
+                    link.kind == MemoryLinkKind::Supersedes
+                        && link.to == id
+                        && self.entry_is_live(link.from, now_ms)
+                });
+                let mut links: Vec<MemoryLink> = Vec::with_capacity(cap.min(incident.len()));
+                for kind in [MemoryLinkKind::Supersedes, MemoryLinkKind::TemporalBefore] {
+                    for link in &incident {
+                        if links.len() >= cap {
+                            break;
+                        }
+                        if link.kind == kind {
+                            links.push((*link).clone());
+                        }
+                    }
+                }
                 LinkedMemory {
                     entry,
                     stale,
@@ -590,6 +653,15 @@ impl WorkingMemory {
                 }
             })
             .collect()
+    }
+
+    /// A node counts as live while it is still retained *and* unexpired at
+    /// `now_ms`: retrieval already excludes expired entries, so link verdicts
+    /// must agree with retrieval about what still exists.
+    fn entry_is_live(&self, memory_id: u64, now_ms: u64) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.memory_id == memory_id && entry.expires_at_ms > now_ms)
     }
 
     fn entry_from_event(
@@ -625,14 +697,24 @@ impl WorkingMemory {
             expires_at_ms: now_ms.saturating_add(ttl),
             retention,
             write_decision,
+            memory_id: 0,
         })
     }
 
     fn push_bounded(
         &mut self,
-        entry: MemoryEntry,
+        mut entry: MemoryEntry,
         now_ms: u64,
     ) -> Result<&MemoryEntry, AdaptationError> {
+        // Node identity is assigned at insertion and never derived from the
+        // source event id: one event id may legitimately be retained more
+        // than once, and links must name exactly this entry.
+        let memory_id = self.next_memory_id;
+        let next = memory_id
+            .checked_add(1)
+            .ok_or(AdaptationError::Invariant("memory node id space exhausted"))?;
+        entry.memory_id = memory_id;
+        self.next_memory_id = next;
         self.compact(now_ms);
         self.entries.push_back(entry);
         self.compact(now_ms);
@@ -1298,6 +1380,405 @@ mod tests {
         )
         .expect_err("a zero per-write budget is no bound at all");
         assert!(matches!(error, AdaptationError::InvalidConfiguration(_)));
+    }
+
+    #[test]
+    fn link_store_bound_must_cover_one_maximum_write() {
+        // A store that cannot hold one maximum-size write would drop an
+        // explicit supersession the very same write just had accepted, which
+        // is not historical edge eviction — it is a lost caller-owned fact.
+        let error = WorkingMemory::new(
+            WorkingMemoryConfig {
+                max_links: 1,
+                max_links_per_memory: 2,
+                ..WorkingMemoryConfig::default()
+            },
+            test_pseudonymizer(),
+        )
+        .expect_err("max_links must cover one maximum-size write");
+        assert!(matches!(error, AdaptationError::InvalidConfiguration(_)));
+    }
+
+    /// Mint a permit and perform one durable write inside the same call: the
+    /// permit is a non-serializable capability for that gate pass, so it
+    /// never outlives the write it authorizes.
+    fn durable_write(
+        memory: &mut WorkingMemory,
+        security: &mut SecurityRuntime,
+        id: &str,
+        claim: &str,
+        topic: Option<&str>,
+        now_ms: u64,
+    ) {
+        durable_write_superseding(memory, security, id, claim, topic, now_ms, &[])
+            .expect("durable remember");
+    }
+
+    fn durable_write_superseding(
+        memory: &mut WorkingMemory,
+        security: &mut SecurityRuntime,
+        id: &str,
+        claim: &str,
+        topic: Option<&str>,
+        now_ms: u64,
+        supersedes: &[&str],
+    ) -> Result<u64, AdaptationError> {
+        let source = event(id, SourceClass::System, TrustLevel::Trusted, None);
+        let (_, permit) = security.authorize_memory_write(&source, None);
+        let permit = permit.expect("system permit");
+        memory
+            .remember_durable_superseding(&permit, claim, topic, now_ms, supersedes)
+            .map(|entry| entry.memory_id)
+    }
+
+    fn unfiltered_query(limit: usize) -> MemoryQuery<'static> {
+        MemoryQuery {
+            source_namespace: None,
+            actor_id: None,
+            topic: None,
+            limit,
+        }
+    }
+
+    #[test]
+    fn staleness_is_decided_from_the_full_edge_set_not_the_capped_view() {
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig {
+            max_links_per_memory: 2,
+            ..WorkingMemoryConfig::default()
+        });
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-a",
+            "claim a",
+            Some("game-x"),
+            1_000,
+        );
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-b",
+            "claim b",
+            Some("game-x"),
+            2_000,
+        );
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-c",
+            "claim c",
+            Some("game-x"),
+            3_000,
+        );
+        // evt-a now carries two temporal edges — its whole view budget — so
+        // the later explicit supersession is the third incident edge.
+        durable_write_superseding(
+            &mut memory,
+            &mut security,
+            "evt-d",
+            "claim d",
+            Some("game-x"),
+            4_000,
+            &["evt-a"],
+        )
+        .expect("supersession accepted");
+
+        let results = memory.relevant_linked(
+            MemoryQuery {
+                source_namespace: None,
+                actor_id: None,
+                topic: Some("game-x"),
+                limit: 10,
+            },
+            4_500,
+        );
+        let a = results
+            .iter()
+            .find(|item| item.entry.source.event_id == "evt-a")
+            .expect("evt-a retained");
+        assert!(
+            a.stale,
+            "a supersession that fell past the view cap still marks its target stale"
+        );
+        assert!(a.links.len() <= 2, "the view stays capped");
+        assert_eq!(
+            a.links.first().map(|link| link.kind),
+            Some(MemoryLinkKind::Supersedes),
+            "semantically decisive edges lead the bounded view: {:?}",
+            a.links
+        );
+        assert_eq!(a.links[0].to, a.entry.memory_id);
+    }
+
+    #[test]
+    fn an_ambiguous_supersession_target_is_refused_and_stores_nothing() {
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig::default());
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-same",
+            "first claim",
+            None,
+            1_000,
+        );
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-same",
+            "second unrelated claim",
+            None,
+            2_000,
+        );
+        assert_eq!(memory.len(), 2, "duplicate retained ids stay allowed");
+        let copies: Vec<u64> = memory
+            .entries()
+            .iter()
+            .map(|entry| entry.memory_id)
+            .collect();
+        assert_ne!(copies[0], copies[1], "each retained copy is its own node");
+        let links_before = memory.links().len();
+
+        let error = durable_write_superseding(
+            &mut memory,
+            &mut security,
+            "evt-update",
+            "an update",
+            None,
+            3_000,
+            &["evt-same"],
+        )
+        .expect_err("one source event id retained twice must not be guessed onto a node");
+        assert!(matches!(error, AdaptationError::InvalidInput(_)));
+        assert_eq!(memory.len(), 2, "a refused write stores nothing");
+        assert_eq!(
+            memory.links().len(),
+            links_before,
+            "a refused write mints no links"
+        );
+        let results = memory.relevant_linked(unfiltered_query(10), 3_500);
+        assert!(
+            results.iter().all(|item| !item.stale),
+            "neither duplicate may be marked stale by a refused write"
+        );
+    }
+
+    #[test]
+    fn an_expired_supersession_target_is_refused_and_stores_nothing() {
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig {
+            durable_ttl_ms: 1_000,
+            ..WorkingMemoryConfig::default()
+        });
+        durable_write(&mut memory, &mut security, "evt-old", "old claim", None, 0);
+        assert_eq!(
+            memory.len(),
+            1,
+            "expired but not yet compacted: still physically present"
+        );
+
+        let error = durable_write_superseding(
+            &mut memory,
+            &mut security,
+            "evt-update",
+            "an update",
+            None,
+            2_500,
+            &["evt-old"],
+        )
+        .expect_err(
+            "an expired memory is already deleted for retrieval and cannot authorize an update \
+             relation",
+        );
+        assert!(matches!(error, AdaptationError::InvalidInput(_)));
+        assert_eq!(memory.len(), 1, "a refused write stores nothing");
+        assert!(memory.links().is_empty(), "a refused write mints no links");
+    }
+
+    #[test]
+    fn an_accepted_write_keeps_every_explicit_supersession_it_declared() {
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig {
+            max_links: 2,
+            max_links_per_memory: 2,
+            ..WorkingMemoryConfig::default()
+        });
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-a",
+            "claim a",
+            Some("game-x"),
+            1_000,
+        );
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-b",
+            "claim b",
+            Some("game-x"),
+            2_000,
+        );
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-c",
+            "claim c",
+            Some("game-x"),
+            3_000,
+        );
+        assert_eq!(
+            memory.links().len(),
+            2,
+            "the store is at its cap from historical edges only"
+        );
+
+        let update_id = durable_write_superseding(
+            &mut memory,
+            &mut security,
+            "evt-d",
+            "claim d",
+            Some("game-x"),
+            4_000,
+            &["evt-a", "evt-b"],
+        )
+        .expect("write accepted");
+
+        let declared = memory
+            .links()
+            .iter()
+            .filter(|link| link.from == update_id && link.kind == MemoryLinkKind::Supersedes)
+            .count();
+        assert_eq!(
+            declared, 2,
+            "every explicit supersession of one accepted write survives it while its endpoints \
+             remain retained"
+        );
+        assert!(
+            memory
+                .entries()
+                .iter()
+                .any(|entry| entry.source.event_id == "evt-a")
+                && memory
+                    .entries()
+                    .iter()
+                    .any(|entry| entry.source.event_id == "evt-b"),
+            "endpoints retained"
+        );
+        let results = memory.relevant_linked(
+            MemoryQuery {
+                source_namespace: None,
+                actor_id: None,
+                topic: Some("game-x"),
+                limit: 10,
+            },
+            4_500,
+        );
+        for superseded in ["evt-a", "evt-b"] {
+            assert!(
+                results
+                    .iter()
+                    .find(|item| item.entry.source.event_id == superseded)
+                    .map(|item| item.stale)
+                    .unwrap_or_else(|| panic!("{superseded} retained")),
+                "{superseded} is reported stale"
+            );
+        }
+    }
+
+    #[test]
+    fn deletion_prunes_by_node_identity_not_by_a_shared_source_event_id() {
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig {
+            durable_ttl_ms: 1_000,
+            working_ttl_ms: 10_000_000,
+            ..WorkingMemoryConfig::default()
+        });
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-x",
+            "durable copy",
+            Some("topic-x"),
+            0,
+        );
+        // The same source event id legitimately exists again as working
+        // memory (the scheduler may replay one); it is a different node.
+        let working = event(
+            "evt-x",
+            SourceClass::PublicChat,
+            TrustLevel::Untrusted,
+            Some("viewer-1"),
+        );
+        memory
+            .remember_working(&working, "working copy", Some("topic-x"), 0)
+            .expect("working copy");
+        let durable_id = memory
+            .entries()
+            .iter()
+            .find(|entry| {
+                entry.source.event_id == "evt-x" && entry.retention == RetentionClass::Durable
+            })
+            .map(|entry| entry.memory_id)
+            .expect("durable copy");
+        let working_id = memory
+            .entries()
+            .iter()
+            .find(|entry| entry.retention == RetentionClass::Working)
+            .map(|entry| entry.memory_id)
+            .expect("working copy");
+        assert_ne!(durable_id, working_id);
+
+        durable_write_superseding(
+            &mut memory,
+            &mut security,
+            "evt-update",
+            "an update",
+            Some("topic-x"),
+            100,
+            &["evt-x"],
+        )
+        .expect("unique live durable target");
+        assert_eq!(
+            memory.links().len(),
+            2,
+            "one supersession plus one temporal spine edge to the durable node"
+        );
+
+        // Expire the *durable* node while the working copy with the same
+        // source event id survives: the edges must go with the node they
+        // pointed at, not stay alive behind the shared id.
+        memory.compact(1_050);
+        assert!(
+            memory
+                .entries()
+                .iter()
+                .any(|entry| entry.memory_id == working_id),
+            "the working copy is still retained"
+        );
+        assert!(
+            memory.links().is_empty(),
+            "an edge may not outlive its node through a shared source event id"
+        );
+        let results = memory.relevant_linked(
+            MemoryQuery {
+                source_namespace: None,
+                actor_id: None,
+                topic: Some("topic-x"),
+                limit: 10,
+            },
+            1_050,
+        );
+        let survivor = results
+            .iter()
+            .find(|item| item.entry.source.event_id == "evt-x")
+            .expect("working copy retained");
+        assert!(
+            !survivor.stale,
+            "the surviving copy is a different node and must not inherit the deleted node's \
+             staleness"
+        );
     }
 
     #[test]

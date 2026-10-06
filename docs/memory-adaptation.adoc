@@ -181,17 +181,19 @@ The Rust tests cover:
 +WorkingMemory+ retains a small versioned link vocabulary, +memory-link-v1+, between retained entries. Two kinds exist today:
 
 * +temporal_before+ — derived deterministically at write time: the new entry links to the newest retained same-topic durable entry, walking older ones within the per-write budget. No model output is involved.
-* +supersedes+ — declared by the caller through +remember_durable_superseding+, the permit-gated durable path. Every declared target must already be a retained durable memory; a target that is absent, unknown, or working-only refuses the whole write before anything is stored.
+* +supersedes+ — declared by the caller through +remember_durable_superseding+, the permit-gated durable path. Every declared target is resolved *before* anything is stored to exactly one still-live retained durable node; a target that is absent, unknown, working-only, expired at the write timestamp, or ambiguous (one source event id retained more than once) refuses the whole write, so nothing is stored and no link is minted.
 
 Causal kinds are intentionally deferred until a real evidence source exists; the vocabulary version string pins the schema so adding one is an explicit, replay-visible change.
 
-A link carries only its endpoint ids, kind, and creation timestamp. It never carries claim, topic, or actor content, so edge metadata cannot become a covert archive of deleted (or live) content (see docs/security-threat-model.adoc section 8).
+A link carries only its endpoint node ids, kind, and creation timestamp. The endpoint is +MemoryEntry::memory_id+, a monotonic per-insertion identity: a source event id is neither unique among retained entries nor durable identity (the scheduler may legitimately replay one), so it is never a link endpoint and deletion prunes by node identity — removing one of two copies that share an event id cannot keep the other copy's edges alive or inherit its staleness. The link never carries claim, topic, or actor content, so edge metadata cannot become a covert archive of deleted (or live) content (see docs/security-threat-model.adoc section 8).
 
 Bounds, both validated positive and owned by the #51 unified retention policy:
 
-* +max_links+ (default 2,048; +AIVTUBER_MEMORY_MAX_LINKS+) caps the store-wide edge count. Insert-compact evicts entries first, then the edge cap is enforced deterministically.
+* +max_links+ (default 2,048; +AIVTUBER_MEMORY_MAX_LINKS+) caps the store-wide edge count. Insert-compact evicts entries first, then the edge cap is enforced deterministically, oldest edge first.
 * +max_links_per_memory+ (default 8; +AIVTUBER_MEMORY_MAX_LINKS_PER_WRITE+) is the per-write creation budget and the per-entry retrieval cap, so a single entry's neighborhood can never fan out.
+
+Both must hold +max_links >= max_links_per_memory+: the store has to be able to hold one maximum-size write, otherwise the store bound would drop an explicit supersession that the very same write just had accepted — which is not historical edge eviction but a lost caller-owned fact. The configuration is refused at startup instead.
 
 Only permit-gated memory enters the graph: links are created exclusively inside the +MemoryWritePermit+ durable path, so public chat and generated/model output cannot mint links or authority.
 
-Compaction and deletion prune links: an edge survives only while both endpoints are retained. Staleness is therefore defined over live edges — a retained entry is stale when a retained +supersedes+ edge points at it, and pruning guarantees no stale verdict can ever cite a deleted target. Retrieval via +relevant_linked+ is single-hop with the per-entry cap above; short-lived thread context (#80) is never persisted as links.
+Compaction and deletion prune links by node identity: an edge survives only while both endpoint nodes are retained. Staleness is decided over the **full** retained edge set, never over the capped presentation view — a supersession that fell past the per-entry cap still marks its target stale — and the superseding node must itself still be live at the read timestamp, so an expired-but-not-yet-compacted memory can neither authorize an update relation nor keep a claim marked. The bounded view is deterministic and leads with the semantically decisive edges (supersessions before temporal spine edges, creation order within a kind) before the cap cuts it. Retrieval via +relevant_linked+ is single-hop with that per-entry cap; short-lived thread context (#80) is never persisted as links.

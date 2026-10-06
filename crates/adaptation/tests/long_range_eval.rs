@@ -268,8 +268,8 @@ fn an_update_case_marks_the_superseded_claim_stale_and_keeps_the_whole_timeline(
     assert!(
         results[0].links.iter().any(|link| {
             link.kind == MemoryLinkKind::Supersedes
-                && link.from == "evt-enjoy"
-                && link.to == "evt-dislike"
+                && link.from == results[0].entry.memory_id
+                && link.to == results[1].entry.memory_id
         }),
         "the supersession edge is visible: {:?}",
         results[0].links
