@@ -2127,15 +2127,25 @@ fn malformed_first_audio_percentiles_are_refused_before_calibration() {
         }),
         "of the three",
     );
-    // The first value the u64 cast cannot represent (2^64) equals the old `>`
-    // boundary instead of exceeding it; it must be rejected, not saturated to
-    // u64::MAX (re-review of PR #225).
+    // Values at/above 2^53 are refused outright: a raw JSON integer there
+    // can already have been rounded during parsing, and the f64->u64 cast
+    // boundary (2^64) sits inside that range (re-reviews of PR #225).
     refused(
         malformed_row(|row| {
             row["metrics"]["cached.first_audio.p95_ms"]["value"] =
                 serde_json::json!(18_446_744_073_709_551_616.0_f64);
         }),
-        "not representable",
+        "2^53",
+    );
+    // The first unsafe *raw JSON integer*: 2^53+1 rounds to 2^53 during
+    // deserialization, so the parsed f64 no longer equals the integer the
+    // source wrote — refused, never recorded as 9007199254740992.
+    refused(
+        malformed_row(|row| {
+            row["metrics"]["cached.first_audio.p95_ms"]["value"] =
+                serde_json::json!(9_007_199_254_740_993_u64);
+        }),
+        "2^53",
     );
 }
 

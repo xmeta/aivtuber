@@ -244,6 +244,43 @@ fn overlapping_full_report(run_id: &str, commit: &str) -> String {
 }
 
 #[test]
+fn a_raw_json_integer_beyond_exact_representation_is_refused() {
+    // 2^53+1 rounds to 2^53 while the row is parsed, before validation can
+    // see it: the CLI must fail closed instead of emitting 9007199254740992
+    // as a measured latency (re-review of PR #225).
+    let dir = temp_dir("jsonl-precision");
+    let jsonl = dir.join("history.jsonl");
+    let mut row: serde_json::Value =
+        serde_json::from_str(&aggregate_row("run-a", "aaaa1111", 100)).expect("json");
+    row["metrics"]["cached.first_audio.p95_ms"]["value"] =
+        serde_json::json!(9_007_199_254_740_993_u64);
+    fs::write(&jsonl, format!("{row}\n")).expect("history written");
+    let out = dir.join("proposals.json");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_slo-baseline"))
+        .args([
+            "--benchmark-history",
+            jsonl.to_str().expect("utf8 path"),
+            "--out",
+            out.to_str().expect("utf8 path"),
+        ])
+        .output()
+        .expect("slo-baseline runs");
+    assert!(
+        !output.status.success(),
+        "a JSON integer that does not survive parsing must fail closed"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("2^53"), "{stderr}");
+    assert!(
+        !out.exists(),
+        "no proposal may be emitted from a measurement that was rounded"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn rows_from_two_benchmark_suites_are_refused() {
     // Two otherwise-identical rows differing only in benchmark_suite must not
     // reach one pool as one calibration (review of PR #225).

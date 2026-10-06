@@ -468,8 +468,10 @@ naming the aggregate contribution. Identity comes from the row itself
 runs, and the repeated-run floor apply exactly as they do to full reports.
 Only rows of the `replay-comparison` suite convert — the suite whose metric
 names the shell maps — and a row's first-audio percentiles must be integral,
-positively sampled, consistently counted and ordered, because calibration
-records measured numbers rather than repairing them. Where one run exists as
+fully representable as written (below 2^53, where a raw JSON integer can still
+be rounded during parsing), positively sampled, consistently counted and
+ordered, because calibration records measured numbers rather than repairing
+them. Where one run exists as
 both a full `slo-report` (recorded from #224 on) and its aggregate row, the two
 are complementary views of one measurement: `slo-baseline` collapses the pair
 into the full report — the run counts once, whichever artifact arrives first —

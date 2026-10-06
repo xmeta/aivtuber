@@ -1752,6 +1752,14 @@ pub const AGGREGATE_SUITE: &str = "replay-comparison";
 /// artifacts and the two have to be told apart.
 const AGGREGATE_SHELL_LIMITATION: &str = "aggregate #58 history row: a percentile-only shell";
 
+/// The largest integer binary64 represents exactly. A raw JSON integer at or
+/// above it has already been rounded during deserialization — `2^53 + 1`
+/// arrives as `2^53` — so integer-valued latency in that range is refused
+/// rather than recorded as a number the source never wrote. The bound also
+/// sits far below the `f64 -> u64` cast boundary (2^64), which it subsumes
+/// (re-review of PR #225).
+const EXACT_INTEGER_BOUNDARY: f64 = 9_007_199_254_740_992.0;
+
 impl SloReport {
     /// A percentile-only pooling shell built from one #58 aggregate history
     /// row (`schemas/benchmark-result.schema.json`, the `benchmark-data`
@@ -1877,17 +1885,20 @@ impl SloReport {
                             metric.value
                         )));
                     }
-                    // `u64::MAX as f64` rounds up to exactly 2^64, so a JSON
-                    // number of 2^64 only *equals* a `>` boundary rather than
-                    // exceeding it, and the cast would saturate it to
-                    // u64::MAX — changing the measured number. The first
-                    // unrepresentable value is therefore rejected explicitly.
-                    if metric.value >= u64::MAX as f64 {
+                    // binary64 represents every integer below 2^53 exactly
+                    // and nothing at/above it reliably: a raw JSON integer
+                    // in this range has already been rounded by
+                    // deserialization before validation runs (2^53+1 arrives
+                    // as 2^53), so accepting it would record a number the
+                    // source never wrote. This also subsumes the f64->u64
+                    // cast boundary, which sat at 2^64.
+                    if metric.value >= EXACT_INTEGER_BOUNDARY {
                         return Err(SloError::new(format!(
-                            "aggregate history row metric {name} value {} is not representable \
-                             as a millisecond count (the first non-representable boundary is \
-                             18446744073709551616); calibration preserves measured numbers and \
-                             refuses to saturate this one",
+                            "aggregate history row metric {name} value {} is at or above \
+                             {EXACT_INTEGER_BOUNDARY} (2^53), where a raw JSON integer can be \
+                             rounded during parsing (2^53+1 arrives as 2^53); calibration \
+                             preserves the number the source wrote and refuses to record one \
+                             it did not",
                             metric.value
                         )));
                     }
