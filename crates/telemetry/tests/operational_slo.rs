@@ -8,11 +8,11 @@
 use aivtuber_domain::InteractionDeadlineClass;
 use aivtuber_telemetry::{
     AttributionSummary, BaselineEvidence, BaselineProposalSet, BaselineRun, BenchmarkReport,
-    CacheLevel, ComparisonMode, EventObservation, EvidenceSource, FailureOrigin, MIN_BASELINE_RUNS,
-    MissAttribution, MissAttribution as Attribution, ObjectiveKind, ReproducibilityMetadata,
-    RouteClass, STREAM_HOUR_MS, SloAction, SloError, SloEvaluationConfig, SloIndicatorResult,
-    SloProvenance, SloReport, SloStatus, SloTarget, SloTargets, SloWindow, TrafficPlane,
-    WindowKind, attribution_of, catalog, evaluate,
+    BenchmarkResult, CacheLevel, ComparisonMode, EventObservation, EvidenceSource, FailureOrigin,
+    MIN_BASELINE_RUNS, MissAttribution, MissAttribution as Attribution, ObjectiveKind,
+    ReproducibilityMetadata, RouteClass, STREAM_HOUR_MS, SloAction, SloError, SloEvaluationConfig,
+    SloIndicatorResult, SloProvenance, SloReport, SloStatus, SloTarget, SloTargets, SloVerdict,
+    SloWindow, TrafficPlane, WindowKind, attribution_of, catalog, evaluate,
 };
 
 const CALIBRATION_SOURCE: &str = "04-full-generative.json (dataset=slo-fixture, commit=deadbeef)";
@@ -193,7 +193,7 @@ fn an_uncalibrated_latency_indicator_reports_evidence_but_no_value() {
         .expect("audio calibration point");
     assert_eq!(calibration.samples, 40);
     assert_eq!(calibration.p50_ms, 21);
-    assert_eq!(calibration.max_ms, 41);
+    assert_eq!(calibration.max_ms, Some(41));
     assert!(
         evaluated
             .uncalibrated
@@ -1392,7 +1392,10 @@ fn a_latency_objective_publishes_percentiles_and_never_a_zero_ratio() {
     let latency = audio.latency.as_ref().expect("percentiles");
     assert_eq!(latency.samples, 40);
     assert_eq!(latency.field, "event_to_first_audio_ms");
-    assert!(latency.p95_ms > 0 && latency.max_ms >= latency.p99_ms);
+    assert!(
+        latency.p95_ms > 0
+            && latency.max_ms.expect("a full report records a max") >= latency.p99_ms
+    );
 }
 
 #[test]
@@ -1699,4 +1702,473 @@ fn a_baseline_proposal_set_round_trips_through_json() {
     let summary = pooled.markdown_summary();
     assert!(summary.contains("measured evidence, not a target"));
     assert!(summary.contains("Series:"), "series is shown for audit");
+}
+
+// ---------------------------------------------------------------------------
+// #58 aggregate history -> baseline selection (issue #71)
+// ---------------------------------------------------------------------------
+
+/// A production #58 aggregate row, verbatim from the `benchmark-data` branch
+/// (`data/replay-comparison.deterministic_only__starter-replay-comparison-v1__
+/// replay-benchmark-v1-top_k-2-reuse_thresh__4242-w6bnyp.jsonl`, first line),
+/// pinned so the ingest can never drift from the bytes history actually
+/// recorded.
+const PRODUCTION_AGGREGATE_ROW: &str = r#"{"schema_version":"1","benchmark_suite":"replay-comparison","mode":"deterministic_only","dataset_id":"starter-replay-comparison-v1","git":{"commit":"039c151696b0ce8faedd27cf0b2d3e956f51222e"},"environment":{"os":"linux","architecture":"x86_64","rust_version":"rustc 1.98.1 (48a229cea 2026-09-01)","bun_version":"1.3.14","cargo_profile":"debug"},"configuration":{"config_version":"replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0","runtime_profile":"cached","asset_version":"starter-v1/compiler-0.1.0","index_version":"asset-semantic-fnv1a64-b45ae4ea0463f981","retriever_version":"benchmark-semantic-v1","seed":4242,"stream_duration_ms":180000},"metrics":{"cached.first_audio.p50_ms":{"value":83,"sample_count":3},"cached.first_audio.p95_ms":{"value":112,"sample_count":3},"cached.first_audio.p99_ms":{"value":112,"sample_count":3},"cached.first_visible.p95_ms":{"value":33,"sample_count":3},"routing.llm_calls_per_100_events":{"value":0,"sample_count":3},"routing.route_decision.p95_us":{"value":3,"sample_count":3},"semantic.wrong_reuse_rate_pct":{"value":0,"sample_count":0}},"invariants":{"reliability.deterministic_replay_mismatch_count":{"value":0},"reliability.stale_dispatch_count":{"value":0},"reliability.unauthorized_privileged_action_count":{"value":0},"resource.invalid_route_transition_count":{"value":0},"resource.retention_bound_violation_count":{"value":0}},"recording":{"run_id":"run-36719154068","recorded_at":"2026-09-30T13:06:12Z","attempt":1}}"#;
+
+/// A minimal #58 aggregate history row, shaped exactly like the rows the
+/// `benchmark-data` recorder appends, with the knobs each pooling rule is
+/// tested through.
+fn aggregate_row(run_id: &str, commit: &str, seed: u64, p95_ms: u64) -> String {
+    serde_json::json!({
+        "schema_version": "1",
+        "benchmark_suite": "replay-comparison",
+        "mode": "deterministic_only",
+        "dataset_id": "slo-fixture",
+        "git": { "commit": commit },
+        "environment": {
+            "os": "linux",
+            "architecture": "x86_64",
+            "rust_version": "rustc 1.98.1 (48a229cea 2026-09-01)",
+            "cargo_profile": "debug"
+        },
+        "configuration": {
+            "config_version": "bench-v1",
+            "asset_version": "starter-v1",
+            "seed": seed,
+            "stream_duration_ms": 180000
+        },
+        "metrics": {
+            "cached.first_audio.p50_ms": { "value": p95_ms.saturating_sub(20), "sample_count": 3 },
+            "cached.first_audio.p95_ms": { "value": p95_ms, "sample_count": 3 },
+            "cached.first_audio.p99_ms": { "value": p95_ms, "sample_count": 3 }
+        },
+        "invariants": {},
+        "recording": { "run_id": run_id, "recorded_at": "2026-09-30T13:06:12Z", "attempt": 1 }
+    })
+    .to_string()
+}
+
+fn aggregate_shell(run_id: &str, commit: &str, seed: u64, p95_ms: u64) -> SloReport {
+    let row = BenchmarkResult::from_json(aggregate_row(run_id, commit, seed, p95_ms).as_bytes())
+        .expect("aggregate row parses");
+    SloReport::from_benchmark_result(&row).expect("shell")
+}
+
+#[test]
+fn a_production_aggregate_history_row_becomes_a_percentile_only_shell() {
+    let row = BenchmarkResult::from_json(PRODUCTION_AGGREGATE_ROW.as_bytes())
+        .expect("the bytes history actually recorded parse");
+    let shell = SloReport::from_benchmark_result(&row).expect("shell");
+
+    // Percentiles flow through; nothing else claims to be measured: no
+    // indicator rows, no windows, no invariant tallies.
+    assert!(shell.indicators.is_empty());
+    assert!(shell.windows.is_empty());
+    assert!(shell.error_budgets.is_empty());
+    assert_eq!(shell.latency_calibration.len(), 1);
+    let point = &shell.latency_calibration[0];
+    assert_eq!(
+        point.indicator,
+        "availability.event_to_first_audio_within_target"
+    );
+    assert_eq!(point.window, "session");
+    assert_eq!(point.field, "event_to_first_audio_ms");
+    assert_eq!((point.p50_ms, point.p95_ms, point.p99_ms), (83, 112, 112));
+    assert_eq!(point.samples, 3);
+    assert_eq!(
+        point.max_ms, None,
+        "the aggregate row records no per-run maximum, and none is invented"
+    );
+
+    // Identity comes straight from the row, so the usual pooling rules apply.
+    assert_eq!(shell.source.run_id.as_deref(), Some("run-36719154068"));
+    assert_eq!(
+        shell.source.git_commit,
+        "039c151696b0ce8faedd27cf0b2d3e956f51222e"
+    );
+    assert_eq!(shell.source.mode, ComparisonMode::DeterministicOnly);
+    assert_eq!(shell.source.dataset_id, "starter-replay-comparison-v1");
+    assert_eq!(shell.source.seed, 4242);
+    assert_eq!(shell.source.stream_duration_ms, Some(180_000));
+    assert!(shell.counts_toward_active_slo);
+    assert_eq!(shell.verdict, SloVerdict::Uncalibrated);
+
+    // A shell is a report artifact: it survives serialization unchanged, with
+    // the absent maximum simply absent.
+    let bytes = serde_json::to_string(&shell).expect("serialize");
+    assert!(!bytes.contains("max_ms"));
+    let round_tripped: SloReport = serde_json::from_str(&bytes).expect("parse");
+    assert_eq!(round_tripped, shell);
+}
+
+#[test]
+fn aggregate_history_rows_pool_latency_evidence_but_never_a_citable_baseline() {
+    let pooled = BaselineProposalSet::from_reports(&[
+        aggregate_shell("run-a", "aaaa1111", 7, 100),
+        aggregate_shell("run-b", "bbbb2222", 7, 200),
+    ])
+    .expect("proposal set");
+
+    assert_eq!(pooled.contributing_reports, 2);
+    assert_eq!(
+        pooled.series.as_deref(),
+        Some("deterministic_only|slo-fixture|bench-v1|7")
+    );
+    assert_eq!(
+        pooled.revisions,
+        vec!["aaaa1111".to_owned(), "bbbb2222".to_owned()]
+    );
+
+    let proposal = pooled
+        .proposals
+        .get("availability.event_to_first_audio_within_target")
+        .expect("latency proposal");
+    let latency = proposal.latency.as_ref().expect("target-free percentiles");
+    assert_eq!(latency.runs, 2);
+    assert_eq!(latency.samples, 6);
+    assert_eq!(
+        latency.p95_ms, 200,
+        "the worst observed percentile across runs is the conservative evidence"
+    );
+    assert_eq!(latency.p99_ms, 200);
+    assert_eq!(latency.max_ms, None, "no per-run maximum was recorded");
+    assert_eq!(proposal.threshold_ms, None);
+    assert_eq!(proposal.eligible, None);
+    assert_eq!(proposal.conforming, None);
+    assert!(
+        proposal.baseline.is_none(),
+        "an aggregate history carries no denominators, so it never publishes a citable baseline"
+    );
+
+    // Ratio objectives are honestly absent, not silently zero.
+    assert!(
+        pooled
+            .not_measured
+            .contains(&"availability.speech_presence_rate".to_owned())
+    );
+
+    // The markdown renders the missing maximum as unknown, never as zero.
+    let markdown = pooled.markdown_summary();
+    assert!(markdown.contains("200 / 200 / -"), "{markdown}");
+}
+
+#[test]
+fn aggregate_history_rows_from_two_compatibility_series_are_refused() {
+    let error = BaselineProposalSet::from_reports(&[
+        aggregate_shell("run-a", "aaaa1111", 7, 100),
+        aggregate_shell("run-b", "bbbb2222", 9, 100),
+    ])
+    .expect_err("one series per history");
+    assert!(
+        error.to_string().contains("compatibility series"),
+        "{error}"
+    );
+}
+
+#[test]
+fn an_aggregate_history_row_without_a_run_identity_is_refused() {
+    let mut row: serde_json::Value =
+        serde_json::from_str(&aggregate_row("run-a", "aaaa1111", 7, 100)).expect("json");
+    row.as_object_mut()
+        .expect("object")
+        .remove("recording")
+        .expect("recording present to remove");
+    let row = BenchmarkResult::from_json(row.to_string().as_bytes()).expect("row parses");
+    let error = SloReport::from_benchmark_result(&row).expect_err("no identity, no evidence");
+    assert!(error.to_string().contains("recording.run_id"), "{error}");
+}
+
+#[test]
+fn an_aggregate_history_row_without_a_series_dataset_is_refused() {
+    let mut row: serde_json::Value =
+        serde_json::from_str(&aggregate_row("run-a", "aaaa1111", 7, 100)).expect("json");
+    row.as_object_mut()
+        .expect("object")
+        .remove("dataset_id")
+        .expect("dataset_id present to remove");
+    let row = BenchmarkResult::from_json(row.to_string().as_bytes()).expect("row parses");
+    let error = SloReport::from_benchmark_result(&row).expect_err("no series, no evidence");
+    assert!(error.to_string().contains("dataset_id"), "{error}");
+}
+
+#[test]
+fn an_aggregate_history_row_from_a_non_operational_mode_is_refused() {
+    let mut row: serde_json::Value =
+        serde_json::from_str(&aggregate_row("run-a", "aaaa1111", 7, 100)).expect("json");
+    row["mode"] = serde_json::json!("resource_soak");
+    let row = BenchmarkResult::from_json(row.to_string().as_bytes()).expect("row parses");
+    let error = SloReport::from_benchmark_result(&row).expect_err("outside the operational series");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot feed SLO baseline selection"),
+        "{error}"
+    );
+}
+
+/// A full `slo-report` evaluation whose session first-audio percentiles are
+/// exactly what `aggregate_row(_, _, 7, p95)` records — three samples ending
+/// at `latencies[2]` nearest-rank to p95/p99 — so the report and that row's
+/// shell are two views of one measured run (the overlap review of PR #225
+/// requires pooling).
+fn full_report_for(run_id: &str, latencies: [u64; 3]) -> SloReport {
+    let events = latencies
+        .iter()
+        .enumerate()
+        .map(|(index, latency)| {
+            let mut event = EventObservation::new(
+                format!("evt-{index}"),
+                ComparisonMode::DeterministicOnly,
+                RouteClass::Deterministic,
+            );
+            event.routing_latency_us = 10;
+            event.cache_lookup = true;
+            event.cache_hit = true;
+            event.cache_level = Some(CacheLevel::Memory);
+            event.stream_offset_ms = Some((index as u64 + 1) * 1_000);
+            event.event_to_first_audio_ms = Some(*latency);
+            event
+        })
+        .collect();
+    let report = BenchmarkReport::from_events(
+        metadata("slo-fixture", 180_000),
+        ComparisonMode::DeterministicOnly,
+        events,
+    )
+    .expect("benchmark report");
+    evaluate(
+        &report,
+        &SloTargets::default(),
+        SloEvaluationConfig {
+            run_id: Some(run_id.to_owned()),
+            ..SloEvaluationConfig::default()
+        },
+    )
+    .expect("SLO report")
+}
+
+#[test]
+fn a_full_report_and_its_aggregate_shell_are_one_run_in_either_order() {
+    // run-a exists as both artifacts — the #224 migration overlap — and must
+    // pool as one run; run-b is an old aggregate-only run whose percentile
+    // evidence must keep contributing alongside it.
+    let full = full_report_for("run-a", [60, 80, 100]);
+    let shell = aggregate_shell("run-a", "deadbeef", 7, 100);
+    let old = aggregate_shell("run-b", "cccc3333", 7, 200);
+
+    for (label, reports) in [
+        (
+            "shell first",
+            vec![shell.clone(), old.clone(), full.clone()],
+        ),
+        ("full first", vec![full.clone(), shell.clone(), old.clone()]),
+    ] {
+        let pooled = BaselineProposalSet::from_reports(&reports)
+            .unwrap_or_else(|error| panic!("{label}: the mixed history must pool: {error}"));
+        assert_eq!(pooled.contributing_reports, 2, "{label}");
+        assert_eq!(
+            pooled
+                .contributing_runs
+                .iter()
+                .filter(|run| run.run_id == "run-a")
+                .count(),
+            1,
+            "{label}: two artifacts of one run are one run"
+        );
+        let latency = pooled
+            .proposals
+            .get("availability.event_to_first_audio_within_target")
+            .expect("latency proposal")
+            .latency
+            .clone()
+            .expect("target-free percentiles");
+        assert_eq!(latency.runs, 2, "{label}");
+        assert_eq!(latency.samples, 6, "{label}");
+        assert_eq!(
+            latency.p95_ms, 200,
+            "{label}: the aggregate-only run still contributes its percentiles"
+        );
+        assert_eq!(
+            latency.max_ms,
+            Some(100),
+            "{label}: the full report's per-run maximum survives the collapse"
+        );
+        assert!(
+            pooled
+                .limitations
+                .iter()
+                .any(|line| line.contains("aggregate-history shell")),
+            "{label}: the collapse is declared: {}",
+            pooled.limitations.join("; ")
+        );
+    }
+}
+
+#[test]
+fn a_full_report_and_shell_that_disagree_are_refused_in_either_order() {
+    let full = full_report_for("run-a", [60, 80, 200]);
+    let shell = aggregate_shell("run-a", "deadbeef", 7, 100);
+    let independent = aggregate_shell("run-b", "cccc3333", 7, 200);
+
+    let forward =
+        BaselineProposalSet::from_reports(&[full.clone(), shell.clone(), independent.clone()])
+            .expect_err("a pair that disagrees on percentiles is not one measurement");
+    let reversed = BaselineProposalSet::from_reports(&[independent, shell, full])
+        .expect_err("the same disagreement must fail when reversed");
+    assert_eq!(
+        forward.to_string(),
+        reversed.to_string(),
+        "argument order must not change the outcome"
+    );
+    assert!(forward.to_string().contains("disagree"), "{forward}");
+}
+
+#[test]
+fn a_full_report_and_shell_that_disagree_on_duration_are_refused_in_either_order() {
+    // Represented duration is a measurement of the run, not cosmetic
+    // metadata: a pair contradicting it is two attempts of one identity, not
+    // two views of one measurement (re-review of PR #225).
+    let full = full_report_for("run-a", [60, 80, 100]);
+    let mut shell = aggregate_shell("run-a", "deadbeef", 7, 100);
+    shell.source.stream_duration_ms = Some(3_600_000);
+    let independent = aggregate_shell("run-b", "cccc3333", 7, 200);
+
+    let forward =
+        BaselineProposalSet::from_reports(&[full.clone(), shell.clone(), independent.clone()])
+            .expect_err("a duration mismatch is not one measurement");
+    let reversed = BaselineProposalSet::from_reports(&[independent, shell, full])
+        .expect_err("the same mismatch must fail when reversed");
+    assert_eq!(
+        forward.to_string(),
+        reversed.to_string(),
+        "argument order must not change the outcome"
+    );
+    assert!(
+        forward.to_string().contains("stream_duration_ms"),
+        "{forward}"
+    );
+}
+
+#[test]
+fn an_aggregate_history_row_from_another_benchmark_suite_is_refused() {
+    // Two otherwise-identical rows differing only in benchmark_suite: one is
+    // calibration evidence, and the other must not silently pool as the same
+    // suite's measurement (review of PR #225).
+    let mut other: serde_json::Value =
+        serde_json::from_str(&aggregate_row("run-a", "aaaa1111", 7, 100)).expect("json");
+    other["benchmark_suite"] = serde_json::json!("resource-soak");
+    let other = BenchmarkResult::from_json(other.to_string().as_bytes()).expect("row parses");
+    let error = SloReport::from_benchmark_result(&other).expect_err("one suite per importer");
+    assert!(error.to_string().contains("benchmark_suite"), "{error}");
+    assert!(error.to_string().contains("replay-comparison"), "{error}");
+
+    let identical =
+        BenchmarkResult::from_json(aggregate_row("run-a", "aaaa1111", 7, 100).as_bytes())
+            .expect("row parses");
+    SloReport::from_benchmark_result(&identical)
+        .expect("the identical replay-comparison row still converts");
+}
+
+/// One `aggregate_row` mutated before parsing, so each malformed-evidence
+/// rule is refused on the row shape it exists to refuse.
+fn malformed_row(rotate: impl FnOnce(&mut serde_json::Value)) -> BenchmarkResult {
+    let mut row: serde_json::Value =
+        serde_json::from_str(&aggregate_row("run-a", "aaaa1111", 7, 100)).expect("json");
+    rotate(&mut row);
+    BenchmarkResult::from_json(row.to_string().as_bytes()).expect("row parses")
+}
+
+#[test]
+fn malformed_first_audio_percentiles_are_refused_before_calibration() {
+    let refused = |row: BenchmarkResult, expected: &str| {
+        let error =
+            SloReport::from_benchmark_result(&row).expect_err("malformed evidence is refused");
+        assert!(
+            error.to_string().contains(expected),
+            "expected {expected:?} in: {error}"
+        );
+    };
+
+    // A fractional latency must not be rounded into an integer.
+    refused(
+        malformed_row(|row| {
+            row["metrics"]["cached.first_audio.p95_ms"]["value"] = serde_json::json!(100.5)
+        }),
+        "integral",
+    );
+    // A percentile with no samples behind it is not calibration evidence.
+    refused(
+        malformed_row(|row| {
+            row["metrics"]["cached.first_audio.p95_ms"]["sample_count"] = serde_json::json!(0)
+        }),
+        "positive sample count",
+    );
+    // One run's percentiles describe one sample set.
+    refused(
+        malformed_row(|row| {
+            row["metrics"]["cached.first_audio.p50_ms"]["sample_count"] = serde_json::json!(2)
+        }),
+        "disagree on sample_count",
+    );
+    // An unordered triplet must not be silently repaired by sorting.
+    refused(
+        malformed_row(|row| {
+            row["metrics"]["cached.first_audio.p99_ms"]["value"] = serde_json::json!(50)
+        }),
+        "not ordered",
+    );
+    // A half-present triplet is not half-dropped either.
+    refused(
+        malformed_row(|row| {
+            row["metrics"]
+                .as_object_mut()
+                .expect("metrics object")
+                .remove("cached.first_audio.p99_ms");
+        }),
+        "of the three",
+    );
+    // Values at/above 2^53 are refused outright: a raw JSON integer there
+    // can already have been rounded during parsing, and the f64->u64 cast
+    // boundary (2^64) sits inside that range (re-reviews of PR #225).
+    refused(
+        malformed_row(|row| {
+            row["metrics"]["cached.first_audio.p95_ms"]["value"] =
+                serde_json::json!(18_446_744_073_709_551_616.0_f64);
+        }),
+        "2^53",
+    );
+    // The first unsafe *raw JSON integer*: 2^53+1 rounds to 2^53 during
+    // deserialization, so the parsed f64 no longer equals the integer the
+    // source wrote — refused, never recorded as 9007199254740992.
+    refused(
+        malformed_row(|row| {
+            row["metrics"]["cached.first_audio.p95_ms"]["value"] =
+                serde_json::json!(9_007_199_254_740_993_u64);
+        }),
+        "2^53",
+    );
+}
+
+#[test]
+fn an_identical_aggregate_history_row_is_not_a_second_measurement() {
+    let row = BenchmarkResult::from_json(aggregate_row("run-a", "aaaa1111", 7, 100).as_bytes())
+        .expect("row parses");
+    let shell = SloReport::from_benchmark_result(&row).expect("shell");
+    let pooled = BaselineProposalSet::from_reports(&[
+        shell.clone(),
+        shell,
+        aggregate_shell("run-b", "bbbb2222", 7, 100),
+    ])
+    .expect("proposal set");
+    assert_eq!(pooled.contributing_reports, 2);
+    assert_eq!(pooled.duplicate_reports, 1);
+    let proposal = pooled
+        .proposals
+        .get("availability.event_to_first_audio_within_target")
+        .expect("latency proposal");
+    assert_eq!(
+        proposal.latency.as_ref().expect("latency").runs,
+        2,
+        "a double-passed row is not a second measurement"
+    );
 }

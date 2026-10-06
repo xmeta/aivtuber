@@ -17,6 +17,9 @@
 //!   repeat with *different* content fails closed, because `run_id` names the
 //!   run but not which attempt is newer, and the order files are passed in is
 //!   not provenance;
+//! * a run supplied as both a full report and its aggregate-history shell is
+//!   still one run: the pair collapses to the full report once their shared
+//!   identity and percentiles verify as agreeing, and fails closed otherwise;
 //! * fewer than [`MIN_BASELINE_RUNS`] distinct runs produce no proposals;
 //! * represented stream time is summed exactly (no per-run ceil).
 //!
@@ -31,19 +34,30 @@
 //!
 //! Usage:
 //! ```text
-//! slo-baseline <slo-report.json>... [--out <proposals.json>] [--markdown <summary.md>]
+//! slo-baseline <slo-report.json>... [--benchmark-history <data.jsonl>]...
+//!              [--out <proposals.json>] [--markdown <summary.md>]
 //! ```
+//!
+//! `--benchmark-history <data.jsonl>` (repeatable) feeds the #58 aggregate
+//! history (`benchmark-data` branch, `data/<suite>.<series>.jsonl`) into the
+//! same pooling. Each row becomes a percentile-only shell via
+//! [`SloReport::from_benchmark_result`]: it contributes target-free latency
+//! evidence — the measured numbers a probe boundary is chosen from — and no
+//! ratio, because the aggregate row carries no per-event denominators. A
+//! history of aggregates can therefore inform boundary selection but can never
+//! publish a citable `baseline` on its own. Rows must name the
+//! `replay-comparison` suite — the suite whose metric names the shell maps —
+//! so another suite's history fails closed instead of pooling here.
 
 #![forbid(unsafe_code)]
 
-use aivtuber_telemetry::{BaselineProposalSet, SloError, SloReport};
+use aivtuber_telemetry::{BaselineProposalSet, BenchmarkResult, SloError, SloReport};
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-const USAGE: &str =
-    "usage: slo-baseline <slo-report.json>... [--out <proposals.json>] [--markdown <summary.md>]";
+const USAGE: &str = "usage: slo-baseline <slo-report.json>... [--benchmark-history <data.jsonl>]... [--out <proposals.json>] [--markdown <summary.md>]";
 
 fn main() -> ExitCode {
     match run() {
@@ -57,6 +71,7 @@ fn main() -> ExitCode {
 
 struct Arguments {
     reports: Vec<PathBuf>,
+    history: Vec<PathBuf>,
     output: Option<PathBuf>,
     markdown: Option<PathBuf>,
 }
@@ -64,16 +79,52 @@ struct Arguments {
 fn run() -> Result<(), Box<dyn Error>> {
     let Arguments {
         reports,
+        history,
         output,
         markdown,
     } = parse_args(std::env::args().skip(1).collect())?;
 
-    let mut history = Vec::with_capacity(reports.len());
+    let mut pooled = Vec::with_capacity(reports.len() + history.len());
     for path in &reports {
-        history.push(read_report(path)?);
+        pooled.push(read_report(path)?);
+    }
+    // #58 aggregate rows enter the same pooling as percentile-only shells,
+    // so every rule `from_reports` enforces (one series, distinct run
+    // identities, the repeated-run floor) applies to them unchanged.
+    let mut aggregate_shells = 0_usize;
+    for path in &history {
+        let bytes = fs::read(path)?;
+        let mut rows = 0_usize;
+        for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            rows += 1;
+            let row = BenchmarkResult::from_json(line).map_err(|error| {
+                SloError::new(format!("{}:{}: {error}", path.display(), index + 1))
+            })?;
+            pooled.push(SloReport::from_benchmark_result(&row).map_err(|error| {
+                SloError::new(format!("{}:{}: {error}", path.display(), index + 1))
+            })?);
+            aggregate_shells += 1;
+        }
+        if rows == 0 {
+            return Err(SloError::new(format!(
+                "{} contains no benchmark rows; pass a #58 history file (data/<suite>.<series>.jsonl)\n{USAGE}",
+                path.display()
+            ))
+            .into());
+        }
     }
 
-    let proposals = BaselineProposalSet::from_reports(&history)?;
+    let mut proposals = BaselineProposalSet::from_reports(&pooled)?;
+    if aggregate_shells > 0 {
+        proposals.limitations.push(format!(
+            "{aggregate_shells} aggregate #58 history row(s) contributed percentile-only \
+             evidence: the rows carry no per-event denominators, so their runs never form ratio \
+             evidence or a citable `baseline` — pool full `slo-report` artifacts for those"
+        ));
+    }
 
     if let Some(path) = &output {
         write(path, &proposals.to_json_pretty()?)?;
@@ -105,6 +156,7 @@ fn write(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
 
 fn parse_args(args: Vec<String>) -> Result<Arguments, Box<dyn Error>> {
     let mut reports = Vec::new();
+    let mut history = Vec::new();
     let mut output: Option<PathBuf> = None;
     let mut markdown: Option<PathBuf> = None;
 
@@ -119,6 +171,14 @@ fn parse_args(args: Vec<String>) -> Result<Arguments, Box<dyn Error>> {
                 markdown = Some(PathBuf::from(required_value(&args, index, "--markdown")?));
                 index += 2;
             }
+            "--benchmark-history" => {
+                history.push(PathBuf::from(required_value(
+                    &args,
+                    index,
+                    "--benchmark-history",
+                )?));
+                index += 2;
+            }
             unknown if unknown.starts_with("--") => {
                 return Err(format!("unknown argument {unknown:?}\n{USAGE}").into());
             }
@@ -129,11 +189,15 @@ fn parse_args(args: Vec<String>) -> Result<Arguments, Box<dyn Error>> {
         }
     }
 
-    if reports.is_empty() {
-        return Err(format!("at least one SLO report is required\n{USAGE}").into());
+    if reports.is_empty() && history.is_empty() {
+        return Err(format!(
+            "at least one SLO report or --benchmark-history file is required\n{USAGE}"
+        )
+        .into());
     }
     Ok(Arguments {
         reports,
+        history,
         output,
         markdown,
     })
