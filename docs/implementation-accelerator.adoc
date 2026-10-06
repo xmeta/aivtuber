@@ -102,7 +102,7 @@ tgrep -n -t rust 'ShadowComparisonRecord|TraceStage' .
 |#71 operational SLOs
 |+docs/operational-slo.adoc+, +crates/telemetry/src/operational_slo.rs+, +crates/app/src/bin/slo-report.rs+, +docs/performance-goals.adoc+
 |SRE error-budget patterns; keep aivtuber indicators and zero-tolerance invariants project-owned (delivered in link:operational-slo.adoc[Operational SLOs and Error Budgets])
-|Generate one session/scenario SLI report from #70 baseline evidence before setting targets (delivered; no numeric target is checked in yet)
+|Generate one session/scenario SLI report from #70 baseline evidence before setting targets (delivered; the first calibrated targets cite the recorded #70 evidence)
 |If the denominator/window cannot be reproduced from a benchmark artifact, do not define the SLO
 
 |#145 property tests

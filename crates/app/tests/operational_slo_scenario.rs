@@ -236,15 +236,18 @@ fn nothing_is_calibrated_until_a_target_file_says_so() {
     }));
 }
 
-/// The checked-in target file must stay valid against this catalog and stay
-/// empty until a target cites measured evidence.
+/// The checked-in target file must stay valid against this catalog, and every
+/// numeric target in it must cite the measured baseline evidence it was
+/// calibrated from — the rule that used to be enforced by keeping the file
+/// empty (#71) is now enforced on each entry instead.
 #[test]
-fn the_checked_in_target_file_is_valid_and_still_empty() {
+fn the_checked_in_target_file_is_calibrated_and_cites_measured_evidence() {
     let bytes =
         std::fs::read(repository_path("examples/slo/slo-targets.json")).expect("targets file");
     let targets = SloTargets::from_json(&bytes).expect("parse targets");
+    let catalog = aivtuber_telemetry::catalog();
     targets
-        .validate(&aivtuber_telemetry::catalog())
+        .validate(&catalog)
         .expect("targets describe this catalog");
 
     assert_eq!(
@@ -252,9 +255,58 @@ fn the_checked_in_target_file_is_valid_and_still_empty() {
         aivtuber_telemetry::SLO_CATALOG_VERSION
     );
     assert!(
-        targets.targets.is_empty(),
-        "a numeric target may only be checked in once it cites measured baseline evidence"
+        !targets.targets.is_empty(),
+        "#71's remaining criterion is calibrated numeric targets; the file must not ship empty"
     );
+    for (id, target) in &targets.targets {
+        let indicator = catalog
+            .iter()
+            .find(|entry| entry.id == *id)
+            .unwrap_or_else(|| panic!("{id} must name an indicator"));
+        assert_ne!(
+            indicator.kind,
+            aivtuber_telemetry::ObjectiveKind::Invariant,
+            "zero-tolerance invariants must never carry a ratio target"
+        );
+        let baseline = &target.baseline;
+        assert!(
+            baseline.value.is_finite() && (0.0..=1.0).contains(&baseline.value),
+            "{id}: baseline must be the measured ratio"
+        );
+        assert!(
+            baseline
+                .series
+                .as_deref()
+                .is_some_and(|series| !series.trim().is_empty()),
+            "{id}: a target must name the #58 compatibility series it was calibrated in"
+        );
+        assert!(
+            baseline.runs.len() as u64 >= aivtuber_telemetry::MIN_BASELINE_RUNS,
+            "{id}: one run is a data point, not a baseline"
+        );
+        let mut seen = std::collections::HashSet::new();
+        for run in &baseline.runs {
+            assert!(
+                !run.run_id.trim().is_empty(),
+                "{id}: unnamed run is not evidence"
+            );
+            assert!(
+                !run.git_commit.trim().is_empty(),
+                "{id}: evidence must say which revision measured it"
+            );
+            assert!(seen.insert(&run.run_id), "{id}: a run counts exactly once");
+        }
+        assert!(
+            !baseline.source.trim().is_empty(),
+            "{id}: a target must cite the artifact it was calibrated from"
+        );
+        if indicator.latency_thresholded {
+            assert!(
+                target.threshold_ms.is_some(),
+                "{id}: a latency objective without a threshold has no defined miss"
+            );
+        }
+    }
     let description = targets
         .description
         .expect("the target file must explain which contract it is not");

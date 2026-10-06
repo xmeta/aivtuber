@@ -1,6 +1,141 @@
 {
   "schema_version": "1",
   "catalog_version": "slo-catalog-v1",
-  "description": "Operational SLO targets (issue #71). Intentionally empty: no numeric target is checked in until one is calibrated from measured baseline evidence produced by `cargo run --locked -p aivtuber-app --bin slo-report`. A target entry must name the artifact it was calibrated from, and a zero-tolerance invariant must never appear here. This file is deliberately NOT benchmarks/budgets.json: those are per-pull-request regression budgets, these are absolute operational objectives.",
-  "targets": {}
+  "description": "Operational SLO targets (issue #71), calibrated from measured baseline evidence: three distinct recorded runs (three revisions) of the full_generative starter-replay-comparison-v1 series, pooled by `slo-baseline`; each entry cites the series, runs, and revisions it was calibrated from, and the latency thresholds were probed over those same stored runs before their conforming ratio was pooled. Ratios are product decisions chosen above the measured value, not the value the fixture happened to produce. A target entry must name the artifact it was calibrated from, and a zero-tolerance invariant must never appear here. This file is deliberately NOT benchmarks/budgets.json: those are per-pull-request regression budgets, these are absolute operational objectives.",
+  "targets": {
+    "availability.event_to_first_audio_within_target": {
+      "target": 0.99,
+      "threshold_ms": 250,
+      "baseline": {
+        "value": 1.0,
+        "source": "slo-baseline: 3 distinct session run(s) [run-37507647365,run-37521790573,run-37530348470]; series=full_generative|starter-replay-comparison-v1|replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0|4242; datasets=starter-replay-comparison-v1; revisions=4eafd2c95af6c8e59ff4d4e962f38979316082db,9148c4f899df33ec67d564b3845ff9ad58a3cd3e,d8f277cc079d537d48982fc5f39c374626f3378e; config=replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0; mode=full_generative; seed=4242; probe_threshold_ms=250",
+        "series": "full_generative|starter-replay-comparison-v1|replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0|4242",
+        "runs": [
+          {
+            "run_id": "run-37507647365",
+            "git_commit": "d8f277cc079d537d48982fc5f39c374626f3378e"
+          },
+          {
+            "run_id": "run-37521790573",
+            "git_commit": "4eafd2c95af6c8e59ff4d4e962f38979316082db"
+          },
+          {
+            "run_id": "run-37530348470",
+            "git_commit": "9148c4f899df33ec67d564b3845ff9ad58a3cd3e"
+          }
+        ]
+      }
+    },
+    "availability.event_to_first_visible_within_target": {
+      "target": 0.99,
+      "threshold_ms": 100,
+      "baseline": {
+        "value": 1.0,
+        "source": "slo-baseline: 3 distinct session run(s) [run-37507647365,run-37521790573,run-37530348470]; series=full_generative|starter-replay-comparison-v1|replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0|4242; datasets=starter-replay-comparison-v1; revisions=4eafd2c95af6c8e59ff4d4e962f38979316082db,9148c4f899df33ec67d564b3845ff9ad58a3cd3e,d8f277cc079d537d48982fc5f39c374626f3378e; config=replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0; mode=full_generative; seed=4242; probe_threshold_ms=100",
+        "series": "full_generative|starter-replay-comparison-v1|replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0|4242",
+        "runs": [
+          {
+            "run_id": "run-37507647365",
+            "git_commit": "d8f277cc079d537d48982fc5f39c374626f3378e"
+          },
+          {
+            "run_id": "run-37521790573",
+            "git_commit": "4eafd2c95af6c8e59ff4d4e962f38979316082db"
+          },
+          {
+            "run_id": "run-37530348470",
+            "git_commit": "9148c4f899df33ec67d564b3845ff9ad58a3cd3e"
+          }
+        ]
+      }
+    },
+    "availability.speech_presence_rate": {
+      "target": 0.99,
+      "baseline": {
+        "value": 1.0,
+        "source": "slo-baseline: 3 distinct session run(s) [run-37507647365,run-37521790573,run-37530348470]; series=full_generative|starter-replay-comparison-v1|replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0|4242; datasets=starter-replay-comparison-v1; revisions=4eafd2c95af6c8e59ff4d4e962f38979316082db,9148c4f899df33ec67d564b3845ff9ad58a3cd3e,d8f277cc079d537d48982fc5f39c374626f3378e; config=replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0; mode=full_generative; seed=4242",
+        "series": "full_generative|starter-replay-comparison-v1|replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0|4242",
+        "runs": [
+          {
+            "run_id": "run-37507647365",
+            "git_commit": "d8f277cc079d537d48982fc5f39c374626f3378e"
+          },
+          {
+            "run_id": "run-37521790573",
+            "git_commit": "4eafd2c95af6c8e59ff4d4e962f38979316082db"
+          },
+          {
+            "run_id": "run-37530348470",
+            "git_commit": "9148c4f899df33ec67d564b3845ff9ad58a3cd3e"
+          }
+        ]
+      }
+    },
+    "quality.semantic_reuse_correctness": {
+      "target": 0.9,
+      "baseline": {
+        "value": 1.0,
+        "source": "slo-baseline: 3 distinct session run(s) [run-37507647365,run-37521790573,run-37530348470]; series=full_generative|starter-replay-comparison-v1|replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0|4242; datasets=starter-replay-comparison-v1; revisions=4eafd2c95af6c8e59ff4d4e962f38979316082db,9148c4f899df33ec67d564b3845ff9ad58a3cd3e,d8f277cc079d537d48982fc5f39c374626f3378e; config=replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0; mode=full_generative; seed=4242",
+        "series": "full_generative|starter-replay-comparison-v1|replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0|4242",
+        "runs": [
+          {
+            "run_id": "run-37507647365",
+            "git_commit": "d8f277cc079d537d48982fc5f39c374626f3378e"
+          },
+          {
+            "run_id": "run-37521790573",
+            "git_commit": "4eafd2c95af6c8e59ff4d4e962f38979316082db"
+          },
+          {
+            "run_id": "run-37530348470",
+            "git_commit": "9148c4f899df33ec67d564b3845ff9ad58a3cd3e"
+          }
+        ]
+      }
+    },
+    "reliability.deadline_adherence_rate": {
+      "target": 0.99,
+      "baseline": {
+        "value": 1.0,
+        "source": "slo-baseline: 3 distinct session run(s) [run-37507647365,run-37521790573,run-37530348470]; series=full_generative|starter-replay-comparison-v1|replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0|4242; datasets=starter-replay-comparison-v1; revisions=4eafd2c95af6c8e59ff4d4e962f38979316082db,9148c4f899df33ec67d564b3845ff9ad58a3cd3e,d8f277cc079d537d48982fc5f39c374626f3378e; config=replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0; mode=full_generative; seed=4242",
+        "series": "full_generative|starter-replay-comparison-v1|replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0|4242",
+        "runs": [
+          {
+            "run_id": "run-37507647365",
+            "git_commit": "d8f277cc079d537d48982fc5f39c374626f3378e"
+          },
+          {
+            "run_id": "run-37521790573",
+            "git_commit": "4eafd2c95af6c8e59ff4d4e962f38979316082db"
+          },
+          {
+            "run_id": "run-37530348470",
+            "git_commit": "9148c4f899df33ec67d564b3845ff9ad58a3cd3e"
+          }
+        ]
+      }
+    },
+    "reliability.generative_budget_admission_rate": {
+      "target": 0.95,
+      "baseline": {
+        "value": 1.0,
+        "source": "slo-baseline: 3 distinct session run(s) [run-37507647365,run-37521790573,run-37530348470]; series=full_generative|starter-replay-comparison-v1|replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0|4242; datasets=starter-replay-comparison-v1; revisions=4eafd2c95af6c8e59ff4d4e962f38979316082db,9148c4f899df33ec67d564b3845ff9ad58a3cd3e,d8f277cc079d537d48982fc5f39c374626f3378e; config=replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0; mode=full_generative; seed=4242",
+        "series": "full_generative|starter-replay-comparison-v1|replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0|4242",
+        "runs": [
+          {
+            "run_id": "run-37507647365",
+            "git_commit": "d8f277cc079d537d48982fc5f39c374626f3378e"
+          },
+          {
+            "run_id": "run-37521790573",
+            "git_commit": "4eafd2c95af6c8e59ff4d4e962f38979316082db"
+          },
+          {
+            "run_id": "run-37530348470",
+            "git_commit": "9148c4f899df33ec67d564b3845ff9ad58a3cd3e"
+          }
+        ]
+      }
+    }
+  }
 }
