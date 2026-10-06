@@ -2024,6 +2024,32 @@ fn a_full_report_and_shell_that_disagree_are_refused_in_either_order() {
 }
 
 #[test]
+fn a_full_report_and_shell_that_disagree_on_duration_are_refused_in_either_order() {
+    // Represented duration is a measurement of the run, not cosmetic
+    // metadata: a pair contradicting it is two attempts of one identity, not
+    // two views of one measurement (re-review of PR #225).
+    let full = full_report_for("run-a", [60, 80, 100]);
+    let mut shell = aggregate_shell("run-a", "deadbeef", 7, 100);
+    shell.source.stream_duration_ms = Some(3_600_000);
+    let independent = aggregate_shell("run-b", "cccc3333", 7, 200);
+
+    let forward =
+        BaselineProposalSet::from_reports(&[full.clone(), shell.clone(), independent.clone()])
+            .expect_err("a duration mismatch is not one measurement");
+    let reversed = BaselineProposalSet::from_reports(&[independent, shell, full])
+        .expect_err("the same mismatch must fail when reversed");
+    assert_eq!(
+        forward.to_string(),
+        reversed.to_string(),
+        "argument order must not change the outcome"
+    );
+    assert!(
+        forward.to_string().contains("stream_duration_ms"),
+        "{forward}"
+    );
+}
+
+#[test]
 fn an_aggregate_history_row_from_another_benchmark_suite_is_refused() {
     // Two otherwise-identical rows differing only in benchmark_suite: one is
     // calibration evidence, and the other must not silently pool as the same
@@ -2100,6 +2126,16 @@ fn malformed_first_audio_percentiles_are_refused_before_calibration() {
                 .remove("cached.first_audio.p99_ms");
         }),
         "of the three",
+    );
+    // The first value the u64 cast cannot represent (2^64) equals the old `>`
+    // boundary instead of exceeding it; it must be rejected, not saturated to
+    // u64::MAX (re-review of PR #225).
+    refused(
+        malformed_row(|row| {
+            row["metrics"]["cached.first_audio.p95_ms"]["value"] =
+                serde_json::json!(18_446_744_073_709_551_616.0_f64);
+        }),
+        "not representable",
     );
 }
 

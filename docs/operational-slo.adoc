@@ -473,9 +473,10 @@ records measured numbers rather than repairing them. Where one run exists as
 both a full `slo-report` (recorded from #224 on) and its aggregate row, the two
 are complementary views of one measurement: `slo-baseline` collapses the pair
 into the full report — the run counts once, whichever artifact arrives first —
-only after verifying that the revision, the series, and every percentile the
-shell carries agree with it. Two conflicting full reports, two conflicting
-shells, or a pair failing that verification still fail closed.
+only after verifying that the revision, the series, the represented
+duration, and every percentile the shell carries agree with it. Two conflicting
+full reports, two conflicting shells, or a pair failing that verification still
+fail closed.
 The aggregate row also records `first_visible` p95 alone — without p50/p99 —
 so first-visible calibration still waits on full reports; that ceiling is the
 recorded metric set, not the pooling.

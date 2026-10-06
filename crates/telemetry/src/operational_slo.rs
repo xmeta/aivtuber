@@ -1868,13 +1868,26 @@ impl SloReport {
                     if !metric.value.is_finite()
                         || metric.value < 0.0
                         || metric.value.fract() != 0.0
-                        || metric.value > u64::MAX as f64
                     {
                         return Err(SloError::new(format!(
                             "aggregate history row metric {name} value {} is not a finite, \
                              non-negative integral millisecond measurement; calibration \
                              preserves measured numbers as they are and refuses to coerce this \
                              one",
+                            metric.value
+                        )));
+                    }
+                    // `u64::MAX as f64` rounds up to exactly 2^64, so a JSON
+                    // number of 2^64 only *equals* a `>` boundary rather than
+                    // exceeding it, and the cast would saturate it to
+                    // u64::MAX — changing the measured number. The first
+                    // unrepresentable value is therefore rejected explicitly.
+                    if metric.value >= u64::MAX as f64 {
+                        return Err(SloError::new(format!(
+                            "aggregate history row metric {name} value {} is not representable \
+                             as a millisecond count (the first non-representable boundary is \
+                             18446744073709551616); calibration preserves measured numbers and \
+                             refuses to saturate this one",
                             metric.value
                         )));
                     }
@@ -2115,10 +2128,10 @@ pub struct BaselineProposalSet {
 /// [`BaselineProposalSet::from_reports`] applies to complementary artifacts).
 ///
 /// The pair may pool as the full report only when everything the two
-/// artifacts *share* agrees: the revision and compatibility series they
-/// identify, and every percentile the shell carries. Anything less and the
-/// two artifacts could be different measurements under one identity, which
-/// fails closed exactly like any other conflicting repeat.
+/// artifacts *share* agrees: the revision, compatibility series, and
+/// represented duration they carry, and every percentile the shell holds.
+/// Anything less and the two artifacts could be different measurements under
+/// one identity, which fails closed exactly like any other conflicting repeat.
 fn collapse_into_full(full: &SloReport, shell: &SloReport) -> Result<(), SloError> {
     let run = shell.source.run_id.as_deref().unwrap_or("<none>");
     if full.source.git_commit != shell.source.git_commit {
@@ -2127,6 +2140,14 @@ fn collapse_into_full(full: &SloReport, shell: &SloReport) -> Result<(), SloErro
              from revision {:?}; one run has one revision, so the two artifacts cannot describe \
              the same measurement",
             full.source.git_commit, shell.source.git_commit
+        )));
+    }
+    if full.source.stream_duration_ms != shell.source.stream_duration_ms {
+        return Err(SloError::new(format!(
+            "run {run:?} appears as a full report and an aggregate shell that disagree on \
+             stream_duration_ms ({:?} vs {:?}); the represented duration is part of what the run \
+             measured, so the pair is not verified as one measurement",
+            full.source.stream_duration_ms, shell.source.stream_duration_ms
         )));
     }
     if full.source.mode.as_str() != shell.source.mode.as_str()
@@ -2207,8 +2228,9 @@ impl BaselineProposalSet {
     ///   arrive as both a full report and the percentile-only shell built
     ///   from its #58 aggregate row. The two collapse to the full report —
     ///   the run counts once, argument order irrelevant — only after their
-    ///   shared identity (revision and series) and every percentile the shell
-    ///   carries are verified to agree with it. Two conflicting full reports,
+    ///   shared identity (revision, series, and represented duration) and
+    ///   every percentile the shell carries are verified to agree with it.
+    ///   Two conflicting full reports,
     ///   two conflicting shells, or a pair failing that verification fail
     ///   closed exactly like any other conflicting repeat.
     /// * **Provenance per indicator, not per history.** A run whose denominator
