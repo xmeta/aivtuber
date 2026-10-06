@@ -1906,6 +1906,203 @@ fn an_aggregate_history_row_from_a_non_operational_mode_is_refused() {
     );
 }
 
+/// A full `slo-report` evaluation whose session first-audio percentiles are
+/// exactly what `aggregate_row(_, _, 7, p95)` records — three samples ending
+/// at `latencies[2]` nearest-rank to p95/p99 — so the report and that row's
+/// shell are two views of one measured run (the overlap review of PR #225
+/// requires pooling).
+fn full_report_for(run_id: &str, latencies: [u64; 3]) -> SloReport {
+    let events = latencies
+        .iter()
+        .enumerate()
+        .map(|(index, latency)| {
+            let mut event = EventObservation::new(
+                format!("evt-{index}"),
+                ComparisonMode::DeterministicOnly,
+                RouteClass::Deterministic,
+            );
+            event.routing_latency_us = 10;
+            event.cache_lookup = true;
+            event.cache_hit = true;
+            event.cache_level = Some(CacheLevel::Memory);
+            event.stream_offset_ms = Some((index as u64 + 1) * 1_000);
+            event.event_to_first_audio_ms = Some(*latency);
+            event
+        })
+        .collect();
+    let report = BenchmarkReport::from_events(
+        metadata("slo-fixture", 180_000),
+        ComparisonMode::DeterministicOnly,
+        events,
+    )
+    .expect("benchmark report");
+    evaluate(
+        &report,
+        &SloTargets::default(),
+        SloEvaluationConfig {
+            run_id: Some(run_id.to_owned()),
+            ..SloEvaluationConfig::default()
+        },
+    )
+    .expect("SLO report")
+}
+
+#[test]
+fn a_full_report_and_its_aggregate_shell_are_one_run_in_either_order() {
+    // run-a exists as both artifacts — the #224 migration overlap — and must
+    // pool as one run; run-b is an old aggregate-only run whose percentile
+    // evidence must keep contributing alongside it.
+    let full = full_report_for("run-a", [60, 80, 100]);
+    let shell = aggregate_shell("run-a", "deadbeef", 7, 100);
+    let old = aggregate_shell("run-b", "cccc3333", 7, 200);
+
+    for (label, reports) in [
+        (
+            "shell first",
+            vec![shell.clone(), old.clone(), full.clone()],
+        ),
+        ("full first", vec![full.clone(), shell.clone(), old.clone()]),
+    ] {
+        let pooled = BaselineProposalSet::from_reports(&reports)
+            .unwrap_or_else(|error| panic!("{label}: the mixed history must pool: {error}"));
+        assert_eq!(pooled.contributing_reports, 2, "{label}");
+        assert_eq!(
+            pooled
+                .contributing_runs
+                .iter()
+                .filter(|run| run.run_id == "run-a")
+                .count(),
+            1,
+            "{label}: two artifacts of one run are one run"
+        );
+        let latency = pooled
+            .proposals
+            .get("availability.event_to_first_audio_within_target")
+            .expect("latency proposal")
+            .latency
+            .clone()
+            .expect("target-free percentiles");
+        assert_eq!(latency.runs, 2, "{label}");
+        assert_eq!(latency.samples, 6, "{label}");
+        assert_eq!(
+            latency.p95_ms, 200,
+            "{label}: the aggregate-only run still contributes its percentiles"
+        );
+        assert_eq!(
+            latency.max_ms,
+            Some(100),
+            "{label}: the full report's per-run maximum survives the collapse"
+        );
+        assert!(
+            pooled
+                .limitations
+                .iter()
+                .any(|line| line.contains("aggregate-history shell")),
+            "{label}: the collapse is declared: {}",
+            pooled.limitations.join("; ")
+        );
+    }
+}
+
+#[test]
+fn a_full_report_and_shell_that_disagree_are_refused_in_either_order() {
+    let full = full_report_for("run-a", [60, 80, 200]);
+    let shell = aggregate_shell("run-a", "deadbeef", 7, 100);
+    let independent = aggregate_shell("run-b", "cccc3333", 7, 200);
+
+    let forward =
+        BaselineProposalSet::from_reports(&[full.clone(), shell.clone(), independent.clone()])
+            .expect_err("a pair that disagrees on percentiles is not one measurement");
+    let reversed = BaselineProposalSet::from_reports(&[independent, shell, full])
+        .expect_err("the same disagreement must fail when reversed");
+    assert_eq!(
+        forward.to_string(),
+        reversed.to_string(),
+        "argument order must not change the outcome"
+    );
+    assert!(forward.to_string().contains("disagree"), "{forward}");
+}
+
+#[test]
+fn an_aggregate_history_row_from_another_benchmark_suite_is_refused() {
+    // Two otherwise-identical rows differing only in benchmark_suite: one is
+    // calibration evidence, and the other must not silently pool as the same
+    // suite's measurement (review of PR #225).
+    let mut other: serde_json::Value =
+        serde_json::from_str(&aggregate_row("run-a", "aaaa1111", 7, 100)).expect("json");
+    other["benchmark_suite"] = serde_json::json!("resource-soak");
+    let other = BenchmarkResult::from_json(other.to_string().as_bytes()).expect("row parses");
+    let error = SloReport::from_benchmark_result(&other).expect_err("one suite per importer");
+    assert!(error.to_string().contains("benchmark_suite"), "{error}");
+    assert!(error.to_string().contains("replay-comparison"), "{error}");
+
+    let identical =
+        BenchmarkResult::from_json(aggregate_row("run-a", "aaaa1111", 7, 100).as_bytes())
+            .expect("row parses");
+    SloReport::from_benchmark_result(&identical)
+        .expect("the identical replay-comparison row still converts");
+}
+
+/// One `aggregate_row` mutated before parsing, so each malformed-evidence
+/// rule is refused on the row shape it exists to refuse.
+fn malformed_row(rotate: impl FnOnce(&mut serde_json::Value)) -> BenchmarkResult {
+    let mut row: serde_json::Value =
+        serde_json::from_str(&aggregate_row("run-a", "aaaa1111", 7, 100)).expect("json");
+    rotate(&mut row);
+    BenchmarkResult::from_json(row.to_string().as_bytes()).expect("row parses")
+}
+
+#[test]
+fn malformed_first_audio_percentiles_are_refused_before_calibration() {
+    let refused = |row: BenchmarkResult, expected: &str| {
+        let error =
+            SloReport::from_benchmark_result(&row).expect_err("malformed evidence is refused");
+        assert!(
+            error.to_string().contains(expected),
+            "expected {expected:?} in: {error}"
+        );
+    };
+
+    // A fractional latency must not be rounded into an integer.
+    refused(
+        malformed_row(|row| {
+            row["metrics"]["cached.first_audio.p95_ms"]["value"] = serde_json::json!(100.5)
+        }),
+        "integral",
+    );
+    // A percentile with no samples behind it is not calibration evidence.
+    refused(
+        malformed_row(|row| {
+            row["metrics"]["cached.first_audio.p95_ms"]["sample_count"] = serde_json::json!(0)
+        }),
+        "positive sample count",
+    );
+    // One run's percentiles describe one sample set.
+    refused(
+        malformed_row(|row| {
+            row["metrics"]["cached.first_audio.p50_ms"]["sample_count"] = serde_json::json!(2)
+        }),
+        "disagree on sample_count",
+    );
+    // An unordered triplet must not be silently repaired by sorting.
+    refused(
+        malformed_row(|row| {
+            row["metrics"]["cached.first_audio.p99_ms"]["value"] = serde_json::json!(50)
+        }),
+        "not ordered",
+    );
+    // A half-present triplet is not half-dropped either.
+    refused(
+        malformed_row(|row| {
+            row["metrics"]
+                .as_object_mut()
+                .expect("metrics object")
+                .remove("cached.first_audio.p99_ms");
+        }),
+        "of the three",
+    );
+}
+
 #[test]
 fn an_identical_aggregate_history_row_is_not_a_second_measurement() {
     let row = BenchmarkResult::from_json(aggregate_row("run-a", "aaaa1111", 7, 100).as_bytes())

@@ -46,7 +46,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::{
-    BenchmarkReport, BenchmarkResult, ComparisonMode, EventObservation, RouteClass, TelemetryError,
+    BenchmarkReport, BenchmarkResult, ComparisonMode, EventObservation, MetricValue, RouteClass,
+    TelemetryError,
 };
 
 /// Report contract version this module emits.
@@ -1734,6 +1735,23 @@ pub fn overall_verdict(indicators: &[SloIndicatorResult]) -> SloVerdict {
 // Baseline selection from a run history (#58 metrics -> #71 targets)
 // ---------------------------------------------------------------------------
 
+/// The one #58 benchmark suite the aggregate-history importer calibrates.
+///
+/// The shell maps this suite's metric names (`cached.first_audio.*`), and a
+/// history file is only namespaced per suite on disk
+/// (`data/<suite>.<series>.jsonl`). The importer receives bare rows, so suite
+/// identity has to be re-checked at ingest: without it, another suite's row
+/// that happens to share mode/dataset/config/seed would pool as if it
+/// measured this suite's workload (review of #225).
+pub const AGGREGATE_SUITE: &str = "replay-comparison";
+
+/// The limitation that marks a report built by
+/// [`SloReport::from_benchmark_result`]: the percentile-only shell of one #58
+/// aggregate row. A full `slo-report` evaluation never carries this text, so
+/// it doubles as the shell discriminator when one run arrives as both
+/// artifacts and the two have to be told apart.
+const AGGREGATE_SHELL_LIMITATION: &str = "aggregate #58 history row: a percentile-only shell";
+
 impl SloReport {
     /// A percentile-only pooling shell built from one #58 aggregate history
     /// row (`schemas/benchmark-result.schema.json`, the `benchmark-data`
@@ -1752,11 +1770,22 @@ impl SloReport {
     /// Identity comes straight from the row (`recording.run_id`, revision,
     /// and the #58 series fields), so [`BaselineProposalSet::from_reports`]
     /// applies its usual rules — one series, distinct runs by identity, the
-    /// repeated-run floor — unchanged to a mixed or aggregate-only history.
+    /// repeated-run floor, and the full/shell collapse for a run supplied as
+    /// both — unchanged to a mixed or aggregate-only history. Only rows of
+    /// the [`AGGREGATE_SUITE`] suite convert at all.
     pub fn from_benchmark_result(result: &BenchmarkResult) -> Result<Self, SloError> {
         result
             .validate()
             .map_err(|error| SloError::new(format!("aggregate history row: {error}")))?;
+        if result.benchmark_suite.trim() != AGGREGATE_SUITE {
+            return Err(SloError::new(format!(
+                "aggregate history row benchmark_suite {:?} is not {AGGREGATE_SUITE:?}; only \
+                 that suite's rows carry the metric names this shell maps, so another suite's \
+                 history (data/<suite>.<series>.jsonl) fails closed instead of pooling as this \
+                 suite's calibration evidence",
+                result.benchmark_suite
+            )));
+        }
         let dataset_id = result
             .dataset_id
             .as_deref()
@@ -1800,34 +1829,111 @@ impl SloReport {
                 ))
             })?;
 
-        let percentile = |name: &str| -> Option<(u64, u64)> {
-            result.metrics.get(name).map(|metric| {
-                (
-                    metric.value.round() as u64,
-                    metric.sample_count.unwrap_or(0),
-                )
-            })
-        };
         // Only the first-audio percentiles are complete in the aggregate row
         // (p50/p95/p99 together). The first-visible column records p95 alone,
         // and a percentile the row does not carry is left absent rather than
         // guessed; that ceiling is documented in docs/operational-slo.adoc.
+        //
+        // Calibration evidence preserves measured numbers; it never normalizes
+        // them. The benchmark schema allows any numeric metric value, so a
+        // fractional, negative, uncounted, or self-contradictory latency is
+        // refused here rather than silently coerced into something that merely
+        // looks measured (review of #225).
+        const FIRST_AUDIO_PERCENTILES: [&str; 3] = [
+            "cached.first_audio.p50_ms",
+            "cached.first_audio.p95_ms",
+            "cached.first_audio.p99_ms",
+        ];
         let mut latency_calibration = Vec::new();
-        if let (Some((p50_ms, _)), Some((p95_ms, samples)), Some((p99_ms, _))) = (
-            percentile("cached.first_audio.p50_ms"),
-            percentile("cached.first_audio.p95_ms"),
-            percentile("cached.first_audio.p99_ms"),
-        ) {
-            latency_calibration.push(LatencyCalibration {
-                indicator: "availability.event_to_first_audio_within_target".to_owned(),
-                window: "session".to_owned(),
-                field: "event_to_first_audio_ms".to_owned(),
-                samples,
-                p50_ms,
-                p95_ms,
-                p99_ms,
-                max_ms: None,
-            });
+        let present: Vec<(&str, &MetricValue)> = FIRST_AUDIO_PERCENTILES
+            .iter()
+            .filter_map(|name| result.metrics.get(*name).map(|metric| (*name, metric)))
+            .collect();
+        match present.len() {
+            // No first-audio column at all: no calibration, honestly absent.
+            0 => {}
+            // Some but not all of the triplet: neither usable evidence nor a
+            // measurement this shell may silently drop half of.
+            1 | 2 => {
+                return Err(SloError::new(format!(
+                    "aggregate history row carries only {} of the three cached.first_audio \
+                     percentiles ({}); an incomplete triplet is neither evidence this shell can \
+                     calibrate from nor a measurement it may silently discard",
+                    present.len(),
+                    FIRST_AUDIO_PERCENTILES.join(", ")
+                )));
+            }
+            _ => {
+                for (name, metric) in &present {
+                    if !metric.value.is_finite()
+                        || metric.value < 0.0
+                        || metric.value.fract() != 0.0
+                        || metric.value > u64::MAX as f64
+                    {
+                        return Err(SloError::new(format!(
+                            "aggregate history row metric {name} value {} is not a finite, \
+                             non-negative integral millisecond measurement; calibration \
+                             preserves measured numbers as they are and refuses to coerce this \
+                             one",
+                            metric.value
+                        )));
+                    }
+                    match metric.sample_count {
+                        Some(count) if count > 0 => {}
+                        other => {
+                            return Err(SloError::new(format!(
+                                "aggregate history row metric {name} carries sample_count \
+                                 {other:?}, not a positive sample count; a percentile with no \
+                                 samples behind it is not calibration evidence"
+                            )));
+                        }
+                    }
+                }
+                let counts: BTreeSet<u64> = present
+                    .iter()
+                    .map(|(_, metric)| {
+                        metric
+                            .sample_count
+                            .expect("every sample count was required to be present above")
+                    })
+                    .collect();
+                if counts.len() != 1 {
+                    return Err(SloError::new(format!(
+                        "aggregate history row first-audio percentiles disagree on sample_count \
+                         ({counts:?}); one run's percentiles must describe one sample set"
+                    )));
+                }
+                let value = |name: &str| -> u64 {
+                    present
+                        .iter()
+                        .find(|(candidate, _)| *candidate == name)
+                        .expect("the triplet was required above")
+                        .1
+                        .value as u64
+                };
+                let (p50_ms, p95_ms, p99_ms) = (
+                    value("cached.first_audio.p50_ms"),
+                    value("cached.first_audio.p95_ms"),
+                    value("cached.first_audio.p99_ms"),
+                );
+                if !(p50_ms <= p95_ms && p95_ms <= p99_ms) {
+                    return Err(SloError::new(format!(
+                        "aggregate history row first-audio percentiles are not ordered \
+                         (p50={p50_ms} p95={p95_ms} p99={p99_ms}); an unordered triplet is not \
+                         one sample set and is repaired by no one here"
+                    )));
+                }
+                latency_calibration.push(LatencyCalibration {
+                    indicator: "availability.event_to_first_audio_within_target".to_owned(),
+                    window: "session".to_owned(),
+                    field: "event_to_first_audio_ms".to_owned(),
+                    samples: counts.into_iter().next().expect("one count above"),
+                    p50_ms,
+                    p95_ms,
+                    p99_ms,
+                    max_ms: None,
+                });
+            }
         }
 
         Ok(Self {
@@ -1854,14 +1960,22 @@ impl SloReport {
             aar_candidates: Vec::new(),
             uncalibrated: Vec::new(),
             not_yet_measured: Vec::new(),
-            limitations: vec![
-                "aggregate #58 history row: a percentile-only shell — it carries no per-event \
-                 denominators, so it contributes latency calibration evidence only and never a \
-                 ratio or a citable baseline"
-                    .to_owned(),
-            ],
+            limitations: vec![format!(
+                "{AGGREGATE_SHELL_LIMITATION} — it carries no per-event denominators, so it \
+                 contributes latency calibration evidence only and never a ratio or a citable \
+                 baseline"
+            )],
             verdict: SloVerdict::Uncalibrated,
         })
+    }
+
+    /// Whether this report is the percentile-only shell of a #58 aggregate
+    /// row rather than a full `slo-report` evaluation (see
+    /// [`AGGREGATE_SHELL_LIMITATION`]).
+    fn is_aggregate_shell(&self) -> bool {
+        self.limitations
+            .iter()
+            .any(|line| line.starts_with(AGGREGATE_SHELL_LIMITATION))
     }
 }
 
@@ -1996,6 +2110,75 @@ pub struct BaselineProposalSet {
     pub limitations: Vec<String>,
 }
 
+/// Verify that a full report and an aggregate-history shell describe one
+/// measured run before the pair collapses into the full report (the rule
+/// [`BaselineProposalSet::from_reports`] applies to complementary artifacts).
+///
+/// The pair may pool as the full report only when everything the two
+/// artifacts *share* agrees: the revision and compatibility series they
+/// identify, and every percentile the shell carries. Anything less and the
+/// two artifacts could be different measurements under one identity, which
+/// fails closed exactly like any other conflicting repeat.
+fn collapse_into_full(full: &SloReport, shell: &SloReport) -> Result<(), SloError> {
+    let run = shell.source.run_id.as_deref().unwrap_or("<none>");
+    if full.source.git_commit != shell.source.git_commit {
+        return Err(SloError::new(format!(
+            "run {run:?} appears as a full report from revision {:?} and an aggregate shell \
+             from revision {:?}; one run has one revision, so the two artifacts cannot describe \
+             the same measurement",
+            full.source.git_commit, shell.source.git_commit
+        )));
+    }
+    if full.source.mode.as_str() != shell.source.mode.as_str()
+        || full.source.dataset_id != shell.source.dataset_id
+        || full.source.config_version != shell.source.config_version
+        || full.source.seed != shell.source.seed
+    {
+        return Err(SloError::new(format!(
+            "run {run:?} appears in more than one compatibility series across its full report \
+             and aggregate shell; one run belongs to exactly one series"
+        )));
+    }
+    for point in &shell.latency_calibration {
+        let mate = full
+            .latency_calibration
+            .iter()
+            .find(|candidate| {
+                candidate.indicator == point.indicator
+                    && candidate.window == point.window
+                    && candidate.field == point.field
+            })
+            .ok_or_else(|| {
+                SloError::new(format!(
+                    "the aggregate shell of run {run:?} carries {} / {} percentiles the full \
+                     report does not record, so the pair cannot be verified as one measurement",
+                    point.indicator, point.window
+                ))
+            })?;
+        if (mate.samples, mate.p50_ms, mate.p95_ms, mate.p99_ms)
+            != (point.samples, point.p50_ms, point.p95_ms, point.p99_ms)
+        {
+            return Err(SloError::new(format!(
+                "the aggregate shell and the full report of run {run:?} disagree on {} / {} \
+                 percentiles (shell: p50={} p95={} p99={} over {} samples, full report: p50={} \
+                 p95={} p99={} over {} samples); two artifacts of one run must measure the same \
+                 numbers",
+                point.indicator,
+                point.window,
+                point.p50_ms,
+                point.p95_ms,
+                point.p99_ms,
+                point.samples,
+                mate.p50_ms,
+                mate.p95_ms,
+                mate.p99_ms,
+                mate.samples
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl BaselineProposalSet {
     /// Pool a history of SLO reports into per-indicator calibration evidence.
     ///
@@ -2019,6 +2202,15 @@ impl BaselineProposalSet {
     ///   names the run but not which attempt is newer, and argument order is not
     ///   provenance. Fewer than [`MIN_BASELINE_RUNS`] distinct runs produce no
     ///   proposals at all, since one run calibrates nothing.
+    /// * **Complementary views of one run collapse; conflicts never do.**
+    ///   During the migration to durable full reports (#224) the same run can
+    ///   arrive as both a full report and the percentile-only shell built
+    ///   from its #58 aggregate row. The two collapse to the full report —
+    ///   the run counts once, argument order irrelevant — only after their
+    ///   shared identity (revision and series) and every percentile the shell
+    ///   carries are verified to agree with it. Two conflicting full reports,
+    ///   two conflicting shells, or a pair failing that verification fail
+    ///   closed exactly like any other conflicting repeat.
     /// * **Provenance per indicator, not per history.** A run whose denominator
     ///   is empty for one indicator contributed no evidence for it, so the
     ///   manifest and the coverage attached to that indicator's evidence name
@@ -2108,10 +2300,17 @@ impl BaselineProposalSet {
             serde_json::to_string(report)
                 .map_err(|error| SloError::new(format!("canonicalize report: {error}")))
         };
-        // run identity -> canonical payload of the artifact accepted for it
-        let mut accepted: BTreeMap<String, String> = BTreeMap::new();
+        // run identity -> the accepted artifact for it: its canonical payload,
+        // whether it is an aggregate shell, and where it sits in `distinct`.
+        struct Accepted {
+            canonical: String,
+            shell: bool,
+            distinct: usize,
+        }
+        let mut accepted: BTreeMap<String, Accepted> = BTreeMap::new();
         let mut distinct: Vec<&SloReport> = Vec::new();
         let mut duplicate_reports = 0_u64;
+        let mut collapsed_shells = 0_u64;
         let mut excluded_experimental = 0_u64;
         for report in reports {
             if !report.counts_toward_active_slo {
@@ -2126,33 +2325,61 @@ impl BaselineProposalSet {
                 .trim()
                 .to_owned();
             let canonical = canonical_json(report)?;
+            let incoming_shell = report.is_aggregate_shell();
             match accepted.entry(run_id) {
-                Entry::Occupied(occupied) => {
+                Entry::Occupied(mut occupied) => {
                     // The same run identity with identical content is one run
                     // measured twice: a double-passed file or a byte-identical
                     // retry, which carries no second measurement.
-                    if *occupied.get() == canonical {
+                    if occupied.get().canonical == canonical {
                         duplicate_reports += 1;
                         continue;
                     }
-                    // Two attempts of one run disagree. `run_id` says they are
-                    // the same logical run; it does not say which attempt is
-                    // newer, and the order in which paths reach this function is
-                    // not provenance. Choosing the last one would make durable
-                    // calibration evidence a function of filesystem/glob/argv
-                    // ordering, so pooling fails closed instead: the operator
-                    // names the authoritative artifact explicitly.
-                    return Err(SloError::new(format!(
-                        "run identity {:?} appears twice with different measurements; the two \
-                         artifacts are attempts of one run and carry no authoritative ordering, so \
-                         choosing one would make the baseline depend on the order the files were \
-                         passed — pool exactly one artifact per run identity, or give each attempt \
-                         its own --run-id",
-                        occupied.key()
-                    )));
+                    if occupied.get().shell == incoming_shell {
+                        // Two attempts of one run disagree. `run_id` says they
+                        // are the same logical run; it does not say which
+                        // attempt is newer, and the order in which paths reach
+                        // this function is not provenance. Choosing the last
+                        // one would make durable calibration evidence a
+                        // function of filesystem/glob/argv ordering, so
+                        // pooling fails closed instead: the operator names the
+                        // authoritative artifact explicitly.
+                        return Err(SloError::new(format!(
+                            "run identity {:?} appears twice with different measurements; the \
+                             two artifacts are attempts of one run and carry no authoritative \
+                             ordering, so choosing one would make the baseline depend on the \
+                             order the files were passed — pool exactly one artifact per run \
+                             identity, or give each attempt its own --run-id",
+                            occupied.key()
+                        )));
+                    }
+                    // One full report and one shell of the same run: two
+                    // complementary views of a single measurement, not two
+                    // attempts. They collapse to the full report only once
+                    // everything they share is verified to agree; a mismatch
+                    // fails closed like any other conflicting repeat.
+                    let prior: &SloReport = distinct[occupied.get().distinct];
+                    let (shell, full) = if occupied.get().shell {
+                        (prior, report)
+                    } else {
+                        (report, prior)
+                    };
+                    collapse_into_full(full, shell)?;
+                    if occupied.get().shell {
+                        // The full report is the richer artifact: it becomes
+                        // the accepted one, whichever order the two arrived in.
+                        occupied.get_mut().canonical = canonical;
+                        occupied.get_mut().shell = false;
+                        distinct[occupied.get().distinct] = report;
+                    }
+                    collapsed_shells += 1;
                 }
                 Entry::Vacant(vacant) => {
-                    vacant.insert(canonical);
+                    vacant.insert(Accepted {
+                        canonical,
+                        shell: incoming_shell,
+                        distinct: distinct.len(),
+                    });
                     distinct.push(report);
                 }
             }
@@ -2185,6 +2412,13 @@ impl BaselineProposalSet {
             limitations.push(format!(
                 "{duplicate_reports} report(s) repeated a run identity already in the history with \
                  identical content and were not counted as further runs"
+            ));
+        }
+        if collapsed_shells > 0 {
+            limitations.push(format!(
+                "{collapsed_shells} run(s) arrived as both a full report and an aggregate-history \
+                 shell; the pair agreed on identity and percentiles, collapsed to the full \
+                 report, and counted as one run"
             ));
         }
         if (distinct.len() as u64) < MIN_BASELINE_RUNS {

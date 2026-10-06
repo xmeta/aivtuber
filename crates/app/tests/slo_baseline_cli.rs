@@ -7,6 +7,11 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+use aivtuber_telemetry::{
+    BenchmarkReport, CacheLevel, ComparisonMode, EventObservation, ReproducibilityMetadata,
+    RouteClass, SloEvaluationConfig, SloTargets, evaluate,
+};
+
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("slo-baseline-cli-{}-{name}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
@@ -108,6 +113,159 @@ fn the_history_flag_pools_latency_evidence_and_never_a_citable_baseline() {
 
     assert!(!fs::read(&markdown).expect("markdown file").is_empty());
     assert!(String::from_utf8_lossy(&output.stdout).contains("Operational SLO baseline proposal"));
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_full_report_and_the_aggregate_row_of_the_same_run_count_once() {
+    // The #224 migration overlap: run-a exists as a durable full report *and*
+    // as a row of the old aggregate history; run-b is an aggregate-only run
+    // whose percentile evidence must keep pooling alongside it.
+    let dir = temp_dir("mixed");
+    let jsonl = dir.join("history.jsonl");
+    fs::write(
+        &jsonl,
+        format!(
+            "{}\n{}\n",
+            aggregate_row("run-a", "aaaa1111", 100),
+            aggregate_row("run-b", "bbbb2222", 200)
+        ),
+    )
+    .expect("history written");
+    let full = dir.join("run-a.json");
+    fs::write(&full, overlapping_full_report("run-a", "aaaa1111")).expect("report written");
+    let out = dir.join("proposals.json");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_slo-baseline"))
+        .args([
+            full.to_str().expect("utf8 path"),
+            "--benchmark-history",
+            jsonl.to_str().expect("utf8 path"),
+            "--out",
+            out.to_str().expect("utf8 path"),
+        ])
+        .output()
+        .expect("slo-baseline runs");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let proposals: serde_json::Value =
+        serde_json::from_slice(&fs::read(&out).expect("proposal file")).expect("valid json");
+
+    // The overlapped run counts once, in either artifact's company.
+    let runs = proposals["contributing_runs"]
+        .as_array()
+        .expect("run manifest");
+    let run_ids: Vec<&str> = runs
+        .iter()
+        .filter_map(|run| run["run_id"].as_str())
+        .collect();
+    assert_eq!(run_ids.len(), 2, "one run per identity: {run_ids:?}");
+    assert_eq!(
+        run_ids.iter().filter(|id| **id == "run-a").count(),
+        1,
+        "run-a arrived as two artifacts but is one run: {run_ids:?}"
+    );
+
+    // The old aggregate-only run still contributes its percentile evidence,
+    // and the full report's per-run maximum survives the collapse.
+    let latency =
+        &proposals["proposals"]["availability.event_to_first_audio_within_target"]["latency"];
+    assert_eq!(latency["runs"], 2);
+    assert_eq!(latency["samples"], 6);
+    assert_eq!(latency["p95_ms"], 200, "worst observed percentile");
+    assert_eq!(
+        latency["max_ms"], 100,
+        "the full report's per-run maximum survives the collapse"
+    );
+    assert!(
+        proposals["limitations"]
+            .to_string()
+            .contains("aggregate-history shell"),
+        "the collapse is declared: {}",
+        proposals["limitations"]
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The full `slo-report` artifact for the run the aggregate history's first
+/// row also records, with session percentiles (80 / 100 / 100 over 3 samples)
+/// matching what `aggregate_row(_, _, 100)` says about that same run.
+fn overlapping_full_report(run_id: &str, commit: &str) -> String {
+    let metadata = ReproducibilityMetadata {
+        dataset_id: "starter-replay-comparison-v1".to_owned(),
+        git_commit: commit.to_owned(),
+        rust_toolchain: "rustc 1.98.1 (48a229cea 2026-09-01)".to_owned(),
+        bun_toolchain: None,
+        config_version: "replay-benchmark-v1".to_owned(),
+        asset_version: "starter-v1".to_owned(),
+        index_version: None,
+        jev_model: None,
+        thinking_model: None,
+        tts_model: None,
+        seed: 4242,
+        stream_duration_ms: Some(180_000),
+    };
+    let events = [60_u64, 80, 100]
+        .iter()
+        .enumerate()
+        .map(|(index, latency)| {
+            let mut event = EventObservation::new(
+                format!("evt-{index}"),
+                ComparisonMode::DeterministicOnly,
+                RouteClass::Deterministic,
+            );
+            event.routing_latency_us = 10;
+            event.cache_lookup = true;
+            event.cache_hit = true;
+            event.cache_level = Some(CacheLevel::Memory);
+            event.stream_offset_ms = Some((index as u64 + 1) * 1_000);
+            event.event_to_first_audio_ms = Some(*latency);
+            event
+        })
+        .collect();
+    let report = BenchmarkReport::from_events(metadata, ComparisonMode::DeterministicOnly, events)
+        .expect("benchmark report");
+    let slo = evaluate(
+        &report,
+        &SloTargets::default(),
+        SloEvaluationConfig {
+            run_id: Some(run_id.to_owned()),
+            ..SloEvaluationConfig::default()
+        },
+    )
+    .expect("SLO report");
+    serde_json::to_string_pretty(&slo).expect("serialized report")
+}
+
+#[test]
+fn rows_from_two_benchmark_suites_are_refused() {
+    // Two otherwise-identical rows differing only in benchmark_suite must not
+    // reach one pool as one calibration (review of PR #225).
+    let dir = temp_dir("suites");
+    let jsonl = dir.join("mixed-suites.jsonl");
+    let mut other: serde_json::Value =
+        serde_json::from_str(&aggregate_row("run-b", "bbbb2222", 200)).expect("json");
+    other["benchmark_suite"] = serde_json::json!("resource-soak");
+    fs::write(
+        &jsonl,
+        format!("{}\n{other}\n", aggregate_row("run-a", "aaaa1111", 100)),
+    )
+    .expect("history written");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_slo-baseline"))
+        .args(["--benchmark-history", jsonl.to_str().expect("utf8 path")])
+        .output()
+        .expect("slo-baseline runs");
+    assert!(!output.status.success(), "a foreign suite must fail closed");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("benchmark_suite"), "{stderr}");
+    assert!(stderr.contains("replay-comparison"), "{stderr}");
 
     let _ = fs::remove_dir_all(&dir);
 }

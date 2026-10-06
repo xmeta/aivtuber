@@ -17,6 +17,9 @@
 //!   repeat with *different* content fails closed, because `run_id` names the
 //!   run but not which attempt is newer, and the order files are passed in is
 //!   not provenance;
+//! * a run supplied as both a full report and its aggregate-history shell is
+//!   still one run: the pair collapses to the full report once their shared
+//!   identity and percentiles verify as agreeing, and fails closed otherwise;
 //! * fewer than [`MIN_BASELINE_RUNS`] distinct runs produce no proposals;
 //! * represented stream time is summed exactly (no per-run ceil).
 //!
@@ -42,7 +45,9 @@
 //! evidence — the measured numbers a probe boundary is chosen from — and no
 //! ratio, because the aggregate row carries no per-event denominators. A
 //! history of aggregates can therefore inform boundary selection but can never
-//! publish a citable `baseline` on its own.
+//! publish a citable `baseline` on its own. Rows must name the
+//! `replay-comparison` suite — the suite whose metric names the shell maps —
+//! so another suite's history fails closed instead of pooling here.
 
 #![forbid(unsafe_code)]
 
