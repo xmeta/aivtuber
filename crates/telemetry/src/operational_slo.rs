@@ -45,7 +45,9 @@ use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use crate::{BenchmarkReport, ComparisonMode, EventObservation, RouteClass, TelemetryError};
+use crate::{
+    BenchmarkReport, BenchmarkResult, ComparisonMode, EventObservation, RouteClass, TelemetryError,
+};
 
 /// Report contract version this module emits.
 pub const SLO_REPORT_SCHEMA_VERSION: &str = "1";
@@ -801,7 +803,12 @@ pub struct LatencyCalibration {
     pub p50_ms: u64,
     pub p95_ms: u64,
     pub p99_ms: u64,
-    pub max_ms: u64,
+    /// Worst observed sample, when the source artifact recorded one. `None`
+    /// means "not recorded" and is never rendered as zero: a #58 aggregate
+    /// history row carries percentiles but no per-run maximum, and inventing
+    /// one would be a measurement the run never made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_ms: Option<u64>,
 }
 
 /// Identity of one measured run a pooled baseline was computed from.
@@ -1727,6 +1734,137 @@ pub fn overall_verdict(indicators: &[SloIndicatorResult]) -> SloVerdict {
 // Baseline selection from a run history (#58 metrics -> #71 targets)
 // ---------------------------------------------------------------------------
 
+impl SloReport {
+    /// A percentile-only pooling shell built from one #58 aggregate history
+    /// row (`schemas/benchmark-result.schema.json`, the `benchmark-data`
+    /// branch's `data/<suite>.<series>.jsonl`).
+    ///
+    /// The aggregate row retains selected measured percentiles but *not* the
+    /// per-event denominators and classifications the operational indicators
+    /// are defined on (see "Where the history lives" in
+    /// docs/operational-slo.adoc), so the shell deliberately carries no
+    /// indicator rows, no windows, and no invariant tallies: it can feed the
+    /// target-free latency evidence a probe boundary is chosen from — never a
+    /// ratio, and never a citable `baseline`. The recorded invariant counters
+    /// are assertions, not measurements, and are dropped for exactly that
+    /// reason.
+    ///
+    /// Identity comes straight from the row (`recording.run_id`, revision,
+    /// and the #58 series fields), so [`BaselineProposalSet::from_reports`]
+    /// applies its usual rules — one series, distinct runs by identity, the
+    /// repeated-run floor — unchanged to a mixed or aggregate-only history.
+    pub fn from_benchmark_result(result: &BenchmarkResult) -> Result<Self, SloError> {
+        result
+            .validate()
+            .map_err(|error| SloError::new(format!("aggregate history row: {error}")))?;
+        let dataset_id = result
+            .dataset_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                SloError::new(
+                    "aggregate history row carries no dataset_id, so it belongs to no #58 \
+                     compatibility series and is not calibration evidence"
+                        .to_owned(),
+                )
+            })?
+            .to_owned();
+        let run_id = result
+            .recording
+            .as_ref()
+            .map(|recording| recording.run_id.trim())
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                SloError::new(
+                    "aggregate history row carries no recording.run_id, so it is a measurement \
+                     but not calibration evidence; append it through the #58 history recorder, \
+                     which stamps the run identity (#58 recording.run_id semantics)"
+                        .to_owned(),
+                )
+            })?;
+        let mode = ComparisonMode::ALL
+            .into_iter()
+            .find(|mode| mode.as_str() == result.mode)
+            .ok_or_else(|| {
+                SloError::new(format!(
+                    "aggregate history row mode {:?} carries no operational latency series this \
+                     catalog reports on (one of: {}), so it cannot feed SLO baseline selection",
+                    result.mode,
+                    ComparisonMode::ALL
+                        .iter()
+                        .map(|mode| mode.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })?;
+
+        let percentile = |name: &str| -> Option<(u64, u64)> {
+            result.metrics.get(name).map(|metric| {
+                (
+                    metric.value.round() as u64,
+                    metric.sample_count.unwrap_or(0),
+                )
+            })
+        };
+        // Only the first-audio percentiles are complete in the aggregate row
+        // (p50/p95/p99 together). The first-visible column records p95 alone,
+        // and a percentile the row does not carry is left absent rather than
+        // guessed; that ceiling is documented in docs/operational-slo.adoc.
+        let mut latency_calibration = Vec::new();
+        if let (Some((p50_ms, _)), Some((p95_ms, samples)), Some((p99_ms, _))) = (
+            percentile("cached.first_audio.p50_ms"),
+            percentile("cached.first_audio.p95_ms"),
+            percentile("cached.first_audio.p99_ms"),
+        ) {
+            latency_calibration.push(LatencyCalibration {
+                indicator: "availability.event_to_first_audio_within_target".to_owned(),
+                window: "session".to_owned(),
+                field: "event_to_first_audio_ms".to_owned(),
+                samples,
+                p50_ms,
+                p95_ms,
+                p99_ms,
+                max_ms: None,
+            });
+        }
+
+        Ok(Self {
+            schema_version: SLO_REPORT_SCHEMA_VERSION.to_owned(),
+            catalog_version: SLO_CATALOG_VERSION.to_owned(),
+            counts_toward_active_slo: true,
+            source: SloSource {
+                dataset_id,
+                git_commit: result.git.commit.clone(),
+                mode,
+                config_version: result.configuration.config_version.clone(),
+                seed: result.configuration.seed,
+                stream_duration_ms: result.configuration.stream_duration_ms,
+                source_digest: None,
+                provenance: SloProvenance::ReplayFixture,
+                plane: TrafficPlane::Active,
+                run_id: Some(run_id),
+            },
+            windows: Vec::new(),
+            indicators: Vec::new(),
+            latency_calibration,
+            error_budgets: Vec::new(),
+            failure_attribution: AttributionSummary::default(),
+            aar_candidates: Vec::new(),
+            uncalibrated: Vec::new(),
+            not_yet_measured: Vec::new(),
+            limitations: vec![
+                "aggregate #58 history row: a percentile-only shell — it carries no per-event \
+                 denominators, so it contributes latency calibration evidence only and never a \
+                 ratio or a citable baseline"
+                    .to_owned(),
+            ],
+            verdict: SloVerdict::Uncalibrated,
+        })
+    }
+}
+
 /// Target-free latency evidence pooled across a run history.
 ///
 /// The artifact carries per-run percentiles, not raw samples, so a pooled
@@ -1740,7 +1878,11 @@ pub struct BaselineLatency {
     pub samples: u64,
     pub p95_ms: u64,
     pub p99_ms: u64,
-    pub max_ms: u64,
+    /// Worst observed maximum across contributing runs, or `None` when the
+    /// history carried no per-run maximum (a #58 aggregate row). Rendered `-`
+    /// rather than a fabricated zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_ms: Option<u64>,
 }
 
 /// Pooled calibration evidence for one indicator over a history of runs.
@@ -1785,7 +1927,7 @@ struct LatencyPool {
     samples: u64,
     p95_ms: u64,
     p99_ms: u64,
-    max_ms: u64,
+    max_ms: Option<u64>,
 }
 
 /// Internal accumulator for one indicator's pooled denominators plus the
@@ -2186,7 +2328,9 @@ impl BaselineProposalSet {
                 entry.samples += point.samples;
                 entry.p95_ms = entry.p95_ms.max(point.p95_ms);
                 entry.p99_ms = entry.p99_ms.max(point.p99_ms);
-                entry.max_ms = entry.max_ms.max(point.max_ms);
+                if let Some(max_ms) = point.max_ms {
+                    entry.max_ms = Some(entry.max_ms.map_or(max_ms, |current| current.max(max_ms)));
+                }
             }
         }
 
@@ -2429,10 +2573,11 @@ impl BaselineProposalSet {
                 .latency
                 .as_ref()
                 .map(|latency| {
-                    format!(
-                        "{} / {} / {}",
-                        latency.p95_ms, latency.p99_ms, latency.max_ms
-                    )
+                    let max = latency
+                        .max_ms
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_owned());
+                    format!("{} / {} / {max}", latency.p95_ms, latency.p99_ms)
                 })
                 .unwrap_or_else(|| "-".to_owned());
             out.push_str(&format!(
@@ -2751,7 +2896,7 @@ fn latency_calibration_for(
                 p50_ms: nearest_rank(&values, 50),
                 p95_ms: nearest_rank(&values, 95),
                 p99_ms: nearest_rank(&values, 99),
-                max_ms: values.last().copied().unwrap_or(0),
+                max_ms: Some(values.last().copied().unwrap_or(0)),
             }
         })
         .collect()

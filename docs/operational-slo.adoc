@@ -454,6 +454,22 @@ it after the fact. Both histories are written from the same measured run and
 keyed on the same compatibility series, which is what makes the trend history
 and the calibration history comparable.
 
+What the aggregate history *can* feed, it now feeds directly:
+`--benchmark-history data/<suite>.<series>.jsonl` on `slo-baseline` pools each
+row as a percentile-only shell (`SloReport::from_benchmark_result`), so the
+target-free first-audio percentiles of every recorded run inform the choice of
+probe boundary — the repeated runs behind the #58 `trends/` become
+boundary-selection evidence without re-running anything. The shell carries no
+indicator rows, so this path can never publish a ratio or a citable
+`baseline`: pooled aggregates report latency percentiles and `not_measured`
+for every other objective, and the proposal gains a `limitations` entry
+naming the aggregate contribution. Identity comes from the row itself
+(`recording.run_id`, revision, and the series fields), so one series, distinct
+runs, and the repeated-run floor apply exactly as they do to full reports.
+The aggregate row also records `first_visible` p95 alone — without p50/p99 —
+so first-visible calibration still waits on full reports; that ceiling is the
+recorded metric set, not the pooling.
+
 Retrieve it the way any branch is retrieved, then pool one leaf directory:
 
 [source,shell]
