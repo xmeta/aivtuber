@@ -42,7 +42,11 @@ Do not invent absolute targets without baseline data. The process is:
   results on the `benchmark-data` branch (one JSONL line per result, keyed
   by suite/mode/commit/run). Repeated nightly runs of an unchanged revision
   accumulate as distinct rows — they are the variance signal; only a retry
-  of the same run (`recording.run_id`) replaces its earlier row.
+  of the same run (`recording.run_id`) replaces its earlier row. The same
+  identity rule governs the operational SLO history (#71): `slo-report
+  --run-id` stamps each report and `slo-baseline` counts runs by that
+  identity alone, never by report content, because two independent
+  deterministic runs of one revision produce byte-identical reports.
 . After enough stable runs (target: 10+ nightly runs for the resource tier),
   read `trends/<suite>.<series>.md`, estimate normal runner variance per
   metric, and publish the baseline in this document. Series are split on the

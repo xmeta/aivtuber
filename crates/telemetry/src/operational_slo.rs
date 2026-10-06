@@ -40,7 +40,9 @@
 //! runtime still produced no user-visible output). See [`attribution_of`].
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use sha2::{Digest, Sha256};
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::{BenchmarkReport, ComparisonMode, EventObservation, RouteClass, TelemetryError};
@@ -62,6 +64,18 @@ pub const DEFAULT_ROLLING_WINDOW_HOURS: u32 = 3;
 /// Default number of consecutive missed windows before a miss becomes a
 /// candidate for the after-action review process (#62).
 pub const DEFAULT_PERSISTENT_MISS_WINDOWS: u64 = 3;
+
+/// Minimum number of *distinct* active-plane runs a history must contain before
+/// it may produce baseline evidence. One run calibrates nothing, and a run
+/// identity seen twice (a retry, or the same artifact passed twice) is not a
+/// second run.
+pub const MIN_BASELINE_RUNS: u64 = 2;
+
+/// Reserved prefix marking a probe placeholder in
+/// [`SloTarget::threshold_probe`]. [`SloTargets::validate`] refuses it, so a
+/// probed boundary can never be written into a targets file as if it were
+/// calibration evidence.
+pub const PROBE_SOURCE_MARKER: &str = "latency probe;";
 
 /// Traffic plane the evaluation belongs to.
 ///
@@ -790,6 +804,19 @@ pub struct LatencyCalibration {
     pub max_ms: u64,
 }
 
+/// Identity of one measured run a pooled baseline was computed from.
+///
+/// `run_id` carries #58's `recording.run_id` semantics: stable across retries
+/// of one run, distinct across distinct runs. The revision travels per run
+/// because one series may pool runs built from more than one commit; dataset,
+/// config, mode and seed are pinned by the series the evidence names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BaselineRun {
+    pub run_id: String,
+    pub git_commit: String,
+}
+
 /// Measured evidence a target was calibrated from.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -801,6 +828,17 @@ pub struct BaselineEvidence {
     /// Represented stream hours the calibration evidence covers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_hours: Option<u64>,
+    /// The #58 compatibility series (`mode|dataset_id|config_version|seed`) the
+    /// evidence belongs to. It is carried in the evidence itself because this
+    /// block is the part a reviewer copies into a durable target: the proposal's
+    /// top-level series is gone once the block is copied out of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub series: Option<String>,
+    /// The runs the value was pooled from. A target has to be able to prove
+    /// *which* repeated runs formed its baseline, so the identities travel with
+    /// the evidence, not merely alongside it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<BaselineRun>,
 }
 
 /// One calibrated objective.
@@ -814,6 +852,26 @@ pub struct SloTarget {
     pub threshold_ms: Option<u64>,
     /// The measurement the target was chosen from. Required.
     pub baseline: BaselineEvidence,
+}
+
+impl SloTarget {
+    /// A threshold-only target used to *measure* a candidate latency boundary
+    /// during calibration (the probe step). It is not a calibrated objective:
+    /// it carries no measured baseline and must never be written into a targets
+    /// file — [`SloTargets::validate`] would refuse it, which is the point.
+    pub fn threshold_probe(threshold_ms: u64) -> Self {
+        Self {
+            target: 1.0,
+            threshold_ms: Some(threshold_ms),
+            baseline: BaselineEvidence {
+                value: 0.0,
+                source: format!("{PROBE_SOURCE_MARKER} not calibration evidence"),
+                stream_hours: None,
+                series: None,
+                runs: Vec::new(),
+            },
+        }
+    }
 }
 
 /// Repository-controlled operational targets, reviewed like code.
@@ -848,7 +906,21 @@ impl SloTargets {
     }
 
     /// Reject a target file that cannot be trusted to describe this catalog.
+    ///
+    /// `allow_probe: true` is the measurement path (`slo-report --probe-latency`):
+    /// a [`SloTarget::threshold_probe`] is the *tool* that measures a candidate
+    /// boundary, so it may drive an evaluation, but it can never pass a targets
+    /// file — the default `allow_probe: false` — because a probe is not
+    /// calibration evidence.
+    pub fn validate_for_evaluation(&self, catalog: &[SloIndicator]) -> Result<(), SloError> {
+        self.validate_inner(catalog, true)
+    }
+
     pub fn validate(&self, catalog: &[SloIndicator]) -> Result<(), SloError> {
+        self.validate_inner(catalog, false)
+    }
+
+    fn validate_inner(&self, catalog: &[SloIndicator], allow_probe: bool) -> Result<(), SloError> {
         if self.catalog_version != SLO_CATALOG_VERSION {
             return Err(SloError::new(format!(
                 "target file targets catalog {:?} but this build implements {:?}; a threshold \
@@ -912,6 +984,71 @@ impl SloTargets {
                     "target {id:?} must cite the measured artifact it was calibrated from"
                 )));
             }
+            // The probe placeholder is a measurement *tool*, never evidence: a
+            // targets file carrying one has skipped the measured-ratio step.
+            let probe = target.baseline.source.starts_with(PROBE_SOURCE_MARKER);
+            if !allow_probe && probe {
+                return Err(SloError::new(format!(
+                    "target {id:?} cites a latency probe, not calibration evidence; measure the \
+                     candidate boundary over a run history first (slo-report with the probe target, \
+                     then slo-baseline over the probed reports)"
+                )));
+            }
+            // Everything a *calibrated* target must prove about the evidence it
+            // cites. The proposal generates all of this; a probe is the tool
+            // that produces it and is the one shape exempt (it only reaches
+            // here on the measurement path, above). Without these checks a
+            // target could carry a hand-written `source` string and no measured
+            // history at all, which is a bypass around the whole evidence chain
+            // this contract exists to build: `source` merely has to be
+            // non-empty, and the runner manifest, series, and revision would
+            // all be optional.
+            if !probe {
+                let series = target
+                    .baseline
+                    .series
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or_default();
+                if series.is_empty() {
+                    return Err(SloError::new(format!(
+                        "target {id:?} baseline names no #58 compatibility series; a ratio \
+                         measured outside a known mode+dataset_id+config_version+seed series is \
+                         evidence about no particular workload"
+                    )));
+                }
+                let mut named: BTreeSet<&str> = BTreeSet::new();
+                for run in &target.baseline.runs {
+                    let run_id = run.run_id.trim();
+                    if run_id.is_empty() {
+                        return Err(SloError::new(format!(
+                            "target {id:?} baseline cites a contributing run with an empty run \
+                             identity; a run that cannot be named is not evidence"
+                        )));
+                    }
+                    if run.git_commit.trim().is_empty() {
+                        return Err(SloError::new(format!(
+                            "target {id:?} baseline cites run {run_id:?} without a revision; \
+                             evidence whose revision is unknown cannot be re-measured or audited"
+                        )));
+                    }
+                    if !named.insert(run_id) {
+                        return Err(SloError::new(format!(
+                            "target {id:?} baseline names run {run_id:?} more than once; repeated \
+                             artifacts of one run are one measurement, so a run identity counts \
+                             exactly one contribution"
+                        )));
+                    }
+                }
+                if (target.baseline.runs.len() as u64) < MIN_BASELINE_RUNS {
+                    return Err(SloError::new(format!(
+                        "target {id:?} baseline names {} contributing run(s); calibration \
+                         evidence needs at least {MIN_BASELINE_RUNS} distinct measured runs, \
+                         because one run is a data point and not a baseline",
+                        target.baseline.runs.len()
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -943,13 +1080,18 @@ impl SloProvenance {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SloEvaluationConfig {
     pub plane: TrafficPlane,
     pub provenance: SloProvenance,
     pub rolling_window_hours: u32,
     pub persistent_miss_windows: u64,
+    /// Stable identity of the run this artifact measured, with the same
+    /// semantics as #58's `recording.run_id`: stable across retries of one run,
+    /// distinct across distinct runs ([`SloSource::run_id`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 impl Default for SloEvaluationConfig {
@@ -959,6 +1101,7 @@ impl Default for SloEvaluationConfig {
             provenance: SloProvenance::ReplayFixture,
             rolling_window_hours: DEFAULT_ROLLING_WINDOW_HOURS,
             persistent_miss_windows: DEFAULT_PERSISTENT_MISS_WINDOWS,
+            run_id: None,
         }
     }
 }
@@ -972,8 +1115,33 @@ pub struct SloSource {
     pub config_version: String,
     pub seed: u64,
     pub stream_duration_ms: Option<u64>,
+    /// SHA-256 over the canonical (recursively key-sorted) JSON of the replay
+    /// report this one was evaluated from.
+    ///
+    /// The #58 series fields and the revision say *which workload* a run
+    /// belongs to; they cannot say *which artifact* produced it, because two
+    /// different observations of one revision, series, and duration are
+    /// indistinguishable without it. This is what makes the pairing a stored
+    /// report claims verifiable rather than assumed: the latency probe
+    /// re-evaluates the source artifact, so a report paired with anything but
+    /// the artifact it names could yield a ratio that run never measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_digest: Option<String>,
     pub provenance: SloProvenance,
     pub plane: TrafficPlane,
+    /// Stable identity of the run this report measured, with the semantics #58
+    /// already uses for `recording.run_id`: stable across retries of one run,
+    /// distinct across distinct runs.
+    ///
+    /// It is the *only* run identity calibration pooling accepts. Report
+    /// content cannot stand in for it: two independent deterministic runs of
+    /// one revision produce byte-identical reports, so payload equality would
+    /// collapse two measurements into one, while a retry can differ in content
+    /// and would be counted twice. `None` means "a measurement, but not a
+    /// calibratable run"; [`BaselineProposalSet::from_reports`] refuses such a
+    /// report rather than guessing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 /// One reporting window and the observations that fell inside it.
@@ -1178,6 +1346,207 @@ impl SloReport {
     }
 }
 
+/// SHA-256 over the canonical (recursively key-sorted) JSON of the
+/// replay report, recorded as [`SloSource::source_digest`].
+///
+/// The digest names the *artifact* the evaluation consumed. The #58
+/// series fields say which workload a run belongs to, but two different
+/// observations of one revision, series and duration are
+/// indistinguishable without it: the latency probe verifies a stored
+/// report's pairing by re-evaluating the artifact it claims to come
+/// from, so a report paired with anything but the artifact it names
+/// could yield a ratio that run never measured.
+///
+/// The canonical form is defined so a verifier holding only the stored
+/// JSON document — `scripts/slo-record.mjs`, in JavaScript — can
+/// recompute it byte-for-byte without this crate:
+///
+/// - object keys are sorted recursively and explicitly, so the form
+///   depends on content, not on struct declaration order or on
+///   serde_json's map backing (nothing here leans on the absence of
+///   `preserve_order`);
+/// - numbers are rendered exactly as ECMAScript renders them
+///   (`JSON.stringify`): integer-backed values plain, floats by
+///   shortest round-trip digits with no trailing `.0` and JS exponent
+///   thresholds. serde_json would write `1.0` where ECMAScript writes
+///   `1`, and a parsed document cannot tell an integral float from an
+///   integer, so *this* side adopts ECMAScript's rendering — the type
+///   distinction serde_json keeps is erased exactly where JSON
+///   parsing erases it;
+/// - strings, booleans and null use serde_json's standard escapes,
+///   which coincide with `JSON.stringify` for every valid UTF-8
+///   document.
+fn source_digest_of(report: &BenchmarkReport) -> Result<String, SloError> {
+    let value = serde_json::to_value(report)
+        .map_err(|error| SloError::new(format!("canonicalize report: {error}")))?;
+    Ok(canonical_digest(&value))
+}
+
+/// Digest of one JSON value in the canonical form [`source_digest_of`]
+/// documents. Split out so the contract can be pinned against
+/// ECMAScript's own rendering in tests without building a full report.
+fn canonical_digest(value: &serde_json::Value) -> String {
+    let mut canonical = String::new();
+    write_canonical(value, &mut canonical);
+    let digest = Sha256::digest(canonical.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Render one JSON value in the canonical form: object keys sorted
+/// (explicitly, never trusting serde_json's map implementation), array
+/// order preserved because it is content, not layout.
+fn write_canonical(value: &serde_json::Value, out: &mut String) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+            entries.sort_by(|left, right| left.0.cmp(right.0));
+            out.push('{');
+            for (index, (key, item)) in entries.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::to_string(*key).expect("a map key serializes"));
+                out.push(':');
+                write_canonical(item, out);
+            }
+            out.push('}');
+        }
+        serde_json::Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_canonical(item, out);
+            }
+            out.push(']');
+        }
+        serde_json::Value::String(string) => {
+            out.push_str(&serde_json::to_string(string).expect("a string serializes"));
+        }
+        serde_json::Value::Number(number) => write_canonical_number(number, out),
+        serde_json::Value::Bool(true) => out.push_str("true"),
+        serde_json::Value::Bool(false) => out.push_str("false"),
+        serde_json::Value::Null => out.push_str("null"),
+    }
+}
+
+/// Integer-backed numbers keep serde_json's plain digits — the same
+/// digits ECMAScript prints. Floats take the ECMAScript rendering.
+fn write_canonical_number(number: &serde_json::Number, out: &mut String) {
+    if let Some(unsigned) = number.as_u64() {
+        out.push_str(&unsigned.to_string());
+    } else if let Some(signed) = number.as_i64() {
+        out.push_str(&signed.to_string());
+    } else if let Some(float) = number.as_f64() {
+        write_canonical_f64(float, out);
+    }
+}
+
+/// ECMAScript `Number::toString` for one finite float: shortest
+/// round-trip digits, decimal notation for `1e-6 ≤ |value| < 1e21`,
+/// exponential `1e+21` / `1e-7` outside, never a trailing `.0`, and
+/// `-0.0` collapsing to `0` exactly as `String(-0)` does.
+fn write_canonical_f64(value: f64, out: &mut String) {
+    if value == 0.0 {
+        out.push('0');
+        return;
+    }
+    if !value.is_finite() {
+        // serde_json renders non-finite floats as `null`; a verifier
+        // reading the stored document sees `null` too, so `null` is the
+        // consistent canonical rendering on this side as well.
+        out.push_str("null");
+        return;
+    }
+    let (digits, exponent) = shortest_digits(value.abs());
+    if value < 0.0 {
+        out.push('-');
+    }
+    write_ecmascript_digits(&digits, exponent, out);
+}
+
+/// Shortest round-trip decimal digits of a positive finite float, with
+/// the decimal exponent `n` such that the value equals `0.<digits> ×
+/// 10^n`. The digits come from serde_json's own ryu rendering — never
+/// recomputed here — so this side and the stored document can never
+/// disagree about *which* digits are shortest; only their placement is
+/// rewritten into ECMAScript's notation.
+fn shortest_digits(value: f64) -> (Vec<u8>, i32) {
+    let rendered = serde_json::to_string(&value).expect("a float serializes");
+    let (mantissa, exponent) = match rendered.split_once('e') {
+        Some((mantissa, exponent)) => (
+            mantissa,
+            exponent
+                .parse::<i32>()
+                .expect("ryu writes a plain decimal exponent"),
+        ),
+        None => (rendered.as_str(), 0),
+    };
+    let (integer, fraction) = match mantissa.split_once('.') {
+        Some((integer, fraction)) => (integer, fraction),
+        None => (mantissa, ""),
+    };
+    // value = <all digits as an integer> × 10^scale, then normalize to
+    // shortest significant digits, adjusting the scale per digit lost.
+    let mut digits: Vec<u8> = integer
+        .bytes()
+        .chain(fraction.bytes())
+        .map(|byte| byte - b'0')
+        .collect();
+    let mut scale = exponent - fraction.len() as i32;
+    while digits.len() > 1 && digits[0] == 0 {
+        digits.remove(0);
+    }
+    while digits.len() > 1 && *digits.last().expect("digits is non-empty") == 0 {
+        digits.pop();
+        scale += 1;
+    }
+    let exponent = scale + digits.len() as i32;
+    (digits, exponent)
+}
+
+/// ECMAScript `Number::toString` placement rules for shortest digits
+/// `s` (length `k`) with value `0.s × 10^n`.
+fn write_ecmascript_digits(digits: &[u8], exponent: i32, out: &mut String) {
+    let significand: String = digits
+        .iter()
+        .map(|digit| char::from(b'0' + digit))
+        .collect();
+    let count = digits.len() as i32;
+    if count <= exponent && exponent <= 21 {
+        // s followed by n−k zeros
+        out.push_str(&significand);
+        for _ in 0..(exponent - count) {
+            out.push('0');
+        }
+    } else if 0 < exponent && exponent <= count {
+        // decimal point inside the digits
+        let point = exponent as usize;
+        out.push_str(&significand[..point]);
+        out.push('.');
+        out.push_str(&significand[point..]);
+    } else if -6 < exponent && exponent <= 0 {
+        // 0. + (−n zeros) + s
+        out.push_str("0.");
+        for _ in 0..(-exponent) {
+            out.push('0');
+        }
+        out.push_str(&significand);
+    } else {
+        // d[.ddd]e±(n−1)
+        out.push_str(&significand[..1]);
+        if count > 1 {
+            out.push('.');
+            out.push_str(&significand[1..]);
+        }
+        out.push('e');
+        let power = exponent - 1;
+        out.push(if power < 0 { '-' } else { '+' });
+        out.push_str(&power.abs().to_string());
+    }
+}
+
 /// Evaluate one benchmark report into an operational SLO report.
 pub fn evaluate(
     report: &BenchmarkReport,
@@ -1185,9 +1554,11 @@ pub fn evaluate(
     config: SloEvaluationConfig,
 ) -> Result<SloReport, SloError> {
     let catalog = catalog();
-    targets.validate(&catalog)?;
+    // The evaluation path accepts a probe target (that is how a candidate
+    // boundary gets measured); the targets-file path does not.
+    targets.validate_for_evaluation(&catalog)?;
 
-    let windows = build_windows(report, config);
+    let windows = build_windows(report, &config);
     let events = report.events.as_slice();
 
     let mut indicators = Vec::new();
@@ -1299,8 +1670,10 @@ pub fn evaluate(
             config_version: report.metadata.config_version.clone(),
             seed: report.metadata.seed,
             stream_duration_ms: report.metadata.stream_duration_ms,
+            source_digest: Some(source_digest_of(report)?),
             provenance: config.provenance,
             plane: config.plane,
+            run_id: config.run_id.clone(),
         },
         windows,
         latency_calibration,
@@ -1348,6 +1721,765 @@ pub fn overall_verdict(indicators: &[SloIndicatorResult]) -> SloVerdict {
     } else {
         SloVerdict::Uncalibrated
     }
+}
+
+// ---------------------------------------------------------------------------
+// Baseline selection from a run history (#58 metrics -> #71 targets)
+// ---------------------------------------------------------------------------
+
+/// Target-free latency evidence pooled across a run history.
+///
+/// The artifact carries per-run percentiles, not raw samples, so a pooled
+/// percentile cannot be reconstructed. A threshold chosen for a latency
+/// objective has to hold for *every* run in the history, so the worst observed
+/// percentile is the conservative evidence rather than the median run's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BaselineLatency {
+    pub field: String,
+    pub runs: u64,
+    pub samples: u64,
+    pub p95_ms: u64,
+    pub p99_ms: u64,
+    pub max_ms: u64,
+}
+
+/// Pooled calibration evidence for one indicator over a history of runs.
+///
+/// This is deliberately *not* a target. It publishes the measured evidence a
+/// target is chosen from, in the `BaselineEvidence` shape a target entry has to
+/// cite, so choosing a target is a documented product decision above the
+/// measurement rather than a number the fixture happened to produce.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BaselineProposal {
+    pub indicator: String,
+    /// Window series pooled. Always `session`: stream-hour and rolling windows
+    /// partition the same run, so pooling them would count every event once per
+    /// window it appears in.
+    pub window: String,
+    /// Number of contributing runs that carried eligible evidence.
+    pub runs: u64,
+    /// Pooled session denominator (ratio objectives only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eligible: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conforming: Option<u64>,
+    /// For a latency objective whose ratio was *measured* at a candidate
+    /// boundary (the probe step), the threshold in ms the pooled ratio was
+    /// computed at. A ratio is only comparable within one boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold_ms: Option<u64>,
+    /// Pooled measured ratio, ready to paste into a target entry as its
+    /// `baseline`. The target ratio itself remains a product decision made
+    /// *above* this value, not equal to it by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<BaselineEvidence>,
+    /// Target-free latency percentiles; a `threshold_ms` is chosen from these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency: Option<BaselineLatency>,
+}
+
+/// Internal accumulator for pooled latency percentiles across contributing runs.
+#[derive(Default)]
+struct LatencyPool {
+    runs: u64,
+    samples: u64,
+    p95_ms: u64,
+    p99_ms: u64,
+    max_ms: u64,
+}
+
+/// Internal accumulator for one indicator's pooled denominators plus the
+/// provenance of exactly the runs that produced them.
+///
+/// Provenance is tracked per indicator, not per history: a run with an empty
+/// denominator for an indicator contributed no evidence for it, so listing it
+/// would let one measured run satisfy the repeated-run floor.
+#[derive(Default)]
+struct RatioPool {
+    runs: u64,
+    eligible: u64,
+    conforming: u64,
+    contributors: Vec<BaselineRun>,
+    represented_ms: u64,
+    without_duration: u64,
+}
+
+impl RatioPool {
+    fn add(&mut self, run: BaselineRun, stream_duration_ms: Option<u64>, row: &SloIndicatorResult) {
+        self.runs += 1;
+        self.eligible = self.eligible.saturating_add(row.eligible);
+        self.conforming = self.conforming.saturating_add(row.conforming);
+        match stream_duration_ms {
+            Some(ms) => self.represented_ms = self.represented_ms.saturating_add(ms),
+            None => self.without_duration += 1,
+        }
+        self.contributors.push(run);
+    }
+}
+
+/// Calibration evidence pooled from a history of SLO reports (#58 history).
+///
+/// This is the missing link the issue names: repeated measured runs, not a
+/// single one, are what turn a measurement into a baseline. It reads the
+/// per-run SLO reports the project already produces and pools them, so a target
+/// can be chosen from evidence instead of invented.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BaselineProposalSet {
+    pub schema_version: String,
+    pub catalog_version: String,
+    pub reports: u64,
+    pub contributing_reports: u64,
+    /// Input reports that repeated a run identity already in the history with
+    /// identical content: the same artifact passed twice, or a byte-identical
+    /// retry. They carry no second measurement. A repeat of a run identity with
+    /// *different* content is refused instead of pooled.
+    #[serde(default)]
+    pub duplicate_reports: u64,
+    pub excluded_experimental_reports: u64,
+    /// The #58 compatibility series every contributing run belongs to:
+    /// `mode|dataset_id|config_version|seed`. Pooled evidence is only valid
+    /// within one series; the field names it so the boundary is auditable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub series: Option<String>,
+    pub revisions: Vec<String>,
+    pub datasets: Vec<String>,
+    /// Identity of every contributing run, sorted by run id. The same manifest
+    /// is embedded in each proposal's [`BaselineEvidence`], so it survives the
+    /// copy into a target.
+    #[serde(default)]
+    pub contributing_runs: Vec<BaselineRun>,
+    pub proposals: BTreeMap<String, BaselineProposal>,
+    /// Objectives with no eligible evidence in any contributing run.
+    pub not_measured: Vec<String>,
+    pub limitations: Vec<String>,
+}
+
+impl BaselineProposalSet {
+    /// Pool a history of SLO reports into per-indicator calibration evidence.
+    ///
+    /// The rules a history must satisfy, each enforced rather than assumed:
+    ///
+    /// * **One compatibility series.** Reports from different
+    ///   `mode + dataset_id + config_version + seed` series are the boundary
+    ///   docs/performance-goals.adoc[#58] defines and are refused, not merged:
+    ///   values written against a different workload/configuration are not
+    ///   evidence about this one.
+    /// * **One report contract.** A `schema_version` this build does not emit
+    ///   fails closed, exactly like a target file for another contract.
+    /// * **Distinct runs by identity, never by payload.** A run is identified
+    ///   by [`SloSource::run_id`], the #58 `recording.run_id` semantics: two
+    ///   independent deterministic runs of one revision produce byte-identical
+    ///   reports and are two measurements, while a retry of one run is one
+    ///   measurement however its numbers came out. A report with no run
+    ///   identity is refused, because content cannot be used to infer one.
+    ///   Repeated artifacts for one run identity collapse to that run when they
+    ///   agree; when they *disagree* the history fails closed, because `run_id`
+    ///   names the run but not which attempt is newer, and argument order is not
+    ///   provenance. Fewer than [`MIN_BASELINE_RUNS`] distinct runs produce no
+    ///   proposals at all, since one run calibrates nothing.
+    /// * **Provenance per indicator, not per history.** A run whose denominator
+    ///   is empty for one indicator contributed no evidence for it, so the
+    ///   manifest and the coverage attached to that indicator's evidence name
+    ///   exactly the runs that produced eligible observations for *it*. An
+    ///   indicator pooled from fewer than [`MIN_BASELINE_RUNS`] such runs
+    ///   publishes no [`BaselineEvidence`] at all, however many runs the
+    ///   history contains — including a probed latency boundary, where only
+    ///   runs with eligible samples at the candidate count. Publishing the
+    ///   whole history's manifest there would let one measured run satisfy the
+    ///   repeated-run floor the evidence exists to enforce.
+    /// * **Exact time.** Represented time is summed exactly over an
+    ///   indicator's contributing runs; a partial hour never rounds up to one.
+    ///   Sub-hour evidence omits `stream_hours` instead of claiming an hour it
+    ///   did not stand for.
+    ///
+    /// Only `active`-plane reports contribute: an experimental route must not
+    /// move the active baseline any more than it may move the active SLO.
+    pub fn from_reports(reports: &[SloReport]) -> Result<Self, SloError> {
+        for report in reports {
+            if report.schema_version != SLO_REPORT_SCHEMA_VERSION {
+                return Err(SloError::new(format!(
+                    "report for dataset {:?} declares schema {:?} but this build emits \
+                     {:?}; pooling a report written for another contract fails closed",
+                    report.source.dataset_id, report.schema_version, SLO_REPORT_SCHEMA_VERSION
+                )));
+            }
+            if report.catalog_version != SLO_CATALOG_VERSION {
+                return Err(SloError::new(format!(
+                    "report for dataset {:?} was evaluated against catalog {:?} but this build \
+                     implements {:?}; pooling values written against different indicator \
+                     definitions is not comparable",
+                    report.source.dataset_id, report.catalog_version, SLO_CATALOG_VERSION
+                )));
+            }
+            match report.source.run_id.as_deref().map(str::trim) {
+                Some(run_id) if !run_id.is_empty() => {}
+                _ => {
+                    return Err(SloError::new(format!(
+                        "report for dataset {:?} carries no run identity, so it is a measurement \
+                         but not calibration evidence; regenerate it with `slo-report --run-id \
+                         <stable-id>` (#58 `recording.run_id` semantics: stable across retries of \
+                         one run, distinct across distinct runs), because two independent runs can \
+                         produce identical reports and content can never stand in for identity",
+                        report.source.dataset_id
+                    )));
+                }
+            }
+        }
+
+        // A series is #58's compatibility boundary. Everything pooled must sit
+        // inside one, or the pooled value describes no workload at all.
+        let series_key = |report: &SloReport| {
+            format!(
+                "{}|{}|{}|{}",
+                report.source.mode.as_str(),
+                report.source.dataset_id,
+                report.source.config_version,
+                report.source.seed
+            )
+        };
+        let mut series: Option<String> = None;
+        for report in reports {
+            if !report.counts_toward_active_slo {
+                continue;
+            }
+            let key = series_key(report);
+            match &series {
+                None => series = Some(key),
+                Some(first) if *first == key => {}
+                Some(first) => {
+                    return Err(SloError::new(format!(
+                        "the history spans more than one compatibility series ({first:?} vs \
+                         {key:?}); a baseline is only valid within one \
+                         mode+dataset_id+config_version+seed series, so pool one series at a time"
+                    )));
+                }
+            }
+        }
+
+        // Distinct-run detection is by run identity, never by payload. Two
+        // independent deterministic runs of one revision produce identical
+        // reports, and a retry of one run can produce a different one, so
+        // content decides neither question. Content equality is used only to
+        // recognise an identical repeat of one run; a *conflicting* repeat is
+        // refused, never resolved (see below).
+        let canonical_json = |report: &SloReport| -> Result<String, SloError> {
+            serde_json::to_string(report)
+                .map_err(|error| SloError::new(format!("canonicalize report: {error}")))
+        };
+        // run identity -> canonical payload of the artifact accepted for it
+        let mut accepted: BTreeMap<String, String> = BTreeMap::new();
+        let mut distinct: Vec<&SloReport> = Vec::new();
+        let mut duplicate_reports = 0_u64;
+        let mut excluded_experimental = 0_u64;
+        for report in reports {
+            if !report.counts_toward_active_slo {
+                excluded_experimental += 1;
+                continue;
+            }
+            let run_id = report
+                .source
+                .run_id
+                .as_deref()
+                .expect("every report's run identity was required above")
+                .trim()
+                .to_owned();
+            let canonical = canonical_json(report)?;
+            match accepted.entry(run_id) {
+                Entry::Occupied(occupied) => {
+                    // The same run identity with identical content is one run
+                    // measured twice: a double-passed file or a byte-identical
+                    // retry, which carries no second measurement.
+                    if *occupied.get() == canonical {
+                        duplicate_reports += 1;
+                        continue;
+                    }
+                    // Two attempts of one run disagree. `run_id` says they are
+                    // the same logical run; it does not say which attempt is
+                    // newer, and the order in which paths reach this function is
+                    // not provenance. Choosing the last one would make durable
+                    // calibration evidence a function of filesystem/glob/argv
+                    // ordering, so pooling fails closed instead: the operator
+                    // names the authoritative artifact explicitly.
+                    return Err(SloError::new(format!(
+                        "run identity {:?} appears twice with different measurements; the two \
+                         artifacts are attempts of one run and carry no authoritative ordering, so \
+                         choosing one would make the baseline depend on the order the files were \
+                         passed — pool exactly one artifact per run identity, or give each attempt \
+                         its own --run-id",
+                        occupied.key()
+                    )));
+                }
+                Entry::Vacant(vacant) => {
+                    vacant.insert(canonical);
+                    distinct.push(report);
+                }
+            }
+        }
+
+        // Identity of every contributing run, so the durable evidence can name
+        // *which* runs formed a baseline rather than merely how many were seen.
+        let mut run_manifest: Vec<BaselineRun> = distinct
+            .iter()
+            .map(|report| BaselineRun {
+                run_id: report
+                    .source
+                    .run_id
+                    .clone()
+                    .expect("run identities were required above"),
+                git_commit: report.source.git_commit.clone(),
+            })
+            .collect();
+        run_manifest.sort_by(|left, right| left.run_id.cmp(&right.run_id));
+
+        let mut limitations = vec![
+            "baselines pool the `session` window only: stream-hour and rolling windows partition \
+             the same run, so pooling them would count each event once per window"
+                .to_owned(),
+            "latency percentiles are the worst observed across contributing runs, not a pooled \
+             percentile, because the artifact carries per-run percentiles rather than raw samples"
+                .to_owned(),
+        ];
+        if duplicate_reports > 0 {
+            limitations.push(format!(
+                "{duplicate_reports} report(s) repeated a run identity already in the history with \
+                 identical content and were not counted as further runs"
+            ));
+        }
+        if (distinct.len() as u64) < MIN_BASELINE_RUNS {
+            limitations.push(format!(
+                "only {} distinct active run(s) in the history; at least {MIN_BASELINE_RUNS} are \
+                 required before any pooled value is calibration evidence, so none is published",
+                distinct.len()
+            ));
+            return Ok(Self {
+                schema_version: SLO_REPORT_SCHEMA_VERSION.to_owned(),
+                catalog_version: SLO_CATALOG_VERSION.to_owned(),
+                reports: reports.len() as u64,
+                contributing_reports: distinct.len() as u64,
+                duplicate_reports,
+                excluded_experimental_reports: excluded_experimental,
+                revisions: distinct
+                    .iter()
+                    .map(|report| report.source.git_commit.clone())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
+                datasets: distinct
+                    .iter()
+                    .map(|report| report.source.dataset_id.clone())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
+                series,
+                contributing_runs: run_manifest,
+                proposals: BTreeMap::new(),
+                not_measured: Vec::new(),
+                limitations,
+            });
+        }
+
+        let catalog = catalog();
+        let latency_ids: BTreeSet<&str> = catalog
+            .iter()
+            .filter(|indicator| indicator.latency_thresholded)
+            .map(|indicator| indicator.id)
+            .collect();
+
+        let mut datasets: BTreeSet<&str> = BTreeSet::new();
+        let mut revisions: BTreeSet<&str> = BTreeSet::new();
+        let mut config_versions: BTreeSet<&str> = BTreeSet::new();
+        let mut modes: BTreeSet<&str> = BTreeSet::new();
+        let mut seeds: BTreeSet<u64> = BTreeSet::new();
+        // Represented stream time, summed exactly. No per-run ceil: ten
+        // two-second runs are twenty seconds of evidence, not ten hours.
+        let mut represented_ms = 0_u64;
+        let mut reports_without_duration = 0_u64;
+
+        // indicator -> pooled denominators and the runs that produced them
+        let mut pools: BTreeMap<&str, RatioPool> = BTreeMap::new();
+        // (indicator, field) -> pooled percentile evidence
+        let mut latency: BTreeMap<(&str, &str), LatencyPool> = BTreeMap::new();
+        // Latency indicator -> the single candidate boundary every contributing
+        // run was probed at. Ratios measured at different boundaries are not
+        // poolable, so a mixed history is refused.
+        let mut latency_thresholds: BTreeMap<&str, u64> = BTreeMap::new();
+
+        for report in &distinct {
+            datasets.insert(report.source.dataset_id.as_str());
+            revisions.insert(report.source.git_commit.as_str());
+            config_versions.insert(report.source.config_version.as_str());
+            modes.insert(report.source.mode.as_str());
+            seeds.insert(report.source.seed);
+            match report.source.stream_duration_ms {
+                Some(ms) => represented_ms = represented_ms.saturating_add(ms),
+                None => reports_without_duration += 1,
+            }
+            // The identity of the run this row came from, so evidence can be
+            // attributed to the run that actually produced it.
+            let contributor = BaselineRun {
+                run_id: report
+                    .source
+                    .run_id
+                    .clone()
+                    .expect("every report's run identity was required above"),
+                git_commit: report.source.git_commit.clone(),
+            };
+            let stream_duration_ms = report.source.stream_duration_ms;
+
+            for row in report
+                .indicators
+                .iter()
+                .filter(|row| row.window == "session")
+            {
+                // Invariants are not probabilistic and never carry a ratio.
+                if row.kind != ObjectiveKind::Slo || row.unit != IndicatorUnit::Ratio {
+                    continue;
+                }
+                if latency_ids.contains(row.id.as_str()) {
+                    // A latency objective's ratio depends on a candidate
+                    // boundary. Without one (the target-free report) its
+                    // evidence is the percentile; with one (the probe step)
+                    // the measured ratio pools like any other. Ratios probed
+                    // at two different boundaries are never pooled.
+                    if let (Some(threshold_ms), true) = (row.threshold_ms, row.eligible > 0) {
+                        match latency_thresholds.get(row.id.as_str()) {
+                            Some(existing) if *existing != threshold_ms => {
+                                return Err(SloError::new(format!(
+                                    "latency indicator {:?} was probed at {} ms and {} ms in the \
+                                     same history; ratios measured at different boundaries are not \
+                                     poolable",
+                                    row.id, existing, threshold_ms
+                                )));
+                            }
+                            Some(_) => {}
+                            None => {
+                                latency_thresholds.insert(row.id.as_str(), threshold_ms);
+                            }
+                        }
+                        pools.entry(row.id.as_str()).or_default().add(
+                            contributor.clone(),
+                            stream_duration_ms,
+                            row,
+                        );
+                    }
+                    continue;
+                }
+                if row.eligible == 0 {
+                    continue;
+                }
+                pools.entry(row.id.as_str()).or_default().add(
+                    contributor.clone(),
+                    stream_duration_ms,
+                    row,
+                );
+            }
+
+            for point in report
+                .latency_calibration
+                .iter()
+                .filter(|point| point.window == "session" && point.samples > 0)
+            {
+                let entry = latency
+                    .entry((point.indicator.as_str(), point.field.as_str()))
+                    .or_default();
+                entry.runs += 1;
+                entry.samples += point.samples;
+                entry.p95_ms = entry.p95_ms.max(point.p95_ms);
+                entry.p99_ms = entry.p99_ms.max(point.p99_ms);
+                entry.max_ms = entry.max_ms.max(point.max_ms);
+            }
+        }
+
+        // A boundary change restarts the series (docs/performance-goals.adoc),
+        // so every identity field in the series key must be singular.
+        debug_assert_eq!(modes.len(), 1);
+        debug_assert_eq!(config_versions.len(), 1);
+        debug_assert_eq!(seeds.len(), 1);
+        let series = series.expect("distinct non-empty history has a series");
+        // The evidence one indicator's pool is worth, if it is worth publishing at
+        // all. It names the runs that actually contributed eligible
+        // observations — not the whole history — because that is the set the
+        // value was measured from and the set a reviewer has to be able to
+        // re-measure. The same identities travel structurally in
+        // [`BaselineEvidence::runs`] and [`BaselineEvidence::series`]; the prose
+        // is for a reader. `datasets`/`config`/`mode`/`seed` stay series-wide
+        // because `dataset_id` is part of the series key, so they are singular
+        // for any subset of the contributing runs.
+        let evidence_for = |pool: &RatioPool, boundary: Option<u64>| -> Option<BaselineEvidence> {
+            // One run is a data point. An indicator measured in fewer than
+            // `MIN_BASELINE_RUNS` runs is one, whatever else the history
+            // measured, so it never becomes target-ready evidence.
+            if pool.runs < MIN_BASELINE_RUNS {
+                return None;
+            }
+            let revisions = pool
+                .contributors
+                .iter()
+                .map(|run| run.git_commit.as_str())
+                .collect::<BTreeSet<_>>();
+            let mut source = format!(
+                "slo-baseline: {} distinct session run(s) [{}]; series={series}; datasets={}; \
+                 revisions={}; config={}; mode={}; seed={}",
+                pool.runs,
+                // `join_sorted` re-sorts, which is harmless: run ids are unique.
+                join_sorted(pool.contributors.iter().map(|run| run.run_id.as_str())),
+                join_sorted(datasets.iter()),
+                join_sorted(revisions.iter()),
+                join_sorted(config_versions.iter()),
+                join_sorted(modes.iter()),
+                join_sorted(seeds.iter()),
+            );
+            if let Some(threshold_ms) = boundary {
+                source.push_str(&format!("; probe_threshold_ms={threshold_ms}"));
+            }
+            // Coverage is exactly the contributing runs' represented time: a
+            // partial hour is evidence of a partial hour, and evidence
+            // covering less than a full hour omits `stream_hours` rather than
+            // claiming one.
+            let whole_hours = pool.represented_ms / STREAM_HOUR_MS;
+            Some(BaselineEvidence {
+                value: pool.conforming as f64 / pool.eligible as f64,
+                source,
+                stream_hours: (whole_hours > 0).then_some(whole_hours),
+                series: Some(series.clone()),
+                runs: pool.contributors.clone(),
+            })
+        };
+        // History-wide represented time, retained for the limitation below;
+        // each indicator's own coverage comes from its contributing runs.
+        let history_whole_hours = represented_ms / STREAM_HOUR_MS;
+        let mut proposals: BTreeMap<String, BaselineProposal> = BTreeMap::new();
+        for (id, pool) in &pools {
+            proposals.insert(
+                (*id).to_owned(),
+                BaselineProposal {
+                    indicator: (*id).to_owned(),
+                    window: "session".to_owned(),
+                    runs: pool.runs,
+                    threshold_ms: None,
+                    eligible: Some(pool.eligible),
+                    conforming: Some(pool.conforming),
+                    baseline: evidence_for(pool, None),
+                    latency: None,
+                },
+            );
+        }
+        for ((id, field), pool) in &latency {
+            let proposal = proposals
+                .entry((*id).to_owned())
+                .or_insert_with(|| BaselineProposal {
+                    indicator: (*id).to_owned(),
+                    window: "session".to_owned(),
+                    runs: 0,
+                    threshold_ms: None,
+                    eligible: None,
+                    conforming: None,
+                    baseline: None,
+                    latency: None,
+                });
+            proposal.runs = proposal.runs.max(pool.runs);
+            // The probe step closes the calibration cycle: with a single
+            // candidate boundary across the history, the measured ratio is a
+            // valid `BaselineEvidence` and the first latency target can be
+            // calibrated without inventing anything.
+            if let Some(threshold_ms) = latency_thresholds.get(id) {
+                proposal.threshold_ms = Some(*threshold_ms);
+                if let Some(pool) = pools.get(id) {
+                    // Only runs that had eligible latency samples at the
+                    // candidate boundary count toward the calibration floor,
+                    // exactly as for any other indicator.
+                    proposal.eligible = Some(pool.eligible);
+                    proposal.conforming = Some(pool.conforming);
+                    proposal.baseline = evidence_for(pool, Some(*threshold_ms));
+                }
+            }
+            proposal.latency = Some(BaselineLatency {
+                field: (*field).to_owned(),
+                runs: pool.runs,
+                samples: pool.samples,
+                p95_ms: pool.p95_ms,
+                p99_ms: pool.p99_ms,
+                max_ms: pool.max_ms,
+            });
+        }
+
+        let not_measured: Vec<String> = catalog
+            .iter()
+            .filter(|indicator| {
+                indicator.kind == ObjectiveKind::Slo
+                    && indicator.evidence == EvidenceSource::Measured
+            })
+            .filter(|indicator| !proposals.contains_key(indicator.id))
+            .map(|indicator| indicator.id.to_owned())
+            .collect();
+
+        if reports_without_duration > 0 {
+            limitations.push(format!(
+                "{reports_without_duration} contributing report(s) recorded no stream duration, so \
+                 the represented time may be under-counted"
+            ));
+        }
+        if excluded_experimental > 0 {
+            limitations.push(format!(
+                "{excluded_experimental} experimental-plane report(s) were excluded from the \
+                 active baseline"
+            ));
+        }
+        if history_whole_hours == 0 {
+            limitations.push(format!(
+                "the history represents {represented_ms} ms of logical stream time, less than one \
+                 full stream hour, so `stream_hours` is omitted rather than rounded up"
+            ));
+        }
+        // An indicator measured in the history but pooled from too few runs is
+        // named, not silently dropped and not published as calibration
+        // evidence: the repeated-run floor is about *this* indicator.
+        let under_sampled = pools
+            .iter()
+            .filter(|(_, pool)| pool.runs < MIN_BASELINE_RUNS)
+            .map(|(id, pool)| format!("{id} ({})", pool.runs))
+            .collect::<Vec<_>>();
+        if !under_sampled.is_empty() {
+            limitations.push(format!(
+                "{} indicator(s) were measured but pooled from fewer than {MIN_BASELINE_RUNS} \
+                 contributing run(s), so no target-ready baseline is published for them: {}; a run \
+                 with an empty denominator for an indicator produced no evidence for it",
+                under_sampled.len(),
+                under_sampled.join(", ")
+            ));
+        }
+        let partial_duration = pools
+            .iter()
+            .filter(|(_, pool)| pool.without_duration > 0)
+            .map(|(id, pool)| format!("{id} ({}/{})", pool.without_duration, pool.runs))
+            .collect::<Vec<_>>();
+        if !partial_duration.is_empty() {
+            limitations.push(format!(
+                "for some indicators a contributing run recorded no stream duration, so their \
+                 coverage may be under-counted (run(s) missing a duration per indicator): {}",
+                partial_duration.join(", ")
+            ));
+        }
+
+        Ok(Self {
+            schema_version: SLO_REPORT_SCHEMA_VERSION.to_owned(),
+            catalog_version: SLO_CATALOG_VERSION.to_owned(),
+            reports: reports.len() as u64,
+            contributing_reports: distinct.len() as u64,
+            duplicate_reports,
+            excluded_experimental_reports: excluded_experimental,
+            revisions: revisions.into_iter().map(ToOwned::to_owned).collect(),
+            datasets: datasets.into_iter().map(ToOwned::to_owned).collect(),
+            series: Some(series),
+            contributing_runs: run_manifest,
+            proposals,
+            not_measured,
+            limitations,
+        })
+    }
+
+    pub fn to_json_pretty(&self) -> Result<Vec<u8>, SloError> {
+        serde_json::to_vec_pretty(self)
+            .map_err(|error| SloError::new(format!("serialize baseline proposal: {error}")))
+    }
+
+    pub fn markdown_summary(&self) -> String {
+        let mut out = format!(
+            "Operational SLO baseline proposal — {} report(s) pooled ({} contributing distinct, {} \
+             duplicate, {} experimental excluded)\n\n",
+            self.reports,
+            self.contributing_reports,
+            self.duplicate_reports,
+            self.excluded_experimental_reports
+        );
+        if let Some(series) = &self.series {
+            out.push_str(&format!("Series: `{series}`\n\n"));
+        }
+        if !self.contributing_runs.is_empty() {
+            out.push_str(&format!(
+                "Runs: {}\n\n",
+                self.contributing_runs
+                    .iter()
+                    .map(|run| format!("`{}`@{}", run.run_id, run.git_commit))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        out.push_str(
+            "| Indicator | Runs | Eligible | Conforming | Value | Threshold ms | Stream hours | Latency p95/p99/max |\n\
+             |---|---|---|---|---|---|---|---|\n",
+        );
+        for proposal in self.proposals.values() {
+            let value = proposal
+                .baseline
+                .as_ref()
+                .map(|baseline| format!("{:.4}", baseline.value))
+                .unwrap_or_else(|| "-".to_owned());
+            let threshold = proposal
+                .threshold_ms
+                .map(|threshold| threshold.to_string())
+                .unwrap_or_else(|| "-".to_owned());
+            let stream_hours = proposal
+                .baseline
+                .as_ref()
+                .and_then(|baseline| baseline.stream_hours)
+                .map(|hours| hours.to_string())
+                .unwrap_or_else(|| "-".to_owned());
+            let latency = proposal
+                .latency
+                .as_ref()
+                .map(|latency| {
+                    format!(
+                        "{} / {} / {}",
+                        latency.p95_ms, latency.p99_ms, latency.max_ms
+                    )
+                })
+                .unwrap_or_else(|| "-".to_owned());
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                proposal.indicator,
+                proposal.runs,
+                proposal
+                    .eligible
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                proposal
+                    .conforming
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                value,
+                threshold,
+                stream_hours,
+                latency,
+            ));
+        }
+        if !self.not_measured.is_empty() {
+            out.push_str(&format!(
+                "\nNot measured in any contributing run: {}\n",
+                self.not_measured.join("; ")
+            ));
+        }
+        for limitation in &self.limitations {
+            out.push_str(&format!("\n> {limitation}\n"));
+        }
+        out.push_str(
+            "\nThis is measured evidence, not a target. A target ratio is a product decision \
+             made above the value shown, and the chosen `baseline` block is copied from here.\n",
+        );
+        out
+    }
+}
+
+/// Join a collection into a comma-separated list for provenance text.
+fn join_sorted<I>(values: I) -> String
+where
+    I: IntoIterator,
+    I::Item: ToString,
+{
+    let mut items: Vec<String> = values.into_iter().map(|value| value.to_string()).collect();
+    items.sort_unstable();
+    items.dedup();
+    items.join(",")
 }
 
 fn status_for(
@@ -1496,7 +2628,7 @@ fn aar_candidates(indicators: &[SloIndicatorResult], threshold: u64) -> Vec<AarC
 /// Bucketing is over the logical stream offset recorded at admission. An
 /// artifact that carries no offsets degrades to a single session window and
 /// says so, rather than inventing hour boundaries from the event index.
-fn build_windows(report: &BenchmarkReport, config: SloEvaluationConfig) -> Vec<SloWindow> {
+fn build_windows(report: &BenchmarkReport, config: &SloEvaluationConfig) -> Vec<SloWindow> {
     let events = &report.events;
     let observed_end = events
         .iter()
@@ -1701,5 +2833,84 @@ impl std::error::Error for SloError {}
 impl From<TelemetryError> for SloError {
     fn from(error: TelemetryError) -> Self {
         Self::new(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod source_digest_tests {
+    use super::*;
+
+    fn canonical(value: &serde_json::Value) -> String {
+        let mut out = String::new();
+        write_canonical(value, &mut out);
+        out
+    }
+
+    /// Every expectation is ECMAScript's own rendering (`JSON.stringify`
+    /// / `String`), captured from Bun: the recorder's JavaScript
+    /// verifier recomputes the digest from the stored document with
+    /// exactly these rules, so both sides must render each value
+    /// identically or every recorded pair would be refused.
+    #[test]
+    fn numbers_render_exactly_as_ecmascript_renders_them() {
+        let cases: &[(serde_json::Value, &str)] = &[
+            (serde_json::Value::from(1_u64), "1"),
+            (serde_json::Value::from(1.0_f64), "1"),
+            (serde_json::Value::from(0.0_f64), "0"),
+            (serde_json::Value::from(-0.0_f64), "0"),
+            (serde_json::Value::from(0.5_f64), "0.5"),
+            (serde_json::Value::from(0.9_f64), "0.9"),
+            (serde_json::Value::from(7_u64), "7"),
+            (serde_json::Value::from(100.0_f64), "100"),
+            (serde_json::Value::from(123.456_f64), "123.456"),
+            (serde_json::Value::from(0.0001_f64), "0.0001"),
+            (serde_json::Value::from(1e-5_f64), "0.00001"),
+            (serde_json::Value::from(1e-6_f64), "0.000001"),
+            (serde_json::Value::from(1e-7_f64), "1e-7"),
+            (serde_json::Value::from(2.5e-7_f64), "2.5e-7"),
+            (serde_json::Value::from(1e16_f64), "10000000000000000"),
+            (serde_json::Value::from(1e20_f64), "100000000000000000000"),
+            (serde_json::Value::from(1e21_f64), "1e+21"),
+            (serde_json::Value::from(1.5e21_f64), "1.5e+21"),
+            (
+                serde_json::Value::from(123456789012345680000.0_f64),
+                "123456789012345680000",
+            ),
+            (serde_json::Value::from(-0.5_f64), "-0.5"),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(canonical(value), *expected, "for {value}");
+        }
+    }
+
+    #[test]
+    fn object_keys_sort_recursively_and_array_order_survives() {
+        let value = serde_json::json!({
+            "b": 1_u64,
+            "a": { "d": [3_u64, 1_u64, 2_u64], "c": serde_json::Value::Null },
+        });
+        assert_eq!(canonical(&value), r#"{"a":{"c":null,"d":[3,1,2]},"b":1}"#);
+    }
+
+    /// Shared with `tests/slo-record.test.mjs`: both sides digest this
+    /// exact document — the Rust side while evaluating, the JavaScript
+    /// side from the stored file — so a digest mismatch can only mean
+    /// the canonical forms diverged, never the pairing logic.
+    #[test]
+    fn the_digest_matches_the_javascript_verifier_on_one_document() {
+        let value = serde_json::json!({
+            "a": 1_u64,
+            "b": serde_json::Value::from(1.0_f64),
+            "c": serde_json::Value::from(1e-7_f64),
+            "d": [serde_json::Value::from(0.5_f64), serde_json::Value::from(-0.0_f64)],
+            "e": "x",
+            "f": serde_json::Value::Null,
+            "g": true,
+            "h": serde_json::Value::from(1e21_f64),
+        });
+        assert_eq!(
+            canonical_digest(&value),
+            "67ab96b3cba323e2e72493aed8212bce68f7c432660d27492f338ab4cc477802"
+        );
     }
 }

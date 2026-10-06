@@ -8,11 +8,11 @@
 
 use aivtuber_domain::InteractionDeadlineClass;
 use aivtuber_telemetry::{
-    AttributionSummary, BaselineEvidence, BenchmarkReport, ComparisonMode, EventObservation,
-    EventVerdict, EvidenceSource, IndicatorUnit, ObjectiveKind, ReproducibilityMetadata,
-    RouteClass, STREAM_HOUR_MS, SloEvaluationConfig, SloIndicatorResult, SloReport, SloStatus,
-    SloTarget, SloTargets, SloVerdict, WindowKind, attribution_of, catalog, evaluate,
-    overall_verdict,
+    AttributionSummary, BaselineEvidence, BaselineRun, BenchmarkReport, ComparisonMode,
+    EventObservation, EventVerdict, EvidenceSource, IndicatorUnit, ObjectiveKind,
+    ReproducibilityMetadata, RouteClass, STREAM_HOUR_MS, SloEvaluationConfig, SloIndicatorResult,
+    SloReport, SloStatus, SloTarget, SloTargets, SloVerdict, WindowKind, attribution_of, catalog,
+    evaluate, overall_verdict,
 };
 
 fn observation(route: RouteClass) -> EventObservation {
@@ -49,11 +49,26 @@ fn result<'a>(report: &'a SloReport, id: &str, window: &str) -> &'a SloIndicator
         .unwrap_or_else(|| panic!("missing indicator {id} in window {window}"))
 }
 
+/// Real-looking calibration evidence: a calibrated target has to name its #58
+/// compatibility series and at least `MIN_BASELINE_RUNS` runs with revisions,
+/// so a helper that omitted them would only exercise the bypass the validator
+/// now closes rather than the rule each test means to pin.
 fn baseline() -> BaselineEvidence {
     BaselineEvidence {
         value: 0.0,
         source: "slo-review-fixture (dataset=slo-review-fixture, commit=deadbeef)".to_owned(),
         stream_hours: Some(1),
+        series: Some("deterministic_semantic|slo-review-fixture|bench-v1|7".to_owned()),
+        runs: vec![
+            BaselineRun {
+                run_id: "run-a".to_owned(),
+                git_commit: "deadbeef".to_owned(),
+            },
+            BaselineRun {
+                run_id: "run-b".to_owned(),
+                git_commit: "deadbeef".to_owned(),
+            },
+        ],
     }
 }
 
@@ -669,6 +684,8 @@ fn hardening_an_impossible_baseline_is_refused() {
                         value,
                         source: "hardening-fixture".to_owned(),
                         stream_hours: Some(1),
+                        series: None,
+                        runs: Vec::new(),
                     },
                 },
             )]
@@ -696,6 +713,8 @@ fn hardening_a_baseline_covering_no_time_is_refused() {
                     value: 0.98,
                     source: "hardening-fixture".to_owned(),
                     stream_hours: Some(0),
+                    series: None,
+                    runs: Vec::new(),
                 },
             },
         )]

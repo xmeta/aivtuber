@@ -21,8 +21,9 @@ pub use causal_trace::{
     CausalTraceRetentionMetrics, StageOutcome, StageReason, TraceSpan, TraceStage,
 };
 pub use operational_slo::{
-    AarCandidate, AttributionSummary, BaselineEvidence, ErrorBudget, EventVerdict, EvidenceSource,
-    FailureOrigin, IndicatorUnit, LatencyCalibration, MissAttribution, ObjectiveKind,
+    AarCandidate, AttributionSummary, BaselineEvidence, BaselineLatency, BaselineProposal,
+    BaselineProposalSet, BaselineRun, ErrorBudget, EventVerdict, EvidenceSource, FailureOrigin,
+    IndicatorUnit, LatencyCalibration, MIN_BASELINE_RUNS, MissAttribution, ObjectiveKind,
     SLO_CATALOG_VERSION, SLO_REPORT_SCHEMA_VERSION, STREAM_HOUR_MS, SloAction, SloError,
     SloEvaluationConfig, SloIndicator, SloIndicatorResult, SloProvenance, SloReport, SloStatus,
     SloTarget, SloTargets, SloVerdict, SloWindow, TrafficPlane, WindowKind, attribution_of,

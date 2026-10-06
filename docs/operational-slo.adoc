@@ -347,9 +347,26 @@ cargo run --locked -p aivtuber-app --bin replay-benchmark -- \
 cargo run --locked -p aivtuber-app --bin slo-report -- \
   --report target/aivtuber-benchmarks/04-full-generative.json \
   --targets examples/slo/slo-targets.json \
+  --run-id "run-$GITHUB_RUN_ID" \
   --out target/aivtuber-slo/slo-report.json \
   --markdown target/aivtuber-slo/slo-summary.md \
   --provenance scenario-replay
+
+# pool a history of reports into calibration evidence (no targets)
+cargo run --locked -p aivtuber-app --bin slo-baseline -- \
+  target/aivtuber-slo/2026-10-01/slo-report.json \
+  target/aivtuber-slo/2026-10-02/slo-report.json \
+  target/aivtuber-slo/2026-10-03/slo-report.json \
+  --out target/aivtuber-slo/baseline-proposal.json \
+  --markdown target/aivtuber-slo/baseline-proposal.md
+
+# latency probe step: measure a candidate boundary over each run, then pool  cargo run --locked -p aivtuber-app --bin slo-report -- \
+  --report target/aivtuber-benchmarks/04-full-generative.json \
+  --run-id "run-$GITHUB_RUN_ID" \
+  --probe-latency availability.event_to_first_audio_within_target=250 \
+  --out target/aivtuber-slo/probed-run.json
+cargo run --locked -p aivtuber-app --bin slo-baseline -- \
+  target/aivtuber-slo/probed-run-1.json target/aivtuber-slo/probed-run-2.json
 ----
 
 Without `--targets` the report publishes measured values and target-free latency
@@ -357,25 +374,219 @@ percentiles, and the verdict stays `incomplete`. `--fail-on-breach` makes a
 breach exit non-zero for a pipeline that wants to gate on it; it is off by
 default, because an operational objective is not a PR gate.
 
+`--run-id` is required. It is the stable identity of the run the report
+measured, with the same semantics as #58's `recording.run_id`: stable across
+retries of one run, distinct across distinct runs (`run-$GITHUB_RUN_ID` is
+therefore the natural value in CI — it is exactly what the persisted history
+uses — and a date or session label is one locally).
+`slo-baseline` counts runs by this identity alone, so a report produced without
+it is a measurement that can never join a calibration history.
+
 == Choosing a target
+
+A single run is a data point, not a baseline. `slo-baseline` is the tool that
+closes that gap: it reads a *history* of `slo-report` outputs — the #58
+measured runs — and pools them into per-indicator calibration evidence. It
+emits evidence, never a target. For a ratio objective the proposal carries the
+pooled `conforming / eligible` value in exactly the `BaselineEvidence` shape a
+target entry must cite, so the target is copied from a measurement instead of
+improvised.
+
+That history is a repository artifact, not a local one: the trusted
+push-to-main job records and persists it, so the runs behind a target can be
+retrieved and audited later (see *Where the history lives* below).
+
+The pooling is deliberately conservative, and each rule is enforced, not
+assumed:
+
+* **One compatibility series.** Every contributing report must share
+  `mode + dataset_id + config_version + seed` — the #58 baseline boundary in
+  link:performance-goals.adoc[Performance Goals and Baselines]. A history that
+  spans two series is refused, not merged, and the report names the series it
+  pooled so the boundary is auditable.
+* **Distinct runs, by identity and never by payload.** A run is identified by
+  its `--run-id`, the #58 `recording.run_id` semantics. Two nightly runs of one
+  revision produce byte-identical reports and still count as two measurements
+  of runner variance; a retry of one run is one measurement however its numbers
+  came out. A report with no run identity is refused, because content cannot be
+  used to infer one. Repeated artifacts for one run identity collapse to a
+  single run when they agree (a double-passed file is not a second
+  measurement); when they *disagree* the history fails closed rather than
+  picking one. `run_id` names the run, but not which attempt is newer, and the
+  order the files happen to be passed in is not provenance — so the operator
+  pools exactly one artifact per run identity instead. Fewer than two distinct
+  runs (`MIN_BASELINE_RUNS`) produce no proposals at all — one run calibrates
+  nothing.
+* **Provenance per indicator, not per history.** A run with an empty
+  denominator for one indicator contributed no evidence for *that* indicator, so
+  the `series`/`runs` manifest and the `stream_hours` coverage attached to an
+  indicator's baseline name exactly the runs that produced eligible observations
+  for it. An indicator pooled from fewer than `MIN_BASELINE_RUNS` contributing
+  runs publishes no target-ready baseline at all, however many runs the history
+  contains — the same rule applies to a probed latency boundary, where only runs
+  that had eligible samples at the candidate count. Naming the whole history
+  there would let one measured run satisfy the repeated-run floor.
+* **Exact time.** Represented time is summed exactly over an indicator's
+  contributing runs; a partial hour never rounds up to one. Two-second runs are
+  two seconds of evidence, and sub-hour evidence omits `stream_hours` rather
+  than claiming a full hour.
+* **Active plane only.** An experimental report is excluded, exactly as it is
+  excluded from the active SLO.
+* **One report contract.** A `schema_version` or catalog version this build
+  does not implement fails closed.
+
+=== Where the history lives
+
+`slo-baseline` is only useful if a history actually exists, so the measurement
+is persisted rather than left on whichever machine happened to run it. The
+trusted `record-main` job (the push-to-main half of
+link:benchmark-gate.adoc[the benchmark gate]) records the target-free SLO report
+for each mode of every main revision and appends it to the `slo-data` branch via
+`scripts/slo-record.mjs`, under the same re-run-invariant identity the benchmark
+history uses (`run-<github.run_id>`): a re-run of one workflow run replaces its
+own artifacts, while distinct runs accumulate into a calibratable series.
+
+The SLO history is deliberately *separate* from `benchmark-data` rather than a
+new column in it. That branch stores `BenchmarkResult` aggregates, which retain
+selected #58 metrics but not the per-event denominators and classifications the
+operational indicators are defined on, so an SLO cannot be reconstructed from
+it after the fact. Both histories are written from the same measured run and
+keyed on the same compatibility series, which is what makes the trend history
+and the calibration history comparable.
+
+Retrieve it the way any branch is retrieved, then pool one leaf directory:
+
+[source,shell]
+----
+git fetch origin slo-data
+git worktree add target/slo-history origin/slo-data
+
+cargo run --locked -p aivtuber-app --bin slo-baseline -- \
+  target/slo-history/reports/<schema>/<catalog>/<series>/*.json \
+  --out target/aivtuber-slo/baseline-proposal.json
+----
+
+On the branch, one document lives at
+`reports/<schema-version>/<catalog-version>/<series>/<run>.json`. There are two
+partition boundaries, and both are ones `slo-baseline` refuses to pool across:
+the SLO report contract (`schema_version` and `catalog_version`) and the #58
+workload series. Pool one leaf directory at a time — it is exactly one contract
+in exactly one series, which is the only history the selector accepts.
+
+Bumping the catalog therefore starts a new partition rather than poisoning the
+existing one: new calibration history accumulates alongside the old, and the
+old history stays auditable under the contract it was measured against.
+
+=== The probe source is persisted too
+
+A latency objective cannot be finished from the stored `SloReport`. The probe
+step re-reads the per-event observations, and a stored report carries only the
+`latency_calibration` quantiles (p50/p95/p99/max) — which are enough to *choose*
+a boundary, but not to reconstruct the exact conforming count at it. An archived
+`SloReport` therefore cannot be probed later: `slo-report --report <stored>`
+fails with `not a replay benchmark report: missing field metadata`.
+
+The recorder stores the raw replay report alongside it, under the same contract,
+series, and run identity, in a parallel tree:
+
+[source,shell]
+----
+reports/<schema>/<catalog>/<series>/<run>.json            # the SLO report
+benchmark-reports/<schema>/<catalog>/<series>/<run>.json  # its replay source
+----
+
+They are in separate trees on purpose: the ratio retrieval above is a wildcard
+over `reports/<...>/*.json`, and a replay report in that directory would be
+refused as not an SLO report. The pair is checked on the way in — a replay
+report from a different dataset, config, seed, or mode is refused — so a stored
+run can never be probed against a different workload than the one it was pooled
+from. A run whose replay report is missing is refused outright rather than
+half-recorded.
+
+With both trees retained, the latency cycle is executable from the history after
+the trusted main job has finished — see <<The latency calibration cycle>>.
+
+=== The latency calibration cycle
+
+A latency objective has a chicken-and-egg problem the ratio objectives do not:
+its conforming ratio does not exist until a `threshold_ms` is chosen, and the
+threshold is chosen *from* the measurements. Two steps close the cycle, and
+both are measured:
+
+. Pool the target-free history with `slo-baseline` and read the worst-observed
+  percentiles: they are the evidence a candidate boundary is chosen from.
+. Probe every run *already in the history* — not a fresh re-run of the
+  workload — by running `slo-report --report` over each retrieved
+  `benchmark-reports/<schema>/<catalog>/<series>/<run>.json` with
+  `--probe-latency <indicator-id>=<threshold-ms>` and that run's own
+  `--run-id`. This evaluates the objective *at* the boundary over the stored
+  per-event observations:
+
+[source,shell]
+----
+raw=benchmark-reports/<schema>/<catalog>/<series>
+mkdir -p target/aivtuber-slo/probed
+for run in target/slo-history/$raw/*.json; do
+  cargo run --locked -p aivtuber-app --bin slo-report -- \
+    --report "$run" --run-id <that-run's-source.run_id> \
+    --probe-latency availability.event_to_first_audio_within_target=250 \
+    --out "target/aivtuber-slo/probed/$(basename "$run")"
+done
+cargo run --locked -p aivtuber-app --bin slo-baseline -- \
+  target/aivtuber-slo/probed/*.json
+----
+
+  The proposal now carries the measured conforming ratio at that boundary as a
+  valid `BaselineEvidence` — the first latency target is constructible entirely
+  from measured artifacts, and every one of them is an artifact that survived
+  the run that produced it.
+
+Re-running the workload later produces *new* measured runs; it does not make an
+already-recorded historical run probeable, which is why the source report is
+persisted next to the SLO report.
+
+A probe is a measurement tool, not evidence: `SloTarget::threshold_probe` is
+refused in a targets file, so a boundary can never be written down without the
+measured ratio to justify it. Probed histories must share one boundary; ratios
+measured at two different thresholds are refused, not averaged.
 
 The procedure is deliberately boring:
 
 . Run the benchmark over a #70 scenario workload (and, when it exists, the #40
   fault overlay) and produce an SLO report with no targets.
+. Repeat it, and pool the runs with `slo-baseline`. One run calibrates
+  nothing; repeated runs are what turn a measurement into a baseline.
 . Read `latency_calibration` for the target-free p50/p95/p99/max, and the
   indicator table for the measured ratios.
-. Choose `threshold_ms` from the calibration evidence for latency objectives,
-  and choose a ratio that is a *product* decision, not a number the fixture
+. For latency objectives, run the probe step above. For every objective,
+  choose a ratio that is a *product* decision, not a number the fixture
   happened to produce.
-. Add the entry with its `baseline` block naming the artifact, dataset, and
-  revision it came from, and review the file like code.
+. Add the entry with its `baseline` block — copied from the proposal, which
+  names the dataset, revision, and series it was measured over — and review
+  the file like code.
 . Re-run and confirm the verdict. A target that is immediately red is a
   measurement problem, not a reason to loosen the target.
 
-Repeated nightly runs of the same revision are what turn one measurement into a
-baseline; a single run is a data point, exactly as link:performance-goals.adoc[
-Performance Goals and Baselines] requires for #58.
+The `baseline` block in a target entry is copied from an `slo-baseline`
+proposal rather than written by hand, and the target ratio is a product
+decision made *above* the measured value — the proposal never prescribes it.
+An indicator the history measured too thinly has no `baseline` block to copy at
+all; `slo-baseline` names it in `limitations` instead of publishing a value
+that one run happened to measure.
+Validation enforces this rather than trusting it: a calibrated target whose
+`baseline` names no compatibility `series`, fewer than `MIN_BASELINE_RUNS`
+contributing runs, a run without a revision, or the same run identity twice is
+refused, so a target cannot cite a hand-written `source` string and no measured
+history at all. Only a latency probe is exempt, and only on the measurement
+path — `SloTargets::validate` still refuses to let one into a targets file.
+The provenance is durable and structured, because the evidence block is the
+only part that survives the copy: `series` names the #58 compatibility series
+(`mode|dataset_id|config_version|seed`) and `runs` lists every contributing
+run identity with the revision it measured, so a target can still name *which*
+repeated runs formed its baseline after the proposal file is gone. The `source`
+string repeats the same identities for a human reader. Repeated nightly runs of
+the same revision are what turn one measurement into a baseline, exactly as
+link:performance-goals.adoc[Performance Goals and Baselines] requires for #58.
 
 == What this does not cover yet
 
