@@ -40,6 +40,7 @@
 //! runtime still produced no user-visible output). See [`attribution_of`].
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -1114,6 +1115,18 @@ pub struct SloSource {
     pub config_version: String,
     pub seed: u64,
     pub stream_duration_ms: Option<u64>,
+    /// SHA-256 over the canonical (recursively key-sorted) JSON of the replay
+    /// report this one was evaluated from.
+    ///
+    /// The #58 series fields and the revision say *which workload* a run
+    /// belongs to; they cannot say *which artifact* produced it, because two
+    /// different observations of one revision, series, and duration are
+    /// indistinguishable without it. This is what makes the pairing a stored
+    /// report claims verifiable rather than assumed: the latency probe
+    /// re-evaluates the source artifact, so a report paired with anything but
+    /// the artifact it names could yield a ratio that run never measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_digest: Option<String>,
     pub provenance: SloProvenance,
     pub plane: TrafficPlane,
     /// Stable identity of the run this report measured, with the semantics #58
@@ -1333,6 +1346,207 @@ impl SloReport {
     }
 }
 
+/// SHA-256 over the canonical (recursively key-sorted) JSON of the
+/// replay report, recorded as [`SloSource::source_digest`].
+///
+/// The digest names the *artifact* the evaluation consumed. The #58
+/// series fields say which workload a run belongs to, but two different
+/// observations of one revision, series and duration are
+/// indistinguishable without it: the latency probe verifies a stored
+/// report's pairing by re-evaluating the artifact it claims to come
+/// from, so a report paired with anything but the artifact it names
+/// could yield a ratio that run never measured.
+///
+/// The canonical form is defined so a verifier holding only the stored
+/// JSON document — `scripts/slo-record.mjs`, in JavaScript — can
+/// recompute it byte-for-byte without this crate:
+///
+/// - object keys are sorted recursively and explicitly, so the form
+///   depends on content, not on struct declaration order or on
+///   serde_json's map backing (nothing here leans on the absence of
+///   `preserve_order`);
+/// - numbers are rendered exactly as ECMAScript renders them
+///   (`JSON.stringify`): integer-backed values plain, floats by
+///   shortest round-trip digits with no trailing `.0` and JS exponent
+///   thresholds. serde_json would write `1.0` where ECMAScript writes
+///   `1`, and a parsed document cannot tell an integral float from an
+///   integer, so *this* side adopts ECMAScript's rendering — the type
+///   distinction serde_json keeps is erased exactly where JSON
+///   parsing erases it;
+/// - strings, booleans and null use serde_json's standard escapes,
+///   which coincide with `JSON.stringify` for every valid UTF-8
+///   document.
+fn source_digest_of(report: &BenchmarkReport) -> Result<String, SloError> {
+    let value = serde_json::to_value(report)
+        .map_err(|error| SloError::new(format!("canonicalize report: {error}")))?;
+    Ok(canonical_digest(&value))
+}
+
+/// Digest of one JSON value in the canonical form [`source_digest_of`]
+/// documents. Split out so the contract can be pinned against
+/// ECMAScript's own rendering in tests without building a full report.
+fn canonical_digest(value: &serde_json::Value) -> String {
+    let mut canonical = String::new();
+    write_canonical(value, &mut canonical);
+    let digest = Sha256::digest(canonical.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Render one JSON value in the canonical form: object keys sorted
+/// (explicitly, never trusting serde_json's map implementation), array
+/// order preserved because it is content, not layout.
+fn write_canonical(value: &serde_json::Value, out: &mut String) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+            entries.sort_by(|left, right| left.0.cmp(right.0));
+            out.push('{');
+            for (index, (key, item)) in entries.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::to_string(*key).expect("a map key serializes"));
+                out.push(':');
+                write_canonical(item, out);
+            }
+            out.push('}');
+        }
+        serde_json::Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_canonical(item, out);
+            }
+            out.push(']');
+        }
+        serde_json::Value::String(string) => {
+            out.push_str(&serde_json::to_string(string).expect("a string serializes"));
+        }
+        serde_json::Value::Number(number) => write_canonical_number(number, out),
+        serde_json::Value::Bool(true) => out.push_str("true"),
+        serde_json::Value::Bool(false) => out.push_str("false"),
+        serde_json::Value::Null => out.push_str("null"),
+    }
+}
+
+/// Integer-backed numbers keep serde_json's plain digits — the same
+/// digits ECMAScript prints. Floats take the ECMAScript rendering.
+fn write_canonical_number(number: &serde_json::Number, out: &mut String) {
+    if let Some(unsigned) = number.as_u64() {
+        out.push_str(&unsigned.to_string());
+    } else if let Some(signed) = number.as_i64() {
+        out.push_str(&signed.to_string());
+    } else if let Some(float) = number.as_f64() {
+        write_canonical_f64(float, out);
+    }
+}
+
+/// ECMAScript `Number::toString` for one finite float: shortest
+/// round-trip digits, decimal notation for `1e-6 ≤ |value| < 1e21`,
+/// exponential `1e+21` / `1e-7` outside, never a trailing `.0`, and
+/// `-0.0` collapsing to `0` exactly as `String(-0)` does.
+fn write_canonical_f64(value: f64, out: &mut String) {
+    if value == 0.0 {
+        out.push('0');
+        return;
+    }
+    if !value.is_finite() {
+        // serde_json renders non-finite floats as `null`; a verifier
+        // reading the stored document sees `null` too, so `null` is the
+        // consistent canonical rendering on this side as well.
+        out.push_str("null");
+        return;
+    }
+    let (digits, exponent) = shortest_digits(value.abs());
+    if value < 0.0 {
+        out.push('-');
+    }
+    write_ecmascript_digits(&digits, exponent, out);
+}
+
+/// Shortest round-trip decimal digits of a positive finite float, with
+/// the decimal exponent `n` such that the value equals `0.<digits> ×
+/// 10^n`. The digits come from serde_json's own ryu rendering — never
+/// recomputed here — so this side and the stored document can never
+/// disagree about *which* digits are shortest; only their placement is
+/// rewritten into ECMAScript's notation.
+fn shortest_digits(value: f64) -> (Vec<u8>, i32) {
+    let rendered = serde_json::to_string(&value).expect("a float serializes");
+    let (mantissa, exponent) = match rendered.split_once('e') {
+        Some((mantissa, exponent)) => (
+            mantissa,
+            exponent
+                .parse::<i32>()
+                .expect("ryu writes a plain decimal exponent"),
+        ),
+        None => (rendered.as_str(), 0),
+    };
+    let (integer, fraction) = match mantissa.split_once('.') {
+        Some((integer, fraction)) => (integer, fraction),
+        None => (mantissa, ""),
+    };
+    // value = <all digits as an integer> × 10^scale, then normalize to
+    // shortest significant digits, adjusting the scale per digit lost.
+    let mut digits: Vec<u8> = integer
+        .bytes()
+        .chain(fraction.bytes())
+        .map(|byte| byte - b'0')
+        .collect();
+    let mut scale = exponent - fraction.len() as i32;
+    while digits.len() > 1 && digits[0] == 0 {
+        digits.remove(0);
+    }
+    while digits.len() > 1 && *digits.last().expect("digits is non-empty") == 0 {
+        digits.pop();
+        scale += 1;
+    }
+    let exponent = scale + digits.len() as i32;
+    (digits, exponent)
+}
+
+/// ECMAScript `Number::toString` placement rules for shortest digits
+/// `s` (length `k`) with value `0.s × 10^n`.
+fn write_ecmascript_digits(digits: &[u8], exponent: i32, out: &mut String) {
+    let significand: String = digits
+        .iter()
+        .map(|digit| char::from(b'0' + digit))
+        .collect();
+    let count = digits.len() as i32;
+    if count <= exponent && exponent <= 21 {
+        // s followed by n−k zeros
+        out.push_str(&significand);
+        for _ in 0..(exponent - count) {
+            out.push('0');
+        }
+    } else if 0 < exponent && exponent <= count {
+        // decimal point inside the digits
+        let point = exponent as usize;
+        out.push_str(&significand[..point]);
+        out.push('.');
+        out.push_str(&significand[point..]);
+    } else if -6 < exponent && exponent <= 0 {
+        // 0. + (−n zeros) + s
+        out.push_str("0.");
+        for _ in 0..(-exponent) {
+            out.push('0');
+        }
+        out.push_str(&significand);
+    } else {
+        // d[.ddd]e±(n−1)
+        out.push_str(&significand[..1]);
+        if count > 1 {
+            out.push('.');
+            out.push_str(&significand[1..]);
+        }
+        out.push('e');
+        let power = exponent - 1;
+        out.push(if power < 0 { '-' } else { '+' });
+        out.push_str(&power.abs().to_string());
+    }
+}
+
 /// Evaluate one benchmark report into an operational SLO report.
 pub fn evaluate(
     report: &BenchmarkReport,
@@ -1456,6 +1670,7 @@ pub fn evaluate(
             config_version: report.metadata.config_version.clone(),
             seed: report.metadata.seed,
             stream_duration_ms: report.metadata.stream_duration_ms,
+            source_digest: Some(source_digest_of(report)?),
             provenance: config.provenance,
             plane: config.plane,
             run_id: config.run_id.clone(),
@@ -2618,5 +2833,84 @@ impl std::error::Error for SloError {}
 impl From<TelemetryError> for SloError {
     fn from(error: TelemetryError) -> Self {
         Self::new(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod source_digest_tests {
+    use super::*;
+
+    fn canonical(value: &serde_json::Value) -> String {
+        let mut out = String::new();
+        write_canonical(value, &mut out);
+        out
+    }
+
+    /// Every expectation is ECMAScript's own rendering (`JSON.stringify`
+    /// / `String`), captured from Bun: the recorder's JavaScript
+    /// verifier recomputes the digest from the stored document with
+    /// exactly these rules, so both sides must render each value
+    /// identically or every recorded pair would be refused.
+    #[test]
+    fn numbers_render_exactly_as_ecmascript_renders_them() {
+        let cases: &[(serde_json::Value, &str)] = &[
+            (serde_json::Value::from(1_u64), "1"),
+            (serde_json::Value::from(1.0_f64), "1"),
+            (serde_json::Value::from(0.0_f64), "0"),
+            (serde_json::Value::from(-0.0_f64), "0"),
+            (serde_json::Value::from(0.5_f64), "0.5"),
+            (serde_json::Value::from(0.9_f64), "0.9"),
+            (serde_json::Value::from(7_u64), "7"),
+            (serde_json::Value::from(100.0_f64), "100"),
+            (serde_json::Value::from(123.456_f64), "123.456"),
+            (serde_json::Value::from(0.0001_f64), "0.0001"),
+            (serde_json::Value::from(1e-5_f64), "0.00001"),
+            (serde_json::Value::from(1e-6_f64), "0.000001"),
+            (serde_json::Value::from(1e-7_f64), "1e-7"),
+            (serde_json::Value::from(2.5e-7_f64), "2.5e-7"),
+            (serde_json::Value::from(1e16_f64), "10000000000000000"),
+            (serde_json::Value::from(1e20_f64), "100000000000000000000"),
+            (serde_json::Value::from(1e21_f64), "1e+21"),
+            (serde_json::Value::from(1.5e21_f64), "1.5e+21"),
+            (
+                serde_json::Value::from(123456789012345680000.0_f64),
+                "123456789012345680000",
+            ),
+            (serde_json::Value::from(-0.5_f64), "-0.5"),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(canonical(value), *expected, "for {value}");
+        }
+    }
+
+    #[test]
+    fn object_keys_sort_recursively_and_array_order_survives() {
+        let value = serde_json::json!({
+            "b": 1_u64,
+            "a": { "d": [3_u64, 1_u64, 2_u64], "c": serde_json::Value::Null },
+        });
+        assert_eq!(canonical(&value), r#"{"a":{"c":null,"d":[3,1,2]},"b":1}"#);
+    }
+
+    /// Shared with `tests/slo-record.test.mjs`: both sides digest this
+    /// exact document — the Rust side while evaluating, the JavaScript
+    /// side from the stored file — so a digest mismatch can only mean
+    /// the canonical forms diverged, never the pairing logic.
+    #[test]
+    fn the_digest_matches_the_javascript_verifier_on_one_document() {
+        let value = serde_json::json!({
+            "a": 1_u64,
+            "b": serde_json::Value::from(1.0_f64),
+            "c": serde_json::Value::from(1e-7_f64),
+            "d": [serde_json::Value::from(0.5_f64), serde_json::Value::from(-0.0_f64)],
+            "e": "x",
+            "f": serde_json::Value::Null,
+            "g": true,
+            "h": serde_json::Value::from(1e21_f64),
+        });
+        assert_eq!(
+            canonical_digest(&value),
+            "67ab96b3cba323e2e72493aed8212bce68f7c432660d27492f338ab4cc477802"
+        );
     }
 }

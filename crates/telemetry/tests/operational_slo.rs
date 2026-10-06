@@ -609,6 +609,75 @@ fn a_scenario_replay_is_labelled_as_such_in_the_report() {
 }
 
 #[test]
+fn the_report_names_the_artifact_it_was_evaluated_from() {
+    let evaluated = evaluate_default(&report(vec![observation(RouteClass::Silent)], 60_000));
+
+    let digest = evaluated
+        .source
+        .source_digest
+        .as_deref()
+        .expect("every freshly evaluated report records its source digest");
+    assert_eq!(digest.len(), 64, "SHA-256 hex is 64 characters");
+    assert!(
+        digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "digest is lowercase hex: {digest}"
+    );
+}
+
+#[test]
+fn the_source_digest_is_deterministic_and_ignores_the_evaluation_config() {
+    let artifact = report(vec![observation(RouteClass::Silent)], 60_000);
+    let first = evaluate_default(&artifact);
+    let second = evaluate(
+        &artifact,
+        &SloTargets::default(),
+        SloEvaluationConfig {
+            provenance: SloProvenance::ScenarioReplay,
+            plane: TrafficPlane::Experimental,
+            ..SloEvaluationConfig::default()
+        },
+    )
+    .expect("SLO report");
+
+    // The digest names the artifact, so it cannot depend on who
+    // evaluated it, with which targets, or on which plane.
+    assert_eq!(
+        first.source.source_digest, second.source.source_digest,
+        "one artifact must always produce one digest"
+    );
+}
+
+#[test]
+fn the_source_digest_changes_with_the_artifact_content() {
+    let base = report(vec![observation(RouteClass::Silent)], 60_000);
+    let base_digest = evaluate_default(&base).source.source_digest;
+
+    // Same metadata, same duration, different observations: another
+    // observation of the same revision and series, which is exactly
+    // the case the series fields cannot distinguish.
+    let other_artifacts = [
+        report(vec![observation(RouteClass::Deterministic)], 60_000),
+        {
+            let mut rerun = metadata("slo-fixture", 60_000);
+            rerun.seed = 8;
+            BenchmarkReport::from_events(
+                rerun,
+                ComparisonMode::DeterministicSemantic,
+                vec![observation(RouteClass::Silent)],
+            )
+            .expect("benchmark report")
+        },
+    ];
+    for artifact in other_artifacts {
+        let digest = evaluate_default(&artifact).source.source_digest;
+        assert_ne!(
+            digest, base_digest,
+            "a different artifact must produce a different digest"
+        );
+    }
+}
+
+#[test]
 fn insufficient_samples_do_not_decide_an_objective() {
     let events: Vec<EventObservation> = (0..5_u64)
         .map(|index| {

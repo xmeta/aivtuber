@@ -9,3 +9,7 @@ publish.workspace = true
 aivtuber-domain = { path = "../domain" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# Already used by aivtuber-adapters, aivtuber-adaptation, and aivtuber-app, and
+# already pinned in Cargo.lock: it binds an SLO report to the exact replay
+# artifact it was evaluated from. No new crate enters the graph.
+sha2 = "0.10"

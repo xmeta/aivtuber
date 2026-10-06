@@ -12,10 +12,10 @@
 // Untrusted pull_request jobs must never invoke this script.
 //
 // Usage:
-//   bun scripts/slo-record.mjs --files <slo-report.json>... [--root <dir>]
-//                              [--benchmarks <replay-report-dir>]
+//   bun scripts/slo-record.mjs --files <slo-report.json>...
+//                              --benchmarks <replay-report-dir> [--root <dir>]
 //
-// `--benchmarks` points at the directory of raw replay reports
+// `--benchmarks` is required. It points at the directory of raw replay reports
 // (`replay-benchmark`'s `<mode>.json`). Each SLO report is paired with the
 // replay report of the same `<stem>` and the pair is stored under the same
 // contract/series/run identity, because latency calibration cannot be finished
@@ -24,6 +24,11 @@
 // Without the raw report a stored run could only ever supply the
 // threshold-selection percentiles, never the measured conforming ratio at the
 // chosen boundary.
+//
+// The pair is also verified as one artifact: `git_commit`, represented
+// duration, and the replay report's canonical-form digest (the SLO report's
+// `source.source_digest`) must all match, so a stored run can never claim a
+// probe source it was not evaluated from.
 //
 // Layout on the branch — one document per logical run, partitioned by the SLO
 // contract it was written for and then by the #58 compatibility series:
@@ -58,6 +63,7 @@
 // secrets, so nothing sensitive can leak into history.
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { join, dirname, isAbsolute, relative, basename } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -89,13 +95,9 @@ function parseArgs(argv) {
   }
   if (args.files.length === 0) {
     console.error(
-      "usage: slo-record.mjs --files <slo-report.json>... [--root <dir>] " +
-        "[--benchmarks <replay-report-dir>]",
+      "usage: slo-record.mjs --files <slo-report.json>... --benchmarks <replay-report-dir> " +
+        "[--root <dir>]",
     );
-    process.exit(1);
-  }
-  if (args.benchmarks !== undefined && args.benchmarks.trim() === "") {
-    console.error("--benchmarks requires a directory path");
     process.exit(1);
   }
   return args;
@@ -225,12 +227,22 @@ export function requireRecordable(report, file) {
 ///
 /// The pair is what makes latency calibration durable: the probe step
 /// (`slo-report --probe-latency`) re-reads the per-event observations, which a
-/// stored `SloReport` does not carry, so the raw report must be retained. If the
-/// pair came from a different workload the probe would measure a ratio that has
-/// nothing to do with the history it would be pooled into, so the #58 series
-/// fields are compared and the pair is refused on any difference. `git_commit`
-/// is deliberately not compared: the revision is what a baseline is attributed
-/// to, not part of the compatibility boundary, and one series may span several.
+/// stored `SloReport` does not carry, so the raw report must be retained. If
+/// the pair came from a different workload the probe would measure a ratio
+/// that has nothing to do with the history it would be pooled into, so the #58
+/// series fields are compared and the pair is refused on any difference.
+///
+/// Series fields are *workload* identity, not *artifact* identity: a series
+/// may legitimately span several revisions and represented durations, but one
+/// stored pair may not — the probe re-reads *this* raw report to re-measure
+/// *this* stored run. So the revision and represented duration are compared
+/// too, and finally the pair is bound by digest: the SLO report's
+/// `source.source_digest` (computed by `evaluate` over the canonical form of
+/// the replay report) is recomputed here over the raw document. A match proves
+/// the two documents are one artifact; it also distinguishes two different
+/// observations of one revision, series, and duration, which the identity
+/// fields alone cannot do. The canonical form is defined on the Rust side so
+/// this recomputation is byte-exact (`sourceDigestOf` below).
 export function requirePairable(benchmark, sloReport, file) {
   const fail = (message) => {
     throw new Error(`${file}: ${message}`);
@@ -265,6 +277,68 @@ export function requirePairable(benchmark, sloReport, file) {
         `(seed ${JSON.stringify(metadata.seed)} vs ${JSON.stringify(source.seed)})`,
     );
   }
+  // Artifact identity, on top of series identity. A series may span several
+  // revisions and durations; one stored pair may not, because the probe
+  // re-measures the stored run from *this* raw report.
+  if (metadata.git_commit !== source.git_commit) {
+    fail(
+      `is not the replay report the SLO report was evaluated from ` +
+        `(git_commit ${JSON.stringify(metadata.git_commit)} vs ` +
+        `${JSON.stringify(source.git_commit)})`,
+    );
+  }
+  if (
+    (metadata.stream_duration_ms ?? null) !== (source.stream_duration_ms ?? null)
+  ) {
+    fail(
+      `is not the replay report the SLO report was evaluated from ` +
+        `(stream_duration_ms ${JSON.stringify(metadata.stream_duration_ms ?? null)} vs ` +
+        `${JSON.stringify(source.stream_duration_ms ?? null)})`,
+    );
+  }
+  // The strongest binding: the digest names the exact source artifact, so
+  // two different observations of one revision, series, and duration —
+  // which the identity fields cannot distinguish — are refused here.
+  if (typeof source.source_digest !== "string" || source.source_digest.trim() === "") {
+    fail(
+      "carries no `source.source_digest`; re-evaluate the SLO report from this replay " +
+        "report with `slo-report` so the pair is bound to the exact artifact",
+    );
+  }
+  const digest = sourceDigestOf(benchmark);
+  if (digest !== source.source_digest) {
+    fail(
+      `is not the replay report the SLO report was evaluated from ` +
+        `(source digest ${digest} vs ${source.source_digest})`,
+    );
+  }
+}
+
+/// Canonical JSON: object keys sorted recursively, array order kept, numbers
+/// and strings exactly as `JSON.stringify` renders them.
+///
+/// This is the JavaScript half of the canonical form `evaluate` defines on
+/// the Rust side (`source_digest_of` in `operational_slo.rs`): the Rust side
+/// renders floats ECMAScript-style (no trailing `.0`, JS exponent
+/// thresholds) precisely so that this function, applied to the stored
+/// document, reproduces its digest byte-for-byte.
+function canonicalJson(value) {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(",")}]`;
+  }
+  if (value !== null && typeof value === "object") {
+    const entries = Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`);
+    return `{${entries.join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+/// SHA-256 hex digest of a document's canonical form — the same value the
+/// Rust evaluation stored in the SLO report's `source.source_digest`.
+export function sourceDigestOf(document) {
+  return createHash("sha256").update(canonicalJson(document)).digest("hex");
 }
 
 function git(args, cwd, options = {}) {
@@ -317,6 +391,11 @@ const README = [
   "  document. This is the tree `slo-baseline` pools.",
   "- `benchmark-reports/<schema>/<catalog>/<series>/<run>.json` — the raw",
   "  `replay-benchmark` mode report that the SLO report was evaluated from.",
+  "",
+  "Each pair is verified as one artifact at record time: the SLO report's",
+  "`source.source_digest` must equal the canonical-form digest of the stored",
+  "replay report, and the revision and represented duration must match, so a",
+  "probe later measures exactly what the stored run measured.",
   "",
   "Both are partitioned on two compatibility boundaries: the SLO report",
   "contract (`<schema>`/`<catalog>` are `schema_version`/`catalog_version`, and",
@@ -372,12 +451,19 @@ const README = [
 function main() {
   const { files, root: rootArg, benchmarks: benchmarksArg } = parseArgs(process.argv.slice(2));
   const root = rootArg ? (isAbsolute(rootArg) ? rootArg : join(scriptRoot, rootArg)) : scriptRoot;
-  const benchmarkDir =
-    benchmarksArg === undefined
-      ? undefined
-      : isAbsolute(benchmarksArg)
-        ? benchmarksArg
-        : join(root, benchmarksArg);
+  // Required, not optional: a stored SLO run without its raw replay report
+  // can never be probed for latency, and the pair cannot be verified as one
+  // artifact. Correctness of the persisted evidence contract must not depend
+  // on every caller remembering a flag.
+  if (benchmarksArg === undefined) {
+    console.error(
+      "slo-record: --benchmarks <replay-report-dir> is required: a stored SLO run " +
+        "without its raw replay report can never be probed and its pair cannot be " +
+        "verified, so every calibration-history write needs the replay source",
+    );
+    process.exit(1);
+  }
+  const benchmarkDir = isAbsolute(benchmarksArg) ? benchmarksArg : join(root, benchmarksArg);
   const worktree = join(root, "target", "slo-data-wt");
 
   const incoming = files.map((file) => {
@@ -399,38 +485,37 @@ function main() {
   });
 
   // Pair each SLO report with the replay report it was evaluated from. A
-  // missing pair is refused rather than skipped: a stored run whose source is
-  // missing cannot be probed later, which is exactly the gap this closes.
+  // missing or mismatched pair is refused rather than skipped: a stored run
+  // whose source is missing or is not the artifact the SLO report claims
+  // cannot be probed honestly later, which is exactly the gap this closes.
   const sources = new Map();
-  if (benchmarkDir !== undefined) {
-    for (const entry of incoming) {
-      const stem = basename(entry.file, ".json");
-      const candidate = join(benchmarkDir, `${stem}.json`);
-      if (!existsSync(candidate)) {
-        console.error(
-          `slo-record: ${entry.file}: no replay report at ${candidate}; the latency probe ` +
-            `needs the source report, so a run without it cannot be probed later`,
-        );
-        process.exit(1);
-      }
-      let benchmark;
-      try {
-        benchmark = JSON.parse(readFileSync(candidate, "utf8"));
-      } catch (error) {
-        console.error(`slo-record: ${candidate}: not a replay benchmark report: ${error.message}`);
-        process.exit(1);
-      }
-      try {
-        requirePairable(benchmark, entry.report, candidate);
-      } catch (error) {
-        console.error(`slo-record: ${error.message}`);
-        process.exit(1);
-      }
-      sources.set(entry.path, {
-        document: benchmark,
-        path: benchmarkPathOf(entry.report),
-      });
+  for (const entry of incoming) {
+    const stem = basename(entry.file, ".json");
+    const candidate = join(benchmarkDir, `${stem}.json`);
+    if (!existsSync(candidate)) {
+      console.error(
+        `slo-record: ${entry.file}: no replay report at ${candidate}; the latency probe ` +
+          `needs the source report, so a run without it cannot be probed later`,
+      );
+      process.exit(1);
     }
+    let benchmark;
+    try {
+      benchmark = JSON.parse(readFileSync(candidate, "utf8"));
+    } catch (error) {
+      console.error(`slo-record: ${candidate}: not a replay benchmark report: ${error.message}`);
+      process.exit(1);
+    }
+    try {
+      requirePairable(benchmark, entry.report, candidate);
+    } catch (error) {
+      console.error(`slo-record: ${error.message}`);
+      process.exit(1);
+    }
+    sources.set(entry.path, {
+      document: benchmark,
+      path: benchmarkPathOf(entry.report),
+    });
   }
 
   ensureHistoryWorktree(root, worktree);
