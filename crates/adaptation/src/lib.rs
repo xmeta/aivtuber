@@ -412,6 +412,29 @@ impl WorkingMemory {
         for target in &unique {
             targets.push(self.resolve_supersession_target(target, now_ms)?);
         }
+        // Explicit supersession evidence is never evicted to make room for
+        // more of it: shedding the edge that marks a still-retained target
+        // makes that claim current again while the memory that replaced it
+        // is alive — the stale fact this layer exists to keep (#105). The
+        // bound therefore refuses the *later* write instead of forgetting
+        // the earlier evidence, and it refuses it before anything is stored
+        // ("stores nothing, mints nothing"), so the caller learns the
+        // evidence was not accepted rather than discovering later that a
+        // claim resurrected. Derived temporal edges are shed to make room
+        // instead — there are always enough of them — so only a write that
+        // adds explicit evidence can be refused here.
+        let explicit_retained = self
+            .links
+            .iter()
+            .filter(|link| link.kind == MemoryLinkKind::Supersedes)
+            .count();
+        if explicit_retained + unique.len() > self.config.max_links {
+            return Err(AdaptationError::InvalidInput(
+                "the link store cannot hold this write's supersession evidence without \
+                 discarding earlier evidence for a still-retained claim; raise max_links or let \
+                 retention prune the earlier edges first",
+            ));
+        }
         let retention = RetentionClass::Durable;
         let claim = bounded_nonempty(claim, self.config.max_claim_bytes, "memory claim")?;
         let topic = bounded_optional(topic, self.config.max_topic_bytes, "memory topic")?;
@@ -574,28 +597,35 @@ impl WorkingMemory {
         }
     }
 
+    /// Re-enforce the store-wide edge bound by shedding **derived** edges
+    /// only, oldest first. Explicit supersession evidence is never removed
+    /// here: [`Self::remember_durable_superseding`] refuses any write whose
+    /// supersession edges would not fit alongside the ones already retained,
+    /// so once the derived edges are gone the store is provably within its
+    /// bound and this loop exits — an explicit-only store cannot be over the
+    /// limit. Shedding an explicit edge instead would make the claim it marks
+    /// current again while the memory that replaced it is still live, which
+    /// is the stale fact #105 exists to keep, so the bound yields to that
+    /// correctness rule rather than forgetting evidence.
     fn enforce_link_bound(&mut self) {
         while self.links.len() > self.config.max_links {
-            // Caller-declared supersession evidence and derived temporal
-            // context are not interchangeable: losing the evidence would
-            // resurrect a claim the caller replaced while both endpoints are
-            // still live, whereas a temporal edge is re-derived from record
-            // time on the next write in that topic. The bound therefore sheds
-            // the oldest derived edge first and only falls back to the oldest
-            // supersession once no derived edge is left.
-            let derived = self
+            let Some(derived) = self
                 .links
                 .iter()
-                .position(|link| link.kind == MemoryLinkKind::TemporalBefore);
-            match derived {
-                Some(index) => {
-                    self.links.remove(index);
-                }
-                None => {
-                    self.links.pop_front();
-                }
-            }
+                .position(|link| link.kind == MemoryLinkKind::TemporalBefore)
+            else {
+                // Unreachable: the pre-store supersession check guarantees
+                // explicit edges alone fit, so there is always a derived edge
+                // left to shed before the bound can be exceeded.
+                break;
+            };
+            self.links.remove(derived);
         }
+        debug_assert!(
+            self.links.len() <= self.config.max_links,
+            "an explicit-only link store exceeded its bound; the pre-store supersession check \
+             must prevent this"
+        );
         self.links_high_water = self.links_high_water.max(self.links.len());
     }
 
@@ -1814,6 +1844,164 @@ mod tests {
             a.stale,
             "the superseded claim stays marked while both endpoints are live"
         );
+    }
+
+    #[test]
+    fn a_supersession_write_that_would_evict_earlier_evidence_is_refused() {
+        // The re-review reproduction: with both limits at 1 the store cannot
+        // hold two explicit edges, and evicting `B -> A` made A current again
+        // while B — the memory that replaced it — was still alive. The bound
+        // now refuses the *later* write instead of forgetting the earlier
+        // evidence, and it refuses it before anything is stored, so the
+        // caller learns the evidence was not accepted.
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig {
+            max_links: 1,
+            max_links_per_memory: 1,
+            ..WorkingMemoryConfig::default()
+        });
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-a",
+            "claim a",
+            Some("game-x"),
+            1_000,
+        );
+        durable_write_superseding(
+            &mut memory,
+            &mut security,
+            "evt-b",
+            "claim b replaces a",
+            Some("game-x"),
+            2_000,
+            &["evt-a"],
+        )
+        .expect("the first supersession fits the bound");
+        assert_eq!(memory.links().len(), 1);
+
+        let error = durable_write_superseding(
+            &mut memory,
+            &mut security,
+            "evt-c",
+            "claim c replaces b",
+            Some("game-x"),
+            3_000,
+            &["evt-b"],
+        )
+        .expect_err("evidence that would displace earlier evidence is refused");
+        assert!(
+            error.to_string().contains("supersession evidence"),
+            "{error}"
+        );
+        assert_eq!(memory.len(), 2, "the refused write stored nothing");
+        assert_eq!(memory.links().len(), 1, "and mangled nothing");
+
+        let results = memory.relevant_linked(unfiltered_query(10), 3_500);
+        assert_eq!(results.len(), 2, "claim c was never accepted");
+        let a = results
+            .iter()
+            .find(|item| item.entry.source.event_id == "evt-a")
+            .expect("claim a is still retained");
+        assert!(
+            a.stale,
+            "A was explicitly superseded and is still retained: {:?}",
+            memory.links()
+        );
+        let b = results
+            .iter()
+            .find(|item| item.entry.source.event_id == "evt-b")
+            .expect("claim b is still retained");
+        assert!(
+            !b.stale,
+            "C's evidence was refused, so nothing retained supersedes B"
+        );
+    }
+
+    #[test]
+    fn an_explicit_supersession_chain_survives_derived_edge_pressure() {
+        // The same `A <- B <- C` shape at a bound that can hold the chain:
+        // the store is then only ever allowed to shed derived edges, so both
+        // explicitly superseded nodes keep their verdict while all three are
+        // live — the assertion the re-review asked for under edge pressure.
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig {
+            max_entries: 8,
+            max_links: 2,
+            max_links_per_memory: 1,
+            ..WorkingMemoryConfig::default()
+        });
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-a",
+            "claim a",
+            Some("game-x"),
+            1_000,
+        );
+        durable_write_superseding(
+            &mut memory,
+            &mut security,
+            "evt-b",
+            "claim b replaces a",
+            Some("game-x"),
+            2_000,
+            &["evt-a"],
+        )
+        .expect("first link fits");
+        durable_write_superseding(
+            &mut memory,
+            &mut security,
+            "evt-c",
+            "claim c replaces b",
+            Some("game-x"),
+            3_000,
+            &["evt-b"],
+        )
+        .expect("the chain fits the bound");
+        assert_eq!(memory.links().len(), 2, "the chain fills the bound");
+
+        // Derived pressure: every later same-topic write wants a temporal
+        // edge the bound must shed instead of touching the chain.
+        for (id, at_ms) in [("evt-d", 4_000_u64), ("evt-e", 5_000_u64)] {
+            durable_write(
+                &mut memory,
+                &mut security,
+                id,
+                "a later claim",
+                Some("game-x"),
+                at_ms,
+            );
+        }
+        assert_eq!(
+            memory
+                .links()
+                .iter()
+                .filter(|link| link.kind == MemoryLinkKind::Supersedes)
+                .count(),
+            2,
+            "both explicit edges survived derived pressure: {:?}",
+            memory.links()
+        );
+
+        let results = memory.relevant_linked(unfiltered_query(10), 5_500);
+        assert_eq!(results.len(), 5, "every node is retained");
+        for id in ["evt-a", "evt-b"] {
+            let item = results
+                .iter()
+                .find(|result| result.entry.source.event_id == id)
+                .expect("retained");
+            assert!(
+                item.stale,
+                "{id} was explicitly superseded and is still retained: {:?}",
+                memory.links()
+            );
+        }
+        let c = results
+            .iter()
+            .find(|result| result.entry.source.event_id == "evt-c")
+            .expect("retained");
+        assert!(!c.stale, "nothing retained supersedes C");
     }
 
     #[test]
