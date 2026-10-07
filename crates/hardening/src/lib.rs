@@ -224,8 +224,14 @@ mod tests {
                 working_memory_limit: limit,
                 ..SoakConfig::default()
             };
-            let error = config
+            // Core-probe rule: the scenario soak shares only the common
+            // bounds, so a small window must still be a valid *scenario*
+            // experiment (#105 review round 6).
+            config
                 .validate()
+                .expect("the common bounds accept a small working window");
+            let error = config
+                .validate_link_probe()
                 .expect_err("a window that cannot retain a link is not a link probe");
             assert!(
                 error.to_string().contains("working_memory_limit"),
@@ -236,7 +242,7 @@ mod tests {
             working_memory_limit: 3,
             ..SoakConfig::default()
         }
-        .validate()
+        .validate_link_probe()
         .expect("three node slots keep the target alive through link creation");
 
         // The same refusal reaches the run path the review probe exercised.
@@ -280,6 +286,79 @@ mod tests {
         assert!(
             report.final_state.memory_links_high_water > 0,
             "the link store was actually exercised: {:?}",
+            report.final_state
+        );
+        assert!(report.final_state.memory_links <= config.memory_links_limit);
+    }
+
+    #[test]
+    fn a_core_soak_too_short_to_mint_a_second_durable_write_is_refused() {
+        // Round-6 reproduction: `logical_events = 2` with the default
+        // window (durable_every = 16) performs only the initial durable
+        // write, so no supersession edge is ever created — yet the report
+        // still carried clean `memory_links = 0` checks, a bounded-state
+        // check that cannot fail. The probe now refuses configurations that
+        // can never reach the second durable write instead of reporting a
+        // false green.
+        let config = SoakConfig {
+            logical_events: 2,
+            ..SoakConfig::default()
+        };
+        let error = config
+            .validate_link_probe()
+            .expect_err("a run with a single durable write never mints a link");
+        assert!(
+            error.to_string().contains("second durable write"),
+            "the refusal names the missing link opportunity: {error}"
+        );
+        let error = run_core_soak(config, metadata(2, 50))
+            .expect_err("the run path refuses the same configuration before it starts");
+        assert!(
+            error.to_string().contains("second durable write"),
+            "{error}"
+        );
+
+        // Boundary: one event past the cadence reaches the second durable
+        // write, and the accepted run really does retain a link.
+        let config = SoakConfig {
+            logical_events: 17,
+            ..SoakConfig::default()
+        };
+        let report =
+            run_core_soak(config, metadata(17, 50)).expect("the boundary configuration runs");
+        assert!(
+            report.final_state.memory_links > 0,
+            "one event past the cadence already mints an edge: {:?}",
+            report.final_state
+        );
+    }
+
+    #[test]
+    fn an_accepted_link_limited_soak_completes_without_exhausting_explicit_evidence() {
+        // Round-6 reproduction: 160 events over a 256-entry window with an
+        // 8-link store passed validation but aborted mid-workload — at the
+        // old fixed window/16 cadence the retained explicit chain reached 9
+        // edges while supersession evidence is never shed. The cadence now
+        // slows to fit the configured link budget and `validate_link_probe`
+        // pins the projection, so an accepted configuration always runs to
+        // completion with its evidence intact.
+        let config = SoakConfig {
+            logical_events: 160,
+            working_memory_limit: 256,
+            memory_links_limit: 8,
+            ..SoakConfig::default()
+        };
+        assert!(
+            config.max_retained_supersession_chain() <= config.memory_links_limit,
+            "the projected chain fits the budget: {} edge(s) at cadence {}",
+            config.max_retained_supersession_chain(),
+            config.durable_every()
+        );
+        let report = run_core_soak(config.clone(), metadata(160, 50))
+            .expect("the accepted configuration completes instead of aborting mid-workload");
+        assert!(
+            report.final_state.memory_links > 0,
+            "the probe still exercised the link store: {:?}",
             report.final_state
         );
         assert!(report.final_state.memory_links <= config.memory_links_limit);

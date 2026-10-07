@@ -322,6 +322,40 @@ fn a_provider_fault_on_a_workload_with_no_misses_is_refused() {
 }
 
 #[test]
+fn a_window_the_core_link_probe_refuses_is_still_a_valid_scenario_run() {
+    // Round-6: the core link-probe minimum (three node slots, so a window
+    // can retain a link) is not a scenario-retention invariant. The
+    // scenario workload only performs working-memory writes and omits the
+    // link growth findings, so a two-entry window is a valid bounded
+    // experiment and must not be refused by core-only rules.
+    let scenario = burst_scenario("two-slot-window");
+    let overlay = overlay(
+        "two-slot-window",
+        1,
+        vec![FaultSpec {
+            subsystem: FaultSubsystem::ContentIngress,
+            occurrence: 1,
+            kind: FaultKind::Flood,
+        }],
+    );
+    let config = SoakConfig {
+        working_memory_limit: 2,
+        ..small_config()
+    };
+    let report = run_scenario_soak(&scenario, &overlay, config, metadata())
+        .expect("a two-entry working window is a valid scenario experiment");
+    assert!(
+        report.final_state.working_memory_entries <= 2,
+        "the small window is enforced: {:?}",
+        report.final_state.working_memory_entries
+    );
+    assert!(
+        report.finding("memory_links").is_none(),
+        "scenario reports still omit link checks"
+    );
+}
+
+#[test]
 fn leading_and_trailing_idle_are_part_of_the_declared_timeline() {
     // The soak must start at the scenario's declared logical_start and settle to
     // the declared stream end, not normalise away the idle phases around the

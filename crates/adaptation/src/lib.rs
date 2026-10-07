@@ -73,6 +73,14 @@ pub struct MemoryEntry {
 /// causal kinds wait for an evidence source that can actually establish them.
 pub const MEMORY_LINK_VOCAB_VERSION: &str = "memory-link-v1";
 
+/// How many raw supersession declarations one write may hand
+/// `remember_durable_superseding`, as a multiple of
+/// `max_links_per_memory`. Duplicates count once, but the pass that
+/// discovers that stays bounded too: a restate may buy this factor of
+/// slack over the edge budget, never an unbounded scan or allocation over
+/// an arbitrary slice (#105 review round 6).
+const SUPERSESSION_DECLARATION_FACTOR: usize = 8;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryLinkKind {
@@ -388,7 +396,10 @@ impl WorkingMemory {
     /// `max_links_per_memory` bounds what one write may create. Repeating one
     /// target declares it once: the budget counts edges the write creates,
     /// not the strings it was handed, so duplicates can neither blow the
-    /// budget nor consume it.
+    /// budget nor consume it. The raw declaration list itself is bounded by
+    /// a fixed multiple of that budget (and the dedup buffer never grows
+    /// past the budget), so a flood of restated ids cannot buy an unbounded
+    /// scan on a bounded-adaptation API.
     pub fn remember_durable_superseding(
         &mut self,
         permit: &MemoryWritePermit,
@@ -397,16 +408,31 @@ impl WorkingMemory {
         now_ms: u64,
         supersedes: &[&str],
     ) -> Result<&MemoryEntry, AdaptationError> {
-        let mut unique: Vec<&str> = Vec::with_capacity(supersedes.len());
+        let declarations_bound = self
+            .config
+            .max_links_per_memory
+            .saturating_mul(SUPERSESSION_DECLARATION_FACTOR);
+        if supersedes.len() > declarations_bound {
+            return Err(AdaptationError::InvalidInput(
+                "one write may not hand more supersession declarations than the bounded input \
+                 allows; collapse repeated declarations before calling",
+            ));
+        }
+        let mut unique: Vec<&str> =
+            Vec::with_capacity(self.config.max_links_per_memory.min(supersedes.len()));
         for target in supersedes {
             if !unique.contains(target) {
+                // Refuse as soon as a new unique target exceeds the budget:
+                // at cap+1 uniques the write is already rejected, so
+                // buffering beyond that would only waste memory.
+                if unique.len() >= self.config.max_links_per_memory {
+                    return Err(AdaptationError::InvalidInput(
+                        "one write may not declare more supersessions than the per-memory link \
+                         budget",
+                    ));
+                }
                 unique.push(target);
             }
-        }
-        if unique.len() > self.config.max_links_per_memory {
-            return Err(AdaptationError::InvalidInput(
-                "one write may not declare more supersessions than the per-memory link budget",
-            ));
         }
         let mut targets = Vec::with_capacity(unique.len());
         for target in &unique {
@@ -2351,6 +2377,69 @@ mod tests {
                 "cap {cap}: whatever the duplicates did not spend stays available to the spine"
             );
         }
+    }
+
+    #[test]
+    fn supersession_declarations_are_bounded_before_deduplication() {
+        // Round-6: the dedup pass used to allocate capacity for — and walk —
+        // the entire raw slice before applying the per-write budget, so a
+        // flood of restated ids could force unbounded allocation and CPU
+        // despite producing a single edge. The input is now bounded before
+        // any allocation, while ordinary restatement inside that bound keeps
+        // its old meaning: duplicates still count once.
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig {
+            max_links: 4,
+            max_links_per_memory: 2,
+            ..WorkingMemoryConfig::default()
+        });
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-a",
+            "claim a",
+            Some("game-x"),
+            1_000,
+        );
+        let links_before = memory.links().len();
+
+        // Bound: max_links_per_memory (2) × SUPERSESSION_DECLARATION_FACTOR.
+        let flood = vec!["evt-a"; 4_096];
+        let error = durable_write_superseding(
+            &mut memory,
+            &mut security,
+            "evt-b",
+            "claim b",
+            Some("game-x"),
+            2_000,
+            &flood,
+        )
+        .expect_err("an oversized declaration list is refused before the dedup scan");
+        assert!(
+            error.to_string().contains("declarations"),
+            "the refusal names the unbounded input: {error}"
+        );
+        assert_eq!(memory.len(), 1, "the refused write stored nothing");
+        assert_eq!(memory.links().len(), links_before, "and mangled nothing");
+
+        // Inside the bound, restatement keeps its old meaning: duplicates
+        // count once rather than erroring or spending budget.
+        let written = durable_write_superseding(
+            &mut memory,
+            &mut security,
+            "evt-b",
+            "claim b replaces a",
+            Some("game-x"),
+            2_000,
+            &["evt-a", "evt-a", "evt-a"],
+        )
+        .expect("restatement inside the bound is still one target");
+        let supersessions = memory
+            .links()
+            .iter()
+            .filter(|link| link.from == written && link.kind == MemoryLinkKind::Supersedes)
+            .count();
+        assert_eq!(supersessions, 1, "three names, one edge");
     }
 
     #[test]

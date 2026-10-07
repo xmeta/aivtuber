@@ -305,6 +305,21 @@ impl SoakConfig {
                  the probe cannot perform a single durable supersession write",
             ));
         }
+        Ok(())
+    }
+
+    /// Core-soak link-probe rules, on top of the common bounds in
+    /// [`SoakConfig::validate`].
+    ///
+    /// The scenario soak deliberately performs only working-memory writes
+    /// and reports `growth_findings(..., false)`, so it calls `validate`
+    /// alone: a one- or two-entry window is a valid bounded scenario
+    /// experiment, not a broken link probe (#105 review round 6). The core
+    /// soak, by contrast, must be a *runnable* link experiment — these are
+    /// the rules that keep it from aborting mid-run or reporting link checks
+    /// it never exercised.
+    pub fn validate_link_probe(&self) -> Result<(), HardeningError> {
+        self.validate()?;
         // A configuration accepted as a link-store probe must be able to
         // retain a link. Every durable slot also writes one working entry,
         // so the supersession target is only still retained at link creation
@@ -321,7 +336,77 @@ impl SoakConfig {
                  reports on",
             ));
         }
+        // The probe mints its first supersession edge only on the *second*
+        // durable write. A run no longer than one cadence gap performs just
+        // the initial durable write, creates no edge at all, and would still
+        // report clean `memory_links = 0` checks — a bounded-state check
+        // that cannot fail (#105 review round 6). Refuse the configuration
+        // instead of emitting a false green.
+        if self.logical_events <= self.durable_every() {
+            return Err(HardeningError::InvalidConfiguration(
+                "soak logical_events must reach the second durable write: the probe needs \
+                 more than one durable_every of events before it can mint its first \
+                 supersession link, or the report would claim link checks it never \
+                 exercised",
+            ));
+        }
+        // An accepted configuration must also *complete*: explicit
+        // supersession evidence is never shed, so a workload whose retained
+        // chain outgrows `memory_links_limit` deterministically aborts
+        // mid-run with an invalid-adaptation error. `durable_every` slows
+        // the cadence down to fit the link budget, and this check pins that
+        // projection — if a future cadence change breaks it, the config is
+        // refused up front rather than failing halfway through the
+        // experiment (#105 review round 6).
+        let chain = self.max_retained_supersession_chain();
+        if chain > self.memory_links_limit {
+            return Err(HardeningError::InvalidConfiguration(
+                "soak memory_links_limit cannot hold this workload's retained supersession \
+                 chain at its configured cadence and window: an accepted configuration must \
+                 run to completion, never exhaust explicit evidence mid-run",
+            ));
+        }
         Ok(())
+    }
+
+    /// Cadence of the core soak's permit-gated durable supersession write:
+    /// one durable claim every this-many events, the first at event 0.
+    ///
+    /// Two constraints shape it (#105 review round 6):
+    ///
+    /// * window/16 pacing keeps the supersession target comfortably inside
+    ///   its TTL and the retained chain a small fraction of the window, and
+    /// * link-budget pacing keeps the *retained explicit chain* below
+    ///   `memory_links_limit`. Edges are born every `durable_every` events
+    ///   and pruned only when FIFO retention evicts their older endpoint,
+    ///   so the chain converges to `ceil(window / (durable_every + 1)) - 1`
+    ///   concurrent edges; requiring `durable_every + 1 >= ceil(window /
+    ///   (links + 1))` holds it to the configured bound. Without that, a
+    ///   small link store over a large window would exhaust explicit
+    ///   evidence and abort mid-run.
+    pub fn durable_every(&self) -> u64 {
+        let by_window = (self.working_memory_limit / 16) as u64;
+        // ceil(window / (links + 1)) - 1, without a division-by-links+1
+        // subtlety: ceil(a / b) == (a + b - 1) / b.
+        let by_links = ((self.working_memory_limit + self.memory_links_limit)
+            / (self.memory_links_limit + 1))
+            .saturating_sub(1) as u64;
+        by_window.max(by_links).max(1)
+    }
+
+    /// Upper bound on explicit supersession edges this configuration's core
+    /// workload can hold in the store at once: edges are born once per
+    /// durable cadence and pruned when retention evicts their older
+    /// endpoint, so the count saturates at `ceil(window / (cadence + 1)) - 1`
+    /// and is additionally capped by how many edges the run can ever mint.
+    /// The exact maximum, used by `validate_link_probe` to refuse
+    /// configurations that would abort mid-run (#105 review round 6).
+    pub fn max_retained_supersession_chain(&self) -> usize {
+        let durable_every = self.durable_every();
+        let window = self.working_memory_limit as u64;
+        let by_window = (window + durable_every) / (durable_every + 1);
+        let by_run = self.logical_events.saturating_sub(1) / durable_every;
+        by_window.saturating_sub(1).min(by_run) as usize
     }
 
     pub fn logical_duration_ms(&self) -> u64 {
@@ -396,7 +481,7 @@ pub fn run_core_soak(
     config: SoakConfig,
     metadata: ReproducibilityMetadata,
 ) -> Result<SoakReport, HardeningError> {
-    config.validate()?;
+    config.validate_link_probe()?;
     metadata
         .validate()
         .map_err(|error| HardeningError::InvalidMetadata(error.to_string()))?;
@@ -450,17 +535,18 @@ pub fn run_core_soak(
     let midpoint_index = config.logical_events / 2;
     let mut midpoint = None;
     // The edge store is bounded state too, so the soak has to populate it:
-    // a system-source durable claim every sixteenth node slot supersedes the
-    // previous one through the same permit gate production uses, creating
-    // supersession edges plus the deterministic same-topic temporal spine —
-    // often enough that the store actually reaches its bound and plateaus
-    // before the midpoint, which is what the growth findings watch. The gap
-    // between two durable writes stays far below the node bound, so a
-    // supersession target is always still retained when it is declared, and
-    // `SoakConfig::validate` refuses node windows too small to hold the
-    // working entry, the target, and the new durable entry together — a run
-    // that could never retain a link must not claim to probe the link store.
-    let durable_every = ((config.working_memory_limit / 16).max(1)) as u64;
+    // a system-source durable claim every `durable_every` node slot
+    // supersedes the previous one through the same permit gate production
+    // uses, creating supersession edges plus the deterministic same-topic
+    // temporal spine — often enough that the store plateaus before the
+    // midpoint, which is what the growth findings watch. `durable_every`
+    // derives from both the window and the link budget, so the retained
+    // explicit chain fits `memory_links_limit` instead of exhausting it
+    // mid-run, and `SoakConfig::validate_link_probe` refuses windows too
+    // small to retain a link, runs too short to mint one, and cadences whose
+    // projected chain outgrows the budget — so an accepted run really
+    // exercises the link store it reports on (#105 review round 6).
+    let durable_every = config.durable_every();
     let supersede_targets = config.working_memory_limit >= 2;
     let mut previous_durable: Option<String> = None;
 
@@ -546,6 +632,10 @@ pub fn run_core_soak(
         .ok_or_else(|| HardeningError::Invariant("soak midpoint was not captured".to_owned()))?;
     let final_state = snapshot(&scheduler, &security, &memory, &telemetry, &assets);
     let telemetry_summary = telemetry.summary(metadata.stream_duration_ms);
+    // `validate_link_probe` guaranteed this run reaches its second durable
+    // write, so the link checks below always describe link activity that
+    // actually happened — `true` is a promise the configuration already
+    // kept, never a hope (#105 review round 6).
     let growth = growth_findings(&config, &midpoint, &final_state, true);
     let flood = run_content_flood(config.ingress_queue_limit)?;
 
