@@ -237,7 +237,11 @@ fn nothing_is_calibrated_until_a_target_file_says_so() {
 }
 
 /// The checked-in target file must stay valid against this catalog and stay
-/// empty until a target cites measured evidence.
+/// empty until a target cites measured evidence from a representative series
+/// at a sufficient denominator. The first calibration cycle ran on the
+/// mock-driven smoke fixture, whose pooled denominators sat below the sample
+/// floors — evidence that cannot decide an objective cannot justify a target
+/// for it (docs/operational-slo.adoc, PR #228 review).
 #[test]
 fn the_checked_in_target_file_is_valid_and_still_empty() {
     let bytes =
@@ -253,7 +257,8 @@ fn the_checked_in_target_file_is_valid_and_still_empty() {
     );
     assert!(
         targets.targets.is_empty(),
-        "a numeric target may only be checked in once it cites measured baseline evidence"
+        "a numeric target may only be checked in once it cites measured baseline evidence from a \
+         representative series whose pooled denominators reach the sample floor"
     );
     let description = targets
         .description

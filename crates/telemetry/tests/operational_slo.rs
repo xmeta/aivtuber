@@ -103,6 +103,10 @@ fn calibrated(target: f64, baseline: f64) -> SloTarget {
             stream_hours: Some(1),
             series: Some(CALIBRATION_SERIES.to_owned()),
             runs: calibration_manifest(),
+            // At every indicator's sample floor, so the helper represents
+            // evidence a target is allowed to cite; the floor itself is
+            // pinned by its own regression below.
+            eligible: Some(15),
         },
     }
 }
@@ -383,6 +387,181 @@ fn an_external_provider_failure_is_attributed_away_from_the_runtime_when_a_fallb
     assert_eq!(fallback.miss_attribution.runtime_handled, 0);
     assert_eq!(mixed.failure_attribution.runtime_handled, 1);
     assert_eq!(mixed.verdict, aivtuber_telemetry::SloVerdict::Breach);
+}
+
+#[test]
+fn a_target_calibrated_for_another_series_is_not_applied_to_this_report() {
+    // The fixture report belongs to `deterministic_semantic|slo-fixture|bench-v1|7`.
+    // A target calibrated on a different compatibility series must not decide
+    // this report: cross-series reuse would silently apply — or silently
+    // loosen — an objective calibrated for a different workload, exactly
+    // what `baseline.series` claims to scope.
+    let mut foreign = calibrated(1.0, 1.0);
+    foreign.baseline.series = Some("deterministic_semantic|other-dataset|bench-v1|7".to_owned());
+
+    let mut handled = observation(RouteClass::CachedFallback);
+    handled.fallback_reason = Some("unavailable".to_owned());
+    handled.event_to_first_audio_ms = Some(50);
+
+    let cross = evaluate(
+        &report(vec![handled.clone()], 1_000),
+        &targets(&[("reliability.fallback_delivery_rate", foreign)]),
+        SloEvaluationConfig::default(),
+    )
+    .expect("SLO report");
+    let row = result(&cross, "reliability.fallback_delivery_rate", "session");
+    assert_eq!(
+        row.target, None,
+        "a target calibrated for another series must not be applied"
+    );
+    assert_eq!(
+        row.status,
+        SloStatus::Uncalibrated,
+        "cross-series application must produce neither Met nor Missed"
+    );
+    assert_eq!(
+        row.value,
+        Some(1.0),
+        "the measured value still publishes as calibration evidence"
+    );
+    assert!(
+        cross
+            .limitations
+            .iter()
+            .any(|line| line.contains("compatibility series")),
+        "the report says why the target was not applied: {:?}",
+        cross.limitations
+    );
+
+    // Positive control: the same target on the report's own series still
+    // decides the objective, so the boundary selects on series alone.
+    let same = evaluate(
+        &report(vec![handled], 1_000),
+        &targets(&[("reliability.fallback_delivery_rate", calibrated(1.0, 1.0))]),
+        SloEvaluationConfig::default(),
+    )
+    .expect("SLO report");
+    let row = result(&same, "reliability.fallback_delivery_rate", "session");
+    assert_eq!(row.target, Some(1.0));
+    assert_eq!(row.status, SloStatus::Met);
+}
+
+#[test]
+fn a_baseline_below_the_indicator_sample_floor_is_refused() {
+    // Evidence the contract itself would call too thin to *decide* the
+    // objective must not be citable as the reason a target exists. The
+    // denominator now travels in the evidence precisely so this is checked
+    // rather than trusted.
+    let mut under_floor = calibrated(0.99, 1.0);
+    under_floor.baseline.eligible = Some(4); // speech presence floor is 15
+
+    let file = targets(&[("availability.speech_presence_rate", under_floor.clone())]);
+    let error = file
+        .validate(&aivtuber_telemetry::catalog())
+        .expect_err("below-floor evidence must not justify a target");
+    assert!(error.to_string().contains("sample floor"), "{error}");
+
+    // At the floor the same evidence validates, so the boundary is the floor
+    // itself and nothing else.
+    let at_floor = targets(&[("availability.speech_presence_rate", calibrated(0.99, 1.0))]);
+    at_floor
+        .validate(&aivtuber_telemetry::catalog())
+        .expect("evidence at the sample floor is citable");
+}
+
+#[test]
+fn a_version_one_target_file_without_the_eligible_denominator_is_refused_by_validation() {
+    // Compatibility is part of the contract, not a parser accident. A
+    // version-1 artifact written before the denominator existed must still
+    // load — if parsing failed first, the file's own `schema_version` could
+    // never be read to say which contract it wrote — and it is refused
+    // afterwards, in validation, named for what it lacks instead of being
+    // reported as an unreadable file.
+    let bytes = br#"{
+        "schema_version": "1",
+        "catalog_version": "slo-catalog-v1",
+        "targets": {
+            "availability.speech_presence_rate": {
+                "target": 0.95,
+                "baseline": {
+                    "value": 0.97,
+                    "source": "run-legacy (dataset=slo-fixture, commit=deadbeef)",
+                    "stream_hours": 3,
+                    "series": "deterministic_semantic|slo-fixture|bench-v1|7",
+                    "runs": [
+                        {"run_id": "run-a", "git_commit": "deadbeef"},
+                        {"run_id": "run-b", "git_commit": "deadbeef"}
+                    ]
+                }
+            }
+        }
+    }"#;
+    let file = SloTargets::from_json(bytes).expect("a version-1 target file must still parse");
+    let error = file
+        .validate(&catalog())
+        .expect_err("evidence without a denominator cannot justify a target");
+    assert!(
+        error.to_string().contains("eligible"),
+        "the refusal names the missing denominator, not a parse failure: {error}"
+    );
+}
+
+#[test]
+fn series_keys_escape_separators_so_distinct_tuples_cannot_collide() {
+    // Under a raw `mode|dataset|config|seed` join, a report over dataset
+    // `alpha|beta` + config `gamma` and a target calibrated for dataset
+    // `alpha` + config `beta|gamma` produce the *same* key — the exact shape
+    // that would let one workload's target decide another's verdict.
+    let mut piped = report(
+        vec![{
+            let mut handled = observation(RouteClass::CachedFallback);
+            handled.fallback_reason = Some("unavailable".to_owned());
+            handled.event_to_first_audio_ms = Some(50);
+            handled
+        }],
+        1_000,
+    );
+    piped.metadata.dataset_id = "alpha|beta".to_owned();
+    piped.metadata.config_version = "gamma".to_owned();
+
+    // The key the legacy unescaped join would have produced for the *other*
+    // tuple: identical text, different workload.
+    let mut colliding = calibrated(1.0, 1.0);
+    colliding.baseline.series = Some("deterministic_semantic|alpha|beta|gamma|7".to_owned());
+    let crossed = evaluate(
+        &piped,
+        &targets(&[("reliability.fallback_delivery_rate", colliding)]),
+        SloEvaluationConfig::default(),
+    )
+    .expect("SLO report");
+    let row = result(&crossed, "reliability.fallback_delivery_rate", "session");
+    assert_eq!(
+        row.target, None,
+        "a colliding tuple must not match across the separator"
+    );
+    assert_eq!(row.status, SloStatus::Uncalibrated);
+    assert!(
+        crossed
+            .limitations
+            .iter()
+            .any(|line| line.contains("compatibility series")),
+        "the report says why: {:?}",
+        crossed.limitations
+    );
+
+    // The properly escaped key of the report's own tuple does apply, so the
+    // escaping widens nothing — it only removes the collision.
+    let mut matching = calibrated(1.0, 1.0);
+    matching.baseline.series = Some("deterministic_semantic|alpha%7Cbeta|gamma|7".to_owned());
+    let own = evaluate(
+        &piped,
+        &targets(&[("reliability.fallback_delivery_rate", matching)]),
+        SloEvaluationConfig::default(),
+    )
+    .expect("SLO report");
+    let row = result(&own, "reliability.fallback_delivery_rate", "session");
+    assert_eq!(row.target, Some(1.0));
+    assert_eq!(row.status, SloStatus::Met);
 }
 
 #[test]
@@ -1168,7 +1347,8 @@ fn a_handwritten_target_without_a_run_manifest_is_refused() {
         "baseline": {
             "value": 0.95,
             "source": "handwritten, not a measured artifact",
-            "stream_hours": 1
+            "stream_hours": 1,
+            "eligible": 15
         }
     }"#;
     let mut file = SloTargets::default();
