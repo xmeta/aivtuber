@@ -492,3 +492,44 @@ fn a_long_logical_time_scenario_plateaus_at_retained_state_bounds() {
         );
     }
 }
+
+#[test]
+fn a_scenario_report_carries_no_link_bound_it_never_exercises() {
+    // Round-4 finding: the scenario trace only records working memory —
+    // links are minted exclusively on the permit-gated durable path, which
+    // this workload never drives — so a `memory_links` growth check here
+    // would read zero because the subsystem was not exercised, not because
+    // it stayed bounded. Such a check cannot fail: it would pass even if
+    // link creation or pruning were completely broken. The report therefore
+    // omits both link metrics while the core soak still carries them, and
+    // the raw counters remain visible in the snapshots as observations.
+    let scenario = burst_scenario("linkless-growth-soak");
+    let report = run_scenario_soak(
+        &scenario,
+        &overlay(
+            "linkless-growth-soak",
+            1,
+            vec![FaultSpec {
+                subsystem: FaultSubsystem::ContentIngress,
+                occurrence: 1,
+                kind: FaultKind::Flood,
+            }],
+        ),
+        small_config(),
+        metadata(),
+    )
+    .expect("soak");
+
+    assert_eq!(report.final_state.memory_links, 0);
+    assert_eq!(report.final_state.memory_links_high_water, 0);
+    assert!(
+        report.finding("memory_links").is_none(),
+        "a bound the workload cannot move must not be reported as checked"
+    );
+    assert!(
+        report.finding("memory_links_high_water").is_none(),
+        "a bound the workload cannot move must not be reported as checked"
+    );
+    // The metrics this workload does exercise are still reported.
+    assert!(report.finding("working_memory_entries").is_some());
+}

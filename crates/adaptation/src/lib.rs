@@ -422,15 +422,30 @@ impl WorkingMemory {
         // evidence was not accepted rather than discovering later that a
         // claim resurrected. Derived temporal edges are shed to make room
         // instead — there are always enough of them — so only a write that
-        // adds explicit evidence can be refused here. The count is
-        // *projected* through this write's own compaction first: an edge
-        // whose endpoint is already expired at `now_ms`, or is the entry
-        // this insertion capacity-evicts, will not be retained by the write
-        // it would be blocking, so it is dead evidence rather than a claim
-        // held against a still-retained node (round 3: valid updates must
-        // not wait for an unrelated write to free logically dead capacity).
-        let explicit_retained = self.projected_explicit_links(now_ms);
-        if explicit_retained + unique.len() > self.config.max_links {
+        // adds explicit evidence can be refused here. The fit is judged
+        // over what this write would *leave retained*: the edges already
+        // stored are projected through this write's own compaction first
+        // (expiry trim, then the capacity pop), and each new edge counts
+        // only if its target survives that same projection — an endpoint
+        // already expired at `now_ms`, the node this insertion
+        // capacity-evicts, or a fresh target that is itself that evicted
+        // node, is dead evidence the write removes anyway rather than a
+        // claim held against a still-retained node (round 3: valid updates
+        // must not wait for an unrelated write to free logically dead
+        // capacity; round 4: the evicted *target* of a new edge must not
+        // consume capacity the store will never spend).
+        let survivors = self.projected_survivors(now_ms);
+        let explicit_retained = self
+            .links
+            .iter()
+            .filter(|link| {
+                link.kind == MemoryLinkKind::Supersedes
+                    && survivors.contains(&link.from)
+                    && survivors.contains(&link.to)
+            })
+            .count();
+        let new_evidence_retained = targets.iter().filter(|id| survivors.contains(id)).count();
+        if explicit_retained + new_evidence_retained > self.config.max_links {
             return Err(AdaptationError::InvalidInput(
                 "the link store cannot hold this write's supersession evidence without \
                  discarding earlier evidence for a still-retained claim; raise max_links or let \
@@ -590,14 +605,15 @@ impl WorkingMemory {
             .retain(|link| alive.contains(&link.from) && alive.contains(&link.to));
     }
 
-    /// The explicit supersession edges that would still be *retained* after
-    /// this write's own insertion compaction has run, without mutating the
-    /// store: mirrors `push_bounded`'s two `compact` passes (expiry trim,
-    /// push at the back, pop from the front while over the node bound), then
-    /// counts only supersession edges whose two endpoints survive them. The
-    /// inserted node itself carries no old edge, so it never needs an id in
-    /// this projection.
-    fn projected_explicit_links(&self, now_ms: u64) -> usize {
+    /// The node ids that would still be retained after this write's own
+    /// insertion compaction has run, without mutating the store: mirrors
+    /// `push_bounded`'s two `compact` passes (expiry trim, push at the back,
+    /// pop from the front while over the node bound). Stored edges and new
+    /// supersession targets are both judged against this set, so evidence
+    /// this write itself removes never counts against this write. The
+    /// inserted node is not in the set yet; it always survives because the
+    /// pops come from the front and `max_entries >= 1`.
+    fn projected_survivors(&self, now_ms: u64) -> HashSet<u64> {
         let mut survivors: Vec<u64> = self
             .entries
             .iter()
@@ -611,15 +627,7 @@ impl WorkingMemory {
             .saturating_add(1)
             .saturating_sub(self.config.max_entries);
         survivors.drain(..excess);
-        let alive: HashSet<u64> = survivors.into_iter().collect();
-        self.links
-            .iter()
-            .filter(|link| {
-                link.kind == MemoryLinkKind::Supersedes
-                    && alive.contains(&link.from)
-                    && alive.contains(&link.to)
-            })
-            .count()
+        survivors.into_iter().collect()
     }
 
     fn push_link(&mut self, link: MemoryLink) {
@@ -2103,6 +2111,97 @@ mod tests {
             .find(|item| item.entry.source.event_id == "evt-b")
             .expect("claim b is still retained");
         assert!(b.stale, "C -> B marks the replaced claim stale");
+        let c = results
+            .iter()
+            .find(|item| item.entry.source.event_id == "evt-c")
+            .expect("claim c was accepted");
+        assert!(!c.stale, "nothing retained supersedes C");
+    }
+
+    #[test]
+    fn a_supersession_target_this_insertion_evicts_does_not_consume_link_capacity() {
+        // Round-4 capacity reproduction: three node slots hold X, A, B and
+        // the one-edge store holds the retained B -> A evidence. C
+        // supersedes X — the node this insertion capacity-evicts — so the
+        // fresh C -> X edge is pruned by the same write's compaction and
+        // the store ends exactly where it started. Refusing C would hold a
+        // write hostage to a slot its own insertion frees; the evicted
+        // target leaves no retained claim that could resurrect.
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig {
+            max_entries: 3,
+            max_links: 1,
+            max_links_per_memory: 1,
+            ..WorkingMemoryConfig::default()
+        });
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-x",
+            "claim x",
+            Some("game-x"),
+            1_000,
+        );
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-a",
+            "claim a",
+            Some("game-x"),
+            2_000,
+        );
+        durable_write_superseding(
+            &mut memory,
+            &mut security,
+            "evt-b",
+            "claim b replaces a",
+            Some("game-x"),
+            3_000,
+            &["evt-a"],
+        )
+        .expect("the first supersession fits the bound");
+        assert_eq!(memory.links().len(), 1);
+
+        let written = durable_write_superseding(
+            &mut memory,
+            &mut security,
+            "evt-c",
+            "claim c replaces x",
+            Some("game-x"),
+            4_000,
+            &["evt-x"],
+        )
+        .expect("a target this insertion evicts does not consume link capacity");
+
+        assert_eq!(memory.len(), 3, "the insertion evicted X");
+        assert!(
+            memory
+                .entries()
+                .iter()
+                .all(|entry| entry.source.event_id != "evt-x"),
+            "X is capacity-evicted: {:?}",
+            memory.entries()
+        );
+        assert_eq!(
+            memory.links().len(),
+            1,
+            "C -> X was pruned with X; B -> A remains: {:?}",
+            memory.links()
+        );
+        assert_eq!(memory.links()[0].kind, MemoryLinkKind::Supersedes);
+        assert_eq!(memory.links()[0].from, retained_node(&memory, "evt-b"));
+        assert_eq!(memory.links()[0].to, retained_node(&memory, "evt-a"));
+        assert!(
+            memory.links().iter().all(|link| link.from != written),
+            "no edge survives from the new node when its only target was evicted"
+        );
+
+        let results = memory.relevant_linked(unfiltered_query(10), 4_500);
+        let a = results
+            .iter()
+            .find(|item| item.entry.source.event_id == "evt-a")
+            .expect("claim a is still retained");
+        assert!(a.stale, "B -> A survives the write untouched");
         let c = results
             .iter()
             .find(|item| item.entry.source.event_id == "evt-c")

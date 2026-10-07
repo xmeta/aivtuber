@@ -546,7 +546,7 @@ pub fn run_core_soak(
         .ok_or_else(|| HardeningError::Invariant("soak midpoint was not captured".to_owned()))?;
     let final_state = snapshot(&scheduler, &security, &memory, &telemetry, &assets);
     let telemetry_summary = telemetry.summary(metadata.stream_duration_ms);
-    let growth = growth_findings(&config, &midpoint, &final_state);
+    let growth = growth_findings(&config, &midpoint, &final_state, true);
     let flood = run_content_flood(config.ingress_queue_limit)?;
 
     Ok(SoakReport {
@@ -604,12 +604,24 @@ pub(crate) fn snapshot(
     }
 }
 
+/// Build the retained-state growth findings a run reports on.
+///
+/// `exercises_links` marks workloads that actually mint links (the core
+/// soak's permit-gated durable writes). A run whose workload structurally
+/// cannot create a link — the scenario trace only records working memory —
+/// must not emit `memory_links` checks: a bound that reads zero because the
+/// subsystem was never exercised is a check that cannot fail, and would
+/// pass even if link creation or pruning were completely broken (#105
+/// review round 4). Those runs still carry the raw counters in their state
+/// snapshots as observations; they just do not claim to have probed a bound
+/// they never touched.
 pub(crate) fn growth_findings(
     config: &SoakConfig,
     midpoint: &StateSnapshot,
     final_state: &StateSnapshot,
+    exercises_links: bool,
 ) -> Vec<GrowthFinding> {
-    vec![
+    let mut findings = vec![
         growth(
             "scheduler_items",
             midpoint.scheduler_items,
@@ -673,20 +685,26 @@ pub(crate) fn growth_findings(
             Some(config.memory_compaction_limit),
             Some(51),
         ),
-        growth(
-            "memory_links",
-            midpoint.memory_links,
-            final_state.memory_links,
-            Some(config.memory_links_limit),
-            Some(51),
-        ),
-        growth(
-            "memory_links_high_water",
-            midpoint.memory_links_high_water,
-            final_state.memory_links_high_water,
-            Some(config.memory_links_limit),
-            Some(51),
-        ),
+    ];
+    if exercises_links {
+        findings.extend([
+            growth(
+                "memory_links",
+                midpoint.memory_links,
+                final_state.memory_links,
+                Some(config.memory_links_limit),
+                Some(51),
+            ),
+            growth(
+                "memory_links_high_water",
+                midpoint.memory_links_high_water,
+                final_state.memory_links_high_water,
+                Some(config.memory_links_limit),
+                Some(51),
+            ),
+        ]);
+    }
+    findings.extend([
         growth(
             "telemetry_events",
             midpoint.telemetry_events,
@@ -708,7 +726,8 @@ pub(crate) fn growth_findings(
             Some(config.promotion_metadata_limit),
             Some(51),
         ),
-    ]
+    ]);
+    findings
 }
 
 fn growth(

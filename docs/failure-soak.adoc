@@ -126,6 +126,14 @@ The soak records midpoint and final retained-state counts for:
 
 A metric is marked +lifetime_growth_detected+ when the second half continues materially increasing with cumulative event count. Configured live-state bounds are separately marked +configured_limit_exceeded+ and make the CLI fail.
 
+The link-store metrics (+memory_links+ and +memory_links_high_water+) appear
+only in reports whose workload can actually mint links. The synthetic core soak
+does so through its permit-gated durable writes; the scenario-driven soak only
+records working memory, so its reports omit both metrics rather than pass a
+bound that reads zero because the subsystem was never exercised. The raw
+counters still appear in both reports' state snapshots as observations.
+(issue #105 review round 4.)
+
 Known lifetime-growth findings are intentionally reported, not hidden:
 
 [cols="1,1,2"]
