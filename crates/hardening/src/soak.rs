@@ -29,12 +29,16 @@ use std::path::{Path, PathBuf};
 pub const RESOURCE_BENCH_SUITE: &str = "resource-soak";
 /// Dataset identity of the logical-time soak workload; changing the workload
 /// shape materially requires changing this id so history series never mix.
-pub const RESOURCE_BENCH_DATASET: &str = "hardening-soak-v1";
+/// v2: the timed loop gained the #105 memory/link operations (permit-gated
+/// durable writes, supersession resolution, link creation and pruning), so
+/// pre-link v1 measurements must never pool with the new workload.
+pub const RESOURCE_BENCH_DATASET: &str = "hardening-soak-v2";
 /// Result `mode` for resource-soak runs (schemas/benchmark-result.schema.json).
 pub const RESOURCE_BENCH_MODE: &str = "resource_soak";
 /// Config identity prefix; the CLI appends the workload parameters it ran so
-/// recorded history remains reproducible.
-pub const RESOURCE_BENCH_CONFIG_VERSION: &str = "resource-bench-v1";
+/// recorded history remains reproducible. Bumped alongside
+/// [`RESOURCE_BENCH_DATASET`] for the same #105 workload-shape change.
+pub const RESOURCE_BENCH_CONFIG_VERSION: &str = "resource-bench-v2";
 
 /// Wall-clock context for a soak run, measured around `run_core_soak`.
 /// The soak itself uses logical time and stays deterministic; wall clock is
@@ -301,6 +305,22 @@ impl SoakConfig {
                  the probe cannot perform a single durable supersession write",
             ));
         }
+        // A configuration accepted as a link-store probe must be able to
+        // retain a link. Every durable slot also writes one working entry,
+        // so the supersession target is only still retained at link creation
+        // when the window holds all three nodes: the working entry, the
+        // target, and the new durable entry. With fewer node slots the
+        // target is always the oldest entry the insertion evicts, the new
+        // edge is pruned before it counts, and the run would report zero
+        // links while claiming to probe the store (#105 review round 3).
+        if self.working_memory_limit < 3 {
+            return Err(HardeningError::InvalidConfiguration(
+                "soak working_memory_limit must leave room to retain a link: the window has \
+                 to hold the working entry, the supersession target, and the new durable entry \
+                 (at least 3 node slots), or the probe cannot exercise the link store it \
+                 reports on",
+            ));
+        }
         Ok(())
     }
 
@@ -436,9 +456,10 @@ pub fn run_core_soak(
     // often enough that the store actually reaches its bound and plateaus
     // before the midpoint, which is what the growth findings watch. The gap
     // between two durable writes stays far below the node bound, so a
-    // supersession target is always still retained when it is declared; a
-    // window too small to hold two durable writes at all declares no
-    // supersession instead of failing closed on a target it evicted itself.
+    // supersession target is always still retained when it is declared, and
+    // `SoakConfig::validate` refuses node windows too small to hold the
+    // working entry, the target, and the new durable entry together — a run
+    // that could never retain a link must not claim to probe the link store.
     let durable_every = ((config.working_memory_limit / 16).max(1)) as u64;
     let supersede_targets = config.working_memory_limit >= 2;
     let mut previous_durable: Option<String> = None;

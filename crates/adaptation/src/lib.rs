@@ -422,17 +422,19 @@ impl WorkingMemory {
         // evidence was not accepted rather than discovering later that a
         // claim resurrected. Derived temporal edges are shed to make room
         // instead — there are always enough of them — so only a write that
-        // adds explicit evidence can be refused here.
-        let explicit_retained = self
-            .links
-            .iter()
-            .filter(|link| link.kind == MemoryLinkKind::Supersedes)
-            .count();
+        // adds explicit evidence can be refused here. The count is
+        // *projected* through this write's own compaction first: an edge
+        // whose endpoint is already expired at `now_ms`, or is the entry
+        // this insertion capacity-evicts, will not be retained by the write
+        // it would be blocking, so it is dead evidence rather than a claim
+        // held against a still-retained node (round 3: valid updates must
+        // not wait for an unrelated write to free logically dead capacity).
+        let explicit_retained = self.projected_explicit_links(now_ms);
         if explicit_retained + unique.len() > self.config.max_links {
             return Err(AdaptationError::InvalidInput(
                 "the link store cannot hold this write's supersession evidence without \
                  discarding earlier evidence for a still-retained claim; raise max_links or let \
-                 retention prune the earlier edges first",
+                 retention expire the earlier endpoints first",
             ));
         }
         let retention = RetentionClass::Durable;
@@ -586,6 +588,38 @@ impl WorkingMemory {
         let alive: HashSet<u64> = self.entries.iter().map(|entry| entry.memory_id).collect();
         self.links
             .retain(|link| alive.contains(&link.from) && alive.contains(&link.to));
+    }
+
+    /// The explicit supersession edges that would still be *retained* after
+    /// this write's own insertion compaction has run, without mutating the
+    /// store: mirrors `push_bounded`'s two `compact` passes (expiry trim,
+    /// push at the back, pop from the front while over the node bound), then
+    /// counts only supersession edges whose two endpoints survive them. The
+    /// inserted node itself carries no old edge, so it never needs an id in
+    /// this projection.
+    fn projected_explicit_links(&self, now_ms: u64) -> usize {
+        let mut survivors: Vec<u64> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.expires_at_ms > now_ms)
+            .map(|entry| entry.memory_id)
+            .collect();
+        let excess = survivors.len().saturating_sub(self.config.max_entries);
+        survivors.drain(..excess);
+        let excess = survivors
+            .len()
+            .saturating_add(1)
+            .saturating_sub(self.config.max_entries);
+        survivors.drain(..excess);
+        let alive: HashSet<u64> = survivors.into_iter().collect();
+        self.links
+            .iter()
+            .filter(|link| {
+                link.kind == MemoryLinkKind::Supersedes
+                    && alive.contains(&link.from)
+                    && alive.contains(&link.to)
+            })
+            .count()
     }
 
     fn push_link(&mut self, link: MemoryLink) {
@@ -1916,6 +1950,164 @@ mod tests {
             !b.stale,
             "C's evidence was refused, so nothing retained supersedes B"
         );
+    }
+
+    #[test]
+    fn a_superseding_write_is_not_blocked_by_an_edge_that_its_own_compaction_expires() {
+        // Round-3 expiry reproduction: the retained B -> A edge has an
+        // endpoint already expired at the write timestamp but not yet
+        // physically compacted. It is dead evidence — not a claim held
+        // against a still-retained node — so counting it would refuse a
+        // supersession that fits once this write's own compaction runs, and
+        // a valid update would wait for an unrelated write to free
+        // logically dead capacity.
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig {
+            max_links: 1,
+            max_links_per_memory: 1,
+            durable_ttl_ms: 1_000,
+            ..WorkingMemoryConfig::default()
+        });
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-a",
+            "claim a",
+            Some("game-x"),
+            100,
+        );
+        durable_write_superseding(
+            &mut memory,
+            &mut security,
+            "evt-b",
+            "claim b replaces a",
+            Some("game-x"),
+            200,
+            &["evt-a"],
+        )
+        .expect("the first supersession fits the bound");
+        assert_eq!(memory.links().len(), 1);
+
+        // A expired at 1_100 while B (created at 200) stays live until
+        // 1_200, so at 1_150 the B -> A edge is dead but not compacted.
+        let written = durable_write_superseding(
+            &mut memory,
+            &mut security,
+            "evt-c",
+            "claim c replaces b",
+            Some("game-x"),
+            1_150,
+            &["evt-b"],
+        )
+        .expect("an edge that expires with this write's own compaction does not block the write");
+
+        assert_eq!(
+            memory.links().len(),
+            1,
+            "one live edge remains: {:?}",
+            memory.links()
+        );
+        assert_eq!(memory.links()[0].kind, MemoryLinkKind::Supersedes);
+        assert_eq!(memory.links()[0].from, written);
+        assert_eq!(memory.links()[0].to, retained_node(&memory, "evt-b"));
+        assert!(
+            memory
+                .entries()
+                .iter()
+                .all(|entry| entry.source.event_id != "evt-a"),
+            "this write's compaction physically removed the expired endpoint"
+        );
+
+        let results = memory.relevant_linked(unfiltered_query(10), 1_150);
+        assert_eq!(results.len(), 2, "A is expired, B and C are retained");
+        let b = results
+            .iter()
+            .find(|item| item.entry.source.event_id == "evt-b")
+            .expect("claim b is still retained");
+        assert!(b.stale, "C -> B marks the replaced claim stale");
+        let c = results
+            .iter()
+            .find(|item| item.entry.source.event_id == "evt-c")
+            .expect("claim c was accepted");
+        assert!(!c.stale, "nothing retained supersedes C");
+    }
+
+    #[test]
+    fn a_superseding_write_is_not_blocked_by_edges_its_own_insertion_evicts() {
+        // Round-3 capacity reproduction: with two node slots the insertion
+        // of C evicts A, which prunes the dead B -> A edge within the same
+        // write, so C -> B exactly fits the one-edge store. The earlier
+        // evidence went with the node retention already removed — no
+        // still-retained claim loses its marker — so refusing C would only
+        // make a valid update wait for an unrelated write to free the slot.
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig {
+            max_entries: 2,
+            max_links: 1,
+            max_links_per_memory: 1,
+            ..WorkingMemoryConfig::default()
+        });
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-a",
+            "claim a",
+            Some("game-x"),
+            1_000,
+        );
+        durable_write_superseding(
+            &mut memory,
+            &mut security,
+            "evt-b",
+            "claim b replaces a",
+            Some("game-x"),
+            2_000,
+            &["evt-a"],
+        )
+        .expect("the first supersession fits the bound");
+        assert_eq!(memory.links().len(), 1);
+
+        let written = durable_write_superseding(
+            &mut memory,
+            &mut security,
+            "evt-c",
+            "claim c replaces b",
+            Some("game-x"),
+            3_000,
+            &["evt-b"],
+        )
+        .expect("an edge that this insertion evicts does not block the write");
+
+        assert_eq!(memory.len(), 2, "the insertion evicted A");
+        assert!(
+            memory
+                .entries()
+                .iter()
+                .all(|entry| entry.source.event_id != "evt-a"),
+            "A is capacity-evicted: {:?}",
+            memory.entries()
+        );
+        assert_eq!(
+            memory.links().len(),
+            1,
+            "the one-edge store keeps C -> B: {:?}",
+            memory.links()
+        );
+        assert_eq!(memory.links()[0].kind, MemoryLinkKind::Supersedes);
+        assert_eq!(memory.links()[0].from, written);
+        assert_eq!(memory.links()[0].to, retained_node(&memory, "evt-b"));
+
+        let results = memory.relevant_linked(unfiltered_query(10), 3_500);
+        let b = results
+            .iter()
+            .find(|item| item.entry.source.event_id == "evt-b")
+            .expect("claim b is still retained");
+        assert!(b.stale, "C -> B marks the replaced claim stale");
+        let c = results
+            .iter()
+            .find(|item| item.entry.source.event_id == "evt-c")
+            .expect("claim c was accepted");
+        assert!(!c.stale, "nothing retained supersedes C");
     }
 
     #[test]

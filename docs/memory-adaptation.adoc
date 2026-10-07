@@ -167,6 +167,11 @@ The Rust tests cover:
 * bounded-link creation, per-write/store caps, deletion-driven link pruning,
   supersession staleness, contradiction-without-evidence, and link
   determinism (issue #105, section 10);
+* projected pre-store link capacity: an edge whose endpoint is already
+  expired or is evicted by the write's own insertion never blocks a
+  supersession that fits after that compaction, while evidence for a
+  still-retained claim still refuses the later write (issue #105 review
+  round 3, section 10);
 * one-hop linked-node retrieval inside the query limit, expired endpoints
   excluded from returned link views, record-time temporal ordering, and
   vocabulary-versioned link artifacts (issue #105 review round, section 10);
@@ -184,7 +189,11 @@ The Rust tests cover:
 The hardening retention soak additionally carries the link store's current and
 high-water edge counts in every state snapshot and growth finding, so a
 long-running soak that lets links grow — or stops pruning them — fails the same
-plateau check every other bounded subsystem is held to.
+plateau check every other bounded subsystem is held to. Because every durable
+slot also writes one working entry, the probe refuses as configuration any node
+window that cannot hold the working entry, the supersession target, and the new
+durable entry together (fewer than 3 slots): a run that could never retain a
+link must not report zero links as a clean link-store probe.
 
 == 10. Bounded episodic links (issue #105)
 
@@ -202,7 +211,7 @@ Bounds, both validated positive and owned by the #51 unified retention policy:
 * +max_links+ (default 2,048; +AIVTUBER_MEMORY_MAX_LINKS+) caps the store-wide edge count. Insert-compact evicts entries first, then the edge cap is enforced deterministically, oldest edge first.
 * +max_links_per_memory+ (default 8; +AIVTUBER_MEMORY_MAX_LINKS_PER_WRITE+) is the per-write creation budget and the per-entry retrieval cap, so a single entry's neighborhood can never fan out.
 
-Both must hold +max_links >= max_links_per_memory+: the store has to be able to hold one maximum-size write, otherwise the store bound would drop an explicit supersession that the very same write just had accepted — which is not historical edge eviction but a lost caller-owned fact. The configuration is refused at startup instead, and the hardening probe refuses a soak link limit below the same per-write budget as configuration rather than failing at construction. When the store is over its bound, only derived temporal edges are shed (oldest first) — a temporal edge is re-derived from record time on the next write in that topic, an explicit supersession is not. Explicit supersession evidence is never dropped: a write whose supersession edges would not fit alongside the ones already retained is refused *before* anything is stored ("stores nothing, mints nothing"), so an accepted configuration can no longer discard the last evidence for a still-retained stale claim and hand it back as current. The remedy for that refusal is a larger +max_links+ or letting retention prune the earlier edges first; only a write that adds explicit evidence can hit it.
+Both must hold +max_links >= max_links_per_memory+: the store has to be able to hold one maximum-size write, otherwise the store bound would drop an explicit supersession that the very same write just had accepted — which is not historical edge eviction but a lost caller-owned fact. The configuration is refused at startup instead, and the hardening probe refuses a soak link limit below the same per-write budget as configuration rather than failing at construction. When the store is over its bound, only derived temporal edges are shed (oldest first) — a temporal edge is re-derived from record time on the next write in that topic, an explicit supersession is not. Explicit supersession evidence is never dropped: a write whose supersession edges would not fit alongside the ones already retained is refused *before* anything is stored ("stores nothing, mints nothing"), so an accepted configuration can no longer discard the last evidence for a still-retained stale claim and hand it back as current. The fit is judged over the edges this write would *leave retained*, not the raw store: an edge whose endpoint is already expired at the write timestamp — or is the node this insertion itself capacity-evicts — is dead evidence the write's own compaction removes anyway, so it never blocks a supersession that fits once that compaction has run (a valid update must not wait for an unrelated write to free logically dead capacity). Only a write whose supersession edges would displace evidence that stays retained is refused; its remedy is a larger +max_links+ or letting retention expire the earlier endpoints first.
 
 Only permit-gated memory enters the graph: links are created exclusively inside the +MemoryWritePermit+ durable path, so public chat and generated/model output cannot mint links or authority.
 

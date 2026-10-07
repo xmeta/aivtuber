@@ -201,6 +201,90 @@ mod tests {
             .expect("exactly one maximum-size write is a valid store");
     }
 
+    #[test]
+    fn the_resource_bench_identity_is_versioned_for_the_link_workload() {
+        // #105 added permit-gated durable writes, supersession resolution and
+        // link creation/pruning to the timed soak loop. History trends series
+        // on (suite, mode, dataset, config_version), so the pre-link and
+        // post-link workloads must be different series — pooling them would
+        // attribute a workload change to a regression or improvement.
+        assert_eq!(RESOURCE_BENCH_DATASET, "hardening-soak-v2");
+        assert_eq!(RESOURCE_BENCH_CONFIG_VERSION, "resource-bench-v2");
+    }
+
+    #[test]
+    fn a_soak_window_too_small_to_retain_a_link_is_refused_as_configuration() {
+        // Round-3 reproduction: with two node slots every iteration writes a
+        // working entry before the durable one, so the supersession target is
+        // always the oldest entry the next insertion evicts and the new edge
+        // is pruned before it counts. Such a run reports zero links while
+        // claiming to probe the link store; it must be refused instead.
+        for limit in [1_usize, 2] {
+            let config = SoakConfig {
+                working_memory_limit: limit,
+                ..SoakConfig::default()
+            };
+            let error = config
+                .validate()
+                .expect_err("a window that cannot retain a link is not a link probe");
+            assert!(
+                error.to_string().contains("working_memory_limit"),
+                "the refusal names the offending bound: {error}"
+            );
+        }
+        SoakConfig {
+            working_memory_limit: 3,
+            ..SoakConfig::default()
+        }
+        .validate()
+        .expect("three node slots keep the target alive through link creation");
+
+        // The same refusal reaches the run path the review probe exercised.
+        let config = SoakConfig {
+            logical_events: 64,
+            event_interval_ms: 50,
+            working_memory_limit: 2,
+            ..SoakConfig::default()
+        };
+        let error = run_core_soak(config, metadata(64, 50))
+            .expect_err("a two-slot soak claims to probe links it can never retain");
+        assert!(
+            error.to_string().contains("working_memory_limit"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_smallest_accepted_soak_still_retains_a_link() {
+        // The boundary the refusal leaves behind: at three node slots the
+        // working entry, the supersession target, and the new durable entry
+        // coexist, so every configuration the probe accepts really does
+        // populate — and retain in — the link store it reports on.
+        let config = SoakConfig {
+            logical_events: 64,
+            event_interval_ms: 50,
+            working_memory_limit: 3,
+            memory_links_limit: 8,
+            ..SoakConfig::default()
+        };
+        let report = run_core_soak(
+            config.clone(),
+            metadata(config.logical_events, config.event_interval_ms),
+        )
+        .expect("three-slot soak runs");
+        assert!(
+            report.final_state.memory_links > 0,
+            "the probe retains a link: {:?}",
+            report.final_state
+        );
+        assert!(
+            report.final_state.memory_links_high_water > 0,
+            "the link store was actually exercised: {:?}",
+            report.final_state
+        );
+        assert!(report.final_state.memory_links <= config.memory_links_limit);
+    }
+
     fn resource_environment() -> aivtuber_telemetry::BenchmarkEnvironment {
         aivtuber_telemetry::BenchmarkEnvironment {
             os: std::env::consts::OS.to_owned(),
