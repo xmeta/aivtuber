@@ -290,6 +290,17 @@ impl SoakConfig {
                 "soak bounds must be positive and logical_events >= 2",
             ));
         }
+        // A link store that cannot hold one maximum-size write is refused by
+        // `WorkingMemory::new` — which would fail the experiment at
+        // construction rather than report an invalid configuration here, so
+        // the same rule the adapter enforces is checked up front.
+        if self.memory_links_limit < WorkingMemoryConfig::default().max_links_per_memory {
+            return Err(HardeningError::InvalidConfiguration(
+                "soak memory_links_limit must cover one maximum-size write: it has to be at \
+                 least the per-write link budget (WorkingMemoryConfig::max_links_per_memory), or \
+                 the probe cannot perform a single durable supersession write",
+            ));
+        }
         Ok(())
     }
 

@@ -174,6 +174,33 @@ mod tests {
         assert_eq!(report.metadata.dataset_id, "hardening-unit-soak");
     }
 
+    #[test]
+    fn a_soak_link_limit_below_the_per_write_budget_is_refused_as_configuration() {
+        // `WorkingMemory::new` rejects a store smaller than one maximum-size
+        // write; without this check a seemingly valid probe config (1..=7
+        // links) would fail at construction instead of being named here.
+        let config = SoakConfig {
+            memory_links_limit: 7,
+            ..SoakConfig::default()
+        };
+        let error = config
+            .validate()
+            .expect_err("a link store smaller than one write cannot run the probe");
+        assert!(
+            error.to_string().contains("memory_links_limit"),
+            "the refusal names the offending bound: {error}"
+        );
+
+        let at_budget = SoakConfig {
+            memory_links_limit: aivtuber_adaptation::WorkingMemoryConfig::default()
+                .max_links_per_memory,
+            ..SoakConfig::default()
+        };
+        at_budget
+            .validate()
+            .expect("exactly one maximum-size write is a valid store");
+    }
+
     fn resource_environment() -> aivtuber_telemetry::BenchmarkEnvironment {
         aivtuber_telemetry::BenchmarkEnvironment {
             os: std::env::consts::OS.to_owned(),

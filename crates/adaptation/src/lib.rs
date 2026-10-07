@@ -382,10 +382,13 @@ impl WorkingMemory {
     /// retained durable memories this claim replaces (issue #105's update
     /// evidence, owned by the caller). Targets are resolved to exactly one
     /// live retained durable node *before* anything is stored — unknown,
-    /// working-only, expired, or ambiguous targets refuse the whole write
-    /// ("stores nothing, mints nothing"), links ride the same
+    /// working-only, expired, future-dated, or ambiguous targets refuse the
+    /// whole write ("stores nothing, mints nothing"), links ride the same
     /// non-serializable permit path as the claim, and
-    /// `max_links_per_memory` bounds what one write may create.
+    /// `max_links_per_memory` bounds what one write may create. Repeating one
+    /// target declares it once: the budget counts edges the write creates,
+    /// not the strings it was handed, so duplicates can neither blow the
+    /// budget nor consume it.
     pub fn remember_durable_superseding(
         &mut self,
         permit: &MemoryWritePermit,
@@ -394,13 +397,19 @@ impl WorkingMemory {
         now_ms: u64,
         supersedes: &[&str],
     ) -> Result<&MemoryEntry, AdaptationError> {
-        if supersedes.len() > self.config.max_links_per_memory {
+        let mut unique: Vec<&str> = Vec::with_capacity(supersedes.len());
+        for target in supersedes {
+            if !unique.contains(target) {
+                unique.push(target);
+            }
+        }
+        if unique.len() > self.config.max_links_per_memory {
             return Err(AdaptationError::InvalidInput(
                 "one write may not declare more supersessions than the per-memory link budget",
             ));
         }
-        let mut targets = Vec::with_capacity(supersedes.len());
-        for target in supersedes {
+        let mut targets = Vec::with_capacity(unique.len());
+        for target in &unique {
             targets.push(self.resolve_supersession_target(target, now_ms)?);
         }
         let retention = RetentionClass::Durable;
@@ -445,7 +454,11 @@ impl WorkingMemory {
     ///   physically removed it yet;
     /// * an id retained as more than one live durable memory is refused as
     ///   ambiguous — a source event id is not a node identity, and the link
-    ///   must not be guessed onto one of several candidates.
+    ///   must not be guessed onto one of several candidates;
+    /// * a target recorded *after* the superseding write is refused — a claim
+    ///   cannot replace evidence from its own future, or a backfill would mark
+    ///   a logically later claim stale and contradict the record-time ordering
+    ///   the temporal spine and retrieval ranking both follow.
     fn resolve_supersession_target(&self, id: &str, now_ms: u64) -> Result<u64, AdaptationError> {
         let retained: Vec<&MemoryEntry> = self
             .entries
@@ -470,6 +483,12 @@ impl WorkingMemory {
             return Err(AdaptationError::InvalidInput(
                 "supersession target is ambiguous: one source event id matches more than one \
                  retained durable memory, and links must not guess which node the caller meant",
+            ));
+        }
+        if target.created_at_ms > now_ms {
+            return Err(AdaptationError::InvalidInput(
+                "supersession target was recorded after the superseding write; a claim cannot \
+                 replace evidence from its own future",
             ));
         }
         Ok(target.memory_id)
@@ -557,7 +576,25 @@ impl WorkingMemory {
 
     fn enforce_link_bound(&mut self) {
         while self.links.len() > self.config.max_links {
-            self.links.pop_front();
+            // Caller-declared supersession evidence and derived temporal
+            // context are not interchangeable: losing the evidence would
+            // resurrect a claim the caller replaced while both endpoints are
+            // still live, whereas a temporal edge is re-derived from record
+            // time on the next write in that topic. The bound therefore sheds
+            // the oldest derived edge first and only falls back to the oldest
+            // supersession once no derived edge is left.
+            let derived = self
+                .links
+                .iter()
+                .position(|link| link.kind == MemoryLinkKind::TemporalBefore);
+            match derived {
+                Some(index) => {
+                    self.links.remove(index);
+                }
+                None => {
+                    self.links.pop_front();
+                }
+            }
         }
         self.links_high_water = self.links_high_water.max(self.links.len());
     }
@@ -653,15 +690,28 @@ impl WorkingMemory {
     /// cannot keep a claim marked. A view is only shown while *both* endpoints
     /// are live, so an expired node leaves no dangling relation behind, and
     /// the expansion resolves those same endpoints into results: a
-    /// supersession that changed topic or actor brings the claim it replaces
-    /// back with it, without the caller scanning the store to find it. The
-    /// whole result set stays within `query.limit`, expansion never displaces
-    /// a direct match, and both the view and the expansion are deterministic
-    /// (supersessions before temporal edges, creation order within a kind), so
-    /// a neighborhood can never fan out.
+    /// supersession that changed topic brings the claim it replaces back with
+    /// it, without the caller scanning the store to find it. The hop keeps the
+    /// query's **actor** scope — the derived temporal spine connects every
+    /// durable entry that shares a topic, so without that scope an
+    /// actor-only query would pull another viewer's claim into its context —
+    /// while topic is deliberately not required, because following a claim to
+    /// what replaced it is the point of the hop; verdicts (`stale`) and edge
+    /// metadata stay complete either way, since an edge carries node ids and
+    /// never content. The whole result set stays within `query.limit`,
+    /// expansion never displaces a direct match, and both the view and the
+    /// expansion are deterministic (supersessions before temporal edges,
+    /// creation order within a kind), so a neighborhood can never fan out.
     pub fn relevant_linked(&self, query: MemoryQuery<'_>, now_ms: u64) -> Vec<LinkedMemory<'_>> {
         let cap = self.config.max_links_per_memory;
         let limit = query.limit;
+        // The actor scope `relevant` ranks under, computed before the query is
+        // moved: an actor-scoped query must not receive another actor's claim
+        // as expansion context.
+        let actor = query
+            .source_namespace
+            .zip(query.actor_id)
+            .map(|(source, actor)| self.pseudonymizer.pseudonymize(source, actor));
         let live: HashSet<u64> = self
             .entries
             .iter()
@@ -679,9 +729,9 @@ impl WorkingMemory {
             .collect();
 
         // One hop outward, ranked by the match that points at it: a linked
-        // node that already matched is not added twice, a dead endpoint is
-        // never resolved, and the caller's limit is the bound on how much
-        // context the hop may add.
+        // node that already matched is not added twice, a dead endpoint or an
+        // out-of-scope actor is never resolved, and the caller's limit is the
+        // bound on how much context the hop may add.
         let mut expanded: Vec<(&MemoryEntry, bool, Vec<MemoryLink>)> = Vec::new();
         if matched.len() < limit {
             let mut selected: HashSet<u64> = matched
@@ -695,7 +745,7 @@ impl WorkingMemory {
                     } else {
                         link.from
                     };
-                    if !live.contains(&other) || !selected.insert(other) {
+                    if !live.contains(&other) {
                         continue;
                     }
                     let Some(node) = self
@@ -705,6 +755,14 @@ impl WorkingMemory {
                     else {
                         continue;
                     };
+                    if actor.as_ref().is_some_and(|scope| {
+                        node.source.pseudonymous_actor_id.as_ref() != Some(scope)
+                    }) {
+                        continue;
+                    }
+                    if !selected.insert(other) {
+                        continue;
+                    }
                     let (stale, node_links) = self.link_view(node.memory_id, &live, cap);
                     expanded.push((node, stale, node_links));
                     if matched.len() + expanded.len() >= limit {
@@ -1548,6 +1606,272 @@ mod tests {
             .find(|entry| entry.source.event_id == event_id)
             .map(|entry| entry.memory_id)
             .expect("retained node")
+    }
+
+    /// A durable write from a system source that still carries an actor, so a
+    /// retrieval query can scope by that actor the way a viewer-scoped
+    /// lookup does.
+    fn durable_write_actor(
+        memory: &mut WorkingMemory,
+        security: &mut SecurityRuntime,
+        id: &str,
+        topic: Option<&str>,
+        now_ms: u64,
+        actor: &str,
+        supersedes: &[&str],
+    ) -> u64 {
+        let source = event(id, SourceClass::System, TrustLevel::Trusted, Some(actor));
+        let (_, permit) = security.authorize_memory_write(&source, None);
+        let permit = permit.expect("system permit");
+        memory
+            .remember_durable_superseding(
+                &permit,
+                &format!("claim from {id}"),
+                topic,
+                now_ms,
+                supersedes,
+            )
+            .expect("durable remember")
+            .memory_id
+    }
+
+    #[test]
+    fn an_actor_scoped_query_never_expands_into_another_actors_claim() {
+        // The derived temporal spine connects every durable entry that shares
+        // a topic, so an unscoped hop would hand viewer 1's query a claim
+        // viewer 2 wrote — unrelated viewer memory in retrieved context.
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig::default());
+        durable_write_actor(
+            &mut memory,
+            &mut security,
+            "evt-one",
+            Some("game-x"),
+            1_000,
+            "viewer-1",
+            &[],
+        );
+        durable_write_actor(
+            &mut memory,
+            &mut security,
+            "evt-two",
+            Some("game-x"),
+            2_000,
+            "viewer-2",
+            &[],
+        );
+        durable_write_actor(
+            &mut memory,
+            &mut security,
+            "evt-update",
+            Some("game-x"),
+            3_000,
+            "viewer-2",
+            &["evt-one"],
+        );
+        assert!(
+            !memory.links().is_empty(),
+            "the fixture produced both a temporal and a cross-actor supersession edge"
+        );
+
+        let scoped = memory.relevant_linked(
+            MemoryQuery {
+                source_namespace: Some("system-health"),
+                actor_id: Some("viewer-1"),
+                topic: None,
+                limit: 10,
+            },
+            3_500,
+        );
+        assert_eq!(
+            scoped.len(),
+            1,
+            "only the scoped actor's own claim is retrieved: {:?}",
+            scoped
+                .iter()
+                .map(|item| item.entry.source.event_id.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(scoped[0].entry.source.event_id, "evt-one");
+        // Scope bounds *content*, not verdicts or edge metadata: the edge
+        // carries node ids only, and the staleness verdict still comes from
+        // the full retained edge set.
+        assert!(
+            scoped[0].stale,
+            "the cross-actor supersession still marks it"
+        );
+        assert!(
+            !scoped[0].links.is_empty(),
+            "the bounded view still names the relations"
+        );
+
+        // Without an actor scope the same edges are all reachable: the hop
+        // only ever narrows to what the query asked for.
+        let unscoped = memory.relevant_linked(unfiltered_query(10), 3_500);
+        assert_eq!(unscoped.len(), 3, "every live node is retrievable unscoped");
+    }
+
+    #[test]
+    fn a_supersession_target_recorded_after_the_write_is_refused() {
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig::default());
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-later",
+            "claim recorded later",
+            Some("game-x"),
+            2_000,
+        );
+
+        let error = durable_write_superseding(
+            &mut memory,
+            &mut security,
+            "evt-backfill",
+            "backfilled claim",
+            Some("game-x"),
+            1_000,
+            &["evt-later"],
+        )
+        .expect_err("a claim cannot replace evidence from its own future");
+        assert!(error.to_string().contains("recorded after"), "{error}");
+        assert_eq!(memory.len(), 1, "the refused write stored nothing");
+        assert!(
+            memory.links().is_empty(),
+            "and minted no edge that would mark the later claim stale"
+        );
+
+        // The same declaration in logical order is accepted, so the rule is
+        // direction and not a blanket ban on backfills.
+        durable_write_superseding(
+            &mut memory,
+            &mut security,
+            "evt-update",
+            "an update",
+            Some("game-y"),
+            3_000,
+            &["evt-later"],
+        )
+        .expect("a later claim may replace an earlier one");
+        assert_eq!(
+            memory.links().len(),
+            1,
+            "the accepted supersession is stored"
+        );
+    }
+
+    #[test]
+    fn the_store_bound_sheds_derived_edges_before_explicit_supersession() {
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig {
+            max_links: 1,
+            max_links_per_memory: 1,
+            ..WorkingMemoryConfig::default()
+        });
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-a",
+            "claim a",
+            Some("game-x"),
+            1_000,
+        );
+        durable_write_superseding(
+            &mut memory,
+            &mut security,
+            "evt-b",
+            "claim b replaces a",
+            Some("game-x"),
+            2_000,
+            &["evt-a"],
+        )
+        .expect("supersession accepted");
+        assert_eq!(memory.links().len(), 1, "the store sits at its bound");
+
+        // The next derived edge must not evict the caller's evidence: doing
+        // so would resurrect a replaced claim while both nodes are live.
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-c",
+            "claim c",
+            Some("game-x"),
+            3_000,
+        );
+        assert_eq!(
+            memory.links().front().map(|link| link.kind),
+            Some(MemoryLinkKind::Supersedes),
+            "the bound sheds derived context first: {:?}",
+            memory.links()
+        );
+
+        let results = memory.relevant_linked(unfiltered_query(10), 3_500);
+        let a = results
+            .iter()
+            .find(|item| item.entry.source.event_id == "evt-a")
+            .expect("claim a is still retained");
+        assert!(
+            a.stale,
+            "the superseded claim stays marked while both endpoints are live"
+        );
+    }
+
+    #[test]
+    fn repeated_supersession_targets_are_counted_once_against_the_write_budget() {
+        for cap in [2_usize, 3] {
+            let mut security = security();
+            let mut memory = test_memory(WorkingMemoryConfig {
+                max_links: cap + 2,
+                max_links_per_memory: cap,
+                ..WorkingMemoryConfig::default()
+            });
+            durable_write(
+                &mut memory,
+                &mut security,
+                "evt-a",
+                "claim a",
+                Some("game-x"),
+                1_000,
+            );
+            durable_write(
+                &mut memory,
+                &mut security,
+                "evt-b",
+                "claim b",
+                Some("game-x"),
+                2_000,
+            );
+
+            // Three declarations, two unique targets: the raw count must not
+            // refuse the write, and the duplicate must not eat a budget slot
+            // the temporal spine could have used.
+            let written = durable_write_superseding(
+                &mut memory,
+                &mut security,
+                "evt-d",
+                "claim d",
+                Some("game-x"),
+                3_000,
+                &["evt-a", "evt-a", "evt-b"],
+            )
+            .unwrap_or_else(|error| panic!("cap {cap}: duplicate names are one target: {error}"));
+            let supersessions = memory
+                .links()
+                .iter()
+                .filter(|link| link.from == written && link.kind == MemoryLinkKind::Supersedes)
+                .count();
+            assert_eq!(supersessions, 2, "cap {cap}: one edge per unique target");
+            let temporal = memory
+                .links()
+                .iter()
+                .filter(|link| link.to == written && link.kind == MemoryLinkKind::TemporalBefore)
+                .count();
+            assert_eq!(
+                temporal,
+                usize::from(cap >= 3),
+                "cap {cap}: whatever the duplicates did not spend stays available to the spine"
+            );
+        }
     }
 
     #[test]
