@@ -4,7 +4,8 @@
 //! measured runs) into per-indicator calibration evidence, so a target can be
 //! chosen from repeated measurements instead of invented. It emits
 //! [`BaselineProposal`] evidence, never a target: the target ratio stays a
-//! product decision made above the measured value.
+//! product decision chosen against the measured value — a minimum conforming
+//! ratio never above the measured baseline.
 //!
 //! Rules enforced here (see `docs/operational-slo.adoc`):
 //!
