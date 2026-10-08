@@ -331,14 +331,33 @@ impl WorkingMemory {
         &self.links
     }
 
-    /// The versioned form of the retained edge set. Anything that persists or
-    /// replays links serializes this envelope rather than the bare list, so
-    /// [`MEMORY_LINK_VOCAB_VERSION`] can never be separated from the data it
-    /// versions.
-    pub fn link_snapshot(&self) -> MemoryLinkSnapshot {
+    /// The versioned form of the retained edge set visible at `now_ms`.
+    /// Anything that persists or replays links serializes this envelope
+    /// rather than the bare list, so [`MEMORY_LINK_VOCAB_VERSION`] can never
+    /// be separated from the data it versions. Only edges recorded at or
+    /// before the read timestamp whose both endpoints are still visible
+    /// there are retained: an edge must not outlive a removed memory as a
+    /// covert archive of its content (docs/security-threat-model.adoc §8;
+    /// #105 review round 11).
+    pub fn link_snapshot(&self, now_ms: u64) -> MemoryLinkSnapshot {
+        let visible: HashSet<u64> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.expires_at_ms > now_ms && entry.created_at_ms <= now_ms)
+            .map(|entry| entry.memory_id)
+            .collect();
         MemoryLinkSnapshot {
             vocab_version: MEMORY_LINK_VOCAB_VERSION,
-            links: self.links.iter().cloned().collect(),
+            links: self
+                .links
+                .iter()
+                .filter(|link| {
+                    link.created_at_ms <= now_ms
+                        && visible.contains(&link.from)
+                        && visible.contains(&link.to)
+                })
+                .cloned()
+                .collect(),
         }
     }
 
@@ -737,6 +756,14 @@ impl WorkingMemory {
         if query.limit == 0 {
             return Vec::new();
         }
+        // A query that names an actor but not the namespace its pseudonym is
+        // hashed in carries an explicit filter that cannot be evaluated: the
+        // `zip` below would silently drop it and return every actor's
+        // memory. Fail closed with no matches instead of widening the scope
+        // (#105 review round 11).
+        if query.actor_id.is_some() && query.source_namespace.is_none() {
+            return Vec::new();
+        }
         let actor = query
             .source_namespace
             .zip(query.actor_id)
@@ -766,13 +793,18 @@ impl WorkingMemory {
             })
             .collect::<Vec<_>>();
 
+        // Equal record times break by insertion order (`memory_id`, newest
+        // first): that is the same timeline `TemporalBefore` derives its
+        // edges from, so two replay-visible views can never disagree on
+        // which same-tick write came later — an arbitrary event id could
+        // (#105 review round 11).
         ranked.sort_by(|left, right| {
             right
                 .0
                 .cmp(&left.0)
                 .then_with(|| right.1.cmp(&left.1))
                 .then_with(|| right.2.created_at_ms.cmp(&left.2.created_at_ms))
-                .then_with(|| left.2.source.event_id.cmp(&right.2.source.event_id))
+                .then_with(|| right.2.memory_id.cmp(&left.2.memory_id))
         });
         ranked
             .into_iter()
@@ -813,6 +845,13 @@ impl WorkingMemory {
     /// expansion are deterministic (supersessions before temporal edges,
     /// creation order within a kind), so a neighborhood can never fan out.
     pub fn relevant_linked(&self, query: MemoryQuery<'_>, now_ms: u64) -> Vec<LinkedMemory<'_>> {
+        // Fail closed on an actor filter that cannot be evaluated — same
+        // rule as `relevant`: without the namespace the pseudonym cannot be
+        // computed, and dropping the filter would hand back every actor's
+        // memory (#105 review round 11).
+        if query.actor_id.is_some() && query.source_namespace.is_none() {
+            return Vec::new();
+        }
         let cap = self.config.max_links_per_memory;
         let limit = query.limit;
         // The actor scope `relevant` ranks under, computed before the query is
@@ -917,8 +956,10 @@ impl WorkingMemory {
     /// replay-time query must not see a relation from the future — the
     /// staleness verdict is likewise drawn only from edges that already exist
     /// at the read timestamp (#105 review round 10). Supersessions lead,
-    /// creation order breaks ties within a kind, and the per-memory budget
-    /// cuts the view.
+    /// **newest first** by record time (node ids break ties) so the
+    /// per-entry cap can never truncate the latest correction behind an
+    /// older one; temporal spine edges keep creation order; and the
+    /// per-memory budget cuts the view (#105 review round 11).
     fn link_view(
         &self,
         memory_id: u64,
@@ -943,13 +984,29 @@ impl WorkingMemory {
         });
         let mut links: Vec<MemoryLink> = Vec::with_capacity(cap.min(incident.len()));
         for kind in [MemoryLinkKind::Supersedes, MemoryLinkKind::TemporalBefore] {
-            for link in &incident {
+            let mut ordered: Vec<&MemoryLink> = incident
+                .iter()
+                .copied()
+                .filter(|link| link.kind == kind)
+                .collect();
+            if kind == MemoryLinkKind::Supersedes {
+                // Newest correction first: response generation consumes this
+                // view, and a cap of one must surface the latest supersession
+                // rather than the oldest (#105 review round 11). Ties break
+                // on node ids so truncation stays deterministic.
+                ordered.sort_by(|left, right| {
+                    right
+                        .created_at_ms
+                        .cmp(&left.created_at_ms)
+                        .then_with(|| left.from.cmp(&right.from))
+                        .then_with(|| left.to.cmp(&right.to))
+                });
+            }
+            for link in ordered {
                 if links.len() >= cap {
                     break;
                 }
-                if link.kind == kind {
-                    links.push((*link).clone());
-                }
+                links.push((*link).clone());
             }
         }
         (stale, links)
@@ -2005,6 +2062,246 @@ mod tests {
     }
 
     #[test]
+    fn equal_time_retrieval_and_temporal_edges_agree_on_the_same_order() {
+        // Round-11: two durable writes at one millisecond. The `TemporalBefore`
+        // edge derives its order from insertion (the retained timeline), so
+        // newest-first retrieval must show the later insert first — ordering
+        // by arbitrary event ids could disagree with the edge (#105 review
+        // round 11).
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig::default());
+        // Insertion order deliberately disagrees with event-id order:
+        // `evt-a` is written first even though `evt-z` sorts after it.
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-a",
+            "first write",
+            Some("same"),
+            1_000,
+        );
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-z",
+            "second write",
+            Some("same"),
+            1_000,
+        );
+
+        let results = memory.relevant_linked(unfiltered_query(10), 2_000);
+        let ids: Vec<&str> = results
+            .iter()
+            .map(|item| item.entry.source.event_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["evt-z", "evt-a"],
+            "equal-time retrieval follows insertion order, not event ids"
+        );
+        let edge = results[0]
+            .links
+            .iter()
+            .find(|link| link.kind == MemoryLinkKind::TemporalBefore)
+            .expect("the same-tick writes are linked");
+        assert_eq!(
+            edge.from, results[1].entry.memory_id,
+            "the edge declares the earlier insert as predecessor"
+        );
+        assert_eq!(
+            edge.to, results[0].entry.memory_id,
+            "retrieval leads with the edge's successor: the two views agree"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_never_archives_an_edge_to_an_expired_endpoint() {
+        // Threat model §8: an edge must not become a covert archive of
+        // content retention removed. After `evt-a` expires without an
+        // explicit compaction, the physical store still holds the edge —
+        // but the persisted snapshot at a later read time must not
+        // (#105 review round 11).
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig {
+            durable_ttl_ms: 1_500,
+            ..WorkingMemoryConfig::default()
+        });
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-a",
+            "claim a",
+            Some("game-x"),
+            1_000,
+        );
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-b",
+            "claim b",
+            Some("game-x"),
+            2_000,
+        );
+        assert_eq!(memory.links().len(), 1, "one temporal edge between them");
+
+        let before = memory.link_snapshot(2_400);
+        assert_eq!(before.links.len(), 1, "both endpoints live at 2400");
+        assert_eq!(
+            before.vocab_version, MEMORY_LINK_VOCAB_VERSION,
+            "the envelope still versions its data"
+        );
+
+        // `evt-a` expired at 2_500; compaction has not run, so only the
+        // snapshot filter can keep the edge out of the replay artifact.
+        assert_eq!(
+            memory.links().len(),
+            1,
+            "the physical store is unchanged — nothing was compacted"
+        );
+        let after = memory.link_snapshot(3_000);
+        assert!(
+            after.links.is_empty(),
+            "no edge outlives its expired endpoint in the artifact: {:?}",
+            after.links
+        );
+        assert_eq!(after.vocab_version, MEMORY_LINK_VOCAB_VERSION);
+    }
+
+    #[test]
+    fn the_per_entry_cap_never_hides_the_newest_supersession() {
+        // Round-11: with a per-entry cap of one, two supersessions of the
+        // same claim must surface the *latest* correction — response
+        // generation consumes this view, and truncating to the oldest would
+        // hand it obsolete context (#105 review round 11).
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig {
+            max_links_per_memory: 1,
+            ..WorkingMemoryConfig::default()
+        });
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-old",
+            "old claim",
+            Some("old-topic"),
+            1_000,
+        );
+        durable_write_superseding(
+            &mut memory,
+            &mut security,
+            "evt-first",
+            "first correction",
+            Some("first-topic"),
+            2_000,
+            &["evt-old"],
+        )
+        .expect("first supersession");
+        durable_write_superseding(
+            &mut memory,
+            &mut security,
+            "evt-latest",
+            "latest correction",
+            Some("latest-topic"),
+            3_000,
+            &["evt-old"],
+        )
+        .expect("second supersession");
+        assert_eq!(memory.links().len(), 2, "both corrections are retained");
+
+        let results = memory.relevant_linked(
+            MemoryQuery {
+                source_namespace: None,
+                actor_id: None,
+                topic: Some("old-topic"),
+                limit: 3,
+            },
+            3_500,
+        );
+        let ids: Vec<&str> = results
+            .iter()
+            .map(|item| item.entry.source.event_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["evt-old", "evt-latest"],
+            "the latest correction is reachable within the node/link budgets, not the oldest"
+        );
+        assert!(
+            results[0].stale,
+            "the claim is superseded — verdict unchanged"
+        );
+        assert_eq!(
+            results[0].links.len(),
+            1,
+            "the cap of one still applies: {:?}",
+            results[0].links
+        );
+    }
+
+    #[test]
+    fn an_actor_filter_without_a_namespace_fails_closed() {
+        // Round-11: `source_namespace.zip(actor_id)` drops an actor filter
+        // whose namespace is missing, which would silently widen the query
+        // to every actor. An evaluable partial scope returns no matches
+        // instead (#105 review round 11).
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig::default());
+        durable_write_actor(
+            &mut memory,
+            &mut security,
+            "evt-a",
+            Some("topic"),
+            1_000,
+            "viewer-a",
+            &[],
+        );
+        durable_write_actor(
+            &mut memory,
+            &mut security,
+            "evt-b",
+            Some("topic"),
+            2_000,
+            "viewer-b",
+            &[],
+        );
+
+        let partial = MemoryQuery {
+            source_namespace: None,
+            actor_id: Some("viewer-a"),
+            topic: Some("topic"),
+            limit: 10,
+        };
+        assert!(
+            memory.relevant(partial.clone(), 3_000).is_empty(),
+            "relevant refuses a filter it cannot evaluate"
+        );
+        assert!(
+            memory.relevant_linked(partial, 3_000).is_empty(),
+            "relevant_linked refuses the same partial scope"
+        );
+
+        // With the namespace the scope is evaluable and isolates actors.
+        let scoped = memory.relevant_linked(
+            MemoryQuery {
+                source_namespace: Some("system-health"),
+                actor_id: Some("viewer-a"),
+                topic: Some("topic"),
+                limit: 10,
+            },
+            3_000,
+        );
+        let ids: Vec<&str> = scoped
+            .iter()
+            .map(|item| item.entry.source.event_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["evt-a"],
+            "the evaluable scope returns only that actor's memory"
+        );
+    }
+
+    #[test]
     fn a_supersession_target_recorded_after_the_write_is_refused() {
         let mut security = security();
         let mut memory = test_memory(WorkingMemoryConfig::default());
@@ -2776,7 +3073,7 @@ mod tests {
         );
 
         let snapshot =
-            serde_json::to_value(memory.link_snapshot()).expect("serialize the link envelope");
+            serde_json::to_value(memory.link_snapshot(3_000)).expect("serialize the link envelope");
         assert_eq!(
             snapshot["vocab_version"],
             Value::String(MEMORY_LINK_VOCAB_VERSION.to_owned())
