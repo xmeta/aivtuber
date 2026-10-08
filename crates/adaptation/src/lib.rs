@@ -779,7 +779,11 @@ impl WorkingMemory {
 
     /// The same ranking as [`Self::relevant`], each result joined with its
     /// bounded link view, and — filling whatever the query limit still allows
-    /// — with the live nodes one link away from those results. `stale` is a
+    /// — with the live nodes one link away from those results. Direct matches
+    /// and the expansion both keep the query's **actor** scope: a direct
+    /// match can arrive through the topic alone when the query supplies an
+    /// actor *and* a topic, so the scope is reapplied to every result, not
+    /// only the hop. `stale` is a
     /// verdict over the **full** retained edge set, never over the capped
     /// presentation view: a supersession that fell past
     /// `max_links_per_memory` still marks its target stale, and the
@@ -789,8 +793,8 @@ impl WorkingMemory {
     /// are live, so an expired node leaves no dangling relation behind, and
     /// the expansion resolves those same endpoints into results: a
     /// supersession that changed topic brings the claim it replaces back with
-    /// it, without the caller scanning the store to find it. The hop keeps the
-    /// query's **actor** scope — the derived temporal spine connects every
+    /// it, without the caller scanning the store to find it. The hop keeps
+    /// that same actor scope — the derived temporal spine connects every
     /// durable entry that shares a topic, so without that scope an
     /// actor-only query would pull another viewer's claim into its context —
     /// while topic is deliberately not required, because following a claim to
@@ -805,7 +809,7 @@ impl WorkingMemory {
         let limit = query.limit;
         // The actor scope `relevant` ranks under, computed before the query is
         // moved: an actor-scoped query must not receive another actor's claim
-        // as expansion context.
+        // as context, direct or expanded.
         let actor = query
             .source_namespace
             .zip(query.actor_id)
@@ -820,6 +824,19 @@ impl WorkingMemory {
         let matched: Vec<(&MemoryEntry, bool, Vec<MemoryLink>)> = self
             .relevant(query, now_ms)
             .into_iter()
+            // The actor scope is reapplied to direct matches, not only the
+            // hop: with an actor *and* a topic supplied, `relevant` admits
+            // entries matching either signal, so another actor's same-topic
+            // claim already ranks as a direct match here and no expansion
+            // check would ever see it (#105 review round 8). Ranking keeps
+            // every actor match above every topic-only match, so this filter
+            // only ever drops the tail of the taken window and can never
+            // displace an in-scope direct match.
+            .filter(|entry| {
+                actor
+                    .as_ref()
+                    .is_none_or(|scope| entry.source.pseudonymous_actor_id.as_ref() == Some(scope))
+            })
             .map(|entry| {
                 let (stale, links) = self.link_view(entry.memory_id, &live, cap);
                 (entry, stale, links)
@@ -1807,6 +1824,68 @@ mod tests {
         // only ever narrows to what the query asked for.
         let unscoped = memory.relevant_linked(unfiltered_query(10), 3_500);
         assert_eq!(unscoped.len(), 3, "every live node is retrievable unscoped");
+    }
+
+    #[test]
+    fn an_actor_and_topic_query_never_returns_another_actors_direct_match() {
+        // With an actor *and* a topic supplied, `relevant` admits entries
+        // matching either signal, so another viewer's same-topic claim ranks
+        // as a direct match — the hop's actor check never sees it, and only
+        // `relevant_linked`'s own re-filter can refuse it (#105 review
+        // round 8).
+        let mut memory = test_memory(WorkingMemoryConfig::default());
+        let own = event(
+            "evt-own",
+            SourceClass::PublicChat,
+            TrustLevel::Untrusted,
+            Some("viewer-a"),
+        );
+        let foreign = event(
+            "evt-foreign",
+            SourceClass::PublicChat,
+            TrustLevel::Untrusted,
+            Some("viewer-b"),
+        );
+        memory
+            .remember_working(&own, "likes rust", Some("coding"), 10)
+            .expect("own");
+        memory
+            .remember_working(&foreign, "also likes rust", Some("coding"), 20)
+            .expect("foreign");
+
+        let scoped = memory.relevant_linked(
+            MemoryQuery {
+                source_namespace: Some("public-chat"),
+                actor_id: Some("viewer-a"),
+                topic: Some("coding"),
+                limit: 10,
+            },
+            30,
+        );
+        assert_eq!(
+            scoped.len(),
+            1,
+            "the other viewer's same-topic claim must not arrive as context: {:?}",
+            scoped
+                .iter()
+                .map(|item| item.entry.source.event_id.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(scoped[0].entry.source.event_id, "evt-own");
+
+        // The same topic without an actor scope still admits both entries:
+        // the removal comes from the actor scope, not from narrowing what a
+        // topic match means.
+        let unscoped = memory.relevant_linked(
+            MemoryQuery {
+                source_namespace: None,
+                actor_id: None,
+                topic: Some("coding"),
+                limit: 10,
+            },
+            30,
+        );
+        assert_eq!(unscoped.len(), 2, "both claims stay topic-retrievable");
     }
 
     #[test]
