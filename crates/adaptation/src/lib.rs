@@ -729,6 +729,10 @@ impl WorkingMemory {
         record
     }
 
+    /// Ranked matches visible at `now_ms`: an entry must have been recorded
+    /// at or before the query time and not yet expired — `created_at_ms <=
+    /// now_ms < expires_at_ms` — so replay-time retrieval can never read
+    /// evidence from the future (#105 review round 10).
     pub fn relevant(&self, query: MemoryQuery<'_>, now_ms: u64) -> Vec<&MemoryEntry> {
         if query.limit == 0 {
             return Vec::new();
@@ -742,7 +746,7 @@ impl WorkingMemory {
         let mut ranked = self
             .entries
             .iter()
-            .filter(|entry| entry.expires_at_ms > now_ms)
+            .filter(|entry| entry.expires_at_ms > now_ms && entry.created_at_ms <= now_ms)
             .map(|entry| {
                 let actor_match = u8::from(
                     actor.as_ref().is_some()
@@ -783,8 +787,12 @@ impl WorkingMemory {
     /// and the expansion both keep the query's **actor** scope: a direct
     /// match can arrive through the topic alone when the query supplies an
     /// actor *and* a topic, so the scope is reapplied to every result, not
-    /// only the hop. `stale` is a
-    /// verdict over the **full** retained edge set, never over the capped
+    /// only the hop. Visibility is time-indexed throughout: nodes and edges
+    /// recorded after `now_ms` do not exist for the query, so direct
+    /// matches, the staleness verdict, the link view, and the hop all stay
+    /// inside the read timestamp and a replay can never act on evidence
+    /// from its own future (#105 review round 10). `stale` is a
+    /// verdict over the **full** retained edge set visible at `now_ms`, never over the capped
     /// presentation view: a supersession that fell past
     /// `max_links_per_memory` still marks its target stale, and the
     /// superseding node must itself still be live at `now_ms` — an expired
@@ -814,10 +822,14 @@ impl WorkingMemory {
             .source_namespace
             .zip(query.actor_id)
             .map(|(source, actor)| self.pseudonymizer.pseudonymize(source, actor));
+        // Nodes must be visible at the read timestamp: recorded at or before
+        // `now_ms` and not yet expired. A future node is not live for this
+        // query, so neither the link view nor the hop can resolve it (#105
+        // review round 10).
         let live: HashSet<u64> = self
             .entries
             .iter()
-            .filter(|entry| entry.expires_at_ms > now_ms)
+            .filter(|entry| entry.expires_at_ms > now_ms && entry.created_at_ms <= now_ms)
             .map(|entry| entry.memory_id)
             .collect();
 
@@ -838,7 +850,7 @@ impl WorkingMemory {
                     .is_none_or(|scope| entry.source.pseudonymous_actor_id.as_ref() == Some(scope))
             })
             .map(|entry| {
-                let (stale, links) = self.link_view(entry.memory_id, &live, cap);
+                let (stale, links) = self.link_view(entry.memory_id, &live, cap, now_ms);
                 (entry, stale, links)
             })
             .collect();
@@ -878,7 +890,7 @@ impl WorkingMemory {
                     if !selected.insert(other) {
                         continue;
                     }
-                    let (stale, node_links) = self.link_view(node.memory_id, &live, cap);
+                    let (stale, node_links) = self.link_view(node.memory_id, &live, cap, now_ms);
                     expanded.push((node, stale, node_links));
                     if matched.len() + expanded.len() >= limit {
                         break 'hop;
@@ -900,21 +912,26 @@ impl WorkingMemory {
     }
 
     /// One entry's bounded link view, with every edge required to have **both**
-    /// endpoints live at `now_ms`: retrieval already treats an expired node as
-    /// deleted, so relation metadata about it would expose a dangling edge to
-    /// a node that no longer exists. Supersessions lead, creation order breaks
-    /// ties within a kind, and the per-memory budget cuts the view.
+    /// endpoints live at `now_ms` and to have been recorded at or before
+    /// `now_ms`: retrieval already treats an expired node as deleted, and a
+    /// replay-time query must not see a relation from the future — the
+    /// staleness verdict is likewise drawn only from edges that already exist
+    /// at the read timestamp (#105 review round 10). Supersessions lead,
+    /// creation order breaks ties within a kind, and the per-memory budget
+    /// cuts the view.
     fn link_view(
         &self,
         memory_id: u64,
         live: &HashSet<u64>,
         cap: usize,
+        now_ms: u64,
     ) -> (bool, Vec<MemoryLink>) {
         let incident: Vec<&MemoryLink> = self
             .links
             .iter()
             .filter(|link| {
                 (link.from == memory_id || link.to == memory_id)
+                    && link.created_at_ms <= now_ms
                     && live.contains(&link.from)
                     && live.contains(&link.to)
             })
@@ -1886,6 +1903,105 @@ mod tests {
             30,
         );
         assert_eq!(unscoped.len(), 2, "both claims stay topic-retrievable");
+    }
+
+    #[test]
+    fn a_historical_query_never_reads_evidence_from_the_future() {
+        // Round-10: durable A at 1000 (topic "old"), durable B at 2000
+        // superseding A (topic "new"). A query at 1500 predates B: A must
+        // come back current — no future edge in its view, no future node
+        // through the hop — and B itself must be invisible before its own
+        // creation time. After the supersession the verdict flips.
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig::default());
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-a",
+            "old claim",
+            Some("old"),
+            1_000,
+        );
+        durable_write_superseding(
+            &mut memory,
+            &mut security,
+            "evt-b",
+            "new claim",
+            Some("new"),
+            2_000,
+            &["evt-a"],
+        )
+        .expect("b supersedes a");
+
+        let past = memory.relevant_linked(
+            MemoryQuery {
+                source_namespace: None,
+                actor_id: None,
+                topic: Some("old"),
+                limit: 10,
+            },
+            1_500,
+        );
+        assert_eq!(
+            past.len(),
+            1,
+            "B does not exist at 1500: {:?}",
+            past.iter()
+                .map(|item| item.entry.source.event_id.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(past[0].entry.source.event_id, "evt-a");
+        assert!(
+            !past[0].stale,
+            "an edge recorded at 2000 cannot mark A stale at 1500"
+        );
+        assert!(
+            past[0].links.iter().all(|link| link.created_at_ms <= 1_500),
+            "the view never shows a relation from the future: {:?}",
+            past[0].links
+        );
+
+        // B is invisible as a direct match before its creation time too.
+        let future_direct = memory.relevant(
+            MemoryQuery {
+                source_namespace: None,
+                actor_id: None,
+                topic: Some("new"),
+                limit: 10,
+            },
+            1_500,
+        );
+        assert!(
+            future_direct.is_empty(),
+            "a claim recorded at 2000 must not be readable at 1500"
+        );
+
+        // After the supersession exists in time, the verdict flips: staleness
+        // is drawn from the retained edge set visible at the read timestamp.
+        let after = memory.relevant_linked(
+            MemoryQuery {
+                source_namespace: None,
+                actor_id: None,
+                topic: Some("old"),
+                limit: 10,
+            },
+            2_500,
+        );
+        let a = after
+            .iter()
+            .find(|item| item.entry.source.event_id == "evt-a")
+            .expect("A is still retained");
+        assert!(
+            a.stale,
+            "the supersession at 2000 is visible at 2500, so A is stale"
+        );
+        assert!(
+            a.links
+                .iter()
+                .any(|link| link.created_at_ms == 2_000 && link.kind == MemoryLinkKind::Supersedes),
+            "the now-visible supersession edge is in the view: {:?}",
+            a.links
+        );
     }
 
     #[test]

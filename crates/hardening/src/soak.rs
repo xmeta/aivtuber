@@ -316,24 +316,10 @@ impl SoakConfig {
         // The cadence projection (`durable_every`) computes
         // `working_memory_limit + memory_links_limit` and
         // `memory_links_limit + 1`. A deserialized `SoakConfig` can set
-        // either bound to `usize::MAX`: the additions then panic in debug
-        // builds and wrap the divisor to zero in release builds, where the
-        // division aborts. Bounds whose sums cannot be evaluated are not a
-        // runnable experiment, so they are refused here as invalid
-        // configuration instead of crashing after acceptance (#105 review
-        // round 7).
-        if self
-            .working_memory_limit
-            .checked_add(self.memory_links_limit)
-            .is_none()
-            || self.memory_links_limit.checked_add(1).is_none()
-        {
-            return Err(HardeningError::InvalidConfiguration(
-                "soak link bounds overflow: working_memory_limit + memory_links_limit and \
-                 memory_links_limit + 1 must both fit in usize, or the cadence projection \
-                 cannot be evaluated",
-            ));
-        }
+        // either bound to `usize::MAX`. This is *core cadence* validation
+        // and lives with the other link-probe rules: the scenario soak
+        // never evaluates `durable_every` (#105 review round 10; the check
+        // itself was added in round 7).
         Ok(())
     }
 
@@ -349,6 +335,46 @@ impl SoakConfig {
     /// it never exercised.
     pub fn validate_link_probe(&self) -> Result<(), HardeningError> {
         self.validate()?;
+        // The cadence projection (`durable_every`) computes
+        // `working_memory_limit + memory_links_limit` and
+        // `memory_links_limit + 1`. A deserialized `SoakConfig` can set
+        // either bound to `usize::MAX`: the additions then panic in debug
+        // builds and wrap the divisor to zero in release builds, where the
+        // division aborts. Bounds whose sums cannot be evaluated are not a
+        // runnable experiment, so they are refused here as invalid
+        // configuration instead of crashing after acceptance. Core-only:
+        // the scenario soak never evaluates `durable_every`, so it keeps
+        // accepting huge-but-constructible bounds (#105 review rounds 7,
+        // 10).
+        if self
+            .working_memory_limit
+            .checked_add(self.memory_links_limit)
+            .is_none()
+            || self.memory_links_limit.checked_add(1).is_none()
+        {
+            return Err(HardeningError::InvalidConfiguration(
+                "soak link bounds overflow: working_memory_limit + memory_links_limit and \
+                 memory_links_limit + 1 must both fit in usize, or the cadence projection \
+                 cannot be evaluated",
+            ));
+        }
+        // The core probe drives its own logical clock: event `i` is
+        // timestamped `i * event_interval_ms`. If that product saturates,
+        // later events collapse onto `u64::MAX`, a TTL added to such a
+        // timestamp no longer sits strictly after it, and compaction deletes
+        // the entry mid-run — so an accepted configuration must complete or
+        // be refused here (#105 review round 10). Scenario timestamps come
+        // from its trace, not from this product, so the rule is core-only.
+        if self
+            .logical_events
+            .checked_mul(self.event_interval_ms)
+            .is_none()
+        {
+            return Err(HardeningError::InvalidConfiguration(
+                "soak logical clock saturates: logical_events * event_interval_ms must fit \
+                 in u64, or later events collapse to u64::MAX and the run aborts mid-write",
+            ));
+        }
         // A link store that cannot hold one maximum-size write is refused by
         // `WorkingMemory::new` — which would fail the experiment at
         // construction rather than report an invalid configuration here, so

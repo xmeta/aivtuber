@@ -542,33 +542,45 @@ mod tests {
     }
 
     #[test]
-    fn overflowing_link_bounds_are_refused_not_panicked() {
+    fn overflowing_link_bounds_are_refused_by_the_probe_and_never_panic() {
         // A deserialized SoakConfig can carry usize::MAX bounds. The cadence
         // projection adds them, which used to panic in debug (overflow) and
-        // divide by zero in release (wrapped divisor) *after* validate()
-        // accepted the config — a crash where InvalidConfiguration belongs
-        // (#105 review round 7).
+        // divide by zero in release (wrapped divisor) *after* validation
+        // accepted the config — a crash where InvalidConfiguration belongs.
+        // The cadence sums are core-probe inputs, so the refusal lives in
+        // `validate_link_probe`; common `validate` stays permissive for the
+        // linkless scenario soak (#105 review rounds 7 and 10).
         let links_max = SoakConfig {
             memory_links_limit: usize::MAX,
             ..SoakConfig::default()
         };
-        let error = links_max
+        links_max
             .validate()
-            .expect_err("usize::MAX link bound must be refused")
+            .expect("the overflow rule is core-only, so common validation accepts");
+        let error = links_max
+            .validate_link_probe()
+            .expect_err("usize::MAX link bound must be refused by the probe")
             .to_string();
         assert!(
             error.contains("overflow"),
             "the refusal names the overflowing arithmetic, got: {error}"
         );
 
-        // working_memory_limit + memory_links_limit must also be evaluable.
-        let window_max = SoakConfig {
+        // working_memory_limit + memory_links_limit must also be evaluable —
+        // the reviewer's exact linkless-scenario case: a huge window with a
+        // tiny link bound is constructible for the scenario soak, which
+        // never evaluates the cadence, but is not a runnable probe.
+        let huge_window_tiny_links = SoakConfig {
             working_memory_limit: usize::MAX,
+            memory_links_limit: 1,
             ..SoakConfig::default()
         };
-        let error = window_max
+        huge_window_tiny_links
             .validate()
-            .expect_err("usize::MAX window bound must be refused")
+            .expect("a linkless scenario may configure a huge window and a tiny link bound");
+        let error = huge_window_tiny_links
+            .validate_link_probe()
+            .expect_err("the probe still needs evaluable cadence sums")
             .to_string();
         assert!(
             error.contains("overflow"),
@@ -579,10 +591,37 @@ mod tests {
         // validation, so they must not panic even on these bounds — the
         // saturating arithmetic keeps the divisor nonzero and the sums
         // bounded.
-        for config in [&links_max, &window_max] {
+        for config in [&links_max, &huge_window_tiny_links] {
             let cadence = config.durable_every();
             assert!(cadence >= 1, "cadence stays defined");
             let _ = config.max_retained_supersession_chain();
         }
+    }
+
+    #[test]
+    fn a_saturating_logical_clock_is_refused_by_the_core_probe() {
+        // Round-10: event `i` is timestamped `i * event_interval_ms`. With
+        // interval = u64::MAX that product saturates, later events collapse
+        // onto u64::MAX, a TTL added to such a timestamp no longer sits
+        // strictly after it, and compaction deletes the entry mid-run — an
+        // accepted probe must complete or be refused, never abort halfway.
+        // Common validate stays permissive: scenario timestamps come from
+        // its trace, not from this product.
+        let config = SoakConfig {
+            logical_events: 17,
+            event_interval_ms: u64::MAX,
+            ..SoakConfig::default()
+        };
+        config
+            .validate()
+            .expect("the logical-clock rule is core-only");
+        let error = config
+            .validate_link_probe()
+            .expect_err("a saturating logical clock must not be accepted")
+            .to_string();
+        assert!(
+            error.contains("saturates"),
+            "the refusal names the saturating clock, got: {error}"
+        );
     }
 }
