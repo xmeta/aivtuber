@@ -356,6 +356,44 @@ fn a_window_the_core_link_probe_refuses_is_still_a_valid_scenario_run() {
 }
 
 #[test]
+fn a_linkless_scenario_accepts_link_budgets_below_the_core_probe_minimum() {
+    // Round-9: the per-write link minimum (store must hold one
+    // maximum-size write) is a *core-probe* rule. The scenario workload
+    // never takes the durable path, so caps the core probe refuses — 1 and
+    // 7, both below the per-write budget of 8 — are valid linkless
+    // experiments: the store aligns its per-write budget down to the
+    // reported cap instead.
+    for cap in [1, 7] {
+        let id = format!("tiny-link-cap-{cap}");
+        let scenario = burst_scenario(&id);
+        let overlay = overlay(
+            &id,
+            1,
+            vec![FaultSpec {
+                subsystem: FaultSubsystem::ContentIngress,
+                occurrence: 1,
+                kind: FaultKind::Flood,
+            }],
+        );
+        let config = SoakConfig {
+            memory_links_limit: cap,
+            ..small_config()
+        };
+        let report = run_scenario_soak(&scenario, &overlay, config, metadata())
+            .expect("a linkless scenario accepts a tiny positive link bound");
+        assert!(
+            report.finding("memory_links").is_none()
+                && report.finding("memory_links_high_water").is_none(),
+            "a linkless run still reports no link-bound checks (cap {cap})"
+        );
+        assert!(
+            report.final_state.memory_links == 0,
+            "the workload mints no links, so the tiny cap never binds (cap {cap})"
+        );
+    }
+}
+
+#[test]
 fn leading_and_trailing_idle_are_part_of_the_declared_timeline() {
     // The soak must start at the scenario's declared logical_start and settle to
     // the declared stream end, not normalise away the idle phases around the

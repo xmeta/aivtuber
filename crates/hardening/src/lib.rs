@@ -175,16 +175,22 @@ mod tests {
     }
 
     #[test]
-    fn a_soak_link_limit_below_the_per_write_budget_is_refused_as_configuration() {
+    fn a_soak_link_limit_below_the_per_write_budget_is_refused_by_the_core_probe() {
         // `WorkingMemory::new` rejects a store smaller than one maximum-size
-        // write; without this check a seemingly valid probe config (1..=7
-        // links) would fail at construction instead of being named here.
+        // write, so the core probe refuses that config up front — but common
+        // `validate` accepts it: the linkless scenario soak never mints a
+        // link, aligns its per-write budget down to its reported cap, and
+        // must be able to configure a small positive link bound (#105 review
+        // round 9).
         let config = SoakConfig {
             memory_links_limit: 7,
             ..SoakConfig::default()
         };
-        let error = config
+        config
             .validate()
+            .expect("a small positive link bound is valid common configuration");
+        let error = config
+            .validate_link_probe()
             .expect_err("a link store smaller than one write cannot run the probe");
         assert!(
             error.to_string().contains("memory_links_limit"),
@@ -197,8 +203,8 @@ mod tests {
             ..SoakConfig::default()
         };
         at_budget
-            .validate()
-            .expect("exactly one maximum-size write is a valid store");
+            .validate_link_probe()
+            .expect("exactly one maximum-size write is a valid probe store");
     }
 
     #[test]

@@ -307,17 +307,12 @@ impl SoakConfig {
                 "soak bounds must be positive and logical_events >= 2",
             ));
         }
-        // A link store that cannot hold one maximum-size write is refused by
-        // `WorkingMemory::new` — which would fail the experiment at
-        // construction rather than report an invalid configuration here, so
-        // the same rule the adapter enforces is checked up front.
-        if self.memory_links_limit < WorkingMemoryConfig::default().max_links_per_memory {
-            return Err(HardeningError::InvalidConfiguration(
-                "soak memory_links_limit must cover one maximum-size write: it has to be at \
-                 least the per-write link budget (WorkingMemoryConfig::max_links_per_memory), or \
-                 the probe cannot perform a single durable supersession write",
-            ));
-        }
+        // A link store that cannot hold one maximum-size write is a
+        // *core-probe* rule, checked in `validate_link_probe` below: the
+        // scenario soak performs only working-memory writes, mints no links,
+        // and aligns its store's per-write budget down to its reported cap,
+        // so tiny positive link bounds stay valid for linkless experiments
+        // (#105 review round 9).
         // The cadence projection (`durable_every`) computes
         // `working_memory_limit + memory_links_limit` and
         // `memory_links_limit + 1`. A deserialized `SoakConfig` can set
@@ -354,6 +349,20 @@ impl SoakConfig {
     /// it never exercised.
     pub fn validate_link_probe(&self) -> Result<(), HardeningError> {
         self.validate()?;
+        // A link store that cannot hold one maximum-size write is refused by
+        // `WorkingMemory::new` — which would fail the experiment at
+        // construction rather than report an invalid configuration here, so
+        // the same rule the adapter enforces is checked up front. It lives
+        // here rather than in common `validate` because only the core probe
+        // mints durable supersession writes: a linkless scenario experiment
+        // may configure a small positive link bound (#105 review round 9).
+        if self.memory_links_limit < WorkingMemoryConfig::default().max_links_per_memory {
+            return Err(HardeningError::InvalidConfiguration(
+                "soak memory_links_limit must cover one maximum-size write: it has to be at \
+                 least the per-write link budget (WorkingMemoryConfig::max_links_per_memory), or \
+                 the probe cannot perform a single durable supersession write",
+            ));
+        }
         // A configuration accepted as a link-store probe must be able to
         // retain a link. Every durable slot also writes one working entry,
         // so the supersession target is only still retained at link creation

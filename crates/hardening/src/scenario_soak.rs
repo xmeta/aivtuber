@@ -285,6 +285,15 @@ pub fn run_scenario_soak(
             // an unwired limit would silently diverge from the growth
             // findings the report claims to enforce (#105 review round 4).
             max_links: config.memory_links_limit,
+            // This store never mints links, so its per-write budget is
+            // aligned down to the reported cap instead of the core probe's
+            // stricter default: `WorkingMemory::new` requires
+            // `max_links >= max_links_per_memory`, and a linkless scenario
+            // with a tiny positive link bound must still construct its store
+            // (#105 review round 9).
+            max_links_per_memory: WorkingMemoryConfig::default()
+                .max_links_per_memory
+                .min(config.memory_links_limit),
             ..WorkingMemoryConfig::default()
         },
         ActorPseudonymizer::new("scenario-soak-v1", [0x40; 32])
