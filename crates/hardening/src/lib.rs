@@ -424,6 +424,30 @@ mod tests {
             result.metrics["resource.hot_assets_resident_count"].value,
             config.generated_asset_limit as f64
         );
+        // The link footprint must be trendable in benchmark history: the
+        // nightly workflow records only this result, so the counters that
+        // reach SoakReport have to be published here too, mirroring the
+        // report exactly (#105 review round 7).
+        assert_eq!(
+            result.metrics["resource.memory_links_count"].value,
+            report.final_state.memory_links as f64
+        );
+        assert_eq!(
+            result.metrics["resource.memory_links_high_water_count"].value,
+            report.final_state.memory_links_high_water as f64
+        );
+        // This core soak mints supersession links (round-6 rules guarantee
+        // the second durable write), so the published counts must show a
+        // real, exercised footprint rather than an always-zero series.
+        assert!(
+            result.metrics["resource.memory_links_high_water_count"].value >= 1.0,
+            "a core soak must record at least one minted link"
+        );
+        assert!(
+            result.metrics["resource.memory_links_high_water_count"].value
+                >= result.metrics["resource.memory_links_count"].value,
+            "high water cannot be below the current count"
+        );
         assert!(result.metrics.contains_key("resource.peak_rss_kib"));
         assert!(
             result
@@ -509,5 +533,50 @@ mod tests {
         let parsed =
             aivtuber_telemetry::BenchmarkResult::from_json(&bytes).expect("contract valid");
         assert_eq!(parsed, result);
+    }
+
+    #[test]
+    fn overflowing_link_bounds_are_refused_not_panicked() {
+        // A deserialized SoakConfig can carry usize::MAX bounds. The cadence
+        // projection adds them, which used to panic in debug (overflow) and
+        // divide by zero in release (wrapped divisor) *after* validate()
+        // accepted the config — a crash where InvalidConfiguration belongs
+        // (#105 review round 7).
+        let links_max = SoakConfig {
+            memory_links_limit: usize::MAX,
+            ..SoakConfig::default()
+        };
+        let error = links_max
+            .validate()
+            .expect_err("usize::MAX link bound must be refused")
+            .to_string();
+        assert!(
+            error.contains("overflow"),
+            "the refusal names the overflowing arithmetic, got: {error}"
+        );
+
+        // working_memory_limit + memory_links_limit must also be evaluable.
+        let window_max = SoakConfig {
+            working_memory_limit: usize::MAX,
+            ..SoakConfig::default()
+        };
+        let error = window_max
+            .validate()
+            .expect_err("usize::MAX window bound must be refused")
+            .to_string();
+        assert!(
+            error.contains("overflow"),
+            "the refusal names the overflowing arithmetic, got: {error}"
+        );
+
+        // Defense in depth: the projections are public and callable without
+        // validation, so they must not panic even on these bounds — the
+        // saturating arithmetic keeps the divisor nonzero and the sums
+        // bounded.
+        for config in [&links_max, &window_max] {
+            let cadence = config.durable_every();
+            assert!(cadence >= 1, "cadence stays defined");
+            let _ = config.max_retained_supersession_chain();
+        }
     }
 }

@@ -118,6 +118,19 @@ pub fn resource_bench_result(
             "resource.memory_compaction_records_count".to_owned(),
             metric(report.final_state.memory_compaction_records),
         ),
+        // Link footprint belongs in the recorded result, not only in the
+        // auxiliary SoakReport: the nightly workflow records just this
+        // BenchmarkResult into history, so without these keys a workload
+        // that doubles its steady link footprint while staying under the
+        // configured cap trends nowhere (#105 review round 7).
+        (
+            "resource.memory_links_count".to_owned(),
+            metric(report.final_state.memory_links),
+        ),
+        (
+            "resource.memory_links_high_water_count".to_owned(),
+            metric(report.final_state.memory_links_high_water),
+        ),
         (
             "resource.telemetry_events_retained_count".to_owned(),
             metric(report.final_state.telemetry_events),
@@ -305,6 +318,27 @@ impl SoakConfig {
                  the probe cannot perform a single durable supersession write",
             ));
         }
+        // The cadence projection (`durable_every`) computes
+        // `working_memory_limit + memory_links_limit` and
+        // `memory_links_limit + 1`. A deserialized `SoakConfig` can set
+        // either bound to `usize::MAX`: the additions then panic in debug
+        // builds and wrap the divisor to zero in release builds, where the
+        // division aborts. Bounds whose sums cannot be evaluated are not a
+        // runnable experiment, so they are refused here as invalid
+        // configuration instead of crashing after acceptance (#105 review
+        // round 7).
+        if self
+            .working_memory_limit
+            .checked_add(self.memory_links_limit)
+            .is_none()
+            || self.memory_links_limit.checked_add(1).is_none()
+        {
+            return Err(HardeningError::InvalidConfiguration(
+                "soak link bounds overflow: working_memory_limit + memory_links_limit and \
+                 memory_links_limit + 1 must both fit in usize, or the cadence projection \
+                 cannot be evaluated",
+            ));
+        }
         Ok(())
     }
 
@@ -387,10 +421,16 @@ impl SoakConfig {
     pub fn durable_every(&self) -> u64 {
         let by_window = (self.working_memory_limit / 16) as u64;
         // ceil(window / (links + 1)) - 1, without a division-by-links+1
-        // subtlety: ceil(a / b) == (a + b - 1) / b.
-        let by_links = ((self.working_memory_limit + self.memory_links_limit)
-            / (self.memory_links_limit + 1))
-            .saturating_sub(1) as u64;
+        // subtlety: ceil(a / b) == (a + b - 1) / b. The sums saturate
+        // rather than wrap: this is a public projection callable without
+        // `validate`, and a wrapped divisor of zero would abort the run on
+        // a config that merely skipped validation (#105 review round 7).
+        // `saturating_add(1)` never yields zero, so the divisor is safe.
+        let by_links = (self
+            .working_memory_limit
+            .saturating_add(self.memory_links_limit)
+            / self.memory_links_limit.saturating_add(1))
+        .saturating_sub(1) as u64;
         by_window.max(by_links).max(1)
     }
 
@@ -404,7 +444,9 @@ impl SoakConfig {
     pub fn max_retained_supersession_chain(&self) -> usize {
         let durable_every = self.durable_every();
         let window = self.working_memory_limit as u64;
-        let by_window = (window + durable_every) / (durable_every + 1);
+        // Saturating like `durable_every`: an unvalidated huge window must
+        // not overflow the u64 addition here (#105 review round 7).
+        let by_window = window.saturating_add(durable_every) / durable_every.saturating_add(1);
         let by_run = self.logical_events.saturating_sub(1) / durable_every;
         by_window.saturating_sub(1).min(by_run) as usize
     }
