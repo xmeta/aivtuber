@@ -47,7 +47,7 @@ Short-lived working memory may contain untrusted public content. Durable retenti
 
 Public chat without that permit is rejected before +WorkingMemory::remember_durable+ can be called.
 
-A permit records the source event id, source, source class, trust level, optional actor, and the deterministic gate decision. The stored entry converts the actor to the configured pseudonym before retention.
+A permit records the source event id, source, source class, trust level, optional actor, the deterministic gate decision, and the source event's own claim text (its payload `text`) — the binding a consumer needs to tell the event's verified claim from an unrelated sentence supplied beside the permit. The stored entry converts the actor to the configured pseudonym before retention.
 
 === 3.1 Epistemic classes and crystallization
 
@@ -59,11 +59,11 @@ Every retained entry carries a versioned epistemic class (+MemoryEpistemicClass+
 * observation;
 * persona opinion.
 
-The class is derived **once at write time** from the source class and trust level the security runtime already assigned to the source event — never from claim text, retrieval rank, model output, or link structure. It is stored on the entry and never recomputed, so retrieval, ranking, and temporal/graph linkage cannot change a claim's class. The retrieval view serializes the class and names the vocabulary version it was derived under, so a replay can identify the classification instead of inferring it from field presence. Those classes describe provenance/epistemic status; they are not authorization and never feed a gate.
+The class is derived **once at write time** from the source class and trust level the security runtime already assigned to the source event and from whether the retained claim *is that event's own claim text* (its payload `text`) — never from claim text alone, retrieval rank, model output, or link structure. It is stored on the entry and never recomputed, so retrieval, ranking, and temporal/graph linkage cannot change a claim's class. The vocabulary version (+memory-epistemic-v1+) is stored **on each entry**, not stamped from the current process constant, so an artifact written under an older vocabulary is identifiable instead of being presented as derived under the present one. The retrieval view serializes the class and reports the entry's own stored version. Those classes describe provenance/epistemic status; they are not authorization and never feed a gate.
 
-The derivation fails closed. +VerifiedFact+ is reachable from exactly one combination — a *trusted* system-plane source. Deliberately stricter than the write gate, which also admits semi-trusted system sources: a semi-trusted system write is admitted but classified as an observation, so the store can never mint facts the runtime did not verify. Public chat and donations are a +ViewerClaim+ at any nominal trust, trusted performer speech is +PerformerExperience+, authenticated operator content is a +PersonaOpinion+ (an asserted opinion, not an independently verified fact), and every other source is an unasserted +Observation+.
+The derivation fails closed and binds verification to the specific claim. +VerifiedFact+ is reachable from exactly one combination — a *trusted* system-plane source **whose event carried that exact claim**. A permit proves the event was authorized, not the content of a sentence supplied separately alongside it, so a trusted system permit writing an unrelated claim is an +Observation+, not a fact. This is deliberately stricter than the write gate, which also admits semi-trusted system sources: a semi-trusted system write is admitted but classified as an observation, so the store can never mint facts the runtime did not verify. Public chat and donations are a +ViewerClaim+ at any nominal trust, trusted performer speech is +PerformerExperience+, authenticated operator content is a +PersonaOpinion+ (an asserted opinion, not an independently verified fact), and every other source is an unasserted +Observation+.
 
-Public content MUST NOT self-promote from claim/observation to verified fact. Model repetition, summarization, retrieval rank, or temporal/graph linkage alone is insufficient verification; the class is a write-time fact about provenance, so nothing downstream can raise it.
+Public content MUST NOT self-promote from claim/observation to verified fact. Model repetition, summarization, retrieval rank, or temporal/graph linkage alone is insufficient verification; the class is a write-time fact about provenance and claim binding, so nothing downstream can raise it.
 
 Likewise, short-lived conversation/thread context is not automatically durable memory. Any future "crystallization" from active context into a retained atomic memory still passes the existing non-serializable +MemoryWritePermit+ gate and retention policy.
 
@@ -185,12 +185,15 @@ The Rust tests cover:
   expiry, timeline precision/bounds, and provenance survival cases (issue #105
   link-aware baseline, +tests/long_range_eval.rs+);
 * epistemic-class derivation and non-promotion (issue #105, section 3.1): a
-  trusted system observation is the only +VerifiedFact+; a semi-trusted system
-  write is admitted by the gate yet stays an +Observation+; a viewer claim
-  written through an authenticated +memory.admin+ permit stays a +ViewerClaim+
-  in the store and in the serialized retrieval view, which also names the
-  +memory-epistemic-v1+ vocabulary; a public working-memory claim carries no
-  linkage through which to promote itself;
+  trusted system event's own claim is the only +VerifiedFact+, while an
+  unrelated claim written through that same trusted permit stays an
+  +Observation+; a semi-trusted system write is admitted by the gate yet stays
+  an +Observation+; a viewer claim written through an authenticated
+  +memory.admin+ permit stays a +ViewerClaim+ in the store and in the
+  serialized retrieval view, which reports the entry's stored
+  +memory-epistemic-v1+ vocabulary; each serialized entry persists its own
+  vocabulary version; a public working-memory claim carries no linkage through
+  which to promote itself;
 * frequency/quality promotion;
 * provenance and compatibility preservation across L1 persistence;
 * negative-quality rollback/invalidation;

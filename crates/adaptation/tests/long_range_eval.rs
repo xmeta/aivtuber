@@ -156,7 +156,13 @@ impl Eval {
     /// `memory.admin` authority. A denied event panics — a case memory that
     /// failed the gate must never be silently stored.
     fn remember(&mut self, spec: &Memory) {
-        let event = event(spec.id, spec.source_class, spec.trust, spec.actor);
+        // The event carries the claim as its own text: a case that wants to
+        // test an unbound claim must build the event differently, because a
+        // permitted event that never carried the claim is not evidence for it.
+        let mut event = event(spec.id, spec.source_class, spec.trust, spec.actor);
+        event
+            .payload
+            .insert("text".to_owned(), Value::String(spec.claim.to_owned()));
         let authority = (spec.source_class != SourceClass::System).then_some(&self.admin);
         let (decision, permit) = self.security.authorize_memory_write(&event, authority);
         assert_ne!(

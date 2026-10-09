@@ -60,15 +60,25 @@ pub enum MemoryEpistemicClass {
 impl MemoryEpistemicClass {
     /// Classify a write from trusted metadata only.
     ///
-    /// `VerifiedFact` is reachable from exactly one combination — a *trusted*
-    /// system-plane source. The memory-write gate also admits a semi-trusted
-    /// system write, public chat, and authenticated operator content; all of
-    /// those fail closed to a weaker class, so the only way a claim becomes a
-    /// verified fact is a trusted runtime observation, never repetition,
+    /// `claim_is_bound` says the retained claim is the source event's *own*
+    /// claim text (its payload `text`), not an arbitrary sentence the caller
+    /// supplied next to a permit. A trusted source event proves event
+    /// provenance, not the content of a separately written claim, so
+    /// `VerifiedFact` additionally requires the binding: a trusted system
+    /// permit carrying an unrelated claim fails closed to `Observation`.
+    ///
+    /// The memory-write gate also admits a semi-trusted system write, public
+    /// chat, and authenticated operator content; all of those fail closed to a
+    /// weaker class, so the only way a claim becomes a verified fact is a
+    /// trusted runtime observation of that exact claim — never repetition,
     /// retrieval, or linkage.
-    pub fn derive(source_class: SourceClass, trust_level: TrustLevel) -> Self {
+    pub fn derive(
+        source_class: SourceClass,
+        trust_level: TrustLevel,
+        claim_is_bound: bool,
+    ) -> Self {
         match (source_class, trust_level) {
-            (SourceClass::System, TrustLevel::Trusted) => Self::VerifiedFact,
+            (SourceClass::System, TrustLevel::Trusted) if claim_is_bound => Self::VerifiedFact,
             (SourceClass::PublicChat | SourceClass::Donation, _) => Self::ViewerClaim,
             (SourceClass::Speech, TrustLevel::Trusted) => Self::PerformerExperience,
             (SourceClass::Operator, _) => Self::PersonaOpinion,
@@ -96,9 +106,15 @@ pub struct MemoryEntry {
     pub retention: RetentionClass,
     pub write_decision: MemoryGateDecision,
     /// Epistemic class derived once at write time from trusted source metadata
-    /// (#105 §3.1). Stored, never recomputed: retrieval, ranking, and link
-    /// structure cannot change a claim's class.
+    /// and whether the claim is the source event's own claim text (#105 §3.1).
+    /// Stored, never recomputed: retrieval, ranking, and link structure cannot
+    /// change a claim's class.
     pub epistemic_class: MemoryEpistemicClass,
+    /// Epistemic vocabulary this entry's class was derived under, stored with
+    /// the entry rather than stamped from the current process constant, so a
+    /// replay can tell a class derived under an older vocabulary from one
+    /// derived under the present one.
+    pub epistemic_version: String,
     /// Internal node identity, assigned when the entry is inserted. Links
     /// reference this and never `source.event_id`: a source event id is not
     /// unique among retained entries (the scheduler may legitimately replay
@@ -165,10 +181,11 @@ pub struct LinkedMemory<'a> {
     /// view: a replay has to be able to identify which vocabulary shaped a
     /// record instead of inferring it from field presence.
     pub vocab_version: &'static str,
-    /// Epistemic vocabulary the carried class was derived under, serialized
-    /// with the view so a replay can identify the classification rather than
-    /// infer it (#105 §3.1).
-    pub epistemic_version: &'static str,
+    /// Epistemic vocabulary the carried entry's class was derived under. Read
+    /// from the entry itself, not stamped from the current process constant, so
+    /// the view reports the version the class was actually derived under
+    /// (#105 §3.1).
+    pub epistemic_version: &'a str,
 }
 
 /// Serialized envelope for the retained edge set. The vocabulary version
@@ -548,6 +565,11 @@ impl WorkingMemory {
         }
         let retention = RetentionClass::Durable;
         let claim = bounded_nonempty(claim, self.config.max_claim_bytes, "memory claim")?;
+        // Verification is bound to the claim, not the permit: the retained text
+        // must be the source event's own claim, or a trusted permit could
+        // launder an unrelated sentence into a verified fact (#105 review
+        // round 2).
+        let claim_is_bound = permit.source_claim() == Some(claim.as_str());
         let topic = bounded_optional(topic, self.config.max_topic_bytes, "memory topic")?;
         let actor = permit
             .actor_id()
@@ -570,7 +592,9 @@ impl WorkingMemory {
             epistemic_class: MemoryEpistemicClass::derive(
                 permit.source_class(),
                 permit.trust_level(),
+                claim_is_bound,
             ),
+            epistemic_version: MEMORY_EPISTEMIC_VOCAB_VERSION.to_owned(),
             memory_id: 0,
         };
         let topic = entry.topic.clone();
@@ -999,7 +1023,7 @@ impl WorkingMemory {
                 stale,
                 links,
                 vocab_version: MEMORY_LINK_VOCAB_VERSION,
-                epistemic_version: MEMORY_EPISTEMIC_VOCAB_VERSION,
+                epistemic_version: entry.epistemic_version.as_str(),
             })
             .collect()
     }
@@ -1082,6 +1106,14 @@ impl WorkingMemory {
         write_decision: MemoryGateDecision,
     ) -> Result<MemoryEntry, AdaptationError> {
         let claim = bounded_nonempty(claim, self.config.max_claim_bytes, "memory claim")?;
+        // A working entry's claim is likewise only the event's own claim when it
+        // matches the event text; a derived or rephrased sentence is not the
+        // runtime's observation (#105 review round 2).
+        let claim_is_bound = event
+            .payload
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            == Some(claim.as_str());
         let topic = bounded_optional(topic, self.config.max_topic_bytes, "memory topic")?;
         let actor = event
             .actor_id
@@ -1105,7 +1137,12 @@ impl WorkingMemory {
             expires_at_ms: now_ms.saturating_add(ttl),
             retention,
             write_decision,
-            epistemic_class: MemoryEpistemicClass::derive(event.source_class, event.trust_level),
+            epistemic_class: MemoryEpistemicClass::derive(
+                event.source_class,
+                event.trust_level,
+                claim_is_bound,
+            ),
+            epistemic_version: MEMORY_EPISTEMIC_VOCAB_VERSION.to_owned(),
             memory_id: 0,
         })
     }
@@ -1832,7 +1869,13 @@ mod tests {
         now_ms: u64,
         supersedes: &[&str],
     ) -> Result<u64, AdaptationError> {
-        let source = event(id, SourceClass::System, TrustLevel::Trusted, None);
+        // The event carries the claim as its own text, so the write is
+        // genuinely bound to the permitted event (the tested case for a
+        // verified fact). Unbound writes are covered separately.
+        let mut source = event(id, SourceClass::System, TrustLevel::Trusted, None);
+        source
+            .payload
+            .insert("text".to_owned(), Value::String(claim.to_owned()));
         let (_, permit) = security.authorize_memory_write(&source, None);
         let permit = permit.expect("system permit");
         memory
@@ -1870,17 +1913,15 @@ mod tests {
         actor: &str,
         supersedes: &[&str],
     ) -> u64 {
-        let source = event(id, SourceClass::System, TrustLevel::Trusted, Some(actor));
+        let claim = format!("claim from {id}");
+        let mut source = event(id, SourceClass::System, TrustLevel::Trusted, Some(actor));
+        source
+            .payload
+            .insert("text".to_owned(), Value::String(claim.clone()));
         let (_, permit) = security.authorize_memory_write(&source, None);
         let permit = permit.expect("system permit");
         memory
-            .remember_durable_superseding(
-                &permit,
-                &format!("claim from {id}"),
-                topic,
-                now_ms,
-                supersedes,
-            )
+            .remember_durable_superseding(&permit, &claim, topic, now_ms, supersedes)
             .expect("durable remember")
             .memory_id
     }
@@ -3243,28 +3284,58 @@ mod tests {
         use SourceClass::*;
         use TrustLevel::*;
         let cases = [
-            ((System, Trusted), MemoryEpistemicClass::VerifiedFact),
+            ((System, Trusted, true), MemoryEpistemicClass::VerifiedFact),
+            // A trusted permit for a claim the event never carried is not
+            // verified evidence — binding is required, not just provenance.
+            ((System, Trusted, false), MemoryEpistemicClass::Observation),
             // The gate admits a semi-trusted system write; it is not a fact.
-            ((System, SemiTrusted), MemoryEpistemicClass::Observation),
-            ((System, Untrusted), MemoryEpistemicClass::Observation),
+            (
+                (System, SemiTrusted, true),
+                MemoryEpistemicClass::Observation,
+            ),
+            ((System, Untrusted, true), MemoryEpistemicClass::Observation),
             // Public content is a viewer assertion at any nominal trust.
-            ((PublicChat, Untrusted), MemoryEpistemicClass::ViewerClaim),
-            ((PublicChat, Trusted), MemoryEpistemicClass::ViewerClaim),
-            ((Donation, SemiTrusted), MemoryEpistemicClass::ViewerClaim),
-            ((Speech, Trusted), MemoryEpistemicClass::PerformerExperience),
-            ((Speech, SemiTrusted), MemoryEpistemicClass::Observation),
+            (
+                (PublicChat, Untrusted, true),
+                MemoryEpistemicClass::ViewerClaim,
+            ),
+            (
+                (PublicChat, Trusted, true),
+                MemoryEpistemicClass::ViewerClaim,
+            ),
+            (
+                (Donation, SemiTrusted, false),
+                MemoryEpistemicClass::ViewerClaim,
+            ),
+            (
+                (Speech, Trusted, true),
+                MemoryEpistemicClass::PerformerExperience,
+            ),
+            (
+                (Speech, SemiTrusted, true),
+                MemoryEpistemicClass::Observation,
+            ),
             // An authenticated operator asserts an opinion, not a fact.
-            ((Operator, Trusted), MemoryEpistemicClass::PersonaOpinion),
-            ((Game, Untrusted), MemoryEpistemicClass::Observation),
-            ((Stream, SemiTrusted), MemoryEpistemicClass::Observation),
-            ((Timer, Trusted), MemoryEpistemicClass::Observation),
+            (
+                (Operator, Trusted, true),
+                MemoryEpistemicClass::PersonaOpinion,
+            ),
+            ((Game, Untrusted, true), MemoryEpistemicClass::Observation),
+            (
+                (Stream, SemiTrusted, true),
+                MemoryEpistemicClass::Observation,
+            ),
+            ((Timer, Trusted, true), MemoryEpistemicClass::Observation),
         ];
-        for ((source_class, trust_level), expected) in cases {
-            let class = MemoryEpistemicClass::derive(source_class, trust_level);
-            assert_eq!(class, expected, "{source_class:?}/{trust_level:?}");
+        for ((source_class, trust_level, bound), expected) in cases {
+            let class = MemoryEpistemicClass::derive(source_class, trust_level, bound);
+            assert_eq!(
+                class, expected,
+                "{source_class:?}/{trust_level:?}/bound={bound}"
+            );
             assert_eq!(
                 class,
-                MemoryEpistemicClass::derive(source_class, trust_level),
+                MemoryEpistemicClass::derive(source_class, trust_level, bound),
                 "derivation is deterministic"
             );
         }
@@ -3274,7 +3345,87 @@ mod tests {
                 .filter(|(_, class)| *class == MemoryEpistemicClass::VerifiedFact)
                 .count(),
             1,
-            "exactly one metadata route reaches VerifiedFact"
+            "exactly one route reaches VerifiedFact: trusted, system, and bound"
+        );
+    }
+
+    #[test]
+    fn a_trusted_permit_for_an_unrelated_claim_is_not_a_verified_fact() {
+        // #105 review round 2: a permit proves the *event* was authorized, not
+        // the content of a sentence supplied next to it. A trusted system
+        // health event that never asserted this claim must not launder it into
+        // a verified fact.
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig::default());
+        let mut source = event("evt-health", SourceClass::System, TrustLevel::Trusted, None);
+        source.payload.insert(
+            "text".to_owned(),
+            Value::String("stream is healthy".to_owned()),
+        );
+        let (decision, permit) = security.authorize_memory_write(&source, None);
+        assert_eq!(decision, MemoryWriteDecision::AllowedSystemSource);
+        let permit = permit.expect("trusted system permit");
+
+        let unrelated = memory
+            .remember_durable(
+                &permit,
+                "viewer asserts the game author is X",
+                Some("lore"),
+                1_000,
+            )
+            .expect("durable write");
+        assert_eq!(
+            unrelated.epistemic_class,
+            MemoryEpistemicClass::Observation,
+            "an unrelated sentence through a trusted permit is not verified evidence"
+        );
+
+        // The event's own claim *is* the verified evidence.
+        let bound = memory
+            .remember_durable(&permit, "stream is healthy", Some("health"), 2_000)
+            .expect("durable write of the event's own claim");
+        assert_eq!(
+            bound.epistemic_class,
+            MemoryEpistemicClass::VerifiedFact,
+            "the permitted event's own claim is the verified fact"
+        );
+    }
+
+    #[test]
+    fn every_entry_persists_the_epistemic_vocabulary_it_was_classified_under() {
+        // #105 review round 2: a class is worthless to a replay without the
+        // vocabulary it was derived under. The version is stored per entry, not
+        // stamped from the current process constant, so an older artifact stays
+        // identifiable instead of being presented as derived under the current
+        // vocabulary.
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig::default());
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-a",
+            "claim a",
+            Some("game-x"),
+            1_000,
+        );
+
+        let entries = serde_json::to_value(memory.entries()).expect("serialize entries");
+        assert_eq!(
+            entries[0]["epistemic_version"],
+            Value::String(MEMORY_EPISTEMIC_VOCAB_VERSION.to_owned()),
+            "each serialized entry names the vocabulary its class was derived under: {entries}"
+        );
+        assert_eq!(
+            entries[0]["epistemic_class"],
+            Value::String("verified_fact".to_owned()),
+            "the bound claim is the verified fact: {entries}"
+        );
+
+        let view = memory.relevant_linked(unfiltered_query(4), 1_500);
+        assert_eq!(
+            view[0].epistemic_version,
+            view[0].entry.epistemic_version.as_str(),
+            "the view reports the entry's stored version rather than the process constant"
         );
     }
 
@@ -3287,11 +3438,17 @@ mod tests {
         // verified (#105 §3.1).
         let mut security = security();
         let mut memory = test_memory(WorkingMemoryConfig::default());
-        let source = event(
+        // Bind the claim, so the only reason this is not a fact is the trust
+        // level — not a missing claim binding.
+        let mut source = event(
             "evt-semi",
             SourceClass::System,
             TrustLevel::SemiTrusted,
             None,
+        );
+        source.payload.insert(
+            "text".to_owned(),
+            Value::String("semi-trusted observation".to_owned()),
         );
         let (decision, permit) = security.authorize_memory_write(&source, None);
         assert_eq!(decision, MemoryWriteDecision::AllowedSystemSource);

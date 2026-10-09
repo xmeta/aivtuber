@@ -156,7 +156,7 @@ Public chat SHOULD NOT become durable identity/fact memory solely because an LLM
 
 Claim provenance must not silently become epistemic authority.
 
-Retained entries carry a write-time epistemic class (fact/claim/observation/experience/opinion) derived only from the source class and trust level the security runtime assigned, and never recomputed. An untrusted viewer assertion remains a viewer claim unless a separate trusted verification/update policy explicitly changes its class; LLM repetition, summarization, semantic similarity, or graph linkage alone MUST NOT promote a claim to verified fact. The class is not authorization and never feeds a gate.
+Retained entries carry a write-time epistemic class (fact/claim/observation/experience/opinion) derived only from the source class and trust level the security runtime assigned *and* whether the retained claim is the source event's own text; the class and the vocabulary version it was derived under are stored on the entry and never recomputed. A memory-write permit proves the source event was authorized, not that an arbitrary sentence supplied alongside it was verified, so such a claim MUST NOT be treated as a verified fact. An untrusted viewer assertion remains a viewer claim unless a separate trusted verification/update policy explicitly changes its class; LLM repetition, summarization, semantic similarity, or graph linkage alone MUST NOT promote a claim to verified fact. The class is not authorization and never feeds a gate.
 
 Deletion/expiry semantics also apply to future relation metadata: an edge or summary MUST NOT become a covert archive of content that retention policy removed.
 

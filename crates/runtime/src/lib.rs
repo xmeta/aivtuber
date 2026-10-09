@@ -115,6 +115,11 @@ pub struct MemoryWritePermit {
     trust_level: TrustLevel,
     actor_id: Option<String>,
     decision: MemoryWriteDecision,
+    /// The claim the source event itself carried (its payload `text`). A permit
+    /// proves the *event* was authorized, not the content of an arbitrary
+    /// sentence a caller supplies alongside it, so a consumer that wants to
+    /// treat a retained claim as verified evidence must check it against this.
+    source_claim: Option<String>,
 }
 
 impl MemoryWritePermit {
@@ -140,6 +145,11 @@ impl MemoryWritePermit {
 
     pub fn decision(&self) -> MemoryWriteDecision {
         self.decision
+    }
+
+    /// The source event's own claim text, when its payload carried one.
+    pub fn source_claim(&self) -> Option<&str> {
+        self.source_claim.as_deref()
     }
 }
 
@@ -609,6 +619,11 @@ impl SecurityRuntime {
                 trust_level: event.trust_level,
                 actor_id: event.actor_id.clone(),
                 decision,
+                source_claim: event
+                    .payload
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
             });
         (decision, permit)
     }
