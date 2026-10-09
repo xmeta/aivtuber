@@ -41,6 +41,42 @@ impl From<MemoryWriteDecision> for MemoryGateDecision {
     }
 }
 
+/// Epistemic class of a retained claim (#105 §3.1), derived deterministically
+/// at write time from the source class and trust level the security runtime
+/// already assigned to the source event. It describes what kind of knowledge a
+/// memory represents; it is **not** authorization and never feeds a gate, and
+/// it is never derived from claim text, retrieval rank, model output, or link
+/// structure — any of those would let public content promote itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryEpistemicClass {
+    VerifiedFact,
+    ViewerClaim,
+    PerformerExperience,
+    Observation,
+    PersonaOpinion,
+}
+
+impl MemoryEpistemicClass {
+    /// Classify a write from trusted metadata only.
+    ///
+    /// `VerifiedFact` is reachable from exactly one combination — a *trusted*
+    /// system-plane source. The memory-write gate also admits a semi-trusted
+    /// system write, public chat, and authenticated operator content; all of
+    /// those fail closed to a weaker class, so the only way a claim becomes a
+    /// verified fact is a trusted runtime observation, never repetition,
+    /// retrieval, or linkage.
+    pub fn derive(source_class: SourceClass, trust_level: TrustLevel) -> Self {
+        match (source_class, trust_level) {
+            (SourceClass::System, TrustLevel::Trusted) => Self::VerifiedFact,
+            (SourceClass::PublicChat | SourceClass::Donation, _) => Self::ViewerClaim,
+            (SourceClass::Speech, TrustLevel::Trusted) => Self::PerformerExperience,
+            (SourceClass::Operator, _) => Self::PersonaOpinion,
+            _ => Self::Observation,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemorySourceMetadata {
     pub event_id: String,
@@ -59,6 +95,10 @@ pub struct MemoryEntry {
     pub expires_at_ms: u64,
     pub retention: RetentionClass,
     pub write_decision: MemoryGateDecision,
+    /// Epistemic class derived once at write time from trusted source metadata
+    /// (#105 §3.1). Stored, never recomputed: retrieval, ranking, and link
+    /// structure cannot change a claim's class.
+    pub epistemic_class: MemoryEpistemicClass,
     /// Internal node identity, assigned when the entry is inserted. Links
     /// reference this and never `source.event_id`: a source event id is not
     /// unique among retained entries (the scheduler may legitimately replay
@@ -72,6 +112,11 @@ pub struct MemoryEntry {
 /// supersession is declared by the caller that owns the update evidence;
 /// causal kinds wait for an evidence source that can actually establish them.
 pub const MEMORY_LINK_VOCAB_VERSION: &str = "memory-link-v1";
+
+/// Versioned epistemic vocabulary for retained memory (#105 §3.1). The
+/// retrieval view names it, so a replay can identify which classification
+/// shaped a record instead of inferring it from field presence.
+pub const MEMORY_EPISTEMIC_VOCAB_VERSION: &str = "memory-epistemic-v1";
 
 /// How many raw supersession declarations one write may hand
 /// `remember_durable_superseding`, as a multiple of
@@ -120,6 +165,10 @@ pub struct LinkedMemory<'a> {
     /// view: a replay has to be able to identify which vocabulary shaped a
     /// record instead of inferring it from field presence.
     pub vocab_version: &'static str,
+    /// Epistemic vocabulary the carried class was derived under, serialized
+    /// with the view so a replay can identify the classification rather than
+    /// infer it (#105 §3.1).
+    pub epistemic_version: &'static str,
 }
 
 /// Serialized envelope for the retained edge set. The vocabulary version
@@ -518,6 +567,10 @@ impl WorkingMemory {
             expires_at_ms: now_ms.saturating_add(ttl),
             retention,
             write_decision: permit.decision().into(),
+            epistemic_class: MemoryEpistemicClass::derive(
+                permit.source_class(),
+                permit.trust_level(),
+            ),
             memory_id: 0,
         };
         let topic = entry.topic.clone();
@@ -946,6 +999,7 @@ impl WorkingMemory {
                 stale,
                 links,
                 vocab_version: MEMORY_LINK_VOCAB_VERSION,
+                epistemic_version: MEMORY_EPISTEMIC_VOCAB_VERSION,
             })
             .collect()
     }
@@ -1051,6 +1105,7 @@ impl WorkingMemory {
             expires_at_ms: now_ms.saturating_add(ttl),
             retention,
             write_decision,
+            epistemic_class: MemoryEpistemicClass::derive(event.source_class, event.trust_level),
             memory_id: 0,
         })
     }
@@ -3166,6 +3221,116 @@ mod tests {
             view["vocab_version"],
             Value::String(MEMORY_LINK_VOCAB_VERSION.to_owned()),
             "a replay can identify the vocabulary instead of inferring it: {view}"
+        );
+        assert_eq!(
+            view["epistemic_version"],
+            Value::String(MEMORY_EPISTEMIC_VOCAB_VERSION.to_owned()),
+            "the same view names the epistemic vocabulary it was classified under"
+        );
+        assert_eq!(
+            view["entry"]["epistemic_class"],
+            Value::String("verified_fact".to_owned()),
+            "and carries the class the entry was written with: {view}"
+        );
+    }
+
+    #[test]
+    fn the_epistemic_class_is_a_pure_function_of_trusted_metadata() {
+        // #105 §3.1: the class comes from the source class and trust level the
+        // security runtime already established — never from claim text,
+        // retrieval rank, model output, or linkage. `VerifiedFact` has exactly
+        // one route in, so nothing a viewer says can be promoted by repetition.
+        use SourceClass::*;
+        use TrustLevel::*;
+        let cases = [
+            ((System, Trusted), MemoryEpistemicClass::VerifiedFact),
+            // The gate admits a semi-trusted system write; it is not a fact.
+            ((System, SemiTrusted), MemoryEpistemicClass::Observation),
+            ((System, Untrusted), MemoryEpistemicClass::Observation),
+            // Public content is a viewer assertion at any nominal trust.
+            ((PublicChat, Untrusted), MemoryEpistemicClass::ViewerClaim),
+            ((PublicChat, Trusted), MemoryEpistemicClass::ViewerClaim),
+            ((Donation, SemiTrusted), MemoryEpistemicClass::ViewerClaim),
+            ((Speech, Trusted), MemoryEpistemicClass::PerformerExperience),
+            ((Speech, SemiTrusted), MemoryEpistemicClass::Observation),
+            // An authenticated operator asserts an opinion, not a fact.
+            ((Operator, Trusted), MemoryEpistemicClass::PersonaOpinion),
+            ((Game, Untrusted), MemoryEpistemicClass::Observation),
+            ((Stream, SemiTrusted), MemoryEpistemicClass::Observation),
+            ((Timer, Trusted), MemoryEpistemicClass::Observation),
+        ];
+        for ((source_class, trust_level), expected) in cases {
+            let class = MemoryEpistemicClass::derive(source_class, trust_level);
+            assert_eq!(class, expected, "{source_class:?}/{trust_level:?}");
+            assert_eq!(
+                class,
+                MemoryEpistemicClass::derive(source_class, trust_level),
+                "derivation is deterministic"
+            );
+        }
+        assert_eq!(
+            cases
+                .iter()
+                .filter(|(_, class)| *class == MemoryEpistemicClass::VerifiedFact)
+                .count(),
+            1,
+            "exactly one metadata route reaches VerifiedFact"
+        );
+    }
+
+    #[test]
+    fn a_semi_trusted_system_write_is_admitted_but_is_not_a_verified_fact() {
+        // `SecurityRuntime::authorize_memory_write` admits a semi-trusted
+        // system-plane source, so classification is deliberately stricter than
+        // the gate: a semi-trusted observation is admitted but stays an
+        // observation, or the store could mint facts the runtime never
+        // verified (#105 §3.1).
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig::default());
+        let source = event(
+            "evt-semi",
+            SourceClass::System,
+            TrustLevel::SemiTrusted,
+            None,
+        );
+        let (decision, permit) = security.authorize_memory_write(&source, None);
+        assert_eq!(decision, MemoryWriteDecision::AllowedSystemSource);
+        let permit = permit.expect("the gate admits a semi-trusted system write");
+        let stored = memory
+            .remember_durable(&permit, "semi-trusted observation", Some("health"), 1_000)
+            .expect("durable write");
+        assert_eq!(
+            stored.epistemic_class,
+            MemoryEpistemicClass::Observation,
+            "admitted by the gate, still not a verified fact"
+        );
+    }
+
+    #[test]
+    fn public_content_stays_a_viewer_claim_through_retrieval() {
+        // A viewer assertion in working memory must come back as a viewer
+        // claim: no ranking, repetition, or linkage may promote it, and a
+        // content-plane write mints no links that could carry an upgrade.
+        let mut memory = test_memory(WorkingMemoryConfig::default());
+        let public = event(
+            "evt-chat",
+            SourceClass::PublicChat,
+            TrustLevel::Untrusted,
+            Some("viewer-1"),
+        );
+        memory
+            .remember_working(&public, "the author is x", Some("lore"), 1_000)
+            .expect("public working write");
+        let results = memory.relevant(unfiltered_query(4), 1_500);
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].epistemic_class,
+            MemoryEpistemicClass::ViewerClaim,
+            "retrieval returns the class it was written with"
+        );
+        assert!(
+            memory.links().is_empty(),
+            "a public claim has no linkage through which to self-promote"
         );
     }
 
