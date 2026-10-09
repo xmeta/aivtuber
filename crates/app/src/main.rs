@@ -441,6 +441,11 @@ fn build_runtime_retention_policy() -> Result<RuntimeRetentionPolicy, Box<dyn Er
             "AIVTUBER_MEMORY_MAX_COMPACTION_RECORDS",
             defaults.max_memory_compaction_records,
         )?,
+        max_memory_links: env_usize("AIVTUBER_MEMORY_MAX_LINKS", defaults.max_memory_links)?,
+        max_memory_links_per_write: env_usize(
+            "AIVTUBER_MEMORY_MAX_LINKS_PER_WRITE",
+            defaults.max_memory_links_per_write,
+        )?,
         max_adaptation_feedback_assets: env_usize(
             "AIVTUBER_RETENTION_MAX_ADAPTATION_FEEDBACK_ASSETS",
             defaults.max_adaptation_feedback_assets,
@@ -473,6 +478,8 @@ fn build_runtime_retention_policy() -> Result<RuntimeRetentionPolicy, Box<dyn Er
         || policy.max_cached_variant_groups == 0
         || policy.max_working_memory_entries == 0
         || policy.max_memory_compaction_records == 0
+        || policy.max_memory_links == 0
+        || policy.max_memory_links_per_write == 0
         || policy.max_adaptation_feedback_assets == 0
         || policy.max_adaptation_recent_groups == 0
         || policy.max_adaptation_decisions == 0
@@ -480,6 +487,17 @@ fn build_runtime_retention_policy() -> Result<RuntimeRetentionPolicy, Box<dyn Er
         || policy.max_causal_traces == 0
     {
         return Err(io::Error::other("runtime retention limits must be positive").into());
+    }
+    // The store must be able to hold one maximum-size write, or the store
+    // bound would drop an explicit supersession the same write just had
+    // accepted (WorkingMemory::new refuses this shape; fail here with the
+    // env-var names instead).
+    if policy.max_memory_links < policy.max_memory_links_per_write {
+        return Err(io::Error::other(
+            "AIVTUBER_MEMORY_MAX_LINKS must cover one maximum-size write \
+             (>= AIVTUBER_MEMORY_MAX_LINKS_PER_WRITE)",
+        )
+        .into());
     }
     Ok(policy)
 }

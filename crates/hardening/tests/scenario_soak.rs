@@ -104,6 +104,7 @@ fn small_config() -> SoakConfig {
         telemetry_limit: 64,
         working_memory_limit: 32,
         memory_compaction_limit: 16,
+        memory_links_limit: 64,
         generated_asset_limit: 16,
         promotion_metadata_limit: 16,
         generated_asset_every: 25,
@@ -321,6 +322,78 @@ fn a_provider_fault_on_a_workload_with_no_misses_is_refused() {
 }
 
 #[test]
+fn a_window_the_core_link_probe_refuses_is_still_a_valid_scenario_run() {
+    // Round-6: the core link-probe minimum (three node slots, so a window
+    // can retain a link) is not a scenario-retention invariant. The
+    // scenario workload only performs working-memory writes and omits the
+    // link growth findings, so a two-entry window is a valid bounded
+    // experiment and must not be refused by core-only rules.
+    let scenario = burst_scenario("two-slot-window");
+    let overlay = overlay(
+        "two-slot-window",
+        1,
+        vec![FaultSpec {
+            subsystem: FaultSubsystem::ContentIngress,
+            occurrence: 1,
+            kind: FaultKind::Flood,
+        }],
+    );
+    let config = SoakConfig {
+        working_memory_limit: 2,
+        ..small_config()
+    };
+    let report = run_scenario_soak(&scenario, &overlay, config, metadata())
+        .expect("a two-entry working window is a valid scenario experiment");
+    assert!(
+        report.final_state.working_memory_entries <= 2,
+        "the small window is enforced: {:?}",
+        report.final_state.working_memory_entries
+    );
+    assert!(
+        report.finding("memory_links").is_none(),
+        "scenario reports still omit link checks"
+    );
+}
+
+#[test]
+fn a_linkless_scenario_accepts_link_budgets_below_the_core_probe_minimum() {
+    // Round-9: the per-write link minimum (store must hold one
+    // maximum-size write) is a *core-probe* rule. The scenario workload
+    // never takes the durable path, so caps the core probe refuses — 1 and
+    // 7, both below the per-write budget of 8 — are valid linkless
+    // experiments: the store aligns its per-write budget down to the
+    // reported cap instead.
+    for cap in [1, 7] {
+        let id = format!("tiny-link-cap-{cap}");
+        let scenario = burst_scenario(&id);
+        let overlay = overlay(
+            &id,
+            1,
+            vec![FaultSpec {
+                subsystem: FaultSubsystem::ContentIngress,
+                occurrence: 1,
+                kind: FaultKind::Flood,
+            }],
+        );
+        let config = SoakConfig {
+            memory_links_limit: cap,
+            ..small_config()
+        };
+        let report = run_scenario_soak(&scenario, &overlay, config, metadata())
+            .expect("a linkless scenario accepts a tiny positive link bound");
+        assert!(
+            report.finding("memory_links").is_none()
+                && report.finding("memory_links_high_water").is_none(),
+            "a linkless run still reports no link-bound checks (cap {cap})"
+        );
+        assert!(
+            report.final_state.memory_links == 0,
+            "the workload mints no links, so the tiny cap never binds (cap {cap})"
+        );
+    }
+}
+
+#[test]
 fn leading_and_trailing_idle_are_part_of_the_declared_timeline() {
     // The soak must start at the scenario's declared logical_start and settle to
     // the declared stream end, not normalise away the idle phases around the
@@ -490,4 +563,45 @@ fn a_long_logical_time_scenario_plateaus_at_retained_state_bounds() {
             "{metric} must stay within its configured bound: {finding:?}"
         );
     }
+}
+
+#[test]
+fn a_scenario_report_carries_no_link_bound_it_never_exercises() {
+    // Round-4 finding: the scenario trace only records working memory —
+    // links are minted exclusively on the permit-gated durable path, which
+    // this workload never drives — so a `memory_links` growth check here
+    // would read zero because the subsystem was not exercised, not because
+    // it stayed bounded. Such a check cannot fail: it would pass even if
+    // link creation or pruning were completely broken. The report therefore
+    // omits both link metrics while the core soak still carries them, and
+    // the raw counters remain visible in the snapshots as observations.
+    let scenario = burst_scenario("linkless-growth-soak");
+    let report = run_scenario_soak(
+        &scenario,
+        &overlay(
+            "linkless-growth-soak",
+            1,
+            vec![FaultSpec {
+                subsystem: FaultSubsystem::ContentIngress,
+                occurrence: 1,
+                kind: FaultKind::Flood,
+            }],
+        ),
+        small_config(),
+        metadata(),
+    )
+    .expect("soak");
+
+    assert_eq!(report.final_state.memory_links, 0);
+    assert_eq!(report.final_state.memory_links_high_water, 0);
+    assert!(
+        report.finding("memory_links").is_none(),
+        "a bound the workload cannot move must not be reported as checked"
+    );
+    assert!(
+        report.finding("memory_links_high_water").is_none(),
+        "a bound the workload cannot move must not be reported as checked"
+    );
+    // The metrics this workload does exercise are still reported.
+    assert!(report.finding("working_memory_entries").is_some());
 }

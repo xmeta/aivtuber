@@ -97,12 +97,16 @@ fn run() -> Result<(), Box<dyn Error>> {
 
 fn run_synthetic_mode(config: SoakConfig, output: &PathBuf) -> Result<(), Box<dyn Error>> {
     let metadata = ReproducibilityMetadata {
-        dataset_id: "hardening-soak-v1".to_owned(),
+        // The synthetic soak runs the same link-enabled `run_core_soak`
+        // workload the resource bench times; v2 keeps pre-link reports a
+        // separate identity so the two workload shapes are never confused
+        // (see `RESOURCE_BENCH_DATASET`).
+        dataset_id: "hardening-soak-v2".to_owned(),
         git_commit: git_revision(),
         rust_toolchain: command_output("rustc", &["--version"])
             .unwrap_or_else(|| "unknown-rustc".to_owned()),
         bun_toolchain: command_output("bun", &["--version"]),
-        config_version: "hardening-soak-v1".to_owned(),
+        config_version: "hardening-soak-v2".to_owned(),
         asset_version: "generated-dynamic-fixture-v1".to_owned(),
         index_version: None,
         jev_model: None,

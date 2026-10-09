@@ -101,6 +101,7 @@ mod tests {
             telemetry_limit: 64,
             working_memory_limit: 32,
             memory_compaction_limit: 16,
+            memory_links_limit: 64,
             generated_asset_limit: 16,
             promotion_metadata_limit: 16,
             generated_asset_every: 25,
@@ -134,6 +135,16 @@ mod tests {
             report.final_state.promotion_metadata,
             config.promotion_metadata_limit
         );
+        assert!(
+            report.final_state.memory_links_high_water > 0,
+            "the soak must actually populate the link store it claims to bound"
+        );
+        assert!(
+            report.final_state.memory_links <= config.memory_links_limit,
+            "{} links within a bound of {}",
+            report.final_state.memory_links,
+            config.memory_links_limit
+        );
 
         for metric in [
             "scheduler_items",
@@ -144,6 +155,8 @@ mod tests {
             "rate_limit_sources",
             "working_memory_entries",
             "memory_compaction_records",
+            "memory_links",
+            "memory_links_high_water",
             "telemetry_events",
             "hot_assets",
             "promotion_metadata",
@@ -159,6 +172,202 @@ mod tests {
             );
         }
         assert_eq!(report.metadata.dataset_id, "hardening-unit-soak");
+    }
+
+    #[test]
+    fn a_soak_link_limit_below_the_per_write_budget_is_refused_by_the_core_probe() {
+        // `WorkingMemory::new` rejects a store smaller than one maximum-size
+        // write, so the core probe refuses that config up front — but common
+        // `validate` accepts it: the linkless scenario soak never mints a
+        // link, aligns its per-write budget down to its reported cap, and
+        // must be able to configure a small positive link bound (#105 review
+        // round 9).
+        let config = SoakConfig {
+            memory_links_limit: 7,
+            ..SoakConfig::default()
+        };
+        config
+            .validate()
+            .expect("a small positive link bound is valid common configuration");
+        let error = config
+            .validate_link_probe()
+            .expect_err("a link store smaller than one write cannot run the probe");
+        assert!(
+            error.to_string().contains("memory_links_limit"),
+            "the refusal names the offending bound: {error}"
+        );
+
+        let at_budget = SoakConfig {
+            memory_links_limit: aivtuber_adaptation::WorkingMemoryConfig::default()
+                .max_links_per_memory,
+            ..SoakConfig::default()
+        };
+        at_budget
+            .validate_link_probe()
+            .expect("exactly one maximum-size write is a valid probe store");
+    }
+
+    #[test]
+    fn the_resource_bench_identity_is_versioned_for_the_link_workload() {
+        // #105 added permit-gated durable writes, supersession resolution and
+        // link creation/pruning to the timed soak loop. History trends series
+        // on (suite, mode, dataset, config_version), so the pre-link and
+        // post-link workloads must be different series — pooling them would
+        // attribute a workload change to a regression or improvement.
+        assert_eq!(RESOURCE_BENCH_DATASET, "hardening-soak-v2");
+        assert_eq!(RESOURCE_BENCH_CONFIG_VERSION, "resource-bench-v2");
+    }
+
+    #[test]
+    fn a_soak_window_too_small_to_retain_a_link_is_refused_as_configuration() {
+        // Round-3 reproduction: with two node slots every iteration writes a
+        // working entry before the durable one, so the supersession target is
+        // always the oldest entry the next insertion evicts and the new edge
+        // is pruned before it counts. Such a run reports zero links while
+        // claiming to probe the link store; it must be refused instead.
+        for limit in [1_usize, 2] {
+            let config = SoakConfig {
+                working_memory_limit: limit,
+                ..SoakConfig::default()
+            };
+            // Core-probe rule: the scenario soak shares only the common
+            // bounds, so a small window must still be a valid *scenario*
+            // experiment (#105 review round 6).
+            config
+                .validate()
+                .expect("the common bounds accept a small working window");
+            let error = config
+                .validate_link_probe()
+                .expect_err("a window that cannot retain a link is not a link probe");
+            assert!(
+                error.to_string().contains("working_memory_limit"),
+                "the refusal names the offending bound: {error}"
+            );
+        }
+        SoakConfig {
+            working_memory_limit: 3,
+            ..SoakConfig::default()
+        }
+        .validate_link_probe()
+        .expect("three node slots keep the target alive through link creation");
+
+        // The same refusal reaches the run path the review probe exercised.
+        let config = SoakConfig {
+            logical_events: 64,
+            event_interval_ms: 50,
+            working_memory_limit: 2,
+            ..SoakConfig::default()
+        };
+        let error = run_core_soak(config, metadata(64, 50))
+            .expect_err("a two-slot soak claims to probe links it can never retain");
+        assert!(
+            error.to_string().contains("working_memory_limit"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_smallest_accepted_soak_still_retains_a_link() {
+        // The boundary the refusal leaves behind: at three node slots the
+        // working entry, the supersession target, and the new durable entry
+        // coexist, so every configuration the probe accepts really does
+        // populate — and retain in — the link store it reports on.
+        let config = SoakConfig {
+            logical_events: 64,
+            event_interval_ms: 50,
+            working_memory_limit: 3,
+            memory_links_limit: 8,
+            ..SoakConfig::default()
+        };
+        let report = run_core_soak(
+            config.clone(),
+            metadata(config.logical_events, config.event_interval_ms),
+        )
+        .expect("three-slot soak runs");
+        assert!(
+            report.final_state.memory_links > 0,
+            "the probe retains a link: {:?}",
+            report.final_state
+        );
+        assert!(
+            report.final_state.memory_links_high_water > 0,
+            "the link store was actually exercised: {:?}",
+            report.final_state
+        );
+        assert!(report.final_state.memory_links <= config.memory_links_limit);
+    }
+
+    #[test]
+    fn a_core_soak_too_short_to_mint_a_second_durable_write_is_refused() {
+        // Round-6 reproduction: `logical_events = 2` with the default
+        // window (durable_every = 16) performs only the initial durable
+        // write, so no supersession edge is ever created — yet the report
+        // still carried clean `memory_links = 0` checks, a bounded-state
+        // check that cannot fail. The probe now refuses configurations that
+        // can never reach the second durable write instead of reporting a
+        // false green.
+        let config = SoakConfig {
+            logical_events: 2,
+            ..SoakConfig::default()
+        };
+        let error = config
+            .validate_link_probe()
+            .expect_err("a run with a single durable write never mints a link");
+        assert!(
+            error.to_string().contains("second durable write"),
+            "the refusal names the missing link opportunity: {error}"
+        );
+        let error = run_core_soak(config, metadata(2, 50))
+            .expect_err("the run path refuses the same configuration before it starts");
+        assert!(
+            error.to_string().contains("second durable write"),
+            "{error}"
+        );
+
+        // Boundary: one event past the cadence reaches the second durable
+        // write, and the accepted run really does retain a link.
+        let config = SoakConfig {
+            logical_events: 17,
+            ..SoakConfig::default()
+        };
+        let report =
+            run_core_soak(config, metadata(17, 50)).expect("the boundary configuration runs");
+        assert!(
+            report.final_state.memory_links > 0,
+            "one event past the cadence already mints an edge: {:?}",
+            report.final_state
+        );
+    }
+
+    #[test]
+    fn an_accepted_link_limited_soak_completes_without_exhausting_explicit_evidence() {
+        // Round-6 reproduction: 160 events over a 256-entry window with an
+        // 8-link store passed validation but aborted mid-workload — at the
+        // old fixed window/16 cadence the retained explicit chain reached 9
+        // edges while supersession evidence is never shed. The cadence now
+        // slows to fit the configured link budget and `validate_link_probe`
+        // pins the projection, so an accepted configuration always runs to
+        // completion with its evidence intact.
+        let config = SoakConfig {
+            logical_events: 160,
+            working_memory_limit: 256,
+            memory_links_limit: 8,
+            ..SoakConfig::default()
+        };
+        assert!(
+            config.max_retained_supersession_chain() <= config.memory_links_limit,
+            "the projected chain fits the budget: {} edge(s) at cadence {}",
+            config.max_retained_supersession_chain(),
+            config.durable_every()
+        );
+        let report = run_core_soak(config.clone(), metadata(160, 50))
+            .expect("the accepted configuration completes instead of aborting mid-workload");
+        assert!(
+            report.final_state.memory_links > 0,
+            "the probe still exercised the link store: {:?}",
+            report.final_state
+        );
+        assert!(report.final_state.memory_links <= config.memory_links_limit);
     }
 
     fn resource_environment() -> aivtuber_telemetry::BenchmarkEnvironment {
@@ -220,6 +429,30 @@ mod tests {
         assert_eq!(
             result.metrics["resource.hot_assets_resident_count"].value,
             config.generated_asset_limit as f64
+        );
+        // The link footprint must be trendable in benchmark history: the
+        // nightly workflow records only this result, so the counters that
+        // reach SoakReport have to be published here too, mirroring the
+        // report exactly (#105 review round 7).
+        assert_eq!(
+            result.metrics["resource.memory_links_count"].value,
+            report.final_state.memory_links as f64
+        );
+        assert_eq!(
+            result.metrics["resource.memory_links_high_water_count"].value,
+            report.final_state.memory_links_high_water as f64
+        );
+        // This core soak mints supersession links (round-6 rules guarantee
+        // the second durable write), so the published counts must show a
+        // real, exercised footprint rather than an always-zero series.
+        assert!(
+            result.metrics["resource.memory_links_high_water_count"].value >= 1.0,
+            "a core soak must record at least one minted link"
+        );
+        assert!(
+            result.metrics["resource.memory_links_high_water_count"].value
+                >= result.metrics["resource.memory_links_count"].value,
+            "high water cannot be below the current count"
         );
         assert!(result.metrics.contains_key("resource.peak_rss_kib"));
         assert!(
@@ -306,5 +539,89 @@ mod tests {
         let parsed =
             aivtuber_telemetry::BenchmarkResult::from_json(&bytes).expect("contract valid");
         assert_eq!(parsed, result);
+    }
+
+    #[test]
+    fn overflowing_link_bounds_are_refused_by_the_probe_and_never_panic() {
+        // A deserialized SoakConfig can carry usize::MAX bounds. The cadence
+        // projection adds them, which used to panic in debug (overflow) and
+        // divide by zero in release (wrapped divisor) *after* validation
+        // accepted the config — a crash where InvalidConfiguration belongs.
+        // The cadence sums are core-probe inputs, so the refusal lives in
+        // `validate_link_probe`; common `validate` stays permissive for the
+        // linkless scenario soak (#105 review rounds 7 and 10).
+        let links_max = SoakConfig {
+            memory_links_limit: usize::MAX,
+            ..SoakConfig::default()
+        };
+        links_max
+            .validate()
+            .expect("the overflow rule is core-only, so common validation accepts");
+        let error = links_max
+            .validate_link_probe()
+            .expect_err("usize::MAX link bound must be refused by the probe")
+            .to_string();
+        assert!(
+            error.contains("overflow"),
+            "the refusal names the overflowing arithmetic, got: {error}"
+        );
+
+        // working_memory_limit + memory_links_limit must also be evaluable —
+        // the reviewer's exact linkless-scenario case: a huge window with a
+        // tiny link bound is constructible for the scenario soak, which
+        // never evaluates the cadence, but is not a runnable probe.
+        let huge_window_tiny_links = SoakConfig {
+            working_memory_limit: usize::MAX,
+            memory_links_limit: 1,
+            ..SoakConfig::default()
+        };
+        huge_window_tiny_links
+            .validate()
+            .expect("a linkless scenario may configure a huge window and a tiny link bound");
+        let error = huge_window_tiny_links
+            .validate_link_probe()
+            .expect_err("the probe still needs evaluable cadence sums")
+            .to_string();
+        assert!(
+            error.contains("overflow"),
+            "the refusal names the overflowing arithmetic, got: {error}"
+        );
+
+        // Defense in depth: the projections are public and callable without
+        // validation, so they must not panic even on these bounds — the
+        // saturating arithmetic keeps the divisor nonzero and the sums
+        // bounded.
+        for config in [&links_max, &huge_window_tiny_links] {
+            let cadence = config.durable_every();
+            assert!(cadence >= 1, "cadence stays defined");
+            let _ = config.max_retained_supersession_chain();
+        }
+    }
+
+    #[test]
+    fn a_saturating_logical_clock_is_refused_by_the_core_probe() {
+        // Round-10: event `i` is timestamped `i * event_interval_ms`. With
+        // interval = u64::MAX that product saturates, later events collapse
+        // onto u64::MAX, a TTL added to such a timestamp no longer sits
+        // strictly after it, and compaction deletes the entry mid-run — an
+        // accepted probe must complete or be refused, never abort halfway.
+        // Common validate stays permissive: scenario timestamps come from
+        // its trace, not from this product.
+        let config = SoakConfig {
+            logical_events: 17,
+            event_interval_ms: u64::MAX,
+            ..SoakConfig::default()
+        };
+        config
+            .validate()
+            .expect("the logical-clock rule is core-only");
+        let error = config
+            .validate_link_probe()
+            .expect_err("a saturating logical clock must not be accepted")
+            .to_string();
+        assert!(
+            error.contains("saturates"),
+            "the refusal names the saturating clock, got: {error}"
+        );
     }
 }

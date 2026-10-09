@@ -27,6 +27,8 @@ pub struct RuntimeRetentionPolicy {
     pub max_cached_variant_groups: usize,
     pub max_working_memory_entries: usize,
     pub max_memory_compaction_records: usize,
+    pub max_memory_links: usize,
+    pub max_memory_links_per_write: usize,
     pub max_adaptation_feedback_assets: usize,
     pub max_adaptation_recent_groups: usize,
     pub max_adaptation_decisions: usize,
@@ -48,6 +50,8 @@ impl Default for RuntimeRetentionPolicy {
             max_cached_variant_groups: 256,
             max_working_memory_entries: 256,
             max_memory_compaction_records: 256,
+            max_memory_links: 2_048,
+            max_memory_links_per_write: 8,
             max_adaptation_feedback_assets: 1_024,
             max_adaptation_recent_groups: 256,
             max_adaptation_decisions: 1_024,
@@ -86,6 +90,11 @@ impl RuntimeRetentionPolicy {
     pub fn working_memory_config(self, mut config: WorkingMemoryConfig) -> WorkingMemoryConfig {
         config.max_entries = self.max_working_memory_entries;
         config.max_compaction_records = self.max_memory_compaction_records;
+        // Memory links are part of the same unified bounded retention policy
+        // as the nodes they connect (#51): edges never get a private,
+        // unbounded contract of their own.
+        config.max_links = self.max_memory_links;
+        config.max_links_per_memory = self.max_memory_links_per_write;
         config
     }
 
@@ -134,6 +143,7 @@ pub struct RuntimeRetentionSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aivtuber_adaptation::{ActorPseudonymizer, WorkingMemory};
 
     #[test]
     fn one_policy_derives_all_production_retention_configs() {
@@ -149,6 +159,8 @@ mod tests {
             max_cached_variant_groups: 19,
             max_working_memory_entries: 20,
             max_memory_compaction_records: 21,
+            max_memory_links: 30,
+            max_memory_links_per_write: 29,
             max_adaptation_feedback_assets: 22,
             max_adaptation_recent_groups: 23,
             max_adaptation_decisions: 24,
@@ -176,6 +188,16 @@ mod tests {
         let memory = policy.working_memory_config(WorkingMemoryConfig::default());
         assert_eq!(memory.max_entries, 20);
         assert_eq!(memory.max_compaction_records, 21);
+        assert_eq!(memory.max_links, 30);
+        assert_eq!(memory.max_links_per_memory, 29);
+        // The derived config must be constructible: the store bound has to
+        // cover one maximum-size write, so the policy can never hand
+        // WorkingMemory a shape that drops an accepted write's own links.
+        WorkingMemory::new(
+            memory,
+            ActorPseudonymizer::new("test-v1", [0x42; 32]).expect("key"),
+        )
+        .expect("policy-derived link bounds are a valid working-memory config");
 
         let adaptation = policy.adaptation_config();
         assert_eq!(adaptation.max_feedback_assets, 22);

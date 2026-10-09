@@ -29,12 +29,16 @@ use std::path::{Path, PathBuf};
 pub const RESOURCE_BENCH_SUITE: &str = "resource-soak";
 /// Dataset identity of the logical-time soak workload; changing the workload
 /// shape materially requires changing this id so history series never mix.
-pub const RESOURCE_BENCH_DATASET: &str = "hardening-soak-v1";
+/// v2: the timed loop gained the #105 memory/link operations (permit-gated
+/// durable writes, supersession resolution, link creation and pruning), so
+/// pre-link v1 measurements must never pool with the new workload.
+pub const RESOURCE_BENCH_DATASET: &str = "hardening-soak-v2";
 /// Result `mode` for resource-soak runs (schemas/benchmark-result.schema.json).
 pub const RESOURCE_BENCH_MODE: &str = "resource_soak";
 /// Config identity prefix; the CLI appends the workload parameters it ran so
-/// recorded history remains reproducible.
-pub const RESOURCE_BENCH_CONFIG_VERSION: &str = "resource-bench-v1";
+/// recorded history remains reproducible. Bumped alongside
+/// [`RESOURCE_BENCH_DATASET`] for the same #105 workload-shape change.
+pub const RESOURCE_BENCH_CONFIG_VERSION: &str = "resource-bench-v2";
 
 /// Wall-clock context for a soak run, measured around `run_core_soak`.
 /// The soak itself uses logical time and stays deterministic; wall clock is
@@ -113,6 +117,19 @@ pub fn resource_bench_result(
         (
             "resource.memory_compaction_records_count".to_owned(),
             metric(report.final_state.memory_compaction_records),
+        ),
+        // Link footprint belongs in the recorded result, not only in the
+        // auxiliary SoakReport: the nightly workflow records just this
+        // BenchmarkResult into history, so without these keys a workload
+        // that doubles its steady link footprint while staying under the
+        // configured cap trends nowhere (#105 review round 7).
+        (
+            "resource.memory_links_count".to_owned(),
+            metric(report.final_state.memory_links),
+        ),
+        (
+            "resource.memory_links_high_water_count".to_owned(),
+            metric(report.final_state.memory_links_high_water),
         ),
         (
             "resource.telemetry_events_retained_count".to_owned(),
@@ -239,6 +256,11 @@ pub struct SoakConfig {
     pub telemetry_limit: usize,
     pub working_memory_limit: usize,
     pub memory_compaction_limit: usize,
+    /// Store-wide edge bound the retained link graph may reach, mirroring
+    /// `WorkingMemoryConfig::max_links` for the probe (production default is
+    /// 2,048). Watched like every other retention bound so a regression that
+    /// lets the link store grow — or stops pruning it — is visible here.
+    pub memory_links_limit: usize,
     pub generated_asset_limit: usize,
     pub promotion_metadata_limit: usize,
     pub generated_asset_every: u64,
@@ -258,6 +280,7 @@ impl Default for SoakConfig {
             telemetry_limit: 1_024,
             working_memory_limit: 256,
             memory_compaction_limit: 128,
+            memory_links_limit: 128,
             generated_asset_limit: 8,
             promotion_metadata_limit: 8,
             generated_asset_every: 200,
@@ -275,6 +298,7 @@ impl SoakConfig {
             || self.telemetry_limit == 0
             || self.working_memory_limit == 0
             || self.memory_compaction_limit == 0
+            || self.memory_links_limit == 0
             || self.generated_asset_limit == 0
             || self.promotion_metadata_limit == 0
             || self.generated_asset_every == 0
@@ -283,7 +307,183 @@ impl SoakConfig {
                 "soak bounds must be positive and logical_events >= 2",
             ));
         }
+        // A link store that cannot hold one maximum-size write is a
+        // *core-probe* rule, checked in `validate_link_probe` below: the
+        // scenario soak performs only working-memory writes, mints no links,
+        // and aligns its store's per-write budget down to its reported cap,
+        // so tiny positive link bounds stay valid for linkless experiments
+        // (#105 review round 9).
+        // The cadence projection (`durable_every`) computes
+        // `working_memory_limit + memory_links_limit` and
+        // `memory_links_limit + 1`. A deserialized `SoakConfig` can set
+        // either bound to `usize::MAX`. This is *core cadence* validation
+        // and lives with the other link-probe rules: the scenario soak
+        // never evaluates `durable_every` (#105 review round 10; the check
+        // itself was added in round 7).
         Ok(())
+    }
+
+    /// Core-soak link-probe rules, on top of the common bounds in
+    /// [`SoakConfig::validate`].
+    ///
+    /// The scenario soak deliberately performs only working-memory writes
+    /// and reports `growth_findings(..., false)`, so it calls `validate`
+    /// alone: a one- or two-entry window is a valid bounded scenario
+    /// experiment, not a broken link probe (#105 review round 6). The core
+    /// soak, by contrast, must be a *runnable* link experiment — these are
+    /// the rules that keep it from aborting mid-run or reporting link checks
+    /// it never exercised.
+    pub fn validate_link_probe(&self) -> Result<(), HardeningError> {
+        self.validate()?;
+        // The cadence projection (`durable_every`) computes
+        // `working_memory_limit + memory_links_limit` and
+        // `memory_links_limit + 1`. A deserialized `SoakConfig` can set
+        // either bound to `usize::MAX`: the additions then panic in debug
+        // builds and wrap the divisor to zero in release builds, where the
+        // division aborts. Bounds whose sums cannot be evaluated are not a
+        // runnable experiment, so they are refused here as invalid
+        // configuration instead of crashing after acceptance. Core-only:
+        // the scenario soak never evaluates `durable_every`, so it keeps
+        // accepting huge-but-constructible bounds (#105 review rounds 7,
+        // 10).
+        if self
+            .working_memory_limit
+            .checked_add(self.memory_links_limit)
+            .is_none()
+            || self.memory_links_limit.checked_add(1).is_none()
+        {
+            return Err(HardeningError::InvalidConfiguration(
+                "soak link bounds overflow: working_memory_limit + memory_links_limit and \
+                 memory_links_limit + 1 must both fit in usize, or the cadence projection \
+                 cannot be evaluated",
+            ));
+        }
+        // The core probe drives its own logical clock: event `i` is
+        // timestamped `i * event_interval_ms`. If that product saturates,
+        // later events collapse onto `u64::MAX`, a TTL added to such a
+        // timestamp no longer sits strictly after it, and compaction deletes
+        // the entry mid-run — so an accepted configuration must complete or
+        // be refused here (#105 review round 10). Scenario timestamps come
+        // from its trace, not from this product, so the rule is core-only.
+        if self
+            .logical_events
+            .checked_mul(self.event_interval_ms)
+            .is_none()
+        {
+            return Err(HardeningError::InvalidConfiguration(
+                "soak logical clock saturates: logical_events * event_interval_ms must fit \
+                 in u64, or later events collapse to u64::MAX and the run aborts mid-write",
+            ));
+        }
+        // A link store that cannot hold one maximum-size write is refused by
+        // `WorkingMemory::new` — which would fail the experiment at
+        // construction rather than report an invalid configuration here, so
+        // the same rule the adapter enforces is checked up front. It lives
+        // here rather than in common `validate` because only the core probe
+        // mints durable supersession writes: a linkless scenario experiment
+        // may configure a small positive link bound (#105 review round 9).
+        if self.memory_links_limit < WorkingMemoryConfig::default().max_links_per_memory {
+            return Err(HardeningError::InvalidConfiguration(
+                "soak memory_links_limit must cover one maximum-size write: it has to be at \
+                 least the per-write link budget (WorkingMemoryConfig::max_links_per_memory), or \
+                 the probe cannot perform a single durable supersession write",
+            ));
+        }
+        // A configuration accepted as a link-store probe must be able to
+        // retain a link. Every durable slot also writes one working entry,
+        // so the supersession target is only still retained at link creation
+        // when the window holds all three nodes: the working entry, the
+        // target, and the new durable entry. With fewer node slots the
+        // target is always the oldest entry the insertion evicts, the new
+        // edge is pruned before it counts, and the run would report zero
+        // links while claiming to probe the store (#105 review round 3).
+        if self.working_memory_limit < 3 {
+            return Err(HardeningError::InvalidConfiguration(
+                "soak working_memory_limit must leave room to retain a link: the window has \
+                 to hold the working entry, the supersession target, and the new durable entry \
+                 (at least 3 node slots), or the probe cannot exercise the link store it \
+                 reports on",
+            ));
+        }
+        // The probe mints its first supersession edge only on the *second*
+        // durable write. A run no longer than one cadence gap performs just
+        // the initial durable write, creates no edge at all, and would still
+        // report clean `memory_links = 0` checks — a bounded-state check
+        // that cannot fail (#105 review round 6). Refuse the configuration
+        // instead of emitting a false green.
+        if self.logical_events <= self.durable_every() {
+            return Err(HardeningError::InvalidConfiguration(
+                "soak logical_events must reach the second durable write: the probe needs \
+                 more than one durable_every of events before it can mint its first \
+                 supersession link, or the report would claim link checks it never \
+                 exercised",
+            ));
+        }
+        // An accepted configuration must also *complete*: explicit
+        // supersession evidence is never shed, so a workload whose retained
+        // chain outgrows `memory_links_limit` deterministically aborts
+        // mid-run with an invalid-adaptation error. `durable_every` slows
+        // the cadence down to fit the link budget, and this check pins that
+        // projection — if a future cadence change breaks it, the config is
+        // refused up front rather than failing halfway through the
+        // experiment (#105 review round 6).
+        let chain = self.max_retained_supersession_chain();
+        if chain > self.memory_links_limit {
+            return Err(HardeningError::InvalidConfiguration(
+                "soak memory_links_limit cannot hold this workload's retained supersession \
+                 chain at its configured cadence and window: an accepted configuration must \
+                 run to completion, never exhaust explicit evidence mid-run",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Cadence of the core soak's permit-gated durable supersession write:
+    /// one durable claim every this-many events, the first at event 0.
+    ///
+    /// Two constraints shape it (#105 review round 6):
+    ///
+    /// * window/16 pacing keeps the supersession target comfortably inside
+    ///   its TTL and the retained chain a small fraction of the window, and
+    /// * link-budget pacing keeps the *retained explicit chain* below
+    ///   `memory_links_limit`. Edges are born every `durable_every` events
+    ///   and pruned only when FIFO retention evicts their older endpoint,
+    ///   so the chain converges to `ceil(window / (durable_every + 1)) - 1`
+    ///   concurrent edges; requiring `durable_every + 1 >= ceil(window /
+    ///   (links + 1))` holds it to the configured bound. Without that, a
+    ///   small link store over a large window would exhaust explicit
+    ///   evidence and abort mid-run.
+    pub fn durable_every(&self) -> u64 {
+        let by_window = (self.working_memory_limit / 16) as u64;
+        // ceil(window / (links + 1)) - 1, without a division-by-links+1
+        // subtlety: ceil(a / b) == (a + b - 1) / b. The sums saturate
+        // rather than wrap: this is a public projection callable without
+        // `validate`, and a wrapped divisor of zero would abort the run on
+        // a config that merely skipped validation (#105 review round 7).
+        // `saturating_add(1)` never yields zero, so the divisor is safe.
+        let by_links = (self
+            .working_memory_limit
+            .saturating_add(self.memory_links_limit)
+            / self.memory_links_limit.saturating_add(1))
+        .saturating_sub(1) as u64;
+        by_window.max(by_links).max(1)
+    }
+
+    /// Upper bound on explicit supersession edges this configuration's core
+    /// workload can hold in the store at once: edges are born once per
+    /// durable cadence and pruned when retention evicts their older
+    /// endpoint, so the count saturates at `ceil(window / (cadence + 1)) - 1`
+    /// and is additionally capped by how many edges the run can ever mint.
+    /// The exact maximum, used by `validate_link_probe` to refuse
+    /// configurations that would abort mid-run (#105 review round 6).
+    pub fn max_retained_supersession_chain(&self) -> usize {
+        let durable_every = self.durable_every();
+        let window = self.working_memory_limit as u64;
+        // Saturating like `durable_every`: an unvalidated huge window must
+        // not overflow the u64 addition here (#105 review round 7).
+        let by_window = window.saturating_add(durable_every) / durable_every.saturating_add(1);
+        let by_run = self.logical_events.saturating_sub(1) / durable_every;
+        by_window.saturating_sub(1).min(by_run) as usize
     }
 
     pub fn logical_duration_ms(&self) -> u64 {
@@ -304,6 +504,8 @@ pub struct StateSnapshot {
     pub rate_limit_sources: usize,
     pub working_memory_entries: usize,
     pub memory_compaction_records: usize,
+    pub memory_links: usize,
+    pub memory_links_high_water: usize,
     pub telemetry_events: usize,
     pub hot_assets: usize,
     pub promotion_metadata: usize,
@@ -356,7 +558,7 @@ pub fn run_core_soak(
     config: SoakConfig,
     metadata: ReproducibilityMetadata,
 ) -> Result<SoakReport, HardeningError> {
-    config.validate()?;
+    config.validate_link_probe()?;
     metadata
         .validate()
         .map_err(|error| HardeningError::InvalidMetadata(error.to_string()))?;
@@ -384,7 +586,12 @@ pub fn run_core_soak(
         WorkingMemoryConfig {
             max_entries: config.working_memory_limit,
             working_ttl_ms: config.logical_duration_ms().saturating_add(1),
+            // Durable targets must outlive the run: a supersession target
+            // that expired mid-soak would refuse the write instead of
+            // exercising the link store.
+            durable_ttl_ms: config.logical_duration_ms().saturating_add(1),
             max_compaction_records: config.memory_compaction_limit,
+            max_links: config.memory_links_limit,
             ..WorkingMemoryConfig::default()
         },
         ActorPseudonymizer::new("hardening-test-v1", [0x24; 32])
@@ -404,6 +611,21 @@ pub fn run_core_soak(
     });
     let midpoint_index = config.logical_events / 2;
     let mut midpoint = None;
+    // The edge store is bounded state too, so the soak has to populate it:
+    // a system-source durable claim every `durable_every` node slot
+    // supersedes the previous one through the same permit gate production
+    // uses, creating supersession edges plus the deterministic same-topic
+    // temporal spine — often enough that the store plateaus before the
+    // midpoint, which is what the growth findings watch. `durable_every`
+    // derives from both the window and the link budget, so the retained
+    // explicit chain fits `memory_links_limit` instead of exhausting it
+    // mid-run, and `SoakConfig::validate_link_probe` refuses windows too
+    // small to retain a link, runs too short to mint one, and cadences whose
+    // projected chain outgrows the budget — so an accepted run really
+    // exercises the link store it reports on (#105 review round 6).
+    let durable_every = config.durable_every();
+    let supersede_targets = config.working_memory_limit >= 2;
+    let mut previous_durable: Option<String> = None;
 
     for index in 0..config.logical_events {
         let at_ms = index.saturating_mul(config.event_interval_ms);
@@ -433,6 +655,29 @@ pub fn run_core_soak(
         memory
             .remember_working(&event, "soak event", Some("soak"), at_ms)
             .map_err(|error| HardeningError::Adaptation(error.to_string()))?;
+
+        if index % durable_every == 0 {
+            let durable = system_event(index + 1);
+            let (_, permit) = security.authorize_memory_write(&durable, None);
+            let permit = permit.ok_or_else(|| {
+                HardeningError::Runtime("durable soak write denied by security gate".to_owned())
+            })?;
+            let supersedes: Vec<&str> = if supersede_targets {
+                previous_durable.as_deref().into_iter().collect()
+            } else {
+                Vec::new()
+            };
+            memory
+                .remember_durable_superseding(
+                    &permit,
+                    "soak durable claim",
+                    Some("soak-durable"),
+                    at_ms,
+                    &supersedes,
+                )
+                .map_err(|error| HardeningError::Adaptation(error.to_string()))?;
+            previous_durable = Some(durable.event_id.clone());
+        }
 
         let mut observation = EventObservation::new(
             event.event_id.clone(),
@@ -464,7 +709,11 @@ pub fn run_core_soak(
         .ok_or_else(|| HardeningError::Invariant("soak midpoint was not captured".to_owned()))?;
     let final_state = snapshot(&scheduler, &security, &memory, &telemetry, &assets);
     let telemetry_summary = telemetry.summary(metadata.stream_duration_ms);
-    let growth = growth_findings(&config, &midpoint, &final_state);
+    // `validate_link_probe` guaranteed this run reaches its second durable
+    // write, so the link checks below always describe link activity that
+    // actually happened — `true` is a promise the configuration already
+    // kept, never a hope (#105 review round 6).
+    let growth = growth_findings(&config, &midpoint, &final_state, true);
     let flood = run_content_flood(config.ingress_queue_limit)?;
 
     Ok(SoakReport {
@@ -514,18 +763,32 @@ pub(crate) fn snapshot(
         rate_limit_sources: security_metrics.rate_limit_sources,
         working_memory_entries: memory_metrics.entries,
         memory_compaction_records: memory_metrics.compactions,
+        memory_links: memory_metrics.links,
+        memory_links_high_water: memory_metrics.links_high_water,
         telemetry_events: telemetry.retention_metrics().retained,
         hot_assets: hot_metrics.dynamic_resident,
         promotion_metadata: hot_metrics.promotion_metadata_retained,
     }
 }
 
+/// Build the retained-state growth findings a run reports on.
+///
+/// `exercises_links` marks workloads that actually mint links (the core
+/// soak's permit-gated durable writes). A run whose workload structurally
+/// cannot create a link — the scenario trace only records working memory —
+/// must not emit `memory_links` checks: a bound that reads zero because the
+/// subsystem was never exercised is a check that cannot fail, and would
+/// pass even if link creation or pruning were completely broken (#105
+/// review round 4). Those runs still carry the raw counters in their state
+/// snapshots as observations; they just do not claim to have probed a bound
+/// they never touched.
 pub(crate) fn growth_findings(
     config: &SoakConfig,
     midpoint: &StateSnapshot,
     final_state: &StateSnapshot,
+    exercises_links: bool,
 ) -> Vec<GrowthFinding> {
-    vec![
+    let mut findings = vec![
         growth(
             "scheduler_items",
             midpoint.scheduler_items,
@@ -589,6 +852,26 @@ pub(crate) fn growth_findings(
             Some(config.memory_compaction_limit),
             Some(51),
         ),
+    ];
+    if exercises_links {
+        findings.extend([
+            growth(
+                "memory_links",
+                midpoint.memory_links,
+                final_state.memory_links,
+                Some(config.memory_links_limit),
+                Some(51),
+            ),
+            growth(
+                "memory_links_high_water",
+                midpoint.memory_links_high_water,
+                final_state.memory_links_high_water,
+                Some(config.memory_links_limit),
+                Some(51),
+            ),
+        ]);
+    }
+    findings.extend([
         growth(
             "telemetry_events",
             midpoint.telemetry_events,
@@ -610,7 +893,8 @@ pub(crate) fn growth_findings(
             Some(config.promotion_metadata_limit),
             Some(51),
         ),
-    ]
+    ]);
+    findings
 }
 
 fn growth(
@@ -748,6 +1032,31 @@ fn content_event(sequence: u64) -> EventEnvelope {
         payload: BTreeMap::from([(
             "text".to_owned(),
             Value::String("hardening event".to_owned()),
+        )]),
+    }
+}
+
+/// A trusted system-plane event: the soak's durable writes go through the
+/// same permit gate production uses, and only system-source (or
+/// memory-admin) evidence earns a durable permit — public chat never does.
+fn system_event(sequence: u64) -> EventEnvelope {
+    EventEnvelope {
+        schema_version: EVENT_SCHEMA_VERSION.to_owned(),
+        event_id: format!("evt-hardening-system-{sequence}"),
+        correlation_id: "corr-hardening".to_owned(),
+        sequence,
+        observed_at: "2026-09-25T00:00:00Z".to_owned(),
+        source: "hardening-system".to_owned(),
+        source_class: SourceClass::System,
+        plane: SecurityPlane::System,
+        trust_level: TrustLevel::Trusted,
+        kind: EventKind::SystemHealth,
+        actor_id: None,
+        priority_hint: None,
+        authorization: None,
+        payload: BTreeMap::from([(
+            "text".to_owned(),
+            Value::String("hardening system event".to_owned()),
         )]),
     }
 }

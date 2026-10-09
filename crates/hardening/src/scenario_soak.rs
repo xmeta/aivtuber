@@ -279,6 +279,21 @@ pub fn run_scenario_soak(
             max_entries: config.working_memory_limit,
             working_ttl_ms: config.logical_duration_ms().saturating_add(1),
             max_compaction_records: config.memory_compaction_limit,
+            // The reported link bound is the enforced link bound: links are
+            // minted only on the permit-gated durable path, which this
+            // content trace never takes, so the cap cannot bind today — but
+            // an unwired limit would silently diverge from the growth
+            // findings the report claims to enforce (#105 review round 4).
+            max_links: config.memory_links_limit,
+            // This store never mints links, so its per-write budget is
+            // aligned down to the reported cap instead of the core probe's
+            // stricter default: `WorkingMemory::new` requires
+            // `max_links >= max_links_per_memory`, and a linkless scenario
+            // with a tiny positive link bound must still construct its store
+            // (#105 review round 9).
+            max_links_per_memory: WorkingMemoryConfig::default()
+                .max_links_per_memory
+                .min(config.memory_links_limit),
             ..WorkingMemoryConfig::default()
         },
         ActorPseudonymizer::new("scenario-soak-v1", [0x40; 32])
@@ -425,7 +440,7 @@ pub fn run_scenario_soak(
     })?;
     let final_state = snapshot(&scheduler, &security, &memory, &telemetry, &assets);
     let telemetry_summary = telemetry.summary(metadata.stream_duration_ms);
-    let growth = growth_findings(&config, &midpoint, &final_state);
+    let growth = growth_findings(&config, &midpoint, &final_state, false);
     faults.consumed = injector.consumed().to_vec();
     // Reachability was checked before the run; this guards the invariant that no
     // planned fault can slip through as a false pass.

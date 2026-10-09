@@ -63,6 +63,20 @@ Existing production tests continue to cover complementary degraded-mode invarian
 
 The workload runs without wall-clock sleeping. This keeps CI/replay deterministic while exercising the state transitions that accumulate over a long stream.
 
+The core workload mints its permit-gated durable supersession write every
++durable_every+ events — by default +working_memory_limit / 16+, widened when
+the configured link budget needs a slower cadence so the retained explicit
+supersession chain fits +memory_links_limit+. Those link-probe rules live in
++SoakConfig::validate_link_probe+ and are checked before the run starts: the
+window must be able to retain a link (at least three node slots), the run must
+be long enough to reach the second durable write that mints the first edge,
+and the projected retained chain must fit the link budget. An accepted
+configuration therefore always runs to completion, and its +memory_links+
+growth checks always describe link activity that actually happened. The
+scenario soak shares only the common +SoakConfig::validate+ bounds, since its
+working-memory-only trace never mints links and a small window is a valid
+scenario experiment. (issue #105 review round 6.)
+
 The CI smoke uses 5,000 events. A full local report uses the default eight-hour logical workload:
 
 [source,shell]
@@ -125,6 +139,14 @@ The soak records midpoint and final retained-state counts for:
 * hot Performance Assets.
 
 A metric is marked +lifetime_growth_detected+ when the second half continues materially increasing with cumulative event count. Configured live-state bounds are separately marked +configured_limit_exceeded+ and make the CLI fail.
+
+The link-store metrics (+memory_links+ and +memory_links_high_water+) appear
+only in reports whose workload can actually mint links. The synthetic core soak
+does so through its permit-gated durable writes; the scenario-driven soak only
+records working memory, so its reports omit both metrics rather than pass a
+bound that reads zero because the subsystem was never exercised. The raw
+counters still appear in both reports' state snapshots as observations.
+(issue #105 review round 4.)
 
 Known lifetime-growth findings are intentionally reported, not hidden:
 
