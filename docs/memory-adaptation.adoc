@@ -47,7 +47,7 @@ Short-lived working memory may contain untrusted public content. Durable retenti
 
 Public chat without that permit is rejected before +WorkingMemory::remember_durable+ can be called.
 
-A permit records the source event id, source, source class, trust level, optional actor, the deterministic gate decision, and the source event's own claim text (its payload `text`) — the binding a consumer needs to tell the event's verified claim from an unrelated sentence supplied beside the permit. The stored entry converts the actor to the configured pseudonym before retention.
+A permit records the source event id, source, source class, trust level, optional actor, the deterministic gate decision, and the source event's own claim text (its payload `text`) — the binding a consumer needs to tell the event's verified claim from an unrelated sentence supplied beside the permit. The claim is retained content, not diagnostic metadata: the permit's debug representation reports only whether the event carried one and prints a redaction marker in place of the text, so ordinary debug/tracing output cannot disclose it. The permit remains non-serializable, and the stored entry converts the actor to the configured pseudonym before retention.
 
 === 3.1 Epistemic classes and crystallization
 
@@ -61,7 +61,7 @@ Every retained entry carries a versioned epistemic class (+MemoryEpistemicClass+
 
 The class is derived **once at write time** from the source class and trust level the security runtime already assigned to the source event and from whether the retained claim *is that event's own claim text* (its payload `text`) — never from claim text alone, retrieval rank, model output, or link structure. It is stored on the entry and never recomputed, so retrieval, ranking, and temporal/graph linkage cannot change a claim's class. The vocabulary version (+memory-epistemic-v1+) is stored **on each entry**, not stamped from the current process constant, so an artifact written under an older vocabulary is identifiable instead of being presented as derived under the present one. The retrieval view serializes the class and reports the entry's own stored version. Those classes describe provenance/epistemic status; they are not authorization and never feed a gate.
 
-The derivation fails closed and binds verification to the specific claim. +VerifiedFact+ is reachable from exactly one combination — a *trusted* system-plane source **whose event carried that exact claim**. A permit proves the event was authorized, not the content of a sentence supplied separately alongside it, so a trusted system permit writing an unrelated claim is an +Observation+, not a fact. This is deliberately stricter than the write gate, which also admits semi-trusted system sources: a semi-trusted system write is admitted but classified as an observation, so the store can never mint facts the runtime did not verify. Public chat and donations are a +ViewerClaim+ at any nominal trust, trusted performer speech is +PerformerExperience+, authenticated operator content is a +PersonaOpinion+ (an asserted opinion, not an independently verified fact), and every other source is an unasserted +Observation+.
+The derivation fails closed and binds verification to the specific claim. +VerifiedFact+ is reachable from exactly one combination — a *trusted* system-plane source **whose event carried that claim**. A permit proves the event was authorized, not the content of a sentence supplied separately alongside it, so a trusted system permit writing an unrelated claim is an +Observation+, not a fact. The binding is judged on the **full** text of both sides, after the same normalization and *before* the storage byte truncation: a claim the event actually carried is not downgraded because normalization rewrote its case or whitespace or because the stored copy is truncated to the claim-byte bound, and content appended to the event's claim cannot inherit its provenance by matching a truncated prefix. This is deliberately stricter than the write gate, which also admits semi-trusted system sources: a semi-trusted system write is admitted but classified as an observation, so the store can never mint facts the runtime did not verify. Public chat and donations are a +ViewerClaim+ at any nominal trust, trusted performer speech is +PerformerExperience+, authenticated operator content is a +PersonaOpinion+ (an asserted opinion, not an independently verified fact), and every other source is an unasserted +Observation+.
 
 Public content MUST NOT self-promote from claim/observation to verified fact. Model repetition, summarization, retrieval rank, or temporal/graph linkage alone is insufficient verification; the class is a write-time fact about provenance and claim binding, so nothing downstream can raise it.
 
@@ -187,7 +187,10 @@ The Rust tests cover:
 * epistemic-class derivation and non-promotion (issue #105, section 3.1): a
   trusted system event's own claim is the only +VerifiedFact+, while an
   unrelated claim written through that same trusted permit stays an
-  +Observation+; a semi-trusted system write is admitted by the gate yet stays
+  +Observation+; the binding survives the normalization of case/whitespace and
+  the storage byte truncation, while a sentence appended to the event's claim
+  is an +Observation+; the permit's debug output redacts the source claim;
+  a semi-trusted system write is admitted by the gate yet stays
   an +Observation+; a viewer claim written through an authenticated
   +memory.admin+ permit stays a +ViewerClaim+ in the store and in the
   serialized retrieval view, which reports the entry's stored

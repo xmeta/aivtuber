@@ -564,12 +564,18 @@ impl WorkingMemory {
             ));
         }
         let retention = RetentionClass::Durable;
+        // Verification binds to the claim, not the permit (#105 review round
+        // 2): the retained text must be the source event's own claim, or a
+        // trusted permit could launder an unrelated sentence into a verified
+        // fact. The binding is decided on the *full* text before storage
+        // truncation, and on the normalized form of both sides, so appended
+        // content cannot hide behind a truncated prefix and the event's own
+        // claim is not downgraded just because normalization rewrote its case
+        // or whitespace (#105 review round 3).
+        let claim_is_bound = permit
+            .source_claim()
+            .is_some_and(|source_claim| normalize(source_claim) == normalize(claim));
         let claim = bounded_nonempty(claim, self.config.max_claim_bytes, "memory claim")?;
-        // Verification is bound to the claim, not the permit: the retained text
-        // must be the source event's own claim, or a trusted permit could
-        // launder an unrelated sentence into a verified fact (#105 review
-        // round 2).
-        let claim_is_bound = permit.source_claim() == Some(claim.as_str());
         let topic = bounded_optional(topic, self.config.max_topic_bytes, "memory topic")?;
         let actor = permit
             .actor_id()
@@ -1105,15 +1111,18 @@ impl WorkingMemory {
         retention: RetentionClass,
         write_decision: MemoryGateDecision,
     ) -> Result<MemoryEntry, AdaptationError> {
-        let claim = bounded_nonempty(claim, self.config.max_claim_bytes, "memory claim")?;
-        // A working entry's claim is likewise only the event's own claim when it
-        // matches the event text; a derived or rephrased sentence is not the
-        // runtime's observation (#105 review round 2).
+        // A working entry's claim is likewise only the event's own claim when
+        // it matches the event text; a derived or rephrased sentence is not the
+        // runtime's observation (#105 review round 2). As on the durable path,
+        // the comparison uses the full normalized texts, so truncation cannot
+        // hide appended content and a case/whitespace rewrite does not
+        // downgrade the event's own claim (#105 review round 3).
         let claim_is_bound = event
             .payload
             .get("text")
             .and_then(serde_json::Value::as_str)
-            == Some(claim.as_str());
+            .is_some_and(|event_text| normalize(event_text) == normalize(claim));
+        let claim = bounded_nonempty(claim, self.config.max_claim_bytes, "memory claim")?;
         let topic = bounded_optional(topic, self.config.max_topic_bytes, "memory topic")?;
         let actor = event
             .actor_id
@@ -3388,6 +3397,90 @@ mod tests {
             bound.epistemic_class,
             MemoryEpistemicClass::VerifiedFact,
             "the permitted event's own claim is the verified fact"
+        );
+    }
+
+    #[test]
+    fn claim_binding_survives_normalization_but_not_an_appended_sentence() {
+        // #105 review round 3: the event's own claim must not be downgraded
+        // just because storage normalizes case and whitespace, and appended
+        // content must not inherit the event's provenance.
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig::default());
+        let mut source = event("evt-health", SourceClass::System, TrustLevel::Trusted, None);
+        source.payload.insert(
+            "text".to_owned(),
+            Value::String("Stream   Is Healthy".to_owned()),
+        );
+        let (_, permit) = security.authorize_memory_write(&source, None);
+        let permit = permit.expect("trusted system permit");
+
+        let bound = memory
+            .remember_durable(&permit, "Stream   Is Healthy", Some("health"), 1_000)
+            .expect("durable write");
+        assert_eq!(
+            bound.epistemic_class,
+            MemoryEpistemicClass::VerifiedFact,
+            "the event's own claim stays verified under case/whitespace normalization"
+        );
+
+        let appended = memory
+            .remember_durable(
+                &permit,
+                "Stream   Is Healthy and the author is X",
+                Some("lore"),
+                2_000,
+            )
+            .expect("durable write");
+        assert_eq!(
+            appended.epistemic_class,
+            MemoryEpistemicClass::Observation,
+            "content appended to the event's claim is not verified evidence"
+        );
+    }
+
+    #[test]
+    fn claim_binding_is_judged_before_storage_truncation() {
+        // #105 review round 3: binding must not be tested against the truncated
+        // stored text. An event whose own claim exceeds the storage budget
+        // would be wrongly downgraded, while an appended sentence that only
+        // matches a truncated prefix would wrongly inherit provenance.
+        let config = WorkingMemoryConfig {
+            max_claim_bytes: 20,
+            ..WorkingMemoryConfig::default()
+        };
+        let mut security = security();
+        let mut memory = test_memory(config);
+        let event_text = "stream is healthy today";
+        let mut source = event("evt-health", SourceClass::System, TrustLevel::Trusted, None);
+        source
+            .payload
+            .insert("text".to_owned(), Value::String(event_text.to_owned()));
+        let (_, permit) = security.authorize_memory_write(&source, None);
+        let permit = permit.expect("trusted system permit");
+
+        let bound = memory
+            .remember_durable(&permit, event_text, Some("health"), 1_000)
+            .expect("durable write");
+        assert!(
+            bound.normalized_claim.len() < event_text.len(),
+            "the stored claim is truncated: {}",
+            bound.normalized_claim
+        );
+        assert_eq!(
+            bound.epistemic_class,
+            MemoryEpistemicClass::VerifiedFact,
+            "truncating the stored text must not downgrade the event's own claim"
+        );
+
+        let extended = format!("{event_text} and the author is X");
+        let appended = memory
+            .remember_durable(&permit, &extended, Some("lore"), 2_000)
+            .expect("durable write");
+        assert_eq!(
+            appended.epistemic_class,
+            MemoryEpistemicClass::Observation,
+            "content appended to the event's claim is not verified evidence"
         );
     }
 
