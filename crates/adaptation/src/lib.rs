@@ -956,10 +956,12 @@ impl WorkingMemory {
     /// replay-time query must not see a relation from the future — the
     /// staleness verdict is likewise drawn only from edges that already exist
     /// at the read timestamp (#105 review round 10). Supersessions lead,
-    /// **newest first** by record time (node ids break ties) so the
-    /// per-entry cap can never truncate the latest correction behind an
-    /// older one; temporal spine edges keep creation order; and the
-    /// per-memory budget cuts the view (#105 review round 11).
+    /// **newest first** by record time with the higher node id breaking ties
+    /// — the same insertion-order tie-break `relevant` and `TemporalBefore`
+    /// use — so the per-entry cap can never truncate the latest correction
+    /// behind an older one, even for a same-tick pair; temporal spine edges
+    /// keep creation order; and the per-memory budget cuts the view (#105
+    /// review rounds 11-12).
     fn link_view(
         &self,
         memory_id: u64,
@@ -992,14 +994,18 @@ impl WorkingMemory {
             if kind == MemoryLinkKind::Supersedes {
                 // Newest correction first: response generation consumes this
                 // view, and a cap of one must surface the latest supersession
-                // rather than the oldest (#105 review round 11). Ties break
-                // on node ids so truncation stays deterministic.
+                // rather than the oldest (#105 review round 11). Equal record
+                // times break on the *higher* node id — insertion order,
+                // newest first — exactly like `relevant` and the timeline
+                // `TemporalBefore` derives from, so a same-tick pair can never
+                // disagree about which correction is later (#105 review round
+                // 12). The secondary key keeps truncation deterministic.
                 ordered.sort_by(|left, right| {
                     right
                         .created_at_ms
                         .cmp(&left.created_at_ms)
-                        .then_with(|| left.from.cmp(&right.from))
-                        .then_with(|| left.to.cmp(&right.to))
+                        .then_with(|| right.from.cmp(&left.from))
+                        .then_with(|| right.to.cmp(&left.to))
                 });
             }
             for link in ordered {
@@ -2234,6 +2240,80 @@ mod tests {
             results[0].links.len(),
             1,
             "the cap of one still applies: {:?}",
+            results[0].links
+        );
+    }
+
+    #[test]
+    fn same_time_supersessions_lead_with_the_newest_insertion() {
+        // Round-12: two corrections that supersede the same target at the
+        // *same* record time must still lead with the later insertion when
+        // the per-entry cap exposes only one edge. `relevant` and
+        // `TemporalBefore` already treat the larger `memory_id` as newest for
+        // equal time, so the bounded view must use the same tie-break or it
+        // can hand response generation the older same-tick correction.
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig {
+            max_links_per_memory: 1,
+            ..WorkingMemoryConfig::default()
+        });
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-old",
+            "old claim",
+            Some("old-topic"),
+            1_000,
+        );
+        // Both corrections carry record time 2_000; `evt-first` is inserted
+        // first, so it holds the smaller `memory_id`.
+        durable_write_superseding(
+            &mut memory,
+            &mut security,
+            "evt-first",
+            "first correction",
+            Some("first-topic"),
+            2_000,
+            &["evt-old"],
+        )
+        .expect("first same-tick supersession");
+        durable_write_superseding(
+            &mut memory,
+            &mut security,
+            "evt-latest",
+            "latest correction",
+            Some("latest-topic"),
+            2_000,
+            &["evt-old"],
+        )
+        .expect("second same-tick supersession");
+        assert_eq!(memory.links().len(), 2, "both corrections are retained");
+
+        let results = memory.relevant_linked(
+            MemoryQuery {
+                source_namespace: None,
+                actor_id: None,
+                topic: Some("old-topic"),
+                limit: 3,
+            },
+            2_500,
+        );
+        let ids: Vec<&str> = results
+            .iter()
+            .map(|item| item.entry.source.event_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["evt-old", "evt-latest"],
+            "equal-time supersessions break newest-first, matching retrieval's own tie-break"
+        );
+        assert!(
+            results[0].stale,
+            "the claim is superseded — verdict unchanged"
+        );
+        assert_eq!(
+            results[0].links[0].from, results[1].entry.memory_id,
+            "the cap of one surfaces the later insertion's edge: {:?}",
             results[0].links
         );
     }
