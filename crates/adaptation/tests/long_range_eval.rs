@@ -27,8 +27,9 @@
 //! byte-identical links for identical inputs.
 
 use aivtuber_adaptation::{
-    ActorPseudonymizer, LinkedMemory, MemoryGateDecision, MemoryLinkKind, MemoryQuery,
-    RetentionClass, WorkingMemory, WorkingMemoryConfig,
+    ActorPseudonymizer, LinkedMemory, MEMORY_EPISTEMIC_VOCAB_VERSION, MemoryEpistemicClass,
+    MemoryGateDecision, MemoryLinkKind, MemoryQuery, RetentionClass, WorkingMemory,
+    WorkingMemoryConfig,
 };
 use aivtuber_domain::{
     AuthenticatedControl, AuthorizationMethod, Capability, ControlSecret, EVENT_SCHEMA_VERSION,
@@ -155,7 +156,13 @@ impl Eval {
     /// `memory.admin` authority. A denied event panics — a case memory that
     /// failed the gate must never be silently stored.
     fn remember(&mut self, spec: &Memory) {
-        let event = event(spec.id, spec.source_class, spec.trust, spec.actor);
+        // The event carries the claim as its own text: a case that wants to
+        // test an unbound claim must build the event differently, because a
+        // permitted event that never carried the claim is not evidence for it.
+        let mut event = event(spec.id, spec.source_class, spec.trust, spec.actor);
+        event
+            .payload
+            .insert("text".to_owned(), Value::String(spec.claim.to_owned()));
         let authority = (spec.source_class != SourceClass::System).then_some(&self.admin);
         let (decision, permit) = self.security.authorize_memory_write(&event, authority);
         assert_ne!(
@@ -491,6 +498,45 @@ fn provenance_class_survives_retrieval_and_gate_denied_memory_never_enters() {
     assert_eq!(
         system.write_decision,
         MemoryGateDecision::AllowedSystemSource
+    );
+
+    // Provenance, not the writing authority, decides the epistemic class: the
+    // admin permit made the viewer claim *storable*, it did not make it a
+    // fact, and it must survive retrieval as a claim (#105 §3.1).
+    assert_eq!(
+        viewer_claim.epistemic_class,
+        MemoryEpistemicClass::ViewerClaim,
+        "an authenticated write of public content is still a viewer claim"
+    );
+    assert_eq!(
+        system.epistemic_class,
+        MemoryEpistemicClass::VerifiedFact,
+        "a trusted system observation is the only verified fact"
+    );
+    let view = serde_json::to_value(
+        eval.memory
+            .relevant_linked(
+                MemoryQuery {
+                    source_namespace: None,
+                    actor_id: None,
+                    topic: Some("health"),
+                    limit: 4,
+                },
+                2_000,
+            )
+            .first()
+            .expect("system entry view"),
+    )
+    .expect("serialize the retrieval view");
+    assert_eq!(
+        view["entry"]["epistemic_class"],
+        Value::String("verified_fact".to_owned()),
+        "the class is serialized with the retrieved entry: {view}"
+    );
+    assert_eq!(
+        view["epistemic_version"],
+        Value::String(MEMORY_EPISTEMIC_VOCAB_VERSION.to_owned()),
+        "the view names the epistemic vocabulary rather than implying it"
     );
 
     // The gate is the only way in: public chat without authority is denied

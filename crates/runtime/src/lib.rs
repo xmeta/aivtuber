@@ -107,7 +107,7 @@ pub enum MemoryWriteDecision {
 
 /// Non-serializable proof that the deterministic memory-write gate authorized
 /// one concrete source event. Only `SecurityRuntime` can construct permits.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct MemoryWritePermit {
     event_id: String,
     source: String,
@@ -115,6 +115,33 @@ pub struct MemoryWritePermit {
     trust_level: TrustLevel,
     actor_id: Option<String>,
     decision: MemoryWriteDecision,
+    /// The claim the source event itself carried (its payload `text`). A permit
+    /// proves the *event* was authorized, not the content of an arbitrary
+    /// sentence a caller supplies alongside it, so a consumer that wants to
+    /// treat a retained claim as verified evidence must check it against this.
+    source_claim: Option<String>,
+}
+
+impl fmt::Debug for MemoryWritePermit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The permit carries the source event's own claim text. That is
+        // retained content, not diagnostic metadata, and a permit is
+        // non-serializable authority: debug/trace output reports only whether
+        // the event carried a claim, so `{:?}` is not a disclosure path
+        // (#105 review round 3).
+        f.debug_struct("MemoryWritePermit")
+            .field("event_id", &self.event_id)
+            .field("source", &self.source)
+            .field("source_class", &self.source_class)
+            .field("trust_level", &self.trust_level)
+            .field("actor_id", &self.actor_id)
+            .field("decision", &self.decision)
+            .field(
+                "source_claim",
+                &self.source_claim.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 impl MemoryWritePermit {
@@ -140,6 +167,11 @@ impl MemoryWritePermit {
 
     pub fn decision(&self) -> MemoryWriteDecision {
         self.decision
+    }
+
+    /// The source event's own claim text, when its payload carried one.
+    pub fn source_claim(&self) -> Option<&str> {
+        self.source_claim.as_deref()
     }
 }
 
@@ -609,6 +641,11 @@ impl SecurityRuntime {
                 trust_level: event.trust_level,
                 actor_id: event.actor_id.clone(),
                 decision,
+                source_claim: event
+                    .payload
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
             });
         (decision, permit)
     }
@@ -1138,5 +1175,27 @@ mod tests {
         assert_eq!(permit.trust_level(), chat.trust_level);
         assert_eq!(permit.actor_id(), chat.actor_id.as_deref());
         assert_eq!(permit.decision(), MemoryWriteDecision::AllowedMemoryAdmin);
+    }
+
+    #[test]
+    fn memory_permit_debug_does_not_disclose_the_retained_claim() {
+        // #105 review round 3: the permit now also carries the source event's
+        // own payload text, so the derived `Debug` would print retained content
+        // verbatim. Debug/tracing output must not become a disclosure path for
+        // it, while the non-content metadata stays diagnosable.
+        let mut runtime = runtime_with(SecurityRuntimeConfig::default(), &[]);
+        let chat = chat_event("evt-memory", 1, "chat-a", "sentinel-claim-text");
+        let admin = authenticated(Capability::MemoryAdmin, "memory.admin");
+        let (_, permit) = runtime.authorize_memory_write(&chat, Some(admin.authority()));
+        let permit = permit.expect("memory permit");
+        assert_eq!(permit.source_claim(), Some("sentinel-claim-text"));
+
+        let debug = format!("{permit:?}");
+        assert!(
+            !debug.contains("sentinel-claim-text"),
+            "the permit's Debug must not print the source claim: {debug}"
+        );
+        assert!(debug.contains("[REDACTED]"), "{debug}");
+        assert!(debug.contains("evt-memory"), "{debug}");
     }
 }
