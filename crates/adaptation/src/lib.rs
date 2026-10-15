@@ -575,6 +575,20 @@ impl WorkingMemory {
         let claim_is_bound = permit
             .source_claim()
             .is_some_and(|source_claim| normalize(source_claim) == normalize(claim));
+        // A verified fact must be stored complete or not at all (#105 review
+        // round 4): truncating it at the byte bound can drop the negation or
+        // qualifier that bounded it, so the store would assert a claim whose
+        // meaning changed. Weaker classes keep truncation because they assert
+        // nothing.
+        require_complete_verified_claim(
+            claim,
+            self.config.max_claim_bytes,
+            MemoryEpistemicClass::derive(
+                permit.source_class(),
+                permit.trust_level(),
+                claim_is_bound,
+            ),
+        )?;
         let claim = bounded_nonempty(claim, self.config.max_claim_bytes, "memory claim")?;
         let topic = bounded_optional(topic, self.config.max_topic_bytes, "memory topic")?;
         let actor = permit
@@ -1122,6 +1136,13 @@ impl WorkingMemory {
             .get("text")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|event_text| normalize(event_text) == normalize(claim));
+        // Same complete-or-reject rule as the durable path: a verified fact
+        // is never stored truncated (#105 review round 4).
+        require_complete_verified_claim(
+            claim,
+            self.config.max_claim_bytes,
+            MemoryEpistemicClass::derive(event.source_class, event.trust_level, claim_is_bound),
+        )?;
         let claim = bounded_nonempty(claim, self.config.max_claim_bytes, "memory claim")?;
         let topic = bounded_optional(topic, self.config.max_topic_bytes, "memory topic")?;
         let actor = event
@@ -1669,6 +1690,29 @@ fn normalize(value: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
+}
+
+/// A claim classed `VerifiedFact` must fit the storage budget in full.
+///
+/// Truncating a verified fact at `max_bytes` can drop the negation or
+/// qualifier that bounded it — for example cutting "not verified" off "the
+/// game author is not verified" — so the retained copy would assert something
+/// the runtime never observed. Fail the write closed with a typed error
+/// instead of storing a corrupted fact; this is stricter than the byte bound
+/// alone and never applies to weaker classes (+ViewerClaim+,
+/// +PerformerExperience+, +Observation+, +PersonaOpinion+), which assert
+/// nothing and keep the truncation semantics (#105 review round 4).
+fn require_complete_verified_claim(
+    value: &str,
+    max_bytes: usize,
+    epistemic_class: MemoryEpistemicClass,
+) -> Result<(), AdaptationError> {
+    if epistemic_class == MemoryEpistemicClass::VerifiedFact && normalize(value).len() > max_bytes {
+        return Err(AdaptationError::InvalidInput(
+            "a verified-fact claim longer than max_claim_bytes would be stored truncated and could lose the negation or qualifier that bounded it; shorten the source event's own claim or raise max_claim_bytes",
+        ));
+    }
+    Ok(())
 }
 
 fn bounded_nonempty(
@@ -3440,11 +3484,12 @@ mod tests {
     }
 
     #[test]
-    fn claim_binding_is_judged_before_storage_truncation() {
-        // #105 review round 3: binding must not be tested against the truncated
-        // stored text. An event whose own claim exceeds the storage budget
-        // would be wrongly downgraded, while an appended sentence that only
-        // matches a truncated prefix would wrongly inherit provenance.
+    fn binding_is_judged_on_full_text_and_overlong_verified_facts_are_rejected() {
+        // #105 review round 3 + round 4: binding must not be tested against
+        // the truncated stored text, and a verified fact whose own claim
+        // exceeds the storage budget must be rejected rather than stored
+        // truncated — truncation could drop the negation or qualifier that
+        // bounded it.
         let config = WorkingMemoryConfig {
             max_claim_bytes: 20,
             ..WorkingMemoryConfig::default()
@@ -3459,20 +3504,25 @@ mod tests {
         let (_, permit) = security.authorize_memory_write(&source, None);
         let permit = permit.expect("trusted system permit");
 
-        let bound = memory
+        // Round 4: the event's own claim is recognized as bound (it reaches
+        // VerifiedFact) and, being overlong, is refused — not stored
+        // truncated. If binding were judged on the truncated copy instead,
+        // this overlong write would slip through as an unverified class and
+        // be stored, so the rejection is the discriminator.
+        let error = memory
             .remember_durable(&permit, event_text, Some("health"), 1_000)
-            .expect("durable write");
+            .expect_err("an overlong verified fact must be rejected, not truncated");
         assert!(
-            bound.normalized_claim.len() < event_text.len(),
-            "the stored claim is truncated: {}",
-            bound.normalized_claim
+            matches!(error, AdaptationError::InvalidInput(_)),
+            "typed rejection: {error}"
         );
-        assert_eq!(
-            bound.epistemic_class,
-            MemoryEpistemicClass::VerifiedFact,
-            "truncating the stored text must not downgrade the event's own claim"
+        assert!(
+            memory.entries().is_empty(),
+            "a rejected write stores nothing"
         );
 
+        // Weaker classes keep the truncation semantics: an appended sentence
+        // is an Observation, and it is stored truncated rather than refused.
         let extended = format!("{event_text} and the author is X");
         let appended = memory
             .remember_durable(&permit, &extended, Some("lore"), 2_000)
@@ -3482,6 +3532,80 @@ mod tests {
             MemoryEpistemicClass::Observation,
             "content appended to the event's claim is not verified evidence"
         );
+        assert!(
+            appended.normalized_claim.len() < extended.len(),
+            "the weaker class keeps the bounded truncation: {}",
+            appended.normalized_claim
+        );
+    }
+
+    #[test]
+    fn a_negation_beyond_the_byte_limit_is_rejected_not_truncated() {
+        // #105 review round 4: a qualifier/negation that falls beyond the
+        // storage byte bound must cause a typed rejection of the verified
+        // fact, never a truncated stored copy whose meaning flipped.
+        let config = WorkingMemoryConfig {
+            max_claim_bytes: 20,
+            ..WorkingMemoryConfig::default()
+        };
+        let mut security = security();
+        let mut memory = test_memory(config);
+        // 31 bytes normalized: truncating at 20 would drop "not verified".
+        let event_text = "the game author is not verified";
+        assert!(
+            normalize(event_text).len() > 20,
+            "the case really is overlong"
+        );
+        let mut source = event("evt-lore", SourceClass::System, TrustLevel::Trusted, None);
+        source
+            .payload
+            .insert("text".to_owned(), Value::String(event_text.to_owned()));
+        let (_, permit) = security.authorize_memory_write(&source, None);
+        let permit = permit.expect("trusted system permit");
+
+        let error = memory
+            .remember_durable(&permit, event_text, Some("lore"), 1_000)
+            .expect_err("the negation beyond the byte limit must reject the write");
+        assert!(
+            matches!(error, AdaptationError::InvalidInput(_)),
+            "typed rejection: {error}"
+        );
+        assert!(
+            memory.entries().is_empty(),
+            "nothing is stored when the verified fact is rejected"
+        );
+
+        // The same claim through the same permit is accepted once the budget
+        // holds it in full: the rejection is the byte bound, not the content.
+        let generous = test_memory(WorkingMemoryConfig {
+            max_claim_bytes: 64,
+            ..WorkingMemoryConfig::default()
+        });
+        let stored = {
+            let mut memory = generous;
+            let stored = memory
+                .remember_durable(&permit, event_text, Some("lore"), 1_000)
+                .expect("a complete verified fact is stored");
+            assert_eq!(
+                stored.epistemic_class,
+                MemoryEpistemicClass::VerifiedFact,
+                "the complete claim is the verified fact"
+            );
+            assert_eq!(
+                stored.normalized_claim, "the game author is not verified",
+                "the negation survives intact"
+            );
+            stored.normalized_claim.clone()
+        };
+        assert_eq!(stored, "the game author is not verified");
+
+        // The working-memory path enforces the same complete-or-reject rule.
+        let mut working = test_memory(config);
+        let error = working
+            .remember_working(&source, event_text, Some("lore"), 1_000)
+            .expect_err("an overlong verified fact is rejected in working memory too");
+        assert!(matches!(error, AdaptationError::InvalidInput(_)));
+        assert!(working.entries().is_empty());
     }
 
     #[test]
