@@ -3609,6 +3609,176 @@ mod tests {
     }
 
     #[test]
+    fn the_issue_231_counterexample_cannot_be_stored_as_a_verified_fact() {
+        // #231's exact reproduction. At a 17-byte budget the prefix itself is
+        // a complete-looking proposition ("server is healthy"), so a
+        // truncating store would certify the opposite of the claim's own tail
+        // ("... but this statement is false") — the retained proposition would
+        // not be the one the runtime observed.
+        let config = WorkingMemoryConfig {
+            max_claim_bytes: 17,
+            ..WorkingMemoryConfig::default()
+        };
+        let mut security = security();
+        let mut memory = test_memory(config);
+        let event_text = "server is healthy but this statement is false";
+        assert_eq!(
+            normalize("server is healthy").len(),
+            17,
+            "the counterexample truncates exactly at the byte bound"
+        );
+        assert!(
+            normalize(event_text).len() > 17,
+            "the claim really is overlong"
+        );
+        let mut source = event("evt-health", SourceClass::System, TrustLevel::Trusted, None);
+        source
+            .payload
+            .insert("text".to_owned(), Value::String(event_text.to_owned()));
+        let (_, permit) = security.authorize_memory_write(&source, None);
+        let permit = permit.expect("trusted system permit");
+
+        let error = memory
+            .remember_durable(&permit, event_text, Some("health"), 1_000)
+            .expect_err("the counterexample must not be stored truncated");
+        assert!(
+            matches!(error, AdaptationError::InvalidInput(_)),
+            "typed rejection: {error}"
+        );
+        // #231 acceptance: a refused write inserts nothing at all — no entry,
+        // no link, and no burned node id.
+        assert!(memory.entries().is_empty(), "no entry is inserted");
+        assert!(memory.links().is_empty(), "no link is inserted");
+        assert_eq!(memory.len(), 0, "the store is untouched");
+
+        // The high-water mark proves "no partial insertion": the first
+        // accepted write still takes the first node id, so the refused write
+        // consumed nothing a replay would miss.
+        let complete = "server is healthy";
+        let mut second = event(
+            "evt-health-2",
+            SourceClass::System,
+            TrustLevel::Trusted,
+            None,
+        );
+        second
+            .payload
+            .insert("text".to_owned(), Value::String(complete.to_owned()));
+        let (_, permit) = security.authorize_memory_write(&second, None);
+        let permit = permit.expect("trusted system permit");
+        let stored = memory
+            .remember_durable(&permit, complete, Some("health"), 2_000)
+            .expect("a complete trusted claim at the byte bound is stored");
+        assert_eq!(
+            stored.memory_id, 1,
+            "the refused write did not consume a node id"
+        );
+        assert_eq!(stored.epistemic_class, MemoryEpistemicClass::VerifiedFact);
+        assert_eq!(stored.normalized_claim, complete);
+
+        // The complete proposition is retained once the budget holds it in
+        // full, so the rejection is the byte bound and not the qualification.
+        let mut generous = test_memory(WorkingMemoryConfig {
+            max_claim_bytes: 64,
+            ..WorkingMemoryConfig::default()
+        });
+        let mut third = event(
+            "evt-health-3",
+            SourceClass::System,
+            TrustLevel::Trusted,
+            None,
+        );
+        third
+            .payload
+            .insert("text".to_owned(), Value::String(event_text.to_owned()));
+        let (_, permit) = security.authorize_memory_write(&third, None);
+        let permit = permit.expect("trusted system permit");
+        let stored = generous
+            .remember_durable(&permit, event_text, Some("health"), 3_000)
+            .expect("a complete verified fact is stored");
+        assert_eq!(stored.normalized_claim, event_text);
+        assert_eq!(stored.epistemic_class, MemoryEpistemicClass::VerifiedFact);
+    }
+
+    #[test]
+    fn the_verified_fact_bound_is_measured_in_bytes_across_a_multi_byte_claim() {
+        // #231 acceptance: the bound the invariant is judged against is the
+        // same byte bound the truncation used, including where bytes and
+        // characters disagree. A claim with fewer than `max_claim_bytes`
+        // characters but more bytes must still be refused, an accepted one
+        // must be stored whole (never cut inside a character), and a weaker
+        // class must still truncate only on a character boundary.
+        let claim = "作者は未確認である";
+        let claim_bytes = normalize(claim).len();
+        let claim_chars = normalize(claim).chars().count();
+        assert!(
+            claim_bytes > 24 && claim_chars < 24,
+            "byte and character counts must disagree: {claim_bytes} bytes, {claim_chars} characters"
+        );
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig {
+            max_claim_bytes: 24,
+            ..WorkingMemoryConfig::default()
+        });
+        let mut source = event("evt-lore", SourceClass::System, TrustLevel::Trusted, None);
+        source
+            .payload
+            .insert("text".to_owned(), Value::String(claim.to_owned()));
+        let (_, permit) = security.authorize_memory_write(&source, None);
+        let permit = permit.expect("trusted system permit");
+
+        let error = memory
+            .remember_durable(&permit, claim, Some("lore"), 1_000)
+            .expect_err("the byte bound, not the character count, rejects this claim");
+        assert!(
+            matches!(error, AdaptationError::InvalidInput(_)),
+            "typed rejection: {error}"
+        );
+        assert!(memory.entries().is_empty(), "nothing is stored");
+
+        // Fits in bytes: the retained text is the input, intact.
+        let mut generous = test_memory(WorkingMemoryConfig {
+            max_claim_bytes: 64,
+            ..WorkingMemoryConfig::default()
+        });
+        let stored = generous
+            .remember_durable(&permit, claim, Some("lore"), 1_000)
+            .expect("a claim the budget holds in full is stored");
+        assert_eq!(
+            stored.normalized_claim, claim,
+            "no character is split or dropped"
+        );
+        assert_eq!(stored.epistemic_class, MemoryEpistemicClass::VerifiedFact);
+
+        // A weaker class keeps the truncation semantics, and the cut still
+        // lands on a character boundary of the same normalized text.
+        let appended = format!("{claim} and the stream is calm");
+        let mut truncating = test_memory(WorkingMemoryConfig {
+            max_claim_bytes: 24,
+            ..WorkingMemoryConfig::default()
+        });
+        let observation = truncating
+            .remember_durable(&permit, &appended, Some("lore"), 2_000)
+            .expect("a weaker class is still stored truncated");
+        assert_eq!(
+            observation.epistemic_class,
+            MemoryEpistemicClass::Observation,
+            "appended content is not verified evidence"
+        );
+        assert!(observation.normalized_claim.len() <= 24);
+        assert!(
+            observation.normalized_claim.len() < normalize(&appended).len(),
+            "this case really is truncated: {}",
+            observation.normalized_claim
+        );
+        assert!(
+            normalize(&appended).starts_with(&observation.normalized_claim),
+            "the cut lands on a character boundary: {}",
+            observation.normalized_claim
+        );
+    }
+
+    #[test]
     fn every_entry_persists_the_epistemic_vocabulary_it_was_classified_under() {
         // #105 review round 2: a class is worthless to a replay without the
         // vocabulary it was derived under. The version is stored per entry, not
