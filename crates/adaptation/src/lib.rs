@@ -11,7 +11,7 @@ use aivtuber_runtime::{MemoryWriteDecision, MemoryWritePermit};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
@@ -41,51 +41,7 @@ impl From<MemoryWriteDecision> for MemoryGateDecision {
     }
 }
 
-/// Epistemic class of a retained claim (#105 §3.1), derived deterministically
-/// at write time from the source class and trust level the security runtime
-/// already assigned to the source event. It describes what kind of knowledge a
-/// memory represents; it is **not** authorization and never feeds a gate, and
-/// it is never derived from claim text, retrieval rank, model output, or link
-/// structure — any of those would let public content promote itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MemoryEpistemicClass {
-    VerifiedFact,
-    ViewerClaim,
-    PerformerExperience,
-    Observation,
-    PersonaOpinion,
-}
-
-impl MemoryEpistemicClass {
-    /// Classify a write from trusted metadata only.
-    ///
-    /// `claim_is_bound` says the retained claim is the source event's *own*
-    /// claim text (its payload `text`), not an arbitrary sentence the caller
-    /// supplied next to a permit. A trusted source event proves event
-    /// provenance, not the content of a separately written claim, so
-    /// `VerifiedFact` additionally requires the binding: a trusted system
-    /// permit carrying an unrelated claim fails closed to `Observation`.
-    ///
-    /// The memory-write gate also admits a semi-trusted system write, public
-    /// chat, and authenticated operator content; all of those fail closed to a
-    /// weaker class, so the only way a claim becomes a verified fact is a
-    /// trusted runtime observation of that exact claim — never repetition,
-    /// retrieval, or linkage.
-    pub fn derive(
-        source_class: SourceClass,
-        trust_level: TrustLevel,
-        claim_is_bound: bool,
-    ) -> Self {
-        match (source_class, trust_level) {
-            (SourceClass::System, TrustLevel::Trusted) if claim_is_bound => Self::VerifiedFact,
-            (SourceClass::PublicChat | SourceClass::Donation, _) => Self::ViewerClaim,
-            (SourceClass::Speech, TrustLevel::Trusted) => Self::PerformerExperience,
-            (SourceClass::Operator, _) => Self::PersonaOpinion,
-            _ => Self::Observation,
-        }
-    }
-}
+pub use aivtuber_domain::EpistemicClass as MemoryEpistemicClass;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemorySourceMetadata {
@@ -1048,6 +1004,136 @@ impl WorkingMemory {
             .collect()
     }
 
+    /// Whether a retained entry may be handed to generation as shared context,
+    /// independent of who is asking.
+    ///
+    /// "Carries no actor" is not evidence of anything: a `ChatMessage` and an
+    /// `OperatorCommand` are both valid envelopes without an `actor_id`, so an
+    /// unowned public claim and an operator's private record would both look
+    /// like shared memory under that test (#105 review). Sharing is therefore
+    /// decided per source class:
+    ///
+    /// * `System`, `Game`, `Stream`, and `Timer` observations and the
+    ///   performer's own `Speech` are the stream's knowledge, attributable to
+    ///   the runtime rather than to a person;
+    /// * `PublicChat` and `Donation` are somebody's words, so they are in scope
+    ///   only for that same actor (see [`Self::context_for`]);
+    /// * `Operator` is the operator's private record. A privacy *label* is not
+    ///   an egress authorization, so it never enters generation; a deliberate
+    ///   declassification policy would have to authorize it first.
+    fn generation_shared(entry: &MemoryEntry) -> bool {
+        match entry.source.source_class {
+            SourceClass::System
+            | SourceClass::Speech
+            | SourceClass::Game
+            | SourceClass::Stream
+            | SourceClass::Timer => true,
+            SourceClass::PublicChat | SourceClass::Donation | SourceClass::Operator => false,
+        }
+    }
+
+    /// Bounded retrieval for a generation context (#105).
+    ///
+    /// An entry is in scope when it is *shared* by source class (see
+    /// [`Self::generation_shared`]) and not attributed to somebody else, or
+    /// when it is the current speaker's own claim — the speaker's own words are
+    /// their context even though nobody else may see them.
+    ///
+    /// Visibility is the same time-indexed rule as `relevant`: a claim recorded
+    /// after `now_ms` or already expired at `now_ms` does not exist for the
+    /// query, so a replay can never act on its own future.
+    ///
+    /// Supersession is applied, not ignored: a claim an explicit supersession
+    /// replaced is not evidence of the present, so the superseded node is
+    /// dropped and its live correction is promoted into the same rank bucket.
+    /// A correction that changed topic therefore cannot be cut behind the claim
+    /// it replaced — the failure the existing `stale` verdict exists to prevent
+    /// (#105 review).
+    ///
+    /// Ranking is deterministic over the retained state: promoted/topic matches
+    /// lead, then logical record time (newest first) with node id breaking ties
+    /// — the same timeline `relevant` and `TemporalBefore` use — so the same
+    /// retained memory always yields the same prefix, and `limit` bounds both
+    /// the result and the work.
+    pub fn context_for(
+        &self,
+        source_namespace: &str,
+        actor_id: Option<&str>,
+        topic: Option<&str>,
+        limit: usize,
+        now_ms: u64,
+    ) -> Vec<&MemoryEntry> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let actor_scope =
+            actor_id.map(|actor| self.pseudonymizer.pseudonymize(source_namespace, actor));
+        let normalized_topic = topic.map(normalize);
+        let live =
+            |entry: &MemoryEntry| entry.expires_at_ms > now_ms && entry.created_at_ms <= now_ms;
+        let matches_topic = |entry: &MemoryEntry| {
+            normalized_topic.as_deref().is_some()
+                && normalized_topic.as_deref() == entry.topic.as_deref().map(normalize).as_deref()
+        };
+        // Only a supersession whose superseding node is itself alive at the
+        // read timestamp replaces anything: an expired correction is already
+        // deleted for retrieval and cannot keep the claim it corrected current
+        // either — the same rule `link_view` applies to its `stale` verdict.
+        let mut correction_of: HashMap<u64, u64> = HashMap::new();
+        for link in &self.links {
+            if link.kind != MemoryLinkKind::Supersedes || link.created_at_ms > now_ms {
+                continue;
+            }
+            let superseder_live = self
+                .entries
+                .iter()
+                .any(|entry| entry.memory_id == link.from && live(entry));
+            if superseder_live {
+                correction_of.entry(link.to).or_insert(link.from);
+            }
+        }
+        let visible: Vec<&MemoryEntry> = self.entries.iter().filter(|entry| live(entry)).collect();
+        let mut promoted: HashSet<u64> = HashSet::new();
+        for entry in &visible {
+            if matches_topic(entry)
+                && let Some(correction) = correction_of.get(&entry.memory_id)
+            {
+                promoted.insert(*correction);
+            }
+        }
+        let in_scope = |entry: &MemoryEntry| {
+            let owner = entry.source.pseudonymous_actor_id.as_ref();
+            let own_claim = actor_scope
+                .as_ref()
+                .is_some_and(|scope| owner == Some(scope));
+            let shared = Self::generation_shared(entry)
+                && owner.is_none_or(|owner| actor_scope.as_ref() == Some(owner));
+            own_claim || shared
+        };
+        let mut ranked = visible
+            .into_iter()
+            .filter(|entry| !correction_of.contains_key(&entry.memory_id))
+            .filter(|entry| in_scope(entry))
+            .map(|entry| {
+                let priority =
+                    u8::from(matches_topic(entry) || promoted.contains(&entry.memory_id));
+                (priority, entry)
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| right.1.created_at_ms.cmp(&left.1.created_at_ms))
+                .then_with(|| right.1.memory_id.cmp(&left.1.memory_id))
+        });
+        ranked
+            .into_iter()
+            .take(limit)
+            .map(|(_, entry)| entry)
+            .collect()
+    }
+
     /// One entry's bounded link view, with every edge required to have **both**
     /// endpoints live at `now_ms` and to have been recorded at or before
     /// `now_ms`: retrieval already treats an expired node as deleted, and a
@@ -1934,6 +2020,196 @@ mod tests {
         memory
             .remember_durable_superseding(&permit, claim, topic, now_ms, supersedes)
             .map(|entry| entry.memory_id)
+    }
+
+    #[test]
+    fn generation_context_scopes_to_the_speaker_and_shared_memory() {
+        // #105: a reply may use the speaker's own claims and actorless shared
+        // memory, never a third party's claim — the failure mode that would
+        // turn another viewer's sentence into this reply's "context".
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig::default());
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-shared",
+            "the boss is weak to fire",
+            Some("game-x"),
+            1_000,
+        );
+        let own = event(
+            "evt-own",
+            SourceClass::PublicChat,
+            TrustLevel::Untrusted,
+            Some("viewer:a"),
+        );
+        memory
+            .remember_working(&own, "i like fire magic", Some("game-x"), 1_000)
+            .expect("own claim");
+        let other = event(
+            "evt-other",
+            SourceClass::PublicChat,
+            TrustLevel::Untrusted,
+            Some("viewer:b"),
+        );
+        memory
+            .remember_working(&other, "i hate fire magic", Some("game-x"), 1_000)
+            .expect("other claim");
+
+        let texts = |entries: Vec<&MemoryEntry>| {
+            entries
+                .iter()
+                .map(|entry| entry.normalized_claim.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let scoped =
+            texts(memory.context_for("public-chat", Some("viewer:a"), Some("game-x"), 8, 1_001));
+        assert!(
+            scoped.contains(&"the boss is weak to fire".to_owned()),
+            "{scoped:?}"
+        );
+        assert!(
+            scoped.contains(&"i like fire magic".to_owned()),
+            "{scoped:?}"
+        );
+        assert!(
+            !scoped.contains(&"i hate fire magic".to_owned()),
+            "another actor's claim is out of scope: {scoped:?}"
+        );
+        // Equal record times break on the node id, newest first — the same
+        // insertion-order timeline `relevant` uses, so the ordering is a
+        // property of the retained state rather than of this call.
+        assert_eq!(scoped[0], "i like fire magic");
+
+        // An actorless event has no speaker to scope to: shared memory only.
+        let shared_only = texts(memory.context_for("public-chat", None, Some("game-x"), 8, 1_001));
+        assert_eq!(shared_only, vec!["the boss is weak to fire".to_owned()]);
+
+        // The caller's limit bounds the result, and nothing survives expiry.
+        assert_eq!(
+            memory
+                .context_for("public-chat", Some("viewer:a"), Some("game-x"), 1, 1_001)
+                .len(),
+            1
+        );
+        assert!(
+            memory
+                .context_for("public-chat", Some("viewer:a"), Some("game-x"), 8, u64::MAX)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn generation_context_excludes_unattributable_and_private_memory() {
+        // #105 review: "carries no actor" is not "safe to share". A public
+        // claim nobody is attributable for, and an operator's private record,
+        // are both valid actorless envelopes — and neither may reach another
+        // party's reply.
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig::default());
+        let anonymous = event(
+            "evt-anon",
+            SourceClass::PublicChat,
+            TrustLevel::Untrusted,
+            None,
+        );
+        memory
+            .remember_working(
+                &anonymous,
+                "somebody hates this game",
+                Some("game-x"),
+                1_000,
+            )
+            .expect("anonymous public claim retained");
+        let mut operator = event("evt-op", SourceClass::Operator, TrustLevel::Trusted, None);
+        operator.kind = EventKind::OperatorCommand;
+        operator.plane = SecurityPlane::Control;
+        memory
+            .remember_working(
+                &operator,
+                "the operator's private note",
+                Some("game-x"),
+                1_000,
+            )
+            .expect("private operator memory retained");
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-shared",
+            "the boss is weak to fire",
+            Some("game-x"),
+            1_000,
+        );
+
+        let viewer = memory
+            .context_for("public-chat", Some("viewer:a"), Some("game-x"), 8, 1_001)
+            .iter()
+            .map(|entry| entry.normalized_claim.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            viewer,
+            vec!["the boss is weak to fire".to_owned()],
+            "only runtime-owned knowledge is shared; the anonymous claim and the private \
+             record stay out"
+        );
+        let anonymous_event = memory
+            .context_for("public-chat", None, Some("game-x"), 8, 1_001)
+            .iter()
+            .map(|entry| entry.normalized_claim.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            anonymous_event,
+            vec!["the boss is weak to fire".to_owned()],
+            "an actorless current event gets the shared set, not unattributable claims"
+        );
+    }
+
+    #[test]
+    fn generation_context_replaces_a_superseded_claim_with_its_correction() {
+        // #105 review: the context must not hand generation a claim an explicit
+        // supersession already replaced — even when the correction moved to a
+        // different topic, so that a tight budget cannot keep the old fact and
+        // drop its replacement.
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig::default());
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-old",
+            "the boss is weak to fire",
+            Some("game-x"),
+            1_000,
+        );
+        durable_write_superseding(
+            &mut memory,
+            &mut security,
+            "evt-new",
+            "the boss is weak to ice",
+            Some("reload.boss"),
+            1_001,
+            &["evt-old"],
+        )
+        .expect("correction retained");
+
+        let context = memory
+            .context_for("system-health", None, Some("game-x"), 8, 1_002)
+            .iter()
+            .map(|entry| entry.normalized_claim.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            context,
+            vec!["the boss is weak to ice".to_owned()],
+            "the superseded claim is gone and its correction rides the match"
+        );
+        // The correction is what the *unrelated* topic query sees too, so the
+        // pair can never present as two equally current facts.
+        let unrelated = memory
+            .context_for("system-health", None, Some("reload.boss"), 8, 1_002)
+            .iter()
+            .map(|entry| entry.normalized_claim.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(unrelated, vec!["the boss is weak to ice".to_owned()]);
     }
 
     fn unfiltered_query(limit: usize) -> MemoryQuery<'static> {

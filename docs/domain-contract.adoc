@@ -133,6 +133,8 @@ A thinking request contains only:
 
 Every `ThinkingContent` item carries its source class, trust level, privacy class, optional event provenance, and bounded text. Untrusted viewer content therefore remains marked `untrusted` when it crosses the thinking boundary; constructing the request does not elevate trust.
 
+A `memory` context item additionally carries `epistemic_class` — the class its claim was retained under (`verified_fact`, `viewer_claim`, `performer_experience`, `observation`, `persona_opinion`). The field is present exactly on `memory` items: a memory item without it, or a non-memory item that carries one, is rejected by `ThinkingRequest::validate`, so provenance can neither be dropped in transit nor invented for content that was never retained. Carrying a class is a phrasing input, not an authorization: it is not a capability and cannot widen what the runtime will emit.
+
 Raw transcript or stream-history fields are not part of either request type. If historical content is needed for generation, an upstream component must deliberately reduce/select it into bounded `curated_context` items with explicit provenance, trust, and privacy metadata.
 
 The initial internal request schema versions are `ReflexRequest 0.1.0`, `ReflexContext 0.1.0`, and `ThinkingRequest 0.1.0`. Reflex replay records carry both the request and context schema versions.

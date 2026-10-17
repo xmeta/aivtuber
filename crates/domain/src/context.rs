@@ -236,6 +236,54 @@ pub enum ThinkingContextSource {
     OperatorCurated,
 }
 
+/// What kind of knowledge a retained claim represents (#105 §3.1).
+///
+/// Derived once at write time from the source class and trust level the
+/// security runtime already assigned, and carried unchanged from retention
+/// through retrieval into the thinking request: generation needs the class to
+/// phrase a claim ("a viewer said X" versus "X") without the request builder
+/// re-deriving it from text, rank, or model output. It is **not**
+/// authorization and never feeds a gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpistemicClass {
+    VerifiedFact,
+    ViewerClaim,
+    PerformerExperience,
+    Observation,
+    PersonaOpinion,
+}
+
+impl EpistemicClass {
+    /// Classify a write from trusted metadata only.
+    ///
+    /// `claim_is_bound` says the retained claim is the source event's *own*
+    /// claim text (its payload `text`), not an arbitrary sentence the caller
+    /// supplied next to a permit. A trusted source event proves event
+    /// provenance, not the content of a separately written claim, so
+    /// `VerifiedFact` additionally requires the binding: a trusted system
+    /// permit carrying an unrelated claim fails closed to `Observation`.
+    ///
+    /// The memory-write gate also admits a semi-trusted system write, public
+    /// chat, and authenticated operator content; all of those fail closed to a
+    /// weaker class, so the only way a claim becomes a verified fact is a
+    /// trusted runtime observation of that exact claim — never repetition,
+    /// retrieval, or linkage.
+    pub fn derive(
+        source_class: SourceClass,
+        trust_level: TrustLevel,
+        claim_is_bound: bool,
+    ) -> Self {
+        match (source_class, trust_level) {
+            (SourceClass::System, TrustLevel::Trusted) if claim_is_bound => Self::VerifiedFact,
+            (SourceClass::PublicChat | SourceClass::Donation, _) => Self::ViewerClaim,
+            (SourceClass::Speech, TrustLevel::Trusted) => Self::PerformerExperience,
+            (SourceClass::Operator, _) => Self::PersonaOpinion,
+            _ => Self::Observation,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ThinkingContent {
@@ -245,6 +293,12 @@ pub struct ThinkingContent {
     pub source_class: Option<SourceClass>,
     pub trust_level: TrustLevel,
     pub privacy: PrivacyClass,
+    /// The retained class of a `memory` item (#105). `Some` exactly when the
+    /// source is [`ThinkingContextSource::Memory`]: a retained claim that does
+    /// not name the class it was classified under has lost the provenance
+    /// generation needs, and a non-memory item must not acquire one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epistemic_class: Option<EpistemicClass>,
     pub text: String,
 }
 
@@ -261,6 +315,7 @@ impl ThinkingContent {
             source_class: Some(event.source_class),
             trust_level: event.trust_level,
             privacy,
+            epistemic_class: None,
             text: text.into(),
         }
     }
@@ -281,6 +336,22 @@ impl ThinkingContent {
                 field,
                 "current_event content requires event_id, event_kind, and source_class",
             ));
+        }
+        match (self.source, self.epistemic_class) {
+            (ThinkingContextSource::Memory, None) => {
+                return Err(DomainValidationError::new(
+                    field,
+                    "memory content must name the epistemic class it was retained under",
+                ));
+            }
+            (ThinkingContextSource::Memory, Some(_)) => {}
+            (_, Some(_)) => {
+                return Err(DomainValidationError::new(
+                    field,
+                    "only memory content carries an epistemic class",
+                ));
+            }
+            (_, None) => {}
         }
         Ok(())
     }
@@ -470,6 +541,7 @@ mod tests {
                 source_class: Some(SourceClass::PublicChat),
                 trust_level: TrustLevel::Untrusted,
                 privacy: PrivacyClass::Pseudonymous,
+                epistemic_class: None,
                 text: "previous public interaction summary".to_owned(),
             }],
         )
@@ -586,6 +658,60 @@ mod tests {
     }
 
     #[test]
+    fn thinking_context_names_an_epistemic_class_exactly_for_memory() {
+        // #105: the class has to survive retrieval into the request, or
+        // generation cannot phrase a claim differently from a fact.
+        let mut request = thinking_request();
+        request.curated_context = vec![ThinkingContent {
+            source: ThinkingContextSource::Memory,
+            event_id: None,
+            event_kind: None,
+            source_class: None,
+            trust_level: TrustLevel::SemiTrusted,
+            privacy: PrivacyClass::Private,
+            epistemic_class: None,
+            text: "the boss is weak to fire".to_owned(),
+        }];
+        assert_eq!(
+            request
+                .validate()
+                .expect_err("memory without its class")
+                .field(),
+            "thinking_request.curated_context"
+        );
+
+        request.curated_context[0].source = ThinkingContextSource::RecentInteraction;
+        request.curated_context[0].epistemic_class = Some(EpistemicClass::VerifiedFact);
+        assert_eq!(
+            request
+                .validate()
+                .expect_err("a non-memory item cannot acquire a class")
+                .field(),
+            "thinking_request.curated_context"
+        );
+
+        // A memory item that names its class is valid and the class travels on
+        // the wire, so a provider sees what kind of claim it was given.
+        request.curated_context[0].source = ThinkingContextSource::Memory;
+        request.curated_context[0].epistemic_class = Some(EpistemicClass::ViewerClaim);
+        request.validate().expect("memory with its class is valid");
+        let json = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(
+            json["curated_context"][0]["epistemic_class"],
+            serde_json::json!("viewer_claim")
+        );
+
+        // Other sources serialize without the field at all.
+        let item = ThinkingContent::from_event(&chat_event(), "hello", PrivacyClass::Pseudonymous);
+        assert!(
+            serde_json::to_value(&item)
+                .expect("serialize item")
+                .get("epistemic_class")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn thinking_text_and_curated_context_are_bounded() {
         let mut request = thinking_request();
         request.input.text = "x".repeat(MAX_THINKING_TEXT_BYTES + 1);
@@ -603,6 +729,7 @@ mod tests {
                 source_class: None,
                 trust_level: TrustLevel::SemiTrusted,
                 privacy: PrivacyClass::Private,
+                epistemic_class: Some(EpistemicClass::Observation),
                 text: format!("memory-{index}"),
             })
             .collect();
@@ -621,6 +748,7 @@ mod tests {
                 source_class: None,
                 trust_level: TrustLevel::SemiTrusted,
                 privacy: PrivacyClass::Private,
+                epistemic_class: Some(EpistemicClass::Observation),
                 text: "m".repeat(MAX_THINKING_TEXT_BYTES / 2),
             })
             .collect();

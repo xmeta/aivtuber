@@ -666,7 +666,7 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
     &value[..end]
 }
 
-fn privacy_for_source(source: SourceClass) -> PrivacyClass {
+pub(crate) fn privacy_for_source(source: SourceClass) -> PrivacyClass {
     match source {
         SourceClass::PublicChat | SourceClass::Donation | SourceClass::Speech => {
             PrivacyClass::Pseudonymous
