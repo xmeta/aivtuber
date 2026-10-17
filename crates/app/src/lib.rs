@@ -3638,6 +3638,37 @@ mod tests {
         app.remember_working_memory(&own, own_text, Some("game-x"), 0)
             .expect("own claim stored");
 
+        // An operator's private record, stored as a valid control-plane
+        // envelope: it carries no actor, but actorless is not shared, so it
+        // must not reach the provider request (#105 review).
+        let private_text = "the operator's private note";
+        let mut operator = chat_event(43);
+        operator.event_id = "evt-op".to_owned();
+        operator.source = "local-control".to_owned();
+        operator.source_class = SourceClass::Operator;
+        operator.plane = SecurityPlane::Control;
+        operator.trust_level = TrustLevel::Trusted;
+        operator.kind = aivtuber_domain::EventKind::OperatorCommand;
+        operator.actor_id = None;
+        operator.authorization = Some(aivtuber_domain::AuthorizationContext {
+            principal: "operator:test".to_owned(),
+            method: AuthorizationMethod::OperatorHotkey,
+            capabilities: BTreeSet::from([Capability::MemoryAdmin]),
+        });
+        operator.payload = BTreeMap::from([("text".to_owned(), json!(private_text))]);
+        app.remember_working_memory(&operator, private_text, Some("game-x"), 0)
+            .expect("operator memory stored");
+
+        // A public claim with no actor at all: a valid envelope, but nobody is
+        // attributable for it, so it is not this reply's context either.
+        let anonymous_text = "somebody said the boss is immune to fire";
+        let mut anonymous = chat_event(44);
+        anonymous.event_id = "evt-anon".to_owned();
+        anonymous.actor_id = None;
+        anonymous.payload = BTreeMap::from([("text".to_owned(), json!(anonymous_text))]);
+        app.remember_working_memory(&anonymous, anonymous_text, Some("game-x"), 0)
+            .expect("anonymous claim stored");
+
         let mut event = chat_event(30);
         event.payload.insert("topic".to_owned(), json!("game-x"));
         let raw = serde_json::to_vec(&event).expect("event json");
@@ -3688,6 +3719,22 @@ mod tests {
                 .iter()
                 .any(|item| item.text == "the boss is immune to fire"),
             "another viewer's claim is out of the reply's scope: {context:?}"
+        );
+
+        // The exact provider request: the OpenAI-compatible adapter serializes
+        // this request, so what the wire would carry is what this asserts on.
+        let wire = serde_json::to_string(request).expect("serialize thinking request");
+        assert!(
+            !wire.contains(private_text),
+            "private operator content never reaches the provider request"
+        );
+        assert!(
+            !wire.contains(anonymous_text),
+            "an unattributable public claim is not another party's context"
+        );
+        assert!(
+            wire.contains("verified_fact"),
+            "the retained class travels on the wire: {wire}"
         );
 
         // Release the capture lock before the worker runs again: the engine
