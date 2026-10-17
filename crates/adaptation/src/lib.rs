@@ -41,51 +41,7 @@ impl From<MemoryWriteDecision> for MemoryGateDecision {
     }
 }
 
-/// Epistemic class of a retained claim (#105 §3.1), derived deterministically
-/// at write time from the source class and trust level the security runtime
-/// already assigned to the source event. It describes what kind of knowledge a
-/// memory represents; it is **not** authorization and never feeds a gate, and
-/// it is never derived from claim text, retrieval rank, model output, or link
-/// structure — any of those would let public content promote itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MemoryEpistemicClass {
-    VerifiedFact,
-    ViewerClaim,
-    PerformerExperience,
-    Observation,
-    PersonaOpinion,
-}
-
-impl MemoryEpistemicClass {
-    /// Classify a write from trusted metadata only.
-    ///
-    /// `claim_is_bound` says the retained claim is the source event's *own*
-    /// claim text (its payload `text`), not an arbitrary sentence the caller
-    /// supplied next to a permit. A trusted source event proves event
-    /// provenance, not the content of a separately written claim, so
-    /// `VerifiedFact` additionally requires the binding: a trusted system
-    /// permit carrying an unrelated claim fails closed to `Observation`.
-    ///
-    /// The memory-write gate also admits a semi-trusted system write, public
-    /// chat, and authenticated operator content; all of those fail closed to a
-    /// weaker class, so the only way a claim becomes a verified fact is a
-    /// trusted runtime observation of that exact claim — never repetition,
-    /// retrieval, or linkage.
-    pub fn derive(
-        source_class: SourceClass,
-        trust_level: TrustLevel,
-        claim_is_bound: bool,
-    ) -> Self {
-        match (source_class, trust_level) {
-            (SourceClass::System, TrustLevel::Trusted) if claim_is_bound => Self::VerifiedFact,
-            (SourceClass::PublicChat | SourceClass::Donation, _) => Self::ViewerClaim,
-            (SourceClass::Speech, TrustLevel::Trusted) => Self::PerformerExperience,
-            (SourceClass::Operator, _) => Self::PersonaOpinion,
-            _ => Self::Observation,
-        }
-    }
-}
+pub use aivtuber_domain::EpistemicClass as MemoryEpistemicClass;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemorySourceMetadata {
@@ -1048,6 +1004,77 @@ impl WorkingMemory {
             .collect()
     }
 
+    /// Bounded retrieval for a generation context (#105).
+    ///
+    /// The actor scope here is deliberately not [`Self::relevant`]'s exclusive
+    /// filter: replying to one actor may draw on that actor's own retained
+    /// claims **and** on retained claims that carry no actor at all (trusted
+    /// system observations, performer experience, operator persona memory),
+    /// because those are the stream's shared knowledge rather than a private
+    /// record of someone else. Another actor's claim is never returned, whether
+    /// or not it matches the topic — cross-viewer leakage is exactly the
+    /// failure this scope prevents. When the current event carries no actor,
+    /// only actorless claims are in scope: with no one to scope to, the safe
+    /// reading is the shared set, not everything.
+    ///
+    /// Ranking is deterministic over the retained state: topic matches lead,
+    /// then logical record time (newest first) with node id breaking ties — the
+    /// same timeline `relevant` and `TemporalBefore` use — so the same retained
+    /// memory always yields the same prefix and `limit` bounds the result.
+    /// Visibility is the same time-indexed rule as `relevant`: a claim recorded
+    /// after `now_ms` or already expired at `now_ms` does not exist for the
+    /// query, so a replay can never act on its own future.
+    pub fn context_for(
+        &self,
+        source_namespace: &str,
+        actor_id: Option<&str>,
+        topic: Option<&str>,
+        limit: usize,
+        now_ms: u64,
+    ) -> Vec<&MemoryEntry> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let actor_scope =
+            actor_id.map(|actor| self.pseudonymizer.pseudonymize(source_namespace, actor));
+        let normalized_topic = topic.map(normalize);
+        let mut ranked = self
+            .entries
+            .iter()
+            .filter(|entry| entry.expires_at_ms > now_ms && entry.created_at_ms <= now_ms)
+            .filter(
+                |entry| match (&actor_scope, entry.source.pseudonymous_actor_id.as_ref()) {
+                    // The current speaker's own claims and the shared (actorless)
+                    // ones. Any other actor is out of scope.
+                    (Some(scope), Some(owner)) => owner == scope,
+                    (Some(_), None) => true,
+                    (None, Some(_)) => false,
+                    (None, None) => true,
+                },
+            )
+            .map(|entry| {
+                let topic_match = u8::from(
+                    normalized_topic.as_deref().is_some()
+                        && normalized_topic.as_deref()
+                            == entry.topic.as_deref().map(normalize).as_deref(),
+                );
+                (topic_match, entry)
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| right.1.created_at_ms.cmp(&left.1.created_at_ms))
+                .then_with(|| right.1.memory_id.cmp(&left.1.memory_id))
+        });
+        ranked
+            .into_iter()
+            .take(limit)
+            .map(|(_, entry)| entry)
+            .collect()
+    }
+
     /// One entry's bounded link view, with every edge required to have **both**
     /// endpoints live at `now_ms` and to have been recorded at or before
     /// `now_ms`: retrieval already treats an expired node as deleted, and a
@@ -1934,6 +1961,84 @@ mod tests {
         memory
             .remember_durable_superseding(&permit, claim, topic, now_ms, supersedes)
             .map(|entry| entry.memory_id)
+    }
+
+    #[test]
+    fn generation_context_scopes_to_the_speaker_and_shared_memory() {
+        // #105: a reply may use the speaker's own claims and actorless shared
+        // memory, never a third party's claim — the failure mode that would
+        // turn another viewer's sentence into this reply's "context".
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig::default());
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-shared",
+            "the boss is weak to fire",
+            Some("game-x"),
+            1_000,
+        );
+        let own = event(
+            "evt-own",
+            SourceClass::PublicChat,
+            TrustLevel::Untrusted,
+            Some("viewer:a"),
+        );
+        memory
+            .remember_working(&own, "i like fire magic", Some("game-x"), 1_000)
+            .expect("own claim");
+        let other = event(
+            "evt-other",
+            SourceClass::PublicChat,
+            TrustLevel::Untrusted,
+            Some("viewer:b"),
+        );
+        memory
+            .remember_working(&other, "i hate fire magic", Some("game-x"), 1_000)
+            .expect("other claim");
+
+        let texts = |entries: Vec<&MemoryEntry>| {
+            entries
+                .iter()
+                .map(|entry| entry.normalized_claim.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let scoped =
+            texts(memory.context_for("public-chat", Some("viewer:a"), Some("game-x"), 8, 1_001));
+        assert!(
+            scoped.contains(&"the boss is weak to fire".to_owned()),
+            "{scoped:?}"
+        );
+        assert!(
+            scoped.contains(&"i like fire magic".to_owned()),
+            "{scoped:?}"
+        );
+        assert!(
+            !scoped.contains(&"i hate fire magic".to_owned()),
+            "another actor's claim is out of scope: {scoped:?}"
+        );
+        // Equal record times break on the node id, newest first — the same
+        // insertion-order timeline `relevant` uses, so the ordering is a
+        // property of the retained state rather than of this call.
+        assert_eq!(scoped[0], "i like fire magic");
+
+        // An actorless event has no speaker to scope to: shared memory only.
+        let shared_only = texts(memory.context_for("public-chat", None, Some("game-x"), 8, 1_001));
+        assert_eq!(shared_only, vec!["the boss is weak to fire".to_owned()]);
+
+        // The caller's limit bounds the result, and nothing survives expiry.
+        assert_eq!(
+            memory
+                .context_for("public-chat", Some("viewer:a"), Some("game-x"), 1, 1_001)
+                .len(),
+            1
+        );
+        assert!(
+            memory
+                .context_for("public-chat", Some("viewer:a"), Some("game-x"), 8, u64::MAX)
+                .is_empty()
+        );
     }
 
     fn unfiltered_query(limit: usize) -> MemoryQuery<'static> {

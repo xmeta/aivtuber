@@ -42,7 +42,8 @@ use aivtuber_asset_store::CacheTier;
 use aivtuber_domain::{
     AuthenticatedControl, AuthenticatedControlCommand, AuthorizedStreamAction,
     DeadlineExhaustionReason, DeadlineStage, EngineError, EventEnvelope, FallbackReason,
-    InteractionDeadline,
+    InteractionDeadline, MAX_THINKING_CONTEXT_BYTES, MAX_THINKING_CONTEXT_ITEMS,
+    MAX_THINKING_TEXT_BYTES, ThinkingContent, ThinkingContextSource,
 };
 use aivtuber_generative::{
     CancellationStage, FallbackDirective, GeneratedTextGateDecision,
@@ -1263,6 +1264,87 @@ where
         })
     }
 
+    /// Fill a generation route's curated context with bounded retained memory
+    /// (#105).
+    ///
+    /// Only memory the write gate already admitted can appear: this reads
+    /// [`WorkingMemory`] and never writes it, so recall can neither mint a
+    /// claim, promote a class, nor buy a durable write. The scope rule lives in
+    /// [`WorkingMemory::context_for`] — the current actor's own claims plus
+    /// actorless shared memory, never another viewer's claim.
+    ///
+    /// The budget is a prefix rule, not a truncation: the current event's text
+    /// is charged first, then retained claims in rank order until the request's
+    /// total context bytes are spent. A claim that does not fit is dropped
+    /// whole, because shortening a retained claim is the semantic corruption
+    /// #231 fixed for the store — a truncated claim would reach generation as
+    /// if it were what the runtime ever admitted. Each item keeps the class it
+    /// was classified under, so generation can phrase a viewer claim as one.
+    fn attach_memory_context(
+        &mut self,
+        event: &EventEnvelope,
+        route: &mut PlaybackRoute,
+        at_ms: u64,
+    ) {
+        let PlaybackRoute::Generate(generation) = route else {
+            return;
+        };
+        let Some(adaptation) = self.adaptation.as_ref() else {
+            return;
+        };
+        // Curated context a caller already supplied (operator curation) is not
+        // displaced by retrieval: the operator owns that slot.
+        if !generation.thinking.curated_context.is_empty() {
+            return;
+        }
+        let topic = event
+            .payload
+            .get("topic")
+            .and_then(serde_json::Value::as_str);
+        let entries = adaptation.memory.context_for(
+            &event.source,
+            event.actor_id.as_deref(),
+            topic,
+            MAX_THINKING_CONTEXT_ITEMS,
+            at_ms,
+        );
+        let mut used_bytes = generation.thinking.input.text.len();
+        let mut context = Vec::with_capacity(entries.len().min(MAX_THINKING_CONTEXT_ITEMS));
+        for entry in entries {
+            let text = &entry.normalized_claim;
+            if text.len() > MAX_THINKING_TEXT_BYTES {
+                // Too large for one item's text bound even on its own: skip it
+                // rather than shorten it, and let the next claim use the room.
+                continue;
+            }
+            if used_bytes.saturating_add(text.len()) > MAX_THINKING_CONTEXT_BYTES {
+                break;
+            }
+            used_bytes += text.len();
+            context.push(ThinkingContent {
+                source: ThinkingContextSource::Memory,
+                event_id: Some(entry.source.event_id.clone()),
+                // Retained entries do not store an event kind; the class and
+                // source class are what generation is meant to phrase with.
+                event_kind: None,
+                source_class: Some(entry.source.source_class),
+                trust_level: entry.source.trust_level,
+                privacy: routing::privacy_for_source(entry.source.source_class),
+                epistemic_class: Some(entry.epistemic_class),
+                text: text.clone(),
+            });
+        }
+        if context.is_empty() {
+            return;
+        }
+        generation.thinking.curated_context = context;
+        if generation.thinking.validate().is_err() {
+            // Fail closed to "no memory context" rather than failing the event:
+            // retrieval enriches a reply and is never a precondition for one.
+            generation.thinking.curated_context = Vec::new();
+        }
+    }
+
     fn handle_event(
         &mut self,
         mut event: EventEnvelope,
@@ -1285,7 +1367,7 @@ where
         // #164: `route_with_budget` only *stages* the shadow job. If the active
         // route fails, the stage is dropped below so no denial and no charge
         // can leak into the next, unrelated event.
-        let route = match self.router.route_with_budget(&event, Some(route_budget)) {
+        let mut route = match self.router.route_with_budget(&event, Some(route_budget)) {
             Ok(route) => route,
             Err(error) => {
                 self.router.discard_shadow_submission();
@@ -1300,6 +1382,11 @@ where
         // The staged shadow job is now real: the #69 governor decides whether it
         // is queued. A refusal can never fail an active event.
         self.commit_shadow_budget(at_ms);
+        // #105: a generated reply may draw on bounded retained memory that the
+        // write gate already admitted. The composition root does this because
+        // it owns both the memory store and the routed request; the planner
+        // keeps producing a memory-free request.
+        self.attach_memory_context(&event, &mut route, at_ms);
         let routing_latency_us = elapsed_us(route_started);
         let decision = self.router.decision_record().cloned();
         let template_fallback = self
@@ -3377,6 +3464,36 @@ mod tests {
         )
     }
 
+    #[derive(Clone, Default)]
+    struct CapturingThinking {
+        requests: Arc<std::sync::Mutex<Vec<aivtuber_domain::ThinkingRequest>>>,
+    }
+
+    impl aivtuber_domain::ThinkingEngine for CapturingThinking {
+        fn generate<'a>(
+            &'a self,
+            request: &'a aivtuber_domain::ThinkingRequest,
+        ) -> aivtuber_domain::EngineFuture<'a, aivtuber_domain::GeneratedReply> {
+            self.requests
+                .lock()
+                .expect("captured requests")
+                .push(request.clone());
+            Box::pin(async {
+                Ok(aivtuber_domain::GeneratedReply {
+                    text: "ok".to_owned(),
+                })
+            })
+        }
+
+        fn identity(&self) -> aivtuber_domain::BackendIdentity {
+            aivtuber_domain::BackendIdentity {
+                name: "capturing-thinking".to_owned(),
+                model_alias: Some("capture".to_owned()),
+                model_version: Some("1".to_owned()),
+            }
+        }
+    }
+
     fn adaptation_runtime(policy: PromotionPolicy) -> AdaptationRuntime {
         AdaptationRuntime::new(
             WorkingMemory::new(
@@ -3461,6 +3578,224 @@ mod tests {
             250,
         )
         .with_generation(generative_runtime(thinking, tts))
+    }
+
+    /// #105: the thinking request carries retained memory and its class, and
+    /// nothing from another viewer.
+    #[test]
+    fn generated_reply_carries_retained_memory_with_its_epistemic_class() {
+        let thinking = CapturingThinking::default();
+        let requests = Arc::clone(&thinking.requests);
+        let mut app = generation_app(
+            FixedGenerateRoute {
+                reply_context: ReflexContext::default(),
+                fallback_variant_group: None,
+            },
+            thinking,
+            MockTts::default(),
+            SecretRedactor::default(),
+            None,
+            RecordingAudio::default(),
+            RecordingAvatar::default(),
+        )
+        .with_adaptation(adaptation_runtime(PromotionPolicy::default()));
+        app.startup().expect("startup");
+
+        // A trusted system observation of the game state, claimed in the
+        // event's own words, is the only way to a verified fact.
+        let fact_text = "the boss is weak to fire";
+        let mut fact = chat_event(40);
+        fact.event_id = "evt-fact".to_owned();
+        fact.source = "runtime:game".to_owned();
+        fact.source_class = SourceClass::System;
+        fact.trust_level = TrustLevel::Trusted;
+        fact.kind = aivtuber_domain::EventKind::SystemHealth;
+        fact.plane = SecurityPlane::System;
+        fact.actor_id = None;
+        fact.payload = BTreeMap::from([
+            ("text".to_owned(), json!(fact_text)),
+            ("topic".to_owned(), json!("game-x")),
+        ]);
+        let authority = memory_admin_authority();
+        app.remember_durable_memory(&fact, Some(&authority), fact_text, Some("game-x"), 0)
+            .expect("verified fact admitted");
+
+        // Another viewer's claim on the same topic must never reach this reply.
+        let mut other = chat_event(41);
+        other.event_id = "evt-other".to_owned();
+        other.actor_id = Some("viewer:other".to_owned());
+        other.payload = BTreeMap::from([("text".to_owned(), json!("the boss is immune to fire"))]);
+        app.remember_working_memory(&other, "the boss is immune to fire", Some("game-x"), 0)
+            .expect("other viewer claim stored");
+
+        // The current viewer's own claim is in scope. Retention normalizes
+        // whitespace and case, so the retained form is what reaches the
+        // request.
+        let own_text = "i think the boss is weak to fire";
+        let mut own = chat_event(42);
+        own.event_id = "evt-own".to_owned();
+        own.payload = BTreeMap::from([("text".to_owned(), json!(own_text))]);
+        app.remember_working_memory(&own, own_text, Some("game-x"), 0)
+            .expect("own claim stored");
+
+        let mut event = chat_event(30);
+        event.payload.insert("topic".to_owned(), json!("game-x"));
+        let raw = serde_json::to_vec(&event).expect("event json");
+        app.process_content_bytes(&raw, 0, 30)
+            .expect("generation submission");
+        wait_for_generation_completion(&mut app, 0);
+
+        let captured = requests.lock().expect("captured requests");
+        let request = captured.last().expect("thinking request");
+        request
+            .validate()
+            .expect("the enriched request stays valid");
+        let context = &request.curated_context;
+        assert_eq!(
+            context.len(),
+            2,
+            "the verified fact and the speaker's own claim, never the other viewer's: {context:?}"
+        );
+        assert!(
+            context
+                .iter()
+                .all(|item| item.source == ThinkingContextSource::Memory),
+            "retained memory is labelled as memory: {context:?}"
+        );
+        let fact = context
+            .iter()
+            .find(|item| item.text == fact_text)
+            .expect("the verified fact is in context");
+        assert_eq!(
+            fact.epistemic_class,
+            Some(aivtuber_domain::EpistemicClass::VerifiedFact),
+            "a trusted bound observation keeps its class instead of becoming a bare sentence"
+        );
+        assert_eq!(fact.privacy, PrivacyClass::Public);
+        assert_eq!(fact.trust_level, TrustLevel::Trusted);
+        let own = context
+            .iter()
+            .find(|item| item.text == own_text)
+            .expect("the speaker's own claim is in context");
+        assert_eq!(
+            own.epistemic_class,
+            Some(aivtuber_domain::EpistemicClass::ViewerClaim),
+            "a viewer claim is carried as a claim, not as fact"
+        );
+        assert_eq!(own.privacy, PrivacyClass::Pseudonymous);
+        assert!(
+            !context
+                .iter()
+                .any(|item| item.text == "the boss is immune to fire"),
+            "another viewer's claim is out of the reply's scope: {context:?}"
+        );
+
+        // Release the capture lock before the worker runs again: the engine
+        // takes it on the generation thread.
+        drop(captured);
+
+        // Replay: the same retained state produces the same request context.
+        let mut event = chat_event(30);
+        event.payload.insert("topic".to_owned(), json!("game-x"));
+        let raw = serde_json::to_vec(&event).expect("event json");
+        app.process_content_bytes(&raw, 0, 30)
+            .expect("second generation submission");
+        wait_for_generation_completion(&mut app, 0);
+        let replay = requests.lock().expect("captured requests");
+        assert_eq!(
+            replay[replay.len() - 1].curated_context,
+            replay[replay.len() - 2].curated_context,
+            "bounded retrieval over an unchanged retained state is deterministic"
+        );
+    }
+
+    /// #105: the context budget drops a claim whole; it never shortens one.
+    #[test]
+    fn oversized_memory_drops_whole_instead_of_truncating() {
+        let thinking = CapturingThinking::default();
+        let requests = Arc::clone(&thinking.requests);
+        let memory = WorkingMemory::new(
+            WorkingMemoryConfig {
+                max_entries: 8,
+                working_ttl_ms: 1_000,
+                durable_ttl_ms: 60_000,
+                max_claim_bytes: 4_096,
+                max_topic_bytes: 64,
+                ..WorkingMemoryConfig::default()
+            },
+            ActorPseudonymizer::new("test-v1", [0x42; 32]).expect("test pseudonymizer"),
+        )
+        .expect("working memory");
+        let adaptation = AdaptationRuntime::new(
+            memory,
+            AdaptationEngine::new(PromotionPolicy::default(), "test-adaptation-v1", 42)
+                .expect("adaptation engine"),
+        );
+        let mut app = generation_app(
+            FixedGenerateRoute {
+                reply_context: ReflexContext::default(),
+                fallback_variant_group: None,
+            },
+            thinking,
+            MockTts::default(),
+            SecretRedactor::default(),
+            None,
+            RecordingAudio::default(),
+            RecordingAvatar::default(),
+        )
+        .with_adaptation(adaptation);
+        app.startup().expect("startup");
+
+        // Three claims that individually fit the request's per-item text bound
+        // but not its total context budget: the prefix rule keeps the newest
+        // two whole and leaves the oldest out entirely.
+        let claims = (0..3)
+            .map(|index| format!("{index}{}", "x".repeat(2_999)))
+            .collect::<Vec<_>>();
+        let authority = memory_admin_authority();
+        for (index, claim) in claims.iter().enumerate() {
+            let mut fact = chat_event(50 + index as u64);
+            fact.event_id = format!("evt-big-{index}");
+            fact.source = "runtime:game".to_owned();
+            fact.source_class = SourceClass::System;
+            fact.trust_level = TrustLevel::Trusted;
+            fact.kind = aivtuber_domain::EventKind::SystemHealth;
+            fact.plane = SecurityPlane::System;
+            fact.actor_id = None;
+            fact.payload = BTreeMap::from([("text".to_owned(), json!(claim))]);
+            app.remember_durable_memory(&fact, Some(&authority), claim, Some("game-x"), 0)
+                .expect("bounded claim admitted");
+        }
+
+        let mut event = chat_event(30);
+        event.payload.insert("topic".to_owned(), json!("game-x"));
+        let raw = serde_json::to_vec(&event).expect("event json");
+        app.process_content_bytes(&raw, 0, 30)
+            .expect("generation submission");
+        wait_for_generation_completion(&mut app, 0);
+
+        let requests = requests.lock().expect("captured requests");
+        let context = &requests.last().expect("thinking request").curated_context;
+        assert_eq!(
+            context.len(),
+            2,
+            "the request budget holds two 3 KB claims, not three: {:?}",
+            context
+                .iter()
+                .map(|item| item.text.len())
+                .collect::<Vec<_>>()
+        );
+        for item in context {
+            assert!(
+                claims.iter().any(|claim| claim == &item.text),
+                "an included claim is the retained claim, never a shortened prefix (len {})",
+                item.text.len()
+            );
+        }
+        assert!(
+            !context.iter().any(|item| item.text == claims[0]),
+            "the oldest claim is the one the prefix budget leaves out"
+        );
     }
 
     fn wait_for_generation_completion<R>(app: &mut ProductionApp<R>, now_ms: u64)

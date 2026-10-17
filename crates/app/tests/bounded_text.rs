@@ -59,6 +59,7 @@ fn curated(text: String) -> ThinkingContent {
         source_class: Some(SourceClass::PublicChat),
         trust_level: TrustLevel::Untrusted,
         privacy: PrivacyClass::Pseudonymous,
+        epistemic_class: None,
         text,
     }
 }
