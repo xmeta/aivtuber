@@ -107,6 +107,8 @@ API keys are passed only through adapter configuration and use redacted debug ou
 
 The OpenAI-compatible adapter uses the Responses API shape and keeps endpoint/model selection configurable. The normalized TTS adapter likewise keeps endpoint, backend identity, model identity, voice model, and viseme mapping configurable.
 
+Both HTTP provider adapters accept HTTPS endpoints or loopback-only HTTP endpoints, validated by the parsed URL authority rather than a string prefix. The exported shared HTTP transport repeats this validation at the network boundary so direct callers cannot bypass the endpoint policy and send secrets over remote plaintext HTTP. Loopback HTTP(S) requests bypass environment-configured HTTP proxies so local inference inputs and bearer keys are never routed through a proxy; remote HTTPS providers retain their configured proxy behavior. Redirects are not followed: a remote provider cannot use a 307/308 response to forward curated input to a different host, regardless of whether bearer authorization is stripped. The shared HTTP transport bounds decoded response bodies to 1 MiB (the underlying ureq default is 10 MiB), rejecting oversized responses rather than returning partial JSON. Redirects, malformed responses, and oversized responses fail through the existing typed backend/fallback path without publishing or caching partial output.
+
 The executable composition root creates the generative runtime only when explicitly enabled:
 
 [source,text]
