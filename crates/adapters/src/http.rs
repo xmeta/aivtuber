@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt;
+use std::io::Read;
 use std::time::Duration;
 
 /// Maximum decoded JSON response payload accepted from a generation provider.
@@ -109,14 +110,18 @@ impl JsonHttpTransport for UreqJsonTransport {
             .get("content-type")
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        // ureq's default limit is 10 MiB; explicitly enforce the smaller
-        // application budget instead. Read at most cap+1 so an exactly-on-cap
-        // response is accepted and a longer one is rejected, not truncated.
-        let body = response
+        // ureq applies Body::limit() before content decompression. Also cap
+        // the outer decoded reader: a tiny gzip response must not expand
+        // into an unbounded allocation. Read cap+1 to detect overflow.
+        let reader = response
             .body_mut()
             .with_config()
             .limit(MAX_PROVIDER_RESPONSE_BYTES + 1)
-            .read_to_vec()
+            .reader();
+        let mut body = Vec::new();
+        reader
+            .take(MAX_PROVIDER_RESPONSE_BYTES + 1)
+            .read_to_end(&mut body)
             .map_err(|error| HttpTransportError::Unavailable(error.to_string()))?;
         if body.len() as u64 > MAX_PROVIDER_RESPONSE_BYTES {
             return Err(HttpTransportError::Unavailable(format!(
@@ -327,6 +332,27 @@ mod transport_limits_tests {
         let error = result.expect_err("oversized response must fail closed");
         assert!(
             error.to_string().contains("limit"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn compressed_provider_response_cannot_exceed_decoded_byte_budget() {
+        // 1,051 compressed bytes expand to 1 MiB + 1. The ureq input
+        // limiter alone cannot bound the decompressed Vec allocation.
+        let compressed = include_bytes!("../tests/fixtures/gzip-over-decoded-budget.gz");
+        assert!(compressed.len() < MAX_PROVIDER_RESPONSE_BYTES as usize);
+        let (endpoint, server) = serve_once(
+            compressed.to_vec(),
+            "200 OK",
+            "Content-Encoding: gzip\r\nContent-Type: application/json\r\n",
+        );
+        let result =
+            UreqJsonTransport::default().post_json(&endpoint, None, b"{}", Duration::from_secs(5));
+        server.join().expect("server");
+        let error = result.expect_err("decompressed response must fail closed");
+        assert!(
+            error.to_string().contains("exceeded"),
             "unexpected error: {error}"
         );
     }
