@@ -269,11 +269,13 @@ A generated reply is enriched at the composition root with bounded retained memo
 
 == 12. Measured long-range evaluation (issue #105)
 
-Section 11 is a contract; this section is its measurement. `crates/app/tests/memory_long_range_eval.rs` runs synthetic, privacy-safe versions of the issue's scenario classes — preference change, a correction that moved topic (with and without the item bound in play), goal -> attempt -> result, a contradiction that is not an update, record time inverting event time, expiry keeping the newer linked claim, another viewer's same-topic claim, budget pressure, an oversized claim, retention plateau, and an empty actor scope — and measures what reaches generation.
+Section 11 is a contract; this section is its measurement. The cases are data (`examples/memory-long-range/cases.json`, fixture schema `memory-eval-v1`), not Rust code, so the identical inputs can be handed to an external memory sidecar and both sides can emit the same report shape. They are synthetic, privacy-safe versions of the issue's scenario classes: preference change, a correction that moved topic (with and without the item bound in play), goal -> attempt -> result, a contradiction that is not an update, record time inverting event time, expiry keeping the newer linked claim, another viewer's same-topic claim, budget pressure, an oversized claim, retention plateau, and an empty actor scope.
 
-It calls `retained_memory_context`, the same function the composition root calls for every generated reply, so a number cannot describe a re-implementation. Every claim enters through the real `authorize_memory_write` gate first.
+A fixture case declares its claims, their explicit update evidence, the query, and what it expects: `must_deliver`, `must_not_deliver`, `stale` (a subset of the refused claims), `expected_temporal_errors`, and optionally the exact `expected_delivery_order`. `text_bytes` tiles a short ASCII seed to a known byte length, so a byte-budget case stays readable instead of carrying a multi-kilobyte literal. A fixture that could not be compared — unknown schema version, repeated claim id, an expectation naming a claim that does not exist, a claim both required and refused — is refused with its case named, never measured ambiguously.
 
-The report is versioned `memory-long-range-eval/v1` and byte-identical across runs, so two revisions — or a future sidecar implementation fed the same cases — can be compared rather than described.
+The runner calls `retained_memory_context`, the same function the composition root calls for every generated reply, so a number cannot describe a re-implementation. Every claim enters through the real `authorize_memory_write` gate first.
+
+The report is versioned `memory-long-range-eval/v1`, names the fixture version it measured, and is byte-identical across runs, so two revisions — or a sidecar adapter that emits this shape — can be compared rather than described. A violation is reported with its evidence and makes the CLI exit non-zero; it never stops the remaining cases, so one breach does not hide the rest.
 
 [cols="2,3"]
 |===
@@ -310,5 +312,9 @@ Measured against `main` at `579d9527` (the #236 merge), 13 cases:
 * causal kinds (`caused_by`, `resulted_in`) are not measured, because the link vocabulary does not contain them yet (section 10). There is nothing to count until an evidence source establishes one.
 
 The measured comparison against an external sidecar (Hindsight first, then Graphiti) on these same cases remains open on #105: it needs those services plus a provider key, neither of which a deterministic CI run has.
+Run it two ways:
 
-Run it with `cargo test -p aivtuber-app --test memory_long_range_eval -- --nocapture`; the JSON report is printed to stderr.
+* `cargo test -p aivtuber-app --test memory_long_range_eval -- --nocapture` prints the report and asserts every case measures cleanly;
+* `cargo run -p aivtuber-app --bin memory-long-range-eval -- examples/memory-long-range/cases.json target/memory-report.json` writes the report artifact and exits non-zero on any violation, which is what a comparison run (runtime vs. sidecar adapter) should consume.
+
+A sidecar comparison is meaningful only if both sides accept the same fixture and emit the same report fields. The aggregate shown above is the runtime's baseline: a sidecar has to beat it on `temporal_order_errors` or `current_fact_correctness` — and not regress `stale_memory_use`, `absent_violations`, `truncated_claims`, or the bounds — before adopting it buys anything this issue asks for.

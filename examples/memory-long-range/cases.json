@@ -1,0 +1,555 @@
+{
+  "schema_version": "memory-eval-v1",
+  "cases": [
+    {
+      "id": "preference_update",
+      "claims": [
+        {
+          "event_id": "evt-dislike",
+          "actor": "viewer-1",
+          "text": "viewer disliked game x",
+          "topic": "game-x",
+          "recorded_at_ms": 1000
+        },
+        {
+          "event_id": "evt-enjoy",
+          "actor": "viewer-1",
+          "text": "viewer enjoyed the game x ending",
+          "topic": "game-x",
+          "recorded_at_ms": 2000,
+          "supersedes": "evt-dislike"
+        }
+      ],
+      "query": {
+        "actor": "viewer-1",
+        "topic": "game-x",
+        "now_ms": 3000,
+        "charged_bytes": 64
+      },
+      "must_deliver": ["evt-enjoy"],
+      "must_not_deliver": ["evt-dislike"],
+      "stale": ["evt-dislike"],
+      "expected_delivery_order": ["evt-enjoy"]
+    },
+    {
+      "id": "topic_shifted_correction",
+      "claims": [
+        {
+          "event_id": "evt-dislike",
+          "actor": "viewer-1",
+          "text": "viewer disliked game x",
+          "topic": "game-x",
+          "recorded_at_ms": 1000
+        },
+        {
+          "event_id": "evt-enjoy",
+          "actor": "viewer-1",
+          "text": "viewer enjoyed the game x ending",
+          "topic": "ending-arc",
+          "recorded_at_ms": 2000,
+          "supersedes": "evt-dislike"
+        }
+      ],
+      "query": {
+        "actor": "viewer-1",
+        "topic": "game-x",
+        "now_ms": 3000,
+        "charged_bytes": 64
+      },
+      "must_deliver": ["evt-enjoy"],
+      "must_not_deliver": ["evt-dislike"],
+      "stale": ["evt-dislike"],
+      "expected_delivery_order": ["evt-enjoy"]
+    },
+    {
+      "id": "topic_shifted_correction_under_limit",
+      "claims": [
+        {
+          "event_id": "evt-old",
+          "actor": "viewer-1",
+          "text": "viewer disliked game x",
+          "topic": "game-x",
+          "recorded_at_ms": 500
+        },
+        {
+          "event_id": "evt-c1",
+          "actor": "viewer-1",
+          "text": "competing claim 1",
+          "topic": "game-x",
+          "recorded_at_ms": 1000
+        },
+        {
+          "event_id": "evt-c2",
+          "actor": "viewer-1",
+          "text": "competing claim 2",
+          "topic": "game-x",
+          "recorded_at_ms": 2000
+        },
+        {
+          "event_id": "evt-c3",
+          "actor": "viewer-1",
+          "text": "competing claim 3",
+          "topic": "game-x",
+          "recorded_at_ms": 3000
+        },
+        {
+          "event_id": "evt-c4",
+          "actor": "viewer-1",
+          "text": "competing claim 4",
+          "topic": "game-x",
+          "recorded_at_ms": 4000
+        },
+        {
+          "event_id": "evt-c5",
+          "actor": "viewer-1",
+          "text": "competing claim 5",
+          "topic": "game-x",
+          "recorded_at_ms": 5000
+        },
+        {
+          "event_id": "evt-c6",
+          "actor": "viewer-1",
+          "text": "competing claim 6",
+          "topic": "game-x",
+          "recorded_at_ms": 6000
+        },
+        {
+          "event_id": "evt-c7",
+          "actor": "viewer-1",
+          "text": "competing claim 7",
+          "topic": "game-x",
+          "recorded_at_ms": 7000
+        },
+        {
+          "event_id": "evt-c8",
+          "actor": "viewer-1",
+          "text": "competing claim 8",
+          "topic": "game-x",
+          "recorded_at_ms": 8000
+        },
+        {
+          "event_id": "evt-c9",
+          "actor": "viewer-1",
+          "text": "competing claim 9",
+          "topic": "game-x",
+          "recorded_at_ms": 9000
+        },
+        {
+          "event_id": "evt-c10",
+          "actor": "viewer-1",
+          "text": "competing claim 10",
+          "topic": "game-x",
+          "recorded_at_ms": 10000
+        },
+        {
+          "event_id": "evt-c11",
+          "actor": "viewer-1",
+          "text": "competing claim 11",
+          "topic": "game-x",
+          "recorded_at_ms": 11000
+        },
+        {
+          "event_id": "evt-c12",
+          "actor": "viewer-1",
+          "text": "competing claim 12",
+          "topic": "game-x",
+          "recorded_at_ms": 12000
+        },
+        {
+          "event_id": "evt-enjoy",
+          "actor": "viewer-1",
+          "text": "viewer enjoyed the game x ending",
+          "topic": "ending-arc",
+          "recorded_at_ms": 13000,
+          "supersedes": "evt-old"
+        }
+      ],
+      "query": {
+        "actor": "viewer-1",
+        "topic": "game-x",
+        "now_ms": 14000,
+        "charged_bytes": 64
+      },
+      "must_deliver": [
+        "evt-enjoy",
+        "evt-c12",
+        "evt-c11",
+        "evt-c10",
+        "evt-c9",
+        "evt-c8",
+        "evt-c7",
+        "evt-c6",
+        "evt-c5",
+        "evt-c4",
+        "evt-c3",
+        "evt-c2"
+      ],
+      "must_not_deliver": ["evt-old", "evt-c1"],
+      "stale": ["evt-old"],
+      "expected_delivery_order": [
+        "evt-enjoy",
+        "evt-c12",
+        "evt-c11",
+        "evt-c10",
+        "evt-c9",
+        "evt-c8",
+        "evt-c7",
+        "evt-c6",
+        "evt-c5",
+        "evt-c4",
+        "evt-c3",
+        "evt-c2"
+      ]
+    },
+    {
+      "id": "goal_attempt_result",
+      "claims": [
+        {
+          "event_id": "evt-goal",
+          "actor": "viewer-1",
+          "text": "goal: clear the raid tonight",
+          "topic": "raid-night",
+          "recorded_at_ms": 1000
+        },
+        {
+          "event_id": "evt-attempt",
+          "actor": "viewer-1",
+          "text": "attempt: pulled the second boss",
+          "topic": "raid-night",
+          "recorded_at_ms": 2000
+        },
+        {
+          "event_id": "evt-result",
+          "actor": "viewer-1",
+          "text": "result: cleared the raid",
+          "topic": "raid-night",
+          "recorded_at_ms": 3000
+        }
+      ],
+      "query": {
+        "actor": "viewer-1",
+        "topic": "raid-night",
+        "now_ms": 4000,
+        "charged_bytes": 64
+      },
+      "must_deliver": ["evt-goal", "evt-attempt", "evt-result"],
+      "expected_delivery_order": ["evt-result", "evt-attempt", "evt-goal"]
+    },
+    {
+      "id": "record_time_inverts_event_time",
+      "claims": [
+        {
+          "event_id": "evt-finished",
+          "actor": "viewer-1",
+          "text": "finished game x",
+          "topic": "game-x",
+          "recorded_at_ms": 1000,
+          "event_at_ms": 900
+        },
+        {
+          "event_id": "evt-started",
+          "actor": "viewer-1",
+          "text": "started game y",
+          "topic": "game-y",
+          "recorded_at_ms": 1500,
+          "event_at_ms": 100
+        }
+      ],
+      "query": {
+        "actor": "viewer-1",
+        "now_ms": 2000,
+        "charged_bytes": 64
+      },
+      "must_deliver": ["evt-started", "evt-finished"],
+      "expected_temporal_errors": 1,
+      "expected_delivery_order": ["evt-started", "evt-finished"]
+    },
+    {
+      "id": "contradiction_without_update",
+      "claims": [
+        {
+          "event_id": "evt-claim-a",
+          "actor": "viewer-1",
+          "text": "viewer prefers game x",
+          "topic": "game-x",
+          "recorded_at_ms": 1000
+        },
+        {
+          "event_id": "evt-claim-b",
+          "actor": "viewer-1",
+          "text": "viewer prefers another game",
+          "topic": "game-x",
+          "recorded_at_ms": 2000
+        }
+      ],
+      "query": {
+        "actor": "viewer-1",
+        "topic": "game-x",
+        "now_ms": 3000,
+        "charged_bytes": 64
+      },
+      "must_deliver": ["evt-claim-a", "evt-claim-b"]
+    },
+    {
+      "id": "other_viewer_same_topic",
+      "claims": [
+        {
+          "event_id": "evt-v1",
+          "actor": "viewer-1",
+          "text": "viewer one loved the boss fight",
+          "topic": "game-x",
+          "recorded_at_ms": 1000
+        },
+        {
+          "event_id": "evt-v2",
+          "actor": "viewer-2",
+          "text": "viewer two loved the boss fight",
+          "topic": "game-x",
+          "recorded_at_ms": 2000
+        }
+      ],
+      "query": {
+        "actor": "viewer-1",
+        "topic": "game-x",
+        "now_ms": 3000,
+        "charged_bytes": 64
+      },
+      "must_deliver": ["evt-v1"],
+      "must_not_deliver": ["evt-v2"]
+    },
+    {
+      "id": "expiry_keeps_newer_linked",
+      "config": {
+        "durable_ttl_ms": 1000
+      },
+      "claims": [
+        {
+          "event_id": "evt-old",
+          "actor": "viewer-1",
+          "text": "old opinion about game x",
+          "topic": "game-x",
+          "recorded_at_ms": 100
+        },
+        {
+          "event_id": "evt-new",
+          "actor": "viewer-1",
+          "text": "current opinion about game x",
+          "topic": "game-x",
+          "recorded_at_ms": 1000,
+          "supersedes": "evt-old"
+        }
+      ],
+      "query": {
+        "actor": "viewer-1",
+        "topic": "game-x",
+        "now_ms": 1600,
+        "charged_bytes": 64
+      },
+      "must_deliver": ["evt-new"],
+      "must_not_deliver": ["evt-old"],
+      "stale": ["evt-old"]
+    },
+    {
+      "id": "budget_pressure_drops_whole",
+      "config": {
+        "max_claim_bytes": 8192
+      },
+      "claims": [
+        {
+          "event_id": "evt-current",
+          "actor": "viewer-1",
+          "text": "current fact: the raid moved to friday",
+          "topic": "raid-night",
+          "recorded_at_ms": 3000
+        },
+        {
+          "event_id": "evt-o1",
+          "actor": "viewer-1",
+          "text": "detail one ",
+          "text_bytes": 3000,
+          "topic": "raid-night",
+          "recorded_at_ms": 2000
+        },
+        {
+          "event_id": "evt-o2",
+          "actor": "viewer-1",
+          "text": "detail two ",
+          "text_bytes": 3000,
+          "topic": "raid-night",
+          "recorded_at_ms": 1500
+        },
+        {
+          "event_id": "evt-o3",
+          "actor": "viewer-1",
+          "text": "detail three ",
+          "text_bytes": 3000,
+          "topic": "raid-night",
+          "recorded_at_ms": 1000
+        }
+      ],
+      "query": {
+        "actor": "viewer-1",
+        "topic": "raid-night",
+        "now_ms": 4000,
+        "charged_bytes": 1000
+      },
+      "must_deliver": ["evt-current", "evt-o1", "evt-o2"],
+      "must_not_deliver": ["evt-o3"],
+      "expected_delivery_order": ["evt-current", "evt-o1", "evt-o2"]
+    },
+    {
+      "id": "oversized_claim_skipped_whole",
+      "config": {
+        "max_claim_bytes": 8192
+      },
+      "claims": [
+        {
+          "event_id": "evt-huge",
+          "actor": "viewer-1",
+          "text": "huge claim ",
+          "text_bytes": 4224,
+          "topic": "raid-night",
+          "recorded_at_ms": 3000
+        },
+        {
+          "event_id": "evt-current",
+          "actor": "viewer-1",
+          "text": "current fact: the raid moved to friday",
+          "topic": "raid-night",
+          "recorded_at_ms": 2000
+        }
+      ],
+      "query": {
+        "actor": "viewer-1",
+        "topic": "raid-night",
+        "now_ms": 4000,
+        "charged_bytes": 64
+      },
+      "must_deliver": ["evt-current"],
+      "must_not_deliver": ["evt-huge"]
+    },
+    {
+      "id": "retention_plateau",
+      "config": {
+        "max_entries": 4,
+        "max_links": 6,
+        "max_links_per_memory": 4
+      },
+      "claims": [
+        {
+          "event_id": "evt-p1",
+          "actor": "viewer-1",
+          "text": "plateau claim 1",
+          "topic": "game-x",
+          "recorded_at_ms": 1000
+        },
+        {
+          "event_id": "evt-p2",
+          "actor": "viewer-1",
+          "text": "plateau claim 2",
+          "topic": "game-x",
+          "recorded_at_ms": 2000
+        },
+        {
+          "event_id": "evt-p3",
+          "actor": "viewer-1",
+          "text": "plateau claim 3",
+          "topic": "game-x",
+          "recorded_at_ms": 3000
+        },
+        {
+          "event_id": "evt-p4",
+          "actor": "viewer-1",
+          "text": "plateau claim 4",
+          "topic": "game-x",
+          "recorded_at_ms": 4000
+        },
+        {
+          "event_id": "evt-p5",
+          "actor": "viewer-1",
+          "text": "plateau claim 5",
+          "topic": "game-x",
+          "recorded_at_ms": 5000
+        },
+        {
+          "event_id": "evt-p6",
+          "actor": "viewer-1",
+          "text": "plateau claim 6",
+          "topic": "game-x",
+          "recorded_at_ms": 6000
+        },
+        {
+          "event_id": "evt-p7",
+          "actor": "viewer-1",
+          "text": "plateau claim 7",
+          "topic": "game-x",
+          "recorded_at_ms": 7000
+        },
+        {
+          "event_id": "evt-p8",
+          "actor": "viewer-1",
+          "text": "plateau claim 8",
+          "topic": "game-x",
+          "recorded_at_ms": 8000
+        }
+      ],
+      "query": {
+        "actor": "viewer-1",
+        "topic": "game-x",
+        "now_ms": 9000,
+        "charged_bytes": 64
+      },
+      "must_deliver": ["evt-p5", "evt-p6", "evt-p7", "evt-p8"],
+      "must_not_deliver": ["evt-p1", "evt-p2", "evt-p3", "evt-p4"],
+      "expected_delivery_order": ["evt-p8", "evt-p7", "evt-p6", "evt-p5"]
+    },
+    {
+      "id": "no_scoped_memory",
+      "claims": [
+        {
+          "event_id": "evt-other-viewer",
+          "actor": "viewer-2",
+          "text": "viewer two talked about game x",
+          "topic": "game-x",
+          "recorded_at_ms": 1000
+        }
+      ],
+      "query": {
+        "actor": "viewer-1",
+        "topic": "game-x",
+        "now_ms": 2000,
+        "charged_bytes": 64
+      },
+      "must_not_deliver": ["evt-other-viewer"],
+      "expected_delivery_order": []
+    },
+    {
+      "id": "topic_mismatch_ranks_lower",
+      "claims": [
+        {
+          "event_id": "evt-other-topic",
+          "actor": "viewer-1",
+          "text": "viewer talked about game y",
+          "topic": "game-y",
+          "recorded_at_ms": 2000
+        },
+        {
+          "event_id": "evt-this-topic",
+          "actor": "viewer-1",
+          "text": "viewer talked about game x",
+          "topic": "game-x",
+          "recorded_at_ms": 1000
+        }
+      ],
+      "query": {
+        "actor": "viewer-1",
+        "topic": "game-x",
+        "now_ms": 3000,
+        "charged_bytes": 64
+      },
+      "must_deliver": ["evt-this-topic", "evt-other-topic"],
+      "expected_temporal_errors": 1,
+      "expected_delivery_order": ["evt-this-topic", "evt-other-topic"]
+    }
+  ]
+}
