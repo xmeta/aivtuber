@@ -2,6 +2,7 @@
 
 mod budget;
 mod deadline;
+mod memory_compare;
 mod memory_context;
 mod memory_eval;
 mod moderation_evidence;
@@ -23,6 +24,7 @@ mod tool_execution;
 pub use aivtuber_domain::scenario::*;
 pub use budget::*;
 pub use deadline::*;
+pub use memory_compare::*;
 pub use memory_context::*;
 pub use memory_eval::*;
 pub use moderation_evidence::*;

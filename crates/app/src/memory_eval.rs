@@ -291,6 +291,10 @@ pub struct CaseReport {
     pub case: String,
     pub delivered: Vec<String>,
     pub must_deliver: Vec<String>,
+    /// The claims this case refused, carried so a comparison can re-derive
+    /// `absent_violations` from what was actually delivered instead of
+    /// trusting a candidate's own count.
+    pub refused_claims: Vec<String>,
     pub stale_claims: Vec<String>,
     pub current_fact_correctness: f64,
     pub stale_memory_use: usize,
@@ -525,6 +529,7 @@ fn run_case(
         case: case.id.clone(),
         delivered: delivered.clone(),
         must_deliver: case.must_deliver.clone(),
+        refused_claims: case.must_not_deliver.clone(),
         stale_claims: case.stale.clone(),
         current_fact_correctness,
         stale_memory_use,
