@@ -1644,7 +1644,10 @@ mod tests {
             identity("active"),
             identity("shadow"),
             None,
-            bounded_config(),
+            // This test verifies active-route equivalence and record redaction,
+            // not whether a 250 ms production deadline can be met under CI
+            // scheduling contention. Deadline behavior has separate tests.
+            gated_deadline(),
         )
         .expect("planner");
 
