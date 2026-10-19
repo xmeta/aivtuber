@@ -40,6 +40,7 @@ dependencies = [
  "tokio",
  "tungstenite",
  "ureq",
+ "url",
 ]
 
 [[package]]
