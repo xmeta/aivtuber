@@ -165,10 +165,7 @@ impl ThinkingEngine for OpenAiResponsesAdapter {
 }
 
 fn validate_config(config: &OpenAiResponsesConfig) -> Result<(), EngineError> {
-    if !(config.endpoint.starts_with("https://")
-        || config.endpoint.starts_with("http://127.0.0.1")
-        || config.endpoint.starts_with("http://localhost"))
-    {
+    if !crate::http::is_secure_provider_endpoint(&config.endpoint) {
         return Err(EngineError::new(
             EngineErrorKind::InvalidRequest,
             "OpenAI-compatible endpoint must use HTTPS or localhost HTTP",
@@ -295,6 +292,25 @@ mod tests {
             }))
             .expect("response JSON"),
             content_type: Some("application/json".to_owned()),
+        }
+    }
+
+    #[test]
+    fn remote_http_authority_must_not_pass_as_localhost() {
+        for endpoint in [
+            "http://localhost.attacker.invalid/v1/responses",
+            "http://127.0.0.1.attacker.invalid/v1/responses",
+            "http://localhost@attacker.invalid/v1/responses",
+            "http://127.0.0.1@attacker.invalid/v1/responses",
+        ] {
+            let config = OpenAiResponsesConfig {
+                endpoint: endpoint.to_owned(),
+                ..OpenAiResponsesConfig::default()
+            };
+            assert!(
+                validate_config(&config).is_err(),
+                "remote HTTP authority was allowed: {endpoint}"
+            );
         }
     }
 
