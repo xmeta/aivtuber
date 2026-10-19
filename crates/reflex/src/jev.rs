@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
+use std::io::Read;
 use std::pin::Pin;
 use std::sync::{
     Arc, Mutex,
@@ -198,19 +199,32 @@ impl HttpTransport for UreqTransport {
 
         let mut response = request.send(body).map_err(map_ureq_error)?;
         let status = response.status().as_u16();
-        let body = response
+        // The ureq body limit applies to the compressed input stream. Wrap
+        // its decoded reader in an outer cap to avoid gzip amplification.
+        let reader = response
             .body_mut()
             .with_config()
             .limit((MAX_JEV_RESPONSE_BYTES + 1) as u64)
-            .read_to_vec()
-            .map_err(|error| TransportError::Unavailable(error.to_string()))?;
-        if body.len() > MAX_JEV_RESPONSE_BYTES {
-            return Err(TransportError::Unavailable(format!(
-                "Jev HTTP response exceeded {MAX_JEV_RESPONSE_BYTES} byte limit"
-            )));
-        }
+            .reader();
+        let body = read_bounded_jev_body(reader)?;
         Ok(HttpResponse { status, body })
     }
+}
+
+fn read_bounded_jev_body(reader: impl Read) -> Result<Vec<u8>, TransportError> {
+    // Cap decoded bytes, in addition to the transport's compressed-byte cap.
+    // The extra byte distinguishes an exactly-sized response from overflow.
+    let mut body = Vec::new();
+    reader
+        .take((MAX_JEV_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut body)
+        .map_err(|error| TransportError::Unavailable(error.to_string()))?;
+    if body.len() > MAX_JEV_RESPONSE_BYTES {
+        return Err(TransportError::Unavailable(format!(
+            "Jev HTTP response exceeded {MAX_JEV_RESPONSE_BYTES} byte limit"
+        )));
+    }
+    Ok(body)
 }
 
 fn map_ureq_error(error: ureq::Error) -> TransportError {
@@ -1143,6 +1157,8 @@ mod tests {
         SecurityPlane, SourceClass, TrustLevel,
     };
     use std::collections::{BTreeMap, VecDeque};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::sync::Mutex;
 
     #[test]
@@ -1200,6 +1216,54 @@ mod tests {
         let transport = UreqTransport::default();
         assert!(transport.agent.config().https_only());
         assert_eq!(transport.agent.config().max_redirects(), 0);
+    }
+
+    #[test]
+    fn compressed_jev_http_body_is_bounded_after_gzip_decoding() {
+        // Exercise ureq's actual Content-Encoding decoder over a local test
+        // server. JevTransport's HTTPS policy stays intact: this test uses
+        // a raw ureq request strictly to exercise its response decoding.
+        let compressed = include_bytes!("../tests/fixtures/gzip-over-decoded-budget.gz");
+        assert!(compressed.len() < MAX_JEV_RESPONSE_BYTES);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listen");
+        let endpoint = format!("http://{}/test", listener.local_addr().expect("address"));
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("read timeout");
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 4096];
+                let n = stream.read(&mut chunk).expect("read request");
+                assert!(n > 0, "incomplete HTTP headers");
+                request.extend_from_slice(&chunk[..n]);
+                assert!(request.len() < 16 * 1024, "oversized test request");
+                if request.windows(4).any(|chunk| chunk == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Encoding: gzip\r\nConnection: close\r\n\r\n",
+                compressed.len()
+            );
+            stream.write_all(headers.as_bytes()).expect("headers");
+            stream.write_all(compressed).expect("gzip payload");
+        });
+        let mut response = ureq::get(&endpoint)
+            .call()
+            .expect("local gzip HTTP response");
+        let reader = response
+            .body_mut()
+            .with_config()
+            .limit((MAX_JEV_RESPONSE_BYTES + 1) as u64)
+            .reader();
+        let error = read_bounded_jev_body(reader).expect_err("decompressed payload exceeds 1 MiB");
+        server.join().expect("server");
+        assert!(
+            error.to_string().contains("exceeded"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
