@@ -285,6 +285,8 @@ Full replay records retain measured latency. Deterministic replay fingerprints n
 
 One absolute reflex deadline covers request serialization, transport attempts, retry backoff, response parsing, and normalization.
 
+* Jev HTTP endpoint configuration and the exported HTTP transport both validate the parsed URL and require a valid HTTPS host with no embedded username/password; string-prefix checks do not establish a secure destination. Direct transport callers cannot bypass this policy. Requests do not follow redirects. A 307/308 redirect could replay the bounded, curated event/context request body to a different HTTPS host, even if the HTTP library strips the bearer token. Redirect responses are treated as provider errors and cannot carry a decision into the scheduler.
+* Jev HTTP responses are limited to 1 MiB before JSON deserialization. A larger response is rejected rather than truncated; the pure response parser enforces the same limit for fuzz, replay, and mock transport callers. Oversized provider output cannot produce a decision.
 * HTTP 401/403 fails as authentication without retry.
 * HTTP 400/422 fails as invalid request without retry.
 * HTTP 429 and 529 use bounded exponential backoff only while deadline budget remains.
