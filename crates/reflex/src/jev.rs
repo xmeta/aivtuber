@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
+use std::io::Read;
 use std::pin::Pin;
 use std::sync::{
     Arc, Mutex,
@@ -19,6 +20,9 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
 const DEFAULT_MODEL: &str = "jev-latest";
+// System One responses are structured decision metadata, not media.
+// Refuse oversized provider output before JSON parsing or normalization.
+const MAX_JEV_RESPONSE_BYTES: usize = 1024 * 1024;
 
 pub struct JevApiKey(Vec<u8>);
 
@@ -75,12 +79,23 @@ impl Default for JevAdapterConfig {
     }
 }
 
+// Validate the parsed authority once, and enforce this same security policy
+// at both configuration and the exported HTTP transport boundary.
+fn is_secure_jev_endpoint(endpoint: &str) -> bool {
+    url::Url::parse(endpoint).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.has_host()
+            && url.username().is_empty()
+            && url.password().is_none()
+    })
+}
+
 impl JevAdapterConfig {
     fn validate(&self) -> Result<(), EngineError> {
-        if !self.endpoint.starts_with("https://") {
+        if !is_secure_jev_endpoint(&self.endpoint) {
             return Err(EngineError::new(
                 EngineErrorKind::InvalidRequest,
-                "Jev endpoint must use HTTPS",
+                "Jev endpoint must be a valid HTTPS URL without embedded credentials",
             ));
         }
         if self.model_alias.trim().is_empty() || self.deadline.is_zero() {
@@ -138,7 +153,13 @@ pub struct UreqTransport {
 
 impl Default for UreqTransport {
     fn default() -> Self {
-        let config = ureq::Agent::config_builder().https_only(true).build();
+        // Jev receives curated event/context data. Even over HTTPS, a 307/308
+        // redirect could replay the request body to a different host, so
+        // provider redirects must never be followed.
+        let config = ureq::Agent::config_builder()
+            .https_only(true)
+            .max_redirects(0)
+            .build();
         Self {
             agent: config.into(),
         }
@@ -158,6 +179,13 @@ impl HttpTransport for UreqTransport {
         body: &[u8],
         timeout: Duration,
     ) -> Result<HttpResponse, TransportError> {
+        // The public transport can be called without JevAdapterConfig. Check
+        // before constructing an Authorization header or doing network I/O.
+        if !is_secure_jev_endpoint(endpoint) {
+            return Err(TransportError::Unavailable(
+                "Jev endpoint must be a valid HTTPS URL without embedded credentials".to_owned(),
+            ));
+        }
         let authorization = format!("Bearer {bearer_token}");
         let request = self
             .agent
@@ -171,12 +199,32 @@ impl HttpTransport for UreqTransport {
 
         let mut response = request.send(body).map_err(map_ureq_error)?;
         let status = response.status().as_u16();
-        let body = response
+        // The ureq body limit applies to the compressed input stream. Wrap
+        // its decoded reader in an outer cap to avoid gzip amplification.
+        let reader = response
             .body_mut()
-            .read_to_vec()
-            .map_err(|error| TransportError::Unavailable(error.to_string()))?;
+            .with_config()
+            .limit((MAX_JEV_RESPONSE_BYTES + 1) as u64)
+            .reader();
+        let body = read_bounded_jev_body(reader)?;
         Ok(HttpResponse { status, body })
     }
+}
+
+fn read_bounded_jev_body(reader: impl Read) -> Result<Vec<u8>, TransportError> {
+    // Cap decoded bytes, in addition to the transport's compressed-byte cap.
+    // The extra byte distinguishes an exactly-sized response from overflow.
+    let mut body = Vec::new();
+    reader
+        .take((MAX_JEV_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut body)
+        .map_err(|error| TransportError::Unavailable(error.to_string()))?;
+    if body.len() > MAX_JEV_RESPONSE_BYTES {
+        return Err(TransportError::Unavailable(format!(
+            "Jev HTTP response exceeded {MAX_JEV_RESPONSE_BYTES} byte limit"
+        )));
+    }
+    Ok(body)
 }
 
 fn map_ureq_error(error: ureq::Error) -> TransportError {
@@ -804,6 +852,12 @@ pub struct NormalizedResponse {
 /// Returns a message rather than a typed error so the adapter can wrap it in a
 /// `JevCallFailure` with its retry/latency context unchanged.
 pub fn parse_jev_response_body(body: &[u8]) -> Result<SystemOneResponse, String> {
+    // Also constrain mock/replay/fuzz callers that bypass the HTTP transport.
+    if body.len() > MAX_JEV_RESPONSE_BYTES {
+        return Err(format!(
+            "Jev response exceeded {MAX_JEV_RESPONSE_BYTES} byte limit"
+        ));
+    }
     serde_json::from_slice(body).map_err(|error| format!("invalid Jev response JSON: {error}"))
 }
 
@@ -1103,7 +1157,127 @@ mod tests {
         SecurityPlane, SourceClass, TrustLevel,
     };
     use std::collections::{BTreeMap, VecDeque};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::sync::Mutex;
+
+    #[test]
+    fn jev_endpoint_rejects_malformed_urls_and_embedded_credentials() {
+        for endpoint in [
+            "https://",
+            "https://user:password@provider.example/v1/systemone",
+            "https://user@provider.example/v1/systemone",
+            "https://provider.example:invalid/v1/systemone",
+            "http://provider.example/v1/systemone",
+        ] {
+            let config = JevAdapterConfig {
+                endpoint: endpoint.to_owned(),
+                ..JevAdapterConfig::default()
+            };
+            assert!(
+                config.validate().is_err(),
+                "unexpectedly accepted Jev endpoint: {endpoint}"
+            );
+        }
+        assert!(JevAdapterConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn jev_transport_rejects_invalid_urls_before_sending_bearer_credentials() {
+        // A caller using the public transport directly must not bypass
+        // JevAdapterConfig validation and send a secret to a malformed URL.
+        let transport = UreqTransport::default();
+        for endpoint in [
+            "https://",
+            "http://127.0.0.1:9/v1/systemone",
+            "https://user:password@provider.invalid/v1/systemone",
+            "https://user@provider.invalid/v1/systemone",
+            "https://provider.invalid:invalid/v1/systemone",
+        ] {
+            let error = transport
+                .post_json(
+                    endpoint,
+                    "sensitive-test-key",
+                    b"{\"state\":\"private\"}",
+                    Duration::from_millis(50),
+                )
+                .expect_err("invalid endpoint must be rejected before network I/O");
+            assert!(
+                error.to_string().contains("valid HTTPS URL"),
+                "unexpected transport error for {endpoint}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn jev_provider_requests_must_not_follow_redirects() {
+        // A 307/308 could replay the curated ReflexRequest body to an
+        // arbitrary HTTPS endpoint, even though ureq strips bearer auth.
+        let transport = UreqTransport::default();
+        assert!(transport.agent.config().https_only());
+        assert_eq!(transport.agent.config().max_redirects(), 0);
+    }
+
+    #[test]
+    fn compressed_jev_http_body_is_bounded_after_gzip_decoding() {
+        // Exercise ureq's actual Content-Encoding decoder over a local test
+        // server. JevTransport's HTTPS policy stays intact: this test uses
+        // a raw ureq request strictly to exercise its response decoding.
+        let compressed = include_bytes!("../tests/fixtures/gzip-over-decoded-budget.gz");
+        assert!(compressed.len() < MAX_JEV_RESPONSE_BYTES);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listen");
+        let endpoint = format!("http://{}/test", listener.local_addr().expect("address"));
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("read timeout");
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 4096];
+                let n = stream.read(&mut chunk).expect("read request");
+                assert!(n > 0, "incomplete HTTP headers");
+                request.extend_from_slice(&chunk[..n]);
+                assert!(request.len() < 16 * 1024, "oversized test request");
+                if request.windows(4).any(|chunk| chunk == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Encoding: gzip\r\nConnection: close\r\n\r\n",
+                compressed.len()
+            );
+            stream.write_all(headers.as_bytes()).expect("headers");
+            stream.write_all(compressed).expect("gzip payload");
+        });
+        let mut response = ureq::get(&endpoint)
+            .call()
+            .expect("local gzip HTTP response");
+        let reader = response
+            .body_mut()
+            .with_config()
+            .limit((MAX_JEV_RESPONSE_BYTES + 1) as u64)
+            .reader();
+        let error = read_bounded_jev_body(reader).expect_err("decompressed payload exceeds 1 MiB");
+        server.join().expect("server");
+        assert!(
+            error.to_string().contains("exceeded"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_jev_response_before_json_parsing() {
+        let mut at_limit = success_body("asset.a");
+        at_limit.resize(MAX_JEV_RESPONSE_BYTES, b' ');
+        assert!(
+            parse_jev_response_body(&at_limit).is_ok(),
+            "a complete response at the exact byte limit is valid"
+        );
+        at_limit.push(b' ');
+        let error = parse_jev_response_body(&at_limit).expect_err("oversized Jev response");
+        assert!(error.contains("exceeded"), "unexpected error: {error}");
+    }
 
     #[derive(Debug, Clone)]
     struct RecordedRequest {
@@ -1329,6 +1503,32 @@ mod tests {
                 .evaluate_evidence(&request())
                 .expect_err("must fail fast");
             assert_eq!(failure.kind, kind);
+            assert_eq!(failure.attempts, 1);
+            assert_eq!(transport.requests().len(), 1);
+        }
+    }
+
+    #[test]
+    fn redirects_fail_closed_without_retry_or_decision() {
+        // The ureq transport returns 3xx as-is with max_redirects(0).
+        // The adapter must not treat those responses as provider decisions
+        // or retry them into a later successful response.
+        for status in [301_u16, 302, 307, 308] {
+            let transport = Arc::new(MockTransport::with_responses(vec![
+                Ok(HttpResponse {
+                    status,
+                    body: Vec::new(),
+                }),
+                Ok(HttpResponse {
+                    status: 200,
+                    body: success_body("asset.a"),
+                }),
+            ]));
+            let adapter = adapter(transport.clone());
+            let failure = adapter
+                .evaluate_evidence(&request())
+                .expect_err("redirect must fail closed");
+            assert_eq!(failure.kind, EngineErrorKind::Unavailable);
             assert_eq!(failure.attempts, 1);
             assert_eq!(transport.requests().len(), 1);
         }
