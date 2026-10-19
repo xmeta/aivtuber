@@ -265,3 +265,50 @@ A generated reply is enriched at the composition root with bounded retained memo
 * *Budget* — the current event's own text is charged first, then claims in rank order until `MAX_THINKING_CONTEXT_BYTES`; `MAX_THINKING_CONTEXT_ITEMS` and `MAX_THINKING_TEXT_BYTES` bound the list and each item. A claim that does not fit is dropped whole: shortening it would present a claim the runtime never admitted as if it had — the defect #231 fixed for the store, one layer up.
 * *Determinism and failure* — ranking is topic match first, then logical record time, with node id breaking ties, so an unchanged retained state yields an identical request context. If an enriched request still fails validation the context is cleared and the reply proceeds; retrieval enriches a reply and is never a precondition for one.
 * *Curated slot* — a caller-supplied curated context (operator curation) is not displaced by retrieval.
+* *One rule, two callers* — the scope/supersession/rank half lives in `WorkingMemory::context_for`, the byte/item half in `aivtuber_app::retained_memory_context`, and nothing else assembles memory content for a request. The composition root calls it per generated reply and the evaluation in section 12 calls the same function, so a measured result cannot come from a parallel implementation.
+
+== 12. Measured long-range evaluation (issue #105)
+
+Section 11 is a contract; this section is its measurement. `crates/app/tests/memory_long_range_eval.rs` runs synthetic, privacy-safe versions of the issue's scenario classes — preference change, a correction that moved topic (with and without the item bound in play), goal -> attempt -> result, a contradiction that is not an update, record time inverting event time, expiry keeping the newer linked claim, another viewer's same-topic claim, budget pressure, an oversized claim, retention plateau, and an empty actor scope — and measures what reaches generation.
+
+It calls `retained_memory_context`, the same function the composition root calls for every generated reply, so a number cannot describe a re-implementation. Every claim enters through the real `authorize_memory_write` gate first.
+
+The report is versioned `memory-long-range-eval/v1` and byte-identical across runs, so two revisions — or a future sidecar implementation fed the same cases — can be compared rather than described.
+
+[cols="2,3"]
+|===
+|Metric |Meaning
+
+|`current_fact_correctness`
+|share of the claims a case requires that were actually delivered
+
+|`stale_memory_use`
+|superseded claims delivered as if current; zero-tolerance, and zero
+
+|`absent_violations`
+|claims delivered that the case refuses: another viewer's, expired, or cut by the budget
+
+|`temporal_order_errors`
+|delivered pairs whose true event chronology contradicts the delivered order
+
+|`truncated_claims`
+|delivered text that differs from the retained claim; must stay zero
+
+|`context_items`, `claim_bytes`, `request_bytes`, `within_*_budget`
+|the request bounds, measured against the domain limits rather than assumed
+
+|`entries_high_water`, `links_high_water`
+|retained state against the #51 bounds, including the plateau case
+|===
+
+Measured against `main` at `579d9527` (the #236 merge), 13 cases:
+
+* current-fact correctness 1.0, stale-memory use 0, absent violations 0, truncated claims 0;
+* temporal-order errors 2. The store keeps *record* time, so a claim recalled out of event order can still be delivered ahead of a later event. This is the class a timeline-aware sidecar would have to fix: retrieval alone cannot, because the event timestamp is not retained;
+* the request bounds hold where they bind: 12 of 12 items in the limit case, 7,038 of 8,192 bytes in the budget case, and the largest retained state in the suite is 14 entries / 69 links, inside the configured bounds. The plateau case stops growing at its own 4 entries / 6 links;
+* one rule is measured instead of left implicit: topic is a *rank*, not a filter. An in-scope claim on another topic is still delivered behind the topic match, so the precision cost of the current rule is visible in the `topic_mismatch_ranks_lower` case rather than inferred;
+* causal kinds (`caused_by`, `resulted_in`) are not measured, because the link vocabulary does not contain them yet (section 10). There is nothing to count until an evidence source establishes one.
+
+The measured comparison against an external sidecar (Hindsight first, then Graphiti) on these same cases remains open on #105: it needs those services plus a provider key, neither of which a deterministic CI run has.
+
+Run it with `cargo test -p aivtuber-app --test memory_long_range_eval -- --nocapture`; the JSON report is printed to stderr.

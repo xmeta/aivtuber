@@ -2,6 +2,7 @@
 
 mod budget;
 mod deadline;
+mod memory_context;
 mod moderation_evidence;
 mod operator_control;
 mod outputs;
@@ -21,6 +22,7 @@ mod tool_execution;
 pub use aivtuber_domain::scenario::*;
 pub use budget::*;
 pub use deadline::*;
+pub use memory_context::*;
 pub use moderation_evidence::*;
 pub use operator_control::*;
 pub use outputs::*;
@@ -42,8 +44,7 @@ use aivtuber_asset_store::CacheTier;
 use aivtuber_domain::{
     AuthenticatedControl, AuthenticatedControlCommand, AuthorizedStreamAction,
     DeadlineExhaustionReason, DeadlineStage, EngineError, EventEnvelope, FallbackReason,
-    InteractionDeadline, MAX_THINKING_CONTEXT_BYTES, MAX_THINKING_CONTEXT_ITEMS,
-    MAX_THINKING_TEXT_BYTES, ThinkingContent, ThinkingContextSource,
+    InteractionDeadline,
 };
 use aivtuber_generative::{
     CancellationStage, FallbackDirective, GeneratedTextGateDecision,
@@ -1280,6 +1281,8 @@ where
     /// #231 fixed for the store — a truncated claim would reach generation as
     /// if it were what the runtime ever admitted. Each item keeps the class it
     /// was classified under, so generation can phrase a viewer claim as one.
+    /// The whole delivered-memory rule lives in [`retained_memory_context`],
+    /// which the long-range evaluation calls as well.
     fn attach_memory_context(
         &mut self,
         event: &EventEnvelope,
@@ -1301,39 +1304,14 @@ where
             .payload
             .get("topic")
             .and_then(serde_json::Value::as_str);
-        let entries = adaptation.memory.context_for(
+        let context = retained_memory_context(
+            &adaptation.memory,
             &event.source,
             event.actor_id.as_deref(),
             topic,
-            MAX_THINKING_CONTEXT_ITEMS,
             at_ms,
+            generation.thinking.input.text.len(),
         );
-        let mut used_bytes = generation.thinking.input.text.len();
-        let mut context = Vec::with_capacity(entries.len().min(MAX_THINKING_CONTEXT_ITEMS));
-        for entry in entries {
-            let text = &entry.normalized_claim;
-            if text.len() > MAX_THINKING_TEXT_BYTES {
-                // Too large for one item's text bound even on its own: skip it
-                // rather than shorten it, and let the next claim use the room.
-                continue;
-            }
-            if used_bytes.saturating_add(text.len()) > MAX_THINKING_CONTEXT_BYTES {
-                break;
-            }
-            used_bytes += text.len();
-            context.push(ThinkingContent {
-                source: ThinkingContextSource::Memory,
-                event_id: Some(entry.source.event_id.clone()),
-                // Retained entries do not store an event kind; the class and
-                // source class are what generation is meant to phrase with.
-                event_kind: None,
-                source_class: Some(entry.source.source_class),
-                trust_level: entry.source.trust_level,
-                privacy: routing::privacy_for_source(entry.source.source_class),
-                epistemic_class: Some(entry.epistemic_class),
-                text: text.clone(),
-            });
-        }
         if context.is_empty() {
             return;
         }
@@ -2844,8 +2822,8 @@ mod tests {
         AuthorizationMethod, BackendIdentity, Capability, ControlSecret, EVENT_SCHEMA_VERSION,
         EngineErrorKind, EngineFuture, GeneratedReply, LocalControlIngress, OperatorCommandInput,
         PrivacyClass, ReflexContext, RetrievalSnapshot, SecurityPlane, SourceClass, SpeechArtifact,
-        SpeechProgress, SpeechProgressSink, SpeechRequest, ThinkingEngine, TrustLevel,
-        TtsBackendIdentity, TtsEngine,
+        SpeechProgress, SpeechProgressSink, SpeechRequest, ThinkingContextSource, ThinkingEngine,
+        TrustLevel, TtsBackendIdentity, TtsEngine,
     };
     use aivtuber_generative::{PerformanceCompiler, PerformanceCompilerConfig};
     use aivtuber_reflex::{
