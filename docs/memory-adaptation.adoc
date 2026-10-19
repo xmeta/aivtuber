@@ -311,10 +311,14 @@ Measured against `main` at `579d9527` (the #236 merge), 13 cases:
 * one rule is measured instead of left implicit: topic is a *rank*, not a filter. An in-scope claim on another topic is still delivered behind the topic match, so the precision cost of the current rule is visible in the `topic_mismatch_ranks_lower` case rather than inferred;
 * causal kinds (`caused_by`, `resulted_in`) are not measured, because the link vocabulary does not contain them yet (section 10). There is nothing to count until an evidence source establishes one.
 
-The measured comparison against an external sidecar (Hindsight first, then Graphiti) on these same cases remains open on #105: it needs those services plus a provider key, neither of which a deterministic CI run has.
-Run it two ways:
+The measured comparison against an external sidecar (Hindsight first, then Graphiti) on these same cases remains open on #105: it needs those services plus a provider key, neither of which a deterministic CI run has. What is *not* open is the rule that judges such a run: it is executable, so the verdict does not depend on whoever reads the numbers.
+
+Run it three ways:
 
 * `cargo test -p aivtuber-app --test memory_long_range_eval -- --nocapture` prints the report and asserts every case measures cleanly;
-* `cargo run -p aivtuber-app --bin memory-long-range-eval -- examples/memory-long-range/cases.json target/memory-report.json` writes the report artifact and exits non-zero on any violation, which is what a comparison run (runtime vs. sidecar adapter) should consume.
+* `cargo run -p aivtuber-app --bin memory-long-range-eval -- examples/memory-long-range/cases.json target/memory-runtime.json` writes the report artifact and exits non-zero on any violation, which is what a comparison run should consume;
+* `cargo run -p aivtuber-app --bin memory-eval-compare -- target/memory-runtime.json target/memory-sidecar.json --out target/memory-verdict.json` judges a candidate report against the runtime's (`memory-eval-compare/v1`) and exits non-zero for a rejected candidate or an incomparable pair.
 
-A sidecar comparison is meaningful only if both sides accept the same fixture and emit the same report fields. The aggregate shown above is the runtime's baseline: a sidecar has to beat it on `temporal_order_errors` or `current_fact_correctness` — and not regress `stale_memory_use`, `absent_violations`, `truncated_claims`, or the bounds — before adopting it buys anything this issue asks for.
+The verdict rule is exactly the sentence this section states: `Improvement` when the candidate beats `temporal_order_errors` or `current_fact_correctness` and regresses nothing, `Rejected` when it leaks a superseded, refused, or shortened claim or breaks a request bound, `NoImprovement` otherwise — and a win never rescues a leak, because the zero-tolerance checks are decided per case, not on the average.
+
+A candidate report is never trusted on its declared totals. Each case row carries the claims it required (`must_deliver`) and the claims it refused (`refused_claims`), so correctness, `stale_memory_use`, and `absent_violations` are re-derived from the delivered list and the aggregates are re-derived from the case rows. A report whose numbers disagree with its own records — or which covers a different set of cases, names another fixture document, or carries another schema — is refused as *incomparable*: "not verifiable" must not be reported as a measurement.
