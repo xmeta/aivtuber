@@ -42,6 +42,24 @@ pub trait JsonHttpTransport: Send + Sync {
     ) -> Result<HttpResponse, HttpTransportError>;
 }
 
+/// A transport that can issue a JSON request with any HTTP method.
+///
+/// [`JsonHttpTransport`] only speaks POST, which is all a generation provider
+/// needs. A memory sidecar also reads, updates and deletes, so the method
+/// travels with the request here. The endpoint policy is the same one the
+/// POST path already applies: TLS for remote hosts, plain HTTP only for
+/// loopback, and never a redirect.
+pub trait JsonHttpRequestTransport: Send + Sync {
+    fn request_json(
+        &self,
+        method: &str,
+        endpoint: &str,
+        bearer_token: Option<&str>,
+        body: &[u8],
+        timeout: Duration,
+    ) -> Result<HttpResponse, HttpTransportError>;
+}
+
 #[derive(Clone)]
 pub struct UreqJsonTransport {
     agent: ureq::Agent,
@@ -69,6 +87,19 @@ impl JsonHttpTransport for UreqJsonTransport {
         body: &[u8],
         timeout: Duration,
     ) -> Result<HttpResponse, HttpTransportError> {
+        self.request_json("POST", endpoint, bearer_token, body, timeout)
+    }
+}
+
+impl JsonHttpRequestTransport for UreqJsonTransport {
+    fn request_json(
+        &self,
+        method: &str,
+        endpoint: &str,
+        bearer_token: Option<&str>,
+        body: &[u8],
+        timeout: Duration,
+    ) -> Result<HttpResponse, HttpTransportError> {
         // Validate at the actual network boundary as well as in adapter
         // configuration. This transport is public and may be called directly
         // by future providers with private JSON or bearer credentials.
@@ -78,11 +109,21 @@ impl JsonHttpTransport for UreqJsonTransport {
                     .to_owned(),
             ));
         }
-        let mut config = self
-            .agent
-            .post(endpoint)
-            .header("content-type", "application/json")
-            .config()
+        // `force_send_body` lets the bodyless methods share one send path: an
+        // empty body is not a body, so GET and DELETE still carry no content.
+        let config = match method {
+            "GET" => self.agent.get(endpoint).force_send_body().config(),
+            "DELETE" => self.agent.delete(endpoint).force_send_body().config(),
+            "POST" => self.agent.post(endpoint).config(),
+            "PUT" => self.agent.put(endpoint).config(),
+            "PATCH" => self.agent.patch(endpoint).config(),
+            other => {
+                return Err(HttpTransportError::Unavailable(format!(
+                    "unsupported HTTP method {other}"
+                )));
+            }
+        };
+        let mut config = config
             .timeout_global(Some(timeout))
             .http_status_as_error(false)
             // Never follow provider redirects: a 307/308 could otherwise
@@ -99,6 +140,9 @@ impl JsonHttpTransport for UreqJsonTransport {
         }
         let mut request = config.build();
 
+        if !body.is_empty() {
+            request = request.header("content-type", "application/json");
+        }
         if let Some(token) = bearer_token {
             request = request.header("authorization", &format!("Bearer {token}"));
         }

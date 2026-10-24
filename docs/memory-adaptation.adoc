@@ -311,14 +311,48 @@ Measured against `main` at `579d9527` (the #236 merge), 13 cases:
 * one rule is measured instead of left implicit: topic is a *rank*, not a filter. An in-scope claim on another topic is still delivered behind the topic match, so the precision cost of the current rule is visible in the `topic_mismatch_ranks_lower` case rather than inferred;
 * causal kinds (`caused_by`, `resulted_in`) are not measured, because the link vocabulary does not contain them yet (section 10). There is nothing to count until an evidence source establishes one.
 
-The measured comparison against an external sidecar (Hindsight first, then Graphiti) on these same cases remains open on #105: it needs those services plus a provider key, neither of which a deterministic CI run has. What is *not* open is the rule that judges such a run: it is executable, so the verdict does not depend on whoever reads the numbers.
+=== 12.1 Measuring an external memory service
 
-Run it three ways:
+The same fixture is handed to a memory service through the provider-neutral port in `aivtuber-domain` (`MemorySidecar`: open a scope, retain a claim, recall within a scope, retire a claim, close the scope). `aivtuber-adapters` implements that port for Hindsight; `memory-sidecar-eval` drives it. The boundary is split so a number can only describe the service's retrieval:
+
+* *Admission stays the project's* — every claim enters through the real `authorize_memory_write` gate before the service is told about it. A service cannot buy an admission the project would not grant.
+* *Retention policy stays the project's* — the project's entry bound, its durable TTL, and its explicit supersession evidence decide what the service may keep: the runner retires claims the store would have evicted, expired, or replaced, so the candidate is measured holding the memory the project would have kept rather than everything it was ever told. Retirement is not deletion; it is the instruction that the claim must stop being recalled, which is exactly what the runtime needs.
+* *Retrieval is the service's* — ranking, matching, and order are the thing under test, and the runner does not re-rank what the service answered.
+* *Acceptance stays the project's* — scope, liveness, and identity are re-checked against the project's own records, and the request budget is applied by `aivtuber_app::bounded_prefix`, the same rule the runtime's own context path applies. An item the project refuses never reaches generation; it is recorded in `refused_items` with the reason (`out_of_scope`, `removed`, `unknown`) as evidence of what the service widened or kept.
+
+Measured 2026-10-25 against a local Hindsight deployment on the same 13-case fixture as the baseline above:
+
+[cols="2,1,1"]
+|===
+|Metric |Runtime |Hindsight
+
+|`current_fact_correctness` |1.0 |0.968
+|`stale_memory_use` |0 |0
+|`absent_violations` |0 |3
+|`truncated_claims` |0 |1
+|`temporal_order_errors` |2 |14
+|max context items / request bytes |12 / 7,038 |12 / 7,038
+|entries high-water |14 |13
+|`refused_items` |0 |0
+|===
+
+The verdict is `rejected`, and the reasons are the cases:
+
+* `topic_shifted_correction_under_limit` — the service returned a competing claim the case refuses (`evt-c1`) and dropped `evt-enjoy`, the claim the supersession promoted. The case requires 12 claims and the item bound is 12, so which claims a ranking returns decides membership, and semantic similarity to the request's topic ranks the correction — filed under a new topic — last.
+* `budget_pressure_drops_whole` — the service answered `evt-o3` ahead of `evt-o1`. Both are 3,000 bytes, so the same 7,038-of-8,192-byte budget admits the claim the case refuses and refuses the one it requires.
+* `oversized_claim_skipped_whole` — the service returned the 4,224-byte claim the runtime drops whole (over `MAX_THINKING_TEXT_BYTES`), and answered with a shortened rendering of the text it had stored. That is the shortened-claim class: the project would present text it never admitted, so the metric is what stops the service's prose from becoming the project's record.
+
+The service got the authority boundary right: no out-of-scope claim was returned and no retired claim came back, so `refused_items` is empty and every zero-tolerance scope and removal check passed. What it fails is retrieval quality and text fidelity, which is the comparison's actual question; keeping the runtime's own store is the supported verdict, not a formality.
+
+This closes the Hindsight half of the issue's comparison. Graphiti is still unmeasured: it needs its own adapter over the same port plus a running deployment, and the rule that will judge it is already executable.
+
+Run it four ways:
 
 * `cargo test -p aivtuber-app --test memory_long_range_eval -- --nocapture` prints the report and asserts every case measures cleanly;
 * `cargo run -p aivtuber-app --bin memory-long-range-eval -- examples/memory-long-range/cases.json target/memory-runtime.json` writes the report artifact and exits non-zero on any violation, which is what a comparison run should consume;
+* `cargo run -p aivtuber-app --bin memory-sidecar-eval -- examples/memory-long-range/cases.json http://localhost:8888 target/memory-sidecar.json` measures a service (bearer token from `AIVTUBER_MEMORY_SIDECAR_TOKEN`, never from the command line) and emits the same schema;
 * `cargo run -p aivtuber-app --bin memory-eval-compare -- target/memory-runtime.json target/memory-sidecar.json --out target/memory-verdict.json` judges a candidate report against the runtime's (`memory-eval-compare/v1`) and exits non-zero for a rejected candidate or an incomparable pair.
 
-The verdict rule is exactly the sentence this section states: `Improvement` when the candidate beats `temporal_order_errors` or `current_fact_correctness` and regresses nothing, `Rejected` when it leaks a superseded, refused, or shortened claim or breaks a request bound, `NoImprovement` otherwise — and a win never rescues a leak, because the zero-tolerance checks are decided per case, not on the average.
+The verdict rule is exactly the sentence this section states: `Improvement` when the candidate beats `temporal_order_errors` or `current_fact_correctness` and regresses nothing, `Rejected` when it leaks a superseded, refused, or shortened claim, answers with an item the project has to refuse, or breaks a request bound, `NoImprovement` otherwise — and a win never rescues a leak, because the zero-tolerance checks are decided per case, not on the average. A refusal is not a delivered-memory leak (the item never reached generation), but it still rejects the candidate: a project that has to filter its memory service's answers forever is not better off for adopting it.
 
 A candidate report is never trusted on its declared totals. Each case row carries the claims it required (`must_deliver`) and the claims it refused (`refused_claims`), so correctness, `stale_memory_use`, and `absent_violations` are re-derived from the delivered list and the aggregates are re-derived from the case rows. A report whose numbers disagree with its own records — or which covers a different set of cases, names another fixture document, or carries another schema — is refused as *incomparable*: "not verifiable" must not be reported as a measurement.
