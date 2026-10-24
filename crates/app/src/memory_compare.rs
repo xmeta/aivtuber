@@ -4,10 +4,10 @@
 //! Section 12 of `docs/memory-adaptation.adoc` states the comparison rule in
 //! prose: a sidecar has to beat the runtime on `temporal_order_errors` or
 //! `current_fact_correctness` — and not regress `stale_memory_use`,
-//! `absent_violations`, `truncated_claims`, or the bounds — before adopting it
-//! buys anything. This module is that rule, in code, applied to two
-//! `memory-long-range-eval/v1` documents so the same verdict comes out on
-//! every machine.
+//! `absent_violations`, `truncated_claims`, answer with an item the project
+//! has to refuse, or break the bounds — before adopting it buys anything. This
+//! module is that rule, in code, applied to two `memory-long-range-eval/v1`
+//! documents so the same verdict comes out on every machine.
 //!
 //! A candidate report is *verified against its own records*, never trusted on
 //! its declared totals: correctness and stale-memory use are recomputed from
@@ -189,6 +189,29 @@ pub fn compare(
                 ));
             }
         }
+        // A service that answers with content the project must refuse is
+        // worse than one that answers with nothing: it shows the service
+        // widened the scope the request named or kept a claim the project
+        // retired. Refusal kept the item out of generation, so this is not a
+        // delivered-memory regression; it is still a reason not to adopt the
+        // candidate, because the project would be filtering for it forever.
+        if !candidate_case.refused_items.is_empty() {
+            reasons.push(format!(
+                "case {:?}: candidate answered with {} item(s) the project refused: {}",
+                runtime_case.case,
+                candidate_case.refused_items.len(),
+                candidate_case
+                    .refused_items
+                    .iter()
+                    .map(|item| format!(
+                        "{:?} {}",
+                        item.reason,
+                        item.claim_id.as_deref().unwrap_or("<unnamed>")
+                    ))
+                    .collect::<Vec<String>>()
+                    .join(", ")
+            ));
+        }
         if !candidate_case.within_item_budget {
             reasons.push(format!(
                 "case {:?}: candidate item bound violated",
@@ -240,6 +263,12 @@ pub fn compare(
             "max_request_bytes",
             runtime_totals.max_request_bytes as f64,
             candidate_totals.max_request_bytes as f64,
+            true,
+        ),
+        scalar_delta(
+            "refused_items",
+            runtime_totals.refused_items as f64,
+            candidate_totals.refused_items as f64,
             true,
         ),
     ] {
@@ -444,6 +473,14 @@ fn validate_totals(
                 .map(|case| case.temporal_order_errors)
                 .sum::<usize>() as f64
                 - totals.temporal_order_errors as f64,
+        ),
+        (
+            "refused_items",
+            cases
+                .iter()
+                .map(|case| case.refused_items.len())
+                .sum::<usize>() as f64
+                - totals.refused_items as f64,
         ),
         (
             "truncated_claims",

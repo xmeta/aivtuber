@@ -48,20 +48,51 @@ pub fn retained_memory_context(
         MAX_THINKING_CONTEXT_ITEMS,
         now_ms,
     );
+    let content = entries.into_iter().map(memory_content).collect();
+    bounded_context(content, charged_bytes)
+}
+
+/// The request budget, applied to whatever retained content a request carries.
+///
+/// This is the only place the item and byte bounds are enforced, so the
+/// runtime's own delivery and a sidecar's answer are cut by the same rule: a
+/// claim larger than one item's own bound is skipped whole, and the budget is
+/// a prefix rule, never a truncation.
+pub fn bounded_context(
+    content: Vec<ThinkingContent>,
+    charged_bytes: usize,
+) -> Vec<ThinkingContent> {
+    bounded_prefix(content, charged_bytes, |item| item.text.as_str())
+}
+
+/// The request budget, applied to items of any shape.
+///
+/// [`bounded_context`] is the runtime's use of this rule; the long-range
+/// evaluation applies it to what a memory sidecar answered, so a candidate's
+/// delivery is cut by the same item and byte bounds the runtime obeys instead
+/// of by a second implementation of them.
+pub fn bounded_prefix<T>(
+    content: Vec<T>,
+    charged_bytes: usize,
+    text: impl Fn(&T) -> &str,
+) -> Vec<T> {
     let mut used_bytes = charged_bytes;
-    let mut context = Vec::with_capacity(entries.len().min(MAX_THINKING_CONTEXT_ITEMS));
-    for entry in entries {
-        let text = &entry.normalized_claim;
-        if text.len() > MAX_THINKING_TEXT_BYTES {
-            continue;
-        }
-        if used_bytes.saturating_add(text.len()) > MAX_THINKING_CONTEXT_BYTES {
+    let mut bounded = Vec::with_capacity(content.len().min(MAX_THINKING_CONTEXT_ITEMS));
+    for item in content {
+        if bounded.len() >= MAX_THINKING_CONTEXT_ITEMS {
             break;
         }
-        used_bytes += text.len();
-        context.push(memory_content(entry));
+        let len = text(&item).len();
+        if len > MAX_THINKING_TEXT_BYTES {
+            continue;
+        }
+        if used_bytes.saturating_add(len) > MAX_THINKING_CONTEXT_BYTES {
+            break;
+        }
+        used_bytes += len;
+        bounded.push(item);
     }
-    context
+    bounded
 }
 
 /// One retained entry as request content.
