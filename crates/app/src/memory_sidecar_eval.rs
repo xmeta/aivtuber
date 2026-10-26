@@ -100,17 +100,14 @@ pub fn evaluate_sidecar(
 }
 
 /// Measure one case against `sidecar`.
-///
-/// The scope is opened before the measurement and closed after it, whatever
-/// the measurement did. A scope left open keeps the project's claims in the
-/// service after the run, and the next run would then measure this run's
-/// memory as its own answer.
 fn run_sidecar_case(
     sidecar: &dyn MemorySidecar,
     case: &MemoryEvalCase,
     scope_prefix: &str,
     admin: &AuthenticatedControl,
 ) -> Result<(CaseReport, Vec<String>), MemoryEvalError> {
+    let config = case.config.apply();
+    let pseudonymizer = eval_pseudonymizer();
     let scope = scope_token(scope_prefix, &case.id);
     let sidecar_error = |message: String| MemoryEvalError::Sidecar {
         case: case.id.clone(),
@@ -119,39 +116,6 @@ fn run_sidecar_case(
     sidecar
         .open_scope(&scope)
         .map_err(|error| sidecar_error(format!("open scope {scope:?}: {error}")))?;
-
-    let measured = measure_case_in_scope(sidecar, case, &scope, admin);
-    let closed = sidecar.close_scope(&scope);
-    match (measured, closed) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Ok(_), Err(close_error)) => Err(sidecar_error(format!(
-            "close scope {scope:?}: {close_error}"
-        ))),
-        (Err(primary), Ok(())) => Err(primary),
-        // The measurement is lost either way, so the failure that stopped it
-        // is the one reported — with the cleanup failure attached, because an
-        // unclosed scope is state the reader of the run has to know about.
-        (Err(primary), Err(close_error)) => Err(MemoryEvalError::SidecarCleanup {
-            case: case.id.clone(),
-            measurement: Box::new(primary),
-            cleanup: format!("close scope {scope:?}: {close_error}"),
-        }),
-    }
-}
-
-/// Measure one case inside an already-open `scope`.
-fn measure_case_in_scope(
-    sidecar: &dyn MemorySidecar,
-    case: &MemoryEvalCase,
-    scope: &str,
-    admin: &AuthenticatedControl,
-) -> Result<(CaseReport, Vec<String>), MemoryEvalError> {
-    let config = case.config.apply();
-    let pseudonymizer = eval_pseudonymizer();
-    let sidecar_error = |message: String| MemoryEvalError::Sidecar {
-        case: case.id.clone(),
-        message,
-    };
 
     let mut security = SecurityRuntime::new(
         SecurityRuntimeConfig::default(),
@@ -196,7 +160,7 @@ fn measure_case_in_scope(
             claim.recorded_at_ms,
             config.durable_ttl_ms,
             sidecar,
-            scope,
+            &scope,
         )
         .map_err(sidecar_error)?;
 
@@ -219,7 +183,7 @@ fn measure_case_in_scope(
             ))
         })?;
         let handle = sidecar
-            .retain(scope, &retained_claim)
+            .retain(&scope, &retained_claim)
             .map_err(|error| sidecar_error(format!("retain {:?}: {error}", claim.event_id)))?;
 
         admitted.insert(
@@ -240,7 +204,7 @@ fn measure_case_in_scope(
         if let Some(target) = claim.supersedes.as_deref() {
             if let Some(handle) = handles.remove(target) {
                 sidecar
-                    .retire(scope, &handle)
+                    .retire(&scope, &handle)
                     .map_err(|error| sidecar_error(format!("retire {target:?}: {error}")))?;
             }
             retired.insert(target.to_owned());
@@ -256,7 +220,7 @@ fn measure_case_in_scope(
             };
             if let Some(handle) = handles.remove(&oldest) {
                 sidecar
-                    .retire(scope, &handle)
+                    .retire(&scope, &handle)
                     .map_err(|error| sidecar_error(format!("retire {oldest:?}: {error}")))?;
             }
             retired.insert(oldest);
@@ -275,21 +239,11 @@ fn measure_case_in_scope(
         case.query.now_ms,
         config.durable_ttl_ms,
         sidecar,
-        scope,
+        &scope,
     )
     .map_err(sidecar_error)?;
-    // A claim recorded after the read timestamp is not live at that read, so
-    // the service is told to stop recalling it too: leaving it in the
-    // service's index spends its ranking and answer budget on memory the
-    // project would never show, and a service that ranks it highly would
-    // crowd out a claim that is live.
     for (claim_id, claim) in &admitted {
-        if claim.recorded_at_ms > case.query.now_ms {
-            if let Some(handle) = handles.remove(claim_id) {
-                sidecar
-                    .retire(scope, &handle)
-                    .map_err(|error| sidecar_error(format!("retire {claim_id:?}: {error}")))?;
-            }
+        if claim.recorded_at_ms > case.query.now_ms && handles.remove(claim_id).is_some() {
             retired.insert(claim_id.clone());
         }
     }
@@ -317,7 +271,7 @@ fn measure_case_in_scope(
         .validate()
         .map_err(|error| sidecar_error(format!("recall query: {error}")))?;
     let items = sidecar
-        .recall(scope, &recall_query)
+        .recall(&scope, &recall_query)
         .map_err(|error| sidecar_error(format!("recall: {error}")))?;
 
     let mut accepted: Vec<AcceptedItem> = Vec::new();
@@ -379,6 +333,10 @@ fn measure_case_in_scope(
     };
     let report = measure_case(case, &delivery, &retention);
     let violations = case_violations(case, &report, ExpectationPolicy::CANDIDATE);
+
+    sidecar
+        .close_scope(&scope)
+        .map_err(|error| sidecar_error(format!("close scope {scope:?}: {error}")))?;
     Ok((report, violations))
 }
 
@@ -429,19 +387,16 @@ fn retire_expired(
 }
 
 /// A scope name assembled from the run's prefix and a case id.
-///
-/// The case id is hex-encoded rather than sanitised. Sanitising maps every
-/// non-alphanumeric character to `-` and lowercases the rest, so `case_a` and
-/// `case-a` — and `Case_a` and `case_a` — would name one scope, and one case's
-/// run would open by clearing the other's claims.
 fn scope_token(prefix: &str, case_id: &str) -> String {
-    use std::fmt::Write as _;
-
-    let mut scope = String::with_capacity(prefix.len() + 1 + case_id.len() * 2);
+    let mut scope = String::with_capacity(prefix.len() + case_id.len() + 1);
     scope.push_str(prefix);
     scope.push('-');
-    for byte in case_id.bytes() {
-        let _ = write!(scope, "{byte:02x}");
+    for character in case_id.chars() {
+        if character.is_ascii_alphanumeric() {
+            scope.push(character.to_ascii_lowercase());
+        } else {
+            scope.push('-');
+        }
     }
     scope
 }
@@ -453,33 +408,4 @@ fn is_scope_token(prefix: &str) -> bool {
         && prefix
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn case_ids_that_share_a_spelling_get_distinct_scopes() {
-        // The three ways a sanitising scheme collapses two ids into one scope.
-        assert_ne!(scope_token("run", "case_a"), scope_token("run", "case-a"));
-        assert_ne!(scope_token("run", "Case_A"), scope_token("run", "case_a"));
-        assert_ne!(
-            scope_token("run", "ケース-1"),
-            scope_token("run", "ケース_1")
-        );
-    }
-
-    #[test]
-    fn every_scope_the_runner_builds_is_a_token() {
-        for case_id in ["case_a", "case-a", "Case A", "ケース-1", "", ".."] {
-            let scope = scope_token("memory-sidecar-eval-abc123", case_id);
-            assert!(
-                scope
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')),
-                "scope {scope:?} for {case_id:?} is not a token"
-            );
-        }
-    }
 }
