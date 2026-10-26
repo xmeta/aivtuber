@@ -216,6 +216,34 @@ fn update_len_prefixed(mac: &mut Hmac<Sha256>, value: &[u8]) {
     mac.update(value);
 }
 
+/// Whether claims of this source class may be handed to generation as shared
+/// context, independent of who is asking.
+///
+/// The rule lives here, not in the caller, because more than one retrieval
+/// path has to apply it: the store's own [`WorkingMemory::context_for`], and
+/// the long-range evaluation, which applies the same rule to what an
+/// external memory service answers (#105). A second copy of the rule would be
+/// a second contract.
+///
+/// * `System`, `Game`, `Stream`, and `Timer` observations and the
+///   performer's own `Speech` are the stream's knowledge, attributable to the
+///   runtime rather than to a person;
+/// * `PublicChat` and `Donation` are somebody's words, so they are in scope
+///   only for that same actor;
+/// * `Operator` is the operator's private record. A privacy *label* is not an
+///   egress authorization, so it never enters generation; a deliberate
+///   declassification policy would have to authorize it first.
+pub fn source_class_is_shared(source_class: SourceClass) -> bool {
+    match source_class {
+        SourceClass::System
+        | SourceClass::Speech
+        | SourceClass::Game
+        | SourceClass::Stream
+        | SourceClass::Timer => true,
+        SourceClass::PublicChat | SourceClass::Donation | SourceClass::Operator => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkingMemoryConfig {
     pub max_entries: usize,
@@ -1022,14 +1050,7 @@ impl WorkingMemory {
     ///   an egress authorization, so it never enters generation; a deliberate
     ///   declassification policy would have to authorize it first.
     fn generation_shared(entry: &MemoryEntry) -> bool {
-        match entry.source.source_class {
-            SourceClass::System
-            | SourceClass::Speech
-            | SourceClass::Game
-            | SourceClass::Stream
-            | SourceClass::Timer => true,
-            SourceClass::PublicChat | SourceClass::Donation | SourceClass::Operator => false,
-        }
+        source_class_is_shared(entry.source.source_class)
     }
 
     /// Bounded retrieval for a generation context (#105).

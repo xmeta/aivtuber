@@ -10,6 +10,7 @@ mod event;
 mod interfaces;
 mod reflex;
 pub mod scenario;
+mod sidecar;
 mod task;
 
 pub use context::{
@@ -46,6 +47,10 @@ pub use reflex::{
     ResponseRoute, RouteDecision,
 };
 pub use scenario::*;
+pub use sidecar::{
+    MAX_SIDECAR_CLAIM_BYTES, MAX_SIDECAR_QUERY_BYTES, MAX_SIDECAR_RECALL_ITEMS, MemorySidecar,
+    SidecarClaim, SidecarHandle, SidecarRecallItem, SidecarRecallQuery,
+};
 pub use task::{
     AgentTask, MAX_TASK_ID_BYTES, MAX_TASK_LIFETIME_MS_HARD, MAX_TASK_OBSERVATIONS_HARD,
     MAX_TASK_PENDING_TTL_MS_HARD, MAX_TASK_REASON_BYTES, MAX_TASK_REPLANS_HARD,
