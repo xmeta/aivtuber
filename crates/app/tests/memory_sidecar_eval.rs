@@ -47,36 +47,79 @@ struct Stored {
     retired: bool,
 }
 
+/// A call the fake service fails, so a test can state what the runner does
+/// when the service stops answering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Break {
+    /// Every call answers.
+    Nothing,
+    /// The recall fails; the scope still closes.
+    Recall,
+    /// The recall fails and so does the close: the run ends with both.
+    RecallAndClose,
+}
+
 /// A memory service with no ranking of its own: it keeps what it is told and
 /// answers with everything it still has, so the tests can state exactly what
 /// the project accepted.
 struct FakeSidecar {
     answer: Answer,
+    /// A call this deployment fails.
+    breaks: Break,
     /// A claim id the service invents, which the project never admitted.
     unknown: Option<String>,
     scopes: Mutex<BTreeMap<String, Vec<(String, Stored)>>>,
+    /// Scopes the runner opened, in order: the names are the runner's own.
+    opened: Mutex<Vec<String>>,
+    /// Scopes the runner closed, in order.
+    closed: Mutex<Vec<String>>,
+    /// Claims the runner told the service to stop recalling.
+    retired: Mutex<Vec<String>>,
 }
 
 impl FakeSidecar {
     fn new(answer: Answer) -> Self {
+        Self::with_breaks(answer, Break::Nothing)
+    }
+
+    fn with_breaks(answer: Answer, breaks: Break) -> Self {
         Self {
             answer,
+            breaks,
             unknown: None,
             scopes: Mutex::new(BTreeMap::new()),
+            opened: Mutex::new(Vec::new()),
+            closed: Mutex::new(Vec::new()),
+            retired: Mutex::new(Vec::new()),
         }
     }
 
     fn with_unknown(answer: Answer, claim_id: &str) -> Self {
         Self {
-            answer,
             unknown: Some(claim_id.to_owned()),
-            scopes: Mutex::new(BTreeMap::new()),
+            ..Self::new(answer)
         }
+    }
+
+    fn opened(&self) -> Vec<String> {
+        self.opened.lock().expect("fake sidecar lock").clone()
+    }
+
+    fn closed(&self) -> Vec<String> {
+        self.closed.lock().expect("fake sidecar lock").clone()
+    }
+
+    fn retired(&self) -> Vec<String> {
+        self.retired.lock().expect("fake sidecar lock").clone()
     }
 }
 
 impl MemorySidecar for FakeSidecar {
     fn open_scope(&self, scope: &str) -> Result<(), EngineError> {
+        self.opened
+            .lock()
+            .expect("fake sidecar lock")
+            .push(scope.to_owned());
         self.scopes
             .lock()
             .expect("fake sidecar lock")
@@ -107,6 +150,12 @@ impl MemorySidecar for FakeSidecar {
         query: &SidecarRecallQuery,
     ) -> Result<Vec<SidecarRecallItem>, EngineError> {
         query.validate()?;
+        if self.breaks != Break::Nothing {
+            return Err(EngineError::new(
+                EngineErrorKind::Unavailable,
+                "the deployment dropped the recall",
+            ));
+        }
         let scopes = self.scopes.lock().expect("fake sidecar lock");
         let items = scopes.get(scope).ok_or_else(|| {
             EngineError::new(EngineErrorKind::Backend, "recalled from a closed scope")
@@ -149,6 +198,10 @@ impl MemorySidecar for FakeSidecar {
     }
 
     fn retire(&self, scope: &str, handle: &SidecarHandle) -> Result<(), EngineError> {
+        self.retired
+            .lock()
+            .expect("fake sidecar lock")
+            .push(handle.as_str().to_owned());
         let mut scopes = self.scopes.lock().expect("fake sidecar lock");
         let items = scopes.get_mut(scope).ok_or_else(|| {
             EngineError::new(EngineErrorKind::Backend, "retired in a closed scope")
@@ -162,6 +215,16 @@ impl MemorySidecar for FakeSidecar {
     }
 
     fn close_scope(&self, scope: &str) -> Result<(), EngineError> {
+        self.closed
+            .lock()
+            .expect("fake sidecar lock")
+            .push(scope.to_owned());
+        if self.breaks == Break::RecallAndClose {
+            return Err(EngineError::new(
+                EngineErrorKind::Unavailable,
+                "the deployment dropped the close",
+            ));
+        }
         self.scopes.lock().expect("fake sidecar lock").remove(scope);
         Ok(())
     }
@@ -508,6 +571,160 @@ fn an_expired_claim_the_service_keeps_is_refused() {
             claim_id: Some("evt-old".to_owned()),
             reason: RefusalReason::Removed,
         }]
+    );
+}
+
+/// A run that fails halfway still closes the scope it opened: an open scope
+/// keeps the project's claims in the service, and a later run would measure
+/// them as its own answer.
+#[test]
+fn a_failed_case_closes_its_scope() {
+    let fake = FakeSidecar::with_breaks(Answer::Conforming, Break::Recall);
+    let fixture = fixture(vec![case(
+        "cleanup",
+        vec![claim(
+            "evt-1",
+            Some("viewer-1"),
+            Some("game-x"),
+            1000,
+            "the claim",
+        )],
+        query(Some("game-x"), 3000, 64),
+        &["evt-1"],
+        &[],
+    )]);
+    let error =
+        evaluate_sidecar(&fake, &fixture, "test").expect_err("a dropped recall fails the run");
+    assert!(
+        format!("{error}").contains("recall"),
+        "the recall failure is reported: {error}"
+    );
+    let opened = fake.opened();
+    let closed = fake.closed();
+    assert_eq!(opened.len(), 1);
+    assert_eq!(closed, opened, "the failed run closed the scope it opened");
+}
+
+/// When the cleanup fails as well, both failures survive into the error: the
+/// cause of the stop and the state the run left behind.
+#[test]
+fn a_failed_case_reports_the_cleanup_failure_too() {
+    let fake = FakeSidecar::with_breaks(Answer::Conforming, Break::RecallAndClose);
+    let fixture = fixture(vec![case(
+        "cleanup",
+        vec![claim(
+            "evt-1",
+            Some("viewer-1"),
+            Some("game-x"),
+            1000,
+            "the claim",
+        )],
+        query(Some("game-x"), 3000, 64),
+        &["evt-1"],
+        &[],
+    )]);
+    let error = evaluate_sidecar(&fake, &fixture, "test").expect_err("both calls failed");
+    let message = format!("{error}");
+    assert!(
+        message.contains("dropped the recall"),
+        "the measurement failure is kept: {message}"
+    );
+    assert!(
+        message.contains("close scope"),
+        "the cleanup failure is kept: {message}"
+    );
+    assert_eq!(fake.closed().len(), 1, "the close was attempted");
+}
+
+/// A claim recorded after the read is not live at that read, so the service is
+/// told to stop recalling it: an index that keeps it spends its ranking and
+/// answer budget on memory the project would never show.
+#[test]
+fn a_claim_recorded_after_the_read_is_retired_from_the_service() {
+    let fake = FakeSidecar::new(Answer::Conforming);
+    let fixture = fixture(vec![case(
+        "future",
+        vec![
+            claim(
+                "evt-live",
+                Some("viewer-1"),
+                Some("game-x"),
+                1000,
+                "live claim",
+            ),
+            claim(
+                "evt-future",
+                Some("viewer-1"),
+                Some("game-x"),
+                5000,
+                "a claim from after the read",
+            ),
+        ],
+        query(Some("game-x"), 3000, 64),
+        &["evt-live"],
+        &["evt-future"],
+    )]);
+    let outcome = evaluate_sidecar(&fake, &fixture, "test").expect("the case measures");
+    assert_eq!(outcome.report.cases[0].delivered, ["evt-live"]);
+    assert!(
+        fake.retired().iter().any(|id| id == "evt-future"),
+        "the service was told to forget the future claim, got {:?}",
+        fake.retired()
+    );
+    assert!(
+        outcome.violations.is_empty(),
+        "the future claim never reached the answer:\n{}",
+        outcome.violations.join("\n")
+    );
+}
+
+/// Case ids that a sanitising scheme would collapse name different scopes, so
+/// one case's run cannot clear the other's claims.
+#[test]
+fn case_ids_with_one_spelling_measure_in_distinct_scopes() {
+    let fake = FakeSidecar::new(Answer::Conforming);
+    let fixture = fixture(vec![
+        case(
+            "case_a",
+            vec![claim(
+                "evt-a",
+                Some("viewer-1"),
+                Some("game-x"),
+                1000,
+                "claim a",
+            )],
+            query(Some("game-x"), 3000, 64),
+            &["evt-a"],
+            &[],
+        ),
+        case(
+            "case-a",
+            vec![claim(
+                "evt-b",
+                Some("viewer-1"),
+                Some("game-x"),
+                1000,
+                "claim b",
+            )],
+            query(Some("game-x"), 3000, 64),
+            &["evt-b"],
+            &[],
+        ),
+    ]);
+    let outcome = evaluate_sidecar(&fake, &fixture, "test").expect("both cases measure");
+    let opened = fake.opened();
+    assert_eq!(opened.len(), 2);
+    assert_ne!(
+        opened[0], opened[1],
+        "two case ids must not name one scope: {opened:?}"
+    );
+    assert_eq!(fake.closed(), opened, "each scope was closed");
+    assert_eq!(outcome.report.cases[0].delivered, ["evt-a"]);
+    assert_eq!(outcome.report.cases[1].delivered, ["evt-b"]);
+    assert!(
+        outcome.violations.is_empty(),
+        "{}",
+        outcome.violations.join("\n")
     );
 }
 

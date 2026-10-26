@@ -77,6 +77,17 @@ pub enum MemoryEvalError {
         case: String,
         message: String,
     },
+    /// A measurement failure, followed by a failure to finish the run.
+    ///
+    /// Both are kept: the measurement error says why the run stopped, and the
+    /// cleanup error says what the run may have left behind on the service. A
+    /// report that named only one of them would hide either the cause or the
+    /// state.
+    SidecarCleanup {
+        case: String,
+        measurement: Box<MemoryEvalError>,
+        cleanup: String,
+    },
 }
 
 impl fmt::Display for MemoryEvalError {
@@ -93,11 +104,26 @@ impl fmt::Display for MemoryEvalError {
             Self::Sidecar { case, message } => {
                 write!(formatter, "case {case}: memory sidecar failed: {message}")
             }
+            Self::SidecarCleanup {
+                case,
+                measurement,
+                cleanup,
+            } => write!(
+                formatter,
+                "case {case}: {measurement}; the run could not be cleaned up: {cleanup}"
+            ),
         }
     }
 }
 
-impl Error for MemoryEvalError {}
+impl Error for MemoryEvalError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::SidecarCleanup { measurement, .. } => Some(measurement.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 /// A case document: many synthetic long-range memory cases.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

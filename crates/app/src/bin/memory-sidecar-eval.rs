@@ -31,11 +31,25 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::process::{self, ExitCode};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Namespace the run's service scopes are opened under. It is part of the
-/// scope name, so two runs against one deployment cannot share claims.
+/// Fixed part of the namespace the run's service scopes are opened under.
 const SCOPE_PREFIX: &str = "memory-sidecar-eval";
+
+/// The namespace this run's service scopes are opened under.
+///
+/// A fixed prefix would be shared by every run, and since opening a scope
+/// clears it first, two runs against one deployment would each clear and then
+/// measure the other's claims. The process id and start time make the run's
+/// namespace its own.
+fn run_scope_prefix() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    format!("{SCOPE_PREFIX}-{}-{nanos:x}", process::id())
+}
 
 fn main() -> ExitCode {
     match run() {
@@ -67,7 +81,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     config.validate()?;
     let sidecar = HindsightSidecar::new(config);
 
-    let outcome = evaluate_sidecar(&sidecar, &fixture, SCOPE_PREFIX)?;
+    let outcome = evaluate_sidecar(&sidecar, &fixture, &run_scope_prefix())?;
     let report = serde_json::to_string_pretty(&outcome.report)?;
     println!("{report}");
     if let Some(path) = arguments.get(2) {
