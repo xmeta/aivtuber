@@ -170,6 +170,23 @@ impl HindsightSidecar {
 
     /// Issue one JSON request and return the parsed answer.
     fn send(&self, method: &str, url: &str, body: Option<&Value>) -> Result<Value, EngineError> {
+        self.send_allowing(method, url, body, &[])
+    }
+
+    /// Issue one JSON request, treating the listed statuses as an answer
+    /// rather than a failure.
+    ///
+    /// Only a status the caller names is tolerated, and it is tolerated as
+    /// "nothing to report": every other failure still stops the caller, so a
+    /// request the project depends on is never continued past an unknown
+    /// outcome.
+    fn send_allowing(
+        &self,
+        method: &str,
+        url: &str,
+        body: Option<&Value>,
+        allowed: &[u16],
+    ) -> Result<Value, EngineError> {
         let payload = body
             .map(|value| {
                 serde_json::to_vec(value).map_err(|error| {
@@ -194,6 +211,9 @@ impl HindsightSidecar {
             )
             .map_err(transport_error)?;
         if !(200..300).contains(&response.status) {
+            if allowed.contains(&response.status) {
+                return Ok(Value::Null);
+            }
             // The body of a failure may echo the request, and the request
             // holds the claim, so the error carries the status alone.
             return Err(EngineError::new(
@@ -237,9 +257,13 @@ impl MemorySidecar for HindsightSidecar {
     fn open_scope(&self, scope: &str) -> Result<(), EngineError> {
         self.config.validate()?;
         let url = self.scope_url(scope, &[])?;
-        // A scope that does not exist yet is not an error here: the goal is
-        // an empty scope, and it is about to be created.
-        let _ = self.send("DELETE", &url, None);
+        // A scope that does not exist yet answers 404 to the clear, and that
+        // is the only failure the open can continue past: the goal is an
+        // empty scope, and it is about to be created. A 403, a 500, or a
+        // timeout means the scope may still hold an earlier run's claims, so
+        // the open stops rather than measuring that run's memory as this
+        // run's answer.
+        self.send_allowing("DELETE", &url, None, &[404])?;
         self.send("PUT", &url, Some(&json!({ "name": scope })))?;
         Ok(())
     }
@@ -335,7 +359,10 @@ impl MemorySidecar for HindsightSidecar {
                     "hindsight recall answered without a results array",
                 )
             })?;
-        Ok(results.iter().map(item_from_result).collect())
+        Ok(narrow_to_scope(
+            results.iter().map(item_from_result).collect(),
+            query,
+        ))
     }
 
     /// Retire a retained claim so it stops being recalled.
@@ -432,6 +459,35 @@ fn item_from_result(value: &Value) -> SidecarRecallItem {
         topic,
         event_at_ms,
     }
+}
+
+/// Narrow the service's answer to what the query asked for.
+///
+/// The tag filter the adapter sends is a hint to the service, not a guarantee:
+/// a match of `any` also answers unscoped claims, and a service that ignores
+/// the filter answers everything. The port says a recall is restricted to the
+/// scope it named — `actor: None` asks for the scope that carries no actor —
+/// and that `limit` is how many items the caller will use, so both are
+/// enforced here, on what the service actually answered.
+fn narrow_to_scope(
+    items: Vec<SidecarRecallItem>,
+    query: &SidecarRecallQuery,
+) -> Vec<SidecarRecallItem> {
+    let mut answered: Vec<SidecarRecallItem> = items
+        .into_iter()
+        .filter(|item| match (&query.actor, &item.actor) {
+            // An unscoped claim is shared with every viewer: that is how the
+            // project files a claim that carries no actor.
+            (Some(_), None) => true,
+            (Some(asked), Some(seen)) => asked == seen,
+            (None, None) => true,
+            // A recall with no actor is the scope that carries no actor, not
+            // every scope the deployment happens to hold.
+            (None, Some(_)) => false,
+        })
+        .collect();
+    answered.truncate(query.limit);
+    answered
 }
 
 fn transport_error(error: HttpTransportError) -> EngineError {
@@ -764,6 +820,136 @@ mod tests {
             .retain("scope-1", &claim())
             .expect_err("a dropped claim is an error");
         assert!(error.message.contains("evt-enjoy"), "{error}");
+    }
+
+    #[test]
+    fn open_scope_stops_when_the_scope_cannot_be_cleared() {
+        for status in [403_u16, 500] {
+            let (sidecar, transport) = sidecar(vec![Ok(HttpResponse {
+                status,
+                body: Vec::new(),
+                content_type: None,
+            })]);
+            let error = sidecar
+                .open_scope("scope-1")
+                .expect_err("a scope that cannot be cleared is not opened");
+            assert_eq!(error.kind, EngineErrorKind::Unavailable, "status {status}");
+            let requests = transport.requests();
+            assert_eq!(
+                requests.len(),
+                1,
+                "status {status}: the open must stop at the clear, got {requests:?}"
+            );
+            assert_eq!(requests[0].method, "DELETE");
+        }
+    }
+
+    #[test]
+    fn open_scope_stops_when_the_clear_times_out() {
+        let (sidecar, transport) = sidecar(vec![Err(HttpTransportError::Timeout)]);
+        let error = sidecar
+            .open_scope("scope-1")
+            .expect_err("a timed out clear stops the open");
+        assert_eq!(error.kind, EngineErrorKind::Timeout);
+        assert_eq!(transport.requests().len(), 1);
+    }
+
+    #[test]
+    fn recall_applies_the_callers_item_limit() {
+        let (sidecar, _transport) = sidecar(vec![ok(json!({
+            "results": [
+                {
+                    "id": "mem-1",
+                    "text": "one",
+                    "metadata": {"claim_id": "evt-1", "actor": "actor-key"}
+                },
+                {
+                    "id": "mem-2",
+                    "text": "two",
+                    "metadata": {"claim_id": "evt-2", "actor": "actor-key"}
+                }
+            ]
+        }))]);
+        let items = sidecar
+            .recall(
+                "scope-1",
+                &SidecarRecallQuery {
+                    actor: Some("actor-key".to_owned()),
+                    query: "game x".to_owned(),
+                    limit: 1,
+                    now_ms: 3000,
+                },
+            )
+            .expect("recall");
+        assert_eq!(items.len(), 1, "the caller's limit bounds the answer");
+        assert_eq!(items[0].claim_id, "evt-1");
+    }
+
+    #[test]
+    fn recall_without_an_actor_answers_only_unscoped_claims() {
+        let (sidecar, _transport) = sidecar(vec![ok(json!({
+            "results": [
+                {
+                    "id": "mem-1",
+                    "text": "another view's claim",
+                    "metadata": {"claim_id": "evt-other", "actor": "other-key"}
+                },
+                {
+                    "id": "mem-2",
+                    "text": "a claim shared with every viewer",
+                    "metadata": {"claim_id": "evt-shared"}
+                }
+            ]
+        }))]);
+        let items = sidecar
+            .recall(
+                "scope-1",
+                &SidecarRecallQuery {
+                    actor: None,
+                    query: "game x".to_owned(),
+                    limit: 12,
+                    now_ms: 3000,
+                },
+            )
+            .expect("recall");
+        assert_eq!(items.len(), 1, "no actor asks for the scope that has none");
+        assert_eq!(items[0].claim_id, "evt-shared");
+    }
+
+    #[test]
+    fn recall_drops_another_actors_claims_but_keeps_shared_ones() {
+        let (sidecar, _transport) = sidecar(vec![ok(json!({
+            "results": [
+                {
+                    "id": "mem-1",
+                    "text": "the asked viewer's claim",
+                    "metadata": {"claim_id": "evt-own", "actor": "actor-key"}
+                },
+                {
+                    "id": "mem-2",
+                    "text": "another view's claim",
+                    "metadata": {"claim_id": "evt-other", "actor": "other-key"}
+                },
+                {
+                    "id": "mem-3",
+                    "text": "a claim shared with every viewer",
+                    "metadata": {"claim_id": "evt-shared"}
+                }
+            ]
+        }))]);
+        let items = sidecar
+            .recall(
+                "scope-1",
+                &SidecarRecallQuery {
+                    actor: Some("actor-key".to_owned()),
+                    query: "game x".to_owned(),
+                    limit: 12,
+                    now_ms: 3000,
+                },
+            )
+            .expect("recall");
+        let claim_ids: Vec<&str> = items.iter().map(|item| item.claim_id.as_str()).collect();
+        assert_eq!(claim_ids, ["evt-own", "evt-shared"]);
     }
 
     #[test]
