@@ -7,7 +7,6 @@
 //! for replay after a disconnect, and secrets use redacted debug output.
 
 mod audio;
-mod hindsight;
 mod http;
 mod mcp;
 mod obs;
@@ -17,7 +16,6 @@ mod tts_http;
 mod vts;
 
 pub use audio::*;
-pub use hindsight::*;
 pub use http::*;
 pub use mcp::*;
 pub use obs::*;

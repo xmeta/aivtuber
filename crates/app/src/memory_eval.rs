@@ -47,36 +47,13 @@ pub const MEMORY_EVAL_REPORT_SCHEMA_VERSION: &str = "memory-long-range-eval/v1";
 /// actor-pseudonymization key, so it must not vary between compared runs.
 pub const MEMORY_EVAL_SOURCE_NAMESPACE: &str = "public-chat";
 
-/// The request the synthetic events make.
-///
-/// The runtime ranks retained claims by the request's topic, so a topic is
-/// the retrieval signal. A request that carries no topic still needs a
-/// non-empty retrieval request when an external service is asked, and this is
-/// the request the synthetic event made.
-pub const MEMORY_EVAL_REQUEST_TEXT: &str = "what happened next?";
-
-/// The pseudonymization key version the evaluation runs under.
-///
-/// It is part of the actor scope a claim is filed under, so both sides of a
-/// comparison must derive the same scope key: a claim filed under one scope
-/// and looked up under another would measure nothing.
-pub const MEMORY_EVAL_PSEUDONYM_KEY_VERSION: &str = "memory-eval-v1";
-
 const ADMIN_SECRET: [u8; 32] = [0x21_u8; 32];
 
 #[derive(Debug)]
 pub enum MemoryEvalError {
     InvalidFixture(String),
-    WriteGateDenied {
-        case: String,
-        claim: String,
-    },
+    WriteGateDenied { case: String, claim: String },
     Write(String),
-    /// A memory sidecar refused or failed a call the measurement needed.
-    Sidecar {
-        case: String,
-        message: String,
-    },
 }
 
 impl fmt::Display for MemoryEvalError {
@@ -90,9 +67,6 @@ impl fmt::Display for MemoryEvalError {
                 "case {case}: claim {claim} did not pass the memory-write gate"
             ),
             Self::Write(message) => write!(formatter, "durable write failed: {message}"),
-            Self::Sidecar { case, message } => {
-                write!(formatter, "case {case}: memory sidecar failed: {message}")
-            }
         }
     }
 }
@@ -237,8 +211,7 @@ pub struct MemoryEvalConfig {
 }
 
 impl MemoryEvalConfig {
-    /// The store configuration a case's bounds describe.
-    pub fn apply(self) -> WorkingMemoryConfig {
+    fn apply(self) -> WorkingMemoryConfig {
         let defaults = WorkingMemoryConfig::default();
         WorkingMemoryConfig {
             max_entries: self.max_entries.unwrap_or(defaults.max_entries),
@@ -276,15 +249,11 @@ pub struct MemoryEvalClaim {
 }
 
 impl MemoryEvalClaim {
-    /// When the claim's content happened. The store deliberately keeps no
-    /// event time, so this is the ground truth the temporal-order metric
-    /// measures against.
-    pub fn event_at(&self) -> u64 {
+    fn event_at(&self) -> u64 {
         self.event_at_ms.unwrap_or(self.recorded_at_ms)
     }
 
-    /// The claim text, tiled to `text_bytes` when the case asks for it.
-    pub fn claim_text(&self) -> Result<String, MemoryEvalError> {
+    fn claim_text(&self) -> Result<String, MemoryEvalError> {
         let Some(bytes) = self.text_bytes else {
             return Ok(self.text.clone());
         };
@@ -317,98 +286,6 @@ pub struct MemoryEvalQuery {
     pub charged_bytes: usize,
 }
 
-/// One claim that reached generation.
-///
-/// The delivered text and the retained text are kept apart on purpose: a
-/// claim that reaches generation with text other than the text the project
-/// retained is a *shortened* claim, and the comparison has to see that
-/// difference rather than trust a count.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DeliveredClaim {
-    /// The project's claim id.
-    pub claim_id: String,
-    /// The text that reached generation.
-    pub delivered_text: String,
-    /// The text the project retained for the claim.
-    pub retained_text: String,
-}
-
-/// Why the project refused an item a service answered with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RefusalReason {
-    /// The item named a claim of somebody else: the service answered outside
-    /// the scope the request asked for.
-    OutOfScope,
-    /// The item named a claim the project had already retired: the service
-    /// kept content the project removed.
-    Removed,
-    /// The item named no claim the project admitted.
-    Unknown,
-}
-
-/// One item a service answered with that the project refused.
-///
-/// The project filters what it accepts, so a refused item never reaches
-/// generation. It is still recorded: the service's answer is the evidence
-/// for whether the service kept content the project removed or widened the
-/// scope the request asked for.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RefusedItem {
-    /// The claim the item named, when it named one.
-    #[serde(default)]
-    pub claim_id: Option<String>,
-    pub reason: RefusalReason,
-}
-
-/// One case's delivery, in the shape both sides of a comparison report.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CaseDelivery {
-    /// Claims that reached generation, in delivery order.
-    pub claims: Vec<DeliveredClaim>,
-    /// Items a service answered with that the project refused.
-    pub refused: Vec<RefusedItem>,
-}
-
-/// The retention numbers a report carries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RetentionSnapshot {
-    pub entries_high_water: usize,
-    pub links_high_water: usize,
-    pub max_entries: usize,
-    pub max_links: usize,
-}
-
-/// Which fixture expectations a measurement enforces.
-///
-/// The runtime enforces every expectation: the fixture pins the runtime's own
-/// behavior, so a difference is a defect. A candidate is measured instead of
-/// pinned: a different delivery order or a different temporal-error count is
-/// the result under test, not a failure of the candidate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExpectationPolicy {
-    /// Whether the delivered order must match the case's pinned order.
-    pub enforce_delivery_order: bool,
-    /// Whether the temporal-error count must match the case's expectation.
-    pub enforce_temporal_count: bool,
-}
-
-impl ExpectationPolicy {
-    /// The runtime's own expectations: every one of them.
-    pub const RUNTIME: Self = Self {
-        enforce_delivery_order: true,
-        enforce_temporal_count: true,
-    };
-    /// A candidate's expectations: the quality metrics are the result, not a
-    /// failure of the candidate.
-    pub const CANDIDATE: Self = Self {
-        enforce_delivery_order: false,
-        enforce_temporal_count: false,
-    };
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CaseReport {
     pub case: String,
@@ -422,13 +299,6 @@ pub struct CaseReport {
     pub current_fact_correctness: f64,
     pub stale_memory_use: usize,
     pub absent_violations: usize,
-    /// Items the service answered with that the project refused: they fell
-    /// outside the requested actor scope, they named a claim the project had
-    /// already retired, or they named no claim the project admitted. A
-    /// service that widens the scope or keeps removed content shows up here;
-    /// a report written before this field existed still parses.
-    #[serde(default)]
-    pub refused_items: Vec<RefusedItem>,
     pub temporal_order_errors: usize,
     pub context_items: usize,
     pub claim_bytes: usize,
@@ -448,9 +318,6 @@ pub struct Totals {
     pub current_fact_correctness: f64,
     pub stale_memory_use: usize,
     pub absent_violations: usize,
-    /// Items a service answered with that the project refused.
-    #[serde(default)]
-    pub refused_items: usize,
     pub temporal_order_errors: usize,
     pub truncated_claims: usize,
     pub max_context_items: usize,
@@ -493,44 +360,8 @@ pub fn evaluate(fixture: &MemoryEvalFixture) -> Result<MemoryEvalOutcome, Memory
         violations.extend(case_violations);
         cases.push(report);
     }
-    Ok(MemoryEvalOutcome {
-        report: report_for(fixture, cases),
-        violations,
-    })
-}
-/// The report a set of measured cases produces.
-pub fn outcome_for(
-    fixture: &MemoryEvalFixture,
-    cases: Vec<CaseReport>,
-    violations: Vec<String>,
-) -> MemoryEvalOutcome {
-    MemoryEvalOutcome {
-        report: report_for(fixture, cases),
-        violations,
-    }
-}
-
-/// The report envelope both sides of a comparison emit.
-pub fn report_for(fixture: &MemoryEvalFixture, cases: Vec<CaseReport>) -> EvalReport {
-    EvalReport {
-        schema_version: MEMORY_EVAL_REPORT_SCHEMA_VERSION.to_owned(),
-        fixture_schema_version: fixture.schema_version.clone(),
-        context_item_budget: MAX_THINKING_CONTEXT_ITEMS,
-        context_byte_budget: MAX_THINKING_CONTEXT_BYTES,
-        item_byte_budget: MAX_THINKING_TEXT_BYTES,
-        totals: totals_for(&cases),
-        cases,
-    }
-}
-
-/// The aggregate of a report's case rows.
-///
-/// Both sides of a comparison derive their totals the same way, so a
-/// difference in the aggregate is a difference in the cases and never in the
-/// arithmetic.
-pub fn totals_for(cases: &[CaseReport]) -> Totals {
     let case_count = cases.len();
-    Totals {
+    let totals = Totals {
         cases: case_count,
         current_fact_correctness: cases
             .iter()
@@ -539,7 +370,6 @@ pub fn totals_for(cases: &[CaseReport]) -> Totals {
             / case_count as f64,
         stale_memory_use: cases.iter().map(|case| case.stale_memory_use).sum(),
         absent_violations: cases.iter().map(|case| case.absent_violations).sum(),
-        refused_items: cases.iter().map(|case| case.refused_items.len()).sum(),
         temporal_order_errors: cases.iter().map(|case| case.temporal_order_errors).sum(),
         truncated_claims: cases.iter().map(|case| case.truncated_claims).sum(),
         max_context_items: cases
@@ -563,202 +393,19 @@ pub fn totals_for(cases: &[CaseReport]) -> Totals {
             .map(|case| case.links_high_water)
             .max()
             .unwrap_or(0),
-    }
-}
-
-/// Measure one case's delivery against the case's expectations.
-///
-/// This is the one measurement both sides of a comparison run: the runtime's
-/// own delivery and a sidecar's answer are measured by the same code, so a
-/// difference in the numbers is a difference in the retrieval and never in
-/// the metric.
-pub fn measure_case(
-    case: &MemoryEvalCase,
-    delivery: &CaseDelivery,
-    retention: &RetentionSnapshot,
-) -> CaseReport {
-    let event_at: BTreeMap<&str, u64> = case
-        .claims
-        .iter()
-        .map(|claim| (claim.event_id.as_str(), claim.event_at()))
-        .collect();
-    let delivered: Vec<String> = delivery
-        .claims
-        .iter()
-        .map(|claim| claim.claim_id.clone())
-        .collect();
-    let truncated_claims = delivery
-        .claims
-        .iter()
-        .filter(|claim| claim.delivered_text != claim.retained_text)
-        .count();
-    let current_hits = case
-        .must_deliver
-        .iter()
-        .filter(|required| delivered.contains(required))
-        .count();
-    let current_fact_correctness = if case.must_deliver.is_empty() {
-        1.0
-    } else {
-        current_hits as f64 / case.must_deliver.len() as f64
     };
-    let stale_memory_use = delivered
-        .iter()
-        .filter(|id| case.stale.contains(id))
-        .count();
-    let absent_violations = delivered
-        .iter()
-        .filter(|id| case.must_not_deliver.contains(id))
-        .count();
-    let temporal_order_errors = delivered
-        .windows(2)
-        .filter(|pair| event_at[pair[1].as_str()] > event_at[pair[0].as_str()])
-        .count();
-
-    let claim_bytes: usize = delivery
-        .claims
-        .iter()
-        .map(|claim| claim.delivered_text.len())
-        .sum();
-    let request_bytes = case.query.charged_bytes.saturating_add(claim_bytes);
-    CaseReport {
-        case: case.id.clone(),
-        delivered,
-        must_deliver: case.must_deliver.clone(),
-        refused_claims: case.must_not_deliver.clone(),
-        stale_claims: case.stale.clone(),
-        current_fact_correctness,
-        stale_memory_use,
-        absent_violations,
-        refused_items: delivery.refused.clone(),
-        temporal_order_errors,
-        context_items: delivery.claims.len(),
-        claim_bytes,
-        request_bytes,
-        within_item_budget: delivery.claims.len() <= MAX_THINKING_CONTEXT_ITEMS
-            && delivery
-                .claims
-                .iter()
-                .all(|claim| claim.delivered_text.len() <= MAX_THINKING_TEXT_BYTES),
-        within_byte_budget: request_bytes <= MAX_THINKING_CONTEXT_BYTES,
-        truncated_claims,
-        entries_high_water: retention.entries_high_water,
-        links_high_water: retention.links_high_water,
-        max_entries: retention.max_entries,
-        max_links: retention.max_links,
-    }
-}
-
-/// The expectations a measurement missed.
-///
-/// A violation never aborts a run: it is recorded so a breach is reported
-/// with its evidence instead of only failing the first case.
-pub fn case_violations(
-    case: &MemoryEvalCase,
-    report: &CaseReport,
-    policy: ExpectationPolicy,
-) -> Vec<String> {
-    let mut violations = Vec::new();
-    let push = |violations: &mut Vec<String>, message: String| {
-        violations.push(format!("case {}: {message}", case.id));
-    };
-    for required in &case.must_deliver {
-        if !report.delivered.contains(required) {
-            push(
-                &mut violations,
-                format!("required current claim {required:?} was not delivered"),
-            );
-        }
-    }
-    if report.stale_memory_use > 0 {
-        push(
-            &mut violations,
-            format!(
-                "{} superseded claim(s) reached generation",
-                report.stale_memory_use
-            ),
-        );
-    }
-    if report.absent_violations > 0 {
-        push(
-            &mut violations,
-            format!(
-                "{} refused claim(s) reached generation",
-                report.absent_violations
-            ),
-        );
-    }
-    if report.truncated_claims > 0 {
-        push(
-            &mut violations,
-            format!(
-                "{} shortened claim(s) reached generation",
-                report.truncated_claims
-            ),
-        );
-    }
-    if !report.within_item_budget || !report.within_byte_budget {
-        push(
-            &mut violations,
-            format!(
-                "request bounds violated: {} items, {} bytes",
-                report.context_items, report.request_bytes
-            ),
-        );
-    }
-    if !report.refused_items.is_empty() {
-        push(
-            &mut violations,
-            format!(
-                "{} item(s) the service answered with were refused by the project: {}",
-                report.refused_items.len(),
-                report
-                    .refused_items
-                    .iter()
-                    .map(|item| format!(
-                        "{:?} {}",
-                        item.reason,
-                        item.claim_id.as_deref().unwrap_or("<unnamed>")
-                    ))
-                    .collect::<Vec<String>>()
-                    .join(", ")
-            ),
-        );
-    }
-    if policy.enforce_temporal_count
-        && report.temporal_order_errors != case.expected_temporal_errors
-    {
-        push(
-            &mut violations,
-            format!(
-                "temporal_order_errors {}, expected {}",
-                report.temporal_order_errors, case.expected_temporal_errors
-            ),
-        );
-    }
-    if report.entries_high_water > report.max_entries || report.links_high_water > report.max_links
-    {
-        push(
-            &mut violations,
-            format!(
-                "retention exceeded its bounds: {} entries / {} links",
-                report.entries_high_water, report.links_high_water
-            ),
-        );
-    }
-    if policy.enforce_delivery_order
-        && !case.expected_delivery_order.is_empty()
-        && report.delivered != case.expected_delivery_order
-    {
-        push(
-            &mut violations,
-            format!(
-                "delivered order {:?}, expected {:?}",
-                report.delivered, case.expected_delivery_order
-            ),
-        );
-    }
-    violations
+    Ok(MemoryEvalOutcome {
+        report: EvalReport {
+            schema_version: MEMORY_EVAL_REPORT_SCHEMA_VERSION.to_owned(),
+            fixture_schema_version: fixture.schema_version.clone(),
+            context_item_budget: MAX_THINKING_CONTEXT_ITEMS,
+            context_byte_budget: MAX_THINKING_CONTEXT_BYTES,
+            item_byte_budget: MAX_THINKING_TEXT_BYTES,
+            totals,
+            cases,
+        },
+        violations,
+    })
 }
 
 fn run_case(
@@ -773,7 +420,9 @@ fn run_case(
     )
     .map_err(|error| MemoryEvalError::Write(error.to_string()))?;
     let config = case.config.apply();
-    let mut memory = WorkingMemory::new(config, eval_pseudonymizer())
+    let pseudonymizer =
+        ActorPseudonymizer::new("memory-eval-v1", [0x5a; 32]).expect("fixed evaluation key");
+    let mut memory = WorkingMemory::new(config, pseudonymizer)
         .map_err(|error| MemoryEvalError::Write(error.to_string()))?;
 
     for claim in &case.claims {
@@ -820,7 +469,13 @@ fn run_case(
         case.query.charged_bytes,
     );
 
-    let mut delivery = CaseDelivery::default();
+    let event_at: BTreeMap<&str, u64> = case
+        .claims
+        .iter()
+        .map(|claim| (claim.event_id.as_str(), claim.event_at()))
+        .collect();
+    let mut delivered: Vec<String> = Vec::with_capacity(context.len());
+    let mut truncated_claims = 0usize;
     for item in &context {
         let event_id = item.event_id.as_deref().ok_or_else(|| {
             MemoryEvalError::InvalidFixture(format!(
@@ -838,43 +493,134 @@ fn run_case(
                     case.id
                 ))
             })?;
-        delivery.claims.push(DeliveredClaim {
-            claim_id: claim.event_id.clone(),
-            delivered_text: item.text.clone(),
-            retained_text: stored_claim(&memory, event_id)
-                .unwrap_or_default()
-                .to_owned(),
-        });
+        if stored_claim(&memory, event_id) != Some(item.text.as_str()) {
+            truncated_claims += 1;
+        }
+        delivered.push(claim.event_id.clone());
     }
 
+    let current_hits = case
+        .must_deliver
+        .iter()
+        .filter(|required| delivered.contains(required))
+        .count();
+    let current_fact_correctness = if case.must_deliver.is_empty() {
+        1.0
+    } else {
+        current_hits as f64 / case.must_deliver.len() as f64
+    };
+    let stale_memory_use = delivered
+        .iter()
+        .filter(|id| case.stale.contains(id))
+        .count();
+    let absent_violations = delivered
+        .iter()
+        .filter(|id| case.must_not_deliver.contains(id))
+        .count();
+    let temporal_order_errors = delivered
+        .windows(2)
+        .filter(|pair| event_at[pair[1].as_str()] > event_at[pair[0].as_str()])
+        .count();
+
+    let claim_bytes: usize = context.iter().map(|item| item.text.len()).sum();
+    let request_bytes = case.query.charged_bytes.saturating_add(claim_bytes);
     let metrics = memory.retention_metrics();
-    let retention = RetentionSnapshot {
+    let report = CaseReport {
+        case: case.id.clone(),
+        delivered: delivered.clone(),
+        must_deliver: case.must_deliver.clone(),
+        refused_claims: case.must_not_deliver.clone(),
+        stale_claims: case.stale.clone(),
+        current_fact_correctness,
+        stale_memory_use,
+        absent_violations,
+        temporal_order_errors,
+        context_items: context.len(),
+        claim_bytes,
+        request_bytes,
+        within_item_budget: context.len() <= MAX_THINKING_CONTEXT_ITEMS
+            && context
+                .iter()
+                .all(|item| item.text.len() <= MAX_THINKING_TEXT_BYTES),
+        within_byte_budget: request_bytes <= MAX_THINKING_CONTEXT_BYTES,
+        truncated_claims,
         entries_high_water: metrics.entries_high_water,
         links_high_water: metrics.links_high_water,
         max_entries: config.max_entries,
         max_links: config.max_links,
     };
-    let report = measure_case(case, &delivery, &retention);
-    let violations = case_violations(case, &report, ExpectationPolicy::RUNTIME);
+
+    let mut violations = Vec::new();
+    let push = |violations: &mut Vec<String>, message: String| {
+        violations.push(format!("case {}: {message}", case.id));
+    };
+    for required in &case.must_deliver {
+        if !delivered.contains(required) {
+            push(
+                &mut violations,
+                format!("required current claim {required:?} was not delivered"),
+            );
+        }
+    }
+    if stale_memory_use > 0 {
+        push(
+            &mut violations,
+            format!("{stale_memory_use} superseded claim(s) reached generation"),
+        );
+    }
+    if absent_violations > 0 {
+        push(
+            &mut violations,
+            format!("{absent_violations} refused claim(s) reached generation"),
+        );
+    }
+    if truncated_claims > 0 {
+        push(
+            &mut violations,
+            format!("{truncated_claims} shortened claim(s) reached generation"),
+        );
+    }
+    if !report.within_item_budget || !report.within_byte_budget {
+        push(
+            &mut violations,
+            format!(
+                "request bounds violated: {} items, {request_bytes} bytes",
+                report.context_items
+            ),
+        );
+    }
+    if temporal_order_errors != case.expected_temporal_errors {
+        push(
+            &mut violations,
+            format!(
+                "temporal_order_errors {temporal_order_errors}, expected {}",
+                case.expected_temporal_errors
+            ),
+        );
+    }
+    if report.entries_high_water > report.max_entries || report.links_high_water > report.max_links
+    {
+        push(
+            &mut violations,
+            format!(
+                "retention exceeded its bounds: {} entries / {} links",
+                report.entries_high_water, report.links_high_water
+            ),
+        );
+    }
+    if !case.expected_delivery_order.is_empty() && delivered != case.expected_delivery_order {
+        push(
+            &mut violations,
+            format!(
+                "delivered order {delivered:?}, expected {:?}",
+                case.expected_delivery_order
+            ),
+        );
+    }
     Ok((report, violations))
 }
 
-/// The pseudonymizer every side of a comparison derives its scope keys with.
-///
-/// A claim filed under one scope key and looked up under another would make a
-/// comparison measure nothing, so the runtime path and the sidecar path share
-/// this one derivation.
-pub fn eval_pseudonymizer() -> ActorPseudonymizer {
-    ActorPseudonymizer::new(MEMORY_EVAL_PSEUDONYM_KEY_VERSION, [0x5a; 32])
-        .expect("fixed evaluation key")
-}
-
-/// The text the project retained for a claim.
-///
-/// The retained text is the reference a delivered claim is compared against:
-/// a claim that reaches generation with other text than this is a shortened
-/// claim, whatever the reason.
-pub fn stored_claim<'a>(memory: &'a WorkingMemory, event_id: &str) -> Option<&'a str> {
+fn stored_claim<'a>(memory: &'a WorkingMemory, event_id: &str) -> Option<&'a str> {
     memory
         .entries()
         .iter()
@@ -882,12 +628,7 @@ pub fn stored_claim<'a>(memory: &'a WorkingMemory, event_id: &str) -> Option<&'a
         .map(|entry| entry.normalized_claim.as_str())
 }
 
-/// The synthetic event a case's claim arrives as.
-///
-/// Every claim in the fixture is a public chat message, so the envelope is
-/// the same for all of them: the harness measures the runtime and the
-/// sidecar against one shape of evidence.
-pub fn event(id: &str, actor: Option<&str>) -> EventEnvelope {
+fn event(id: &str, actor: Option<&str>) -> EventEnvelope {
     EventEnvelope {
         schema_version: EVENT_SCHEMA_VERSION.to_owned(),
         event_id: id.to_owned(),
@@ -904,17 +645,12 @@ pub fn event(id: &str, actor: Option<&str>) -> EventEnvelope {
         authorization: None,
         payload: BTreeMap::from([(
             "text".to_owned(),
-            Value::String(MEMORY_EVAL_REQUEST_TEXT.to_owned()),
+            Value::String("what happened next?".to_owned()),
         )]),
     }
 }
 
-/// The operator authority the evaluation's durable writes are made under.
-///
-/// The memory-write gate mints its permit from an authenticated local
-/// ingress, and the gate only mints one for an authenticated caller, so the
-/// evaluation authenticates exactly like the runtime does.
-pub fn memory_admin() -> AuthenticatedControl {
+fn memory_admin() -> AuthenticatedControl {
     let ingress = LocalControlIngress::new(
         "memory-eval",
         "operator:test",

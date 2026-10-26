@@ -10,10 +10,10 @@
 //! Applies `docs/memory-adaptation.adoc` section 12's rule to two
 //! `memory-long-range-eval/v1` documents: a candidate wins only by beating the
 //! runtime on `temporal_order_errors` or `current_fact_correctness`, and
-//! regresses if it leaks a superseded, refused, or shortened claim, answers
-//! with an item the project has to refuse, or breaks a request bound. A report
-//! that disagrees with its own case rows, covers a different set of cases, or
-//! carries another schema is refused as incomparable rather than compared.
+//! regresses if it leaks a superseded, refused, or shortened claim or breaks a
+//! request bound. A report that disagrees with its own case rows, covers a
+//! different set of cases, or carries another schema is refused as
+//! incomparable rather than compared.
 //!
 //! Exit status is non-zero for an *incomparable* pair or for a regressed
 //! candidate — the same gate `benchmark-compare` gives the benchmark budget —
