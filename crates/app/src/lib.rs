@@ -45,7 +45,9 @@ pub use support_bundle::*;
 pub use task_plane::*;
 pub use tool_execution::*;
 
-use aivtuber_adaptation::{AdaptationEngine, AppliedAdaptation, MemoryEntry, WorkingMemory};
+use aivtuber_adaptation::{
+    AdaptationEngine, AppliedAdaptation, MemoryEntry, MemoryEvidence, WorkingMemory,
+};
 use aivtuber_asset_store::CacheTier;
 use aivtuber_domain::{
     AuthenticatedControl, AuthenticatedControlCommand, AuthorizedStreamAction,
@@ -1035,6 +1037,35 @@ where
         now_ms: u64,
         supersedes: &[&str],
     ) -> Result<MemoryEntry, AppError> {
+        self.remember_durable_memory_with_evidence(
+            event,
+            authority,
+            claim,
+            topic,
+            now_ms,
+            supersedes,
+            &[],
+        )
+    }
+
+    /// A durable write carrying both caller-owned relations (#105):
+    /// `supersedes` names the retained claims this write replaces, and
+    /// `caused_by` names the retained claims that brought it about. The
+    /// security gate decides first on the same non-serializable permit path,
+    /// and every target must resolve to exactly one live durable node before
+    /// anything is stored, so a relation can never widen the gate or outlive a
+    /// node retention removed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn remember_durable_memory_with_evidence(
+        &mut self,
+        event: &EventEnvelope,
+        authority: Option<&AuthenticatedControl>,
+        claim: &str,
+        topic: Option<&str>,
+        now_ms: u64,
+        supersedes: &[&str],
+        caused_by: &[&str],
+    ) -> Result<MemoryEntry, AppError> {
         event
             .validate()
             .map_err(|error| AppError::Adaptation(error.to_string()))?;
@@ -1049,7 +1080,16 @@ where
         })?;
         adaptation
             .memory
-            .remember_durable_superseding(&permit, claim, topic, now_ms, supersedes)
+            .remember_durable_with_evidence(
+                &permit,
+                claim,
+                topic,
+                now_ms,
+                MemoryEvidence {
+                    supersedes,
+                    caused_by,
+                },
+            )
             .cloned()
             .map_err(|error| AppError::Adaptation(error.to_string()))
     }
@@ -4077,6 +4117,103 @@ mod tests {
         let memory = app.adaptation().expect("adaptation").memory();
         assert_eq!(memory.len(), 2, "the refused write stored nothing");
         assert_eq!(memory.links().len(), 1, "the refused write minted nothing");
+    }
+
+    #[test]
+    fn causal_evidence_reaches_the_link_store_through_production_app() {
+        // A cause is caller-owned evidence, so the composition root has to
+        // expose the same path a supersession gets (#105): the permit decides
+        // first, then the target must resolve to a live retained claim, and
+        // only then is the edge minted.
+        let mut app = app(
+            FixedSilentRoute,
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        )
+        .with_adaptation(adaptation_runtime(PromotionPolicy::default()));
+        app.startup().expect("startup");
+        let authority = memory_admin_authority();
+        let cause = chat_event(50);
+        let effect = chat_event(51);
+        let cause_entry = app
+            .remember_durable_memory(
+                &cause,
+                Some(&authority),
+                "the stream crashed mid-song",
+                Some("game-x"),
+                10,
+            )
+            .expect("first durable write");
+
+        // Without the gate no causal evidence may reach the store: the write
+        // is denied, so neither the claim nor its edge exists.
+        let denied = app
+            .remember_durable_memory_with_evidence(
+                &effect,
+                None,
+                "the viewer asked to restart the song",
+                Some("game-x"),
+                20,
+                &[],
+                &["evt-50"],
+            )
+            .expect_err("public chat without authority must not declare a cause");
+        assert!(denied.to_string().contains("security gate"));
+        assert_eq!(
+            app.adaptation().expect("adaptation").memory().links().len(),
+            0,
+            "a denied write mints no link"
+        );
+
+        let effect_entry = app
+            .remember_durable_memory_with_evidence(
+                &effect,
+                Some(&authority),
+                "the viewer asked to restart the song",
+                Some("game-x"),
+                20,
+                &[],
+                &["evt-50"],
+            )
+            .expect("causal durable write");
+        assert!(
+            app.adaptation()
+                .expect("adaptation")
+                .memory()
+                .links()
+                .iter()
+                .any(|link| {
+                    link.kind == aivtuber_adaptation::MemoryLinkKind::CausedBy
+                        && link.from == effect_entry.memory_id
+                        && link.to == cause_entry.memory_id
+                }),
+            "a production causal write creates the CausedBy edge"
+        );
+
+        // An unknown cause refuses the whole write, so a caller cannot record
+        // an account of its own reasoning against evidence that never existed.
+        let third = chat_event(52);
+        let error = app
+            .remember_durable_memory_with_evidence(
+                &third,
+                Some(&authority),
+                "an unrelated claim",
+                Some("game-z"),
+                30,
+                &[],
+                &["evt-missing"],
+            )
+            .expect_err("an unknown cause refuses the write");
+        assert!(
+            error.to_string().contains("retained durable memory"),
+            "{error}"
+        );
+        assert_eq!(
+            app.adaptation().expect("adaptation").memory().len(),
+            2,
+            "the refused write stored nothing"
+        );
     }
 
     #[test]
