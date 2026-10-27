@@ -319,6 +319,82 @@ fn the_causal_row_is_recomputed_from_the_fixture_not_from_a_report() {
     );
 }
 
+/// A report names the document it measured by digest, so a fixture revision
+/// that keeps every case id is still refused (#105 review round 14).
+#[test]
+fn a_report_measured_against_another_fixture_revision_is_incomparable() {
+    let runtime = runtime_report();
+    let mut revised = published_fixture();
+    {
+        let case = revised
+            .cases
+            .iter_mut()
+            .find(|case| case.id == "causal_reason_travels_with_its_effect")
+            .expect("the causal case is published");
+        assert!(
+            case.claims[1].caused_by.is_some(),
+            "the published revision declares the pair"
+        );
+        assert_eq!(case.expected_retained_causal_spans, Some(1));
+        // One declaration and its pin change; every case id stays as it was,
+        // and the revision is still a document a run could measure.
+        case.claims[1].caused_by = None;
+        case.expected_retained_causal_spans = None;
+    }
+    revised.validate().expect("the revision is measurable");
+    assert_ne!(
+        aivtuber_app::fixture_digest(&revised),
+        runtime.fixture_digest,
+        "a changed declaration is a different document"
+    );
+
+    let error = compare(&revised, &runtime, &runtime).expect_err("a stale report is refused");
+    assert!(
+        error.to_string().contains("fixture_digest"),
+        "the refusal names the document identity: {error}"
+    );
+}
+
+/// The runtime report carries the fixture's digest and its own rows carry the
+/// fixture's expectations, which is what the comparison re-checks.
+#[test]
+fn a_report_carries_the_fixture_it_measured() {
+    let fixture = published_fixture();
+    let runtime = runtime_report();
+    assert_eq!(
+        runtime.fixture_digest,
+        aivtuber_app::fixture_digest(&fixture)
+    );
+    assert!(
+        !runtime.fixture_digest.is_empty(),
+        "a report without a document digest proves nothing"
+    );
+    for (case, fixture_case) in runtime.cases.iter().zip(&fixture.cases) {
+        assert_eq!(case.must_deliver, fixture_case.must_deliver);
+        assert_eq!(case.refused_claims, fixture_case.must_not_deliver);
+        assert_eq!(case.stale_claims, fixture_case.stale);
+    }
+}
+
+/// A row that answers other questions than the fixture asks is refused, even
+/// when its own numbers are consistent with each other.
+#[test]
+fn a_report_row_that_carries_other_expectations_is_refused() {
+    let runtime = runtime_report();
+    let mut candidate = runtime_report();
+    case_mut(&mut candidate, "preference_update").must_deliver =
+        vec!["evt-does-not-exist".to_owned()];
+
+    let error = compare(&published_fixture(), &runtime, &candidate)
+        .expect_err("a row about other questions is refused");
+    assert!(
+        error
+            .to_string()
+            .contains("expectations the fixture does not declare"),
+        "the refusal explains the mismatch: {error}"
+    );
+}
+
 /// A causal count invented beside a delivery that cannot support it is refused
 /// rather than shown.
 #[test]

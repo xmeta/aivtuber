@@ -35,7 +35,7 @@ use aivtuber_domain::{
 };
 use aivtuber_runtime::{MemoryWriteDecision, SecurityRuntime, SecurityRuntimeConfig};
 use aivtuber_scheduler::SchedulerConfig;
-use aivtuber_telemetry::SecretRedactor;
+use aivtuber_telemetry::{SecretRedactor, canonical_json_digest};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -462,11 +462,12 @@ pub fn declared_causal_edges(case: &MemoryEvalCase) -> Vec<CausalEdge> {
 /// The comparison's causal metric: rows on both sides are re-derived from the
 /// fixture's declarations and the delivered set, never read from a report's
 /// own causal count, because a report's number is a claim about a store the
-/// comparison was not handed. What it can show is that the answer returned
-/// the reason with the event it explains — which is the whole question a
-/// sidecar that has no causal edge to keep can be asked.
+/// comparison was not handed. What it can show is that the answer returned both
+/// members of a pair the fixture declares — not that it carried the relation
+/// itself, which the port never hands a service; the fixture declarations are
+/// the only causal statement either side of the comparison has.
 ///
-/// `delivered` compares against the retained edge direction: an edge counts
+/// `delivered` compares against the declared edge direction: an edge counts
 /// once, when *both* of its endpoints are in the delivered set.
 pub fn declared_causal_pairs_delivered(case: &MemoryEvalCase, delivered: &[String]) -> usize {
     declared_causal_edges(case)
@@ -573,11 +574,16 @@ pub struct CaseReport {
     pub refused_claims: Vec<String>,
     pub stale_claims: Vec<String>,
     /// Retained causal evidence the request could use: `CausedBy` edges the
-    /// store actually holds, with both endpoints delivered, so generation can
-    /// say why a claim exists. Read from the store's own link view rather than
-    /// from the fixture's declaration, so losing the edge lowers this even
-    /// while both claims still reach generation. Additive, so a report written
-    /// before this field existed still parses.
+    /// store actually holds, with both endpoints delivered. Read from the
+    /// store's own link view rather than from the fixture's declaration, so
+    /// losing the edge lowers this even while both claims still reach
+    /// generation.
+    ///
+    /// This measures the *store* half — the edge is retained and both of its
+    /// claims are in the request. The generation input itself carries claims,
+    /// not links (`ThinkingContent` has no edge field), so whether a reply can
+    /// state the relation is not measured here and is not claimed. Additive,
+    /// so a report written before this field existed still parses.
     #[serde(default)]
     pub retained_causal_spans: usize,
     pub current_fact_correctness: f64,
@@ -628,6 +634,16 @@ pub struct Totals {
 pub struct EvalReport {
     pub schema_version: String,
     pub fixture_schema_version: String,
+    /// Canonical digest of the case document this report measured (#105).
+    ///
+    /// The version string cannot tell two revisions of the same schema apart,
+    /// so a comparison needs the document itself, not its name: a report is
+    /// only comparable with a fixture it can prove it measured. The rule is
+    /// [`fixture_digest`]'s, and it is the canonical form
+    /// [`aivtuber_telemetry::canonical_json_digest`] documents, so a producer
+    /// in another process can derive the same value.
+    #[serde(default)]
+    pub fixture_digest: String,
     pub context_item_budget: usize,
     pub context_byte_budget: usize,
     pub item_byte_budget: usize,
@@ -674,11 +690,24 @@ pub fn outcome_for(
     }
 }
 
+/// The canonical digest of a case document (#105).
+///
+/// A fixture is plain JSON by construction — strings, bounded integers, arrays
+/// and maps — so canonicalizing it cannot fail; a document that somehow could
+/// not be digested would be a programming error and not a measurement result.
+/// The digest names the *document*, not its version: two revisions of
+/// `memory-eval-v1` that change one `caused_by` are different documents, and a
+/// report measured against one of them is not comparable with the other.
+pub fn fixture_digest(fixture: &MemoryEvalFixture) -> String {
+    canonical_json_digest(&serde_json::to_value(fixture).expect("a fixture serializes to JSON"))
+}
+
 /// The report envelope both sides of a comparison emit.
 pub fn report_for(fixture: &MemoryEvalFixture, cases: Vec<CaseReport>) -> EvalReport {
     EvalReport {
         schema_version: MEMORY_EVAL_REPORT_SCHEMA_VERSION.to_owned(),
         fixture_schema_version: fixture.schema_version.clone(),
+        fixture_digest: fixture_digest(fixture),
         context_item_budget: MAX_THINKING_CONTEXT_ITEMS,
         context_byte_budget: MAX_THINKING_CONTEXT_BYTES,
         item_byte_budget: MAX_THINKING_TEXT_BYTES,

@@ -372,9 +372,9 @@ fn measure_case_in_scope(
         refused,
         // The port hands a service claims, not the relations between them, so
         // a service retains no project edge and its retained-span count is 0
-        // by construction. What a service can be asked is whether the reason
-        // came back with the event it explains, and the comparison re-derives
-        // that from the fixture's declarations and this delivered set.
+        // by construction. What a service can be asked is whether both members
+        // of a declared pair came back, and the comparison re-derives that
+        // from the fixture's declarations and this delivered set.
         causal_edges: Vec::new(),
     };
     let retention = RetentionSnapshot {

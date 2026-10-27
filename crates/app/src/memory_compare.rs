@@ -21,14 +21,19 @@
 //! fixture and each side's delivered set, and a report whose own retained-span
 //! count exceeds what its delivery could support is refused. A candidate's
 //! causal number is never the compared one: it describes a store the comparison
-//! was not handed, and what a sidecar can be asked is whether the reason came
-//! back with the event it explains.
+//! was not handed, and what a sidecar can be asked is whether both members of a
+//! declared pair came back.
+//!
+//! Both reports also have to name that document by its canonical digest, and
+//! each row has to carry the fixture's own expectations: the case ids can stay
+//! identical across two revisions of a fixture, so "the same cases" is not the
+//! same statement as "the same document".
 
 use serde::{Deserialize, Serialize};
 
 use crate::memory_eval::{
     CaseReport, EvalReport, MEMORY_EVAL_FIXTURE_SCHEMA_VERSION, MEMORY_EVAL_REPORT_SCHEMA_VERSION,
-    MemoryEvalCase, MemoryEvalFixture, Totals, declared_causal_pairs_delivered,
+    MemoryEvalCase, MemoryEvalFixture, Totals, declared_causal_pairs_delivered, fixture_digest,
 };
 
 /// The verdict artifact's own version. It is separate from the report's: the
@@ -145,9 +150,12 @@ impl MemoryComparison {
 /// `fixture` is the case document both reports measured. It is required
 /// because the causal declarations are part of it and of nothing else: without
 /// the document, a causal row could only repeat what a report claims about
-/// itself. Both reports must describe that document and carry the same
-/// schema; otherwise the numbers are not about the same questions and no
-/// verdict is meaningful.
+/// itself. Each report must carry that document's canonical digest — a version
+/// string cannot tell two revisions of the same schema apart — and its case
+/// rows must carry the fixture's own expectations, so a report measured
+/// against another revision is refused rather than re-read under this one.
+/// Both reports must also carry the same schema; otherwise the numbers are not
+/// about the same questions and no verdict is meaningful.
 pub fn compare(
     fixture: &MemoryEvalFixture,
     runtime: &EvalReport,
@@ -156,8 +164,9 @@ pub fn compare(
     fixture.validate().map_err(|error| {
         MemoryCompareError::Incomparable(format!("the fixture could not be measured: {error}"))
     })?;
-    validate_report(fixture, runtime, "runtime")?;
-    validate_report(fixture, candidate, "sidecar")?;
+    let digest = fixture_digest(fixture);
+    validate_report(fixture, &digest, runtime, "runtime")?;
+    validate_report(fixture, &digest, candidate, "sidecar")?;
     let mut deltas = Vec::new();
     let mut case_deltas = Vec::new();
     let mut reasons = Vec::new();
@@ -390,6 +399,7 @@ fn scalar_delta(metric: &str, runtime: f64, candidate: f64, lower_is_better: boo
 /// cannot improve on paper while delivering something else.
 fn validate_report(
     fixture: &MemoryEvalFixture,
+    digest: &str,
     report: &EvalReport,
     label: &str,
 ) -> Result<(), MemoryCompareError> {
@@ -397,6 +407,15 @@ fn validate_report(
         return Err(MemoryCompareError::Incomparable(format!(
             "{label} schema_version {:?}, expected {MEMORY_EVAL_REPORT_SCHEMA_VERSION}",
             report.schema_version
+        )));
+    }
+    // The document itself, not its version: a report that cannot prove which
+    // revision it measured must not be re-read under this one, or the causal
+    // declarations could be taken from a document the delivery never saw.
+    if report.fixture_digest != digest {
+        return Err(MemoryCompareError::Incomparable(format!(
+            "{label} fixture_digest {:?} does not name the fixture it is compared under ({digest})",
+            report.fixture_digest
         )));
     }
     if report.fixture_schema_version != MEMORY_EVAL_FIXTURE_SCHEMA_VERSION {
@@ -451,6 +470,36 @@ fn validate_case(
     case: &CaseReport,
     label: &str,
 ) -> Result<(), MemoryCompareError> {
+    // The row has to carry the fixture's own expectations: they are the
+    // questions the case asks, and a report that answered different ones is
+    // not a measurement of this document even when the case id matches.
+    if case.must_deliver != fixture_case.must_deliver
+        || case.refused_claims != fixture_case.must_not_deliver
+        || case.stale_claims != fixture_case.stale
+    {
+        return Err(MemoryCompareError::Incomparable(format!(
+            "{label} case {:?} carries expectations the fixture does not declare: must_deliver {:?} (fixture {:?}), refused {:?} (fixture {:?}), stale {:?} (fixture {:?})",
+            case.case,
+            case.must_deliver,
+            fixture_case.must_deliver,
+            case.refused_claims,
+            fixture_case.must_not_deliver,
+            case.stale_claims,
+            fixture_case.stale
+        )));
+    }
+    for id in &case.delivered {
+        if !fixture_case
+            .claims
+            .iter()
+            .any(|claim| claim.event_id == *id)
+        {
+            return Err(MemoryCompareError::Incomparable(format!(
+                "{label} case {:?} delivered {id:?}, which the fixture does not declare",
+                case.case
+            )));
+        }
+    }
     if !case.current_fact_correctness.is_finite()
         || !(0.0..=1.0).contains(&case.current_fact_correctness)
     {
