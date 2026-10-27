@@ -22,7 +22,9 @@
 //! [`MemoryEvalOutcome::violations`] so a breach is reported with its evidence
 //! instead of only failing the first case.
 
-use aivtuber_adaptation::{ActorPseudonymizer, MemoryEntry, WorkingMemory, WorkingMemoryConfig};
+use aivtuber_adaptation::{
+    ActorPseudonymizer, MemoryEntry, MemoryEvidence, WorkingMemory, WorkingMemoryConfig,
+};
 use aivtuber_domain::{
     AuthenticatedControl, AuthorizationMethod, Capability, ControlSecret, EVENT_SCHEMA_VERSION,
     EventEnvelope, EventKind, LocalControlIngress, MAX_THINKING_CONTEXT_BYTES,
@@ -193,6 +195,14 @@ impl MemoryEvalFixture {
                         claim.event_id
                     )));
                 }
+                if let Some(target) = claim.caused_by.as_deref()
+                    && !case.claims.iter().any(|other| other.event_id == target)
+                {
+                    return Err(fail(format!(
+                        "claim {:?} is caused by unknown claim {target:?}",
+                        claim.event_id
+                    )));
+                }
             }
             for id in case
                 .must_deliver
@@ -214,6 +224,20 @@ impl MemoryEvalFixture {
             for id in &case.must_deliver {
                 if case.must_not_deliver.contains(id) {
                     return Err(fail(format!("claim {id:?} is both required and refused")));
+                }
+            }
+            if let Some(expected) = case.expected_causal_spans {
+                if expected > case.claims.len() {
+                    return Err(fail(format!(
+                        "expected_causal_spans {expected} exceeds the {} claim(s) in the case",
+                        case.claims.len()
+                    )));
+                }
+                if expected > 0 && !case.claims.iter().any(|claim| claim.caused_by.is_some()) {
+                    return Err(fail(
+                        "expected_causal_spans is pinned but no claim declares caused_by"
+                            .to_owned(),
+                    ));
                 }
             }
         }
@@ -250,6 +274,13 @@ pub struct MemoryEvalCase {
     /// only".
     #[serde(default)]
     pub expected_delivery_order: Vec<String>,
+    /// How many delivered claims must arrive together with the cause they
+    /// declare through `caused_by` (#105). `None` measures without pinning;
+    /// `Some` makes a lost causal edge visible, because a causal edge never
+    /// changes which claim is current and would otherwise leave no trace in
+    /// these metrics.
+    #[serde(default)]
+    pub expected_causal_spans: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,6 +330,12 @@ pub struct MemoryEvalClaim {
     pub event_at_ms: Option<u64>,
     #[serde(default)]
     pub supersedes: Option<String>,
+    /// A retained claim that brought this one about (#105). The store resolves
+    /// it under the same rules as `supersedes`; the fixture declares it so a
+    /// measurement can see whether retrieval delivers the reason with the
+    /// effect.
+    #[serde(default)]
+    pub caused_by: Option<String>,
 }
 
 impl MemoryEvalClaim {
@@ -419,6 +456,10 @@ pub struct ExpectationPolicy {
     pub enforce_delivery_order: bool,
     /// Whether the temporal-error count must match the case's expectation.
     pub enforce_temporal_count: bool,
+    /// Whether the causal-span count must match the case's expectation. The
+    /// store's own delivery is pinned; a candidate's retrieval is the result
+    /// under test, so it is measured without being declared a failure.
+    pub enforce_causal_spans: bool,
 }
 
 impl ExpectationPolicy {
@@ -426,12 +467,14 @@ impl ExpectationPolicy {
     pub const RUNTIME: Self = Self {
         enforce_delivery_order: true,
         enforce_temporal_count: true,
+        enforce_causal_spans: true,
     };
     /// A candidate's expectations: the quality metrics are the result, not a
     /// failure of the candidate.
     pub const CANDIDATE: Self = Self {
         enforce_delivery_order: false,
         enforce_temporal_count: false,
+        enforce_causal_spans: false,
     };
 }
 
@@ -445,6 +488,11 @@ pub struct CaseReport {
     /// trusting a candidate's own count.
     pub refused_claims: Vec<String>,
     pub stale_claims: Vec<String>,
+    /// Delivered claims that arrived with the cause they declare: the evidence
+    /// a request needs to say why a claim exists. Additive, so a report
+    /// written before this field existed still parses.
+    #[serde(default)]
+    pub causal_spans_delivered: usize,
     pub current_fact_correctness: f64,
     pub stale_memory_use: usize,
     pub absent_violations: usize,
@@ -474,6 +522,9 @@ pub struct Totals {
     pub current_fact_correctness: f64,
     pub stale_memory_use: usize,
     pub absent_violations: usize,
+    /// Delivered claims that arrived with the cause they declare (#105).
+    #[serde(default)]
+    pub causal_spans_delivered: usize,
     /// Items a service answered with that the project refused.
     #[serde(default)]
     pub refused_items: usize,
@@ -565,6 +616,7 @@ pub fn totals_for(cases: &[CaseReport]) -> Totals {
             / case_count as f64,
         stale_memory_use: cases.iter().map(|case| case.stale_memory_use).sum(),
         absent_violations: cases.iter().map(|case| case.absent_violations).sum(),
+        causal_spans_delivered: cases.iter().map(|case| case.causal_spans_delivered).sum(),
         refused_items: cases.iter().map(|case| case.refused_items.len()).sum(),
         temporal_order_errors: cases.iter().map(|case| case.temporal_order_errors).sum(),
         truncated_claims: cases.iter().map(|case| case.truncated_claims).sum(),
@@ -640,6 +692,28 @@ pub fn measure_case(
         .windows(2)
         .filter(|pair| event_at[pair[1].as_str()] > event_at[pair[0].as_str()])
         .count();
+    // A causal span is delivered when the claim and the cause it declares both
+    // reach generation: an edge to a claim the request leaves behind explains
+    // nothing. Only the store's own delivery can declare the cause, so this is
+    // derived from the fixture and the delivered set, never from a report.
+    let causes: BTreeMap<&str, &str> = case
+        .claims
+        .iter()
+        .filter_map(|claim| {
+            claim
+                .caused_by
+                .as_deref()
+                .map(|cause| (claim.event_id.as_str(), cause))
+        })
+        .collect();
+    let causal_spans_delivered = delivered
+        .iter()
+        .filter(|id| {
+            causes
+                .get(id.as_str())
+                .is_some_and(|cause| delivered.iter().any(|other| other == cause))
+        })
+        .count();
 
     let claim_bytes: usize = delivery
         .claims
@@ -653,6 +727,7 @@ pub fn measure_case(
         must_deliver: case.must_deliver.clone(),
         refused_claims: case.must_not_deliver.clone(),
         stale_claims: case.stale.clone(),
+        causal_spans_delivered,
         current_fact_correctness,
         stale_memory_use,
         absent_violations,
@@ -784,6 +859,18 @@ pub fn case_violations(
             ),
         );
     }
+    if policy.enforce_causal_spans
+        && let Some(expected) = case.expected_causal_spans
+        && report.causal_spans_delivered != expected
+    {
+        push(
+            &mut violations,
+            format!(
+                "causal spans delivered {}, expected {expected}",
+                report.causal_spans_delivered
+            ),
+        );
+    }
     violations
 }
 
@@ -819,21 +906,20 @@ fn run_case(
             case: case.id.clone(),
             claim: claim.event_id.clone(),
         })?;
-        let written = match claim.supersedes.as_deref() {
-            Some(target) => memory.remember_durable_superseding(
-                &permit,
-                &text,
-                claim.topic.as_deref(),
-                claim.recorded_at_ms,
-                &[target],
-            ),
-            None => memory.remember_durable(
-                &permit,
-                &text,
-                claim.topic.as_deref(),
-                claim.recorded_at_ms,
-            ),
-        };
+        // Both declarations ride the same permit-gated path the runtime uses,
+        // so a fixture cannot write evidence the gate would have refused.
+        let supersedes: Vec<&str> = claim.supersedes.iter().map(String::as_str).collect();
+        let caused_by: Vec<&str> = claim.caused_by.iter().map(String::as_str).collect();
+        let written = memory.remember_durable_with_evidence(
+            &permit,
+            &text,
+            claim.topic.as_deref(),
+            claim.recorded_at_ms,
+            MemoryEvidence {
+                supersedes: &supersedes,
+                caused_by: &caused_by,
+            },
+        );
         written.map_err(|error| MemoryEvalError::Write(format!("{}: {error}", claim.event_id)))?;
     }
 

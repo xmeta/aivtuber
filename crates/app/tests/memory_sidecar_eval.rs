@@ -246,6 +246,7 @@ fn claim(
         recorded_at_ms,
         event_at_ms: None,
         supersedes: None,
+        caused_by: None,
     }
 }
 
@@ -275,6 +276,7 @@ fn case(
         stale: Vec::new(),
         expected_temporal_errors: 0,
         expected_delivery_order: Vec::new(),
+        expected_causal_spans: None,
     }
 }
 

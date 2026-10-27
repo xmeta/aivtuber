@@ -89,6 +89,11 @@ pub struct CaseDelta {
     pub candidate_absent_violations: usize,
     pub runtime_truncated_claims: usize,
     pub candidate_truncated_claims: usize,
+    /// Delivered claims that arrived with the cause they declare (#105).
+    #[serde(default)]
+    pub runtime_causal_spans_delivered: usize,
+    #[serde(default)]
+    pub candidate_causal_spans_delivered: usize,
     pub runtime_request_bytes: usize,
     pub candidate_request_bytes: usize,
 }
@@ -171,6 +176,8 @@ pub fn compare(
             candidate_absent_violations: candidate_case.absent_violations,
             runtime_truncated_claims: runtime_case.truncated_claims,
             candidate_truncated_claims: candidate_case.truncated_claims,
+            runtime_causal_spans_delivered: runtime_case.causal_spans_delivered,
+            candidate_causal_spans_delivered: candidate_case.causal_spans_delivered,
             runtime_request_bytes: runtime_case.request_bytes,
             candidate_request_bytes: candidate_case.request_bytes,
         });
@@ -270,6 +277,15 @@ pub fn compare(
             runtime_totals.refused_items as f64,
             candidate_totals.refused_items as f64,
             true,
+        ),
+        // Reported, not scored: the section-12 rule still decides a win on
+        // temporal order or current-fact correctness, so a sidecar that
+        // happens to deliver more cause/effect pairs cannot win on that alone.
+        scalar_delta(
+            "causal_spans_delivered",
+            runtime_totals.causal_spans_delivered as f64,
+            candidate_totals.causal_spans_delivered as f64,
+            false,
         ),
     ] {
         deltas.push(delta);
@@ -432,6 +448,18 @@ fn validate_case(case: &CaseReport, label: &str) -> Result<(), MemoryCompareErro
             case.case, case.absent_violations, case.delivered, case.refused_claims
         )));
     }
+    // A causal span is a delivered claim plus its delivered cause, so it can
+    // never outnumber the delivered claims. The report does not carry the
+    // fixture's declarations, so this is the check that can be made from the
+    // report alone; the runtime's own count is pinned by the fixture.
+    if case.causal_spans_delivered > case.delivered.len() {
+        return Err(MemoryCompareError::Incomparable(format!(
+            "{label} case {:?} declares {} causal span(s) over {} delivered claim(s)",
+            case.case,
+            case.causal_spans_delivered,
+            case.delivered.len()
+        )));
+    }
     Ok(())
 }
 
@@ -489,6 +517,14 @@ fn validate_totals(
                 .map(|case| case.truncated_claims)
                 .sum::<usize>() as f64
                 - totals.truncated_claims as f64,
+        ),
+        (
+            "causal_spans_delivered",
+            cases
+                .iter()
+                .map(|case| case.causal_spans_delivered)
+                .sum::<usize>() as f64
+                - totals.causal_spans_delivered as f64,
         ),
     ];
     let mismatched: Vec<&str> = failures

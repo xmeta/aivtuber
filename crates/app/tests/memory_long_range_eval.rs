@@ -33,8 +33,9 @@ fn published_fixture() -> MemoryEvalFixture {
 
 /// The scenario classes this issue mandates. Removing one silently would shrink
 /// the comparison, so the published fixture must keep all of them.
-const REQUIRED_CASES: [&str; 13] = [
+const REQUIRED_CASES: [&str; 14] = [
     "preference_update",
+    "causal_reason_travels_with_its_effect",
     "topic_shifted_correction",
     "topic_shifted_correction_under_limit",
     "goal_attempt_result",
@@ -78,6 +79,10 @@ fn the_published_fixture_measures_cleanly() {
     assert_eq!(totals.stale_memory_use, 0);
     assert_eq!(totals.absent_violations, 0);
     assert_eq!(totals.truncated_claims, 0);
+    assert_eq!(
+        totals.causal_spans_delivered, 1,
+        "the fixture must keep measuring a delivered cause/effect pair"
+    );
     assert!(
         totals.temporal_order_errors >= 1,
         "the fixture must keep detecting the record-time/event-time class"
@@ -131,6 +136,16 @@ fn a_fixture_that_cannot_be_compared_is_refused() {
         .push("evt-does-not-exist".to_owned());
     let error = evaluate(&fixture).expect_err("an unknown expectation is refused");
     assert!(error.to_string().contains("evt-does-not-exist"), "{error}");
+
+    let mut fixture = published_fixture();
+    let causal = fixture
+        .cases
+        .iter_mut()
+        .find(|case| case.id == "causal_reason_travels_with_its_effect")
+        .expect("the causal case is published");
+    causal.claims[1].caused_by = Some("evt-not-a-claim".to_owned());
+    let error = evaluate(&fixture).expect_err("an unknown cause is refused");
+    assert!(error.to_string().contains("evt-not-a-claim"), "{error}");
 }
 
 #[test]
