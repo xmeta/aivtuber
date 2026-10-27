@@ -57,7 +57,7 @@
         "charged_bytes": 64
       },
       "must_deliver": ["evt-boss-bug", "evt-boss-retry"],
-      "expected_causal_spans": 1
+      "expected_retained_causal_spans": 1
     },
     {
       "id": "topic_shifted_correction",

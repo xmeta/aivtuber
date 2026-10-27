@@ -4,16 +4,20 @@
 //! Usage:
 //!
 //! ```text
-//! memory-eval-compare <runtime-report.json> <sidecar-report.json> [--out <verdict.json>]
+//! memory-eval-compare <fixture.json> <runtime-report.json> <sidecar-report.json> [--out <verdict.json>]
 //! ```
 //!
-//! Applies `docs/memory-adaptation.adoc` section 12's rule to two
-//! `memory-long-range-eval/v1` documents: a candidate wins only by beating the
-//! runtime on `temporal_order_errors` or `current_fact_correctness`, and
-//! regresses if it leaks a superseded, refused, or shortened claim, answers
-//! with an item the project has to refuse, or breaks a request bound. A report
-//! that disagrees with its own case rows, covers a different set of cases, or
-//! carries another schema is refused as incomparable rather than compared.
+//! Applies `docs/memory-adaptation.adoc` section 12's rule to the two
+//! `memory-long-range-eval/v1` documents measured against `<fixture.json>`: a
+//! candidate wins only by beating the runtime on `temporal_order_errors` or
+//! `current_fact_correctness`, and regresses if it leaks a superseded, refused,
+//! or shortened claim, answers with an item the project has to refuse, or
+//! breaks a request bound. The fixture is an input because the causal
+//! declarations live there and nowhere in a report; the causal row is
+//! re-derived from it and each side's delivered set. A report that disagrees
+//! with its own case rows, covers a different set of cases, is not about that
+//! fixture, or carries another schema is refused as incomparable rather than
+//! compared.
 //!
 //! Exit status is non-zero for an *incomparable* pair or for a regressed
 //! candidate — the same gate `benchmark-compare` gives the benchmark budget —
@@ -23,10 +27,10 @@
 //!
 //! ```text
 //! memory-long-range-eval examples/memory-long-range/cases.json target/memory-runtime.json
-//! memory-eval-compare target/memory-runtime.json target/memory-sidecar.json --out target/memory-verdict.json
+//! memory-eval-compare examples/memory-long-range/cases.json target/memory-runtime.json target/memory-sidecar.json --out target/memory-verdict.json
 //! ```
 
-use aivtuber_app::{EvalReport, compare};
+use aivtuber_app::{EvalReport, MemoryEvalFixture, compare};
 use std::env;
 use std::error::Error;
 use std::fs;
@@ -53,7 +57,7 @@ fn run() -> Result<bool, Box<dyn Error>> {
         match arguments[index].as_str() {
             "--out" => {
                 output = Some(PathBuf::from(arguments.get(index + 1).ok_or(
-                    "usage: memory-eval-compare <runtime-report.json> <sidecar-report.json> [--out <verdict.json>]",
+                    "usage: memory-eval-compare <fixture.json> <runtime-report.json> <sidecar-report.json> [--out <verdict.json>]",
                 )?));
                 index += 2;
             }
@@ -63,14 +67,15 @@ fn run() -> Result<bool, Box<dyn Error>> {
             }
         }
     }
-    if paths.len() != 2 {
+    if paths.len() != 3 {
         return Err(
-            "usage: memory-eval-compare <runtime-report.json> <sidecar-report.json> [--out <verdict.json>]".into(),
+            "usage: memory-eval-compare <fixture.json> <runtime-report.json> <sidecar-report.json> [--out <verdict.json>]".into(),
         );
     }
-    let runtime = load_report(&paths[0])?;
-    let candidate = load_report(&paths[1])?;
-    let comparison = compare(&runtime, &candidate)?;
+    let fixture = load_fixture(&paths[0])?;
+    let runtime = load_report(&paths[1])?;
+    let candidate = load_report(&paths[2])?;
+    let comparison = compare(&fixture, &runtime, &candidate)?;
     let verdict = serde_json::to_string_pretty(&comparison)?;
     println!("{verdict}");
     if let Some(path) = output {
@@ -84,6 +89,11 @@ fn run() -> Result<bool, Box<dyn Error>> {
 }
 
 fn load_report(path: &str) -> Result<EvalReport, Box<dyn Error>> {
+    let bytes = fs::read(path).map_err(|error| format!("read {path}: {error}"))?;
+    serde_json::from_slice(&bytes).map_err(|error| format!("parse {path}: {error}").into())
+}
+
+fn load_fixture(path: &str) -> Result<MemoryEvalFixture, Box<dyn Error>> {
     let bytes = fs::read(path).map_err(|error| format!("read {path}: {error}"))?;
     serde_json::from_slice(&bytes).map_err(|error| format!("parse {path}: {error}").into())
 }

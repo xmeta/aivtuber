@@ -15,12 +15,20 @@
 //! rows. A report that disagrees with its own records, covers a different set
 //! of cases, or names another schema is refused as incomparable rather than
 //! compared, because "unverifiable" is not a measurement.
+//!
+//! The fixture is an input, not a footnote. The causal declarations live in the
+//! case document and in no report, so the causal row is re-derived from the
+//! fixture and each side's delivered set, and a report whose own retained-span
+//! count exceeds what its delivery could support is refused. A candidate's
+//! causal number is never the compared one: it describes a store the comparison
+//! was not handed, and what a sidecar can be asked is whether the reason came
+//! back with the event it explains.
 
 use serde::{Deserialize, Serialize};
 
 use crate::memory_eval::{
     CaseReport, EvalReport, MEMORY_EVAL_FIXTURE_SCHEMA_VERSION, MEMORY_EVAL_REPORT_SCHEMA_VERSION,
-    Totals,
+    MemoryEvalCase, MemoryEvalFixture, Totals, declared_causal_pairs_delivered,
 };
 
 /// The verdict artifact's own version. It is separate from the report's: the
@@ -89,11 +97,14 @@ pub struct CaseDelta {
     pub candidate_absent_violations: usize,
     pub runtime_truncated_claims: usize,
     pub candidate_truncated_claims: usize,
-    /// Delivered claims that arrived with the cause they declare (#105).
+    /// Declared cause/effect pairs whose two members both reached generation
+    /// (#105). Recomputed by this comparison from the fixture and each side's
+    /// delivered set: a candidate's own retained-span count is a claim about a
+    /// store it did not hand over, so it is never the compared number.
     #[serde(default)]
-    pub runtime_causal_spans_delivered: usize,
+    pub runtime_causal_pairs_delivered: usize,
     #[serde(default)]
-    pub candidate_causal_spans_delivered: usize,
+    pub candidate_causal_pairs_delivered: usize,
     pub runtime_request_bytes: usize,
     pub candidate_request_bytes: usize,
 }
@@ -131,33 +142,33 @@ impl MemoryComparison {
 
 /// Judge `candidate` against `runtime` under the section-12 rule.
 ///
-/// Both documents must describe the same fixture and carry the same schema;
-/// otherwise the numbers are not about the same questions and no verdict is
-/// meaningful.
+/// `fixture` is the case document both reports measured. It is required
+/// because the causal declarations are part of it and of nothing else: without
+/// the document, a causal row could only repeat what a report claims about
+/// itself. Both reports must describe that document and carry the same
+/// schema; otherwise the numbers are not about the same questions and no
+/// verdict is meaningful.
 pub fn compare(
+    fixture: &MemoryEvalFixture,
     runtime: &EvalReport,
     candidate: &EvalReport,
 ) -> Result<MemoryComparison, MemoryCompareError> {
-    validate_report(runtime, "runtime")?;
-    validate_report(candidate, "sidecar")?;
-    if runtime.cases.len() != candidate.cases.len() {
-        return Err(MemoryCompareError::Incomparable(format!(
-            "runtime covers {} case(s), sidecar covers {}",
-            runtime.cases.len(),
-            candidate.cases.len()
-        )));
-    }
+    fixture.validate().map_err(|error| {
+        MemoryCompareError::Incomparable(format!("the fixture could not be measured: {error}"))
+    })?;
+    validate_report(fixture, runtime, "runtime")?;
+    validate_report(fixture, candidate, "sidecar")?;
     let mut deltas = Vec::new();
     let mut case_deltas = Vec::new();
     let mut reasons = Vec::new();
 
-    for (runtime_case, candidate_case) in runtime.cases.iter().zip(&candidate.cases) {
-        if runtime_case.case != candidate_case.case {
-            return Err(MemoryCompareError::Incomparable(format!(
-                "case order differs: {:?} (runtime) vs {:?} (sidecar)",
-                runtime_case.case, candidate_case.case
-            )));
-        }
+    for (fixture_case, (runtime_case, candidate_case)) in fixture
+        .cases
+        .iter()
+        .zip(runtime.cases.iter().zip(&candidate.cases))
+    {
+        // Each report's rows are already pinned to the fixture's order by
+        // `validate_report`, so both sides name the same case here.
         if runtime_case.must_deliver != candidate_case.must_deliver {
             return Err(MemoryCompareError::Incomparable(format!(
                 "case {:?} requires different claims on each side",
@@ -176,8 +187,14 @@ pub fn compare(
             candidate_absent_violations: candidate_case.absent_violations,
             runtime_truncated_claims: runtime_case.truncated_claims,
             candidate_truncated_claims: candidate_case.truncated_claims,
-            runtime_causal_spans_delivered: runtime_case.causal_spans_delivered,
-            candidate_causal_spans_delivered: candidate_case.causal_spans_delivered,
+            runtime_causal_pairs_delivered: declared_causal_pairs_delivered(
+                fixture_case,
+                &runtime_case.delivered,
+            ),
+            candidate_causal_pairs_delivered: declared_causal_pairs_delivered(
+                fixture_case,
+                &candidate_case.delivered,
+            ),
             runtime_request_bytes: runtime_case.request_bytes,
             candidate_request_bytes: candidate_case.request_bytes,
         });
@@ -281,10 +298,18 @@ pub fn compare(
         // Reported, not scored: the section-12 rule still decides a win on
         // temporal order or current-fact correctness, so a sidecar that
         // happens to deliver more cause/effect pairs cannot win on that alone.
+        // Both sides are re-derived from the fixture and the delivered sets,
+        // so neither number can be improved by editing a report.
         scalar_delta(
-            "causal_spans_delivered",
-            runtime_totals.causal_spans_delivered as f64,
-            candidate_totals.causal_spans_delivered as f64,
+            "causal_pairs_delivered",
+            case_deltas
+                .iter()
+                .map(|case| case.runtime_causal_pairs_delivered)
+                .sum::<usize>() as f64,
+            case_deltas
+                .iter()
+                .map(|case| case.candidate_causal_pairs_delivered)
+                .sum::<usize>() as f64,
             false,
         ),
     ] {
@@ -363,7 +388,11 @@ fn scalar_delta(metric: &str, runtime: f64, candidate: f64, lower_is_better: boo
 /// Correctness and stale-memory use are re-derived from each case's delivered
 /// list, and every aggregate is re-derived from the case rows, so a report
 /// cannot improve on paper while delivering something else.
-fn validate_report(report: &EvalReport, label: &str) -> Result<(), MemoryCompareError> {
+fn validate_report(
+    fixture: &MemoryEvalFixture,
+    report: &EvalReport,
+    label: &str,
+) -> Result<(), MemoryCompareError> {
     if report.schema_version != MEMORY_EVAL_REPORT_SCHEMA_VERSION {
         return Err(MemoryCompareError::Incomparable(format!(
             "{label} schema_version {:?}, expected {MEMORY_EVAL_REPORT_SCHEMA_VERSION}",
@@ -374,6 +403,13 @@ fn validate_report(report: &EvalReport, label: &str) -> Result<(), MemoryCompare
         return Err(MemoryCompareError::Incomparable(format!(
             "{label} fixture_schema_version {:?}, expected {MEMORY_EVAL_FIXTURE_SCHEMA_VERSION}",
             report.fixture_schema_version
+        )));
+    }
+    if report.cases.len() != fixture.cases.len() {
+        return Err(MemoryCompareError::Incomparable(format!(
+            "{label} covers {} case(s), the fixture has {}",
+            report.cases.len(),
+            fixture.cases.len()
         )));
     }
     if report.cases.is_empty() {
@@ -389,19 +425,32 @@ fn validate_report(report: &EvalReport, label: &str) -> Result<(), MemoryCompare
         )));
     }
     let mut seen = std::collections::BTreeSet::new();
-    for case in &report.cases {
+    for (fixture_case, case) in fixture.cases.iter().zip(&report.cases) {
         if !seen.insert(case.case.as_str()) {
             return Err(MemoryCompareError::Incomparable(format!(
                 "{label} repeats case {:?}",
                 case.case
             )));
         }
-        validate_case(case, label)?;
+        // The report has to be about the fixture document it is compared
+        // under, case for case: two revisions can share a schema version while
+        // asking different questions.
+        if case.case != fixture_case.id {
+            return Err(MemoryCompareError::Incomparable(format!(
+                "{label} case order differs from the fixture: {:?} where {:?} was measured",
+                case.case, fixture_case.id
+            )));
+        }
+        validate_case(fixture_case, case, label)?;
     }
     validate_totals(&report.totals, &report.cases, label)
 }
 
-fn validate_case(case: &CaseReport, label: &str) -> Result<(), MemoryCompareError> {
+fn validate_case(
+    fixture_case: &MemoryEvalCase,
+    case: &CaseReport,
+    label: &str,
+) -> Result<(), MemoryCompareError> {
     if !case.current_fact_correctness.is_finite()
         || !(0.0..=1.0).contains(&case.current_fact_correctness)
     {
@@ -448,16 +497,18 @@ fn validate_case(case: &CaseReport, label: &str) -> Result<(), MemoryCompareErro
             case.case, case.absent_violations, case.delivered, case.refused_claims
         )));
     }
-    // A causal span is a delivered claim plus its delivered cause, so it can
-    // never outnumber the delivered claims. The report does not carry the
-    // fixture's declarations, so this is the check that can be made from the
-    // report alone; the runtime's own count is pinned by the fixture.
-    if case.causal_spans_delivered > case.delivered.len() {
+    // Retained causal spans are edges the store holds, so they can never
+    // outnumber the fixture's declared pairs that the delivered set supports:
+    // an answer can return both members of at most the pairs the case
+    // declares, and a store can retain at most the pairs its claims declared.
+    // The bound is grounded in the fixture rather than in the report, so a
+    // count invented beside a delivery that supports none is refused instead
+    // of shown.
+    let supported = declared_causal_pairs_delivered(fixture_case, &case.delivered);
+    if case.retained_causal_spans > supported {
         return Err(MemoryCompareError::Incomparable(format!(
-            "{label} case {:?} declares {} causal span(s) over {} delivered claim(s)",
-            case.case,
-            case.causal_spans_delivered,
-            case.delivered.len()
+            "{label} case {:?} declares {} retained causal span(s), but its delivered set supports {supported} of the fixture's declared pair(s)",
+            case.case, case.retained_causal_spans
         )));
     }
     Ok(())
@@ -519,12 +570,12 @@ fn validate_totals(
                 - totals.truncated_claims as f64,
         ),
         (
-            "causal_spans_delivered",
+            "retained_causal_spans",
             cases
                 .iter()
-                .map(|case| case.causal_spans_delivered)
+                .map(|case| case.retained_causal_spans)
                 .sum::<usize>() as f64
-                - totals.causal_spans_delivered as f64,
+                - totals.retained_causal_spans as f64,
         ),
     ];
     let mismatched: Vec<&str> = failures

@@ -276,7 +276,7 @@ fn case(
         stale: Vec::new(),
         expected_temporal_errors: 0,
         expected_delivery_order: Vec::new(),
-        expected_causal_spans: None,
+        expected_retained_causal_spans: None,
     }
 }
 
@@ -524,6 +524,8 @@ fn the_request_budget_is_the_runtimes_own() {
             },
         ],
         refused: Vec::new(),
+        // No retained project edge: the case declares no causal pair.
+        causal_edges: Vec::new(),
     };
     let measured = measure_case(
         &fixture.cases[0],
@@ -763,7 +765,8 @@ fn a_refused_service_item_rejects_the_candidate() {
     assert_eq!(candidate.report.totals.absent_violations, 0);
     assert_eq!(candidate.report.totals.refused_items, 1);
 
-    let comparison = compare(&runtime.report, &candidate.report).expect("comparable reports");
+    let comparison =
+        compare(&fixture, &runtime.report, &candidate.report).expect("comparable reports");
     assert!(comparison.is_regression());
     assert!(
         comparison
@@ -794,7 +797,8 @@ fn an_equivalent_candidate_is_no_improvement() {
     )]);
     let runtime = evaluate(&fixture).expect("the runtime measures the fixture");
     let candidate = evaluate_fake(Answer::Conforming, &fixture);
-    let comparison = compare(&runtime.report, &candidate.report).expect("comparable reports");
+    let comparison =
+        compare(&fixture, &runtime.report, &candidate.report).expect("comparable reports");
     assert_eq!(
         comparison.verdict,
         aivtuber_app::CandidateVerdict::NoImprovement,

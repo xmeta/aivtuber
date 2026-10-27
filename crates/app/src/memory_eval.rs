@@ -11,19 +11,21 @@
 //!
 //! * [`MEMORY_EVAL_FIXTURE_SCHEMA_VERSION`] — the case document
 //!   (`examples/memory-long-range/cases.json`): claims, their declared
-//!   update evidence, the query, and what the case expects to be delivered;
+//!   update and causal evidence, the query, and what the case expects to be
+//!   delivered;
 //! * [`MEMORY_EVAL_REPORT_SCHEMA_VERSION`] — the measured report: current-fact
 //!   correctness, stale-memory use, absent violations, temporal-order errors,
-//!   delivered bytes/items against the domain bounds, and retention
-//!   high-water. It is deterministic, so two runs are byte-identical and two
-//!   revisions are comparable.
+//!   retained causal spans, delivered bytes/items against the domain bounds,
+//!   and retention high-water. It is deterministic, so two runs are
+//!   byte-identical and two revisions are comparable.
 //!
 //! A violation never aborts the run: it is recorded in
 //! [`MemoryEvalOutcome::violations`] so a breach is reported with its evidence
 //! instead of only failing the first case.
 
 use aivtuber_adaptation::{
-    ActorPseudonymizer, MemoryEntry, MemoryEvidence, WorkingMemory, WorkingMemoryConfig,
+    ActorPseudonymizer, MemoryEntry, MemoryEvidence, MemoryLinkKind, WorkingMemory,
+    WorkingMemoryConfig,
 };
 use aivtuber_domain::{
     AuthenticatedControl, AuthorizationMethod, Capability, ControlSecret, EVENT_SCHEMA_VERSION,
@@ -226,18 +228,17 @@ impl MemoryEvalFixture {
                     return Err(fail(format!("claim {id:?} is both required and refused")));
                 }
             }
-            if let Some(expected) = case.expected_causal_spans {
-                if expected > case.claims.len() {
+            if let Some(expected) = case.expected_retained_causal_spans {
+                let declared = case
+                    .claims
+                    .iter()
+                    .filter(|claim| claim.caused_by.is_some())
+                    .count();
+                if expected > declared {
                     return Err(fail(format!(
-                        "expected_causal_spans {expected} exceeds the {} claim(s) in the case",
-                        case.claims.len()
+                        "expected_retained_causal_spans {expected} exceeds the {declared} declared \
+                         causal edge(s) in the case"
                     )));
-                }
-                if expected > 0 && !case.claims.iter().any(|claim| claim.caused_by.is_some()) {
-                    return Err(fail(
-                        "expected_causal_spans is pinned but no claim declares caused_by"
-                            .to_owned(),
-                    ));
                 }
             }
         }
@@ -274,13 +275,13 @@ pub struct MemoryEvalCase {
     /// only".
     #[serde(default)]
     pub expected_delivery_order: Vec<String>,
-    /// How many delivered claims must arrive together with the cause they
-    /// declare through `caused_by` (#105). `None` measures without pinning;
-    /// `Some` makes a lost causal edge visible, because a causal edge never
-    /// changes which claim is current and would otherwise leave no trace in
-    /// these metrics.
+    /// How many retained causal edges must be usable — both endpoints
+    /// delivered — for the claims this case declares through `caused_by`
+    /// (#105). `None` measures without pinning; `Some` makes a lost edge
+    /// visible, because a causal edge never changes which claim is current and
+    /// would otherwise leave no trace in these metrics.
     #[serde(default)]
-    pub expected_causal_spans: Option<usize>,
+    pub expected_retained_causal_spans: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -426,6 +427,83 @@ pub struct RefusedItem {
     pub reason: RefusalReason,
 }
 
+/// A causal edge between two project claims (#105).
+///
+/// `effect` is the claim that was caused; `cause` is the retained claim that
+/// brought it about. The direction is carried explicitly and never inferred
+/// from delivery order, so a measurement cannot count a reversed pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CausalEdge {
+    pub effect: String,
+    pub cause: String,
+}
+
+/// The causal pairs a case's claims declare, as claim-id edges.
+///
+/// This is the fixture's *claim*, not evidence: two claims can declare a pair
+/// while the store holds no edge for it — the gate refused the write, the
+/// edge was never minted, or it was lost — so a measurement of this runtime
+/// never counts a span from this list. It is what a comparison has to work
+/// with, because an external service is handed claims and not relations.
+pub fn declared_causal_edges(case: &MemoryEvalCase) -> Vec<CausalEdge> {
+    case.claims
+        .iter()
+        .filter_map(|claim| {
+            claim.caused_by.as_ref().map(|cause| CausalEdge {
+                effect: claim.event_id.clone(),
+                cause: cause.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Declared causal pairs whose two members both reached generation.
+///
+/// The comparison's causal metric: rows on both sides are re-derived from the
+/// fixture's declarations and the delivered set, never read from a report's
+/// own causal count, because a report's number is a claim about a store the
+/// comparison was not handed. What it can show is that the answer returned
+/// the reason with the event it explains — which is the whole question a
+/// sidecar that has no causal edge to keep can be asked.
+///
+/// `delivered` compares against the retained edge direction: an edge counts
+/// once, when *both* of its endpoints are in the delivered set.
+pub fn declared_causal_pairs_delivered(case: &MemoryEvalCase, delivered: &[String]) -> usize {
+    declared_causal_edges(case)
+        .into_iter()
+        .filter(|edge| delivered.contains(&edge.effect) && delivered.contains(&edge.cause))
+        .count()
+}
+
+/// The causal edges the store retains and would hand out at `now_ms` (#105).
+///
+/// Read through [`WorkingMemory::link_snapshot`] — the same versioned view the
+/// runtime persists and replays — so this is evidence and not declaration:
+/// only `CausedBy` edges whose endpoints are both live at the read timestamp
+/// are returned, and an edge that was never retained, whose cause was evicted,
+/// or that was recorded after the read cannot be counted. Node ids are mapped
+/// back to the source event ids the fixture and the reports name, so an edge
+/// is only usable when both of its claims are still identifiable.
+pub fn retained_causal_edges(memory: &WorkingMemory, now_ms: u64) -> Vec<CausalEdge> {
+    let claim_ids: BTreeMap<u64, &str> = memory
+        .entries()
+        .iter()
+        .map(|entry| (entry.memory_id, entry.source.event_id.as_str()))
+        .collect();
+    memory
+        .link_snapshot(now_ms)
+        .links
+        .into_iter()
+        .filter(|link| link.kind == MemoryLinkKind::CausedBy)
+        .filter_map(|link| {
+            Some(CausalEdge {
+                effect: claim_ids.get(&link.from)?.to_string(),
+                cause: claim_ids.get(&link.to)?.to_string(),
+            })
+        })
+        .collect()
+}
+
 /// One case's delivery, in the shape both sides of a comparison report.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CaseDelivery {
@@ -433,6 +511,12 @@ pub struct CaseDelivery {
     pub claims: Vec<DeliveredClaim>,
     /// Items a service answered with that the project refused.
     pub refused: Vec<RefusedItem>,
+    /// The store's own causal evidence for these claims, read from the
+    /// retained links ([`retained_causal_edges`]). The runtime fills it from
+    /// the store; a service retains no project edge, so its delivery carries
+    /// none — which is the truth about the evidence it kept, not a missing
+    /// measurement.
+    pub causal_edges: Vec<CausalEdge>,
 }
 
 /// The retention numbers a report carries.
@@ -488,11 +572,14 @@ pub struct CaseReport {
     /// trusting a candidate's own count.
     pub refused_claims: Vec<String>,
     pub stale_claims: Vec<String>,
-    /// Delivered claims that arrived with the cause they declare: the evidence
-    /// a request needs to say why a claim exists. Additive, so a report
-    /// written before this field existed still parses.
+    /// Retained causal evidence the request could use: `CausedBy` edges the
+    /// store actually holds, with both endpoints delivered, so generation can
+    /// say why a claim exists. Read from the store's own link view rather than
+    /// from the fixture's declaration, so losing the edge lowers this even
+    /// while both claims still reach generation. Additive, so a report written
+    /// before this field existed still parses.
     #[serde(default)]
-    pub causal_spans_delivered: usize,
+    pub retained_causal_spans: usize,
     pub current_fact_correctness: f64,
     pub stale_memory_use: usize,
     pub absent_violations: usize,
@@ -522,9 +609,9 @@ pub struct Totals {
     pub current_fact_correctness: f64,
     pub stale_memory_use: usize,
     pub absent_violations: usize,
-    /// Delivered claims that arrived with the cause they declare (#105).
+    /// Retained causal edges the requests could use (#105).
     #[serde(default)]
-    pub causal_spans_delivered: usize,
+    pub retained_causal_spans: usize,
     /// Items a service answered with that the project refused.
     #[serde(default)]
     pub refused_items: usize,
@@ -616,7 +703,7 @@ pub fn totals_for(cases: &[CaseReport]) -> Totals {
             / case_count as f64,
         stale_memory_use: cases.iter().map(|case| case.stale_memory_use).sum(),
         absent_violations: cases.iter().map(|case| case.absent_violations).sum(),
-        causal_spans_delivered: cases.iter().map(|case| case.causal_spans_delivered).sum(),
+        retained_causal_spans: cases.iter().map(|case| case.retained_causal_spans).sum(),
         refused_items: cases.iter().map(|case| case.refused_items.len()).sum(),
         temporal_order_errors: cases.iter().map(|case| case.temporal_order_errors).sum(),
         truncated_claims: cases.iter().map(|case| case.truncated_claims).sum(),
@@ -692,27 +779,16 @@ pub fn measure_case(
         .windows(2)
         .filter(|pair| event_at[pair[1].as_str()] > event_at[pair[0].as_str()])
         .count();
-    // A causal span is delivered when the claim and the cause it declares both
-    // reach generation: an edge to a claim the request leaves behind explains
-    // nothing. Only the store's own delivery can declare the cause, so this is
-    // derived from the fixture and the delivered set, never from a report.
-    let causes: BTreeMap<&str, &str> = case
-        .claims
+    // A causal span is an edge the *store* retains whose two endpoints both
+    // reached generation: a relation to a claim the request leaves behind
+    // explains nothing, and a pair that only the fixture declares is not
+    // evidence the store ever kept. Reading the retained edges is what makes
+    // a lost link visible; measuring the declaration instead would report the
+    // fixture's intent back and never notice the loss (#105 review round 13).
+    let retained_causal_spans = delivery
+        .causal_edges
         .iter()
-        .filter_map(|claim| {
-            claim
-                .caused_by
-                .as_deref()
-                .map(|cause| (claim.event_id.as_str(), cause))
-        })
-        .collect();
-    let causal_spans_delivered = delivered
-        .iter()
-        .filter(|id| {
-            causes
-                .get(id.as_str())
-                .is_some_and(|cause| delivered.iter().any(|other| other == cause))
-        })
+        .filter(|edge| delivered.contains(&edge.effect) && delivered.contains(&edge.cause))
         .count();
 
     let claim_bytes: usize = delivery
@@ -727,7 +803,7 @@ pub fn measure_case(
         must_deliver: case.must_deliver.clone(),
         refused_claims: case.must_not_deliver.clone(),
         stale_claims: case.stale.clone(),
-        causal_spans_delivered,
+        retained_causal_spans,
         current_fact_correctness,
         stale_memory_use,
         absent_violations,
@@ -860,24 +936,31 @@ pub fn case_violations(
         );
     }
     if policy.enforce_causal_spans
-        && let Some(expected) = case.expected_causal_spans
-        && report.causal_spans_delivered != expected
+        && let Some(expected) = case.expected_retained_causal_spans
+        && report.retained_causal_spans != expected
     {
         push(
             &mut violations,
             format!(
-                "causal spans delivered {}, expected {expected}",
-                report.causal_spans_delivered
+                "retained causal spans {}, expected {expected}",
+                report.retained_causal_spans
             ),
         );
     }
     violations
 }
 
-fn run_case(
+/// Write a case's claims into a fresh store, exactly the way the runtime
+/// does: through the real `authorize_memory_write` gate, with both declared
+/// relations riding the permit's own path.
+///
+/// This is the store whose delivery a case measures, and the seam the causal
+/// regression tests read the retained edges back from: what the store holds
+/// is the evidence, and what the fixture declares is only the request.
+fn write_case_claims(
     case: &MemoryEvalCase,
     admin: &AuthenticatedControl,
-) -> Result<(CaseReport, Vec<String>), MemoryEvalError> {
+) -> Result<WorkingMemory, MemoryEvalError> {
     let mut security = SecurityRuntime::new(
         SecurityRuntimeConfig::default(),
         SchedulerConfig::default(),
@@ -885,8 +968,7 @@ fn run_case(
         None,
     )
     .map_err(|error| MemoryEvalError::Write(error.to_string()))?;
-    let config = case.config.apply();
-    let mut memory = WorkingMemory::new(config, eval_pseudonymizer())
+    let mut memory = WorkingMemory::new(case.config.apply(), eval_pseudonymizer())
         .map_err(|error| MemoryEvalError::Write(error.to_string()))?;
 
     for claim in &case.claims {
@@ -922,6 +1004,15 @@ fn run_case(
         );
         written.map_err(|error| MemoryEvalError::Write(format!("{}: {error}", claim.event_id)))?;
     }
+    Ok(memory)
+}
+
+fn run_case(
+    case: &MemoryEvalCase,
+    admin: &AuthenticatedControl,
+) -> Result<(CaseReport, Vec<String>), MemoryEvalError> {
+    let config = case.config.apply();
+    let memory = write_case_claims(case, admin)?;
 
     let context = retained_memory_context(
         &memory,
@@ -958,6 +1049,11 @@ fn run_case(
                 .to_owned(),
         });
     }
+
+    // The store's own causal evidence, read back at the query's timestamp: a
+    // claim pair only counts as a delivered span when the store holds the edge
+    // and retrieval made both endpoints usable.
+    delivery.causal_edges = retained_causal_edges(&memory, case.query.now_ms);
 
     let metrics = memory.retention_metrics();
     let retention = RetentionSnapshot {
@@ -1050,4 +1146,241 @@ pub fn memory_admin() -> AuthenticatedControl {
         .expect("authenticated evaluation admin")
         .authority()
         .clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aivtuber_adaptation::MemoryLink;
+
+    /// The published fixture, read from the file every run measures.
+    fn published_fixture() -> MemoryEvalFixture {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/memory-long-range/cases.json");
+        let bytes =
+            std::fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()))
+    }
+
+    fn causal_case(fixture: &MemoryEvalFixture) -> &MemoryEvalCase {
+        fixture
+            .cases
+            .iter()
+            .find(|case| case.id == "causal_reason_travels_with_its_effect")
+            .expect("the published fixture keeps the causal case")
+    }
+
+    fn retention_for(memory: &WorkingMemory, case: &MemoryEvalCase) -> RetentionSnapshot {
+        let metrics = memory.retention_metrics();
+        let config = case.config.apply();
+        RetentionSnapshot {
+            entries_high_water: metrics.entries_high_water,
+            links_high_water: metrics.links_high_water,
+            max_entries: config.max_entries,
+            max_links: config.max_links,
+        }
+    }
+
+    /// A delivery of the named claims carrying the causal evidence supplied.
+    fn delivery(
+        memory: &WorkingMemory,
+        delivered: &[&str],
+        causal_edges: Vec<CausalEdge>,
+    ) -> CaseDelivery {
+        CaseDelivery {
+            claims: delivered
+                .iter()
+                .map(|id| DeliveredClaim {
+                    claim_id: (*id).to_owned(),
+                    delivered_text: stored_claim(memory, id).unwrap_or_default().to_owned(),
+                    retained_text: stored_claim(memory, id).unwrap_or_default().to_owned(),
+                })
+                .collect(),
+            refused: Vec::new(),
+            causal_edges,
+        }
+    }
+
+    /// The store retains the declared edge, with the effect on the `from` end,
+    /// and hands it out only while both of its endpoints are live.
+    #[test]
+    fn the_store_retains_the_declared_causal_edge() {
+        let fixture = published_fixture();
+        let case = causal_case(&fixture);
+        let memory = write_case_claims(case, &memory_admin()).expect("the case writes");
+
+        assert_eq!(
+            retained_causal_edges(&memory, case.query.now_ms),
+            [CausalEdge {
+                effect: "evt-boss-retry".to_owned(),
+                cause: "evt-boss-bug".to_owned(),
+            }],
+            "the metric reads the store's own edge, not the fixture's declaration"
+        );
+
+        // The edge is a stored link between the two retained claims, with the
+        // effect as `from` — the direction the write path defines and the one
+        // a reader of the retained evidence sees.
+        let effect = memory
+            .entries()
+            .iter()
+            .find(|entry| entry.source.event_id == "evt-boss-retry")
+            .expect("the effect is retained");
+        let cause = memory
+            .entries()
+            .iter()
+            .find(|entry| entry.source.event_id == "evt-boss-bug")
+            .expect("the cause is retained");
+        let stored: Vec<&MemoryLink> = memory
+            .links()
+            .iter()
+            .filter(|link| link.kind == MemoryLinkKind::CausedBy)
+            .collect();
+        assert_eq!(stored.len(), 1, "one declared cause is one edge");
+        assert_eq!(
+            (stored[0].from, stored[0].to),
+            (effect.memory_id, cause.memory_id)
+        );
+
+        // Evidence expires with its endpoints: at the timestamp the cause is no
+        // longer live, the same read hands out no edge.
+        assert!(
+            retained_causal_edges(&memory, cause.expires_at_ms).is_empty(),
+            "an edge is usable only while both endpoints are live"
+        );
+    }
+
+    /// The review's falsifier: both claims delivered, the retained edge gone.
+    ///
+    /// Nothing else in the report moves — the pair still reaches generation —
+    /// so the metric and the case's own pin are the only things that can see
+    /// the loss, and both must.
+    #[test]
+    fn a_delivered_pair_without_a_retained_edge_is_not_a_causal_span() {
+        let fixture = published_fixture();
+        let case = causal_case(&fixture);
+        let memory = write_case_claims(case, &memory_admin()).expect("the case writes");
+        let retention = retention_for(&memory, case);
+        // The order the store delivers in: newest record first.
+        let delivered = ["evt-boss-retry", "evt-boss-bug"];
+
+        let kept = delivery(
+            &memory,
+            &delivered,
+            retained_causal_edges(&memory, case.query.now_ms),
+        );
+        let report = measure_case(case, &kept, &retention);
+        assert_eq!(report.retained_causal_spans, 1);
+        let violations = case_violations(case, &report, ExpectationPolicy::RUNTIME);
+        assert!(violations.is_empty(), "{violations:?}");
+
+        let lost = delivery(&memory, &delivered, Vec::new());
+        let report = measure_case(case, &lost, &retention);
+        assert_eq!(
+            report.delivered, delivered,
+            "both claims still reach generation"
+        );
+        assert_eq!(
+            report.retained_causal_spans, 0,
+            "a pair the store retains no edge for is not a causal span"
+        );
+        let violations = case_violations(case, &report, ExpectationPolicy::RUNTIME);
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.contains("retained causal spans 0, expected 1")),
+            "the lost edge must fail the case: {violations:?}"
+        );
+    }
+
+    /// A retained edge whose cause the request may not see explains nothing.
+    ///
+    /// The store keeps the caller's edge (the write path resolves the target,
+    /// not the scope), and retrieval holds the scope rule at both endpoints,
+    /// so the pair reaches the request un-usable — which is exactly what the
+    /// span metric has to say and where "delivered" is decided, not here.
+    #[test]
+    fn a_cause_outside_the_request_scope_is_not_a_delivered_span() {
+        let case: MemoryEvalCase = serde_json::from_value(serde_json::json!({
+            "id": "cross_scope_cause",
+            "claims": [
+                {
+                    "event_id": "evt-other",
+                    "actor": "viewer-2",
+                    "text": "viewer two saw the bug",
+                    "topic": "game-x",
+                    "recorded_at_ms": 1000
+                },
+                {
+                    "event_id": "evt-mine",
+                    "actor": "viewer-1",
+                    "text": "viewer one retried the boss",
+                    "topic": "game-x",
+                    "recorded_at_ms": 2000,
+                    "caused_by": "evt-other"
+                }
+            ],
+            "query": { "actor": "viewer-1", "topic": "game-x", "now_ms": 3000, "charged_bytes": 16 },
+            "must_deliver": ["evt-mine"]
+        }))
+        .expect("probe case");
+        let admin = memory_admin();
+        let memory = write_case_claims(&case, &admin).expect("the case writes");
+        assert_eq!(
+            retained_causal_edges(&memory, case.query.now_ms).len(),
+            1,
+            "the store keeps the edge the caller declared"
+        );
+
+        let (report, violations) = run_case(&case, &admin).expect("the case measures");
+        assert!(violations.is_empty(), "{violations:?}");
+        assert_eq!(
+            report.delivered,
+            ["evt-mine"],
+            "scope keeps the other viewer's claim out of the request"
+        );
+        assert_eq!(
+            report.retained_causal_spans, 0,
+            "an edge to a claim the request cannot see explains nothing"
+        );
+    }
+
+    /// A case that declares nothing retains no edge, so the metric cannot be
+    /// satisfied by the fixture alone.
+    #[test]
+    fn an_undeclared_pair_leaves_no_edge_to_count() {
+        let mut fixture = published_fixture();
+        let index = fixture
+            .cases
+            .iter()
+            .position(|case| case.id == "causal_reason_travels_with_its_effect")
+            .expect("the published fixture keeps the causal case");
+        fixture.cases[index].claims[1].caused_by = None;
+
+        // The pin is unsatisfiable without a declaration, so the fixture
+        // contract refuses it before a run could measure zero and be told the
+        // number was wrong.
+        assert_eq!(fixture.cases[index].expected_retained_causal_spans, Some(1));
+        let error = fixture
+            .validate()
+            .expect_err("an unsatisfiable pin is refused");
+        assert!(
+            error.to_string().contains("expected_retained_causal_spans"),
+            "{error}"
+        );
+
+        let case = &mut fixture.cases[index];
+        case.expected_retained_causal_spans = None;
+        let memory = write_case_claims(case, &memory_admin()).expect("the case writes");
+        assert!(
+            stored_claim(&memory, "evt-boss-bug").is_some()
+                && stored_claim(&memory, "evt-boss-retry").is_some(),
+            "both claims are retained"
+        );
+        assert!(
+            retained_causal_edges(&memory, case.query.now_ms).is_empty(),
+            "no declaration, no retained edge, no span"
+        );
+    }
 }

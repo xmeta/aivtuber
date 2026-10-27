@@ -80,8 +80,8 @@ fn the_published_fixture_measures_cleanly() {
     assert_eq!(totals.absent_violations, 0);
     assert_eq!(totals.truncated_claims, 0);
     assert_eq!(
-        totals.causal_spans_delivered, 1,
-        "the fixture must keep measuring a delivered cause/effect pair"
+        totals.retained_causal_spans, 1,
+        "the fixture must keep measuring a retained cause/effect edge"
     );
     assert!(
         totals.temporal_order_errors >= 1,
@@ -146,6 +146,48 @@ fn a_fixture_that_cannot_be_compared_is_refused() {
     causal.claims[1].caused_by = Some("evt-not-a-claim".to_owned());
     let error = evaluate(&fixture).expect_err("an unknown cause is refused");
     assert!(error.to_string().contains("evt-not-a-claim"), "{error}");
+}
+
+/// The causal metric reads the store's retained edge, not the fixture's
+/// declaration (#105 review round 13).
+///
+/// A run whose declaration was dropped still delivers both claims — the pair
+/// is what the case requires — and must measure no span, because no stored
+/// edge made the relation usable.
+#[test]
+fn a_pair_the_store_never_linked_is_not_a_retained_span() {
+    let mut fixture = published_fixture();
+    let causal = fixture
+        .cases
+        .iter_mut()
+        .find(|case| case.id == "causal_reason_travels_with_its_effect")
+        .expect("the causal case is published");
+    causal.claims[1].caused_by = None;
+    causal.expected_retained_causal_spans = None;
+
+    let outcome = evaluate(&fixture).expect("the fixture evaluates");
+    assert!(
+        outcome.violations.is_empty(),
+        "nothing else about the case changed:\n{}",
+        outcome.violations.join("\n")
+    );
+    let case = outcome
+        .report
+        .cases
+        .iter()
+        .find(|case| case.case == "causal_reason_travels_with_its_effect")
+        .expect("the case is measured");
+    assert!(
+        case.delivered.contains(&"evt-boss-bug".to_owned())
+            && case.delivered.contains(&"evt-boss-retry".to_owned()),
+        "both claims still reach generation: {:?}",
+        case.delivered
+    );
+    assert_eq!(
+        case.retained_causal_spans, 0,
+        "a declaration the store never turned into an edge is not evidence"
+    );
+    assert_eq!(outcome.report.totals.retained_causal_spans, 0);
 }
 
 #[test]
