@@ -1430,13 +1430,19 @@ impl SloReport {
 fn source_digest_of(report: &BenchmarkReport) -> Result<String, SloError> {
     let value = serde_json::to_value(report)
         .map_err(|error| SloError::new(format!("canonicalize report: {error}")))?;
-    Ok(canonical_digest(&value))
+    Ok(canonical_json_digest(&value))
 }
 
 /// Digest of one JSON value in the canonical form [`source_digest_of`]
 /// documents. Split out so the contract can be pinned against
 /// ECMAScript's own rendering in tests without building a full report.
-fn canonical_digest(value: &serde_json::Value) -> String {
+///
+/// Public because the *rule* is shared, not just the function: an artifact
+/// that names the document it describes — the SLO source report here, the
+/// #105 long-range fixture in `aivtuber-app` — has to digest it the same way
+/// on every machine, and a second canonicalization would be a second
+/// contract that could disagree with this one.
+pub fn canonical_json_digest(value: &serde_json::Value) -> String {
     let mut canonical = String::new();
     write_canonical(value, &mut canonical);
     let digest = Sha256::digest(canonical.as_bytes());
@@ -3460,7 +3466,7 @@ mod source_digest_tests {
             "h": serde_json::Value::from(1e21_f64),
         });
         assert_eq!(
-            canonical_digest(&value),
+            canonical_json_digest(&value),
             "67ab96b3cba323e2e72493aed8212bce68f7c432660d27492f338ab4cc477802"
         );
     }

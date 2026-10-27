@@ -54,6 +54,11 @@ fn renormalize(report: &mut EvalReport) {
         .map(|case| case.temporal_order_errors)
         .sum();
     report.totals.truncated_claims = report.cases.iter().map(|case| case.truncated_claims).sum();
+    report.totals.retained_causal_spans = report
+        .cases
+        .iter()
+        .map(|case| case.retained_causal_spans)
+        .sum();
     report.totals.max_context_items = report
         .cases
         .iter()
@@ -116,7 +121,8 @@ fn candidate_with_ordered_timeline() -> EvalReport {
 #[test]
 fn the_runtime_compared_with_itself_is_not_an_improvement() {
     let runtime = runtime_report();
-    let comparison = compare(&runtime, &runtime).expect("a report is comparable with itself");
+    let comparison = compare(&published_fixture(), &runtime, &runtime)
+        .expect("a report is comparable with itself");
     assert_eq!(comparison.verdict, CandidateVerdict::NoImprovement);
     assert!(!comparison.is_regression());
     assert!(
@@ -134,7 +140,7 @@ fn the_runtime_compared_with_itself_is_not_an_improvement() {
 fn a_sidecar_that_recovers_true_temporal_order_is_an_improvement() {
     let runtime = runtime_report();
     let candidate = candidate_with_ordered_timeline();
-    let comparison = compare(&runtime, &candidate).expect("comparable");
+    let comparison = compare(&published_fixture(), &runtime, &candidate).expect("comparable");
     assert_eq!(comparison.verdict, CandidateVerdict::Improvement);
     assert!(!comparison.is_regression());
     assert!(
@@ -165,7 +171,7 @@ fn a_sidecar_that_leaks_a_superseded_claim_is_rejected() {
     renormalize(&mut candidate);
 
     let runtime = runtime_report();
-    let comparison = compare(&runtime, &candidate).expect("comparable");
+    let comparison = compare(&published_fixture(), &runtime, &candidate).expect("comparable");
     assert_eq!(comparison.verdict, CandidateVerdict::Rejected);
     assert!(comparison.is_regression());
     assert!(
@@ -194,7 +200,7 @@ fn a_sidecar_that_overstays_a_request_bound_is_rejected() {
     case_mut(&mut candidate, "budget_pressure_drops_whole").within_byte_budget = false;
 
     let runtime = runtime_report();
-    let comparison = compare(&runtime, &candidate).expect("comparable");
+    let comparison = compare(&published_fixture(), &runtime, &candidate).expect("comparable");
     assert_eq!(comparison.verdict, CandidateVerdict::Rejected);
     assert!(
         comparison
@@ -218,7 +224,8 @@ fn a_report_that_contradicts_its_own_records_is_incomparable() {
         case.delivered.push("evt-dislike".to_owned());
     }
     renormalize(&mut lying);
-    let error = compare(&runtime, &lying).expect_err("a lying report is refused");
+    let error =
+        compare(&published_fixture(), &runtime, &lying).expect_err("a lying report is refused");
     assert!(
         error.to_string().contains("stale_memory_use"),
         "the refusal names the mismatched metric: {error}"
@@ -227,7 +234,8 @@ fn a_report_that_contradicts_its_own_records_is_incomparable() {
     // A total edited without editing the rows it claims to summarize.
     let mut tampered = runtime_report();
     tampered.totals.current_fact_correctness = 1.5;
-    let error = compare(&runtime, &tampered).expect_err("an impossible total is refused");
+    let error = compare(&published_fixture(), &runtime, &tampered)
+        .expect_err("an impossible total is refused");
     match error {
         MemoryCompareError::Incomparable(message) => assert!(
             message.contains("totals disagree") || message.contains("correctness"),
@@ -243,17 +251,20 @@ fn a_report_about_a_different_run_is_incomparable() {
     let mut fewer_cases = runtime_report();
     fewer_cases.cases.pop();
     renormalize(&mut fewer_cases);
-    let error = compare(&runtime, &fewer_cases).expect_err("coverage must match");
+    let error =
+        compare(&published_fixture(), &runtime, &fewer_cases).expect_err("coverage must match");
     assert!(error.to_string().contains("covers"), "{error}");
 
     let mut renamed = runtime_report();
     renamed.cases[0].case = "another_suite".to_owned();
-    let error = compare(&runtime, &renamed).expect_err("case identity must match");
+    let error =
+        compare(&published_fixture(), &runtime, &renamed).expect_err("case identity must match");
     assert!(error.to_string().contains("order differs"), "{error}");
 
     let mut other_schema = runtime_report();
     other_schema.schema_version = "memory-long-range-eval/v2".to_owned();
-    let error = compare(&runtime, &other_schema).expect_err("one schema or none");
+    let error =
+        compare(&published_fixture(), &runtime, &other_schema).expect_err("one schema or none");
     assert!(
         error.to_string().contains("schema_version"),
         "the refusal names the schema it refused: {error}"
@@ -263,17 +274,159 @@ fn a_report_about_a_different_run_is_incomparable() {
     // the case ids may look alike while meaning different claims.
     let mut other_fixture = runtime_report();
     other_fixture.fixture_schema_version = "memory-eval-v0".to_owned();
-    let error = compare(&runtime, &other_fixture).expect_err("one fixture or none");
+    let error =
+        compare(&published_fixture(), &runtime, &other_fixture).expect_err("one fixture or none");
     assert!(
         error.to_string().contains("fixture_schema_version"),
         "the refusal names the fixture document it refused: {error}"
     );
 }
 
+/// The causal row comes from the fixture and the delivered sets, never from a
+/// report's own number (#105 review round 13).
+///
+/// A candidate keeps no project edge, so its own retained-span count is 0 even
+/// where it returned both members of the declared pair. The compared number
+/// still shows the pair, because it is re-derived rather than read.
+#[test]
+fn the_causal_row_is_recomputed_from_the_fixture_not_from_a_report() {
+    let runtime = runtime_report();
+    let mut candidate = runtime_report();
+    {
+        let case = case_mut(&mut candidate, "causal_reason_travels_with_its_effect");
+        assert_eq!(case.retained_causal_spans, 1);
+        case.retained_causal_spans = 0;
+    }
+    renormalize(&mut candidate);
+
+    let comparison = compare(&published_fixture(), &runtime, &candidate).expect("comparable");
+    let delta = comparison
+        .case_deltas
+        .iter()
+        .find(|delta| delta.case == "causal_reason_travels_with_its_effect")
+        .expect("the causal case is compared");
+    assert_eq!(delta.runtime_causal_pairs_delivered, 1);
+    assert_eq!(delta.candidate_causal_pairs_delivered, 1);
+    let row = comparison
+        .deltas
+        .iter()
+        .find(|delta| delta.metric == "causal_pairs_delivered")
+        .expect("the causal row is reported");
+    assert_eq!((row.runtime, row.candidate), (1.0, 1.0));
+    assert!(
+        !row.candidate_better && !row.candidate_worse,
+        "a metric the comparison reports, not one it scores"
+    );
+}
+
+/// A report names the document it measured by digest, so a fixture revision
+/// that keeps every case id is still refused (#105 review round 14).
+#[test]
+fn a_report_measured_against_another_fixture_revision_is_incomparable() {
+    let runtime = runtime_report();
+    let mut revised = published_fixture();
+    {
+        let case = revised
+            .cases
+            .iter_mut()
+            .find(|case| case.id == "causal_reason_travels_with_its_effect")
+            .expect("the causal case is published");
+        assert!(
+            case.claims[1].caused_by.is_some(),
+            "the published revision declares the pair"
+        );
+        assert_eq!(case.expected_retained_causal_spans, Some(1));
+        // One declaration and its pin change; every case id stays as it was,
+        // and the revision is still a document a run could measure.
+        case.claims[1].caused_by = None;
+        case.expected_retained_causal_spans = None;
+    }
+    revised.validate().expect("the revision is measurable");
+    assert_ne!(
+        aivtuber_app::fixture_digest(&revised),
+        runtime.fixture_digest,
+        "a changed declaration is a different document"
+    );
+
+    let error = compare(&revised, &runtime, &runtime).expect_err("a stale report is refused");
+    assert!(
+        error.to_string().contains("fixture_digest"),
+        "the refusal names the document identity: {error}"
+    );
+}
+
+/// The runtime report carries the fixture's digest and its own rows carry the
+/// fixture's expectations, which is what the comparison re-checks.
+#[test]
+fn a_report_carries_the_fixture_it_measured() {
+    let fixture = published_fixture();
+    let runtime = runtime_report();
+    assert_eq!(
+        runtime.fixture_digest,
+        aivtuber_app::fixture_digest(&fixture)
+    );
+    assert!(
+        !runtime.fixture_digest.is_empty(),
+        "a report without a document digest proves nothing"
+    );
+    for (case, fixture_case) in runtime.cases.iter().zip(&fixture.cases) {
+        assert_eq!(case.must_deliver, fixture_case.must_deliver);
+        assert_eq!(case.refused_claims, fixture_case.must_not_deliver);
+        assert_eq!(case.stale_claims, fixture_case.stale);
+    }
+}
+
+/// A row that answers other questions than the fixture asks is refused, even
+/// when its own numbers are consistent with each other.
+#[test]
+fn a_report_row_that_carries_other_expectations_is_refused() {
+    let runtime = runtime_report();
+    let mut candidate = runtime_report();
+    case_mut(&mut candidate, "preference_update").must_deliver =
+        vec!["evt-does-not-exist".to_owned()];
+
+    let error = compare(&published_fixture(), &runtime, &candidate)
+        .expect_err("a row about other questions is refused");
+    assert!(
+        error
+            .to_string()
+            .contains("expectations the fixture does not declare"),
+        "the refusal explains the mismatch: {error}"
+    );
+}
+
+/// A causal count invented beside a delivery that cannot support it is refused
+/// rather than shown.
+#[test]
+fn a_causal_count_the_delivery_cannot_support_is_refused() {
+    let runtime = runtime_report();
+    let mut candidate = runtime_report();
+    {
+        // The delivery is untouched; only the count changes. No causal pair is
+        // declared for this case, so nothing can support the claim.
+        let case = case_mut(&mut candidate, "preference_update");
+        assert_eq!(case.retained_causal_spans, 0);
+        case.retained_causal_spans = 1;
+    }
+    renormalize(&mut candidate);
+
+    let error = compare(&published_fixture(), &runtime, &candidate)
+        .expect_err("an unsupported causal count is refused");
+    assert!(
+        error.to_string().contains("retained causal span"),
+        "the refusal names the metric: {error}"
+    );
+}
+
 #[test]
 fn the_verdict_round_trips_as_json() {
     let runtime = runtime_report();
-    let comparison = compare(&runtime, &candidate_with_ordered_timeline()).expect("comparable");
+    let comparison = compare(
+        &published_fixture(),
+        &runtime,
+        &candidate_with_ordered_timeline(),
+    )
+    .expect("comparable");
     let json = serde_json::to_string(&comparison).expect("serialize the verdict");
     let back: aivtuber_app::MemoryComparison =
         serde_json::from_str(&json).expect("deserialize the verdict");
