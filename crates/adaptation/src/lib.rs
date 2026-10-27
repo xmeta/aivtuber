@@ -80,10 +80,16 @@ pub struct MemoryEntry {
 }
 
 /// Versioned edge vocabulary for retained episodic memory (#105). Kept small
-/// on purpose: temporal order is derived deterministically at write time and
-/// supersession is declared by the caller that owns the update evidence;
-/// causal kinds wait for an evidence source that can actually establish them.
-pub const MEMORY_LINK_VOCAB_VERSION: &str = "memory-link-v1";
+/// on purpose: temporal order is derived deterministically at write time, and
+/// supersession and causation are declared by the caller that owns the
+/// evidence — a model may recommend either, but only the permit-gated durable
+/// path can turn one into an edge.
+///
+/// `memory-link-v2` adds the causal kind. The version is pinned so the
+/// change is replay-visible: an artifact written under v1 simply carries no
+/// causal edges, and a reader never has to infer the vocabulary from which
+/// kinds happen to appear.
+pub const MEMORY_LINK_VOCAB_VERSION: &str = "memory-link-v2";
 
 /// Versioned epistemic vocabulary for retained memory (#105 §3.1). The
 /// retrieval view names it, so a replay can identify which classification
@@ -107,6 +113,14 @@ pub enum MemoryLinkKind {
     /// `from` explicitly supersedes `to` — declared at write time through the
     /// same permit path as the claim itself.
     Supersedes,
+    /// `from` was caused by `to` — declared at write time through the same
+    /// permit path as the claim itself.
+    ///
+    /// Only one direction is stored. The other reading of the same evidence —
+    /// "`to` resulted in `from`" — is this edge seen from its other endpoint,
+    /// so a second kind would spend two units of the per-write budget on one
+    /// fact and could disagree with the first after partial eviction.
+    CausedBy,
 }
 
 /// One edge between retained memory nodes. It carries no claim content —
@@ -152,6 +166,82 @@ pub struct LinkedMemory<'a> {
 pub struct MemoryLinkSnapshot {
     pub vocab_version: &'static str,
     pub links: Vec<MemoryLink>,
+}
+
+/// The caller-owned evidence a durable write may carry (#105).
+///
+/// Both lists name retained *source event ids*; each is resolved to exactly
+/// one live node before anything is stored, and both ride the same
+/// non-serializable permit path as the claim, so evidence can never widen the
+/// memory-write gate. They also share one per-write budget: the edge bound is
+/// a cost bound, and splitting the same number of edges across two lists must
+/// not spend it twice.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemoryEvidence<'a> {
+    /// Retained claims this write replaces — the update evidence a caller owns.
+    pub supersedes: &'a [&'a str],
+    /// Retained claims that brought this one about. What this claim *resulted
+    /// in* is the same edge read from the other endpoint, so no inverse list
+    /// exists.
+    pub caused_by: &'a [&'a str],
+}
+
+/// The declared relation a target resolution is serving.
+///
+/// It exists only so a refusal names which declaration was rejected: both
+/// kinds share every rule and the same per-write budget, so the resolution
+/// logic is one function, not two copies that could drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeclaredRelation {
+    Supersession,
+    Causal,
+}
+
+impl DeclaredRelation {
+    fn missing(self) -> &'static str {
+        match self {
+            Self::Supersession => "supersession target must be a retained durable memory",
+            Self::Causal => "causal target must be a retained durable memory",
+        }
+    }
+
+    fn expired(self) -> &'static str {
+        match self {
+            Self::Supersession => {
+                "supersession target has expired; an expired memory cannot authorize an update \
+                 relation"
+            }
+            Self::Causal => {
+                "causal target has expired; an expired memory cannot authorize a causal relation"
+            }
+        }
+    }
+
+    fn ambiguous(self) -> &'static str {
+        match self {
+            Self::Supersession => {
+                "supersession target is ambiguous: one source event id matches more than one \
+                 retained durable memory, and links must not guess which node the caller meant"
+            }
+            Self::Causal => {
+                "causal target is ambiguous: one source event id matches more than one retained \
+                 durable memory, and links must not guess which node the caller meant"
+            }
+        }
+    }
+
+    fn recorded_in_the_future(self) -> &'static str {
+        match self {
+            Self::Supersession => {
+                "supersession target was recorded after the superseding write; a claim cannot \
+                 replace evidence from its own future"
+            }
+            Self::Causal => {
+                "causal target was recorded after the write that declares it; a claim cannot be \
+                 caused by evidence from its own future"
+            }
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -455,9 +545,35 @@ impl WorkingMemory {
         self.remember_durable_superseding(permit, claim, topic, now_ms, &[])
     }
 
+    /// A durable write that declares supersession only (#105).
+    ///
+    /// This is [`Self::remember_durable_with_evidence`] with no causal
+    /// evidence — the narrower entry point call sites that only update a claim
+    /// already use.
+    pub fn remember_durable_superseding(
+        &mut self,
+        permit: &MemoryWritePermit,
+        claim: &str,
+        topic: Option<&str>,
+        now_ms: u64,
+        supersedes: &[&str],
+    ) -> Result<&MemoryEntry, AdaptationError> {
+        self.remember_durable_with_evidence(
+            permit,
+            claim,
+            topic,
+            now_ms,
+            MemoryEvidence {
+                supersedes,
+                caused_by: &[],
+            },
+        )
+    }
+
     /// A durable write that may also declare supersession: `supersedes` names
     /// retained durable memories this claim replaces (issue #105's update
-    /// evidence, owned by the caller). Targets are resolved to exactly one
+    /// evidence, owned by the caller) and `caused_by` names retained durable
+    /// memories that brought it about. Targets are resolved to exactly one
     /// live retained durable node *before* anything is stored — unknown,
     /// working-only, expired, future-dated, or ambiguous targets refuse the
     /// whole write ("stores nothing, mints nothing"), links ride the same
@@ -469,48 +585,82 @@ impl WorkingMemory {
     /// a fixed multiple of that budget (and the dedup buffer never grows
     /// past the budget), so a flood of restated ids cannot buy an unbounded
     /// scan on a bounded-adaptation API.
-    pub fn remember_durable_superseding(
+    pub fn remember_durable_with_evidence(
         &mut self,
         permit: &MemoryWritePermit,
         claim: &str,
         topic: Option<&str>,
         now_ms: u64,
-        supersedes: &[&str],
+        evidence: MemoryEvidence<'_>,
     ) -> Result<&MemoryEntry, AdaptationError> {
+        // Each list is bounded before it is walked, so a flood of restated ids
+        // cannot buy an unbounded scan on a bounded-adaptation API.
         let declarations_bound = self
             .config
             .max_links_per_memory
             .saturating_mul(SUPERSESSION_DECLARATION_FACTOR);
-        if supersedes.len() > declarations_bound {
+        if evidence.supersedes.len() > declarations_bound
+            || evidence.caused_by.len() > declarations_bound
+        {
             return Err(AdaptationError::InvalidInput(
-                "one write may not hand more supersession declarations than the bounded input \
-                 allows; collapse repeated declarations before calling",
+                "one write may not hand more explicit relation declarations than the bounded \
+                 input allows; collapse repeated declarations before calling",
             ));
         }
-        let mut unique: Vec<&str> =
-            Vec::with_capacity(self.config.max_links_per_memory.min(supersedes.len()));
-        for target in supersedes {
-            if !unique.contains(target) {
-                // Refuse as soon as a new unique target exceeds the budget:
-                // at cap+1 uniques the write is already rejected, so
-                // buffering beyond that would only waste memory.
-                if unique.len() >= self.config.max_links_per_memory {
+        // Both kinds draw on one budget: the edge bound is a cost bound, and
+        // splitting the same number of edges across two lists must not spend
+        // it twice. Refusing at cap+1 means the dedup buffers never grow past
+        // the budget either.
+        let mut budget = self.config.max_links_per_memory;
+        let mut declared_supersedes: Vec<&str> =
+            Vec::with_capacity(budget.min(evidence.supersedes.len()));
+        for target in evidence.supersedes {
+            if !declared_supersedes.contains(target) {
+                if budget == 0 {
                     return Err(AdaptationError::InvalidInput(
-                        "one write may not declare more supersessions than the per-memory link \
-                         budget",
+                        "one write may not declare more explicit relations than the per-memory \
+                         link budget",
                     ));
                 }
-                unique.push(target);
+                declared_supersedes.push(target);
+                budget -= 1;
             }
         }
-        let mut targets = Vec::with_capacity(unique.len());
-        for target in &unique {
-            targets.push(self.resolve_supersession_target(target, now_ms)?);
+        let mut declared_causes: Vec<&str> =
+            Vec::with_capacity(budget.min(evidence.caused_by.len()));
+        for target in evidence.caused_by {
+            if !declared_causes.contains(target) {
+                if budget == 0 {
+                    return Err(AdaptationError::InvalidInput(
+                        "one write may not declare more explicit relations than the per-memory \
+                         link budget",
+                    ));
+                }
+                declared_causes.push(target);
+                budget -= 1;
+            }
         }
-        // Explicit supersession evidence is never evicted to make room for
-        // more of it: shedding the edge that marks a still-retained target
-        // makes that claim current again while the memory that replaced it
-        // is alive — the stale fact this layer exists to keep (#105). The
+        let mut targets = Vec::with_capacity(declared_supersedes.len());
+        for target in &declared_supersedes {
+            targets.push(self.resolve_declared_target(
+                target,
+                now_ms,
+                DeclaredRelation::Supersession,
+            )?);
+        }
+        let mut cause_nodes = Vec::with_capacity(declared_causes.len());
+        for target in &declared_causes {
+            cause_nodes.push(self.resolve_declared_target(
+                target,
+                now_ms,
+                DeclaredRelation::Causal,
+            )?);
+        }
+        // Explicit evidence is never evicted to make room for more of it:
+        // shedding the edge that marks a still-retained target makes that
+        // claim current again while the memory that replaced it is alive —
+        // the stale fact this layer exists to keep (#105) — and shedding a
+        // causal edge loses the caller's account of why a claim exists. The
         // bound therefore refuses the *later* write instead of forgetting
         // the earlier evidence, and it refuses it before anything is stored
         // ("stores nothing, mints nothing"), so the caller learns the
@@ -534,17 +684,23 @@ impl WorkingMemory {
             .links
             .iter()
             .filter(|link| {
-                link.kind == MemoryLinkKind::Supersedes
-                    && survivors.contains(&link.from)
+                matches!(
+                    link.kind,
+                    MemoryLinkKind::Supersedes | MemoryLinkKind::CausedBy
+                ) && survivors.contains(&link.from)
                     && survivors.contains(&link.to)
             })
             .count();
-        let new_evidence_retained = targets.iter().filter(|id| survivors.contains(id)).count();
+        let new_evidence_retained = targets
+            .iter()
+            .chain(cause_nodes.iter())
+            .filter(|id| survivors.contains(id))
+            .count();
         if explicit_retained + new_evidence_retained > self.config.max_links {
             return Err(AdaptationError::InvalidInput(
-                "the link store cannot hold this write's supersession evidence without \
-                 discarding earlier evidence for a still-retained claim; raise max_links or let \
-                 retention expire the earlier endpoints first",
+                "the link store cannot hold this write's explicit evidence without discarding \
+                 earlier evidence for a still-retained claim; raise max_links or let retention \
+                 expire the earlier endpoints first",
             ));
         }
         let retention = RetentionClass::Durable;
@@ -604,28 +760,36 @@ impl WorkingMemory {
         let topic = entry.topic.clone();
         let stored = self.push_bounded(entry, now_ms)?;
         let new_id = stored.memory_id;
-        self.link_new_memory(new_id, topic.as_deref(), now_ms, &targets);
+        self.link_new_memory(new_id, topic.as_deref(), now_ms, &targets, &cause_nodes);
         self.entries.back().ok_or(AdaptationError::Invariant(
             "inserted memory entry disappeared",
         ))
     }
 
-    /// Resolve a declared supersession target to exactly one node, failing
-    /// closed at every point identity or liveness is in doubt:
+    /// Resolve a declared relation target to exactly one node, failing closed
+    /// at every point identity or liveness is in doubt:
     ///
     /// * unknown or working-only ids are refused — no cross-retention edge;
     /// * an id whose only durable matches are expired *at `now_ms`* is
     ///   refused — an expired memory is already deleted for retrieval, so it
-    ///   cannot authorize an update relation just because compaction has not
+    ///   cannot authorize a relation just because compaction has not
     ///   physically removed it yet;
     /// * an id retained as more than one live durable memory is refused as
     ///   ambiguous — a source event id is not a node identity, and the link
     ///   must not be guessed onto one of several candidates;
-    /// * a target recorded *after* the superseding write is refused — a claim
-    ///   cannot replace evidence from its own future, or a backfill would mark
-    ///   a logically later claim stale and contradict the record-time ordering
-    ///   the temporal spine and retrieval ranking both follow.
-    fn resolve_supersession_target(&self, id: &str, now_ms: u64) -> Result<u64, AdaptationError> {
+    /// * a target recorded *after* the write is refused — a claim cannot
+    ///   replace or be caused by evidence from its own future, or a backfill
+    ///   would contradict the record-time ordering the temporal spine and
+    ///   retrieval ranking both follow.
+    ///
+    /// `relation` only names the kind in the refusal, so an operator learns
+    /// which declaration was rejected; both kinds share the rules.
+    fn resolve_declared_target(
+        &self,
+        id: &str,
+        now_ms: u64,
+        relation: DeclaredRelation,
+    ) -> Result<u64, AdaptationError> {
         let retained: Vec<&MemoryEntry> = self
             .entries
             .iter()
@@ -634,53 +798,53 @@ impl WorkingMemory {
             })
             .collect();
         if retained.is_empty() {
-            return Err(AdaptationError::InvalidInput(
-                "supersession target must be a retained durable memory",
-            ));
+            return Err(AdaptationError::InvalidInput(relation.missing()));
         }
         let mut live = retained.iter().filter(|entry| entry.expires_at_ms > now_ms);
         let Some(target) = live.next() else {
-            return Err(AdaptationError::InvalidInput(
-                "supersession target has expired; an expired memory cannot authorize an update \
-                 relation",
-            ));
+            return Err(AdaptationError::InvalidInput(relation.expired()));
         };
         if live.next().is_some() {
-            return Err(AdaptationError::InvalidInput(
-                "supersession target is ambiguous: one source event id matches more than one \
-                 retained durable memory, and links must not guess which node the caller meant",
-            ));
+            return Err(AdaptationError::InvalidInput(relation.ambiguous()));
         }
         if target.created_at_ms > now_ms {
             return Err(AdaptationError::InvalidInput(
-                "supersession target was recorded after the superseding write; a claim cannot \
-                 replace evidence from its own future",
+                relation.recorded_in_the_future(),
             ));
         }
         Ok(target.memory_id)
     }
 
     /// Create this write's links, deterministic by construction: explicit
-    /// supersessions first (they are the caller-owned evidence), then a
-    /// temporal spine to the most recent same-topic durable memories, all
-    /// within the per-memory budget. Same claims written twice dedupe to one
-    /// edge, and the store total is re-bounded afterwards.
+    /// evidence first (supersession, then causation — both caller-owned), then
+    /// a temporal spine to the most recent same-topic durable memories, all
+    /// within the one per-memory budget. Same claims written twice dedupe to
+    /// one edge, and the store total is re-bounded afterwards.
     fn link_new_memory(
         &mut self,
         new_id: u64,
         topic: Option<&str>,
         now_ms: u64,
         supersedes: &[u64],
+        caused_by: &[u64],
     ) {
         let mut budget = self.config.max_links_per_memory;
-        for target in supersedes {
+        for (target, kind) in supersedes
+            .iter()
+            .map(|target| (target, MemoryLinkKind::Supersedes))
+            .chain(
+                caused_by
+                    .iter()
+                    .map(|target| (target, MemoryLinkKind::CausedBy)),
+            )
+        {
             if budget == 0 {
                 break;
             }
             self.push_link(MemoryLink {
                 from: new_id,
                 to: *target,
-                kind: MemoryLinkKind::Supersedes,
+                kind,
                 created_at_ms: now_ms,
             });
             budget -= 1;
@@ -735,8 +899,8 @@ impl WorkingMemory {
     /// insertion compaction has run, without mutating the store: mirrors
     /// `push_bounded`'s two `compact` passes (expiry trim, push at the back,
     /// pop from the front while over the node bound). Stored edges and new
-    /// supersession targets are both judged against this set, so evidence
-    /// this write itself removes never counts against this write. The
+    /// explicit targets are both judged against this set, so evidence this
+    /// write itself removes never counts against this write. The
     /// inserted node is not in the set yet; it always survives because the
     /// pops come from the front and `max_entries >= 1`.
     fn projected_survivors(&self, now_ms: u64) -> HashSet<u64> {
@@ -766,15 +930,17 @@ impl WorkingMemory {
     }
 
     /// Re-enforce the store-wide edge bound by shedding **derived** edges
-    /// only, oldest first. Explicit supersession evidence is never removed
-    /// here: [`Self::remember_durable_superseding`] refuses any write whose
-    /// supersession edges would not fit alongside the ones already retained,
-    /// so once the derived edges are gone the store is provably within its
-    /// bound and this loop exits — an explicit-only store cannot be over the
-    /// limit. Shedding an explicit edge instead would make the claim it marks
-    /// current again while the memory that replaced it is still live, which
-    /// is the stale fact #105 exists to keep, so the bound yields to that
-    /// correctness rule rather than forgetting evidence.
+    /// only, oldest first. Explicit evidence — supersession and causation — is
+    /// never removed here: [`Self::remember_durable_with_evidence`] refuses any
+    /// write whose explicit edges would not fit alongside the ones already
+    /// retained, so once the derived edges are gone the store is provably
+    /// within its bound and this loop exits — an explicit-only store cannot be
+    /// over the limit. Shedding an explicit supersession edge instead would
+    /// make the claim it marks current again while the memory that replaced it
+    /// is still live, which is the stale fact #105 exists to keep; shedding a
+    /// causal edge would lose the caller's account of why a claim exists, and
+    /// neither is re-derivable from record time. The bound therefore yields to
+    /// that correctness rule rather than forgetting evidence.
     fn enforce_link_bound(&mut self) {
         while self.links.len() > self.config.max_links {
             let Some(derived) = self
@@ -782,16 +948,17 @@ impl WorkingMemory {
                 .iter()
                 .position(|link| link.kind == MemoryLinkKind::TemporalBefore)
             else {
-                // Unreachable: the pre-store supersession check guarantees
-                // explicit edges alone fit, so there is always a derived edge
-                // left to shed before the bound can be exceeded.
+                // Unreachable: the pre-store explicit-evidence check
+                // guarantees supersession and causal edges alone fit, so
+                // there is always a derived edge left to shed before the
+                // bound can be exceeded.
                 break;
             };
             self.links.remove(derived);
         }
         debug_assert!(
             self.links.len() <= self.config.max_links,
-            "an explicit-only link store exceeded its bound; the pre-store supersession check \
+            "an explicit-only link store exceeded its bound; the pre-store explicit-evidence check \
              must prevent this"
         );
         self.links_high_water = self.links_high_water.max(self.links.len());
@@ -1160,12 +1327,16 @@ impl WorkingMemory {
     /// `now_ms`: retrieval already treats an expired node as deleted, and a
     /// replay-time query must not see a relation from the future — the
     /// staleness verdict is likewise drawn only from edges that already exist
-    /// at the read timestamp (#105 review round 10). Supersessions lead,
-    /// **newest first** by record time with the higher node id breaking ties
-    /// — the same insertion-order tie-break `relevant` and `TemporalBefore`
-    /// use — so the per-entry cap can never truncate the latest correction
-    /// behind an older one, even for a same-tick pair; temporal spine edges
-    /// keep creation order; and the per-memory budget cuts the view (#105
+    /// at the read timestamp (#105 review round 10). Caller-owned evidence
+    /// leads: supersessions first, then causal edges, both **newest first** by
+    /// record time with the higher node id breaking ties — the same
+    /// insertion-order tie-break `relevant` and `TemporalBefore` use — so the
+    /// per-entry cap can never truncate the latest correction behind an older
+    /// one, even for a same-tick pair, and staleness (decided from
+    /// supersession) outranks causation when only one edge fits. Temporal
+    /// spine edges keep creation order, because the spine is the one kind the
+    /// next write in the topic re-derives; and the per-memory budget cuts the
+    /// view (#105
     /// review rounds 11-12).
     fn link_view(
         &self,
@@ -1190,13 +1361,21 @@ impl WorkingMemory {
                 && live.contains(&link.from)
         });
         let mut links: Vec<MemoryLink> = Vec::with_capacity(cap.min(incident.len()));
-        for kind in [MemoryLinkKind::Supersedes, MemoryLinkKind::TemporalBefore] {
+        // Explicit evidence leads, supersession before causation, then the
+        // derived temporal spine: the caller-owned relations are the ones a
+        // capped view must not drop, and the spine is the one that can be
+        // re-derived on the next write in the topic.
+        for kind in [
+            MemoryLinkKind::Supersedes,
+            MemoryLinkKind::CausedBy,
+            MemoryLinkKind::TemporalBefore,
+        ] {
             let mut ordered: Vec<&MemoryLink> = incident
                 .iter()
                 .copied()
                 .filter(|link| link.kind == kind)
                 .collect();
-            if kind == MemoryLinkKind::Supersedes {
+            if kind != MemoryLinkKind::TemporalBefore {
                 // Newest correction first: response generation consumes this
                 // view, and a cap of one must surface the latest supersession
                 // rather than the oldest (#105 review round 11). Equal record
@@ -2976,10 +3155,7 @@ mod tests {
             &["evt-b"],
         )
         .expect_err("evidence that would displace earlier evidence is refused");
-        assert!(
-            error.to_string().contains("supersession evidence"),
-            "{error}"
-        );
+        assert!(error.to_string().contains("explicit evidence"), "{error}");
         assert_eq!(memory.len(), 2, "the refused write stored nothing");
         assert_eq!(memory.links().len(), 1, "and mangled nothing");
 
@@ -4351,6 +4527,366 @@ mod tests {
             results.iter().all(|item| !item.stale),
             "neither duplicate may be marked stale by a refused write"
         );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn durable_write_with_evidence(
+        memory: &mut WorkingMemory,
+        security: &mut SecurityRuntime,
+        id: &str,
+        claim: &str,
+        topic: Option<&str>,
+        now_ms: u64,
+        supersedes: &[&str],
+        caused_by: &[&str],
+    ) -> Result<u64, AdaptationError> {
+        let mut source = event(id, SourceClass::System, TrustLevel::Trusted, None);
+        source
+            .payload
+            .insert("text".to_owned(), Value::String(claim.to_owned()));
+        let (_, permit) = security.authorize_memory_write(&source, None);
+        let permit = permit.expect("system permit");
+        memory
+            .remember_durable_with_evidence(
+                &permit,
+                claim,
+                topic,
+                now_ms,
+                MemoryEvidence {
+                    supersedes,
+                    caused_by,
+                },
+            )
+            .map(|entry| entry.memory_id)
+    }
+
+    #[test]
+    fn a_causal_declaration_links_the_new_claim_to_its_cause() {
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig::default());
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-goal",
+            "the viewer wants to finish game x",
+            None,
+            1_000,
+        );
+        let goal = retained_node(&memory, "evt-goal");
+        let attempt = durable_write_with_evidence(
+            &mut memory,
+            &mut security,
+            "evt-attempt",
+            "the viewer tried the final boss again",
+            None,
+            2_000,
+            &[],
+            &["evt-goal"],
+        )
+        .expect("a declared cause is accepted");
+
+        let links = memory.links();
+        assert_eq!(links.len(), 1, "one declaration mints one edge: {links:?}");
+        assert_eq!(links[0].from, attempt);
+        assert_eq!(links[0].to, goal);
+        assert_eq!(links[0].kind, MemoryLinkKind::CausedBy);
+        assert_eq!(links[0].created_at_ms, 2_000);
+
+        // The edge is visible from both endpoints through the retrieval view,
+        // so a response can say what an outcome followed from as well as what
+        // it led to.
+        let results = memory.relevant_linked(unfiltered_query(8), 3_000);
+        let from_attempt = results
+            .iter()
+            .find(|item| item.entry.memory_id == attempt)
+            .expect("the attempt is retrievable");
+        assert_eq!(from_attempt.links[0].kind, MemoryLinkKind::CausedBy);
+        assert_eq!(from_attempt.links[0].to, goal);
+        assert_eq!(
+            from_attempt.vocab_version, MEMORY_LINK_VOCAB_VERSION,
+            "the view names the vocabulary that shaped it"
+        );
+    }
+
+    #[test]
+    fn a_causal_target_that_is_not_retained_refuses_the_write() {
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig::default());
+        let error = durable_write_with_evidence(
+            &mut memory,
+            &mut security,
+            "evt-result",
+            "the attempt worked",
+            None,
+            2_000,
+            &[],
+            &["evt-never-written"],
+        )
+        .expect_err("an unknown cause is refused");
+        assert!(
+            matches!(&error, AdaptationError::InvalidInput(message)
+                if message.starts_with("causal target must be")),
+            "{error}"
+        );
+        assert_eq!(memory.len(), 0, "a refused write stores nothing");
+        assert!(memory.links().is_empty(), "a refused write mints no links");
+    }
+
+    #[test]
+    fn a_causal_target_from_the_future_is_refused() {
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig::default());
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-cause",
+            "the later claim",
+            None,
+            3_000,
+        );
+        let error = durable_write_with_evidence(
+            &mut memory,
+            &mut security,
+            "evt-effect",
+            "the earlier claim",
+            None,
+            2_000,
+            &[],
+            &["evt-cause"],
+        )
+        .expect_err("a claim cannot be caused by evidence from its own future");
+        assert!(
+            matches!(&error, AdaptationError::InvalidInput(message)
+                if message.starts_with("causal target was recorded after")),
+            "{error}"
+        );
+        assert_eq!(memory.len(), 1);
+        assert!(memory.links().is_empty());
+    }
+
+    #[test]
+    fn supersession_and_causation_share_the_per_write_budget() {
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig {
+            max_links_per_memory: 2,
+            ..WorkingMemoryConfig::default()
+        });
+        for (index, id) in ["evt-a", "evt-b", "evt-c"].iter().enumerate() {
+            durable_write(
+                &mut memory,
+                &mut security,
+                id,
+                "a retained claim",
+                None,
+                1_000 + index as u64,
+            );
+        }
+
+        let error = durable_write_with_evidence(
+            &mut memory,
+            &mut security,
+            "evt-d",
+            "an update with two declared causes",
+            None,
+            2_000,
+            &["evt-a"],
+            &["evt-b", "evt-c"],
+        )
+        .expect_err("three explicit edges exceed a budget of two");
+        assert!(
+            matches!(&error, AdaptationError::InvalidInput(message)
+                if message.contains("explicit relations than the per-memory link budget")),
+            "{error}"
+        );
+        assert_eq!(memory.len(), 3, "a refused write stores nothing");
+        assert!(memory.links().is_empty(), "a refused write mints no links");
+
+        // Two declarations across the two kinds fit the one budget, in the
+        // order the write listed them: supersession first, then causation.
+        let updater = durable_write_with_evidence(
+            &mut memory,
+            &mut security,
+            "evt-e",
+            "an update caused by one earlier claim",
+            None,
+            2_500,
+            &["evt-a"],
+            &["evt-b"],
+        )
+        .expect("two declarations fit");
+        let kinds: Vec<MemoryLinkKind> = memory
+            .links()
+            .iter()
+            .filter(|link| link.from == updater)
+            .map(|link| link.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            [MemoryLinkKind::Supersedes, MemoryLinkKind::CausedBy],
+            "explicit evidence is emitted supersession first, then causation"
+        );
+    }
+
+    #[test]
+    fn causal_evidence_is_never_shed_to_make_room() {
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig {
+            max_links: 2,
+            max_links_per_memory: 1,
+            ..WorkingMemoryConfig::default()
+        });
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-cause",
+            "the claim everything follows from",
+            None,
+            1_000,
+        );
+        for (index, id) in ["evt-1", "evt-2"].iter().enumerate() {
+            durable_write_with_evidence(
+                &mut memory,
+                &mut security,
+                id,
+                "an outcome",
+                None,
+                2_000 + index as u64,
+                &[],
+                &["evt-cause"],
+            )
+            .expect("the store can hold both explicit edges");
+        }
+        assert_eq!(
+            memory
+                .links()
+                .iter()
+                .filter(|link| link.kind == MemoryLinkKind::CausedBy)
+                .count(),
+            2,
+            "both causal edges are the caller's evidence"
+        );
+
+        let error = durable_write_with_evidence(
+            &mut memory,
+            &mut security,
+            "evt-3",
+            "a third outcome",
+            None,
+            3_000,
+            &[],
+            &["evt-cause"],
+        )
+        .expect_err("a third explicit edge would displace evidence");
+        assert!(
+            matches!(&error, AdaptationError::InvalidInput(message)
+                if message.contains("cannot hold this write's explicit evidence")),
+            "{error}"
+        );
+        assert_eq!(
+            memory
+                .links()
+                .iter()
+                .filter(|link| link.kind == MemoryLinkKind::CausedBy)
+                .count(),
+            2,
+            "the refused write left the retained causal evidence alone"
+        );
+    }
+
+    #[test]
+    fn an_expired_cause_prunes_its_causal_edge() {
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig {
+            durable_ttl_ms: 1_000,
+            ..WorkingMemoryConfig::default()
+        });
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-cause",
+            "the cause",
+            None,
+            0,
+        );
+        durable_write_with_evidence(
+            &mut memory,
+            &mut security,
+            "evt-effect",
+            "the effect",
+            None,
+            500,
+            &[],
+            &["evt-cause"],
+        )
+        .expect("the cause is live at the write");
+        assert_eq!(memory.links().len(), 1);
+
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-unrelated",
+            "an unrelated write triggers compaction",
+            None,
+            2_000,
+        );
+        assert!(
+            memory.links().is_empty(),
+            "an expired endpoint takes its edge with it: {:?}",
+            memory.links()
+        );
+    }
+
+    #[test]
+    fn the_link_view_leads_with_explicit_evidence() {
+        let mut security = security();
+        let mut memory = test_memory(WorkingMemoryConfig::default());
+        durable_write(
+            &mut memory,
+            &mut security,
+            "evt-old",
+            "the claim that gets replaced",
+            Some("game-x"),
+            1_000,
+        );
+        let updater = durable_write_with_evidence(
+            &mut memory,
+            &mut security,
+            "evt-new",
+            "the claim that replaces it",
+            Some("game-x"),
+            2_000,
+            &["evt-old"],
+            &["evt-old"],
+        )
+        .expect("both relations are accepted");
+
+        let view = memory.link_view(
+            updater,
+            &memory
+                .entries()
+                .iter()
+                .map(|entry| entry.memory_id)
+                .collect(),
+            WorkingMemoryConfig::default().max_links_per_memory,
+            3_000,
+        );
+        let kinds: Vec<MemoryLinkKind> = view.1.iter().map(|link| link.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                MemoryLinkKind::Supersedes,
+                MemoryLinkKind::CausedBy,
+                MemoryLinkKind::TemporalBefore,
+            ],
+            "explicit evidence leads the capped view, the derived spine trails it: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn the_vocabulary_version_names_the_causal_kind() {
+        assert_eq!(MEMORY_LINK_VOCAB_VERSION, "memory-link-v2");
+        let memory = test_memory(WorkingMemoryConfig::default());
+        assert_eq!(memory.link_snapshot(0).vocab_version, "memory-link-v2");
     }
 
     #[test]
