@@ -1376,9 +1376,11 @@ impl WorkingMemory {
                 .filter(|link| link.kind == kind)
                 .collect();
             if kind != MemoryLinkKind::TemporalBefore {
-                // Newest correction first: response generation consumes this
-                // view, and a cap of one must surface the latest supersession
-                // rather than the oldest (#105 review round 11). Equal record
+                // Newest correction first: a caller that reads this view must
+                // get the latest supersession rather than the oldest when the
+                // cap is one (#105 review round 11). The view is the bounded
+                // retrieval surface, not the generation input: §11's request
+                // content carries claims, never edges. Equal record
                 // times break on the *higher* node id — insertion order,
                 // newest first — exactly like `relevant` and the timeline
                 // `TemporalBefore` derives from, so a same-tick pair can never
