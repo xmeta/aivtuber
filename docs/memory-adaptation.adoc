@@ -383,9 +383,49 @@ Run it four ways:
 
 * `cargo test -p aivtuber-app --test memory_long_range_eval -- --nocapture` prints the report and asserts every case measures cleanly;
 * `cargo run -p aivtuber-app --bin memory-long-range-eval -- examples/memory-long-range/cases.json target/memory-runtime.json` writes the report artifact and exits non-zero on any violation, which is what a comparison run should consume;
-* `cargo run -p aivtuber-app --bin memory-sidecar-eval -- examples/memory-long-range/cases.json http://localhost:8888 target/memory-sidecar.json` measures a service (bearer token from `AIVTUBER_MEMORY_SIDECAR_TOKEN`, never from the command line) and emits the same schema;
+* `cargo run -p aivtuber-app --bin memory-sidecar-eval -- examples/memory-long-range/cases.json http://localhost:8888 target/memory-sidecar.json` measures a service (bearer token from `AIVTUBER_MEMORY_SIDECAR_TOKEN`, never from the command line) and emits the same schema; `--provider` selects the deployment speaking the port — `hindsight` by default, `graphiti` for §12.3 — and an unknown provider is a usage error rather than a silent fallback;
 * `cargo run -p aivtuber-app --bin memory-eval-compare -- examples/memory-long-range/cases.json target/memory-runtime.json target/memory-sidecar.json --out target/memory-verdict.json` judges a candidate report against the runtime's (`memory-eval-compare/v1`) under the case document both measured, and exits non-zero for a rejected candidate or an incomparable pair. The fixture is an input rather than a version string because the causal declarations live there and nowhere in a report. Each report also names the document it measured by its canonical digest (`fixture_digest`), so a revision that keeps every case id — one changed declaration is enough — is refused rather than re-read under the new document, and each case row has to carry the fixture's own expectations (`must_deliver`, the refused claims, the stale subset) and to name only claims the fixture declares.
 
 The verdict rule is exactly the sentence this section states: `Improvement` when the candidate beats `temporal_order_errors` or `current_fact_correctness` and regresses nothing, `Rejected` when it leaks a superseded, refused, or shortened claim, answers with an item the project has to refuse, or breaks a request bound, `NoImprovement` otherwise — and a win never rescues a leak, because the zero-tolerance checks are decided per case, not on the average. A refusal is not a delivered-memory leak (the item never reached generation), but it still rejects the candidate: a project that has to filter its memory service's answers forever is not better off for adopting it. `causal_pairs_delivered` — the fixture's declared cause/effect pairs whose two members both came back — is reported per case and in the totals for both sides. It is re-derived by the comparison from the case document and each side's delivered set, never read from a report's own causal count, because a sidecar keeps no project edge and such a number would describe a store the comparison was not handed. It is a metric the comparison shows rather than one it scores: a candidate cannot be adopted on causal coverage alone, because the rule that decides adoption is unchanged.
 
 A candidate report is never trusted on its declared totals. Each case row carries the claims it required (`must_deliver`) and the claims it refused (`refused_claims`), so correctness, `stale_memory_use`, and `absent_violations` are re-derived from the delivered list and the aggregates are re-derived from the case rows. `retained_causal_spans` is summed the same way, and each case row is bounded by the fixture: a count above the declared pairs that case's delivered set supports is refused, because an answer can return both members of at most the pairs the case declares and a store can retain at most the pairs its claims declared — an invented count beside a delivery that supports none is refused rather than shown. A report whose numbers disagree with its own records — or which covers a different set of cases, is not about the fixture's cases in the fixture's order, does not carry that document's digest, carries other expectations than the fixture declares, names another fixture document, or carries another schema — is refused as *incomparable*: "not verifiable" must not be reported as a measurement.
+
+=== 12.3 Graphiti adapter (unmeasured)
+
+`GraphitiSidecar` implements the same `MemorySidecar` port, so the comparison above judges it without an evaluator change; `memory-sidecar-eval` selects it with `--provider graphiti`. A run is a measurement only when a Graphiti server is reachable at the endpoint: Graphiti extracts entities and facts with a model before an episode becomes searchable, so it also needs an LLM and embedding provider (OpenAI by default) and a running Neo4j or FalkorDB behind the server. Hindsight needs neither.
+
+[source,sh]
+----
+AIVTUBER_MEMORY_SIDECAR_TOKEN=... cargo run -p aivtuber-app --bin memory-sidecar-eval -- \
+  examples/memory-long-range/cases.json http://localhost:8000 target/memory-graphiti.json --provider graphiti
+----
+
+The token is optional: it is sent as a bearer header when set, and a self-hosted server without an authenticating proxy accepts the request without it. The claim is the episode the project files; Graphiti's extracted facts are the service's answer, not the project's record.
+
+[cols="1,3",options="header"]
+|===
+|Port operation |Requests
+
+|`open_scope`
+|`DELETE /group/<scope>`, tolerating 404: a group left by an earlier run would make this run measure two inputs at once.
+
+|`retain_claim`
+|`POST /messages` with `group_id` = the scope, one message whose `content` is the admitted claim text, `name` = the claim id, `role_type` = `user`, `timestamp` = the claim's event time, and `source_description` carrying `aivtuber-v1:`-prefixed metadata (claim id, actor, topic, both instants). The handle is then polled out of `GET /episodes/<scope>?last_n=64`, because the service is asynchronous and a retirement needs the episode that now exists.
+
+|`recall_claims`
+|`POST /search` with `group_ids`, the query, and `max_facts` over-fetched by 4 inside the request's own bound; every returned fact is resolved through the episode ids it names back to the retained claim, and a fact whose episodes are all gone is skipped rather than attributed to a claim the project no longer holds.
+
+|`retire_claim`
+|`DELETE /episode/<handle>`, tolerating 404: an episode already gone is the state retirement asks for.
+
+|`close_scope`
+|`DELETE /group/<scope>`, tolerating 404.
+|===
+
+Three things the adapter deliberately does not do:
+
+* It does not treat the service's own expiry as the boundary. Supersession, actor scope, the retention window, and the request's item and byte bounds stay project-enforced before and after the call, exactly as for Hindsight; a service hint is not an authority.
+* It does not return an extracted fact as claim text. The recall item carries the episode body the project filed, so prose Graphiti's model wrote around the claim cannot reach the thinking request as if the project had admitted it.
+* It does not hide the divergence Graphiti introduces. Deleting an episode leaves facts other episodes also support, so a retired claim can keep shaping a surviving fact. That is what `stale_memory_use` measures on the next run; the adapter reports the state instead of filtering it away.
+
+No Graphiti report has been recorded. This subsection exists so the next step is a run rather than a design question: bring up the store and provider keys, run the command above, and judge the report with `memory-eval-compare` under the same fixture. Until that report exists, the §12.2 verdict — keep the runtime's own store — is unchanged, and a Graphiti deployment must not be described as measured or adopted.
