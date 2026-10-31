@@ -308,7 +308,7 @@ The report is versioned `memory-long-range-eval/v1`, names the fixture version i
 |retained state against the #51 bounds, including the plateau case
 |===
 
-Measured against `main` at `f1796da4` (the #253 merge), 14 cases:
+Measured against `main` at `e08aaf3a` (the #254 merge), the 14-case suite — the 13 cases present at `f1796da4` (the #253 merge) plus `causal_reason_travels_with_its_effect`:
 
 * current-fact correctness 1.0, stale-memory use 0, absent violations 0, truncated claims 0;
 * temporal-order errors 2. The store keeps *record* time, so a claim recalled out of event order can still be delivered ahead of a later event. This is the class a timeline-aware sidecar would have to fix: retrieval alone cannot, because the event timestamp is not retained;
@@ -353,7 +353,7 @@ The review of the run that first used this boundary found six places where 12.1'
 |The runner retires it on the service before the recall rather than only dropping its local handle: memory the project would never show must not consume the service's ranking or answer budget ahead of a claim that is live.
 |===
 
-Measured 2026-10-25 against a local Hindsight deployment on the same 13-case fixture as the baseline above:
+Measured 2026-10-25 against a local Hindsight deployment on the then-current 13-case fixture (the causal case did not exist yet):
 
 [cols="2,1,1"]
 |===
