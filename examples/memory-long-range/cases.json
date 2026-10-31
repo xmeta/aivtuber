@@ -32,6 +32,34 @@
       "expected_delivery_order": ["evt-enjoy"]
     },
     {
+      "id": "causal_reason_travels_with_its_effect",
+      "claims": [
+        {
+          "event_id": "evt-boss-bug",
+          "actor": "viewer-1",
+          "text": "the boss fight broke when the patch landed",
+          "topic": "game-x",
+          "recorded_at_ms": 1000
+        },
+        {
+          "event_id": "evt-boss-retry",
+          "actor": "viewer-1",
+          "text": "viewer retried the boss after the fix",
+          "topic": "game-x",
+          "recorded_at_ms": 2000,
+          "caused_by": "evt-boss-bug"
+        }
+      ],
+      "query": {
+        "actor": "viewer-1",
+        "topic": "game-x",
+        "now_ms": 3000,
+        "charged_bytes": 64
+      },
+      "must_deliver": ["evt-boss-bug", "evt-boss-retry"],
+      "expected_retained_causal_spans": 1
+    },
+    {
       "id": "topic_shifted_correction",
       "claims": [
         {

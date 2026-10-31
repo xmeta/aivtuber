@@ -22,7 +22,7 @@
 //! ```text
 //! memory-long-range-eval examples/memory-long-range/cases.json target/memory-runtime.json
 //! memory-sidecar-eval examples/memory-long-range/cases.json http://localhost:8888 target/memory-sidecar.json
-//! memory-eval-compare target/memory-runtime.json target/memory-sidecar.json --out target/memory-verdict.json
+//! memory-eval-compare examples/memory-long-range/cases.json target/memory-runtime.json target/memory-sidecar.json --out target/memory-verdict.json
 //! ```
 
 use aivtuber_adapters::{HindsightConfig, HindsightSidecar};
