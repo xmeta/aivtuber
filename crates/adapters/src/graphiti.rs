@@ -13,7 +13,7 @@
 //! to the claims that produced them — and the project still decides admission,
 //! retention, and what may reach generation, as it does for Hindsight.
 //!
-//! Three properties matter more than the wire format:
+//! Four properties matter more than the wire format:
 //!
 //! * **The project stays the authority.** Nothing here writes durable memory:
 //!   the caller has already passed the write gate, and the adapter only
@@ -22,8 +22,19 @@
 //!   it accepts a message and returns before extraction finishes. A claim that
 //!   never appears in the episode list is a failed retain — not an empty
 //!   recall — so an extraction failure cannot be scored as a retrieval miss.
+//! * **Retirement removes derived state, or fails.** The reference server's
+//!   `DELETE /episode/{uuid}` removes only the episode node; facts and entity
+//!   summaries derived from it survive. A deployment therefore has to expose a
+//!   cleanup route that calls `Graphiti.remove_episode`, and the adapter refuses
+//!   to report a retirement when that route is absent or does not confirm.
 //! * **Private claim text never enters an error message.** Failures carry the
 //!   status (or the schema gap) alone; the claim travels only in the request.
+//!
+//! The server does not store the message content verbatim either: it files the
+//! body behind `(role_type): ` (or `role(role_type): `). The adapter sends an
+//! empty custom role, so recall strips the known `(user): ` envelope and
+//! refuses an episode body that does not carry it instead of returning a wire
+//! copy the project never wrote.
 //!
 //! The reference server ships without authentication and without tenant
 //! isolation, so a deployment is a loopback-only spike rather than a
@@ -69,8 +80,36 @@ const MAX_DESCRIPTION_BYTES: usize = 1024;
 /// so one constant is used rather than a guess per source class.
 const CLAIM_ROLE: &str = "user";
 
-/// Episodes read back when locating a retained claim or resolving a fact.
-const EPISODE_WINDOW: u64 = 64;
+/// The custom role sent with a claim.
+///
+/// The server's `Message.role` is required even though it is nullable, and
+/// its envelope builder treats an empty role as absent. Sending `""` keeps
+/// the request valid without changing the `(user): ` body the adapter reads
+/// back.
+const CLAIM_CUSTOM_ROLE: &str = "";
+
+/// The envelope the reference server adds to a message it files.
+///
+/// `POST /messages` does not store `content` verbatim: the server files
+/// `f'{role or ""}({role_type}): {content}'` as the episode body. The adapter
+/// sends an empty role, so a claim is read back behind exactly this prefix;
+/// recall strips it so the project gets the text it admitted, not the wire
+/// copy.
+const CLAIM_CONTENT_PREFIX: &str = "(user): ";
+
+/// Episodes read back while waiting for a freshly retained claim.
+///
+/// Materialization is asynchronous, so the claim being waited for is among
+/// the newest episodes once it exists; a small window is enough.
+const RETAIN_EPISODE_WINDOW: u64 = 64;
+
+/// Episodes read back when resolving a recall's facts.
+///
+/// Recall can name an older episode than retention polling ever sees. The
+/// project bounds a scope at 256 retained entries, so a window of the same
+/// size is the complete live set the adapter has to resolve against; a
+/// smaller window silently dropped a still-retained answer.
+const RECALL_EPISODE_WINDOW: u64 = 256;
 
 /// Default per-request timeout.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -98,6 +137,17 @@ pub struct GraphitiConfig {
     /// Optional bearer credential for a fronting proxy. The reference server
     /// has no authentication of its own, and the token is never printed.
     pub bearer_token: Option<SecretString>,
+    /// Path template of a cleanup-capable retirement endpoint, for example
+    /// `/episode/{uuid}/cleanup`.
+    ///
+    /// The reference server's `DELETE /episode/{uuid}` removes only the
+    /// episode node: the facts and entity summaries derived from it survive.
+    /// A retirement therefore requires a route that calls
+    /// `Graphiti.remove_episode` (which also repairs shared edges and
+    /// summaries). Without this path `retire` fails closed instead of
+    /// reporting a deletion the deployment did not perform. `{uuid}` and
+    /// `{scope}` are substituted as one path segment each.
+    pub cleanup_path: Option<String>,
 }
 
 impl GraphitiConfig {
@@ -109,6 +159,7 @@ impl GraphitiConfig {
             ingest_timeout: DEFAULT_INGEST_TIMEOUT,
             poll_interval: DEFAULT_POLL_INTERVAL,
             bearer_token: None,
+            cleanup_path: None,
         }
     }
 
@@ -133,6 +184,12 @@ impl GraphitiConfig {
     /// Set the bearer credential for a fronting proxy.
     pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
         self.bearer_token = Some(SecretString::new(token));
+        self
+    }
+
+    /// Set the cleanup-capable retirement endpoint path.
+    pub fn with_cleanup_path(mut self, path: impl Into<String>) -> Self {
+        self.cleanup_path = Some(path.into());
         self
     }
 
@@ -181,8 +238,60 @@ impl GraphitiConfig {
                 ),
             ));
         }
+        if let Some(path) = &self.cleanup_path {
+            validate_cleanup_path(path)?;
+        }
         Ok(())
     }
+}
+
+/// Refuse a cleanup path that cannot name one endpoint below the base URL.
+///
+/// The path is an operator-owned template, not a URL: it must stay below the
+/// configured endpoint and name the episode it retires. Keeping the check here
+/// means a typo is a configuration error, not a request to an unintended
+/// route at retirement time.
+fn validate_cleanup_path(path: &str) -> Result<(), EngineError> {
+    if !path.starts_with('/') {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidRequest,
+            "graphiti cleanup path must start with '/'",
+        ));
+    }
+    if path.len() > 512 {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidRequest,
+            "graphiti cleanup path is longer than 512 bytes",
+        ));
+    }
+    if path.contains('?') || path.contains('#') {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidRequest,
+            "graphiti cleanup path must not carry a query or fragment",
+        ));
+    }
+    if path.matches("{uuid}").count() != 1 {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidRequest,
+            "graphiti cleanup path must contain exactly one {uuid} placeholder",
+        ));
+    }
+    let remaining = path.replace("{uuid}", "").replace("{scope}", "");
+    if remaining.contains('{') || remaining.contains('}') {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidRequest,
+            "graphiti cleanup path has an unknown placeholder",
+        ));
+    }
+    for segment in path.trim_start_matches('/').split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidRequest,
+                "graphiti cleanup path must not carry an empty, '.' or '..' segment",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A Graphiti deployment behind the project's memory-sidecar port.
@@ -300,12 +409,39 @@ impl GraphitiSidecar {
         self.url_for(&["group", scope])
     }
 
-    /// The episodes a scope holds, newest first within the window.
+    /// The cleanup URL for one retired episode.
+    ///
+    /// The placeholder values are single path segments; `url_for` percent-
+    /// encodes them, so a handle is never allowed to choose a different
+    /// route. A deployment without a cleanup path is a configuration error,
+    /// not a reason to fall back to the reference server's episode-only
+    /// delete.
+    fn cleanup_url(&self, scope: &str, handle: &str) -> Result<String, EngineError> {
+        let path = self.config.cleanup_path.as_deref().ok_or_else(|| {
+            EngineError::new(
+                EngineErrorKind::Unavailable,
+                "graphiti deployment has no cleanup endpoint: retirement would leave derived facts behind; set GraphitiConfig::with_cleanup_path",
+            )
+        })?;
+        // Substitute inside each template segment so a handle can never
+        // introduce a path separator of its own; `url_for` then percent-
+        // encodes the placeholder value as one segment.
+        let segments: Vec<String> = path
+            .trim_start_matches('/')
+            .split('/')
+            .map(|segment| segment.replace("{uuid}", handle).replace("{scope}", scope))
+            .collect();
+        let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
+        self.url_for(&segments)
+    }
+
+    /// The episodes a scope holds, newest first within `window`.
     ///
     /// The window is bounded and reapplied on every poll: materialization is
     /// asynchronous, so the claim being waited for is among the newest
-    /// episodes once it exists.
-    fn list_episodes(&self, scope: &str) -> Result<Vec<Value>, EngineError> {
+    /// episodes once it exists. A recall passes the project's retained-entry
+    /// bound so an older live claim is still resolvable.
+    fn list_episodes(&self, scope: &str, window: u64) -> Result<Vec<Value>, EngineError> {
         let base = self.url_for(&["episodes", scope])?;
         let mut url = url::Url::parse(&base).map_err(|error| {
             EngineError::new(
@@ -314,7 +450,7 @@ impl GraphitiSidecar {
             )
         })?;
         url.query_pairs_mut()
-            .append_pair("last_n", &EPISODE_WINDOW.to_string());
+            .append_pair("last_n", &window.to_string());
         episodes_from(self.send("GET", url.as_str(), None)?)
     }
 }
@@ -349,6 +485,7 @@ impl MemorySidecar for GraphitiSidecar {
             "messages": [{
                 "content": claim.text,
                 "role_type": CLAIM_ROLE,
+                "role": CLAIM_CUSTOM_ROLE,
                 "name": claim.claim_id,
                 // Event time, not record time: the claim's place in the
                 // chronology is what the service is being asked to keep.
@@ -360,7 +497,7 @@ impl MemorySidecar for GraphitiSidecar {
 
         let deadline = Instant::now() + self.config.ingest_timeout;
         loop {
-            let episodes = self.list_episodes(scope)?;
+            let episodes = self.list_episodes(scope, RETAIN_EPISODE_WINDOW)?;
             if let Some(uuid) = episodes.iter().find_map(|episode| {
                 let uuid = episode_uuid(episode)?;
                 episode_matches(episode, &claim.claim_id).then(|| uuid.to_owned())
@@ -416,7 +553,7 @@ impl MemorySidecar for GraphitiSidecar {
         if facts.is_empty() {
             return Ok(Vec::new());
         }
-        let episodes = self.list_episodes(scope)?;
+        let episodes = self.list_episodes(scope, RECALL_EPISODE_WINDOW)?;
         let mut items: Vec<SidecarRecallItem> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         'facts: for fact in facts {
@@ -434,13 +571,10 @@ impl MemorySidecar for GraphitiSidecar {
                     // The same claim already answered at a better rank.
                     continue 'facts;
                 }
-                let text = episode
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| backend("graphiti episode answered without content"))?;
+                let text = episode_claim_text(episode)?;
                 items.push(SidecarRecallItem {
                     claim_id: metadata.claim_id,
-                    text: text.to_owned(),
+                    text,
                     actor: metadata.actor,
                     topic: metadata.topic,
                     event_at_ms: Some(metadata.event_at_ms),
@@ -451,12 +585,15 @@ impl MemorySidecar for GraphitiSidecar {
         Ok(narrow_to_scope(items, query))
     }
 
-    /// Retire a retained claim so it stops being recalled.
+    /// Retire a retained claim so it stops being recalled and leaves no
+    /// derived fact or summary behind.
     ///
-    /// Graphiti deletes the episode. Facts other episodes also contributed to
-    /// survive, so a retired claim can still shape a surviving fact; that is
-    /// measured by the comparison rather than hidden here. A 404 means the
-    /// episode is already gone, which is the state retirement asks for.
+    /// The endpoint is the deployment's, not the reference server's:
+    /// `DELETE /episode/{uuid}` only removes the episode node, so it cannot
+    /// satisfy the project's retirement invariant. The configured route must
+    /// perform Graphiti's own episode removal and confirm it with a JSON
+    /// `{"success": true}` answer; anything else fails closed rather than
+    /// reporting a retirement that did not happen.
     fn retire(&self, scope: &str, handle: &SidecarHandle) -> Result<(), EngineError> {
         self.config.validate()?;
         validate_scope(scope)?;
@@ -466,12 +603,13 @@ impl MemorySidecar for GraphitiSidecar {
                 "graphiti episode handle must not be empty",
             ));
         }
-        self.send_allowing(
-            "DELETE",
-            &self.url_for(&["episode", handle.as_str()])?,
-            None,
-            &[404],
-        )?;
+        let url = self.cleanup_url(scope, handle.as_str())?;
+        let response = self.send("DELETE", &url, None)?;
+        if response.get("success").and_then(Value::as_bool) != Some(true) {
+            return Err(backend(
+                "graphiti cleanup endpoint did not confirm the episode removal",
+            ));
+        }
         Ok(())
     }
 
@@ -532,6 +670,28 @@ fn parse_description(value: &str) -> Option<ClaimMetadata> {
     let encoded = value.strip_prefix(DESCRIPTION_PREFIX)?;
     let metadata: ClaimMetadata = serde_json::from_str(encoded).ok()?;
     (!metadata.claim_id.is_empty()).then_some(metadata)
+}
+
+/// The claim text the server filed behind its message envelope.
+///
+/// The reference server always prefixes the body it stores; a body without
+/// the envelope means the deployment is not the wire contract this adapter
+/// was written for, so the answer is refused rather than returning a text the
+/// project never admitted.
+fn episode_claim_text(episode: &Value) -> Result<String, EngineError> {
+    let content = episode
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| backend("graphiti episode answered without content"))?;
+    let text = content.strip_prefix(CLAIM_CONTENT_PREFIX).ok_or_else(|| {
+        backend("graphiti episode content is not the message envelope this adapter writes")
+    })?;
+    if text.is_empty() {
+        return Err(backend(
+            "graphiti episode carries no claim behind its envelope",
+        ));
+    }
+    Ok(text.to_owned())
 }
 
 /// The episode identity, when the service kept one.
@@ -765,7 +925,9 @@ mod tests {
         json!({
             "uuid": uuid,
             "name": claim.claim_id,
-            "content": claim.text,
+            // The reference server stores the message behind this envelope,
+            // not the raw content the adapter sent.
+            "content": format!("{CLAIM_CONTENT_PREFIX}{}", claim.text),
             "source_description": description_for(claim).expect("claim metadata"),
         })
     }
@@ -788,6 +950,7 @@ mod tests {
         let message = &body["messages"][0];
         assert_eq!(message["content"], "viewer enjoyed the game x ending");
         assert_eq!(message["role_type"], "user");
+        assert_eq!(message["role"], "");
         assert_eq!(message["name"], "evt-enjoy");
         // Event time, not record time.
         assert_eq!(message["timestamp"], "1970-01-01T00:00:02Z");
@@ -801,7 +964,7 @@ mod tests {
 
         assert_eq!(requests[1].method, "GET");
         assert!(requests[1].url.contains("/episodes/scope-1"));
-        assert!(requests[1].url.contains("last_n="));
+        assert!(requests[1].url.contains("last_n=64"));
     }
 
     #[test]
@@ -876,6 +1039,69 @@ mod tests {
         assert_eq!(body["group_ids"][0], "scope-1");
         assert_eq!(body["query"], "game x");
         assert_eq!(body["max_facts"], 48);
+    }
+
+    #[test]
+    fn episode_text_strips_only_the_server_envelope() {
+        let mut claim = claim();
+        claim.text = "(user): this is the claim's own text".to_owned();
+        let episode = episode_for("ep-1", &claim);
+        assert_eq!(
+            episode_claim_text(&episode).expect("envelope"),
+            "(user): this is the claim's own text"
+        );
+    }
+
+    #[test]
+    fn recall_refuses_an_episode_without_the_server_envelope() {
+        let mut episode = episode_for("ep-1", &claim());
+        episode["content"] = json!(claim().text);
+        let (sidecar, _transport) = sidecar(vec![
+            response(
+                200,
+                json!({"facts": [{"uuid": "f1", "episodes": ["ep-1"]}]}),
+            ),
+            response(200, json!([episode])),
+        ]);
+        let error = sidecar
+            .recall("scope-1", &query(Some("actor-key"), 12))
+            .expect_err("a body that is not the known envelope is refused");
+        assert_eq!(error.kind, EngineErrorKind::Backend);
+        assert!(error.message.contains("envelope"), "{error}");
+        assert!(
+            !error.message.contains("viewer enjoyed"),
+            "the failure must not carry the claim: {error}"
+        );
+    }
+
+    #[test]
+    fn recall_resolves_an_older_live_claim_beyond_the_retain_window() {
+        // The project retains at most 256 entries in a scope, so recall has
+        // to resolve against that complete live set: 100 episodes put the
+        // fact's episode well outside the 64-episode polling window.
+        let mut episodes: Vec<Value> = (1..=100_u64)
+            .rev()
+            .map(|index| {
+                let mut aged = claim();
+                aged.claim_id = format!("evt-{index}");
+                episode_for(&format!("ep-{index}"), &aged)
+            })
+            .collect();
+        assert_eq!(episodes.len(), 100);
+        let (sidecar, transport) = sidecar(vec![
+            response(
+                200,
+                json!({"facts": [{"uuid": "f-old", "episodes": ["ep-1"]}]}),
+            ),
+            response(200, Value::Array(std::mem::take(&mut episodes))),
+        ]);
+        let items = sidecar
+            .recall("scope-1", &query(Some("actor-key"), 12))
+            .expect("recall");
+        assert_eq!(items.len(), 1, "the older live claim must not be dropped");
+        assert_eq!(items[0].claim_id, "evt-1");
+        let request = &transport.requests()[1];
+        assert!(request.url.contains("last_n=256"), "{}", request.url);
     }
 
     #[test]
@@ -1001,20 +1227,92 @@ mod tests {
         assert!(error.message.contains("facts"), "{error}");
     }
 
+    fn cleanup_sidecar(
+        responses: Vec<Result<HttpResponse, HttpTransportError>>,
+    ) -> (GraphitiSidecar, Arc<MockTransport>) {
+        let transport = Arc::new(MockTransport::new(responses));
+        let config = GraphitiConfig::new("http://localhost:8000")
+            .with_ingest_timeout(Duration::from_millis(50))
+            .with_poll_interval(Duration::from_millis(5))
+            .with_cleanup_path("/episode/{uuid}/cleanup");
+        let sidecar = GraphitiSidecar::with_transport(config, transport.clone());
+        (sidecar, transport)
+    }
+
     #[test]
-    fn retire_deletes_the_episode_and_tolerates_an_absent_one() {
-        let (first, transport) = sidecar(vec![empty(200)]);
-        first
+    fn retire_calls_the_cleanup_endpoint_and_requires_confirmation() {
+        let (sidecar, transport) = cleanup_sidecar(vec![response(200, json!({"success": true}))]);
+        sidecar
             .retire("scope-1", &SidecarHandle::new("ep-1"))
             .expect("retire");
         let request = &transport.requests()[0];
         assert_eq!(request.method, "DELETE");
-        assert!(request.url.ends_with("/episode/ep-1"));
+        assert!(
+            request.url.ends_with("/episode/ep-1/cleanup"),
+            "{}",
+            request.url
+        );
+    }
 
-        let (second, _transport) = sidecar(vec![empty(404)]);
-        second
+    #[test]
+    fn retire_refuses_when_cleanup_is_not_confirmed() {
+        for body in [json!({"success": false}), json!({}), Value::Null] {
+            let (sidecar, _transport) = cleanup_sidecar(vec![response(200, body)]);
+            let error = sidecar
+                .retire("scope-1", &SidecarHandle::new("ep-1"))
+                .expect_err("an unconfirmed cleanup is not a retirement");
+            assert_eq!(error.kind, EngineErrorKind::Backend, "{error}");
+            assert!(error.message.contains("cleanup"), "{error}");
+        }
+    }
+
+    #[test]
+    fn retire_without_a_cleanup_endpoint_fails_closed() {
+        let (sidecar, transport) = sidecar(vec![empty(200)]);
+        let error = sidecar
             .retire("scope-1", &SidecarHandle::new("ep-1"))
-            .expect("an already deleted episode is retired");
+            .expect_err("the reference server's episode delete is not enough");
+        assert_eq!(error.kind, EngineErrorKind::Unavailable);
+        assert!(error.message.contains("cleanup"), "{error}");
+        assert!(
+            transport.requests().is_empty(),
+            "no request may pretend to retire"
+        );
+    }
+
+    #[test]
+    fn retire_keeps_an_opaque_handle_inside_one_path_segment() {
+        let (sidecar, transport) = cleanup_sidecar(vec![response(200, json!({"success": true}))]);
+        sidecar
+            .retire("scope-1", &SidecarHandle::new("ep/../other?x"))
+            .expect("retire");
+        let url = &transport.requests()[0].url;
+        assert!(
+            url.ends_with("/episode/ep%2F..%2Fother%3Fx/cleanup"),
+            "{url}"
+        );
+        assert!(!url.contains("/other"), "{url}");
+    }
+
+    #[test]
+    fn a_cleanup_path_that_cannot_name_one_episode_is_refused() {
+        for path in [
+            "episode/{uuid}/cleanup",
+            "/episode/cleanup",
+            "/episode/{uuid}/{unknown}",
+            "/episode/{uuid}/../cleanup",
+            "/episode/{uuid}/cleanup?x=1",
+        ] {
+            let error = GraphitiConfig::new("http://127.0.0.1:8000")
+                .with_cleanup_path(path)
+                .validate()
+                .expect_err("an unusable cleanup path is refused");
+            assert_eq!(error.kind, EngineErrorKind::InvalidRequest, "{path}");
+        }
+        GraphitiConfig::new("http://127.0.0.1:8000")
+            .with_cleanup_path("/groups/{scope}/episodes/{uuid}/cleanup")
+            .validate()
+            .expect("a scoped cleanup path");
     }
 
     #[test]

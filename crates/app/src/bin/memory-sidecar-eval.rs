@@ -6,6 +6,7 @@
 //! ```text
 //! memory-sidecar-eval [--provider hindsight|graphiti]
 //!                     [--ingest-timeout-ms <n>]
+//!                     [--cleanup-path <path>]
 //!                     <cases.json> <endpoint> [report.json]
 //! ```
 //!
@@ -19,7 +20,10 @@
 //! Hindsight is the default, so the existing invocation keeps working.
 //! `--provider graphiti` selects the Graphiti adapter, whose ingestion is
 //! asynchronous and model-bound: `--ingest-timeout-ms` is the deadline for one
-//! claim to materialize as an episode (default 180000).
+//! claim to materialize as an episode (default 180000). Graphiti also needs
+//! `--cleanup-path`, the route its deployment exposes for an episode removal
+//! that also repairs derived facts; the reference server's episode delete
+//! leaves them behind, so retirement without the route fails closed.
 //!
 //! The bearer credential comes from `AIVTUBER_MEMORY_SIDECAR_TOKEN`, never from
 //! the command line, where it would land in a process listing. It applies to
@@ -29,7 +33,7 @@
 //! ```text
 //! memory-long-range-eval examples/memory-long-range/cases.json target/memory-runtime.json
 //! memory-sidecar-eval examples/memory-long-range/cases.json http://localhost:8888 target/memory-sidecar.json
-//! memory-sidecar-eval --provider graphiti --ingest-timeout-ms 300000 examples/memory-long-range/cases.json http://127.0.0.1:8000 target/memory-graphiti.json
+//! memory-sidecar-eval --provider graphiti --ingest-timeout-ms 300000 --cleanup-path '/episode/{uuid}/cleanup' examples/memory-long-range/cases.json http://127.0.0.1:8000 target/memory-graphiti.json
 //! memory-eval-compare examples/memory-long-range/cases.json target/memory-runtime.json target/memory-sidecar.json --out target/memory-verdict.json
 //! ```
 
@@ -43,7 +47,7 @@ use std::path::PathBuf;
 use std::process::{self, ExitCode};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const USAGE: &str = "usage: memory-sidecar-eval [--provider hindsight|graphiti] [--ingest-timeout-ms <n>] <cases.json> <endpoint> [report.json]";
+const USAGE: &str = "usage: memory-sidecar-eval [--provider hindsight|graphiti] [--ingest-timeout-ms <n>] [--cleanup-path <path>] <cases.json> <endpoint> [report.json]";
 
 /// Default deadline for one Graphiti claim to materialize as an episode.
 const DEFAULT_GRAPHITI_INGEST_TIMEOUT: Duration = Duration::from_secs(180);
@@ -74,6 +78,7 @@ enum Provider {
 struct Arguments {
     provider: Provider,
     graphiti_ingest_timeout: Duration,
+    cleanup_path: Option<String>,
     fixture: PathBuf,
     endpoint: String,
     report: Option<PathBuf>,
@@ -82,6 +87,7 @@ struct Arguments {
 fn parse_arguments(arguments: Vec<String>) -> Result<Arguments, String> {
     let mut provider = Provider::Hindsight;
     let mut graphiti_ingest_timeout = DEFAULT_GRAPHITI_INGEST_TIMEOUT;
+    let mut cleanup_path = None;
     let mut positional: Vec<String> = Vec::new();
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
@@ -108,6 +114,12 @@ fn parse_arguments(arguments: Vec<String>) -> Result<Arguments, String> {
                 }
                 graphiti_ingest_timeout = Duration::from_millis(millis);
             }
+            "--cleanup-path" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| format!("--cleanup-path needs a value\n{USAGE}"))?;
+                cleanup_path = Some(value);
+            }
             other if other.starts_with("--") => {
                 return Err(format!("unknown option {other:?}\n{USAGE}"));
             }
@@ -120,6 +132,7 @@ fn parse_arguments(arguments: Vec<String>) -> Result<Arguments, String> {
     Ok(Arguments {
         provider,
         graphiti_ingest_timeout,
+        cleanup_path,
         fixture: PathBuf::from(&positional[0]),
         endpoint: positional[1].clone(),
         report: positional.get(2).map(PathBuf::from),
@@ -156,8 +169,14 @@ fn run() -> Result<(), Box<dyn Error>> {
             Box::new(HindsightSidecar::new(config))
         }
         Provider::Graphiti => {
+            let cleanup_path = arguments.cleanup_path.clone().ok_or_else(|| {
+                format!(
+                    "--provider graphiti requires --cleanup-path: the reference server's episode delete leaves derived facts behind\n{USAGE}"
+                )
+            })?;
             let mut config = GraphitiConfig::new(arguments.endpoint.clone())
-                .with_ingest_timeout(arguments.graphiti_ingest_timeout);
+                .with_ingest_timeout(arguments.graphiti_ingest_timeout)
+                .with_cleanup_path(cleanup_path);
             if let Some(token) = &token {
                 config = config.with_bearer_token(token.clone());
             }
