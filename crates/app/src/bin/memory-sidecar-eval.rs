@@ -33,7 +33,7 @@
 //! ```text
 //! memory-long-range-eval examples/memory-long-range/cases.json target/memory-runtime.json
 //! memory-sidecar-eval examples/memory-long-range/cases.json http://localhost:8888 target/memory-sidecar.json
-//! memory-sidecar-eval --provider graphiti --ingest-timeout-ms 300000 --cleanup-path '/episode/{uuid}/cleanup' examples/memory-long-range/cases.json http://127.0.0.1:8000 target/memory-graphiti.json
+//! memory-sidecar-eval --provider graphiti --ingest-timeout-ms 300000 --cleanup-path '/group/{scope}/episode/{uuid}/cleanup' examples/memory-long-range/cases.json http://127.0.0.1:8000 target/memory-graphiti.json
 //! memory-eval-compare examples/memory-long-range/cases.json target/memory-runtime.json target/memory-sidecar.json --out target/memory-verdict.json
 //! ```
 

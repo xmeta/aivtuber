@@ -10,7 +10,7 @@
 //!
 //! ```text
 //! AIVTUBER_GRAPHITI_ENDPOINT=http://127.0.0.1:8000 \
-//! AIVTUBER_GRAPHITI_CLEANUP_PATH='/episode/{uuid}/cleanup' \
+//! AIVTUBER_GRAPHITI_CLEANUP_PATH='/group/{scope}/episode/{uuid}/cleanup' \
 //! cargo test -p aivtuber-adapters --test graphiti_live -- --ignored --nocapture
 //! ```
 
@@ -30,7 +30,7 @@ fn endpoint() -> String {
 
 fn cleanup_path() -> String {
     env::var("AIVTUBER_GRAPHITI_CLEANUP_PATH")
-        .unwrap_or_else(|_| "/episode/{uuid}/cleanup".to_owned())
+        .unwrap_or_else(|_| "/group/{scope}/episode/{uuid}/cleanup".to_owned())
 }
 
 fn token() -> Option<String> {

@@ -390,15 +390,15 @@ The verdict rule is exactly the sentence this section states: `Improvement` when
 
 A candidate report is never trusted on its declared totals. Each case row carries the claims it required (`must_deliver`) and the claims it refused (`refused_claims`), so correctness, `stale_memory_use`, and `absent_violations` are re-derived from the delivered list and the aggregates are re-derived from the case rows. `retained_causal_spans` is summed the same way, and each case row is bounded by the fixture: a count above the declared pairs that case's delivered set supports is refused, because an answer can return both members of at most the pairs the case declares and a store can retain at most the pairs its claims declared — an invented count beside a delivery that supports none is refused rather than shown. A report whose numbers disagree with its own records — or which covers a different set of cases, is not about the fixture's cases in the fixture's order, does not carry that document's digest, carries other expectations than the fixture declares, names another fixture document, or carries another schema — is refused as *incomparable*: "not verifiable" must not be reported as a measurement.
 
-=== 12.3 Graphiti adapter (unmeasured)
+=== 12.3 Graphiti adapter (measured, rejected)
 
-`GraphitiSidecar` implements the same `MemorySidecar` port, so the comparison above judges it without an evaluator change; `memory-sidecar-eval` selects it with `--provider graphiti`. A run is a measurement only when a Graphiti server is reachable at the endpoint: Graphiti extracts entities and facts with a model before an episode becomes searchable, so it also needs an LLM and embedding provider (OpenAI by default) and a running Neo4j or FalkorDB behind the server. The deployment must also expose the cleanup-capable retirement route described below, because the reference server's episode delete cannot satisfy the port's retirement contract. Hindsight needs neither the provider nor the route.
+`GraphitiSidecar` implements the same `MemorySidecar` port, so the comparison above judges it without an evaluator change; `memory-sidecar-eval` selects it with `--provider graphiti`. A run is a measurement only when a Graphiti server is reachable at the endpoint: Graphiti extracts entities and facts with a model before an episode becomes searchable, so it also needs an LLM and embedding provider (OpenAI by default) and a running Neo4j or FalkorDB behind the server. The deployment must also expose the cleanup-capable retirement route described below, because the reference server's episode delete cannot satisfy the port's retirement contract. The route is scoped by the group: FalkorDB keeps one graph per `group_id`, and `Graphiti.remove_episode` looks the episode up through the driver's default graph, so a route without the group answers "not found" for a live episode. Hindsight needs neither the provider nor the route.
 
 [source,sh]
 ----
 AIVTUBER_MEMORY_SIDECAR_TOKEN=... cargo run -p aivtuber-app --bin memory-sidecar-eval -- \
   --provider graphiti \
-  --cleanup-path '/episode/{uuid}/cleanup' \
+  --cleanup-path '/group/{scope}/episode/{uuid}/cleanup' \
   examples/memory-long-range/cases.json http://localhost:8000 target/memory-graphiti.json
 ----
 
@@ -408,11 +408,22 @@ The reference server does not expose a cleanup-capable deletion. Its `DELETE /ep
 
 [source,python]
 ----
-@router.delete('/episode/{uuid}/cleanup', status_code=200)
-async def delete_episode_cleanup(uuid: str, graphiti: ZepGraphitiDep):
-    await graphiti.remove_episode(uuid)
+@router.delete('/group/{group_id}/episode/{uuid}/cleanup', status_code=200)
+async def delete_episode_cleanup(group_id: str, uuid: str, graphiti: ZepGraphitiDep):
+    # FalkorDB keeps one graph per group. `remove_episode` looks the episode up
+    # through the driver's default graph, so an unscoped call raises
+    # NodeNotFoundError for a live episode; scope the driver to the group first.
+    scoped = Graphiti(
+        graph_driver=graphiti.driver.clone(database=group_id),
+        llm_client=graphiti.llm_client,
+        embedder=graphiti.embedder,
+        cross_encoder=graphiti.cross_encoder,
+    )
+    await scoped.remove_episode(uuid)
     return Result(message='Episode and derived state removed', success=True)
 ----
+
+A runnable version of that patch, together with FalkorDB and selectable OpenAI-compatible/Gemini clients, is in link:../examples/memory-graphiti/README.adoc[examples/memory-graphiti]. Its `run-eval.sh` starts the stack, waits for `/healthcheck`, writes the runtime and Graphiti reports, and runs `memory-eval-compare`. The stack exposes the same message envelope as the reference server and the cleanup route above; it is not a production service and binds to loopback only.
 
 `Graphiti.remove_episode` deletes facts the retired episode alone supported, removes it from facts other episodes still support, deletes entities mentioned only by it, and rebuilds surviving entity summaries. The adapter does not fall back to `DELETE /episode/<handle>`: a 200 from that route is not a retirement, and an unconfirmed cleanup answer is an error. The live check `cargo test -p aivtuber-adapters --test graphiti_live -- --ignored` exercises this contract against `AIVTUBER_GRAPHITI_ENDPOINT` and `AIVTUBER_GRAPHITI_CLEANUP_PATH` and verifies that the episode and every derived fact naming it are gone.
 
@@ -442,4 +453,22 @@ Three things the adapter deliberately does not do:
 * It does not return an extracted fact as claim text. The recall item carries the episode body the project filed, decoded from the server's known message envelope, so prose Graphiti's model wrote around the claim cannot reach the thinking request as if the project had admitted it.
 * It does not assume a deletion. Retirement is reported only after the cleanup route confirms Graphiti removed the episode's derived state; a deployment without that route fails closed rather than hiding the divergence behind a successful HTTP status.
 
-No Graphiti report has been recorded. This subsection exists so the next step is a run rather than a design question: bring up the store and provider keys, run the command above, and judge the report with `memory-eval-compare` under the same fixture. Until that report exists, the §12.2 verdict — keep the runtime's own store — is unchanged, and a Graphiti deployment must not be described as measured or adopted.
+Measured 2026-11-04 against that reference stack, on the full 14-case fixture: Ollama's cloud-routed `gpt-oss:120b` as the extractor with `json_object` structured output, `nomic-embed-text` (768 dimensions) as the embedder, the pass-through reranker, `graphiti-core==0.31.2` on FalkorDB `v4.22.3`.
+
+[cols="2,1,1",options="header"]
+|===
+|Metric |Runtime |Graphiti
+
+|`current_fact_correctness` |1.0 |0.661
+|`stale_memory_use` |0 |0
+|`absent_violations` |0 |1
+|`truncated_claims` |0 |0
+|`temporal_order_errors` |2 |8
+|max context items / request bytes |12 / 7,038 |12 / 1,000
+|entries / links high-water |14 / 69 |13 / 0
+|`refused_items` |0 |0
+|===
+
+The verdict is `rejected`, and the reason is one case: `topic_shifted_correction_under_limit` has an item bound of 12 and refuses two claims; the service returned `evt-c1`, which the case refuses, and missed `evt-c9`, so correctness in that case is 11 of 12. The same case also produced 6 of the 8 temporal-order errors, `retention_plateau` produced the other 2, and four cases (`causal_reason_travels_with_its_effect`, `budget_pressure_drops_whole`, `oversized_claim_skipped_whole`, and most of `goal_attempt_result`) came back with facts that did not map to a retained claim. Graphiti kept every request inside its item and byte bounds and returned no stale or shortened text, and after the deployment fix below it returned no retired item; retrieval quality and the refused claim are what reject it.
+
+The first full run, before the deployment fix, reported 7 `refused_items`: FalkorDB keeps one graph per group and `Graphiti.remove_episode` is not group-scoped upstream, so the route's `NodeNotFoundError` branch reported "already absent" for a live episode and left the facts in place. The route and the CLI example above carry the group for that reason; the ignored live check `cargo test -p aivtuber-adapters --test graphiti_live -- --ignored` passes against the fixed stack, and the rerun reports `refused_items: 0`. The full record, including the provider attempts that blocked earlier runs, is link:experiments/EXP-0105-graphiti-sidecar-eval.adoc[EXP-0105]. The §12.2 verdict — keep the runtime's own store — is unchanged, and this configuration must not be described as adopted.

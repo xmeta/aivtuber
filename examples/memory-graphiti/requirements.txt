@@ -1,0 +1,11 @@
+# Pinned to the graphiti-core release the adapter's wire contract was checked
+# against. Bump this and the FalkorDB image together, and re-run the live
+# cleanup test, when the upstream message/episode shape changes.
+graphiti-core[falkordb,google-genai]==0.31.2
+falkordb==1.6.1
+# falkordb 1.6.1 passes a keyword redis 8.1 no longer accepts; the upstream
+# server lock resolves 8.0.0, so this deployment pins the same pair.
+redis==8.0.0
+fastapi==0.136.3
+uvicorn==0.45.0
+pydantic-settings==2.10.1

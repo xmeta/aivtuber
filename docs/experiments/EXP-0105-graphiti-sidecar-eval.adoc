@@ -1,0 +1,335 @@
+= EXP-0105: Graphiti memory-sidecar evaluation
+:toc:
+:toclevels: 2
+
+Status: measured 2026-11-04 on the full 14-case fixture; verdict `rejected`;
+the runtime's own store remains the supported default.
+
+== Decision question
+
+Does a Graphiti deployment behind the project's `MemorySidecar` port deliver
+better long-range retrieval than the runtime's own store, without leaking a
+superseded, refused, absent, or shortened claim, and without breaking the
+request's item or byte bounds?
+
+== Context / baseline
+
+The runtime's own store was measured on the 14-case fixture at
+`examples/memory-long-range/cases.json`: 14 cases, current-fact correctness
+1.0, stale-memory use 0, absent violations 0, truncated claims 0,
+`temporal_order_errors` 2, max context 12 items / 7,038 bytes, retained state
+14 entries / 69 links. The Hindsight sidecar measured earlier was rejected
+(§12.2 of `docs/memory-adaptation.adoc`); the runtime store remains the
+supported default.
+
+PR #256 adds the Graphiti adapter and provider selection; this record's branch
+adds a runnable reference stack (`examples/memory-graphiti/`) and the run
+below. PR #256 alone was not a measurement; this record is one.
+
+== Hypothesis / expected outcome
+
+Graphiti's extracted temporal graph can reduce `temporal_order_errors` below
+the runtime's 2 by answering with facts whose validity windows reflect event
+time, while keeping every zero-tolerance guardrail at zero. If it cannot, or
+if it leaks a claim the project refused, the runtime store stays the default.
+
+== Guardrails
+
+* `stale_memory_use`, `absent_violations`, and `truncated_claims` must stay 0.
+* No item the project must refuse; `refused_items` must stay empty.
+* `within_item_budget` and `within_byte_budget` must hold in every case.
+* Retirement must remove the episode and every fact naming it; a cleanup route
+  that cannot confirm this fails closed.
+* The comparison must be under the same fixture digest; a subset run is not
+  comparable and is refused by `memory-eval-compare`.
+
+== Cheapest informative test
+
+The full 14-case suite. `memory-eval-compare` refuses a report that covers a
+different case set, and the fixture's causal declarations live in the case
+document, so a one-case smoke run cannot answer the decision question. The
+deployment smoke test (health, route shape, cleanup) is cheaper but only
+validates plumbing; it is not reported as a measurement.
+
+== Dataset / workload
+
+`examples/memory-long-range/cases.json`, 14 cases, 48 claims, fixture digest
+`ef8918bf116a350032ce1fb23b0e67102d7c1e32c66b9be6be8c7c8d34dc37a3`. One
+run, completed 2026-11-04 in about six minutes.
+
+== Commit / base / head
+
+* base: `origin/main` at `9daa1dd8` (the #255 docs merge);
+* adapter head: `4675eaf7` (PR #256);
+* this deployment/evaluation record: the commit that adds
+  `examples/memory-graphiti/` and this file.
+
+== Profile / config fingerprint
+
+* `graphiti-core==0.31.2`, `falkordb==1.6.1`, `redis==8.0.0`, FalkorDB
+  `v4.22.3`; the `redis` pin is required because `falkordb 1.6.1` passes a
+  keyword that `redis 8.1` no longer accepts;
+* extractor: Ollama's OpenAI-compatible endpoint at
+  `http://host.docker.internal:11434/v1`, model `gpt-oss:120b-cloud`
+  (116.8B parameters, MXFP4, 131,072-token context, cloud-routed by the local
+  Ollama daemon), `LLM_STRUCTURED_OUTPUT=json_object`, temperature 0.0,
+  `LLM_MAX_TOKENS=8192`;
+* embedder: `nomic-embed-text` on the same endpoint, 768 dimensions;
+* reference stack in `examples/memory-graphiti/` uses a pass-through reranker,
+  so the run measures Graphiti's hybrid-search order rather than a
+  provider-reranked order;
+* `MemorySidecar` adapter with
+  `--cleanup-path '/group/{scope}/episode/{uuid}/cleanup'`;
+* service bound to loopback, no authentication;
+* runtime baseline is the same fixture under the project's own store;
+* the extractor is a cloud model: claim text left the host on every ingestion
+  request. The deployment is a reference implementation, not a privacy or
+  production configuration.
+
+== Seed
+
+The fixture is deterministic and has no seed. Graphiti's extraction and
+deduplication are model-bound and may vary between runs; this record is one
+run of one model/provider configuration and is not a distribution.
+
+== Provider / model versions
+
+The run used the local Ollama daemon's cloud-routed `gpt-oss:120b` for
+extraction and the locally pulled `nomic-embed-text` for embeddings. Earlier
+provider attempts on the same stack failed before any episode was ingested and
+are kept here as the record of why the run needed this configuration:
+
+[cols="1,2,3",options="header"]
+|===
+|Provider |Attempt |Result
+
+|Gemini
+|`gemini-2.5-flash` metadata and `gemini-embedding-001` embedding probe with the checkout's `GEMINI_API_KEY`
+|Model metadata returned HTTP 200; the embedding call returned `402` with "prepayment credits are depleted". No request was charged to a fallback.
+
+|OpenRouter
+|`GET /api/v1/key`, then `google/gemini-2.5-flash` chat and `openai/text-embedding-3-small` embeddings
+|The key reports `limit_usd: 0` and spend `$0.055970986`; chat and embeddings both returned `403` (`key_limit`).
+
+|Ollama (local)
+|`gpt-oss:20b` through the OpenAI-compatible endpoint
+|The model failed to load ("model failed to load, this may be due to resource limitations or an internal error"); the host had 31.9 GiB total and 6.5 GiB free, and the model needs about 13.4 GiB.
+|===
+
+The deployment accepts any OpenAI-compatible `/chat/completions` and
+`/embeddings` endpoint, so the provider is a configuration change rather than
+an adapter change.
+
+== Toolchain
+
+Rust toolchain pinned by `rust-toolchain.toml`; Docker 29.3.1 / Compose
+v5.1.1; Python 3.12 service image; `cargo --locked` for every evaluator
+command.
+
+== Exploratory unknowns
+
+* Whether Graphiti's extraction on the 14-case suite yields facts that map back
+  to the retained claims at all; the adapter skips a fact whose episodes are all
+  gone.
+* Whether the service's ranking returns the claim a supersession promoted when
+  the item bound is tight.
+* Whether the pass-through reranker changes the comparison enough to matter;
+  a provider-reranked deployment is a separate configuration and must be
+  reported separately.
+
+The run answered the first two for this configuration; the third remains open
+because only the pass-through reranker was measured.
+
+== Confirmatory success / guardrail criteria
+
+Success: `Improvement` from `memory-eval-compare` (better
+`temporal_order_errors` or `current_fact_correctness`, no regression), with all
+zero-tolerance checks at zero and both request bounds true.
+
+Guardrail failure: any stale, absent, refused, or shortened claim; any
+out-of-scope item; any request-bound break; any cleanup route that leaves a
+derived fact naming the retired episode.
+
+Criterion version / recorded-at: `memory-adaptation.adoc` §12 rule as of
+2026-11-02; no criterion was changed after seeing a Graphiti result.
+
+== Actual
+
+`examples/memory-graphiti/run-eval.sh` produced the runtime baseline, the
+Graphiti report, and the comparison under one fixture digest. Artifacts are in
+`target/graphiti-eval/20261104T014802Z/` (not committed).
+
+=== Deployment defect found by the first run, and fixed before the measurement
+
+The first full run (`target/graphiti-eval/20261104T013031Z`, same provider
+configuration) completed with 7 `refused_items`: the service answered with
+claims the project had already retired. The cause was in the reference stack, not in
+Graphiti's removal logic: FalkorDB keeps one graph per `group_id`, and
+`Graphiti.remove_episode(uuid)` looks the episode up through the driver's
+*default* graph. The cleanup route therefore raised `NodeNotFoundError` for a
+live episode, and the route's "already absent" branch turned that into
+`{"success": true}`. Every retirement was a no-op.
+
+The route is now
+`DELETE /group/{group_id}/episode/{uuid}/cleanup`: it clones the driver to the
+group's graph before calling `remove_episode`, and the adapter passes
+`{scope}`. After the fix:
+
+* a manual ingest → cleanup → search returned `200 Episode and derived state
+  removed`, `GET /episodes` returned `[]`, and `/search` returned no facts;
+* the ignored live contract test passed:
+  `cargo test -p aivtuber-adapters --test graphiti_live -- --ignored`;
+* the full rerun below reports `refused_items: 0`.
+
+The first run is not used as the measurement because its retirement path was
+broken; it is evidence that the guardrail works.
+
+=== Run result
+
+[cols="2,1,1",options="header"]
+|===
+|Metric |Runtime baseline |Graphiti
+
+|`current_fact_correctness` |1.0 |0.661 (11 of 12 in the under-limit case; four cases delivered nothing)
+|`stale_memory_use` |0 |0
+|`absent_violations` |0 |1 (delivered `evt-c1`, which the case refuses)
+|`truncated_claims` |0 |0
+|`temporal_order_errors` |2 |8
+|max context items / request bytes |12 / 7,038 |12 / 1,000
+|entries / links high-water |14 / 69 |13 / 0
+|`refused_items` |0 |0
+|`causal_pairs_delivered` |1 |0
+|verdict |— |`rejected`
+|===
+
+`memory-eval-compare` rejected the candidate on one reason:
+
+[quote]
+____
+case "topic_shifted_correction_under_limit": candidate absent_violations 1,
+which must be zero
+____
+
+The case's item bound is 12 and it refuses two claims (`evt-old`, `evt-c1`).
+The service returned 12 items including `evt-c1` and missed `evt-c9`; the
+comparison re-derived correctness 11/12 from the delivered set. This is the
+same failure class as the Hindsight rejection: under a tight item bound,
+semantic ranking decides membership, and the service returns a claim the
+project would refuse while dropping a live one.
+
+Other case-level deviations:
+
+* `causal_reason_travels_with_its_effect` — 0 of 2 delivered. No returned fact
+  mapped back to either the bug claim or the retry claim, so the fixture's
+  cause/effect pair could not be delivered.
+* `goal_attempt_result` — 1 of 3 (`evt-attempt` only).
+* `budget_pressure_drops_whole` — 0 of 3; the case's byte budget admitted
+  nothing that mapped back to a retained claim.
+* `oversized_claim_skipped_whole` — 0 of 1.
+* `contradiction_without_update` and `topic_mismatch_ranks_lower` — 1 of 2
+  each.
+* `retention_plateau` — 4 of 4 delivered, but 2 temporal-order errors.
+* `topic_shifted_correction_under_limit` — 6 temporal-order errors on top of
+  the refused claim.
+
+The candidate did keep every request within the item and byte bounds
+(`within_item_budget`/`within_byte_budget` true in all 14 cases), returned no
+stale claim from the fixture's stale subset, no shortened text, and no item the
+project retired after the cleanup fix. Those are the parts it got right; the
+decision rule still rejects it because retrieval quality regressed and one
+refused claim reached the request.
+
+== Measurement report
+
+Only values produced under fixture digest
+`ef8918bf116a350032ce1fb23b0e67102d7c1e32c66b9be6be8c7c8d34dc37a3` are in the
+table above. The report and verdict are:
+
+* `target/graphiti-eval/20261104T014802Z/memory-graphiti.json`
+  (`memory-long-range-eval/v1`);
+* `target/graphiti-eval/20261104T014802Z/memory-verdict.json`
+  (`memory-eval-compare/v1`, `verdict: rejected`);
+* `target/graphiti-eval/20261104T014802Z/status.txt`
+  (`completed: ... compare_exit=1`).
+
+== Evidence artifacts
+
+* runtime baseline: `target/graphiti-eval/20261104T014802Z/memory-runtime.json`
+  (generated locally; not committed);
+* deployment: `examples/memory-graphiti/` (committed with this record),
+  including the group-scoped cleanup route and `run-eval.sh`;
+* live retirement check: `cargo test -p aivtuber-adapters --test graphiti_live
+  -- --ignored` against the fixed stack (1 passed, 7.3 s);
+* provider failures before the run: the commands and status codes in the
+  provider table above; no response body containing a key is retained;
+* no response body from the cloud extractor is retained; only counts, delivered
+  claim ids, and the derived metrics are recorded.
+
+== Noise / uncertainty / missing evidence
+
+* One run, one model. Extraction and fact resolution are model-bound; a
+  different extractor, an OpenAI reranker, or a different item/byte budget can
+  change both membership and order. This is not a distribution.
+* The extractor is Ollama's cloud-routed 120B model, not a local weight run and
+  not a provider-independent measurement of Graphiti.
+* The pass-through reranker means the measured order is Graphiti's hybrid
+  search order; a deployment with the upstream logprob reranker is a different
+  configuration and is not covered here.
+* FalkorDB was measured, not Neo4j. The deployment's cleanup route had to be
+  scoped to the group's graph, and an operator porting the route to another
+  backend must re-check `remove_episode`'s scoping there.
+* The comparison scores what the fixture declares. A claim delivered that the
+  fixture refuses is scored through `absent_violations`; a claim missing from
+  `must_deliver` is scored through correctness. Both are visible per case in
+  the verdict file.
+* No per-run latency/cost is recorded. The cloud model is a usage-bearing
+  endpoint; the six-minute wall clock is not a service SLO.
+
+== Expected-vs-actual difference
+
+Expected: a temporal graph reduces the runtime's 2 temporal-order errors while
+keeping every guardrail at zero. Actual: temporal-order errors rose to 8,
+correctness fell from 1.0 to 0.661, and one refused claim reached the request.
+The hypothesis is not supported for this configuration.
+
+== Likely explanation
+
+Graphiti stores extracted facts, and the port maps a fact back to the episode
+that supported it. When a case has many near-duplicate claims and a tight item
+bound, the service's hybrid ranking chooses which facts to return; nothing in
+the deployment enforces the project's retention or supersession order at
+ranking time. The same shape of miss that rejected Hindsight appears here:
+the model-extracted graph is not a substitute for the project's ordering and
+budget policy. The cleanup defect found by the first run also shows the
+deployment's storage scoping (one graph per group) is a correctness surface:
+an unscoped route turns retirement into a silent success.
+
+== Decision
+
+Reject Graphiti for the runtime's default memory path. Keep the runtime's own
+store as the supported default (§12.2 verdict unchanged). The deployment stays
+in the repository as a reference/evaluation stack, not as a production
+dependency, and its cleanup route must remain group-scoped. This is a measured
+rejection for this configuration, not a claim that no Graphiti deployment can
+ever win.
+
+== Follow-up / owning issue
+
+#105 owns the comparison. Follow-ups:
+
+. Keep the group-scoped cleanup route; a deployment using Neo4j or another
+  driver must verify `remove_episode`'s scoping before claiming retirement.
+. If Graphiti is revisited, measure a provider-reranked deployment and a
+  budget-aware retrieval configuration separately; do not mix them with this
+  fingerprint.
+. Any new report must use the same fixture digest and the full 14 cases; a
+  subset is refused as incomparable.
+
+== Revisit condition
+
+Revisit when any of the following changes: a provider-reranked Graphiti
+deployment is available; Graphiti's message/episode wire shape or
+`remove_episode` scoping changes; the reference stack moves to a different
+graph backend; or the project's item/byte/retention policy changes enough that
+the comparison's question is different. Re-run the adapter contract tests and
+the live retirement check before trusting a new deployment.

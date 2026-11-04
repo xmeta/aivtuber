@@ -1,0 +1,271 @@
+= Graphiti reference stack for the #105 memory-sidecar evaluation
+:toc:
+:toclevels: 2
+
+This directory contains the deployment the `memory-sidecar-eval --provider graphiti`
+run is meant to measure. It is a reference implementation, not a production
+service.
+
+[WARNING]
+====
+The service has no authentication, authorization, or prompt-injection
+protection. The compose file binds the service and FalkorDB to `127.0.0.1`
+only. Do not expose it to an untrusted network. For a networked deployment, put
+an authenticating proxy in front of it and set
+`AIVTUBER_MEMORY_SIDECAR_TOKEN` on the evaluator side.
+====
+
+== What is here
+
+[cols="1,3",options="header"]
+|===
+|File |Purpose
+
+|`app.py`
+|The FastAPI service: `/messages`, `/search`, `/episodes/{group}`, `/group/{group}`, `/episode/{uuid}`, and the cleanup route `/group/{group}/episode/{uuid}/cleanup` that calls `Graphiti.remove_episode` in the group's graph.
+
+|`Dockerfile`
+|The service image, pinned by `requirements.txt`.
+
+|`docker-compose.yml`
+|The service plus FalkorDB v4.22.3. No Neo4j is required.
+
+|`.env.example`
+|Provider configuration. Copy it to `.env`; `.env` is gitignored.
+
+|`run-eval.sh`
+|Preflight, stack startup, baseline report, sidecar report, and comparison.
+|===
+
+The wire shape follows Graphiti's `server/graph_service` (Apache-2.0). The
+service stores a message as `f'{role or ""}({role_type}): {content}'`, exactly
+as the upstream reference server does; `GraphitiSidecar` strips that envelope
+when it reads the claim back. `POST /messages` is asynchronous and returns
+`202`; the adapter polls `/episodes/{group}` until the episode exists.
+
+The cleanup route is not decorative. `DELETE /episode/{uuid}` removes only the
+episode node. Retirement in the port must also remove facts and entity
+summaries derived from that episode, so `app.py` implements
+`DELETE /group/{group}/episode/{uuid}/cleanup` with `Graphiti.remove_episode`.
+The adapter fails closed if the route is missing or does not answer
+`{"success": true}`.
+
+The group is in the route because FalkorDB keeps one graph per group.
+`Graphiti.remove_episode` looks the episode up through the driver's default
+graph, so an unscoped cleanup route answers `NodeNotFoundError` for a live
+episode, reports it as "already absent", and leaves the episode and its facts
+in place. The route clones the driver to the group's graph before removing.
+
+== Quick start
+
+[source,sh]
+----
+cd examples/memory-graphiti
+cp .env.example .env
+$EDITOR .env
+./run-eval.sh --check
+./run-eval.sh
+----
+
+`run-eval.sh` writes to `target/graphiti-eval/<UTC timestamp>/`:
+
+* `memory-runtime.json` — the runtime's own store under the same fixture;
+* `memory-graphiti.json` — the Graphiti report;
+* `memory-graphiti.stdout.json` — the same report as emitted by the CLI;
+* `memory-verdict.json` — `memory-eval-compare/v1`;
+* `status.txt` — `running`, `completed`, `failed`, or `blocked: ...`.
+
+A blocked status is evidence, not a measurement. In particular, a provider
+`402` (no credit), `401` (bad key), or a model that cannot load is recorded
+as blocked and no report is fabricated.
+
+To stop the stack:
+
+[source,sh]
+----
+docker compose --project-directory examples/memory-graphiti \
+  -f examples/memory-graphiti/docker-compose.yml down
+----
+
+The named `falkordb-data` volume survives `down`; use `down -v` only when the
+measurement data is intentionally disposable.
+
+== Provider configurations
+
+The stack has two independent choices: the extractor LLM and the embedder.
+Both support an OpenAI-compatible endpoint or Gemini's native client.
+
+=== OpenAI
+
+[source,dotenv]
+----
+LLM_PROVIDER=openai
+LLM_MODEL=gpt-4.1-mini
+LLM_BASE_URL=https://api.openai.com/v1
+LLM_API_KEY=sk-...
+EMBEDDER_PROVIDER=openai
+EMBEDDER_MODEL=text-embedding-3-small
+EMBEDDER_BASE_URL=https://api.openai.com/v1
+EMBEDDER_API_KEY=sk-...
+EMBEDDER_DIM=1536
+----
+
+=== Gemini
+
+[source,dotenv]
+----
+LLM_PROVIDER=gemini
+LLM_MODEL=gemini-2.5-flash
+GEMINI_API_KEY=...
+EMBEDDER_PROVIDER=gemini
+EMBEDDER_MODEL=gemini-embedding-001
+EMBEDDER_DIM=1024
+----
+
+The native Gemini client is used so the request does not depend on an
+OpenAI-compatible translation layer. `EMBEDDER_DIM` is the output
+dimensionality; it must match the model and must not be changed between
+creating the FalkorDB volume and reading it.
+
+=== OpenRouter
+
+OpenRouter exposes OpenAI-compatible chat completions. Use it for the
+extractor only if the account has credit, and use an embedding provider that
+actually serves embeddings; do not assume the chat catalogue includes one.
+
+[source,dotenv]
+----
+LLM_PROVIDER=openai
+LLM_MODEL=google/gemini-2.5-flash
+LLM_BASE_URL=https://openrouter.ai/api/v1
+LLM_API_KEY=sk-or-v1-...
+EMBEDDER_PROVIDER=openai
+EMBEDDER_MODEL=text-embedding-3-small
+EMBEDDER_BASE_URL=https://api.openai.com/v1
+EMBEDDER_API_KEY=sk-...
+EMBEDDER_DIM=1536
+----
+
+=== Local Ollama / vLLM / llama.cpp
+
+Any endpoint that implements `POST /v1/chat/completions` and
+`POST /v1/embeddings` can be used. For Docker Desktop, the host is reachable as
+`host.docker.internal`; on Linux, use the bridge gateway or run the stack with
+host networking.
+
+[source,dotenv]
+----
+LLM_PROVIDER=openai
+LLM_MODEL=gpt-oss:20b
+LLM_BASE_URL=http://host.docker.internal:11434/v1
+LLM_API_KEY=ollama
+LLM_STRUCTURED_OUTPUT=json_object
+LLM_MAX_TOKENS=8192
+EMBEDDER_PROVIDER=openai
+EMBEDDER_MODEL=nomic-embed-text
+EMBEDDER_BASE_URL=http://host.docker.internal:11434/v1
+EMBEDDER_API_KEY=ollama
+EMBEDDER_DIM=768
+----
+
+`LLM_STRUCTURED_OUTPUT=json_object` is the safe default for small local
+models and for servers that accept a JSON-schema response format but do not
+enforce it. Extraction quality with small models is the dominant failure mode:
+Graphiti needs structured entity/fact output and deduplication, so a model that
+cannot emit the schema will make claims time out rather than produce a
+comparable report.
+
+== What the measurement includes
+
+The reference stack uses a pass-through reranker (`PassThroughReranker` in
+`app.py`). Graphiti's upstream OpenAI reranker asks for logprobs, which several
+OpenAI-compatible endpoints do not implement. A run against this stack
+therefore measures Graphiti's hybrid-search order, not a provider-reranked
+order. That is part of the configuration fingerprint and must be stated beside
+the report; it is not equivalent to a deployment that enables the OpenAI
+reranker.
+
+The adapter, not the service, owns:
+
+* admission (`authorize_memory_write` runs before any message is sent);
+* retention (the runner retires claims the project's store would have evicted,
+  expired, or superseded);
+* scope and liveness checks on the answer;
+* the request's item and byte bounds.
+
+The service owns ranking and matching. The comparison rule is in
+`docs/memory-adaptation.adoc` §12.
+
+== Manual commands
+
+If the stack is already running, the three commands are:
+
+[source,sh]
+----
+cargo run --locked -p aivtuber-app --bin memory-long-range-eval -- \
+  examples/memory-long-range/cases.json target/memory-runtime.json
+
+cargo run --locked -p aivtuber-app --bin memory-sidecar-eval -- \
+  --provider graphiti \
+  --cleanup-path '/group/{scope}/episode/{uuid}/cleanup' \
+  --ingest-timeout-ms 300000 \
+  examples/memory-long-range/cases.json http://127.0.0.1:8000 \
+  target/memory-graphiti.json
+
+cargo run --locked -p aivtuber-app --bin memory-eval-compare -- \
+  examples/memory-long-range/cases.json \
+  target/memory-runtime.json target/memory-graphiti.json \
+  --out target/memory-verdict.json
+----
+
+The optional bearer token is read from `AIVTUBER_MEMORY_SIDECAR_TOKEN`, never
+from a command-line argument. The reference stack does not enforce it; a token
+is only useful behind a proxy.
+
+== Troubleshooting
+
+[cols="1,3",options="header"]
+|===
+|Symptom |Check
+
+|`/healthcheck` never becomes healthy
+|`docker compose ... logs graphiti`. The usual cause is a missing key or a provider URL that is unreachable from inside the container.
+
+|`401` / `402` / `403` from the provider
+|The key is invalid, has no credit, or its limit is exhausted. Record the status as blocked; do not report a zero.
+
+|`422` on `POST /messages`
+|`role_type` must be `user`, `assistant`, or `system`; `role` may be empty. The adapter sends `role: ""` on purpose.
+
+|`retain` times out
+|The model did not materialize an episode within `--ingest-timeout-ms`. Inspect the worker log for schema/JSON errors. A small local model is the usual cause.
+
+|cleanup route returns `404`
+|The episode was already gone; this stack treats that as a successful retirement. Any other error is not converted to success.
+
+|`graphiti cleanup path must start with '/'` (Windows)
+|Git Bash/MSYS rewrote `/episode/{uuid}/cleanup` into a Windows path before the adapter saw it. Prefix the `memory-sidecar-eval` command with `MSYS_NO_PATHCONV=1`; `run-eval.sh` does that for its own invocation.
+
+|`docker compose config` fails
+|`.env` is missing. Copy `.env.example`; `run-eval.sh --check` reports which value is absent without printing it.
+|===
+
+== Version pinning
+
+`graphiti-core==0.31.2`, `falkordb==1.6.1`, `redis==8.0.0`, and
+`falkordb/falkordb:v4.22.3` are pinned together. The adapter's contract was
+written against the message envelope and episode shape of that release. The
+`redis` pin matters: `falkordb 1.6.1` passes a keyword that `redis 8.1` no
+longer accepts, and the service fails at startup without it. When any pin is
+bumped, re-run:
+
+[source,sh]
+----
+cargo test --locked -p aivtuber-adapters
+AIVTUBER_GRAPHITI_ENDPOINT=http://127.0.0.1:8000 \
+AIVTUBER_GRAPHITI_CLEANUP_PATH='/group/{scope}/episode/{uuid}/cleanup' \
+  cargo test --locked -p aivtuber-adapters --test graphiti_live -- --ignored --nocapture
+----
+
+The live test is ignored by default because it needs a running deployment,
+provider credit, and the cleanup route.

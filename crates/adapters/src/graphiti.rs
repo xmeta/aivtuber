@@ -138,7 +138,13 @@ pub struct GraphitiConfig {
     /// has no authentication of its own, and the token is never printed.
     pub bearer_token: Option<SecretString>,
     /// Path template of a cleanup-capable retirement endpoint, for example
-    /// `/episode/{uuid}/cleanup`.
+    /// `/group/{scope}/episode/{uuid}/cleanup`.
+    ///
+    /// A deployment whose storage keeps one graph per scope (FalkorDB, the
+    /// reference stack) has to include `{scope}`: `Graphiti.remove_episode`
+    /// looks the episode up through the driver's default graph, so a route
+    /// without the scope answers "not found" for a live episode and leaves
+    /// its facts behind.
     ///
     /// The reference server's `DELETE /episode/{uuid}` removes only the
     /// episode node: the facts and entity summaries derived from it survive.
