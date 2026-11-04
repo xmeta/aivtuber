@@ -1,0 +1,47 @@
+name: aivtuber-graphiti-eval
+
+services:
+  falkordb:
+    image: falkordb/falkordb:v4.22.3
+    command: ["--port", "6379"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - falkordb-data:/var/lib/falkordb/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6379", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  graphiti:
+    build:
+      context: .
+    env_file:
+      - .env
+    environment:
+      FALKORDB_HOST: falkordb
+      FALKORDB_PORT: "6379"
+      FALKORDB_DATABASE: ${FALKORDB_DATABASE:-default_db}
+    ports:
+      # The service has no authentication. Keep it on loopback.
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      falkordb:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthcheck', timeout=2)",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+
+volumes:
+  falkordb-data:
