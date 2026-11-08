@@ -414,3 +414,139 @@ So the viewer sees a moderate smile and a look at chat as the greeting starts, a
 ----
 
 It compiles to a plan with channels {Face, Body, Gaze}, no audio command, and three avatar commands at the plan start in the order expression, gesture, gaze: Expression (+calm+, 0.25 on the VRM profile), Gesture (+nod+, amplitude 0.4), Gaze (+speaker+). If the avatar adapter is unavailable the commands are dropped and nothing else changes.
+
+== Consequences
+
+=== Positive
+
+* One validated record coordinates face, gaze, gesture and prosody; Jev's unused free strings and a future typed Thinking hint have a bounded place to land.
+* The model-facing surface is closed and small; no text parsing, no raw ids, no priority, no free numbers. The authority boundary is structural (no field exists) rather than a filter.
+* Dispatch-time compilation makes avatar-profile switches (VTS to local VRM) and cached-audio reuse cheap, and gives replay one place to record what was requested, clamped and realized.
+* Degradation is a total, versioned function, so a missing preset or TTS style is a recorded note, not a branch in an adapter.
+
+=== Costs / trade-offs
+
+* A new vocabulary, two capability tables per profile, a compatibility matrix and a fallback chain to author and maintain; the persona (#72) and #59 ratings decide whether eight affects and eleven gestures are enough (A-INTENT-001).
+* Quantization to four levels loses Jev's float precision on purpose.
+* Dispatch-time compilation adds a (small, unmeasured) step to the cached fast path and makes continuity state part of replay.
+* The performance asset schema bump is incompatible for old readers (coordinated with ADR-0004 D-3).
+* Phrase-level sync only; no word-level gesture timing until a TTS supplies timing evidence.
+
+=== Known limitations
+
+* No spike and no measurement: all bounds, level values, offsets, the 200 ms tail lead and the vocabulary sizes are proposals. The compile cost on the fast path is unmeasured.
+* The BML/SAIBA papers and the EMAGE paper were not read; BML facts come from the standard's wiki page, which states no license. AIRI's MMD gaze controller was not read. The AIRI marker regular expression was read, not run.
+* Only one Japanese example was worked, by hand. No TTS engine, no VTS model and no VRM model was exercised; the VTS degradation variant is reasoned from the existing hotkey-prefix mapping in +crates/app/src/outputs.rs+, not run.
+* The persona contract (#72), the naturalness budget (#89) and scene availability (#88) were not designed here; this ADR only defines the queries it needs from them.
+* A face preset may suppress visemes on some VRM models (override semantics); how much that matters for a given model is not examined.
+* Command timing is on the logical timeline; acoustic and OBS-capture alignment of avatar against audio is out of scope (A-AUDIO-001, ADR-0003 limitations).
+* Starter-pack preset names (+smile_soft+, +nod_small+, ...) do not equal the neutral vocabulary; legacy assets bypass the compiler, and mapping the starter pack into authored intents is implementation work.
+
+== Test plan
+
+Mapped to the acceptance criteria of #84. "Fixture" means a positive or negative JSON fixture with Rust/TypeScript parity; "property" means a proptest with the repository's pinned seeds (+docs/property-testing.adoc+).
+
+[cols="3,6"]
+|===
+|Acceptance criterion |Evidence
+
+|Bounded versioned PerformanceIntent type exists
+|Fixtures: valid minimal, valid maximal (4 anchors), invalid: wrong +schema_version+, 5 anchors, offset 301, unknown enum member, over 1 KiB. Rust-to-schema and fixture-to-Rust parity. Property: any intent that validates serializes to at most 1 KiB and round-trips.
+
+|No arbitrary model-generated frame-level parameters are accepted
+|Negative fixtures: a raw parameter key (+ParamMouthOpenY+), a +parameters+ map, a numeric yaw/pitch, a hotkey id string, a float level, a +priority+ field, a tool/OBS field: each fails parsing under +deny_unknown_fields+. A type-level test that no compiler output type contains a string produced by a producer (presets come only from the profile table).
+
+|Jev/Thinking can provide high-level hints through typed fields
+|Jev adapter fixtures: reflex decisions in +examples/reflex-decisions+ map to expected hints (0.64 quantizes to moderate; 0.1 to no field; an unmapped +reaction_family+ yields no field and a counter). Thinking: a typed hint is accepted; the same text with a tag-like token (+[joy]+, +<|ACT {}|>+) produces no hint and no state change, and the token is judged only by the output gate. Producer-subset test: a Jev hint that carries prosody or anchors is rejected as a whole.
+
+|Deterministic compiler clamps/validates intent
+|Property: compile is a pure function (same inputs, same command digest, repeated and across processes); every command has +at_ms+ >= plan start, belongs to the plan's generation, is at most the bound of 8, and uses only preset handles present in the profile. Matrix fixtures: each compatibility rule (wave under sadness, strong gesture under apologize, anger over cap) yields the documented neutral variant and a note. Anchor spacing and offset clamps.
+
+|Gaze/gesture/expression/prosody share one coherent intent
+|Golden test of the worked example: the three phrase-0 commands, the two tail commands and the absent phrase-1 start commands at the stated +at_ms+; the incoherence cases (sad face on a joy intent) are unrepresentable by construction (one affect field).
+
+|Unsupported TTS style fields degrade deterministically
+|+resolve_style+ tests over TTS capability sets: none, rate-only, rate and styles, full. Dropped dimensions appear in +unsupported+, the request contains only supported dimensions, and no provider vocabulary appears in domain types. Streaming and buffered paths yield the same request.
+
+|Cached/template/generated routes can all reference the intent model
+|A cached 0.2.0 asset with an envelope: requested intent inside the envelope compiles over the cached audio (no regeneration); outside it, the authored intent plays with +EnvelopeMismatch+. A legacy 0.1.0 asset still plays through the unchanged +dispatch_asset+ path (the existing cached-playback tests stay green). A template with one intent over composed segments.
+
+|#83 phrase units can preserve continuity
+|Two-phrase and three-phrase fixtures: continue emits no command, transition emits one, hold emits no gaze, a gesture overlapping the previous gesture's duration is dropped, final phrase tail lands inside the live window (test that the generation is still live at the tail +at_ms+), cancel mid-reply leaves no queued commands for the cancelled generation.
+
+|Replay records validated intent and compiler version
+|Record round-trip fixture. Replay test: feed the recorded validated intent, identities and seed to the compiler and compare the command digest; change one table version and see the identity differ while audio compatibility is unaffected.
+
+|Tests cover incompatible/missing avatar/TTS capabilities
+|Capability matrix: VRM profile, VTS-like profile with registered hotkeys only, minimal profile (neutral and camera only), a profile missing neutral or camera (load fails), avatar adapter +Unavailable+ (commands produced, dropped by the output, audio unaffected, performer not blocked), unavailable gaze target in the scene, TTS with no style support.
+|===
+
+Additions from the issue's sparse-anchor section:
+
+[cols="3,6"]
+|===
+|Criterion |Evidence
+
+|Bounded maximum number of anchors
+|Covered above (5 anchors rejected; model-supplied maximum 2 enforced).
+
+|Anchors never expose raw avatar parameter ids
+|Covered above; additionally a grep-style test over the schema that no property named like a parameter id exists.
+
+|Compiler can ignore unsupported anchors deterministically
+|Anchor with an unresolvable +pause(k)+, an unsupported gesture, a suppressed budget: each dropped with the right note, remaining anchors unchanged and in order.
+
+|Speech timing/prosody may influence timing without overriding compatibility
+|Property: scaling the phrase duration scales decile and +phrase_end+ anchors proportionally and never adds, removes or reorders anchors; an incompatible gesture stays dropped at any duration.
+
+|#89 budgets still cap gesture/gaze frequency
+|With a stub +NaturalnessBudget+ that refuses, no gesture or gaze command is emitted beyond the budget regardless of intent; repetition ring bounded at 16.
+|===
+
+Security and authority tests: the compiler has no access to an authority or capability constructor (dependency/visibility test); every emitted avatar command still passes +authorize_avatar_action+ in the app path; a hint arriving from an untrusted-derived event cannot raise a persona ceiling. Latency: the cached fast-path benchmark (+replay-benchmark+) must show no regression with the compiler in the path; the compile call itself gets a micro-benchmark to turn the "a few lookups" claim into a number. Metrics: each D9 counter has a test that it increments from the record.
+
+== Staging and rollback
+
+. Schema and fixtures first: +performance-intent.schema.json+, negative fixtures, Rust types with validation, TypeScript parity. No runtime consumer. Rollback: delete the schema and types.
+. Pure pieces next: assembler, quantizer, compatibility matrix, +resolve_style+, profile capability types and loaders, each against fixtures. No behavior change yet.
+. Compiler behind a flag at dispatch for assets that carry an intent; legacy assets unchanged; the generated path keeps its fixed neutral intent until Thinking hints exist. Rollback: flag off restores today's behavior exactly.
+. Jev adapter, then the floor backchannel table, then the typed Thinking side channel and the asset 0.2.0 bump (with ADR-0004's fields).
+. Replay record and metrics wired through telemetry.
+
+The expensive-to-reverse points are the vocabulary members and the asset schema bump; hence vocabulary version in every record and the single coordinated bump.
+
+== Revisit conditions
+
+* #59 ratings show the vocabulary cannot express common persona behavior, or Level quantization produces visibly wrong intensity.
+* A TTS backend appears that supplies word or phoneme timing: reconsider word-level sync (A-INTENT-002).
+* The fast-path benchmark shows measurable cost from dispatch-time compilation: reconsider baking per profile (Q3).
+* A required avatar behavior needs more than symbolic gaze or preset gestures (full-body motion libraries, VRMA clips).
+* The reflex schema gains closed families (then the Jev mapping table becomes a direct mapping).
+* #72, #88 or #89 contracts conflict with the queries defined here.
+
+== Open questions
+
+For the supervisor; none is decided.
+
+. *Q1 (gaze vocabulary)*: v1 keeps the existing five targets and maps co-host to +speaker+, offscreen/thinking to +away+, neutral to +camera+, deferring "donation alert". Extending the enum changes the reflex and asset schemas (incompatible). Accept the mapping for v1, or take the enum change now with the 0.2.0 bump?
+. *Q2 (level quantization)*: four ordinal levels instead of floats. Acceptable, or keep a float with a quantization step in the digest?
+. *Q3 (when to compile)*: dispatch-time compilation (proposed) versus compile when the asset is built (profile-bound baked tracks, no continuity across cached phrases). Accept dispatch time pending the benchmark?
+. *Q4 (expression family)*: fold the facial-expression family into affect (proposed), or keep a separate optional field with a coherence rule?
+. *Q5 (inline tags)*: confirm that text is never parsed for performance information, and decide whether the output gate should reject or merely count tag-like tokens (+[x]+, +<|...|>+) in a reply. Counting only is proposed.
+. *Q6 (precedence)*: Thinking over Jev over default, with operator-authored data first. Acceptable?
+. *Q7 (naming)*: +PerformanceCompiler+ already names the asset builder in +crates/generative+. Rename that, or call the new component +IntentCompiler+ (proposed)?
+. *Q8 (release on cancel)*: who issues the neutral release after a cancel, and is the ADR-0003 +Reset+ added to +AvatarPlaybackCommand+ (an adapter-visible enum change)? The composition root on the lifecycle +Cancelled+ event is proposed.
+. *Q9 (profile data placement)*: avatar and TTS capability tables as domain-level operator configuration schemas, or adapter-private like the renderer protocol (ADR-0003 decision 7)? Domain-level is proposed because the compiler needs them and they contain no raw ids, but the VTS hotkey names would then be profile data.
+. *Q10 (interruptibility and priority)*: confirm that priority is excluded from the intent and interruptibility is downward only (+PreferEarlyYield+).
+. *Q11 (placement)*: types and pure rules in +crates/domain+, compiler in +crates/runtime+, floor table beside the floor policy (as proposed), or the compiler in +crates/scheduler+ with ADR-0005's policy?
+. *Q12 (persona and budget contracts)*: #72 ceilings and #89 budgets are assumed to expose the queries in D3 and D5. Is that the intended direction, or should #84 wait for them?
+. *Q13 (starter pack)*: map the starter pack's free-string presets into authored intents and profile tables, or leave them as legacy assets indefinitely?
+
+== Related
+
+* Issue: #84. Related issues: #54, #58, #59, #66, #72, #81, #83, #88, #89, #219, #222.
+* PR: none opened (design-only).
+* Assumptions: A-TTS-001, A-VTS-001, A-AUDIO-001 (existing); proposed A-INTENT-001 to A-INTENT-003.
+* Other ADRs: link:0001-three-layer-runtime.adoc[ADR-0001], link:0002-mcp-tool-authority-boundary.adoc[ADR-0002], link:0003-local-vrm-renderer.adoc[ADR-0003], link:0004-speech-lifecycle-and-text-projection.adoc[ADR-0004], link:0005-conversational-floor-policy.adoc[ADR-0005].
+* Documents: link:../research-register.adoc[Research register], link:../reuse-first.adoc[Reuse-first], link:../implementation-accelerator.adoc[Implementation accelerator], link:../domain-contract.adoc[Domain contract], link:../security-threat-model.adoc[Security threat model].
+* External references (pattern only): BML 1.0 standard (Radboud University wiki), AIRI and Open-LLM-VTuber (MIT, commits above), Neuro SDK (MIT), VRM 1.0 specification (vrm-c), EMAGE (CVPR 2024).
