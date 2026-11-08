@@ -2,15 +2,15 @@ use aivtuber_adaptation::{
     ActorPseudonymizer, AdaptationEngine, PromotionPolicy, WorkingMemory, WorkingMemoryConfig,
 };
 use aivtuber_adapters::{
-    NormalizedHttpTtsAdapter, NormalizedHttpTtsConfig, ObsWebSocketAdapter, ObsWebSocketConfig,
-    OpenAiResponsesAdapter, OpenAiResponsesConfig, ProcessAudioConfig, ProcessAudioPlayer,
-    SecretString, VTubeStudioAdapter, VTubeStudioConfig,
+    LocalAvatarConfig, LocalAvatarServer, NormalizedHttpTtsAdapter, NormalizedHttpTtsConfig,
+    ObsWebSocketAdapter, ObsWebSocketConfig, OpenAiResponsesAdapter, OpenAiResponsesConfig,
+    ProcessAudioConfig, ProcessAudioPlayer, SecretString, VTubeStudioAdapter, VTubeStudioConfig,
 };
 use aivtuber_app::{
     AdaptationRuntime, AdapterHealth, AvatarOutput, CompositionProfile, GenerativeBudgetPolicy,
-    GenerativeRuntime, IntentRoutePlanner, IntentShadowPolicy, NoopAvatarOutput, NoopStreamOutput,
-    ObsStreamOutput, OperatorControlServer, OperatorRateLimiter, ProductionApp, ProfileSummary,
-    RawIngressConfig, RawIngressMetrics, RawIngressMetricsSnapshot, RoutePlanner,
+    GenerativeRuntime, IntentRoutePlanner, IntentShadowPolicy, LocalAvatarOutput, NoopAvatarOutput,
+    NoopStreamOutput, ObsStreamOutput, OperatorControlServer, OperatorRateLimiter, ProductionApp,
+    ProfileSummary, RawIngressConfig, RawIngressMetrics, RawIngressMetricsSnapshot, RoutePlanner,
     RuntimeRetentionPolicy, SHADOW_ORCHESTRATOR_SCHEMA_VERSION, ShadowOrchestratorConfig,
     ShadowPolicyIdentity, ShadowingRoutePlanner, StreamOutput, VtsAvatarOutput, VtsPlaybackConfig,
     apply_dispatched_request, pump_bounded_records,
@@ -611,8 +611,46 @@ fn build_adaptation_runtime(
     Ok(AdaptationRuntime::new(memory, engine))
 }
 
+/// `AIVTUBER_AVATAR_OUTPUT=local|vts|none`. Unset keeps the historical
+/// behavior (`AIVTUBER_VTS_ENABLED` selects VTube Studio, otherwise none).
 fn build_avatar_output() -> Result<Box<dyn AvatarOutput>, Box<dyn Error>> {
-    if !env_bool("AIVTUBER_VTS_ENABLED", false)? {
+    match env_optional("AIVTUBER_AVATAR_OUTPUT").as_deref() {
+        None => build_vts_avatar_output(env_bool("AIVTUBER_VTS_ENABLED", false)?),
+        Some("vts") => build_vts_avatar_output(true),
+        Some("none") => Ok(Box::new(NoopAvatarOutput)),
+        Some("local") => build_local_avatar_output(),
+        Some(other) => {
+            Err(format!("AIVTUBER_AVATAR_OUTPUT must be local, vts or none (got {other:?})").into())
+        }
+    }
+}
+
+fn build_local_avatar_output() -> Result<Box<dyn AvatarOutput>, Box<dyn Error>> {
+    let port = env_u64("AIVTUBER_LOCAL_AVATAR_PORT", 8765)?;
+    let defaults = LocalAvatarConfig::default();
+    let config = LocalAvatarConfig {
+        port: u16::try_from(port).map_err(|_| "AIVTUBER_LOCAL_AVATAR_PORT must fit in u16")?,
+        page_dir: env_path("AIVTUBER_LOCAL_AVATAR_PAGE_DIR"),
+        queue_capacity: env_usize("AIVTUBER_LOCAL_AVATAR_QUEUE", defaults.queue_capacity)?,
+        max_command_age: std::time::Duration::from_millis(env_u64(
+            "AIVTUBER_MAX_DISPATCH_LATENESS_MS",
+            250,
+        )?),
+    };
+    let server = LocalAvatarServer::start(config)?;
+    let output = LocalAvatarOutput::new(server, runtime_avatar_authority()?);
+    // Deliberate operator console output: the launch URL carries the
+    // per-launch secret and is the only way to hand it to OBS. Do not capture
+    // stderr into shared logs.
+    eprintln!(
+        "local avatar renderer URL (contains a per-launch secret, do not share or log): {}",
+        output.launch_url()
+    );
+    Ok(Box::new(output))
+}
+
+fn build_vts_avatar_output(enabled: bool) -> Result<Box<dyn AvatarOutput>, Box<dyn Error>> {
+    if !enabled {
         return Ok(Box::new(NoopAvatarOutput));
     }
 

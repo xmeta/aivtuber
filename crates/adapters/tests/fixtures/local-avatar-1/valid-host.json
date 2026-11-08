@@ -1,0 +1,8 @@
+[
+  {"v": 1, "epoch": "e-7f3a", "seq": 1, "cmd": {"op": "reset"}},
+  {"v": 1, "epoch": "e-7f3a", "seq": 2, "cmd": {"op": "viseme", "viseme": "aa", "weight": 0.8}},
+  {"v": 1, "epoch": "e-7f3a", "seq": 3, "cmd": {"op": "viseme", "viseme": "neutral", "weight": 0.0}},
+  {"v": 1, "epoch": "e-7f3a", "seq": 4, "cmd": {"op": "gaze", "target": "chat"}},
+  {"v": 1, "epoch": "e-7f3a", "seq": 5, "cmd": {"op": "expression", "preset": "joy", "intensity": 1.0}},
+  {"v": 1, "epoch": "e-7f3a", "seq": 6, "cmd": {"op": "gesture", "preset": "nod", "amplitude": 2.0}}
+]

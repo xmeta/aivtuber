@@ -1,8 +1,11 @@
 use crate::{AudioOutput, AvatarOutput, StreamOutput};
-use aivtuber_adapters::{AudioPlayRequest, AudioPlayer, ObsWebSocketAdapter, VTubeStudioAdapter};
+use aivtuber_adapters::{
+    AudioPlayRequest, AudioPlayer, DropReason, GazeTarget, LocalAvatarHandle, LocalAvatarHealth,
+    LocalAvatarServer, LocalAvatarState, ObsWebSocketAdapter, VTubeStudioAdapter, WireCommand,
+};
 use aivtuber_domain::{
-    AuthenticatedControl, AuthorizedStreamAction, AvatarAction, EngineError, Viseme,
-    authorize_avatar_action,
+    AuthenticatedControl, AuthorizedStreamAction, AvatarAction, EngineError, EngineErrorKind,
+    Viseme, authorize_avatar_action,
 };
 use aivtuber_runtime::{AudioPlaybackCommand, AvatarPlaybackCommand};
 use std::collections::BTreeMap;
@@ -168,6 +171,96 @@ impl AvatarOutput for VtsAvatarOutput {
     }
 }
 
+/// Local VRM renderer output (ADR-0003, #219). `execute` only authorizes and
+/// enqueues into the adapter's bounded queue: an absent, restarting or slow
+/// renderer drops and counts commands and never fails or blocks the
+/// dispatcher. Renderer availability is reported through `connect()`, which
+/// `maintain_adapters` polls into `AdapterHealth::avatar_error`.
+#[derive(Debug)]
+pub struct LocalAvatarOutput {
+    // Owns the listener threads; dropping the output stops the server.
+    server: LocalAvatarServer,
+    handle: LocalAvatarHandle,
+    authority: AuthenticatedControl,
+}
+
+impl LocalAvatarOutput {
+    pub fn new(server: LocalAvatarServer, authority: AuthenticatedControl) -> Self {
+        let handle = server.handle();
+        Self {
+            server,
+            handle,
+            authority,
+        }
+    }
+
+    pub fn health(&self) -> LocalAvatarHealth {
+        self.handle.health()
+    }
+
+    /// Operator-facing URL; contains the per-launch secret, never log it.
+    pub fn launch_url(&self) -> String {
+        self.server.launch_url()
+    }
+
+    fn wire_for(command: &AvatarPlaybackCommand) -> Option<WireCommand> {
+        let wire = match command {
+            AvatarPlaybackCommand::Expression {
+                preset, intensity, ..
+            } => WireCommand::Expression {
+                preset: preset.clone(),
+                intensity: *intensity,
+            },
+            AvatarPlaybackCommand::Gesture {
+                preset, amplitude, ..
+            } => WireCommand::Gesture {
+                preset: preset.clone(),
+                amplitude: *amplitude,
+            },
+            AvatarPlaybackCommand::Gaze { target, .. } => WireCommand::Gaze {
+                target: GazeTarget::parse(target)?,
+            },
+            AvatarPlaybackCommand::Viseme { viseme, weight, .. } => WireCommand::Viseme {
+                viseme: *viseme,
+                weight: *weight,
+            },
+            AvatarPlaybackCommand::Reset { .. } => WireCommand::Reset {},
+        };
+        wire.validate().ok().map(|()| wire)
+    }
+}
+
+impl AvatarOutput for LocalAvatarOutput {
+    fn connect(&mut self) -> Result<(), EngineError> {
+        match self.handle.health().state {
+            LocalAvatarState::Ready => Ok(()),
+            state => Err(EngineError::new(
+                EngineErrorKind::Unavailable,
+                format!("local avatar renderer is {state:?}"),
+            )),
+        }
+    }
+
+    fn execute(&mut self, command: &AvatarPlaybackCommand) -> Result<(), EngineError> {
+        let Some(wire) = Self::wire_for(command) else {
+            self.handle.record_drop(DropReason::Unmapped);
+            return Ok(());
+        };
+        // Same authority gate as every other avatar output. A failure here is
+        // a wiring bug, not renderer weather, so it is a real error.
+        authorize_avatar_action(
+            &self.authority,
+            AvatarAction {
+                action: format!("avatar.local:{}", wire.kind()),
+                parameters: BTreeMap::new(),
+            },
+        )?;
+        // Drop-and-count is already recorded by the adapter.
+        let _ = self.handle.enqueue(wire);
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub struct ObsStreamOutput {
     adapter: ObsWebSocketAdapter,
@@ -216,7 +309,7 @@ mod tests {
     };
     use std::collections::BTreeSet;
 
-    fn output(reset_hotkey: Option<&str>) -> VtsAvatarOutput {
+    fn authority() -> AuthenticatedControl {
         let secret = [9_u8; 32];
         let ingress = LocalControlIngress::new(
             "local-runtime",
@@ -239,14 +332,101 @@ mod tests {
                 &secret,
             )
             .expect("authenticate");
+        command.authority().clone()
+    }
+
+    fn output(reset_hotkey: Option<&str>) -> VtsAvatarOutput {
         VtsAvatarOutput::new(
             VTubeStudioAdapter::new(VTubeStudioConfig::default()).expect("adapter"),
-            command.authority().clone(),
+            authority(),
             VtsPlaybackConfig {
                 reset_hotkey: reset_hotkey.map(str::to_owned),
                 ..VtsPlaybackConfig::default()
             },
         )
+    }
+
+    fn local_output() -> LocalAvatarOutput {
+        let server = LocalAvatarServer::start(aivtuber_adapters::LocalAvatarConfig {
+            port: 0,
+            ..aivtuber_adapters::LocalAvatarConfig::default()
+        })
+        .expect("server");
+        LocalAvatarOutput::new(server, authority())
+    }
+
+    #[test]
+    fn local_output_never_fails_or_blocks_when_the_renderer_is_absent() {
+        let mut out = local_output();
+        // Availability is reported through connect(), not through execute().
+        assert!(out.connect().is_err());
+        let started = std::time::Instant::now();
+        for generation in 0..1000 {
+            let viseme = AvatarPlaybackCommand::Viseme {
+                generation,
+                at_ms: 0,
+                viseme: Viseme::Aa,
+                weight: 0.5,
+            };
+            assert!(out.execute(&viseme).is_ok());
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        // Unknown gaze target and out-of-range values have no wire form.
+        let gaze = AvatarPlaybackCommand::Gaze {
+            generation: 1,
+            at_ms: 0,
+            target: "ceiling".to_owned(),
+        };
+        assert!(out.execute(&gaze).is_ok());
+        let bad = AvatarPlaybackCommand::Viseme {
+            generation: 1,
+            at_ms: 0,
+            viseme: Viseme::Aa,
+            weight: 7.0,
+        };
+        assert!(out.execute(&bad).is_ok());
+        let health = out.health();
+        assert_eq!(health.dropped_count(DropReason::NotReady), 1000);
+        assert_eq!(health.dropped_count(DropReason::Unmapped), 2);
+        assert_eq!(health.sent, 0);
+    }
+
+    #[test]
+    fn local_output_maps_every_command_to_the_wire_form() {
+        let cases = [
+            (
+                AvatarPlaybackCommand::Reset {
+                    generation: 1,
+                    at_ms: 0,
+                },
+                Some(WireCommand::Reset {}),
+            ),
+            (
+                AvatarPlaybackCommand::Gaze {
+                    generation: 1,
+                    at_ms: 0,
+                    target: "chat".to_owned(),
+                },
+                Some(WireCommand::Gaze {
+                    target: GazeTarget::Chat,
+                }),
+            ),
+            (
+                AvatarPlaybackCommand::Expression {
+                    generation: 1,
+                    at_ms: 0,
+                    preset: "joy".to_owned(),
+                    intensity: 0.4,
+                },
+                Some(WireCommand::Expression {
+                    preset: "joy".to_owned(),
+                    intensity: 0.4,
+                }),
+            ),
+        ];
+        for (command, expected) in cases {
+            assert_eq!(LocalAvatarOutput::wire_for(&command), expected);
+        }
     }
 
     fn parameters(action: &aivtuber_domain::AuthorizedAvatarAction) -> BTreeMap<String, f64> {
