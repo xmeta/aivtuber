@@ -1,0 +1,26 @@
+{
+  "name": "aivtuber-local-avatar-renderer",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Local VRM renderer page for the local-avatar/1 protocol (ADR-0003, issue #219).",
+  "packageManager": "bun@1.3.14",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "vite build",
+    "test": "bun test test",
+    "check:licenses": "node scripts/check-licenses.mjs",
+    "audit": "bun audit",
+    "smoke": "node smoke/smoke.mjs"
+  },
+  "dependencies": {
+    "@pixiv/three-vrm": "3.5.5",
+    "three": "0.187.0"
+  },
+  "devDependencies": {
+    "@types/three": "0.187.0",
+    "playwright-core": "1.65.0",
+    "typescript": "6.0.3",
+    "vite": "8.3.6"
+  }
+}

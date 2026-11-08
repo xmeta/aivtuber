@@ -251,9 +251,12 @@ fn serve_static(stream: &mut TcpStream, shared: &Shared, method: &str, path: &st
         Ok(body) => {
             let ctype = content_type(&file);
             // The page may talk to nothing but this origin (no CDN, no
-            // third-party egress).
+            // third-party egress). `blob:` in connect-src is required because
+            // three.js decodes embedded model textures by fetching a blob: URL
+            // the page itself created from the model bytes; it names no other
+            // host (observed under the CSP in the S3 smoke test).
             let csp = format!(
-                "default-src 'self'; connect-src 'self' ws://{}; img-src 'self' data: blob:; \
+                "default-src 'self'; connect-src 'self' blob: ws://{}; img-src 'self' data: blob:; \
                  script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'",
                 shared.host
             );

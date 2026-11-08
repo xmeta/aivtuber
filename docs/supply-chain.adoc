@@ -97,3 +97,33 @@ across `ci.yml`. That validator is deliberately unmodified: the pull-request
 gate stays stable-only, and the scheduled workflow is asserted separately by
 `scripts/validate.mjs` (nightly declared explicitly, no `pull_request`
 trigger).
+
+== 8. Renderer npm bundle (`renderer/local-avatar`)
+
+Issue: #219 (S3) · Decision: ADR-0003 decision 8 · CI job: `renderer` in `.github/workflows/ci.yml`
+
+`cargo deny` audits resolved Rust graphs only. The local VRM renderer is a separate npm project with its own `package.json` and `bun.lock` under `renderer/local-avatar/`; the root `package.json` and `bun.lock` are untouched. Its dependencies are therefore gated by the checks below, not by `cargo deny`.
+
+=== Policy
+
+* *Exact pins.* Every entry in `dependencies` and `devDependencies` is an exact version (no ranges, no tags). The renderer's `package.json` pins the same `packageManager` Bun as the root, and the `renderer` job pins the same `bun-version`, which `scripts/validate-toolchain-pins.mjs` already enforces for every `bun-version:` in `ci.yml`.
+* *Frozen lockfile, no install hooks.* CI installs with `bun install --frozen-lockfile --ignore-scripts`. Do not refresh `bun.lock` implicitly. Regenerate it only with the pinned Bun (an older Bun cannot read a newer lockfile format; 1.3.14 writes `lockfileVersion` 1) and in a PR that says why.
+* *No CDN.* The bundle is built locally (`bun run build`); the page loads nothing from another origin, which the host's CSP (`default-src 'self'`) also enforces. `dist/` is not committed.
+* *Production dependencies* (what ships in the bundle) are `three` and `@pixiv/three-vrm`. A new production dependency needs the adoption record from `docs/reuse-first.adoc` section 5 in the PR.
+* *License allowlist.* `bun run check:licenses` (`renderer/local-avatar/scripts/check-licenses.mjs`, no dependencies) reads the installed `node_modules/*/package.json` and fails on any license outside `MIT`, `ISC`, `BSD-2-Clause`, `BSD-3-Clause`, `Apache-2.0`, `0BSD` (SPDX `OR` = any allowed, `AND` = all allowed). The runtime closure (what ships in the bundle) is held to the allowlist with no exceptions. Build/test-only tooling may carry an explicit exception in the script, each with a reason.
+* *Advisory audit.* `bun audit` (Bun 1.3.14 supports it) queries the npm advisory database for the locked tree, any severity, runtime and build tooling alike. Exceptions follow the same reason / owner / revisit procedure as section 4, recorded in this section, passed with `bun audit --ignore=<GHSA id>`, and re-reviewed whenever `bun.lock` changes.
+
+=== Current validation (2026-11)
+
+39 installed packages, 15 in the runtime closure (`three` 0.187.0, `@pixiv/three-vrm` 3.5.5 and its 6 `three-vrm-*` and 7 `types-*` packages), all `MIT`. `bun audit` reports no vulnerabilities.
+
+Active license exception (build/test only):
+
+* `lightningcss` (and its platform binary package), `MPL-2.0`. *Reason:* transitive dependency of Vite, used at build time to transform CSS; file-level weak copyleft, used unmodified, never copied into or linked with `dist/`. *Owner:* #219. *Revisit:* if it enters the runtime closure (the script then fails), or when Vite drops it.
+
+Active advisory exceptions: none.
+
+=== Tooling installed by the `renderer` job but absent from every lock file
+
+* *Chromium for Playwright.* Installed by `node node_modules/playwright-core/cli.js install --with-deps chromium`; the browser build is determined by the exact-pinned `playwright-core` (1.65.0) and cached by the hash of `bun.lock`. It is test tooling only and never ships. *Owner:* #219. *Revisit:* when Playwright is bumped.
+* *Sample VRM model.* `smoke/fetch-model.mjs` downloads `VRM1_Constraint_Twist_Sample.vrm` from `pixiv/three-vrm` pinned to commit `3caf7a21ee68f0d5dfa363ab3d577450bbf60136` and refuses any file whose SHA-256 is not `12c2b97e95e700783a6a550dc0eee2d7880aeedccef9ae67bc4c5a2f0f2631a2`. It is never committed; its license is the VRM metadata embedded in the file (see "Model and rights" in `docs/vts-obs-adapters.adoc` section 6).

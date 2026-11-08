@@ -301,7 +301,8 @@ The supervisor decided the ten questions raised by the spike. They are recorded 
 
 * (Done in #219 S1: canonical viseme enum and +Reset+ in +AvatarPlaybackCommand+.)
 * Canonical expression and gesture preset vocabularies and how a pack/asset declares the renderer profile it needs (asset-store +viseme_mapping+ is the likely home); the exact compatibility-identity field fed by the +hello+ model hash and profile id.
-* +docs/supply-chain.adoc+ policy text for the renderer bundle (decision 8), landing with the code.
+* (Done in #219 S3: +docs/supply-chain.adoc+ section 8 (renderer bundle policy, decision 8), the +renderer/local-avatar+ bundle, the headless SwiftShader smoke job and the OBS capture guide in link:../vts-obs-adapters.adoc[VTS/OBS adapters]. The smoke ran on Windows 11 with system Edge and with Playwright's headless Chromium; the Linux CI image is exercised by the new +renderer+ job.)
+* (Observed in #219 S3: the host's CSP needed +blob:+ in +connect-src+, because three.js decodes embedded model textures by fetching a +blob:+ URL the page itself creates; without it the model rendered without textures.)
 * The adapter-private protocol version, fixtures and the exact HTTP status for a rejected second connection.
 * The not-yet-attributed cold-start time must be profiled before any latency claim.
 == Related

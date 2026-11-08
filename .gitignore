@@ -6,3 +6,10 @@ node_modules/
 *.log
 .DS_Store
 .tgrep/
+
+# Local avatar renderer (issue #219): built output and operator-supplied models
+# are never committed (model licenses are independent of the code license).
+/renderer/local-avatar/dist/
+*.vrm
+/renderer/local-avatar/smoke/.cache/
+/renderer/local-avatar/smoke/out/

@@ -263,3 +263,104 @@ jobs:
             echo "Invalid benchmark result fixture unexpectedly passed."
             exit 1
           fi
+
+  # Issue #219 S3 / ADR-0003: the local VRM renderer is a separate npm project
+  # (renderer/local-avatar, its own package.json + bun.lock). cargo-deny does
+  # not see it, so this job is its supply-chain gate (docs/supply-chain.adoc
+  # section 8) and also runs the GPU-less end-to-end smoke: the real Rust
+  # LocalAvatarOutput serves the built bundle and a pinned sample model to
+  # headless Chromium under SwiftShader.
+  #
+  # Not in main's required status checks (it downloads a browser and a model);
+  # a failure is visible on the PR and is meant to be treated as blocking for
+  # renderer changes.
+  renderer:
+    name: Local avatar renderer
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: renderer/local-avatar
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      # Vite and Playwright run on Node, not Bun.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+
+      # Exact pins + committed lock; --ignore-scripts so no dependency can run
+      # an install hook.
+      - name: Install renderer dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Unit tests
+        run: bun run test
+
+      - name: Build bundle
+        run: bun run build
+
+      # MIT/BSD/Apache/ISC allowlist over the installed tree.
+      - name: License allowlist
+        run: bun run check:licenses
+
+      # Advisory audit of the locked tree. Exceptions: docs/supply-chain.adoc
+      # section 8 (none active).
+      - name: Advisory audit
+        run: bun audit
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-${{ hashFiles('renderer/local-avatar/bun.lock') }}
+
+      - name: Install Chromium
+        run: node node_modules/playwright-core/cli.js install --with-deps chromium
+
+      # The sample model is fetched pinned to an upstream commit and verified
+      # by SHA-256 (smoke/fetch-model.mjs); never committed.
+      - name: Cache sample model
+        uses: actions/cache@v4
+        with:
+          path: renderer/local-avatar/smoke/.cache
+          key: vrm-sample-12c2b97e95e700783a6a550dc0eee2d7880aeedccef9ae67bc4c5a2f0f2631a2
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: renderer-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+
+      - name: Build smoke host (real LocalAvatarOutput)
+        working-directory: .
+        run: cargo build --locked -p aivtuber-app --example local_avatar_smoke
+
+      - name: Headless smoke (SwiftShader, no GPU)
+        run: node smoke/smoke.mjs --bin ../../target/debug/examples/local_avatar_smoke
+
+      # Screenshots are evidence when the smoke fails; they contain only the
+      # sample model.
+      - name: Upload smoke output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: local-avatar-smoke
+          path: renderer/local-avatar/smoke/out/
+          if-no-files-found: ignore
+          retention-days: 7

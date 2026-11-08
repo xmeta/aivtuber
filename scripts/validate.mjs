@@ -1838,5 +1838,55 @@ for (const file of trackedFiles) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Issue #219 S3 / ADR-0003 decision 8: the renderer's npm tree is outside
+// cargo-deny, so its supply-chain gates must stay wired and its pins exact.
+// ---------------------------------------------------------------------------
+{
+  const rendererDir = join(root, "renderer/local-avatar");
+  const rendererCheck = (ok, message) => {
+    if (ok) {
+      passes += 1;
+      console.log(`ok        renderer/local-avatar: ${message}`);
+    } else {
+      failures += 1;
+      console.error(`FAIL      renderer/local-avatar: ${message} (issue #219)`);
+    }
+  };
+  const rendererPkg = JSON.parse(
+    readFileSync(join(rendererDir, "package.json"), "utf8"),
+  );
+  const inexact = Object.entries({
+    ...rendererPkg.dependencies,
+    ...rendererPkg.devDependencies,
+  }).filter(([, version]) => !/^\d+\.\d+\.\d+$/.test(version));
+  rendererCheck(
+    inexact.length === 0,
+    `all dependencies exact-pinned${inexact.length ? ` (not exact: ${inexact.map(([n]) => n).join(", ")})` : ""}`,
+  );
+  rendererCheck(
+    existsSync(join(rendererDir, "bun.lock")),
+    "bun.lock is committed",
+  );
+  const ciText = readFileSync(join(root, ".github/workflows/ci.yml"), "utf8");
+  const rendererJob = ciText.split(/^ {2}renderer:\n/m)[1] ?? "";
+  for (const needle of [
+    "bun install --frozen-lockfile --ignore-scripts",
+    "bun run check:licenses",
+    "bun audit",
+    "node smoke/smoke.mjs",
+  ]) {
+    rendererCheck(
+      rendererJob.includes(needle),
+      `ci.yml renderer job runs "${needle}"`,
+    );
+  }
+  const model = readFileSync(join(rendererDir, "smoke/fetch-model.mjs"), "utf8");
+  rendererCheck(
+    /commit: "[0-9a-f]{40}"/.test(model) && /sha256: "[0-9a-f]{64}"/.test(model),
+    "sample model is pinned to a commit and a SHA-256",
+  );
+}
+
 console.log(`\n${passes} passed, ${failures} failed`);
 process.exit(failures > 0 ? 1 : 0);
