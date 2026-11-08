@@ -58,7 +58,7 @@ The pattern puts a control channel inside a content channel. Three concrete cons
 * *Parse-then-strip asymmetry.* The text is gated and logged before TTS (ADR-0004 order); a marker parser that runs after, or a strip step that is separate from the extract step, creates a window where the text the gate approved differs from the text spoken or displayed. Typed fields are validated as a whole before commit and never alter the text.
 * *Prompting with runtime identifiers.* AIRI's Live2D ACT prompt lists exact model expression names and motion file names for the model to emit. That makes the model's output a raw model id, which the issue and ADR-0003 forbid in the domain. The intent vocabulary is project-owned and the avatar profile maps it.
 
-Therefore: text is never parsed for performance information. Tag-like tokens that survive in text are ordinary text for the gate and the projection to judge; a counter for them is proposed (Open question Q5).
+Therefore: text is never parsed for performance information. Tag-like tokens that survive in text are ordinary text for the gate and the projection to judge; they are counted, never rejected or interpreted (decided, S-3).
 
 == Reuse / Adapt / Build comparison
 
@@ -157,12 +157,12 @@ Design rules:
 |AffectClass |8 |neutral, joy, calm, sadness, anger, surprise, thinking, embarrassed (the first six equal ADR-0003's spike profile names; the last two have no VRM 1.0 preset and always need a fallback)
 |Level |4 |subtle, mild, moderate, strong
 |GestureFamily |11 |nod, shake, tilt_head, lean_forward, lean_back, recoil, wave, small_point, shrug, bow, beat
-|Gaze (AttentionTarget) |5 |camera, chat, game, speaker, away (the existing enum, unchanged in v1; Open question Q1)
+|Gaze (AttentionTarget) |5 |camera, chat, game, speaker, away (the existing enum, unchanged in v1; decided, S-1)
 |StyleClass / RateClass / Energy / Emphasis / Pause |6 / 3 / 3 / 3 / 3 |neutral, cheerful, calm, serious, gentle, excited / slow, normal, fast / low, normal, high / none, light, strong / none, short, long
 |AnchorKind / SyncRef / Channel |5 / 4 forms / 3 |as in the sketch
 |===
 
-Issue gaze examples map as: camera/audience to +camera+, co-host/other speaker to +speaker+, offscreen/thinking to +away+, neutral to +camera+. "Donation alert" has no member; adding one is a coordinated change to the reflex and asset gaze enums (an incompatible change) and is deferred (Q1).
+Issue gaze examples map as: camera/audience to +camera+, co-host/other speaker to +speaker+, offscreen/thinking to +away+, neutral to +camera+. "Donation alert" has no member; adding one is a coordinated change to the reflex and asset gaze enums (an incompatible change) and is deferred (decided, S-1).
 
 === D2. Producers: each may supply a bounded subset, all are validated, none is trusted
 
@@ -206,7 +206,7 @@ Every clamp, drop and substitution produces a +CompileNote+ from a closed reason
 
 === D4. The PerformanceCompiler: a pure function, run at dispatch
 
-*When.* Visual compilation runs when a phrase is dispatched (the point where +dispatch_asset+ turns an asset into commands today), not when the asset is built. Reasons: continuity needs the previous phrase's actual end pose (D5); the avatar profile may differ per session (VTS today, local VRM after #219), and baking presets into a cached asset would tie it to one profile; and a requested intent variation inside an asset's envelope then costs a table lookup, not a regenerated asset. Cost: a few table lookups per phrase; *not measured*, and the fast-path latency tests must show no regression (test plan). Open question Q3 records the alternative (compile when the asset is built).
+*When.* Visual compilation runs when a phrase is dispatched (the point where +dispatch_asset+ turns an asset into commands today), not when the asset is built. Reasons: continuity needs the previous phrase's actual end pose (D5); the avatar profile may differ per session (VTS today, local VRM after #219), and baking presets into a cached asset would tie it to one profile; and a requested intent variation inside an asset's envelope then costs a table lookup, not a regenerated asset. Cost: a few table lookups per phrase; *not measured*, and the fast-path latency tests must show no regression (test plan). Decided (S-2): dispatch time; the replay record carries the compiled-command digest.
 
 *Prosody is resolved earlier*, at synthesis time, because the TTS request needs it before audio exists (D6).
 
@@ -218,7 +218,7 @@ speech_timing = { start_at_ms (plan), duration_ms, pause_offsets_ms (<=3, declar
 
 Steps, all deterministic: resolve each +SyncRef+ to an absolute +at_ms+ on the plan's timeline (an unresolved +pause(k)+ is dropped with +UnresolvedSync+; a +decile+ is always resolvable); apply continuity (D5); map affect to a profile preset and intensity; map each gesture anchor to a profile preset and amplitude; map gaze targets; consult the naturalness budget; choose a variant; emit commands in the stable order expression, gesture, gaze (the order +dispatch_asset+ uses before its stable sort by +at_ms+). Commands carry the plan's scheduler +generation+, so the existing liveness check (+command_is_live+) purges them on cancel exactly as today. The compiler never emits a +Viseme+; visemes continue to come from the viseme track, and the profile flag +face_shared_with_lipsync+ records that a face preset may attenuate them (VRM +overrideMouth+ semantics), so the compiler does not promise that a smile coexists with full lip sync.
 
-*Capability model* (provider-neutral types in the domain crate; contents are operator-owned profile data, identified by id, revision and hash):
+*Capability model.* Per supervisor decision S-6 the mapping tables below are adapter-private; the domain and the compiler see only a provider-neutral capability set (which +intent-vocab/1+ affect/level, gesture/level and gaze members the adapter supports, plus the +face_shared_with_lipsync+ flag) and the adapter resolves a member to its own preset handle at the output boundary. The sketch shows the content of that data, identified by id, revision and hash:
 
 ----
 AvatarCapabilities
@@ -251,7 +251,7 @@ Expected behavior across the two profiles in scope: the VRM profile (ADR-0003) c
 * *Prosody as timing evidence only.* Duration, pause offsets and the rate class may move where an anchor lands (deciles and pauses scale with the real duration), but cannot change which anchors exist or override compatibility. Emphasis, energy and pause reach the compiler only as the summary classes in the intent; there is no per-word marker.
 * *Causality.* Phrase i is compiled from information available at phrase i. It never reads a later phrase (research register "causal phrase-local compilation").
 * *Continuity (#83).* The compiler keeps a bounded +ContinuityState+ for the current reply and the previous one: last affect (class, level), last gaze, the end time of the last gesture per its profile +duration_ms+, last variant per family. Rules: *continue* affect emits no command when class and level are unchanged; *transition* emits a command at the phrase start and lets the renderer interpolate; *hold* gaze emits no gaze command; a new gesture never starts before the previous gesture's declared duration has elapsed (otherwise it is dropped, not queued); the *tail* of a final phrase is +return_to_neutral+ by default, emitted a configured lead (proposed 200 ms) before the end so that it falls inside the phrase's live window (a command exactly at the end tick may already be past +command_is_live+; to be tested); a non-final phrase holds. A phrase never resets to neutral at its start unless its intent says so.
-* *Cancel and release.* If a reply is cancelled after +Started+ (ADR-0004 +Cancelled { reached: Started }+), pending commands vanish by generation, but a face already set to joy would stay. The release (the ADR-0003 +Reset+, which is not in +AvatarPlaybackCommand+ today) is issued by the composition root on the lifecycle event, not by the compiler (Open question Q8).
+* *Cancel and release.* If a reply is cancelled after +Started+ (ADR-0004 +Cancelled { reached: Started }+), pending commands vanish by generation, but a face already set to joy would stay. The release is a +Reset+ (ADR-0003; not in +AvatarPlaybackCommand+ today). Decided (S-5): the scheduler-owned cancel path asks the compiler for the neutral release and +Reset+ is added to +AvatarPlaybackCommand+.
 * *Floor (#81).* A non-verbal backchannel is an intent with +speech = None+ and a gesture anchor at +phrase_start+. It compiles to a +PlannedPerformance+ with channels {Body, Gaze} (and Face only if an affect is given), no +AudioPlaybackCommand+, and a short duration taken from the profile's gesture +duration_ms+. Its scheduler priority comes from the caller (the floor policy's scheduling request, ranked from the classified event), never from the intent. +Yield+ and +Interrupt+ produce no intent.
 * *Naturalness (#89).* The compiler asks a +NaturalnessBudget+ view whether a gesture or gaze shift is permitted at +at_ms+; a refusal drops the item with +BudgetSuppressed+. The budget, its numbers and its owner are #89; this ADR defines only the query, and that the bounded history it needs is the same ring as the repetition window (last 16 compiled gestures/expressions). Diversity never overrides compatibility (accelerator row for #89): variants are chosen only among already-compatible profile presets.
 
@@ -301,11 +301,12 @@ compiler_identity = compiler:<semver> | mapping:<fallback+placement+compatibilit
 . +schemas/performance-intent.schema.json+ 0.1.0 with positive and negative fixtures (under a new +examples/performance-intents/+), Rust types with +deny_unknown_fields+, TypeScript reference parity, Rust-to-schema parity;
 . +schemas/performance-asset.schema.json+ 0.1.0 to 0.2.0: +intent+, +intent_envelope+, +compatibility.intent_mapping+, together with ADR-0004's +speech_text+ and +speech_projection+;
 . an +intent-compile-record+ schema (or the telemetry vocabulary) for the replay record;
-. avatar profile and TTS capability configuration schemas (operator-owned data; whether these are domain schemas or adapter-private follows ADR-0003 decision 7 and is Q9);
+. a provider-neutral capability set type (which +intent-vocab/1+ presets an adapter supports; no raw ids). The mapping tables themselves are adapter-private (S-6) and are not domain schemas;
+. +Reset+ added to +AvatarPlaybackCommand+ and its adapter handling (S-5);
 . the typed hint side channel on the generative reply and the typed +TtsStyleRequest+ replacing +SpeechRequest.style+;
-. deferred: a closed +gesture_family+/+reaction_family+ enum in the reflex schema (an incompatible change), and any gaze enum extension (Q1).
+. deferred: a closed +gesture_family+/+reaction_family+ enum in the reflex schema (an incompatible change), and any gaze enum extension (decided out of v1, S-1).
 
-*Placement (proposed).* Types, vocabularies, quantization, structural validation, clamp and compatibility rules, the assembler, and +resolve_style+ in +crates/domain+ (provider-neutral, pure); the visual compiler and +ContinuityState+ in +crates/runtime+ beside +dispatch_asset+ and the playback command types; the floor-to-intent table next to the floor policy; Jev and Thinking adapters in +crates/reflex+ and +crates/generative+ (they only build hints). The generative crate depends on domain, asset-store and scheduler but not on runtime, which is why prosody resolution and hint assembly are in domain and the visual compile is at dispatch. The name +PerformanceCompiler+ already belongs to the asset builder in +crates/generative/src/lib.rs:273+; the new component is called +IntentCompiler+ in code to avoid two meanings (Q7).
+*Placement (proposed).* Types, vocabularies, quantization, structural validation, clamp and compatibility rules, the assembler, and +resolve_style+ in +crates/domain+ (provider-neutral, pure); the visual compiler and +ContinuityState+ in +crates/runtime+ beside +dispatch_asset+ and the playback command types; the floor-to-intent table next to the floor policy; Jev and Thinking adapters in +crates/reflex+ and +crates/generative+ (they only build hints). The generative crate depends on domain, asset-store and scheduler but not on runtime, which is why prosody resolution and hint assembly are in domain and the visual compile is at dispatch. The name +PerformanceCompiler+ already belongs to the asset builder in +crates/generative/src/lib.rs:273+; the new component is called +IntentCompiler+ in code to avoid two meanings (decided, S-4).
 
 === D9. Metrics
 
@@ -457,7 +458,7 @@ Mapped to the acceptance criteria of #84. "Fixture" means a positive or negative
 |Negative fixtures: a raw parameter key (+ParamMouthOpenY+), a +parameters+ map, a numeric yaw/pitch, a hotkey id string, a float level, a +priority+ field, a tool/OBS field: each fails parsing under +deny_unknown_fields+. A type-level test that no compiler output type contains a string produced by a producer (presets come only from the profile table).
 
 |Jev/Thinking can provide high-level hints through typed fields
-|Jev adapter fixtures: reflex decisions in +examples/reflex-decisions+ map to expected hints (0.64 quantizes to moderate; 0.1 to no field; an unmapped +reaction_family+ yields no field and a counter). Thinking: a typed hint is accepted; the same text with a tag-like token (+[joy]+, +<|ACT {}|>+) produces no hint and no state change, and the token is judged only by the output gate. Producer-subset test: a Jev hint that carries prosody or anchors is rejected as a whole.
+|Jev adapter fixtures: reflex decisions in +examples/reflex-decisions+ map to expected hints (0.64 quantizes to moderate; 0.1 to no field; an unmapped +reaction_family+ yields no field and a counter). Thinking: a typed hint is accepted; the same text with a tag-like token (+[joy]+, +<|ACT {}|>+) produces no hint and no state change, and the token is judged only by the output gate and increments the tag-like-token counter (S-3). Producer-subset test: a Jev hint that carries prosody or anchors is rejected as a whole.
 
 |Deterministic compiler clamps/validates intent
 |Property: compile is a pure function (same inputs, same command digest, repeated and across processes); every command has +at_ms+ >= plan start, belongs to the plan's generation, is at most the bound of 8, and uses only preset handles present in the profile. Matrix fixtures: each compatibility rule (wave under sadness, strong gesture under apologize, anger over cap) yields the documented neutral variant and a note. Anchor spacing and offset clamps.
@@ -472,7 +473,7 @@ Mapped to the acceptance criteria of #84. "Fixture" means a positive or negative
 |A cached 0.2.0 asset with an envelope: requested intent inside the envelope compiles over the cached audio (no regeneration); outside it, the authored intent plays with +EnvelopeMismatch+. A legacy 0.1.0 asset still plays through the unchanged +dispatch_asset+ path (the existing cached-playback tests stay green). A template with one intent over composed segments.
 
 |#83 phrase units can preserve continuity
-|Two-phrase and three-phrase fixtures: continue emits no command, transition emits one, hold emits no gaze, a gesture overlapping the previous gesture's duration is dropped, final phrase tail lands inside the live window (test that the generation is still live at the tail +at_ms+), cancel mid-reply leaves no queued commands for the cancelled generation.
+|Two-phrase and three-phrase fixtures: continue emits no command, transition emits one, hold emits no gaze, a gesture overlapping the previous gesture's duration is dropped, final phrase tail lands inside the live window (test that the generation is still live at the tail +at_ms+), cancel mid-reply leaves no queued commands for the cancelled generation and the scheduler cancel path obtains a +Reset+ from the compiler (S-5).
 
 |Replay records validated intent and compiler version
 |Record round-trip fixture. Replay test: feed the recorded validated intent, identities and seed to the compiler and compare the command digest; change one table version and see the identity differ while audio compatibility is unaffected.
@@ -519,34 +520,46 @@ The expensive-to-reverse points are the vocabulary members and the asset schema 
 
 * #59 ratings show the vocabulary cannot express common persona behavior, or Level quantization produces visibly wrong intensity.
 * A TTS backend appears that supplies word or phoneme timing: reconsider word-level sync (A-INTENT-002).
-* The fast-path benchmark shows measurable cost from dispatch-time compilation: reconsider baking per profile (Q3).
+* The fast-path benchmark shows measurable cost from dispatch-time compilation: reconsider baking per profile (S-2).
 * A required avatar behavior needs more than symbolic gaze or preset gestures (full-body motion libraries, VRMA clips).
 * The reflex schema gains closed families (then the Jev mapping table becomes a direct mapping).
 * #72, #88 or #89 contracts conflict with the queries defined here.
 
+== Supervisor decisions
+
+Recorded after review; the ADR status remains Proposed. They prevail over the Decision section where they differ. The review accepted the deviations listed in the pull request description (no priority field, consistent with ADR-0005 S-7; text is never parsed for tags).
+
+. *S-1 (gaze, closes Q1)*: keep the existing five gaze targets for v1. No incompatible enum change now; revisit with evidence. The D1 mapping (co-host to +speaker+, offscreen/thinking to +away+, neutral to +camera+) stands and "donation alert" stays deferred.
+. *S-2 (when to compile, closes Q3)*: compile at dispatch time, because adapter capability is only known then. Replay records the compiled-command digest together with the intent identity and the compiler identity, so dispatch-time compilation stays reproducible (D8 record).
+. *S-3 (tags, closes Q5)*: tag-like tokens in reply text (for example +[x]+, +<|...|>+) are counted, never rejected, because rejecting would break legitimate text such as 「[笑]」. They are never interpreted as performance information.
+. *S-4 (naming, closes Q7)*: the component is named +IntentCompiler+; the existing +generative::PerformanceCompiler+ asset builder keeps its name.
+. *S-5 (release on cancel, closes Q8)*: the scheduler-owned cancel path asks the +IntentCompiler+ for the neutral release, and +Reset+ is added to +AvatarPlaybackCommand+, which aligns with ADR-0003's snap-to-neutral. This is schema/domain work for the implementation issue.
+. *S-6 (capability tables, closes Q9)*: the capability mapping tables are adapter-private. The domain sees only which +intent-vocab/1+ presets an adapter supports (a provider-neutral capability set), never raw ids. The D4 sketch remains the description of what an adapter's own data must express.
+. *S-7 (persona and budget contracts; Q12 stays open)*: undecided until #72 and #89 are designed. Recorded as proposed assumption A-INTENT-004: #72 style classes can supply level ceilings and #89 can answer a per-channel permit query, in the shapes D3 and D5 describe. Falsifier: either design cannot expose those queries, which would move clamp or budget logic into this design.
+
 == Open questions
 
-For the supervisor; none is decided.
+Decided items are marked; the rest stay open for the supervisor.
 
-. *Q1 (gaze vocabulary)*: v1 keeps the existing five targets and maps co-host to +speaker+, offscreen/thinking to +away+, neutral to +camera+, deferring "donation alert". Extending the enum changes the reflex and asset schemas (incompatible). Accept the mapping for v1, or take the enum change now with the 0.2.0 bump?
+. *Q1 (gaze vocabulary) - DECIDED, see S-1*: the existing five targets stay for v1; no enum change now.
 . *Q2 (level quantization)*: four ordinal levels instead of floats. Acceptable, or keep a float with a quantization step in the digest?
-. *Q3 (when to compile)*: dispatch-time compilation (proposed) versus compile when the asset is built (profile-bound baked tracks, no continuity across cached phrases). Accept dispatch time pending the benchmark?
+. *Q3 (when to compile) - DECIDED, see S-2*: dispatch time.
 . *Q4 (expression family)*: fold the facial-expression family into affect (proposed), or keep a separate optional field with a coherence rule?
-. *Q5 (inline tags)*: confirm that text is never parsed for performance information, and decide whether the output gate should reject or merely count tag-like tokens (+[x]+, +<|...|>+) in a reply. Counting only is proposed.
+. *Q5 (inline tags) - DECIDED, see S-3*: never interpreted; tag-like tokens are counted, not rejected.
 . *Q6 (precedence)*: Thinking over Jev over default, with operator-authored data first. Acceptable?
-. *Q7 (naming)*: +PerformanceCompiler+ already names the asset builder in +crates/generative+. Rename that, or call the new component +IntentCompiler+ (proposed)?
-. *Q8 (release on cancel)*: who issues the neutral release after a cancel, and is the ADR-0003 +Reset+ added to +AvatarPlaybackCommand+ (an adapter-visible enum change)? The composition root on the lifecycle +Cancelled+ event is proposed.
-. *Q9 (profile data placement)*: avatar and TTS capability tables as domain-level operator configuration schemas, or adapter-private like the renderer protocol (ADR-0003 decision 7)? Domain-level is proposed because the compiler needs them and they contain no raw ids, but the VTS hotkey names would then be profile data.
+. *Q7 (naming) - DECIDED, see S-4*: +IntentCompiler+.
+. *Q8 (release on cancel) - DECIDED, see S-5*: the scheduler-owned cancel path asks the compiler; +Reset+ is added to +AvatarPlaybackCommand+.
+. *Q9 (profile data placement) - DECIDED, see S-6*: mapping tables adapter-private; the domain sees a capability set.
 . *Q10 (interruptibility and priority)*: confirm that priority is excluded from the intent and interruptibility is downward only (+PreferEarlyYield+).
 . *Q11 (placement)*: types and pure rules in +crates/domain+, compiler in +crates/runtime+, floor table beside the floor policy (as proposed), or the compiler in +crates/scheduler+ with ADR-0005's policy?
-. *Q12 (persona and budget contracts)*: #72 ceilings and #89 budgets are assumed to expose the queries in D3 and D5. Is that the intended direction, or should #84 wait for them?
+. *Q12 (persona and budget contracts) - OPEN, see S-7*: #72 ceilings and #89 budgets are assumed to expose the queries in D3 and D5. Is that the intended direction, or should #84 wait for them?
 . *Q13 (starter pack)*: map the starter pack's free-string presets into authored intents and profile tables, or leave them as legacy assets indefinitely?
 
 == Related
 
 * Issue: #84. Related issues: #54, #58, #59, #66, #72, #81, #83, #88, #89, #219, #222.
 * PR: none opened (design-only).
-* Assumptions: A-TTS-001, A-VTS-001, A-AUDIO-001 (existing); proposed A-INTENT-001 to A-INTENT-003.
+* Assumptions: A-TTS-001, A-VTS-001, A-AUDIO-001 (existing); proposed A-INTENT-001 to A-INTENT-004 (A-INTENT-004 is defined in S-7).
 * Other ADRs: link:0001-three-layer-runtime.adoc[ADR-0001], link:0002-mcp-tool-authority-boundary.adoc[ADR-0002], link:0003-local-vrm-renderer.adoc[ADR-0003], link:0004-speech-lifecycle-and-text-projection.adoc[ADR-0004], link:0005-conversational-floor-policy.adoc[ADR-0005].
 * Documents: link:../research-register.adoc[Research register], link:../reuse-first.adoc[Reuse-first], link:../implementation-accelerator.adoc[Implementation accelerator], link:../domain-contract.adoc[Domain contract], link:../security-threat-model.adoc[Security threat model].
 * External references (pattern only): BML 1.0 standard (Radboud University wiki), AIRI and Open-LLM-VTuber (MIT, commits above), Neuro SDK (MIT), VRM 1.0 specification (vrm-c), EMAGE (CVPR 2024).
