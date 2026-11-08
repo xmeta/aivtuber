@@ -164,6 +164,8 @@ For compatible filler/reaction assets it:
 * applies the same deterministic time-variation factor to duration, interrupt points, audio start, and viseme offsets;
 * exposes per-event event-to-first-audio and event-to-first-visible-reaction measurements.
 
+Viseme cue names are a closed provider-neutral vocabulary: `aa ih ou ee oh neutral` (VRM 1.0 mouth presets; `neutral` is all mouth shapes zero). It is normative in `schemas/viseme-track.schema.json` and the Rust type `aivtuber_domain::Viseme`. Existing tracks that use the legacy letters `A I U E O N` stay valid: the reader accepts them as deprecated read-only aliases and normalizes them to `aa ih ou ee oh neutral`, so no legacy or provider name reaches `AvatarPlaybackCommand::Viseme` or an adapter. New tracks must use canonical names. `AvatarPlaybackCommand::Reset` snaps the avatar to neutral (ADR-0003); `schemas/avatar-playback-command.schema.json` is its serialized contract.
+
 The source-controlled starter fixture is link:../examples/starter-reaction-pack/README.adoc[`examples/starter-reaction-pack`]. It contains three semantic families with two variants each. Audio remains an external `audio://` reference; only descriptors and compact viseme timing JSON are committed.
 
 == 11. Generated asset provenance

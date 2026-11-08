@@ -32,12 +32,19 @@ export interface TtsRequest {
   speed?: number;
 }
 
+/**
+ * Closed, provider-neutral viseme vocabulary (ADR-0003 Decision 4): the VRM 1.0
+ * mouth presets plus "neutral" (all mouth shapes zero). Mirrors the Rust
+ * `aivtuber_domain::Viseme` and `schemas/viseme-track.schema.json`.
+ */
+export const CANONICAL_VISEMES = ["aa", "ih", "ou", "ee", "oh", "neutral"] as const;
+export type Viseme = (typeof CANONICAL_VISEMES)[number];
+
 /** Viseme timeline aligned with the produced audio. */
 export interface VisemeFrame {
   /** Offset from audio start in ms. */
   atMs: number;
-  /** Canonical viseme id (e.g. "aa", "ih", "sil"). */
-  viseme: string;
+  viseme: Viseme;
   durationMs: number;
 }
 

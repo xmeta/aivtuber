@@ -4,10 +4,12 @@
 // invariants documented in src/thinking.ts / src/tts.ts.
 
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 
 import { MockThinkingEngine } from "../src/adapters-mocks.js";
 import { MockTtsEngine } from "../src/adapters-mocks.js";
 import type { LlmRequest, ThinkingEngine } from "../src/thinking.js";
+import { CANONICAL_VISEMES } from "../src/tts.js";
 import type { TtsEngine, TtsRequest } from "../src/tts.js";
 
 const llmRequest: LlmRequest = {
@@ -223,6 +225,17 @@ describe("TtsEngine contract", () => {
     if (!outcome.ok || !outcome.result.visemeTrack) return;
     const total = outcome.result.visemeTrack.frames.reduce((sum, f) => sum + f.durationMs, 0);
     expect(total).toBeLessThanOrEqual(outcome.result.durationMs + 5);
+  });
+
+  test("canonical viseme set matches the normative schema and the mock emits only it", async () => {
+    const schema = JSON.parse(readFileSync("schemas/viseme-track.schema.json", "utf8"));
+    expect([...CANONICAL_VISEMES]).toEqual(schema.$defs.canonical_viseme.enum);
+    const outcome = await new MockTtsEngine({ durationMs: 1000, chunks: 1 }).synthesize(ttsRequest);
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok || !outcome.result.visemeTrack) return;
+    for (const frame of outcome.result.visemeTrack.frames) {
+      expect(CANONICAL_VISEMES).toContain(frame.viseme);
+    }
   });
 
   // ---- regression: MockTtsEngine.synthesize used to call a non-existent

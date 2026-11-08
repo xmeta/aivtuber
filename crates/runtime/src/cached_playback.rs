@@ -1,12 +1,12 @@
 use aivtuber_asset_store::{
     AssetClass, AssetStore, AssetStoreError, CacheTier, IndexReport, PerformanceAsset,
 };
-use aivtuber_domain::{EventEnvelope, EventKind};
+use aivtuber_domain::{EventEnvelope, EventKind, Viseme};
 use aivtuber_scheduler::{
     AppliedVariation, BlendChannel, PlannedPerformance, Rejection, Scheduler, SeededRng,
     VariationSpec as SchedulerVariationSpec, apply_variation, priority_for_event,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
@@ -19,8 +19,40 @@ pub const VISEME_TRACK_SCHEMA_VERSION: &str = "0.1.0";
 #[serde(deny_unknown_fields)]
 pub struct VisemeCue {
     pub at_ms: u64,
-    pub viseme: String,
+    #[serde(deserialize_with = "deserialize_cue_viseme")]
+    pub viseme: Viseme,
     pub weight: f64,
+}
+
+/// Deprecated cue spellings accepted on read only (`viseme-track.schema.json`).
+/// Tracks authored before the canonical vocabulary used the single-letter
+/// Japanese-vowel names; they are normalized here so no legacy name reaches
+/// the domain or an adapter. Writers must emit canonical names.
+fn legacy_viseme_alias(name: &str) -> Option<Viseme> {
+    match name {
+        "A" => Some(Viseme::Aa),
+        "I" => Some(Viseme::Ih),
+        "U" => Some(Viseme::Ou),
+        "E" => Some(Viseme::Ee),
+        "O" => Some(Viseme::Oh),
+        "N" => Some(Viseme::Neutral),
+        _ => None,
+    }
+}
+
+fn deserialize_cue_viseme<'de, D>(deserializer: D) -> Result<Viseme, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let name = String::deserialize(deserializer)?;
+    if let Some(viseme) = Viseme::ALL.into_iter().find(|v| v.as_str() == name) {
+        return Ok(viseme);
+    }
+    legacy_viseme_alias(&name).ok_or_else(|| {
+        serde::de::Error::custom(format!(
+            "unknown viseme {name:?}; expected one of aa ih ou ee oh neutral"
+        ))
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -42,11 +74,6 @@ impl VisemeTrack {
 
         let mut previous = None;
         for (index, cue) in self.cues.iter().enumerate() {
-            if cue.viseme.trim().is_empty() {
-                return Err(CachedPlaybackError::InvalidVisemeTrack(format!(
-                    "cues[{index}].viseme must not be empty"
-                )));
-            }
             if !cue.weight.is_finite() || !(0.0..=1.0).contains(&cue.weight) {
                 return Err(CachedPlaybackError::InvalidVisemeTrack(format!(
                     "cues[{index}].weight must be in 0..=1"
@@ -137,8 +164,8 @@ pub struct AudioPlaybackCommand {
     pub duration_ms: u64,
     pub speed_factor: f64,
 }
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AvatarPlaybackCommand {
     Expression {
         generation: u64,
@@ -160,9 +187,13 @@ pub enum AvatarPlaybackCommand {
     Viseme {
         generation: u64,
         at_ms: u64,
-        viseme: String,
+        viseme: Viseme,
         weight: f64,
     },
+    /// Snap the avatar to neutral: expressions and visemes to zero, gaze to
+    /// camera, any gesture cancelled (ADR-0003). Scheduled and cancelled like
+    /// every other variant; not yet emitted by any producer (#219 S2/#84).
+    Reset { generation: u64, at_ms: u64 },
 }
 
 impl AvatarPlaybackCommand {
@@ -171,7 +202,26 @@ impl AvatarPlaybackCommand {
             Self::Expression { at_ms, .. }
             | Self::Gesture { at_ms, .. }
             | Self::Gaze { at_ms, .. }
-            | Self::Viseme { at_ms, .. } => *at_ms,
+            | Self::Viseme { at_ms, .. }
+            | Self::Reset { at_ms, .. } => *at_ms,
+        }
+    }
+
+    /// Range checks that mirror `avatar-playback-command.schema.json`; serde
+    /// alone enforces shape and the closed viseme set, not numeric ranges.
+    pub fn validate(&self) -> Result<(), CachedPlaybackError> {
+        let (name, value, max) = match self {
+            Self::Expression { intensity, .. } => ("intensity", *intensity, 1.0),
+            Self::Gesture { amplitude, .. } => ("amplitude", *amplitude, 2.0),
+            Self::Viseme { weight, .. } => ("weight", *weight, 1.0),
+            Self::Gaze { .. } | Self::Reset { .. } => return Ok(()),
+        };
+        if value.is_finite() && (0.0..=max).contains(&value) {
+            Ok(())
+        } else {
+            Err(CachedPlaybackError::InvalidAvatarCommand(format!(
+                "{name} must be in 0..={max}"
+            )))
         }
     }
 }
@@ -277,6 +327,7 @@ pub enum CachedPlaybackError {
     Scheduler(Rejection),
     InvalidVisemeReference(String),
     InvalidVisemeTrack(String),
+    InvalidAvatarCommand(String),
     VisemeDurationMismatch {
         asset_id: String,
         speech_duration_ms: u64,
@@ -314,6 +365,9 @@ impl fmt::Display for CachedPlaybackError {
             }
             Self::InvalidVisemeTrack(message) => {
                 write!(f, "invalid viseme track: {message}")
+            }
+            Self::InvalidAvatarCommand(message) => {
+                write!(f, "invalid avatar command: {message}")
             }
             Self::VisemeDurationMismatch {
                 asset_id,
@@ -813,7 +867,7 @@ where
                 avatar_commands.push(AvatarPlaybackCommand::Viseme {
                     generation: plan.generation,
                     at_ms: at_ms.saturating_add(scale_offset(cue.at_ms, variation.speed_factor)),
-                    viseme: cue.viseme.clone(),
+                    viseme: cue.viseme,
                     weight: cue.weight,
                 });
             }
@@ -1174,5 +1228,126 @@ mod tests {
             outcome.metrics.event_to_first_visible_reaction_ms,
             Some(first_visible_at - event_at_ms)
         );
+    }
+
+    fn fixture_dir(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples")
+            .join(name)
+    }
+
+    fn fixture_files(dir: &Path) -> Vec<PathBuf> {
+        let mut files = fs::read_dir(dir)
+            .expect("fixture dir")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .collect::<Vec<_>>();
+        files.sort();
+        assert!(!files.is_empty(), "no fixtures in {}", dir.display());
+        files
+    }
+
+    #[test]
+    fn legacy_viseme_aliases_normalize_to_the_canonical_set() {
+        let store = LocalVisemeStore::new(fixture_dir("viseme-tracks"));
+        let canonical = store.resolve("valid/canonical.json").expect("canonical");
+        assert_eq!(
+            canonical.cues.iter().map(|c| c.viseme).collect::<Vec<_>>(),
+            [
+                Viseme::Neutral,
+                Viseme::Aa,
+                Viseme::Ih,
+                Viseme::Ou,
+                Viseme::Ee,
+                Viseme::Oh
+            ]
+        );
+        let legacy = store.resolve("valid/legacy-alias.json").expect("legacy");
+        assert_eq!(
+            legacy.cues.iter().map(|c| c.viseme).collect::<Vec<_>>(),
+            [
+                Viseme::Aa,
+                Viseme::Ih,
+                Viseme::Ou,
+                Viseme::Ee,
+                Viseme::Oh,
+                Viseme::Neutral
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_viseme_track_fixtures_are_rejected() {
+        let store = LocalVisemeStore::new(fixture_dir("viseme-tracks"));
+        for file in fixture_files(&fixture_dir("viseme-tracks").join("invalid")) {
+            let reference = format!("invalid/{}", file.file_name().unwrap().to_string_lossy());
+            assert!(store.resolve(&reference).is_err(), "{reference} must fail");
+        }
+    }
+
+    #[test]
+    fn non_monotonic_cues_are_still_rejected_after_the_typed_viseme() {
+        let track = VisemeTrack {
+            schema_version: VISEME_TRACK_SCHEMA_VERSION.to_owned(),
+            duration_ms: 100,
+            cues: vec![
+                VisemeCue {
+                    at_ms: 50,
+                    viseme: Viseme::Aa,
+                    weight: 0.5,
+                },
+                VisemeCue {
+                    at_ms: 10,
+                    viseme: Viseme::Oh,
+                    weight: 0.5,
+                },
+            ],
+        };
+        assert!(track.validate().is_err());
+    }
+
+    #[test]
+    fn avatar_command_fixtures_round_trip_and_invalid_ones_fail() {
+        let dir = fixture_dir("avatar-playback-commands");
+        let mut kinds = BTreeSet::new();
+        for file in fixture_files(&dir.join("valid")) {
+            let text = fs::read_to_string(&file).expect("read");
+            let value: serde_json::Value = serde_json::from_str(&text).expect("json");
+            let command: AvatarPlaybackCommand =
+                serde_json::from_str(&text).expect("valid command parses");
+            command.validate().expect("valid command is in range");
+            assert_eq!(serde_json::to_value(&command).expect("serialize"), value);
+            kinds.insert(value["kind"].as_str().expect("kind").to_owned());
+        }
+        assert_eq!(
+            kinds,
+            ["expression", "gesture", "gaze", "viseme", "reset"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>()
+        );
+        for file in fixture_files(&dir.join("invalid")) {
+            let text = fs::read_to_string(&file).expect("read");
+            assert!(
+                serde_json::from_str::<AvatarPlaybackCommand>(&text)
+                    .map_err(|e| e.to_string())
+                    .and_then(|c| c.validate().map_err(|e| e.to_string()))
+                    .is_err(),
+                "{} must fail",
+                file.display()
+            );
+        }
+    }
+
+    #[test]
+    fn reset_is_ordered_like_any_other_command() {
+        let reset = AvatarPlaybackCommand::Reset {
+            generation: 2,
+            at_ms: 40,
+        };
+        assert_eq!(reset.at_ms(), 40);
+        let mut sink = RecordingAvatarSink::default();
+        sink.schedule_avatar(reset.clone());
+        assert_eq!(sink.commands, vec![reset]);
     }
 }

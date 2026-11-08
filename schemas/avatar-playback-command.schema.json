@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xmeta/aivtuber/schemas/avatar-playback-command.schema.json",
+  "title": "AI VTuber Avatar Playback Command",
+  "description": "Serialized form of aivtuber_runtime::AvatarPlaybackCommand, the typed command the scheduler hands to an AvatarOutput. Audit/replay data only: it carries no authority (the output boundary still authorizes each command). Only viseme and reset are closed vocabularies here; expression/gesture presets and gaze targets stay free strings until their own canonical-vocabulary slice.",
+  "oneOf": [
+    {"$ref": "#/$defs/expression"},
+    {"$ref": "#/$defs/gesture"},
+    {"$ref": "#/$defs/gaze"},
+    {"$ref": "#/$defs/viseme"},
+    {"$ref": "#/$defs/reset"}
+  ],
+  "$defs": {
+    "generation": {"type": "integer", "minimum": 0},
+    "at_ms": {"type": "integer", "minimum": 0},
+    "expression": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "generation", "at_ms", "preset", "intensity"],
+      "properties": {
+        "kind": {"const": "expression"},
+        "generation": {"$ref": "#/$defs/generation"},
+        "at_ms": {"$ref": "#/$defs/at_ms"},
+        "preset": {"type": "string", "minLength": 1},
+        "intensity": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "gesture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "generation", "at_ms", "preset", "amplitude"],
+      "properties": {
+        "kind": {"const": "gesture"},
+        "generation": {"$ref": "#/$defs/generation"},
+        "at_ms": {"$ref": "#/$defs/at_ms"},
+        "preset": {"type": "string", "minLength": 1},
+        "amplitude": {"type": "number", "minimum": 0, "maximum": 2}
+      }
+    },
+    "gaze": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "generation", "at_ms", "target"],
+      "properties": {
+        "kind": {"const": "gaze"},
+        "generation": {"$ref": "#/$defs/generation"},
+        "at_ms": {"$ref": "#/$defs/at_ms"},
+        "target": {"type": "string", "minLength": 1}
+      }
+    },
+    "viseme": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "generation", "at_ms", "viseme", "weight"],
+      "properties": {
+        "kind": {"const": "viseme"},
+        "generation": {"$ref": "#/$defs/generation"},
+        "at_ms": {"$ref": "#/$defs/at_ms"},
+        "viseme": {"type": "string", "enum": ["aa", "ih", "ou", "ee", "oh", "neutral"]},
+        "weight": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "reset": {
+      "description": "Snap to neutral: expressions and visemes to zero, gaze to camera, gesture cancelled (ADR-0003, ADR-0006 S-5).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "generation", "at_ms"],
+      "properties": {
+        "kind": {"const": "reset"},
+        "generation": {"$ref": "#/$defs/generation"},
+        "at_ms": {"$ref": "#/$defs/at_ms"}
+      }
+    }
+  }
+}
