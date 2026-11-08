@@ -112,3 +112,305 @@ Pattern reuse only; no code, no text and no dependency is taken from any source.
 |===
 
 Reuse-first record for this issue: *custom* for the contract and compiler (reason in the last row); *reference only* for every external source above; *no dependency added*.
+
+== Decision
+
+Candidate decision for the supervisor; the open questions at the end list what is undecided. Type and field names are implementation choices.
+
+=== D1. Shape: a small, quantized, out-of-band record
+
+The SAIBA mapping is: producers (Jev, ThinkingEngine, templates, cached assets, the floor policy's backchannel table) are the *intent planners*; +PerformanceIntent+ is the planner's output; the deterministic +PerformanceCompiler+ is the *behavior planner/scheduler*; the playback commands on the existing timeline are its output; the ADR-0003 renderer is the *realizer*, whose ack and the ADR-0004 lifecycle events are the feedback.
+
+----
+PerformanceIntent                      schema_version "0.1.0"; one per phrase unit (#83); <= 1 KiB serialized
+  speech        Option<SpeechRef>      event_id, phrase, final_phrase (ADR-0004); None = non-verbal intent
+  act           SpeechAct              closed, 10
+  affect        Option<Affect>         { class: AffectClass (8), level: Level (4) }
+  gaze          Option<AttentionTarget>   base target from phrase start; the existing five-value enum
+  prosody       Option<Prosody>        { style: StyleClass (6), rate: RateClass (3), energy: Level3 (3),
+                                         emphasis: EmphasisProfile (3), pause: PauseProfile (3) }
+  anchors       Vec<PerformanceAnchor> at most 4
+  continuity    Option<Continuity>     { affect: continue|transition, gaze: hold|shift, tail: return_to_neutral|hold }
+  interruptibility  Default | PreferEarlyYield
+
+PerformanceAnchor
+  at     { sync: SyncRef, offset_ms: -300..=300 }
+  kind   Gaze(AttentionTarget) | Gesture(GestureFamily, Level) | AffectPeak(AffectClass, Level)
+       | Emphasis(EmphasisProfile) | Release(Channel: face|body|gaze)      // hold/release hint
+SyncRef = phrase_start | phrase_end | pause(0..=3) | decile(0..=10)       // positions of the phrase's own speech only
+----
+
+Design rules:
+
+* *No free text, no numbers from the model.* Every field is a closed enum, a small bounded integer, or the +SpeechRef+ the pipeline assigns. +Level+ is an ordinal (+subtle+, +mild+, +moderate+, +strong+) and the compiler owns its numeric value through a versioned table (0.25, 0.5, 0.75, 1.0 for intensity). A float from Jev (+emotion_intensity+ 0..1) is quantized by a fixed rule: values below 0.125 are omitted, otherwise the nearest level with ties rounding up (midpoints 0.375, 0.625, 0.875). Reason: a float invites false precision, makes digests unstable, and gives a model a continuous channel; four levels are enough for the persona styles #72 will pick between.
+* *No priority.* Priority is assigned by the normalizer from the event kind (+priority_for_event+); a hint that carried one would be a self-declared priority (ADR-0005). The deviation from the issue's "priority/interruptibility" wording is deliberate and listed in the handoff.
+* *Interruptibility is downward only.* +PreferEarlyYield+ may ask the scheduler to treat declared interrupt points as preferred yield points; nothing can declare a performance protected or critical. The asset's declared +interrupt_points_ms+ and the scheduler's rank check are unchanged and are the only authority.
+* *Facial-expression family is folded into affect.* The issue lists "emotion/affect class" and "facial-expression family" separately. Two independent fields can disagree (a sad face on a joy intent), which is the incoherence #84 exists to remove; the face is therefore always the realization of +affect+ (plus +AffectPeak+ anchors), and the avatar profile decides the preset. Open question Q4.
+* *No separate base gesture field.* A gesture without timing is ambiguous; gestures exist only as anchors. A producer that supplies only a family (Jev's +gesture_family+) is expanded by a versioned default-placement table (nod at +phrase_end -150 ms+, wave at +phrase_start +100 ms+, beat at +decile 5+, ...).
+* *Closed vocabularies, versioned together* as +intent-vocab/1+ (sizes are the proposed v1 values):
+
+[cols="2,1,5"]
+|===
+|Vocabulary |Size |Members (proposed)
+
+|SpeechAct |10 |greet, acknowledge, answer, explain, joke, thank, apologize, ask, react, backchannel
+|AffectClass |8 |neutral, joy, calm, sadness, anger, surprise, thinking, embarrassed (the first six equal ADR-0003's spike profile names; the last two have no VRM 1.0 preset and always need a fallback)
+|Level |4 |subtle, mild, moderate, strong
+|GestureFamily |11 |nod, shake, tilt_head, lean_forward, lean_back, recoil, wave, small_point, shrug, bow, beat
+|Gaze (AttentionTarget) |5 |camera, chat, game, speaker, away (the existing enum, unchanged in v1; Open question Q1)
+|StyleClass / RateClass / Energy / Emphasis / Pause |6 / 3 / 3 / 3 / 3 |neutral, cheerful, calm, serious, gentle, excited / slow, normal, fast / low, normal, high / none, light, strong / none, short, long
+|AnchorKind / SyncRef / Channel |5 / 4 forms / 3 |as in the sketch
+|===
+
+Issue gaze examples map as: camera/audience to +camera+, co-host/other speaker to +speaker+, offscreen/thinking to +away+, neutral to +camera+. "Donation alert" has no member; adding one is a coordinated change to the reflex and asset gaze enums (an incompatible change) and is deferred (Q1).
+
+=== D2. Producers: each may supply a bounded subset, all are validated, none is trusted
+
+[cols="2,4,4"]
+|===
+|Producer |Fields it may supply |Notes
+
+|Templates and cached assets (operator-authored)
+|All fields. A cached asset also declares an *intent envelope* (D8).
+|Validated at load, like other pack data. A template route (#54) carries one intent for the composed utterance.
+
+|Floor policy (#81)
+|+act = backchannel+, +affect+, +gaze+ (from +FloorDecision.attention+), one gesture anchor; never +speech+.
+|A fixed operator table maps each +BackchannelIntent+ to an intent (Acknowledge: calm subtle, nod subtle; Agreement: joy subtle, nod mild; Sympathy: sadness subtle, tilt_head; Surprise: surprise mild, recoil subtle; ThinkingReceipt: thinking subtle, gaze away). The policy still only recommends; spacing and ladder gating stay with it and the scheduler.
+
+|Jev (+DecisionEngine+)
+|+act+ (from +reaction_family+), +affect+ (class from the family, level from +emotion_intensity+), +gaze+ (from +attention_target+), a default-placement gesture (from +gesture_family+), +interruptibility+.
+|No change to the reflex schema is required for v1: the free strings are mapped through an operator-owned, versioned table; an unmapped string yields no field and a counter. Jev cannot supply prosody, explicit anchors or continuity. A Jev hint is asynchronous and may be absent or late; the assembler never waits.
+
+|ThinkingEngine (generative)
+|+act+, +affect+, +gaze+, at most 2 anchors, +prosody+, +interruptibility+. Never +speech+ (assigned by the pipeline) or +continuity+ (assigned by phrase position).
+|Delivered as a typed side channel next to the text (structured output or a separate typed field of the reply); never as markers inside the text. Today +GeneratedReply+ has only +text+, so this is a new typed field (schema-first, implementation issue).
+
+|Deterministic defaults
+|Per route/class default intent (replaces the hard-coded +speaking.neutral+ at 0.4).
+|Always present, so the pipeline never needs a producer to succeed.
+|===
+
+*Assembly* (a pure function in the domain crate): for each field, the highest-precedence producer that supplied a valid value wins: persona/profile ceilings (clamp, not a source) over template/cached over Thinking over Jev over the deterministic default. Rationale: Thinking has seen the final text, Jev only the event; operator-authored data outranks both (Q6). The set of contributing producers is kept as audit data (+sources+) and is never read for authorization (serialized claims are audit, not capability).
+
+=== D3. Validation: one pipeline, every producer, the same result type
+
++validate(intent, producer, policy) -> ValidatedIntent { intent, clamps }+, pure and total:
+
+. *Structural*: schema version, closed enums, size caps, +deny_unknown_fields+ (so a +priority+, an OBS/tool field or a raw parameter key is a parse failure, not an ignored field), producer-allowed field set. Failure rejects the *whole hint* from that producer (not the reply), records +Rejected(reason)+ and falls through to the next producer or the default.
+. *Clamp*: levels to the persona/profile ceiling per affect and gesture (#72 supplies a named style class that picks values inside validated ranges, as in ADR-0005 D3); anchors beyond 4 dropped from the end; offsets to +-300 ms; anchors on one channel closer than 400 ms dropped (keep the earlier); duplicates dropped.
+. *Compatibility matrix* (operator data, versioned, tested with fixtures). Examples: gestures +wave+, +beat+ and any gesture at +strong+ are incompatible with +sadness+, +calm+ at +subtle+ and +act = apologize+; +wave+ only with +greet+ or +thank+; +act = apologize+ admits only neutral, calm, sadness, embarrassed; +anger+ is capped at +moderate+ unless the persona raises it. An incompatible pair resolves to the *neutral variant*: same family at +subtle+, else the item is dropped; the base affect is never silently replaced by a different class except through the fixed fallback chain below.
+. *Capability* resolution happens in D4 (it depends on the avatar profile and live scene), not here, so a validated intent is profile-independent and can be cached and replayed.
+
+Every clamp, drop and substitution produces a +CompileNote+ from a closed reason enum (+Unsupported+, +Incompatible+, +Clamped+, +BudgetSuppressed+, +UnresolvedSync+, +EnvelopeMismatch+, +Rejected+, +UnmappedFamily+), at most 16 per phrase, saturating.
+
+=== D4. The PerformanceCompiler: a pure function, run at dispatch
+
+*When.* Visual compilation runs when a phrase is dispatched (the point where +dispatch_asset+ turns an asset into commands today), not when the asset is built. Reasons: continuity needs the previous phrase's actual end pose (D5); the avatar profile may differ per session (VTS today, local VRM after #219), and baking presets into a cached asset would tie it to one profile; and a requested intent variation inside an asset's envelope then costs a table lookup, not a regenerated asset. Cost: a few table lookups per phrase; *not measured*, and the fast-path latency tests must show no regression (test plan). Open question Q3 records the alternative (compile when the asset is built).
+
+*Prosody is resolved earlier*, at synthesis time, because the TTS request needs it before audio exists (D6).
+
+----
+compile(validated_intent, speech_timing, avatar_caps, scene_targets, continuity_state, seed)
+  -> CompiledPerformance { avatar: Vec<AvatarPlaybackCommand>, notes, record }
+speech_timing = { start_at_ms (plan), duration_ms, pause_offsets_ms (<=3, declared), generation }
+----
+
+Steps, all deterministic: resolve each +SyncRef+ to an absolute +at_ms+ on the plan's timeline (an unresolved +pause(k)+ is dropped with +UnresolvedSync+; a +decile+ is always resolvable); apply continuity (D5); map affect to a profile preset and intensity; map each gesture anchor to a profile preset and amplitude; map gaze targets; consult the naturalness budget; choose a variant; emit commands in the stable order expression, gesture, gaze (the order +dispatch_asset+ uses before its stable sort by +at_ms+). Commands carry the plan's scheduler +generation+, so the existing liveness check (+command_is_live+) purges them on cancel exactly as today. The compiler never emits a +Viseme+; visemes continue to come from the viseme track, and the profile flag +face_shared_with_lipsync+ records that a face preset may attenuate them (VRM +overrideMouth+ semantics), so the compiler does not promise that a smile coexists with full lip sync.
+
+*Capability model* (provider-neutral types in the domain crate; contents are operator-owned profile data, identified by id, revision and hash):
+
+----
+AvatarCapabilities
+  affect:   AffectClass x Level  -> up to 4 preset handles (variants)   // profile vocabulary, not raw ids
+  gestures: GestureFamily x Level -> up to 4 preset handles + max_amplitude + duration_ms
+  gaze:     set of AttentionTarget (must contain camera)
+  affect fallback overrides (optional)
+  face_shared_with_lipsync: bool
+TtsCapabilities
+  rate: supported range or none; energy: bool; styles: set of StyleClass; pause/emphasis: bool
+SceneTargets: AttentionTarget set currently available (#88 supplies it; default all)
+----
+
+A preset handle is a profile-vocabulary string such as the VRM profile's +joy+ or a VTS profile's +smile_soft+ that the adapter already resolves (ADR-0003 mapping table; the VTS output's hotkey-prefix path). Raw renderer ids stay in the renderer/VTS profile. A profile load fails if it cannot realize +neutral+ affect and +camera+ gaze (A-INTENT-003).
+
+*Degradation order*, fixed and versioned, always ending in something the profile can do:
+
+. affect: exact (class, level) preset; else the same class at the nearest lower level; else the *fallback chain*: +embarrassed -> neutral+, +thinking -> neutral+ (and, if the intent set no gaze and +away+ is available, gaze +away+), +anger -> neutral+, +surprise -> neutral+, +joy -> calm -> neutral+, +sadness -> calm -> neutral+, +calm -> neutral+; a profile may override a link;
+. gesture: exact family and level; else the same family at a lower level; else dropped with +Unsupported+ (no cross-family substitutes in v1: +shake -> nod+ would change meaning);
+. gaze: a target unavailable in the profile or the scene falls back to +camera+;
+. an avatar adapter that is +Unavailable+ does not stop compilation: commands are produced, the output drops them with a typed outcome, and audio proceeds. The record notes +AvatarUnavailable+.
+
+Expected behavior across the two profiles in scope: the VRM profile (ADR-0003) covers joy, anger, sadness, calm, surprise and neutral directly (its expression names are renamed inside the renderer only); thinking and embarrassed fall back. A VTS profile covers exactly the hotkeys the operator registered; anything else follows the same chain. Neither case needs adapter-visible changes; only the profile tables differ.
+
+*Authority.* The compiler's only outputs are +AvatarPlaybackCommand+ values, a +TtsStyleRequest+ and a record. It cannot mint +AuthorizedAvatarAction+, +AuthenticatedControl+ or any capability; each command still passes the existing +authorize_avatar_action+ (+Capability::AvatarControl+) at the output boundary (ADR-0003). The intent type has no field that names a tool, an OBS action, a moderation action or a parameter, and unknown fields fail parsing.
+
+=== D5. Timing, phrases, lifecycle and floor interaction
+
+* *Sync is phrase-relative and logical.* Anchors resolve against the phrase's own plan: +phrase_start+, +phrase_end+ (the asset's duration), up to three declared pause offsets (the ADR-0004 +Boundary+ points, i.e. +interrupt_points_ms+), and deciles of the duration. All are positions on the scheduler's logical timeline, the same timeline audio and visemes already share (the existing test +audio_and_visemes_share_the_scheduled_monotonic_timeline+). They are not audible time: ADR-0004 D-6 and A-AUDIO-001 stand, so the compiler does not re-time on lifecycle events and a backend start latency shifts audio against the avatar equally for every anchor. Today a generated asset declares only the end point, so +pause(k)+ anchors resolve only once #83 or a TTS with pause evidence supplies boundaries; before then they are dropped with +UnresolvedSync+ and deciles carry the load.
+* *Prosody as timing evidence only.* Duration, pause offsets and the rate class may move where an anchor lands (deciles and pauses scale with the real duration), but cannot change which anchors exist or override compatibility. Emphasis, energy and pause reach the compiler only as the summary classes in the intent; there is no per-word marker.
+* *Causality.* Phrase i is compiled from information available at phrase i. It never reads a later phrase (research register "causal phrase-local compilation").
+* *Continuity (#83).* The compiler keeps a bounded +ContinuityState+ for the current reply and the previous one: last affect (class, level), last gaze, the end time of the last gesture per its profile +duration_ms+, last variant per family. Rules: *continue* affect emits no command when class and level are unchanged; *transition* emits a command at the phrase start and lets the renderer interpolate; *hold* gaze emits no gaze command; a new gesture never starts before the previous gesture's declared duration has elapsed (otherwise it is dropped, not queued); the *tail* of a final phrase is +return_to_neutral+ by default, emitted a configured lead (proposed 200 ms) before the end so that it falls inside the phrase's live window (a command exactly at the end tick may already be past +command_is_live+; to be tested); a non-final phrase holds. A phrase never resets to neutral at its start unless its intent says so.
+* *Cancel and release.* If a reply is cancelled after +Started+ (ADR-0004 +Cancelled { reached: Started }+), pending commands vanish by generation, but a face already set to joy would stay. The release (the ADR-0003 +Reset+, which is not in +AvatarPlaybackCommand+ today) is issued by the composition root on the lifecycle event, not by the compiler (Open question Q8).
+* *Floor (#81).* A non-verbal backchannel is an intent with +speech = None+ and a gesture anchor at +phrase_start+. It compiles to a +PlannedPerformance+ with channels {Body, Gaze} (and Face only if an affect is given), no +AudioPlaybackCommand+, and a short duration taken from the profile's gesture +duration_ms+. Its scheduler priority comes from the caller (the floor policy's scheduling request, ranked from the classified event), never from the intent. +Yield+ and +Interrupt+ produce no intent.
+* *Naturalness (#89).* The compiler asks a +NaturalnessBudget+ view whether a gesture or gaze shift is permitted at +at_ms+; a refusal drops the item with +BudgetSuppressed+. The budget, its numbers and its owner are #89; this ADR defines only the query, and that the bounded history it needs is the same ring as the repetition window (last 16 compiled gestures/expressions). Diversity never overrides compatibility (accelerator row for #89): variants are chosen only among already-compatible profile presets.
+
+=== D6. Prosody and TTS degradation
+
+* The prosody stage is +resolve_style(prosody, tts_caps) -> (TtsStyleRequest, notes)+, pure, run just before synthesis. +TtsStyleRequest+ is provider-neutral: a rate class, an energy level, a style class, each present only if the backend's +TtsCapabilities+ supports it. Unsupported dimensions are dropped, never approximated through a provider-specific string, and recorded as +unsupported+ fields. The adapter converts the surviving fields to its own DTO; it is the only place provider vocabulary exists.
+* +SpeechRequest.style: Option<String>+ is replaced in the implementation issue by the typed request.
+* Rate is the only dimension that changes duration, so prosody resolution precedes any timing use: anchors are resolved against the duration the TTS *returned*, never an estimate.
+* A backend with no style support at all gets an empty request: audio is unchanged, the face and gesture still follow the intent.
+
+=== D7. Bounds
+
+[cols="3,2,4"]
+|===
+|Item |Bound |Where enforced
+
+|Serialized intent |1 KiB |structural validation
+|Anchors per intent |4 (model-supplied: 2) |clamp; producer-allowed set
+|Anchor offset |+-300 ms; same-channel spacing 400 ms |clamp
+|Intents in flight (assembled and not finished) |8 |assembler registry; the oldest unstarted is dropped with a typed reason
+|Compile notes per phrase |16 (saturating) |compiler
+|Avatar commands per phrase excluding visemes |at most 1 expression + 1 gaze + 4 anchors + 2 tail = 8 |compiler (property test)
+|Continuity state |current and previous reply; last-16 compiled-item ring |compiler
+|Vocabulary size |each enum at most 16 members; total at most 64 |schema; a member addition changes the vocabulary version
+|Profile tables |4 variants per (family, level); 8 affects x 4 levels; 11 gestures x 4 levels |profile load
+|Unmapped Jev strings |counted, no retained text |Jev adapter
+|===
+
+=== D8. Identity, replay, asset compatibility and schema relation
+
+*Identities* (canonical, length-prefixed keys in the style of +AssetIdentity::stable_key+, ADR-0004 D4):
+
+----
+intent_identity   = schema:<intent schema_version> | vocab:intent-vocab/<n> | digest:<sha256 of canonical JSON of the validated intent>
+compiler_identity = compiler:<semver> | mapping:<fallback+placement+compatibility table version>
+                    | avatar:<profile id>@<rev>+<sha256> | tts:<profile id>@<rev>+<sha256> | policy:<persona style class id>@<rev>
+----
+
+*Replay record* (+IntentCompileRecord+, no free text, digests only, privacy as ADR-0004): +seq+, +at_ms+, +SpeechRef+, ordered +sources+ (deterministic, template, cached, floor, jev, thinking), digest of the raw hints, +intent_identity+ of the validated result, +clamps+ and +notes+, +compiler_identity+, +unsupported+ (field, reason), variation {seed, chosen variant indexes}, a digest of the emitted commands. Replay reads the recorded validated intent and identities and does not re-run producers; re-running the compiler against the recorded inputs must reproduce the command digest (a regression test, not a replay dependency). Jev/Thinking latency and fallback reasons are recorded by their own stages, as in ADR-0005 D9.
+
+*Variation.* Choosing among a family's variants uses the existing +SeededRng+ seeded from the playback timing seed, the event sequence and the intent digest, excluding the last variant used for that family (the existing recent-variant window). Seed and choice are recorded.
+
+*Cached assets and compatibility.* A 0.2.0 asset (coordinated with ADR-0004 D-3 so there is one bump) may carry an authored +intent+ and an +intent_envelope+: the affect classes, maximum level, gaze targets and gesture families that fit the *recorded audio's* tone. At dispatch, a requested intent inside the envelope is compiled over the cached audio; outside it, the asset's authored intent is used and +EnvelopeMismatch+ is recorded, and playback proceeds. Audio is never regenerated solely for a minor intent variation. Compatibility follows ADR-0004 D-4 ("stale but playable"): a change of +compiler_identity+ never invalidates audio; it only means the visual part is compiled differently, which dispatch-time compilation does anyway. A change of vocabulary major version is incompatible and needs the schema bump. Legacy 0.1.0 assets (baked free-string presets, one expression/gesture/gaze) keep the current +dispatch_asset+ path unchanged and are treated as an authored intent that bypasses the compiler.
+
+*Extend or new schema.* A *new* +schemas/performance-intent.schema.json+ (0.1.0), because the intent travels with events, plans and the generative pipeline, not only with assets. The *performance asset schema is extended* in its 0.2.0 bump with optional +intent+ (the intent schema by reference), optional +intent_envelope+ and a +compatibility.intent_mapping+ identity; its existing +expression+, +gesture+, +gaze+ remain for legacy assets. No change to the reflex schema in v1. Everything below is schema-first work for the implementation issue; nothing changes now:
+
+. +schemas/performance-intent.schema.json+ 0.1.0 with positive and negative fixtures (under a new +examples/performance-intents/+), Rust types with +deny_unknown_fields+, TypeScript reference parity, Rust-to-schema parity;
+. +schemas/performance-asset.schema.json+ 0.1.0 to 0.2.0: +intent+, +intent_envelope+, +compatibility.intent_mapping+, together with ADR-0004's +speech_text+ and +speech_projection+;
+. an +intent-compile-record+ schema (or the telemetry vocabulary) for the replay record;
+. avatar profile and TTS capability configuration schemas (operator-owned data; whether these are domain schemas or adapter-private follows ADR-0003 decision 7 and is Q9);
+. the typed hint side channel on the generative reply and the typed +TtsStyleRequest+ replacing +SpeechRequest.style+;
+. deferred: a closed +gesture_family+/+reaction_family+ enum in the reflex schema (an incompatible change), and any gaze enum extension (Q1).
+
+*Placement (proposed).* Types, vocabularies, quantization, structural validation, clamp and compatibility rules, the assembler, and +resolve_style+ in +crates/domain+ (provider-neutral, pure); the visual compiler and +ContinuityState+ in +crates/runtime+ beside +dispatch_asset+ and the playback command types; the floor-to-intent table next to the floor policy; Jev and Thinking adapters in +crates/reflex+ and +crates/generative+ (they only build hints). The generative crate depends on domain, asset-store and scheduler but not on runtime, which is why prosody resolution and hint assembly are in domain and the visual compile is at dispatch. The name +PerformanceCompiler+ already belongs to the asset builder in +crates/generative/src/lib.rs:273+; the new component is called +IntentCompiler+ in code to avoid two meanings (Q7).
+
+=== D9. Metrics
+
+Each issue metric maps to recorded fields, labelled by bounded enums only: intent clamp/fallback frequency (+clamps+, +notes+ by reason and field); gesture/expression/gaze mismatch labels (human-rated in #59 against the record's validated intent and the profile preset actually chosen); cross-phrase continuity failures (a continuity rule dropped or an unexpected reset, from +ContinuityState+ transitions); TTS style fallback rate (+unsupported+ by dimension); same-gesture/expression repetition (the last-16 ring); attention-target appropriateness (human label on gaze versus event kind); multimodal coherence (human rating); producer hint rejection and unmapped-family rates.
+
+== Worked example (Japanese)
+
+A viewer writes 「こんにちは！初見です」 in Twitch chat. The classified event is a +ChatMessage+ (priority Conversation), text-chat floor mode (ADR-0005 D7) yields +TakeTurn+, the route is generated, and the reply is split into two phrases (#83). All timings below are illustrative logical milliseconds from this design, not measurements.
+
+*Producers.* Jev returned +reaction_family = "greet"+, +gesture_family = "nod"+, +attention_target = chat+, +emotion_intensity = 0.64+, which quantizes to +moderate+ (0.64 >= 0.625). Thinking returned typed hints and the reply text:
+
+* phrase 0: 「こんにちは、初見さん！」 (display text, gated)
+* phrase 1: 「来てくれてありがとう、ゆっくりしていってね」
+
+*Assembled and validated intent, phrase 0* (the Thinking hint wins for fields it supplied; Jev's nod family would have been placed at +phrase_end -150 ms+, the same place):
+
+[source,json]
+----
+{
+  "schema_version": "0.1.0",
+  "speech": { "event_id": "evt-twitch-000412", "phrase": 0, "final_phrase": false },
+  "act": "greet",
+  "affect": { "class": "joy", "level": "moderate" },
+  "gaze": "chat",
+  "prosody": { "style": "cheerful", "rate": "normal", "energy": "high", "emphasis": "light", "pause": "short" },
+  "anchors": [
+    { "at": { "sync": "phrase_end", "offset_ms": -150 }, "kind": "gesture", "gesture": "nod", "level": "mild" }
+  ],
+  "continuity": { "affect": "transition", "gaze": "shift", "tail": "hold" },
+  "interruptibility": "default"
+}
+----
+
+*Phrase 1* (act +thank+, same affect and gaze, no anchors; final phrase so the tail is +return_to_neutral+):
+
+[source,json]
+----
+{
+  "schema_version": "0.1.0",
+  "speech": { "event_id": "evt-twitch-000412", "phrase": 1, "final_phrase": true },
+  "act": "thank",
+  "affect": { "class": "joy", "level": "moderate" },
+  "gaze": "chat",
+  "prosody": { "style": "cheerful", "rate": "normal", "energy": "normal", "emphasis": "none", "pause": "short" },
+  "anchors": [],
+  "continuity": { "affect": "continue", "gaze": "hold", "tail": "return_to_neutral" },
+  "interruptibility": "default"
+}
+----
+
+*Prosody resolution (before synthesis).* The TTS profile supports rate and the styles +neutral+, +cheerful+, +calm+ but has no energy control. +TtsStyleRequest { style: cheerful, rate: normal }+ is sent; +energy = high+ is dropped and recorded as +unsupported: [energy]+ (a note, not an error). Neither the request nor the record contains any TTS provider's vocabulary.
+
+*Compilation, phrase 0.* Plan: generation 17, +start_at_ms = 121200+ (event at 120000), +duration_ms = 1600+, priority Conversation from the event kind, channels {Audio, Face, Body, Gaze}, one interrupt point at 1600. The VRM profile maps (joy, moderate) to the handle +joy+ at 0.75, (nod, mild) to +nod+ at amplitude 0.7 with +duration_ms = 600+.
+
+[cols="2,2,3"]
+|===
+|Intent item |Resolution |Result
+
+|affect joy/moderate, from phrase start |121200 |Expression at 121200
+|gaze chat, from phrase start |121200 |Gaze at 121200
+|anchor nod/mild at phrase_end -150 |121200 + 1600 - 150 = 122650 |Gesture at 122650; the nod ends at 123250 (profile duration)
+|===
+
+[source,json]
+----
+{"kind":"expression","generation":17,"at_ms":121200,"preset":"joy","intensity":0.75}
+{"kind":"gaze","generation":17,"at_ms":121200,"target":"chat"}
+{"kind":"gesture","generation":17,"at_ms":122650,"preset":"nod","amplitude":0.7}
+----
+
+and the existing audio path unchanged (visemes still come from the asset's viseme track, scheduled as today):
+
+[source,json]
+----
+{"generation":17,"event_id":"evt-twitch-000412","asset_id":"gen-p0","at_ms":121200,"audio_ref":"tts/gen-p0.wav","duration_ms":1600,"speed_factor":1.0}
+----
+
+*Compilation, phrase 1.* Plan: generation 18, +start_at_ms = 122800+ (phrase 0 ends at 122800), +duration_ms = 2400+, end 125200. Continuity: affect +continue+ with the same class and level emits no expression command; gaze +hold+ emits no gaze command; there is no gesture anchor (a new gesture could not start before 123250 anyway). The tail +return_to_neutral+ is emitted 200 ms before the end so it falls inside the live window of generation 18:
+
+[source,json]
+----
+{"kind":"expression","generation":18,"at_ms":125000,"preset":"neutral","intensity":0.0}
+{"kind":"gaze","generation":18,"at_ms":125000,"target":"camera"}
+{"generation":18,"event_id":"evt-twitch-000412","asset_id":"gen-p1","at_ms":122800,"audio_ref":"tts/gen-p1.wav","duration_ms":2400,"speed_factor":1.0}
+----
+
+So the viewer sees a moderate smile and a look at chat as the greeting starts, a small nod landing 150 ms before the end of the first phrase, the smile and gaze carried across the phrase boundary without a reset, and a release to neutral and camera as the second phrase finishes.
+
+*Degradation variant.* On a VTS profile that registered only +smile_soft+ for joy (no moderate preset) and no nod: the affect resolves to the nearest lower level the profile has, the gesture is dropped, and the record shows +Unsupported(gesture nod)+ while audio and the smile play unchanged.
+
+*Gesture-only variant (floor).* The floor policy returns +Backchannel { intent: Acknowledge, speech_allowed: false }+ while the viewer speaks, with +attention = speaker+. The table gives:
+
+[source,json]
+----
+{
+  "schema_version": "0.1.0",
+  "speech": null,
+  "act": "backchannel",
+  "affect": { "class": "calm", "level": "subtle" },
+  "gaze": "speaker",
+  "anchors": [
+    { "at": { "sync": "phrase_start", "offset_ms": 0 }, "kind": "gesture", "gesture": "nod", "level": "subtle" }
+  ],
+  "interruptibility": "default"
+}
+----
+
+It compiles to a plan with channels {Face, Body, Gaze}, no audio command, and three avatar commands at the plan start in the order expression, gesture, gaze: Expression (+calm+, 0.25 on the VRM profile), Gesture (+nod+, amplitude 0.4), Gaze (+speaker+). If the avatar adapter is unavailable the commands are dropped and nothing else changes.
