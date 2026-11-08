@@ -1,0 +1,473 @@
+{
+  "schema_version": "memory-long-range-eval/v1",
+  "fixture_schema_version": "memory-eval-v1",
+  "fixture_digest": "ef8918bf116a350032ce1fb23b0e67102d7c1e32c66b9be6be8c7c8d34dc37a3",
+  "context_item_budget": 12,
+  "context_byte_budget": 8192,
+  "item_byte_budget": 4096,
+  "totals": {
+    "cases": 14,
+    "current_fact_correctness": 1.0,
+    "stale_memory_use": 0,
+    "absent_violations": 0,
+    "retained_causal_spans": 1,
+    "refused_items": 0,
+    "temporal_order_errors": 2,
+    "truncated_claims": 0,
+    "max_context_items": 12,
+    "max_claim_bytes": 6038,
+    "max_request_bytes": 7038,
+    "max_entries_high_water": 14,
+    "max_links_high_water": 69
+  },
+  "cases": [
+    {
+      "case": "preference_update",
+      "delivered": [
+        "evt-enjoy"
+      ],
+      "must_deliver": [
+        "evt-enjoy"
+      ],
+      "refused_claims": [
+        "evt-dislike"
+      ],
+      "stale_claims": [
+        "evt-dislike"
+      ],
+      "retained_causal_spans": 0,
+      "current_fact_correctness": 1.0,
+      "stale_memory_use": 0,
+      "absent_violations": 0,
+      "refused_items": [],
+      "temporal_order_errors": 0,
+      "context_items": 1,
+      "claim_bytes": 32,
+      "request_bytes": 96,
+      "within_item_budget": true,
+      "within_byte_budget": true,
+      "truncated_claims": 0,
+      "entries_high_water": 2,
+      "links_high_water": 2,
+      "max_entries": 256,
+      "max_links": 2048
+    },
+    {
+      "case": "causal_reason_travels_with_its_effect",
+      "delivered": [
+        "evt-boss-retry",
+        "evt-boss-bug"
+      ],
+      "must_deliver": [
+        "evt-boss-bug",
+        "evt-boss-retry"
+      ],
+      "refused_claims": [],
+      "stale_claims": [],
+      "retained_causal_spans": 1,
+      "current_fact_correctness": 1.0,
+      "stale_memory_use": 0,
+      "absent_violations": 0,
+      "refused_items": [],
+      "temporal_order_errors": 0,
+      "context_items": 2,
+      "claim_bytes": 79,
+      "request_bytes": 143,
+      "within_item_budget": true,
+      "within_byte_budget": true,
+      "truncated_claims": 0,
+      "entries_high_water": 2,
+      "links_high_water": 2,
+      "max_entries": 256,
+      "max_links": 2048
+    },
+    {
+      "case": "topic_shifted_correction",
+      "delivered": [
+        "evt-enjoy"
+      ],
+      "must_deliver": [
+        "evt-enjoy"
+      ],
+      "refused_claims": [
+        "evt-dislike"
+      ],
+      "stale_claims": [
+        "evt-dislike"
+      ],
+      "retained_causal_spans": 0,
+      "current_fact_correctness": 1.0,
+      "stale_memory_use": 0,
+      "absent_violations": 0,
+      "refused_items": [],
+      "temporal_order_errors": 0,
+      "context_items": 1,
+      "claim_bytes": 32,
+      "request_bytes": 96,
+      "within_item_budget": true,
+      "within_byte_budget": true,
+      "truncated_claims": 0,
+      "entries_high_water": 2,
+      "links_high_water": 1,
+      "max_entries": 256,
+      "max_links": 2048
+    },
+    {
+      "case": "topic_shifted_correction_under_limit",
+      "delivered": [
+        "evt-enjoy",
+        "evt-c12",
+        "evt-c11",
+        "evt-c10",
+        "evt-c9",
+        "evt-c8",
+        "evt-c7",
+        "evt-c6",
+        "evt-c5",
+        "evt-c4",
+        "evt-c3",
+        "evt-c2"
+      ],
+      "must_deliver": [
+        "evt-enjoy",
+        "evt-c12",
+        "evt-c11",
+        "evt-c10",
+        "evt-c9",
+        "evt-c8",
+        "evt-c7",
+        "evt-c6",
+        "evt-c5",
+        "evt-c4",
+        "evt-c3",
+        "evt-c2"
+      ],
+      "refused_claims": [
+        "evt-old",
+        "evt-c1"
+      ],
+      "stale_claims": [
+        "evt-old"
+      ],
+      "retained_causal_spans": 0,
+      "current_fact_correctness": 1.0,
+      "stale_memory_use": 0,
+      "absent_violations": 0,
+      "refused_items": [],
+      "temporal_order_errors": 0,
+      "context_items": 12,
+      "claim_bytes": 222,
+      "request_bytes": 286,
+      "within_item_budget": true,
+      "within_byte_budget": true,
+      "truncated_claims": 0,
+      "entries_high_water": 14,
+      "links_high_water": 69,
+      "max_entries": 256,
+      "max_links": 2048
+    },
+    {
+      "case": "goal_attempt_result",
+      "delivered": [
+        "evt-result",
+        "evt-attempt",
+        "evt-goal"
+      ],
+      "must_deliver": [
+        "evt-goal",
+        "evt-attempt",
+        "evt-result"
+      ],
+      "refused_claims": [],
+      "stale_claims": [],
+      "retained_causal_spans": 0,
+      "current_fact_correctness": 1.0,
+      "stale_memory_use": 0,
+      "absent_violations": 0,
+      "refused_items": [],
+      "temporal_order_errors": 0,
+      "context_items": 3,
+      "claim_bytes": 83,
+      "request_bytes": 147,
+      "within_item_budget": true,
+      "within_byte_budget": true,
+      "truncated_claims": 0,
+      "entries_high_water": 3,
+      "links_high_water": 3,
+      "max_entries": 256,
+      "max_links": 2048
+    },
+    {
+      "case": "record_time_inverts_event_time",
+      "delivered": [
+        "evt-started",
+        "evt-finished"
+      ],
+      "must_deliver": [
+        "evt-started",
+        "evt-finished"
+      ],
+      "refused_claims": [],
+      "stale_claims": [],
+      "retained_causal_spans": 0,
+      "current_fact_correctness": 1.0,
+      "stale_memory_use": 0,
+      "absent_violations": 0,
+      "refused_items": [],
+      "temporal_order_errors": 1,
+      "context_items": 2,
+      "claim_bytes": 29,
+      "request_bytes": 93,
+      "within_item_budget": true,
+      "within_byte_budget": true,
+      "truncated_claims": 0,
+      "entries_high_water": 2,
+      "links_high_water": 0,
+      "max_entries": 256,
+      "max_links": 2048
+    },
+    {
+      "case": "contradiction_without_update",
+      "delivered": [
+        "evt-claim-b",
+        "evt-claim-a"
+      ],
+      "must_deliver": [
+        "evt-claim-a",
+        "evt-claim-b"
+      ],
+      "refused_claims": [],
+      "stale_claims": [],
+      "retained_causal_spans": 0,
+      "current_fact_correctness": 1.0,
+      "stale_memory_use": 0,
+      "absent_violations": 0,
+      "refused_items": [],
+      "temporal_order_errors": 0,
+      "context_items": 2,
+      "claim_bytes": 48,
+      "request_bytes": 112,
+      "within_item_budget": true,
+      "within_byte_budget": true,
+      "truncated_claims": 0,
+      "entries_high_water": 2,
+      "links_high_water": 1,
+      "max_entries": 256,
+      "max_links": 2048
+    },
+    {
+      "case": "other_viewer_same_topic",
+      "delivered": [
+        "evt-v1"
+      ],
+      "must_deliver": [
+        "evt-v1"
+      ],
+      "refused_claims": [
+        "evt-v2"
+      ],
+      "stale_claims": [],
+      "retained_causal_spans": 0,
+      "current_fact_correctness": 1.0,
+      "stale_memory_use": 0,
+      "absent_violations": 0,
+      "refused_items": [],
+      "temporal_order_errors": 0,
+      "context_items": 1,
+      "claim_bytes": 31,
+      "request_bytes": 95,
+      "within_item_budget": true,
+      "within_byte_budget": true,
+      "truncated_claims": 0,
+      "entries_high_water": 2,
+      "links_high_water": 1,
+      "max_entries": 256,
+      "max_links": 2048
+    },
+    {
+      "case": "expiry_keeps_newer_linked",
+      "delivered": [
+        "evt-new"
+      ],
+      "must_deliver": [
+        "evt-new"
+      ],
+      "refused_claims": [
+        "evt-old"
+      ],
+      "stale_claims": [
+        "evt-old"
+      ],
+      "retained_causal_spans": 0,
+      "current_fact_correctness": 1.0,
+      "stale_memory_use": 0,
+      "absent_violations": 0,
+      "refused_items": [],
+      "temporal_order_errors": 0,
+      "context_items": 1,
+      "claim_bytes": 28,
+      "request_bytes": 92,
+      "within_item_budget": true,
+      "within_byte_budget": true,
+      "truncated_claims": 0,
+      "entries_high_water": 2,
+      "links_high_water": 2,
+      "max_entries": 256,
+      "max_links": 2048
+    },
+    {
+      "case": "budget_pressure_drops_whole",
+      "delivered": [
+        "evt-current",
+        "evt-o1",
+        "evt-o2"
+      ],
+      "must_deliver": [
+        "evt-current",
+        "evt-o1",
+        "evt-o2"
+      ],
+      "refused_claims": [
+        "evt-o3"
+      ],
+      "stale_claims": [],
+      "retained_causal_spans": 0,
+      "current_fact_correctness": 1.0,
+      "stale_memory_use": 0,
+      "absent_violations": 0,
+      "refused_items": [],
+      "temporal_order_errors": 0,
+      "context_items": 3,
+      "claim_bytes": 6038,
+      "request_bytes": 7038,
+      "within_item_budget": true,
+      "within_byte_budget": true,
+      "truncated_claims": 0,
+      "entries_high_water": 4,
+      "links_high_water": 0,
+      "max_entries": 256,
+      "max_links": 2048
+    },
+    {
+      "case": "oversized_claim_skipped_whole",
+      "delivered": [
+        "evt-current"
+      ],
+      "must_deliver": [
+        "evt-current"
+      ],
+      "refused_claims": [
+        "evt-huge"
+      ],
+      "stale_claims": [],
+      "retained_causal_spans": 0,
+      "current_fact_correctness": 1.0,
+      "stale_memory_use": 0,
+      "absent_violations": 0,
+      "refused_items": [],
+      "temporal_order_errors": 0,
+      "context_items": 1,
+      "claim_bytes": 38,
+      "request_bytes": 102,
+      "within_item_budget": true,
+      "within_byte_budget": true,
+      "truncated_claims": 0,
+      "entries_high_water": 2,
+      "links_high_water": 0,
+      "max_entries": 256,
+      "max_links": 2048
+    },
+    {
+      "case": "retention_plateau",
+      "delivered": [
+        "evt-p8",
+        "evt-p7",
+        "evt-p6",
+        "evt-p5"
+      ],
+      "must_deliver": [
+        "evt-p5",
+        "evt-p6",
+        "evt-p7",
+        "evt-p8"
+      ],
+      "refused_claims": [
+        "evt-p1",
+        "evt-p2",
+        "evt-p3",
+        "evt-p4"
+      ],
+      "stale_claims": [],
+      "retained_causal_spans": 0,
+      "current_fact_correctness": 1.0,
+      "stale_memory_use": 0,
+      "absent_violations": 0,
+      "refused_items": [],
+      "temporal_order_errors": 0,
+      "context_items": 4,
+      "claim_bytes": 60,
+      "request_bytes": 124,
+      "within_item_budget": true,
+      "within_byte_budget": true,
+      "truncated_claims": 0,
+      "entries_high_water": 4,
+      "links_high_water": 6,
+      "max_entries": 4,
+      "max_links": 6
+    },
+    {
+      "case": "no_scoped_memory",
+      "delivered": [],
+      "must_deliver": [],
+      "refused_claims": [
+        "evt-other-viewer"
+      ],
+      "stale_claims": [],
+      "retained_causal_spans": 0,
+      "current_fact_correctness": 1.0,
+      "stale_memory_use": 0,
+      "absent_violations": 0,
+      "refused_items": [],
+      "temporal_order_errors": 0,
+      "context_items": 0,
+      "claim_bytes": 0,
+      "request_bytes": 64,
+      "within_item_budget": true,
+      "within_byte_budget": true,
+      "truncated_claims": 0,
+      "entries_high_water": 1,
+      "links_high_water": 0,
+      "max_entries": 256,
+      "max_links": 2048
+    },
+    {
+      "case": "topic_mismatch_ranks_lower",
+      "delivered": [
+        "evt-this-topic",
+        "evt-other-topic"
+      ],
+      "must_deliver": [
+        "evt-this-topic",
+        "evt-other-topic"
+      ],
+      "refused_claims": [],
+      "stale_claims": [],
+      "retained_causal_spans": 0,
+      "current_fact_correctness": 1.0,
+      "stale_memory_use": 0,
+      "absent_violations": 0,
+      "refused_items": [],
+      "temporal_order_errors": 1,
+      "context_items": 2,
+      "claim_bytes": 52,
+      "request_bytes": 116,
+      "within_item_budget": true,
+      "within_byte_budget": true,
+      "truncated_claims": 0,
+      "entries_high_water": 2,
+      "links_high_water": 0,
+      "max_entries": 256,
+      "max_links": 2048
+    }
+  ]
+}
