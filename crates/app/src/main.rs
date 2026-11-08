@@ -258,7 +258,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "aivtuber-app ready: indexed={} usable={} preloaded={}",
         preload.indexed.indexed, preload.indexed.usable, preload.preloaded
     );
-    report_degraded(app.health());
+    report_degraded(app.avatar_output_name(), app.health());
     eprintln!(
         "raw_ingress: max_record_bytes={} queue_capacity={}",
         raw_ingress_config.max_record_bytes, raw_ingress_config.queue_capacity
@@ -757,9 +757,9 @@ fn fixed_control_secret(name: &str) -> Result<[u8; 32], Box<dyn Error>> {
     Ok(secret)
 }
 
-fn report_degraded(health: &AdapterHealth) {
+fn report_degraded(avatar_output: &str, health: &AdapterHealth) {
     if let Some(error) = &health.avatar_error {
-        eprintln!("VTube Studio degraded: {error}");
+        eprintln!("{avatar_output} degraded: {error}");
     }
     if let Some(error) = &health.stream_error {
         eprintln!("OBS degraded: {error}");

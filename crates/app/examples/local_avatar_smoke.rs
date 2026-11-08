@@ -62,6 +62,8 @@ fn health_json(output: &LocalAvatarOutput) -> serde_json::Value {
         "reconnects": h.reconnects,
         "protocol_errors": h.protocol_errors,
         "stray_acks": h.stray_acks,
+        "unmapped_presets": h.unmapped_presets,
+        "unmapped_preset_overflow": h.unmapped_preset_overflow,
     })
 }
 

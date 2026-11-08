@@ -1,7 +1,8 @@
 use crate::{AudioOutput, AvatarOutput, StreamOutput};
 use aivtuber_adapters::{
     AudioPlayRequest, AudioPlayer, DropReason, GazeTarget, LocalAvatarHandle, LocalAvatarHealth,
-    LocalAvatarServer, LocalAvatarState, ObsWebSocketAdapter, VTubeStudioAdapter, WireCommand,
+    LocalAvatarServer, LocalAvatarState, ObsWebSocketAdapter, PresetKind, PresetMapping,
+    VTubeStudioAdapter, WireCommand, map_preset,
 };
 use aivtuber_domain::{
     AuthenticatedControl, AuthorizedStreamAction, AvatarAction, EngineError, EngineErrorKind,
@@ -158,6 +159,10 @@ impl VtsAvatarOutput {
 }
 
 impl AvatarOutput for VtsAvatarOutput {
+    fn name(&self) -> &'static str {
+        "VTube Studio"
+    }
+
     fn connect(&mut self) -> Result<(), EngineError> {
         self.adapter.connect()
     }
@@ -203,22 +208,41 @@ impl LocalAvatarOutput {
         self.server.launch_url()
     }
 
-    fn wire_for(command: &AvatarPlaybackCommand) -> Option<WireCommand> {
+    /// Pack preset -> renderer wire command. Values are validated against the
+    /// protocol ranges *before* scaling (a bad input must not be rescued by
+    /// attenuation) and clamped after.
+    fn wire_for(command: &AvatarPlaybackCommand) -> Result<WireCommand, Unsent> {
         let wire = match command {
             AvatarPlaybackCommand::Expression {
                 preset, intensity, ..
-            } => WireCommand::Expression {
-                preset: preset.clone(),
-                intensity: *intensity,
-            },
+            } => {
+                let (target, scale) = Self::resolve(PresetKind::Expression, preset)?;
+                let raw = WireCommand::Expression {
+                    preset: target.to_owned(),
+                    intensity: *intensity,
+                };
+                raw.validate().map_err(|_| Unsent::Invalid)?;
+                WireCommand::Expression {
+                    preset: target.to_owned(),
+                    intensity: (intensity * scale).clamp(0.0, 1.0),
+                }
+            }
             AvatarPlaybackCommand::Gesture {
                 preset, amplitude, ..
-            } => WireCommand::Gesture {
-                preset: preset.clone(),
-                amplitude: *amplitude,
-            },
+            } => {
+                let (target, scale) = Self::resolve(PresetKind::Gesture, preset)?;
+                let raw = WireCommand::Gesture {
+                    preset: target.to_owned(),
+                    amplitude: *amplitude,
+                };
+                raw.validate().map_err(|_| Unsent::Invalid)?;
+                WireCommand::Gesture {
+                    preset: target.to_owned(),
+                    amplitude: (amplitude * scale).clamp(0.0, 2.0),
+                }
+            }
             AvatarPlaybackCommand::Gaze { target, .. } => WireCommand::Gaze {
-                target: GazeTarget::parse(target)?,
+                target: GazeTarget::parse(target).ok_or(Unsent::Invalid)?,
             },
             AvatarPlaybackCommand::Viseme { viseme, weight, .. } => WireCommand::Viseme {
                 viseme: *viseme,
@@ -226,11 +250,35 @@ impl LocalAvatarOutput {
             },
             AvatarPlaybackCommand::Reset { .. } => WireCommand::Reset {},
         };
-        wire.validate().ok().map(|()| wire)
+        wire.validate().map_err(|_| Unsent::Invalid)?;
+        Ok(wire)
+    }
+
+    fn resolve(kind: PresetKind, preset: &str) -> Result<(&'static str, f64), Unsent> {
+        match map_preset(kind, preset) {
+            PresetMapping::Mapped { target, scale } => Ok((target, scale)),
+            PresetMapping::Unsupported { .. } | PresetMapping::Unknown => {
+                Err(Unsent::Preset(preset.to_owned()))
+            }
+        }
     }
 }
 
+/// Why a playback command has no wire form. Neither is an error for the
+/// caller: both are counted in the adapter health.
+#[derive(Debug, PartialEq, Eq)]
+enum Unsent {
+    /// Preset with no renderer equivalent (unsupported or unknown).
+    Preset(String),
+    /// Out-of-range value or unknown gaze target.
+    Invalid,
+}
+
 impl AvatarOutput for LocalAvatarOutput {
+    fn name(&self) -> &'static str {
+        "local avatar renderer"
+    }
+
     fn connect(&mut self) -> Result<(), EngineError> {
         match self.handle.health().state {
             LocalAvatarState::Ready => Ok(()),
@@ -242,9 +290,16 @@ impl AvatarOutput for LocalAvatarOutput {
     }
 
     fn execute(&mut self, command: &AvatarPlaybackCommand) -> Result<(), EngineError> {
-        let Some(wire) = Self::wire_for(command) else {
-            self.handle.record_drop(DropReason::Unmapped);
-            return Ok(());
+        let wire = match Self::wire_for(command) {
+            Ok(wire) => wire,
+            Err(Unsent::Preset(name)) => {
+                self.handle.record_unmapped_preset(&name);
+                return Ok(());
+            }
+            Err(Unsent::Invalid) => {
+                self.handle.record_drop(DropReason::Unmapped);
+                return Ok(());
+            }
         };
         // Same authority gate as every other avatar output. A failure here is
         // a wiring bug, not renderer weather, so it is a real error.
@@ -286,6 +341,10 @@ impl StreamOutput for ObsStreamOutput {
 pub struct NoopAvatarOutput;
 
 impl AvatarOutput for NoopAvatarOutput {
+    fn name(&self) -> &'static str {
+        "no avatar output"
+    }
+
     fn execute(&mut self, _command: &AvatarPlaybackCommand) -> Result<(), EngineError> {
         Ok(())
     }
@@ -392,6 +451,86 @@ mod tests {
     }
 
     #[test]
+    fn pack_presets_are_scaled_by_level_and_clamped() {
+        let expr = |preset: &str, intensity: f64| AvatarPlaybackCommand::Expression {
+            generation: 1,
+            at_ms: 0,
+            preset: preset.to_owned(),
+            intensity,
+        };
+        let gesture = |preset: &str, amplitude: f64| AvatarPlaybackCommand::Gesture {
+            generation: 1,
+            at_ms: 0,
+            preset: preset.to_owned(),
+            amplitude,
+        };
+        assert_eq!(
+            LocalAvatarOutput::wire_for(&expr("surprise_medium", 1.0)),
+            Ok(WireCommand::Expression {
+                preset: "surprise".to_owned(),
+                intensity: 0.75
+            })
+        );
+        assert_eq!(
+            LocalAvatarOutput::wire_for(&gesture("nod_small", 2.0)),
+            Ok(WireCommand::Gesture {
+                preset: "nod".to_owned(),
+                amplitude: 1.0
+            })
+        );
+        // Out-of-range input is not rescued by attenuation.
+        assert_eq!(
+            LocalAvatarOutput::wire_for(&expr("smile_soft", 1.5)),
+            Err(Unsent::Invalid)
+        );
+        assert_eq!(
+            LocalAvatarOutput::wire_for(&gesture("recoil_small", 1.0)),
+            Err(Unsent::Preset("recoil_small".to_owned()))
+        );
+    }
+
+    #[test]
+    fn unmapped_presets_never_fail_and_are_counted_by_name() {
+        let mut out = local_output();
+        for preset in ["thinking_soft", "recoil_small", "recoil_small"] {
+            let command = AvatarPlaybackCommand::Expression {
+                generation: 1,
+                at_ms: 0,
+                preset: preset.to_owned(),
+                intensity: 0.5,
+            };
+            assert!(out.execute(&command).is_ok());
+        }
+        // Hostile names stay bounded.
+        for n in 0..100 {
+            let command = AvatarPlaybackCommand::Gesture {
+                generation: 1,
+                at_ms: 0,
+                preset: format!("made_up_{n}"),
+                amplitude: 1.0,
+            };
+            assert!(out.execute(&command).is_ok());
+        }
+        let health = out.health();
+        assert_eq!(health.unmapped_presets["thinking_soft"], 1);
+        assert_eq!(health.unmapped_presets["recoil_small"], 2);
+        assert_eq!(
+            health.unmapped_presets.len(),
+            aivtuber_adapters::MAX_TRACKED_UNMAPPED_PRESETS
+        );
+        assert_eq!(health.unmapped_preset_overflow, 70);
+        assert_eq!(health.dropped_count(DropReason::UnmappedPreset), 103);
+        assert_eq!(health.sent, 0);
+    }
+
+    #[test]
+    fn avatar_outputs_name_themselves_for_health_text() {
+        assert_eq!(local_output().name(), "local avatar renderer");
+        assert_eq!(output(None).name(), "VTube Studio");
+        assert_eq!(NoopAvatarOutput.name(), "no avatar output");
+    }
+
+    #[test]
     fn local_output_maps_every_command_to_the_wire_form() {
         let cases = [
             (
@@ -399,7 +538,7 @@ mod tests {
                     generation: 1,
                     at_ms: 0,
                 },
-                Some(WireCommand::Reset {}),
+                Ok(WireCommand::Reset {}),
             ),
             (
                 AvatarPlaybackCommand::Gaze {
@@ -407,7 +546,7 @@ mod tests {
                     at_ms: 0,
                     target: "chat".to_owned(),
                 },
-                Some(WireCommand::Gaze {
+                Ok(WireCommand::Gaze {
                     target: GazeTarget::Chat,
                 }),
             ),
@@ -418,7 +557,7 @@ mod tests {
                     preset: "joy".to_owned(),
                     intensity: 0.4,
                 },
-                Some(WireCommand::Expression {
+                Ok(WireCommand::Expression {
                     preset: "joy".to_owned(),
                     intensity: 0.4,
                 }),

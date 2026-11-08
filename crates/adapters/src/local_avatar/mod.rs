@@ -11,9 +11,11 @@
 //! * nothing here can block or fail the caller: [`LocalAvatarHandle::enqueue`]
 //!   only takes a short mutex and either queues or drops-and-counts.
 
+mod presets;
 mod protocol;
 mod server;
 
+pub use presets::{PresetKind, PresetMapping, map_preset};
 pub use protocol::*;
 pub use server::LocalAvatarServer;
 
@@ -86,7 +88,14 @@ pub enum DropReason {
     StaleEpoch,
     /// The command has no wire form (for example an unknown gaze target).
     Unmapped,
+    /// An expression/gesture preset the renderer has no honest equivalent
+    /// for; the name is tracked in `LocalAvatarHealth::unmapped_presets`.
+    UnmappedPreset,
 }
+
+/// Max distinct unmapped preset names tracked; further new names only bump
+/// `unmapped_preset_overflow`.
+pub const MAX_TRACKED_UNMAPPED_PRESETS: usize = 32;
 
 /// Bounded health snapshot: closed enums for every counter key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +111,11 @@ pub struct LocalAvatarHealth {
     pub protocol_errors: u64,
     /// Acks/rejects for an unknown epoch or seq.
     pub stray_acks: u64,
+    /// Unmapped/unsupported preset name (sanitized, <= 64 chars) -> count.
+    /// At most [`MAX_TRACKED_UNMAPPED_PRESETS`] distinct names.
+    pub unmapped_presets: BTreeMap<String, u64>,
+    /// Unmapped presets whose name did not fit in `unmapped_presets`.
+    pub unmapped_preset_overflow: u64,
 }
 
 impl LocalAvatarHealth {
@@ -115,6 +129,8 @@ impl LocalAvatarHealth {
             reconnects: 0,
             protocol_errors: 0,
             stray_acks: 0,
+            unmapped_presets: BTreeMap::new(),
+            unmapped_preset_overflow: 0,
         }
     }
 
@@ -223,6 +239,22 @@ impl LocalAvatarHandle {
             enqueued: Instant::now(),
         });
         Ok(())
+    }
+
+    /// Counts a preset that was deliberately not sent (unsupported by the
+    /// renderer, or unknown). Bounded: see [`MAX_TRACKED_UNMAPPED_PRESETS`].
+    pub fn record_unmapped_preset(&self, name: &str) {
+        let key = presets::tracked_name(name);
+        let mut inner = self.shared.lock();
+        inner.drop_one(DropReason::UnmappedPreset);
+        let health = &mut inner.health;
+        if let Some(count) = health.unmapped_presets.get_mut(&key) {
+            *count += 1;
+        } else if health.unmapped_presets.len() < MAX_TRACKED_UNMAPPED_PRESETS {
+            health.unmapped_presets.insert(key, 1);
+        } else {
+            health.unmapped_preset_overflow += 1;
+        }
     }
 
     /// Counts a command that could not be mapped to a wire command.
