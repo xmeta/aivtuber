@@ -1,0 +1,114 @@
+= ADR-0006: Provider-neutral PerformanceIntent and deterministic intent compilation
+:status: Proposed
+:date: 2026-11-08
+
+== Context
+
+Issue #84 asks for a bounded, provider-neutral +PerformanceIntent+ between semantic decision/generation and low-level performance compilation, so that speech, affect, gaze, gesture, expression, timing and prosody stay coherent while models never drive frame-level avatar parameters. It also asks for sparse performance anchors (the EMAGE sparse-anchor principle, not a neural generator), phrase continuity for #83, cached/template compatibility, replay identity, and deterministic degradation when an avatar or TTS backend lacks a capability.
+
+The issue is +status:design-ready+: this ADR records a candidate design, a reuse review, a worked Japanese example and a test plan. It authorizes no production code, no schema change and no dependency. Nothing was run or measured for this ADR (there is no spike); every number below is a proposed bound, not a result.
+
+Inputs this ADR builds on, all merged on +main+ (HEAD +8e6252ca+ when this was written):
+
+* link:0003-local-vrm-renderer.adoc[ADR-0003] (#219): the avatar output is +AvatarOutput::execute(&AvatarPlaybackCommand)+ with typed +Expression { preset, intensity }+, +Gesture { preset, amplitude }+, +Gaze { target }+, +Viseme { viseme, weight }+; the neutral VRM viseme set is +aa ih ou ee oh+; gaze is symbolic; freshness is the renderer epoch plus host +seq+; the expression and gesture preset vocabularies were explicitly deferred to the implementation issue.
+* link:0004-speech-lifecycle-and-text-projection.adoc[ADR-0004] (#222): +SpeechRef { event_id, generation, phrase, final_phrase, ... }+, scheduler-owned +SpeechLifecycleEvent+ with +basis+, declared +Boundary+ points; decision D-3 already plans a performance asset schema bump to 0.2.0.
+* link:0005-conversational-floor-policy.adoc[ADR-0005] (#81): +FloorDecision+ with +BackchannelIntent+ (Acknowledge, EncourageContinuation, Agreement, Surprise, Sympathy, ThinkingReceipt) and an +attention+ target; non-verbal backchannels (a nod) are on, spoken ones are off by default (S-2); the policy never cancels and never writes avatar state directly.
+* the code a compiled intent must land in (all read on +main+): +AvatarPlaybackCommand+ and +AudioPlaybackCommand+ and +dispatch_asset+ in +crates/runtime/src/cached_playback.rs+ (+:106-169+, +:776-866+); +PlannedPerformance+, +BlendChannel+ (Audio, Face, Body, Gaze, Overlay), +Priority+ and +SeededRng+/+apply_variation+ in +crates/scheduler/src/lib.rs+; +schemas/performance-asset.schema.json+ (single +expression+, +gesture+, +gaze+, free-string presets, +compatibility.compiler_version+); +schemas/reflex-decision.schema.json+ (+reaction_family+ and +gesture_family+ are free nullable strings, +attention_target+ is a five-value enum, +emotion_intensity+ is a float); +GeneratedReply { text }+, +SpeechRequest { text, style: Option<String> }+ in +crates/domain/src/interfaces.rs+; the existing +generative::PerformanceCompiler+ (reply plus speech artifact to +PerformanceAsset+, +crates/generative/src/lib.rs:145+, +:273+).
+
+What exists today, which the design must not break:
+
+* a generated reply compiles to one asset with a fixed +speaking.neutral+ expression at 0.4, gaze +camera+, no gesture, and one interrupt point at the end (+generative/src/lib.rs:430-500+); there is no model-supplied performance information at all;
+* cached assets carry free-string preset names (the starter pack uses +smile_soft+, +nod_small+, +tilt_head_small+, +recoil_small+, +eyes_wide+, ...) and one expression, one gesture and one gaze per asset, located by the first timeline marker of the same name (+marker_offset+);
+* +SpeechRequest.style+ is an unvalidated free string, the only prosody hook, and there is no TTS capability description (assumption A-TTS-001).
+
+== Hard constraints
+
+* Model, Jev and generated output are data, never runtime authority (AGENTS.md invariants). A performance hint cannot issue OBS commands, grant tool capability, change moderation, or bypass the output gate (issue #84 "Authority boundary").
+* The normalizer, not the payload, assigns source class, trust and priority. A hint therefore cannot carry a priority or declare itself interrupt-critical (ADR-0005 hard constraints).
+* No raw avatar parameter ids, VRM node/expression names or VTube Studio hotkey/parameter ids in the domain contract (issue #84 non-goals, ADR-0003). They may exist only in operator-owned avatar profile data.
+* No general animation scripting language; no arbitrary model-generated map of parameters (issue #84).
+* Runtime state is explicitly bounded; replay-relevant decisions use logical ordering; Jev/LLM never run in the frame/motor loop; avatar/TTS failure degrades without freezing the deterministic performer.
+* Wire and schema changes are schema-first with positive and negative fixtures and Rust/TypeScript parity (AGENTS.md "Schema/domain change order"; +docs/domain-contract.adoc+ treats a changed or narrowed enum as an incompatible change).
+* Provider-specific DTOs (TTS styles, VTS hotkeys, renderer protocol) stay behind adapters.
+
+== Assumptions
+
+Existing: A-TTS-001 (TTS prosody/streaming controls are provider-specific; this ADR is a direct consumer), A-VTS-001 (no stale avatar replay), A-AUDIO-001 (logical timeline is not acoustic time).
+
+Proposed new assumptions (to be added to the link:../assumptions.adoc[Assumption Register] if this ADR is accepted; none is validated here):
+
+* A-INTENT-001: a closed vocabulary of about 8 affect classes, 11 gesture families, 5 gaze targets and 4 levels is expressive enough for a Japanese persona's live reactions, with persona-specific richness carried by the avatar profile's preset tables rather than by the vocabulary. Falsifier: #59 human ratings that cite "could not express X" for more than a small fraction of phrases.
+* A-INTENT-002: phrase-relative sync points (phrase start, phrase end, declared pauses, deciles of phrase duration) plus the TTS-reported duration are enough for natural gesture timing without word-level timestamps. Falsifier: gesture-onset mismatch labels in #59 that correlate with within-phrase position. Word-level sync needs TTS timing evidence that no current backend contract provides.
+* A-INTENT-003: the avatar profiles in scope (VRM profile from ADR-0003, a VTube Studio hotkey profile) can all supply the minimal set +neutral+ affect and +camera+ gaze; every richer item is optional and degrades. Falsifier: a profile that cannot realize neutral or camera.
+
+== Alternatives considered
+
+. *Status quo*: the generative path keeps a fixed neutral expression, cached assets keep their baked free-string presets, Jev's +gesture_family+/+reaction_family+ stay unused strings. Rejected: nothing coordinates speech, face and gaze; the Jev fields cannot be validated; no replay record says why a gesture happened.
+. *Inline markup in the reply text* (a model writes tags such as +[joy]+ or +<|ACT {...}|>+ in the text and the runtime strips and executes them; the AIRI and Open-LLM-VTuber pattern, see the reuse table). Rejected as the contract, mainly on authority grounds (see "Why not inline tags" below).
+. *BML-style behavior markup between planner and compiler* (behavior-level lexemes with a free constraint solver over sync points). Rejected: it is an animation scripting language (issue non-goal) with unbounded constraint graphs, and its text-embedded sync markers are inline markup again. Only the layering and the sync-point idea are kept.
+. *Raw avatar parameter maps from the model*: rejected by the issue and ADR-0003.
+. *Closed, quantized, out-of-band PerformanceIntent compiled by a pure function* (this ADR). Adopted as the candidate.
+. *Neural co-speech generator* (EMAGE-style): out of scope; the sparse-anchor principle is adopted, not the model.
+
+=== Why not inline tags
+
+The pattern puts a control channel inside a content channel. Three concrete consequences for this repository:
+
+* *Injection through echoed content.* Both reviewed projects scan the model's text (Open-LLM-VTuber: +extract_emotion+ over each sentence; AIRI: a regular expression over each streamed chunk). A reply that quotes or paraphrases viewer text can reproduce a marker verbatim, so untrusted chat content gains a path into avatar control. Nothing in the intent design lets text positions or text content select a performance.
+* *Parse-then-strip asymmetry.* The text is gated and logged before TTS (ADR-0004 order); a marker parser that runs after, or a strip step that is separate from the extract step, creates a window where the text the gate approved differs from the text spoken or displayed. Typed fields are validated as a whole before commit and never alter the text.
+* *Prompting with runtime identifiers.* AIRI's Live2D ACT prompt lists exact model expression names and motion file names for the model to emit. That makes the model's output a raw model id, which the issue and ADR-0003 forbid in the domain. The intent vocabulary is project-owned and the avatar profile maps it.
+
+Therefore: text is never parsed for performance information. Tag-like tokens that survive in text are ordinary text for the gate and the projection to judge; a counter for them is proposed (Open question Q5).
+
+== Reuse / Adapt / Build comparison
+
+Pattern reuse only; no code, no text and no dependency is taken from any source. Reuse-first vocabulary: adopt / wrap / sidecar / partial reuse / reference only / benchmark first / reject / custom. Facts below come from files read on 2026-11-08 at the named commit.
+
+[cols="2,2,3,3,2"]
+|===
+|Source and license |What was read |Pattern found |Adopted / rejected |Mode
+
+|*BML 1.0 and the SAIBA model*, Radboud University BML 1.0 Standard wiki (projects.cs.ru.is, "BML 1.0 Standard"). The page states no license; the only notice is the Redmine footer. Treated as a published spec: facts read, nothing copied.
+|The standard page as rendered 2026-11-08. The SAIBA/BML papers (Kopp et al., IVA 2006; Vilhjalmsson et al., IVA 2007) were seen only as search-result abstracts and were *not read*.
+|Three stages: intent planner, behavior planner, realizer with feedback. Behaviors carry named sync points (face: start, attackPeak, relax, end; gaze: start, ready, relax, end; head and gesture: start, ready, strokeStart, stroke, strokeEnd, relax, end; speech: start, end plus embedded markers). A block has a +composition+ of MERGE, APPEND or REPLACE. Realizer feedback is progress plus typed warnings (including BEHAVIOR_TYPE_NOT_SUPPORTED). Shift behaviors change the ground state; temporary ones do not.
+|*Adopted*: the three-stage separation (our producers are the intent planner, the compiler is the behavior planner, the ADR-0003 renderer is the realizer); sync points as the only timing vocabulary; a typed warning for an unsupported behavior (our +CompileNote+); the temporary-versus-shift distinction (anchors are temporary, base affect and gaze are shifts); +composition+ as the shape of phrase continuity. *Rejected*: free +synchronize/before/after+ constraints between arbitrary behaviors (unbounded, a scripting language); text-embedded +sync+ markers; custom namespaces; required-block all-or-nothing abort (we degrade instead of aborting).
+|Reference only
+
+|*moeru-ai/airi*, MIT (GitHub spdx MIT), commit +f1a30137d6b4c70a20dc193ab9493aa68db36352+
+|+packages/stage-ui/src/constants/emotions.ts+, +packages/stage-ui/src/constants/prompts/live2d-act.ts+, +packages/stage-ui/src/composables/queues.ts+, +packages/stage-ui-three/src/composables/vrm/expression.ts+. The MMD gaze file named in docs/implementation-accelerator.adoc was *not* read.
+|A closed nine-value +Emotion+ enum (happy, sad, angry, think, surprised, awkward, question, curious, neutral) with a separate table per renderer (VRM expression names, motion names, spine animations); intensity clamped to 0..1 with default 1 for a non-number; per-emotion blend durations; the emote logic yields the viseme morphs (aa ee ih oh ou) while speech is active and tracks the morphs it owns so a reset cannot leave one stuck. Control arrives as an in-band +<|ACT {json}|>+ marker in streamed text, found by a regular expression (greedy; behavior with several markers in one chunk was not run). The Live2D prompt lists exact runtime expression names and motion file names to the model.
+|*Adopted*: closed affect enum plus per-renderer mapping tables (our avatar profile); clamped, defaulted intensity; "expression yields visemes during speech" as a compile rule (consistent with the VRM override semantics below); owned-channel release so cancel cannot strand a face. *Rejected*: in-band markers; handing the model raw runtime ids; per-emotion numeric tuning (blend durations, weights) inside the model-facing contract (it stays in the profile/renderer).
+|Reference only
+
+|*Open-LLM-VTuber*, MIT (LICENSE file read; GitHub reports NOASSERTION because the Live2D sample models carry a separate license, LICENSE-Live2D.md), commit +992309c0aa19845960228f880013d4685fde93b5+
+|+src/open_llm_vtuber/live2d_model.py+ (+emo_map+, +extract_emotion+, +remove_emotion_keywords+), +src/open_llm_vtuber/agent/transformers.py+ (+actions_extractor+ then +display_processor+ then +tts_filter+ per sentence), +prompts/utils/live2d_expression_prompt.txt+, +model_dict.json+ (+emotionMap+).
+|The prompt is built from the model's own +emotionMap+ keys, so the vocabulary the LLM sees is the per-model key set; bracket tags such as +[joy]+ are scanned from each sentence; the map goes from a keyword to a numeric expression index (several keywords may share an index, for example anger and disgust), which is a many-to-one fallback; extraction and removal are separate steps; there is no intensity, no timing and no gaze or gesture field.
+|*Adopted*: the many-to-one keyword-to-expression map as precedent for the deterministic affect fallback chain; per-phrase (per-sentence) stage ordering as the shape of causal phrase-local compilation. *Rejected*: bracket tags in text; separate extract and strip steps; the vocabulary being whatever the model file exposes (ours is fixed and versioned).
+|Reference only
+
+|*VedalAI/neuro-sdk*, MIT (GitHub spdx), commit +0cad33ac692f6cc90d36747fea9bbc53ca34b97a+
+|+API/SPECIFICATION.md+ (headings and a search for emote/expression/gesture/gaze/animation terms) and the proposals file for the same terms.
+|No expression, gesture, gaze or animation vocabulary exists in the spec; it defines context, action registration with a JSON schema, forced actions, action results, and a speech-finished message.
+|*Not applicable to the intent contract.* Its action registration is relevant to #221 (Task Plane) and its speech-finished message to ADR-0004, both already recorded elsewhere. Recorded here so the lack of a performance vocabulary is not rediscovered.
+|Not applicable
+
+|*VRM 1.0 specification*, vrm-c/vrm-specification (GitHub reports no license; no license file at the repository root; facts read, nothing copied), commit +94e82dd346fa6cf0337c4421728640e5252dd38e+
+|+specification/VRMC_vrm-1.0/expressions.md+, +specification/VRMC_vrm-1.0/lookAt.md+.
+|Preset expressions: happy, angry, sad, relaxed, surprised (emotions); aa ih ou ee oh (lip sync); blink, blinkLeft, blinkRight; lookUp, lookDown, lookLeft, lookRight; neutral. Values are in 0..1 and implementations should clamp. Custom expressions are allowed. Lip sync, blink and gaze are *procedural*: an expression can set +overrideMouth+, +overrideBlink+, +overrideLookAt+ to none, block or blend, so a smile may attenuate or zero the visemes. LookAt is either bone-driven or expression-driven, with a single gaze direction for both eyes, yaw and pitch from a head-relative space.
+|*Adopted as constraints on the profile mapping*: the five VRM emotion presets plus neutral cover the affect classes joy, anger, sadness, calm, surprise, neutral (ADR-0003's spike profile already uses these six names); thinking and embarrassed have no preset and must degrade; visible lip sync under an expression is not guaranteed by the model, so the compiler must not promise that a smile coexists with full visemes; symbolic gaze maps to yaw/pitch only inside the profile.
+|Spec (constraint source)
+
+|*EMAGE* (CVPR 2024), named by the issue
+|Not re-read here (the issue's own link).
+|Sparse predefined motion hints combined with speech rhythm.
+|*Adopted as a principle only* (sparse anchors; the compiler fills the intervals); no model.
+|Reference only
+
+|*Project-owned PerformanceIntent and compiler*
+|-
+|-
+|*Custom*, with a new type, a closed vocabulary, a quantization rule, a validation/clamp pipeline, capability tables, a replay identity and the authority rules above. No evaluated project offers bounded versioned vocabularies with replay identity, an authority boundary that excludes in-band control, and a deterministic fallback chain; the only generic mechanisms involved are table lookups and a seeded RNG already in the repository (+SeededRng+).
+|Custom
+|===
+
+Reuse-first record for this issue: *custom* for the contract and compiler (reason in the last row); *reference only* for every external source above; *no dependency added*.
