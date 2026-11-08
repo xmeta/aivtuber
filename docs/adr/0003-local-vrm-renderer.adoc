@@ -139,6 +139,8 @@ All of the following is *executable spike evidence from one Windows 11 machine*,
 |0.6 ms
 |===
 
+The cold-start remainder (about 1.5 to 2 s of navigation-to-ready) is unattributed and must be profiled before any latency claim is made from these numbers.
+
 Notes on these numbers:
 
 * "Cold" start is not decomposed. The model fetch+parse+first frame account for roughly 0.25-0.45 s; the remaining ~1.5 s of navigation-to-ready was not attributed (browser page start, 0.76 MB script evaluation and WebGL init are candidates). Three samples per mode is a smoke measurement, not a distribution.
@@ -164,7 +166,8 @@ Proposed, for the supervisor to accept or reject:
 . *Process boundary:* the Rust runtime owns a loopback HTTP+WebSocket listener (+LocalAvatarAdapter+). The renderer page (OBS Browser Source, a Tauri WebView, or a local browser) is the WebSocket *client*, so a browser page needs no listener and the same URL works in OBS. The Rust side stays authoritative for ordering, authorization and freshness.
 . *Epoch and sequence:* the renderer mints a random epoch per page load and per WebSocket connection and resets to neutral. The host stamps every command with the epoch it learned from +hello+ and a per-epoch strictly increasing +seq+ starting at 1. The renderer rejects a command whose epoch differs from its own or whose +seq+ is not greater than the last accepted one, and acks each command (+applied+ or +rejected+ with a typed reason). The host keeps no outbound queue across connections and only issues commands derived from the current scheduler state/generation after +ready+.
 . *Health/readiness:* +hello+ (protocol version, epoch, profile id, model identity: SHA-256 + VRM spec + name), +ready+ (after first neutral frame), periodic +health+ (fps, last seq, frame counter). The host treats missing +ready+ or heartbeats as +Unavailable+ using monotonic timing; this never blocks the deterministic performer.
-. *Model/profile identity:* the +hello+ model hash and +profile id+ feed the existing avatar compatibility identity used by the asset store (see Open questions for the exact field).
+. *Model/profile identity:* the +hello+ model hash and +profile id+ feed the existing avatar compatibility identity used by the asset store (the exact field is deferred to the implementation issue, see Decisions).
+. *Integration point:* +LocalAvatarAdapter+ implements +AvatarOutput+ with typed +AvatarPlaybackCommand+; the +AvatarAdapter+ / +AvatarAction+ string path is not extended.
 . *Wire DTOs* stay adapter-private (renderer protocol schema + fixtures next to the adapter) and are not added to +aivtuber-domain+.
 
 === Proposed protocol sketch (spike shape, not a final schema)
@@ -178,7 +181,7 @@ renderer -> host:  hello  { proto, epoch, profile, renderer{three}, model{sha256
 host -> renderer:  cmd    { epoch, seq, op: expression|viseme|gaze|gesture|reset, ...typed args }
 ----
 
-Host state machine: +Disconnected -> Connected(hello) -> Ready(epoch) -> Disconnected+. On +hello+: drop in-flight commands, reset +seq+, verify profile/model compatibility. On socket close: forget the epoch; +send+ with no ready renderer returns +Unavailable+ and buffers nothing. Hardening: 4 KiB max message, one renderer connection (newest wins in the spike), +Origin+ equal to the served origin, per-launch random token on the WebSocket URL.
+Host state machine: +Disconnected -> Connected(hello) -> Ready(epoch) -> Disconnected+. On +hello+: drop in-flight commands, reset +seq+, verify profile/model compatibility. On socket close: forget the epoch; +send+ with no ready renderer returns +Unavailable+ and buffers nothing. Hardening: 4 KiB max message, one renderer connection (a second connection is rejected while one is live; the spike used "newest wins", which is superseded), +Origin+ equal to the served origin, per-launch random token on the WebSocket URL.
 
 === Provider-neutral mapping
 
@@ -194,8 +197,8 @@ Neutral names come from the existing contracts (+AvatarPlaybackCommand+, +perfor
 |+expressionManager.setValue+
 
 |+Viseme { viseme, weight }+
-|A, I, U, E, O, N; weight 0..1
-|A to +aa+, I to +ih+, U to +ou+, E to +ee+, O to +oh+; N = all visemes zero; only one viseme active
+|aa, ih, ou, ee, oh, plus neutral (all zero); weight 0..1 (the spike wire used the letters A, I, U, E, O, N as stand-ins; the decided neutral set is the VRM 1.0 names, and the VTS adapter maps its A/I/U/E/O onto them)
+|identity for aa/ih/ou/ee/oh (VRM 1.0 spec names inside the renderer profile only); neutral = all visemes zero; only one viseme active
 |+expressionManager.setValue+
 
 |+Gaze { target }+
@@ -214,14 +217,14 @@ Neutral names come from the existing contracts (+AvatarPlaybackCommand+, +perfor
 |renderer state reset; also executed implicitly at every new epoch
 |===
 
-Unmapped presets are rejected, never passed through; the neutral vocabulary is not yet defined in the domain (open question).
+Unmapped presets are rejected, never passed through; the viseme set and the expression/gesture preset vocabularies are not yet canonical enums in +schemas/+ (see Deferred).
 
 == CI strategy without a GPU
 
 * Do not make GPU rendering part of the required-gate. Gate on: (a) Rust-side protocol/state-machine tests against a scripted in-process fake renderer (epoch/seq refusal, no replay, bounded in-flight, +Unavailable+ semantics); (b) renderer unit tests of the mapping and clamping logic with a stub +expressionManager+, no WebGL; (c) a JSON fixture set of commands and expected acks.
 * Optional, non-blocking smoke job: headless Chromium forced to SwiftShader (flags above) loads the bundle, waits for +ready+, sends the commands, and asserts: renderer-reported VRM values, nonzero count of opaque pixels, alpha 0 at corners, restart-neutral behavior. This worked on the spike machine at about 9 fps, so assertions must be state-based and tolerant, not pixel-exact.
 * Not verified: a Linux CI container. The spike ran Edge 156 on Windows 11 with SwiftShader forced; WSL Ubuntu was present but untouched. Playwright's bundled Chromium (browser download) was not used and its headless shell may differ. Verify on the actual CI image before promising a gate.
-* The npm/bun supply chain for the renderer is not covered by +cargo deny+ (+docs/supply-chain.adoc+ does not mention npm/bun); see Open questions.
+* The npm/bun supply chain for the renderer is not covered by +cargo deny+ (+docs/supply-chain.adoc+ does not mention npm/bun); see Decisions and Deferred.
 
 == License findings
 
@@ -277,19 +280,30 @@ Model:
 * Motion needs (VRMA clips, physics, full-body) exceed what the Three.js path delivers cheaply; then benchmark +godot-vrm+ for real.
 * A required behavior needs the render loop to take decisions.
 
-== Open questions for the supervisor
+== Decisions on the former open questions
 
-. *Integration point:* implement +AvatarOutput+ (typed +AvatarPlaybackCommand+, used by the app) and/or +AvatarAdapter+ (stringly +AvatarAction+)? The existing VTS adapter encodes actions as strings (+hotkey.trigger:<id>+, +parameters.inject+); a local adapter could add typed actions instead.
-. *Neutral vocabularies:* expression/gesture presets and visemes are free strings today (VTS uses +A I U E O N+; issue says aa/ih/ou/ee/oh). Where is the canonical list defined, and does a pack/asset declare which profile it needs (asset-store +viseme_mapping+ is the likely home)?
-. *Generation:* should +generation+ be sent on the wire so the renderer can drop older generations on its own, or stay Rust-only?
-. *State after reconnect:* the spike resets to neutral on every new epoch and relies on the scheduler to re-issue. Should the renderer instead hold the last pose for a bounded time on a socket drop (visible freeze vs visible snap to neutral)?
-. *Command TTL:* should commands carry a renderer-side expiry (monotonic ms from receive) to drop frozen-in-transit commands, or is epoch+seq enough?
-. *Gaze:* keep symbolic targets only (matches schema) or add numeric/normalized targets?
-. *Wire contract home:* is an adapter-private protocol schema acceptable, or should it live under +schemas/+ as normative to satisfy the schema/domain change order?
-. *Supply chain:* how are npm/bun renderer dependencies gated (lockfile, license, advisories) given +cargo deny+ does not cover them?
-. *Multiple renderer connections:* newest wins (spike), or reject a second renderer?
-. *Which process serves the page and holds the per-launch token:* the Rust runtime directly, or the Tauri shell?
+The supervisor decided the ten questions raised by the spike. They are recorded here as decisions; the Proposed status of this ADR is unchanged.
 
+=== Decisions
+
+. *Integration point:* +AvatarOutput+ with typed +AvatarPlaybackCommand+ (+crates/app/src/lib.rs+, +crates/runtime/src/cached_playback.rs+), because that is what the app schedules. The +AvatarAdapter+ / +AvatarAction+ string path is not extended.
+. *Viseme vocabulary:* the provider-neutral set is the VRM 1.0 published names +aa ih ou ee oh+ plus neutral. VTS's A/I/U/E/O maps onto it 1:1 inside the VTS adapter. No canonical enum exists in +schemas/+ today (+viseme_ref+ and +viseme_mapping+ are free strings); adding one is schema-first work (see Deferred).
+. *+generation+ on the wire:* no. The renderer-minted epoch plus the host-minted seq are the wire freshness check. +generation+ stays host-side scheduling state.
+. *Socket drop:* the renderer snaps to neutral. This is deterministic and never shows a stale emotion.
+. *TTL:* none in the renderer, which must not depend on wall-clock time. The host owns timing and drops commands whose scheduled window has passed before sending. Epoch plus seq cover replay.
+. *Gaze:* symbolic targets only, matching the existing enums (+gaze+ in +performance-asset.schema.json+; +attention_target+ in the reflex decision). Numeric gaze is out of scope.
+. *Renderer wire protocol:* adapter-private, because a provider-specific DTO stays behind the adapter (AGENTS.md). It is versioned, with positive and negative fixtures in the adapter crate, and it is not placed under +schemas/+.
+. *npm supply chain:* the renderer bundle uses the committed +bun.lock+ with +--frozen-lockfile+, exact pins, an MIT/BSD/Apache/ISC license allowlist check in CI, and an advisory audit. The implementation issue extends +docs/supply-chain.adoc+ (see Deferred).
+. *Second connection:* rejected (HTTP 409 or 403) while one connection is live. Replacing the first would let any local process hijack the avatar. This supersedes the spike's "newest wins".
+. *Page and token:* the Rust runtime serves the bundled page on loopback and mints the per-launch token, so authority stays in Rust. A future Tauri shell only hosts the webview.
+
+=== Deferred to the implementation issue
+
+* Canonical viseme enum (+aa ih ou ee oh+ plus neutral), added schema-first with positive/negative fixtures and Rust/TypeScript parity per the schema/domain change order.
+* Canonical expression and gesture preset vocabularies and how a pack/asset declares the renderer profile it needs (asset-store +viseme_mapping+ is the likely home); the exact compatibility-identity field fed by the +hello+ model hash and profile id.
+* +docs/supply-chain.adoc+ policy text for the renderer bundle (decision 8), landing with the code.
+* The adapter-private protocol version, fixtures and the exact HTTP status for a rejected second connection.
+* The not-yet-attributed cold-start time must be profiled before any latency claim.
 == Related
 
 * Issue: #219 (parent #200)
