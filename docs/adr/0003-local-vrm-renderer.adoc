@@ -1,0 +1,313 @@
+= ADR-0003: Local OSS VRM renderer behind a loopback avatar adapter
+:status: Proposed
+:date: 2026-11-08
+
+== Context
+
+Issue #219 asks for a zero-paid-dependency local avatar path (VRM 1.0 / MToon, transparent output, expression / look-at / viseme, neutral/reset, health, restart without stale replay) that keeps the provider-neutral avatar contract, scheduler, replay and authority boundaries in Rust. VTube Studio stays an optional adapter (see link:../vts-obs-adapters.adoc[VTS/OBS adapters]).
+
+The issue is +status:design-ready+: this ADR records a candidate decision, a proposed process boundary, and the evidence from a throwaway spike. It does not authorize production implementation. Nothing from the spike is committed; only the numbers and the design are recorded here.
+
+Current code that the design must fit:
+
+* +AvatarAdapter::execute(&AuthorizedAvatarAction)+ in +crates/domain/src/interfaces.rs+, where +AvatarAction+ is a stringly typed +{ action, parameters: BTreeMap<String, f64> }+;
+* the production composition path in +crates/app+, which calls +AvatarOutput::execute(&AvatarPlaybackCommand)+ with the typed variants +Expression { preset, intensity }+, +Gesture { preset, amplitude }+, +Gaze { target }+, +Viseme { viseme, weight }+, each carrying a +generation+ (+crates/runtime/src/cached_playback.rs+);
+* the VTS output in +crates/app/src/outputs.rs+ that maps these variants to hotkeys / injected parameters;
+* assumption A-VTS-001 (link:../assumptions.adoc[Assumption Register]): reconnect must not replay stale avatar commands.
+
+== Hard constraints
+
+* Model/generated output is data; the renderer cannot mint operator/tool authority. Renderer-to-host messages are untrusted, bounded data and never feed authorization.
+* Each avatar command still passes through +authorize_avatar_action+ (+Capability::AvatarControl+) before it reaches the adapter, exactly as for VTS.
+* No raw renderer, VRM node or expression names in +aivtuber-domain+ or in scheduler/replay decisions. They may appear only inside the renderer profile.
+* The control transport binds to loopback only; remote exposure is opt-in and authenticated (issue #219).
+* Reconnect, reload or renderer restart cannot replay stale avatar commands (A-VTS-001, issue #219).
+* Retained state on both sides is explicitly bounded (no unbounded outbound queue).
+* No production runtime CDN; dependencies are bundled and pinned.
+* High-level decisions are outside the renderer's 30-60 Hz loop; the renderer only interpolates/blends.
+* Avatar model licenses are independent of the code license and must be surfaced to the user.
+
+== Assumptions
+
+No existing assumption ID covers renderer choice. Proposed new assumptions (to be added to the register if this ADR is accepted):
+
+* A-VRM-001: Chromium-based browser surfaces (OBS Browser Source / CEF, Tauri WebView2) can run WebGL2 with an alpha canvas and honor a transparent page background. Verified here only in desktop Edge/Chromium headless; OBS and Tauri were not run.
+* A-VRM-002: +@pixiv/three-vrm+ 3.x keeps VRM 1.0 + MToon support and stays MIT and maintained. Revisit on the conditions below.
+
+== Alternatives considered
+
+. Status quo: VTube Studio only (rejected for the baseline: requires an external application; issue #219).
+. Adopt +@pixiv/three-vrm+ (Three.js) as a bundled library inside an aivtuber-owned renderer page (wrap).
+. Sidecar a Godot process with V-Sekai +godot-vrm+.
+. Custom renderer: rejected without evaluation; contradicts the reuse-first rule and both candidates already cover VRM 1.0 / MToon.
+
+== Reuse / Adapt / Build comparison
+
+The +godot-vrm+ column is a desk comparison from repository metadata only (GitHub API and README on 2026-11-08). It was not built or run.
+
+[cols="2,2,2,1"]
+|===
+|Dimension |three-vrm (measured spike) |godot-vrm (desk research only) |Status quo (VTS)
+
+|Reuse mode
+|Wrap: bundled pinned library inside a project-owned page
+|Sidecar: separate Godot runtime/process (addon, not a library)
+|Existing adapter
+
+|Code license
+|MIT (all 15 production packages MIT)
+|MIT with a note that sample models carry their own licenses; GitHub reports it as NOASSERTION because of that note
+|Proprietary host application; plugin API only
+
+|Maintenance signal
+|v3.5.5 released 2026-07-09; last push 2026-10-22
+|No GitHub releases; last push 2026-07-08; Godot 4 addon
+|n/a
+
+|VRM 1.0 / MToon
+|Yes; sample VRM 1.0 + MToon model rendered
+|README states VRM 1.0 import/export and MToon (not run)
+|Depends on the user's imported model
+
+|Transparent capture
+|Verified (alpha canvas + transparent page; screenshot alpha stats below). OBS not run
+|Not evaluated (Godot transparent window / window capture)
+|OBS capture of VTS (not evaluated here)
+
+|Platform / deployment fit
+|Same web surface as the planned Tauri shell and OBS Browser Source; no extra runtime
+|Second runtime and packaging path
+|Paid/third-party host required for the product baseline? No, but user must install it
+
+|Headless CI
+|Works with software GL on one machine (see CI strategy)
+|Not evaluated
+|Not possible without the application
+
+|Operational complexity
+|One loopback host + one page
+|Process supervision, Godot export templates, IPC
+|Existing
+|===
+
+== Evidence
+
+All of the following is *executable spike evidence from one Windows 11 machine*, throwaway code kept outside the repository. Categories: spike = observed local behavior; spec = vendor docs/metadata; unverified = listed under Known limitations.
+
+=== Spike setup
+
+* +three+ 0.187.0 and +@pixiv/three-vrm+ 3.5.5, exact-pinned, bundled with Vite 8.0.3 (no CDN; the page only talks to 127.0.0.1).
+* Test host (Node 24.19.0, +ws+ 8.22.1) standing in for the Rust host: serves the bundle and the control WebSocket on 127.0.0.1.
+* Browser: Microsoft Edge 156.0.4314.58 driven by +playwright-core+ 1.65.0 (+channel: 'msedge'+). Playwright's own bundled Chromium was not downloaded or used.
+* Software rendering mode: +--disable-gpu --use-gl=angle --use-angle=swiftshader --enable-unsafe-swiftshader --ignore-gpu-blocklist+. The page reported WebGL renderer "ANGLE ... SwiftShader Device (Subzero) ... SwiftShader driver". GPU mode: default flags, NVIDIA RTX 2070 SUPER (D3D11 via ANGLE).
+* Model: VRM1_Constraint_Twist_Sample.vrm (10,776,032 bytes, SHA-256 12C2B97E...631A2 as hashed on this machine), 1280x720 canvas.
+
+=== Measured numbers
+
+[cols="3,2,2"]
+|===
+|Measurement |SwiftShader (no GPU) |GPU (RTX 2070 SUPER)
+
+|Production JS bundle (single chunk, minified)
+2+|761,637 bytes raw; 186,965 gzip -9; 151,725 brotli. Plus a 341-byte HTML file. Model is a separate file (10.8 MB) and is not part of the bundle.
+
+|Production dependency tree
+2+|15 packages (three, @pixiv/three-vrm, 6 three-vrm-* subpackages, 7 @pixiv/types-* packages), all MIT per license-checker-rseidelsohn 5.0.1. No other runtime dependencies.
+
+|Cold page start to renderer +ready+ (fresh browser process, n=3)
+|2.45 s, 2.16 s, 1.92 s
+|1.86 s, 1.91 s, 1.72 s
+
+|Model fetch from loopback / parse (in page, n=3)
+|73-83 ms / 137-157 ms
+|64-241 ms / 139-158 ms
+
+|Page script start to first rendered frame (n=3)
+|220-242 ms
+|213-406 ms
+
+|Steady-state render rate (1280x720)
+|about 9 fps (8.7-9.3)
+|60 fps (vsync-limited)
+
+|Command sent to ack after the frame containing the new target state was rendered (n=40, p50 / p95 / max)
+|110.9 / 121.2 / 121.9 ms
+|15.3 / 16.3 / 16.7 ms
+
+|Loopback WebSocket round trip with no frame wait (n=40, p50)
+|56.7 ms (main thread busy with 110 ms frames)
+|0.6 ms
+|===
+
+The cold-start remainder (about 1.5 to 2 s of navigation-to-ready) is unattributed and must be profiled before any latency claim is made from these numbers.
+
+Notes on these numbers:
+
+* "Cold" start is not decomposed. The model fetch+parse+first frame account for roughly 0.25-0.45 s; the remaining ~1.5 s of navigation-to-ready was not attributed (browser page start, 0.76 MB script evaluation and WebGL init are candidates). Three samples per mode is a smoke measurement, not a distribution.
+* The command latency is *command sent by the host to the renderer's ack, sent after the render() call of the frame that includes the applied target*. It excludes compositor presentation, OBS capture/encode and display latency. The renderer additionally interpolates toward the target with a 60 ms time constant, so the visible change completes over roughly 150 ms after the first frame; this is a design parameter, not a measured one. On software GL the latency is one frame (~110 ms) and is dominated by frame time, not by the protocol.
+* A "pixel changed" probe (framebuffer read-back, ack on first changed pixel) was also run but is *not reported as evidence*: spring-bone motion made pixels change between frames even with idle motion disabled (screenshot noise floor in the mouth region about 1,100 pixels), so the probe could not separate the command from background motion. Visible-change evidence is instead: (a) the renderer's own VRM expression values read after each command (+happy=1+, +aa=1+, +oh=0.8+, gaze target 35/10 degrees, all returning to zero after +reset+), and (b) a manual look at one screenshot showing the smiling, open-mouth +joy+ expression. A pixel-diff regression test would need spring bones frozen or a mouth-only region with fixed seeds; not done.
+
+=== Functional results (SwiftShader and GPU runs agree)
+
+* Transparent output: canvas created with +alpha: true+, +setClearColor(0, 0)+, body background computed +rgba(0, 0, 0, 0)+. A Playwright screenshot with +omitBackground+ had alpha 0 at all four corners and 726,071 fully transparent pixels of 921,600 (opaque 193,242; partial/anti-aliased 2,287) in the SwiftShader run; GPU run: 725,475 / 193,886 / 2,239. The same page screenshotted without +omitBackground+ is white (headless default); transparency is what the page offers, and consumers must request it.
+* All five commands worked end to end: expression (+joy+ to +happy+), gaze (+away+), viseme (+A+ to +aa+, +O+ to +oh+, single active viseme), gesture (+nod+ bounded head rotation), +reset+. Unknown presets and raw VRM names sent on the wire (+happy+) were rejected with +unknown_preset+; raw VRM names exist only in the renderer profile.
+* Restart: after +page.reload()+ the new page announced a fresh epoch, started with all expression values at zero and gaze at zero, +last_seq+ 0. The test host then replayed the three pre-reload commands verbatim as soon as the new +hello+ arrived; all three were rejected +stale_epoch+ and state stayed neutral. Within the new epoch a repeated +seq+ was rejected +stale_seq+. A forced WebSocket drop without reload produced a third epoch and neutral state after +ready+. In both runs a command written to the terminated socket was lost, not delivered after reconnect.
+* WebSocket hardening on the test host: the server listened on 127.0.0.1; an upgrade with a foreign +Origin+, a missing +Origin+, or a wrong token returned HTTP 403; matching origin + token connected.
+
+=== Finding that changed the design
+
+After a reconnect without reload, the renderer's internal targets were reset immediately but the VRM expression values only changed on the next rendered frame. A host that reads state at +hello+ sees stale values. The spike therefore announces +ready+ only after the first neutral frame of the new epoch has rendered, and the host must treat +hello+ as "not ready yet".
+
+== Decision
+
+Proposed, for the supervisor to accept or reject:
+
+. *Renderer candidate:* adopt +@pixiv/three-vrm+ + Three.js as the baseline, reuse mode *wrap*: a project-owned renderer page that bundles exact-pinned dependencies and exposes only the project's command protocol. +godot-vrm+ is not selected; it is recorded as "reference only / benchmark first", reopened by the revisit conditions. The comparison is desk-only and does not prove three-vrm is better.
+. *Process boundary:* the Rust runtime owns a loopback HTTP+WebSocket listener (+LocalAvatarAdapter+). The renderer page (OBS Browser Source, a Tauri WebView, or a local browser) is the WebSocket *client*, so a browser page needs no listener and the same URL works in OBS. The Rust side stays authoritative for ordering, authorization and freshness.
+. *Epoch and sequence:* the renderer mints a random epoch per page load and per WebSocket connection and resets to neutral. The host stamps every command with the epoch it learned from +hello+ and a per-epoch strictly increasing +seq+ starting at 1. The renderer rejects a command whose epoch differs from its own or whose +seq+ is not greater than the last accepted one, and acks each command (+applied+ or +rejected+ with a typed reason). The host keeps no outbound queue across connections and only issues commands derived from the current scheduler state/generation after +ready+.
+. *Health/readiness:* +hello+ (protocol version, epoch, profile id, model identity: SHA-256 + VRM spec + name), +ready+ (after first neutral frame), periodic +health+ (fps, last seq, frame counter). The host treats missing +ready+ or heartbeats as +Unavailable+ using monotonic timing; this never blocks the deterministic performer.
+. *Model/profile identity:* the +hello+ model hash and +profile id+ feed the existing avatar compatibility identity used by the asset store (the exact field is deferred to the implementation issue, see Decisions).
+. *Integration point:* +LocalAvatarAdapter+ implements +AvatarOutput+ with typed +AvatarPlaybackCommand+; the +AvatarAdapter+ / +AvatarAction+ string path is not extended.
+. *Wire DTOs* stay adapter-private (renderer protocol schema + fixtures next to the adapter) and are not added to +aivtuber-domain+.
+
+=== Proposed protocol sketch (spike shape, not a final schema)
+
+[source,text]
+----
+renderer -> host:  hello  { proto, epoch, profile, renderer{three}, model{sha256, vrm_spec, name} }
+                   ready  { epoch, frame }            # after first neutral frame of this epoch
+                   health { epoch, fps, last_seq, frame }
+                   ack    { epoch, seq, status: applied|rejected, reason? }
+host -> renderer:  cmd    { epoch, seq, op: expression|viseme|gaze|gesture|reset, ...typed args }
+----
+
+Host state machine: +Disconnected -> Connected(hello) -> Ready(epoch) -> Disconnected+. On +hello+: drop in-flight commands, reset +seq+, verify profile/model compatibility. On socket close: forget the epoch; +send+ with no ready renderer returns +Unavailable+ and buffers nothing. Hardening: 4 KiB max message, one renderer connection (a second connection is rejected while one is live; the spike used "newest wins", which is superseded), +Origin+ equal to the served origin, per-launch random token on the WebSocket URL.
+
+=== Provider-neutral mapping
+
+Neutral names come from the existing contracts (+AvatarPlaybackCommand+, +performance-asset.schema.json+ gaze enum, VTS output's +A I U E O N+ visemes). The right-hand columns are renderer-internal.
+
+[cols="2,2,2,2"]
+|===
+|Neutral command |Neutral argument range |Renderer profile mapping (spike +vrm1-default@1+) |three-vrm API
+
+|+Expression { preset, intensity }+
+|preset: renderer-profile vocabulary (spike: neutral, joy, anger, sadness, calm, surprise); intensity 0..1 (clamped)
+|joy to +happy+, anger to +angry+, sadness to +sad+, calm to +relaxed+, surprise to +surprised+, neutral to +neutral+
+|+expressionManager.setValue+
+
+|+Viseme { viseme, weight }+
+|aa, ih, ou, ee, oh, plus neutral (all zero); weight 0..1 (the spike wire used the letters A, I, U, E, O, N as stand-ins; the decided neutral set is the VRM 1.0 names, and the VTS adapter maps its A/I/U/E/O onto them)
+|identity for aa/ih/ou/ee/oh (VRM 1.0 spec names inside the renderer profile only); neutral = all visemes zero; only one viseme active
+|+expressionManager.setValue+
+
+|+Gaze { target }+
+|camera, chat, game, speaker, away (schema enum)
+|target to (yaw, pitch) degrees: camera (0,0), chat (-25,0), game (20,-15), speaker (0,10), away (35,10), applied to an +Object3D+
+|+vrm.lookAt.target+
+
+|+Gesture { preset, amplitude }+
+|preset: profile vocabulary (spike: nod, shake); amplitude 0..2, effective cap 1
+|procedural bounded rotation of the +head+ humanoid bone; idle chest sway and blink are renderer-local
+|+humanoid.getNormalizedBoneNode+ (spike); VRMA clips via +@pixiv/three-vrm-animation+ were *not* tested
+
+|+Reset+ (new)
+|none
+|all expressions and visemes to 0, gaze to camera, gesture cancelled
+|renderer state reset; also executed implicitly at every new epoch
+|===
+
+Unmapped presets are rejected, never passed through; the viseme set and the expression/gesture preset vocabularies are not yet canonical enums in +schemas/+ (see Deferred).
+
+== CI strategy without a GPU
+
+* Do not make GPU rendering part of the required-gate. Gate on: (a) Rust-side protocol/state-machine tests against a scripted in-process fake renderer (epoch/seq refusal, no replay, bounded in-flight, +Unavailable+ semantics); (b) renderer unit tests of the mapping and clamping logic with a stub +expressionManager+, no WebGL; (c) a JSON fixture set of commands and expected acks.
+* Optional, non-blocking smoke job: headless Chromium forced to SwiftShader (flags above) loads the bundle, waits for +ready+, sends the commands, and asserts: renderer-reported VRM values, nonzero count of opaque pixels, alpha 0 at corners, restart-neutral behavior. This worked on the spike machine at about 9 fps, so assertions must be state-based and tolerant, not pixel-exact.
+* Not verified: a Linux CI container. The spike ran Edge 156 on Windows 11 with SwiftShader forced; WSL Ubuntu was present but untouched. Playwright's bundled Chromium (browser download) was not used and its headless shell may differ. Verify on the actual CI image before promising a gate.
+* The npm/bun supply chain for the renderer is not covered by +cargo deny+ (+docs/supply-chain.adoc+ does not mention npm/bun); see Decisions and Deferred.
+
+== License findings
+
+Code:
+
+* +three+ 0.187.0: MIT. +@pixiv/three-vrm+ 3.5.5 and its 13 sub/types packages: MIT. 15/15 production packages MIT (license-checker-rseidelsohn 5.0.1). Repository LICENSE: MIT, (c) 2019-2026 pixiv Inc.
+* +godot-vrm+: MIT (V-Sekai Contributors; VRM Consortium); repo text says sample models carry their own licenses (+vrm_samples/LICENSE_SAMPLES.txt+, not read in this spike).
+* Spike devDependencies (Vite, ws, playwright-core, pngjs, license-checker) are not shipped; their licenses were not audited.
+
+Model:
+
+* Used: +VRM1_Constraint_Twist_Sample.vrm+ from the +pixiv/three-vrm+ repository (+packages/three-vrm/examples/models/+, commit 3caf7a21 of 2026-10-22). Its embedded VRM 1.0 metadata: author pixiv Inc., +licenseUrl+ https://vrm.dev/licenses/1.0/, avatarPermission +everyone+, commercialUsage +corporation+, modification +allowModificationRedistribution+, allowRedistribution true, credit not required, antisocial/hate usage disallowed. The repository's MIT license covers code; the embedded VRM metadata is the model's license statement and no separate model license file was found in the repository. Because redistribution rights and terms are stated only by the embedded metadata, it was used for local testing only and is not copied into the repository by this ADR.
+* VRoid official sample models were not evaluated.
+* Product consequence (issue #219): the app must read and display VRM +meta+ (license URL, avatarPermission, commercialUsage, redistribution, credit notation) at model load, and must not imply every VRM is streamable or redistributable. Models are local files and are never uploaded implicitly.
+
+== Consequences
+
+=== Positive
+
+* One web surface serves OBS Browser Source, the planned Tauri shell, and CI smoke tests.
+* Renderer is a thin interpolator; authority/ordering stay in Rust. Stale-command refusal is enforced on both sides without relying on a queue.
+* Small dependency surface (15 MIT packages, 187 KB gzip JS).
+
+=== Costs / trade-offs
+
+* Adds a JS toolchain and a protocol to maintain next to Rust.
+* Software-GL latency (~110 ms) makes CI unsuitable for timing assertions.
+* Spring-bone motion makes pixel-exact tests unreliable.
+
+=== Known limitations
+
+* OBS Browser Source was not run; transparency was verified only through headless Chromium screenshots and page/canvas attributes. OBS's CEF behavior, color/alpha handling and its frame-rate setting are unverified.
+* Tauri/WebView2 was not run. WebGPU was not tried (WebGL2 only).
+* Linux and GPU-less container rendering unverified (see CI strategy).
+* Gesture/motion: only two procedural head gestures and idle sway were tried; no VRMA animation clips, no body motion library.
+* Latency does not include presentation, OBS capture or audio sync. Lip-sync to real audio was not tested; visemes were driven by hand.
+* Expression override interaction (a happy expression blocking mouth visemes per the model's override settings) was not examined.
+* Soak, memory growth, and context loss recovery were not tested.
+* The godot-vrm comparison is metadata/README only.
+* Only one model was tried.
+
+== Staging and rollback
+
+. Define the neutral vocabulary and a private protocol schema + fixtures; implement the Rust state machine against a fake renderer. No renderer needed.
+. Add the renderer bundle behind a feature/profile flag next to the VTS output; selection per profile. VTS stays the default until the local path passes the acceptance criteria.
+. Rollback point: remove the profile; no domain type changes if the protocol stays adapter-private. Becomes expensive once the neutral vocabulary and compatibility identity enter asset-store packs.
+
+== Revisit conditions
+
+* OBS Browser Source or Tauri WebView2 fails to render the transparent bundle.
+* The Linux CI smoke cannot run under software GL.
+* +@pixiv/three-vrm+ loses maintenance, changes license, or drops VRM 1.0 / MToon.
+* Motion needs (VRMA clips, physics, full-body) exceed what the Three.js path delivers cheaply; then benchmark +godot-vrm+ for real.
+* A required behavior needs the render loop to take decisions.
+
+== Decisions on the former open questions
+
+The supervisor decided the ten questions raised by the spike. They are recorded here as decisions; the Proposed status of this ADR is unchanged.
+
+=== Decisions
+
+. *Integration point:* +AvatarOutput+ with typed +AvatarPlaybackCommand+ (+crates/app/src/lib.rs+, +crates/runtime/src/cached_playback.rs+), because that is what the app schedules. The +AvatarAdapter+ / +AvatarAction+ string path is not extended.
+. *Viseme vocabulary:* the provider-neutral set is the VRM 1.0 published names +aa ih ou ee oh+ plus neutral. VTS's A/I/U/E/O maps onto it 1:1 inside the VTS adapter. No canonical enum exists in +schemas/+ today (+viseme_ref+ and +viseme_mapping+ are free strings); adding one is schema-first work (see Deferred).
+. *+generation+ on the wire:* no. The renderer-minted epoch plus the host-minted seq are the wire freshness check. +generation+ stays host-side scheduling state.
+. *Socket drop:* the renderer snaps to neutral. This is deterministic and never shows a stale emotion.
+. *TTL:* none in the renderer, which must not depend on wall-clock time. The host owns timing and drops commands whose scheduled window has passed before sending. Epoch plus seq cover replay.
+. *Gaze:* symbolic targets only, matching the existing enums (+gaze+ in +performance-asset.schema.json+; +attention_target+ in the reflex decision). Numeric gaze is out of scope.
+. *Renderer wire protocol:* adapter-private, because a provider-specific DTO stays behind the adapter (AGENTS.md). It is versioned, with positive and negative fixtures in the adapter crate, and it is not placed under +schemas/+.
+. *npm supply chain:* the renderer bundle uses the committed +bun.lock+ with +--frozen-lockfile+, exact pins, an MIT/BSD/Apache/ISC license allowlist check in CI, and an advisory audit. The implementation issue extends +docs/supply-chain.adoc+ (see Deferred).
+. *Second connection:* rejected (HTTP 409 or 403) while one connection is live. Replacing the first would let any local process hijack the avatar. This supersedes the spike's "newest wins".
+. *Page and token:* the Rust runtime serves the bundled page on loopback and mints the per-launch token, so authority stays in Rust. A future Tauri shell only hosts the webview.
+
+=== Deferred to the implementation issue
+
+* Canonical viseme enum (+aa ih ou ee oh+ plus neutral), added schema-first with positive/negative fixtures and Rust/TypeScript parity per the schema/domain change order.
+* Canonical expression and gesture preset vocabularies and how a pack/asset declares the renderer profile it needs (asset-store +viseme_mapping+ is the likely home); the exact compatibility-identity field fed by the +hello+ model hash and profile id.
+* +docs/supply-chain.adoc+ policy text for the renderer bundle (decision 8), landing with the code.
+* The adapter-private protocol version, fixtures and the exact HTTP status for a rejected second connection.
+* The not-yet-attributed cold-start time must be profiled before any latency claim.
+== Related
+
+* Issue: #219 (parent #200)
+* PR: none opened
+* Assumptions: A-VTS-001 (existing); A-VRM-001, A-VRM-002 (proposed)
+* Other ADRs: link:0002-mcp-tool-authority-boundary.adoc[ADR-0002] (authority boundary precedent)
+* Docs: link:../vts-obs-adapters.adoc[VTS/OBS adapters], link:../reuse-first.adoc[Reuse-first], link:../research-register.adoc[Research register]
