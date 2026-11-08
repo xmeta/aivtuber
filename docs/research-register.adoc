@@ -230,7 +230,8 @@ recent multi-level agent evaluation research
 current Japanese-capable VAD/ASR/TTS ecosystems
 |Prefer a sidecar boundary for local VAD/ASR/TTS/diarization rather than embedding a heavy model runtime into deterministic Rust core; retain bounded pre-roll before VAD-triggered utterance extraction
 |#66, #92, #220
-|Japanese accuracy/latency; clipped-prefix rate; pre-roll memory/latency; CPU/GPU footprint; IPC/reconnect; model/license suitability at implementation time
+|Japanese accuracy/latency; clipped-prefix rate; pre-roll memory/latency; CPU/GPU footprint; IPC/reconnect; model/license suitability at implementation time.
+First measurement (synthetic-pause VAD and turn-end bench, #92): link:experiments/EXP-0001-japanese-turn-observation-bench.adoc[EXP-0001].
 
 |Modern TTS
 |GPT-SoVITS;
