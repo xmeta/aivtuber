@@ -14,6 +14,8 @@ Use this register to avoid:
 * turning benchmark numbers from a different population/workload into aivtuber production thresholds;
 * treating GitHub popularity as evidence that a dependency fits deterministic/replay/security requirements.
 
+For a dated, evidence-linked comparison with competing open-source projects (what is shipped, designed, measured or not started here versus there), see link:competitive-landscape.adoc[Competitive Capability Landscape].
+
 == Status semantics
 
 Repository issue labels distinguish implementation and design work:
