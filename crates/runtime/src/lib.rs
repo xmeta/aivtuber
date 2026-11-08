@@ -10,7 +10,7 @@ pub use cached_playback::*;
 
 use aivtuber_domain::{
     AuthenticatedControl, AuthenticatedControlCommand, Capability, EventEnvelope, EventKind,
-    SecurityPlane, TrustLevel,
+    SecurityPlane, SourceClass, TrustLevel,
 };
 use aivtuber_scheduler::{Scheduler, SchedulerConfig};
 use aivtuber_telemetry::{AuditCategory, AuditRecord, SecretRedactor};
@@ -89,6 +89,116 @@ pub enum ContentAdmitDecision {
     DroppedRate,
     DroppedBackpressure,
     RejectedNonContent,
+    /// The record declared a trust level above the operator-configured ceiling
+    /// or a source class outside the configured allow-set (#257). The record is
+    /// rejected and audited, never rewritten to fit.
+    RejectedIngressPolicy,
+}
+
+/// Operator-configured ceiling for the stdin content ingress (#257).
+///
+/// A record's `source` is producer-chosen and spoofable, so the ceiling is a
+/// property of the ingress channel the operator wired up, not of anything the
+/// record says about itself. A record above the ceiling is rejected whole;
+/// declared values are never clamped, so a mislabelled producer is visible
+/// instead of silently repaired. The default admits everything the envelope
+/// validation already admits, so existing deployments are unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IngressPolicy {
+    max_trust: TrustLevel,
+    /// One bit per `SourceClass`; see `class_bit`.
+    allowed_classes: u8,
+}
+
+impl Default for IngressPolicy {
+    fn default() -> Self {
+        Self {
+            max_trust: TrustLevel::Trusted,
+            allowed_classes: u8::MAX,
+        }
+    }
+}
+
+fn trust_rank(trust: TrustLevel) -> u8 {
+    match trust {
+        TrustLevel::Untrusted => 0,
+        TrustLevel::SemiTrusted => 1,
+        TrustLevel::Trusted => 2,
+    }
+}
+
+fn class_bit(class: SourceClass) -> u8 {
+    1 << match class {
+        SourceClass::PublicChat => 0,
+        SourceClass::Donation => 1,
+        SourceClass::Speech => 2,
+        SourceClass::Game => 3,
+        SourceClass::Stream => 4,
+        SourceClass::Timer => 5,
+        SourceClass::Operator => 6,
+        SourceClass::System => 7,
+    }
+}
+
+fn parse_source_class(name: &str) -> Option<SourceClass> {
+    Some(match name {
+        "public_chat" => SourceClass::PublicChat,
+        "donation" => SourceClass::Donation,
+        "speech" => SourceClass::Speech,
+        "game" => SourceClass::Game,
+        "stream" => SourceClass::Stream,
+        "timer" => SourceClass::Timer,
+        "operator" => SourceClass::Operator,
+        "system" => SourceClass::System,
+        _ => return None,
+    })
+}
+
+impl IngressPolicy {
+    pub fn new(max_trust: TrustLevel, allowed: &[SourceClass]) -> Self {
+        Self {
+            max_trust,
+            allowed_classes: allowed
+                .iter()
+                .fold(0, |bits, class| bits | class_bit(*class)),
+        }
+    }
+
+    /// Parse operator text: `max_trust` is `untrusted|semi_trusted|trusted`,
+    /// `classes` a comma-separated list of source classes. `None` keeps the
+    /// permissive default for that dimension; anything unrecognised is an
+    /// error so a typo cannot silently widen the ceiling.
+    pub fn parse(max_trust: Option<&str>, classes: Option<&str>) -> Result<Self, RuntimeError> {
+        let mut policy = Self::default();
+        if let Some(value) = max_trust {
+            policy.max_trust = match value.trim() {
+                "untrusted" => TrustLevel::Untrusted,
+                "semi_trusted" => TrustLevel::SemiTrusted,
+                "trusted" => TrustLevel::Trusted,
+                _ => {
+                    return Err(RuntimeError::InvalidConfiguration(
+                        "ingress max trust must be untrusted, semi_trusted or trusted",
+                    ));
+                }
+            };
+        }
+        if let Some(value) = classes {
+            let mut bits = 0_u8;
+            for name in value.split(',') {
+                let class = parse_source_class(name.trim()).ok_or(
+                    RuntimeError::InvalidConfiguration("unknown ingress source class"),
+                )?;
+                bits |= class_bit(class);
+            }
+            policy.allowed_classes = bits;
+        }
+        Ok(policy)
+    }
+
+    fn admits(&self, event: &EventEnvelope) -> bool {
+        trust_rank(event.trust_level) <= trust_rank(self.max_trust)
+            && self.allowed_classes & class_bit(event.source_class) != 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,6 +384,8 @@ pub struct SecurityRuntime {
     rate_limit_sources_expired: u64,
     rate_limit_sources_rejected: u64,
     content_queue_high_water: usize,
+    ingress_policy: IngressPolicy,
+    ingress_policy_rejected: u64,
     /// Bounded allowlist feed for the #68 support bundle: the last K admitted
     /// content events' correlation ids, mapped to their event id and sequence.
     /// Correlation ids are operator-generated incident references (never raw
@@ -327,9 +439,22 @@ impl SecurityRuntime {
             rate_limit_sources_expired: 0,
             rate_limit_sources_rejected: 0,
             content_queue_high_water: 0,
+            ingress_policy: IngressPolicy::default(),
+            ingress_policy_rejected: 0,
             correlations: BTreeMap::new(),
             correlation_order: Vec::new(),
         })
+    }
+
+    /// Install the stdin content-ingress ceiling (#257). Applies to every
+    /// later `admit_content_bytes`; the default policy changes nothing.
+    pub fn set_ingress_policy(&mut self, policy: IngressPolicy) {
+        self.ingress_policy = policy;
+    }
+
+    /// Records rejected for exceeding the ingress ceiling since startup.
+    pub fn ingress_policy_rejected(&self) -> u64 {
+        self.ingress_policy_rejected
     }
 
     pub fn scheduler(&self) -> &Scheduler {
@@ -463,6 +588,16 @@ impl SecurityRuntime {
                 "control/system authority is not accepted on content ingress",
             );
             return Ok(ContentAdmitDecision::RejectedNonContent);
+        }
+
+        if !self.ingress_policy.admits(&event) {
+            self.ingress_policy_rejected = self.ingress_policy_rejected.saturating_add(1);
+            self.record_ingress(
+                &event,
+                "rejected_ingress_policy",
+                "declared trust/source class exceeds the configured ingress ceiling",
+            );
+            return Ok(ContentAdmitDecision::RejectedIngressPolicy);
         }
 
         let payload_bytes = serde_json::to_vec(&event.payload)
@@ -937,6 +1072,67 @@ mod tests {
             ContentAdmitDecision::DroppedPayloadBytes
         );
         assert_eq!(runtime.content_len(), 0);
+    }
+
+    #[test]
+    fn ingress_ceiling_rejects_and_counts_semi_trusted_and_other_classes() {
+        let policy = IngressPolicy::parse(Some("untrusted"), Some("public_chat")).expect("policy");
+        let mut runtime = runtime_with(SecurityRuntimeConfig::default(), &[]);
+        runtime.set_ingress_policy(policy);
+
+        let mut semi = chat_event("evt-semi", 1, "twitch:a", "hi");
+        semi.trust_level = TrustLevel::SemiTrusted;
+        assert_eq!(
+            runtime
+                .admit_content_bytes(&serde_json::to_vec(&semi).unwrap(), 0)
+                .unwrap(),
+            ContentAdmitDecision::RejectedIngressPolicy
+        );
+
+        let mut donation = chat_event("evt-don", 2, "twitch:a", "hi");
+        donation.kind = EventKind::ChatDonation;
+        donation.source_class = SourceClass::Donation;
+        assert_eq!(
+            runtime
+                .admit_content_bytes(&serde_json::to_vec(&donation).unwrap(), 0)
+                .unwrap(),
+            ContentAdmitDecision::RejectedIngressPolicy
+        );
+        assert_eq!(runtime.ingress_policy_rejected(), 2);
+        assert_eq!(runtime.content_len(), 0);
+
+        let ok = chat_event("evt-ok", 3, "twitch:a", "hi");
+        assert_eq!(
+            runtime
+                .admit_content_bytes(&serde_json::to_vec(&ok).unwrap(), 0)
+                .unwrap(),
+            ContentAdmitDecision::Queued
+        );
+        assert_eq!(runtime.ingress_policy_rejected(), 2);
+    }
+
+    #[test]
+    fn default_ingress_policy_keeps_existing_admission() {
+        assert_eq!(
+            IngressPolicy::parse(None, None).unwrap(),
+            IngressPolicy::default()
+        );
+        let mut runtime = runtime_with(SecurityRuntimeConfig::default(), &[]);
+        let mut semi = chat_event("evt-semi", 1, "chat-a", "hi");
+        semi.trust_level = TrustLevel::SemiTrusted;
+        assert_eq!(
+            runtime
+                .admit_content_bytes(&serde_json::to_vec(&semi).unwrap(), 0)
+                .unwrap(),
+            ContentAdmitDecision::Queued
+        );
+        assert_eq!(runtime.ingress_policy_rejected(), 0);
+    }
+
+    #[test]
+    fn ingress_policy_parse_rejects_typos() {
+        assert!(IngressPolicy::parse(Some("untrusts"), None).is_err());
+        assert!(IngressPolicy::parse(None, Some("public_chat,chat")).is_err());
     }
 
     #[test]
