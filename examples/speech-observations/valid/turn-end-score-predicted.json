@@ -1,0 +1,19 @@
+{
+  "schema_version": "0.1.0",
+  "provider_id": "silero-vad",
+  "provider_version": "6.2.3",
+  "language": "ja-JP",
+  "observations": [
+    {
+      "kind": "turn_end_score",
+      "speaker_id": "viewer-a",
+      "observed_at_ms": 2700,
+      "expires_at_ms": 3200,
+      "provider": "vap-style",
+      "model_id": "vap-ja:0.1",
+      "calibrated": true,
+      "score": 0.4,
+      "prediction_horizon_ms": 500
+    }
+  ]
+}

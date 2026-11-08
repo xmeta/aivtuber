@@ -1,0 +1,16 @@
+{
+  "schema_version": "0.1.0",
+  "provider_id": "silero-vad",
+  "provider_version": "6.2.3",
+  "language": "ja",
+  "observations": [
+    {
+      "kind": "turn_end_score",
+      "speaker_id": "viewer-a",
+      "observed_at_ms": 2700,
+      "provider": "smart-turn",
+      "model_id": "smart-turn-v3.2-cpu",
+      "score": 0.62
+    }
+  ]
+}

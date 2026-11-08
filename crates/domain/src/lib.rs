@@ -12,6 +12,7 @@ mod interfaces;
 mod reflex;
 pub mod scenario;
 mod sidecar;
+mod speech;
 mod task;
 
 pub use avatar::Viseme;
@@ -52,6 +53,14 @@ pub use scenario::*;
 pub use sidecar::{
     MAX_SIDECAR_CLAIM_BYTES, MAX_SIDECAR_QUERY_BYTES, MAX_SIDECAR_RECALL_ITEMS, MemorySidecar,
     SidecarClaim, SidecarHandle, SidecarRecallItem, SidecarRecallQuery,
+};
+pub use speech::{
+    FallbackTurnConfig, FallbackTurnSignal, MAX_LANGUAGE_LEN, MAX_MODEL_ID_LEN,
+    MAX_OBSERVATION_TIME_MS, MAX_OBSERVATION_VALIDITY_MS, MAX_PREDICTION_HORIZON_MS,
+    MAX_PROVIDER_TOKEN_LEN, MAX_SPEAKER_ID_LEN, MAX_SPEECH_OBSERVATION_BATCH_BYTES,
+    MAX_SPEECH_OBSERVATIONS_PER_BATCH, SPEECH_OBSERVATION_SCHEMA_VERSION, SpeakerActivity,
+    SpeakerActivityState, SpeechActivityObservation, SpeechEdge, SpeechObservation,
+    SpeechObservationBatch, TurnEndFallbackReason, TurnEndScoreObservation, fallback_turn_signal,
 };
 pub use task::{
     AgentTask, MAX_TASK_ID_BYTES, MAX_TASK_LIFETIME_MS_HARD, MAX_TASK_OBSERVATIONS_HARD,

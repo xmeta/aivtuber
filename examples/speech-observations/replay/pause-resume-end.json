@@ -1,0 +1,134 @@
+{
+  "schema_version": "0.1.0",
+  "name": "speech start, 700 ms mid-utterance pause, resumption, then a true end",
+  "config": {},
+  "steps": [
+    {
+      "now_ms": 50,
+      "poll": "viewer-a",
+      "expect_signal": "no_speech"
+    },
+    {
+      "now_ms": 100,
+      "deliver": {
+        "schema_version": "0.1.0",
+        "provider_id": "silero-vad",
+        "provider_version": "6.2.3",
+        "language": "ja",
+        "observations": [
+          {
+            "kind": "speech_activity",
+            "speaker_id": "viewer-a",
+            "edge": "start",
+            "observed_at_ms": 100,
+            "confidence": 0.93
+          }
+        ]
+      },
+      "expect_outcomes": [
+        "accepted"
+      ]
+    },
+    {
+      "now_ms": 600,
+      "poll": "viewer-a",
+      "expect_signal": "speaker_active"
+    },
+    {
+      "now_ms": 1300,
+      "deliver": {
+        "schema_version": "0.1.0",
+        "provider_id": "silero-vad",
+        "provider_version": "6.2.3",
+        "language": "ja",
+        "observations": [
+          {
+            "kind": "speech_activity",
+            "speaker_id": "viewer-a",
+            "edge": "end",
+            "observed_at_ms": 1290,
+            "confidence": 0.88
+          }
+        ]
+      },
+      "expect_outcomes": [
+        "accepted"
+      ]
+    },
+    {
+      "now_ms": 1300,
+      "poll": "viewer-a",
+      "expect_signal": "waiting"
+    },
+    {
+      "now_ms": 1999,
+      "poll": "viewer-a",
+      "expect_signal": "waiting"
+    },
+    {
+      "now_ms": 2000,
+      "deliver": {
+        "schema_version": "0.1.0",
+        "provider_id": "silero-vad",
+        "provider_version": "6.2.3",
+        "language": "ja",
+        "observations": [
+          {
+            "kind": "speech_activity",
+            "speaker_id": "viewer-a",
+            "edge": "start",
+            "observed_at_ms": 2000
+          }
+        ]
+      },
+      "expect_outcomes": [
+        "accepted"
+      ]
+    },
+    {
+      "now_ms": 2500,
+      "poll": "viewer-a",
+      "expect_signal": "speaker_active"
+    },
+    {
+      "now_ms": 3000,
+      "deliver": {
+        "schema_version": "0.1.0",
+        "provider_id": "silero-vad",
+        "provider_version": "6.2.3",
+        "language": "ja",
+        "observations": [
+          {
+            "kind": "speech_activity",
+            "speaker_id": "viewer-a",
+            "edge": "end",
+            "observed_at_ms": 3000
+          }
+        ]
+      },
+      "expect_outcomes": [
+        "accepted"
+      ]
+    },
+    {
+      "now_ms": 3500,
+      "poll": "viewer-a",
+      "expect_signal": "waiting"
+    },
+    {
+      "now_ms": 3799,
+      "poll": "viewer-a",
+      "expect_signal": "waiting"
+    },
+    {
+      "now_ms": 3800,
+      "poll": "viewer-a",
+      "expect_signal": "turn_end_eligible"
+    },
+    {
+      "now_ms": 4500,
+      "poll": "viewer-a",
+      "expect_signal": "turn_end_eligible"
+    }
+  ]
+}

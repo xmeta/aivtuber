@@ -1,0 +1,17 @@
+{
+  "schema_version": "0.1.0",
+  "provider_id": "silero-vad",
+  "provider_version": "6.2.3",
+  "language": "ja",
+  "observations": [
+    {
+      "kind": "turn_end_score",
+      "speaker_id": "a",
+      "observed_at_ms": 1,
+      "provider": "p",
+      "model_id": "m",
+      "score": 0.5,
+      "calibrated": "yes"
+    }
+  ]
+}

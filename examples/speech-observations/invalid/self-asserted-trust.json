@@ -1,0 +1,15 @@
+{
+  "schema_version": "0.1.0",
+  "provider_id": "silero-vad",
+  "provider_version": "6.2.3",
+  "language": "ja",
+  "observations": [
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 1,
+      "trust_level": "trusted"
+    }
+  ]
+}
