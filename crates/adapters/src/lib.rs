@@ -14,6 +14,7 @@ mod obs;
 mod openai;
 mod transport;
 mod tts_http;
+mod twitch_chat;
 mod vts;
 
 pub use audio::*;
@@ -24,6 +25,7 @@ pub use obs::*;
 pub use openai::*;
 pub use transport::*;
 pub use tts_http::*;
+pub use twitch_chat::*;
 pub use vts::*;
 
 use aivtuber_domain::{EngineError, EngineErrorKind};

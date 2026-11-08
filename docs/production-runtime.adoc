@@ -92,6 +92,47 @@ The process advances the scheduler from a monotonic process clock and services d
 
 The starter pack contains descriptors and viseme metadata only. Audio binaries remain external to Git. Materialize the referenced files below the configured audio root before testing real playback.
 
+== Ingress ceiling and Twitch chat (issue #257)
+
+The stdin content ingress accepts what envelope validation accepts. A record declares its own `source_class`, `plane` and `trust_level`, and the runtime only checks that the declaration is self-consistent. `source` is chosen by the producer and is never evidence of where a record came from, so the operator, not the record, sets a ceiling on the ingress channel:
+
+[cols="1,2,1"]
+|===
+|Variable |Meaning |Default
+
+|`AIVTUBER_INGRESS_MAX_TRUST`
+|Highest `trust_level` the pipe may declare: `untrusted`, `semi_trusted` or `trusted`.
+|`trusted` (no change)
+
+|`AIVTUBER_INGRESS_SOURCE_CLASSES`
+|Comma-separated allow-set of `source_class` values, for example `public_chat`.
+|all (no change)
+|===
+
+A record above the ceiling is rejected whole, audited as `rejected_ingress_policy`, and counted (`ContentAdmitDecision::RejectedIngressPolicy`; the total is printed when stdin closes). It is never rewritten or clamped, so a mislabelled producer is visible. An unrecognised value fails startup instead of silently widening the ceiling.
+
+=== Twitch chat sidecar
+
+`twitch-chat-ingress` (`crates/adapters`) is a separate read-only process. It uses the `twitch-irc` crate with the anonymous `justinfan` login: no OAuth, no credentials, and no send call exists in the binary. Provider types stay in `crates/adapters/src/twitch_chat.rs`; the output is the existing Event Envelope, one JSON line per chat message, so no wire contract is added.
+
+[source,sh]
+----
+export AIVTUBER_INGRESS_MAX_TRUST=untrusted
+export AIVTUBER_INGRESS_SOURCE_CLASSES=public_chat
+cargo run --locked -p aivtuber-adapters --bin twitch-chat-ingress -- --channel somechannel \
+  | cargo run --locked -p aivtuber-app
+----
+
+Options: `--channel` (repeatable, at most 8), `--queue N` (writer queue, default 256), `--stall-secs N` (rebuild the connection after this much silence, default 600), `--stats-secs N`, `--duration-secs N` (exit after N seconds). Diagnostics and counters go to stderr; stdout carries records only.
+
+* *Trust.* Every record is `chat.message` / `public_chat` / `content` / `untrusted` with no `authorization`, whatever the message says. The ceiling above is what makes the app enforce that. Badges, emotes, channel and message id are carried in `payload` as audit data only; nothing reads a badge to decide anything, so a viewer claiming to be a moderator or broadcaster gains no capability and still cannot write memory.
+* *Viewer identity.* `actor_id` is the numeric Twitch user id. Login and display name are not emitted. Pseudonymization happens in the app (`ActorPseudonymizer`, deployment key, applied when working memory is written); the sidecar never holds that key. Do not `tee` the pipe to a file you intend to keep: the raw numeric id is on the pipe.
+* *Bounds.* Network messages go through a bounded writer queue; when it is full the newest record is dropped and counted (`dropped_queue_full`). Records or payloads over 64 KiB / 16 KiB are dropped and counted (`dropped_oversize`); the limits match `SecurityRuntimeConfig` defaults and a test pins them together. Reconnect uses capped exponential backoff, 1 s doubling to 60 s (`SIDECAR_RECONNECT`); `twitch-irc` also rate-limits new connections itself.
+* *Deleted and cleared messages.* `CLEARMSG` and `CLEARCHAT` are counted (`messages_deleted`, `chats_cleared`) and not forwarded: the wire format has no retraction event, and a record already piped cannot be recalled.
+* *TLS.* Connections use the platform TLS stack (`native-tls`: Schannel on Windows, OpenSSL on Linux).
+
+Tests: `cargo test --locked -p aivtuber-adapters --lib twitch` (mapping fixtures, bursts, backoff) and `cargo test --locked -p aivtuber-app --test twitch_ingress_e2e` (stdin path, ceiling, forged message). A live run needs network access and is manual: `--duration-secs 120` against a busy public channel, piped into the app with the ceiling set.
+
 == Audio output
 
 +ProcessAudioPlayer+ uses an external player process without invoking a shell. The default command is +ffplay+, and references are restricted to +audio://+ paths below +AIVTUBER_AUDIO_ROOT+.
