@@ -1,0 +1,512 @@
+= ADR-0004: Provider-neutral speech lifecycle and deterministic display-to-speech text projection
+:status: Proposed
+:date: 2026-11-08
+
+== Context
+
+Issue #222 asks for two provider-neutral speech-output contracts:
+
+. an explicit speech *lifecycle* (Prepared / Committed / Started / Boundary / Finished / Cancelled) whose truth is owned by the scheduler/audio execution path, so that a TTS provider reporting "synthesis done" is never read as "audibly finished" (consumers: #81 floor control, #83 phrase streaming, #84 coherent intent, #92/#93 participant-speech observations, replay and telemetry);
+. a deterministic, offline *projection* from the display text that was gated and logged to the speech text that is sent to TTS (for example 約束 to やくそく, or OpenAI to オープンエーアイ), with a bounded per-persona lexicon and a projection identity that participates in asset and replay compatibility.
+
+The issue is +status:design-ready+: this ADR records a candidate decision, the measured evidence, a code-reading of today's lifecycle truth, and open questions. It does not authorize production implementation. Nothing from the spike is committed; only the numbers and the design are recorded here.
+
+Current code that the design must fit (all on +main+ at the time of writing):
+
+* the output gate runs before TTS: +GenerativePipeline::run_with_output_gate_and_fallback_deadline+ gates the reply at +crates/generative/src/lib.rs:768+ and builds the +SpeechRequest { text, style }+ at +:788+; the app revalidates the same text again before scheduling (+crates/app/src/lib.rs:1854-1895+, see link:../security-threat-model.adoc[security threat model]);
+* +SpeechRequest+, +SpeechArtifact+ and +SpeechProgress+ in +crates/domain/src/interfaces.rs:50-70+ carry no display/speech distinction and no identity;
+* +SpeechTrack.text+ stores only the display text (+crates/asset-store/src/lib.rs:51-60+, filled at +crates/generative/src/lib.rs:470+); +AssetCompatibility+, +RuntimeCompatibility+ and +AssetIdentity::stable_key+ (+crates/asset-store/src/lib.rs:99-109+, +550-556+, +649-699+) are the existing place where voice model and viseme mapping already gate reuse;
+* the scheduler (+crates/scheduler/src/lib.rs+) is a pure logical-time state machine; audio is handed to an +AudioOutput+ at +crates/app/src/lib.rs:2435+ with no completion path back.
+
+== Hard constraints
+
+* The output/publication gate applies before anything irreversible; the projection must not become a way around it (issue #222; link:../security-threat-model.adoc[security threat model]).
+* Model, Jev and generated output are data, never runtime authority. A pronunciation lexicon is operator-owned configuration; it cannot be written from chat, from model output, or from a TTS provider.
+* The projection must not introduce new semantic claims: every character of +speech_text+ must be derivable from the gated +display_text+ plus lexicon entries and constant rule tables (issue #222: "it is a rendering/pronunciation projection, not a second free-form generation step").
+* The baseline must work offline with no Python, no network service and no paid TTS feature (issue #222, local-first requirement).
+* Replay-relevant decisions use monotonic or logical ordering, not wall-clock ordering. Retained state (lexicon, spans, lifecycle logs, queues) is explicitly bounded.
+* Provider-specific wire DTOs and provider speech events stay behind adapters; the domain exposes a provider-neutral contract only.
+* The scheduler/audio execution path owns public lifecycle truth. A cancelled future phrase must never be reported as spoken. Jev/LLM must not run in the frame/motor loop.
+* Dependency additions must pass +cargo deny --locked check+ against the repository +deny.toml+ (AGENTS.md, link:../supply-chain.adoc[supply chain]).
+
+== Assumptions
+
+No existing assumption ID covers pronunciation or playback-completion truth. Proposed new assumptions (to be added to the link:../assumptions.adoc[Assumption Register] if this ADR is accepted):
+
+* A-SPEECH-001: A deterministic lexicon plus rule layer is sufficient for the product's own names, game terms, brand words, numbers and symbols; context-dependent homographs (生物, 人気, 辛い) are not solved by any evaluated analyzer and are handled by lexicon override or left to the TTS. Evidence: this ADR (small, single-annotator sample).
+* A-SPEECH-002: A TTS backend's own Japanese frontend reads ordinary kanji correctly enough that the baseline projection need not rewrite ordinary text. *Unverified here*: no TTS engine was run (see Limitations); this is the principal falsifier for the implementation phase.
+* A-SPEECH-003: Output-adapter return values (+spawn+ returned, mixer enqueue returned) are a backend-return proxy and not acoustic first-audible time, consistent with A-AUDIO-001 and link:../audio-backend-spike.adoc[Native audio backend spike].
+
+== Alternatives considered
+
+. *Status quo*: send the gated display text to TTS and let the vendor read it; infer completion from the TTS duration on the logical clock. Rejected as the end state: no deterministic fix for names/brands, projection and completion are not replay-visible, and the scheduler reports +Completed+ even for commands that were muted, dropped late or failed (see the lifecycle table).
+. *Rule layer plus lexicon only (analyzer-free)*: project-owned, zero third-party dependency, rewrites only spans that need it. Adopted as the baseline (Stage 1).
+. *Add a local morphological analyzer to read ordinary text*: wrap one of jpreprocess, lindera, vibrato or sudachi.rs behind a project-owned trait. Adopted only as an optional second stage (Stage 2), per TTS profile, because the analyzer choice was within measurement noise after the rule layer and each candidate has a supply-chain cost (below).
+. *Cloud pronunciation service or vendor markup dialect (SSML, vendor dictionaries)*: out of scope and prohibited by the issue's non-goals.
+. *Second generative pass to rewrite text for TTS*: prohibited by the issue's non-goals and by the derivability constraint.
+. *Lifecycle inferred from provider events* (for example a vendor "speech finished" callback): rejected; provider events are normalized in adapters into a three-value output observation and only the scheduler owner turns them into public lifecycle.
+
+== Reuse / Adapt / Build comparison
+
+Reuse-first vocabulary: adopt / wrap / sidecar / partial reuse / reference only / benchmark first / reject / custom. All four analyzers are Rust-native and in-process (sidecar was not needed). Numbers are from the spike below (Windows 11, one machine, release build, warm file cache) unless marked as documented-only.
+
+[cols="2,2,2,2,2"]
+|===
+|Dimension |jpreprocess 0.15.0 |lindera 6.2.0 |vibrato 0.5.3 |sudachi.rs 0.7.0
+
+|Reuse mode proposed
+|*Wrap* (Stage 2, conditional on the advisory question below)
+|*Benchmark first / hold*: cleanest advisories, but build-time network fetch and baked-in dictionaries
+|*Reject for now*: three unmaintained-advisory crates, 282 MB and 0.77 s for UniDic
+|*Reject for now*: git-only source violates +deny.toml+ sources policy; revisit if published to crates.io
+
+|Maintenance (GitHub API and crates.io, 2026-11-08)
+|crates.io 0.15.0 on 2026-06-11; repo pushed 2026-11-08; 0.16.0-rc0 published the same day (not evaluated)
+|6.2.0 on 2026-09-26; repo pushed 2026-11-06
+|0.5.3 on 2026-10-25; previous release 0.5.2 was 2025-03 and 0.5.1 was 2023-05
+|v0.7.0 on 2026-09-24; previous v0.6.11 was 2026-04; repo pushed 2026-10-02; *not on crates.io*
+
+|Native user dictionary
+|Lindera-style user dictionary, CSV or binary, passed to +JPreprocess::with_dictionaries+ (documented in crate docs; *not run*)
+|CSV (+surface,pos,reading+) via +load_user_dictionary+ with the dictionary metadata (README example; *not run*)
+|+Dictionary::reset_user_lexicon_from_reader+ with a MeCab-format CSV; *run*: 19 entries on mecab-ipadic gave the same result as the project-owned pre-substitution (54.7 percent, 58/106)
+|User dictionary is a separate binary built with the +sudachi+ build tool and bound to a system dictionary; +Config::user_dict+ (documented; *not run*)
+
+|Reading for numbers and counters
+|Built in (OpenJTalk NJD rules, including the sound-change pronunciation field, for example ジュッ plus プン)
+|None (digits come back unread)
+|None
+|Partial: single digits read, multi-digit OOV numbers read digit by digit (for example 10 gives イチレイ in the probe)
+
+|Dictionary used here
+|naist-jdic from the jpreprocess v0.15.0 release asset, loaded from file at runtime (80.1 MB unpacked)
+|mecab-ipadic-2.7.0-20250920 and unidic-mecab-2.1.2, built into the executable by +embed-*+ features
+|ipadic-mecab-2_7_0 (8.0 MB zst) and unidic-cwj-3_1_1+compact (23.5 MB zst) from the v0.5.0 release
+|SudachiDict 20261015 core (202 MB) and small (115 MB)
+
+|Dependency footprint (new crates versus the repo +Cargo.lock+, 336 packages)
+|76 new (117 total at runtime)
+|49 new at runtime, 59 with build-dependencies
+|45 new (48 with build-dependencies)
+|24 new
+
+|+cargo deny+ against the repo +deny.toml+ (crates only, excluding my spike crates)
+|Advisories fail: RUSTSEC-2025-0141 (+bincode+ 2.0.1 unmaintained), RUSTSEC-2024-0449 (+unsafe-libyaml+ via +serde_yaml_ng+ via +lindera+ 3.0.7). Licenses and sources ok
+|Advisories, bans, licenses, sources ok
+|Advisories fail: RUSTSEC-2025-0141 (+bincode+), RUSTSEC-2024-0384 (+instant+ via +argmin+), RUSTSEC-2024-0436 (+paste+ via +argmin+). Licenses and sources ok
+|Sources fail: git source not allowed. Advisories, bans, licenses ok
+
+|Network or other hazards at build or run time
+|Default feature path (+naist-jdic+ bundled) adds a build-script download via +reqwest+, +rustls+, +aws-lc-sys+ (its C build failed in this environment; cause not isolated, a very long build path is suspected; not used). Runtime-file path used instead
+|+embed-*+ build scripts download the dictionary tarball with +ureq+/+rustls+/+ring+, verified with an MD5 digest; +tar+, +flate2+, +md5+ are build-dependencies
+|Dictionaries are separate GitHub release assets, not versioned with the crate; training stack (+rucrf+, +argmin+) is a non-optional dependency
+|Library has +libloading+ in its graph (plugin loading, not exercised); dictionary hosted on S3 and GitHub
+|===
+
+The status-quo column is omitted because it has no dependency footprint; its dimensions are discussed under Alternatives.
+
+== Evidence
+
+Categories used below: *spike* = observed local behaviour (throwaway code, not committed); *documented* = vendor docs or source reading, not run; *unverified* = listed under Limitations.
+
+=== Method
+
+* Harness: std-only Rust library (so analyzer footprints are not polluted) plus one tiny binary per candidate, rustc 1.98.1, release profile with thin LTO, Windows 11, one machine. The lexicon, rule layer and scoring are shared code; only the +tokens(text)+ adapter differs per candidate.
+* Candidate configurations (7): jpreprocess 0.15.0 + naist-jdic; lindera 6.2.0 + ipadic; lindera 6.2.0 + unidic (mecab 2.1.2); vibrato 0.5.3 + ipadic; vibrato 0.5.3 + unidic-cwj-3.1.1 compact; sudachi.rs v0.7.0 (+5de0410b6edfd428fc510cc9763440772e9619d5+) + SudachiDict 20261015 core; same + small.
+* Dataset: 106 items written by the spike author (no third-party text) over eight categories: kanji words (12), homographs needing context (16), numbers/dates/counters/units (23), English and brand words (18), emoji and kaomoji (9), symbols and URLs (6), names (9), game terms (13). Each item has a gold hiragana reading, optionally several accepted alternatives (for example じっぷん or じゅっぷん). 20 of the items are flagged "L": one of the 19 lexicon entries was designed to cover them; the other 86 are "held-out" for the lexicon.
+* Metric: exact match after normalisation (katakana to hiragana, punctuation and symbols removed, prolonged mark and o+u / e+i spellings folded to vowel repetition) and mean character error rate. Kana-only tokens are passed through unchanged; only tokens containing kanji, digits or Latin are replaced by the analyzer's reading.
+* Pipelines: *Raw* = analyzer only; *With lexicon* = lexicon longest-match substitution first; *With rules* = lexicon, then the deterministic rule layer (numbers with 29 kanji, Latin and symbol units, ALLCAPS acronym spelling up to 5 letters, emoji, kaomoji, URL removal, a few symbols), with the resolved kana spliced inline so the analyzer still sees the whole sentence ("FullIn" in the harness).
+* Two later blind sets were written after the rules were frozen and never used for tuning: *blind1* (35 items, number units and Latin forms outside the rule tables) and *blind2* (30 items; written after a rule-mode change made in response to blind1, and its units mostly overlap the rule table, so it checks rule logic, not unit coverage).
+
+=== Pinned artifacts
+
+Spike inputs, for reproducing or later pinning. SHA-256 of the downloaded archives (the extracted runtime files are listed where a runtime file is loaded directly).
+
+[cols="3,5"]
+|===
+|Artifact |Identity
+
+|jpreprocess, jpreprocess-core and siblings |0.15.0 (crates.io), resolved with +lindera+ 3.0.7
+|naist-jdic for jpreprocess |release asset +naist-jdic-jpreprocess.tar.gz+ of jpreprocess v0.15.0, SHA-256 +8a930bbc57bf4adcf521d53544c7dc9ab8ab3aa997a591b1b1608dc5539017b8+ (28,668,638 bytes); built from +jpreprocess/naist-jdic+ v0.1.3
+|lindera, lindera-ipadic, lindera-unidic |6.2.0; build-time tarballs +mecab-ipadic-2.7.0-20250920.tar.gz+ (MD5 +a95c409f12f1023fce8ef91f991ef042+) and +unidic-mecab-2.1.2.tar.gz+ (MD5 +f4502a563e1da44747f61dcd2b269e35+) from the upstream-configured host
+|vibrato |0.5.3 (crates.io)
+|vibrato ipadic |release v0.5.0 asset +ipadic-mecab-2_7_0.tar.xz+, SHA-256 +4764f983b7c3a9e1cb6a5ee945e00558efd812980e0dad61224f63ee3b0475d9+; extracted +system.dic.zst+ SHA-256 +82a6da70bb4a17be70f20ff44f650f9ad1d2b0b4fcb2f39c17fc797f92d0ab75+
+|vibrato unidic |release v0.5.0 asset +unidic-cwj-3_1_1+compact.tar.xz+, SHA-256 +9bd032f29424daaf90a92d2835961b2f3a3c0a4cf15e2092c63cd356c2e9b4d2+; extracted +system.dic.zst+ SHA-256 +487ca64b39a31af2f054d905d333a82d0ec0872530d3610342b3c56b0b4b4ad0+
+|sudachi.rs |git tag v0.7.0, commit +5de0410b6edfd428fc510cc9763440772e9619d5+
+|SudachiDict 20261015 (V1 format) |core zip SHA-256 +5cf5cb7f1ea943a988e2fb5d285a9a8b3538861faefa7a2604c2cd18c387f503+ (+system_core.dic+ +e815659f6ad6f6118725103d47d317d660276ff3a15f668f8fc123ec3c4e6646+); small zip SHA-256 +91134373add92680278281b64bd92952faf2a685c8d05db7e727d0f9ffbd09f5+ (+system_small.dic+ +c5e2bb9988cc88b05c37734d985eac59c9c4b35353187f068c605f3d3908716a+)
+|===
+
+=== Accuracy (exact match, items correct)
+
+[cols="3,1,1,1,1,1,1,1,1"]
+|===
+|Candidate |main, Raw |main, with lexicon |main, with lexicon and rules |of which held-out (of 86) |blind1, Raw |blind1, with rules |blind2, Raw |blind2, with rules
+
+|jpreprocess + naist-jdic |83/106 |93/106 |99/106 |79 |33/35 |27/35 |25/30 |27/30
+|lindera + ipadic |46/106 |58/106 |96/106 |76 |0/35 |25/35 |0/30 |26/30
+|lindera + unidic 2.1.2 |58/106 |69/106 |98/106 |78 |10/35 |24/35 |13/30 |27/30
+|vibrato + ipadic |46/106 |58/106 |96/106 |76 |0/35 |25/35 |0/30 |26/30
+|vibrato + unidic-cwj 3.1.1 |62/106 |70/106 |98/106 |78 |11/35 |24/35 |12/30 |28/30
+|sudachi.rs + core |66/106 |72/106 |100/106 |80 |17/35 |25/35 |13/30 |27/30
+|sudachi.rs + small |58/106 |70/106 |98/106 |78 |15/35 |24/35 |13/30 |27/30
+|===
+
+Reading the table honestly:
+
+* The "main, with lexicon and rules" column is *not* a held-out estimate: the rule layer and lexicon were written looking at this set. It shows the ceiling of the approach, not expected field accuracy.
+* The lexicon column measures plumbing: of the 20 designed-for items, 18 to 20 are right after the lexicon alone on every candidate (the others also contain digits or acronyms that need the rule layer); it says nothing about coverage of unseen names. Held-out items are unchanged by the lexicon (identical held-out counts before and after on every candidate).
+* On blind1, the project-written number/counter rules *lost* to jpreprocess's built-in OpenJTalk rules (jpreprocess Raw 33/35 versus 24-25/35 for the other six configurations with the hand-written rules, and 27/35 for jpreprocess itself when the hand-written rules were applied in front of it). A mode that leaves numerals and kanji counters to the analyzer and keeps only Latin-unit, acronym, emoji, URL and symbol rules ("Min" in the harness) restores jpreprocess to 31/35 on blind1 and 27/30 on blind2. Differences between candidates on blind2 (26 to 28 of 30) are within sampling noise.
+* The single discriminating, reproducible difference is unit/counter coverage: OpenJTalk's NJD rules cover far more counters than the 22-entry table written for the spike, and sound changes are carried in the pronunciation field. The hand-written table is the weakest part of the rule layer and should not be extended without evidence.
+* Segment-split rule application (resolved text isolated from the analyzer) was strictly worse than inline splicing on blind1 and blind2 (for example sudachi core 23/35 versus 25/35 and 23/30 versus 27/30): cutting the sentence at an override boundary loses the analyzer's context (+5分間休む+ became ごふんマヤスム). Inline splicing is the recommended mechanism.
+
+Failures that no candidate fixes (main set, with lexicon and rules): 生物 as なまもの (H07), 人気 as ひとけ (H11), 辛い as からい before カレー (H13), and the kaomoji +(*^o^*)+ (the heuristic requires non-alphanumeric inner characters). 一日中 as いちにちじゅう fails on six of seven configurations (jpreprocess passes) and 上手 as かみて on three. These are context-dependent; the project can only fix them with a lexicon entry or by leaving the span to the TTS.
+
+=== What a deterministic rule layer must cover regardless of the analyzer
+
+Observed Raw failures common to every analyzer except where noted:
+
+* *Numbers, dates, counters, units*: ipadic returns digits unread (0/23 numbers); unidic/sudachi read single digits but not multi-digit or counter sound changes (3 to 6 of 23). Only jpreprocess reads them (21/23 main, 33/35 blind1) and still misses unit symbols (+100m+, +36.5℃+). A rule layer for symbol units, percent, decimals and width folding is needed even with jpreprocess; kanji counters can be delegated to jpreprocess (see above).
+* *Latin script*: brand words (OpenAI, GitHub, VTuber, YouTube, Twitch, Discord) fail everywhere except where a dictionary happens to contain them (SudachiDict core knows OpenAI and Python). ALLCAPS acronyms (AI, GPU, USB, PC, HP, S) are fixed by a 26-letter spelling table. Unknown mixed-case words (Python, Wi-Fi, React, iPhone, Switch) stay wrong on every candidate and need either a lexicon entry or an explicit policy (leave to TTS, spell out, or flag).
+* *Emoji, kaomoji, URLs, hash and wave-dash symbols*: analyzers either leave them or, in jpreprocess, spell a URL out letter by letter. They are deleted (or replaced by a configured literal) by rules, not read.
+* *Width normalisation* of full-width digits and Latin letters before matching.
+* *Names and game terms* (星乃ひかり, 魔導核, 剛力丸): on Raw the candidates read 9 to 13 of 13 game terms and 7 to 8 of 9 names; the failures are the designed fictional items (for example vibrato with UniDic read 月城アカリ as ガツジョウ...). Adding the 19 lexicon entries raised the main-set total by 6 (sudachi.rs core) to 12 (ipadic-based) items (18 to 20 of the 20 designed items are right with the lexicon alone); held-out items did not change. The lexicon is for the product's own vocabulary, not for general names.
+
+=== Determinism, latency, load time, memory
+
+All spike. Per-sentence latency is the mean over 300 passes of the 106 inputs on a warm process; load time is the median of seven separate processes (min to max shown); peak working set is from +GetProcessMemoryInfo+ after the run. Output was byte-identical across three in-process passes and across seven separate processes for every candidate (one hash per candidate); this does *not* establish cross-OS, cross-CPU or cross-build identity.
+
+[cols="2,1,1,1,1,1,1"]
+|===
+|Candidate |load ms (median, min-max) |peak WS MB |per sentence, analyzer only, mean / p95 / max µs |per sentence, lexicon + rules + analyzer, mean / p95 / max µs |executable bytes |dictionary on disk
+
+|jpreprocess (file dict) |42 (40-52) |112.7 |27 / 45 / 347 |21 / 39 / 157 |2,605,568 |80,055,769 unpacked (28.7 MB download)
+|lindera ipadic (embedded) |0.7 (0.7-0.8) |13.0 |5 / 7 / 349 |7 / 12 / 151 |247,675,904 for ipadic and unidic together |about 47.5 MB built into the exe
+|lindera unidic 2.1.2 (embedded) |0.9 (0.9-1.0) |16.8 |6 / 11 / 57 |9 / 16 / 351 |(same exe) |about 199 MB built into the exe
+|vibrato ipadic |241 (235-246) |71.3 |6 / 10 / 56 |9 / 14 / 166 |616,960 |8.0 MB zst
+|vibrato unidic-cwj compact |767 (755-814) |282.3 |52 / 118 / 471 |48 / 128 / 540 |(same exe) |23.5 MB zst
+|sudachi.rs core |42 (40-42) |92.4 |8 / 13 / 256 |9 / 16 / 109 |3,036,672 |202.2 MB
+|sudachi.rs small |18 (18-20) |45.8 |8 / 12 / 68 |9 / 17 / 87 |(same exe) |115.3 MB
+|===
+
+Every candidate reads a 10 to 20 character sentence in well under 0.2 ms at p95, far below TTS latency, so latency does not discriminate. Embedded lindera's 0.7 ms load is a lazily paged static: the cost moves to the first page faults and to a 247 MB executable. Maximum values are single outliers on a shared desktop and are indicative only.
+
+Lexicon scaling (spike, vibrato with ipadic, linear-scan lexicon, lexicon plus rules plus analyzer path): 19 entries gave 9 / 17 µs (mean / p95); 2,067 entries (75,004 bytes UTF-8 TSV) gave 40 / 72 µs. The prototype scans linearly; a trie or Aho-Corasick automaton would be linear in the input and is the expected production shape.
+
+=== Licenses (code and, separately, each dictionary)
+
+Verified from crates.io metadata, repository license files and the notice files shipped with the dictionary archives, 2026-11-08. This is an engineering read, not legal advice.
+
+[cols="2,2,3,2"]
+|===
+|Component |License |Notes and obligations |Flag
+
+|jpreprocess 0.15.0 (code)
+|BSD-3-Clause
+|Contains code derived from OpenJTalk (modified BSD, Nagoya Institute of Technology, 2008-2016) and Lindera (MIT)
+|none
+
+|naist-jdic as built by jpreprocess (dictionary data, +jpreprocess/naist-jdic+ v0.1.3, release asset +naist-jdic-jpreprocess.tar.gz+)
+|README and crate say BSD-3-Clause; GitHub reports NOASSERTION
+|Notices for NAIST 2009, UniDic Consortium 2011-2017 and Nagoya Institute of Technology 2008-2016; the shipped +NOTICE.txt+ also lists a pointer to +lindera-ipadic-neologd v0.25.0+ without saying whether NEologd entries are in the data
+|*unclear*: three copyright notices to reproduce; NEologd provenance of entries not stated
+
+|lindera, lindera-ipadic, lindera-unidic 6.2.0 (code)
+|MIT
+|Dictionary data is downloaded at build time (below)
+|build-time network (see Dependency findings)
+
+|mecab-ipadic-2.7.0 (data used by lindera, vibrato, and ancestor of naist-jdic)
+|Custom permissive license of NAIST and ICOT, not an SPDX-listed license
+|"Use, reproduction, and distribution is permitted" with the notice kept; the ICOT paragraph also requires that any redistribution not violate the laws and regulations of the countries having jurisdiction, and carries a no-warranty clause
+|*non-standard text*: needs a decision on whether the ICOT legal-compliance clause is acceptable for redistribution
+
+|unidic-mecab-2.1.2 (data used by lindera) and unidic-cwj-3.1.1 (data used by vibrato)
+|The notices shipped with lindera and with the vibrato archive reproduce the BSD-3-Clause text (UniDic Consortium 2011-2017 and 2011-2021). The upstream distribution terms (which I recall as a GPL / LGPL / BSD choice) were not re-read in this session
+|vibrato archives additionally carry a LegalOn Technologies 2023 copyright for the connection-id remapping, and state that ids were remapped "using CORE data in BCCWJ". Whether the BCCWJ-derived remapping carries terms beyond BSD was not verified
+|BSD choice is fine; *BCCWJ-derived remap not verified*
+
+|vibrato 0.5.3 (code)
+|MIT OR Apache-2.0
+|Dictionaries are not part of the crate
+|none for code
+
+|sudachi.rs 0.7.0 (code)
+|Apache-2.0
+|Not published on crates.io; only available as a git dependency or vendored
+|supply-chain policy (git source)
+
+|SudachiDict 20261015 core and full (data)
+|Apache-2.0 umbrella plus +LEGAL+ file
+|Core and notcore lexicons include parts of mecab-unidic-neologd, which in turn used Hatena keyword list data (copyright held by Hatena), Japan Post postal-code data (no copyright asserted), a station-name list by an individual author (free use, no liability), a personal-name entry list by an individual author that relates to Mozc's name dictionary, and web-crawled reading pairs restricted to combinations of those sources
+|*mixed provenance*: umbrella license is Apache-2.0 but third-party conditions are heterogeneous and some are informal
+
+|SudachiDict 20261015 small (data)
+|Apache-2.0, UniDic-only vocabulary and +matrix.def+ under the UniDic BSD-3-Clause notice
+|Cleanest of the Sudachi variants
+|none identified
+|===
+
+The transitive crate licenses all fell inside the repository allow-list in the +cargo deny+ run; the only license errors were the spike's own unlicensed crates, which are not production crates.
+
+=== Dependency findings from +cargo deny+
+
+Run per candidate against the repository +deny.toml+ with a pruned +Cargo.lock+ (spike crates excluded from the conclusions; the harness crates themselves report "unlicensed", which is an artifact). Results are in the comparison table. Consequences for the repository policy:
+
+* jpreprocess and vibrato both need advisory exceptions (+docs/supply-chain.adoc+ requires reason, owner and revisit condition). jpreprocess: +bincode+ 2.0.1 and +unsafe-libyaml+; vibrato: +bincode+, +instant+, +paste+.
+* sudachi.rs cannot enter the graph without an +allow-git+/+allow-org+ entry or vendoring, because +unknown-git = deny+.
+* lindera is the only candidate with a clean +cargo deny+ result, but its +embed-*+ build scripts download dictionary tarballs over HTTPS at build time (verified with MD5 only), which conflicts with offline and reproducible builds and adds a build-time TLS stack (+ureq+, +rustls+, +ring+). The offline alternative (build the dictionary with the Lindera CLI from a pinned source archive and load it at runtime) was not tried.
+* jpreprocess with its default bundled-dictionary feature would add a build-time +reqwest+/+aws-lc-sys+ download. The spike used the runtime-file path (+SystemDictionaryConfig::File+) to avoid it. jpreprocess 0.15.0 depends on the older +lindera+ 3.0.7 line, so adopting both jpreprocess and lindera 6 would carry two Lindera generations.
+
+=== Lifecycle code reading (no spike)
+
+Every row cites what is on +main+ at commit +3093000233de1d382de7c1fea35b775d13164a33+. "Known today" is whether the truth is observable as a typed fact by any consumer, not whether the code path exists.
+
+[cols="1,4,1,4"]
+|===
+|State |Where the truth is (or would be) known today |Known today? |Gap or conflation
+
+|Prepared
+|Cached asset: +CachedPerformer::handle_asset_id+ resolves the asset (+crates/runtime/src/cached_playback.rs:497+; +AssetStore::resolve_with_tier+ at +crates/asset-store/src/lib.rs:1365+) and its visemes (+cached_playback.rs:593+, +686-708+). Generated reply: TTS result at +crates/generative/src/lib.rs:793-816+, asset compile at +:822-834+, +GenerationDisposition::Generated+ at +:840-845+, app-side gate recheck at +crates/app/src/lib.rs:1854-1895+, hot-cache insert at +:1898+.
+|No
+|Surfaces only as trace booleans and counts (+GenerationTrace.tts_attempted+, +tts_progress_chunks+, +crates/generative/src/lib.rs:79-94+) and an +Ok+ result. There is no identity for "this exact speech text and audio were prepared". Streaming +SpeechProgress { sequence, final_chunk }+ (+crates/domain/src/interfaces.rs:63-70+) is validated and collapsed into a single +SpeechArtifact+ (+generative/src/lib.rs:555-577+, +600-615+), so phrase sequence from the provider is discarded. One reply is exactly one phrase.
+
+|Committed
+|The only commit point is +Scheduler::schedule_at+ accepting the plan: generation assigned at +crates/scheduler/src/lib.rs:620-621+, item pushed at +:637-641+; reached from +cached_playback.rs:630-633+. Rejections (duplicate event +:493-500+, cooldown +:505-509+, priority +:526-531+) return +Err(Rejection)+.
+|Partly (as a return value)
+|Nothing records "committed"; a rejected plan after successful TTS is an +AppError::Playback+ and the generated asset has already been inserted hot (+app/src/lib.rs:1898+ before scheduling) so synthesized work is silently orphaned. The #106 commit barrier is design-only; today's precursor is the double gate check (+generative:768+ and +app:1854-1895+). The scheduler generation (attempt id) and +GenerationCancellationToken+ (a generative attempt) are different things with the same word.
+
+|Started
+|Logical: +Playing+ at schedule time when start is not in the future (+scheduler:623-626+) or at +advance_to+ (+:427-446+, status set at +:444+). Output hand-off: +dispatch_audio+ (+app/src/lib.rs:2412-2444+) after the time gate (+:2418+), liveness (+:2422+, +command_is_live+ at +:2849-2858+) and mute drop (+:2431+) calls +AudioOutput::execute+ (+:2435+, trait at +:87-89+). Adapters: +ProcessAudioPlayer::play+ returns at process spawn (+crates/adapters/src/audio.rs:131-138+); +RodioAudioPlayer::play+ returns after mixer enqueue (+:201-244+).
+|No (logical only)
+|+Playing+ is derived purely from the logical clock; it is independent of whether audio was handed off, muted, dropped for lateness or failed. +AudioDispatch+ is recorded as +Completed+ at event-handling time, before the tick that dispatches (+app/src/lib.rs:2361-2377+). Even a successful hand-off is only a backend-return proxy, not first-audible time (A-AUDIO-001, +docs/audio-backend-spike.adoc+).
+
+|Boundary
+|Declared points: asset +interrupt_points_ms+ (+asset-store:168-169+), scaled into the plan (+cached_playback.rs:611-621+), normalized (+scheduler:758-763+) and used by +next_safe_boundary+ (+:745-756+) only to compute +cancel_at_ms+ when preempting (+:533-552+). Generated assets declare a single point at the end of speech (+generative/src/lib.rs:479+).
+|No (planning only)
+|No event when a boundary is reached; no phrase boundaries exist because one reply is one asset (#83 not built). A consumer such as #81 cannot learn "a safe interrupt point just passed".
+
+|Finished
+|Logical: +advance_to+ turns +Playing+ into +Completed+ at the natural end (+scheduler:401-417+, retired to history +:355-372+, +156-162+). That end is start plus +duration_ms+, which is the *TTS-reported* duration (+cached_playback.rs:609-610+, compile at +generative:459-462+). Device: +ProcessAudioPlayer+ drops the child exit (+adapters/audio.rs:134-136+); +RodioAudioPlayer::is_idle+ exists (+:192-197+) but is not reachable through +AudioOutput+.
+|No (conflated)
+|This is the main conflation: "Finished" means the synthesized duration elapsed on the logical clock. A muted, late-dropped or failed command still ends as +Completed+; a cancelled future phrase is not distinguished from one that was spoken except through +Status+. TTS completion and playback completion are indistinguishable in recorded state.
+
+|Cancelled
+|Scheduler: +stop_all+ (+scheduler:650-685+), +stop_current+ (+:688-703+), displaced queued work +cancel_queued+ (+:720-734+, called at +:600+), safe-boundary preemption through +cancel_at_ms+ (+:548-552+) resolved in +advance_to+ (+:403-410+, +429-433+). Operator: +runtime/src/lib.rs:694-695+ keeps only the count (+ControlOutcome::Stopped { cancelled }+, +:206+); the app adds a causal-trace span with +StageReason::OperatorStop+ (+app/src/lib.rs:2545+). Generation: +CancellationStage+ (+generative:58-65+, returns at +:731+, +765+, +819+, +837+) mapped to +StageReason::GenerationCancelled+ (+app/src/lib.rs:2306-2327+).
+|Partly
+|The reason is not stored: +ScheduledItem { plan, status, cancel_at_ms }+ (+scheduler:99-104+) has no reason or "reached" field. A queued item retired because its +cancel_at_ms+ precedes its start is retired without being marked +Cancelled+ (+scheduler:419-425+). +purge_cancelled_pending+ (+app/src/lib.rs:2646-2654+) and the lateness drop in +command_is_live+ discard pending commands without any record. Terminal history is a ring bounded by +history_capacity+ (+scheduler:184-189+, +374-382+); the amount spoken before cancel is only derivable while an entry survives. Cancel after TTS but before commit (+AfterTts+) discards synthesized audio with no lifecycle trace.
+|===
+
+Cross-cutting display-versus-speech gap: +SpeechRequest.text+ is the gated display text (+generative/src/lib.rs:788-791+) and is also what +SpeechTrack.text+ stores (+:470+); nothing in +AssetCompatibility+ or +AssetIdentity+ identifies how text was turned into speech, so changing a lexicon cannot invalidate cached or generated audio.
+
+== Decision
+
+This section is the *candidate* decision for the supervisor; the open questions below list what remains undecided.
+
+=== D1. Projection architecture: two stages, rule layer and lexicon are project-owned
+
+* *Stage 1 (baseline, required, no new third-party dependency)*: a project-owned +custom+ rule layer and bounded lexicon, analyzer-free, that rewrites only the spans that need it. Reuse-first record: +custom+, because no evaluated crate offers a bounded and versioned lexicon with replay identity, a derivability audit and the output-gate ordering this repository requires; the only generic mechanism involved (longest-match scan) is small. Earlier modes do not fit for the same reasons.
+* *Stage 2 (optional, enabled per TTS profile that lacks a usable Japanese frontend)*: analyzer-assisted reading behind a project-owned trait that maps a string to non-overlapping (range, reading) pairs. Recommended implementation: *wrap* jpreprocess 0.15.0 with a runtime-loaded, hash-pinned naist-jdic (so no build-time network), because it is the only candidate that brings counter and numeral rules, is small, and is on crates.io under BSD-3-Clause. This is *conditional on the supervisor accepting two advisory exceptions* (RUSTSEC-2025-0141, RUSTSEC-2024-0449) with owner and revisit date, or on upstream removing the dependencies. Lindera 6.2.0 with an offline-built dictionary is the fallback if exceptions are refused. Vibrato and sudachi.rs are rejected for now (see comparison); revisit conditions below.
+* The spike supports *not* choosing an analyzer on accuracy: after the rule layer the seven configurations are within noise on the blind sets, and the residual errors are shared context-dependent homographs. Operational fit (counter coverage, size, advisories, build-time network, source policy) is what separates them.
+
+=== D2. Contract and invariants
+
+Proposed provider-neutral domain types (names are implementation choices):
+
+----
+SpeechTextProjection
+  display_text      the gated text; the only text the publication policy reasons about
+  speech_text       what is sent to TTS
+  identity          ProjectionIdentity (below)
+  spans             bounded list of (display range, speech range, origin)
+  outcome           Identity | Projected | Fallback(reason)
+
+origin  = Passthrough | Rule(rule_id) | Lexicon(entry_id) | Analyzer(token index)
+----
+
+Invariants, each testable and independent of the analyzer:
+
+. *Order*: projection runs after the output gate and its revalidation, and before the +SpeechRequest+ is built (between +generative/src/lib.rs:774+ and +:788+). The public-output policy is evaluated on *both* +display_text+ and +speech_text+; if +speech_text+ is rejected the outcome is +Fallback(GateRejected)+ and +speech_text = display_text+ (already allowed). Projection can never turn a rejected display text into an allowed speech text.
+. *Derivability*: the spans cover +speech_text+ with no gaps; +Passthrough+ spans equal the input substring byte for byte; +Rule+ spans equal the pure rule applied to the input substring; +Lexicon+ spans equal the reading of an entry whose surface equals the input substring, naming entry id and revision; +Analyzer+ spans equal the dictionary reading of that token. A verifier re-runs the projection and compares (projection is pure and deterministic), so verification needs no trust in the analyzer.
+. *Charset and size*: +speech_text+ may contain only hiragana, katakana, the prolonged mark, ASCII punctuation, and characters passed through from the input; no Latin word unless passed through by policy; length at most 3x the input and at most a fixed cap; otherwise +Fallback(TooLong)+.
+. *Deletions are allowed, insertions are not*: emoji, kaomoji and URLs may be deleted. Replacement text may only come from a lexicon entry or from a constant rule table (for example the 26 letter names, or a configured URL placeholder); it never comes from model output.
+. *Authority*: lexicon entries and the active rule/analyzer profile are operator-owned configuration loaded through the local operator path. Public chat, Jev, the LLM and the TTS provider cannot add, edit or select them; model-suggested corrections (the "pronunciation correction labels" metric) are proposals that need an operator action, in the same spirit as the durable-memory write permit.
+. *Failure mode*: any projection failure degrades to +speech_text = display_text+ with a typed +Fallback+ reason and a metric; it never blocks the deterministic performer and never calls a network service. No generative reading hints are accepted from the model in this design.
+
+=== D3. Rule layer and lexicon design with bounds
+
+* *Lexicon*: per persona or project profile, a list of (surface, reading, optional note) entries applied by longest match before the analyzer, with the resolved kana spliced inline (spike evidence: inline beats isolating the span). Latin entries need an ASCII-letter boundary on both sides; matching is on the width-folded input.
+* *Bounds (proposed)*: at most 2,048 entries and at most 131,072 bytes of UTF-8 in total per profile; surface 1 to 32 Unicode scalar values; reading 1 to 64 scalar values, restricted to hiragana, katakana and the prolonged mark; no duplicate surfaces; at most 4 active profiles (persona, project, platform, session). The projector accepts at most 2,000 characters per call. Measured: 2,067 entries / 75,004 bytes cost about 30 µs extra per sentence with a linear-scan prototype.
+* *Rule layer (analyzer-independent)*: width folding; emoji and kaomoji deletion; URL handling; ALLCAPS acronym spelling up to 5 letters; symbol units (percent, degree, metre, gram and their prefixed forms), decimals, thousands separators; a short symbol table (ampersand, multiplication sign). Kanji counters and plain numerals are *not* hand-written when jpreprocess is the Stage-2 analyzer; with no analyzer they are left to the TTS and recorded as not projected. Every rule has a stable +rule_id+ and a version.
+* *Out of the box policy for unresolved Latin words*: pass through unchanged and count as +unprojected+ (the spike showed that letter-spelling a word such as Python is worse than leaving it to the TTS); the lexicon is the remedy.
+
+=== D4. Projection identity, replay and asset compatibility
+
+The projection identity is a canonical, length-prefixed key in the style of +AssetIdentity::stable_key+ (+crates/asset-store/src/lib.rs:674-699+):
+
+----
+projection = rules:<rules_version> | analyzer:<name>-<version> or "-" |
+             dictionary:<name>-<version>+<sha256> or "-" |
+             lexicon:<profile-id>@<revision>+<sha256> | scope:<overrides_only|full>
+----
+
+* *Asset compatibility*: add an optional +speech_projection+ component beside +voice_model+ and +viseme_mapping+ in +AssetCompatibility+, +RuntimeCompatibility+ and +AssetIdentity+, and add resolved +speech_text+ beside +text+ in +SpeechTrack+. Both the JSON schema (+additionalProperties: false+) and the Rust types (+deny_unknown_fields+) reject unknown fields, so old readers cannot ignore the new fields: this is an incompatible wire change under +docs/domain-contract.adoc+ ("old readers can safely ignore") and needs a +schema_version+ bump of the performance asset schema (0.1.0 to 0.2.0), following the schema-first change order in AGENTS.md. Open question Q3.
+* *Compatibility rule (proposed)*: a change of rules version, analyzer or dictionary identity is a hard incompatibility for assets that carry pre-rendered audio; a change of lexicon revision marks only assets whose recorded spans reference a changed entry as stale. A stale asset is playable but not eligible for semantic reuse until regenerated. Open question Q4.
+* *Replay*: the lifecycle +Prepared+ event and the telemetry record the projection identity and a digest of +speech_text+; replay consumes the recorded +speech_text+ and does not re-run the analyzer, so replay does not depend on analyzer or dictionary availability. Re-projection is a separate regression test.
+
+=== D5. Lifecycle contract and single owner
+
+Smallest provider-neutral type (domain crate; names are implementation choices):
+
+----
+SpeechLifecycleEvent
+  seq        per-process monotonic sequence (ordering; not wall clock)
+  at_ms      scheduler logical time in milliseconds
+  speech     SpeechRef
+  phase      SpeechPhase
+  basis      LogicalTimeline | OutputAccepted | OutputDrained   (how the fact was observed)
+
+SpeechRef
+  event_id, generation (scheduler attempt id; None until Committed),
+  phrase (0-based), final_phrase (bool),
+  asset_identity (stable key, includes projection), speech_text_digest
+
+SpeechPhase
+  Prepared | Committed | Started | Boundary { offset_ms }
+  | Finished
+  | Cancelled { reason: SpeechCancelReason, reached: BeforeCommit | Committed | Started }
+
+SpeechCancelReason
+  OperatorStop | Muted | Preempted | Superseded | SchedulerRejected(kind)
+  | StaleOrLate | GenerationCancelled(stage) | OutputFailure | Shutdown | GateRejected
+
+OutputObservation (adapter-normalized input, three values)
+  Accepted | Drained | Failed(kind)
+----
+
+* *Single owner*: a +SpeechLifecycleLog+ inside the scheduler crate is the only constructor of +SpeechLifecycleEvent+ and the only writer of +seq+. The scheduler's own transitions (+schedule_at+, +advance_to+, +stop_all+, +cancel_queued+, safe-boundary preemption) write Committed, logical Started, Boundary, Finished and Cancelled with reasons. The composition root's +dispatch_audio+ and the output adapters are *reporters*: they pass +OutputObservation+ values back into the scheduler (and call +prepare+ for Prepared); they do not emit events. Provider-specific signals (process exit, +Player::empty+, a vendor "finished" callback) are mapped to +OutputObservation+ inside adapters and never cross the boundary.
+* *Truth rules*: +Finished+ is emitted only when the logical end has passed *and* no failure, mute or drop was recorded for that generation; +basis+ says whether a drain was observed. A cancelled or never-started future phrase is reported +Cancelled+, never +Finished+. TTS success emits +Prepared+ only. Muted, late-dropped and failed commands emit +Cancelled+ with a reason instead of vanishing.
+* *Phrase and finality*: +phrase+ and +final_phrase+ are explicit from day one; a single-phrase reply is phrase 0 and final. #83 later emits phrase 0..n; the end of a non-final phrase is +Finished+ (with +final_phrase+ false) followed by +Started+ of the next phrase, and +Boundary+ is reserved for declared safe points inside a phrase.
+* *Boundedness*: live state is a map keyed by generation, bounded by scheduler live items; terminal records share the scheduler history ring; the outbound queue is bounded and only +Boundary+ may be coalesced or dropped. A slow consumer detects loss through +seq+ gaps and re-synchronizes from a snapshot of the live map and recent ring, so it does not need provider events (#81).
+* *Privacy*: events carry digests and identities, not text, consistent with the causal-trace rule of no free-text fields.
+* *Metrics* map directly: committed-to-started latency (Committed vs Started +at_ms+), started-to-finished duration, cancellation before/after commit (+reached+), incomplete-versus-final mismatches (+seq+ and +final_phrase+ checks), pronunciation override use and projection failures (+origin+ and +outcome+).
+
+=== D6. What is explicitly not decided here
+
+Which analyzer ships first; the asset schema version policy; whether projection mismatch is hard or soft; the default for URLs and unknown Latin words; and whether Stage 2 is needed at all for the chosen baseline TTS. See Open questions.
+
+== Consequences
+
+=== Positive
+
+* Names, game terms and brand words become a deterministic, auditable, offline fix with a measured per-sentence cost of a few tens of microseconds, independent of any TTS vendor feature.
+* The scheduler stops equating "TTS duration elapsed" with "spoken": muted, dropped, failed and preempted speech become typed lifecycle facts that #81, #83 and #84 can consume without provider events, and that replay and telemetry can record.
+* Projection identity enters the same compatibility mechanism as voice model and viseme mapping, so a lexicon or analyzer change cannot silently reuse stale audio.
+
+=== Costs / trade-offs
+
+* A new, versioned lexicon artifact with an operator workflow, a rule table to maintain, and (for Stage 2) a dictionary to pin, hash and ship with attribution.
+* An incompatible performance-asset schema change (new optional fields rejected by old readers) with the full schema/fixture/parity/replay update cycle.
+* The scheduler gains a return path from audio output; the audio adapters need to expose acceptance, drain and failure, which the process player currently discards.
+* Stage 2 introduces dependency exceptions or a build-time-network workaround, and an extra 40 to 280 MB of memory depending on the choice.
+
+=== Known limitations
+
+. *Sample size and annotator*: 106 + 35 + 30 items, one annotator (the spike author); gold readings were not independently reviewed. Per-candidate differences of a few items are noise.
+. *Rules tuned on the main set*: the rule-layer columns on the main set are optimistic. Only blind1 was a coverage test; blind2 mostly reuses units already in the rule table. The "Min" rule mode was introduced after seeing blind1, so blind1 is contaminated for that mode and only blind2 is clean for it.
+. *No TTS in the loop*: reading correctness was judged against kana gold, not against what a TTS engine pronounces. Whether kana-only output harms accent and prosody for the baseline TTS, and whether the TTS already reads ordinary kanji well enough that Stage 2 is unnecessary, is unmeasured (A-SPEECH-002).
+. *Kana projection side effects*: rewriting whole sentences to kana discards kanji word-boundary and accent hints; the proposed default scope is overrides only for that reason. Deleting emoji removes tone cues; this is a deletion, not a claim, but it changes delivery.
+. *Heuristics*: the kaomoji detector fails on faces containing letters (+(*^o^*)+), and the acronym rule would spell English words written in capitals (for example NASA).
+. *Homographs are not solved* by any candidate (生物, 人気, 辛い); only lexicon entries or TTS context help, and a lexicon entry is context-free.
+. *Platform and determinism*: one Windows machine, warm file cache, no cold-start or cross-OS/CPU timing, no concurrent load test; byte-identical output was shown within one build only. Maximum latencies include scheduler noise. One dependency build (+aws-lc-sys+ under the default jpreprocess feature) failed in the scratch environment; a long build path is suspected but was not confirmed, and the runtime-file dictionary path avoided it.
+. *Not exercised*: native user-dictionary support was run only for vibrato; the vibrato BCCWJ-derived remap terms, the lindera offline dictionary build, jpreprocess 0.16.0-rc0, sudachi.rs plugin loading and the user-dictionary build tools were not examined.
+. *Lifecycle design is code-reading only*: no lifecycle code or prototype exists; the proposal is checked against the code by citation, not by running it. Real audible-start and drain behaviour of the process and native players remains a proxy measurement (A-AUDIO-001).
+
+== Test plan
+
+Maps the acceptance list of #222 to concrete tests for the implementation phase. Fixtures follow the schema-first order in AGENTS.md.
+
+[cols="3,5"]
+|===
+|Acceptance criterion |Test
+
+|Provider-neutral speech lifecycle type exists
+|Serde and bound tests for +SpeechLifecycleEvent+; JSON schema and Rust parity (both directions) for the lifecycle record if it is serialized into replay or telemetry; compile-time check that the domain crate has no dependency on adapters or the scheduler.
+
+|Scheduler/audio path distinguishes TTS-complete from playback-finished
+|Mock TTS returns an artifact: only +Prepared+ is emitted. A mock audio output that returns +Failed+, a muted runtime, a late-dropped command and a normal run produce respectively +Cancelled(OutputFailure)+, +Cancelled(Muted)+, +Cancelled(StaleOrLate)+ and +Finished+; none of the failing paths may produce +Finished+.
+
+|Phrase and final identity explicit
+|Three-phrase fixture: +phrase+ 0, 1, 2 in order, +final_phrase+ true only on the last, phrase 1 failing leaves phrase 0 +Finished+ and phrase 2 +Cancelled+, never replayed.
+
+|Cancellation reason and finality explicit
+|Table test over every cancel source (operator stop, mute, higher-priority preemption at a safe boundary, queued supersession, scheduler rejection, generation cancel at each +CancellationStage+, shutdown, gate rejection) asserting reason and +reached+.
+
+|#81 can consume lifecycle without provider-specific events
+|A consumer test built only on +SpeechLifecycleEvent+ and a snapshot; two different fake provider adapters (process-exit style and vendor-callback style) yield identical lifecycle sequences for the same scenario.
+
+|Display and speech text can differ through bounded deterministic projection
+|Golden fixtures (positive and negative) for lexicon, numbers, Latin, emoji, URL; property tests: determinism across runs, derivability verifier accepts every output and rejects hand-mutated spans, charset and length caps, lexicon bounds (entries, bytes, scalar lengths, duplicates).
+
+|Projection cannot bypass output/publication policy
+|A text allowed as display but whose projection is rejected falls back to display text with +Fallback(GateRejected)+; a text rejected as display never reaches projection; ordering test that no +SpeechRequest+ is built before both decisions are recorded.
+
+|Local lexicon and rules work without a network service
+|Projection crate tests run with no network feature enabled; +cargo deny+ bans network client crates in the projection crate; load-from-file test with the dictionary absent degrades to Stage 1 with a typed reason.
+
+|Projection/version identity participates in asset and replay compatibility
+|Changing rules version, analyzer, dictionary or lexicon revision changes +AssetIdentity::stable_key+; +StaleAssetIdentity+ is raised for a retrieved asset whose identity changed; replay fixture records the identity and replays the recorded +speech_text+ without the analyzer.
+
+|Tests cover Japanese reading override, phrase sequence, cancel-before-start, cancel-after-commit, final completion, stale generation
+|Named scenario tests: override fixture 星乃ひかり to ほしのひかり and OpenAI to オープンエーアイ; the three-phrase sequence; cancel while +Queued+ (reached Committed); cancel while +Playing+ (reached Started, spoken duration recorded); natural completion of the final phrase; a command whose generation is no longer live or is beyond the lateness window.
+
+|Provider-specific lifecycle events stay in adapters
+|Adapter-level mapping tests from raw provider signals to +OutputObservation+; an architecture test asserting no provider type appears in the domain or scheduler public API.
+|===
+
+Metrics and evaluation hooks follow docs/metrics.adoc: committed-to-started latency, started-to-finished duration, cancellation before/after commit, incomplete/final mismatch, override use, correction labels, projection failure rate. Before enabling Stage 2 for a TTS profile, run the falsifier below.
+
+*Falsifier for the implementation phase*: with the chosen baseline TTS, compare (a) display text sent as is, (b) Stage 1 overrides only, (c) Stage 1 plus Stage 2 full reading, on a labelled set of at least 300 items reviewed by two annotators, judging reading errors and prosody. Stage 2 is justified only if (c) reduces reading errors without a prosody regression relative to (b).
+
+== Staging and rollback
+
+. *Shadow*: compute the projection and lifecycle events alongside the current path, record identity and spans, send the unchanged display text to TTS. No behaviour change.
+. *Lifecycle first*: add the lifecycle log and the output-observation return path (adapters report acceptance, drain, failure) before any projection change, because #81 and #83 need it independently. Rollback: ignore the events.
+. *Stage 1 projection behind a profile flag*, per persona, default off; the asset schema bump lands with this step.
+. *Stage 2 analyzer* behind a second flag and only after the falsifier.
+
+Rollback is cheap until audio is generated and cached with projected text (assets then carry +speech_projection+ and become incompatible if reverted). After that, rollback means regenerating those assets or reverting to the display text, which remains valid because projection is additive.
+
+== Revisit conditions
+
+* jpreprocess removes or replaces +bincode+/+unsafe-libyaml+ (for example in 0.16.0), or its release line stalls.
+* Lindera ships an offline, hash-pinned dictionary build path, or the repository accepts a build-time-network exception.
+* Vibrato clears the +argmin+/+bincode+ advisories; sudachi.rs is published to crates.io or the sources policy gains a vetted allow entry; SudachiDict provenance (Hatena, Mozc, station list) is clarified.
+* A TTS profile with a weak Japanese frontend becomes the baseline (#220), making Stage 2 mandatory.
+* The falsifier shows kana projection harming prosody, or the baseline TTS already reads names correctly, making Stage 1 lexicon use rare.
+* #83 phrase streaming or #106 commit barrier changes where commit happens or how phrases are identified.
+* A privacy or security review finds that speech text needs its own retention class.
+
+== Open questions
+
+. *Q1 (scope)*: Is the baseline Stage 1 only (analyzer-free), with Stage 2 deferred until the falsifier? This ADR recommends yes.
+. *Q2 (supply chain)*: For Stage 2, accept the jpreprocess advisory exceptions with owner and revisit date, prefer lindera with an offline dictionary build, or wait for jpreprocess 0.16 (rc0 published 2026-11-08, not evaluated)?
+. *Q3 (schema)*: Bump the performance asset schema to 0.2.0 for +speech_text+ and +speech_projection+ (an incompatible change under the current +deny_unknown_fields+ policy), or carry projection data in a separate sidecar record keyed by asset identity?
+. *Q4 (compatibility)*: Is a projection mismatch a hard incompatibility like +voice_model+, or "stale but playable, regenerate"? The recommended split is hard for rules/analyzer/dictionary and soft per-entry for lexicon revisions.
+. *Q5 (policy defaults)*: URLs: delete, or replace with a configured literal such as リンク? Unknown Latin words: pass through, spell out, or reject? Emoji: always delete?
+. *Q6 (hints)*: Is any generator-supplied reading hint allowed (validated against analyzer n-best readings), given "model output is data"? This ADR excludes it.
+. *Q7 (scope default)*: Default projection scope overrides-only versus full-sentence reading; this needs a measurement with the chosen baseline TTS.
+. *Q8 (authority)*: Who may edit the lexicon (operator ingress capability, config file, both), and may the adaptation layer propose entries from correction labels?
+. *Q9 (basis)*: Is a logical-timeline +Started+/+Finished+ with an explicit +basis+ acceptable for #81 in the first increment, or must the first increment require an observed output acknowledgment?
+. *Q10 (naming)*: "generation" is used for the scheduler attempt id and for +GenerationCancellationToken+ attempts. Rename one (for example +attempt+) before the new contract hardens the ambiguity?
+. *Q11 (placement)*: The domain crate cannot depend on the scheduler. Should the lifecycle types live in the domain crate with the log in the scheduler crate, as proposed, or entirely in the scheduler crate?
+. *Q12 (phrases before #83)*: Is a single-phrase default (phrase 0, final) acceptable until phrase streaming exists, including for streaming TTS progress that is currently collapsed?
+. *Q13 (dictionary distribution)*: Download at install with hash verification, or bundle in releases? Bundling requires reproducing NAIST, UniDic and NITech notices and a decision on the NEologd pointer and on the ICOT compliance clause in mecab-ipadic-derived data.
+. *Q14 (replay)*: Record the projected +speech_text+ (proposed) or its digest only, given the retention-class rule for raw text in docs/domain-contract.adoc?
+
+== Related
+
+* Issue: #222 (parent #94). Consumers: #81, #83, #84, #92, #93. Related design issues: #106 (commit barrier), #219/#220 (local-first baseline).
+* PR: none yet (design-only; no PR opened).
+* Assumptions: A-AUDIO-001, A-TTS-001; proposed A-SPEECH-001 to A-SPEECH-003.
+* Other ADRs: link:0001-three-layer-runtime.adoc[ADR-0001], link:0002-mcp-tool-authority-boundary.adoc[ADR-0002], link:0003-local-vrm-renderer.adoc[ADR-0003].
+* Documents: link:../research-register.adoc[Research register], link:../reuse-first.adoc[Reuse-first], link:../implementation-accelerator.adoc[Implementation accelerator], link:../audio-backend-spike.adoc[Native audio backend spike], link:../supply-chain.adoc[Supply chain], link:../security-threat-model.adoc[Security threat model].

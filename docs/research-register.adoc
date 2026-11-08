@@ -192,7 +192,7 @@ local model ecosystems
 Neuro SDK speech lifecycle events
 |Separate display text from bounded deterministic speech text, and expose scheduler-owned audible lifecycle instead of inferring it from TTS completion
 |#81, #83, #222
-|Japanese names/game terms; chunk-boundary pronunciation; semantic-preservation gate; cancel-before/after-commit; provider event normalization
+|Japanese names/game terms; chunk-boundary pronunciation; semantic-preservation gate; cancel-before/after-commit; provider event normalization. Proposed decision, analyzer comparison and lifecycle code-reading for #222: link:adr/0004-speech-lifecycle-and-text-projection.adoc[ADR-0004] (Proposed; no TTS engine was run, spike sample is small and single-annotator)
 
 |Realtime media/data plane
 |AIRI plugin control/data-plane design;
