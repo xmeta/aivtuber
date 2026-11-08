@@ -172,7 +172,7 @@ V-Sekai `godot-vrm`;
 AIRI behavior/runtime patterns
 |Use VRM 1.0/MToon as the zero-paid baseline avatar path; keep provider-neutral PerformanceIntent/AvatarAdapter and replay semantics above the renderer
 |#84, #91, #219, #205
-|Transparent capture quality; viseme/expression/look-at coverage; WebGL/WebGPU portability; renderer crash/reconnect; model asset licensing; no CDN/runtime paid-host requirement
+|Transparent capture quality; viseme/expression/look-at coverage; WebGL/WebGPU portability; renderer crash/reconnect; model asset licensing; no CDN/runtime paid-host requirement. Proposed decision and spike evidence for #219: link:adr/0003-local-vrm-renderer.adoc[ADR-0003] (Proposed; OBS, Tauri and Linux CI unverified)
 
 |Local generative baseline
 |`llama.cpp` / `llama-server` Responses API;
