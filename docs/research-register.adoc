@@ -59,7 +59,7 @@ Full-Duplex-Bench family;
 LiveKit Agents / Pipecat
 |Persona-conditioned turn style; distinguish hold/shift/backchannel/interruption; tentative interruption before irreversible cancellation
 |#59, #70, #81, #92
-|Japanese/multilingual timing; false-turn-take rate; interruption/resume behavior under aivtuber phrase/scheduler boundaries
+|Japanese/multilingual timing; false-turn-take rate; interruption/resume behavior under aivtuber phrase/scheduler boundaries. Proposed floor policy, reuse review of Pipecat/LiveKit/Open-LLM-VTuber/AIRI and a synthetic replay simulation for #81: link:adr/0005-conversational-floor-policy.adoc[ADR-0005] (Proposed; synthetic data only, no real Japanese dialogue, no human judgement of backchannels)
 
 |Backchannels
 |Yeah, Un, Oh: Continuous and Real-time Backchannel Prediction with VAP (NAACL 2025)

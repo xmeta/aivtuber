@@ -1,0 +1,439 @@
+= ADR-0005: Deterministic conversational-floor policy with reversibility-tiered timing and tentative interruption
+:status: Proposed
+:date: 2026-11-08
+
+== Context
+
+Issue #81 asks for a provider-neutral conversational-floor layer that decides when the performer should hold, yield, backchannel, take a turn, interrupt, or wait, separately from deciding what to say.
+It is +status:design-ready+: this ADR records a candidate decision, a reuse review of four public projects, and a throwaway replay simulation. It authorizes no production code and adds no dependency.
+Nothing from the simulation is committed; only the numbers and the design are recorded here (see Known limitations).
+
+Inputs this ADR builds on, all merged on +main+ at +d78d714f+:
+
+* link:../experiments/EXP-0001-japanese-turn-observation-bench.adoc[EXP-0001] (#92): VAD-derived speech activity is usable; Smart Turn v3.2 was not better than a fixed silence timeout on Japanese; the supervisor decisions carry the reversibility-class question to #81 (11.1 item 5) and make the turn-end value an optional score with a +calibrated+ flag that defaults to false (11.1 item 3).
+* link:0004-speech-lifecycle-and-text-projection.adoc[ADR-0004] (#222): +SpeechLifecycleEvent+ with +phase+, +phrase+, +final_phrase+ and +basis+; decision D-6 says #81 must read +basis+ and must not treat +LogicalTimeline+ as audible.
+* link:0003-local-vrm-renderer.adoc[ADR-0003] (#219): the avatar already exposes symbolic +Expression+, +Gesture+ (nod), +Gaze+ commands, so non-verbal backchannels have an output path; measured command-to-rendered-frame latency is 15 to 17 ms on a GPU and about 111 ms on software GL, plus a 60 ms interpolation time constant.
+* the existing scheduler (+crates/scheduler/src/lib.rs+): +Priority+ ranks (Operator 0 to Background 5), preemption rejected when +incoming_rank > playing_rank+ (+:526-531+), +next_safe_boundary+ over declared +interrupt_points_ms+ (+:745-756+), +min_reaction_spacing_ms+ default 1500 (+:185,197+), and a +cancel_at_ms+ that is set when a plan is preempted. There is no pause or resume primitive.
+* the speculative-preparation rule in link:../architecture.adoc[architecture 6.3.1]: preparation is data, never public output, and only a deterministic commit path may make it irreversible.
+
+Today a generated reply declares exactly one interrupt point, at the end of the speech (+crates/generative/src/lib.rs:479+, see also ADR-0004 lifecycle table). That matters for the barge-in numbers below.
+
+== Hard constraints
+
+* Model, Jev and generated output are data, never runtime authority. Jev may recommend a floor action; the deterministic policy decides (issue #81 non-goal: Jev must not stop or dispatch scheduler actions).
+* Untrusted content cannot declare itself interrupt-critical. Source class, trust and priority are assigned by the normalizer, never by the payload.
+* Operator emergency stop is an independent control path and is not routed through the floor policy or its state.
+* The scheduler owns cancellation, safe interrupt points, priority arbitration and generation fencing. The floor policy never cancels or dispatches directly.
+* Nothing speculative becomes public except through the deterministic commit path (architecture 6.3.1).
+* The policy runs outside the frame/motor loop and is a pure function of its inputs; replay uses logical or monotonic ordering, not wall-clock ordering.
+* All retained state is explicitly bounded (decision log, backchannel history, outstanding preparations).
+* Provider-specific DTOs stay behind adapters; the floor contract must not hard-code one VAD, VAP or turn-detection provider.
+* Raw audio does not enter the domain contract (EXP-0001 guardrail).
+
+== Assumptions
+
+No existing assumption ID covers floor timing. Proposed new assumptions (to be added to the link:../assumptions.adoc[Assumption Register] if this ADR is accepted):
+
+* A-FLOOR-001: A silence ladder over VAD observations, with the irreversible TakeTurn at about 800 ms, is an acceptable first floor policy for Japanese speech until real labelled dialogue exists. Evidence: EXP-0001 and section Results below, both on synthetic constructions. *Not validated on real conversation*; this is the principal falsifier for the implementation phase.
+* A-FLOOR-002: A non-verbal backchannel (gaze, face, nod) at about 300 ms of silence is not perceived as annoying, while a spoken one on the same trigger is. Evidence: none beyond the mechanical overlap measurements below. Needs a human-rated #59 sample.
+* A-FLOOR-003: Attenuating the performer ("duck") on a tentative interruption, and restoring it on a false one, is acceptable without a pause primitive in the scheduler. Evidence: none; the ducked durations below are model outputs, not listener judgements.
+* Related existing IDs: A-AUDIO-001 (output-adapter return is not acoustic first-audible time) and the proposed A-SPEECH-003 from ADR-0004.
+
+== Alternatives considered
+
+. *Status quo*: speak whenever a reply is ready; the only interruption is operator stop. Rejected as the end state: the issue exists because this is not a floor policy.
+. *Fixed silence timeout only* (one threshold, one action). The baseline. Cheap and predictable but forces one trade-off for all actions: at 800 ms the lag at a true end is about 870 ms; at 500 ms 39 percent of holds are cut (section Results).
+. *Delegate turn and interruption handling to LiveKit Agents or Pipecat as the orchestrator.* Rejected: both frameworks own interruption and cancellation inside their pipelines (LiveKit pauses and cancels the speech handle, Pipecat broadcasts an interruption on turn start), which conflicts with scheduler authority, the lifecycle truth rules of ADR-0004 and the commit barrier. Their state machines and defaults are reused as references only.
+. *Model-driven turn-end (Smart Turn, Jev, a VAP-style model) as the commit trigger.* Rejected for now: EXP-0001 found no model-based claim confirmable without a real labelled Japanese turn set (11.1 item 1), and Smart Turn fired on 83 to 85 percent of holds. A model score is admitted only as an optional, flagged input that may start reversible work.
+. *Pause and resume of the performer's audio* (LiveKit's false-interruption recovery). Not adopted in the first slice: it needs a pause primitive in the scheduler and output adapters that does not exist, and a paused-then-resumed phrase makes lifecycle +Started/Boundary/Finished+ truth ambiguous. A reversible attenuation (duck) gives the same recovery property without touching the timeline. Revisit if listener tests reject ducking.
+. *Reversibility-tiered deterministic policy (proposed)*: separate thresholds by how costly the action is to take back; early preparation, late commit; tentative then confirmed interruption.
+
+== Reuse / Adapt / Build comparison
+
+Reuse-first vocabulary per link:../reuse-first.adoc[reuse-first]. All four projects were read through the GitHub contents API at the commits shown; nothing was cloned, run or installed, and no dependency is proposed.
+
+[cols="2,2,3,3,2"]
+|===
+|Project / license / commit |Files read |Pattern found |Conflict with this repository |Mode
+
+|*Pipecat* (pipecat-ai/pipecat); BSD-2-Clause (LICENSE read: "Copyright (c) 2024-2026, Daily"); commit +3dbb0c84+
+|+src/pipecat/turns/user_turn_controller.py+, +user_turn_strategies.py+, +user_start/base_user_turn_start_strategy.py+, +user_start/vad_user_turn_start_strategy.py+, +user_start/min_words_user_turn_start_strategy.py+, +user_stop/speech_timeout_user_turn_stop_strategy.py+, +user_stop/turn_analyzer_user_turn_stop_strategy.py+, +turns/eager_end_of_turn_mixin.py+, +audio/vad/vad_analyzer.py+
+|(1) A turn-start strategy decides whether a detected start interrupts the bot (+enable_interruptions+, default true). (2) +MinWordsUserTurnStartStrategy+: while the bot is speaking, a user turn starts only after +min_words+ spoken words (one word when the bot is silent); for Japanese and Chinese each character counts as a word. (3) +SpeechTimeoutUserTurnStopStrategy+: a +user_speech_timeout+ of 0.6 s after the VAD stop event; the VAD default +stop_secs+ is 0.2 s, so the default end-of-turn silence is on the order of 0.8 s (derived from two constants, not measured). (4) The controller has +on_user_turn_inference_triggered+ carrying a +UserTurnSpeculation+ when the turn "hasn't ended yet", +on_user_turn_resumed+ (user speaks again; the speculative answer is void) and +on_user_turn_speculation_cancelled+: a speculate / cancel / confirm vocabulary that matches early prepare and late commit. (5) The eager end-of-turn mixin is "off by default: it spends an inference on every prediction, including the ones the service withdraws", the cost the Results section measures. (6) Default stop strategy is Smart Turn v3 (docstring).
+|An interruption is broadcast on turn start with no tentative state in the files read; the bot's speech is cancelled by the framework, not by a scheduler. The word-count evidence needs ASR, which the first slice does not have. Smart Turn is not adopted (EXP-0001). I found no pause or resume of the bot's speech in these files (a statement about the files read, not the repository).
+|*Reference only.* Reuse the speculate / resume / cancel vocabulary and the "evidence tier while the bot speaks" idea (words) as a future ASR-conditioned confirm rule.
+
+|*LiveKit Agents* (livekit/agents); Apache-2.0 (LICENSE file read: Apache License 2.0); commit +1e352e41+
+|+livekit-agents/livekit/agents/voice/turn.py+, +voice/agent_activity.py+ (+_interrupt_by_audio_activity+, +on_start_of_speech+, +on_end_of_speech+, +_start_false_interruption_timer+, +_pause_enabled+, +on_preemptive_generation+, +on_preflight_stale+, +on_agent_backchannel_opportunity+), +voice/audio_recognition.py+ (backchannel boundary and preflight parts), +voice/endpointing.py+ (option names only)
+|(1) Defaults: interruption +min_duration+ 0.5 s, +min_words+ 0, +resume_false_interruption+ true, +false_interruption_timeout+ 2.0 s, +backchannel_boundary+ (1.0, 1.0) s; endpointing +min_delay+ 0.5 s / +max_delay+ 3.0 s (a separate table of streaming defaults uses 0.3 / 2.5 s); preemptive generation enabled, +preemptive_tts+ false, +max_speech_duration+ 10 s, +max_retries+ 3 per turn. (2) *False-interruption recovery*: on VAD speech of at least +min_duration+ while the agent speaks, the audio output is paused (not cancelled) and the speech handle is recorded as paused; when the user stops, a timer of +false_interruption_timeout+ starts; if no turn commits before it fires the audio is resumed and an +agent_false_interruption(resumed=True)+ event is emitted; a final transcript or turn commit instead interrupts the paused handle. Pausing requires an output that reports +can_pause+. (3) *Preemptive generation* runs the LLM only by default, is skipped for long user speech, is capped, is cancelled when the transcript moves on (+on_preflight_stale+), and is adopted only if the final transcript and chat context are equivalent. (4) The turn detector protocol has an optional +backchannel_probability+ and a +backchannel_threshold+; the agent's own backchannel opportunity handler is a no-op marked TODO at this commit.
+|Pause and resume assume an audio sink that can pause, which the scheduler and adapters do not have; `speech_handle.interrupt()` makes the framework the authority on cancellation. VAD duration (not semantics) arms the pause, and a 2 s resume timer is long for a performer that must not talk over a user. Their adaptive (ML) interruption detector in +inference/interruption.py+ was not read and its licensing or hosting terms are unverified.
+|*Reference only.* Adopt the tentative / confirmed / false state machine, the "arm on duration, confirm on semantics or commit" rule, the preflight-stale cancellation, and their defaults as starting configuration values. Do not adopt the pause primitive or the framework-owned cancel.
+
+|*Open-LLM-VTuber*; MIT for code (LICENSE read: "Copyright (c) 2025 Yi-Ting Chiu"); a separate +LICENSE-Live2D.md+ covers Live2D sample data, which is why GitHub reports NOASSERTION; commit +992309c0+
+|+src/open_llm_vtuber/vad/silero.py+, +websocket_handler.py+ (+_handle_raw_audio_data+, +_handle_interrupt+), +conversations/conversation_handler.py+ (+handle_individual_interrupt+), +conversations/single_conversation.py+, +agent/agents/basic_memory_agent.py+ (+handle_interrupt+)
+|(1) Silero VAD with probability threshold 0.4, three consecutive hits (about 0.1 s) to activate and 24 misses (about 0.8 s) to end the utterance; the activation emits a +<|PAUSE|>+ token that the server forwards to the client as an +interrupt+ control. (2) The server cancels the conversation task, and the agent rewrites the last assistant message to the text the user actually *heard* plus an ellipsis, then records an "[Interrupted by user]" turn. (3) +<|RESUME|>+ is ignored.
+|Any 0.1 s activation hard-cancels the reply with no tentative state and no resume. The "heard text" is reported by the client, so it is untrusted data; here heard text must come from scheduler-owned lifecycle events (+basis+). Task cancellation has no generation fence.
+|*Reference only.* Reuse the idea that interruption must record what was actually spoken (map to ADR-0004 +Started/Boundary/Finished+ with +basis+). Its 0.8 s end-of-utterance default is the same constant as the fixed-800 baseline measured here.
+
+|*AIRI* (moeru-ai/airi); MIT (LICENSE read: "Copyright (c) 2024-PRESENT Neko Ayaka"); commit +0723b7d3+
+|+packages/core-agent/src/voice/interruption.ts+, +voice/turn.ts+, +packages/stage-layouts/src/composables/use-chat-interruption.ts+. VAD worker sources exist in the tree and were *not* read.
+|(1) A typed +Interruption+ whose +silenced+ and +done+ promises are separate completion boundaries (playback silent versus durable notification recorded), keyed by +TurnRef{sessionId, turnId}+ and a +PlaybackReceipt+. (2) A +VoiceInterruptionEvent+ travels separately from user-authored chat ("durable external control information"). (3) In the UI a new submission cancels the visible session's response before sending; stop targets the most recent turn of another session.
+|The composer cancel is a local-UI, owner-trust action; applying it to public chat would violate "normal chat cannot force unsafe interruption". No turn-taking or false-interruption logic was found in the three files read.
+|*Reference only.* Reuse the two-boundary completion idea (silenced versus recorded) and the separation of interruption cause from user text for the replay record.
+
+|*Floor policy itself*
+|n/a
+|n/a
+|n/a
+|*Custom.* Earlier modes do not fit: the policy must be a pure, replayable function over project-owned types (scheduler priority and safe points, ADR-0004 lifecycle, #92 observation flags, commit barrier). It is about 200 lines in the simulation, not a media or turn-detection pipeline. VAD plumbing stays the EXP-0001 sidecar decision; no custom media pipeline is proposed, which is what #81 asks to be justified before one is written.
+|===
+
+Search-tool note (AGENTS.md): the repository was searched with +tgrep+ 1.0.11 indexed at the checkout root. The four external repositories are not part of this checkout, so their file lists were obtained with the GitHub trees API and filtered with plain +grep+; this substitution applies only to external content and is recorded here for reviewers.
+
+== Evidence
+
+=== Method
+
+A throwaway pure function +decide(state, observation, own_speech, event, config) -> (state, decision)+ was written in Python (scratch only) and replayed over the saved EXP-0001 per-frame Silero v6 speech probabilities for the same 424 labelled streams (A 142, B1 80, B2 114, C 88), in the clean and the noisy15 conditions (EXP-0001 4.2; seed 20261108). The observation adapter applies the EXP-0001 hysteresis (on at 0.5, off at 0.35) frame by frame and delivers each observation only at the end of its 32 ms frame, so the policy is causal. Smart Turn scores from the same saved run were used where stated, delayed by 120 ms (about the measured inference p95) before they are visible.
+
+*The data are synthetic.* Streams are read Common Voice sentences with inserted silences of exactly 300, 500 or 700 ms (EXP-0001 4.3, 9). They contain no breath, filler, overlap, backchannel, cough, laughter or game audio. Every limitation L1 to L14 of EXP-0001 applies here, and the absolute rates must not be read as production rates; only the ordering of policies and the mechanisms are claimed.
+
+*Reproduction check.* Applying EXP-0001's own +ev_fixed+ rule (min-speech-filtered segments with an oracle next-segment start) to the saved scores reproduced its published clean counts exactly: false take on holds 145/194 at 300 ms, 83/194 at 500 ms, 7/194 at 800 ms (noisy15: 142, 72, 7). The causal policy in this ADR gives fewer false takes at 800 ms (1/194 clean, 6/194 noisy15) because it treats any raw VAD run, however short, as activity that resets the silence clock. In all six clean streams where the two rules differ at 800 ms (B1_046, B1_064, B1_073, B2_023, B2_056, B2_098) a raw VAD run shorter than the 250 ms minimum (32 to 224 ms) lies in or next to the pause. Whether such a fragment is real speech or a pause-construction artifact cannot be decided from this data, so *both numbers are reported* and the finding is carried as a requirement on #92 (D2): the observation must expose raw activity without the 250 ms debounce, or the floor cannot see these cases.
+
+Assumed parameters (not measured, all configurable in the sim): a spoken backchannel asset lasts 400 ms; duck takes 50 ms to apply after a decision and a scheduler dispatch takes 50 ms; a synthetic performer reply is 8 s long; "phrase" boundaries are spaced 1.2 to 2.4 s, "fine" boundaries 0.6 s, "none" means the single end-of-speech interrupt point that generated replies declare today; the preparation time P of LLM plus TTS is swept at 300, 600, 1000 and 1500 ms. Ten random phase offsets per stream give 3360 barge-in trials per condition; they are not independent draws.
+
+=== Results: TakeTurn timing (policy 1, fixed silence before TakeTurn)
+
+Cell: rate (count/total; 95% Wilson interval), clean condition. "EXP semantics" is EXP-0001's published rule for the same data. Policies 2 and 3 use the same TakeTurn rule as the matching policy 1 row, so their false-take and lag columns are identical to it *by construction*.
+
+[cols="2,3,3,2,2,2",options="header"]
+|===
+|TakeTurn after silence of |False take on holds, causal raw activity |False take on holds, EXP semantics |False take on natural pauses in single utterances (A) |Lag at true end p50 / p90 (ms) |Non-speech streams fired
+|300 ms |73% (141/194; 66-78) |75% (145/194; 68-80) |4% (6/142; 2-9) |388 / 429 |0/88
+|500 ms |39% (76/194; 33-46) |43% (83/194; 36-50) |0% (0/142; 0-3) |580 / 621 |0/88
+|600 ms |34% (65/194; 27-40) |36% (69/194; 29-43) |0% (0/142; 0-3) |676 / 717 |0/88
+|700 ms |6% (11/194; 3-10) |10% (20/194; 7-15) |0% (0/142; 0-3) |772 / 813 |0/88
+|*800 ms* |*1% (1/194; 0-3)* |*4% (7/194; 2-7)* |0% (0/142; 0-3) |*868 / 909* |0/88
+|1000 ms |0% (0/194; 0-2) |1% (1/194; 0-3) |0% (0/142; 0-3) |1092 / 1133 |0/88
+|===
+
+Noisy15 condition (pink noise 15 dB below speech): 300 ms 72% (140/194) and lag 420 / 489; 500 ms 36% (69/194), 612 / 681; 600 ms 28% (54/194), 708 / 777; 700 ms 7% (13/194), 803 / 873; *800 ms 3% (6/194; 1-7) [EXP semantics 4% (7/194)], 899 / 969*; 1000 ms 0% (0/194), 1123 / 1193. One true end never received a TakeTurn at any threshold; at 300 ms 4 (clean) or 5 (noisy15) did not. The turn never opens on non-speech, so 0/88 fires in both conditions.
+
+Reading: with VAD alone only the 800 ms row keeps the false-take rate at a few percent, and 700 ms costs 96 ms less lag for roughly 5 to 6 additional points of false takes on this synthetic distribution. A silence-only policy cannot distinguish a hold longer than its threshold from a true end; the long tail of real hesitation lengths is not represented here.
+
+=== Results: backchannel tiers (policy 2) and what they land on
+
+Policy 2 adds a non-verbal backchannel (ladder level 3, nod) and optionally a short cached vocal backchannel (level 4) on the silence ladder before TakeTurn at 800 ms. A backchannel counts as "on a hold" when it fires before the reference end of the turn, so the user was still taking the floor. A vocal backchannel "collides" when the user's speech resumes within the assumed 400 ms asset duration.
+
+[cols="3,2,2,2,2,2",options="header"]
+|===
+|Backchannel configuration (clean) |Non-verbal on holds |Vocal on holds |Vocal colliding with resumed speech (overlap p50 / p90 of the 400 ms asset) |True ends preceded by non-verbal |True ends preceded by vocal
+|non-verbal at 300 ms only |73% (141/194; 66-78) |0% |n/a |99% (332/336) |0%
+|plus vocal at 500 ms, preceding speech at least 1000 ms |73% (141/194) |38% (74/194; 32-45) |38% (74/194); 272 / 336 ms |99% |*100% (335/336)*
+|vocal at 500 ms, preceding speech at least 3000 ms |73% |10% (19/194; 6-15) |10% (19/194) |99% |55% (184/336)
+|vocal at 500 ms, preceding speech at least 5000 ms |73% |2% (3/194; 1-4) |2% (3/194) |99% |22% (74/336)
+|vocal at 400 ms, preceding speech at least 1000 ms |73% |66% (128/194; 59-72) |65% (127/194); 240 / 400 ms |99% |100% (335/336)
+|===
+
+Noisy15 is the same within a few points (vocal at 500 ms and 1000 ms minimum speech: holds 34% (65/194), colliding 33% (64/194), true ends 100%; with 3000 ms: holds 10%, true ends 56%; with 5000 ms: holds 2%, true ends 22%). Non-verbal on natural pauses inside single utterances: 4% (6/142) clean.
+
+Findings:
+
+. A vocal backchannel fired from the silence ladder lands before the take on essentially every true end (100 percent with a 1 s minimum). That is "a spoken filler for every wait", an explicit #81 non-goal. Requiring 3 s or 5 s of preceding speech reduces it to 55 and 22 percent of ends in this data, because these sentences are 1.2 to 9 s long; the number tracks the data, not a general rule.
+. Every vocal backchannel that landed on a hold overlapped the resumed speech (median 272 ms of 400 ms). This is a consequence of the three-valued pause distribution, because a hold that survives 500 ms must resume before the 800 ms take; with real, continuous pause lengths some would clear. It does not say a short vocal acknowledgement is acceptable when it overlaps.
+. A non-verbal backchannel at 300 ms precedes 73 percent of holds and 99 percent of true ends. It is cheap to take back (D3) but would be a nod before almost every reply; whether that reads as attentive or mechanical is a persona and #59 question. Japanese aizuchi frequency norms were not studied here.
+. The tier structure does not change the TakeTurn false rate or lag at all (by construction). Its measurable benefit in this data is only that something visible happens at about 330 ms instead of 870 ms; whether that is perceived as responsiveness was not tested.
+
+=== Results: early prepare, late commit (policy 3)
+
+Preparation starts at threshold E of silence; the result stays speculative; commit is still at 800 ms; preparation is cancelled when raw speech resumes. Lead time is commit time minus preparation start. Because the commit rule is fixed, the lead is *deterministic*: 800 minus E plus the 32 ms frame quantum, with no spread (p10 = p50 = p90). What varies is the waste.
+
+[cols="2,2,2,2,2,3",options="header"]
+|===
+|Prepare at E (clean) |Lead (ms) |Preparations started / cancelled / committed |Cancelled per 100 true ends |Holds that triggered a cancelled preparation |Median first-audio lag after the true end for assumed P = 300 / 600 / 1000 / 1500 ms
+|no early prepare (policies 1 and 2) |0 |0 |0 |0 |1168 / 1468 / 1868 / 2368
+|300 ms |480 |488 / 152 / 336 |45 |72% (139/194) |*868* / 988 / 1388 / 1888
+|400 ms |384 |470 / 134 / 336 |40 |68% (132/194) |868 / 1084 / 1484 / 1984
+|500 ms |288 |412 / 76 / 336 |23 |39% (75/194) |880 / 1180 / 1580 / 2080
+|600 ms |192 |400 / 64 / 336 |19 |33% (64/194) |976 / 1276 / 1676 / 2176
+|Smart Turn score of at least 0.5 starts it (uncalibrated; never commits) |448 / 480 / 480 (p10 / p50 / p90) |441 / 124 / 317 |37 |60% (116/194) |871 / 994 / 1394 / 1894
+|===
+
+Noisy15: cancelled per 100 true ends 43, 30, 19 and 15 for E = 300, 400, 500, 600 ms; Smart Turn 35; first-audio lags about 30 ms later than the clean ones, as the true-end lag is.
+
+Findings:
+
+. The saving is *min(P, lead)*. Early preparation cannot hide a preparation longer than 800 minus E: with E = 400 ms it removes 300 to 384 ms of a 600 to 1500 ms LLM-plus-TTS time, and a 1.5 s preparation still ends 1984 ms after the end of the user's speech. It makes a 300 ms preparation free, not a 1.5 s one. Hiding more needs streaming inputs (partial transcripts, phrase-level output, #83) or reversible masking (#82).
+. The cost is real: at E = 400 ms two out of five turn ends are accompanied by a wasted preparation (and 68 percent of holds cancel one). Pipecat leaves the equivalent feature off by default for this reason, and LiveKit caps it at 3 attempts, skips long speech and does not run TTS preemptively. The design keeps those bounds.
+. A Smart Turn trigger cancelled 18 percent fewer preparations than a 300 ms timer at the same median lead (124 versus 152 cancelled), but gave no early preparation for 6 percent of true ends (20/336) and costs 94 ms of CPU per inference (EXP-0001). This is within what 194 holds can resolve, and it is consistent with the AUC of 0.64 in EXP-0001; it is not evidence for adopting the model.
+
+=== Results: barge-in on the performer's own speech
+
+User speech starts at a random time while the performer speaks. Tentative means the raw VAD run reached 96 ms (three frames); confirmed means it reached M ms. Latencies are measured from the energy-defined acoustic onset of the user's speech; clean condition, 3360 trials each. "Duck" is the first perceptible yield (attenuation plus a 50 ms application delay). "Stop" is the time the performer's audio ends if the scheduler cancels at the next declared interrupt point at or after confirmation plus a 50 ms dispatch.
+
+[cols="3,1,1,1,2,2,2",options="header"]
+|===
+|Confirmation rule |Duck p50 / p90 (ms) |Confirm p50 / p90 (ms) |Never confirmed |Stop, phrase boundaries every 1.2-2.4 s p50 / p90 |Stop, fine boundaries every 0.6 s p50 / p90 |Stop, single end-of-speech point (today's generated reply) p50 / p90
+|cancel on first activity of 96 ms (Pipecat default and Open-LLM-VTuber pattern) |194 / 258 |144 / 208 |0 |1088 / 1919 |500 / 748 |4820 / 7104
+|confirm at 256 ms |194 / 258 |304 / 368 |0 |1246 / 2085 |673 / 900 |4820 / 7104
+|*confirm at 400 ms* |194 / 258 |464 / 528 |10 |1410 / 2255 |814 / 1061 |4832 / 7109
+|confirm at 600 ms |194 / 258 |656 / 848 |10 |1636 / 2489 |1018 / 1295 |4832 / 7109
+|confirm at 800 ms |194 / 258 |848 / 1264 |30 |1869 / 2729 |1250 / 1612 |4820 / 7104
+|===
+
+False yield. In the 88 non-speech streams there was one tentative activation in one stream (clean only) and no confirmation under any rule; with noisy15 there was none. *This is not informative about coughs, laughter or backchannels*, because EXP-0001 contains none. As a labelled stand-in, the first speech run of each of the 336 speaking streams was truncated to a burst of 128 to 640 ms by forcing the VAD probability to 0.02 afterwards (a VAD-trace surrogate, not audio) and replayed against the speaking performer:
+
+[cols="3,1,1,1,1,1",options="header"]
+|===
+|Rule: bursts that were confirmed as interruptions (out of 336) |128 ms |192 ms |288 ms |416 ms |640 ms
+|cancel on first activity |336 |336 |336 |336 |336
+|confirm at 256 ms |0 |0 |336 |336 |336
+|*confirm at 400 ms* |0 |0 |0 |330 |330
+|confirm at 600 ms |0 |0 |0 |0 |317
+|confirm at 800 ms |0 |0 |0 |0 |0
+|===
+
+Every tentative burst that was not confirmed resumed after a holdoff of 500 ms of silence; the performer stayed ducked for a median of 544, 608 and 704 ms for bursts of 128, 192 and 288 ms (clean; noisy15 is the same to the frame). Noisy15 results are otherwise within one or two trials of clean.
+
+Findings:
+
+. Cancelling on the first activity (the common default) turns every short sound into a cancelled reply. A tentative stage removes that for bursts shorter than the confirmation threshold, at the price of confirm latency: 400 ms costs about 320 ms more than a hard cancel. The threshold is a cough-versus-speech trade, and 400 ms sits at the same order as LiveKit's 500 ms +min_duration+.
+. *Yield latency is dominated by safe-point density, not by detection.* Detection plus confirmation is 0.2 to 0.5 s, but the audio stops at the next declared interrupt point: about 1.4 s at phrase granularity, 0.8 s at 0.6 s granularity, and 4.8 s (p50) against the single end-of-speech point that generated replies declare today. Until #83 phrase streaming (or asset-declared finer interrupt points) exists, a confirmed barge-in cannot be honoured quickly by a policy that respects safe points, and the duck is the only immediate cue. The floor policy must not bypass this for ordinary user speech; see open question Q3.
+. The simulated user speech is read sentences that start at a random time; real barge-in speech often begins with a short filler or breath, which the 96 ms tentative run and the debounce question (D2) interact with. Not measured.
+
+=== Results: stale-observation rejection
+
+For each hold, a delivery stall of 600 ms was injected at a random point inside the pause (5 draws per stream, 970 trials). During a stall the policy is still ticked with the last delivered observation. Without a freshness rule the silence clock keeps counting through the stall; with the rule (observation age above 160 ms makes the policy Wait, cancel preparation and withhold TakeTurn) it does not.
+
+[cols="3,2,3",options="header"]
+|===
+|Condition |False take on holds |Lag at true ends p50 / p90 / p99 (ms), 670 streams with a 600 ms stall within 800 ms after the end
+|no stall (reference), clean |1% (5/970; 0-1) |868 / 909 / 979
+|stall, no freshness rule, clean |*40% (384/970; 37-43)* |868 / 909 / 979
+|stall, freshness rule (age at most 160 ms), clean |1% (5/970; 0-1) |917 / 1241 / 1326
+|no stall, noisy15 |3% (30/970; 2-4) |899 / 969 / 1039
+|stall, no freshness rule, noisy15 |35% (336/970; 32-38) |899 / 969 / 1039
+|stall, freshness rule, noisy15 |2% (16/970; 1-3) |955 / 1252 / 1356
+|===
+
+The rule trades a bounded extra lag (p90 up by about 330 ms when the stall lands at the true end) for removing the dominant failure of a frozen feed. A stall of 600 ms is an assumed magnitude; the point is the mechanism.
+
+=== Results: determinism and the issue's path coverage
+
+The pure function was exercised on 20 rows (idle, speaking, tentative, confirmed, false interruption, stale feed, no VAD, critical trusted event, untrusted critical event, donation, normal chat, busy game segment) and all produced the expected action; 1000 repeated evaluations of the same input returned identical output. This is a sanity check of the sketch, not a measurement: the Jev path and the persona path are not modelled (Jev is advisory and absent from the function). The rows are the seed fixtures for the test plan.
+
+== Decision
+
+Candidate decision, not yet accepted. The supervisor owns the decisions listed under Decisions requested.
+
+=== D1. Single owner, placement and boundaries
+
+* A single deterministic +FloorPolicy+ is the only producer of +FloorDecision+. It is a pure function of explicit inputs and configuration; it reads no clock, performs no I/O and holds no randomness. It runs on the control tick, never in the frame or motor loop, and never waits on Jev, a provider or a generation.
+* It emits recommendations to existing owners and nothing else: scheduling requests go through the normal scheduler path (so rank checks, cooldowns, +min_reaction_spacing_ms+ and +next_safe_boundary+ apply unchanged); preparation directives go to the generation executor; non-verbal backchannels go through the normal avatar command path (ADR-0003 +Expression+, +Gesture+, +Gaze+). +Yield+ and +Interrupt+ become a preemption request evaluated by the scheduler, whose +cancel_at_ms+ mechanism executes it. The policy cannot cancel.
+* Operator stop never enters the policy. Its path stays as it is today; the policy has no input or state that can delay it, and a stuck or panicking policy must not delay it (test in the plan).
+* Placement is proposed, not decided: types in +crates/domain+ (provider-neutral, bounded, versioned), the policy as a module that has access to the scheduler's lifecycle log. The domain crate cannot depend on the scheduler (ADR-0004 Q11), so the policy would live next to the lifecycle owner. See Q1.
+
+=== D2. Types and inputs
+
+Names are implementation choices. Sketch:
+
+----
+FloorAction
+  Hold | Yield | Backchannel | TakeTurn | Interrupt | Wait
+
+FloorDecision
+  seq, at_ms               logical time, per-process monotonic sequence
+  action: FloorAction
+  reason: FloorReason      closed enum (for replay and metrics; no free text)
+  backchannel: Option<{ ladder_level 1..4, intent: BackchannelIntent, speech_allowed }>
+  prepare: None | Start { turn_epoch } | Cancel { turn_epoch }
+  interruption: NoInterruption | Tentative | Confirmed | FalseInterrupt | Resume
+  attenuate: bool          reversible duck while Tentative
+  earliest_ms, deadline_ms Option    (issue: earliest turn time, maximum wait)
+  attention: AttentionTarget         existing enum
+  inputs: { observation seq + age, lifecycle seq + basis, event id, config version, jev hint digest, fallback }
+
+FloorInput
+  observation: Option<TurnObservation>   (#92)
+  own_speech: view of the latest SpeechLifecycleEvent for the performer (#222)
+  event: classified event { scheduler Priority assigned by the normalizer, trust, kind }
+  attention, game_busy, bounded backchannel history, config
+  jev_hint: Option<JevFloorHint>         advisory, may be absent
+----
+
+* *Observation (#92) fields the policy needs.* +speech_active: Option<bool>+ (absent when no VAD); the logical time of the last activity edge and of the observation itself, assigned at ingress by the normalizer, not by the provider; the raw run start; an optional turn-end score object +{ value, provider_id, calibrated }+; the +calibrated+ flag defaults to false and an uncalibrated score is *never* read as a probability and may only start reversible preparation (policy 3 variant). The policy computes silence as logical-now minus the last activity edge, so a provider that freezes cannot extend or shorten it (D6). *Requirement on #92:* expose raw activity edges without the 250 ms minimum-speech debounce; segments filtered by that debounce hide 6 of 194 holds' fragments in this data (Evidence, reproduction check). A debounced "utterance started" flag may exist in addition, as the turn-opening signal.
+* *Own speech (#222)* is read through +basis+, as D-6 requires:
+** +Prepared+: not speaking. The floor is free.
+** +Committed+ and not yet +Started+: the floor is reserved but nothing is audible. A confirmed user interruption cancels without waiting for a boundary (cancel reached +Committed+), which is free.
+** +Started+ and +Boundary+: speaking. With +basis = LogicalTimeline+ the policy treats it as speaking for Hold and Yield purposes (conservative) but metrics that name audible overlap are labelled with the +basis+ and not reported as audible truth.
+** +Finished+ and +Cancelled+: free, subject to +min_reaction_spacing_ms+.
+* *Priority and attention.* Priority is the scheduler's +Priority+ assigned by the normalizer. A user's voice does not outrank the performer's current speech by itself: the policy emits +Yield+ only if the scheduler would accept the preemption (+incoming_rank <= playing_rank+); otherwise it holds and may answer with a non-verbal backchannel. +AttentionTarget+ is both an input and an output: a non-verbal backchannel gazes at the speaker; a busy game segment (+attention = Game+) defers non-critical TakeTurn with a deadline.
+* *Semantic response selection is separate*: the input has no response text type, only identities, priorities and flags; whether to speak is floor policy, what to say is generation.
+
+=== D3. Reversibility classes and thresholds (configuration, measured defaults)
+
+The measured trade-off of EXP-0001 and this replay says one threshold cannot serve every action. Each action class has its own silence threshold, bounds and budget, all configuration with validated ranges. Defaults below are starting values to be re-measured on real dialogue (A-FLOOR-001), not tuned results.
+
+[cols="2,2,2,2,3",options="header"]
+|===
+|Class |Actions |Default silence threshold (range) |Undo cost |Evidence and budget
+|R0 speculative |early prepare (no public effect) |500 ms (400-600) |cancel the job; compute wasted |lead 288 ms; 23 wasted per 100 true ends (40 at 400 ms). At most 3 per turn, one outstanding, no speculative TTS by default, none for speech longer than a configured cap.
+|R1 visible non-verbal |gaze shift, face, nod (ladder 1-3) |300 ms (200-500) |one renderer interpolation, about 150 ms visible (ADR-0003) |precedes 73% of holds and 99% of true ends in this data. Spacing budget applies; persona-scalable.
+|R2 short spoken |cached, content-free vocal backchannel (ladder 4) |*not on the silence ladder by default* |cannot unspeak; ends at the next boundary |fires before 100% of true ends and overlaps every hold it lands on (Results). Allowed only through event-driven paths (donation acknowledgement) or a monologue budget: preceding speech at least 5 s, spacing of at least a configured number of seconds, never when a prepared reply is ready. Disabled until #59 rates it.
+|R3 irreversible |TakeTurn (ladder 5), committing generation |800 ms (700-1000) |public speech |false take on holds 1% / 4% (700 ms: 6% / 10%); lag 868 ms. The range covers the measured curve; below 700 ms is outside it.
+|R4 displaces others |Interrupt of lower-priority performer speech; Yield at confirmation |priority-gated, at a safe point |scheduler-owned |respects +next_safe_boundary+, rank check and spacing.
+|===
+
+* Persona (#72) selects a *named style class* (for example fast, normal, calm), and a validated table maps the class to values inside the ranges above. A persona never supplies raw thresholds, VAD probabilities or scheduler timings, and any value outside a range is rejected at load, not clamped silently.
+* Backchannel *timing* and *type* are separate fields: timing is the policy's decision, +BackchannelIntent+ (Acknowledge, EncourageContinuation, Agreement, Surprise, Sympathy, ThinkingReceipt) is a recommendation, and the pair is satisfied non-verbally when speech is not allowed (intent to gesture or expression mapping lives in the avatar profile, ADR-0003). #59 can score timing error and type error independently from the logged fields.
+* Ladder mapping: 0 is +Wait+ or +Hold+, 1 to 3 are +Backchannel+ with +speech_allowed = false+, 4 is +Backchannel+ with a cached asset, 5 is +TakeTurn+.
+
+=== D4. Early prepare, late commit and the commit barrier
+
+* +prepare = Start+ opens a speculative job tagged with a +turn_epoch+. The epoch advances whenever raw user speech resumes or the source event or revision changes. The result is data held outside scheduler state.
+* At +TakeTurn+ the existing deterministic commit path revalidates, in this order: the epoch is still current, the source event or revision is current, the remaining deadline and resource policy, the publication-containment gate, and the phrase's atomic commit rules (architecture 6.3.1). Any failure discards the result; a late provider completion after a cancel is discarded by the same fence.
+* Speculative work emits no +SpeechLifecycleEvent+ (ADR-0004). +Prepared+ is emitted when the committed path admits the result, so a cancelled preparation is never visible in the lifecycle log and cannot be mistaken for a reply. See Q5.
+* The measured limit applies: the lead is 800 minus E, so preparation hides at most 288 to 384 ms; the ADR does not claim more.
+* Only the floor policy decides when to prepare; a model score may start preparation only as an uncalibrated hint (D2).
+
+=== D5. Barge-in and false-interruption recovery
+
+* States: +NoInterruption+, +Tentative+, +Confirmed+, +FalseInterrupt+, +Resume+ (the issue's vocabulary). All user speech while the performer is speaking enters +Tentative+ only after a raw run of at least 96 ms. Evidence tiers: duration (default confirm at 400 ms of continuous raw activity); semantic evidence (words, a future ASR adapter, in the manner of Pipecat's +min_words+ and LiveKit's final-transcript commit) may confirm earlier or veto a long run. Configuration, not logic, selects the tier.
+* +Tentative+ attenuates the performer (a duck) and changes nothing in the scheduler. Therefore *Resume is only the restoration of attenuation*: no phrase is cancelled or replayed, no generation is created, and generation fencing cannot be violated by recovery. This is the difference from LiveKit's pause and resume.
+* +Confirmed+ emits +Yield+, a preemption request that the scheduler honours at the next safe interrupt point (or immediately if the reply had reached only +Committed+, D2). The lifecycle then records +Cancelled { reason: Preempted, reached: Started }+ and the heard portion is exactly what the lifecycle says was spoken, not client-reported text.
+* +FalseInterrupt+ is declared when raw speech ends before confirmation and 500 ms of silence has elapsed; the attenuation is restored. While +Tentative+ the stale-observation rule applies: if the feed stalls, the attenuation is released after a configured maximum duration rather than held indefinitely.
+* The state is bounded (a single tentative window per speaking phrase) and recorded in +FloorDecision.interruption+; metrics are tentative count, confirmed count, false-interrupt count, resume latency, incorrectly resumed (restored and then the user held the floor), and incorrectly cancelled (confirmed but the next user input shows it was a backchannel).
+* Operator stop remains immediate and outside this machine. Priority outranking is not decided by user speech: a +StrongReaction+ or higher performer segment is held (the scheduler would reject the preemption).
+* Whether a hold at a phrase boundary while +Tentative+ is needed (so a next phrase does not start under an unconfirmed interruption) requires a scheduler capability that does not exist; see Q4. Without it a phrase boundary reached while tentative simply continues, attenuated.
+
+=== D6. Stale-observation rejection
+
+* Every observation carries a normalizer-assigned logical timestamp and a monotonic +seq+. Duplicates and out-of-order observations are dropped.
+* For decisions that are costly to reverse (TakeTurn, Yield confirmation, Interrupt) the observation must be fresh: age at most 160 ms by default (five frames; range 96-320 ms). A stale or absent observation yields +Wait+ (listening) or +Hold+ (speaking) with a +StaleObservation+ reason, cancels preparation, and never extrapolates the silence clock. Measured: removes 40 percent false takes under a frozen feed at a cost of bounded extra lag (Results).
+* A turn-end score has its own time to live which must be at least the inference p99 plus the polling cadence (about 125 plus 100 ms from EXP-0001 section 7). It cannot satisfy the freshness rule for a commit by itself because it never commits.
+* The policy requires fresh evidence to leave a protective state. A recovered feed starts with a fresh run (speech or silence) and a new silence clock.
+
+=== D7. Fallback when no VAD is present (text-chat-only mode)
+
+* +speech_active+ is absent. There is no silence clock, so no silence-ladder action exists: the message boundary is the turn end. This keeps the system usable with only the Twitch ingress that is already on +main+.
+* A complete, admitted message while the performer is idle yields +TakeTurn+ subject to priority, +game_busy+ (a non-critical message defers with a deadline) and +min_reaction_spacing_ms+. While the performer is speaking, normal chat yields +Hold+ (defer) and at most a non-verbal acknowledgement; it can never yield +Interrupt+. A donation yields an acknowledgement backchannel (ladder 4, allowed because it is event-driven) and a later full turn. A trusted critical game event may yield +Interrupt+ at the next safe point if the asset is interruptible; an untrusted event that merely claims criticality is ranked by the normalizer and held.
+* Mid-session loss of the VAD (stale feed beyond a configured duration) degrades to this same path and is recorded as a +VadUnavailable+ fallback reason, never as silence.
+* These rows are exercised in the 20-row sanity table above; the busy-game and donation rows are examples of the shape, not final policy.
+
+=== D8. Jev role
+
+* Jev is advisory and asynchronous. The policy never waits for it; it uses the latest hint only while the hint is fresh, otherwise runs with +jev_hint = None+ and records a fallback reason.
+* Jev may recommend: an action from the set allowed at the current reversibility class, a +BackchannelIntent+, a strength, an interrupt probability that the tier gate reads as input, and an attention target. It cannot move a threshold below the configured floor of its class, cannot add an action the class forbids, and cannot touch R3 or R4 timing (it may only request a later TakeTurn up to the deadline).
+* Jev is *not* in the timing path by default. EXP-0001 11.2 Q7 is unresolved and no model beat the silence baseline in this work; a Jev timing role requires a real labelled turn set first.
+* The replay record stores the hint digest, its latency and the fallback reason (issue "Replay" list).
+
+=== D9. Replay and metrics
+
+* Replay inputs are the ordered observation stream, lifecycle events, classified events, hint digests and the configuration version. Re-running reproduces every +FloorDecision+ where Jev is absent or recorded; no wall-clock value is consulted.
+* Decision log: bounded ring, privacy rule of ADR-0004 (identities and digests, no free text).
+* Metrics map to the issue: time from end-of-turn to turn start (the lag columns), overlap and interruption rate, interruption success and cancel rate (D5 counters), backchannel rate by level, unnecessary spoken-backchannel rate on reviewed samples (needs #59), long-silence-before-response rate, phrase-boundary versus hard-interrupt distribution (the stop columns), Jev latency and fallback, operator and critical-event preemption latency, plus the new counters: cancelled preparations per 100 turn ends, stale-observation waits, and false-take rate on holds when labelled data exists.
+
+=== Decisions requested from the supervisor
+
+Not decided here.
+
+. Q1 placement of types and policy (D1).
+. Q2 whether R2 (spoken backchannel) is disabled until #59 rates it, or enabled with the monologue budget (D3).
+. Q3 whether a scheduler-owned fast, fade-out preemption (a declared interruptible region with a fade) is acceptable for voice barge-in, given that safe-point density makes yield 0.8 to 4.8 s.
+. Q4 whether the scheduler should gain a "hold at next boundary" capability (a pause analogue) for tentative interruptions.
+. Q5 whether speculative preparation is outside the lifecycle log until commit (D4).
+. Q6 the #92 requirement for raw activity edges (D2) and whether to commit the scratch simulator as an experiment record.
+
+== Consequences
+
+=== Positive
+
+* One threshold no longer carries every action: visible acknowledgement can occur at about 330 ms while the irreversible take stays at about 870 ms.
+* Tentative interruption removes the cancel-on-any-sound failure without a pause primitive and without touching generation fencing.
+* The policy is testable from synthetic fixtures before any microphone exists, and degrades to chat-only behaviour deterministically.
+* Preparation waste and stale-feed hazards are bounded by construction and measured.
+
+=== Costs / trade-offs
+
+* Early preparation costs wasted LLM or TTS work (19 to 45 per 100 turn ends) for a lead of at most 192 to 480 ms.
+* A freshness rule adds lag when the feed hiccups (p90 up by about 330 ms in the stalled trials).
+* A confirm threshold adds about 160 to 320 ms of confirmation latency over a hard cancel.
+* Non-verbal acknowledgement precedes almost every reply in this data; persona budgets are needed so it does not read as mechanical.
+* Yield cannot be faster than safe-point density allows, and that is currently a single point per generated reply.
+
+=== Known limitations
+
+* *Synthetic data only.* Read sentences with three constructed pause lengths, no real hesitation, filler, overlap, breath, cough, backchannel, laughter or game audio, one language, one speaker per stream. The pause distribution makes "hold that survives 500 ms" and "colliding" nearly equivalent. EXP-0001 L1 to L14 apply.
+* The barge-in false-yield test uses a surrogate (truncated VAD probability traces) and a noise class that produced almost no activations; it measures the machinery, not real coughs.
+* No ASR or semantic evidence was available; the confirm rule is duration only. No human judged "acceptable" versus "annoying"; those words describe a mechanical overlap proxy.
+* The executor (scheduler cooldowns, +min_reaction_spacing_ms+, the real avatar latency, audio start latency) is modelled by constants (duck 50 ms, dispatch 50 ms, backchannel 400 ms, reply 8 s). Ten phases per stream are correlated draws; Wilson intervals treat streams as independent.
+* The causal numbers depend on treating sub-250 ms raw VAD runs as activity; the published EXP-0001 semantics give 4 percent at 800 ms where this gives 1 percent. Neither is a production rate.
+* The simulator and its outputs are scratch files and are not committed or reproducible from the repository. Only the saved EXP-0001 scores (local, also uncommitted) and the committed EXP-0001 scripts are upstream of it.
+* External-project statements describe the files and commits named, not the projects in general. LiveKit's adaptive interruption detector and AIRI's VAD workers were not read.
+* The Jev and persona paths are specified but not simulated.
+
+== Test plan
+
+Seeds come from the 20 sanity rows; every case is a replay fixture first and a live path second. Mapping to the issue's acceptance list:
+
+[cols="3,4"]
+|===
+|Acceptance criterion |Test
+|Typed floor-action contract exists |Domain serde round trip with +deny_unknown_fields+, bounded sizes, closed +FloorReason+, schema-first if the decision is recorded on a wire (schemas/ then Rust parity); positive and negative fixtures.
+|Semantic response selection is separate |Compile-time or structural test that +FloorInput+ carries no response or chat text; a policy test that identical floor inputs give identical decisions for different candidate replies.
+|Jev can recommend bounded actions |Fixtures with a valid hint, an out-of-class hint (clamped to the allowed set), an unknown enum value (rejected), and a hint with an expired time to live.
+|Deterministic policy remains authoritative |Property test over random hints and inputs: the chosen action is always within the class-allowed set and no threshold is lowered below its configured floor; 1000-repeat determinism check (done in the sanity table).
+|Non-verbal backchannels are first-class |Level 1 to 3 emits +Backchannel+ with +speech_allowed = false+ and a valid avatar command; a spoken recommendation is satisfied non-verbally when speech is disallowed.
+|Normal chat cannot force unsafe interruption |Normal chat, untrusted critical claims and equal-rank events while speaking never yield +Interrupt+; payload-declared priority fields are ignored.
+|Scheduler safe interrupt points are honoured |+Yield+ and +Interrupt+ are executed only through the scheduler; measured stop time always falls on a declared interrupt point or the natural end; a plan with +interruptible = false+ is never cancelled mid-phrase.
+|Operator emergency control remains independent |Operator stop with the floor policy saturated, panicking or blocked on a full input queue still stops within the existing bound.
+|Floor decisions are replayable |Record the golden observation stream (a hold, a true end, a stalled feed) and replay twice in two processes with identical decisions; replay under a different wall-clock rate yields the same output.
+|Metrics measure turn-start delay, interruption and backchannel behaviour |Counter and histogram presence tests for each D9 metric; the synthetic bench above reproduces the lag, stop and cancelled-preparation columns within tolerance as a regression guard, not as an SLO.
+|Tests cover speaking, idle, critical event, donation, busy game and Jev-failure paths |The 20 sanity rows plus a Jev timeout and an unavailable-provider fixture that must produce the same decision as +jev_hint = None+ with a fallback reason.
+|Persona influences bounded turn style without owning floor authority |Style classes map into ranges; out-of-range values fail at load; a persona cannot raise priority or disable operator stop.
+|Backchannel timing and type are separate |The log carries timing and +BackchannelIntent+ independently; a fixture changes only the intent and leaves timing unchanged.
+|Floor tests include short hesitation versus actual turn end |Fixture pairs from this bench: an observed pause of about 450 ms followed by resumed speech yields no TakeTurn, a non-verbal backchannel and a cancelled preparation; a true end yields TakeTurn at 800 ms. *Limit:* a silence-only policy cannot separate a hold longer than 800 ms from an end; do not add a fixture that pretends otherwise.
+|Tentative interruption and false-interruption recovery |A 288 ms burst against a speaking performer: Tentative then FalseInterrupt then Resume, no scheduler mutation, no phrase replay; a 700 ms speech run: Confirmed, preemption at the next safe point, +Cancelled+ recorded with its +reached+ field; a stalled feed during Tentative releases the attenuation.
+|Stale-observation rejection |Stalled feed (frozen last observation) never produces TakeTurn or Yield; duplicate and out-of-order observations are dropped.
+|No-VAD fallback |The text-chat rows from the sanity table, plus mid-session VAD loss degrading to chat-only behaviour with a recorded reason.
+|===
+
+Falsifier named by link:../implementation-accelerator.adoc[the accelerator] ("short hesitation versus true turn-end fixtures produce different floor actions") is met for holds shorter than the commit threshold only; see the limit above.
+
+== Staging and rollback
+
+. Types, the pure policy and replay fixtures with no live input (no microphone); the text-chat-only mode first, behind configuration.
+. Wire the #92 observation (VAD sidecar) in shadow mode: log decisions, act on none, compare with the fixed-800 baseline on recorded sessions.
+. Enable R1 non-verbal backchannel and R0 preparation; keep R2 disabled.
+. Enable Tentative / Confirmed barge-in once safe-point density is improved by #83.
+Rollback at each stage is a configuration flag returning to the previous behaviour; the policy has no persistent state beyond the bounded decision ring.
+
+== Revisit conditions
+
+* A real, permissively usable, human-labelled Japanese turn set exists (EXP-0001 11.1 item 1): re-measure every table here and revisit the 800 ms default and the Smart Turn rejection.
+* #92 cannot expose raw activity edges, or its debounce changes: re-run the reproduction check.
+* #83 phrase streaming or finer interrupt points land: re-measure yield latency and revisit Q3 and Q4.
+* Listener tests (#59) reject ducking or accept a spoken backchannel: revisit A-FLOOR-002 and A-FLOOR-003 and the pause-primitive alternative.
+* A scheduler pause primitive appears for another reason.
+* Persona work (#72) needs a threshold outside the D3 ranges.
+
+== Open questions
+
+. *Q1 (placement)*: domain types plus a policy module beside the scheduler's lifecycle log, a new crate, or +crates/runtime+?
+. *Q2 (spoken backchannel)*: disabled until rated, or enabled under a monologue budget?
+. *Q3 (fast preemption)*: may a declared fade-out region provide a faster yield for confirmed voice barge-in without weakening "normal chat cannot force unsafe interruption" (a voice user is a different source class from public chat, but speaker identity never implies authorization per #92/#93)?
+. *Q4 (hold at boundary)*: add a "hold at next boundary" scheduler primitive, or accept continuing attenuated?
+. *Q5 (lifecycle visibility of speculation)*: confirm that cancelled preparations never appear in +SpeechLifecycleEvent+.
+. *Q6 (#92 raw edges and scripts)*: require raw activity edges in the #92 contract; commit the scratch simulator as an experiment record under +examples/benchmarks/+, or keep it uncommitted?
+. *Q7 (voice-user trust)*: how is a local microphone speaker's source class and priority assigned by the normalizer, since Yield depends on it?
+. *Q8 (aizuchi norms)*: what backchannel frequency is right for a Japanese-speaking persona, and who rates it?
+. *Q9 (heard text)*: confirm that interruption records use lifecycle-derived heard portions only, never client-reported text.
+. *Q10 (R2 budget numbers)*: spacing and monologue-length defaults need real sessions.
+
+== Related
+
+* Issue: #81. Related issues: #58, #59, #67, #72, #74, #75, #80, #82, #83, #91, #92, #93, #106, #192, #222. Parent / consumers as in the issue.
+* PR: none yet (design-only).
+* Assumptions: proposed A-FLOOR-001 to A-FLOOR-003; existing A-AUDIO-001; proposed A-SPEECH-003.
+* Other ADRs: link:0001-three-layer-runtime.adoc[ADR-0001], link:0002-mcp-tool-authority-boundary.adoc[ADR-0002], link:0003-local-vrm-renderer.adoc[ADR-0003], link:0004-speech-lifecycle-and-text-projection.adoc[ADR-0004].
+* Documents: link:../experiments/EXP-0001-japanese-turn-observation-bench.adoc[EXP-0001], link:../architecture.adoc[Architecture 6.3.1], link:../research-register.adoc[Research register], link:../reuse-first.adoc[Reuse-first], link:../implementation-accelerator.adoc[Implementation accelerator 7.2], link:../security-threat-model.adoc[Security threat model].
+* External references named by the issue (not re-read here): Prompt-Guided Turn-Taking Prediction (SIGDIAL 2025), Yeah, Un, Oh (NAACL 2025).
