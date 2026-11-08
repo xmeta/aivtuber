@@ -98,7 +98,7 @@ AIRI implementation patterns
 recent streamable co-speech gesture work
 |Sparse performance anchors plus causal phrase-local compilation; no dependency on unseen future phrases
 |#83, #84, #89
-|Mapping to available Live2D/VTS assets; Japanese prosody usefulness; anchor count/budget
+|Mapping to available Live2D/VTS assets; Japanese prosody usefulness; anchor count/budget. Proposed bounded PerformanceIntent, compiler, capability degradation and reuse review (BML/SAIBA, AIRI, Open-LLM-VTuber, Neuro SDK, VRM 1.0) for #84: link:adr/0006-performance-intent.adoc[ADR-0006] (Proposed; design only, nothing run or measured, one hand-worked Japanese example)
 
 |Live-stream moderation
 |Analyzing Norm Violations in Live-Stream Chat (EMNLP 2023);
