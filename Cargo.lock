@@ -30,6 +30,7 @@ dependencies = [
  "aivtuber-domain",
  "aivtuber-scheduler",
  "base64 0.23.1",
+ "getrandom 0.4.3",
  "rig-core",
  "rig-rmcp",
  "rmcp 3.5.0",

@@ -9,6 +9,7 @@
 mod audio;
 mod hindsight;
 mod http;
+mod local_avatar;
 mod mcp;
 mod obs;
 mod openai;
@@ -20,6 +21,7 @@ mod vts;
 pub use audio::*;
 pub use hindsight::*;
 pub use http::*;
+pub use local_avatar::*;
 pub use mcp::*;
 pub use obs::*;
 pub use openai::*;
