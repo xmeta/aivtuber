@@ -121,7 +121,7 @@ Do not place real tokens/passwords in repository files, shell history shared wit
 
 == 6. Local avatar renderer (`local-avatar/1`)
 
-The local avatar output is the zero-paid-dependency alternative to VTube Studio (ADR-0003, issue #219). The Rust runtime hosts a loopback HTTP + WebSocket listener; the renderer page (OBS Browser Source, a webview or a local browser) is the WebSocket client. The renderer bundle itself arrives with slice S3; slice S2 ships the host, the protocol and a mock-renderer test suite.
+The local avatar output is the zero-paid-dependency alternative to VTube Studio (ADR-0003, issue #219). The Rust runtime hosts a loopback HTTP + WebSocket listener; the renderer page (OBS Browser Source, a webview or a local browser) is the WebSocket client. The renderer page lives in `renderer/local-avatar/` (TypeScript, Vite, three.js and `@pixiv/three-vrm`, exact-pinned, no CDN). The Rust host, the protocol and a mock-renderer test suite are covered by `cargo test`; the real page is covered by a headless end-to-end smoke test (see "CI and smoke test" below).
 
 === Selecting and running it
 
@@ -129,7 +129,7 @@ The local avatar output is the zero-paid-dependency alternative to VTube Studio 
 ----
 export AIVTUBER_AVATAR_OUTPUT=local          # local | vts | none; unset keeps AIVTUBER_VTS_ENABLED behavior
 export AIVTUBER_LOCAL_AVATAR_PORT=8765       # 127.0.0.1 only; there is no bind-address option
-export AIVTUBER_LOCAL_AVATAR_PAGE_DIR=./renderer/dist   # static bundle, optional until S3
+export AIVTUBER_LOCAL_AVATAR_PAGE_DIR=./renderer/local-avatar/dist   # built renderer bundle
 export AIVTUBER_LOCAL_AVATAR_QUEUE=64        # outbound queue capacity
 ----
 
@@ -137,13 +137,63 @@ The queue-age limit reuses `AIVTUBER_MAX_DISPATCH_LATENESS_MS`. On start the run
 
 CI test (no GPU, no browser): `cargo test --locked -p aivtuber-adapters --test local_avatar`.
 
+=== Building the renderer
+
+The bundle is built by the operator; `dist/` is not committed and nothing is fetched from a CDN at runtime. You need Bun and Node.
+
+[source,sh]
+----
+cd renderer/local-avatar
+bun install --frozen-lockfile --ignore-scripts
+bun run build                         # writes renderer/local-avatar/dist
+cp /path/to/your-model.vrm dist/model.vrm   # operator-supplied model, see "Model and rights"
+cd ../..
+AIVTUBER_AVATAR_OUTPUT=local AIVTUBER_LOCAL_AVATAR_PAGE_DIR=./renderer/local-avatar/dist cargo run --locked -p aivtuber-app
+----
+
+The model must sit inside the served directory; the page loads `model.vrm` by default. To use another file in the same directory add `&model=other.vrm` to the launch URL (same-origin paths of `[A-Za-z0-9._/-]` only; anything else is refused by the page).
+
+The page connects to the host with the token in its own URL, mints a fresh epoch for every connection, loads the model, renders one neutral frame and only then reports `ready`. It never connects without a rendered model, so a missing or broken model shows as `disconnected` health, with the reason in the page's browser console. On a socket drop it snaps to neutral and reconnects with a new epoch and a bounded backoff (250 ms doubling to 5 s).
+
+=== OBS Browser Source capture (no paid software)
+
+. Start the runtime as above and copy the `local avatar renderer URL` printed on stderr (`http://127.0.0.1:<port>/?token=...`). The token changes on every launch, so update the source URL after each restart.
+. In OBS add a *Browser* source, paste that URL, and set *Width* and *Height* to your canvas, for example 1920 and 1080 (a portrait source such as 1080 by 1920 also works; the camera backs away to keep the avatar's shoulders in frame).
+. Leave *Custom CSS* empty and keep *Shutdown source when not visible* off, otherwise the page disconnects and returns to neutral whenever the scene is hidden.
+. The page background and canvas are transparent (`alpha` canvas, `clear alpha 0`), so the avatar composites over your scene without a chroma key. Do not add a background color in OBS.
+. The page runs entirely in OBS's embedded browser (CEF/Chromium, WebGL2). It uses `requestAnimationFrame`, so its frame rate follows the Browser source's FPS setting.
+
+OBS's own Browser Source was not run while writing this guide: the transparent output and rendering are verified in headless Chromium and system Edge (ADR-0003 assumption A-VRM-001 stays open until OBS is checked). Treat the first OBS run as part of the live smoke.
+
+=== Model and rights
+
+No VRM model is part of this repository. A VRM file carries its own license in its embedded metadata (`meta`: license URL, avatar permission, commercial usage, redistribution, credit notation, allowed modification) and that, not the code license of this project, governs what you may do with it. *You are responsible for checking that you have the right to use the model and to stream or publish it.* The page logs the model's `meta` summary and SHA-256 in the browser console when it loads (`[local-avatar] model loaded`) so you can read what you are about to broadcast; models are local files and are never uploaded.
+
+The tests and CI use `VRM1_Constraint_Twist_Sample.vrm` from `pixiv/three-vrm`, fetched pinned to commit `3caf7a21ee68f0d5dfa363ab3d577450bbf60136` and verified by SHA-256 `12c2b97e95e700783a6a550dc0eee2d7880aeedccef9ae67bc4c5a2f0f2631a2`. Its embedded VRM 1.0 metadata (read from the file) states: author and copyright `pixiv Inc.` (2022), license URL `https://vrm.dev/licenses/1.0/`, avatar permission `everyone`, commercial usage `corporation`, modification and redistribution allowed (`allowModificationRedistribution`), credit notation `unnecessary`, antisocial or hateful usage not allowed. No separate model license file was found in the upstream repository, so the file is downloaded for local testing only and is not copied into this repository.
+
+=== CI and smoke test
+
+The `renderer` job in `.github/workflows/ci.yml` runs typecheck, unit tests, the build, the license allowlist and `bun audit` (see `docs/supply-chain.adoc` section 8), then the headless smoke: `crates/app/examples/local_avatar_smoke.rs` starts the real `LocalAvatarOutput`, serving the built bundle plus the pinned sample model, and `renderer/local-avatar/smoke/smoke.mjs` opens its launch URL in headless Chromium forced to SwiftShader (`--use-angle=swiftshader --enable-unsafe-swiftshader`, no GPU). It asserts: `ready` arrives, every scripted command (reset, expression, gaze, visemes, reset) is acked by the host, the renderer's exposed expression values follow each command, a transparent screenshot has alpha 0 at all four corners and avatar pixels in the middle, no CSP violation occurs, and after a page reload a new epoch starts neutral with no old command replayed. Assertions are state-based: software GL renders at roughly 9 frames per second and spring-bone motion makes pixel comparison unreliable.
+
+Run it locally (system Edge shown; omit `SMOKE_BROWSER_CHANNEL` to use Playwright's Chromium after `node node_modules/playwright-core/cli.js install chromium`):
+
+[source,sh]
+----
+cd renderer/local-avatar && bun install --frozen-lockfile && bun run build && cd ../..
+cargo build --locked -p aivtuber-app --example local_avatar_smoke
+cd renderer/local-avatar
+SMOKE_BROWSER_CHANNEL=msedge node smoke/smoke.mjs --bin ../../target/debug/examples/local_avatar_smoke
+----
+
+The read-only state hook `window.__avatarDebug.snapshot()` exists only when the page URL carries `debug=1`; it returns copies of epoch, last accepted seq, expression values and gaze, and accepts no input.
+
 === Security properties
 
 * Binds `127.0.0.1` only. Remote exposure is not offered by this adapter.
 * The token is 32 bytes from the OS CSPRNG, minted per launch, compared in constant time.
 * The WebSocket upgrade requires the token, an `Origin` exactly equal to `http://127.0.0.1:<port>`, and a matching `Host` header (DNS-rebinding guard). Anything else gets HTTP 403, checked before the connection-limit check so an unauthenticated peer cannot probe for a live renderer.
 * A second connection while one is live gets HTTP 409. The live connection is never displaced.
-* Static files are served only from the configured directory, with a strict path allowlist, symlink-resolved containment, `GET`/`HEAD` only, `nosniff`, `no-store` and a CSP that restricts the page to its own origin. The page is public to local processes by design and must hold no secret.
+* Static files are served only from the configured directory, with a strict path allowlist, symlink-resolved containment, `GET`/`HEAD` only, `nosniff`, `no-store` and a CSP that restricts the page to its own origin (`blob:` is additionally allowed in `connect-src` because three.js decodes embedded model textures by fetching a `blob:` URL it created itself). The page is public to local processes by design and must hold no secret.
 * Renderer frames are untrusted bounded data (4 KiB max, closed field sets, closed reject-reason set). They never feed authorization; each host command is still authorized with `Capability::AvatarControl` before it is queued.
 
 === Protocol
