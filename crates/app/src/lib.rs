@@ -89,6 +89,12 @@ pub trait AudioOutput: Send {
 }
 
 pub trait AvatarOutput: Send {
+    /// Operator-facing name of this output, used in health/warning text so a
+    /// message never names a different avatar output than the active one.
+    fn name(&self) -> &'static str {
+        "avatar output"
+    }
+
     fn connect(&mut self) -> Result<(), EngineError> {
         Ok(())
     }
@@ -1240,6 +1246,11 @@ where
 
     pub fn health(&self) -> &AdapterHealth {
         &self.health
+    }
+
+    /// Name of the active avatar output (see [`AvatarOutput::name`]).
+    pub fn avatar_output_name(&self) -> &'static str {
+        self.avatar.name()
     }
 
     pub fn security(&self) -> &SecurityRuntime {

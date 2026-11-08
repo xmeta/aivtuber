@@ -193,6 +193,24 @@ try {
   await run("reset", cmd("reset"), allZero);
   await run("expression joy", cmd("expression", { preset: "joy", intensity: 1 }), (s) => near(s.expressions.joy, 1));
   writeFileSync(join(outDir, "joy.png"), await page.screenshot({ omitBackground: true }));
+  // Real pack presets go through the host-side mapping (#219 S4): the renderer
+  // only knows its own vocabulary, so surprise_medium (intensity 0.8) must
+  // arrive as `surprise` at 0.8 * moderate(0.75) = 0.6.
+  await run("pack preset surprise_medium", cmd("expression", { preset: "surprise_medium", intensity: 0.8 }), (s) => near(s.expressions.surprise, 0.6));
+  await run("pack gesture nod_small", cmd("gesture", { preset: "nod_small", amplitude: 1 }), () => true);
+  // No renderer equivalent: never sent, never an error, counted by name.
+  const beforeUnmapped = await health();
+  for (const line of [cmd("gesture", { preset: "recoil_small", amplitude: 1 }), cmd("expression", { preset: "thinking_soft", intensity: 0.5 })]) {
+    const reply = await hostSend(line);
+    check("unsupported pack preset: accepted by host", reply.event === "executed", JSON.stringify(reply));
+  }
+  const afterUnmapped = await health();
+  check("unsupported presets are not sent", afterUnmapped.sent === beforeUnmapped.sent, `${beforeUnmapped.sent} -> ${afterUnmapped.sent}`);
+  check(
+    "unsupported presets are counted by name",
+    afterUnmapped.unmapped_presets?.recoil_small === 1 && afterUnmapped.unmapped_presets?.thinking_soft === 1 && afterUnmapped.dropped?.UnmappedPreset === 2,
+    JSON.stringify(afterUnmapped.unmapped_presets),
+  );
   await run("gaze away", cmd("gaze", { target: "away" }), (s) => Math.abs(s.gaze.yaw - 35) < 1.5 && Math.abs(s.gaze.pitch - 10) < 1.5);
   await run("viseme aa", cmd("viseme", { viseme: "aa", weight: 0.8 }), (s) => near(s.visemes.aa, 0.8));
   await run("viseme ih replaces aa", cmd("viseme", { viseme: "ih", weight: 0.5 }), (s) => near(s.visemes.ih, 0.5) && near(s.visemes.aa, 0));
