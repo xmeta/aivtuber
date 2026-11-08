@@ -287,7 +287,7 @@ The supervisor decided the ten questions raised by the spike. They are recorded 
 === Decisions
 
 . *Integration point:* +AvatarOutput+ with typed +AvatarPlaybackCommand+ (+crates/app/src/lib.rs+, +crates/runtime/src/cached_playback.rs+), because that is what the app schedules. The +AvatarAdapter+ / +AvatarAction+ string path is not extended.
-. *Viseme vocabulary:* the provider-neutral set is the VRM 1.0 published names +aa ih ou ee oh+ plus neutral. VTS's A/I/U/E/O maps onto it 1:1 inside the VTS adapter. No canonical enum exists in +schemas/+ today (+viseme_ref+ and +viseme_mapping+ are free strings); adding one is schema-first work (see Deferred).
+. *Viseme vocabulary:* the provider-neutral set is the VRM 1.0 published names +aa ih ou ee oh+ plus neutral. VTS's A/I/U/E/O maps onto it 1:1 inside the VTS adapter. The closed set is normative in +schemas/viseme-track.schema.json+ (track cues) and +schemas/avatar-playback-command.schema.json+ (the typed command), with Rust type +aivtuber_domain::Viseme+ (#219 S1). +viseme_ref+ and +viseme_mapping+ in the Performance Asset stay free strings: +viseme_ref+ is a pointer to a track and +viseme_mapping+ names the producer's mapping version, so neither carries cue names.
 . *+generation+ on the wire:* no. The renderer-minted epoch plus the host-minted seq are the wire freshness check. +generation+ stays host-side scheduling state.
 . *Socket drop:* the renderer snaps to neutral. This is deterministic and never shows a stale emotion.
 . *TTL:* none in the renderer, which must not depend on wall-clock time. The host owns timing and drops commands whose scheduled window has passed before sending. Epoch plus seq cover replay.
@@ -299,7 +299,7 @@ The supervisor decided the ten questions raised by the spike. They are recorded 
 
 === Deferred to the implementation issue
 
-* Canonical viseme enum (+aa ih ou ee oh+ plus neutral), added schema-first with positive/negative fixtures and Rust/TypeScript parity per the schema/domain change order.
+* (Done in #219 S1: canonical viseme enum and +Reset+ in +AvatarPlaybackCommand+.)
 * Canonical expression and gesture preset vocabularies and how a pack/asset declares the renderer profile it needs (asset-store +viseme_mapping+ is the likely home); the exact compatibility-identity field fed by the +hello+ model hash and profile id.
 * +docs/supply-chain.adoc+ policy text for the renderer bundle (decision 8), landing with the code.
 * The adapter-private protocol version, fixtures and the exact HTTP status for a rejected second connection.

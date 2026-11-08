@@ -2725,7 +2725,8 @@ fn avatar_generation(command: &AvatarPlaybackCommand) -> u64 {
         AvatarPlaybackCommand::Expression { generation, .. }
         | AvatarPlaybackCommand::Gesture { generation, .. }
         | AvatarPlaybackCommand::Gaze { generation, .. }
-        | AvatarPlaybackCommand::Viseme { generation, .. } => *generation,
+        | AvatarPlaybackCommand::Viseme { generation, .. }
+        | AvatarPlaybackCommand::Reset { generation, .. } => *generation,
     }
 }
 

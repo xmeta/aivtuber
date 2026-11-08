@@ -18,6 +18,7 @@ import type {
   TtsRequest,
   TtsResult,
   TtsStreamChunk,
+  Viseme,
   VisemeFrame,
 } from "./tts.js";
 
@@ -115,13 +116,13 @@ export interface MockTtsScript {
   modelAlias?: string;
 }
 
-function framesFor(durationMs: number, voice: string): VisemeFrame[] {
-  // Simple deterministic viseme pattern aligned to the duration.
-  const pattern = ["sil", "aa", "ih", "mm", "sil"];
+function framesFor(durationMs: number): VisemeFrame[] {
+  // Simple deterministic canonical-viseme pattern aligned to the duration.
+  const pattern: Viseme[] = ["neutral", "aa", "ih", "ou", "neutral"];
   const frameMs = Math.max(1, Math.floor(durationMs / pattern.length));
   return pattern.map((viseme, i) => ({
     atMs: i * frameMs,
-    viseme: `${viseme}:${voice}`,
+    viseme,
     durationMs: frameMs,
   }));
 }
@@ -154,7 +155,7 @@ export class MockTtsEngine implements TtsEngine {
       visemeTrack: {
         voice_model: "mock-voice-v1",
         viseme_mapping: "mock-map-1",
-        frames: framesFor(durationMs, request.voiceId),
+        frames: framesFor(durationMs),
       },
       backend: { name: this.name, model_alias: this.version().model_alias },
       latency_ms: 3,

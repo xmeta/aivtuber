@@ -18,6 +18,7 @@ addFormats(ajv);
 
 const eventSchema = ajv.compile(loadJson("schemas/event-envelope.schema.json"));
 const reflexSchema = ajv.compile(loadJson("schemas/reflex-decision.schema.json"));
+const avatarCommandSchema = ajv.compile(loadJson("schemas/avatar-playback-command.schema.json"));
 
 const output = execFileSync(
   "cargo",
@@ -25,6 +26,13 @@ const output = execFileSync(
   { cwd: root, encoding: "utf8" },
 );
 const emitted = JSON.parse(output);
+
+const avatarOutput = execFileSync(
+  "cargo",
+  ["run", "--locked", "--quiet", "-p", "aivtuber-runtime", "--example", "avatar_command_parity"],
+  { cwd: root, encoding: "utf8" },
+);
+const avatarEmitted = JSON.parse(avatarOutput);
 
 let failures = 0;
 function check(label, validator, value) {
@@ -46,6 +54,14 @@ for (const [index, decision] of emitted.reflex_decisions.entries()) {
   check(`Rust ReflexDecision[${index}] -> JSON Schema`, reflexSchema, decision);
 }
 
+for (const [index, command] of avatarEmitted.commands.entries()) {
+  check(`Rust AvatarPlaybackCommand[${index}] (${command.kind}) -> JSON Schema`, avatarCommandSchema, command);
+}
+if (!avatarEmitted.commands.some((command) => command.kind === "reset")) {
+  failures += 1;
+  console.error("FAIL      expected a Rust AvatarPlaybackCommand::Reset sample");
+}
+
 if (emitted.events.length !== 8) {
   failures += 1;
   console.error(`FAIL      expected 8 Rust EventEnvelope samples, got ${emitted.events.length}`);
@@ -55,5 +71,6 @@ if (emitted.reflex_decisions.length < 1) {
   console.error("FAIL      expected at least one Rust ReflexDecision sample");
 }
 
-console.log(`\n${emitted.events.length + emitted.reflex_decisions.length - failures} passed, ${failures} failed`);
+const total = emitted.events.length + emitted.reflex_decisions.length + avatarEmitted.commands.length;
+console.log(`\n${total - failures} passed, ${failures} failed`);
 process.exit(failures > 0 ? 1 : 0);

@@ -2,6 +2,7 @@
 
 //! Provider-neutral domain types and interfaces for the AI VTuber runtime.
 
+mod avatar;
 mod context;
 mod control;
 mod deadline;
@@ -13,6 +14,7 @@ pub mod scenario;
 mod sidecar;
 mod task;
 
+pub use avatar::Viseme;
 pub use context::{
     EpistemicClass, MAX_RECENT_ITEMS, MAX_RETRIEVAL_CANDIDATES, MAX_SNAPSHOT_STRING_BYTES,
     MAX_THINKING_CONTEXT_BYTES, MAX_THINKING_CONTEXT_ITEMS, MAX_THINKING_TEXT_BYTES,

@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xmeta/aivtuber/schemas/viseme-track.schema.json",
+  "title": "AI VTuber Viseme Track",
+  "description": "Compact local viseme timing resolved from a Performance Asset speech.viseme_ref (crates/runtime::cached_playback). Cue viseme names are the closed canonical vocabulary (ADR-0003); the legacy single-letter names used by existing 0.1.0 packs are accepted on read only and are normalized to canonical by the reader. Cross-field rules (non-decreasing at_ms, at_ms <= duration_ms) are enforced by the Rust reader.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "duration_ms", "cues"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1.0"},
+    "duration_ms": {"type": "integer", "minimum": 0},
+    "cues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["at_ms", "viseme", "weight"],
+        "properties": {
+          "at_ms": {"type": "integer", "minimum": 0},
+          "viseme": {
+            "anyOf": [
+              {"$ref": "#/$defs/canonical_viseme"},
+              {"$ref": "#/$defs/deprecated_viseme_alias"}
+            ]
+          },
+          "weight": {"type": "number", "minimum": 0, "maximum": 1}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "canonical_viseme": {
+      "type": "string",
+      "enum": ["aa", "ih", "ou", "ee", "oh", "neutral"]
+    },
+    "deprecated_viseme_alias": {
+      "description": "Read-only legacy spellings: A=aa I=ih U=ou E=ee O=oh N=neutral.",
+      "type": "string",
+      "enum": ["A", "I", "U", "E", "O", "N"]
+    }
+  }
+}

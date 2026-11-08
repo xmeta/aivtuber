@@ -7,6 +7,10 @@
 //   and their embedded input.event must conform to event-envelope.schema.json
 // - Performance Asset valid/starter fixtures must conform to performance-asset.schema.json
 // - examples/performance-assets/invalid/*.json must REJECT against that schema
+// - examples/viseme-tracks/valid and the starter pack viseme tracks must conform to
+//   viseme-track.schema.json; examples/viseme-tracks/invalid must REJECT
+// - examples/avatar-playback-commands/valid must conform to
+//   avatar-playback-command.schema.json; .../invalid must REJECT
 // - examples/evaluation/reaction-quality/*.json must conform to the reaction-quality dataset schema
 //   and development/holdout partitions must not share case IDs or leakage groups.
 // - examples/evaluation/reaction-quality-review/*.json must conform to the pairwise-review schema
@@ -81,6 +85,8 @@ const shadowDivergence = validators["schemas/shadow-divergence-report.schema.jso
 const moderationEvaluation = validators["schemas/moderation-evaluation.schema.json"];
 const streamScenario = validators["schemas/stream-scenario.schema.json"];
 const faultOverlay = validators["schemas/fault-overlay.schema.json"];
+const visemeTrack = validators["schemas/viseme-track.schema.json"];
+const avatarCommand = validators["schemas/avatar-playback-command.schema.json"];
 
 function report(ok, label, validator) {
   if (ok) {
@@ -157,6 +163,27 @@ for (const file of listJson("examples/performance-assets/invalid")) {
   } else {
     passes += 1;
     console.log(`ok        ${file} (rejected as intended)`);
+  }
+}
+
+for (const [validator, validDirs, invalidDir] of [
+  [visemeTrack, ["examples/viseme-tracks/valid", "examples/starter-reaction-pack/viseme"], "examples/viseme-tracks/invalid"],
+  [avatarCommand, ["examples/avatar-playback-commands/valid"], "examples/avatar-playback-commands/invalid"],
+]) {
+  if (!validator) continue;
+  for (const dir of validDirs) {
+    for (const file of listJson(dir)) {
+      report(validator(loadJson(join(root, file))), file, validator);
+    }
+  }
+  for (const file of listJson(invalidDir)) {
+    if (validator(loadJson(join(root, file)))) {
+      failures += 1;
+      console.error(`FAIL      ${file} (expected rejection, but it validated)`);
+    } else {
+      passes += 1;
+      console.log(`ok        ${file} (rejected as intended)`);
+    }
   }
 }
 
