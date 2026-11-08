@@ -43,7 +43,7 @@ Dataset/workload:
 
 Commit/base/head:
   Branch docs/92-japanese-turn-observation-bench from origin/main bbf77d51 (docs only).
-  The benchmark scripts live outside the repository (see section 9, limitation L12).
+  Benchmark scripts: examples/benchmarks/turn-observation/ (see section 9, limitation L12).
 
 Profile/config fingerprint:
   VAD hysteresis: speech on at p >= 0.5, off at p < 0.35, a segment needs >= 250 ms of speech;
@@ -77,8 +77,9 @@ Actual:
   Sections 5-7.
 
 Evidence artifacts:
-  Local only (not committed): analysis JSON per condition, per-stream VAD/model scores,
-  timing JSON, footprint JSON. See limitation L12.
+  Scripts are committed (examples/benchmarks/turn-observation/). Outputs (analysis JSON per
+  condition, per-stream VAD/model scores, timing JSON, footprint JSON) are local only and not
+  committed; the tables in this record are the retained evidence. See limitation L12.
 
 Noise / uncertainty / missing evidence:
   Section 9.
@@ -99,7 +100,7 @@ Decision:
   Japanese data exists. See section 8.
 
 Follow-up / owning issue:
-  #92 (contract fields: section 7). Real-dialogue label set: open question Q1.
+  #92 (contract fields: section 7). Real labelled Japanese turns are the blocker (section 11.1, item 1).
 
 Revisit condition:
   A real Japanese dialogue set with human turn labels, or a Smart Turn release with
@@ -185,7 +186,7 @@ The data are synthetic constructions from read speech; section 9 lists what that
 
 Findings that need a decision from the project owner:
 
-* The Smart Turn *code and weights are declared BSD-2-Clause*, which is permissive, and the model card does list Japanese among 23 languages (section 6.4). The unverified items are the upstream Whisper Tiny weights license and the terms of the commercial-TTS audio in the training data. Neither blocks measurement; both should be cleared before any adoption (Q5).
+* The Smart Turn *code and weights are declared BSD-2-Clause*, which is permissive, and the model card does list Japanese among 23 languages (section 6.4). The unverified items are the upstream Whisper Tiny weights license and the terms of the commercial-TTS audio in the training data. Neither blocks measurement; both should be cleared before any adoption (section 11.1, item 4).
 * TEN VAD fails the "permissive only" constraint.
 
 == 4. Dataset construction
@@ -414,7 +415,7 @@ In noise Silero v6 held up (the VAD offset lag grew from 61 to 100 ms at p50) an
 
 == 7. Implications for the #92 observation contract
 
-The contract is not decided here; this section states what a real provider can populate, from these measurements.
+The contract is not decided here; this section states what a real provider can populate, from these measurements. The supervisor-decided recommended contract shape (optional fields, scored value with a +calibrated+ flag, declared language) is in section 11.1.
 
 [cols="2,4",options="header"]
 |===
@@ -496,7 +497,7 @@ The pause lengths in this set are drawn from three values; real conversational h
 . *L9, one CPU class and a Python driver.* Latency may be lower with a native binding and on other CPUs; the vendor-reported 10-65 ms for Smart Turn was not reproduced single-threaded here.
 . *L10, the Japanese vendor-test replication used 79 samples* from one shard, all synthetic.
 . *L11, license verification is partial.* See section 3.2: upstream Whisper Tiny weights, the commercial-TTS training audio, the ReazonSpeech corpus, and the official Common Voice distribution were not checked; pip dependencies were not audited.
-. *L12, reproducibility.* The scripts (dataset builder, evaluator, timing and footprint harnesses) were written in a scratch directory and are *not committed*. This record gives the parameters needed to rewrite them, but it is not runnable from the repository. Committing them (for example under +examples/+) is a decision for the project owner (Q2).
+. *L12, reproducibility.* The scripts are committed under link:../../examples/benchmarks/turn-observation/README.md[+examples/benchmarks/turn-observation/+] with pinned requirements, hash-checked asset downloads and reproduction steps; audio, models, virtual environments and per-stream results are not committed. The committed copies were cleaned after the run (machine paths replaced by +TURN_BENCH_DIR+, a downloader added, the abandoned first-pass scripts omitted). After cleaning, only the asset downloader (against already-downloaded files) and +analyze.py+ (against the saved scores, same numbers) were re-run; the whole pipeline was *not* re-executed from an empty directory, so a clean-room rerun may need small fixes. CI does not run them.
 . *L13, hardware generality.* Single machine; RSS from Windows working set; no GPU, no ARM, no other OS.
 . *L14, no confirmatory criterion.* Nothing here is a pass/fail against a pre-stated threshold; do not use these numbers as SLOs (as docs/research-register.adoc already warns for external benchmarks).
 
@@ -510,15 +511,26 @@ The pause lengths in this set are drawn from three values; real conversational h
 * TEN VAD was downloaded (hash recorded) but not run.
 * Repository search used tgrep 1.0.11 as required; external pages were read with the fetch and gh tools.
 
-== 11. Open design questions (for the project owner)
+== 11. Open design questions and supervisor decisions
 
-. *Q1.* What is the source of real labelled Japanese conversational turns (own recordings with consent, a permissively licensed corpus)? Without it no model-based turn-end claim can be confirmed.
-. *Q2.* Should the benchmark scripts be committed (for example +examples/benchmarks/turn-observation/+) so this record is reproducible, given #92 forbids production implementation?
-. *Q3.* Should +turn_end_probability+ be optional with an explicit semantics tag (uncalibrated score vs probability), and should +prediction_horizon_ms+ be optional with nowcast = 0?
-. *Q4.* Is the language field "declared by configuration" in the contract, given that no candidate detects language?
-. *Q5.* Who clears the Smart Turn weights provenance (Whisper Tiny weights license, commercial-TTS training audio) if the model is revisited?
-. *Q6.* What reversibility classes decide the silence threshold (about 300-500 ms tentative versus about 800 ms commit)? This is a #81 policy decision, not a #92 one.
-. *Q7.* Is a fixed 800 ms lag (about 870 ms after the true end here) acceptable for the VTuber persona, or must a text-aware or VAP-style projection be pursued?
+=== 11.1 Supervisor decisions
+
+Recorded after review, on the questions raised by this experiment. They are inputs to the implementation issue; no schema change is made here.
+
+. *Real labelled Japanese turns (was Q1): unresolved, and the blocker.* No model-based turn-end claim (adopting, rejecting, or tuning Smart Turn or any successor) can be confirmed until a real, permissively usable, human-labelled Japanese conversational turn set exists. Next step: identify such a source. No action now.
+. *Scripts (was Q2): committed.* Under link:../../examples/benchmarks/turn-observation/README.md[+examples/benchmarks/turn-observation/+]: the scripts, a pinned +requirements.txt+, and a README with reproduction steps, the dataset mirror and revision, model URLs and versions, and license notes. No audio, models, virtual environments or results beyond small summaries are committed, there are no machine paths, and CI does not run them.
+. *Contract shape (was Q3 and Q4): decided as the recommended shape for the implementation issue.*
+** All provider-derived turn fields are optional.
+** A turn-end value is carried as a *provider score with explicit semantics*: a provider/model id plus a +calibrated+ flag that defaults to false. Consumers must not treat an uncalibrated score as a probability.
+** +prediction_horizon_ms+ is optional and absent unless a provider actually predicts ahead (none of the measured providers does).
+** +language+ is declared by configuration, never inferred.
+** No schema change now.
+. *Smart Turn weights provenance (was Q5): deferred.* Whoever proposes adopting Smart Turn later must clear the weights provenance (the Whisper Tiny base and the TTS training audio) in that PR.
+. *Reversibility classes and thresholds (was Q6): deferred to #81.* This record's measured suggestion (about 800 ms of VAD silence before an irreversible TakeTurn; 300-500 ms only for reversible actions) is carried to #81 as input, not as a decision. It was measured on synthetic pauses (section 4.3) and must be re-measured on real dialogue.
+
+=== 11.2 Still open
+
+. *Q7.* Is a fixed 800 ms lag (about 870 ms after the true end here) acceptable for the VTuber persona, or must a text-aware or VAP-style projection be pursued? This depends on the blocker in 11.1 item 1.
 
 == 12. Related
 
