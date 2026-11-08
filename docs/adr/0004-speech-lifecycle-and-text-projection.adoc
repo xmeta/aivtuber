@@ -390,9 +390,21 @@ OutputObservation (adapter-normalized input, three values)
 * *Privacy*: events carry digests and identities, not text, consistent with the causal-trace rule of no free-text fields.
 * *Metrics* map directly: committed-to-started latency (Committed vs Started +at_ms+), started-to-finished duration, cancellation before/after commit (+reached+), incomplete-versus-final mismatches (+seq+ and +final_phrase+ checks), pronunciation override use and projection failures (+origin+ and +outcome+).
 
+=== Supervisor decisions
+
+Recorded after review; the ADR status remains Proposed.
+
+. *D-1 (scope)*: Stage 1 only. The project-owned custom lexicon plus rule layer is the baseline. Stage 2 (an analyzer) is deferred until a TTS-in-the-loop test shows the target TTS mis-reads ordinary kanji, that is, until A-SPEECH-002 is measured. Reason: after the rules the analyzers are within noise on the blind sets, and the projection's job is overrides, which the lexicon and rules do. This supersedes the Stage 2 recommendation in D1; the jpreprocess wrap there is retained only as the first candidate to re-evaluate.
+. *D-2 (supply chain)*: No advisory exceptions now. When Stage 2 triggers, re-evaluate jpreprocess at its then-current release (0.16 or later) against +cargo deny+ first. lindera is acceptable only with an offline, hash-pinned dictionary build and no build-time network. vibrato and sudachi.rs stay rejected for now. The mecab-ipadic / ICOT and SudachiDict-provenance questions need answers only if one of those is reconsidered.
+. *D-3 (schema)*: +speech_text+ and +speech_projection+ will bump the performance asset schema to 0.2.0 as a schema-first change in the implementation issue, with a migration note. It is incompatible because of +deny_unknown_fields+. No schema change is made in this ADR's pull request.
+. *D-4 (compatibility)*: A projection mismatch is stale but playable, not a hard incompatibility (this replaces the hard/soft split in D4). Cached audio still carries the meaning; it is re-synthesized lazily and the event is counted. In addition, an operator-forced invalidation per lexicon entry is provided, for when a wrong reading must stop immediately (for example a name).
+. *D-5 (defaults)*: URLs are not spoken: dropped from +speech_text+ and kept in the display text. Emoji and kaomoji are dropped from +speech_text+. Unknown Latin words pass through unchanged to the TTS and are counted as +projection_passthrough_latin+ so the lexicon can be grown from evidence.
+. *D-6 (basis)*: The logical-timeline Started/Finished with an explicit +basis+ is acceptable for #81 initially. #81 must read +basis+ and must not treat +LogicalTimeline+ as audible.
+. *D-7 (naming)*: The ambiguity of "generation" (scheduler attempt id versus +GenerationCancellationToken+ attempts) is recorded and resolved in the implementation issue. Nothing is renamed now.
+
 === D6. What is explicitly not decided here
 
-Which analyzer ships first; the asset schema version policy; whether projection mismatch is hard or soft; the default for URLs and unknown Latin words; and whether Stage 2 is needed at all for the chosen baseline TTS. See Open questions.
+Which analyzer ships if Stage 2 triggers, and whether Stage 2 is needed at all for the chosen baseline TTS (A-SPEECH-002). Schema policy, compatibility, defaults, basis and naming are decided in Supervisor decisions above; the remaining questions are under Open questions.
 
 == Consequences
 
@@ -419,6 +431,7 @@ Which analyzer ships first; the asset schema version policy; whether projection 
 . *Homographs are not solved* by any candidate (生物, 人気, 辛い); only lexicon entries or TTS context help, and a lexicon entry is context-free.
 . *Platform and determinism*: one Windows machine, warm file cache, no cold-start or cross-OS/CPU timing, no concurrent load test; byte-identical output was shown within one build only. Maximum latencies include scheduler noise. One dependency build (+aws-lc-sys+ under the default jpreprocess feature) failed in the scratch environment; a long build path is suspected but was not confirmed, and the runtime-file dictionary path avoided it.
 . *Not exercised*: native user-dictionary support was run only for vibrato; the vibrato BCCWJ-derived remap terms, the lindera offline dictionary build, jpreprocess 0.16.0-rc0, sudachi.rs plugin loading and the user-dictionary build tools were not examined.
+. *Bug candidate (own issue)*: on the generated path the asset is inserted into the hot cache (+crates/app/src/lib.rs:1898+) before the scheduler accepts it (+:1900+); a scheduler rejection (duplicate event, cooldown, priority) then surfaces as +AppError::Playback+ and leaves an orphaned hot-cache asset with synthesized audio that was never committed. Found by code reading, not reproduced.
 . *Lifecycle design is code-reading only*: no lifecycle code or prototype exists; the proposal is checked against the code by citation, not by running it. Real audible-start and drain behaviour of the process and native players remains a proxy measurement (A-AUDIO-001).
 
 == Test plan
@@ -488,19 +501,19 @@ Rollback is cheap until audio is generated and cached with projected text (asset
 
 == Open questions
 
-. *Q1 (scope)*: Is the baseline Stage 1 only (analyzer-free), with Stage 2 deferred until the falsifier? This ADR recommends yes.
-. *Q2 (supply chain)*: For Stage 2, accept the jpreprocess advisory exceptions with owner and revisit date, prefer lindera with an offline dictionary build, or wait for jpreprocess 0.16 (rc0 published 2026-11-08, not evaluated)?
-. *Q3 (schema)*: Bump the performance asset schema to 0.2.0 for +speech_text+ and +speech_projection+ (an incompatible change under the current +deny_unknown_fields+ policy), or carry projection data in a separate sidecar record keyed by asset identity?
-. *Q4 (compatibility)*: Is a projection mismatch a hard incompatibility like +voice_model+, or "stale but playable, regenerate"? The recommended split is hard for rules/analyzer/dictionary and soft per-entry for lexicon revisions.
-. *Q5 (policy defaults)*: URLs: delete, or replace with a configured literal such as リンク? Unknown Latin words: pass through, spell out, or reject? Emoji: always delete?
+. *Q1 (scope) - DECIDED, see D-1*: Stage 1 only; Stage 2 deferred until A-SPEECH-002 is measured.
+. *Q2 (supply chain) - DECIDED, see D-2*: no advisory exceptions now; re-evaluate jpreprocess at its then-current release when Stage 2 triggers; lindera only with an offline, hash-pinned dictionary build.
+. *Q3 (schema) - DECIDED, see D-3*: bump the performance asset schema to 0.2.0 in the implementation issue, schema-first, with a migration note.
+. *Q4 (compatibility) - DECIDED, see D-4*: stale but playable; lazy re-synthesis counted; operator-forced invalidation per lexicon entry.
+. *Q5 (policy defaults) - DECIDED, see D-5*: URLs and emoji/kaomoji dropped from speech text; unknown Latin words pass through and are counted.
 . *Q6 (hints)*: Is any generator-supplied reading hint allowed (validated against analyzer n-best readings), given "model output is data"? This ADR excludes it.
 . *Q7 (scope default)*: Default projection scope overrides-only versus full-sentence reading; this needs a measurement with the chosen baseline TTS.
 . *Q8 (authority)*: Who may edit the lexicon (operator ingress capability, config file, both), and may the adaptation layer propose entries from correction labels?
-. *Q9 (basis)*: Is a logical-timeline +Started+/+Finished+ with an explicit +basis+ acceptable for #81 in the first increment, or must the first increment require an observed output acknowledgment?
-. *Q10 (naming)*: "generation" is used for the scheduler attempt id and for +GenerationCancellationToken+ attempts. Rename one (for example +attempt+) before the new contract hardens the ambiguity?
+. *Q9 (basis) - DECIDED, see D-6*: logical-timeline Started/Finished with explicit +basis+ is acceptable for #81 initially.
+. *Q10 (naming) - DECIDED, see D-7*: ambiguity recorded; resolved in the implementation issue, nothing renamed now.
 . *Q11 (placement)*: The domain crate cannot depend on the scheduler. Should the lifecycle types live in the domain crate with the log in the scheduler crate, as proposed, or entirely in the scheduler crate?
 . *Q12 (phrases before #83)*: Is a single-phrase default (phrase 0, final) acceptable until phrase streaming exists, including for streaming TTS progress that is currently collapsed?
-. *Q13 (dictionary distribution)*: Download at install with hash verification, or bundle in releases? Bundling requires reproducing NAIST, UniDic and NITech notices and a decision on the NEologd pointer and on the ICOT compliance clause in mecab-ipadic-derived data.
+. *Q13 (dictionary distribution)*: Download at install with hash verification, or bundle in releases? Bundling requires reproducing NAIST, UniDic and NITech notices and a decision on the NEologd pointer and on the ICOT compliance clause in mecab-ipadic-derived data. Per D-2 this only needs an answer if a mecab-ipadic-derived or SudachiDict dictionary is reconsidered.
 . *Q14 (replay)*: Record the projected +speech_text+ (proposed) or its digest only, given the retention-class rule for raw text in docs/domain-contract.adoc?
 
 == Related
