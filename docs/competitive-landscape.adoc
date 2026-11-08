@@ -1,0 +1,377 @@
+= Competitive Capability Landscape
+:toc:
+:toclevels: 2
+
+*As of: 2026-11-09* (repository `main` at `8e6252ca`; competitor facts fetched the same day).
+
+This document compares aivtuber with the strongest open-source rivals and with two voice-agent frameworks used as references.
+It is a maintained *evidence table*, not a roadmap and not marketing.
+GitHub issues remain the source of truth for ownership and readiness (link:roadmap.adoc[Roadmap]); external patterns are mapped to issues in link:research-register.adoc[Research and Design Register]; dependency decisions live in link:reuse-first.adoc[Reuse-First matrix] and link:supply-chain.adoc[Supply chain].
+
+== 1. Reading rules
+
+Every aivtuber cell uses exactly one status word, and a claim without that word is a defect in this document.
+
+[cols="1,4"]
+|===
+|Status |Meaning
+
+|*shipped*
+|Code on `main` exists and is cited as `path:line`. It says nothing about quality or about a live-stream run unless a run record is cited.
+
+|*designed (ADR-000N)*
+|Only a Proposed ADR exists. No production code. An ADR spike or throwaway script is not shipped code.
+
+|*measured (EXP-0001)*
+|An offline experiment produced numbers. The experiment code is throwaway; nothing is in `crates/`.
+
+|*not started*
+|No code, no ADR. An issue number is given when one exists.
+|===
+
+Competitor cells state what the cited README or source says and nothing else.
+A competitor cell that says "not seen" means the stated files were searched and nothing was found; it is not a claim of absence.
+No competitor was run, so latency, quality, reliability and barge-in behaviour are *not compared* anywhere in this document.
+
+== 2. Competitor snapshot (fetched 2026-11-09 with `gh repo view`)
+
+[cols="3,1,1,1,3"]
+|===
+|Project |Stars |Last push |Licence (GitHub) |Notes
+
+|https://github.com/moeru-ai/airi[moeru-ai/airi]
+|51,218
+|2026-11-08
+|MIT
+|Latest release v0.14.1. Web, PWA and Electron app; very active.
+
+|https://github.com/Open-LLM-VTuber/Open-LLM-VTuber[Open-LLM-VTuber] (OLV)
+|14,639
+|2026-05-15
+|"Other" (the LICENSE file is MIT)
+|Last push is about six months old. The README asks for no new feature issues or PRs while a v2.0 rewrite is planned (README line 14). Bundled Live2D sample models are *not* MIT (see section 6).
+
+|https://github.com/shinshin86/aituber-onair[shinshin86/aituber-onair]
+|319
+|2026-11-07
+|MIT
+|Modular TypeScript npm packages plus starter templates. Small but active and Japanese-community oriented.
+
+|https://github.com/pipecat-ai/pipecat[pipecat-ai/pipecat]
+|17,127
+|2026-11-08
+|BSD-2-Clause
+|Voice-agent pipeline framework (Python). Reference only.
+
+|https://github.com/livekit/agents[livekit/agents]
+|15,140
+|2026-11-08
+|Apache-2.0
+|Voice-agent framework (Python) on LiveKit's transport. Reference only.
+|===
+
+== 3. Capability matrix
+
+Competitor evidence is linked in section 7; `README n` means line `n` of the README fetched on the as-of date.
+
+[cols="2,5,3,3,3,2,2"]
+|===
+|Capability |aivtuber (this repository) |AIRI |Open-LLM-VTuber |aituber-onair |pipecat |livekit/agents
+
+|Platform chat ingress
+a|*shipped*: Twitch, read-only, anonymous login, no send call: `crates/adapters/src/twitch_chat.rs:83` (`TwitchRecordMapper`), `crates/adapters/src/bin/twitch-chat-ingress.rs:115`, ceiling `crates/app/src/main.rs:102`, forged-badge test `crates/app/tests/twitch_ingress_e2e.rs:52`, operator doc `docs/production-runtime.adoc:116`. No recorded live run (the doc calls it manual). YouTube, Discord and others: *not started*, no open issue.
+|Discord, Telegram (README 245-246); Bilibili plugin and Discord/Telegram/Satori/Twitter packages in the repo tree. No Twitch or YouTube package seen.
+|Bilibili requirements file only (repo tree). Nothing else seen.
+|YouTube / Twitch comment reaction (README 53, 470).
+|n/a
+|n/a
+
+|Voice input (VAD / STT)
+a|*not started* in `crates/` (searches for whisper, silero, microphone found nothing). *measured (EXP-0001)* offline: Silero v6 VAD, Smart Turn v3.2, fixed-silence baselines on Japanese read speech (`docs/experiments/EXP-0001-japanese-turn-observation-bench.adoc`). Issue #92 (`status:design-ready`).
+|Browser and Discord audio input, client-side speech recognition and talking detection (README 251-255).
+|ASR via sherpa-onnx, FunASR, Faster-Whisper, Whisper.cpp and others (README 84).
+|Not seen.
+|Silero VAD among many STT services (README 101).
+|STT plug-ins, semantic turn detection (README 35, 40).
+
+|Turn-taking / barge-in
+a|*designed (ADR-0005)* and *measured (EXP-0001)*. The only shipped interruption is the operator stop below. No audio path exists to interrupt. Issues #81, #92, #106.
+|Not claimed in README.
+|"Voice interruption without headphones" (README 73).
+|Not seen.
+|Turn-start strategy with `enable_interruptions`, `MinWords` strategy (source read in ADR-0005).
+|Interruption by audio activity, false-interruption timer, preemptive generation (source read in ADR-0005).
+
+|TTS and Japanese pronunciation
+a|TTS: *shipped* provider-neutral HTTP adapter with voice model and viseme mapping fields `crates/adapters/src/tts_http.rs:38`; local playback `crates/adapters/src/audio.rs:51` (process) and `:142` (rodio, opt-in). Display-to-speech reading projection (for example kanji to kana, lexicon): *designed (ADR-0004)*, issue #222. No pronunciation code exists.
+|Multi-provider TTS including local Kokoro (README 257).
+|Many TTS back ends (README 85).
+|VOICEVOX, VoicePeak, AIVIS Speech, OpenAI TTS and others (README 379). No pronunciation lexicon seen.
+|Many TTS services.
+|Many TTS plug-ins.
+
+|Avatar (VRM / Live2D / VTS)
+a|*shipped*: VTube Studio adapter `crates/adapters/src/vts.rs:81` and `crates/app/src/outputs.rs:53`; OBS adapter `crates/adapters/src/obs.rs:77`. In-repo VRM renderer: *designed (ADR-0003)*, issue #219 (`status:agent-ready`); the ADR records throwaway spike numbers only, nothing from the spike is committed. Native Live2D: *not started* and not planned (licence).
+|VRM and Live2D (README 259-267).
+|Live2D, transparent desktop pet mode (README 73-76).
+|PNG, VRM, Live2D, Inochi2D and other templates (README 81, 344).
+|Third-party video avatars (HeyGen, Tavus, LemonSlice, Simli; README 98).
+|Third-party video avatars (README 281-284).
+
+|Expression / gesture coordination
+a|*shipped*: typed avatar commands (expression, gesture, gaze, viseme, each with a generation) `crates/runtime/src/cached_playback.rs:142`, executed by `crates/app/src/outputs.rs:89`. One coherent intent across speech, gaze, gesture and expression: *designed (ADR-0006)*, issue #84. Gaze continuity (#91), anti-repetition (#89), affect continuity (#86): *not started*, no ADR.
+|Automatic blink, look-at, idle eye movement for VRM and Live2D (README 262-270).
+|Backend-controlled expression mapping (README 75).
+|Emotion-aware TTS (README 379); lip-sync from audio output in the VRM example (README 142).
+|n/a
+|n/a
+
+|Memory
+a|*shipped* bounded working memory with pseudonymized actors `crates/adaptation/src/lib.rs:400`, `:248`, wired in `crates/app/src/main.rs:581`. Long-range retrieval via a sidecar: only an *evaluation* harness (`crates/adapters/src/hindsight.rs:118`, `crates/app/src/memory_sidecar_eval.rs`); issue #105 is still `status:agent-ready`, so no adoption decision exists.
+|In-browser DuckDB WASM / pglite; "Memory Alaya" unchecked/WIP (README 247-249).
+|Long-term memory "temporarily removed"; chat logs persist (README 51).
+|Long-term memory; viewer points and levels package (README 54-55, 460).
+|Via services.
+|Via plug-ins.
+
+|Moderation
+a|Live moderation actions: *not started* (#74, #76). Offline shadow-evaluation evidence only: *shipped* `crates/app/src/moderation_evidence.rs:1`, with no path to act (#77 remaining acceptance is #211). Inbound trust handling is *shipped* (see security row).
+|Not seen in README.
+|Not seen in README.
+|Not seen in README.
+|n/a
+|n/a
+
+|Security / authority model
+a|*shipped*: non-serializable memory-write permit `crates/runtime/src/lib.rs:221`; non-serializable authenticated control proof `crates/domain/src/control.rs:46`; operator trust ceiling on the stdin ingress `crates/runtime/src/lib.rs:107`, `crates/app/src/main.rs:102`. Tests show a forged moderator badge gains nothing (`crates/app/tests/twitch_ingress_e2e.rs:52`).
+|Not seen in README.
+|Not seen in README.
+|Not seen in README.
+|Not seen.
+|Not seen.
+
+|Operator emergency control
+a|*shipped*: authenticated local control endpoint with `stop` and `mute` `crates/app/src/operator_control.rs:201`, client `crates/app/src/bin/aivtuberctl.rs:64`, scheduler test `crates/scheduler/src/lib.rs:1078`. A 34 minute live run with real VTube Studio and OBS, including operator mute and stop, is recorded in `docs/release-v0.1.adoc` section 12 (2026-10-02; cached profile only).
+|Not seen.
+|Not seen.
+|Not seen.
+|Not seen.
+|Not seen.
+
+|Replay / benchmarking
+a|*shipped*: deterministic scheduler replay `crates/scheduler/src/replay.rs:74`, `replay-benchmark` `crates/app/src/bin/replay-benchmark.rs:188`, benchmark gate `crates/telemetry/src/benchmark_gate.rs`, failure soak `crates/hardening/src/soak.rs`, libFuzzer targets `fuzz/` (`docs/fuzzing.adoc`). The replay benchmark uses in-process mocks and makes no hosted-provider latency claim (`docs/metrics.adoc:107`).
+|Not seen.
+|Not seen.
+|Not seen.
+|Unit tests with pytest (README 204-217).
+|Built-in test framework with judges (README 42, 216).
+
+|Local-only / no paid dependencies
+a|Cached profile: *shipped*, needs no Jev or LLM key (`crates/app/src/profile.rs:76`). The `reflex` and `full` profiles refuse to start without `AIVTUBER_JEV_API_KEY` (`crates/app/src/profile.rs:79`), and `full` needs the OpenAI-shaped generative adapter. The zero-paid-dependency profile is issue #220 (`status:blocked`, `status:design-ready`); *not started*. VTube Studio is a third-party closed application.
+|Ollama and other local back ends listed (README 353); Kokoro TTS local.
+|"Run completely offline" (README 47, 67).
+|Provider-based; local use not claimed in README.
+|Local services possible; not claimed in README.
+|Needs LiveKit transport.
+
+|Desktop app
+a|*not started* (no Tauri code in `crates/`). Issue #205 (`status:blocked`, `status:design-ready`).
+|Electron desktop app (README 191, 306).
+|Desktop client with pet mode (README 69).
+|Web app and templates; no desktop installer seen.
+|n/a
+|n/a
+
+|Games / tools / MCP
+a|MCP tool adapter *shipped* (`crates/adapters/src/mcp.rs:17`) with a bounded task plane (`crates/app/src/task_plane.rs:52`); maturity not assessed here. Game context (#88) and ActionWindow (#221): *not started*, no ADR for either. No game integration exists.
+|Minecraft, Factorio (WIP/PoC), Kerbal Space Program, MCP launcher (README 241-243, 399).
+|MCP servers via `mcp_servers.json` (repo root); vision (README).
+|MCP support in the chat package (README 368).
+|Pipecat Flows built in (README 42).
+|Native MCP support (README 41).
+|===
+
+== 4. Where we lead (verified only)
+
+Each item below is a design property that was checked in code or a recorded run; none is a statement about overall product quality.
+
+. *Authority is data-type enforced, not prompt enforced.* Memory writes require a non-serializable permit that only the security runtime constructs (`crates/runtime/src/lib.rs:221`), and privileged control requires a non-serializable proof minted only by authenticated local ingress (`crates/domain/src/control.rs:46`). No competitor README or the pipecat / livekit READMEs describe an equivalent; this is an absence in READMEs, not an exhaustive source search.
+. *Untrusted public chat cannot self-escalate.* The Twitch path pins chat to `untrusted` / `public_chat` and the app rejects anything above an operator ceiling (`crates/app/src/main.rs:102`); a test sends forged moderator and broadcaster badges and a forged command and checks no capability results (`crates/app/tests/twitch_ingress_e2e.rs:52`).
+. *Emergency stop is independent of the content path and has been exercised live with real adapters.* Operator `stop` and `mute` went through during non-idle activity in a 34 minute run with real VTube Studio and OBS, including adapter degradation that did not freeze the performer (`docs/release-v0.1.adoc` section 12).
+. *Replay and failure evidence is part of the repository.* Deterministic scheduler replay, a benchmark gate, soak and fuzz targets exist in-tree. The only comparable item seen elsewhere is livekit's built-in test framework (README 42), which tests agent behaviour rather than replaying scheduler decisions.
+. *Japanese turn-observation numbers exist and were published with their limits.* EXP-0001 measured VAD cost and compared Smart Turn v3.2 with fixed-silence rules on Japanese read speech; it found Smart Turn did not beat the fixed-800 ms rule on false turn-take rate. This is a lead in evidence, not in shipped capability (nothing of it is in `crates/`), and the labels were constructed (see the EXP-0001 limitations).
+
+== 5. Where we trail (ranked by user-visible impact)
+
+Impact means what a streamer or a viewer notices first when comparing with AIRI or Open-LLM-VTuber. Status labels were read from GitHub on 2026-11-09.
+
+[cols="1,3,3,3"]
+|===
+|Rank |Gap |Issue and labels |Competitor evidence
+
+|1
+|*No avatar renderer of our own.* The only visible output is a third-party closed application (VTube Studio). The ADR is Proposed and nothing is committed.
+|https://github.com/xmeta/aivtuber/issues/219[#219] (P1, `status:agent-ready`); ADR-0003 (designed).
+|VRM and Live2D in AIRI (README 259-267); VRM / Live2D templates in aituber-onair (README 81).
+
+|2
+|*No voice at all: no microphone, VAD, STT or barge-in.* A viewer cannot talk to the performer.
+|https://github.com/xmeta/aivtuber/issues/92[#92] (P2, `status:design-ready`, Stage 5), https://github.com/xmeta/aivtuber/issues/81[#81] (P1, `status:design-ready`); ADR-0005 (designed), EXP-0001 (measured offline).
+|OLV voice interruption (README 73); AIRI speech recognition and talking detection (README 251-255).
+
+|3
+|*No fully local or zero-paid run for the reactive and generative paths.* `reflex` / `full` demand a Jev key (`crates/app/src/profile.rs:79`).
+|https://github.com/xmeta/aivtuber/issues/220[#220] (P1, `status:blocked`, `status:design-ready`).
+|OLV runs completely offline (README 47, 67); AIRI lists Ollama (README 353).
+
+|4
+|*No installer or desktop app.* Setup is command line and environment variables.
+|https://github.com/xmeta/aivtuber/issues/205[#205] (P2, `status:blocked`, `status:design-ready`).
+|AIRI Electron (README 191); OLV desktop client (README 69).
+
+|5
+|*Only one chat platform (Twitch, read-only).* No YouTube, Discord or Telegram; no live run recorded for Twitch.
+|No open issue for further platforms; Twitch was https://github.com/xmeta/aivtuber/issues/257[#257] (closed). Moderation actions: https://github.com/xmeta/aivtuber/issues/76[#76] (P1, no status label).
+|aituber-onair YouTube and Twitch (README 53, 470); AIRI Discord and Telegram (README 245-246).
+
+|6
+|*No Japanese reading projection or pronunciation lexicon.* TTS output text equals display text.
+|https://github.com/xmeta/aivtuber/issues/222[#222] (P1, `status:design-ready`); ADR-0004 (designed).
+|aituber-onair offers VOICEVOX and AIVIS Speech back ends (README 379), but no lexicon was seen in the README.
+
+|7
+|*No gaze, idle or affect continuity and no coherent performance intent.* Avatar commands are individually typed but not composed into one intent.
+|https://github.com/xmeta/aivtuber/issues/84[#84] (P1, `status:design-ready`); ADR-0006 (designed). https://github.com/xmeta/aivtuber/issues/91[#91], https://github.com/xmeta/aivtuber/issues/89[#89], https://github.com/xmeta/aivtuber/issues/86[#86] (P2, no status label).
+|AIRI automatic blink, look-at and idle eye movement (README 262-270).
+
+|8
+|*No game or world interaction.* MCP tools exist, but no game integration or scene context.
+|https://github.com/xmeta/aivtuber/issues/88[#88] (P2, no status label), https://github.com/xmeta/aivtuber/issues/221[#221] (P1, `status:blocked`, `status:design-ready`).
+|AIRI Minecraft, Factorio, Kerbal Space Program (README 241-243).
+
+|9
+|*Memory is bounded but shallow, and long-range retrieval is only evaluated.*
+|https://github.com/xmeta/aivtuber/issues/105[#105] (P2, `status:agent-ready`, `status:design-ready`).
+|AIRI memory is itself unfinished (README 247-249); OLV removed long-term memory (README 51). This is therefore a parity risk, not a competitor lead.
+
+|10
+|*Live moderation actions do not exist.* Shadow evidence only.
+|https://github.com/xmeta/aivtuber/issues/74[#74], https://github.com/xmeta/aivtuber/issues/76[#76] (P1, no status label); https://github.com/xmeta/aivtuber/issues/211[#211].
+|None of the READMEs read advertise moderation; this is a possible future lead.
+|===
+
+== 6. Licence notes
+
+All licence strings come from `gh repo view` on 2026-11-09 unless a LICENSE file is named. This is an engineering screen, not legal advice, and model weights and voices carry their own licences.
+
+=== Reuse candidates (compatible at repository level)
+
+[cols="3,2,4"]
+|===
+|Candidate |Licence |Note
+
+|https://github.com/robotty/twitch-irc-rs[robotty/twitch-irc-rs] (the `twitch-irc` crate used by `crates/adapters/Cargo.toml:24`)
+|MIT
+|Already adopted behind the sidecar.
+
+|https://github.com/snakers4/silero-vad[snakers4/silero-vad]
+|MIT
+|VAD; measured in EXP-0001.
+
+|https://github.com/k2-fsa/sherpa-onnx[k2-fsa/sherpa-onnx]
+|Apache-2.0
+|VAD, ASR and TTS in one C API; 15,825 stars, pushed 2026-11-07.
+
+|https://github.com/ggml-org/whisper.cpp[ggml-org/whisper.cpp]
+|MIT
+|ASR; 55,018 stars, pushed 2026-11-08.
+
+|https://github.com/pixiv/three-vrm[pixiv/three-vrm]
+|MIT
+|VRM 1.0 library behind ADR-0003; 2,277 stars, pushed 2026-10-22.
+
+|https://github.com/pipecat-ai/smart-turn[pipecat-ai/smart-turn]
+|BSD-2-Clause
+|Licence is fine, but EXP-0001 found it did not beat fixed silence on false turn-take rate for the tested Japanese set. Do not adopt on licence grounds alone; ADR-0005 rejects it as a commit trigger for now. Last push 2026-01-29.
+
+|https://github.com/pipecat-ai/pipecat[pipecat] and https://github.com/livekit/agents[livekit/agents]
+|BSD-2-Clause, Apache-2.0
+|Reference only: adopting either would add a second authoritative pipeline.
+
+|https://github.com/VedalAI/neuro-sdk[VedalAI/neuro-sdk]
+|MIT
+|Protocol reference for ActionWindow (#221).
+
+|https://github.com/chyinan/Kokoro-Engine[chyinan/Kokoro-Engine]
+|MIT
+|Rust and Tauri reference for #205; 160 stars, treat as reference only.
+|===
+
+=== Traps
+
+[cols="3,2,4"]
+|===
+|Project |Licence |Why it is a trap
+
+|https://github.com/TEN-framework/ten-vad[TEN-framework/ten-vad]
+|"Other" (Apache-2.0 plus conditions)
+|The LICENSE file adds conditions, including that you may not deploy it in a way that competes with Agora's offerings (LICENSE line 10). Treat as non-OSI; do not adopt.
+
+|https://github.com/fishaudio/fish-speech[fishaudio/fish-speech]
+|"Other" (Fish Audio Community License, version 1.0)
+|Community licence, not an OSI licence. Read the terms before any use.
+
+|https://github.com/OHF-Voice/piper1-gpl[OHF-Voice/piper1-gpl]
+|GPL-3.0
+|Bundling in-process would impose GPL obligations; whether a separate process avoids them is a legal question.
+
+|https://github.com/Ikaros-521/AI-Vtuber[Ikaros-521/AI-Vtuber]
+|GPL-3.0
+|Reference only; cannot be linked into this repository.
+
+|https://github.com/heshengtao/super-agent-party[heshengtao/super-agent-party]
+|AGPL-3.0
+|Reference only; never copy.
+
+|https://github.com/elevenyellow/handcrafted-persona-engine[elevenyellow/handcrafted-persona-engine]
+|none
+|No licence means all rights reserved; unusable as code.
+
+|Live2D Cubism SDK and sample models
+|Live2D Inc. terms
+|Open-LLM-VTuber's README states its sample models are licensed separately and are not covered by its MIT licence (OLV README 134-140). Any Live2D rendering path carries this risk; VRM avoids it, but individual VRM models have their own licences.
+
+|https://github.com/Open-LLM-VTuber/Open-LLM-VTuber[Open-LLM-VTuber]
+|"Other" on GitHub; LICENSE file is MIT
+|Automated licence scanners will not recognise it; the MIT grant excludes the Live2D sample models.
+|===
+
+== 7. Competitor evidence
+
+All README line numbers refer to the file fetched through the GitHub API on 2026-11-09.
+
+* AIRI: https://github.com/moeru-ai/airi/blob/main/README.md[README] ("Current Progress & Roadmap", lines 236-270; ecosystem lines 385-399); directory listings of https://github.com/moeru-ai/airi/tree/main/integrations[integrations], https://github.com/moeru-ai/airi/tree/main/plugins[plugins] and https://github.com/moeru-ai/airi/tree/main/services[services].
+* Open-LLM-VTuber: https://github.com/Open-LLM-VTuber/Open-LLM-VTuber/blob/main/README.md[README] (lines 14, 47-91, 134-140), https://github.com/Open-LLM-VTuber/Open-LLM-VTuber/blob/main/mcp_servers.json[mcp_servers.json], https://github.com/Open-LLM-VTuber/Open-LLM-VTuber/blob/main/LICENSE[LICENSE].
+* aituber-onair: https://github.com/shinshin86/aituber-onair/blob/main/README.md[README] (lines 13-14, 53-55, 81, 368, 379, 460, 470).
+* pipecat: https://github.com/pipecat-ai/pipecat/blob/main/README.md[README] (lines 42, 92-101); interruption behaviour from the source files named in link:adr/0005-conversational-floor-policy.adoc[ADR-0005] at pipecat commit `3dbb0c84`.
+* livekit/agents: https://github.com/livekit/agents/blob/main/README.md[README] (lines 35-42, 216, 281-284); interruption behaviour from the source files named in ADR-0005 at livekit commit `1e352e41`.
+* Licence traps: https://github.com/TEN-framework/ten-vad/blob/main/LICENSE[ten-vad LICENSE], https://github.com/fishaudio/fish-speech/blob/main/LICENSE[fish-speech LICENSE].
+
+== 8. Limits of this document
+
+* No competitor was run. Nothing here compares latency, quality, stability or barge-in behaviour.
+* README feature lists are marketing text. A checked box (AIRI) or a bullet (OLV) means the maintainers claim it, not that it works well.
+* "Not seen" for a competitor means the cited README and listings only; the source trees were not exhaustively searched.
+* For this project, `shipped` rows were checked by reading the cited lines on `main`; whether each path is exercised by a default CI gate or a live run is stated only where a record is cited.
+* Search for this project was done with tgrep 1.0.11 against an index built from this checkout.
+
+== 9. How to refresh
+
+. Create a branch from current `origin/main`, update the *As of* date and commit id at the top.
+. Re-run `gh repo view <owner/repo> --json stargazerCount,pushedAt,licenseInfo,isArchived` for every repository in sections 2 and 6, and update the figures.
+. Re-fetch the READMEs (`gh api repos/<owner/repo>/readme -H "Accept: application/vnd.github.raw"`) and re-check every cited line number; line numbers drift with every README edit.
+. For each aivtuber `shipped` row, run `tgrep -n '<symbol>' .` and confirm the cited `path:line`. Move a row to `shipped` only with a code citation; never from an ADR or issue.
+. Re-read the live labels with `gh issue list --state open --json number,title,labels` and update section 5; reorder by user-visible impact, not by label.
+. Run `bun scripts/validate.mjs`.
+
+Refresh at least when a competitor ships a release that changes a matrix cell, when an ADR in this table changes status, or before a public comparison is made from this document.
