@@ -1,0 +1,528 @@
+= EXP-0001: Japanese speech-activity and turn-end observation bench (#92)
+:toc:
+:toclevels: 2
+
+This is a durable experiment record in the link:README.adoc[Durable Experiment Records] format.
+It supports the design of the provider-neutral speech/turn observation contract in #92, which is +status:design-ready+: this record contains measurement and a throwaway spike only, no production code, and no new dependency in the repository.
+
+== 1. Record
+
+[source,text]
+----
+Decision question:
+  For Japanese speech, can an off-the-shelf local model give speech-activity and
+  turn-end observations that beat a fixed-silence-timeout baseline, at a latency
+  compatible with the runtime, using only permissively licensed code, weights and data?
+
+Context / baseline:
+  #92 needs SpeechActivity / TurnEndLikelihood observations for #81 (floor policy).
+  docs/implementation-accelerator.adoc names sherpa-onnx + Silero VAD and Pipecat
+  Smart Turn v3 as first candidates and says to "benchmark Japanese/multilingual
+  behavior locally before promotion". Baseline = fixed silence threshold on VAD output.
+
+Hypothesis / expected outcome (exploratory, no numeric threshold pre-registered):
+  Smart Turn should hold through mid-utterance pauses that a fixed timeout would
+  cut, and fire earlier than a long (800 ms) timeout at the true end.
+
+Guardrails:
+  No raw audio in the domain contract; no new repository dependency; sidecar boundary
+  (docs/reuse-first.adoc); a slow model must never sit in the scheduler/frame loop.
+
+Decision-changing evidence:
+  False turn-take rate on held pauses versus lag at true turn end, per method and
+  threshold, with VAD per-frame latency / RTF, load time and RSS.
+
+Cheapest informative test:
+  Synthetic labelled streams built from CC0 Japanese read speech (section 4), CPU only.
+
+Dataset/workload:
+  424 synthetic streams, 47.7 minutes of 16 kHz mono audio, built from Common Voice 22.0 ja
+  (test split). Classes: A single utterance (142), B1 two clips of the same contributor ID
+  joined by a pause (80), B2 pause at a written clause boundary (114), C non-speech (88).
+  Two conditions: "clean" and "noisy15" (pink noise, 15 dB below speech RMS).
+
+Commit/base/head:
+  Branch docs/92-japanese-turn-observation-bench from origin/main bbf77d51 (docs only).
+  The benchmark scripts live outside the repository (see section 9, limitation L12).
+
+Profile/config fingerprint:
+  VAD hysteresis: speech on at p >= 0.5, off at p < 0.35, a segment needs >= 250 ms of speech;
+  32 ms (512 sample) frames; onnxruntime CPUExecutionProvider, 1 intra-op thread.
+
+Seed:
+  20261108 (clip selection, pairing, pause assignment, room-tone tiling); noisy15 mix seed 7.
+
+Asset/index/compiler version:
+  Not applicable (no repository assets, replay index or compiler involved).
+
+Provider/model versions:
+  See section 3.
+
+Toolchain:
+  Python 3.13.12, onnxruntime 1.31.1, sherpa-onnx 2.0.1, numpy 2.5.4, scipy 1.18.1,
+  soundfile 0.14.0, pandas 3.1.1, pyarrow 26.0.1, psutil 7.2.2 (isolated venv, outside the repo).
+
+Other relevant environment:
+  x86-64 desktop-class CPU, 8 physical / 16 logical cores, base-class clock up to about 3.6 GHz,
+  32 GB RAM, Windows 11 Pro. CPU only, no GPU used. Run date 2026-11-08.
+
+Exploratory unknowns:
+  Everything in sections 5-7. No confirmatory criterion was fixed before the results were read.
+
+Confirmatory success/guardrail criteria:
+  None. The question in the task statement was qualitative ("beat a fixed-silence baseline").
+  Criterion version / recorded-at: not applicable.
+
+Actual:
+  Sections 5-7.
+
+Evidence artifacts:
+  Local only (not committed): analysis JSON per condition, per-stream VAD/model scores,
+  timing JSON, footprint JSON. See limitation L12.
+
+Noise / uncertainty / missing evidence:
+  Section 9.
+
+Expected-vs-actual difference:
+  Smart Turn did not hold through the constructed pauses (it called nearly all of them
+  "complete") and was therefore not better than a fixed timeout; see section 6.
+
+Likely explanation:
+  Several, not separable with this data: (1) the model is nearly blind to Japanese clause-final
+  particles and to prosodically final speech (B1), (2) Japanese clause-final particles
+  (けど, から, て, が) can end an utterance, so the label itself is ambiguous, (3) its Japanese
+  training/test data was, in the part we inspected, entirely synthetic speech.
+
+Decision:
+  Narrow. Carry only VAD-derived speech activity plus a deterministic silence heuristic into the
+  #92 first slice. Defer Smart Turn (do not adopt, reference only) until real conversational
+  Japanese data exists. See section 8.
+
+Follow-up / owning issue:
+  #92 (contract fields: section 7). Real-dialogue label set: open question Q1.
+
+Revisit condition:
+  A real Japanese dialogue set with human turn labels, or a Smart Turn release with
+  non-synthetic Japanese hold data, or a different candidate (VAP-style model) is available.
+----
+
+== 2. Result summary
+
+All numbers below are measured here unless explicitly marked as vendor-reported.
+The data are synthetic constructions from read speech; section 9 lists what that does and does not support.
+
+* *VAD (Silero v6, onnxruntime, 1 thread):* per-32 ms-frame inference p50 0.22 ms, p99 0.61 ms, max 4.4 ms; real-time factor 0.0072 including the Python loop. Speech onset was detected a median 48 ms (p90 112 ms clean, 144 ms noisy) after the energy-defined start, and speech end a median 61 ms (p90 104 ms) after the energy-defined end. 12.7% of clean utterances had onset lag above 100 ms, so a bounded pre-roll is required.
+* *Non-speech:* 0 of 88 synthetic non-speech streams (room tone, white/pink noise, mains hum, clicks, tones) produced a speech segment from Silero v6 in either condition.
+* *Fixed silence timeout (Silero v6):* 300 ms fired on 75% of holds (100% of 500 ms and 700 ms nominal pauses) with p50 lag 389 ms; 500 ms fired on 43% with lag 580 ms; 800 ms fired on 4% with lag 868 ms. The VAD shortens a nominal pause by roughly 45 to 60 ms (clean) (observed median gap 256 / 448 / 640 ms for nominal 300 / 500 / 700 ms), so thresholds must be compared with the observed, not nominal, pause.
+* *Smart Turn v3.2 (CPU int8) on top of the VAD:* fired on 83-85% of holds at threshold 0.5 (single-shot at 200 ms: 83%; polled every 100 ms: 85%), at a p50 lag of 271 ms. Its score separated the final turn end from the hold points with AUC 0.64 overall, 0.51 on B1 (chance) and 0.72 on B2. 80% of all scores were above 0.9. One inference costs p50 94 ms and p95 119 ms on 1 CPU thread.
+* *Therefore:* in this set Smart Turn gave earlier firing than fixed-800 ms (271 ms versus 868 ms lag) but at a false turn-take rate about 20 times higher (85% versus 4%), and no better false-take rate than fixed-300 ms (75%) at a similar order of lag. It did not beat the fixed-silence baseline on the metric that matters for a floor policy.
+
+== 3. Setup, pinned versions and license table
+
+=== 3.1 Candidates and pinned artifacts
+
+[cols="2,3,3",options="header"]
+|===
+|Item |Pinned identity |Used for
+
+|Silero VAD v6.x (snakers4/silero-vad)
+|tag v6.2.3 (2026-09-23); +silero_vad.onnx+ sha256 +1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3+ (identical at tag and at master commit 066409f3d9); run through onnxruntime 1.31.1 directly (512 samples + 64 context, state 2x1x128)
+|Frame-level speech probability; own hysteresis (section 4.4)
+
+|sherpa-onnx 2.0.1
+|release v2.0.1 (2026-10-26); +VoiceActivityDetector+ with Silero config. Two models were run through it: the release asset +silero_vad.onnx+ (sha256 +9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6+; its metadata says "silero-vad v4 exported to onnx by k2-fsa, only the 16kHz branch kept") and the Silero v6 file above
+|The sherpa VAD pipeline: segment is emitted when silence >= +min_silence_duration+ (0.3 / 0.5 / 0.8 s), +min_speech_duration+ 0.25 s, threshold 0.5
+
+|pipecat-ai/smart-turn v3.2, CPU int8 build
+|+smart-turn-v3.2-cpu.onnx+ sha256 +2bb026316b14a660486a75b1733cd3fbab8c2fd0314dc9af7be49f8cca967e4f+ (8.7 MB); HF repo pipecat-ai/smart-turn-v3 revision f766f81d3c; GitHub repo commit 4786657e24 (2026-01-29)
+|End-of-turn probability from the last 8 s of audio
+
+|Pipecat feature extraction
+|+_whisper_features.py+ (numpy log-mel, sha256 +139b047d10dee42ad5b4894489012e515a882d8f5e2bffe8ad27b30728fc9968+) fetched from Pipecat main on 2026-11-08 (latest release then v1.15.0); not pinned to a tag
+|Reference preprocessing for Smart Turn, called exactly as +LocalSmartTurnAnalyzerV3+ does (8 s window, zero-pad at the front, +do_normalize=True+, sigmoid output, 0.5 default)
+
+|TEN VAD
+|+ten-vad.onnx+ (sherpa-onnx release asset) downloaded and hashed (sha256 +718cb7ee...+); *not run, not adopted*
+|License record only
+|===
+
+=== 3.2 License table (code / weights / data)
+
+[cols="2,2,3,3",options="header"]
+|===
+|Item |Code |Weights |Data / notes
+
+|Silero VAD
+|MIT (repository LICENSE, "Silero Team")
+|The model file ships in the same repository; the repository README states the project is published under the permissive MIT license. No separate weights license was found.
+|Training data not stated in what was read.
+
+|sherpa-onnx
+|Apache-2.0 (LICENSE file read)
+|Release-asset Silero v4 export: model metadata points at the Silero MIT LICENSE.
+|Framework license does not cover every model (as docs/reuse-first.adoc already says).
+
+|Smart Turn v3.2
+|BSD-2-Clause (repository LICENSE read; GitHub SPDX BSD-2-Clause)
+|HF model card front matter +license: bsd-2-clause+. No separate weights license text. The card says the model uses a Whisper Tiny encoder backbone; the Whisper code license is MIT (read), but the license of the original Whisper Tiny weights was *not* verified here.
+|Training/evaluation data pipecat-ai/smart-turn-data-v3.2-train/test are +cc-by-4.0+ per their dataset cards (attribution required). The Japanese rows of the test shard inspected were all dataset +chirp3_1+ and flagged +synthetic+, i.e. generated with a commercial TTS; the terms of that TTS output were *not* verified. Pipecat's vendored feature code carries BSD-2-Clause with Apache-2.0 portions derived from Hugging Face Transformers.
+
+|TEN VAD (flagged earlier, not adopted)
+|Apache-2.0 *plus additional conditions* (read): no deployment that competes with Agora's offerings or enables others to; use only to create the user's own Application(s); derivatives stay under this license
+|Same license
+|*Not permissive in the sense this project requires.* Recorded only, as instructed.
+
+|ReazonSpeech k2 v2 (alignment aid only, not a candidate)
+|Apache-2.0 (model card)
+|Model card says Apache-2.0
+|Trained on the ReazonSpeech corpus; the corpus license was *not* verified. Used only as a text-similarity check on the first-pass clips (sentence text vs recognised text, >= 0.7); it is not part of any candidate path.
+
+|Common Voice 22.0, Japanese
+|Not applicable
+|Not applicable
+|CC0-1.0. Obtained from the third-party Hugging Face mirror +fsicoli/common_voice_22_0+ (revision ae911de250; card says +cc0-1.0+); the official Mozilla distribution was not accessed. Only the +ja+ test split (8004 clips) was used; clips with fewer than 2 up-votes or any down-vote were dropped (6276 left).
+|===
+
+Findings that need a decision from the project owner:
+
+* The Smart Turn *code and weights are declared BSD-2-Clause*, which is permissive, and the model card does list Japanese among 23 languages (section 6.4). The unverified items are the upstream Whisper Tiny weights license and the terms of the commercial-TTS audio in the training data. Neither blocks measurement; both should be cleared before any adoption (Q5).
+* TEN VAD fails the "permissive only" constraint.
+
+== 4. Dataset construction
+
+The question requires turn labels, which real Japanese conversation corpora with permissive licenses do not offer in the quantity needed here.
+Labels were therefore *constructed*; the construction decides what the results can mean.
+
+=== 4.1 Source clips and reference speech bounds
+
+. Common Voice 22.0 ja test split, mp3 decoded and resampled to 16 kHz mono, filtered by the vote rule above. Clips are single read sentences, a few seconds long.
+. *Reference speech start/end* for each clip is defined by an energy detector, not by hand: 25 ms frames at 10 ms hop; speech frame if level > (95th percentile level - 32 dB); runs of at least 120 ms; runs closer than 400 ms chain; the chain with most voiced time is the utterance. This discards clicks and thumps (a first version without that rule was contaminated, see section 10).
+. A loose agreement filter against the VAD under test was applied: a clip is kept only if Silero's first segment start and last segment end are within 0.4 s of the energy bounds (of 1140 first-pass candidate clips: 116 dropped for low ASR text similarity, 63 for duration outside 1.2-9 s, 210 for VAD disagreement; 751 kept; 190 more clauses-with-comma clips were added later for B2 under the same rules except the ASR check). This is partly circular (clips the VAD handles very differently from the energy detector are excluded) and is limitation L4.
+. Each clip is scaled to speech RMS 0.07 (about -23 dBFS). Room tone for gaps is tiled from the clip's own quietest 300 ms window with crossfades, and a constant -60 dBFS pink noise floor is added to every stream because many Common Voice clips are noise-gated to digital silence.
+
+=== 4.2 Classes
+
+[cols="1,3,3,2",options="header"]
+|===
+|Class |Construction |Label |Count
+
+|A -- true turn end
+|One clip: 0.4 s lead-in, the utterance, then 2.5 s of room tone.
+|Turn end = reference speech end. Any turn-end event before it is a false take (these are natural comma/breath pauses in read speech, not synthetic pauses).
+|142 streams
+
+|B1 -- hold, joined clips
+|Two different sentences from the same Common Voice contributor ID joined by a pause of nominal 300, 500 or 700 ms (reference end of the first to reference start of the second), then 2.5 s of room tone. Speech levels matched.
+|Hold = the pause; turn end = end of the second clip. The first clip ends with sentence-final prosody, so this is the *hardest case for a prosody-aware model and unrealistic as dialogue*.
+|80 streams (27 / 27 / 26 per pause length), 74 contributor IDs
+|B2 -- hold, clause boundary
+|Sentence containing a written comma after a clause-final particle (て 62, が 22, ので 19, から 6, けど 4, のに 1). The comma's expected time is its character position scaled onto the energy-defined speech span; the natural sub-threshold dip (at least 80 ms; median 150 ms, p10 89 ms, p90 310 ms) nearest to that time, accepted within 15% of the utterance duration, is *replaced* by exactly the nominal pause of 300, 500 or 700 ms of room tone. The pause therefore falls at a real prosodic break inside one utterance by one speaker, but its placement relies on a character-proportional timing guess.
+|Hold = the replaced dip; turn end = end of the clip.
+|114 streams (38 per pause length)
+
+|C -- non-speech
+|6 s streams: real mic room tone from Common Voice (30), white noise (12), pink noise (12), 50/60 Hz hum with harmonics (10), room tone with 3-6 impulsive clicks (14), short tones/beeps (10).
+|No speech. Any speech segment or turn-end event is spurious.
+|88 streams
+|===
+
+Totals: 424 streams, 47.7 minutes, 416 distinct source clips from 306 contributor IDs. The same 424 streams were also scored after mixing in pink noise at 15 dB below speech RMS ("noisy15").
+
+=== 4.3 What synthetic pauses do to the comparison
+
+A pause inserted into otherwise continuous audio has *no breath, no pitch reset and no partial-word effects*, and its length is exactly known and uniformly drawn from three values.
+That favours silence-based methods in two ways: their decision depends only on pause length (which here is clean and bimodal), and a pause-length threshold between the hold length and the end gap separates the two classes almost by construction.
+It disfavours prosody/semantics-based methods in the other direction for B1, because the first clip is a complete sentence.
+Real dialogue holds are not drawn from three lengths, are mixed with fillers and backchannels, and overlap other speakers.
+The absolute rates below must not be read as production false-take rates; the *ordering* of methods on this set is the only claim made.
+
+=== 4.4 Metric definitions
+
+* *Turn-end event:* the time a method announces the turn has ended, quantised to the 32 ms frame. Fixed-silence methods fire at (VAD segment end + T). Sherpa fires when its detector emits a segment. Smart Turn is evaluated on the audio from 0.5 s before the first speech up to the evaluation time at silence offsets of 200, 300, ... 1500 ms after the VAD segment end ("polled"), or only at 200 ms ("single-shot", which is Pipecat's default flow); the context is never reset after a fire (a simplification). "+800 ms silence fallback" fires at 800 ms of VAD silence if the model has not fired.
+* *False turn-take:* any turn-end event strictly before the reference turn end of a stream. For B streams this is a fire during the hold (or inside speech); for A streams it is a fire on a natural in-utterance pause.
+* *Lead/lag:* first event at or after the reference end minus the reference end. Positive is late. Negative lag (early fire) is, by definition above, a false take, so no lead is reported. Inference time is not added to the lag.
+* *Missed:* no event at or after the reference end. "No event at all" is the stricter case.
+* *Lag > 1 s or none:* the late-or-missed rate, with 1 s as the arbitrary lateness bound.
+* Confidence intervals are 95% Wilson intervals (shown as the last pair in parentheses); the numbers are small and the streams are not independent draws from a population (contributors and sentences repeat across conditions).
+
+== 5. Speech activity (VAD) results
+
+=== 5.1 Onset, offset and pause observation
+
+[cols="3,2,2",options="header"]
+|===
+|Measure (Silero v6, hysteresis 0.5 / 0.35, min speech 250 ms) |Clean |Noisy15
+
+|Onset lag vs energy start, p50 / p90 (ms), class A
+|48 / 112
+|48 / 144
+
+|Share of utterances with onset lag above 100 ms
+|12.7%
+|16.9%
+
+|Offset lag vs energy end, p50 / p90 (ms)
+|61 / 104
+|100 / 179
+
+|Class A streams with more than one VAD segment (natural internal pauses)
+|31%
+|26%
+
+|VAD-observed pause for nominal 300 ms: p10 / p50 / p90 (ms)
+|224 / 256 / 397
+|128 / 224 / 352
+
+|VAD-observed pause for nominal 500 ms
+|416 / 448 / 515
+|352 / 416 / 512
+
+|VAD-observed pause for nominal 700 ms
+|608 / 640 / 704
+|512 / 608 / 733
+
+|Class C streams with any speech segment / active speech per minute
+|0 of 88 / 0.0 s
+|0 of 88 / 0.0 s
+|===
+
+A 32 ms frame step plus VAD smoothing means every boundary is quantised and biased: the observed median pause is shorter than the nominal one by about 45-60 ms (clean).
+
+=== 5.2 Per-frame latency, real-time factor, load time and memory
+
+CPU only, single intra-op thread unless stated, Python driver loop included (so these are upper-ish bounds for a native binding), timed on 168 clean streams (1147.5 s of audio, 35781 frames), quiet machine, run sequentially.
+
+[cols="3,1,1,1,1,2",options="header"]
+|===
+|Model path |p50 ms |p95 ms |p99 ms |max ms |RTF (wall / model only)
+
+|Silero v6, onnxruntime, 1 thread |0.223 |0.358 |0.609 |4.44 |0.0073 / 0.0072
+|Silero v6, onnxruntime, 4 threads |0.187 |0.237 |0.314 |1.03 |0.0060 / 0.0060
+|sherpa-onnx VAD, Silero v4 export |0.176 |0.267 |0.313 |0.91 |0.0078 / 0.0061
+|sherpa-onnx VAD, Silero v6 |0.171 |0.257 |0.317 |1.50 |0.0192* / 0.0058
+|===
+
+* The sherpa v6 wall-clock RTF includes constructing a new detector (about 0.1 s) for each of the 168 streams; the model-only figure is the comparable one.
+
+Model load and memory, fresh process each time, median of 7 runs. The process baseline (Python, numpy, onnxruntime, sherpa-onnx imported, no model) was about 120 MB RSS and is excluded from the delta.
+
+[cols="3,1,1,1,1",options="header"]
+|===
+|Model |Load (s) median [min-max] |RSS delta after load + 1 inference (MB) |Peak working set (MB, includes baseline) |File size
+
+|Silero v6 via onnxruntime |0.061 [0.054-0.064] |18.5 |140 |2.3 MB
+|sherpa-onnx VAD, Silero v4 export |0.039 [0.037-0.042] |20.9 |141 |0.64 MB
+|sherpa-onnx VAD, Silero v6 |0.116 [0.110-0.121] |30.1 |150 |2.3 MB
+|Smart Turn v3.2 CPU int8 (incl. feature module) |0.172 [0.161-0.206] |39.1 |159 |8.7 MB
+|===
+
+== 6. Turn-end results
+
+=== 6.1 Holds: false turn-take rate (clean condition)
+
+Cell format: rate (count/total; 95% interval). "Pause" columns are nominal pause lengths over B1 and B2 together; observed VAD pauses are shorter (section 5.1).
+
+[cols="4,2,2,2,2,2,2",options="header"]
+|===
+|Method |All holds |Pause 300 ms |Pause 500 ms |Pause 700 ms |B1 joined |B2 clause
+|fixed-300ms |75% (145/194; 68-80) |25% (16/65; 16-36) |100% (65/65; 94-100) |100% (64/64; 94-100) |75% (60/80; 65-83) |75% (85/114; 66-82)
+|fixed-500ms |43% (83/194; 36-50) |5% (3/65; 2-13) |25% (16/65; 16-36) |100% (64/64; 94-100) |44% (35/80; 33-55) |42% (48/114; 33-51)
+|fixed-800ms |4% (7/194; 2-7) |0% (0/65; 0-6) |5% (3/65; 2-13) |6% (4/64; 2-15) |5% (4/80; 2-12) |3% (3/114; 1-7)
+|sherpa-onnx VAD (Silero v4 export) min_silence=300ms |77% (149/194; 70-82) |32% (21/65; 22-44) |98% (64/65; 92-100) |100% (64/64; 94-100) |74% (59/80; 63-82) |79% (90/114; 71-85)
+|sherpa-onnx VAD (Silero v4 export) min_silence=500ms |45% (87/194; 38-52) |3% (2/65; 1-11) |32% (21/65; 22-44) |100% (64/64; 94-100) |49% (39/80; 38-60) |42% (48/114; 33-51)
+|sherpa-onnx VAD (Silero v4 export) min_silence=800ms |1% (1/194; 0-3) |0% (0/65; 0-6) |0% (0/65; 0-6) |2% (1/64; 0-8) |0% (0/80; 0-5) |1% (1/114; 0-5)
+|sherpa-onnx VAD (Silero v6) min_silence=300ms |70% (135/194; 63-76) |9% (6/65; 4-19) |100% (65/65; 94-100) |100% (64/64; 94-100) |68% (54/80; 57-77) |71% (81/114; 62-79)
+|sherpa-onnx VAD (Silero v6) min_silence=500ms |37% (72/194; 31-44) |3% (2/65; 1-11) |9% (6/65; 4-19) |100% (64/64; 94-100) |36% (29/80; 27-47) |38% (43/114; 29-47)
+|sherpa-onnx VAD (Silero v6) min_silence=800ms |1% (2/194; 0-4) |0% (0/65; 0-6) |2% (1/65; 0-8) |2% (1/64; 0-8) |2% (2/80; 1-9) |0% (0/114; 0-3)
+|smart-turn v3.2 single-shot@200ms thr=0.3 |85% (164/194; 79-89) |77% (50/65; 65-85) |86% (56/65; 76-93) |91% (58/64; 81-96) |90% (72/80; 81-95) |81% (92/114; 73-87)
+|smart-turn v3.2 polled/100ms thr=0.3 |86% (167/194; 81-90) |77% (50/65; 65-85) |89% (58/65; 79-95) |92% (59/64; 83-97) |90% (72/80; 81-95) |83% (95/114; 75-89)
+|smart-turn v3.2 polled thr=0.3 + 800ms silence fallback |86% (167/194; 81-90) |77% (50/65; 65-85) |89% (58/65; 79-95) |92% (59/64; 83-97) |90% (72/80; 81-95) |83% (95/114; 75-89)
+|smart-turn v3.2 single-shot@200ms thr=0.5 |83% (161/194; 77-88) |75% (49/65; 64-84) |85% (55/65; 74-91) |89% (57/64; 79-95) |88% (70/80; 78-93) |80% (91/114; 72-86)
+|smart-turn v3.2 polled/100ms thr=0.5 |85% (165/194; 79-89) |75% (49/65; 64-84) |89% (58/65; 79-95) |91% (58/64; 81-96) |90% (72/80; 81-95) |82% (93/114; 73-88)
+|smart-turn v3.2 polled thr=0.5 + 800ms silence fallback |85% (165/194; 79-89) |75% (49/65; 64-84) |89% (58/65; 79-95) |91% (58/64; 81-96) |90% (72/80; 81-95) |82% (93/114; 73-88)
+|smart-turn v3.2 single-shot@200ms thr=0.7 |77% (150/194; 71-83) |71% (46/65; 59-80) |80% (52/65; 69-88) |81% (52/64; 70-89) |85% (68/80; 76-91) |72% (82/114; 63-79)
+|smart-turn v3.2 polled/100ms thr=0.7 |82% (160/194; 77-87) |71% (46/65; 59-80) |86% (56/65; 76-93) |91% (58/64; 81-96) |88% (70/80; 78-93) |79% (90/114; 71-85)
+|smart-turn v3.2 polled thr=0.7 + 800ms silence fallback |82% (160/194; 77-87) |71% (46/65; 59-80) |86% (56/65; 76-93) |91% (58/64; 81-96) |88% (70/80; 78-93) |79% (90/114; 71-85)
+|===
+
+=== 6.2 True ends: lag and missed rate (clean condition)
+
+Over the 336 streams that have a true end (A, B1, B2). The "A: fired before end" column is the share of 142 single-utterance streams in which the method fired on a natural in-utterance pause.
+
+[cols="4,2,2,2,1,1,2,2",options="header"]
+|===
+|Method |A: fired before end (natural pause) |No event at/after end |No event at all |Lag p50 (ms) |Lag p90 (ms) |Lag > 1 s or none |Non-speech streams fired
+|fixed-300ms |8% (11/142; 4-13) |2% (8/336; 1-5) |0% (1/336; 0-2) |389 |429 |2% (8/336; 1-5) |0/88
+|fixed-500ms |0% (0/142; 0-3) |0% (1/336; 0-2) |0% (1/336; 0-2) |580 |621 |0% (1/336; 0-2) |0/88
+|fixed-800ms |0% (0/142; 0-3) |0% (1/336; 0-2) |0% (1/336; 0-2) |868 |909 |1% (2/336; 0-2) |0/88
+|sherpa-onnx VAD (Silero v4 export) min_silence=300ms |6% (8/142; 3-11) |2% (6/336; 1-4) |0% (1/336; 0-2) |365 |417 |2% (7/336; 1-4) |0/88
+|sherpa-onnx VAD (Silero v4 export) min_silence=500ms |0% (0/142; 0-3) |0% (1/336; 0-2) |0% (1/336; 0-2) |555 |609 |1% (3/336; 0-3) |0/88
+|sherpa-onnx VAD (Silero v4 export) min_silence=800ms |0% (0/142; 0-3) |0% (1/336; 0-2) |0% (1/336; 0-2) |843 |897 |3% (9/336; 1-5) |0/88
+|sherpa-onnx VAD (Silero v6) min_silence=300ms |1% (1/142; 0-4) |0% (1/336; 0-2) |0% (1/336; 0-2) |447 |493 |0% (1/336; 0-2) |1/88
+|sherpa-onnx VAD (Silero v6) min_silence=500ms |0% (0/142; 0-3) |0% (1/336; 0-2) |0% (1/336; 0-2) |639 |685 |0% (1/336; 0-2) |1/88
+|sherpa-onnx VAD (Silero v6) min_silence=800ms |0% (0/142; 0-3) |0% (1/336; 0-2) |0% (1/336; 0-2) |927 |973 |3% (9/336; 1-5) |1/88
+|smart-turn v3.2 single-shot@200ms thr=0.3 |13% (18/142; 8-19) |10% (32/336; 7-13) |4% (13/336; 2-7) |271 |312 |10% (32/336; 7-13) |0/88
+|smart-turn v3.2 polled/100ms thr=0.3 |13% (18/142; 8-19) |7% (22/336; 4-10) |1% (5/336; 1-3) |272 |319 |7% (24/336; 5-10) |0/88
+|smart-turn v3.2 polled thr=0.3 + 800ms silence fallback |13% (18/142; 8-19) |5% (17/336; 3-8) |0% (1/336; 0-2) |272 |322 |5% (17/336; 3-8) |0/88
+|smart-turn v3.2 single-shot@200ms thr=0.5 |13% (18/142; 8-19) |11% (36/336; 8-14) |5% (16/336; 3-8) |271 |312 |11% (36/336; 8-14) |0/88
+|smart-turn v3.2 polled/100ms thr=0.5 |13% (18/142; 8-19) |7% (24/336; 5-10) |2% (6/336; 1-4) |272 |320 |7% (25/336; 5-11) |0/88
+|smart-turn v3.2 polled thr=0.5 + 800ms silence fallback |13% (18/142; 8-19) |5% (17/336; 3-8) |0% (1/336; 0-2) |273 |325 |5% (17/336; 3-8) |0/88
+|smart-turn v3.2 single-shot@200ms thr=0.7 |13% (18/142; 8-19) |13% (43/336; 10-17) |6% (20/336; 4-9) |271 |313 |13% (43/336; 10-17) |0/88
+|smart-turn v3.2 polled/100ms thr=0.7 |13% (18/142; 8-19) |7% (25/336; 5-11) |2% (7/336; 1-4) |273 |324 |8% (28/336; 6-12) |0/88
+|smart-turn v3.2 polled thr=0.7 + 800ms silence fallback |13% (18/142; 8-19) |5% (17/336; 3-8) |0% (1/336; 0-2) |274 |338 |5% (17/336; 3-8) |0/88
+|===
+
+=== 6.3 Noisy condition (pink noise 15 dB below speech), selected methods
+
+[cols="4,2,2,2,2,2,2",options="header"]
+|===
+|Method |All holds |Pause 300 ms |Pause 500 ms |Pause 700 ms |B1 joined |B2 clause
+|fixed-300ms |73% (142/194; 67-79) |20% (13/65; 12-31) |100% (65/65; 94-100) |100% (64/64; 94-100) |74% (59/80; 63-82) |73% (83/114; 64-80)
+|fixed-500ms |37% (72/194; 31-44) |5% (3/65; 2-13) |17% (11/65; 10-28) |91% (58/64; 81-96) |41% (33/80; 31-52) |34% (39/114; 26-43)
+|fixed-800ms |4% (7/194; 2-7) |0% (0/65; 0-6) |5% (3/65; 2-13) |6% (4/64; 2-15) |4% (3/80; 1-10) |4% (4/114; 1-9)
+|sherpa-onnx VAD (Silero v4 export) min_silence=500ms |3% (6/194; 1-7) |0% (0/65; 0-6) |0% (0/65; 0-6) |9% (6/64; 4-19) |4% (3/80; 1-10) |3% (3/114; 1-7)
+|sherpa-onnx VAD (Silero v6) min_silence=500ms |34% (65/194; 27-40) |3% (2/65; 1-11) |11% (7/65; 5-21) |88% (56/64; 77-94) |34% (27/80; 24-45) |33% (38/114; 25-42)
+|smart-turn v3.2 single-shot@200ms thr=0.5 |77% (150/194; 71-83) |58% (38/65; 46-70) |85% (55/65; 74-91) |89% (57/64; 79-95) |86% (69/80; 77-92) |71% (81/114; 62-79)
+|smart-turn v3.2 polled/100ms thr=0.5 |80% (156/194; 74-85) |60% (39/65; 48-71) |91% (59/65; 81-96) |91% (58/64; 81-96) |86% (69/80; 77-92) |76% (87/114; 68-83)
+|smart-turn v3.2 polled thr=0.5 + 800ms silence fallback |81% (157/194; 75-86) |60% (39/65; 48-71) |92% (60/65; 83-97) |91% (58/64; 81-96) |88% (70/80; 78-93) |76% (87/114; 68-83)
+|===
+
+[cols="4,2,2,2,1,1,2,2",options="header"]
+|===
+|Method |A: fired before end (natural pause) |No event at/after end |No event at all |Lag p50 (ms) |Lag p90 (ms) |Lag > 1 s or none |Non-speech streams fired
+|fixed-300ms |7% (10/142; 4-12) |2% (6/336; 1-4) |0% (0/336; 0-1) |420 |489 |2% (7/336; 1-4) |0/88
+|fixed-500ms |1% (1/142; 0-4) |0% (1/336; 0-2) |0% (0/336; 0-1) |612 |681 |1% (2/336; 0-2) |0/88
+|fixed-800ms |1% (1/142; 0-4) |1% (2/336; 0-2) |0% (1/336; 0-2) |900 |969 |5% (16/336; 3-8) |0/88
+|sherpa-onnx VAD (Silero v4 export) min_silence=500ms |0% (0/142; 0-3) |0% (1/336; 0-2) |0% (1/336; 0-2) |999 |1332 |50% (168/336; 45-55) |0/88
+|sherpa-onnx VAD (Silero v6) min_silence=500ms |1% (1/142; 0-4) |1% (2/336; 0-2) |0% (1/336; 0-2) |671 |731 |1% (2/336; 0-2) |0/88
+|smart-turn v3.2 single-shot@200ms thr=0.5 |10% (14/142; 6-16) |12% (40/336; 9-16) |5% (18/336; 3-8) |303 |374 |12% (41/336; 9-16) |0/88
+|smart-turn v3.2 polled/100ms thr=0.5 |10% (14/142; 6-16) |5% (17/336; 3-8) |1% (4/336; 0-3) |307 |395 |6% (21/336; 4-9) |0/88
+|smart-turn v3.2 polled thr=0.5 + 800ms silence fallback |10% (14/142; 6-16) |3% (9/336; 1-5) |0% (0/336; 0-1) |309 |411 |3% (10/336; 2-5) |0/88
+|===
+
+In noise Silero v6 held up (the VAD offset lag grew from 61 to 100 ms at p50) and the Smart Turn picture did not change materially (holds 77-81%). The sherpa-onnx *release asset* Silero v4 export, by contrast, kept the speech segment open: its false-take rate fell to 3% but 50% of true ends were later than 1 s or missed, because the model rarely returned to silence under noise. The same sherpa pipeline with the v6 model behaved like the onnxruntime path. The choice of Silero model version therefore matters more than the choice of runtime.
+
+=== 6.4 Smart Turn behaviour
+
+* *Separability.* Using the score at 200 ms after VAD silence onset, for the final end of a stream (n = 315) versus the first pause of a hold stream (B1 n = 71, B2 n = 108): AUC overall 0.638; B1 0.508; B2 0.724. At 300 ms: 0.644 / 0.512 / 0.727. In noise (200 ms): 0.612 / 0.506 / 0.684. B1 is chance level: the model cannot tell a stitched pause after a complete sentence from the real end.
+* *Saturation.* 79.6% of the scores in that comparison were above 0.9 and 5.5% below 0.1. The median score at true ends was 0.98 and at B1 holds also 0.98 (B2: 0.93). It behaves as a near-binary classifier and its output is not a calibrated probability.
+* *Pipeline check against the vendor's data.* The same preprocessing and model reproduced the vendor's published Japanese accuracy on the part of the vendor test set we could fetch: 79 Japanese samples (one 10-shard parquet file, 480 MB), accuracy 97.5% at threshold 0.5 (false "complete" on incomplete audio 5.1%, missed ends 0%). The vendor's own report is 96.16% on 834 Japanese samples (vendor-reported, not reproduced). All 79 samples were dataset +chirp3_1+ and flagged synthetic, so this confirms our pipeline is not broken but says nothing about real speech.
+* *Abrupt-cut probe (supplementary, unrelated to B1/B2).* Cutting 40 class-A utterances at a random point 35-75% through the speech, followed by 400 ms of room tone, gave a mean "complete" score of 0.82 with 87.5% above 0.5; the uncut utterances scored 0.86 on average (minimum 0.02). A hard cut in the middle of a word is not a natural incomplete utterance, so this is only an indication that the model does not treat arbitrary truncation as incomplete.
+* *Japanese support.* The model card and README list Japanese among 23 supported languages, and the vendor's per-language table has Japanese at 96.16% (834 samples). There is no language-detection output and the model is language-agnostic at the API level.
+* *Cost.* One inference (numpy log-mel features plus ONNX, 8 s window) takes p50 94.3 ms / p95 118.5 ms / p99 125 ms on one thread (features 5.2 ms + ONNX 88.4 ms at p50), n = 120. With 4 ONNX threads: p50 67.5 ms / p95 83.4 ms (features 23 ms, ONNX 44 ms; the numpy feature step got slower, we did not investigate why). The vendor's published figures (10 ms on some CPUs, 65 ms on a cloud instance) are not reproduced on this CPU class with a single thread.
+* *Polling.* Re-evaluating every 100 ms after silence onset recovered some single-shot misses (11% no event at/after the end for single-shot, 7% polled, 5% with an 800 ms fallback; clean, threshold 0.5), but it also raised the hold false-take rate by 2 to 5 points.
+
+== 7. Implications for the #92 observation contract
+
+The contract is not decided here; this section states what a real provider can populate, from these measurements.
+
+[cols="2,4",options="header"]
+|===
+|Field (candidate) |What the measured providers can supply
+
+|Speech active / inactive
+|Yes, from any Silero path (~0.2 ms per 32 ms frame). Boundaries are quantised to 32 ms and biased late: onset p50 48 ms / p90 112-144 ms, offset p50 61-100 ms.
+
+|Frame confidence
+|Yes: Silero probability in [0, 1]. Provider-specific and not calibrated across model versions (v4 and v6 behaved very differently in noise).
+
+|Onset pre-roll need
+|12.7% of clean (16.9% noisy) utterances had onset lag above 100 ms, and the p90 was 112-144 ms. Some pre-roll longer than the VAD onset lag has to be retained by the sidecar (the register already requires bounded pre-roll). A pre-roll length was not derived here; the maximum onset lag was not computed.
+
+|+turn_end_probability+
+|Only from Smart Turn, only at evaluation points after VAD silence onset (not a continuous stream), and it is a saturated near-binary score (80% above 0.9 or 5.5% below 0.1). Make the field optional and mark its semantics as "uncalibrated score"; do not let policy treat 0.5 as a probability.
+
+|+prediction_horizon_ms+
+|Not populatable by any measured provider. Smart Turn answers "has the turn ended now", a nowcast. A horizon would need a VAP-style projection model, which was not tested. Suggest the field is absent or 0 for these providers.
+
+|+model_id+ / version
+|Yes: file name plus sha256 (section 3) identifies a model unambiguously, and should be recorded because two Silero versions give materially different results.
+
+|+language+
+|Cannot be detected by either model. It can only be a *declared* value from configuration ("ja"); Smart Turn's multilingual claim is not an output.
+
+|Speaker identity, overlap, partial-transcript flag
+|None of the measured models provide them (single channel, no diarization, no ASR in the path). They come from other adapters.
+
+|Observation age / deadline
+|VAD adds a negligible compute time; Smart Turn adds about 95-120 ms (1 thread) per evaluation. With a 100 ms polling cadence and a 200 ms first evaluation point, observations are at best about 270-300 ms behind the true end, and a stale-observation deadline for turn-end likelihood has to allow at least the inference p99 (about 125 ms here) plus the cadence.
+|===
+
+*Fallback heuristic (what a degrade-safe provider should be).* The accelerator's falsifier asks that an unsupported language or provider degrades to a deterministic silence heuristic. On this data the heuristic would be VAD-observed silence with a threshold that depends on how reversible the action is:
+
+* a long threshold, about 800 ms of VAD silence, before an irreversible or costly TakeTurn: in this set it fired on 4% of holds (clean; also 4% in noise) at a p50 lag of about 870-900 ms;
+* a short threshold, 300-500 ms, only for cheap, reversible actions such as Backchannel or a tentative preparation: 300 ms fired on 75% of holds, 500 ms on 43%, so these are *not* turn-take triggers;
+* a tentative-then-confirm structure matches the existing TentativeInterrupt idea in docs/implementation-accelerator.adoc section 7.2, but this experiment did not test it.
+
+The pause lengths in this set are drawn from three values; real conversational holds and ends overlap in length, so the false-take / lag trade-off of the 800 ms row should be re-measured on real dialogue before it becomes a default. A text-conditioned extension (for example a longer timeout when a streaming transcript ends in a conjunctive particle) was *not tested*.
+
+== 8. Recommendation (reuse-first vocabulary)
+
+[cols="2,2,4",options="header"]
+|===
+|Candidate |Mode |Why / revisit
+
+|Silero VAD (MIT), via onnxruntime or via sherpa-onnx
+|*wrap* inside a local sidecar (sidecar boundary per docs/reuse-first.adoc); adopt for speech-activity observations only
+|Sub-millisecond per frame, 0 false segments on 88 non-speech streams, 19-30 MB over a Python baseline, permissive license. Pin the model file by hash: the v4 export shipped as a sherpa-onnx release asset kept segments open in noise and is not a drop-in for v6. Revisit if real microphone/stream audio shows a different false-activity rate.
+
+|sherpa-onnx (Apache-2.0)
+|*wrap or sidecar*; usable for the VAD primitive
+|Behaves as the underlying model does (see above). Its segment-based API gives turn-end-by-silence directly. Keep policy and observation vocabulary project-owned. Not evaluated here: its ASR/streaming-STT path, other platforms, native bindings.
+
+|Pipecat Smart Turn v3.2
+|*reference only* (sidecar optional experiment); *do not adopt* as a turn-end source for #92 now
+|Declared BSD-2-Clause and lists Japanese, but on 194 constructed Japanese holds it fired on 83-85% of them (fixed-300 ms: 75%; fixed-800 ms: 4%) with AUC 0.64 (0.51 on the hardest class). Costs about 94 ms per inference on one thread. Unverified: weights provenance (Whisper Tiny weights, commercial-TTS training audio). Revisit trigger: a real Japanese conversational hold/end set with human labels, a release with non-synthetic Japanese hold data, or a different benchmark showing the model separating B2-style holds. This also supersedes the earlier "reference/sidecar only, revisit if IPC overhead exceeds the #92 deadline" note: the blocker is accuracy, not IPC.
+
+|TEN VAD
+|*reject* (license)
+|Additional Agora conditions are not permissive; not measured.
+
+|Fixed-silence heuristic on VAD output
+|*custom*, in deterministic policy code
+|Earlier reuse modes do not apply: it is a few lines of policy, depends on project-owned reversibility classes, and was the best-performing method on the false-take metric in this set. It should be tuned on real data before use.
+|===
+
+== 9. Limitations
+
+. *L1, synthetic labels.* Holds are constructed. Real dialogue pauses have breath, pitch, fillers and overlap; no result here measures a real turn-taking decision.
+. *L2, read speech, one speaking style.* Common Voice is short single-speaker read sentences recorded on contributors' devices. It has no conversation, no questions, no backchannels, no interruptions, no overlap, no game/stream background.
+. *L3, reference bounds are an energy detector, not human labels.* Boundary error is probably tens of milliseconds and unquantified. Lag numbers inherit it.
+. *L4, a loose agreement filter used the VAD under test* (+-0.4 s) and removed 18% of candidate clips. Reported VAD onset/offset errors are therefore optimistic.
+. *L5, B1 is an adversarial construction for a prosody-aware model* (complete sentences joined). B2 is closer to a real mid-turn hold but its placement used a character-proportional timing estimate for the comma, so some pauses may sit at a nearby but different break. The clause-final particle mix is dominated by て and が, with only 4 けど and 6 から; hold behaviour for those two (the cases named in the brief) is statistically negligible here.
+. *L6, sample sizes.* 80 B1, 114 B2, 142 A, 88 C; intervals are wide, and streams share contributors and sentences across the clean and noisy conditions. The planned size was at least 150 per class and was not reached after quality filtering.
+. *L7, no B3 class.* A pause inside a syntactically incomplete phrase (after を/に/は) was planned but needs a word aligner. The ASR timestamps tried were found to be shifted by about one token and unreliable (median offset of the correctly aligned token vs a measured comma dip: -0.03 s, only 51% within 0.15 s), so the class was dropped rather than fabricated. The only incompleteness evidence is the abrupt-cut probe in section 6.4.
+. *L8, Smart Turn context handling.* It was evaluated without resetting context after a fire, with a fixed 0.5 s pre-speech context and no Pipecat VAD min-volume gate; Pipecat's own VAD confidence (0.7) was not used. A real integration may differ.
+. *L9, one CPU class and a Python driver.* Latency may be lower with a native binding and on other CPUs; the vendor-reported 10-65 ms for Smart Turn was not reproduced single-threaded here.
+. *L10, the Japanese vendor-test replication used 79 samples* from one shard, all synthetic.
+. *L11, license verification is partial.* See section 3.2: upstream Whisper Tiny weights, the commercial-TTS training audio, the ReazonSpeech corpus, and the official Common Voice distribution were not checked; pip dependencies were not audited.
+. *L12, reproducibility.* The scripts (dataset builder, evaluator, timing and footprint harnesses) were written in a scratch directory and are *not committed*. This record gives the parameters needed to rewrite them, but it is not runnable from the repository. Committing them (for example under +examples/+) is a decision for the project owner (Q2).
+. *L13, hardware generality.* Single machine; RSS from Windows working set; no GPU, no ARM, no other OS.
+. *L14, no confirmatory criterion.* Nothing here is a pass/fail against a pre-stated threshold; do not use these numbers as SLOs (as docs/research-register.adoc already warns for external benchmarks).
+
+== 10. Protocol deviations
+
+* A first complete run (638 streams) was discarded after inspection showed the energy-based reference bounds were contaminated by mouth/button clicks at clip ends (speech seemingly continuing a second after the VAD saw it end) and the room-tone tiles were digital silence. The reference rule was changed (run length and chaining), a -60 dBFS noise floor and the 0.4 s VAD-agreement filter were added, a third hold class (B3, after case particles) was dropped because ASR timestamps proved unreliable, and the whole set was rebuilt and re-run. Only the second run is reported. The first run's direction was similar (Smart Turn false-take above 90%, fixed-800 low) but it is not reported because its labels were wrong.
+* The sherpa ReazonSpeech release tarball repeatedly returned HTTP 504; the same int8 model files were taken from the model's Hugging Face repository (reazon-research/reazonspeech-k2-v2).
+* Common Voice came from a third-party HF mirror, not the official distribution.
+* Pipecat feature code was fetched from main, not a tag.
+* Only the Japanese rows of one vendor test shard were used for the pipeline check.
+* TEN VAD was downloaded (hash recorded) but not run.
+* Repository search used tgrep 1.0.11 as required; external pages were read with the fetch and gh tools.
+
+== 11. Open design questions (for the project owner)
+
+. *Q1.* What is the source of real labelled Japanese conversational turns (own recordings with consent, a permissively licensed corpus)? Without it no model-based turn-end claim can be confirmed.
+. *Q2.* Should the benchmark scripts be committed (for example +examples/benchmarks/turn-observation/+) so this record is reproducible, given #92 forbids production implementation?
+. *Q3.* Should +turn_end_probability+ be optional with an explicit semantics tag (uncalibrated score vs probability), and should +prediction_horizon_ms+ be optional with nowcast = 0?
+. *Q4.* Is the language field "declared by configuration" in the contract, given that no candidate detects language?
+. *Q5.* Who clears the Smart Turn weights provenance (Whisper Tiny weights license, commercial-TTS training audio) if the model is revisited?
+. *Q6.* What reversibility classes decide the silence threshold (about 300-500 ms tentative versus about 800 ms commit)? This is a #81 policy decision, not a #92 one.
+. *Q7.* Is a fixed 800 ms lag (about 870 ms after the true end here) acceptable for the VTuber persona, or must a text-aware or VAP-style projection be pursued?
+
+== 12. Related
+
+* link:README.adoc[Durable Experiment Records]
+* link:../implementation-accelerator.adoc[Implementation Accelerator] (section 7.2 and 8.5)
+* link:../reuse-first.adoc[Reuse-first policy] (Local speech inference row)
+* link:../research-register.adoc[Research and Design Register] (Local Japanese speech row)
