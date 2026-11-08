@@ -23,7 +23,8 @@ use aivtuber_domain::{
 use aivtuber_generative::{GenerativePipeline, PerformanceCompiler, PerformanceCompilerConfig};
 use aivtuber_reflex::{JevAdapter, JevAdapterConfig, JevApiKey, PolicyConfig, ReflexPipeline};
 use aivtuber_runtime::{
-    CachedPerformer, CachedPlaybackConfig, LocalVisemeStore, SecurityRuntime, SecurityRuntimeConfig,
+    CachedPerformer, CachedPlaybackConfig, IngressPolicy, LocalVisemeStore, SecurityRuntime,
+    SecurityRuntimeConfig,
 };
 use aivtuber_scheduler::{Scheduler, SchedulerConfig};
 use aivtuber_telemetry::SecretRedactor;
@@ -92,12 +93,19 @@ fn run() -> Result<(), Box<dyn Error>> {
         Scheduler::new(scheduler_config),
         retention.cached_playback_config(CachedPlaybackConfig::default()),
     );
-    let security = SecurityRuntime::new(
+    let mut security = SecurityRuntime::new(
         security_config,
         scheduler_config,
         SecretRedactor::default(),
         Some("safe cached reaction".to_owned()),
     )?;
+    // Issue #257: operator-owned ceiling on what the stdin content ingress may
+    // declare. Unset = unchanged behaviour (everything envelope validation
+    // admits). Records above it are rejected and counted, never rewritten.
+    security.set_ingress_policy(IngressPolicy::parse(
+        env_optional("AIVTUBER_INGRESS_MAX_TRUST").as_deref(),
+        env_optional("AIVTUBER_INGRESS_SOURCE_CLASSES").as_deref(),
+    )?);
 
     let mut audio_config = ProcessAudioConfig {
         root: env_path("AIVTUBER_AUDIO_ROOT").unwrap_or_else(|| pack_root.join("audio")),
@@ -335,7 +343,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                 // operator who launches the daemon in the background only
                 // sees a fast exit after startup — the local operator
                 // control endpoint is bound and immediately torn down.
-                eprintln!("raw_ingress: stdin closed; shutting down");
+                eprintln!(
+                    "raw_ingress: stdin closed; shutting down ingress_policy_rejected={}",
+                    app.security().ingress_policy_rejected()
+                );
                 report_raw_ingress_metrics(
                     &raw_ingress_metrics,
                     &mut last_raw_ingress_metrics,
