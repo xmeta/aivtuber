@@ -1,0 +1,12 @@
+[
+  {"name": "hello with unsupported version", "frame": {"type": "hello", "v": 9, "epoch": "e1", "model_hash": "12c2b97e00000000000000000000000000000000000000000000000000631a2f", "profile": "p"}},
+  {"name": "hello with short model hash", "frame": {"type": "hello", "v": 1, "epoch": "e1", "model_hash": "abcd", "profile": "p"}},
+  {"name": "hello with non-hex model hash", "frame": {"type": "hello", "v": 1, "epoch": "e1", "model_hash": "zz2b97e00000000000000000000000000000000000000000000000000631a2f", "profile": "p"}},
+  {"name": "hello missing profile", "frame": {"type": "hello", "v": 1, "epoch": "e1", "model_hash": "12c2b97e00000000000000000000000000000000000000000000000000631a2f"}},
+  {"name": "ready without epoch", "frame": {"type": "ready"}},
+  {"name": "ready with extra field", "frame": {"type": "ready", "epoch": "e1", "fps": 60}},
+  {"name": "ack with seq zero", "frame": {"type": "ack", "epoch": "e1", "seq": 0}},
+  {"name": "reject with open-ended reason", "frame": {"type": "reject", "epoch": "e1", "seq": 1, "reason": "because I said so"}},
+  {"name": "unknown frame type", "frame": {"type": "health", "epoch": "e1"}},
+  {"name": "authority claim smuggled in", "frame": {"type": "ack", "epoch": "e1", "seq": 1, "capability": "avatar_control"}}
+]

@@ -3,9 +3,9 @@
 //! Runs on its own threads, outside the frame/motor loop. Plain `std::net`
 //! plus the already-vendored `tungstenite`; no async runtime.
 
-use super::protocol::{HostFrame, RendererFrame, WireCommand, MAX_FRAME_BYTES};
+use super::protocol::{HostFrame, MAX_FRAME_BYTES, RendererFrame, WireCommand};
 use super::{
-    DropReason, LocalAvatarConfig, LocalAvatarHandle, LocalAvatarState, Shared, MAX_IN_FLIGHT,
+    DropReason, LocalAvatarConfig, LocalAvatarHandle, LocalAvatarState, MAX_IN_FLIGHT, Shared,
 };
 use aivtuber_domain::{EngineError, EngineErrorKind};
 use std::cell::Cell;
@@ -15,13 +15,13 @@ use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tungstenite::protocol::WebSocketConfig;
-use tungstenite::{http, Error as WsError, Message, WebSocket};
+use tungstenite::{Error as WsError, Message, WebSocket, http};
 
 const MAX_HEAD_BYTES: usize = 8192;
 const MAX_CONNECTIONS: usize = 16;
@@ -217,7 +217,9 @@ fn header_value(head: &[u8], name: &str) -> Option<String> {
     let text = String::from_utf8_lossy(head);
     text.lines().skip(1).find_map(|line| {
         let (k, v) = line.split_once(':')?;
-        k.trim().eq_ignore_ascii_case(name).then(|| v.trim().to_owned())
+        k.trim()
+            .eq_ignore_ascii_case(name)
+            .then(|| v.trim().to_owned())
     })
 }
 
@@ -314,6 +316,8 @@ fn deny(status: u16) -> ErrorResponse {
 
 fn websocket(stream: TcpStream, shared: &Arc<Shared>) {
     let claimed = Cell::new(false);
+    // The closure's `Result` type is dictated by tungstenite's `Callback`.
+    #[allow(clippy::result_large_err)]
     let callback = |request: &Request, response: Response| -> Result<Response, ErrorResponse> {
         let headers = request.headers();
         let text = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
@@ -390,7 +394,8 @@ fn run_session(shared: &Arc<Shared>, mut ws: WebSocket<TcpStream>) {
                 break;
             }
             Ok(_) => {}
-            Err(WsError::Io(e)) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(WsError::Io(e))
+                if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
             Err(_) => break,
         }
         if session.ready && pump(shared, &mut ws, &mut session).is_err() {
@@ -431,7 +436,7 @@ fn on_frame(
             session.ready = true;
             shared.lock().health.state = LocalAvatarState::Ready;
             // First frame of the epoch: snap to a known state.
-            send(shared, ws, session, WireCommand::Reset)?;
+            send(shared, ws, session, WireCommand::Reset {})?;
         }
         RendererFrame::Ack { epoch, seq } => settle(shared, session, &epoch, seq, None),
         RendererFrame::Reject { epoch, seq, reason } => {

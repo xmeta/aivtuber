@@ -1,0 +1,16 @@
+[
+  {"name": "unsupported version", "frame": {"v": 2, "epoch": "e1", "seq": 1, "cmd": {"op": "reset"}}},
+  {"name": "generation must not be on the wire", "frame": {"v": 1, "epoch": "e1", "seq": 1, "generation": 3, "cmd": {"op": "reset"}}},
+  {"name": "at_ms must not be on the wire", "frame": {"v": 1, "epoch": "e1", "seq": 1, "cmd": {"op": "reset", "at_ms": 5}}},
+  {"name": "seq starts at 1", "frame": {"v": 1, "epoch": "e1", "seq": 0, "cmd": {"op": "reset"}}},
+  {"name": "missing epoch", "frame": {"v": 1, "seq": 1, "cmd": {"op": "reset"}}},
+  {"name": "epoch with separator", "frame": {"v": 1, "epoch": "e 1/../x", "seq": 1, "cmd": {"op": "reset"}}},
+  {"name": "non-canonical viseme letter", "frame": {"v": 1, "epoch": "e1", "seq": 1, "cmd": {"op": "viseme", "viseme": "A", "weight": 0.5}}},
+  {"name": "viseme weight above range", "frame": {"v": 1, "epoch": "e1", "seq": 1, "cmd": {"op": "viseme", "viseme": "aa", "weight": 1.5}}},
+  {"name": "numeric gaze is out of scope", "frame": {"v": 1, "epoch": "e1", "seq": 1, "cmd": {"op": "gaze", "target": 35}}},
+  {"name": "unknown gaze target", "frame": {"v": 1, "epoch": "e1", "seq": 1, "cmd": {"op": "gaze", "target": "ceiling"}}},
+  {"name": "raw renderer name with illegal characters", "frame": {"v": 1, "epoch": "e1", "seq": 1, "cmd": {"op": "expression", "preset": "VRMExpression.happy!", "intensity": 0.5}}},
+  {"name": "expression intensity negative", "frame": {"v": 1, "epoch": "e1", "seq": 1, "cmd": {"op": "expression", "preset": "joy", "intensity": -0.1}}},
+  {"name": "gesture amplitude above range", "frame": {"v": 1, "epoch": "e1", "seq": 1, "cmd": {"op": "gesture", "preset": "nod", "amplitude": 2.5}}},
+  {"name": "unknown op", "frame": {"v": 1, "epoch": "e1", "seq": 1, "cmd": {"op": "teleport"}}}
+]

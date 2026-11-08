@@ -69,7 +69,7 @@ pub enum WireCommand {
     Gesture { preset: String, amplitude: f64 },
     Gaze { target: GazeTarget },
     Viseme { viseme: Viseme, weight: f64 },
-    Reset,
+    Reset {},
 }
 
 impl WireCommand {
@@ -80,7 +80,7 @@ impl WireCommand {
             Self::Gesture { .. } => "gesture",
             Self::Gaze { .. } => "gaze",
             Self::Viseme { .. } => "viseme",
-            Self::Reset => "reset",
+            Self::Reset {} => "reset",
         }
     }
 
@@ -95,7 +95,7 @@ impl WireCommand {
                 ("amplitude", *amplitude, 2.0)
             }
             Self::Viseme { weight, .. } => ("weight", *weight, 1.0),
-            Self::Gaze { .. } | Self::Reset => return Ok(()),
+            Self::Gaze { .. } | Self::Reset {} => return Ok(()),
         };
         if value.is_finite() && (0.0..=max).contains(&value) {
             Ok(())

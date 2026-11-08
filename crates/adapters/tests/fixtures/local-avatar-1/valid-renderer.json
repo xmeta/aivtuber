@@ -1,0 +1,6 @@
+[
+  {"type": "hello", "v": 1, "epoch": "e-7f3a", "model_hash": "12c2b97e00000000000000000000000000000000000000000000000000631a2f", "profile": "vrm1-default@1"},
+  {"type": "ready", "epoch": "e-7f3a"},
+  {"type": "ack", "epoch": "e-7f3a", "seq": 2},
+  {"type": "reject", "epoch": "e-7f3a", "seq": 3, "reason": "stale_seq"}
+]

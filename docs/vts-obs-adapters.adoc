@@ -118,3 +118,49 @@ AIVTUBER_OBS_SCENE='Adapter Smoke Test' cargo test -p aivtuber-adapters --test l
 ----
 
 Do not place real tokens/passwords in repository files, shell history shared with others, test output, or issue/PR text.
+
+== 6. Local avatar renderer (`local-avatar/1`)
+
+The local avatar output is the zero-paid-dependency alternative to VTube Studio (ADR-0003, issue #219). The Rust runtime hosts a loopback HTTP + WebSocket listener; the renderer page (OBS Browser Source, a webview or a local browser) is the WebSocket client. The renderer bundle itself arrives with slice S3; slice S2 ships the host, the protocol and a mock-renderer test suite.
+
+=== Selecting and running it
+
+[source,sh]
+----
+export AIVTUBER_AVATAR_OUTPUT=local          # local | vts | none; unset keeps AIVTUBER_VTS_ENABLED behavior
+export AIVTUBER_LOCAL_AVATAR_PORT=8765       # 127.0.0.1 only; there is no bind-address option
+export AIVTUBER_LOCAL_AVATAR_PAGE_DIR=./renderer/dist   # static bundle, optional until S3
+export AIVTUBER_LOCAL_AVATAR_QUEUE=64        # outbound queue capacity
+----
+
+The queue-age limit reuses `AIVTUBER_MAX_DISPATCH_LATENESS_MS`. On start the runtime prints one line on stderr with the launch URL (`http://127.0.0.1:<port>/?token=...`); give exactly that URL to the OBS Browser Source. The URL contains the per-launch secret: do not paste it into issues, shared logs or screenshots, and do not capture the runtime's stderr into shared logs. The token is never written by the adapter itself and `Debug` output redacts it.
+
+CI test (no GPU, no browser): `cargo test --locked -p aivtuber-adapters --test local_avatar`.
+
+=== Security properties
+
+* Binds `127.0.0.1` only. Remote exposure is not offered by this adapter.
+* The token is 32 bytes from the OS CSPRNG, minted per launch, compared in constant time.
+* The WebSocket upgrade requires the token, an `Origin` exactly equal to `http://127.0.0.1:<port>`, and a matching `Host` header (DNS-rebinding guard). Anything else gets HTTP 403, checked before the connection-limit check so an unauthenticated peer cannot probe for a live renderer.
+* A second connection while one is live gets HTTP 409. The live connection is never displaced.
+* Static files are served only from the configured directory, with a strict path allowlist, symlink-resolved containment, `GET`/`HEAD` only, `nosniff`, `no-store` and a CSP that restricts the page to its own origin. The page is public to local processes by design and must hold no secret.
+* Renderer frames are untrusted bounded data (4 KiB max, closed field sets, closed reject-reason set). They never feed authorization; each host command is still authorized with `Capability::AvatarControl` before it is queued.
+
+=== Protocol
+
+Adapter-private and versioned; it is deliberately not under `schemas/`. Fixtures: `crates/adapters/tests/fixtures/local-avatar-1/`.
+
+----
+host -> renderer:  {v, epoch, seq, cmd}   cmd.op = expression | gesture | gaze | viseme | reset
+renderer -> host:  hello{v, epoch, model_hash, profile} | ready{epoch} | ack{epoch, seq} | reject{epoch, seq, reason}
+----
+
+The renderer mints `epoch`; the host mints `seq` (per epoch, starting at 1). `generation` and `at_ms` never go on the wire. `ready` is sent only after the first neutral frame of the epoch; the host sends nothing before it and then sends `reset` as `seq` 1.
+
+=== Restart and failure semantics
+
+* Commands queued for a previous connection or epoch are dropped and counted (`stale_epoch`), never replayed.
+* A command older than the dispatch window when it could be sent is dropped (`expired`). The renderer has no TTL and no wall clock.
+* The outbound queue is bounded (`queue_full` drops); with more than 64 unanswered commands the state is `degraded` and sending pauses.
+* `LocalAvatarOutput::execute` never blocks and never returns an error for renderer weather; availability is reported through `connect()` into `AdapterHealth::avatar_error` and through `LocalAvatarHealth` counters (sent, acked, rejected by reason, dropped by reason, reconnects).
+* A socket drop moves health to `disconnected`; the renderer snaps to neutral on its side.
