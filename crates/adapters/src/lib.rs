@@ -7,18 +7,21 @@
 //! for replay after a disconnect, and secrets use redacted debug output.
 
 mod audio;
+mod graphiti;
 mod hindsight;
 mod http;
 mod local_avatar;
 mod mcp;
 mod obs;
 mod openai;
+mod time;
 mod transport;
 mod tts_http;
 mod twitch_chat;
 mod vts;
 
 pub use audio::*;
+pub use graphiti::*;
 pub use hindsight::*;
 pub use http::*;
 pub use local_avatar::*;
