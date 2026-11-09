@@ -95,7 +95,7 @@
         "observed_at_ms": {"$ref": "#/$defs/time_ms"},
         "expires_at_ms": {
           "$ref": "#/$defs/time_ms",
-          "description": "Optional absolute expiry on the same timeline; must be after observed_at_ms and at most 60000 ms later. It can only tighten the runtime's max age, never extend it."
+          "description": "Optional absolute expiry on the same timeline; must be after observed_at_ms and at most 60000 ms later. It can only tighten the runtime's max age, never extend it. The cross-field rule is not expressible in JSON Schema; the Rust validator and scripts/validate.mjs enforce it."
         },
         "confidence": {
           "$ref": "#/$defs/unit_interval",

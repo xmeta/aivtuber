@@ -66,7 +66,7 @@ use aivtuber_runtime::{
     CachedAssetSelection, CachedPerformer, CachedPlaybackError, CachedPlaybackOutcome,
     CachedPlaybackTiming, ContentAdmitDecision, ControlOutcome, FastPathPreloadReport,
     LocalVisemeStore, OutputVerdict, PublicOutput, PublicOutputPolicy, RuntimeError,
-    SecurityRuntime,
+    SecurityRuntime, SpeechObservationTracker,
 };
 use aivtuber_scheduler::{Scheduler, Status};
 use aivtuber_telemetry::{
@@ -832,6 +832,7 @@ where
     router: R,
     generative: Option<GenerativeRuntime>,
     adaptation: Option<AdaptationRuntime>,
+    speech_observations: Option<SpeechObservationTracker>,
     audio: Box<dyn AudioOutput>,
     avatar: Box<dyn AvatarOutput>,
     stream: Box<dyn StreamOutput>,
@@ -881,6 +882,7 @@ where
             router,
             generative: None,
             adaptation: None,
+            speech_observations: None,
             audio,
             avatar,
             stream,
@@ -958,6 +960,18 @@ where
     pub fn with_adaptation(mut self, adaptation: AdaptationRuntime) -> Self {
         self.adaptation = Some(adaptation);
         self
+    }
+
+    /// Opt in to speech observation tracking (#92). Observations are untrusted
+    /// content-plane data and reach no scheduler or output; #81 reads the
+    /// tracker's per-speaker state. Absent by default, so behaviour is unchanged.
+    pub fn with_speech_observations(mut self, tracker: SpeechObservationTracker) -> Self {
+        self.speech_observations = Some(tracker);
+        self
+    }
+
+    pub fn speech_observations_mut(&mut self) -> Option<&mut SpeechObservationTracker> {
+        self.speech_observations.as_mut()
     }
 
     pub fn with_comparison_mode(mut self, mode: ComparisonMode) -> Self {
@@ -1217,6 +1231,10 @@ where
             scheduler: self.performer.scheduler().metrics(),
             hot_cache: self.performer.assets().hot_cache_metrics(),
             cached_playback: self.performer.retention_metrics(),
+            speech: self
+                .speech_observations
+                .as_ref()
+                .map(SpeechObservationTracker::metrics),
             working_memory: self
                 .adaptation
                 .as_ref()
@@ -6049,6 +6067,38 @@ mod tests {
             app.causal_traces()
                 .trace_for_correlation("corr-48")
                 .is_some()
+        );
+    }
+
+    /// Issue #92: speech observation metrics ride the retention snapshot, and
+    /// the tracker is absent (no behaviour change) unless composed.
+    #[test]
+    fn speech_observation_metrics_are_exposed_only_when_composed() {
+        let mut app = app(
+            FixedSilentRoute,
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        );
+        assert!(app.retention_snapshot().speech.is_none());
+        assert!(app.speech_observations_mut().is_none());
+
+        let mut app = app.with_speech_observations(
+            aivtuber_runtime::SpeechObservationTracker::new(
+                aivtuber_runtime::SpeechObservationConfig::default(),
+                aivtuber_runtime::IngressPolicy::default(),
+            )
+            .expect("tracker"),
+        );
+        let bytes = br#"{"schema_version":"0.1.0","provider_id":"vad","provider_version":"1","language":"ja","observations":[{"kind":"speech_activity","speaker_id":"s","edge":"start","observed_at_ms":10}]}"#;
+        app.speech_observations_mut()
+            .expect("tracker")
+            .ingest_bytes(bytes, 10)
+            .expect("batch");
+        let speech = app.retention_snapshot().speech.expect("metrics");
+        assert_eq!(
+            (speech.observations_accepted, speech.speakers_high_water),
+            (1, 1)
         );
     }
 
