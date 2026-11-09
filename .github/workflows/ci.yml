@@ -257,6 +257,104 @@ jobs:
           cat "$work/stderr"
           test "$status" -ne 0 && test "$status" -ne 2
 
+  # Issue #220 S2b: the optional local Japanese TTS sidecar (the `sherpa-tts`
+  # feature: the same official sherpa-onnx crate and the same library pin as
+  # `sherpa-stt`, so no new crate path). A sibling of `speech-stt`, not part of
+  # the required `Rust checks`, for the same reason: it needs the engine
+  # libraries. It builds and lints the feature, runs the model-free tests
+  # (HTTP contract with a fake synthesizer, bounds, busy rejection, the
+  # supervisor against a test double) and checks that the sidecar refuses an
+  # unpinned model directory and tampered libraries. It runs no model: no
+  # weights are fetched or cached in CI, and none are ever committed.
+  #
+  # As for STT, the crate's build script downloads unchecked binaries unless
+  # SHERPA_ONNX_ARCHIVE_DIR is set, so the archive is fetched and
+  # SHA-256-verified by our own script first and the variable is set for every
+  # cargo step below. The default workspace gates never enable the feature.
+  speech-tts:
+    name: Local TTS sidecar (sherpa-tts feature, no model)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
+
+      - name: Fetch the pinned sherpa-onnx library archive (SHA-256 verified)
+        run: node scripts/fetch-sherpa-onnx.mjs lib "$RUNNER_TEMP/sherpa-onnx"
+
+      - name: Supply chain with the feature (scoped license exceptions)
+        run: cargo deny --locked --features sherpa-tts check
+
+      - name: Clippy with the feature
+        run: cargo clippy --locked -p aivtuber-adapters --features sherpa-tts --all-targets -- -D warnings
+        env:
+          SHERPA_ONNX_ARCHIVE_DIR: ${{ runner.temp }}/sherpa-onnx
+
+      - name: Build the sidecar
+        run: cargo build --locked -p aivtuber-adapters --features sherpa-tts --bin local-tts-sidecar
+        env:
+          SHERPA_ONNX_ARCHIVE_DIR: ${{ runner.temp }}/sherpa-onnx
+
+      - name: Model-free tests with the feature
+        run: |
+          cargo test --locked -p aivtuber-adapters --features sherpa-tts --lib speech_tts
+          cargo test --locked -p aivtuber-adapters --features sherpa-tts --test tts_sidecar_supervisor
+        env:
+          SHERPA_ONNX_ARCHIVE_DIR: ${{ runner.temp }}/sherpa-onnx
+
+      # Same loader rule as the STT worker (crates/adapters/build.rs): the
+      # libraries are loaded from the sidecar's own directory and the sidecar
+      # verifies the SHA-256 of exactly those files. Place the libraries from
+      # the verified archive beside the binary, then show the refusals. No
+      # weights here and no model is ever run.
+      - name: Sidecar refuses an unpinned model and tampered libraries
+        shell: bash
+        run: |
+          set -u
+          work="$RUNNER_TEMP/tts-check"
+          mkdir -p "$work/x" "$work/good" "$work/no-model" "$work/audio"
+          tar -xjf "$RUNNER_TEMP"/sherpa-onnx/*.tar.bz2 -C "$work/x"
+          cp "$work"/x/*/lib/libsherpa-onnx-c-api.so "$work"/x/*/lib/libonnxruntime.so "$work/good/"
+          cp target/debug/local-tts-sidecar "$work/good/"
+          run() { "$@" < /dev/null 2>"$work/stderr" ; echo $?; }
+          args=(--model-dir "$work/no-model" --audio-root "$work/audio" --listen 127.0.0.1:0)
+
+          # (a) genuine libraries beside the binary, an empty model directory:
+          # the library check passes and the model check refuses (exit 2).
+          status=$(run "$work/good/local-tts-sidecar" "${args[@]}")
+          cat "$work/stderr"
+          test "$status" -eq 2
+          grep -q "model files" "$work/stderr"
+
+          # (b) a library beside the binary is tampered with (one byte
+          # appended): the loader still loads it, the sidecar refuses (exit 2).
+          mkdir -p "$work/tampered"
+          cp "$work"/good/* "$work/tampered/"
+          printf '\0' >> "$work/tampered/libonnxruntime.so"
+          status=$(run "$work/tampered/local-tts-sidecar" "${args[@]}")
+          cat "$work/stderr"
+          test "$status" -eq 2
+          grep -q "engine libraries beside the executable" "$work/stderr"
+
+          # (c) a non-loopback listen address is refused before anything loads.
+          status=$(run "$work/good/local-tts-sidecar" --model-dir "$work/no-model" --audio-root "$work/audio" --listen 0.0.0.0:0)
+          cat "$work/stderr"
+          test "$status" -eq 2
+          grep -q "not loopback" "$work/stderr"
+
   regressions:
     name: Bounded property regressions
     # Issue #147. `cargo test --workspace` runs the proptest suite with

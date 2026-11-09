@@ -45,6 +45,7 @@ dependencies = [
  "cpal",
  "getrandom 0.4.3",
  "hound",
+ "httparse",
  "rig-core",
  "rig-rmcp",
  "rmcp",

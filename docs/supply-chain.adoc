@@ -179,3 +179,53 @@ We do not redistribute weights and never commit them. The operator fetches them 
 === Verification (2026-11)
 
 `cargo deny --locked check` and `cargo deny --locked --features sherpa-stt check` pass on this branch (advisories, bans, licenses, sources ok; duplicate-version warnings only). The feature builds from the verified archive on Windows x64 (debug build 1 m 42 s cold; release build also run).
+
+== 10. Local TTS (feature `sherpa-tts`, issue #220 S2b)
+
+The optional local Japanese text-to-speech sidecar (`local-tts-sidecar`, crates/adapters) wraps the *same* official `sherpa-onnx` crate 2.0.1 as section 9, behind its own off-by-default `sherpa-tts` cargo feature of `aivtuber-adapters` (`sherpa-tts = ["dep:sherpa-onnx"]`). Reuse mode: *wrap* (EXP-0003 section 8; decision Q2/Q3 of the S2a decisions on #220). There is *no new crate path*: the feature adds no dependency, `Cargo.lock` is unchanged, and the two scoped license exceptions of section 9 are the only ones (`cargo deny` below). The HTTP server is hand-rolled over `std::net`, so no server framework entered the graph. Without the feature nothing here is compiled, downloaded or linked.
+
+* *Engine libraries and the unchecked download path:* identical to section 9, and the same rules apply to every build, test or lint with `--features sherpa-tts` (`SHERPA_ONNX_ARCHIVE_DIR` from `node scripts/fetch-sherpa-onnx.mjs lib <dir>`; never `--all-features`). The library pins are the STT ones (`speech_stt::pins::ENGINE_LIBS`): one runtime pin for both features.
+* *Loaded libraries are the verified libraries:* the sidecar links the engine as shared libraries beside its own executable (`crates/adapters/build.rs` adds the same `DT_RPATH $ORIGIN` for `local-tts-sidecar` on Linux). It verifies the libraries in `current_exe()`'s directory at start (exit 2 on a mismatch), and the app (`TtsSidecar::spawn`) resolves `AIVTUBER_TTS_SIDECAR` to a real path and verifies the libraries beside it *before spawning it*. The residual risk of section 9 (initializers run before our check) applies unchanged.
+
+=== Model pin
+
+Supertonic 3 int8 is fetched by `node scripts/fetch-sherpa-onnx.mjs model supertonic-3-int8 <dir>` and verified at every sidecar start against the per-file pins in `crates/adapters/src/speech_tts/pins.rs` (asserted equal to the script by a unit test). We do not redistribute weights and never commit them.
+
+[cols="2,5",options="header"]
+|===
+|Item |Pin
+
+|Archive
+|`sherpa-onnx-supertonic-3-tts-int8-2026-05-11.tar.bz2`, sherpa-onnx `tts-models` release asset (the tag is mutable, the digest is the pin), SHA-256 `82fa96f91c4ef8abaae3a14a3f4153facf88bed821d1f7331cec2700f432c427` (128 MB)
+
+|Upstream
+|`Supertone/supertonic-3` on Hugging Face, revision `3cadd1ee6394adea1bd021217a0e650ede09a323`. The int8 export is a *third-party conversion*; it was not compared with the upstream files (EXP-0003 section 10).
+
+|Files (size, SHA-256)
+|`duration_predictor.int8.onnx` (3,700,147) `c3eb9141...`; `text_encoder.int8.onnx` (36,416,150) `c7befd5e...`; `vector_estimator.int8.onnx` (78,400,833) `20cd86fa...`; `vocoder.int8.onnx` (25,991,073) `e923d60f...`; `tts.json` (8,253) `42078d3a...`; `unicode_indexer.bin` (262,144) `8402ca48...`; `voice.bin` (517,168) `67d5209b...` (full digests in `pins.rs`)
+
+|Identity in provenance
+|`model_alias` `supertonic-3-int8`; `model_version` the bundle digest (SHA-256 over `"<role> <sha256>\n"` per file in table order, the STT convention)
+|===
+
+=== Voice licence: OpenRAIL-M (decision Q1, accepted)
+
+The Supertonic 3 *weights* are licensed under OpenRAIL-M (the `LICENSE` of `Supertone/supertonic-3`; the sample code in the archive is MIT). The project accepts it (S2a decision Q1 on #220) because the restrictions are behavioural, not field-of-use or commercial, and an AI VTuber should disclose a machine-generated voice anyway. What that obliges, read from the model card and licence by EXP-0003 section 3.2 (not legal advice):
+
+* *Passed on to whoever uses or distributes this model through this project.* OpenRAIL-M requires that the licence and its use restrictions reach downstream users as enforceable terms. This section is where this project passes them on; the operator who runs the sidecar accepts them by fetching the weights. The use restrictions (Attachment A) forbid using the model:
+** to violate law, or to harm minors;
+** to generate or spread disinformation, or to disclose personal information in a way that harms;
+** *to publish AI-generated content without clearly disclosing that it is machine-generated* (the duty that shapes this deployment, below);
+** to defame, harass or discriminate, or to exploit vulnerable groups;
+** to impersonate a person or make deepfakes without consent;
+** for fully automated decisions that affect legal rights, for medical advice, or for law-enforcement, justice or immigration uses.
+* *Disclosure of machine-generated audio.* A stream that publishes this voice must say so clearly. `docs/production-runtime.adoc` ("Local Japanese speech output") tells the operator to keep an "AI-generated voice" disclosure on stream (a channel or stream description, or an overlay text), and both the app and the sidecar print a one-line licence notice at startup. The runtime cannot display the disclosure itself.
+* *No redistribution by this project.* We do not bundle the weights, so the licence-file and modified-file-notice duties for distribution are not triggered by the repository; anyone who redistributes a copy must include the licence and these restrictions.
+* *Outputs.* The licensor claims no rights in generated audio; the user is accountable for it.
+* *Revisit* if the licence text is revised (OpenRAIL-M expects the latest version), if the project starts bundling weights, or if legal review reads a restriction differently.
+
+Not adopted, recorded so they are not re-proposed without new evidence (EXP-0003 section 8): VOICEVOX (optional second backend, a later slice; per-character terms and a credit line), Kokoro, Style-Bert-VITS2 (AGPL-3.0), Piper ja (CC BY-NC-SA).
+
+=== Verification (2026-11)
+
+`cargo deny --locked check`, `cargo deny --locked --features sherpa-tts check` and `cargo deny --locked --features sherpa-stt,sherpa-tts check` pass on this branch (advisories, bans, licenses, sources ok); `Cargo.lock` has no change. The feature builds from the verified archive on Windows x64 (release build of `local-tts-sidecar` 1 m 22 s with a warm registry). The CI job `speech-tts` runs the Linux build, lint, model-free tests and the refusal checks.

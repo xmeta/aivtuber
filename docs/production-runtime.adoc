@@ -315,6 +315,85 @@ These agree with EXP-0002 6.1 (k2-v2 final call p50 123 ms, parakeet 323 ms plus
 * CI job `speech-stt` (not required, Linux): builds and lints the `sherpa-stt` feature from a SHA-256-verified library archive, runs the model-free tests and checks that the worker refuses an unpinned model directory; no model is ever run in CI.
 * Manual, with the real model: `cargo run --release --locked -p aivtuber-app --bin speech-sidecar-check -- --wide --duration-secs 60 -- speech-vad-sidecar ... --input-wav clips.wav --pace realtime --stt-worker ... --stt-model k2v2-int8 --stt-model-dir ... --stt-wait-ready-ms 60000`.
 
+== Local Japanese speech output (issue #220, S2b)
+
+The `local` profile can speak with no paid or remote service. `local-tts-sidecar` (crates/adapters, `src/bin/local-tts-sidecar.rs`) is a loopback HTTP server over the official `sherpa-onnx` crate running Supertonic 3 int8 on the CPU. It speaks the *existing* normalized TTS contract, so `NormalizedHttpTtsAdapter` stays the client and nothing else about generation changes. It is off by default, behind the off-by-default `sherpa-tts` cargo feature (the same crate and the same library pin as `sherpa-stt`), and nothing in the default build, the default CI gates or the default tests downloads or needs a model.
+
+[source,text]
+----
+generation worker --POST {text,style,voice_model,viseme_mapping}--> local-tts-sidecar (127.0.0.1)
+        ^                                                              | Supertonic 3 int8, lang=ja, text-derived seed
+        |   200 {"audio_ref":"audio://generated/<digest>.wav",         v
+        +----------"duration_ms":N[,"viseme_ref":...]}   $AIVTUBER_AUDIO_ROOT/generated/<digest>.wav   (16-bit PCM, 44.1 kHz)
+----
+
+=== Operator duty: disclose the voice
+
+The voice weights are licensed OpenRAIL-M. Its use restrictions are passed on in docs/supply-chain.adoc section 10, and one of them applies to every stream: *do not publish AI-generated content without clearly disclosing that it is machine-generated.* Keep an "AI-generated voice" disclosure where viewers see it (a channel or stream description, or an overlay text). The runtime cannot do this for you; it prints the licence notice at startup (`tts_sidecar: voice model Supertonic 3 ... OpenRAIL-M ...`, and the same line from the sidecar itself) so the duty is visible to whoever starts it.
+
+=== Enabling it
+
+[source,shell]
+----
+node scripts/fetch-sherpa-onnx.mjs lib   /path/to/sherpa-libs                  # prints SHERPA_ONNX_ARCHIVE_DIR=...
+node scripts/fetch-sherpa-onnx.mjs model supertonic-3-int8 /path/to/supertonic  # prints --model-dir ... (OpenRAIL-M, see above)
+
+export SHERPA_ONNX_ARCHIVE_DIR=/path/to/sherpa-libs    # mandatory (docs/supply-chain.adoc)
+cargo build --release --locked -p aivtuber-adapters --features sherpa-tts --bin local-tts-sidecar
+
+export AIVTUBER_MODE=local
+export AIVTUBER_GENERATIVE_ENABLED=true
+export AIVTUBER_AUDIO_ROOT=/path/to/audio                   # must exist; the sidecar writes generated/<digest>.wav here
+export AIVTUBER_TTS_ENDPOINT=http://127.0.0.1:8770/v1/synthesize
+export AIVTUBER_TTS_SIDECAR=target/release/local-tts-sidecar
+export AIVTUBER_TTS_SIDECAR_MODEL_DIR=/path/to/supertonic
+# ... plus the Thinking settings of "Composition profiles" above
+----
+
+*Supervised child or a separate process?* Supervised is the documented path (decision Q3, the S3b pattern): with `AIVTUBER_TTS_SIDECAR` set, the app spawns the sidecar, waits for its ready line, owns its lifetime (it exits when the app does, even if the app is killed, because its stdin closes) and *derives* the listen address, path and audio root from `AIVTUBER_TTS_ENDPOINT` and `AIVTUBER_AUDIO_ROOT`, so the two processes cannot disagree about where a WAV file is. A sidecar you start yourself works too (`AIVTUBER_TTS_ENDPOINT` alone; give it the same `--audio-root`), and is the right choice when you want to restart the voice without restarting the app.
+
+* `AIVTUBER_TTS_SIDECAR` (the executable; unset means off, the default). Local profile only, with `AIVTUBER_GENERATIVE_ENABLED=true` and a loopback `http://` `AIVTUBER_TTS_ENDPOINT` that has a port; anything else is a startup error. The libraries beside the executable are checked against their SHA-256 pins *before* it is spawned.
+* `AIVTUBER_TTS_SIDECAR_MODEL_DIR` (required): the directory printed by the fetch script. The sidecar re-verifies every file against the pins at each start and refuses an unpinned directory (exit 2).
+* `AIVTUBER_TTS_SIDECAR_SPEAKER_ID` (default 0, 0 to 9): the voice. Voice choice is configuration only, never request or model output. `AIVTUBER_TTS_SIDECAR_THREADS` (default 4), `AIVTUBER_TTS_SIDECAR_READY_TIMEOUT_MS` (default 60000: a cold first model load measured 6.6 s, a warm one about 1 s).
+* `AIVTUBER_TTS_SIDECAR_AMPLITUDE_VISEMES` (default false): the mouth track, below.
+* `AIVTUBER_TTS_SIDECAR_ARGS`: extra sidecar flags, whitespace separated (`--synth-deadline-ms`, `--max-text-chars`, `--max-cache-mb`, and so on); a flag the app derives is refused.
+* A supervised sidecar records `backend=local-tts-sidecar`, `model_alias=supertonic-3-int8` and the model bundle digest as the model version in TTS provenance, unless `AIVTUBER_TTS_BACKEND_NAME`, `_MODEL_ALIAS` or `_MODEL_VERSION` say otherwise. Set `AIVTUBER_VOICE_MODEL` to a name that identifies the voice (for example `supertonic-3-int8-sid0`) so generated assets and your cached ones agree.
+* `AIVTUBER_TTS_TIMEOUT_MS` (default 15000) still bounds the adapter; the sidecar's own synthesis deadline defaults to 12 s.
+
+=== What the sidecar guarantees
+
+* *Loopback only.* It refuses to bind a non-loopback address, checks that the `Host` header names this machine (a DNS-rebinding page cannot reach it) and requires `Content-Type: application/json`.
+* *Explicit language and seed.* `lang=ja` and a seed derived from the text are passed to the engine on every call; the engine's defaults (English, a fresh random seed) cannot occur. The same reply is the same audio, byte for byte, across processes (measured). The file name is a content address of text, language, seed, voice, steps, speed and the model bundle, so the same request reuses the file and cache and replay keys are stable.
+* *`style` is ignored and reported.* Supertonic has no style: the field is accepted, never an error, and every success carries `X-TTS-Style-Applied: false` (counted in the request log).
+* *Bounded.* Body 16 KiB (413), text 500 characters (422), 4 simultaneous connections, a per-request read deadline (408), one synthesis at a time (a second is refused at once with 503, which the adapter maps to `Overloaded`; nothing queues), a synthesis deadline (504, the late result is discarded), and 256 MiB of generated audio (oldest removed first). Log lines carry counts and timings, never the text.
+* *WAV files* are written through a temp file and an atomic rename under `AIVTUBER_AUDIO_ROOT/generated/`; the reference is `audio://generated/<digest>.wav`, which `ProcessAudioPlayer` resolves under the same root with its existing traversal rules.
+
+=== Text that is not spoken (ADR-0004 D-5)
+
+Before the TTS request, the generative pipeline projects the gated display text to speech text by *deletion only*: URLs (`http://`, `https://`, `ftp://`, `www.`), emoji (with their joiners and selectors) and parenthesised kaomoji such as `(´▽`)` are not spoken. The display text, and the asset compiled from it, are unchanged. Measured in EXP-0003: every engine speaks a URL as letter noise (6 s of audio for one link) and drops or misreads emoji. If a reply has nothing left to speak (only emoji or a link) the result is the typed non-verbal fallback, with no TTS call. Fixture tests: `examples/tts-projection/handling-set.json` (the EXP-0003 handling set).
+
+*Known limitations, not handled yet:* English brand-word readings (`YouTube`, `Twitter`, `VTuber` are misread; they pass through and wait for the ADR-0004 lexicon), symbols such as `&`, `%`, `#`, `@`, kaomoji that contain letters or digits, and bare domains without a scheme or `www.`.
+
+=== Mouth movement
+
+Supertonic returns no visemes. Amplitude-driven mouth movement is the accepted first slice (decision Q7). With `AIVTUBER_TTS_SIDECAR_AMPLITUDE_VISEMES=true` the sidecar derives a coarse open/closed track from the audio envelope (one viseme, `aa`, whose weight follows the loudness; `neutral` when quiet; at most one cue per 80 ms and only when the weight moves) and writes it to `$AIVTUBER_PACK_ROOT/viseme/generated/<digest>.json` in the existing viseme-track format, returning it as `viseme_ref`. The app's `LocalVisemeStore` resolves it like any other track. Text-derived visemes stay with ADR-0004 / #222. Point `AIVTUBER_PACK_ROOT` at a directory you own (the repository's example pack is not a place to write generated files). Off, a generated reply moves the avatar through its expression and gesture tracks only.
+
+=== Failure and degradation
+
+The deterministic performer never waits on the voice. After start-up the app does not wait on the sidecar at all:
+
+* *Cannot start or never ready* (missing binary, a library or model that does not match its pin, a bad model directory): one line `tts_sidecar: unavailable: ...`, and the app runs on; every generated reply takes the typed non-verbal fallback.
+* *Exits or crashes mid-run:* reported once (`tts_sidecar: exited; ...`); the TTS engine is gated on a liveness flag, so each later reply degrades at once with `Unavailable` instead of waiting out a connect timeout (a closed loopback port takes about two seconds to refuse on Windows). No restart is attempted; restart the app (or a sidecar you started yourself) to retry.
+* *Busy, slow or hung:* 503 `Overloaded`, 504 or the adapter timeout, all the existing typed fallbacks (generation runs on the bounded worker, never on the composition thread).
+
+=== Tests
+
+* `cargo test --locked -p aivtuber-adapters --lib speech_tts` (no features, no model): the HTTP contract with a tone synthesizer over a real loopback socket, with the production adapter as the client (request and response, `style` ignored, content-addressed reuse, damaged-cache recovery, every bound: body, text, head, connections, slow client, busy, deadline, byte cap, non-loopback bind and `Host`), the language-and-seed guarantee, the WAV and amplitude track, pins (including that the fetch script pins the same digests).
+* `cargo test --locked -p aivtuber-adapters --test tts_sidecar_supervisor`: the supervisor against `local-tts-sidecar-double` (ready, never ready, exits, hangs, failing engine, busy, ends with its owner, liveness gate).
+* `cargo test --locked -p aivtuber-generative` (projection fixtures and the pipeline: the synthesizer sees the projected text, the asset keeps the display text, an empty projection falls back without a TTS call); `cargo test --locked -p aivtuber-app --test tts_amplitude_viseme --lib tts_sidecar`.
+* CI job `speech-tts` (not required, Linux): builds and lints the `sherpa-tts` feature from the SHA-256-verified library archive, runs the model-free tests and checks that the sidecar refuses an unpinned model directory and tampered libraries; no model is ever run in CI.
+* Manual, with the real model: build as above, start the app with the settings above, send a Japanese chat line, and watch `tts_sidecar:` and `local-tts-sidecar:` lines (`ok chars=.. audio_ms=.. cache=miss total_ms=..`). The synthesis alone measured 0.9 to 1.0 s for 3.5 to 4.3 s of audio on the development host (EXP-0003: RTF 0.24).
+
 == Audio output
 
 +ProcessAudioPlayer+ uses an external player process without invoking a shell. The default command is +ffplay+, and references are restricted to +audio://+ paths below +AIVTUBER_AUDIO_ROOT+.
@@ -396,7 +475,7 @@ export AIVTUBER_OPENAI_ENDPOINT=http://127.0.0.1:8080/v1/responses
 export AIVTUBER_OPENAI_MODEL=<model-alias>
 export AIVTUBER_OPENAI_MODEL_VERSION=<quantization or revision>
 export AIVTUBER_OPENAI_BACKEND_NAME=llama-server       # recorded in audit/provenance
-export AIVTUBER_TTS_ENDPOINT=http://127.0.0.1:<port>/... # loopback TTS (local TTS is #220 S2)
+export AIVTUBER_TTS_ENDPOINT=http://127.0.0.1:<port>/... # loopback TTS: the supervised local sidecar, see "Local Japanese speech output"
 cargo run -p aivtuber-app
 ----
 

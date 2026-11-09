@@ -33,6 +33,7 @@ For one event the buffered provider pipeline is:
 . evaluate generated text with the cloneable `PublicOutputPolicy` snapshot on the provider worker;
 . reject/suppress text blocked by the narrow publication-containment policy or use the configured-secret-redacted text returned by that gate;
 . invoke TTS only with gated public text;
+. send TTS the speech projection of that text (ADR-0004 D-5: URLs, emoji and kaomoji deleted; the display text and the compiled asset keep the gated text; a reply with nothing left to speak takes the non-verbal fallback without a TTS call);
 . check cancellation;
 . compile a dynamic Performance Asset from the gated text and complete speech artifact;
 . validate the asset;

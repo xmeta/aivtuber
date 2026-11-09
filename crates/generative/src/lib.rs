@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::error::Error;
 use std::fmt;
+mod speech_text;
+pub use speech_text::{SpeechProjection, SpeechProjectionReport, project_speech_text};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -773,6 +775,33 @@ impl GenerativePipeline {
             }
         };
 
+        // ADR-0004 D-5: what is spoken is projected from the gated display
+        // text by deletion (URLs, emoji, kaomoji). The display text, and the
+        // asset compiled from it below, stay as the gate published them.
+        let projection = project_speech_text(&gated_reply_text);
+        let speech_text = if projection.report.changed() {
+            // Deletion can join what the gate saw apart, so the gate sees the
+            // projected string too (only when something was deleted). The
+            // production gate records the last decision it saw and the app
+            // commits only when that decision is for the published display
+            // text, so the display text goes through once more, last. Found
+            // by the local end-to-end run: without it every reply that
+            // contained an emoji or a URL was dropped at commit.
+            let decision = output_gate(&projection.text);
+            let _ = output_gate(&gated_reply_text);
+            match decision {
+                GeneratedTextGateDecision::Publish(text) => text,
+                GeneratedTextGateDecision::Reject => String::new(),
+            }
+        } else {
+            gated_reply_text.clone()
+        };
+        if speech_text.trim().is_empty() {
+            // Nothing speakable (an all-emoji or URL-only reply): a typed
+            // non-verbal fallback, never a TTS call on an empty string.
+            trace.fallback_reason = FallbackReason::PolicyOverride;
+            return Ok(fallback_result(trace, fallback.clone()));
+        }
         let tts_timeout = match remaining_provider_timeout(provider_deadline) {
             Ok(timeout) => timeout,
             Err(()) => {
@@ -786,7 +815,7 @@ impl GenerativePipeline {
         trace.tts_attempted = true;
         trace.tts_backend = Some(tts_identity.clone());
         let speech_request = SpeechRequest {
-            text: gated_reply_text.clone(),
+            text: speech_text,
             style: request.style.clone(),
         };
 
@@ -993,6 +1022,8 @@ mod tests {
         calls: Arc<AtomicUsize>,
         cancel_on_call: Option<GenerationCancellationToken>,
         streaming: bool,
+        /// Text of every `SpeechRequest` this engine was asked to speak.
+        spoken: Arc<Mutex<Vec<String>>>,
     }
 
     impl MockTts {
@@ -1006,6 +1037,7 @@ mod tests {
                 calls: Arc::new(AtomicUsize::new(0)),
                 cancel_on_call: None,
                 streaming: false,
+                spoken: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -1021,6 +1053,7 @@ mod tests {
                 calls: Arc::new(AtomicUsize::new(0)),
                 cancel_on_call: None,
                 streaming: false,
+                spoken: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -1028,9 +1061,10 @@ mod tests {
     impl TtsEngine for MockTts {
         fn synthesize<'a>(
             &'a self,
-            _request: &'a SpeechRequest,
+            request: &'a SpeechRequest,
         ) -> EngineFuture<'a, SpeechArtifact> {
             self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.spoken.lock().unwrap().push(request.text.clone());
             if let Some(token) = &self.cancel_on_call {
                 token.cancel();
             }
@@ -1204,6 +1238,145 @@ mod tests {
             .expect("generated asset is promotable");
         assert_eq!(inserted.id, asset.id);
     }
+    #[test]
+    fn tts_receives_the_projected_text_while_the_asset_keeps_the_display_text() {
+        // ADR-0004 D-5: URLs, emoji and kaomoji are not spoken but stay shown.
+        let display = "ありがとう😊 https://example.com/live を見てね(^_^)";
+        let thinking = Arc::new(MockThinking::success(display));
+        let tts = Arc::new(MockTts::success());
+        let pipeline = GenerativePipeline::new(thinking, tts.clone(), compiler());
+
+        let result = pipeline
+            .run(
+                &generation_request(30),
+                &GenerationCancellationToken::default(),
+                None,
+            )
+            .expect("generation");
+
+        assert_eq!(
+            tts.spoken.lock().unwrap().as_slice(),
+            ["ありがとう を見てね"],
+            "the synthesizer never sees a URL, an emoji or a kaomoji"
+        );
+        let GenerationDisposition::Generated { asset } = result.disposition else {
+            panic!("expected generated asset");
+        };
+        assert_eq!(
+            asset.speech.as_ref().and_then(|s| s.text.as_deref()),
+            Some(display),
+            "the display text is unchanged"
+        );
+    }
+
+    #[test]
+    fn plain_replies_reach_tts_byte_for_byte() {
+        let thinking = Arc::new(MockThinking::success(
+            "今日はYouTubeでライブだよ。A&B、100%。",
+        ));
+        let tts = Arc::new(MockTts::success());
+        let pipeline = GenerativePipeline::new(thinking, tts.clone(), compiler());
+        pipeline
+            .run(
+                &generation_request(31),
+                &GenerationCancellationToken::default(),
+                None,
+            )
+            .expect("generation");
+        assert_eq!(
+            tts.spoken.lock().unwrap().as_slice(),
+            ["今日はYouTubeでライブだよ。A&B、100%。"]
+        );
+    }
+
+    #[test]
+    fn a_reply_with_nothing_speakable_falls_back_without_calling_tts() {
+        for display in ["😊✨", "https://example.com/only-a-link", "(^_^)"] {
+            let tts = Arc::new(MockTts::success());
+            let pipeline = GenerativePipeline::new(
+                Arc::new(MockThinking::success(display)),
+                tts.clone(),
+                compiler(),
+            );
+            let result = pipeline
+                .run(
+                    &generation_request(32),
+                    &GenerationCancellationToken::default(),
+                    None,
+                )
+                .expect("generation");
+            assert_eq!(tts.calls.load(AtomicOrdering::SeqCst), 0, "{display}");
+            assert!(!result.trace.tts_attempted, "{display}");
+            assert_eq!(result.trace.fallback_reason, FallbackReason::PolicyOverride);
+            assert!(
+                !matches!(result.disposition, GenerationDisposition::Generated { .. }),
+                "{display}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_output_gate_sees_the_projected_text_only_when_something_was_deleted() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let tts = Arc::new(MockTts::success());
+        let pipeline = GenerativePipeline::new(
+            Arc::new(MockThinking::success("やあ😊")),
+            tts.clone(),
+            compiler(),
+        );
+        let result = pipeline
+            .run_with_output_gate(
+                &generation_request(33),
+                &GenerationCancellationToken::default(),
+                None,
+                move |text| {
+                    recorder.lock().unwrap().push(text.to_owned());
+                    GeneratedTextGateDecision::Publish(text.to_owned())
+                },
+            )
+            .expect("generation");
+        assert!(matches!(
+            result.disposition,
+            GenerationDisposition::Generated { .. }
+        ));
+        // The display text goes through last: the app records the gate's
+        // last decision and commits only if it is for the display text.
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["やあ😊", "やあ", "やあ😊"]
+        );
+
+        // A gate that rejects the projected text stops the reply before TTS.
+        let tts = Arc::new(MockTts::success());
+        let pipeline = GenerativePipeline::new(
+            Arc::new(MockThinking::success("やあ😊")),
+            tts.clone(),
+            compiler(),
+        );
+        let mut calls = 0;
+        let result = pipeline
+            .run_with_output_gate(
+                &generation_request(34),
+                &GenerationCancellationToken::default(),
+                None,
+                move |text| {
+                    calls += 1;
+                    if calls == 1 {
+                        GeneratedTextGateDecision::Publish(text.to_owned())
+                    } else {
+                        GeneratedTextGateDecision::Reject
+                    }
+                },
+            )
+            .expect("generation");
+        assert_eq!(tts.calls.load(AtomicOrdering::SeqCst), 0);
+        assert!(!matches!(
+            result.disposition,
+            GenerationDisposition::Generated { .. }
+        ));
+    }
+
     #[test]
     fn deterministic_inputs_compile_to_the_same_promotable_asset_id() {
         let pipeline = GenerativePipeline::new(
