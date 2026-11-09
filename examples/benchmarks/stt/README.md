@@ -19,7 +19,7 @@ out/    one JSON per run (per-clip text and timings, partials, load time, RSS)  
 
 Keep the work directory away from the scripts directory and run Python with `-I` (isolated mode: no current-directory or
 `PYTHON*` path lookups) and `-X utf8`. The scripts add their own directory to `sys.path` explicitly.
-Disk: about 9 GB for `dl/` (the Whisper float models and Vosk big model dominate), 0.2 GB for `eval/`.
+Disk: about 12 GB for `dl/` (the Whisper float models and Vosk big model dominate), 0.2 GB for `eval/`.
 
 ## Reproduction
 
@@ -39,13 +39,17 @@ $PY run_all.py [--gpu]               # the whole matrix of the record, sequentia
 $PY summarize.py [--first 200] [--drop-common-bad] [tag-substring ...] > "$STT_BENCH_DIR/out/summary.txt"
                                      # plain-text tables; STT_BASE=<tag> adds paired CER differences against that run
 $PY preroll_sensitivity.py           # CER of one engine as the segment start moves relative to the speech onset
+$PY streampad_probe.py               # CER of a streaming engine against the length of trailing zeros before input_finished()
 ```
 
 `run_all.py` runs the Whisper models on the first 150 clips and the Vosk big model on the first 60 only, because they are
 slow on CPU; compare engines on the same clips (`summarize.py --first N`).
 
 Engine names: `sherpa:k2v2-int8`, `sherpa:k2v2-fp32`, `sherpa:k2-ja-en`, `sherpa:parakeet-ja`, `sherpa:sensevoice`,
-`vosk:small`, `vosk:big`, `whisper:<ggml model name without the "ggml-" prefix and ".bin">`.
+`sherpa:dolphin-small`, `sherpa:omnilingual-300m`, `sherpa:qwen3-asr`, `sherpastream:nemotron-560[@pad1.0]` and
+`sherpastream:nemotron-160[@pad1.0]` (native streaming, `@padN` appends N seconds of zeros before `input_finished()`),
+`vosk:small`, `vosk:big`, `whisper:<ggml model name without the "ggml-" prefix and ".bin">`, and
+`whispergpu:<same>` for the CUDA build (needs `fetch_assets.py --with-gpu`).
 
 Timings are wall-clock on one machine and vary with CPU and background load; run on a quiet machine, never two runs at once.
 `bench.py` reports, per run: CER inputs, per-call latency of the final transcription, real-time factor, first-call time, load time,
@@ -70,6 +74,7 @@ bootstrap over clips (seed 20261109).
 | ReazonSpeech k2 v2 | HF `reazon-research/reazonspeech-k2-v2` revision `291488c8151be24d7da4bf7af26e533fad96e407` |
 | sherpa-onnx ja-en zipformer, parakeet-tdt_ctc-0.6b-ja (CTC head), SenseVoice small | sherpa-onnx `asr-models` release assets, sha256 in `fetch_assets.py` (the release tag is mutable, the hash is the pin) |
 | Vosk Japanese small and big | alphacephei.com archives, sha256 in `fetch_assets.py` |
+| Nemotron 3.5 streaming (560 ms, 160 ms), Dolphin small, Omnilingual 300M v2, Qwen3-ASR 0.6B | sherpa-onnx `asr-models` release assets, sha256 in `fetch_assets.py` |
 | Python packages | `requirements.txt` (`sherpa-onnx==2.0.1`, `vosk==0.3.45`) |
 
 ## License notes

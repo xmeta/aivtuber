@@ -59,6 +59,23 @@ ASSETS = [  # (url, dest relative to dl/, sha256)
      "7d1efa2138a65b0b488df37f8b89e3d91a60676e416f515b952358d83dfd347e"),
     (f"{SHERPA_RELEASE}/sherpa-onnx-zipformer-ja-en-reazonspeech-2025-01-17.tar.bz2", "sherpa/zipformer-ja-en.tar.bz2",
      "dc03758608c0280e2cbcaac4597467ffcf846ae0b06436f1706738a11da86f5d"),
+    # Newer Japanese-capable sherpa-onnx models (the catalogue also lists Moonshine ja, which is under the non-commercial
+    # Moonshine Community License and was not run, and Cohere / FunASR-Nano / Dolphin-base variants that were not run).
+    (f"{SHERPA_RELEASE}/sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8-2026-06-11.tar.bz2",
+     "sherpa2/sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8-2026-06-11.tar.bz2",
+     "c6bf5e0df765f9d5b43bc9e0536d4b4b3e7d40bdf5ecf13e45f134c51c05ae3a"),
+    (f"{SHERPA_RELEASE}/sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-160ms-int8-2026-06-11.tar.bz2",
+     "sherpa2/sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-160ms-int8-2026-06-11.tar.bz2",
+     "a81909a1780d84cff16d73c15e13e67d9d81d8839faf14870d507d8499f7a61a"),
+    (f"{SHERPA_RELEASE}/sherpa-onnx-dolphin-small-ctc-multi-lang-int8-2025-04-02.tar.bz2",
+     "sherpa2/sherpa-onnx-dolphin-small-ctc-multi-lang-int8-2025-04-02.tar.bz2",
+     "7346b00ffe42396fff5c96d11892f0d4d72ac11418d47c5a8ada2b0f6ac8d27b"),
+    (f"{SHERPA_RELEASE}/sherpa-onnx-omnilingual-asr-1600-languages-300M-ctc-v2-int8-2026-02-05.tar.bz2",
+     "sherpa2/sherpa-onnx-omnilingual-asr-1600-languages-300M-ctc-v2-int8-2026-02-05.tar.bz2",
+     "951b32409aade32bd525310bb39e9666773ba3fc611a39e817f620936d76c631"),
+    (f"{SHERPA_RELEASE}/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25.tar.bz2",
+     "sherpa2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25.tar.bz2",
+     "393f8a14e2f5fb96746aaab342997a40641001fbd5bf9592a080a8329178ee96"),
     ("https://alphacephei.com/vosk/models/vosk-model-small-ja-0.22.zip", "vosk/vosk-model-small-ja-0.22.zip",
      "efa092d280153a77615e9e0c7d7283e93e600de3d19d3bec686c57ef19d52eac"),
     ("https://alphacephei.com/vosk/models/vosk-model-ja-0.22.zip", "vosk/vosk-model-ja-0.22.zip",
@@ -131,4 +148,7 @@ if __name__ == "__main__":
                      ("vosk/vosk-model-small-ja-0.22.zip", "vosk/small"), ("vosk/vosk-model-ja-0.22.zip", "vosk/big")]:
         if os.path.exists(os.path.join(WORK, "dl", rel)):
             extract(rel, sub)
+    for url, rel, want in ASSETS:  # sherpa2/: one extraction directory per archive, dl/sherpa2/x/<archive name>
+        if rel.startswith("sherpa2/") and os.path.exists(os.path.join(WORK, "dl", rel)):
+            extract(rel, "sherpa2/x/" + os.path.basename(rel)[: -len(".tar.bz2")])
     print("done")

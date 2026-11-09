@@ -16,6 +16,14 @@ MATRIX = [
     ("sherpa:k2-ja-en", 4, 400, 60, 100, "k2-ja-en_t4"),
     ("sherpa:parakeet-ja", 4, 400, 60, 100, "parakeet-ja_t4"),
     ("sherpa:sensevoice", 4, 400, 60, 100, "sensevoice_t4"),
+    ("sherpastream:nemotron-560", 4, 400, 60, 100, "nemotron-560_t4"),  # native streaming (cache-aware transducer), 100 ms feed
+    ("sherpastream:nemotron-160", 4, 150, 20, 20, "nemotron-160_t4"),
+    # a streaming model needs trailing zeros before input_finished() to flush its last chunk (see streampad_probe.py)
+    ("sherpastream:nemotron-560@pad1.0", 4, 150, 20, 20, "nemotron-560-pad1_t4"),
+    ("sherpastream:nemotron-160@pad1.0", 4, 150, 20, 20, "nemotron-160-pad1_t4"),
+    ("sherpa:dolphin-small", 4, 400, 60, 100, "dolphin-small_t4"),
+    ("sherpa:omnilingual-300m", 4, 150, 20, 20, "omnilingual-300m_t4"),
+    ("sherpa:qwen3-asr", 4, 150, 20, 20, "qwen3-asr_t4"),
     ("sherpa:k2v2-int8", 1, 400, 20, 20, "k2v2-int8_t1"),
     ("sherpa:k2v2-int8", 8, 400, 20, 20, "k2v2-int8_t8"),
     ("sherpa:k2v2-int8", 4, 400, 20, 20, "k2v2-int8_t4_run2"),

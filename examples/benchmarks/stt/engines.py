@@ -73,6 +73,17 @@ class Sherpa(Base):
             # The sherpa-onnx export of parakeet-tdt_ctc-0.6b-ja ships the CTC head only (one model.int8.onnx).
             r = so.OfflineRecognizer.from_nemo_ctc(
                 model=p(d, "model.int8.onnx"), tokens=p(d, "tokens.txt"), num_threads=threads, provider="cpu")
+        elif kind == "qwen3-asr":
+            d = glob.glob(p(DL, "sherpa2", "x", "*qwen3-asr*", "*"))[0]
+            r = so.OfflineRecognizer.from_qwen3_asr(
+                conv_frontend=p(d, "conv_frontend.onnx"), encoder=p(d, "encoder.int8.onnx"), decoder=p(d, "decoder.int8.onnx"),
+                tokenizer=p(d, "tokenizer"), num_threads=threads, provider="cpu")
+        elif kind == "dolphin-small":
+            d = glob.glob(p(DL, "sherpa2", "x", "*dolphin-small*", "*"))[0]
+            r = so.OfflineRecognizer.from_dolphin_ctc(model=p(d, "model.int8.onnx"), tokens=p(d, "tokens.txt"), num_threads=threads, provider="cpu")
+        elif kind == "omnilingual-300m":
+            d = glob.glob(p(DL, "sherpa2", "x", "*omnilingual*", "*"))[0]
+            r = so.OfflineRecognizer.from_omnilingual_asr_ctc(model=p(d, "model.int8.onnx"), tokens=p(d, "tokens.txt"), num_threads=threads, provider="cpu")
         elif kind == "sensevoice":
             d = glob.glob(p(DL, "sherpa", "sensevoice-2024", "*"))[0]
             r = so.OfflineRecognizer.from_sense_voice(
@@ -88,6 +99,72 @@ class Sherpa(Base):
         s.accept_waveform(SR, x)
         self.r.decode_stream(s)
         return s.result.text
+
+
+class SherpaStream(Base):
+    """sherpa-onnx OnlineRecognizer (cache-aware streaming transducer), fed 100 ms chunks like a live microphone."""
+
+    def __init__(self, kind, threads):
+        import sherpa_onnx as so
+
+        t0 = time.perf_counter()
+        kind, _, pad = kind.partition("@pad")  # "nemotron-560@pad0.66": zeros appended before input_finished()
+        self.tail_pad = np.zeros(int(float(pad or 0) * SR), dtype=np.float32)
+        chunk = kind.split("-")[1]  # "nemotron-560" -> the export's chunk size in ms
+        d = glob.glob(os.path.join(DL, "sherpa2", "x", f"*nemotron*-{chunk}ms-*", "*"))[0]
+        p = os.path.join
+        self.r = so.OnlineRecognizer.from_transducer(
+            tokens=p(d, "tokens.txt"), encoder=p(d, "encoder.int8.onnx"), decoder=p(d, "decoder.int8.onnx"),
+            joiner=p(d, "joiner.int8.onnx"), num_threads=threads, sample_rate=SR, decoding_method="greedy_search", provider="cpu")
+        self.load_s = time.perf_counter() - t0
+
+    def _stream(self):
+        s = self.r.create_stream()
+        s.set_option("language", "ja")  # declared, as in the sidecar design
+        return s
+
+    def _drain(self, s):
+        while self.r.is_ready(s):
+            self.r.decode_stream(s)
+        return self.r.get_result(s)
+
+    def final(self, x):
+        s = self._stream()
+        k = int(CHUNK_S * SR)
+        for i in range(0, len(x), k):
+            s.accept_waveform(SR, x[i:i + k])
+            self._drain(s)
+        if len(self.tail_pad):
+            s.accept_waveform(SR, self.tail_pad)
+        s.input_finished()
+        return self._drain(s).strip()
+
+    def tail_cost(self, x):
+        s = self._stream()
+        k = int(CHUNK_S * SR)
+        starts = list(range(0, len(x), k))
+        for i in starts[:-1]:
+            s.accept_waveform(SR, x[i:i + k])
+            self._drain(s)
+        t0 = time.perf_counter()
+        s.accept_waveform(SR, x[starts[-1]:starts[-1] + k])
+        self._drain(s)
+        if len(self.tail_pad):
+            s.accept_waveform(SR, self.tail_pad)
+        s.input_finished()
+        text = self._drain(s).strip()
+        return text, time.perf_counter() - t0
+
+    def partials(self, x, step):
+        s = self._stream()
+        k = int(CHUNK_S * SR)
+        out = []
+        for i in range(0, len(x), k):
+            t0 = time.perf_counter()
+            s.accept_waveform(SR, x[i:i + k])
+            text = self._drain(s)
+            out.append((min(i + k, len(x)) / SR, text.strip(), time.perf_counter() - t0))
+        return out
 
 
 class Vosk(Base):
@@ -195,6 +272,8 @@ def make(spec, threads, **kw):
     fam, _, name = spec.partition(":")
     if fam == "sherpa":
         return Sherpa(name, threads)
+    if fam == "sherpastream":
+        return SherpaStream(name, threads)
     if fam == "vosk":
         return Vosk(name, threads)
     if fam == "whisper":
