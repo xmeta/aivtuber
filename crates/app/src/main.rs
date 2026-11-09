@@ -7,11 +7,11 @@ use aivtuber_adapters::{
     ProcessAudioConfig, ProcessAudioPlayer, SecretString, VTubeStudioAdapter, VTubeStudioConfig,
 };
 use aivtuber_app::{
-    AdaptationRuntime, AdapterHealth, AvatarOutput, BargeInConfig, CompositionProfile,
-    GenerativeBudgetPolicy, GenerativeRuntime, IntentRoutePlanner, IntentShadowPolicy,
-    LocalAvatarOutput, NoopAvatarOutput, NoopStreamOutput, ObsStreamOutput, OperatorControlServer,
-    OperatorRateLimiter, ProductionApp, ProfileSummary, RawIngressConfig, RawIngressMetrics,
-    RawIngressMetricsSnapshot, RoutePlanner, RuntimeRetentionPolicy,
+    AdaptationRuntime, AdapterHealth, AvatarOutput, BargeInConfig, BargeInMetrics,
+    CompositionProfile, GenerativeBudgetPolicy, GenerativeRuntime, IntentRoutePlanner,
+    IntentShadowPolicy, LocalAvatarOutput, NoopAvatarOutput, NoopStreamOutput, ObsStreamOutput,
+    OperatorControlServer, OperatorRateLimiter, ProductionApp, ProfileSummary, RawIngressConfig,
+    RawIngressMetrics, RawIngressMetricsSnapshot, RoutePlanner, RuntimeRetentionPolicy,
     SHADOW_ORCHESTRATOR_SCHEMA_VERSION, ShadowOrchestratorConfig, ShadowPolicyIdentity,
     ShadowingRoutePlanner, SpeechConversationConfig, SpeechConversationMetrics, SpeechFloorMetrics,
     SpeechSidecar, SpeechSidecarConfig, SpeechSidecarStats, StreamOutput, VtsAvatarOutput,
@@ -323,6 +323,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut speech_floor_enabled = false;
     let mut speech_barge_in_enabled = false;
     let mut last_floor_metrics = SpeechFloorMetrics::default();
+    let mut last_barge_in_metrics = BargeInMetrics::default();
     let mut last_conversation_metrics = SpeechConversationMetrics::default();
     if let Some(program) = env_optional("AIVTUBER_SPEECH_SIDECAR") {
         let mut tracker = SpeechObservationTracker::new(
@@ -677,6 +678,24 @@ fn run() -> Result<(), Box<dyn Error>> {
                     metrics.queued
                 );
                 last_floor_metrics = metrics;
+            }
+            if let Some(metrics) = app.speech_barge_in_metrics()
+                && metrics != last_barge_in_metrics
+            {
+                eprintln!(
+                    "speech_barge_in_metrics: confirmed={} stopped={} nothing_to_stop={} audio_faded={} audio_hard_stopped={} audio_stop_unsupported={} audio_stop_errors={} avatar_resets={} avatar_reset_errors={} max_decision_to_stop_micros={}",
+                    metrics.confirmed,
+                    metrics.stopped,
+                    metrics.nothing_to_stop,
+                    metrics.audio_faded,
+                    metrics.audio_hard_stopped,
+                    metrics.audio_stop_unsupported,
+                    metrics.audio_stop_errors,
+                    metrics.avatar_resets,
+                    metrics.avatar_reset_errors,
+                    metrics.max_decision_to_stop_micros
+                );
+                last_barge_in_metrics = metrics;
             }
             report_raw_ingress_metrics(&raw_ingress_metrics, &mut last_raw_ingress_metrics, false);
             next_maintenance_ms = now_ms.saturating_add(1_000);

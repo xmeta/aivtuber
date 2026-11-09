@@ -1,0 +1,26 @@
+{
+  "schema_version": "0.1.0",
+  "name": "operator stop does not depend on the floor, the feed or barge-in: with a stale feed (so barge-in can do nothing) the authenticated stop still cancels the performance and drops its pending commands, and no floor decision or barge-in is recorded for it (security-threat-model: operator emergency control independence; #81 S2)",
+  "language": "ja",
+  "backend": "fading",
+  "barge_in": { "fade_ms": 120 },
+  "steps": [
+    { "now_ms": 0, "speak": { "duration_ms": 8000 } },
+    {
+      "now_ms": 1000,
+      "beat": true,
+      "vad": [{ "speaker_id": "mic-local", "edge": "start", "observed_at_ms": 1000 }]
+    },
+    {
+      "now_ms": 1500,
+      "service": true,
+      "expect": { "record": null, "speaking": true, "pending_audio": 1, "yields_decided": 0 }
+    },
+    {
+      "now_ms": 1600,
+      "operator_stop": true,
+      "service": true,
+      "expect": { "record": null, "speaking": false, "pending_audio": 0, "yields_decided": 0 }
+    }
+  ]
+}

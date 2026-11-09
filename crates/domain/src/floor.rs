@@ -52,8 +52,9 @@ pub enum FloorAction {
     Wait,
     /// Speaking performer keeps the floor (a pending reply stays deferred).
     Hold,
-    /// The user confirmed a barge-in; the performer should give way. S1
-    /// records this and executes nothing (fade stop is a later slice).
+    /// The user confirmed a barge-in; the performer should give way. The
+    /// policy only recommends: the app executes it (a bounded-fade stop,
+    /// #81 S2) through the scheduler and its outputs, never the policy.
     Yield,
     /// A pending reply may be routed now.
     TakeTurn,

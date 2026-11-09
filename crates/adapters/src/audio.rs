@@ -118,6 +118,13 @@ impl ProcessAudioPlayer {
         })
     }
 
+    /// Playback processes started by this player that are still running.
+    pub fn tracked_processes(&self) -> usize {
+        let mut running = lock_running(&self.running);
+        running.retain_mut(|tracked| matches!(tracked.child.try_wait(), Ok(None)));
+        running.len()
+    }
+
     pub fn config(&self) -> &ProcessAudioConfig {
         &self.config
     }

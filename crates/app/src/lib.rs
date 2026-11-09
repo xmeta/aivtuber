@@ -1132,6 +1132,10 @@ where
     ///    reported as unsupported), and
     /// 4. sends the avatar a `Reset` through the normal avatar output.
     ///
+    /// It needs the feed to have reported liveness at least once
+    /// ([`Self::note_speech_feed_heartbeat`]); without that it does nothing,
+    /// which is the S1 behaviour (a confirmed yield was recorded only).
+    ///
     /// Operator stop is a separate path and is unaffected.
     pub fn service_barge_in(&mut self, at_ms: u64) -> Option<BargeInRecord> {
         let fade_ms = self.speech_barge_in.as_ref()?.config().fade_ms;
@@ -1144,10 +1148,12 @@ where
         {
             return None;
         }
+        // Stopping speech is the costly-to-reverse decision (ADR-0005 D6): it
+        // needs a feed that reports liveness. A sidecar that never beats keeps
+        // the S1 behaviour, where a confirmed yield was recorded, not executed.
+        let beat_ms = self.speech_feed_heartbeat_ms?;
+        let feed_age_ms = Some(at_ms.saturating_sub(beat_ms));
         let started = Instant::now();
-        let feed_age_ms = self
-            .speech_feed_heartbeat_ms
-            .map(|beat| at_ms.saturating_sub(beat));
         let speakers: Vec<String> = self
             .speech_observations
             .as_ref()?
@@ -6947,6 +6953,10 @@ mod tests {
                     if let Some(edges) = step.get("vad") {
                         vad_edge(&mut app, edges.as_array().expect("edges"), now_ms);
                     }
+                    // Feed liveness (#81 S2): the sidecar's beat arrived now.
+                    if step["beat"] == true {
+                        app.note_speech_feed_heartbeat(now_ms);
+                    }
                     if let Some(transcripts) = step.get("transcripts") {
                         let bytes = batch_bytes(language, transcripts.as_array().expect("array"));
                         app.speech_transcripts_mut()
@@ -7015,7 +7025,7 @@ mod tests {
                     assert_eq!(first, second, "replay must be deterministic: {path:?}");
                     count += 1;
                 }
-                assert!(count >= 6, "expected the floor fixtures, found {count}");
+                assert!(count >= 7, "expected the floor fixtures, found {count}");
             }
 
             /// Absence of the policy, or of any evidence for it, is the
@@ -7091,6 +7101,442 @@ mod tests {
                     before,
                     "the stop did not pass through the floor"
                 );
+            }
+
+            /// Issue #81 S2: the barge-in executor (ADR-0005 S-3). Logical time,
+            /// recording outputs, no microphone, model or audio device.
+            mod barge_in {
+                use super::*;
+                use aivtuber_adapters::AudioStopOutcome;
+                use aivtuber_scheduler::{BlendChannel, PlannedPerformance, Priority};
+                use std::time::Instant;
+
+                #[derive(Clone, Copy, Default, PartialEq, Eq)]
+                enum Backend {
+                    /// Can ramp: answers `Faded`.
+                    #[default]
+                    Fading,
+                    /// Cannot ramp (an external player process): `HardStopped`.
+                    HardOnly,
+                    /// No stop at all: `Unsupported`.
+                    NoStop,
+                    Failing,
+                }
+
+                #[derive(Clone, Default)]
+                struct StopAudio {
+                    stops: Arc<Mutex<Vec<u32>>>,
+                    stop_called_at: Arc<Mutex<Option<Instant>>>,
+                    backend: Arc<Mutex<Backend>>,
+                }
+
+                impl AudioOutput for StopAudio {
+                    fn execute(
+                        &mut self,
+                        _command: &AudioPlaybackCommand,
+                    ) -> Result<(), EngineError> {
+                        Ok(())
+                    }
+
+                    fn stop(&mut self, fade_ms: u32) -> Result<AudioStopOutcome, EngineError> {
+                        self.stops.lock().expect("stops").push(fade_ms);
+                        *self.stop_called_at.lock().expect("at") = Some(Instant::now());
+                        match *self.backend.lock().expect("backend") {
+                            Backend::Fading => Ok(AudioStopOutcome::Faded { fade_ms }),
+                            Backend::HardOnly => Ok(AudioStopOutcome::HardStopped),
+                            Backend::NoStop => Ok(AudioStopOutcome::Unsupported),
+                            Backend::Failing => Err(EngineError::new(
+                                EngineErrorKind::Unavailable,
+                                "audio device unavailable",
+                            )),
+                        }
+                    }
+                }
+
+                struct Rig {
+                    app: ProductionApp<ReflexRoutePlanner<FixedEmbedding>>,
+                    audio: StopAudio,
+                    avatar: RecordingAvatar,
+                }
+
+                fn rig(backend: Backend, barge_in: Option<BargeInConfig>) -> Rig {
+                    let audio = StopAudio::default();
+                    *audio.backend.lock().expect("backend") = backend;
+                    let avatar = RecordingAvatar::default();
+                    let runtime = SecurityRuntime::new(
+                        SecurityRuntimeConfig::default(),
+                        SchedulerConfig {
+                            min_reaction_spacing_ms: 0,
+                            ..SchedulerConfig::default()
+                        },
+                        SecretRedactor::default(),
+                        Some("safe cached reaction".to_owned()),
+                    )
+                    .expect("security runtime");
+                    let mut app = ProductionApp::new(
+                        runtime,
+                        performer(),
+                        LocalVisemeStore::new(pack_root()),
+                        reflex_router_with_transport("cached", true),
+                        Box::new(audio.clone()),
+                        Box::new(avatar.clone()),
+                        Box::new(NoopStreamOutput),
+                        250,
+                    )
+                    .with_speech_transcripts(
+                        SpeechTranscriptTracker::new(
+                            SpeechTranscriptConfig::default(),
+                            IngressPolicy::default(),
+                        )
+                        .expect("transcripts"),
+                    )
+                    .with_speech_observations(
+                        SpeechObservationTracker::new(
+                            SpeechObservationConfig::default(),
+                            IngressPolicy::default(),
+                        )
+                        .expect("vad"),
+                    )
+                    .with_speech_floor(FloorConfig::default())
+                    .expect("floor");
+                    if let Some(config) = barge_in {
+                        app = app.with_barge_in(config).expect("barge-in");
+                    }
+                    app.startup().expect("startup");
+                    Rig { app, audio, avatar }
+                }
+
+                /// A speaking performance on the audio channel, with one
+                /// later audio command still pending for its generation.
+                fn speak(
+                    app: &mut ProductionApp<ReflexRoutePlanner<FixedEmbedding>>,
+                    at_ms: u64,
+                    spec: &serde_json::Value,
+                ) {
+                    let priority = match spec["priority"].as_str().unwrap_or("conversation") {
+                        "high_priority_interaction" => Priority::HighPriorityInteraction,
+                        "commentary" => Priority::Commentary,
+                        _ => Priority::Conversation,
+                    };
+                    let duration_ms = spec["duration_ms"].as_u64().unwrap_or(8_000);
+                    let plan = PlannedPerformance {
+                        event_id: format!("evt-speak-{at_ms}"),
+                        asset_id: format!("asset.speak-{at_ms}"),
+                        priority,
+                        interruptible: spec["interruptible"] != false,
+                        // The single end-of-speech point generated replies
+                        // declare today: a barge-in must not wait for it.
+                        interrupt_points_ms: vec![duration_ms],
+                        start_at_ms: at_ms,
+                        duration_ms,
+                        generation: 0,
+                        exclusive: false,
+                        channels: BTreeSet::from([BlendChannel::Audio, BlendChannel::Face]),
+                    };
+                    let planned = app
+                        .performer
+                        .scheduler_mut()
+                        .schedule(plan)
+                        .expect("schedule speech");
+                    app.pending_audio.commands.push(AudioPlaybackCommand {
+                        generation: planned.generation,
+                        event_id: planned.event_id.clone(),
+                        asset_id: planned.asset_id.clone(),
+                        at_ms: at_ms + duration_ms / 2,
+                        audio_ref: "audio://speak.opus".to_owned(),
+                        duration_ms: duration_ms / 2,
+                        speed_factor: 1.0,
+                    });
+                }
+
+                fn audio_name(audio: Option<AudioStopOutcome>) -> serde_json::Value {
+                    match audio {
+                        None => json!(null),
+                        Some(AudioStopOutcome::Faded { fade_ms }) => {
+                            json!(format!("faded:{fade_ms}"))
+                        }
+                        Some(AudioStopOutcome::HardStopped) => json!("hard_stopped"),
+                        Some(AudioStopOutcome::NothingPlaying) => json!("nothing_playing"),
+                        Some(AudioStopOutcome::Unsupported) => json!("unsupported"),
+                    }
+                }
+
+                fn observe(rig: &Rig, record: Option<&BargeInRecord>) -> serde_json::Value {
+                    let resets = rig
+                        .avatar
+                        .commands
+                        .lock()
+                        .expect("avatar")
+                        .iter()
+                        .filter(|c| matches!(c, AvatarPlaybackCommand::Reset { .. }))
+                        .count();
+                    let floor = rig.app.speech_floor_metrics().expect("floor");
+                    json!({
+                        "record": record.map(|r| json!({
+                            "effect": format!("{:?}", r.effect),
+                            "decided_at_ms": r.decided_at_ms,
+                            "cancelled_playing": r.cancelled_playing,
+                            "cancelled_queued": r.cancelled_queued,
+                            "fade_ms": r.fade_ms,
+                            "audio": audio_name(r.audio),
+                            "audio_error": r.audio_error,
+                            "avatar_reset": r.avatar_reset,
+                        })),
+                        "audio_stops": rig.audio.stops.lock().expect("stops").clone(),
+                        "avatar_resets": resets,
+                        "speaking": rig.app.performer.scheduler().playing_items()
+                            .any(|i| i.plan.channels.contains(&BlendChannel::Audio)),
+                        "pending_audio": rig.app.pending_audio.commands.len(),
+                        "yields_decided": floor.policy.yielded,
+                    })
+                }
+
+                /// Everything observable, so a second run can be compared.
+                fn run_fixture(fixture: &serde_json::Value) -> serde_json::Value {
+                    let backend = match fixture["backend"].as_str().unwrap_or("fading") {
+                        "hard_only" => Backend::HardOnly,
+                        "no_stop" => Backend::NoStop,
+                        "failing" => Backend::Failing,
+                        _ => Backend::Fading,
+                    };
+                    let barge_in =
+                        fixture["barge_in"]["fade_ms"]
+                            .as_u64()
+                            .map(|fade_ms| BargeInConfig {
+                                fade_ms: fade_ms as u32,
+                            });
+                    let mut rig = rig(backend, barge_in);
+                    let language = fixture["language"].as_str().unwrap_or("ja");
+                    let mut observed = Vec::new();
+                    for step in fixture["steps"].as_array().expect("steps") {
+                        let now_ms = step["now_ms"].as_u64().expect("now_ms");
+                        if let Some(spec) = step.get("speak") {
+                            speak(&mut rig.app, now_ms, spec);
+                        }
+                        if let Some(edges) = step.get("vad") {
+                            vad_edge(&mut rig.app, edges.as_array().expect("edges"), now_ms);
+                        }
+                        if let Some(transcripts) = step.get("transcripts") {
+                            let bytes =
+                                batch_bytes(language, transcripts.as_array().expect("array"));
+                            rig.app
+                                .speech_transcripts_mut()
+                                .expect("tracker")
+                                .ingest_bytes(&bytes, now_ms)
+                                .expect("batch");
+                        }
+                        if step["beat"] == true {
+                            rig.app.note_speech_feed_heartbeat(now_ms);
+                        }
+                        let mut record = None;
+                        if step["service"] == true {
+                            record = rig.app.service_barge_in(now_ms);
+                        }
+                        if step["operator_stop"] == true {
+                            let outcome = rig
+                                .app
+                                .handle_control(&stop_command(), now_ms)
+                                .expect("authenticated emergency stop");
+                            assert!(matches!(outcome, ControlOutcome::Stopped { .. }));
+                        }
+                        let seen = observe(&rig, record.as_ref());
+                        // `expect` names the keys the step pins; the rest of
+                        // the observation is still compared across both runs.
+                        if let Some(expected) = step.get("expect") {
+                            for (key, value) in expected.as_object().expect("expect object") {
+                                assert_eq!(&seen[key], value, "{key} at {now_ms} ms");
+                            }
+                        }
+                        observed.push(seen);
+                    }
+                    json!({
+                        "steps": observed,
+                        "decisions": rig.app.speech_floor_decisions(),
+                        "metrics": {
+                            "confirmed": rig.app.speech_barge_in_metrics().map(|m| m.confirmed),
+                            "stopped": rig.app.speech_barge_in_metrics().map(|m| m.stopped),
+                        },
+                    })
+                }
+
+                #[test]
+                fn replay_fixtures_produce_the_expected_barge_in_behaviour_twice() {
+                    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("../../examples/speech-floor/barge-in");
+                    let mut count = 0;
+                    for entry in fs::read_dir(&dir).expect("fixture dir") {
+                        let path = entry.expect("entry").path();
+                        if path.extension().is_none_or(|ext| ext != "json") {
+                            continue;
+                        }
+                        let fixture: serde_json::Value =
+                            serde_json::from_slice(&fs::read(&path).expect("read")).expect("json");
+                        assert_eq!(fixture["schema_version"], "0.1.0", "{path:?}");
+                        let first = run_fixture(&fixture);
+                        let second = run_fixture(&fixture);
+                        assert_eq!(first, second, "replay must be deterministic: {path:?}");
+                        count += 1;
+                    }
+                    assert!(count >= 7, "expected the barge-in fixtures, found {count}");
+                }
+
+                fn start_edge(at_ms: u64) -> Vec<serde_json::Value> {
+                    vec![
+                        json!({"speaker_id": "mic-local", "edge": "start", "observed_at_ms": at_ms}),
+                    ]
+                }
+
+                /// Measured, not asserted to a magic number: the confirmed
+                /// decision to the stop command reaching the output, and the
+                /// logical bound ADR-0005 S-3 gives (confirmation run plus a
+                /// fade of at most 150 ms).
+                #[test]
+                fn a_confirmed_barge_in_reaches_the_output_stop_within_the_bound() {
+                    let mut rig = rig(Backend::Fading, Some(BargeInConfig::default()));
+                    speak(&mut rig.app, 0, &json!({"duration_ms": 8_000}));
+                    vad_edge(&mut rig.app, &start_edge(1_000), 1_000);
+                    let mut stop_at_ms = None;
+                    let mut measured = Duration::ZERO;
+                    for now_ms in (1_000..=1_500).step_by(10) {
+                        rig.app.note_speech_feed_heartbeat(now_ms);
+                        let before = Instant::now();
+                        if let Some(record) = rig.app.service_barge_in(now_ms) {
+                            let called = rig
+                                .audio
+                                .stop_called_at
+                                .lock()
+                                .expect("at")
+                                .expect("stop reached the output");
+                            measured = called.duration_since(before);
+                            assert_eq!(record.effect, BargeInEffect::Stopped);
+                            assert!(record.fade_ms <= 150);
+                            stop_at_ms = Some(now_ms);
+                            break;
+                        }
+                    }
+                    let stop_at_ms = stop_at_ms.expect("a confirmed barge-in");
+                    // First tick at which the raw run reached the confirm bound.
+                    assert_eq!(
+                        stop_at_ms,
+                        1_000 + FloorConfig::default().barge_in_confirm_ms
+                    );
+                    // Decision to the output's stop command: orders of
+                    // magnitude below the 150 ms fade bound.
+                    eprintln!(
+                        "barge_in_stop_latency: decision_to_output_stop_command_micros={} fade_ms={} logical_detect_ms={}",
+                        measured.as_micros(),
+                        BargeInConfig::default().fade_ms,
+                        stop_at_ms - 1_000
+                    );
+                    assert!(measured < Duration::from_millis(150), "{measured:?}");
+                    let record = rig.app.speech_barge_in_records().pop().expect("record");
+                    assert!(record.decision_to_stop_micros < 150_000, "{record:?}");
+                    // Audible stop is at most the fade after the decision.
+                    assert!(record.fade_ms <= 150);
+                    // Avatar went to neutral through the normal output.
+                    assert!(
+                        rig.avatar
+                            .commands
+                            .lock()
+                            .expect("avatar")
+                            .iter()
+                            .any(|c| matches!(c, AvatarPlaybackCommand::Reset { at_ms, .. } if *at_ms == stop_at_ms))
+                    );
+                }
+
+                /// What each output backend does is reported, never assumed.
+                #[test]
+                fn a_backend_that_cannot_fade_hard_stops_and_one_without_stop_is_reported() {
+                    for (backend, audio, error) in [
+                        (
+                            Backend::HardOnly,
+                            Some(AudioStopOutcome::HardStopped),
+                            false,
+                        ),
+                        (Backend::NoStop, Some(AudioStopOutcome::Unsupported), false),
+                        (Backend::Failing, None, true),
+                    ] {
+                        let mut rig = rig(backend, Some(BargeInConfig { fade_ms: 100 }));
+                        speak(&mut rig.app, 0, &json!({"duration_ms": 8_000}));
+                        vad_edge(&mut rig.app, &start_edge(1_000), 1_000);
+                        rig.app.note_speech_feed_heartbeat(1_400);
+                        let record = rig.app.service_barge_in(1_400).expect("confirmed");
+                        // The scheduler cancelled the performance and the
+                        // avatar went neutral whatever the audio backend did.
+                        assert_eq!(record.effect, BargeInEffect::Stopped);
+                        assert_eq!((record.audio, record.audio_error), (audio, error));
+                        assert_eq!(record.avatar_reset, Some(true));
+                        assert!(!observe(&rig, None)["speaking"].as_bool().expect("bool"));
+                        assert_eq!(rig.app.pending_audio.commands.len(), 0, "pending purged");
+                        let m = rig.app.speech_barge_in_metrics().expect("metrics");
+                        assert_eq!((m.confirmed, m.stopped), (1, 1));
+                        assert_eq!(m.audio_stop_errors, u64::from(error));
+                        assert_eq!(
+                            m.audio_hard_stopped + m.audio_stop_unsupported + m.audio_faded,
+                            u64::from(!error)
+                        );
+                    }
+                }
+
+                /// The run is acted on once however long the user keeps talking.
+                #[test]
+                fn one_speech_run_is_decided_and_executed_once() {
+                    let mut rig = rig(Backend::Fading, Some(BargeInConfig::default()));
+                    speak(&mut rig.app, 0, &json!({"duration_ms": 60_000}));
+                    vad_edge(&mut rig.app, &start_edge(1_000), 1_000);
+                    rig.app.note_speech_feed_heartbeat(1_400);
+                    assert!(rig.app.service_barge_in(1_400).is_some());
+                    // The performer starts again while the same run goes on.
+                    speak(&mut rig.app, 1_500, &json!({"duration_ms": 60_000}));
+                    rig.app.note_speech_feed_heartbeat(2_000);
+                    assert!(rig.app.service_barge_in(2_000).is_none());
+                    assert_eq!(rig.audio.stops.lock().expect("stops").len(), 1);
+                    assert_eq!(rig.app.speech_floor_metrics().expect("m").policy.yielded, 1);
+                    assert!(observe(&rig, None)["speaking"].as_bool().expect("bool"));
+                }
+
+                /// A feed that never reported liveness cannot stop output: the
+                /// stop is the costly-to-reverse action (S1 behaviour: recorded
+                /// only). And without the opt-in nothing is ever executed.
+                #[test]
+                fn no_liveness_report_and_no_opt_in_both_mean_no_stop() {
+                    let mut rig = rig(Backend::Fading, Some(BargeInConfig::default()));
+                    speak(&mut rig.app, 0, &json!({"duration_ms": 8_000}));
+                    vad_edge(&mut rig.app, &start_edge(1_000), 1_000);
+                    // No beat was ever received.
+                    assert!(rig.app.service_barge_in(1_500).is_none());
+
+                    let mut off = self::rig(Backend::Fading, None);
+                    speak(&mut off.app, 0, &json!({"duration_ms": 8_000}));
+                    vad_edge(&mut off.app, &start_edge(1_000), 1_000);
+                    off.app.note_speech_feed_heartbeat(1_500);
+                    assert!(off.app.service_barge_in(1_500).is_none());
+                    assert!(off.audio.stops.lock().expect("stops").is_empty());
+                    assert!(off.app.speech_barge_in_metrics().is_none());
+                }
+
+                #[test]
+                fn configuration_is_validated_and_layered_on_the_floor() {
+                    assert!(BargeInConfig { fade_ms: 150 }.validate().is_ok());
+                    assert!(BargeInConfig { fade_ms: 0 }.validate().is_ok());
+                    assert!(BargeInConfig { fade_ms: 151 }.validate().is_err());
+                    let no_floor = conversation_app(
+                        None,
+                        SecurityRuntimeConfig::default(),
+                        IngressPolicy::default(),
+                    );
+                    assert!(no_floor.with_barge_in(BargeInConfig::default()).is_err());
+                    let too_long = floor_app(
+                        Some(FloorConfig::default()),
+                        SpeechConversationConfig::default(),
+                        true,
+                    );
+                    assert!(
+                        too_long
+                            .with_barge_in(BargeInConfig { fade_ms: 151 })
+                            .is_err()
+                    );
+                }
             }
 
             /// The policy reads the same pseudonymous id the VAD uses; another

@@ -1,0 +1,43 @@
+{
+  "schema_version": "0.1.0",
+  "name": "a confirmed barge-in is untrusted conversation-priority speech: it cannot cancel a better-ranked performance (here a high-priority interaction), exactly as it could not preempt it through schedule; the decision is recorded, nothing is stopped and the avatar is untouched (ADR-0005 S-3, S-7; #81 S2)",
+  "language": "ja",
+  "backend": "fading",
+  "barge_in": { "fade_ms": 120 },
+  "steps": [
+    { "now_ms": 0, "speak": { "duration_ms": 8000, "priority": "high_priority_interaction" } },
+    {
+      "now_ms": 1000,
+      "beat": true,
+      "vad": [{ "speaker_id": "mic-local", "edge": "start", "observed_at_ms": 1000 }]
+    },
+    {
+      "now_ms": 1400,
+      "beat": true,
+      "service": true,
+      "expect": {
+        "record": {
+          "effect": "NothingToStop",
+          "decided_at_ms": 1400,
+          "cancelled_playing": 0,
+          "cancelled_queued": 0,
+          "fade_ms": 120,
+          "audio": null,
+          "audio_error": false,
+          "avatar_reset": null
+        },
+        "audio_stops": [],
+        "avatar_resets": 0,
+        "speaking": true,
+        "pending_audio": 1,
+        "yields_decided": 1
+      }
+    },
+    {
+      "now_ms": 1500,
+      "beat": true,
+      "service": true,
+      "expect": { "record": null, "audio_stops": [], "speaking": true, "yields_decided": 1 }
+    }
+  ]
+}

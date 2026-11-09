@@ -1,0 +1,37 @@
+{
+  "schema_version": "0.1.0",
+  "name": "an audio backend that cannot ramp (an external player process) hard-stops on a confirmed barge-in and reports HardStopped; the scheduler cancellation, the dropped pending commands and the avatar Reset happen all the same (ADR-0005 S-3; #81 S2)",
+  "language": "ja",
+  "backend": "hard_only",
+  "barge_in": { "fade_ms": 120 },
+  "steps": [
+    { "now_ms": 0, "speak": { "duration_ms": 8000 } },
+    {
+      "now_ms": 1000,
+      "beat": true,
+      "vad": [{ "speaker_id": "mic-local", "edge": "start", "observed_at_ms": 1000 }]
+    },
+    {
+      "now_ms": 1400,
+      "beat": true,
+      "service": true,
+      "expect": {
+        "record": {
+          "effect": "Stopped",
+          "decided_at_ms": 1400,
+          "cancelled_playing": 1,
+          "cancelled_queued": 0,
+          "fade_ms": 120,
+          "audio": "hard_stopped",
+          "audio_error": false,
+          "avatar_reset": true
+        },
+        "audio_stops": [120],
+        "avatar_resets": 1,
+        "speaking": false,
+        "pending_audio": 0,
+        "yields_decided": 1
+      }
+    }
+  ]
+}

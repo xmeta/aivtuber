@@ -11,9 +11,10 @@
 //!   silence or any other observation can delay a reply, never trigger one.
 //! * Raw user speech, a fresh partial or a stale feed never yields
 //!   `TakeTurn`.
-//! * The policy cancels and dispatches nothing. `Yield` is a recommendation
-//!   that S1 records; the scheduler stays the only owner of cancellation, and
-//!   operator emergency control does not pass through here.
+//! * The policy cancels and dispatches nothing. `Yield` is a recommendation;
+//!   the app executes a confirmed one (S2) through the scheduler's cancel
+//!   path, which stays the only owner of cancellation, and operator
+//!   emergency control does not pass through here.
 
 use aivtuber_domain::{
     DomainValidationError, FallbackTurnSignal, FloorAction, FloorConfig, FloorDecision,

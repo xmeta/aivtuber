@@ -571,6 +571,7 @@ fn run_clock_probe(args: &Args, interval_ms: u64, timeline: &Timeline, emitter: 
         };
         start = !start;
         emitter.emit(&[edge], |_| timeline.runtime_ms(local));
+        emitter.beat();
         std::thread::sleep(Duration::from_millis(interval_ms));
     }
 }

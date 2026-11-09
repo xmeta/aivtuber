@@ -424,6 +424,66 @@ fn a_later_sync_moves_the_timeline_and_the_sidecar_exits_when_stdin_closes() {
     assert!(status.success());
 }
 
+/// Issue #81 S2: the feed-liveness beat is opt-in, bounded, written next to
+/// the unchanged edge lines, and never present without the flag.
+#[test]
+fn the_feed_heartbeat_is_opt_in_and_sits_next_to_unchanged_edges() {
+    use aivtuber_adapters::speech_vad::parse_feed_heartbeat_line;
+    let collect = |extra: &[&str]| {
+        let mut args = vec!["--clock", "local", "--duration-secs", "1"];
+        args.extend_from_slice(extra);
+        let probe = spawn_probe(&args);
+        let mut lines = Vec::new();
+        while let Ok((_, line)) = probe.lines.recv_timeout(Duration::from_secs(5)) {
+            lines.push(line);
+        }
+        lines
+    };
+    let off = collect(&[]);
+    assert!(!off.is_empty());
+    assert!(
+        off.iter()
+            .all(|line| parse_feed_heartbeat_line(line.as_bytes()).is_none())
+    );
+
+    let on = collect(&["--feed-heartbeat-ms", "20"]);
+    let beats: Vec<u64> = on
+        .iter()
+        .filter_map(|line| parse_feed_heartbeat_line(line.as_bytes()))
+        .collect();
+    assert!(beats.len() >= 5, "{beats:?}");
+    assert!(
+        beats.windows(2).all(|pair| pair[1] > pair[0]),
+        "sequence numbers rise: {beats:?}"
+    );
+    // Everything that is not a beat is still a valid observation batch.
+    let batches = on
+        .iter()
+        .filter(|line| parse_feed_heartbeat_line(line.as_bytes()).is_none())
+        .count();
+    assert!(batches >= 5);
+    for line in on
+        .iter()
+        .filter(|line| parse_feed_heartbeat_line(line.as_bytes()).is_none())
+    {
+        SpeechObservationBatch::from_json_bytes(line.as_bytes()).expect("valid batch");
+    }
+}
+
+#[test]
+fn a_heartbeat_interval_out_of_range_is_refused() {
+    for bad in ["5", "1001", "x"] {
+        let status = Command::new(SIDECAR)
+            .args(["--language", "ja", "--feed-heartbeat-ms", bad])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run");
+        assert!(!status.success(), "{bad}");
+    }
+}
+
 #[test]
 fn without_a_clock_sync_the_sidecar_refuses_to_stamp_and_exits() {
     let mut child = Command::new(SIDECAR)
