@@ -19,6 +19,7 @@ mod shadow;
 mod shadow_evidence;
 mod shadow_orchestrator;
 mod speech_conversation;
+mod speech_floor;
 mod speech_sidecar;
 mod support_bundle;
 mod task_plane;
@@ -44,6 +45,7 @@ pub use shadow::*;
 pub use shadow_evidence::*;
 pub use shadow_orchestrator::*;
 pub use speech_conversation::{SpeechConversationConfig, SpeechConversationMetrics};
+pub use speech_floor::SpeechFloorMetrics;
 pub use speech_sidecar::*;
 pub use support_bundle::*;
 pub use task_plane::*;
@@ -852,6 +854,7 @@ where
     speech_observations: Option<SpeechObservationTracker>,
     speech_transcripts: Option<SpeechTranscriptTracker>,
     speech_conversation: Option<speech_conversation::SpeechConversation>,
+    speech_floor: Option<speech_floor::SpeechFloor>,
     audio: Box<dyn AudioOutput>,
     avatar: Box<dyn AvatarOutput>,
     stream: Box<dyn StreamOutput>,
@@ -904,6 +907,7 @@ where
             speech_observations: None,
             speech_transcripts: None,
             speech_conversation: None,
+            speech_floor: None,
             audio,
             avatar,
             stream,
@@ -1035,6 +1039,35 @@ where
         Ok(self)
     }
 
+    /// Opt in to the deterministic conversational-floor gate (#81 S1) for
+    /// spoken finals. Off by default; without it (or without a conversation
+    /// route) finals are routed exactly as before. With it, a final waits while
+    /// the user holds the floor, bounded in count and age. The gate touches no
+    /// scheduler, output or operator path.
+    pub fn with_speech_floor(
+        mut self,
+        config: aivtuber_domain::FloorConfig,
+    ) -> Result<Self, AppError> {
+        self.speech_floor = Some(
+            speech_floor::SpeechFloor::new(config)
+                .map_err(|error| AppError::Routing(error.to_string()))?,
+        );
+        Ok(self)
+    }
+
+    /// Floor gate counters; `None` when not enabled.
+    pub fn speech_floor_metrics(&self) -> Option<SpeechFloorMetrics> {
+        self.speech_floor.as_ref().map(|f| f.metrics())
+    }
+
+    /// Bounded recent floor decisions (oldest first); empty when not enabled.
+    pub fn speech_floor_decisions(&self) -> Vec<aivtuber_domain::FloorDecision> {
+        self.speech_floor
+            .as_ref()
+            .map(|f| f.recent())
+            .unwrap_or_default()
+    }
+
     /// Counters for the speech-to-conversation route; `None` when not enabled.
     pub fn speech_conversation_metrics(&self) -> Option<SpeechConversationMetrics> {
         self.speech_conversation.as_ref().map(|c| c.metrics())
@@ -1053,7 +1086,43 @@ where
             let _ = tracker.take_finals(16);
             return Vec::new();
         };
-        let finals = tracker.take_finals(conversation.config().max_finals_per_tick);
+        let max_finals = conversation.config().max_finals_per_tick;
+        let mut finals = tracker.take_finals(max_finals);
+        if let Some(floor) = self.speech_floor.as_mut() {
+            // Evidence enters only here, from the trackers and the scheduler's
+            // own playing state. Missing evidence degrades to the text-only
+            // path inside the policy, i.e. to the unchanged behaviour.
+            let own = if self.performer.scheduler().playing().is_some() {
+                aivtuber_domain::OwnSpeech::Speaking
+            } else {
+                aivtuber_domain::OwnSpeech::Idle
+            };
+            let observations = self.speech_observations.as_ref();
+            let transcripts: &SpeechTranscriptTracker = tracker;
+            finals = floor.admit(at_ms, finals, max_finals, |speaker| {
+                aivtuber_domain::FloorInput {
+                    now_ms: at_ms,
+                    user: observations
+                        .and_then(|tracker| tracker.view(speaker, at_ms))
+                        .map(|view| aivtuber_domain::UserSpeechEvidence {
+                            signal: view.fallback,
+                            last_edge_ms: view.last_edge_ms,
+                            feed_age_ms: None,
+                        }),
+                    hold: match transcripts.floor_hold(speaker, at_ms) {
+                        aivtuber_runtime::FloorHold::None => aivtuber_domain::TranscriptHold::None,
+                        aivtuber_runtime::FloorHold::Holding { .. } => {
+                            aivtuber_domain::TranscriptHold::Holding
+                        }
+                        aivtuber_runtime::FloorHold::Stale { .. } => {
+                            aivtuber_domain::TranscriptHold::Stale
+                        }
+                    },
+                    own,
+                    reply_waiting: true,
+                }
+            });
+        }
         let events: Vec<(EventEnvelope, u64)> = finals
             .iter()
             .filter_map(|spoken| {
@@ -6607,6 +6676,318 @@ mod tests {
             let metrics = app.speech_conversation_metrics().expect("metrics");
             assert_eq!((metrics.finals_seen, metrics.dropped_blank), (1, 1));
             assert_eq!(app.security().content_len(), 0);
+        }
+
+        /// Issue #81 S1: the deterministic floor gate in front of spoken
+        /// finals. Fixtures and unit tests only: no microphone, model or
+        /// network, and logical time throughout.
+        mod speech_floor_tests {
+            use super::*;
+            use aivtuber_domain::FloorConfig;
+            use aivtuber_runtime::{SpeechObservationConfig, SpeechObservationTracker};
+
+            fn floor_app(
+                floor: Option<FloorConfig>,
+                conversation: SpeechConversationConfig,
+                vad_tracker: bool,
+            ) -> ProductionApp<ReflexRoutePlanner<FixedEmbedding>> {
+                let mut app = conversation_app(
+                    Some(conversation),
+                    SecurityRuntimeConfig::default(),
+                    IngressPolicy::default(),
+                );
+                if vad_tracker {
+                    app = app.with_speech_observations(
+                        SpeechObservationTracker::new(
+                            SpeechObservationConfig::default(),
+                            IngressPolicy::default(),
+                        )
+                        .expect("vad tracker"),
+                    );
+                }
+                if let Some(floor) = floor {
+                    app = app.with_speech_floor(floor).expect("floor");
+                }
+                app
+            }
+
+            fn vad_edge(
+                app: &mut ProductionApp<ReflexRoutePlanner<FixedEmbedding>>,
+                edges: &[serde_json::Value],
+                now_ms: u64,
+            ) {
+                let bytes = serde_json::to_vec(&json!({
+                    "schema_version": "0.1.0",
+                    "provider_id": "silero-vad",
+                    "provider_version": "6.2.3",
+                    "language": "ja",
+                    "observations": edges.iter().map(|edge| json!({
+                        "kind": "speech_activity",
+                        "speaker_id": edge["speaker_id"],
+                        "edge": edge["edge"],
+                        "observed_at_ms": edge["observed_at_ms"],
+                    })).collect::<Vec<_>>(),
+                }))
+                .expect("json");
+                app.speech_observations_mut()
+                    .expect("vad tracker")
+                    .ingest_bytes(&bytes, now_ms)
+                    .expect("vad batch");
+            }
+
+            fn floor_config(value: &serde_json::Value) -> FloorConfig {
+                let defaults = FloorConfig::default();
+                FloorConfig {
+                    take_turn_silence_ms: value["take_turn_silence_ms"]
+                        .as_u64()
+                        .unwrap_or(defaults.take_turn_silence_ms),
+                    max_defer_ms: value["max_defer_ms"]
+                        .as_u64()
+                        .unwrap_or(defaults.max_defer_ms),
+                    max_deferred: value["max_deferred"]
+                        .as_u64()
+                        .map_or(defaults.max_deferred, |v| v as usize),
+                    ..defaults
+                }
+            }
+
+            /// Returns everything observable, so a second run can be compared.
+            fn run_floor_fixture(fixture: &serde_json::Value) -> serde_json::Value {
+                let defaults = SpeechConversationConfig::default();
+                let conversation = SpeechConversationConfig {
+                    max_finals_per_tick: fixture["conversation"]["max_finals_per_tick"]
+                        .as_u64()
+                        .map_or(defaults.max_finals_per_tick, |v| v as usize),
+                    ..defaults
+                };
+                let mut app = floor_app(
+                    Some(floor_config(&fixture["floor"])),
+                    conversation,
+                    fixture["vad_tracker"] != false,
+                );
+                let language = fixture["language"].as_str().expect("language");
+                let mut observed = Vec::new();
+                let mut seed = 0_u64;
+                for step in fixture["steps"].as_array().expect("steps") {
+                    let now_ms = step["now_ms"].as_u64().expect("now_ms");
+                    if let Some(edges) = step.get("vad") {
+                        vad_edge(&mut app, edges.as_array().expect("edges"), now_ms);
+                    }
+                    if let Some(transcripts) = step.get("transcripts") {
+                        let bytes = batch_bytes(language, transcripts.as_array().expect("array"));
+                        app.speech_transcripts_mut()
+                            .expect("tracker")
+                            .ingest_bytes(&bytes, now_ms)
+                            .expect("batch");
+                    }
+                    if step["route"] != true {
+                        continue;
+                    }
+                    seed += 16;
+                    let mut events = Vec::new();
+                    for report in app.route_spoken_finals(now_ms, seed) {
+                        assert_untrusted_speech_envelope(&report.event);
+                        let outcome = report.result.expect("routing");
+                        events.push(json!({
+                            "event_id": report.event.event_id,
+                            "observed_at": report.event.observed_at,
+                            "actor_id": report.event.actor_id,
+                            "text": report.event.payload["text"],
+                            "admission": format!("{:?}", outcome.admission),
+                            "playback": outcome.playback.map(|p| p.asset_id),
+                        }));
+                    }
+                    assert_eq!(&json!(events), &step["expect"], "events at {now_ms} ms");
+                    let m = app.speech_floor_metrics().expect("floor metrics");
+                    let metrics = json!({
+                        "deferred": m.deferred,
+                        "released_after_deferral": m.released_after_deferral,
+                        "dropped_expired": m.dropped_expired,
+                        "dropped_overflow": m.dropped_overflow,
+                        "queued": m.queued,
+                    });
+                    if let Some(expected) = step.get("expect_floor") {
+                        assert_eq!(&metrics, expected, "floor metrics at {now_ms} ms");
+                    }
+                    let last = app.speech_floor_decisions().last().copied();
+                    if let Some(expected) = step.get("expect_decision") {
+                        let last = last.expect("a decision was recorded");
+                        assert_eq!(
+                            &json!({"action": last.action.name(), "reason": last.reason.name()}),
+                            expected,
+                            "decision at {now_ms} ms"
+                        );
+                    }
+                    observed.push(json!({"events": events, "floor": metrics, "decision": last}));
+                }
+                json!({"steps": observed, "decisions": app.speech_floor_decisions()})
+            }
+
+            #[test]
+            fn replay_fixtures_produce_the_expected_floor_behaviour_twice() {
+                let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../examples/speech-floor/replay");
+                let mut count = 0;
+                for entry in fs::read_dir(&dir).expect("fixture dir") {
+                    let path = entry.expect("entry").path();
+                    if path.extension().is_none_or(|ext| ext != "json") {
+                        continue;
+                    }
+                    let fixture: serde_json::Value =
+                        serde_json::from_slice(&fs::read(&path).expect("read")).expect("json");
+                    assert_eq!(fixture["schema_version"], "0.1.0", "{path:?}");
+                    let first = run_floor_fixture(&fixture);
+                    let second = run_floor_fixture(&fixture);
+                    assert_eq!(first, second, "replay must be deterministic: {path:?}");
+                    count += 1;
+                }
+                assert!(count >= 6, "expected the floor fixtures, found {count}");
+            }
+
+            /// Absence of the policy, or of any evidence for it, is the
+            /// pre-#81 behaviour: the same envelope, admission and playback.
+            #[test]
+            fn absent_policy_and_absent_evidence_degrade_to_the_current_behaviour() {
+                fn run(
+                    floor: Option<FloorConfig>,
+                    vad_tracker: bool,
+                ) -> Vec<(String, String, Option<String>)> {
+                    let mut app =
+                        floor_app(floor, SpeechConversationConfig::default(), vad_tracker);
+                    ingest_final(&mut app, "mic-local", 1, "こんにちは", 900, 1_000);
+                    app.route_spoken_finals(1_000, 0)
+                        .into_iter()
+                        .map(|report| {
+                            let outcome = report.result.expect("routing");
+                            (
+                                report.event.event_id,
+                                format!("{:?}", outcome.admission),
+                                outcome.playback.map(|p| p.asset_id),
+                            )
+                        })
+                        .collect()
+                }
+                let baseline = run(None, false);
+                assert_eq!(baseline.len(), 1);
+                assert_eq!(run(Some(FloorConfig::default()), false), baseline);
+                // A VAD tracker that has never heard this speaker is no evidence either.
+                assert_eq!(run(Some(FloorConfig::default()), true), baseline);
+            }
+
+            /// A deferred reply never freezes the performer, and operator
+            /// emergency control is independent of the floor path: it works
+            /// with the floor holding and saturated, and records nothing there.
+            #[test]
+            fn a_held_floor_neither_freezes_the_performer_nor_gates_operator_stop() {
+                let mut app = floor_app(
+                    Some(FloorConfig {
+                        max_deferred: 1,
+                        ..FloorConfig::default()
+                    }),
+                    SpeechConversationConfig::default(),
+                    true,
+                );
+                vad_edge(
+                    &mut app,
+                    &[json!({"speaker_id": "mic-local", "edge": "start", "observed_at_ms": 1_000})],
+                    1_000,
+                );
+                for segment in 1..=3_u64 {
+                    ingest_final(&mut app, "mic-local", segment, "待って", 1_000, 1_000);
+                }
+                assert!(app.route_spoken_finals(1_000, 0).is_empty());
+                let held = app.speech_floor_metrics().expect("metrics");
+                assert_eq!((held.queued, held.dropped_overflow), (1, 2));
+
+                // The deterministic performer keeps ticking and the unrelated
+                // content path still works while the speech floor is held.
+                app.tick(1_100);
+                app.tick(1_200);
+                let raw = serde_json::to_vec(&chat_event(77)).expect("chat json");
+                let outcome = app.process_content_bytes(&raw, 1_300, 9).expect("chat");
+                assert_eq!(outcome.admission, ContentAdmitDecision::Queued);
+
+                let before = app.speech_floor_metrics().expect("metrics");
+                let stopped = app
+                    .handle_control(&stop_command(), 1_400)
+                    .expect("authenticated emergency stop");
+                assert!(matches!(stopped, ControlOutcome::Stopped { .. }));
+                assert_eq!(
+                    app.speech_floor_metrics().expect("metrics"),
+                    before,
+                    "the stop did not pass through the floor"
+                );
+            }
+
+            /// The policy reads the same pseudonymous id the VAD uses; another
+            /// speaker's silence does not release a final.
+            #[test]
+            fn evidence_is_per_speaker() {
+                let mut app = floor_app(
+                    Some(FloorConfig::default()),
+                    SpeechConversationConfig::default(),
+                    true,
+                );
+                vad_edge(
+                    &mut app,
+                    &[
+                        json!({"speaker_id": "mic-a", "edge": "start", "observed_at_ms": 1_000}),
+                        json!({"speaker_id": "mic-b", "edge": "start", "observed_at_ms": 1_000}),
+                    ],
+                    1_000,
+                );
+                vad_edge(
+                    &mut app,
+                    &[json!({"speaker_id": "mic-b", "edge": "end", "observed_at_ms": 1_100})],
+                    1_100,
+                );
+                ingest_final(&mut app, "mic-a", 1, "Aです", 1_150, 1_200);
+                ingest_final(&mut app, "mic-b", 1, "Bです", 1_160, 1_200);
+                // mic-b has been silent for 900 ms; mic-a is still speaking.
+                let reports = app.route_spoken_finals(2_000, 0);
+                let texts: Vec<_> = reports
+                    .iter()
+                    .map(|r| {
+                        r.event.payload["text"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned()
+                    })
+                    .collect();
+                assert_eq!(texts, ["Bです"]);
+                let m = app.speech_floor_metrics().expect("metrics");
+                assert_eq!((m.deferred, m.released_after_deferral, m.queued), (1, 0, 1));
+            }
+
+            #[test]
+            fn bad_config_is_refused_and_no_route_means_no_gating() {
+                let bad = FloorConfig {
+                    max_deferred: 0,
+                    ..FloorConfig::default()
+                };
+                assert!(
+                    conversation_app(
+                        Some(SpeechConversationConfig::default()),
+                        SecurityRuntimeConfig::default(),
+                        IngressPolicy::default()
+                    )
+                    .with_speech_floor(bad)
+                    .is_err()
+                );
+                // Without the conversation route finals are drained as before.
+                let mut app = conversation_app(
+                    None,
+                    SecurityRuntimeConfig::default(),
+                    IngressPolicy::default(),
+                )
+                .with_speech_floor(FloorConfig::default())
+                .expect("floor");
+                ingest_final(&mut app, "mic-local", 1, "こんにちは", 900, 1_000);
+                assert!(app.route_spoken_finals(1_000, 0).is_empty());
+                assert_eq!(app.speech_transcripts_mut().expect("t").pending_finals(), 0);
+                assert_eq!(app.speech_floor_metrics().expect("m").queued, 0);
+                assert!(app.speech_floor_decisions().is_empty());
+            }
         }
     }
 
