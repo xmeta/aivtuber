@@ -33,7 +33,7 @@ tungstenite = "0.30.0"
 ureq = { version = "3.4", features = ["json"] }
 url = "2.5.8"
 rodio = { version = "0.22.2", default-features = false, features = ["wav"], optional = true }
-rmcp = { version = "3.5.0", default-features = false, features = ["client", "server", "macros", "transport-async-rw"] }
+rmcp = { version = "3.9.0", default-features = false, features = ["client", "server", "macros", "transport-async-rw"] }
 tokio = { version = "1.53.1", features = ["sync", "time", "rt", "macros"] }
 tract-onnx = { version = "0.23.10", default-features = false, optional = true }
 hound = { version = "3.5", optional = true }
@@ -47,8 +47,8 @@ rodio = { version = "0.22.2", default-features = false, features = ["wav", "play
 
 [dev-dependencies]
 aivtuber-scheduler = { path = "../scheduler" }
-rig-core = { version = "0.43.0", default-features = false }
-rig-rmcp = { version = "0.43.0", default-features = false }
+rig-core = { version = "0.45.0", default-features = false }
+rig-rmcp = { version = "0.45.0", default-features = false }
 tokio = { version = "1.53.1", features = ["rt", "macros", "time", "io-util"] }
 
 [[bin]]
