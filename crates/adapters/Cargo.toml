@@ -30,6 +30,9 @@ sherpa-tts = ["dep:sherpa-onnx"]
 aivtuber-domain = { path = "../domain" }
 base64 = "0.23.1"
 getrandom = "0.4.3"
+# Request-head parsing for the local TTS sidecar server (#220 S2b): already in
+# Cargo.lock through tungstenite; pinned to that exact version.
+httparse = "=1.10.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11.0"

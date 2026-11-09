@@ -459,26 +459,51 @@ fn find_head_end(buffer: &[u8]) -> Option<usize> {
 }
 
 fn parse_head(text: &str) -> Result<Head, HttpError> {
-    let mut lines = text.split("\r\n");
-    let request_line = lines.next().unwrap_or_default();
-    let mut parts = request_line.split(' ');
-    let (Some(method), Some(path), Some(version), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return Err(HttpError(400, "bad_request", "malformed request line"));
-    };
-    if version != "HTTP/1.1" && version != "HTTP/1.0" {
-        return Err(HttpError(400, "bad_request", "unsupported HTTP version"));
+    // httparse owns the request-line and header grammar: it rejects obsolete
+    // line folding, bare CR/LF, spaces in names and control characters in
+    // values. The head was already cut at the blank line and bounded by
+    // MAX_HEADER_BYTES; the array bounds the header count.
+    // httparse accepts a bare LF as a line end; this server does not, so one
+    // header value cannot smuggle a second header past a proxy that disagrees.
+    let head_bytes = text.as_bytes();
+    let bare = head_bytes.iter().enumerate().any(|(i, b)| match b {
+        b'\n' => i == 0 || head_bytes[i - 1] != b'\r',
+        b'\r' => head_bytes.get(i + 1) != Some(&b'\n'),
+        _ => false,
+    });
+    if bare {
+        return Err(HttpError(
+            400,
+            "bad_request",
+            "bare CR or LF in the request head",
+        ));
     }
-    let mut headers = Vec::new();
-    for line in lines {
-        if headers.len() >= MAX_HEADER_LINES {
+    let mut bytes = head_bytes.to_vec();
+    bytes.extend_from_slice(b"\r\n\r\n");
+    let mut storage = [httparse::EMPTY_HEADER; MAX_HEADER_LINES];
+    let mut request = httparse::Request::new(&mut storage);
+    match request.parse(&bytes) {
+        Ok(httparse::Status::Complete(_)) => {}
+        Ok(httparse::Status::Partial) => {
+            return Err(HttpError(
+                431,
+                "headers_too_large",
+                "request head incomplete",
+            ));
+        }
+        Err(httparse::Error::TooManyHeaders) => {
             return Err(HttpError(431, "headers_too_large", "too many header lines"));
         }
-        let Some((name, value)) = line.split_once(':') else {
-            return Err(HttpError(400, "bad_request", "malformed header line"));
-        };
-        headers.push((name.trim().to_ascii_lowercase(), value.trim().to_owned()));
+        Err(_) => return Err(HttpError(400, "bad_request", "malformed request head")),
+    }
+    let (Some(method), Some(path)) = (request.method, request.path) else {
+        return Err(HttpError(400, "bad_request", "malformed request line"));
+    };
+    let mut headers = Vec::new();
+    for header in request.headers.iter() {
+        let value = std::str::from_utf8(header.value)
+            .map_err(|_| HttpError(400, "bad_request", "header value is not UTF-8"))?;
+        headers.push((header.name.to_ascii_lowercase(), value.trim().to_owned()));
     }
     Ok(Head {
         method: method.to_owned(),
@@ -1324,6 +1349,48 @@ mod tests {
         let mut response = String::new();
         let _ = stream.read_to_string(&mut response);
         assert!(response.starts_with("HTTP/1.1 408"), "{response}");
+        server.stop();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn header_injection_and_obsolete_line_folding_are_refused() {
+        let root = scratch("inject");
+        let server = start(config(&root), ToneSynthesizer::default());
+        let addr = server.local_addr();
+        let body = ok_body("a");
+        let base = format!("POST {DEFAULT_PATH} HTTP/1.1\r\nHost: {addr}\r\n");
+        let tail = format!("Content-Length: {}\r\n\r\n{body}", body.len());
+        for (name, middle) in [
+            (
+                "obsolete line folding",
+                "Content-Type: application/json\r\n  folded\r\n",
+            ),
+            (
+                "bare LF in a value",
+                "Content-Type: application/json\nX-Injected: 1\r\n",
+            ),
+            (
+                "NUL in a value",
+                "X-A: a\0b\r\nContent-Type: application/json\r\n",
+            ),
+            (
+                "space in a header name",
+                "Content Type: application/json\r\n",
+            ),
+            (
+                "header without a colon",
+                "Content-Type application/json\r\n",
+            ),
+        ] {
+            let reply = raw(addr, format!("{base}{middle}{tail}").as_bytes());
+            assert_eq!(reply.status, 400, "{name}");
+        }
+        let line = raw(
+            addr,
+            format!("POST  {DEFAULT_PATH}  HTTP/1.1\r\n\r\n").as_bytes(),
+        );
+        assert_eq!(line.status, 400);
         server.stop();
         let _ = fs::remove_dir_all(&root);
     }
