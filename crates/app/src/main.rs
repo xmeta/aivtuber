@@ -12,8 +12,9 @@ use aivtuber_app::{
     NoopStreamOutput, ObsStreamOutput, OperatorControlServer, OperatorRateLimiter, ProductionApp,
     ProfileSummary, RawIngressConfig, RawIngressMetrics, RawIngressMetricsSnapshot, RoutePlanner,
     RuntimeRetentionPolicy, SHADOW_ORCHESTRATOR_SCHEMA_VERSION, ShadowOrchestratorConfig,
-    ShadowPolicyIdentity, ShadowingRoutePlanner, SpeechSidecar, SpeechSidecarConfig,
-    SpeechSidecarStats, StreamOutput, VtsAvatarOutput, VtsPlaybackConfig, apply_dispatched_request,
+    ShadowPolicyIdentity, ShadowingRoutePlanner, SpeechConversationConfig,
+    SpeechConversationMetrics, SpeechSidecar, SpeechSidecarConfig, SpeechSidecarStats,
+    StreamOutput, VtsAvatarOutput, VtsPlaybackConfig, apply_dispatched_request,
     pump_bounded_records, stt_sidecar_args,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
@@ -318,6 +319,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     // path); a sidecar that cannot start or later fails degrades to no speech
     // observations and never blocks this loop.
     let mut speech_sidecar: Option<SpeechSidecar> = None;
+    let mut speech_conversation_enabled = false;
+    let mut last_conversation_metrics = SpeechConversationMetrics::default();
     if let Some(program) = env_optional("AIVTUBER_SPEECH_SIDECAR") {
         let mut tracker = SpeechObservationTracker::new(
             SpeechObservationConfig::default(),
@@ -370,6 +373,37 @@ fn run() -> Result<(), Box<dyn Error>> {
                     env_optional("AIVTUBER_INGRESS_SOURCE_CLASSES").as_deref(),
                 )?,
             )?);
+            // Issue #92 S3c: route spoken finals into the conversation input.
+            // Off unless AIVTUBER_SPEECH_CONVERSATION is true. A final then
+            // takes the same normalizer path as chat (untrusted `speech`
+            // content, the ingress ceiling and rate limit apply).
+            if env_bool("AIVTUBER_SPEECH_CONVERSATION", false)? {
+                let defaults = SpeechConversationConfig::default();
+                let conversation = SpeechConversationConfig {
+                    max_finals_per_tick: usize::try_from(env_u64(
+                        "AIVTUBER_SPEECH_CONVERSATION_MAX_FINALS_PER_TICK",
+                        defaults.max_finals_per_tick as u64,
+                    )?)
+                    .unwrap_or(usize::MAX),
+                    max_text_chars: usize::try_from(env_u64(
+                        "AIVTUBER_SPEECH_CONVERSATION_MAX_TEXT_CHARS",
+                        defaults.max_text_chars as u64,
+                    )?)
+                    .unwrap_or(usize::MAX),
+                };
+                app = app.with_speech_conversation(conversation)?;
+                speech_conversation_enabled = true;
+                eprintln!(
+                    "speech_conversation: enabled max_finals_per_tick={} max_text_chars={}",
+                    conversation.max_finals_per_tick, conversation.max_text_chars
+                );
+            }
+        } else if env_bool("AIVTUBER_SPEECH_CONVERSATION", false)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "AIVTUBER_SPEECH_CONVERSATION requires AIVTUBER_SPEECH_STT_WORKER",
+            )
+            .into());
         }
         let mut config = SpeechSidecarConfig::new(program, sidecar_args);
         config.resync_interval =
@@ -453,15 +487,41 @@ fn run() -> Result<(), Box<dyn Error>> {
         {
             sidecar.poll_with_transcripts(tracker, transcripts, now_ms, |_, _| {}, |_, _| {});
         }
-        // Finals are the only transcript text that leaves the tracker. Routing
-        // them through the normalizer into Reflex needs the ADR-0004 text
-        // projection and is the next slice; until then they are drained so the
-        // bounded queue never wedges, and only their length is logged (what a
-        // person said is never written to a log).
-        if let Some(tracker) = app.speech_transcripts_mut() {
+        // Finals are the only transcript text that leaves the tracker. With
+        // AIVTUBER_SPEECH_CONVERSATION they go through process_content_bytes
+        // (the chat path); otherwise they are drained so the bounded queue
+        // never wedges. Only lengths are logged (what a person said is never
+        // written to a log). Partials only ever hold the floor.
+        if speech_conversation_enabled {
+            sequence_seed = sequence_seed.saturating_add(16);
+            for report in app.route_spoken_finals(now_ms, sequence_seed) {
+                let chars = report
+                    .event
+                    .payload
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .map_or(0, |text| text.chars().count());
+                match &report.result {
+                    Ok(outcome) => eprintln!(
+                        "speech_conversation: final chars={chars} final_age_ms={} route_micros={} admission={:?} playback={}",
+                        report.final_age_ms,
+                        report.route_micros,
+                        outcome.admission,
+                        outcome
+                            .playback
+                            .as_ref()
+                            .map(|value| value.asset_id.as_str())
+                            .unwrap_or("none")
+                    ),
+                    Err(error) => {
+                        eprintln!("speech_conversation: final chars={chars} rejected: {error}")
+                    }
+                }
+            }
+        } else if let Some(tracker) = app.speech_transcripts_mut() {
             for utterance in tracker.take_finals(16) {
                 eprintln!(
-                    "speech_transcript: final segment={} chars={} (not yet routed to the normalizer)",
+                    "speech_transcript: final segment={} chars={} (conversation routing off)",
                     utterance.segment_id,
                     utterance.text.chars().count()
                 );
@@ -491,6 +551,20 @@ fn run() -> Result<(), Box<dyn Error>> {
                     );
                     last_speech_stats = stats;
                 }
+            }
+            if let Some(metrics) = app.speech_conversation_metrics()
+                && metrics != last_conversation_metrics
+            {
+                eprintln!(
+                    "speech_conversation_metrics: finals={} admitted={} dropped_oversize={} dropped_blank={} dropped_by_runtime={} route_errors={}",
+                    metrics.finals_seen,
+                    metrics.admitted,
+                    metrics.dropped_oversize,
+                    metrics.dropped_blank,
+                    metrics.dropped_by_runtime,
+                    metrics.route_errors
+                );
+                last_conversation_metrics = metrics;
             }
             report_raw_ingress_metrics(&raw_ingress_metrics, &mut last_raw_ingress_metrics, false);
             next_maintenance_ms = now_ms.saturating_add(1_000);
