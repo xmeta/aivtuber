@@ -6171,7 +6171,16 @@ mod tests {
 
         app.tick(playback.plan.end_at_ms().saturating_add(100));
         assert_eq!(audio_log.lock().expect("audio log").len(), audio_before);
-        assert_eq!(avatar_log.lock().expect("avatar log").len(), avatar_before);
+        // The only avatar command after the stop is the operator's neutral
+        // reset (#277); none of the cancelled generation's commands dispatch.
+        {
+            let avatar_log = avatar_log.lock().expect("avatar log");
+            assert_eq!(avatar_log.len(), avatar_before + 1);
+            assert!(matches!(
+                avatar_log.last(),
+                Some(AvatarPlaybackCommand::Reset { .. })
+            ));
+        }
         // With bounded-state separation (#52) the stopped item retired into
         // history; assert via the history view instead of the live items.
         let stopped_item = app
