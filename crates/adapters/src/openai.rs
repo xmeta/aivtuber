@@ -5,8 +5,156 @@ use aivtuber_domain::{
 };
 use serde_json::{Value, json};
 use std::fmt;
+use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// How the Thinking endpoint is authenticated (issue #220 S1).
+///
+/// A remote credential is the default. The unauthenticated variant carries no
+/// secret at all: no placeholder key exists in adapter or domain state, and no
+/// `Authorization` header is ever built for it. It is only usable against a
+/// verified loopback endpoint (see
+/// [`OpenAiResponsesAdapter::with_authentication_and_transport`]), so a reviewed
+/// local inference server can run without weakening remote-provider security.
+#[derive(Clone)]
+pub enum ThinkingAuthentication {
+    /// Send `Authorization: Bearer <key>`; the key must be non-empty.
+    Bearer(SecretString),
+    /// Send no credential. Refused unless the endpoint is loopback.
+    UnauthenticatedLoopback,
+}
+
+impl fmt::Debug for ThinkingAuthentication {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bearer(_) => f.write_str("Bearer([REDACTED])"),
+            Self::UnauthenticatedLoopback => f.write_str("UnauthenticatedLoopback"),
+        }
+    }
+}
+
+impl ThinkingAuthentication {
+    /// Stable label for startup/audit output (never contains a secret).
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Bearer(_) => "bearer",
+            Self::UnauthenticatedLoopback => "unauthenticated-loopback",
+        }
+    }
+
+    /// Resolve the operator's explicit policy value and credential into a
+    /// typed authentication choice.
+    ///
+    /// * `None`/`"bearer"` requires a non-empty credential (today's behavior).
+    /// * `"unauthenticated-loopback"` must be spelled out and must not be
+    ///   combined with a credential, because the credential would be silently
+    ///   ignored.
+    pub fn from_policy(policy: Option<&str>, api_key: Option<String>) -> Result<Self, EngineError> {
+        let api_key = api_key.filter(|key| !key.trim().is_empty());
+        match policy
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            None | Some("") | Some("bearer") => api_key
+                .map(|key| Self::Bearer(SecretString::new(key)))
+                .ok_or_else(|| {
+                    EngineError::new(
+                        EngineErrorKind::Authentication,
+                        "Thinking endpoint requires an API key; set AIVTUBER_OPENAI_API_KEY, or \
+                         explicitly set AIVTUBER_OPENAI_AUTH=unauthenticated-loopback for a \
+                         loopback-only endpoint",
+                    )
+                }),
+            Some("unauthenticated-loopback") => {
+                if api_key.is_some() {
+                    return Err(EngineError::new(
+                        EngineErrorKind::Authentication,
+                        "AIVTUBER_OPENAI_AUTH=unauthenticated-loopback must not be combined with \
+                         AIVTUBER_OPENAI_API_KEY; the key would be silently ignored",
+                    ));
+                }
+                Ok(Self::UnauthenticatedLoopback)
+            }
+            Some(other) => Err(EngineError::new(
+                EngineErrorKind::InvalidRequest,
+                format!(
+                    "AIVTUBER_OPENAI_AUTH must be bearer or unauthenticated-loopback (got {other:?})"
+                ),
+            )),
+        }
+    }
+}
+
+/// Resolves a host name for the loopback check. Injectable so the negative
+/// "name resolves to a non-loopback address" case is testable without DNS.
+pub trait HostResolver: Send + Sync {
+    fn resolve(&self, host: &str, port: u16) -> std::io::Result<Vec<IpAddr>>;
+}
+
+/// Resolver backed by the operating system.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemHostResolver;
+
+impl HostResolver for SystemHostResolver {
+    fn resolve(&self, host: &str, port: u16) -> std::io::Result<Vec<IpAddr>> {
+        Ok((host, port)
+            .to_socket_addrs()?
+            .map(|addr| addr.ip())
+            .collect())
+    }
+}
+
+/// `scheme://host:port` of an endpoint, for non-secret startup/audit output.
+/// Paths and queries are dropped because they can carry tokens.
+pub fn endpoint_origin(endpoint: &str) -> String {
+    match url::Url::parse(endpoint) {
+        Ok(url) => url.origin().ascii_serialization(),
+        Err(_) => "invalid".to_owned(),
+    }
+}
+
+/// Fail closed unless `endpoint` provably targets this machine.
+///
+/// Accepted hosts are IPv4 `127.0.0.0/8`, IPv6 `::1`, and the exact name
+/// `localhost` **resolved** with every returned address loopback. Any other
+/// host name is refused outright, even if it currently resolves to loopback:
+/// a DNS name is an authority the operator does not control.
+pub fn verify_loopback_endpoint(
+    endpoint: &str,
+    resolver: &dyn HostResolver,
+) -> Result<(), EngineError> {
+    let refuse = |reason: &str| {
+        EngineError::new(
+            EngineErrorKind::InvalidRequest,
+            format!("unauthenticated Thinking endpoint refused: {reason}"),
+        )
+    };
+    let url = url::Url::parse(endpoint).map_err(|_| refuse("endpoint is not a valid URL"))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(refuse("endpoint must not embed credentials"));
+    }
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(refuse("endpoint scheme must be http or https"));
+    }
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) if ip.is_loopback() => Ok(()),
+        Some(url::Host::Ipv6(ip)) if ip.is_loopback() => Ok(()),
+        Some(url::Host::Domain("localhost")) => {
+            let port = url.port_or_known_default().unwrap_or(80);
+            let addresses = resolver
+                .resolve("localhost", port)
+                .map_err(|_| refuse("localhost did not resolve"))?;
+            if addresses.is_empty() || addresses.iter().any(|ip| !ip.is_loopback()) {
+                return Err(refuse("localhost resolved to a non-loopback address"));
+            }
+            Ok(())
+        }
+        _ => Err(refuse(
+            "host is not loopback (use 127.0.0.1, [::1] or localhost)",
+        )),
+    }
+}
 
 #[derive(Clone)]
 pub struct OpenAiResponsesConfig {
@@ -44,7 +192,9 @@ impl fmt::Debug for OpenAiResponsesConfig {
 #[derive(Clone)]
 pub struct OpenAiResponsesAdapter {
     config: OpenAiResponsesConfig,
-    api_key: Arc<SecretString>,
+    /// `None` only for the explicit unauthenticated loopback policy.
+    api_key: Option<Arc<SecretString>>,
+    backend_name: String,
     transport: Arc<dyn JsonHttpTransport>,
 }
 
@@ -52,10 +202,14 @@ impl fmt::Debug for OpenAiResponsesAdapter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OpenAiResponsesAdapter")
             .field("config", &self.config)
-            .field("api_key", &"[REDACTED]")
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("authentication", &self.authentication_label())
+            .field("backend_name", &self.backend_name)
             .finish()
     }
 }
+
+const DEFAULT_BACKEND_NAME: &str = "openai-compatible-responses";
 
 impl OpenAiResponsesAdapter {
     pub fn new(config: OpenAiResponsesConfig, api_key: SecretString) -> Result<Self, EngineError> {
@@ -67,18 +221,80 @@ impl OpenAiResponsesAdapter {
         api_key: SecretString,
         transport: Arc<dyn JsonHttpTransport>,
     ) -> Result<Self, EngineError> {
+        Self::with_authentication_and_transport(
+            config,
+            ThinkingAuthentication::Bearer(api_key),
+            Arc::new(SystemHostResolver),
+            transport,
+        )
+    }
+
+    /// Construct with an explicit authentication policy (issue #220 S1).
+    pub fn with_authentication(
+        config: OpenAiResponsesConfig,
+        authentication: ThinkingAuthentication,
+    ) -> Result<Self, EngineError> {
+        Self::with_authentication_and_transport(
+            config,
+            authentication,
+            Arc::new(SystemHostResolver),
+            Arc::new(UreqJsonTransport::default()),
+        )
+    }
+
+    /// Full constructor. `UnauthenticatedLoopback` is refused here, at
+    /// construction, unless [`verify_loopback_endpoint`] accepts the endpoint,
+    /// so a non-loopback unauthenticated adapter cannot exist.
+    pub fn with_authentication_and_transport(
+        config: OpenAiResponsesConfig,
+        authentication: ThinkingAuthentication,
+        resolver: Arc<dyn HostResolver>,
+        transport: Arc<dyn JsonHttpTransport>,
+    ) -> Result<Self, EngineError> {
         validate_config(&config)?;
-        if api_key.expose().trim().is_empty() {
-            return Err(EngineError::new(
-                EngineErrorKind::Authentication,
-                "OpenAI-compatible API key must not be empty",
-            ));
-        }
+        let api_key = match authentication {
+            ThinkingAuthentication::Bearer(api_key) => {
+                if api_key.expose().trim().is_empty() {
+                    return Err(EngineError::new(
+                        EngineErrorKind::Authentication,
+                        "OpenAI-compatible API key must not be empty",
+                    ));
+                }
+                Some(Arc::new(api_key))
+            }
+            ThinkingAuthentication::UnauthenticatedLoopback => {
+                verify_loopback_endpoint(&config.endpoint, resolver.as_ref())?;
+                None
+            }
+        };
         Ok(Self {
             config,
-            api_key: Arc::new(api_key),
+            api_key,
+            backend_name: DEFAULT_BACKEND_NAME.to_owned(),
             transport,
         })
+    }
+
+    /// Override the backend name recorded in audit/provenance (for example
+    /// `llama-server`) so a local engine is distinguishable from a remote one.
+    pub fn with_backend_name(mut self, name: impl Into<String>) -> Self {
+        let name = name.into();
+        if !name.trim().is_empty() {
+            self.backend_name = name;
+        }
+        self
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.config.endpoint
+    }
+
+    pub fn authentication_label(&self) -> &'static str {
+        if self.api_key.is_some() {
+            "bearer"
+        } else {
+            "unauthenticated-loopback"
+        }
     }
 
     pub fn generate_sync(&self, request: &ThinkingRequest) -> Result<GeneratedReply, EngineError> {
@@ -109,7 +325,7 @@ impl OpenAiResponsesAdapter {
             .transport
             .post_json(
                 &self.config.endpoint,
-                Some(self.api_key.expose()),
+                self.api_key.as_ref().map(|key| key.expose()),
                 &body,
                 effective_timeout,
             )
@@ -157,7 +373,7 @@ impl ThinkingEngine for OpenAiResponsesAdapter {
 
     fn identity(&self) -> BackendIdentity {
         BackendIdentity {
-            name: "openai-compatible-responses".to_owned(),
+            name: self.backend_name.clone(),
             model_alias: Some(self.config.model_alias.clone()),
             model_version: self.config.model_version.clone(),
         }
@@ -396,5 +612,175 @@ mod tests {
 
         let error = adapter.generate_sync(&request()).expect_err("rate limited");
         assert_eq!(error.kind, EngineErrorKind::RateLimited);
+    }
+
+    struct FixedResolver(Vec<IpAddr>);
+
+    impl HostResolver for FixedResolver {
+        fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<IpAddr>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn loopback_resolver() -> Arc<dyn HostResolver> {
+        Arc::new(FixedResolver(vec![
+            "127.0.0.1".parse().expect("ip"),
+            "::1".parse().expect("ip"),
+        ]))
+    }
+
+    fn unauthenticated(
+        endpoint: &str,
+        resolver: Arc<dyn HostResolver>,
+        transport: &MockHttpTransport,
+    ) -> Result<OpenAiResponsesAdapter, EngineError> {
+        OpenAiResponsesAdapter::with_authentication_and_transport(
+            OpenAiResponsesConfig {
+                endpoint: endpoint.to_owned(),
+                model_alias: "local-model".to_owned(),
+                ..OpenAiResponsesConfig::default()
+            },
+            ThinkingAuthentication::UnauthenticatedLoopback,
+            resolver,
+            Arc::new(transport.clone()),
+        )
+    }
+
+    #[test]
+    fn unauthenticated_mode_is_refused_for_remote_endpoints() {
+        let transport = MockHttpTransport::new(Ok(response("unused")));
+        for endpoint in [
+            "https://api.openai.com/v1/responses",
+            "https://api.example.invalid/v1/responses",
+            "http://192.168.0.5:8080/v1/responses",
+            "http://10.0.0.5:8080/v1/responses",
+            "http://localhost.attacker.invalid/v1/responses",
+            "http://127.0.0.1@attacker.invalid/v1/responses",
+            "https://user:pass@127.0.0.1/v1/responses",
+        ] {
+            let error = unauthenticated(endpoint, loopback_resolver(), &transport).expect_err(
+                &format!("unauthenticated remote endpoint allowed: {endpoint}"),
+            );
+            assert!(
+                matches!(
+                    error.kind,
+                    EngineErrorKind::InvalidRequest | EngineErrorKind::Authentication
+                ),
+                "unexpected error for {endpoint}: {error:?}"
+            );
+        }
+        assert!(transport.requests().is_empty(), "no request may be sent");
+    }
+
+    #[test]
+    fn unauthenticated_mode_refuses_names_that_resolve_off_loopback() {
+        let transport = MockHttpTransport::new(Ok(response("unused")));
+        // `localhost` rewritten by a hosts file or hostile resolver.
+        for resolved in [
+            vec!["10.0.0.5".parse().expect("ip")],
+            vec![
+                "127.0.0.1".parse().expect("ip"),
+                "10.0.0.5".parse().expect("ip"),
+            ],
+            Vec::new(),
+        ] {
+            let error = unauthenticated(
+                "http://localhost:8080/v1/responses",
+                Arc::new(FixedResolver(resolved)),
+                &transport,
+            )
+            .expect_err("localhost resolving off loopback must be refused");
+            assert_eq!(error.kind, EngineErrorKind::InvalidRequest);
+        }
+        // A non-`localhost` name is refused even when it resolves to loopback.
+        let error = unauthenticated(
+            "https://llm.internal.example:8080/v1/responses",
+            loopback_resolver(),
+            &transport,
+        )
+        .expect_err("arbitrary DNS names are not loopback authorities");
+        assert!(error.message.contains("not loopback"));
+    }
+
+    #[test]
+    fn missing_key_without_explicit_unauthenticated_policy_is_refused() {
+        for key in [None, Some(String::new()), Some("   ".to_owned())] {
+            let error = ThinkingAuthentication::from_policy(None, key.clone())
+                .expect_err("default policy requires a credential");
+            assert_eq!(error.kind, EngineErrorKind::Authentication);
+            let error = ThinkingAuthentication::from_policy(Some("bearer"), key)
+                .expect_err("explicit bearer requires a credential");
+            assert_eq!(error.kind, EngineErrorKind::Authentication);
+        }
+        assert!(matches!(
+            ThinkingAuthentication::from_policy(None, Some("k".to_owned())),
+            Ok(ThinkingAuthentication::Bearer(_))
+        ));
+        // The credential would be silently ignored: refuse the combination.
+        assert!(
+            ThinkingAuthentication::from_policy(
+                Some("unauthenticated-loopback"),
+                Some("k".to_owned())
+            )
+            .is_err()
+        );
+        assert!(ThinkingAuthentication::from_policy(Some("none"), None).is_err());
+        assert!(matches!(
+            ThinkingAuthentication::from_policy(Some("Unauthenticated-Loopback"), None),
+            Ok(ThinkingAuthentication::UnauthenticatedLoopback)
+        ));
+    }
+
+    #[test]
+    fn unauthenticated_loopback_sends_no_credential_and_keeps_identity() {
+        for endpoint in [
+            "http://127.0.0.1:8080/v1/responses",
+            "http://127.0.0.2:8080/v1/responses",
+            "http://[::1]:8080/v1/responses",
+            "http://localhost:8080/v1/responses",
+        ] {
+            let transport = MockHttpTransport::new(Ok(response("こんにちは！")));
+            let adapter = unauthenticated(endpoint, loopback_resolver(), &transport)
+                .unwrap_or_else(|error| panic!("loopback endpoint refused {endpoint}: {error:?}"))
+                .with_backend_name("llama-server");
+            adapter.generate_sync(&request()).expect("reply");
+
+            let requests = transport.requests();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].endpoint, endpoint);
+            assert!(
+                requests[0].bearer_token.is_none(),
+                "no Authorization credential may be sent in unauthenticated mode"
+            );
+            let identity = adapter.identity();
+            assert_eq!(identity.name, "llama-server");
+            assert_eq!(identity.model_alias.as_deref(), Some("local-model"));
+            assert_eq!(adapter.endpoint(), endpoint);
+            assert_eq!(adapter.authentication_label(), "unauthenticated-loopback");
+        }
+    }
+
+    #[test]
+    fn unauthenticated_mode_keeps_remote_deadline_and_cancellation_semantics() {
+        let transport = MockHttpTransport::new(Ok(response("bounded")));
+        let adapter = unauthenticated(
+            "http://127.0.0.1:8080/v1/responses",
+            loopback_resolver(),
+            &transport,
+        )
+        .expect("adapter");
+        adapter
+            .generate_sync_with_timeout(&request(), Duration::from_millis(37))
+            .expect("bounded reply");
+        assert_eq!(transport.requests()[0].timeout, Duration::from_millis(37));
+
+        let error = adapter
+            .generate_sync_with_timeout(&request(), Duration::ZERO)
+            .expect_err("exhausted budget");
+        assert_eq!(error.kind, EngineErrorKind::Timeout);
+        assert_eq!(transport.requests().len(), 1, "no call without budget");
+
+        let debug = format!("{adapter:?}");
+        assert!(debug.contains("unauthenticated-loopback"));
     }
 }

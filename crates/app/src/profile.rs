@@ -23,16 +23,22 @@ pub enum CompositionProfile {
     /// Semantic retrieval + Jev + template + LLM/TTS generative fallback
     /// (`ReflexRoutePlanner` + generative runtime).
     Full,
+    /// Zero-paid-dependency local profile (issue #220 S1): deterministic
+    /// intent fast path + deterministic routing fallback (no Jev, no semantic
+    /// retrieval) + a Thinking engine that must be a local/loopback endpoint.
+    /// Free text chat/speech reaches Thinking instead of ending `Silent`.
+    Local,
 }
 
 impl CompositionProfile {
-    pub const ALL: [Self; 3] = [Self::Cached, Self::Reflex, Self::Full];
+    pub const ALL: [Self; 4] = [Self::Cached, Self::Reflex, Self::Full, Self::Local];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Cached => "cached",
             Self::Reflex => "reflex",
             Self::Full => "full",
+            Self::Local => "local",
         }
     }
 
@@ -41,8 +47,9 @@ impl CompositionProfile {
             "cached" => Ok(Self::Cached),
             "reflex" => Ok(Self::Reflex),
             "full" => Ok(Self::Full),
+            "local" => Ok(Self::Local),
             other => Err(ProfileError::new(format!(
-                "unknown composition profile {other:?}; expected one of cached, reflex, full"
+                "unknown composition profile {other:?}; expected one of cached, reflex, full, local"
             ))),
         }
     }
@@ -60,7 +67,13 @@ impl CompositionProfile {
     }
 
     pub fn generative_route(self) -> bool {
-        self == Self::Full
+        matches!(self, Self::Full | Self::Local)
+    }
+
+    /// Whether every provider endpoint must be loopback (nothing leaves the
+    /// machine). Enforced by [`Self::validate_provider_endpoints`].
+    pub fn loopback_only(self) -> bool {
+        self == Self::Local
     }
 
     /// Validate the profile against the environment-provided configuration
@@ -81,15 +94,38 @@ impl CompositionProfile {
             )));
         }
         if self.generative_route() && !generative_configured {
-            return Err(ProfileError::new(
-                "profile \"full\" requires generative backend configuration (AIVTUBER_GENERATIVE_ENABLED=true with thinking/TTS endpoints); use the \"reflex\" profile for a documented degraded fallback or complete the configuration",
-            ));
+            return Err(ProfileError::new(format!(
+                "profile {:?} requires generative backend configuration (AIVTUBER_GENERATIVE_ENABLED=true with thinking/TTS endpoints); use the \"reflex\" profile for a documented degraded fallback or complete the configuration",
+                self.as_str()
+            )));
         }
         if !self.generative_route() && generative_configured {
             return Err(ProfileError::new(format!(
                 "generative backend is configured but profile {:?} cannot reach it; select the \"full\" profile or remove the generative configuration to avoid a misleading composition",
                 self.as_str()
             )));
+        }
+        Ok(())
+    }
+
+    /// Fail closed when a loopback-only profile is pointed at a provider
+    /// endpoint that is not provably this machine. `endpoints` pairs a
+    /// human-readable role with its already-verified loopback status, so the
+    /// error names the offender without echoing the URL.
+    pub fn validate_provider_endpoints(
+        self,
+        endpoints: &[(&str, bool)],
+    ) -> Result<(), ProfileError> {
+        if !self.loopback_only() {
+            return Ok(());
+        }
+        for (role, loopback) in endpoints {
+            if !loopback {
+                return Err(ProfileError::new(format!(
+                    "profile {:?} is loopback-only but the {role} endpoint is not a loopback address; point it at 127.0.0.1/[::1]/localhost or select the \"full\" profile",
+                    self.as_str()
+                )));
+            }
         }
         Ok(())
     }
@@ -155,6 +191,9 @@ impl ProfileSummary {
                 CompositionProfile::Reflex | CompositionProfile::Full => {
                     "cached_template".to_owned()
                 }
+                // No decision model: deterministic intent playback, else
+                // Thinking, else the typed non-verbal reaction (#220 S1).
+                CompositionProfile::Local => "deterministic_local".to_owned(),
             },
             config_fingerprint,
         }
@@ -236,6 +275,39 @@ mod tests {
         assert!(full.jev());
         assert!(full.template_route());
         assert!(full.generative_route());
+
+        let local = CompositionProfile::Local;
+        assert!(!local.semantic_retrieval());
+        assert!(!local.jev(), "local must not require a paid decision model");
+        assert!(!local.template_route());
+        assert!(local.generative_route());
+        assert!(local.loopback_only());
+        assert!(!full.loopback_only());
+    }
+
+    #[test]
+    fn local_profile_needs_generative_config_but_not_jev_credentials() {
+        CompositionProfile::Local
+            .validate(true, false)
+            .expect("local runs without a Jev credential");
+        let error = CompositionProfile::Local
+            .validate(false, false)
+            .expect_err("local without a Thinking engine would silently do nothing");
+        assert!(error.to_string().contains("local"));
+    }
+
+    #[test]
+    fn loopback_only_profile_refuses_non_loopback_provider_endpoints() {
+        CompositionProfile::Local
+            .validate_provider_endpoints(&[("thinking", true), ("tts", true)])
+            .expect("all loopback");
+        let error = CompositionProfile::Local
+            .validate_provider_endpoints(&[("thinking", true), ("tts", false)])
+            .expect_err("remote TTS breaks the local promise");
+        assert!(error.to_string().contains("tts"));
+        CompositionProfile::Full
+            .validate_provider_endpoints(&[("thinking", false)])
+            .expect("only the local profile is loopback-only");
     }
 
     #[test]

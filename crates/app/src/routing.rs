@@ -386,6 +386,74 @@ impl RoutePlanner for IntentRoutePlanner {
     }
 }
 
+/// Deterministic route planner for the `local` profile (issue #220 S1).
+///
+/// No decision model is involved, so a Jev credential is never required:
+///
+/// 1. an explicit non-empty `intent` takes the deterministic cached path
+///    (identical to [`IntentRoutePlanner`]);
+/// 2. otherwise public-chat/donation/speech content that carries free text is
+///    routed to the Thinking engine with reason `NoCachedMatch`;
+/// 3. anything else (timers, game/stream/system events, empty text) is
+///    `Silent`.
+///
+/// Event kind and text are read from the already-normalized envelope; the
+/// planner never grants authority, and generated output still passes the
+/// publication gates downstream. When Thinking fails there is no cached
+/// variant group, so the existing typed fallback yields a non-verbal
+/// reaction rather than a stall.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LocalRoutePlanner;
+
+impl RoutePlanner for LocalRoutePlanner {
+    fn route(&mut self, event: &EventEnvelope) -> Result<PlaybackRoute, AppError> {
+        if let Some(intent) = event
+            .payload
+            .get("intent")
+            .and_then(serde_json::Value::as_str)
+            .filter(|intent| !intent.trim().is_empty())
+        {
+            return Ok(PlaybackRoute::Intent(intent.to_owned()));
+        }
+        if !matches!(
+            event.kind,
+            EventKind::ChatMessage | EventKind::ChatDonation | EventKind::SpeechInput
+        ) {
+            return Ok(PlaybackRoute::Silent);
+        }
+        let has_text = ["text", "message"].into_iter().any(|key| {
+            event
+                .payload
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+        });
+        if !has_text {
+            return Ok(PlaybackRoute::Silent);
+        }
+        let text = bounded_current_event_text(event)?;
+        let thinking = ThinkingRequest::from_event(
+            event,
+            text,
+            privacy_for_source(event.source_class),
+            ReflexContext::default(),
+            RetrievalSnapshot::default(),
+            Vec::new(),
+        );
+        thinking.validate().map_err(|error| {
+            AppError::Routing(format!("invalid local thinking request: {error}"))
+        })?;
+        Ok(PlaybackRoute::Generate(Box::new(GenerationRoute {
+            source_event: event.clone(),
+            thinking,
+            routing_reason: GenerationRoutingReason::NoCachedMatch,
+            intent: "generated.reply".to_owned(),
+            style: None,
+            fallback_variant_group: None,
+        })))
+    }
+}
+
 pub trait QueryEmbeddingProvider: Send {
     fn embedding(&mut self, event: &EventEnvelope) -> Result<Vec<f32>, AppError>;
 }
@@ -894,5 +962,69 @@ mod tests {
         assert_eq!(truncate_utf8(value, 6), "aあ");
         assert_eq!(truncate_utf8(value, 7), value);
         assert_eq!(truncate_utf8(value, 99), value);
+    }
+
+    fn text_payload(text: &str) -> BTreeMap<String, serde_json::Value> {
+        BTreeMap::from([("text".to_owned(), serde_json::json!(text))])
+    }
+
+    #[test]
+    fn local_planner_routes_free_text_chat_and_speech_to_thinking() {
+        for kind in [EventKind::ChatMessage, EventKind::SpeechInput] {
+            let mut event = chat_event(text_payload("昨日もまた負けてたよねｗ"));
+            event.kind = kind;
+            let route = LocalRoutePlanner.route(&event).expect("route");
+            let PlaybackRoute::Generate(generation) = route else {
+                panic!("free text must reach Thinking, got {route:?}");
+            };
+            assert_eq!(generation.thinking.input.text, "昨日もまた負けてたよねｗ");
+            assert_eq!(
+                generation.routing_reason,
+                GenerationRoutingReason::NoCachedMatch
+            );
+            assert_eq!(generation.source_event.event_id, event.event_id);
+            // No cached variant exists, so a Thinking failure degrades through
+            // the typed non-verbal fallback rather than stalling.
+            assert!(generation.fallback_variant_group.is_none());
+        }
+    }
+
+    #[test]
+    fn local_planner_keeps_explicit_intent_on_the_deterministic_path() {
+        let mut payload = text_payload("こんにちは");
+        payload.insert("intent".to_owned(), serde_json::json!("greeting.hello"));
+        let route = LocalRoutePlanner
+            .route(&chat_event(payload))
+            .expect("route");
+        assert_eq!(route, PlaybackRoute::Intent("greeting.hello".to_owned()));
+    }
+
+    #[test]
+    fn local_planner_is_silent_without_text_or_for_non_conversational_events() {
+        let mut empty = chat_event(text_payload("   "));
+        assert_eq!(
+            LocalRoutePlanner.route(&empty).expect("route"),
+            PlaybackRoute::Silent
+        );
+        empty.payload.clear();
+        assert_eq!(
+            LocalRoutePlanner.route(&empty).expect("route"),
+            PlaybackRoute::Silent
+        );
+        for kind in [
+            EventKind::TimerTick,
+            EventKind::GameEvent,
+            EventKind::StreamEvent,
+            EventKind::SystemHealth,
+            EventKind::OperatorCommand,
+        ] {
+            let mut event = chat_event(text_payload("text that must not trigger Thinking"));
+            event.kind = kind;
+            assert_eq!(
+                LocalRoutePlanner.route(&event).expect("route"),
+                PlaybackRoute::Silent,
+                "{kind:?}"
+            );
+        }
     }
 }
