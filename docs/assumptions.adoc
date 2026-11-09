@@ -194,9 +194,11 @@ Do not record secrets, private user data, or raw provider credentials.
 
 *Evidence:* EXP-0001 section 7, ADR-0005; executable: `speech_observation` and `speech_replay` tests in +crates/runtime+.
 
+S2 measurement (`speech-vad-sidecar`, see the Speech sidecar section of `docs/production-runtime.adoc`): with the app's warm-up re-sync, the stamp-to-arrival lag of a model-free probe edge over a pipe was median 0.3 ms and at most 0.9 ms (one run had a 25 ms outlier; first line alone, without warm-up, 11 to 18 ms stale), always non-negative within rounding, inside the 50 ms skew. Real VAD edges arrive about 38 ms after their stamp (frame start plus the 10 ms chunk plus inference), inside the 160 ms age limit. Same-host, two monotonic clocks; the device-buffer latency before the capture callback is not measured.
+
 *Consequence if false:* A mis-mapped timeline makes every observation stale (rejected, counted as `stale_age`) or future-dated, so the floor sees no speech and the deterministic fallback stays at `no_speech`; nothing blocks.
 
-*Revisit when:* the S2 sidecar measures its real clock mapping, or a real labelled Japanese dialogue set exists (EXP-0001 11.1 item 1).
+*Revisit when:* acoustic and device-buffer latency is measured with a loopback rig, a sidecar runs on another host or clock domain, or a real labelled Japanese dialogue set exists (EXP-0001 11.1 item 1).
 
 *Related:* #81, #92, ADR-0005.
 

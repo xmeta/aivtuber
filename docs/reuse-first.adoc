@@ -80,6 +80,18 @@ Record the result as one of:
 |Reuse counter/gauge/histogram facade. Keep the #58 reproducible benchmark/result schema, comparison semantics, dataset/config identity, and budgets project-owned.
 |#58
 
+|Local VAD inference runtime
+|`tract-onnx` (sonos/tract), Silero VAD v6.2.3 `silero_vad_op18_ifless.onnx`
+|Adopt / thin wrapper (ort with dynamic loading is the recorded fallback)
+|Pure Rust, no build-time network, loads the 16 kHz Silero v6 export and matches onnxruntime to under 1e-6 per frame (see docs/production-runtime.adoc, Speech sidecar). The standard `silero_vad.onnx` does not load in tract (`If` node). Keep frame cadence, hysteresis edges (no debounce), pre-roll, clock mapping and the observation contract project-owned. Do not use the sherpa-onnx v4 export.
+|#92
+
+|Microphone capture
+|`cpal`
+|Adopt
+|Already in the lock file through `rodio`; Apache-2.0. Behind the `mic-capture` feature (ALSA headers on Linux). Resampling is a ~60 line windowed-sinc `Resampler` (custom, because a fixed 16 kHz target needs no general resampler crate; linear interpolation would alias).
+|#92
+
 |Agent tool protocol / MCP plumbing
 |official +rmcp+ (modelcontextprotocol/rust-sdk)
 |Adopt / thin wrapper
