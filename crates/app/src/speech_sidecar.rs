@@ -361,9 +361,19 @@ impl SpeechSidecar {
                 Err(TryRecvError::Disconnected) => {
                     // The reader saw EOF: the child closed stdout, normally by
                     // exiting. Everything it sent has been drained above.
-                    let reason = match self.child.try_wait() {
-                        Ok(Some(status)) => format!("sidecar exited ({status})"),
-                        _ => "sidecar closed its output".to_owned(),
+                    // The exit status can land a moment after the pipe
+                    // closes; wait at most 50 ms, once, so an exit is named
+                    // as one (this runs only on the way to degrading).
+                    let status = (0..10).find_map(|_| match self.child.try_wait() {
+                        Ok(Some(status)) => Some(status),
+                        _ => {
+                            thread::sleep(Duration::from_millis(5));
+                            None
+                        }
+                    });
+                    let reason = match status {
+                        Some(status) => format!("sidecar exited ({status})"),
+                        None => "sidecar closed its output".to_owned(),
                     };
                     self.degrade(tracker, transcripts.as_deref_mut(), reason);
                     return;

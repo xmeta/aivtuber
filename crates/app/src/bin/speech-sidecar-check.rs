@@ -14,10 +14,21 @@
 //! `--wide` widens the tracker's age and skew limits to one second so every
 //! observation is accepted and measured; without it the S1 defaults apply and
 //! over-age or future-dated observations are counted as rejects.
+//!
+//! With a transcript worker configured on the sidecar (`--stt-worker ...`,
+//! #92 S3b) every transcript revision is printed too, with its signed
+//! `lag = now_ms - observed_at_ms` (the final's lag is decode plus pipe time
+//! after the end of the covered audio) and its length; the text itself is
+//! printed only with `--show-text`, because it is what a person said.
 
 use aivtuber_app::{SpeechSidecar, SpeechSidecarConfig};
-use aivtuber_domain::{SpeechObservation, SpeechObservationBatch};
-use aivtuber_runtime::{IngressPolicy, SpeechObservationConfig, SpeechObservationTracker};
+use aivtuber_domain::{
+    SpeechObservation, SpeechObservationBatch, SpeechTranscriptBatch, TranscriptKind,
+};
+use aivtuber_runtime::{
+    IngressPolicy, SpeechObservationConfig, SpeechObservationTracker, SpeechTranscriptConfig,
+    SpeechTranscriptTracker,
+};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -35,6 +46,7 @@ fn run() -> Result<(), String> {
     let mut duration = Duration::from_secs(30);
     let mut resync = Duration::from_secs(5);
     let mut wide = false;
+    let mut show_text = false;
     let mut program: Vec<String> = Vec::new();
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -54,6 +66,7 @@ fn run() -> Result<(), String> {
                 resync = Duration::from_millis(n);
             }
             "--wide" => wide = true,
+            "--show-text" => show_text = true,
             "--" => {
                 program = iter.by_ref().collect();
             }
@@ -71,16 +84,26 @@ fn run() -> Result<(), String> {
     }
     let mut tracker = SpeechObservationTracker::new(tracker_config, IngressPolicy::default())
         .map_err(|e| e.to_string())?;
+    let mut transcript_config = SpeechTranscriptConfig::default();
+    if wide {
+        transcript_config.partial_max_age_ms = 60_000;
+        transcript_config.final_max_age_ms = 60_000;
+        transcript_config.max_future_skew_ms = 5_000;
+    }
+    let mut transcripts = SpeechTranscriptTracker::new(transcript_config, IngressPolicy::default())
+        .map_err(|e| e.to_string())?;
     let started = Instant::now();
     let mut config = SpeechSidecarConfig::new(exe, args.to_vec());
     config.resync_interval = resync;
     let mut sidecar = SpeechSidecar::spawn(config, started).map_err(|e| e.to_string())?;
 
     let mut lags: Vec<i64> = Vec::new();
+    let mut final_lags: Vec<i64> = Vec::new();
     let deadline = started + duration;
     while Instant::now() < deadline && !sidecar.is_degraded() {
         let now_ms = started.elapsed().as_millis() as u64;
-        sidecar.poll(&mut tracker, now_ms, |line, _report| {
+        let transcript_lags = &mut final_lags;
+        sidecar.poll_with_transcripts(&mut tracker, Some(&mut transcripts), now_ms, |line, _report| {
             let Ok(batch) = SpeechObservationBatch::from_json_bytes(line) else {
                 return;
             };
@@ -93,6 +116,30 @@ fn run() -> Result<(), String> {
                         activity.edge, activity.observed_at_ms, activity.confidence
                     );
                 }
+            }
+        }, |line, _report| {
+            let Ok(batch) = SpeechTranscriptBatch::from_json_bytes(line) else {
+                return;
+            };
+            for transcript in &batch.transcripts {
+                let lag = now_ms as i64 - transcript.observed_at_ms as i64;
+                if transcript.kind == TranscriptKind::Final && !transcript.text.is_empty() {
+                    transcript_lags.push(lag);
+                }
+                let text = if show_text {
+                    format!(" text={:?}", transcript.text)
+                } else {
+                    String::new()
+                };
+                println!(
+                    "t={now_ms}ms transcript segment={} revision={} kind={:?} covered={}ms observed_at={}ms lag={lag}ms chars={}{text}",
+                    transcript.segment_id,
+                    transcript.revision,
+                    transcript.kind,
+                    transcript.covered_audio_ms,
+                    transcript.observed_at_ms,
+                    transcript.text.chars().count(),
+                );
             }
         });
         std::thread::sleep(Duration::from_millis(2));
@@ -115,6 +162,16 @@ fn run() -> Result<(), String> {
         lags.last(),
         lags.iter().filter(|l| **l < 0).count(),
     );
+    final_lags.sort_unstable();
+    println!(
+        "summary finals={} final_lag_ms min={:?} p50={:?} max={:?} path={:?}",
+        final_lags.len(),
+        final_lags.first(),
+        final_lags.get(final_lags.len().saturating_sub(1) / 2),
+        final_lags.last(),
+        sidecar.transcript_path(),
+    );
+    println!("transcripts {:?}", transcripts.metrics());
     println!("sidecar {stats:?}");
     println!("tracker {:?}", tracker.metrics());
     Ok(())

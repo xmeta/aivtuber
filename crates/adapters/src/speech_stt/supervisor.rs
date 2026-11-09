@@ -368,7 +368,17 @@ fn read_output<R: Read>(mut reader: BufReader<R>, shared: &Shared, max_invalid: 
     }
     // The worker's stdout ended: it exited or closed its output. The watchdog
     // names an exit; this names the rest.
-    let exited = shared.child.lock().expect("child").try_wait();
+    // The exit status lands a moment after the pipe closes: wait briefly so
+    // an exit is named as one, and only a worker that closed stdout and kept
+    // running is reported as `WorkerClosedOutput`.
+    let waited = Instant::now();
+    let exited = loop {
+        let status = shared.child.lock().expect("child").try_wait();
+        if matches!(status, Ok(Some(_))) || waited.elapsed() > Duration::from_millis(500) {
+            break status;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
     shared.fail(match exited {
         Ok(Some(status)) if status.code() == Some(EXIT_DECODE_DEADLINE) => {
             SttUnavailableReason::DecodeDeadlineExceeded

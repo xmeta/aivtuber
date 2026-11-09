@@ -257,6 +257,23 @@ mod tests {
         );
     }
 
+    /// The operator fetch script carries its own copy of the model pins; the
+    /// two must not drift.
+    #[test]
+    fn the_fetch_script_pins_the_same_model_digests() {
+        let script = include_str!("../../../../scripts/fetch-sherpa-onnx.mjs");
+        for pin in [K2V2_INT8, PARAKEET_JA_INT8] {
+            for file in pin.files {
+                assert!(
+                    script.contains(file.sha256) && script.contains(file.file_name),
+                    "scripts/fetch-sherpa-onnx.mjs does not pin {} ({})",
+                    file.file_name,
+                    file.sha256
+                );
+            }
+        }
+    }
+
     #[test]
     fn models_are_selected_by_name_only() {
         assert_eq!(model_by_name("k2v2-int8"), Some(K2V2_INT8));

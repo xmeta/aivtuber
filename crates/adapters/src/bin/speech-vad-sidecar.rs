@@ -28,7 +28,7 @@
 //! `{"stt":{...}}` status line when the transcript path becomes unavailable.
 //! A dead or hung worker costs transcripts only: VAD edges keep flowing.
 
-use aivtuber_adapters::speech_stt::feeder::{FeederConfig, SegmentFeeder};
+use aivtuber_adapters::speech_stt::feeder::{FeederConfig, FrameSink, SegmentFeeder};
 use aivtuber_adapters::speech_stt::supervisor::{SttWorker, SttWorkerConfig};
 #[cfg(feature = "mic-capture")]
 use aivtuber_adapters::speech_vad::StreamClock;
@@ -73,6 +73,10 @@ struct SttArgs {
     startup_timeout: Duration,
     heartbeat_timeout: Duration,
     drain: Duration,
+    /// Wait this long for the worker to load before processing input. For
+    /// file input (`--input-wav`) so a short clip is not skipped while the
+    /// model loads; a live microphone never waits.
+    wait_ready: Duration,
 }
 
 struct Args {
@@ -101,7 +105,8 @@ fn usage() -> String {
      [--stats-secs N] [--stt-worker PROGRAM [--stt-model k2v2-int8|parakeet-ja \
      --stt-model-dir DIR] [--stt-threads N] [--stt-preroll-ms N] [--stt-tail-ms N] \
      [--stt-min-speech-ms N] [--stt-max-segment-ms N] [--stt-startup-timeout-ms N] \
-     [--stt-heartbeat-timeout-ms N] [--stt-drain-ms N] [--stt-arg ARG]...]"
+     [--stt-heartbeat-timeout-ms N] [--stt-drain-ms N] [--stt-wait-ready-ms N] \
+     [--stt-arg ARG]...]"
         .to_owned()
 }
 
@@ -114,6 +119,7 @@ fn parse_args() -> Result<Args, String> {
     let (mut stt_preroll, mut stt_tail, mut stt_min_speech, mut stt_max_segment) =
         (300_u64, 500_u64, 250_u64, 25_000_u64);
     let (mut stt_startup, mut stt_heartbeat, mut stt_drain) = (60_000_u64, 5_000_u64, 8_000_u64);
+    let mut stt_wait_ready = 0_u64;
     let mut a = Args {
         stt: None,
         model: None,
@@ -221,6 +227,9 @@ fn parse_args() -> Result<Args, String> {
                 )?
             }
             "--stt-drain-ms" => stt_drain = int(value("--stt-drain-ms")?, "--stt-drain-ms")?,
+            "--stt-wait-ready-ms" => {
+                stt_wait_ready = int(value("--stt-wait-ready-ms")?, "--stt-wait-ready-ms")?
+            }
             "-h" | "--help" => return Err(usage()),
             other => return Err(format!("unknown argument {other}\n{}", usage())),
         }
@@ -239,6 +248,7 @@ fn parse_args() -> Result<Args, String> {
             startup_timeout: Duration::from_millis(stt_startup),
             heartbeat_timeout: Duration::from_millis(stt_heartbeat),
             drain: Duration::from_millis(stt_drain),
+            wait_ready: Duration::from_millis(stt_wait_ready),
         });
     } else if stt_model.is_some() || stt_model_dir.is_some() || !stt_extra.is_empty() {
         return Err("--stt-* options need --stt-worker".to_owned());
@@ -399,6 +409,14 @@ fn run() -> Result<(), String> {
     }
     let drain = args.stt.as_ref().map_or(Duration::ZERO, |s| s.drain);
     emitter.stt = start_stt(&args, &emitter);
+    if args.input_wav.is_some()
+        && let (Some(stt), Some(feeder)) = (&args.stt, &emitter.stt)
+    {
+        let deadline = Instant::now() + stt.wait_ready;
+        while !feeder.sink().ready() && !feeder.sink().is_failed() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 
     let model = args.model.as_deref().ok_or("--model is required")?;
     let scorer = SileroVad::from_file(std::path::Path::new(model))?;
@@ -565,6 +583,12 @@ fn run_wav(
     // 10 ms of input per step, like a device callback.
     let step = (rate as usize / 100).max(1) * channels;
     let origin_local = timeline.local_ms();
+    // For measurements: where the start of the file falls on the runtime
+    // timeline (the ground truth for end-to-end latency against known clip
+    // boundaries).
+    if let Ok(origin_runtime) = timeline.runtime_ms(origin_local) {
+        eprintln!("speech-vad-sidecar: wav_origin_runtime_ms={origin_runtime}");
+    }
     let mut samples = samples.peekable();
     let mut edges = Vec::new();
     let mut chunk_index = 0_u64;

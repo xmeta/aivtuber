@@ -448,3 +448,138 @@ fn without_a_clock_sync_the_sidecar_refuses_to_stamp_and_exits() {
     std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut stdout).unwrap();
     assert!(stdout.is_empty(), "no unstamped observation may be emitted");
 }
+
+const STT_DOUBLE: &str = env!("CARGO_BIN_EXE_speech-stt-worker-double");
+
+fn stt_args<'a>(worker_mode: &'a [&'a str]) -> Vec<&'a str> {
+    let mut args = vec!["--stt-worker", STT_DOUBLE, "--stt-wait-ready-ms", "15000"];
+    for arg in worker_mode {
+        args.push("--stt-arg");
+        args.push(arg);
+    }
+    args
+}
+
+fn is_transcript(line: &str) -> bool {
+    line.contains("\"transcripts\"")
+}
+
+fn is_status(line: &str) -> bool {
+    line.starts_with("{\"stt\"")
+}
+
+fn observation_lines(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .filter(|l| !is_transcript(l) && !is_status(l))
+        .cloned()
+        .collect()
+}
+
+/// S3b: with a worker, the sidecar relays valid `speech-transcript` lines
+/// next to its observation lines, and a ready status once.
+#[test]
+fn a_worker_adds_transcript_lines_next_to_the_unchanged_edges() {
+    use aivtuber_adapters::speech_stt::{SttStatus, parse_stt_status_line};
+    use aivtuber_domain::{SpeechTranscriptBatch, TranscriptKind};
+    let wav = write_wav("vowel16k-stt.wav", 16_000, 1, &synthetic_vowel_16k());
+    let (lines, stderr, ok) = run_wav(&wav, &stt_args(&["--mode", "normal"]));
+    assert!(ok, "{stderr}");
+    // The VAD edges are exactly what they are without a worker.
+    let edges = parse_edges(&observation_lines(&lines));
+    assert_eq!(
+        edges.iter().map(|e| e.0).collect::<Vec<_>>(),
+        vec![SpeechEdge::Start, SpeechEdge::End],
+        "{lines:?}"
+    );
+    let statuses: Vec<_> = lines
+        .iter()
+        .filter(|l| is_status(l))
+        .filter_map(|l| parse_stt_status_line(l.as_bytes()))
+        .collect();
+    assert_eq!(statuses, [SttStatus::Ready], "{lines:?}");
+    let transcripts: Vec<_> = lines
+        .iter()
+        .filter(|l| is_transcript(l))
+        .map(|l| {
+            SpeechTranscriptBatch::from_json_bytes(l.as_bytes())
+                .unwrap_or_else(|e| panic!("{e}: {l}"))
+        })
+        .collect();
+    assert!(!transcripts.is_empty(), "{lines:?}\n{stderr}");
+    let all: Vec<_> = transcripts.iter().flat_map(|b| &b.transcripts).collect();
+    let finals: Vec<_> = all
+        .iter()
+        .filter(|t| t.kind == TranscriptKind::Final)
+        .collect();
+    assert_eq!(finals.len(), 1, "one segment, one final: {all:?}");
+    assert!(finals[0].text.starts_with("音声"));
+    assert!(all.iter().all(|t| t.speaker_id == "mic-local"));
+    assert!(all.windows(2).all(|w| w[0].revision < w[1].revision));
+    // The segment starts at least 300 ms before the start edge, so it covers
+    // more than the span between the two edges (frame-sized slack for the
+    // clock mapping).
+    let speech_ms = edges[1].1 - edges[0].1;
+    assert!(
+        finals[0].covered_audio_ms + 100 >= speech_ms + 300,
+        "covered {} ms vs edge span {speech_ms} ms",
+        finals[0].covered_audio_ms
+    );
+    assert_eq!(transcripts[0].language, "ja");
+    assert_eq!(transcripts[0].engine.model_id, "double:fake");
+}
+
+/// A worker that dies costs transcripts only: the edges still come out and
+/// the app is told exactly once.
+#[test]
+fn a_dying_worker_degrades_transcripts_without_touching_the_vad_edges() {
+    use aivtuber_adapters::speech_stt::{SttStatus, SttUnavailableReason, parse_stt_status_line};
+    let wav = write_wav("vowel16k-stt-exit.wav", 16_000, 1, &synthetic_vowel_16k());
+    let mut args = stt_args(&["--mode", "exit", "--after-ms", "100"]);
+    args.extend(["--pace", "realtime"]);
+    let (lines, stderr, ok) = run_wav(&wav, &args);
+    assert!(ok, "the sidecar itself keeps running: {stderr}");
+    assert_eq!(
+        parse_edges(&observation_lines(&lines))
+            .iter()
+            .map(|e| e.0)
+            .collect::<Vec<_>>(),
+        vec![SpeechEdge::Start, SpeechEdge::End],
+        "{lines:?}"
+    );
+    let unavailable: Vec<_> = lines
+        .iter()
+        .filter(|l| is_status(l))
+        .filter_map(|l| parse_stt_status_line(l.as_bytes()))
+        .filter(|s| matches!(s, SttStatus::Unavailable { .. }))
+        .collect();
+    assert_eq!(
+        unavailable,
+        [SttStatus::Unavailable {
+            reason: SttUnavailableReason::WorkerExited
+        }],
+        "{lines:?}\n{stderr}"
+    );
+    assert!(lines.iter().all(|l| !is_transcript(l)));
+}
+
+/// A worker that cannot start is reported, and the VAD still runs.
+#[test]
+fn a_worker_that_cannot_start_is_reported_and_the_edges_still_flow() {
+    let wav = write_wav("vowel16k-stt-nobin.wav", 16_000, 1, &synthetic_vowel_16k());
+    let (lines, stderr, ok) = run_wav(&wav, &["--stt-worker", "definitely-not-a-real-stt-worker"]);
+    assert!(ok, "{stderr}");
+    assert!(
+        lines.iter().any(|l| l.contains("worker_failed_to_start")),
+        "{lines:?}"
+    );
+    assert_eq!(parse_edges(&observation_lines(&lines)).len(), 2);
+}
+
+#[test]
+fn stt_options_without_a_worker_are_refused() {
+    let wav = write_wav("vowel16k-stt-flag.wav", 16_000, 1, &synthetic_vowel_16k());
+    let (_, stderr, ok) = run_wav(&wav, &["--stt-model", "k2v2-int8"]);
+    assert!(!ok);
+    assert!(stderr.contains("--stt-worker"), "{stderr}");
+}

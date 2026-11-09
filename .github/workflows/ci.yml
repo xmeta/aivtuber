@@ -155,6 +155,71 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # Issue #92 S3b: the optional local Japanese STT worker (the `sherpa-stt`
+  # feature, the official sherpa-onnx crate). It is a separate job, not part of
+  # the required `Rust checks`, because it needs the engine libraries. It builds
+  # and lints the feature and runs the model-free tests; it runs no model (no
+  # weights are fetched or cached in CI, and none are ever committed).
+  #
+  # The crate's build script downloads prebuilt binaries over HTTPS and
+  # verifies nothing unless SHERPA_ONNX_ARCHIVE_DIR is set, so the archive is
+  # fetched and SHA-256-verified by our own script first and the variable is
+  # set for every cargo step below. The default workspace gates never enable
+  # the feature and never download anything.
+  speech-stt:
+    name: Speech STT worker (sherpa-stt feature, no model)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
+
+      - name: Fetch the pinned sherpa-onnx library archive (SHA-256 verified)
+        run: node scripts/fetch-sherpa-onnx.mjs lib "$RUNNER_TEMP/sherpa-onnx"
+
+      - name: Supply chain with the feature (scoped license exceptions)
+        run: cargo deny --locked --features sherpa-stt check
+
+      - name: Clippy with the feature
+        run: cargo clippy --locked -p aivtuber-adapters --features sherpa-stt --all-targets -- -D warnings
+        env:
+          SHERPA_ONNX_ARCHIVE_DIR: ${{ runner.temp }}/sherpa-onnx
+
+      - name: Build the worker
+        run: cargo build --locked -p aivtuber-adapters --features sherpa-stt --bin speech-stt-worker
+        env:
+          SHERPA_ONNX_ARCHIVE_DIR: ${{ runner.temp }}/sherpa-onnx
+
+      - name: Model-free tests with the feature
+        run: cargo test --locked -p aivtuber-adapters --features sherpa-stt --lib speech_stt
+        env:
+          SHERPA_ONNX_ARCHIVE_DIR: ${{ runner.temp }}/sherpa-onnx
+
+      # No weights here: an empty model directory must be refused (exit 2)
+      # before anything is loaded, which also exercises the engine library pins.
+      - name: Worker refuses an unpinned model directory
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/no-model"
+          set +e
+          target/debug/speech-stt-worker --model k2v2-int8 --model-dir "$RUNNER_TEMP/no-model" --language ja < /dev/null
+          status=$?
+          set -e
+          test "$status" -eq 2
+
   regressions:
     name: Bounded property regressions
     # Issue #147. `cargo test --workspace` runs the proptest suite with

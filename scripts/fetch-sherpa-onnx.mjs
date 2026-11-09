@@ -1,0 +1,142 @@
+// Fetches and verifies the pinned third-party material for the optional
+// `sherpa-stt` feature (issue #92 S3b). Nothing here is part of any default
+// build, and nothing it downloads is committed or redistributed.
+//
+//   node scripts/fetch-sherpa-onnx.mjs lib <dest-dir>
+//       Downloads the sherpa-onnx v2.0.1 shared-library archive for this
+//       platform into <dest-dir>, verifies its SHA-256 against the pin below,
+//       and prints the line to export:
+//           SHERPA_ONNX_ARCHIVE_DIR=<dest-dir>
+//       Every build that enables the `sherpa-stt` feature MUST set that
+//       variable. Without it the sherpa-onnx-sys build script downloads
+//       prebuilt binaries from GitHub over HTTPS and verifies nothing. CI
+//       always runs this script first (docs/supply-chain.adoc).
+//
+//   node scripts/fetch-sherpa-onnx.mjs model k2v2-int8|parakeet-ja <dest-dir>
+//       Operator step: downloads the model files into <dest-dir>, verifying
+//       every file against the pin below, and prints the --model-dir to pass
+//       to the worker. The worker verifies the same SHA-256 pins again at
+//       every start (crates/adapters/src/speech_stt/pins.rs).
+//
+// A mismatch deletes the partial download and exits non-zero. The pins here
+// are asserted equal to the Rust pins by a unit test (pins.rs), so the two
+// copies cannot drift.
+
+import { createHash } from "node:crypto";
+import { createReadStream, createWriteStream, existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { pipeline } from "node:stream/promises";
+import { Readable } from "node:stream";
+import { execFileSync } from "node:child_process";
+
+const SHERPA_RELEASE = "https://github.com/k2-fsa/sherpa-onnx/releases/download";
+const HF = "https://huggingface.co";
+const RZ_REV = "291488c8151be24d7da4bf7af26e533fad96e407"; // reazon-research/reazonspeech-k2-v2
+
+// Engine library archives, sherpa-onnx v2.0.1, `shared` flavour (what the
+// crate's build script asks for with its `shared` feature). SHA-256 values were
+// verified by downloading each archive, and equal the digests GitHub publishes.
+const LIB_ARCHIVES = {
+  "linux-x64": {
+    name: "sherpa-onnx-v2.0.1-linux-x64-shared-lib.tar.bz2",
+    sha256: "532c45bbd41036d83cd70606797529aa8086c2053395a58967736c727625b120",
+  },
+  "win32-x64": {
+    name: "sherpa-onnx-v2.0.1-win-x64-shared-MT-Release-lib.tar.bz2",
+    sha256: "afa4de3ca4ab0afd53bb4aab40d28ee15608364b549ffc0fe0caf6489bfc39a5",
+  },
+};
+
+const MODELS = {
+  "k2v2-int8": {
+    files: [
+      ["encoder-epoch-99-avg-1.int8.onnx", "2c7bd08a8a99f9ddd0d9e458456577b1f6279214e51426f114f9eced44c54e1d"],
+      ["decoder-epoch-99-avg-1.int8.onnx", "8f0bff94d38797b03b762634ed03211a8e303d06cc4603cdd0cf4199d6eb1485"],
+      ["joiner-epoch-99-avg-1.int8.onnx", "49cc7ea1d3d35a40a27442db5e89996da64bf0e683a903dce76e99e57a12e4de"],
+      ["tokens.txt", "2c3ac659818a48a0c04010e0593bbc4d7c8a24a054340b01131499c05fd52def"],
+    ].map(([file, sha256]) => ({ file, sha256, url: `${HF}/reazon-research/reazonspeech-k2-v2/resolve/${RZ_REV}/${file}` })),
+  },
+  "parakeet-ja": {
+    // One archive; its two files are pinned inside the worker.
+    archive: {
+      name: "sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8.tar.bz2",
+      url: `${SHERPA_RELEASE}/asr-models/sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8.tar.bz2`,
+      sha256: "4b0a800ef29f4f4c8667339bf6f60d5bfdc2852ddc9dc5741aea65b6f8d1306b",
+    },
+    innerDir: "sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8",
+    files: [
+      ["model.int8.onnx", "3addd00ef5bd1742078389e540b77394e4a508bdf2f4c9ad1b4a76d93e76598e"],
+      ["tokens.txt", "732f64c53909f2620c713f4106b487d92e6f54a6915b3cd3d1dbd32f9f4f392a"],
+    ],
+  },
+};
+
+function fail(message) {
+  console.error(`fetch-sherpa-onnx: ${message}`);
+  process.exit(1);
+}
+
+async function sha256Of(path) {
+  const hash = createHash("sha256");
+  await pipeline(createReadStream(path), hash);
+  return hash.digest("hex");
+}
+
+// Download to <dest>.part, verify, then rename: a file at its final name has
+// always passed its check.
+async function download(url, dest, expected) {
+  if (existsSync(dest) && (await sha256Of(dest)) === expected) {
+    console.log(`have      ${dest}`);
+    return;
+  }
+  mkdirSync(dirname(dest), { recursive: true });
+  const part = `${dest}.part`;
+  console.log(`download  ${url}`);
+  const response = await fetch(url, { redirect: "follow" });
+  if (!response.ok || !response.body) fail(`${url} answered HTTP ${response.status}`);
+  await pipeline(Readable.fromWeb(response.body), createWriteStream(part));
+  const actual = await sha256Of(part);
+  if (actual !== expected) {
+    rmSync(part, { force: true });
+    fail(`sha256 mismatch for ${url}: got ${actual}, pinned ${expected}`);
+  }
+  renameSync(part, dest);
+  console.log(`ok        ${dest} ${actual}`);
+}
+
+async function fetchLib(dest) {
+  const key = `${process.platform}-${process.arch}`;
+  const archive = LIB_ARCHIVES[key];
+  if (!archive) {
+    fail(`no pinned sherpa-onnx library archive for ${key} (pinned: ${Object.keys(LIB_ARCHIVES).join(", ")})`);
+  }
+  await download(`${SHERPA_RELEASE}/v2.0.1/${archive.name}`, join(dest, archive.name), archive.sha256);
+  console.log(`\nSHERPA_ONNX_ARCHIVE_DIR=${resolve(dest)}`);
+}
+
+async function fetchModel(name, dest) {
+  const model = MODELS[name];
+  if (!model) fail(`unknown model ${name} (${Object.keys(MODELS).join(", ")})`);
+  if (model.archive) {
+    const archivePath = join(dest, model.archive.name);
+    await download(model.archive.url, archivePath, model.archive.sha256);
+    // System tar reads bz2 on Linux, macOS and Windows 10+.
+    execFileSync("tar", ["-xjf", archivePath, "-C", dest], { stdio: "inherit" });
+    const dir = join(dest, model.innerDir);
+    for (const [file, sha256] of model.files) {
+      const actual = await sha256Of(join(dir, file));
+      if (actual !== sha256) fail(`sha256 mismatch for ${join(dir, file)}: got ${actual}, pinned ${sha256}`);
+    }
+    console.log(`\n--model-dir ${resolve(dir)}`);
+    return;
+  }
+  for (const { file, sha256, url } of model.files) {
+    await download(url, join(dest, file), sha256);
+  }
+  console.log(`\n--model-dir ${resolve(dest)}`);
+}
+
+const [command, ...rest] = process.argv.slice(2);
+if (command === "lib" && rest.length === 1) await fetchLib(rest[0]);
+else if (command === "model" && rest.length === 2) await fetchModel(rest[0], rest[1]);
+else fail("usage: fetch-sherpa-onnx.mjs lib <dest-dir> | model k2v2-int8|parakeet-ja <dest-dir>");
