@@ -8,6 +8,7 @@ mod control;
 mod deadline;
 mod error;
 mod event;
+mod floor;
 mod interfaces;
 mod reflex;
 pub mod scenario;
@@ -37,6 +38,7 @@ pub use event::{
     AuthorizationContext, AuthorizationMethod, Capability, EVENT_SCHEMA_VERSION, EventEnvelope,
     EventKind, SecurityPlane, SourceClass, TrustLevel,
 };
+pub use floor::*;
 pub use interfaces::{
     Authorized, AuthorizedAvatarAction, AuthorizedStreamAction, AuthorizedToolAction, AvatarAction,
     AvatarAdapter, DecisionEngine, EngineError, EngineErrorKind, EngineFuture, GeneratedReply,
