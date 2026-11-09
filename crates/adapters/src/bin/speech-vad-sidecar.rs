@@ -33,9 +33,9 @@ use aivtuber_adapters::speech_stt::supervisor::{SttWorker, SttWorkerConfig};
 #[cfg(feature = "mic-capture")]
 use aivtuber_adapters::speech_vad::StreamClock;
 use aivtuber_adapters::speech_vad::{
-    FRAME_MS, HysteresisConfig, LineSink, MAX_PREROLL_MS, ObservationStamper, PreRoll, RawEdge,
-    RuntimeClockMap, SILERO_PROVIDER_VERSION, SileroVad, StamperConfig, VadPipeline,
-    pump_clock_syncs,
+    FRAME_MS, FeedHeartbeat, HysteresisConfig, LineSink, MAX_PREROLL_MS, ObservationStamper,
+    PreRoll, RawEdge, RuntimeClockMap, SILERO_PROVIDER_VERSION, SileroVad, StamperConfig,
+    VadPipeline, pump_clock_syncs,
 };
 use aivtuber_domain::SpeechEdge;
 use std::io::BufReader;
@@ -95,6 +95,9 @@ struct Args {
     clock_probe_ms: Option<u64>,
     duration: Option<Duration>,
     stats_every: Duration,
+    /// Feed-liveness beat interval (#81 S2); 0 = no beat (the default, so a
+    /// consumer that does not know the line never sees it).
+    feed_heartbeat_ms: u64,
 }
 
 fn usage() -> String {
@@ -102,7 +105,7 @@ fn usage() -> String {
      [--speaker-id ID] [--input-wav FILE [--pace realtime|max]] [--input-device NAME] \
      [--list-devices] [--clock sync|local] [--sync-timeout-ms N] [--preroll-ms N] \
      [--start-threshold P] [--end-threshold P] [--clock-probe-ms N] [--duration-secs N] \
-     [--stats-secs N] [--stt-worker PROGRAM [--stt-model k2v2-int8|parakeet-ja \
+     [--stats-secs N] [--feed-heartbeat-ms N] [--stt-worker PROGRAM [--stt-model k2v2-int8|parakeet-ja \
      --stt-model-dir DIR] [--stt-threads N] [--stt-preroll-ms N] [--stt-tail-ms N] \
      [--stt-min-speech-ms N] [--stt-max-segment-ms N] [--stt-startup-timeout-ms N] \
      [--stt-heartbeat-timeout-ms N] [--stt-drain-ms N] [--stt-wait-ready-ms N] \
@@ -136,6 +139,7 @@ fn parse_args() -> Result<Args, String> {
         clock_probe_ms: None,
         duration: None,
         stats_every: Duration::from_secs(10),
+        feed_heartbeat_ms: 0,
     };
     let mut iter = std::env::args().skip(1);
     while let Some(flag) = iter.next() {
@@ -198,6 +202,12 @@ fn parse_args() -> Result<Args, String> {
             "--stats-secs" => {
                 a.stats_every =
                     Duration::from_secs(int(value("--stats-secs")?, "--stats-secs")?.max(1))
+            }
+            "--feed-heartbeat-ms" => {
+                a.feed_heartbeat_ms = int(value("--feed-heartbeat-ms")?, "--feed-heartbeat-ms")?;
+                if a.feed_heartbeat_ms != 0 {
+                    FeedHeartbeat::new(a.feed_heartbeat_ms)?;
+                }
             }
             "--stt-worker" => stt_worker = Some(value("--stt-worker")?),
             "--stt-model" => stt_model = Some(value("--stt-model")?),
@@ -328,6 +338,7 @@ struct Emitter {
     edges_emitted: u64,
     stamp_errors: u64,
     stt: Option<SegmentFeeder<SttWorker>>,
+    heartbeat: Option<FeedHeartbeat>,
 }
 
 impl Args {
@@ -341,6 +352,17 @@ impl Args {
 }
 
 impl Emitter {
+    /// Feed liveness (#81 S2): called only right after a chunk of audio went
+    /// through the scorer, so a stalled device or scorer stops the beat. The
+    /// line is dropped, never queued behind edges, when the sink is full.
+    fn beat(&mut self) {
+        if let Some(heartbeat) = &mut self.heartbeat
+            && let Some(line) = heartbeat.due(Instant::now())
+        {
+            self.sink.send(line);
+        }
+    }
+
     /// Edges out, and the STT segmenter stepped on the same stream position.
     fn step(
         &mut self,
@@ -400,6 +422,10 @@ fn run() -> Result<(), String> {
         edges_emitted: 0,
         stamp_errors: 0,
         stt: None,
+        heartbeat: match args.feed_heartbeat_ms {
+            0 => None,
+            ms => Some(FeedHeartbeat::new(ms)?),
+        },
     };
 
     if let Some(interval_ms) = args.clock_probe_ms {
@@ -545,6 +571,7 @@ fn run_clock_probe(args: &Args, interval_ms: u64, timeline: &Timeline, emitter: 
         };
         start = !start;
         emitter.emit(&[edge], |_| timeline.runtime_ms(local));
+        emitter.beat();
         std::thread::sleep(Duration::from_millis(interval_ms));
     }
 }
@@ -611,6 +638,7 @@ fn run_wav(
         emitter.step(&edges, pipeline.preroll(), |s| {
             timeline.runtime_ms(origin_local + s as f64 / 16.0)
         });
+        emitter.beat();
         if emitter.sink.is_closed() {
             break;
         }
@@ -698,6 +726,7 @@ fn run_mic(
                 .ok_or(aivtuber_adapters::speech_vad::ClockError::NotSynced)?;
             timeline.runtime_ms(local)
         });
+        emitter.beat();
         if Instant::now() >= next_stats {
             next_stats = Instant::now() + args.stats_every;
             let sink = emitter.sink.stats();

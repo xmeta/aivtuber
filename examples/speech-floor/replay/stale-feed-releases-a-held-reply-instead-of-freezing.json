@@ -1,0 +1,110 @@
+{
+  "schema_version": "0.1.0",
+  "name": "a feed that stops beating makes costly decisions wait (stale_observation), and a feed dead beyond vad_loss_ms degrades to the text-only path (vad_unavailable) so the reply is released instead of held forever (ADR-0005 D6, #81 S2)",
+  "language": "ja",
+  "floor": {
+    "max_defer_ms": 60000
+  },
+  "conversation": {},
+  "steps": [
+    {
+      "now_ms": 1000,
+      "beat": true,
+      "vad": [
+        {
+          "speaker_id": "mic-local",
+          "edge": "start",
+          "observed_at_ms": 1000
+        }
+      ]
+    },
+    {
+      "now_ms": 1100,
+      "beat": true,
+      "transcripts": [
+        {
+          "speaker_id": "mic-local",
+          "segment_id": 1,
+          "revision": 0,
+          "kind": "final",
+          "text": "聞こえてる",
+          "covered_audio_ms": 500,
+          "observed_at_ms": 1050
+        }
+      ]
+    },
+    {
+      "now_ms": 1100,
+      "route": true,
+      "expect": [],
+      "expect_floor": {
+        "deferred": 1,
+        "released_after_deferral": 0,
+        "dropped_expired": 0,
+        "dropped_overflow": 0,
+        "queued": 1
+      },
+      "expect_decision": {
+        "action": "wait",
+        "reason": "user_speaking"
+      }
+    },
+    {
+      "now_ms": 1300,
+      "route": true,
+      "expect": [],
+      "expect_floor": {
+        "deferred": 1,
+        "released_after_deferral": 0,
+        "dropped_expired": 0,
+        "dropped_overflow": 0,
+        "queued": 1
+      },
+      "expect_decision": {
+        "action": "wait",
+        "reason": "stale_observation"
+      }
+    },
+    {
+      "now_ms": 6100,
+      "route": true,
+      "expect": [],
+      "expect_floor": {
+        "deferred": 1,
+        "released_after_deferral": 0,
+        "dropped_expired": 0,
+        "dropped_overflow": 0,
+        "queued": 1
+      },
+      "expect_decision": {
+        "action": "wait",
+        "reason": "stale_observation"
+      }
+    },
+    {
+      "now_ms": 6101,
+      "route": true,
+      "expect": [
+        {
+          "event_id": "evt-speech-0000000001",
+          "observed_at": "1970-01-01T00:00:01.050Z",
+          "actor_id": "speaker:mic-local",
+          "text": "聞こえてる",
+          "admission": "Queued",
+          "playback": "reaction.agree.01"
+        }
+      ],
+      "expect_floor": {
+        "deferred": 1,
+        "released_after_deferral": 1,
+        "dropped_expired": 0,
+        "dropped_overflow": 0,
+        "queued": 0
+      },
+      "expect_decision": {
+        "action": "take_turn",
+        "reason": "vad_unavailable"
+      }
+    }
+  ]
+}

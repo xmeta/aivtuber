@@ -1,0 +1,31 @@
+{
+  "schema_version": "0.1.0",
+  "name": "when the feed stops beating, a user run that would have confirmed (500 ms and 2 s) does not stop output: the performer holds (stale_observation) and nothing is cancelled (ADR-0005 D6; #81 S2)",
+  "language": "ja",
+  "backend": "fading",
+  "barge_in": { "fade_ms": 120 },
+  "steps": [
+    { "now_ms": 0, "speak": { "duration_ms": 8000 } },
+    {
+      "now_ms": 1000,
+      "beat": true,
+      "vad": [{ "speaker_id": "mic-local", "edge": "start", "observed_at_ms": 1000 }]
+    },
+    {
+      "now_ms": 1100,
+      "beat": true,
+      "service": true,
+      "expect": { "record": null, "audio_stops": [], "avatar_resets": 0, "speaking": true, "pending_audio": 1, "yields_decided": 0 }
+    },
+    {
+      "now_ms": 1500,
+      "service": true,
+      "expect": { "record": null, "audio_stops": [], "avatar_resets": 0, "speaking": true, "pending_audio": 1, "yields_decided": 0 }
+    },
+    {
+      "now_ms": 3000,
+      "service": true,
+      "expect": { "record": null, "audio_stops": [], "avatar_resets": 0, "speaking": true, "pending_audio": 1, "yields_decided": 0 }
+    }
+  ]
+}

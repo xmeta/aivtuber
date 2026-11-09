@@ -1,8 +1,8 @@
 use crate::{AudioOutput, AvatarOutput, StreamOutput};
 use aivtuber_adapters::{
-    AudioPlayRequest, AudioPlayer, DropReason, GazeTarget, LocalAvatarHandle, LocalAvatarHealth,
-    LocalAvatarServer, LocalAvatarState, ObsWebSocketAdapter, PresetKind, PresetMapping,
-    VTubeStudioAdapter, WireCommand, map_preset,
+    AudioPlayRequest, AudioPlayer, AudioStopOutcome, DropReason, GazeTarget, LocalAvatarHandle,
+    LocalAvatarHealth, LocalAvatarServer, LocalAvatarState, ObsWebSocketAdapter, PresetKind,
+    PresetMapping, VTubeStudioAdapter, WireCommand, map_preset,
 };
 use aivtuber_domain::{
     AuthenticatedControl, AuthorizedStreamAction, AvatarAction, EngineError, EngineErrorKind,
@@ -20,6 +20,10 @@ where
             audio_ref: command.audio_ref.clone(),
             speed_factor: command.speed_factor,
         })
+    }
+
+    fn stop(&mut self, fade_ms: u32) -> Result<AudioStopOutcome, EngineError> {
+        AudioPlayer::stop(self, fade_ms)
     }
 }
 

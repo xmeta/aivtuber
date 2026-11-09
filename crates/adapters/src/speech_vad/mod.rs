@@ -19,6 +19,7 @@
 mod clock;
 mod edges;
 mod emit;
+mod heartbeat;
 #[cfg(feature = "mic-capture")]
 pub mod mic;
 mod pipeline;
@@ -33,6 +34,10 @@ pub use clock::{
 };
 pub use edges::{EdgeDetector, HysteresisConfig};
 pub use emit::{LineHandle, LineSink, ObservationStamper, SinkStats, StamperConfig};
+pub use heartbeat::{
+    FEED_HEARTBEAT_MAX_LINE_BYTES, FEED_HEARTBEAT_MAX_MS, FEED_HEARTBEAT_MIN_MS, FeedHeartbeat,
+    encode_feed_heartbeat_line, parse_feed_heartbeat_line,
+};
 pub use pipeline::{
     FRAME_MS, FRAME_SAMPLES, FrameScorer, PipelineStats, RawEdge, SAMPLE_RATE_HZ, VadPipeline,
 };

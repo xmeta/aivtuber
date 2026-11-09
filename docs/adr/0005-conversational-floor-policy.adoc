@@ -345,6 +345,17 @@ Recorded after review; the ADR status remains Proposed. These prevail over D1 to
 . *S-7 (microphone speaker)*: the normalizer assigns +source_class+ speech and +untrusted+ to any non-operator speaker. Even the operator's own microphone is content plane, never control. Floor priority comes from configuration, never from what was said. This is the rule. Closes Q7. It is consistent with S-3: a voice barge-in is untrusted content that can only make the performer stop, never publish or command.
 . *#92 feedback*: the floor consumes raw activity edges without the 250 ms debounce (the D2 requirement is confirmed, closing the other half of Q6). The two 800 ms false-take numbers, 1% (causal raw activity) and EXP-0001's 4% (segment semantics), are both kept.
 
+=== Implementation notes (#81 S2)
+
+Recorded where the code departs from, or has to interpret, the text above. Operator documentation is in link:../production-runtime.adoc[production-runtime.adoc].
+
+* *D6 feed liveness is a sidecar heartbeat, aged by receipt time.* The sidecar writes a bounded `{"vad":{"heartbeat":{"seq":N}}}` line only after processing audio; it is outside the `speech-observation` schema (it carries no observation, time or authority), and the app ages it by its own receipt time, not by a cross-process stamp. Until the first beat the rule is dormant (the S1 behaviour); the app enables the beat with the floor.
+* *S-3 needed a stop primitive that did not exist.* The ADR assumed an audio stop path. `AudioOutput`/`AudioPlayer` had `play` only, and the production `ProcessAudioPlayer` detached its child, so even operator stop could not end audio already started. S2 adds `stop(fade_ms) -> AudioStopOutcome` (default `Unsupported`; the process backend hard-stops; the optional native backend fades). It is a method on the output the app already owns, called only from the app's barge-in path after the scheduler cancelled; it carries no authority. Operator stop was not changed (see the limits in production-runtime.adoc).
+* *The stop follows the scheduler's arbitration.* A confirmed barge-in is conversation-priority untrusted input, so `Scheduler::stop_speaking_for` leaves a better-ranked performance and a non-interruptible one alone (recorded as `nothing_to_stop`); S-3's "stop at a non-safe point" applies to what the user speech could have preempted anyway. Reserved (queued) audio performances are cancelled with the playing one, since speaking over the user from a reservation would defeat the stop.
+* *Execution requires a reported feed.* Stopping speech is the costly-to-reverse decision (D6), so the executor does nothing until the feed has reported liveness once. A sidecar without the beat therefore keeps the S1 behaviour (a confirmed yield is recorded, never executed).
+* *Only confirmed yields are sequenced.* The executor evaluates the pure policy each tick and records a floor decision (with its sequence and logical time) only for a confirmed `Yield`, once per user speech run, so tentative and held evaluations at tick rate neither fill the bounded ring nor put speculation into the record.
+* *Not implemented here.* A recovered feed counting its confirmation from the original raw start edge rather than from a fresh run (D6 last bullet): the S1 policy has no gap marker, and the sidecar's own `gap` already forces an end edge on a dropped audio chunk. The heard prefix (Q9), backchannels, early preparation and phrase-level interrupt points remain open.
+
 == Consequences
 
 === Positive
