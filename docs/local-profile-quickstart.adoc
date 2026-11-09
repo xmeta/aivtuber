@@ -115,7 +115,7 @@ export AIVTUBER_TTS_SIDECAR_AMPLITUDE_VISEMES=true            # mouth movement f
 
 # speech input (supervised children): live microphone
 export AIVTUBER_SPEECH_SIDECAR=target/release/speech-vad-sidecar
-export AIVTUBER_SPEECH_SIDECAR_ARGS="--model /path/to/local-assets/vad/silero_vad_op18_ifless.onnx --language ja --stt-wait-ready-ms 90000"
+export AIVTUBER_SPEECH_SIDECAR_ARGS="--model /path/to/local-assets/vad/silero_vad_op18_ifless.onnx --language ja"
 export AIVTUBER_SPEECH_STT_WORKER=target/release/speech-stt-worker
 export AIVTUBER_SPEECH_STT_MODEL_DIR=/path/to/local-assets/k2v2
 export AIVTUBER_SPEECH_CONVERSATION=true
@@ -137,7 +137,7 @@ cargo run --release --locked -p aivtuber-app --bin aivtuber-app
 Notes that matter:
 
 * *Paths with spaces* are not supported in `AIVTUBER_SPEECH_SIDECAR_ARGS` (split on whitespace). Use a path without spaces.
-* *No microphone yet?* Add `--input-wav FILE.wav --pace realtime` to `AIVTUBER_SPEECH_SIDECAR_ARGS` (a PCM WAV; the sidecar mixes down and resamples to 16 kHz mono, tests cover 48 kHz stereo). It goes through the same VAD, STT, floor and routing as the microphone; there is no shortcut around the untrusted ingress. When the file ends the sidecar exits and the app logs `speech_sidecar: degraded: sidecar exited` and carries on with typed chat. For a microphone, use `--list-devices` to see names and `--input-device NAME`.
+* *No microphone yet?* Add `--input-wav FILE.wav --pace realtime --stt-wait-ready-ms 90000` to `AIVTUBER_SPEECH_SIDECAR_ARGS` (a PCM WAV; the sidecar mixes down and resamples to 16 kHz mono, tests cover 48 kHz stereo; the last flag makes it wait for the STT model before reading the file, so the first clip is not skipped). It goes through the same VAD, STT, floor and routing as the microphone; there is no shortcut around the untrusted ingress. When the file ends the sidecar exits and the app logs `speech_sidecar: degraded: sidecar exited` and carries on with typed chat. For a microphone, use `--list-devices` to see names and `--input-device NAME`.
 * *Do not set* `AIVTUBER_VOICE_MODEL` unless you also have cached assets for that voice. It names the voice the cached pack was authored for (default `example-voice-v1`); a different name makes every cached descriptor incompatible (`indexed=6 usable=0`) and cached reactions silently find nothing. The synthesizer's own identity is recorded separately in the provenance (`model_alias=supertonic-3-int8`).
 * *Floor and barge-in.* `AIVTUBER_SPEECH_FLOOR` requires `AIVTUBER_SPEECH_CONVERSATION`; `AIVTUBER_SPEECH_BARGE_IN` requires the floor. With the floor on, a spoken turn is answered only after the speaker has been silent for 800 ms (`AIVTUBER_SPEECH_FLOOR_TAKE_TURN_SILENCE_MS`, 700 to 1000). A user who speaks over the avatar for 400 ms stops the playing reply (`speech_barge_in:` log line).
 * *Reply length.* Left at its default the model may write several hundred characters, which is over 30 seconds of speech and can exceed the TTS sidecar's 12 s synthesis deadline (`local-tts-sidecar: deadline_exceeded`; the reply degrades to a non-verbal reaction). `AIVTUBER_OPENAI_MAX_OUTPUT_TOKENS=96` kept replies to 5 to 15 seconds of audio on the measured host.
