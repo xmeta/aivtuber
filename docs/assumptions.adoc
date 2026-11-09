@@ -202,6 +202,22 @@ S2 measurement (`speech-vad-sidecar`, see the Speech sidecar section of `docs/pr
 
 *Related:* #81, #92, ADR-0005.
 
+=== A-SPEECH-STT-001 -- A re-decoded offline recognizer gives usable partials and finals on a CPU shared with the renderer
+
+*Subsystem:* speech transcripts (#92 S3b)
+
+*Status:* Needs validation
+
+*Statement:* Re-decoding the open segment with an offline recognizer (ReazonSpeech k2-v2 int8 through sherpa-onnx, 4 CPU threads) about every 500 ms of audio keeps up in real time and yields final text within about 130 ms of the end of the covered audio, early revisable partials (not prefix-stable: about 59% of partials are a prefix of the final, EXP-0002 6.2) and engine text that the pipeline passes on unmodified. The 500 ms end-of-speech tail, the 250 ms minimum speech, the 300 ms pre-roll, the 1500 ms partial age and floor-hold limits and the 10 s final age limit are measured or chosen on read speech and a synthetic floor, not on conversation (decision Q7 accepted this as a limitation).
+
+*Evidence:* EXP-0002 6.1 and 6.2; the end-to-end measurement in the Speech transcripts section of `docs/production-runtime.adoc` (8 clips, this host, final after covered audio p50 127 ms, max 179 ms, identical text in 3 runs); executable: `speech_transcript`, `speech_transcript_replay` (crates/runtime) and `speech_stt` (crates/adapters) tests.
+
+*Consequence if false:* On a host that cannot keep up, partial requests are dropped (counted) and finals arrive late; a final older than 10 s is rejected (`stale_age`); a decode past its deadline ends the worker and the transcript path degrades to nothing while VAD edges and the deterministic fallback carry on. Nothing blocks the scheduler.
+
+*Revisit when:* a real-conversation check (decision Q7) is run, the renderer and an LLM client are measured concurrently, a second platform is pinned, or a streaming Japanese model with a clean license appears (EXP-0002 section 8).
+
+*Related:* #92, EXP-0002, ADR-0004, ADR-0005.
+
 === A-RESEARCH-001 -- External benchmark results do not define aivtuber production thresholds
 
 *Subsystem:* research / evaluation

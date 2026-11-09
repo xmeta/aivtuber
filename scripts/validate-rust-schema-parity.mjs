@@ -20,6 +20,7 @@ const eventSchema = ajv.compile(loadJson("schemas/event-envelope.schema.json"));
 const reflexSchema = ajv.compile(loadJson("schemas/reflex-decision.schema.json"));
 const avatarCommandSchema = ajv.compile(loadJson("schemas/avatar-playback-command.schema.json"));
 const speechObservationSchema = ajv.compile(loadJson("schemas/speech-observation.schema.json"));
+const speechTranscriptSchema = ajv.compile(loadJson("schemas/speech-transcript.schema.json"));
 
 const output = execFileSync(
   "cargo",
@@ -41,6 +42,13 @@ const speechOutput = execFileSync(
   { cwd: root, encoding: "utf8" },
 );
 const speechEmitted = JSON.parse(speechOutput);
+
+const transcriptOutput = execFileSync(
+  "cargo",
+  ["run", "--locked", "--quiet", "-p", "aivtuber-domain", "--example", "speech_transcript_parity"],
+  { cwd: root, encoding: "utf8" },
+);
+const transcriptEmitted = JSON.parse(transcriptOutput);
 
 let failures = 0;
 function check(label, validator, value) {
@@ -73,6 +81,14 @@ if (speechEmitted.batches.length < 4) {
   console.error("FAIL      expected at least 4 Rust SpeechObservationBatch samples");
 }
 
+for (const [index, batch] of transcriptEmitted.batches.entries()) {
+  check(`Rust SpeechTranscriptBatch[${index}] -> JSON Schema`, speechTranscriptSchema, batch);
+}
+if (transcriptEmitted.batches.length < 6) {
+  failures += 1;
+  console.error("FAIL      expected at least 6 Rust SpeechTranscriptBatch samples");
+}
+
 if (!avatarEmitted.commands.some((command) => command.kind === "reset")) {
   failures += 1;
   console.error("FAIL      expected a Rust AvatarPlaybackCommand::Reset sample");
@@ -87,6 +103,6 @@ if (emitted.reflex_decisions.length < 1) {
   console.error("FAIL      expected at least one Rust ReflexDecision sample");
 }
 
-const total = emitted.events.length + emitted.reflex_decisions.length + avatarEmitted.commands.length + speechEmitted.batches.length;
+const total = emitted.events.length + emitted.reflex_decisions.length + avatarEmitted.commands.length + speechEmitted.batches.length + transcriptEmitted.batches.length;
 console.log(`\n${total - failures} passed, ${failures} failed`);
 process.exit(failures > 0 ? 1 : 0);

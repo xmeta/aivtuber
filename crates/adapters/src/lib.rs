@@ -13,6 +13,7 @@ mod local_avatar;
 mod mcp;
 mod obs;
 mod openai;
+pub mod speech_stt;
 pub mod speech_vad;
 mod transport;
 mod tts_http;

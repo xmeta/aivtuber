@@ -86,6 +86,12 @@ Record the result as one of:
 |Pure Rust, no build-time network, loads the 16 kHz Silero v6 export and matches onnxruntime to under 1e-6 per frame (see docs/production-runtime.adoc, Speech sidecar). The standard `silero_vad.onnx` does not load in tract (`If` node). Keep frame cadence, hysteresis edges (no debounce), pre-roll, clock mapping and the observation contract project-owned. Do not use the sherpa-onnx v4 export.
 |#92
 
+|Local Japanese STT runtime
+|`sherpa-onnx` crate 2.0.1 (official, Apache-2.0) with ReazonSpeech k2-v2 int8 (default) or parakeet-tdt_ctc-0.6b-ja int8, behind the off-by-default `sherpa-stt` feature
+|Wrap (EXP-0002 and the S3a decisions on #92; an owned `libloading` FFI is the recorded fallback, not needed)
+|Measured fast enough on CPU (final call p50 123 ms) and reproduces the Python text. Two scoped build-time license exceptions in `deny.toml`, `SHERPA_ONNX_ARCHIVE_DIR` always set from a SHA-256-verified archive (the crate's own download path is never used), engine libraries and models pinned by SHA-256 in the worker, weights never redistributed (docs/supply-chain.adoc section 9). Keep segmentation, pre-roll, the partial cadence, revision/supersede semantics, deadlines, heartbeat, trust labelling and replay identity project-owned (docs/production-runtime.adoc, Speech transcripts).
+|#92
+
 |Microphone capture
 |`cpal`
 |Adopt

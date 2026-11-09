@@ -155,6 +155,108 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # Issue #92 S3b: the optional local Japanese STT worker (the `sherpa-stt`
+  # feature, the official sherpa-onnx crate). It is a separate job, not part of
+  # the required `Rust checks`, because it needs the engine libraries. It builds
+  # and lints the feature and runs the model-free tests; it runs no model (no
+  # weights are fetched or cached in CI, and none are ever committed).
+  #
+  # The crate's build script downloads prebuilt binaries over HTTPS and
+  # verifies nothing unless SHERPA_ONNX_ARCHIVE_DIR is set, so the archive is
+  # fetched and SHA-256-verified by our own script first and the variable is
+  # set for every cargo step below. The default workspace gates never enable
+  # the feature and never download anything.
+  speech-stt:
+    name: Speech STT worker (sherpa-stt feature, no model)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
+
+      - name: Fetch the pinned sherpa-onnx library archive (SHA-256 verified)
+        run: node scripts/fetch-sherpa-onnx.mjs lib "$RUNNER_TEMP/sherpa-onnx"
+
+      - name: Supply chain with the feature (scoped license exceptions)
+        run: cargo deny --locked --features sherpa-stt check
+
+      - name: Clippy with the feature
+        run: cargo clippy --locked -p aivtuber-adapters --features sherpa-stt --all-targets -- -D warnings
+        env:
+          SHERPA_ONNX_ARCHIVE_DIR: ${{ runner.temp }}/sherpa-onnx
+
+      - name: Build the worker
+        run: cargo build --locked -p aivtuber-adapters --features sherpa-stt --bin speech-stt-worker
+        env:
+          SHERPA_ONNX_ARCHIVE_DIR: ${{ runner.temp }}/sherpa-onnx
+
+      - name: Model-free tests with the feature
+        run: cargo test --locked -p aivtuber-adapters --features sherpa-stt --lib speech_stt
+        env:
+          SHERPA_ONNX_ARCHIVE_DIR: ${{ runner.temp }}/sherpa-onnx
+
+      # The engine libraries are loaded from the worker's own directory (rpath
+      # $ORIGIN, DT_RPATH so LD_LIBRARY_PATH cannot override it; crates/adapters/
+      # build.rs), and the worker verifies the SHA-256 of exactly those files.
+      # Place the libraries from the verified archive beside the binary, then
+      # show the refusals. No weights here and no model is ever run.
+      - name: Worker refuses an unpinned model and tampered libraries
+        shell: bash
+        run: |
+          set -u
+          work="$RUNNER_TEMP/worker-check"
+          mkdir -p "$work/x" "$work/good"
+          tar -xjf "$RUNNER_TEMP"/sherpa-onnx/*.tar.bz2 -C "$work/x"
+          cp "$work"/x/*/lib/libsherpa-onnx-c-api.so "$work"/x/*/lib/libonnxruntime.so "$work/good/"
+          cp target/debug/speech-stt-worker "$work/good/"
+          mkdir -p "$work/no-model"
+          run() { "$@" < /dev/null 2>"$work/stderr" ; echo $?; }
+
+          # (a) genuine libraries beside the binary, empty model directory:
+          # the library check passes and the model check refuses (exit 2).
+          status=$(run "$work/good/speech-stt-worker" --model k2v2-int8 --model-dir "$work/no-model" --language ja)
+          cat "$work/stderr"
+          test "$status" -eq 2
+          grep -q "model files" "$work/stderr"
+
+          # (b) a library beside the binary is tampered with (one byte
+          # appended): the loader still loads it, the worker refuses (exit 2).
+          mkdir -p "$work/tampered"
+          cp "$work"/good/* "$work/tampered/"
+          printf '\0' >> "$work/tampered/libonnxruntime.so"
+          status=$(run "$work/tampered/speech-stt-worker" --model k2v2-int8 --model-dir "$work/no-model" --language ja)
+          cat "$work/stderr"
+          test "$status" -eq 2
+          grep -q "engine libraries beside the executable" "$work/stderr"
+
+          # (c) LD_LIBRARY_PATH cannot substitute the libraries: the tampered
+          # set on the library path is ignored and the genuine ones beside the
+          # binary load, so the run reaches the model check, not the library one.
+          status=$(LD_LIBRARY_PATH="$work/tampered" run "$work/good/speech-stt-worker" --model k2v2-int8 --model-dir "$work/no-model" --language ja)
+          test "$status" -eq 2
+          grep -q "model files" "$work/stderr"
+
+          # (d) a missing library cannot be shown as a worker refusal: the
+          # loader refuses first, before main (non-zero, not our exit 2).
+          mkdir -p "$work/missing"
+          cp "$work/good/speech-stt-worker" "$work/good/libsherpa-onnx-c-api.so" "$work/missing/"
+          status=$(run "$work/missing/speech-stt-worker" --model k2v2-int8 --model-dir "$work/no-model" --language ja)
+          cat "$work/stderr"
+          test "$status" -ne 0 && test "$status" -ne 2
+
   regressions:
     name: Bounded property regressions
     # Issue #147. `cargo test --workspace` runs the proptest suite with

@@ -98,6 +98,31 @@ fn round3(value: f32) -> f64 {
     (f64::from(value) * 1000.0).round() / 1000.0
 }
 
+fn try_send_line(sender: &SyncSender<String>, shared: &SinkShared, line: String) {
+    match sender.try_send(line) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            shared.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            shared.closed.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// See [`LineSink::handle`]. Same drop-newest, counted, never-blocking rule.
+#[derive(Clone)]
+pub struct LineHandle {
+    sender: SyncSender<String>,
+    shared: Arc<SinkShared>,
+}
+
+impl LineHandle {
+    pub fn send(&self, line: String) {
+        try_send_line(&self.sender, &self.shared, line);
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SinkStats {
     pub lines_written: u64,
@@ -149,15 +174,17 @@ impl LineSink {
     /// Drop-newest when full, so already queued edges keep their order.
     pub fn send(&self, line: String) {
         let Some(sender) = &self.sender else { return };
-        match sender.try_send(line) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                self.shared.dropped.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                self.shared.closed.store(true, Ordering::Relaxed);
-            }
-        }
+        try_send_line(sender, &self.shared, line);
+    }
+
+    /// A cloneable sender into the same bounded queue, for another thread
+    /// (the STT worker supervisor relays transcript lines through it). Handles
+    /// keep the queue open, so drop them before `finish`.
+    pub fn handle(&self) -> Option<LineHandle> {
+        self.sender.as_ref().map(|sender| LineHandle {
+            sender: sender.clone(),
+            shared: self.shared.clone(),
+        })
     }
 
     pub fn is_closed(&self) -> bool {

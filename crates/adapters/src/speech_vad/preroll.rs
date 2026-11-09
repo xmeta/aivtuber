@@ -15,6 +15,9 @@ pub const MAX_PREROLL_MS: u64 = 2_000;
 pub struct PreRoll {
     capacity: usize,
     samples: VecDeque<f32>,
+    /// Samples pushed since creation or the last `clear`, retained or not.
+    /// Stream positions (`RawEdge::sample16`) count in the same unit.
+    pushed: u64,
 }
 
 impl PreRoll {
@@ -27,6 +30,7 @@ impl PreRoll {
         Ok(Self {
             capacity,
             samples: VecDeque::with_capacity(capacity),
+            pushed: 0,
         })
     }
 
@@ -43,6 +47,7 @@ impl PreRoll {
     }
 
     pub fn push(&mut self, samples: &[f32]) {
+        self.pushed += samples.len() as u64;
         if self.capacity == 0 {
             return;
         }
@@ -64,8 +69,24 @@ impl PreRoll {
             .collect()
     }
 
+    /// Stream position just after the newest held sample.
+    pub fn end_position(&self) -> u64 {
+        self.pushed
+    }
+
+    /// Samples from stream position `from` (clamped to the oldest held
+    /// sample) up to `end_position`, and the position the copy starts at. The
+    /// STT segmenter uses it to take the pre-roll before a start edge.
+    pub fn since(&self, from: u64) -> (u64, Vec<f32>) {
+        let oldest = self.pushed - self.samples.len() as u64;
+        let start = from.clamp(oldest, self.pushed);
+        let skip = (start - oldest) as usize;
+        (start, self.samples.iter().skip(skip).copied().collect())
+    }
+
     pub fn clear(&mut self) {
         self.samples.clear();
+        self.pushed = 0;
     }
 }
 
@@ -111,6 +132,33 @@ mod tests {
         ring.push(&[1.0; 100]);
         assert!(ring.is_empty());
         assert!(PreRoll::new(MAX_PREROLL_MS + 1).is_err());
+    }
+
+    #[test]
+    fn positions_count_every_pushed_sample_and_since_clamps_to_what_is_held() {
+        let mut ring = PreRoll::new(100).unwrap();
+        let all: Vec<f32> = (0..5_000).map(|i| i as f32).collect();
+        ring.push(&all[..3_000]);
+        ring.push(&all[3_000..]);
+        assert_eq!(ring.end_position(), 5_000);
+        // Capacity is 1_600: positions 3_400..5_000 are held.
+        let (start, samples) = ring.since(4_000);
+        assert_eq!((start, samples.len(), samples[0]), (4_000, 1_000, 4_000.0));
+        let (start, samples) = ring.since(0);
+        assert_eq!((start, samples.len(), samples[0]), (3_400, 1_600, 3_400.0));
+        let (start, samples) = ring.since(9_999);
+        assert_eq!((start, samples.len()), (5_000, 0));
+        ring.clear();
+        assert_eq!(ring.end_position(), 0);
+        assert!(ring.since(0).1.is_empty());
+    }
+
+    #[test]
+    fn a_zero_window_still_counts_positions() {
+        let mut ring = PreRoll::new(0).unwrap();
+        ring.push(&[0.0; 321]);
+        assert_eq!(ring.end_position(), 321);
+        assert!(ring.since(0).1.is_empty());
     }
 
     #[test]

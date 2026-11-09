@@ -42,6 +42,24 @@ allow = [
 ]
 confidence-threshold = 0.8
 
+# Scoped exceptions for the build-time-only dependencies of the optional
+# `sherpa-stt` feature (issue #92 S3b, decision Q4). They are reachable only
+# through `sherpa-onnx-sys`'s build script (archive extraction through `zip`),
+# never linked into a runtime binary, and are not global allowlist additions:
+# any other crate under these licenses is still rejected. The default
+# `cargo deny check` graph does not include them (the feature is off), so they
+# report as unused there; `cargo deny --features sherpa-stt check` (the CI job
+# for the feature) exercises them. Reason and revisit condition:
+# docs/supply-chain.adoc, "sherpa-onnx (feature sherpa-stt)".
+[[licenses.exceptions]]
+crate = "libbz2-rs-sys@0.2.6"
+allow = ["bzip2-1.0.6"]
+
+# `CC0-1.0 OR MIT-0`: the OR is satisfied by MIT-0 alone, so CC0-1.0 stays out.
+[[licenses.exceptions]]
+crate = "ppmd-rust@1.5.2"
+allow = ["MIT-0"]
+
 [licenses.private]
 # Workspace crates are internal and not published; skip their license check.
 ignore = true

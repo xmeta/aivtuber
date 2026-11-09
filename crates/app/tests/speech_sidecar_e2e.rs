@@ -207,3 +207,197 @@ fn operator_ceiling_without_speech_rejects_batches_and_stops_the_child() {
     assert!(tracker.metrics().batches_rejected_ingress_policy >= 32);
     assert_eq!(tracker.metrics().observations_accepted, 0);
 }
+
+// ---- Issue #92 S3b: transcripts through the same supervisor ----
+
+use aivtuber_adapters::speech_stt::SttUnavailableReason;
+use aivtuber_app::SpeechTranscriptPath;
+use aivtuber_runtime::{SpeechTranscriptConfig, SpeechTranscriptTracker};
+
+fn transcript_tracker() -> SpeechTranscriptTracker {
+    let config = SpeechTranscriptConfig {
+        // The double stamps with the app's own clock, so ages are pipe
+        // latency; keep the limits generous for a loaded CI host.
+        partial_max_age_ms: 5_000,
+        final_max_age_ms: 5_000,
+        max_future_skew_ms: 1_000,
+        ..SpeechTranscriptConfig::default()
+    };
+    SpeechTranscriptTracker::new(config, IngressPolicy::default()).expect("tracker")
+}
+
+fn poll_both(
+    sidecar: &mut SpeechSidecar,
+    observations: &mut SpeechObservationTracker,
+    transcripts: Option<&mut SpeechTranscriptTracker>,
+    started: Instant,
+) {
+    let now_ms = started.elapsed().as_millis() as u64;
+    sidecar.poll_with_transcripts(observations, transcripts, now_ms, |_, _| {}, |_, _| {});
+}
+
+fn run_until(limit: Duration, mut step: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + limit;
+    while Instant::now() < deadline {
+        if step() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    false
+}
+
+/// Transcript lines reach their own tracker: partials revise and hold the
+/// floor, the final surfaces as untrusted speech content, and the ready
+/// status is seen.
+#[test]
+fn transcript_lines_are_routed_by_key_into_the_transcript_tracker() {
+    let started = Instant::now();
+    let mut observations = tracker(1_000);
+    let mut transcripts = transcript_tracker();
+    let mut sidecar = spawn("transcripts", 250, started);
+    let mut surfaced = Vec::new();
+    let mut saw_hold = false;
+    let done = run_until(Duration::from_secs(10), || {
+        poll_both(
+            &mut sidecar,
+            &mut observations,
+            Some(&mut transcripts),
+            started,
+        );
+        let now_ms = started.elapsed().as_millis() as u64;
+        saw_hold |= transcripts.floor_hold("double", now_ms).name() == "holding";
+        surfaced.extend(transcripts.take_finals(8));
+        surfaced.len() >= 2
+    });
+    assert!(done, "{:?} {:?}", sidecar.stats(), transcripts.metrics());
+    assert_eq!(sidecar.transcript_path(), SpeechTranscriptPath::Ready);
+    assert!(saw_hold, "partials held the floor between finals");
+    assert!(surfaced.iter().all(|f| f.text == "きょうは"));
+    assert!(surfaced.iter().all(|f| {
+        f.provenance.source_class == aivtuber_domain::SourceClass::Speech
+            && f.provenance.trust_level == aivtuber_domain::TrustLevel::Untrusted
+    }));
+    let m = transcripts.metrics();
+    assert!(m.partials_accepted >= 2 && m.finals_surfaced >= 2, "{m:?}");
+    assert_eq!(m.rejected_total(), 0, "{m:?}");
+    assert_eq!(m.provider_unavailable, 0);
+    // Transcript lines never touched the observation tracker.
+    assert_eq!(observations.metrics().batches_rejected_invalid, 0);
+    assert_eq!(sidecar.stats().lines_rejected, 0);
+    assert!(sidecar.stats().transcript_batches_ingested >= 5);
+}
+
+/// The sidecar reporting its worker unavailable degrades the transcript path
+/// only, once. Edges keep being ingested and later transcript lines are
+/// ignored.
+#[test]
+fn an_unavailable_status_degrades_transcripts_once_and_leaves_the_edges() {
+    let started = Instant::now();
+    let mut observations = tracker(1_000);
+    let mut transcripts = transcript_tracker();
+    let mut sidecar = spawn("stt-fail", 250, started);
+    let done = run_until(Duration::from_secs(10), || {
+        poll_both(
+            &mut sidecar,
+            &mut observations,
+            Some(&mut transcripts),
+            started,
+        );
+        sidecar.stats().transcript_lines_ignored >= 3 && sidecar.stats().batches_ingested >= 8
+    });
+    assert!(done, "{:?}", sidecar.stats());
+    assert_eq!(
+        sidecar.transcript_path(),
+        SpeechTranscriptPath::Degraded(SttUnavailableReason::WorkerExited)
+    );
+    assert!(
+        !sidecar.is_degraded(),
+        "the sidecar and its edges keep running"
+    );
+    assert_eq!(
+        transcripts.metrics().provider_unavailable,
+        1,
+        "counted once"
+    );
+    assert_eq!(observations.metrics().provider_unavailable, 0);
+    assert_eq!(transcripts.metrics().partials_accepted, 0);
+}
+
+/// 32 consecutive rejected transcript lines end the transcript path without
+/// stopping the sidecar, and without counting against the observation lines.
+#[test]
+fn thirty_two_invalid_transcript_lines_degrade_transcripts_only() {
+    let started = Instant::now();
+    let mut observations = tracker(1_000);
+    let mut transcripts = transcript_tracker();
+    let mut sidecar = spawn("transcript-garbage", 250, started);
+    let done = run_until(Duration::from_secs(15), || {
+        poll_both(
+            &mut sidecar,
+            &mut observations,
+            Some(&mut transcripts),
+            started,
+        );
+        matches!(
+            sidecar.transcript_path(),
+            SpeechTranscriptPath::Degraded(SttUnavailableReason::InvalidLines)
+        )
+    });
+    assert!(done, "{:?}", sidecar.stats());
+    assert!(!sidecar.is_degraded());
+    assert_eq!(transcripts.metrics().provider_unavailable, 1);
+    assert!(transcripts.metrics().batches_rejected_invalid >= 32);
+    assert_eq!(observations.metrics().provider_unavailable, 0);
+    // Valid edges kept resetting the observation-side counter.
+    assert!(sidecar.stats().batches_ingested >= 10);
+}
+
+/// With no transcript tracker composed (the default), transcript lines are
+/// counted and dropped, and the S2 behaviour is untouched.
+#[test]
+fn transcript_lines_without_a_tracker_are_counted_and_ignored() {
+    let started = Instant::now();
+    let mut observations = tracker(1_000);
+    let mut sidecar = spawn("transcripts", 250, started);
+    let done = run_until(Duration::from_secs(10), || {
+        poll_both(&mut sidecar, &mut observations, None, started);
+        sidecar.stats().transcript_lines_ignored >= 5
+    });
+    assert!(done, "{:?}", sidecar.stats());
+    assert_eq!(sidecar.stats().lines_rejected, 0);
+    assert_eq!(sidecar.stats().transcript_batches_ingested, 0);
+    assert!(!sidecar.is_degraded());
+}
+
+/// A sidecar that dies before it ever reported a worker is one failure of the
+/// observation path; the transcript path had nothing to lose and is not
+/// counted as a second failure.
+#[test]
+fn a_dead_sidecar_with_no_reported_worker_counts_one_failure() {
+    let started = Instant::now();
+    let mut observations = tracker(1_000);
+    let mut transcripts = transcript_tracker();
+    let mut sidecar = spawn("crash", 1_000, started);
+    let done = run_until(Duration::from_secs(10), || {
+        poll_both(
+            &mut sidecar,
+            &mut observations,
+            Some(&mut transcripts),
+            started,
+        );
+        sidecar.is_degraded()
+    });
+    assert!(done);
+    assert_eq!(observations.metrics().provider_unavailable, 1);
+    assert_eq!(transcripts.metrics().provider_unavailable, 0);
+    for _ in 0..10 {
+        poll_both(
+            &mut sidecar,
+            &mut observations,
+            Some(&mut transcripts),
+            started,
+        );
+    }
+    assert_eq!(observations.metrics().provider_unavailable, 1);
+}

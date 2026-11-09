@@ -1,0 +1,22 @@
+{
+  "schema_version": "0.1.0",
+  "provider_id": "speech-stt-worker",
+  "provider_version": "sherpa-onnx-2.0.1",
+  "language": "ja",
+  "engine": {
+    "model_id": "parakeet-tdt-ctc-0.6b-ja-int8",
+    "sha256": "abababababababababababababababababababababababababababababababab"
+  },
+  "transcripts": [
+    {
+      "speaker_id": "mic-local",
+      "segment_id": 1,
+      "revision": 1,
+      "kind": "final",
+      "text": "ありがとうございます",
+      "covered_audio_ms": 2100,
+      "observed_at_ms": 4100,
+      "complete": true
+    }
+  ]
+}

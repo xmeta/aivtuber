@@ -13,6 +13,7 @@ mod reflex;
 pub mod scenario;
 mod sidecar;
 mod speech;
+mod speech_transcript;
 mod task;
 
 pub use avatar::Viseme;
@@ -62,6 +63,7 @@ pub use speech::{
     SpeakerActivityState, SpeechActivityObservation, SpeechEdge, SpeechObservation,
     SpeechObservationBatch, TurnEndFallbackReason, TurnEndScoreObservation, fallback_turn_signal,
 };
+pub use speech_transcript::*;
 pub use task::{
     AgentTask, MAX_TASK_ID_BYTES, MAX_TASK_LIFETIME_MS_HARD, MAX_TASK_OBSERVATIONS_HARD,
     MAX_TASK_PENDING_TTL_MS_HARD, MAX_TASK_REASON_BYTES, MAX_TASK_REPLANS_HARD,

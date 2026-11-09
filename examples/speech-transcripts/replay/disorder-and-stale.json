@@ -1,0 +1,276 @@
+{
+  "schema_version": "0.1.0",
+  "name": "duplicate, superseded, out-of-order, stale and post-final revisions are rejected",
+  "config": {},
+  "steps": [
+    {
+      "now_ms": 1000,
+      "deliver": {
+        "schema_version": "0.1.0",
+        "provider_id": "speech-stt-worker",
+        "provider_version": "sherpa-onnx-2.0.1",
+        "language": "ja",
+        "engine": {
+          "model_id": "reazonspeech-k2-v2-int8",
+          "sha256": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+        },
+        "transcripts": [
+          {
+            "speaker_id": "mic-local",
+            "segment_id": 2,
+            "revision": 3,
+            "kind": "partial",
+            "text": "あ",
+            "covered_audio_ms": 1000,
+            "observed_at_ms": 900,
+            "complete": false
+          }
+        ]
+      },
+      "expect_outcomes": [
+        "accepted_partial"
+      ]
+    },
+    {
+      "now_ms": 1100,
+      "deliver": {
+        "schema_version": "0.1.0",
+        "provider_id": "speech-stt-worker",
+        "provider_version": "sherpa-onnx-2.0.1",
+        "language": "ja",
+        "engine": {
+          "model_id": "reazonspeech-k2-v2-int8",
+          "sha256": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+        },
+        "transcripts": [
+          {
+            "speaker_id": "mic-local",
+            "segment_id": 2,
+            "revision": 3,
+            "kind": "partial",
+            "text": "い",
+            "covered_audio_ms": 1100,
+            "observed_at_ms": 1000,
+            "complete": false
+          }
+        ]
+      },
+      "expect_outcomes": [
+        "stale_revision"
+      ]
+    },
+    {
+      "now_ms": 1100,
+      "deliver": {
+        "schema_version": "0.1.0",
+        "provider_id": "speech-stt-worker",
+        "provider_version": "sherpa-onnx-2.0.1",
+        "language": "ja",
+        "engine": {
+          "model_id": "reazonspeech-k2-v2-int8",
+          "sha256": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+        },
+        "transcripts": [
+          {
+            "speaker_id": "mic-local",
+            "segment_id": 2,
+            "revision": 2,
+            "kind": "partial",
+            "text": "う",
+            "covered_audio_ms": 1100,
+            "observed_at_ms": 1000,
+            "complete": false
+          }
+        ]
+      },
+      "expect_outcomes": [
+        "stale_revision"
+      ]
+    },
+    {
+      "now_ms": 1200,
+      "deliver": {
+        "schema_version": "0.1.0",
+        "provider_id": "speech-stt-worker",
+        "provider_version": "sherpa-onnx-2.0.1",
+        "language": "ja",
+        "engine": {
+          "model_id": "reazonspeech-k2-v2-int8",
+          "sha256": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+        },
+        "transcripts": [
+          {
+            "speaker_id": "mic-local",
+            "segment_id": 2,
+            "revision": 4,
+            "kind": "partial",
+            "text": "え",
+            "covered_audio_ms": 800,
+            "observed_at_ms": 1000,
+            "complete": false
+          }
+        ]
+      },
+      "expect_outcomes": [
+        "out_of_order"
+      ]
+    },
+    {
+      "now_ms": 1200,
+      "deliver": {
+        "schema_version": "0.1.0",
+        "provider_id": "speech-stt-worker",
+        "provider_version": "sherpa-onnx-2.0.1",
+        "language": "ja",
+        "engine": {
+          "model_id": "reazonspeech-k2-v2-int8",
+          "sha256": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+        },
+        "transcripts": [
+          {
+            "speaker_id": "mic-local",
+            "segment_id": 1,
+            "revision": 0,
+            "kind": "partial",
+            "text": "お",
+            "covered_audio_ms": 500,
+            "observed_at_ms": 1100,
+            "complete": false
+          }
+        ]
+      },
+      "expect_outcomes": [
+        "out_of_order"
+      ]
+    },
+    {
+      "now_ms": 1200,
+      "poll_floor": "mic-local",
+      "expect_floor": "holding"
+    },
+    {
+      "now_ms": 4000,
+      "deliver": {
+        "schema_version": "0.1.0",
+        "provider_id": "speech-stt-worker",
+        "provider_version": "sherpa-onnx-2.0.1",
+        "language": "ja",
+        "engine": {
+          "model_id": "reazonspeech-k2-v2-int8",
+          "sha256": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+        },
+        "transcripts": [
+          {
+            "speaker_id": "mic-local",
+            "segment_id": 2,
+            "revision": 5,
+            "kind": "partial",
+            "text": "か",
+            "covered_audio_ms": 1500,
+            "observed_at_ms": 1500,
+            "complete": false
+          }
+        ]
+      },
+      "expect_outcomes": [
+        "stale_age"
+      ]
+    },
+    {
+      "now_ms": 4000,
+      "deliver": {
+        "schema_version": "0.1.0",
+        "provider_id": "speech-stt-worker",
+        "provider_version": "sherpa-onnx-2.0.1",
+        "language": "ja",
+        "engine": {
+          "model_id": "reazonspeech-k2-v2-int8",
+          "sha256": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+        },
+        "transcripts": [
+          {
+            "speaker_id": "mic-local",
+            "segment_id": 2,
+            "revision": 6,
+            "kind": "final",
+            "text": "おわり",
+            "covered_audio_ms": 2000,
+            "observed_at_ms": 3900,
+            "complete": true
+          }
+        ]
+      },
+      "expect_outcomes": [
+        "accepted_final"
+      ]
+    },
+    {
+      "now_ms": 4100,
+      "deliver": {
+        "schema_version": "0.1.0",
+        "provider_id": "speech-stt-worker",
+        "provider_version": "sherpa-onnx-2.0.1",
+        "language": "ja",
+        "engine": {
+          "model_id": "reazonspeech-k2-v2-int8",
+          "sha256": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+        },
+        "transcripts": [
+          {
+            "speaker_id": "mic-local",
+            "segment_id": 2,
+            "revision": 7,
+            "kind": "partial",
+            "text": "き",
+            "covered_audio_ms": 2100,
+            "observed_at_ms": 4000,
+            "complete": false
+          }
+        ]
+      },
+      "expect_outcomes": [
+        "after_final"
+      ]
+    },
+    {
+      "now_ms": 4100,
+      "deliver": {
+        "schema_version": "0.1.0",
+        "provider_id": "speech-stt-worker",
+        "provider_version": "sherpa-onnx-2.0.1",
+        "language": "ja",
+        "engine": {
+          "model_id": "reazonspeech-k2-v2-int8",
+          "sha256": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+        },
+        "transcripts": [
+          {
+            "speaker_id": "mic-local",
+            "segment_id": 2,
+            "revision": 8,
+            "kind": "final",
+            "text": "く",
+            "covered_audio_ms": 2100,
+            "observed_at_ms": 4000,
+            "complete": true
+          }
+        ]
+      },
+      "expect_outcomes": [
+        "after_final"
+      ]
+    },
+    {
+      "now_ms": 4100,
+      "poll_floor": "mic-local",
+      "expect_floor": "none"
+    },
+    {
+      "now_ms": 4100,
+      "take_finals": true,
+      "expect_finals": [
+        "おわり"
+      ]
+    }
+  ]
+}

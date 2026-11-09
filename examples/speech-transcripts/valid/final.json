@@ -1,0 +1,22 @@
+{
+  "schema_version": "0.1.0",
+  "provider_id": "speech-stt-worker",
+  "provider_version": "sherpa-onnx-2.0.1",
+  "language": "ja",
+  "engine": {
+    "model_id": "reazonspeech-k2-v2-int8",
+    "sha256": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+  },
+  "transcripts": [
+    {
+      "speaker_id": "mic-local",
+      "segment_id": 3,
+      "revision": 5,
+      "kind": "final",
+      "text": "こんにちは今日はいい天気ですね",
+      "covered_audio_ms": 3200,
+      "observed_at_ms": 9000,
+      "complete": true
+    }
+  ]
+}

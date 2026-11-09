@@ -179,7 +179,7 @@ Silero VAD v6.2.3 runs through `tract-onnx` 0.23.10 (pure Rust, MIT OR Apache-2.
 === Privacy
 
 * Audio stays in process memory. The sidecar opens no file for writing and no socket; the only output is the observation lines (edges, times, an optional frame confidence), which cannot carry samples. `--input-wav` only reads.
-* The only audio kept beyond the frame being scored is `PreRoll`, a bounded in-memory ring of the most recent 16 kHz mono samples (`--preroll-ms`, default 300, hard cap 2000). It is the hook S3 transcription will read to recover onset the VAD reports late (EXP-0001: 12.7% of clean utterances had onset lag above 100 ms). Nothing reads it in S2, it is cleared on a capture gap, and its `Debug` output shows lengths only.
+* The only audio kept beyond the frame being scored is `PreRoll`, a bounded in-memory ring of the most recent 16 kHz mono samples (`--preroll-ms`, default 300, hard cap 2000). It is the hook the S3b transcription reads to recover onset the VAD reports late (EXP-0001: 12.7% of clean utterances had onset lag above 100 ms). Nothing reads it in S2 or when no STT worker is configured, it is cleared on a capture gap, and its `Debug` output shows lengths only. With `--stt-worker` the segment feeder copies from it into the worker pipe (see Speech transcripts below).
 * Tests that need a WAV generate synthetic signals in memory and write them under the cargo test temp directory; no recorded audio and no model is committed.
 
 === Timeline and clock mapping
@@ -191,7 +191,7 @@ Measured (A-SPEECH-OBS-001): see the assumption entry. Stamp-to-arrival lag of a
 === Failure and bounds
 
 * The child's stdout is read by a dedicated thread through the same bounded line reader as the stdin ingress (`pump_bounded_records`; lines over 16 KiB are drained and dropped, at most 64 lines queued, newest dropped and counted). Each poll ingests at most 64 lines, so a flooding child cannot starve the loop.
-* The app counts `provider_unavailable` once and stops expecting observations when the child exits, closes stdout, cannot be started, or sends 32 consecutive rejected lines (garbage, or batches refused by the operator ingress ceiling, which applies to `speech` exactly as in S1). There is no automatic restart. A silent child is not a failure: silence is normal. A child that hangs without exiting is not detected (the sidecar has no heartbeat; recorded as a limitation).
+* The app counts `provider_unavailable` once and stops expecting observations when the child exits, closes stdout, cannot be started, or sends 32 consecutive rejected lines (garbage, or batches refused by the operator ingress ceiling, which applies to `speech` exactly as in S1). There is no automatic restart. A silent child is not a failure: silence is normal. A child that hangs without exiting is not detected (the sidecar has no heartbeat; recorded as a limitation; the STT worker child it supervises does have one, see Speech transcripts below).
 * Inside the sidecar: the audio callback uses a bounded channel and counts dropped chunks; a drop closes any open segment, resets the model, resampler and clock, and restarts the stream, so a gap is never spliced. Output goes through a 64-line bounded writer (drop-newest, counted); a closed stdout ends the process.
 
 === Tests
@@ -199,6 +199,105 @@ Measured (A-SPEECH-OBS-001): see the assumption entry. Stamp-to-arrival lag of a
 * `cargo test --locked -p aivtuber-adapters --lib speech_vad` (no features): hysteresis and no-debounce, resampler band-limiting and chunk invariance, pre-roll bound, clock map and handshake reader (junk and 5 MiB line flood), stamper schema validity, bounded output under a stalled reader, pipeline mechanics on synthetic signals with a stand-in scorer.
 * `cargo test --locked -p aivtuber-adapters --features silero-vad --test speech_vad_sidecar`: the real binary and the real model (fetched with a SHA-256 check, or `AIVTUBER_SILERO_MODEL`): silence emits nothing, a synthetic vowel emits one raw start/end pair that parses as a valid batch, a very short burst is still an edge pair, 48 kHz stereo input, the clock handshake and its lag measurement, re-sync, exit on stdin close, refusal to stamp without a sync, refusal of an unpinned model. CI runs this in the same job as the workspace tests.
 * `cargo test --locked -p aivtuber-app --test speech_sidecar_e2e`: supervisor against `speech-sidecar-double` (handshake, crash, garbage flood, valid flood, oversize lines, silent child, operator ceiling).
+
+== Speech transcripts (issue #92, S3b)
+
+The speech sidecar can supervise a second child, `speech-stt-worker` (crates/adapters, `src/bin/speech-stt-worker.rs`), that turns the VAD's speech segments into Japanese partial and final transcripts. It is off by default, behind the off-by-default `sherpa-stt` cargo feature, and nothing in the default build, the default CI gates or the default tests downloads or needs a model.
+
+```text
+mic -> 16 kHz -> Silero edges ----------------------------------> sidecar stdout (speech-observation, unchanged)
+                  |
+                  +-> SegmentFeeder (PreRoll >= 300 ms, tail, min speech) --pipe--> speech-stt-worker
+                                                                                        |  sherpa-onnx offline recognizer, CPU
+sidecar stdout <-- relayed speech-transcript lines + {"stt":{...}} status <-- stdout <--+  one JSON line per revision + heartbeat
+        |
+        v
+app: SpeechSidecar::poll_with_transcripts -> SpeechTranscriptTracker (untrusted content)
+```
+
+* *Contract.* `schemas/speech-transcript.schema.json` (positive and negative fixtures in `examples/speech-transcripts`, fixture to Rust and Rust to schema parity): `segment_id`, `revision`, `kind` (`partial`|`final`), `text` (at most 1000 characters, no control characters), the declared `language`, `covered_audio_ms`, `observed_at_ms` (runtime timeline, the end of the covered audio), `engine` (`model_id` and a SHA-256 bundle digest) and `complete` (false on every partial). There is no trust, plane, source class or priority field, and no audio or word timings; extra fields are refused.
+* *Trust.* The runtime assigns the classification, and it is constant: source class `speech`, plane `content`, trust `untrusted`, even for the operator's own microphone. The operator ceiling `AIVTUBER_INGRESS_SOURCE_CLASSES` is applied before parsing, as for observations. Transcript text is data: a transcript that says "ignore your rules" is surfaced verbatim as untrusted content and changes nothing (`hostile-text` replay fixture).
+* *Partial versus final (decision Q6).* A partial is reduced by `SpeechTranscriptTracker` to a `FloorHold` observation (revision, covered audio, the character count of the latest revision, age) that may extend or hold the speaker's floor. Its text is neither retained nor exposed, so a partial cannot start a reply, reach Reflex or Thinking, or be persisted. Only a final leaves the tracker, as a `SurfacedFinal` in a bounded queue (`take_finals`); an empty final closes the segment and is not surfaced.
+* *Revisions (Q10).* A revision supersedes and never appends. A duplicate or lower revision (`stale_revision`), an older segment or a revision that covers less audio (`out_of_order`), anything after the final (`after_final`), an over-age partial (1500 ms) or final (10 s) (`stale_age`) and a future-dated one (`future_dated`) are rejected and counted. Bounds: 16 speakers with one open segment each, 8 pending finals (drop-newest, counted), 1000 characters of text, idle open segments abandoned after 45 s, idle speakers evicted after 5 min.
+* *Text (Q9).* The worker emits the engine's text unmodified. A text that violates the wire bounds is counted (`texts_rejected`) and replaced by an empty final, never rewritten. Display or projection normalisation belongs to the consumer under ADR-0004, so replay keeps the raw text.
+* *Nothing persists and nothing is minted.* No type in the tracker is serializable except the metrics, none carries a privileged-control capability or a durable-memory permit, and `Debug` output of transcripts, finals and audio frames shows lengths only. The app logs only the length of a surfaced final.
+* *Not yet routed.* Finals are drained by the app loop and only counted and logged (length, never text): feeding them through the normalizer into the typed Reflex request needs the ADR-0004 text projection and is the next slice.
+
+=== Enabling it
+
+[source,sh]
+----
+# Operator step, once: fetch the pinned engine libraries and model (every file is SHA-256 checked here and again at every start).
+node scripts/fetch-sherpa-onnx.mjs lib  /path/to/sherpa-libs            # prints SHERPA_ONNX_ARCHIVE_DIR=...
+node scripts/fetch-sherpa-onnx.mjs model k2v2-int8 /path/to/k2v2        # prints --model-dir ...
+
+# Build: SHERPA_ONNX_ARCHIVE_DIR is mandatory (see docs/supply-chain.adoc; without it the crate downloads unchecked binaries).
+export SHERPA_ONNX_ARCHIVE_DIR=/path/to/sherpa-libs
+cargo build --release --locked -p aivtuber-adapters --features silero-vad,mic-capture,sherpa-stt \
+  --bin speech-vad-sidecar --bin speech-stt-worker
+
+export AIVTUBER_SPEECH_SIDECAR=target/release/speech-vad-sidecar
+export AIVTUBER_SPEECH_SIDECAR_ARGS="--model silero_vad_op18_ifless.onnx --language ja"
+export AIVTUBER_SPEECH_STT_WORKER=target/release/speech-stt-worker
+export AIVTUBER_SPEECH_STT_MODEL_DIR=/path/to/k2v2
+cargo run --locked -p aivtuber-app
+----
+
+* `AIVTUBER_SPEECH_STT_WORKER` (the worker program; unset means no transcripts, the default) requires `AIVTUBER_SPEECH_SIDECAR` and `AIVTUBER_SPEECH_STT_MODEL_DIR`. The app composes the transcript tracker and appends `--stt-worker/--stt-model/--stt-model-dir/--stt-threads` to the sidecar's arguments; the sidecar, not the app, spawns and supervises the worker.
+* `AIVTUBER_SPEECH_STT_MODEL`: `k2v2-int8` (default, ReazonSpeech k2-v2 int8, decision Q2) or `parakeet-ja` (accuracy option, CC-BY-4.0, see docs/supply-chain.adoc). `AIVTUBER_SPEECH_STT_THREADS` (default 4; 1 still keeps up in real time).
+* `AIVTUBER_SPEECH_STT_PARTIAL_MAX_AGE_MS` (default 1500), `AIVTUBER_SPEECH_STT_FINAL_MAX_AGE_MS` (default 10000), `AIVTUBER_SPEECH_STT_FLOOR_HOLD_MS` (default 1500): the tracker limits above. All `AIVTUBER_*` variables are removed from the sidecar's and the worker's environment.
+* Sidecar flags (also usable by hand): `--stt-worker PROGRAM`, `--stt-model`, `--stt-model-dir`, `--stt-threads`, `--stt-preroll-ms` (default 300, at least 300), `--stt-tail-ms` (500), `--stt-min-speech-ms` (250), `--stt-max-segment-ms` (25000, split below the worker's 30 s cap), `--stt-startup-timeout-ms` (60000), `--stt-heartbeat-timeout-ms` (5000), `--stt-drain-ms` (8000), `--stt-wait-ready-ms` (for `--input-wav` only: wait for the model before reading the file), `--stt-arg ARG` (raw passthrough to the worker, for test doubles). The pipeline's pre-roll ring grows to the pre-roll plus the minimum speech plus 300 ms when STT is on.
+* The pre-roll hook S2 left unread is read here: a segment opens once the speech span reaches the minimum (a cough never reaches the worker), starts `--stt-preroll-ms` before the first start edge (EXP-0001 onset lag p90 was 112 to 144 ms, EXP-0002 6.5), continues across a pause shorter than the tail and closes when the tail runs out. Raw VAD edges still go out unchanged and undebounced.
+
+=== Worker behaviour
+
+* stdin is 16 kHz mono PCM framing plus segment `START`/`AUDIO`/`END` control (`speech_stt::protocol`); the reader checks every length against its tag before allocating. stdout is one `speech-transcript` JSON line per revision and a heartbeat line (`{"heartbeat":{...}}`, about 1 s, first one after the model loaded). Diagnostics go to stderr.
+* Partial re-decode of the open segment happens at most every 500 ms of new audio, and a partial is emitted only when its text changed. If the decoder is busy the request is dropped, never queued (`partials_dropped_busy`); the final always wins: a partial in flight for a segment that ended is discarded, and the final is queued (at most 2 waiting). A segment is force-finalized at 30 s; later audio of that segment is dropped until its end.
+* A decode runs on its own thread, never on the reader, the coordinator or the audio path. The engine cannot cancel a decode, so one that runs past `--decode-deadline-ms` (default 10 s) ends the worker with exit code 3, which the supervisor reports as `decode_deadline_exceeded`.
+* Pins: the worker refuses to start unless every model file matches the SHA-256 and size pinned in the binary (`speech_stt::pins`), and unless the engine libraries beside it match their pins. The sherpa-onnx libraries are linked as shared libraries and must sit beside the worker executable (Windows: application directory; Linux: `DT_RPATH $ORIGIN` from `crates/adapters/build.rs`, so `LD_LIBRARY_PATH` cannot override it). The worker verifies the libraries in `current_exe()`'s directory, which are the very files the loader used, and the sidecar resolves `--stt-worker` to a real path and verifies the libraries beside it *before spawning that path*, which is the check that can still prevent a load. The loader runs library initializers before the worker's own check; see docs/supply-chain.adoc for the residual risk. Pinned platforms: Windows x64 and Linux x64 (anything else is refused).
+* Privacy: the open segment's audio (at most 30 s) and the decode job copies live in memory only; the worker opens no file for writing and no socket; model files are only read.
+
+=== Failure policy (same as S2, plus a heartbeat)
+
+The sidecar supervises the worker; the first failure is final, the worker is killed, no restart is attempted, and the app is told once through a `{"stt":{"state":"unavailable","reason":"..."}}` line on the sidecar's stdout (a `ready` line is sent at the first heartbeat). The VAD edges and the deterministic floor fallback keep working without any transcript (decision Q3: a crash, OOM or hang in a 0.5-1 GB model must not take them down).
+
+* Reasons: `worker_failed_to_start` (missing binary, or the pinned libraries do not match), `worker_exited`, `decode_deadline_exceeded` (exit code 3), `worker_closed_output`, `worker_stdin_closed`, `invalid_lines` (32 consecutive lines that are not valid transcripts), `heartbeat_missing` (no heartbeat within 5 s once running, or 60 s to load). The heartbeat closes the hung-child limitation S2 recorded, for this child only; the sidecar itself still has none.
+* The app degrades only the *transcript path* (`SpeechSidecar::transcript_path`, counted once in `SpeechTranscriptMetrics::provider_unavailable`) on that status line, or on 32 consecutive transcript lines its tracker rejected. A sidecar that exits degrades both paths as in S2.
+* Backpressure: the pipe to the worker is a bounded queue (512 frames, about 5 s of 10 ms chunks). A refused frame damages the open segment (its remaining audio is not sent and its end carries the skip flag, so the worker closes it with an empty final and never decodes spliced audio); a refused start skips the segment; segments are skipped, not queued, while the worker is still loading. All are counted.
+* The app routes each sidecar line by its top-level key (`stt`, `transcripts`, otherwise an observation batch as before). Transcript lines are counted and ignored when no transcript tracker is composed. `{"stt":...}` is a health line like the stdin `clock_sync` line, not part of either normative schema.
+
+=== Measured (this development host, release build, one run per row, 8 Common Voice ja clips, EXP-0002 scripts for the clips)
+
+End to end through the real binaries (`speech-vad-sidecar` with Silero VAD, `speech-stt-worker` with sherpa-onnx 2.0.1, 4 CPU threads), the WAV played in real time, clip boundaries known. Times are arrival of the final line at the consumer.
+
+[cols="3,2,2,2,2",options="header"]
+|===
+|Model |Final after end of covered audio (decode + pipe) p50 / max |Final after true end of speech p50 / max (includes the 500 ms tail) |First partial after speech onset p50 / max |CER on the 8 clips
+
+|ReazonSpeech k2-v2 int8 (default)
+|127 / 179 ms (3 identical runs: 126 to 128 / 179 to 202)
+|622 / 718 ms
+|631 / 1302 ms
+|14.2% (21/148, identical text in 3 runs)
+
+|parakeet-tdt_ctc-0.6b-ja int8
+|507 / 731 ms
+|801 / 1270 ms
+|921 / 1352 ms
+|14.9% (22/148)
+|===
+
+These agree with EXP-0002 6.1 (k2-v2 final call p50 123 ms, parakeet 323 ms plus pipe). 10 segments for 8 clips because one clip contains two pauses longer than the tail. 49 to 50 partials per run, none dropped. The CER is a plain NFKC / punctuation-stripped Levenshtein on 148 reference characters, a smoke check that the pipeline preserves the engine's text, not an accuracy result (EXP-0002 limitation L1 to L3 apply). Not measured: a live microphone, conversational speech, concurrent load from the renderer and an LLM client, other hosts.
+
+=== Tests
+
+* `cargo test --locked -p aivtuber-domain -p aivtuber-runtime speech`: transcript validation, fixture and schema parity, the tracker (supersede, stale/duplicate/out-of-order/after-final, partials never surfaced, bounds, ingress ceiling before parsing, hostile text inert) and `examples/speech-transcripts/replay/*.json` through `SpeechTranscriptReplayFixture` (logical time, no microphone or model).
+* `cargo test --locked -p aivtuber-adapters --lib speech_stt` (no features, no model): framing with hostile lengths, the worker core against a fake decoder (cadence, drop-when-behind, final wins, 30 s cap, deadline exit, heartbeat during a decode, unmodified and out-of-bounds text), the segment feeder, pins.
+* `cargo test --locked -p aivtuber-adapters --test speech_stt_supervisor`: the supervisor against `speech-stt-worker-double` (ready and relay, exit, hang, never loads, garbage flood, decode deadline, missing binary, unpinned libraries).
+* `cargo test --locked -p aivtuber-adapters --features silero-vad --test speech_vad_sidecar`: also the sidecar with the worker double (transcript lines next to unchanged edges, a dying worker, a worker that cannot start).
+* `cargo test --locked -p aivtuber-app --test speech_sidecar_e2e`: also the app routing (by key, unavailable status, 32 invalid transcript lines, no tracker composed).
+* CI job `speech-stt` (not required, Linux): builds and lints the `sherpa-stt` feature from a SHA-256-verified library archive, runs the model-free tests and checks that the worker refuses an unpinned model directory; no model is ever run in CI.
+* Manual, with the real model: `cargo run --release --locked -p aivtuber-app --bin speech-sidecar-check -- --wide --duration-secs 60 -- speech-vad-sidecar ... --input-wav clips.wav --pace realtime --stt-worker ... --stt-model k2v2-int8 --stt-model-dir ... --stt-wait-ready-ms 60000`.
 
 == Audio output
 

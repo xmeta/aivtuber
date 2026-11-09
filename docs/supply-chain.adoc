@@ -127,3 +127,55 @@ Active advisory exceptions: none.
 
 * *Chromium for Playwright.* Installed by `node node_modules/playwright-core/cli.js install --with-deps chromium`; the browser build is determined by the exact-pinned `playwright-core` (1.65.0) and cached by the hash of `bun.lock`. It is test tooling only and never ships. *Owner:* #219. *Revisit:* when Playwright is bumped.
 * *Sample VRM model.* `smoke/fetch-model.mjs` downloads `VRM1_Constraint_Twist_Sample.vrm` from `pixiv/three-vrm` pinned to commit `3caf7a21ee68f0d5dfa363ab3d577450bbf60136` and refuses any file whose SHA-256 is not `12c2b97e95e700783a6a550dc0eee2d7880aeedccef9ae67bc4c5a2f0f2631a2`. It is never committed; its license is the VRM metadata embedded in the file (see "Model and rights" in `docs/vts-obs-adapters.adoc` section 6).
+
+== 9. sherpa-onnx (feature `sherpa-stt`, issue #92 S3b)
+
+The optional local Japanese speech-to-text worker wraps the official `sherpa-onnx` crate 2.0.1 (k2-fsa, Apache-2.0; `sherpa-onnx-sys` 2.0.1, Apache-2.0) behind the off-by-default `sherpa-stt` cargo feature of `aivtuber-adapters`. Reuse mode: *wrap* (decision Q4 of the S3a decisions on #92; the fallback, an owned `libloading` FFI, was not needed because the scoped exceptions below are accepted by `cargo deny`). Without the feature nothing here is compiled, downloaded or linked.
+
+=== Scoped license exceptions
+
+The crate's build script pulls in two crates whose licenses are not in the global `allow` list. Both are permissive, both are build-time only (they reach the graph through `sherpa-onnx-sys` -> `zip` -> `bzip2`/`ppmd-rust`, archive extraction inside the build script) and neither can be switched off. They are *scoped exceptions*, pinned to the exact crate version, not global allowlist additions: any other crate under these licenses is still rejected.
+
+[cols="2,2,3",options="header"]
+|===
+|Crate |Exception in `deny.toml` |Reason and revisit condition
+
+|`libbz2-rs-sys` 0.2.6
+|`bzip2-1.0.6`
+|The bzip2 / libbzip2 license (BSD-style permissive). Build-time only. Revisit when `sherpa-onnx-sys` drops `zip`/`bzip2` from its build dependencies, or when the crate version changes (the exception names the version, so an upgrade reopens the review).
+
+|`ppmd-rust` 1.5.2
+|`MIT-0`
+|Licensed `CC0-1.0 OR MIT-0`; the `OR` is satisfied by `MIT-0` alone, so `CC0-1.0` is deliberately not allowed. Build-time only. Same revisit condition.
+|===
+
+cargo-deny evaluates the default feature set, so these two exceptions report as "not encountered" warnings in the default `cargo deny --locked check` and are exercised by `cargo deny --locked --features sherpa-stt check`, which the `speech-stt` CI job runs. (`cargo deny --all-features check licenses` fails today for an unrelated reason: the `native-audio-spike` feature's `symphonia` crates are MPL-2.0. That is not changed here.) Cargo.lock gains 29 package entries (25 new crate names, nearly all build-time), and no existing entry is removed or re-versioned.
+
+=== The crate's unchecked download path must never run
+
+The `sherpa-onnx-sys` build script downloads prebuilt libraries from GitHub over HTTPS and *verifies no checksum* unless `SHERPA_ONNX_LIB_DIR` or `SHERPA_ONNX_ARCHIVE_DIR` is set. Rules:
+
+* Every build, test or lint of `aivtuber-adapters` with `--features sherpa-stt` sets `SHERPA_ONNX_ARCHIVE_DIR` to a directory produced by `node scripts/fetch-sherpa-onnx.mjs lib <dir>`, which downloads the pinned archive for the platform and verifies its SHA-256 before it is allowed to exist under its final name. The pins: `sherpa-onnx-v2.0.1-linux-x64-shared-lib.tar.bz2` `532c45bb...` and `sherpa-onnx-v2.0.1-win-x64-shared-MT-Release-lib.tar.bz2` `afa4de3c...` (both downloaded and hashed here, and equal to the digests GitHub publishes). The CI job `speech-stt` does this before any cargo step. Local builders: the same script, then export the variable; do not build the feature without it.
+* No default job enables the feature, so no default build downloads anything. Never use `--all-features` in CI for this reason.
+* The engine libraries (`sherpa-onnx-c-api` and `onnxruntime`, plus `onnxruntime_providers_shared` on Windows) are pinned by SHA-256 inside the worker and checked by the sidecar before it spawns the worker and by the worker at start. The platform table is Windows x64 and Linux x64; other platforms are refused.
+
+=== Loaded libraries are the verified libraries
+
+The worker links the engine as shared libraries, so the OS loader resolves them before `main`. The check is only meaningful if the loader loads exactly the files that are verified, so both are tied to the directory of the executable:
+
+* The libraries must sit *beside* `speech-stt-worker`. On Windows the loader searches the application directory first. On Linux `crates/adapters/build.rs` links the worker with `-Wl,--disable-new-dtags,-rpath,$ORIGIN`: a `DT_RPATH`, which the loader consults before `LD_LIBRARY_PATH` (a `DT_RUNPATH` would come after it), so the environment cannot substitute other libraries; the sherpa-onnx libraries carry their own `$ORIGIN` rpath for `libonnxruntime`. (A `rustc-link-arg` from the dependency's build script does not reach our binary, hence our own build script, scoped to this one binary.) Neither `PATH` nor `LD_LIBRARY_PATH` is relied on.
+* The worker verifies the libraries in `current_exe()`'s directory, never an operator-supplied directory, and exits with code 2 and a clear message if they are missing from it or do not match. The sidecar resolves `--stt-worker` to a real path (no `PATH` lookup, symlinks followed), verifies the libraries beside that file, and spawns exactly that path.
+* A missing library cannot be reported by the worker: the loader refuses first (`error while loading shared libraries`, exit 127). A tampered one is refused by the worker (exit 2). The `speech-stt` CI job shows both, plus that a tampered set on `LD_LIBRARY_PATH` is ignored.
+* *Residual risk:* the loader runs the libraries' initializers before our hash check runs, so a tampered library executes once before the worker refuses it. The sidecar's pre-spawn check covers the supervised path. This is acceptable only because whoever can write beside the binary can already replace the binary itself; the pin guards against wrong, corrupt or silently updated libraries, not against an attacker with write access to the install directory. Static linking (the crate's `static` feature) would remove the shared-library question but was not chosen (a 123 MB static archive per platform, per EXP-0002 section 7, and a second verified archive flavour in CI); revisit if the install directory cannot be trusted.
+
+=== Models: provenance, licenses, no redistribution
+
+We do not redistribute weights and never commit them. The operator fetches them with `node scripts/fetch-sherpa-onnx.mjs model <name> <dir>` (pinned revision, every file SHA-256 checked); the worker verifies the same pins at every start (`crates/adapters/src/speech_stt/pins.rs`, asserted equal to the script by a unit test). The transcript lines record `engine.model_id` and a bundle digest of the pinned files.
+
+* *ReazonSpeech k2-v2 int8 (default, Q2).* Hugging Face `reazon-research/reazonspeech-k2-v2`, revision `291488c8151be24d7da4bf7af26e533fad96e407`, the four `*.int8.onnx`/`tokens.txt` files. Weights Apache-2.0 per the model card (published by the corpus publisher's own project; training recipe icefall, Apache-2.0). *Training-data provenance (Q1, accepted with conditions):* trained on the ReazonSpeech corpus (Japanese TV broadcasts), which is gated and whose card makes dataset access conditional on agreeing to use the data solely for the purpose of Article 30-4 of the Japanese Copyright Act (information analysis, which covers training). That is a term for accessing the dataset and is not stated as a restriction on the released weights. Conditions: we do not redistribute weights (the operator fetches them), and this provenance stays recorded here. Revisit if Reazon or the model card publishes a restriction on the weights, or if the project starts bundling model files.
+* *NVIDIA parakeet-tdt_ctc-0.6b-ja (selectable, `parakeet-ja`).* The sherpa-onnx int8 CTC export `sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8.tar.bz2` (archive SHA-256 `4b0a800ef29f4f4c8667339bf6f60d5bfdc2852ddc9dc5741aea65b6f8d1306b`; a third-party conversion of `nvidia/parakeet-tdt_ctc-0.6b-ja`). *License CC-BY-4.0: attribution required.* Whoever selects or distributes it must keep this notice: "Contains NVIDIA parakeet-tdt_ctc-0.6b-ja (NVIDIA, CC-BY-4.0, https://huggingface.co/nvidia/parakeet-tdt_ctc-0.6b-ja), converted to ONNX by the sherpa-onnx project (k2-fsa)." Trained on ReazonSpeech (model card dataset list): same Article 30-4 note as above.
+* Other candidates evaluated in EXP-0002 (SenseVoice, Moonshine ja, Nemotron streaming, whisper.cpp, Vosk) are not adopted and not pinned.
+
+=== Verification (2026-11)
+
+`cargo deny --locked check` and `cargo deny --locked --features sherpa-stt check` pass on this branch (advisories, bans, licenses, sources ok; duplicate-version warnings only). The feature builds from the verified archive on Windows x64 (debug build 1 m 42 s cold; release build also run).
