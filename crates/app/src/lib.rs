@@ -26,6 +26,7 @@ mod speech_sidecar;
 mod support_bundle;
 mod task_plane;
 mod tool_execution;
+mod tts_sidecar;
 
 pub use aivtuber_domain::scenario::*;
 pub use audio_stop::{AUDIO_STOP_BOUND, AudioStopReport, OperatorStopReport};
@@ -56,6 +57,7 @@ pub use speech_sidecar::*;
 pub use support_bundle::*;
 pub use task_plane::*;
 pub use tool_execution::*;
+pub use tts_sidecar::*;
 
 use aivtuber_adaptation::{
     AdaptationEngine, AppliedAdaptation, MemoryEntry, MemoryEvidence, WorkingMemory,

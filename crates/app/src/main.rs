@@ -1,6 +1,10 @@
 use aivtuber_adaptation::{
     ActorPseudonymizer, AdaptationEngine, PromotionPolicy, WorkingMemory, WorkingMemoryConfig,
 };
+use aivtuber_adapters::speech_tts::pins::{
+    SUPERTONIC_3_INT8, SUPERTONIC_MODEL_ALIAS, VOICE_LICENCE_NOTICE,
+};
+use aivtuber_adapters::speech_tts::supervisor::{LivenessGatedTts, TtsSidecar};
 use aivtuber_adapters::{
     LocalAvatarConfig, LocalAvatarServer, NormalizedHttpTtsAdapter, NormalizedHttpTtsConfig,
     ObsWebSocketAdapter, ObsWebSocketConfig, OpenAiResponsesAdapter, OpenAiResponsesConfig,
@@ -17,8 +21,8 @@ use aivtuber_app::{
     RuntimeRetentionPolicy, SHADOW_ORCHESTRATOR_SCHEMA_VERSION, ShadowOrchestratorConfig,
     ShadowPolicyIdentity, ShadowingRoutePlanner, SpeechConversationConfig,
     SpeechConversationMetrics, SpeechFloorMetrics, SpeechSidecar, SpeechSidecarConfig,
-    SpeechSidecarStats, StreamOutput, VtsAvatarOutput, VtsPlaybackConfig, apply_dispatched_request,
-    pump_bounded_records, stt_sidecar_args,
+    SpeechSidecarStats, StreamOutput, TtsSidecarSettings, VtsAvatarOutput, VtsPlaybackConfig,
+    apply_dispatched_request, pump_bounded_records, stt_sidecar_args,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
@@ -39,6 +43,7 @@ use std::env;
 use std::error::Error;
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -69,6 +74,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
 
     let retention = build_runtime_retention_policy()?;
+    // The player resolves `audio://` references under this root, and a
+    // supervised TTS sidecar is told to write its files under the same one.
+    let audio_root = env_path("AIVTUBER_AUDIO_ROOT").unwrap_or_else(|| pack_root.join("audio"));
 
     // Issue #55: the composition profile — not disconnected env flags —
     // names the active route graph. Resolve and validate before composing.
@@ -76,7 +84,14 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some(mode) => CompositionProfile::parse(&mode)?,
         None => CompositionProfile::Cached,
     };
-    let generative_configured = build_generative_runtime(&compatibility, retention, profile)?;
+    // #220 S2b: optional supervised local TTS sidecar (local profile only).
+    let mut tts_sidecar = start_tts_sidecar(profile, &audio_root, &pack_root)?;
+    let generative_configured = build_generative_runtime(
+        &compatibility,
+        retention,
+        profile,
+        tts_sidecar.as_ref().map(|handle| handle.alive.clone()),
+    )?;
     let jev_api_key_present =
         env_optional("AIVTUBER_JEV_API_KEY").is_some_and(|key| !key.trim().is_empty());
     profile.validate(generative_configured.is_some(), jev_api_key_present)?;
@@ -114,7 +129,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     )?);
 
     let mut audio_config = ProcessAudioConfig {
-        root: env_path("AIVTUBER_AUDIO_ROOT").unwrap_or_else(|| pack_root.join("audio")),
+        root: audio_root,
         ..ProcessAudioConfig::default()
     };
     if let Some(program) = env_optional("AIVTUBER_AUDIO_PROGRAM") {
@@ -544,6 +559,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
         }
 
+        if let Some(handle) = tts_sidecar.as_mut() {
+            handle.poll();
+        }
         let now_ms = elapsed_ms(started);
         // Issue #56: drain dispatched operator requests on the runtime thread.
         // The control endpoint has its own queue and never contends with the
@@ -844,10 +862,117 @@ fn build_runtime_retention_policy() -> Result<RuntimeRetentionPolicy, Box<dyn Er
     Ok(policy)
 }
 
+/// The supervised local TTS sidecar and what the app knows of its health.
+struct TtsSidecarHandle {
+    child: Option<TtsSidecar>,
+    /// False once the sidecar failed to start or exited; the TTS engine is
+    /// gated on it so replies degrade at once instead of timing out.
+    alive: Arc<AtomicBool>,
+    reported_exit: bool,
+}
+
+impl TtsSidecarHandle {
+    /// Report a mid-run exit once. Requests degrade on their own.
+    fn poll(&mut self) {
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        if !self.reported_exit && (!child.is_alive() || !child.output_open()) {
+            self.reported_exit = true;
+            self.alive.store(false, Ordering::Release);
+            eprintln!(
+                "tts_sidecar: exited; speech degrades to non-verbal reactions (no restart; restart the app to retry)"
+            );
+        }
+    }
+}
+
+/// `AIVTUBER_TTS_SIDECAR` (off by default): spawn and own `local-tts-sidecar`.
+/// Misconfiguration is a startup error. A sidecar that cannot start or become
+/// ready is not: the app carries on and every reply degrades to the typed
+/// non-verbal reaction, the same as any TTS failure.
+fn start_tts_sidecar(
+    profile: CompositionProfile,
+    audio_root: &std::path::Path,
+    pack_root: &std::path::Path,
+) -> Result<Option<TtsSidecarHandle>, Box<dyn Error>> {
+    let Some(program) = env_optional("AIVTUBER_TTS_SIDECAR") else {
+        return Ok(None);
+    };
+    if profile != CompositionProfile::Local {
+        return Err(
+            "AIVTUBER_TTS_SIDECAR is supported with AIVTUBER_MODE=local only; start the sidecar yourself and point AIVTUBER_TTS_ENDPOINT at it"
+                .into(),
+        );
+    }
+    if !env_bool("AIVTUBER_GENERATIVE_ENABLED", false)? {
+        return Err("AIVTUBER_TTS_SIDECAR requires AIVTUBER_GENERATIVE_ENABLED=true".into());
+    }
+    let model_dir = env_path("AIVTUBER_TTS_SIDECAR_MODEL_DIR")
+        .ok_or("AIVTUBER_TTS_SIDECAR_MODEL_DIR is required with AIVTUBER_TTS_SIDECAR")?;
+    let extra_args: Vec<String> = env_optional("AIVTUBER_TTS_SIDECAR_ARGS")
+        .map(|value| value.split_whitespace().map(str::to_owned).collect())
+        .unwrap_or_default();
+    let settings = TtsSidecarSettings {
+        program: PathBuf::from(&program),
+        model_dir,
+        audio_root: audio_root.to_path_buf(),
+        viseme_root: env_bool("AIVTUBER_TTS_SIDECAR_AMPLITUDE_VISEMES", false)?
+            .then(|| pack_root.to_path_buf()),
+        endpoint: required_env("AIVTUBER_TTS_ENDPOINT")?,
+        speaker_id: u32::try_from(env_u64("AIVTUBER_TTS_SIDECAR_SPEAKER_ID", 0)?)
+            .map_err(|_| "AIVTUBER_TTS_SIDECAR_SPEAKER_ID is too large")?,
+        threads: u32::try_from(env_u64("AIVTUBER_TTS_SIDECAR_THREADS", 4)?)
+            .map_err(|_| "AIVTUBER_TTS_SIDECAR_THREADS is too large")?,
+        ready_timeout: Duration::from_millis(env_u64(
+            "AIVTUBER_TTS_SIDECAR_READY_TIMEOUT_MS",
+            60_000,
+        )?),
+        extra_args,
+    };
+    let config = settings.sidecar_config()?;
+    // Operator-facing notice of the voice licence (S2a decision Q1).
+    eprintln!("tts_sidecar: {VOICE_LICENCE_NOTICE}");
+    let started = Instant::now();
+    let alive = Arc::new(AtomicBool::new(false));
+    match TtsSidecar::spawn(&config) {
+        Ok(child) => {
+            alive.store(true, Ordering::Release);
+            eprintln!(
+                "tts_sidecar: ready listen={} model={} load_ms={} visemes={}",
+                child.ready().listen,
+                child.ready().model_id,
+                started.elapsed().as_millis(),
+                if settings.viseme_root.is_some() {
+                    "amplitude"
+                } else {
+                    "off"
+                }
+            );
+            Ok(Some(TtsSidecarHandle {
+                child: Some(child),
+                alive,
+                reported_exit: false,
+            }))
+        }
+        Err(message) => {
+            eprintln!(
+                "tts_sidecar: unavailable: {message}; speech degrades to non-verbal reactions"
+            );
+            Ok(Some(TtsSidecarHandle {
+                child: None,
+                alive,
+                reported_exit: true,
+            }))
+        }
+    }
+}
+
 fn build_generative_runtime(
     compatibility: &RuntimeCompatibility,
     retention: RuntimeRetentionPolicy,
     profile: CompositionProfile,
+    supervised_tts: Option<Arc<AtomicBool>>,
 ) -> Result<Option<GenerativeRuntime>, Box<dyn Error>> {
     if !env_bool("AIVTUBER_GENERATIVE_ENABLED", false)? {
         return Ok(None);
@@ -905,12 +1030,25 @@ fn build_generative_runtime(
         aivtuber_domain::ThinkingEngine::identity(&thinking).name,
     );
 
+    // A supervised sidecar has a known identity; record it in provenance
+    // unless the operator overrode it.
+    let (default_backend, default_alias, default_version) = if supervised_tts.is_some() {
+        (
+            aivtuber_adapters::speech_tts::BACKEND_NAME,
+            Some(SUPERTONIC_MODEL_ALIAS.to_owned()),
+            Some(aivtuber_adapters::speech_stt::pins::bundle_sha256(
+                &SUPERTONIC_3_INT8,
+            )),
+        )
+    } else {
+        ("normalized-http-tts", None, None)
+    };
     let tts = NormalizedHttpTtsAdapter::new(
         NormalizedHttpTtsConfig {
             endpoint: tts_endpoint,
-            backend_name: env_string("AIVTUBER_TTS_BACKEND_NAME", "normalized-http-tts"),
-            model_alias: env_optional("AIVTUBER_TTS_MODEL_ALIAS"),
-            model_version: env_optional("AIVTUBER_TTS_MODEL_VERSION"),
+            backend_name: env_string("AIVTUBER_TTS_BACKEND_NAME", default_backend),
+            model_alias: env_optional("AIVTUBER_TTS_MODEL_ALIAS").or(default_alias),
+            model_version: env_optional("AIVTUBER_TTS_MODEL_VERSION").or(default_version),
             voice_model: compatibility.voice_model.clone(),
             viseme_mapping: compatibility.viseme_mapping.clone(),
             timeout: Duration::from_millis(env_u64("AIVTUBER_TTS_TIMEOUT_MS", 15_000)?),
@@ -929,7 +1067,11 @@ fn build_generative_runtime(
         expression_intensity: 0.4,
     })?;
 
-    let pipeline = GenerativePipeline::new(Arc::new(thinking), Arc::new(tts), compiler);
+    let tts: Arc<dyn aivtuber_domain::TtsEngine> = match supervised_tts {
+        Some(alive) => Arc::new(LivenessGatedTts::new(Arc::new(tts), alive)),
+        None => Arc::new(tts),
+    };
+    let pipeline = GenerativePipeline::new(Arc::new(thinking), tts, compiler);
     let runtime =
         GenerativeRuntime::with_execution_config(pipeline, retention.generation_execution_config())
             .map_err(io::Error::other)?;
