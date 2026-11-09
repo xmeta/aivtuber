@@ -29,9 +29,9 @@ use super::{
 };
 use aivtuber_domain::{EventEnvelope, FallbackReason};
 use aivtuber_generative::{
-    Delivery, GenerationCancellationToken, GenerationDisposition, GenerationTrace, PhraseConfig,
-    PhraseDelivery, PhraseEnd, PhraseFailure, PhraseSummary, PhraseUnit, SlotWait,
-    wait_for_started,
+    Delivery, FallbackDirective, GenerationCancellationToken, GenerationDisposition,
+    GenerationTrace, PhraseConfig, PhraseDelivery, PhraseEnd, PhraseFailure, PhraseSummary,
+    PhraseUnit, SlotWait, wait_for_started,
 };
 use aivtuber_runtime::{CachedPlaybackError, CachedPlaybackTiming, OutputVerdict, PublicOutput};
 use aivtuber_scheduler::{PhraseLink, Rejection};
@@ -296,6 +296,10 @@ pub(crate) struct PhraseRun {
     /// A copy of the completion context without the budget reservation, which
     /// stays with the one completion that settles it.
     pub(crate) context: GenerationCompletionContext,
+    /// The fallback chosen at submission. Used only when phrase 0 is refused
+    /// at the commit boundary, so nothing was heard (issue #288); once any
+    /// phrase has been spoken the reply ends without fallback speech.
+    pub(crate) fallback: FallbackDirective,
     pub(crate) segmentation_version: String,
     planned_phrases: u32,
     commits: Vec<PhraseCommitRecord>,
@@ -311,6 +315,7 @@ pub(crate) struct PhraseRun {
 }
 
 impl PhraseRun {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         generation_id: u64,
         event: EventEnvelope,
@@ -319,6 +324,7 @@ impl PhraseRun {
         started: Arc<AtomicU32>,
         provider_deadline: Instant,
         context: GenerationCompletionContext,
+        fallback: FallbackDirective,
     ) -> Self {
         Self {
             generation_id,
@@ -328,6 +334,7 @@ impl PhraseRun {
             started,
             provider_deadline,
             context,
+            fallback,
             segmentation_version: String::new(),
             planned_phrases: 0,
             commits: Vec::new(),
@@ -826,26 +833,46 @@ where
         trace: GenerationTrace,
         now_ms: u64,
     ) {
-        let Some((event, context)) = self
+        let Some((event, context, fallback, seed)) = self
             .generative
             .as_mut()
             .and_then(|generative| generative.phrase.run_mut(generation_id))
-            .map(|run| (run.event.clone(), run.context.clone()))
+            .map(|run| {
+                (
+                    run.event.clone(),
+                    run.context.clone(),
+                    run.fallback.clone(),
+                    run.seed,
+                )
+            })
         else {
             return;
         };
         self.record_generation_calls(&trace);
         let deadline =
             DeadlineObservation::new(context.interaction_deadline, context.remaining_at_route_ms);
+        // Nothing was spoken (phrase 0 refused at the commit boundary): the
+        // same visible fallback as a buffered reply that ended on the gate
+        // (issue #288). If playing it fails the event is observed as unseen.
+        let (playback, route, cache_level, trace) =
+            match self.play_fallback_directive(&event, &fallback, trace.clone(), now_ms, seed) {
+                Ok(played) => (
+                    played.playback,
+                    played.route,
+                    played.cache_level,
+                    played.trace,
+                ),
+                Err(_) => (None, RouteClass::NonVerbalFallback, None, trace),
+            };
         let handled = HandledEvent {
-            playback: None,
-            route: RouteClass::NonVerbalFallback,
+            playback,
+            route,
             routing_latency_us: context.routing_latency_us,
             generation_latency_us: None,
             generation_trace: Some(trace),
             decision: context.decision.clone(),
             template_fallback: context.template_fallback,
-            cache_level: None,
+            cache_level,
             deadline: Some(deadline),
             deferred_generation: false,
             admitted_bytes: None,

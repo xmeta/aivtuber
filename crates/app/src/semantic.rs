@@ -267,7 +267,7 @@ mod tests {
     fn starter_pack_build_is_deterministic_and_records_all_versions() {
         let mut store = AssetStore::new(pack_descriptors(), runtime());
         let report = store.index_local().expect("index assets");
-        assert_eq!(report.usable, 6);
+        assert_eq!(report.usable, 8);
 
         let first = build_semantic_index_from_asset_store(&store, &config()).expect("first index");
         let second =

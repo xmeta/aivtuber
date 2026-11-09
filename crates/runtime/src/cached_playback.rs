@@ -1078,8 +1078,8 @@ mod tests {
             .expect("index and preload starter pack");
 
         assert_eq!(report.indexed.indexed, 6);
-        assert_eq!(report.indexed.usable, 6);
-        assert_eq!(report.preloaded, 6);
+        assert_eq!(report.indexed.usable, 8);
+        assert_eq!(report.preloaded, 8);
 
         for id in [
             "reaction.surprise.01",

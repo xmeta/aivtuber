@@ -191,6 +191,9 @@ mod tests {
         );
         assert_eq!(mapped(Expression, "surprise_bright"), ("surprise", STRONG));
         assert_eq!(mapped(Expression, "smile_soft"), ("joy", MILD));
+        // The speechless `reaction.neutral` fallback (issue #288) must only
+        // use presets this renderer draws, or the "visible" reaction is not.
+        assert_eq!(mapped(Expression, "calm_soft"), ("calm", MILD));
         assert_eq!(mapped(Expression, "smile_bright"), ("joy", STRONG));
         assert_eq!(mapped(Expression, "joy"), ("joy", 1.0));
         assert_eq!(mapped(Expression, "speaking.neutral"), ("neutral", 1.0));

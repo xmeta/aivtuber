@@ -399,11 +399,20 @@ impl RoutePlanner for IntentRoutePlanner {
 ///
 /// Event kind and text are read from the already-normalized envelope; the
 /// planner never grants authority, and generated output still passes the
-/// publication gates downstream. When Thinking fails there is no cached
-/// variant group, so the existing typed fallback yields a non-verbal
-/// reaction rather than a stall.
+/// publication gates downstream. When Thinking fails (or its output is
+/// refused) the route names [`LOCAL_FALLBACK_VARIANT_GROUP`], so the shared
+/// fallback path plays the pack's silent acknowledgement (an expression and
+/// a nod through the avatar output) rather than nothing. If the pack has no
+/// such group the typed non-verbal directive is the last resort and the
+/// fallback counter records it as unseen (issue #288).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LocalRoutePlanner;
+
+/// Pack variant group the `local` profile falls back to when Thinking fails:
+/// a speechless expression-and-nod acknowledgement (starter pack
+/// `reaction.neutral.*`, issue #288). The group name is data in the pack; only
+/// the family name is fixed here.
+pub const LOCAL_FALLBACK_VARIANT_GROUP: &str = "reaction.neutral";
 
 impl RoutePlanner for LocalRoutePlanner {
     fn route(&mut self, event: &EventEnvelope) -> Result<PlaybackRoute, AppError> {
@@ -449,7 +458,7 @@ impl RoutePlanner for LocalRoutePlanner {
             routing_reason: GenerationRoutingReason::NoCachedMatch,
             intent: "generated.reply".to_owned(),
             style: None,
-            fallback_variant_group: None,
+            fallback_variant_group: Some(LOCAL_FALLBACK_VARIANT_GROUP.to_owned()),
         })))
     }
 }
@@ -983,9 +992,11 @@ mod tests {
                 GenerationRoutingReason::NoCachedMatch
             );
             assert_eq!(generation.source_event.event_id, event.event_id);
-            // No cached variant exists, so a Thinking failure degrades through
-            // the typed non-verbal fallback rather than stalling.
-            assert!(generation.fallback_variant_group.is_none());
+            // A Thinking failure plays the pack's silent acknowledgement.
+            assert_eq!(
+                generation.fallback_variant_group.as_deref(),
+                Some(LOCAL_FALLBACK_VARIANT_GROUP)
+            );
         }
     }
 
