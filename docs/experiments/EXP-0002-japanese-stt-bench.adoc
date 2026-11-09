@@ -1,0 +1,670 @@
+= EXP-0002: Japanese speech-to-text engine bench (#92 S3a)
+:toc:
+:toclevels: 2
+
+This is a durable experiment record in the link:README.adoc[Durable Experiment Records] format.
+It is the evaluation slice S3a of #92: it chooses a local Japanese speech-to-text (STT) engine by measurement before any implementation (S3b).
+It contains measurement and throwaway scripts only: no production code, no new dependency in the repository, no model, binary or audio committed.
+It follows link:EXP-0001-japanese-turn-observation-bench.adoc[EXP-0001] (VAD and turn-end) and the merged S1 (observation contract) and S2 (speech-activity sidecar with a bounded +PreRoll+ hook).
+
+== 1. Record
+
+[source,text]
+----
+Decision question:
+  Which local, permissively licensed Japanese STT engine, and which integration path from Rust
+  without build-time network downloads, should #92 S3b implement, producing partial and final
+  transcripts from the S2 VAD segments plus pre-roll?
+
+Context / baseline:
+  S2 ships speech-vad-sidecar (Silero v6 via tract, raw edges, bounded PreRoll, clock-stamped
+  observations over a supervised child-process pipe). docs/reuse-first.adoc names sherpa-onnx
+  ("wrap or sidecar; conformance/benchmark first") for local speech inference and says the
+  framework license does not imply the model license. Baseline for "good enough" is not fixed
+  (no SLO); the comparison is between candidates and against real time.
+
+Hypothesis / expected outcome (exploratory, no numeric threshold pre-registered):
+  A sherpa-onnx Japanese model gives usable accuracy at a real-time factor far below 1 on CPU;
+  Whisper-family models are more accurate but too slow on CPU for partials.
+  Expected going in: a streaming Japanese model exists in sherpa-onnx (it does not, section 6.3).
+
+Guardrails:
+  Code and weights must be permissively licensed, checked separately, and training-data terms
+  recorded; no build-time network download in the integration path; no raw audio retained or
+  sent anywhere; transcripts are untrusted content, never authority; a slow engine must never
+  sit in the scheduler/frame loop; partial transcripts must be bounded.
+
+Decision-changing evidence:
+  CER on a few hundred clips with documented normalisation; latency (final call, first partial);
+  RTF, load time, RSS; determinism; license table; Rust integration cost with cargo deny.
+
+Cheapest informative test:
+  CPU runs of each candidate on the same seeded Common Voice ja clips (section 4), one fresh
+  process per run, plus a license/provenance read and a throwaway Rust build of the leading path.
+
+Dataset/workload:
+  Common Voice 22.0 ja, test split, 400 clips (1471 s of segments, mean 3.7 s, max 10.4 s), seeded sample,
+  trimmed to a VAD-like segment (0.30 s before and 0.50 s after speech). Sherpa-onnx engines ran all 400;
+  Vosk small 200, Vosk big 60, Whisper-family 150 (kotoba q5_0 on CPU: 60), the same first clips of the order. Gold = Common Voice sentence verbatim.
+
+Commit/base/head:
+  Branch docs/92-s3a-japanese-stt-bench from origin/main 636fc58a (docs and scripts only).
+  Benchmark scripts: examples/benchmarks/stt/.
+
+Profile/config fingerprint:
+  CPU only. Offline engines: greedy / default decoding, 4 threads unless stated (Whisper: 8 threads).
+  Whisper: whisper-server, language ja, temperature 0, default greedy decoding, no timestamps, no GPU.
+  Segment: 0.30 s pre-roll, 0.50 s tail around an energy-defined speech span (section 4.2).
+
+Seed:
+  20261109 (clip selection and bootstrap intervals).
+
+Asset/index/compiler version:
+  Not applicable (no repository assets, replay index or compiler involved).
+
+Provider/model versions:
+  Section 3.
+
+Toolchain:
+  Python 3.13.12, numpy 2.5.4, scipy 1.18.1, soundfile 0.14.0, psutil 7.2.2, RapidFuzz 3.14.6,
+  sherpa-onnx 2.0.1 (Python wheel), vosk 0.3.45 (isolated venv outside the repo);
+  whisper.cpp prebuilt CPU binary (nightly b5454, contains v1.9.5); Rust 1.98.1, cargo-deny 0.20.2.
+
+Other relevant environment:
+  x86-64 desktop CPU (Zen 2 class, 8 cores / 16 threads), Windows 11 Pro, discrete GPU present but unused
+  for the CPU tables. Run date 2026-11-09. Single machine, one run per configuration.
+
+Exploratory unknowns:
+  Everything in sections 5-8. No confirmatory criterion was fixed before the results were read.
+
+Confirmatory success/guardrail criteria:
+  None (the question is a selection among candidates).
+  Criterion version / recorded-at: not applicable.
+
+Actual:
+  Sections 2 and 5-8.
+
+Evidence artifacts:
+  Scripts are committed (examples/benchmarks/stt/). Per-run outputs (JSON per run with per-clip text and
+  timings) are local only and not committed; the tables in this record are the retained evidence.
+
+Noise / uncertainty / missing evidence:
+  Section 10. In short: read speech with noisy labels, one machine, intervals are wide, partials are
+  emulated for offline engines, GPU not measured (or measured separately, section 6.6), one corpus.
+
+Expected-vs-actual difference:
+  No Japanese streaming model exists in sherpa-onnx (expected: one does). Whisper-family models were too slow on CPU
+  (RTF 0.76-3.0, seconds per segment) as expected, but were not clearly more accurate than the CPU transducers on this
+  read speech, and on a GPU they were as fast as the transducers. Vosk big was competitive in accuracy.
+
+Likely explanation:
+  The sherpa-onnx Japanese catalogue is offline-only; Whisper pads every input to a 30 s window; on short read
+  sentences with noisy labels the accuracy spread among strong models is within the measurement noise. The first two
+  statements are mechanical, the third is a limitation of the data (section 10).
+
+Decision:
+  Narrow.
+  Carry sherpa-onnx + ReazonSpeech k2-v2 int8 (CPU, prefix re-decode for partials) into the S3b design, with parakeet-ja
+  as the configurable accuracy option and a final-only Whisper GPU tier deferred; reject SenseVoice (license), Vosk,
+  CPU Whisper and sherpa-rs. Conditional on the ReazonSpeech corpus question (section 12, Q1) and on the supervisor
+  choices Q2-Q5. This is a recommendation, not a decision.
+
+Follow-up / owning issue:
+  #92 S3b (implementation). Open questions: section 12.
+
+Revisit condition:
+  A real conversational Japanese test set with permissive terms, or a streaming Japanese model with a clean
+  license, or a clarified ReazonSpeech corpus license, or a sherpa-onnx crate release that drops the
+  non-allowlisted build-time dependencies, or a CPU/GPU target change.
+----
+
+== 2. Result summary
+
+All numbers are measured here unless marked as vendor-reported.
+Accuracy is measured on read speech with noisy labels (section 10): use the ordering and the intervals, not the absolute CER.
+
+* *There is no streaming Japanese model in sherpa-onnx* (section 6.3). ReazonSpeech k2-v2 is an offline Zipformer transducer. "Streaming" with it means re-decoding a growing prefix every 0.5 s: one such call cost p50 102 ms / p95 246 ms (4 threads, int8), and the first non-empty partial arrived about 236 ms after speech onset (bounded by the 0.5 s grid, not by the model). Only about 59% of the partials were a prefix of the final text, so partials are revisable, not stable.
+* *Accuracy on read speech* (same first 150 clips, CER with 95% bootstrap interval): NeMo parakeet-tdt_ctc-0.6b-ja int8 10.3% (8.0-12.6), ReazonSpeech k2-v2 fp32 12.0% (9.0-15.4), SenseVoice 12.9% (10.7-15.3), whisper.cpp large-v3-turbo q5_0 13.1% (10.4-16.1), k2-v2 int8 14.3% (10.1-19.3), whisper medium q5_0 15.6%, whisper small 21.6%, Vosk small 27.8%. On the full 400 clips the sherpa-onnx order is the same: parakeet 15.2%, k2-v2 fp32 16.9%, SenseVoice 17.6%, k2-v2 int8 18.6%, ja-en zipformer 21.5%. Paired against k2-v2 int8, only parakeet (-3.3 pp, interval -5.5 to -1.4, n = 400) and k2-v2 fp32 (-1.6 pp, interval -3.1 to -0.4) are distinguishable on the 400 clips; the strong engines are otherwise within noise of each other. Absolute CER is pessimistic (noisy labels, orthographic scoring; section 10).
+* *CPU cost, final call on a whole segment* (mean segment 3.7 s): k2-v2 int8 RTF 0.039, p50 123 ms, p95 289 ms, load 4.1 s, peak working set 548 MB; parakeet RTF 0.102, p50 323 ms, p95 776 ms, 938 MB, load 9.1 s; SenseVoice RTF 0.053; k2-v2 fp32 RTF 0.046 but 1050 MB. Whisper-family models on 8 CPU threads need *seconds per segment regardless of its length* (30 s window): small 2.9 s (RTF 0.76), medium q5_0 7.4 s (1.9), large-v3-turbo q5_0 12.0 s (3.0), kotoba-whisper v2.0 q5_0 11.8 s (2.9, 60 clips). They cannot do partials or real-time final transcripts on this CPU.
+* *GPU, reported separately* (whisper.cpp CUDA 12.4 build, RTX 2070-class GPU): kotoba-whisper v2.0 fp16 p50 144 ms / p95 201 ms (RTF 0.038), large-v3-turbo fp16 157 / 237 ms (RTF 0.042), load about 20 s, roughly 1.8-1.9 GB of GPU memory above the idle baseline; CER 13.6% and 11.5% on the first 150 clips, i.e. within noise of the CPU transducers. This makes a final-only Whisper tier viable on a machine with a free GPU; contention with the avatar renderer was not measured.
+* *Determinism:* the same input in the same process gave the same text on 100 of 100 re-runs for every sherpa-onnx model and on every Whisper run; a fresh process gave identical text on 400 of 400 clips; changing the thread count of the int8 model changed the text on 3 of 400 clips (1 thread) and 1 of 400 (8 threads), so replay must pin the thread count. Vosk small was *not* repeatable within a process (46 of 50).
+* *Pre-roll matters:* with a 300 ms pre-roll the k2-v2 int8 CER on 200 clips was 14.8%; cutting the segment to start 150 ms before the energy-defined onset gave 16.8%, 100 ms 18.9%, at the onset 22.1%, 100 ms after it 23.3% (section 6.5).
+* *Licenses (section 3.2):* sherpa-onnx, whisper.cpp and Vosk code are Apache-2.0 / MIT. *Non-permissive or non-standard:* SenseVoice weights (custom FunASR license with a forfeiture clause). *Unverified:* the ja-en zipformer weights, Vosk's training data (its README reports CSJ test sets), Whisper's training data. *Risk to decide:* ReazonSpeech k2-v2, parakeet-ja and kotoba-whisper descend from the ReazonSpeech corpus, whose gate demands use under Japanese Copyright Act Article 30-4 only; whether that follows the weights is not determined here.
+* *Rust integration (section 7):* the new official +sherpa-onnx+ crate 2.0.1 (Apache-2.0) built offline in 91 s from a SHA-256-pinned library archive and reproduced the Python text on 100 of 100 clips, but its build script downloads without a checksum unless two environment variables are set, and it fails the repository's +cargo deny+ license gate on two build-time-only crates (+bzip2-1.0.6+, +CC0-1.0 OR MIT-0+). +sherpa-rs+ fails on MPL-2.0. +whisper-rs+ passes +cargo deny+ but needs cmake, a C/C++ toolchain and libclang, and could not be built on this machine.
+* *Recommendation:* sherpa-onnx with ReazonSpeech k2-v2 int8 as the default CPU engine for partial and final transcripts, in the S2 supervised-sidecar pattern; parakeet-ja as the accuracy option on the same runtime; a final-only Whisper-class tier on GPU as an optional later slice; reject SenseVoice, Vosk and CPU Whisper. *Conditional on the ReazonSpeech corpus question (Q1).* Details in sections 8 and 9.
+
+== 3. Setup, pinned versions and license table
+
+=== 3.1 Candidates and pinned artifacts
+
+[cols="2,4,3",options="header"]
+|===
+|Item |Pinned identity |Used for
+
+|sherpa-onnx 2.0.1 (k2-fsa)
+|Python wheel +sherpa-onnx==2.0.1+ (measurements); GitHub release v2.0.1 prebuilt libraries; crate +sherpa-onnx+ / +sherpa-onnx-sys+ 2.0.1 (integration probe)
+|Runtime for the transducer, NeMo CTC and SenseVoice models below
+
+|ReazonSpeech k2-v2 (int8 and fp32)
+|HF +reazon-research/reazonspeech-k2-v2+ revision +291488c8151be24d7da4bf7af26e533fad96e407+; +encoder-epoch-99-avg-1.int8.onnx+ sha256 +2c7bd08a...+ (155 MB), fp32 +ecdb0b77...+ (592 MB). Character-based RNN-T, Zipformer, 159 M parameters. *Offline model*: the card says clips up to about 30 s.
+|Candidate 1
+
+|sherpa-onnx ja-en zipformer 2025-01-17
+|sherpa-onnx +asr-models+ release asset +sherpa-onnx-zipformer-ja-en-reazonspeech-2025-01-17.tar.bz2+ sha256 +dc037586...+ (int8 files used). Its README names +reazon-research/reazonspeech-k2-v2-ja-en+ as the source; that repository answered "Invalid username or password" (not public), so its license could not be read.
+|Candidate 1 variant (license unverified)
+
+|NVIDIA parakeet-tdt_ctc-0.6b-ja, sherpa-onnx int8 export
+|sherpa-onnx +asr-models+ asset +sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8.tar.bz2+ sha256 +4b0a800e...+ (CTC head only, one +model.int8.onnx+); upstream HF +nvidia/parakeet-tdt_ctc-0.6b-ja+ revision +44edb27e...+
+|Candidate 3
+
+|SenseVoice small int8 (2024-07-17)
+|sherpa-onnx +asr-models+ asset +sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2+ sha256 +7d1efa21...+, +language=ja+, ITN off. (The similarly named +...-int8-2025-09-09+ asset is a Cantonese fine-tune, +ASLP-lab/WSYue-ASR+, and transcribed Japanese as Chinese in a first smoke run; it was discarded.)
+|Candidate 3
+
+|Vosk 0.3.45 with +vosk-model-small-ja-0.22+ and +vosk-model-ja-0.22+
+|Python wheel; model archives sha256 +efa092d2...+ (small), +af620db8...+ (big, 1 GB). Kaldi chain model, *native streaming*.
+|Candidate 3 (the only streaming Japanese engine found)
+
+|whisper.cpp
+|Release v1.9.5 has no binary assets; the nightly +b5454+ of the same day (v1.9.5 plus later commits) +whisper-bin-x64.zip+ sha256 +6ba69e34...+ (CPU backend, +ggml-cpu-haswell.dll+ selected on this CPU). Driven through +whisper-server+ (model loaded once, one HTTP request per segment).
+|Candidate 2
+
+|whisper models (ggml)
+|HF +ggerganov/whisper.cpp+ revision +5359861c739e955e79d9a303bcbc70fb988958b1+: small fp16 (+1be3a9b2...+), medium q5_0 (+19fea4b3...+), large-v3-turbo q5_0 (+39422170...+) and fp16 (+1fc70f77...+, GPU run only); kotoba-whisper v2.0 ggml, HF +kotoba-tech/kotoba-whisper-v2.0-ggml+ revision +e3a0cf6a62b95911703cfb97d819292e058f12c3+: fp16 (+eff70a8a...+, GPU run only), q5_0 (+4a3b9219...+, CPU run)
+|Candidate 2
+
+|Common Voice 22.0 ja test split
+|HF mirror +fsicoli/common_voice_22_0+ revision +ae911de250fe9375d08e2daa2105b671d659d446+ (third-party mirror, as in EXP-0001); +ja_test_0.tar+ sha256 +40cd0b6d...+, +test.tsv+ sha256 +11b2ee42...+
+|Evaluation audio and gold text
+|===
+
+Full hashes are in +examples/benchmarks/stt/fetch_assets.py+.
+
+=== 3.2 License table (code / weights / data)
+
+Every license was read from the source named in the last column on 2026-11-09 unless marked *not verified*.
+
+[cols="2,2,3,4,3",options="header"]
+|===
+|Item |Code |Weights |Training data / notes |Read from
+
+|sherpa-onnx
+|Apache-2.0
+|Not applicable (framework). Does not cover the models.
+|Official Rust crates +sherpa-onnx+ / +sherpa-onnx-sys+ 2.0.1 are Apache-2.0 as well.
+|GitHub repository license (SPDX), crates.io
+
+|ReazonSpeech k2-v2 (and its sherpa-onnx export)
+|Apache-2.0 (training recipe: icefall, Apache-2.0)
+|Apache-2.0 (model card)
+|Trained on the ReazonSpeech corpus (Japanese TV broadcasts). The corpus is gated on Hugging Face (+license: other+) and its card makes access conditional on agreeing to use the data solely for the purpose of Article 30-4 of the Japanese Copyright Act (information analysis). *This is a training-data term, not a model license; whether it constrains the use of the trained weights is a legal question not answered here.*
+|HF model card; HF dataset API and card text
+
+|zipformer ja-en 2025-01-17
+|Apache-2.0 (sherpa-onnx)
+|*Not verified.* The upstream HF repository named in the asset README is not publicly readable; no license text found.
+|Presumably the same ReazonSpeech corpus terms as above. *Excluded from any recommendation until the weights license is verified.*
+|sherpa-onnx asset README; HF API
+
+|NVIDIA parakeet-tdt_ctc-0.6b-ja
+|NeMo, Apache-2.0
+|*CC-BY-4.0* (model card): attribution required. Permissive, but not one of the licenses in +deny.toml+ (that file governs crates, not model files).
+|Trained on ReazonSpeech (model card dataset list): same Article 30-4 caveat. The sherpa-onnx export is a third-party conversion of the NVIDIA weights.
+|HF model card
+
+|SenseVoice small
+|MIT (SenseVoice repository)
+|*FunASR Model Open Source License v1.1 (custom, +license: other+): use, copy, modify and share are allowed with attribution and retention of the model name, but the license is not OSI-approved, describes the software as provided for reference and learning, and makes certain community-conduct violations (unjustified denigration of the software) an automatic forfeiture of all licenses.* Non-standard and not permissive in the sense this project requires; flagged, not adopted.
+|Training data not read.
+|FunASR +MODEL_LICENSE+ text; HF model card
+
+|Vosk (library)
+|Apache-2.0
+|Not applicable
+|Python wheel and C library used here; the Rust crate +vosk+ is MIT but unmaintained since 2024-10.
+|GitHub SPDX; crates.io
+
+|Vosk ja-0.22 small and big
+|Not applicable
+|Apache-2.0 (models page)
+|*Training data not stated.* The model README reports decoding on +test_csj+ and +test_tedjp+; CSJ (Corpus of Spontaneous Japanese) is a restricted-use corpus. Whether CSJ was in the training data is *not established*; treat provenance as unresolved.
+|alphacephei.com models page; model README
+
+|whisper.cpp
+|MIT
+|OpenAI Whisper weights: MIT (HF model card +openai/whisper-large-v3-turbo+; +ggerganov/whisper.cpp+ model repository card MIT). The ggml files are conversions.
+|Whisper's 680k-hour web training data is not documented in a license-checkable way.
+|GitHub SPDX; HF cards
+
+|kotoba-whisper v2.0 (and ggml)
+|Apache-2.0 (card)
+|Apache-2.0 (cards of +kotoba-tech/kotoba-whisper-v2.0+ and +...-ggml+)
+|Distilled from Whisper large-v3 and trained on the +all+ subset of the ReazonSpeech corpus (card dataset list): same Article 30-4 caveat, plus Whisper's own provenance.
+|HF model cards
+
+|Common Voice 22.0 ja
+|Not applicable
+|Not applicable
+|CC0-1.0 (card of the third-party HF mirror; official Mozilla distribution not accessed). Common Voice may overlap the training data of some candidates (not checked).
+|HF dataset card
+|===
+
+Findings that need a decision from the project owner:
+
+* *Non-permissive or non-standard:* SenseVoice weights (custom FunASR license with a conduct-forfeiture clause). Not adopted.
+* *Unverified:* the ja-en zipformer weights license; the Vosk ja models' training data; Whisper's training data.
+* *Training-data terms:* every top accuracy candidate (ReazonSpeech k2-v2, parakeet-ja, kotoba-whisper) descends from the ReazonSpeech corpus, whose gate requires agreeing to Japanese Copyright Act Article 30-4 use. The weights carry Apache-2.0 / CC-BY-4.0 licenses, but nobody here has determined whether the corpus terms follow the weights. This is the principal licensing risk and is listed in section 12.
+* *Attribution:* parakeet-ja (CC-BY-4.0) would need an attribution notice in the distribution.
+
+== 4. Dataset and method
+
+=== 4.1 Clips
+
+Common Voice 22.0 ja test split; clips present in the extracted archive with at least 2 up-votes and no down-vote (6276 candidates, the same count as EXP-0001), one clip per +sentence_id+, decoded duration 1.0-12.0 s, seeded shuffle (20261109), first 400 kept.
+The mp3 is decoded and resampled to 16 kHz mono (+scipy.signal.resample_poly+).
+
+=== 4.2 Segments, standing in for S2 VAD output
+
+Each clip is trimmed to start 0.30 s before the first 20 ms frame above max(-50 dBFS, peak RMS - 35 dB) and end 0.50 s after the last such frame, and written as 16-bit PCM.
+This stands in for "Silero segment plus pre-roll plus silence tail" without involving the VAD, so a VAD error (late onset, early cut) is not part of these numbers; section 6.5 measures what a clipped onset costs separately.
+The speech onset is about 0.30 s into every segment by construction, which is how "time after speech onset" is computed.
+
+=== 4.3 Text normalisation (identical for gold and hypothesis)
+
+. NFKC (full/half width, compatibility forms), lower-case.
+. Remove every character whose Unicode category is punctuation (+P*+), symbol (+S*+), separator (+Z*+) or control/format (+C*+).
+. Nothing else is rewritten: no kana/kanji conversion, no numeral conversion, no word list.
+
+*CER* is micro-averaged: total Levenshtein distance over total reference characters (+rapidfuzz+), reported with a 95% bootstrap interval over clips (2000 resamples, seed 20261109).
+A secondary column collapses every run of digits and kanji numerals (+0-9〇一二三四五六七八九十百千万億兆+) into one placeholder, so that choosing "25" versus "二十五" does not count as an error; it also hides real digit errors and is never used instead of the primary figure.
+Paired differences are computed on the same clips with a paired bootstrap.
+
+=== 4.4 What is timed
+
+* *Final call latency:* wall time of one transcription call on the complete segment (Python +perf_counter+). For offline engines this is the time from "segment complete" to "final text", on top of whatever silence the VAD needed to close the segment. For Whisper it includes one HTTP round trip over loopback and 16-bit WAV encoding.
+* *Partials:* offline engines have no partial output; they are emulated by re-decoding the growing prefix every 0.5 s of audio, which is what an integration would have to do. Vosk produces partials natively; it is fed 100 ms chunks. "First partial after speech onset" is the audio time of the first non-empty partial minus the onset (0.30 s) plus the cost of that call. For the emulated engines it is bounded below by the 0.5 s step grid, not by the model.
+* *RTF* is the sum of final call times over the sum of segment durations. It is below 1 when the engine keeps up in real time.
+* *Load time:* constructing the recognizer in-process; for Whisper, spawn of +whisper-server+ until it answers. *Peak RSS* is the peak working set of the process holding the model (the server child for Whisper). Python and numpy are part of the in-process figure.
+* *First call* is the first transcription after load (lazy initialisation); three more calls warm up and are not recorded.
+
+== 5. Accuracy
+
+=== 5.1 sherpa-onnx engines, 400 clips
+
+[cols="4,1,2,2,1,2",options="header"]
+|===
+|Engine (threads) |Clips |CER % (95% CI) |Paired difference to sherpa-onnx k2-v2 int8, pp (95% CI) |Clips with CER > 50% |CER % number-insensitive
+|sherpa-onnx, ReazonSpeech k2-v2 int8 (offline transducer) (4) |400 |18.6 (14.9-22.2) |(base) |41 |18.5
+|sherpa-onnx, ReazonSpeech k2-v2 fp32 (4) |400 |16.9 (13.7-20.4) |-1.6 (-3.1 to -0.4) |35 |16.9
+|sherpa-onnx, NeMo parakeet-tdt_ctc-0.6b-ja int8 (CTC head) (4) |400 |15.2 (12.2-18.6) |-3.3 (-5.5 to -1.4) |32 |15.0
+|sherpa-onnx, SenseVoice small int8 (2024-07-17) (4) |400 |17.6 (14.5-20.9) |-1.0 (-3.2 to +1.0) |43 |17.4
+|sherpa-onnx, reazonspeech-k2-v2-ja-en 2025-01-17 int8 (4) |400 |21.5 (17.7-25.8) |+3.0 (+0.2 to +6.0) |55 |21.5
+|===
+
+=== 5.2 All engines, first 150 clips
+
+Vosk big was run on the first 60 clips only (section 5.3).
+
+[cols="4,1,2,2,1,2",options="header"]
+|===
+|Engine (threads) |Clips |CER % (95% CI) |Paired difference to sherpa-onnx k2-v2 int8, pp (95% CI) |Clips with CER > 50% |CER % number-insensitive
+|sherpa-onnx, ReazonSpeech k2-v2 int8 (offline transducer) (4) |150 |14.3 (10.1-19.3) |(base) |10 |14.3
+|sherpa-onnx, ReazonSpeech k2-v2 fp32 (4) |150 |12.0 (9.0-15.4) |-2.3 (-5.5 to +0.2) |7 |12.0
+|sherpa-onnx, NeMo parakeet-tdt_ctc-0.6b-ja int8 (CTC head) (4) |150 |10.3 (8.0-12.6) |-4.1 (-8.7 to -0.1) |6 |10.2
+|sherpa-onnx, SenseVoice small int8 (2024-07-17) (4) |150 |12.9 (10.7-15.3) |-1.4 (-6.0 to +2.5) |10 |12.9
+|sherpa-onnx, reazonspeech-k2-v2-ja-en 2025-01-17 int8 (4) |150 |17.9 (13.3-23.3) |+3.6 (-1.3 to +8.7) |15 |17.9
+|Vosk small-ja-0.22 (streaming, Kaldi chain) (4) |150 |27.8 (23.8-31.9) |+13.4 (+8.7 to +18.0) |38 |27.8
+|whisper.cpp, whisper small (fp16) (8) |150 |21.6 (17.9-25.5) |+7.2 (+1.9 to +12.3) |24 |21.2
+|whisper.cpp, whisper medium q5_0 (8) |150 |15.6 (12.8-18.6) |+1.2 (-3.5 to +5.5) |20 |15.6
+|whisper.cpp, large-v3-turbo q5_0 (8) |150 |13.1 (10.4-16.1) |-1.2 (-5.9 to +2.9) |14 |12.9
+|whisper.cpp CUDA 12.4, kotoba-whisper v2.0 fp16 (GPU) (4) |150 |13.6 (10.8-16.4) |-0.8 (-4.8 to +2.8) |14 |13.5
+|whisper.cpp CUDA 12.4, large-v3-turbo fp16 (GPU) (4) |150 |11.5 (9.2-14.2) |-2.8 (-7.5 to +1.0) |10 |11.3
+|===
+
+=== 5.3 Vosk big, first 60 clips
+
+[cols="4,1,2,2,1,2",options="header"]
+|===
+|Engine (threads) |Clips |CER % (95% CI) |Paired difference to sherpa-onnx k2-v2 int8, pp (95% CI) |Clips with CER > 50% |CER % number-insensitive
+|sherpa-onnx, ReazonSpeech k2-v2 int8 (offline transducer) (4) |60 |13.8 (7.1-23.5) |(base) |5 |13.8
+|sherpa-onnx, ReazonSpeech k2-v2 fp32 (4) |60 |10.6 (5.8-17.2) |-3.2 (-6.6 to -0.4) |3 |10.6
+|sherpa-onnx, NeMo parakeet-tdt_ctc-0.6b-ja int8 (CTC head) (4) |60 |8.5 (5.9-11.6) |-5.3 (-14.0 to +1.1) |2 |8.3
+|sherpa-onnx, SenseVoice small int8 (2024-07-17) (4) |60 |10.2 (7.2-13.5) |-3.6 (-11.2 to +1.8) |2 |10.0
+|Vosk small-ja-0.22 (streaming, Kaldi chain) (4) |60 |23.7 (18.2-29.7) |+9.9 (+2.5 to +16.2) |13 |23.7
+|Vosk ja-0.22 (streaming, Kaldi chain) (4) |60 |15.2 (10.8-20.5) |+1.4 (-5.3 to +7.0) |4 |15.2
+|whisper.cpp, whisper small (fp16) (8) |60 |20.4 (14.6-27.5) |+6.6 (-2.4 to +15.0) |9 |19.7
+|whisper.cpp, whisper medium q5_0 (8) |60 |13.2 (9.2-17.8) |-0.6 (-9.5 to +5.5) |7 |13.2
+|whisper.cpp, large-v3-turbo q5_0 (8) |60 |12.5 (8.4-17.2) |-1.3 (-10.5 to +4.9) |7 |12.0
+|whisper.cpp, kotoba-whisper v2.0 q5_0 (8) |60 |10.8 (7.1-15.1) |-3.0 (-9.6 to +1.7) |4 |10.7
+|whisper.cpp CUDA 12.4, kotoba-whisper v2.0 fp16 (GPU) (4) |60 |10.8 (7.0-15.1) |-3.0 (-9.8 to +1.8) |4 |10.7
+|whisper.cpp CUDA 12.4, large-v3-turbo fp16 (GPU) (4) |60 |11.1 (7.6-15.1) |-2.7 (-11.3 to +3.9) |6 |10.6
+|===
+
+=== 5.4 Reading the accuracy tables
+
+* The intervals are wide and the clips are short read sentences; the *ordering* of the engines is the only claim. "Paired difference" is the difference in micro CER on the same clips with a paired bootstrap; negative is better than k2-v2 int8.
+* Heavy tails dominate: on the 400-clip set the worst 10% of clips carried about 46% of the total edit distance of k2-v2 fp32, and 23 clips exceeded 50% CER on every sherpa-onnx engine (probable wrong labels or unusable audio, kept in the figures). The "clips with CER > 50%" column is a robustness view: k2-v2 fp32 35, parakeet 32, SenseVoice 43, k2-v2 int8 41, ja-en 55 of 400.
+* The number-insensitive column barely moves the figures (by under 1 point for every engine), so numeral spelling is not what separates the engines here.
+* *Within noise of each other (first 150 clips):* k2-v2 int8, k2-v2 fp32, SenseVoice, whisper large-v3-turbo (CPU and GPU), kotoba-whisper (GPU), whisper medium. *Distinguishable from k2-v2 int8:* parakeet (better, -4.1 pp, interval -8.7 to -0.1), Vosk small (worse, +13.4 pp), whisper small (worse, +7.2 pp). The int8 quantisation of k2-v2 cost 1.6-2.3 pp against fp32 (interval -3.1 to -0.4 on 400 clips) for half the memory.
+* *Vosk big* (60 clips): 15.2% against 13.8% for k2-v2 int8 on the same clips (difference +1.4 pp, interval -5.3 to +7.0), i.e. competitive on read speech, at 1.7 GB resident and with unresolved training-data provenance (section 3.2). Vosk small is far worse (23.7% on the same 60).
+* *Whisper:* accuracy grows with model size (small 21.6%, medium q5_0 15.6%, large-v3-turbo q5_0 13.1% on 150 clips; kotoba-whisper v2.0 q5_0 10.8% on the first 60 clips against 13.8% for k2-v2 int8 there, not distinguishable). Quantisation to q5_0 was not compared with fp16 on CPU; on GPU the fp16 turbo was 11.5% against 13.1% for the CPU q5_0 on the same 150 clips (within noise).
+
+== 6. Latency, cost, partials, determinism
+
+=== 6.1 Final-call latency, real-time factor, load time and memory
+
+[cols="4,1,1,1,1,1,1,1,1,1",options="header"]
+|===
+|Engine |Thr |RTF |Final call p50 ms |p95 ms |max ms |First call ms |Load s |Peak RSS MB |Clips timed
+|sherpa-onnx, ReazonSpeech k2-v2 int8 (offline transducer) |4 |0.039 |123 |289 |393 |118 |4.1 |548 |400
+|sherpa-onnx, ReazonSpeech k2-v2 fp32 |4 |0.046 |148 |336 |427 |129 |2.5 |1050 |400
+|sherpa-onnx, NeMo parakeet-tdt_ctc-0.6b-ja int8 (CTC head) |4 |0.102 |323 |776 |1008 |292 |9.1 |938 |400
+|sherpa-onnx, SenseVoice small int8 (2024-07-17) |4 |0.053 |164 |402 |522 |102 |1.5 |490 |400
+|sherpa-onnx, reazonspeech-k2-v2-ja-en 2025-01-17 int8 |4 |0.028 |92 |210 |313 |81 |2.7 |435 |400
+|sherpa-onnx, ReazonSpeech k2-v2 int8, 1 thread |1 |0.057 |176 |459 |627 |166 |3.5 |534 |400
+|sherpa-onnx, ReazonSpeech k2-v2 int8, 8 threads |8 |0.048 |158 |318 |400 |106 |2.3 |537 |400
+|Vosk small-ja-0.22 (streaming, Kaldi chain) |4 |0.798 |2630 |5443 |8682 |2493 |0.6 |415 |200
+|Vosk small-ja-0.22, second run |4 |0.701 |2488 |5014 |7085 |2425 |0.6 |369 |60
+|Vosk ja-0.22 (streaming, Kaldi chain) |4 |0.140 |457 |1382 |1631 |549 |2.2 |1720 |60
+|whisper.cpp, whisper small (fp16) |8 |0.763 |2867 |3519 |11641 |2904 |0.6 |715 |150
+|whisper.cpp, whisper medium q5_0 |8 |1.896 |7385 |8356 |9569 |7221 |6.7 |991 |150
+|whisper.cpp, large-v3-turbo q5_0 |8 |3.037 |11952 |12292 |12631 |12139 |5.0 |781 |150
+|whisper.cpp, whisper small (fp16), 4 threads |4 |1.149 |4355 |4916 |5055 |4517 |0.6 |711 |40
+|whisper.cpp, kotoba-whisper v2.0 q5_0 |8 |2.944 |11849 |11988 |12086 |11608 |0.6 |709 |60
+|===
+
+* The sherpa-onnx transducers answer a 3-4 s segment in about 0.1-0.3 s on 4 CPU threads (k2-v2 int8 p50 123 ms, p95 289 ms, max 393 ms over 400 clips). The time from the end of speech to the final text is therefore the VAD silence needed to close the segment (EXP-0001: end detected a median 61 ms late; the S1 fallback waits 800 ms before an irreversible turn-take, which is a separate policy) plus this call, minus whatever speculative work was done during the silence. The call cost grows roughly with segment length (RTF 0.04), so a 10 s segment costs about 0.4 s.
+* *Threads:* k2-v2 int8 at 1 / 4 / 8 threads: RTF 0.057 / 0.039 / 0.048 (p50 176 / 123 / 158 ms). More threads than 4 did not help on these short segments. One thread still keeps up in real time with 17 times headroom, which matters when TTS, the renderer and an LLM client share the CPU (their cost was not measured).
+* *Memory:* peak working set includes the Python interpreter and numpy (38 MB before any model was loaded). k2-v2 int8 was 275 MB right after load and grew to 548 MB while decoding (runtime buffers), parakeet went from 720 to 938 MB; a native sidecar would be a little smaller. fp32 k2-v2 doubles it (1050 MB) for a 1.6-2.3 point CER gain; parakeet-ja is 938 MB with a 9 s load.
+* *Whisper on CPU:* the fixed 30 s encoder window makes the final call cost almost independent of the segment length (small p50 2.9 s at 8 threads and 4.4 s at 4; large-v3-sized models 12 s). RTF above 1 means the engine cannot keep up with a continuous stream; Whisper models are therefore not candidates for partials or low-latency finals on this CPU. Shortening the window (+-ac+) was not tried (limitation L9).
+* *Vosk:* the small model's RTF (0.8, repeated at 0.7 on a second run) was far worse than the big model's (0.14), which also reports its own tail cost: the last 100 ms chunk plus the final result took p50 25 / p95 173 ms (small) and 115 / 298 ms (big), so for a streaming engine the speech-end-to-final latency is small once the model keeps up; the small model does not keep up.
+* The first call after load was as fast as the later ones for every sherpa-onnx model (no lazy-initialisation penalty), but loads took 1.5-9 s, so the model must be loaded at sidecar start, not at the first utterance.
+* One Whisper-small call took 11.6 s while a Rust build and an archive extraction were running (section 11), probably because of that load; that maximum is not representative.
+
+=== 6.2 Partials
+
+[cols="4,1,2,2,2,2,1",options="header"]
+|===
+|Engine |Clips |First non-empty partial after speech onset p50 / p95 ms |One partial call p50 / p95 ms |Partial step |Share of partials that are a prefix of the last partial |Partials per clip
+|sherpa-onnx, ReazonSpeech k2-v2 int8 (offline transducer) |60 |236 / 251 |102 / 246 |0.5 s re-decode |59% |8.6
+|sherpa-onnx, ReazonSpeech k2-v2 fp32 |60 |255 / 261 |123 / 274 |0.5 s re-decode |58% |8.6
+|sherpa-onnx, NeMo parakeet-tdt_ctc-0.6b-ja int8 (CTC head) |60 |291 / 836 |269 / 684 |0.5 s re-decode |58% |8.6
+|sherpa-onnx, SenseVoice small int8 (2024-07-17) |60 |246 / 772 |134 / 352 |0.5 s re-decode |58% |8.6
+|sherpa-onnx, reazonspeech-k2-v2-ja-en 2025-01-17 int8 |60 |226 / 237 |70 / 168 |0.5 s re-decode |52% |8.6
+|Vosk small-ja-0.22 (streaming, Kaldi chain) |30 |1092 / 1962 |1 / 346 |100 ms chunks (native) |86% |39.7
+|Vosk ja-0.22 (streaming, Kaldi chain) |10 |1227 / 1609 |1 / 44 |100 ms chunks (native) |82% |40.0
+|whisper.cpp, whisper small (fp16) |8 |2954 / 5947 |2838 / 3283 |0.5 s re-decode |40% |9.1
+|whisper.cpp, whisper medium q5_0 |8 |7334 / 7625 |7336 / 8118 |0.5 s re-decode |40% |9.1
+|whisper.cpp, large-v3-turbo q5_0 |8 |12106 / 12159 |11985 / 12288 |0.5 s re-decode |49% |9.1
+|whisper.cpp, kotoba-whisper v2.0 q5_0 |4 |11924 / 11941 |11810 / 12003 |0.5 s re-decode |62% |7.5
+|whisper.cpp CUDA 12.4, kotoba-whisper v2.0 fp16 (GPU) |8 |328 / 334 |143 / 192 |0.5 s re-decode |58% |9.1
+|whisper.cpp CUDA 12.4, large-v3-turbo fp16 (GPU) |8 |330 / 347 |154 / 218 |0.5 s re-decode |51% |9.1
+|===
+
+* *Offline engines emulated as streaming:* a partial is a full re-decode of everything since the segment start. The k2-v2 int8 call cost p50 102 ms / p95 246 ms across the growing prefixes (parakeet p50 269 ms / p95 684 ms), well inside a 0.5 s step; the largest was 379 ms. The first non-empty partial at 236 ms after onset is the 0.5 s grid (audio time 0.5 s, 0.2 s after onset) plus one decode; a 0.25 s step would roughly halve it at twice the decode load.
+* *Partials are not stable.* Only 52-59% of the non-empty sherpa-onnx partials were a prefix of the last partial's text (after normalisation), and 40-62% for Whisper (8 clips; 4 for kotoba); Vosk's native partials were 82-86%. Earlier text is rewritten as audio arrives. Consumers must treat a partial as a replaceable guess (section 9).
+* *Vosk* streams natively with 100 ms chunks: first non-empty partial about 1.1 s (small) / 1.2 s (big) after speech onset, much later than the 0.2-0.3 s of the emulated offline transducers; its per-chunk cost is small (p50 1 ms) for the big model. That latency is a property of its decoding (it emits words when confident), not of this harness.
+* *Whisper* partials cost a whole 30 s window decode each (3-12 s on CPU), so the emulation is not usable; the column is shown only to document that. On GPU a partial would cost about as much as a final (about 150 ms) but was not measured separately.
+
+=== 6.3 There is no streaming Japanese model in sherpa-onnx
+
+The sherpa-onnx +asr-models+ release (read 2026-11-09) lists streaming zipformer, conformer and paraformer models for English, Chinese, French, Korean and (in the list read) no Japanese entry; the Japanese models in the same release (+zipformer-ja-reazonspeech+, +zipformer-ja-en-reazonspeech+, +nemo-parakeet-tdt_ctc-0.6b-ja+, SenseVoice, whisper) are all offline.
+The ReazonSpeech k2-v2 card says it processes clips of up to about 30 s.
+So "streaming Japanese STT with sherpa-onnx" means re-decoding a growing prefix with an offline model.
+That is affordable here only because the model is fast (section 6.1), and it yields partials that revise earlier text (section 6.2).
+The only native streaming Japanese engine found with a clean code license was Vosk (Kaldi chain); no other maintained streaming Japanese model with a permissive license was found in the sherpa-onnx catalogue or by search.
+
+=== 6.4 Determinism
+
+Same-process repeat means: the first N clips re-run in the same process after all other work, text compared exactly. Cross-run comparisons are over clips both runs processed.
+
+[cols="4,2",options="header"]
+|===
+|Check |Result
+|sherpa-onnx, ReazonSpeech k2-v2 int8 (offline transducer): same input again in the same process |100 of 100 identical
+|sherpa-onnx, ReazonSpeech k2-v2 fp32: same input again in the same process |100 of 100 identical
+|sherpa-onnx, reazonspeech-k2-v2-ja-en 2025-01-17 int8: same input again in the same process |100 of 100 identical
+|sherpa-onnx, NeMo parakeet-tdt_ctc-0.6b-ja int8 (CTC head): same input again in the same process |100 of 100 identical
+|sherpa-onnx, SenseVoice small int8 (2024-07-17): same input again in the same process |100 of 100 identical
+|Vosk small-ja-0.22 (streaming, Kaldi chain): same input again in the same process |46 of 50 identical
+|Vosk ja-0.22 (streaming, Kaldi chain): same input again in the same process |20 of 20 identical
+|whisper.cpp, whisper small (fp16): same input again in the same process |10 of 10 identical
+|whisper.cpp, whisper medium q5_0: same input again in the same process |10 of 10 identical
+|whisper.cpp, large-v3-turbo q5_0: same input again in the same process |10 of 10 identical
+|whisper.cpp, kotoba-whisper v2.0 q5_0: same input again in the same process |5 of 5 identical
+|whisper.cpp CUDA 12.4, kotoba-whisper v2.0 fp16 (GPU): same input again in the same process |10 of 10 identical
+|whisper.cpp CUDA 12.4, large-v3-turbo fp16 (GPU): same input again in the same process |10 of 10 identical
+|same threads, new process |400 of 400 identical
+|4 vs 1 thread |397 of 400 identical
+|4 vs 8 threads |399 of 400 identical
+|Whisper small, 8 vs 4 threads (first 40 clips) |40 of 40 identical
+|Vosk small, two processes (first 60 clips) |60 of 60 identical
+|===
+
+* Every sherpa-onnx model, Whisper (CPU and GPU) and Vosk big returned identical text when the same input was transcribed again in the same process, and a fresh process gave identical text for k2-v2 int8 on all 400 clips.
+* *The thread count is part of the result:* k2-v2 int8 with 1 thread differed from 4 threads on 3 of 400 clips and 8 threads on 1 of 400 (not investigated; plausibly a different accumulation order in the int8 kernels). Pin the thread count in the sidecar configuration, and record it in the transcript provenance, if replay is to compare transcript text. Whisper small gave identical text at 8 and 4 threads on 40 clips.
+* *Vosk small was not repeatable within a process* (4 of 50 re-runs differed) although two separate processes agreed on 60 of 60; unexplained (limitation L10).
+* Decoding here is greedy (transducers, CTC) or whisper.cpp's default greedy with temperature 0; beam search, hotwords and LM fusion were not used and are not covered.
+
+=== 6.5 Cost of a clipped onset (pre-roll sensitivity)
+
+ReazonSpeech k2-v2 int8, 4 threads, first 200 clips, segment start moved relative to the energy-defined speech onset (section 4.2; every segment normally starts 300 ms before it):
+
+[cols="2,2,3",options="header"]
+|===
+|Segment starts |CER % |95% CI
+
+|300 ms before the onset (the normal segment) |14.8 |11.2-19.1
+|150 ms before |16.8 |13.3-21.3
+|100 ms before |18.9 |15.2-23.0
+|50 ms before |20.4 |16.7-24.7
+|at the onset |22.1 |18.4-26.3
+|50 ms after (onset already lost) |23.9 |20.1-28.3
+|100 ms after |23.3 |19.9-27.4
+|150 ms after |26.2 |22.6-30.5
+|200 ms after |28.1 |24.2-32.6
+|300 ms after |31.9 |28.0-36.0
+|===
+
+Reading:
+
+* The recogniser is sensitive to a clipped onset: starting at the energy onset instead of 300 ms earlier costs about 7 points, and each further 100 ms of lost speech costs roughly 2-3 more. The energy rule fires at 35 dB below the peak frame, so the true acoustic onset is earlier than "the onset" here, and the shifts are not a one-to-one model of VAD lag; the shape, not the exact values, is the finding.
+* EXP-0001 measured Silero's onset p50 at 48 ms and p90 at 112-144 ms after an energy-defined start, with 12.7% of utterances above 100 ms. With no pre-roll, utterances whose onset is reported late would be cut roughly like the 0 to +100 ms rows (22-24%); with the S2 default of 300 ms the lead-in absorbs a lag of that size. *A pre-roll of 300 ms (the S2 default) is the least this table supports*: the curve has not flattened at 300 ms, and whether a longer pre-roll still helps was not tested because the clips were trimmed to 300 ms of lead-in. The S2 hard ceiling is 2 s.
+* The segment must also carry a silence tail after the end edge (0.5 s here); a tail-length sweep was not run.
+
+=== 6.6 GPU (reported separately)
+
+Whisper only, with the whisper.cpp CUDA 12.4 binary of the same nightly (+whisper-bin-win-cuda-12.4.0-x64.zip+ sha256 +afef0b88...+), fp16 models, 4 CPU threads for the host side, 150 clips, the same segments and decoding as the CPU runs, server started per model. The GPU is a Turing-class consumer card (RTX 2070-class, 8 GB) that also drives the desktop; the whole-GPU memory figure includes whatever else was using it (the idle reading before these runs was 2490 MB, so the model added roughly 1.8-1.9 GB).
+
+[cols="4,1,1,1,1,1,1,1,1",options="header"]
+|===
+|Engine |Clips |CER % (95% CI) |RTF |Final call p50 / p95 ms |Load s |Host RSS MB |Whole-GPU memory in use MB (idle baseline 2490) |Same text on re-run
+|whisper.cpp CUDA 12.4, kotoba-whisper v2.0 fp16 (GPU) |150 |13.6 (10.8-16.4) |0.038 |144 / 201 |19.8 |715 |4285 |10/10
+|whisper.cpp CUDA 12.4, large-v3-turbo fp16 (GPU) |150 |11.5 (9.2-14.2) |0.042 |157 / 237 |19.9 |441 |4437 |10/10
+|===
+
+* Final transcription on this GPU costs about what the k2-v2 transducer costs on CPU (p50 144-157 ms), with accuracy in the same band (13.6% / 11.5%, within noise of k2-v2 int8 at 14.3% on the same clips). Load takes about 20 s (model upload), so it must be loaded at startup.
+* This is a *final-only* option: a prefix re-decode every 0.5 s would add about 150 ms of GPU time per partial, which was not measured, and the partial instability seen on CPU (40-62% prefix) applies as well.
+* The same GPU renders the VRM avatar (ADR-0003 measured 15-17 ms command-to-frame on a GPU); *contention between STT and the renderer was not measured*, and a machine without a free GPU gets none of this.
+* sherpa-onnx's CUDA builds (for example +sherpa-onnx-v2.0.1-cuda-12.x-...-win-x64-cuda.tar.bz2+, 597 MB) were not tried.
+
+== 7. Integration cost from Rust, without build-time network downloads
+
+Measured and read on 2026-11-09 against this repository's +deny.toml+ and +Cargo.lock+ (scratch crates outside the repository; +cargo deny --locked check+ with a copy of +deny.toml+).
+
+[cols="2,3,3,3",options="header"]
+|===
+|Path |Build and network behaviour |+cargo deny+ against the repo policy |Other cost
+
+|Official crate +sherpa-onnx+ 2.0.1 (Apache-2.0, k2-fsa; safe wrapper with +OfflineRecognizer+, +OnlineRecognizer+, VAD)
+|The build script of +sherpa-onnx-sys+ *downloads the prebuilt libraries from GitHub over HTTPS at build time and does not verify any checksum*, unless +SHERPA_ONNX_LIB_DIR+ (a ready library directory) or +SHERPA_ONNX_ARCHIVE_DIR+ (a directory containing the archive) is set. With the +shared+ feature and +SHERPA_ONNX_ARCHIVE_DIR+ pointing at +sherpa-onnx-v2.0.1-win-x64-shared-MT-Release-lib.tar.bz2+ (7.9 MB, sha256 +afa4de3c...+ matches the digest GitHub publishes) a scratch binary *built offline in 91 s* (+-j2+, idle priority, cold cache) and *reproduced the Python output text on 100 of 100 clips* (ReazonSpeech k2-v2 int8, 4 threads). The archive hash must be verified by our own tooling, not by the crate.
+|*Fails* the license gate: +libbz2-rs-sys 0.2.6+ is +bzip2-1.0.6+ and +ppmd-rust 1.5.2+ is +CC0-1.0 OR MIT-0+; neither is in the allowlist. Both are *build-time only* (through +zip+ in the build script) and cannot be switched off. Advisories, bans and sources pass. 62 new lock entries (26 new crate names) against the repo lock file, nearly all build-time.
+|Two permissive allowlist additions (+bzip2-1.0.6+, +CC0-1.0+/+MIT-0+) with a recorded reason, a CI rule that the two environment variables are always set, and the runtime needs +sherpa-onnx-c-api.dll+ and +onnxruntime.dll+ beside the binary (shared) or a 123 MB static archive.
+
+|Crate +sherpa-rs+ 0.6.8 (MIT, community)
+|Also downloads prebuilt libraries in its build script (dirs, bindgen, cmake, libclang needed).
+|*Fails*: +option-ext+ is MPL-2.0 (build-time through +dirs+). 71 new lock entries.
+|Last release 2025-10-05, behind sherpa-onnx 2.0.1. Not recommended.
+
+|Own thin FFI to the sherpa-onnx C API with +libloading+ (ISC, already allowed), libraries loaded at run time from a directory pinned by SHA-256
+|No build script, no network; the sidecar refuses to start if the library files do not match the pinned hashes (same pattern as the Silero model pin in S2).
+|One new crate name (+libloading+), allowed license.
+|We own the unsafe binding surface (about a dozen C functions: create, create stream, accept waveform, decode, get result, destroy). Not measured here; an estimate, not a result.
+
+|Crate +whisper-rs+ 0.16.0 (Unlicense, community; vendors whisper.cpp 1.8.3)
+|Builds whisper.cpp from vendored source with cmake and bindgen; no download. A scratch build *failed on this machine*: cmake 3.18 on PATH could not find the Visual Studio 2022 generator, and with the Visual Studio cmake no C/C++ compiler was installed ("No CMAKE_C_COMPILER could be found"). Needs cmake, a C/C++ toolchain and libclang on every build host.
+|*Passes* (22 new lock entries, 15 new crate names).
+|The vendored whisper.cpp (1.8.3) lags the 1.9.5 used in the measurements. GPU backends need further toolchains. Not recommended unless Whisper is chosen.
+
+|Pinned prebuilt +whisper-server+ binary (whisper.cpp release asset), SHA-256 verified, driven over loopback HTTP
+|No build, no crate; release v1.9.5 ships *no* binary assets, only a nightly tag does, so the pin would be a nightly or our own build.
+|No Rust dependency.
+|Another process and port, a binary of unknown build provenance, and the 30 s window cost (section 6.1).
+
+|Crate +vosk+ 0.3.1 (MIT) + libvosk
+|Needs the native library supplied by the user.
+|*Passes* (6 new lock entries).
+|Crate unmaintained since 2024-10; native library separately distributed.
+|===
+
+*Not measured:* ESPnet / NeMo ReazonSpeech models (they need PyTorch; the NeMo and ESPnet variants are Apache-2.0 per their cards) and other sherpa-onnx Japanese options not listed; GPU builds of sherpa-onnx.
+
+== 8. Recommendation (reuse-first vocabulary)
+
+The recommendation is *conditional on Q1* (ReazonSpeech corpus terms, section 12): every top accuracy candidate descends from that corpus. Nothing below is a decision; the supervisor owns it.
+
+[cols="3,2,5",options="header"]
+|===
+|Candidate |Mode |Why / revisit
+
+|*sherpa-onnx 2.0.1* (Apache-2.0) running *ReazonSpeech k2-v2 int8* (Apache-2.0 weights)
+|*Wrap*, inside the supervised sidecar (S2 pattern), CPU
+|Fast (RTF 0.04, final call p50 123 ms), 548 MB, deterministic for a fixed thread count, accuracy within noise of every other CPU option except parakeet. Partials by prefix re-decode every ~0.5 s are affordable (call p50 102 ms). Keep segmentation, pre-roll, deadlines, revision/supersede semantics, trust labelling, replay identity and the model/license pin project-owned. Revisit if Q1 goes against ReazonSpeech-derived weights, or if a streaming Japanese model with a clean license appears.
+
+|*sherpa-onnx* with *NeMo parakeet-tdt_ctc-0.6b-ja* int8 (CC-BY-4.0)
+|*Partial reuse* of the same runtime: an alternative model selectable by configuration; *benchmark first* on real speech
+|Best accuracy measured (10.3% against 14.3% on 150 clips; paired -4.1 pp, -3.3 pp on 400), at 2.6 times the cost (RTF 0.10, 938 MB, 9 s load) and with CC-BY attribution. The sherpa-onnx export is the CTC head of a TDT+CTC model; a third-party conversion. Same Article 30-4 caveat. Choose between it and k2-v2 in S3b with Q2.
+
+|*sherpa-onnx* with *zipformer ja-en 2025*
+|*Reject for now*
+|Less accurate here (21.5% on 400 clips, +3.0 pp against k2-v2 int8, interval +0.2 to +6.0) and its weights license could not be read.
+
+|*sherpa-onnx* with *SenseVoice small*
+|*Reject (license)*
+|Accuracy comparable (17.6% on 400 clips) but the weights are under the custom FunASR model license (not OSI, conduct-forfeiture clause). Revisit only if the project accepts that license in writing.
+
+|*whisper.cpp* (MIT) with *kotoba-whisper v2.0* or *large-v3-turbo* (GPU)
+|*Sidecar / benchmark first*; optional *final-only second tier*, not a first slice
+|On a free GPU the final call is as fast as k2-v2 on CPU (p50 144-157 ms) and as accurate (11.5-13.6%), but needs a GPU, about 1.8-1.9 GB of VRAM, a 20 s load, no partials, and a pinned CUDA binary (v1.9.5 ships none; only a nightly does, or a source build through cmake and a C++ toolchain). Contention with the avatar renderer was not measured. Revisit when a Whisper-class accuracy tier is wanted (Q8).
+
+|*whisper.cpp* on *CPU*
+|*Reject* for partials and low-latency finals
+|RTF 0.76 (small) to 3.0 (turbo, kotoba q5_0), 3-12 s per segment from the fixed 30 s window; accuracy gain over k2-v2 not demonstrated.
+
+|*Vosk* 0.3.45 with *ja-0.22*
+|*Reject*; *reference only* for native streaming
+|The only native streaming Japanese engine found, and the big model is competitive on read speech (15.2% against 13.8% on 60 clips), but: 1.7 GB resident, first partial after ~1.2 s, the small model is slow (RTF 0.7-0.8), inaccurate (27.8%) and was not repeatable in-process, and the training data of both models is not stated (the README reports CSJ test sets, a restricted-use corpus). The Rust crate is unmaintained since 2024-10.
+
+|*Official `sherpa-onnx` crate 2.0.1*
+|*Wrap*, if the project accepts two allowlist additions; otherwise *custom* (see next row)
+|Reproduced the Python text on 100/100 clips from a SHA-256-pinned library archive, built offline. Costs: add +bzip2-1.0.6+ and +CC0-1.0+/+MIT-0+ (both build-time only, permissive) to +deny.toml+ with a recorded reason in +docs/supply-chain.adoc+; always set +SHERPA_ONNX_ARCHIVE_DIR+ (or +SHERPA_ONNX_LIB_DIR+) in every build and CI job, because without it the build script downloads unchecked binaries; 26 new crate names, nearly all build-time; verify the archive hash in our own tooling.
+
+|*Own thin FFI* to the sherpa-onnx C API with +libloading+
+|*Custom*, only if the row above is refused
+|Earlier reuse modes (adopt the crate, wrap the crate) do not fit if the allowlist additions or the unchecked-download default are unacceptable. One new crate (+libloading+, ISC, already allowed), runtime SHA-256 pin of the library files, but we own an unsafe binding surface that tracks the C API of the pinned version. Not built or measured here.
+
+|*sherpa-rs* (community crate)
+|*Reject*
+|MPL-2.0 build dependency fails the gate; stale against sherpa-onnx 2.0.1.
+
+|*whisper-rs* (Unlicense; vendors whisper.cpp 1.8.3)
+|*Reject* unless Whisper becomes a product tier
+|Passes +cargo deny+ but needs cmake, a C/C++ toolchain and libclang on every build host (failed on this machine for lack of a C/C++ compiler), and lags the measured whisper.cpp.
+
+|*ReazonSpeech ESPnet / NeMo models* (Apache-2.0 cards)
+|*Reference only*
+|Need PyTorch/NeMo; not run here.
+|===
+
+*Hypothesis check (exploratory, nothing pre-registered):* the expected "a Japanese streaming zipformer exists" was false; "Whisper-family models are more accurate but too slow on CPU for partials" was half right: too slow on CPU (RTF 0.76-3.0) yes, but not clearly more accurate on this read speech (a CPU-quantised turbo at 13.1% is within noise of k2-v2 int8 at 14.3%), and on a GPU they are as fast as the CPU transducers.
+
+== 9. Proposed integration shape (for S3b; not decided here)
+
+Consistent with S2: a supervised child process, bounded queues, drop-newest, degrade to "no transcripts" without blocking the scheduler, no raw audio retention, no restart without an operator decision.
+
+[source,text]
+----
+VAD sidecar (S2, unchanged edges)                    STT worker                          runtime (app)
+  mic -> 16 kHz -> Silero edges ---+
+  PreRoll (<= 2 s, in memory) -----+--> segmenter --> bounded queue (1-2 segments) --> decode loop
+                                        start edge: copy PreRoll tail (>= 300 ms)        partial every ~500 ms of audio
+                                        accumulate until end edge + tail                  final once on end edge + tail
+                                        hard cap per segment (e.g. 30 s), then force-final
+                                                                                          |
+                                                              one JSON line per revision  v
+                                                              stdout (separate pipe) --> SpeechTranscriptTracker
+                                                                                          (bounded, untrusted content)
+----
+
+. *Same supervised-sidecar pattern.* The transcriber is part of, or a child of, the S2 speech sidecar so that the raw audio never crosses a process boundary that the app does not own: the sidecar already owns the microphone, the 16 kHz stream and the +PreRoll+ ring. Two variants, to be decided in S3b (open question Q3): (a) a transcriber thread inside +speech-vad-sidecar+ behind a cargo feature; (b) a second child, +speech-stt-worker+, spawned by the sidecar and fed PCM over its stdin pipe, so a model crash cannot take the VAD down. Variant (b) keeps the heavy model out of the VAD process at the cost of one local pipe of 16 kHz PCM (32 kB/s).
+. *Segment source.* A segment starts at a VAD start edge and takes the newest +PreRoll+ samples (the measured default is 300 ms; EXP-0001's onset-lag p90 was 112-144 ms and section 6.5 shows what each lost millisecond costs). It ends at the end edge plus a silence tail. A minimum speech duration for transcription (the raw edges have none) and a maximum segment length (the models are limited to about 30 s) are STT-side policy. Pre-roll and segmenter buffers are in memory, bounded, never written to disk, and have length-only +Debug+ output.
+. *Partials.* While a segment is open the worker re-decodes the accumulated audio at most every ~500 ms (the measured per-call cost is a fraction of that, section 6.2) and emits a *partial* only when the text changed. The queue between capture and decoder holds at most one pending decode; if the decoder falls behind, partial requests are *dropped* (never queued) and the final always wins. The decoder never runs on the audio-capture thread, never in the scheduler or frame loop.
+. *Wire shape (proposal, schema-first per AGENTS.md).* A new normative schema +schemas/speech-transcript.schema.json+ with positive and negative fixtures, then Rust domain types, in the style of +speech-observation+: +segment_id+ (monotonic per sidecar run), +revision+ (monotonic per segment), +kind+ (+partial+ or +final+), +text+ (bounded characters, bounded batch bytes), +language+ (declared, never inferred), +covered_audio_ms+ and +observed_at_ms+ on the runtime timeline (the end of the audio the text covers, same clock handshake as S2), +engine+ (model id, sha256 of the model files, +calibrated+-style flag: an engine score, if any, is a provider value), and an explicit +complete=false+ on partials. No audio, no PCM, no word timings in the first slice. The schema carries no source class, plane, trust or priority field: the receiving ingress assigns them.
+. *Trust.* Transcribed speech is content from a microphone speaker: source class +speech+, plane +content+, trust +untrusted+, like the S1 observations; it cannot mint a privileged-control capability or a durable-memory permit even when the operator speaks, and the model's output is data. The operator ceiling +AIVTUBER_INGRESS_SOURCE_CLASSES+ applies before parsing, as for observations. A transcript that says "ignore your rules" is just text.
+. *Partial versus final.* Only a *final* may become conversation input to Reflex or Thinking, and only through the normal normalizer and bounded typed request path. A *partial* is incomplete content: it may feed observation-style policy (for example to hold the floor while the user is still talking) but must not start a reply, and must be superseded by revision, never appended. Section 6.2 measured that only about half of the partials are prefixes of the final text, so a consumer must not assume stability.
+. *Failure policy.* Same as S2: a child that exits, closes stdout, sends 32 consecutive invalid lines, or exceeds its decode deadline degrades to "no transcripts", is counted once as provider unavailable, and is not restarted automatically. A hung decode is cancelled by a per-segment deadline in the worker; a hung child that stops emitting is *not detected* without a heartbeat (the S2 limitation), which S3b should add for this child. The deterministic silence fallback of S1 keeps working without any transcript.
+. *Pins and provenance.* The worker takes model file paths from operator configuration and refuses to start unless every model file (and, if dynamically loaded, every engine library) matches a SHA-256 pinned in the binary, as S2 does for the Silero model. Transcript lines record the model id and hash so replay and audit can tell engines apart. No build step downloads anything; the library archive is fetched and hash-checked by a separate documented step.
+. *Replay and metrics.* Transcript lines are replayable with logical time like speech observations (fixture files, no microphone or model); metrics are bounded counters and histograms: decode latency per final, queue drops, partials per segment, final-after-end latency, rejected lines by reason.
+. *Privacy.* No raw audio retention beyond the in-memory ring and the open segment; no transcript persistence in the sidecar; durable memory writes stay behind their own non-serializable permit.
+
+== 10. Limitations
+
+. *L1, read speech, one speaking style.* Common Voice is single-speaker read sentences recorded on contributors' own devices. It has no conversation, fillers, backchannels, overlap, stream-game background or the long, loud, fast speech of a streamer. CER on it says little about absolute performance on VTuber audience or operator speech.
+. *L2, noisy gold.* Common Voice labels contain typed romaji, English words, rare place names and sentences whose text does not match the audio. On the 400-clip set 23 clips exceeded 50% CER on every sherpa-onnx engine run; these are probable label or audio faults and were *kept* in the primary figures (the scripts offer +--drop-common-bad+ as a view). The absolute CER is therefore pessimistic and the ordering is the only claim.
+. *L3, orthographic CER.* Japanese has several correct spellings (kanji versus kana, okurigana, numerals). Counting a correct but differently spelled word as errors penalises every engine, some more than others (an engine trained on one corpus's spelling conventions is favoured). The normalisation removes only punctuation and width differences. No reading-based (kana) CER was computed.
+. *L4, possible training-data overlap.* Common Voice text and audio may have been in the training data of some candidates (Whisper, SenseVoice); this was not checked. ReazonSpeech-derived models were trained on Japanese TV speech, which is a different domain.
+. *L5, segments are not VAD output.* The segment boundaries come from an energy rule (section 4.2), not from the Silero sidecar, so late onsets, early cuts and false segments are not part of these numbers (section 6.5 gives the onset sensitivity of one engine only).
+. *L6, partials of offline engines are emulated* by re-decoding prefixes every 0.5 s, and the "time to first partial" is bounded by that grid. A tuned step would change it. Whisper partials were measured on 8 clips only.
+. *L7, sample sizes.* 400 / 200 / 150 / 60 clips depending on the engine; the intervals in section 5 are wide (the 95% interval on a CER of 15% spans roughly 10 to 19 points at n = 150-200) and clips share sentences structure and contributors. Differences under about 3-4 points are not distinguishable here except where a paired interval says otherwise.
+. *L8, one machine, one run per configuration, a Python driver.* A Zen 2-class 8-core desktop CPU, Windows 11, 8 threads for CPU Whisper and 4 for the others. Native bindings may be a little faster; other CPUs, laptops, Linux and macOS were not measured. The Rust binding was run only to compare text (100 clips) and its timing was not recorded as a benchmark (it ran concurrently with a Whisper run).
+. *L9, Whisper configuration.* +whisper-server+ with default decoding (greedy, best-of 2) and temperature 0, no prompt, no VAD, no audio-context shortening (+-ac+), no word timestamps. Whisper always processes a 30 s window; shortening it (+-ac+) trades accuracy for speed and was not tried. The binary is a nightly build, not a tagged release.
+. *L10, Vosk partials.* The Python wheel was fed 100 ms chunks; the small model's measured real-time factor (0.8, and 0.7 on a repeat run on an idle machine) was far higher than the big model's (0.14); this was not investigated and may be a property of this wheel or of the small model's lookahead decoding rather than a harness artefact. Its same-process repeat differed on 4 of 50 clips while two separate processes agreed on 60 of 60; not explained.
+. *L11, license reading is partial.* See section 3.2: the ja-en model's license, Vosk's training data, Whisper's training data, the ReazonSpeech corpus terms as applied to model weights, and pip dependencies were not resolved or audited. Nothing here is legal advice.
+. *L12, no GPU path for sherpa-onnx.* Only the Whisper CUDA binary was tried (section 6.6); contention with the avatar renderer on the same GPU was not measured.
+. *L13, no confirmatory criterion.* Nothing here is a pass/fail against a pre-stated threshold; do not use these numbers as SLOs.
+
+== 11. Protocol deviations
+
+* *No streaming Japanese sherpa-onnx model.* The brief expected a streaming ReazonSpeech zipformer. None exists in the sherpa-onnx catalogue (section 6.3) and +reazonspeech-k2-v2+ is an offline model; partials are emulated by prefix re-decoding. Vosk was added as the only native streaming Japanese engine found.
+* *Run sizes differ by engine:* 400 clips for sherpa-onnx, 200 for Vosk small, 60 for Vosk big and for kotoba-whisper q5_0, 150 for the other Whisper runs (CPU cost, always the first clips of the same seeded order); paired comparisons use common clips. A first plan of 200 Whisper clips was cut to 150, and kotoba q5_0 to 60, after the first runs showed 7-12 s per clip. Vosk big was cut from 200 to 60 when a partial run showed it was slow.
+* *Whisper binary:* release v1.9.5 ships no binary assets; the nightly +b5454+ (v1.9.5 plus later commits) was used instead of building from source. A source build through +whisper-rs-sys+ failed here for lack of a C/C++ compiler (section 7). The vendored whisper.cpp inside that crate is 1.8.3.
+* *SenseVoice archive:* the first smoke run used the 2025-09-09 sherpa-onnx SenseVoice asset, which is a Cantonese fine-tune and transcribed Japanese as Chinese; it was replaced by the 2024-07-17 asset before any reported run.
+* *Parakeet:* the sherpa-onnx export contains only the CTC head of the TDT+CTC model; the TDT transducer was not run.
+* *ja-en zipformer:* run, but its license could not be read (section 3.2).
+* *Concurrency:* the Rust build and run, a +cargo deny+ run and an extraction of a 0.7 GB archive ran while the Whisper-small run was in progress; the Rust steps used idle priority and two jobs. One Whisper-small call took 11.6 s (p95 3.5 s), probably from that load; the reported p50 is robust to it, the maximum is not. The other timings were taken while only light shell commands ran.
+* *Common Voice from a third-party mirror* (as in EXP-0001); the official distribution was not accessed.
+* *Repository search* used tgrep 1.0.11 as required; external pages and release metadata were read with the fetch, curl and gh tools.
+* *GPU:* run only for Whisper (CUDA build of the same nightly); the first download of the 0.7 GB CUDA archive over the release URL returned HTTP 504 repeatedly and was fetched with +gh release download+ instead (sha256 identical to the one pinned in +fetch_assets.py+). sherpa-onnx GPU builds were not run.
+* *Kotoba fp16 and turbo fp16 on CPU were not run* (about 40 minutes each); kotoba-whisper was measured on CPU as q5_0 only (60 clips) and on GPU as fp16. +large-v3-turbo+ fp16 was downloaded for the GPU run only.
+* *Whisper-small at 4 threads* was run on 40 clips only, to show thread scaling.
+
+== 12. Open questions
+
+. *Q1, ReazonSpeech corpus terms (blocking for adoption of any ReazonSpeech-derived weights).* The corpus gate requires agreeing to use the data solely for Japanese Copyright Act Article 30-4 purposes. The k2-v2 weights are Apache-2.0 and parakeet-ja is CC-BY-4.0, but does the corpus condition follow the weights into a product that ships them (and, for a VTuber, into commercial streaming use)? The project owner should decide whether to accept the risk, obtain a legal reading, or restrict the first slice to a model with clearer provenance. Until then the recommendation below is *conditional*.
+. *Q2, model choice for the default.* ReazonSpeech k2-v2 int8 (fast, small, Apache-2.0) or parakeet-ja (better in this set by a paired margin whose interval just excludes zero, 2.5 times slower, about 940 MB, CC-BY-4.0 attribution)? The measurements support either; the decision depends on the CPU budget next to TTS, the avatar renderer and the LLM client (not measured), and on Q1.
+. *Q3, process shape.* Transcriber thread inside +speech-vad-sidecar+ (no audio crosses a pipe) or a separate +speech-stt-worker+ child (a model crash cannot take VAD down; PCM crosses a local pipe)? Section 9 prefers the second for fault isolation; the first is simpler. Decide in S3b with the S2 sidecar owner's input.
+. *Q4, native library packaging.* Official +sherpa-onnx+ crate (two allowlist additions to +deny.toml+, build-time-only crates, a CI rule to always set +SHERPA_ONNX_ARCHIVE_DIR+) or our own +libloading+ FFI with runtime SHA-256 pins (one new crate, we own the unsafe surface)? Either needs the pinned library archive for each supported OS/arch (only Windows x64 was exercised).
+. *Q5, transcript wire shape.* A new +speech-transcript+ schema (proposed in section 9) or an +EventEnvelope+ kind? The S1 reasoning (signals do not ride the content queue) argues for a separate pipe for partials; final transcripts are content and eventually become +EventEnvelope+ content after the normalizer. Where is the boundary, and who owns the revision/supersede semantics?
+. *Q6, text policy for partials.* May partial text influence floor decisions (for example hold the floor while the user is still talking) or only the final? A partial that says "stop" must not stop anything (model output is data); the operator stop stays on its independent path.
+. *Q7, a Japanese conversational test set.* All accuracy here is read speech. A permissively usable, human-transcribed Japanese conversation or streaming-speech set (the same blocker as EXP-0001 11.1 item 1) is needed before CER numbers can be treated as predictive; none was found.
+. *Q8, Whisper-class accuracy tier.* Is a slow high-accuracy second pass (GPU or a few seconds of CPU per utterance, final-only) wanted after the fast partial/final path, for example for logging or for correcting the first final? It would be a separate decision with its own latency budget; nothing here measures its benefit on real speech.
+. *Q9, punctuation, inverse text normalisation and kana/kanji policy.* The engines differ (SenseVoice and Whisper add punctuation; the transducers do not). Where does text normalisation for downstream Reflex/Thinking live, and is a reading (kana) form needed for matching?
+
+== 13. Related
+
+* link:README.adoc[Durable Experiment Records]
+* link:EXP-0001-japanese-turn-observation-bench.adoc[EXP-0001] (VAD and turn-end)
+* link:../reuse-first.adoc[Reuse-first policy] (Local speech inference, Local VAD inference runtime rows)
+* link:../supply-chain.adoc[Supply-chain policy]
+* link:../research-register.adoc[Research and Design Register] (Local Japanese speech row)
+* link:../../examples/benchmarks/stt/README.md[+examples/benchmarks/stt/+] (scripts, pins, reproduction)

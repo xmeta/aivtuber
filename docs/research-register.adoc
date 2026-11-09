@@ -234,6 +234,7 @@ current Japanese-capable VAD/ASR/TTS ecosystems
 |#66, #92, #220
 |Japanese accuracy/latency; clipped-prefix rate; pre-roll memory/latency; CPU/GPU footprint; IPC/reconnect; model/license suitability at implementation time.
 First measurement (synthetic-pause VAD and turn-end bench, #92): link:experiments/EXP-0001-japanese-turn-observation-bench.adoc[EXP-0001].
+Second measurement (local Japanese STT engine bench: sherpa-onnx ReazonSpeech/parakeet/SenseVoice, Whisper-family via whisper.cpp, Vosk; accuracy, latency, cost, determinism, licenses and Rust integration cost, #92 S3a): link:experiments/EXP-0002-japanese-stt-bench.adoc[EXP-0002].
 
 |Modern TTS
 |GPT-SoVITS;
