@@ -48,6 +48,22 @@ Do not turn an exact live result into an unbounded version-range compatibility c
 
 == Opt-in live probes
 
+== Local `llama-server` Thinking backend (#220 S1)
+
+Verified manually (not in CI) against the adapter's Responses wire shape:
+
+[cols="1,3"]
+|===
+|llama.cpp
+|release `b12224` (`llama-server` 0.9.0-dev, commit `806b3c2be`), Windows x64 Vulkan build `llama-b12224-bin-win-vulkan-x64.zip`, SHA-256 `abb2363a8cf2fa622a40f80330828806fb9f344b483074f29478303a5b76fc27`. License: MIT.
+|Model
+|`Qwen3-4B-Instruct-2507-Q4_K_M.gguf` from `unsloth/Qwen3-4B-Instruct-2507-GGUF` (revision `a06e946bb6b655725eafa393f4a9745d460374c9`), a quantization of `Qwen/Qwen3-4B-Instruct-2507`. License: Apache-2.0 (model card of both repositories). SHA-256 `3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597`. Non-thinking instruct variant, handles Japanese.
+|Endpoint
+|`POST /v1/responses` on `127.0.0.1`, no key. The server returned `output[].content[]` `output_text` items, which `OpenAiResponsesAdapter` already extracts; no adapter wire change was needed. `max_output_tokens` and `model` (matching `--alias`) are honored.
+|===
+
+Binaries and model weights are never committed. Fixture CI uses a fake loopback server speaking this wire shape, not llama-server. The compatibility matrix is deliberately not widened: this is one server/model/revision, observed on one host (see A-LLM-002). Re-run the check when the llama.cpp release or the model changes.
+
 Live Jev and OpenAI-compatible probes are ignored Rust tests in +crates/hardening/tests/live_provider_conformance.rs+.
 
 They use bounded five-second provider timeouts, do not mutate scheduler state, do not write memory, and do not perform public stream actions. Generated reply text and credentials are not printed.

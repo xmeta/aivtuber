@@ -4,18 +4,21 @@ use aivtuber_adaptation::{
 use aivtuber_adapters::{
     LocalAvatarConfig, LocalAvatarServer, NormalizedHttpTtsAdapter, NormalizedHttpTtsConfig,
     ObsWebSocketAdapter, ObsWebSocketConfig, OpenAiResponsesAdapter, OpenAiResponsesConfig,
-    ProcessAudioConfig, ProcessAudioPlayer, SecretString, VTubeStudioAdapter, VTubeStudioConfig,
+    ProcessAudioConfig, ProcessAudioPlayer, SecretString, SystemHostResolver,
+    ThinkingAuthentication, VTubeStudioAdapter, VTubeStudioConfig, endpoint_origin,
+    verify_loopback_endpoint,
 };
 use aivtuber_app::{
     AdaptationRuntime, AdapterHealth, AvatarOutput, BargeInConfig, BargeInMetrics,
     CompositionProfile, GenerativeBudgetPolicy, GenerativeRuntime, IntentRoutePlanner,
-    IntentShadowPolicy, LocalAvatarOutput, NoopAvatarOutput, NoopStreamOutput, ObsStreamOutput,
-    OperatorControlServer, OperatorRateLimiter, ProductionApp, ProfileSummary, RawIngressConfig,
-    RawIngressMetrics, RawIngressMetricsSnapshot, RoutePlanner, RuntimeRetentionPolicy,
-    SHADOW_ORCHESTRATOR_SCHEMA_VERSION, ShadowOrchestratorConfig, ShadowPolicyIdentity,
-    ShadowingRoutePlanner, SpeechConversationConfig, SpeechConversationMetrics, SpeechFloorMetrics,
-    SpeechSidecar, SpeechSidecarConfig, SpeechSidecarStats, StreamOutput, VtsAvatarOutput,
-    VtsPlaybackConfig, apply_dispatched_request, pump_bounded_records, stt_sidecar_args,
+    IntentShadowPolicy, LocalAvatarOutput, LocalRoutePlanner, NoopAvatarOutput, NoopStreamOutput,
+    ObsStreamOutput, OperatorControlServer, OperatorRateLimiter, ProductionApp, ProfileSummary,
+    RawIngressConfig, RawIngressMetrics, RawIngressMetricsSnapshot, RoutePlanner,
+    RuntimeRetentionPolicy, SHADOW_ORCHESTRATOR_SCHEMA_VERSION, ShadowOrchestratorConfig,
+    ShadowPolicyIdentity, ShadowingRoutePlanner, SpeechConversationConfig,
+    SpeechConversationMetrics, SpeechFloorMetrics, SpeechSidecar, SpeechSidecarConfig,
+    SpeechSidecarStats, StreamOutput, VtsAvatarOutput, VtsPlaybackConfig, apply_dispatched_request,
+    pump_bounded_records, stt_sidecar_args,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
@@ -73,7 +76,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some(mode) => CompositionProfile::parse(&mode)?,
         None => CompositionProfile::Cached,
     };
-    let generative_configured = build_generative_runtime(&compatibility, retention)?;
+    let generative_configured = build_generative_runtime(&compatibility, retention, profile)?;
     let jev_api_key_present =
         env_optional("AIVTUBER_JEV_API_KEY").is_some_and(|key| !key.trim().is_empty());
     profile.validate(generative_configured.is_some(), jev_api_key_present)?;
@@ -134,6 +137,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     );
     let active_planner: Box<dyn RoutePlanner> = match profile {
         CompositionProfile::Cached => Box::new(IntentRoutePlanner) as Box<dyn RoutePlanner>,
+        // #220 S1: deterministic routing, no decision model, no Jev.
+        CompositionProfile::Local => Box::new(LocalRoutePlanner) as Box<dyn RoutePlanner>,
         CompositionProfile::Reflex | CompositionProfile::Full => {
             let semantic_pack_root = env_path("AIVTUBER_PACK_ROOT")
                 .unwrap_or_else(|| PathBuf::from("examples/starter-reaction-pack"));
@@ -842,6 +847,7 @@ fn build_runtime_retention_policy() -> Result<RuntimeRetentionPolicy, Box<dyn Er
 fn build_generative_runtime(
     compatibility: &RuntimeCompatibility,
     retention: RuntimeRetentionPolicy,
+    profile: CompositionProfile,
 ) -> Result<Option<GenerativeRuntime>, Box<dyn Error>> {
     if !env_bool("AIVTUBER_GENERATIVE_ENABLED", false)? {
         return Ok(None);
@@ -866,14 +872,42 @@ fn build_generative_runtime(
             .as_millis()
             .min(u128::from(u64::MAX)) as u64,
     )?);
-    let thinking = OpenAiResponsesAdapter::new(
-        thinking_config,
-        SecretString::new(required_env("AIVTUBER_OPENAI_API_KEY")?),
+    // #220 S1: explicit authentication policy. The default still requires a
+    // remote credential; an unauthenticated Thinking endpoint must be spelled
+    // out and is only constructible against a verified loopback host.
+    let thinking_auth = ThinkingAuthentication::from_policy(
+        env_optional("AIVTUBER_OPENAI_AUTH").as_deref(),
+        env_optional("AIVTUBER_OPENAI_API_KEY"),
     )?;
+    let tts_endpoint = required_env("AIVTUBER_TTS_ENDPOINT")?;
+    // The loopback-only profile must not be pointed at a remote provider.
+    let resolver = SystemHostResolver;
+    profile.validate_provider_endpoints(&[
+        (
+            "thinking",
+            verify_loopback_endpoint(&thinking_config.endpoint, &resolver).is_ok(),
+        ),
+        (
+            "tts",
+            verify_loopback_endpoint(&tts_endpoint, &resolver).is_ok(),
+        ),
+    ])?;
+    let mut thinking = OpenAiResponsesAdapter::with_authentication(thinking_config, thinking_auth)?;
+    if let Some(name) = env_optional("AIVTUBER_OPENAI_BACKEND_NAME") {
+        thinking = thinking.with_backend_name(name);
+    }
+    // Non-secret, replay-relevant identity: where Thinking runs and how it is
+    // authenticated. Origin only; no path/query that could carry a token.
+    eprintln!(
+        "thinking: endpoint={} auth={} backend={}",
+        endpoint_origin(thinking.endpoint()),
+        thinking.authentication_label(),
+        aivtuber_domain::ThinkingEngine::identity(&thinking).name,
+    );
 
     let tts = NormalizedHttpTtsAdapter::new(
         NormalizedHttpTtsConfig {
-            endpoint: required_env("AIVTUBER_TTS_ENDPOINT")?,
+            endpoint: tts_endpoint,
             backend_name: env_string("AIVTUBER_TTS_BACKEND_NAME", "normalized-http-tts"),
             model_alias: env_optional("AIVTUBER_TTS_MODEL_ALIAS"),
             model_version: env_optional("AIVTUBER_TTS_MODEL_VERSION"),

@@ -152,6 +152,22 @@ Do not record secrets, private user data, or raw provider credentials.
 
 *Related:* #61, #66, #104.
 
+=== A-LLM-002 -- A loopback endpoint is a sufficient trust boundary for unauthenticated Thinking
+
+*Subsystem:* Thinking provider adapters / `local` composition profile
+
+*Status:* Needs validation (one llama.cpp release and one model observed manually; policy enforced by tests)
+
+*Statement:* A Thinking endpoint whose host is `127.0.0.0/8`, `::1`, or `localhost` resolving only to loopback is on the operator's machine, so it may run without a credential when the operator names that policy explicitly (`AIVTUBER_OPENAI_AUTH=unauthenticated-loopback`). Other local processes and users on the same host are inside this boundary: any of them can use the inference server. A `localhost` lookup is checked at startup and repeated by the HTTP client at connect time.
+
+*Evidence:* `crates/adapters/src/openai.rs` tests (remote host, off-loopback resolution, missing key, no `Authorization` header), `local_profile_free_text_reaches_loopback_thinking_and_plays` in `crates/app/src/lib.rs`, and the manual llama-server check in `docs/provider-conformance.adoc`.
+
+*Consequence if false:* A rebinding or hosts-file change could redirect curated chat text to a remote host without a credential. Remote hosts are never accepted unauthenticated, and the loopback check precedes any request.
+
+*Revisit when:* Multi-user hosts or containers share the loopback namespace, a reverse proxy fronts the server, a non-`localhost` name needs to be allowed, or the llama.cpp Responses endpoint changes.
+
+*Related:* #220, A-LLM-001.
+
 === A-TTS-001 -- TTS streaming/prosody controls are provider-specific
 
 *Subsystem:* TTS adapters / performance compilation

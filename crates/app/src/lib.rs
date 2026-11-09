@@ -4919,6 +4919,145 @@ mod tests {
         );
     }
 
+    /// One-shot loopback server speaking the Responses wire format. Returns the
+    /// endpoint and a handle yielding the raw request it received.
+    fn fake_responses_server(reply: &str) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let endpoint = format!(
+            "http://{}/v1/responses",
+            listener.local_addr().expect("address")
+        );
+        let body = serde_json::to_vec(&json!({
+            "output": [{"type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": reply, "annotations": []}
+            ]}]
+        }))
+        .expect("body");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            let mut received = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let n = stream.read(&mut buffer).expect("read request");
+                assert!(n > 0, "closed before full request");
+                received.extend_from_slice(&buffer[..n]);
+                let Some(end) = received.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&received[..end]).to_ascii_lowercase();
+                let length = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .expect("content length");
+                if received.len() >= end + 4 + length {
+                    break;
+                }
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).expect("head");
+            stream.write_all(&body).expect("body");
+            String::from_utf8_lossy(&received).into_owned()
+        });
+        (endpoint, handle)
+    }
+
+    /// #220 S1: in the `local` composition, free-text chat reaches an
+    /// unauthenticated loopback Thinking server, the reply is gated, compiled
+    /// and scheduled like any generated reply, and no credential is sent.
+    #[test]
+    fn local_profile_free_text_reaches_loopback_thinking_and_plays() {
+        let (endpoint, server) = fake_responses_server("負けても楽しいよ！");
+        let thinking = aivtuber_adapters::OpenAiResponsesAdapter::with_authentication(
+            aivtuber_adapters::OpenAiResponsesConfig {
+                endpoint,
+                model_alias: "local-test-model".to_owned(),
+                timeout: Duration::from_secs(5),
+                ..aivtuber_adapters::OpenAiResponsesConfig::default()
+            },
+            aivtuber_adapters::ThinkingAuthentication::UnauthenticatedLoopback,
+        )
+        .expect("loopback unauthenticated adapter")
+        .with_backend_name("llama-server");
+        let tts = MockTts::default();
+        let tts_log = Arc::clone(&tts.texts);
+        let security = SecurityRuntime::new(
+            SecurityRuntimeConfig::default(),
+            SchedulerConfig {
+                min_reaction_spacing_ms: 0,
+                ..aivtuber_scheduler::SchedulerConfig::default()
+            },
+            SecretRedactor::default(),
+            None,
+        )
+        .expect("security runtime");
+        let mut app = ProductionApp::new(
+            security,
+            performer(),
+            LocalVisemeStore::new(pack_root()),
+            LocalRoutePlanner,
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+            250,
+        )
+        .with_generation(generative_runtime(thinking, tts));
+        app.startup().expect("startup");
+
+        let mut event = chat_event(31);
+        event.payload = BTreeMap::from([
+            ("text".to_owned(), json!("昨日もまた負けてたよねｗ")),
+            ("language".to_owned(), json!("ja")),
+        ]);
+        let raw = serde_json::to_vec(&event).expect("event json");
+        let outcome = app
+            .process_content_bytes(&raw, 0, 31)
+            .expect("generation submission");
+        assert!(outcome.playback.is_none());
+        wait_for_generation_completion(&mut app, 0);
+        let plan = last_scheduled_plan(&app);
+        assert!(plan.asset_id.starts_with("dynamic.generated."));
+        assert_eq!(
+            tts_log.lock().expect("tts log").as_slice(),
+            ["負けても楽しいよ！"]
+        );
+
+        let request = server.join().expect("fake thinking server");
+        let head = request.to_ascii_lowercase();
+        assert!(request.starts_with("POST /v1/responses HTTP/1.1"));
+        assert!(
+            !head.contains("authorization:"),
+            "unauthenticated mode must send no Authorization header"
+        );
+        let body = &request[request.find("\r\n\r\n").expect("body") + 4..];
+        let body: serde_json::Value = serde_json::from_str(body).expect("request JSON");
+        assert_eq!(body["model"], "local-test-model");
+        assert!(
+            body["input"]
+                .as_str()
+                .expect("input")
+                .contains("昨日もまた負けてたよねｗ")
+        );
+
+        let audit = app
+            .security()
+            .audit()
+            .iter()
+            .find(|record| record.category == aivtuber_telemetry::AuditCategory::Generation)
+            .expect("generation audit");
+        assert!(audit.detail.contains("routing_reason=no_cached_match"));
+        assert!(audit.detail.contains("backend=llama-server"));
+        assert!(audit.detail.contains("model_alias=local-test-model"));
+        assert!(!audit.detail.contains("負けても楽しいよ"));
+    }
+
     #[test]
     fn generated_text_is_redacted_before_tts_and_asset_publish() {
         let tts = MockTts::default();
