@@ -781,8 +781,15 @@ impl GenerativePipeline {
         let projection = project_speech_text(&gated_reply_text);
         let speech_text = if projection.report.changed() {
             // Deletion can join what the gate saw apart, so the gate sees the
-            // projected string too (only when something was deleted).
-            match output_gate(&projection.text) {
+            // projected string too (only when something was deleted). The
+            // production gate records the last decision it saw and the app
+            // commits only when that decision is for the published display
+            // text, so the display text goes through once more, last. Found
+            // by the local end-to-end run: without it every reply that
+            // contained an emoji or a URL was dropped at commit.
+            let decision = output_gate(&projection.text);
+            let _ = output_gate(&gated_reply_text);
+            match decision {
                 GeneratedTextGateDecision::Publish(text) => text,
                 GeneratedTextGateDecision::Reject => String::new(),
             }
@@ -1333,7 +1340,12 @@ mod tests {
             result.disposition,
             GenerationDisposition::Generated { .. }
         ));
-        assert_eq!(seen.lock().unwrap().as_slice(), ["やあ😊", "やあ"]);
+        // The display text goes through last: the app records the gate's
+        // last decision and commits only if it is for the display text.
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["やあ😊", "やあ", "やあ😊"]
+        );
 
         // A gate that rejects the projected text stops the reply before TTS.
         let tts = Arc::new(MockTts::success());

@@ -4974,6 +4974,72 @@ mod tests {
     /// #220 S1: in the `local` composition, free-text chat reaches an
     /// unauthenticated loopback Thinking server, the reply is gated, compiled
     /// and scheduled like any generated reply, and no credential is sent.
+    /// #220 S2b regression, found by the local end-to-end run: a reply with an
+    /// emoji, a URL and a kaomoji is spoken as its projection (ADR-0004 D-5),
+    /// and is still committed and scheduled with its display text. The worker's
+    /// output gate records its last decision and the commit requires that
+    /// decision to be for the published display text.
+    #[test]
+    fn a_reply_with_emoji_and_a_url_is_projected_for_tts_and_still_plays() {
+        let display = "ありがとう😊 https://example.com/live を見てね(^_^)";
+        let (endpoint, server) = fake_responses_server(display);
+        let thinking = aivtuber_adapters::OpenAiResponsesAdapter::with_authentication(
+            aivtuber_adapters::OpenAiResponsesConfig {
+                endpoint,
+                model_alias: "local-test-model".to_owned(),
+                timeout: Duration::from_secs(5),
+                ..aivtuber_adapters::OpenAiResponsesConfig::default()
+            },
+            aivtuber_adapters::ThinkingAuthentication::UnauthenticatedLoopback,
+        )
+        .expect("loopback unauthenticated adapter");
+        let tts = MockTts::default();
+        let tts_log = Arc::clone(&tts.texts);
+        let security = SecurityRuntime::new(
+            SecurityRuntimeConfig::default(),
+            SchedulerConfig {
+                min_reaction_spacing_ms: 0,
+                ..aivtuber_scheduler::SchedulerConfig::default()
+            },
+            SecretRedactor::default(),
+            None,
+        )
+        .expect("security runtime");
+        let mut app = ProductionApp::new(
+            security,
+            performer(),
+            LocalVisemeStore::new(pack_root()),
+            LocalRoutePlanner,
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+            250,
+        )
+        .with_generation(generative_runtime(thinking, tts));
+        app.startup().expect("startup");
+
+        let mut event = chat_event(32);
+        event.payload = BTreeMap::from([
+            ("text".to_owned(), json!("配信ありがとう")),
+            ("language".to_owned(), json!("ja")),
+        ]);
+        let raw = serde_json::to_vec(&event).expect("event json");
+        app.process_content_bytes(&raw, 0, 32)
+            .expect("generation submission");
+        wait_for_generation_completion(&mut app, 0);
+        let plan = last_scheduled_plan(&app);
+        assert!(
+            plan.asset_id.starts_with("dynamic.generated."),
+            "a projected reply must still be committed, not dropped as a policy override"
+        );
+        assert_eq!(
+            tts_log.lock().expect("tts log").as_slice(),
+            ["ありがとう を見てね"],
+            "the synthesizer never sees the emoji, the URL or the kaomoji"
+        );
+        server.join().expect("fake thinking server");
+    }
+
     #[test]
     fn local_profile_free_text_reaches_loopback_thinking_and_plays() {
         let (endpoint, server) = fake_responses_server("負けても楽しいよ！");

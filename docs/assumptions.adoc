@@ -184,6 +184,22 @@ Do not record secrets, private user data, or raw provider credentials.
 
 *Related:* #66, #83, #84.
 
+=== A-TTS-002 -- A loopback-only unauthenticated TTS sidecar is a sufficient boundary for local speech
+
+*Subsystem:* local TTS sidecar / `local` composition profile
+
+*Status:* Needs validation (one model, one host observed manually; the policy is enforced by tests)
+
+*Statement:* `local-tts-sidecar` binds only a loopback address, requires a loopback `Host` header and `Content-Type: application/json`, bounds every input, runs one synthesis at a time and takes no credential. Other local processes and users on the same host are inside this boundary: any of them can make it synthesize text, and one that holds the single synthesis slot can delay replies (a denial of speech, never of the performer). The audio the app plays is only what a generation result of its own names, resolved under the audio root by the player's existing traversal rules, so a stranger's request cannot make the app play anything.
+
+*Evidence:* `crates/adapters/src/speech_tts/server.rs` tests (non-loopback bind and `Host`, content type, bounds, busy), `crates/adapters/tests/tts_sidecar_supervisor.rs`, and the manual end-to-end run recorded in the S2b pull request.
+
+*Consequence if false:* A local attacker could burn CPU, fill the generated-audio directory up to its byte cap or keep the voice busy. Text synthesized for a stranger is not curated chat text and is not logged (log lines carry counts and timings only).
+
+*Revisit when:* Multi-user hosts or containers share the loopback namespace, a reverse proxy fronts the sidecar, a second backend (VOICEVOX) is added, or the sidecar must serve a non-loopback client.
+
+*Related:* #220, A-LLM-002, A-TTS-001.
+
 === A-AUDIO-001 -- Current process-player startup cost is acceptable until measured otherwise
 
 *Subsystem:* audio output

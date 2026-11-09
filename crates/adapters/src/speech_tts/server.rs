@@ -280,20 +280,18 @@ impl TtsServer {
                 .counters
                 .connections_rejected
                 .fetch_add(1, Ordering::Relaxed);
-            // Answer on a short-lived thread so a stalled client cannot hold
-            // the accept loop; its write is bounded by a short timeout.
-            let _ = thread::Builder::new()
-                .name("tts-reject".to_owned())
-                .spawn(move || {
-                    let _guard = guard;
-                    let mut stream = stream;
-                    let _ = stream.set_nonblocking(false);
-                    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
-                    write_response(
-                        &mut stream,
-                        error_response(503, "busy", "too many connections"),
-                    );
-                });
+            // Refuse inline, with no thread: the 503 is a few dozen bytes that
+            // fit a fresh socket's send buffer, and the short timeout keeps a
+            // hostile client from holding the accept loop. A connection flood
+            // therefore costs this loop, never a thread per connection.
+            let mut stream = stream;
+            let _ = stream.set_nonblocking(false);
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
+            write_response(
+                &mut stream,
+                error_response(503, "busy", "too many connections"),
+            );
+            drop(guard);
             return;
         }
         let spawned = thread::Builder::new()
