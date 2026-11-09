@@ -29,6 +29,7 @@ The core design separates three time scales:
 * link:docs/generative-fallback.adoc[Generative fallback and dynamic compilation]
 * link:docs/memory-adaptation.adoc[Bounded memory and deterministic adaptation]
 * link:docs/production-runtime.adoc[Production Rust composition runtime (incl. composition profiles: cached / reflex / full, authenticated operator control endpoint, privacy-safe support bundle)]
+* link:docs/local-profile-quickstart.adoc[Local profile quickstart (zero paid dependencies: llama.cpp Thinking, local STT and TTS, VRM avatar; fetch, build, run, verify offline, licences)]
 * link:docs/maintenance.adoc[Maintenance and merge policy]
 * link:docs/after-action-review.adoc[After-action review and incident-to-regression learning]
 * link:AGENTS.md[AI coding-agent development contract]

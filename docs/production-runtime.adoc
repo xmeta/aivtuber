@@ -462,7 +462,7 @@ export AIVTUBER_TTS_ENDPOINT='https://tts.example/v1'
 cargo run -p aivtuber-app
 ----
 
-Local profile with a `llama.cpp` `llama-server` on loopback (see `docs/generative-fallback.adoc` for the authentication policy and `docs/provider-conformance.adoc` for the verified server/model):
+The step-by-step operator guide for the whole local path (assets, build, every variable, loopback verification, licences, troubleshooting, measurements) is link:local-profile-quickstart.adoc[the local profile quickstart]. Local profile with a `llama.cpp` `llama-server` on loopback (see `docs/generative-fallback.adoc` for the authentication policy and `docs/provider-conformance.adoc` for the verified server/model):
 
 [source,shell]
 ----
