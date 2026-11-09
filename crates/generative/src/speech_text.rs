@@ -170,7 +170,7 @@ fn kaomoji_end(chars: &[char], start: usize) -> Option<usize> {
 /// Emoji code points and the joiners that build sequences. Deliberately
 /// narrower than "every pictograph": `★ ☆ ♀ ♂`, the card suits `♡ ♥` and the
 /// music notes `♪ ♫` are ordinary Japanese text decoration and pass through.
-fn is_emoji_part(c: char) -> bool {
+pub(crate) fn is_emoji_part(c: char) -> bool {
     let code = c as u32;
     matches!(
         code,

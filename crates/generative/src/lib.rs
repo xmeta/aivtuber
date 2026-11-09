@@ -21,7 +21,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::error::Error;
 use std::fmt;
+mod phrase;
+mod phrase_pipeline;
 mod speech_text;
+pub use phrase::{
+    Delivery, MAX_PHRASES_CEILING, PHRASE_SEGMENTATION_VERSION, PhraseConfig, PhraseDelivery,
+    PhraseEnd, PhraseFailure, PhraseOptions, PhraseState, PhraseStep, PhraseSummary,
+    PhraseTransitionError, PhraseUnit, SegmentationConfig, SlotWait, segment_reply,
+};
+pub use phrase_pipeline::wait_for_started;
 pub use speech_text::{SpeechProjection, SpeechProjectionReport, project_speech_text};
 use std::sync::{
     Arc, Mutex,
@@ -115,9 +123,21 @@ impl Default for GenerationTrace {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GenerationDisposition {
-    Generated { asset: Box<PerformanceAsset> },
-    Fallback { directive: FallbackDirective },
-    Cancelled { stage: CancellationStage },
+    Generated {
+        asset: Box<PerformanceAsset>,
+    },
+    /// A phrased reply (issue #83): its complete phrases were handed over one
+    /// by one while generation ran, so there is no single asset here, only the
+    /// typed end of the reply.
+    Phrased {
+        summary: PhraseSummary,
+    },
+    Fallback {
+        directive: FallbackDirective,
+    },
+    Cancelled {
+        stage: CancellationStage,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -422,6 +442,42 @@ impl PerformanceCompiler {
         thinking: &BackendIdentity,
         tts: &TtsBackendIdentity,
     ) -> Result<PerformanceAsset, GenerationError> {
+        self.compile_inner(request, reply_text, speech, thinking, tts, None)
+    }
+
+    /// Compile one phrase of a phrased reply (issue #83). The asset id mixes in
+    /// the phrase position so two phrases with the same text stay distinct
+    /// assets. Only phrase 0 carries the expression start: later phrases keep
+    /// the face the first one set instead of restarting it at every boundary
+    /// (cross-phrase continuity proper is #84).
+    pub fn compile_phrase(
+        &self,
+        request: &GenerationRequest,
+        phrase_seq: u32,
+        phrase_text: &str,
+        speech: &SpeechArtifact,
+        thinking: &BackendIdentity,
+        tts: &TtsBackendIdentity,
+    ) -> Result<PerformanceAsset, GenerationError> {
+        self.compile_inner(
+            request,
+            phrase_text,
+            speech,
+            thinking,
+            tts,
+            Some(phrase_seq),
+        )
+    }
+
+    fn compile_inner(
+        &self,
+        request: &GenerationRequest,
+        reply_text: &str,
+        speech: &SpeechArtifact,
+        thinking: &BackendIdentity,
+        tts: &TtsBackendIdentity,
+        phrase_seq: Option<u32>,
+    ) -> Result<PerformanceAsset, GenerationError> {
         if request.intent.trim().is_empty() {
             return Err(GenerationError::new("generation intent must not be empty"));
         }
@@ -434,11 +490,13 @@ impl PerformanceCompiler {
             ));
         }
 
-        let asset_id = generated_asset_id(&request.source_event, reply_text, thinking, tts);
+        let asset_id =
+            generated_asset_id(&request.source_event, reply_text, thinking, tts, phrase_seq);
         let expression = self
             .config
             .expression_preset
             .as_ref()
+            .filter(|_| phrase_seq.is_none_or(|seq| seq == 0))
             .map(|preset| ExpressionTrack {
                 preset: preset.clone(),
                 intensity: self.config.expression_intensity,
@@ -645,6 +703,33 @@ impl GenerativePipeline {
         }
     }
 
+    /// One complete TTS call (streaming when the engine streams, buffered
+    /// otherwise). Partial progress is validated and collapsed into one
+    /// artifact; nothing partial leaves this function.
+    fn synthesize(
+        &self,
+        request: &SpeechRequest,
+        timeout: Option<Duration>,
+        trace: &mut GenerationTrace,
+    ) -> Result<SpeechArtifact, EngineError> {
+        if let Some((result, progress)) = run_streaming_tts(self.tts.as_ref(), request, timeout) {
+            trace.tts_streaming = true;
+            trace.tts_progress_chunks = trace
+                .tts_progress_chunks
+                .saturating_add(progress.progress.len());
+            match result {
+                Ok(speech) => progress.validate_final(&speech).map(|()| speech),
+                Err(error) => Err(error),
+            }
+        } else {
+            let synthesis = match timeout {
+                Some(timeout) => self.tts.synthesize_with_timeout(request, timeout),
+                None => self.tts.synthesize(request),
+            };
+            block_on(synthesis)
+        }
+    }
+
     pub fn run(
         &self,
         request: &GenerationRequest,
@@ -706,27 +791,7 @@ impl GenerativePipeline {
     where
         F: FnMut(&str) -> GeneratedTextGateDecision,
     {
-        request
-            .source_event
-            .validate()
-            .map_err(|error| GenerationError::new(format!("invalid generation event: {error}")))?;
-        request
-            .thinking
-            .validate()
-            .map_err(|error| GenerationError::new(format!("invalid thinking request: {error}")))?;
-        if request.thinking.input.event_id.as_deref()
-            != Some(request.source_event.event_id.as_str())
-            || request.thinking.input.event_kind != Some(request.source_event.kind)
-            || request.thinking.input.source_class != Some(request.source_event.source_class)
-            || request.thinking.input.trust_level != request.source_event.trust_level
-        {
-            return Err(GenerationError::new(
-                "thinking request input provenance must match source_event",
-            ));
-        }
-        if request.intent.trim().is_empty() {
-            return Err(GenerationError::new("generation intent must not be empty"));
-        }
+        validate_generation_request(request)?;
 
         let mut trace = GenerationTrace::default();
         if cancellation.is_cancelled() {
@@ -819,22 +884,7 @@ impl GenerativePipeline {
             style: request.style.clone(),
         };
 
-        let speech_result = if let Some((result, progress)) =
-            run_streaming_tts(self.tts.as_ref(), &speech_request, tts_timeout)
-        {
-            trace.tts_streaming = true;
-            trace.tts_progress_chunks = progress.progress.len();
-            match result {
-                Ok(speech) => progress.validate_final(&speech).map(|()| speech),
-                Err(error) => Err(error),
-            }
-        } else {
-            let synthesis = match tts_timeout {
-                Some(timeout) => self.tts.synthesize_with_timeout(&speech_request, timeout),
-                None => self.tts.synthesize(&speech_request),
-            };
-            block_on(synthesis)
-        };
+        let speech_result = self.synthesize(&speech_request, tts_timeout, &mut trace);
 
         let speech = match speech_result {
             Ok(speech) => speech,
@@ -874,6 +924,32 @@ impl GenerativePipeline {
         })
     }
 }
+/// Checks shared by the buffered and the phrased pipeline before any provider
+/// work: a valid source event and Thinking request whose provenance matches.
+fn validate_generation_request(request: &GenerationRequest) -> Result<(), GenerationError> {
+    request
+        .source_event
+        .validate()
+        .map_err(|error| GenerationError::new(format!("invalid generation event: {error}")))?;
+    request
+        .thinking
+        .validate()
+        .map_err(|error| GenerationError::new(format!("invalid thinking request: {error}")))?;
+    if request.thinking.input.event_id.as_deref() != Some(request.source_event.event_id.as_str())
+        || request.thinking.input.event_kind != Some(request.source_event.kind)
+        || request.thinking.input.source_class != Some(request.source_event.source_class)
+        || request.thinking.input.trust_level != request.source_event.trust_level
+    {
+        return Err(GenerationError::new(
+            "thinking request input provenance must match source_event",
+        ));
+    }
+    if request.intent.trim().is_empty() {
+        return Err(GenerationError::new("generation intent must not be empty"));
+    }
+    Ok(())
+}
+
 fn cancelled_result(mut trace: GenerationTrace, stage: CancellationStage) -> GenerationResult {
     trace.cancelled_stage = Some(stage);
     GenerationResult {
@@ -926,10 +1002,16 @@ fn generated_asset_id(
     reply_text: &str,
     thinking: &BackendIdentity,
     tts: &TtsBackendIdentity,
+    phrase_seq: Option<u32>,
 ) -> String {
     let mut hash = 0xcbf29ce484222325_u64;
     hash_bytes(&mut hash, event.event_id.as_bytes());
     hash_bytes(&mut hash, &event.sequence.to_le_bytes());
+    if let Some(seq) = phrase_seq {
+        // Only phrased assets mix the position in, so buffered ids are unchanged.
+        hash_bytes(&mut hash, b"phrase");
+        hash_bytes(&mut hash, &seq.to_le_bytes());
+    }
     hash_bytes(&mut hash, reply_text.as_bytes());
     hash_bytes(&mut hash, thinking.name.as_bytes());
     if let Some(alias) = thinking.model_alias.as_deref() {
