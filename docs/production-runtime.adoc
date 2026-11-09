@@ -133,6 +133,19 @@ Options: `--channel` (repeatable, at most 8), `--queue N` (writer queue, default
 
 Tests: `cargo test --locked -p aivtuber-adapters --lib twitch` (mapping fixtures, bursts, backoff) and `cargo test --locked -p aivtuber-app --test twitch_ingress_e2e` (stdin path, ceiling, forged message). A live run needs network access and is manual: `--duration-secs 120` against a busy public channel, piped into the app with the ceiling set.
 
+== Speech observations (issue #92, S1)
+
+`schemas/speech-observation.schema.json` is the contract for raw speech-activity edges and an optional turn-end score from a VAD or turn provider. It carries no audio, PCM or transcript text, and no source class, plane, trust or priority field: the receiving ingress assigns them. A microphone speaker, including the operator's own, is always `speech` / `content` / `untrusted` (`SpeechObservationProvenance`); it cannot mint authority, and priority comes from configuration.
+
+Observations do not ride the stdin `EventEnvelope` pipe. An envelope kind would send them through the content queue and the scheduler's `Conversation` priority, and a signal is not content. They enter `SpeechObservationTracker::ingest_bytes` (size-bounded, schema-validated), which first applies the same operator ceiling as the stdin ingress (`IngressPolicy::admits_declared`): if `AIVTUBER_INGRESS_SOURCE_CLASSES` excludes `speech`, every batch is rejected and counted before parsing. If a later sidecar pipes batches over stdin, the same policy applies.
+
+* *Stale rejection.* An activity edge older than `max_age_ms` (160), a turn-end score older than `turn_end_max_age_ms` (400), or any observation past its `expires_at_ms` is rejected and counted by reason (`stale_age`, `expired`, `future_dated`, `out_of_order`, `speaker_capacity`). Ordering uses observed time, never arrival, and nothing blocks.
+* *Raw edges.* No debounce: a 32 ms fragment is an edge and restarts the silence clock (ADR-0005).
+* *Bounded state.* At most 64 speakers; idle speakers are evicted after a logical-time TTL.
+* *Fallback.* `fallback_turn_signal(state, now, config)` is a pure function that reports `turn_end_eligible` after 800 ms of silence. `SpeakerView` says why it applies (`no_turn_end_provider`, `unsupported_language`, `turn_end_stale`). Language is declared by configuration, never inferred. A speaker still active after 60 s without an edge is `activity_stale`. No floor decision is made here; `FloorAction` is #81.
+* *Metrics.* `SpeechObservationMetrics` (observation age, rejects by reason, speaker high water, fallback signals per silence episode, provider unavailable) appears as `RuntimeRetentionSnapshot::speech` when `ProductionApp::with_speech_observations` is composed; it is absent by default.
+* *Replay.* `examples/speech-observations/replay/*.json` run through `SpeechReplayFixture` with logical time and no microphone or model; `cargo test --locked -p aivtuber-runtime speech`.
+
 == Audio output
 
 +ProcessAudioPlayer+ uses an external player process without invoking a shell. The default command is +ffplay+, and references are restricted to +audio://+ paths below +AIVTUBER_AUDIO_ROOT+.

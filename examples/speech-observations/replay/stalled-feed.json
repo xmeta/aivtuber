@@ -1,0 +1,57 @@
+{
+  "schema_version": "0.1.0",
+  "name": "stalled feed: a stale end edge is rejected and the speaker degrades to activity_stale",
+  "config": {},
+  "steps": [
+    {
+      "now_ms": 100,
+      "deliver": {
+        "schema_version": "0.1.0",
+        "provider_id": "silero-vad",
+        "provider_version": "6.2.3",
+        "language": "ja",
+        "observations": [
+          {
+            "kind": "speech_activity",
+            "speaker_id": "viewer-a",
+            "edge": "start",
+            "observed_at_ms": 100
+          }
+        ]
+      },
+      "expect_outcomes": [
+        "accepted"
+      ]
+    },
+    {
+      "now_ms": 900,
+      "deliver": {
+        "schema_version": "0.1.0",
+        "provider_id": "silero-vad",
+        "provider_version": "6.2.3",
+        "language": "ja",
+        "observations": [
+          {
+            "kind": "speech_activity",
+            "speaker_id": "viewer-a",
+            "edge": "end",
+            "observed_at_ms": 500
+          }
+        ]
+      },
+      "expect_outcomes": [
+        "stale_age"
+      ]
+    },
+    {
+      "now_ms": 2000,
+      "poll": "viewer-a",
+      "expect_signal": "speaker_active"
+    },
+    {
+      "now_ms": 61000,
+      "poll": "viewer-a",
+      "expect_signal": "activity_stale"
+    }
+  ]
+}

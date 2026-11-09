@@ -6,7 +6,7 @@ use aivtuber_adaptation::{
 use aivtuber_asset_store::{HotCacheConfig, HotCacheMetrics};
 use aivtuber_runtime::{
     CachedPlaybackConfig, CachedPlaybackRetentionMetrics, SecurityRetentionMetrics,
-    SecurityRuntimeConfig,
+    SecurityRuntimeConfig, SpeechObservationMetrics,
 };
 use aivtuber_scheduler::{HistoryPolicy, SchedulerConfig, SchedulerMetrics};
 use aivtuber_telemetry::{
@@ -135,6 +135,8 @@ pub struct RuntimeRetentionSnapshot {
     pub scheduler: SchedulerMetrics,
     pub hot_cache: HotCacheMetrics,
     pub cached_playback: CachedPlaybackRetentionMetrics,
+    /// `None` unless speech observation tracking was composed (#92).
+    pub speech: Option<SpeechObservationMetrics>,
     pub working_memory: Option<WorkingMemoryRetentionMetrics>,
     pub adaptation: Option<AdaptationRetentionMetrics>,
     pub generation: Option<GenerationExecutionSnapshot>,

@@ -11,6 +11,8 @@
 //   viseme-track.schema.json; examples/viseme-tracks/invalid must REJECT
 // - examples/avatar-playback-commands/valid must conform to
 //   avatar-playback-command.schema.json; .../invalid must REJECT
+// - examples/speech-observations/valid must conform to speech-observation.schema.json;
+//   .../invalid and .../inconsistent (cross-field) must REJECT; .../replay fixtures must carry schema-valid batches (#92)
 // - examples/evaluation/reaction-quality/*.json must conform to the reaction-quality dataset schema
 //   and development/holdout partitions must not share case IDs or leakage groups.
 // - examples/evaluation/reaction-quality-review/*.json must conform to the pairwise-review schema
@@ -87,6 +89,7 @@ const streamScenario = validators["schemas/stream-scenario.schema.json"];
 const faultOverlay = validators["schemas/fault-overlay.schema.json"];
 const visemeTrack = validators["schemas/viseme-track.schema.json"];
 const avatarCommand = validators["schemas/avatar-playback-command.schema.json"];
+const speechObservation = validators["schemas/speech-observation.schema.json"];
 
 function report(ok, label, validator) {
   if (ok) {
@@ -169,6 +172,7 @@ for (const file of listJson("examples/performance-assets/invalid")) {
 for (const [validator, validDirs, invalidDir] of [
   [visemeTrack, ["examples/viseme-tracks/valid", "examples/starter-reaction-pack/viseme"], "examples/viseme-tracks/invalid"],
   [avatarCommand, ["examples/avatar-playback-commands/valid"], "examples/avatar-playback-commands/invalid"],
+  [speechObservation, ["examples/speech-observations/valid"], "examples/speech-observations/invalid"],
 ]) {
   if (!validator) continue;
   for (const dir of validDirs) {
@@ -183,6 +187,86 @@ for (const [validator, validDirs, invalidDir] of [
     } else {
       passes += 1;
       console.log(`ok        ${file} (rejected as intended)`);
+    }
+  }
+}
+
+// Speech observation replay fixtures (#92): every delivered batch must conform
+// to the observation schema, and the step structure must be replayable (exactly
+// one of deliver/poll per step, logical time never decreasing). The signal
+// expectations are executed by the Rust replay runner, not re-implemented here.
+const SPEECH_REPLAY_STEP_KEYS = new Set(["now_ms", "deliver", "poll", "expect_outcomes", "expect_signal"]);
+const SPEECH_REPLAY_SIGNALS = new Set(["no_speech", "speaker_active", "activity_stale", "waiting", "turn_end_eligible"]);
+const SPEECH_OUTCOMES = new Set(["accepted", "stale_age", "expired", "future_dated", "out_of_order", "speaker_capacity"]);
+// JSON Schema cannot compare two fields; the Rust validator enforces the same rule.
+function speechBatchCrossFieldProblems(batch) {
+  const problems = [];
+  batch.observations.forEach((observation, index) => {
+    const { observed_at_ms: at, expires_at_ms: expires } = observation;
+    if (expires !== undefined && !(expires > at && expires - at <= 60000)) {
+      problems.push(`observations[${index}].expires_at_ms must be after observed_at_ms and within 60000 ms`);
+    }
+  });
+  return problems;
+}
+function speechReplayProblems(doc) {
+  const problems = [];
+  if (doc.schema_version !== "0.1.0") problems.push("schema_version must be 0.1.0");
+  if (!Array.isArray(doc.steps) || doc.steps.length === 0 || doc.steps.length > 4096) {
+    return [...problems, "steps must be 1..=4096 items"];
+  }
+  let previous = 0;
+  doc.steps.forEach((step, index) => {
+    const where = `steps[${index}]`;
+    for (const key of Object.keys(step)) {
+      if (!SPEECH_REPLAY_STEP_KEYS.has(key)) problems.push(`${where}.${key} is not allowed`);
+    }
+    if (!Number.isInteger(step.now_ms) || step.now_ms < previous) problems.push(`${where}.now_ms must be an integer that does not decrease`);
+    else previous = step.now_ms;
+    if ((step.deliver !== undefined) === (step.poll !== undefined)) problems.push(`${where} needs exactly one of deliver or poll`);
+    if (step.deliver !== undefined) {
+      if (!speechObservation(step.deliver)) problems.push(`${where}.deliver does not conform to speech-observation.schema.json`);
+      else problems.push(...speechBatchCrossFieldProblems(step.deliver).map((p) => `${where}.deliver ${p}`));
+      for (const name of step.expect_outcomes ?? []) {
+        if (!SPEECH_OUTCOMES.has(name)) problems.push(`${where}.expect_outcomes has unknown outcome ${name}`);
+      }
+    }
+    if (step.expect_signal !== undefined && !SPEECH_REPLAY_SIGNALS.has(step.expect_signal)) {
+      problems.push(`${where}.expect_signal is not a fallback signal name`);
+    }
+  });
+  return problems;
+}
+if (speechObservation) {
+  for (const file of listJson("examples/speech-observations/valid")) {
+    const problems = speechBatchCrossFieldProblems(loadJson(join(root, file)));
+    if (problems.length > 0) {
+      failures += 1;
+      console.error(`FAIL      ${file}: ${problems.join("; ")}`);
+    }
+  }
+  for (const file of listJson("examples/speech-observations/inconsistent")) {
+    const doc = loadJson(join(root, file));
+    if (!speechObservation(doc)) {
+      failures += 1;
+      console.error(`FAIL      ${file} (expected to pass the schema so the cross-field check can judge it)`);
+    } else if (speechBatchCrossFieldProblems(doc).length === 0) {
+      failures += 1;
+      console.error(`FAIL      ${file} (expected a contradiction, but every check passed)`);
+    } else {
+      passes += 1;
+      console.log(`ok        ${file} (rejected as intended)`);
+    }
+  }
+  for (const file of listJson("examples/speech-observations/replay")) {
+    const problems = speechReplayProblems(loadJson(join(root, file)));
+    if (problems.length === 0) {
+      passes += 1;
+      console.log(`ok        ${file}`);
+    } else {
+      failures += 1;
+      console.error(`FAIL      ${file}`);
+      for (const problem of problems) console.error(`          ${problem}`);
     }
   }
 }

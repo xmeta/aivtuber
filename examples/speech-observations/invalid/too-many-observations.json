@@ -1,0 +1,206 @@
+{
+  "schema_version": "0.1.0",
+  "provider_id": "silero-vad",
+  "provider_version": "6.2.3",
+  "language": "ja",
+  "observations": [
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 0
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 1
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 2
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 3
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 4
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 5
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 6
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 7
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 8
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 9
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 10
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 11
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 12
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 13
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 14
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 15
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 16
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 17
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 18
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 19
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 20
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 21
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 22
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 23
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 24
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 25
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 26
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 27
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 28
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 29
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 30
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 31
+    },
+    {
+      "kind": "speech_activity",
+      "speaker_id": "viewer-a",
+      "edge": "start",
+      "observed_at_ms": 32
+    }
+  ]
+}

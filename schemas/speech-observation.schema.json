@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xmeta/aivtuber/schemas/speech-observation.schema.json",
+  "title": "AI VTuber Speech Observation Batch",
+  "description": "Provider-neutral, bounded speech observations (issue #92, slice S1): raw speech-activity edges and an optional turn-end score for one pseudonymous speaker. Serialized form of aivtuber_domain::SpeechObservationBatch. Observation data only: it carries no authority, no priority and no trust claim (the receiving ingress assigns source class, plane and trust, and a microphone speaker is always untrusted content-plane input, even the operator's). There is no raw audio, PCM or transcript text in this contract (transcripts are a later slice). Times are integer milliseconds on the monotonic or logical timeline of the receiving runtime, already mapped there by the adapter; never wall-clock time. The batch declares its language by configuration; it is never inferred.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "provider_id",
+    "provider_version",
+    "language",
+    "observations"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "0.1.0",
+      "description": "Contract version. An incompatible version is refused rather than reinterpreted."
+    },
+    "provider_id": {
+      "$ref": "#/$defs/provider_token",
+      "description": "Adapter or provider that produced the observations (for example a VAD sidecar). Audit data."
+    },
+    "provider_version": {
+      "$ref": "#/$defs/version_token",
+      "description": "Provider/model build identity. Two VAD versions behaved materially differently in EXP-0001, so it is always recorded."
+    },
+    "language": {
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 35,
+      "pattern": "^[a-z]{2,3}(-[A-Za-z0-9]{2,8}){0,3}$",
+      "description": "Language the provider was *configured* for (for example ja). Declared, never inferred: no measured provider detects language."
+    },
+    "observations": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "items": {
+        "oneOf": [
+          {"$ref": "#/$defs/speech_activity"},
+          {"$ref": "#/$defs/turn_end_score"}
+        ]
+      },
+      "description": "Observations in producer order. Bounded; per-speaker ordering is by observed_at_ms, never by arrival."
+    }
+  },
+  "$defs": {
+    "provider_token": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9][a-z0-9._-]*$"
+    },
+    "version_token": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]*$"
+    },
+    "model_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:+/-]*$"
+    },
+    "speaker_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+      "description": "Pseudonymous speaker or session id assigned by the adapter. Not a name, not an account id, not a voiceprint."
+    },
+    "time_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "unit_interval": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "speech_activity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "speaker_id", "edge", "observed_at_ms"],
+      "properties": {
+        "kind": {"const": "speech_activity"},
+        "speaker_id": {"$ref": "#/$defs/speaker_id"},
+        "edge": {
+          "enum": ["start", "end"],
+          "description": "Raw activity edge. No debounce or minimum-speech filter is applied (ADR-0005): a short fragment is still an edge."
+        },
+        "observed_at_ms": {"$ref": "#/$defs/time_ms"},
+        "expires_at_ms": {
+          "$ref": "#/$defs/time_ms",
+          "description": "Optional absolute expiry on the same timeline; must be after observed_at_ms and at most 60000 ms later. It can only tighten the runtime's max age, never extend it. The cross-field rule is not expressible in JSON Schema; the Rust validator and scripts/validate.mjs enforce it."
+        },
+        "confidence": {
+          "$ref": "#/$defs/unit_interval",
+          "description": "Optional frame confidence. Provider-specific and not calibrated across model versions."
+        }
+      }
+    },
+    "turn_end_score": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "speaker_id", "observed_at_ms", "provider", "model_id", "score"],
+      "properties": {
+        "kind": {"const": "turn_end_score"},
+        "speaker_id": {"$ref": "#/$defs/speaker_id"},
+        "observed_at_ms": {"$ref": "#/$defs/time_ms"},
+        "expires_at_ms": {"$ref": "#/$defs/time_ms"},
+        "provider": {"$ref": "#/$defs/provider_token"},
+        "model_id": {"$ref": "#/$defs/model_id"},
+        "calibrated": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether the score is a calibrated probability. Defaults to false; a consumer must not treat an uncalibrated score as a probability (EXP-0001 11.1)."
+        },
+        "score": {
+          "$ref": "#/$defs/unit_interval",
+          "description": "Provider score in [0, 1]. A nowcast (has the turn ended now) unless prediction_horizon_ms is present."
+        },
+        "prediction_horizon_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000,
+          "description": "Present only when the provider actually predicts ahead. Absent for a nowcast; no measured provider predicts."
+        }
+      }
+    }
+  }
+}

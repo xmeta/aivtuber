@@ -30,6 +30,7 @@ The default policy currently caps retained detail/state as follows:
 |Adaptation recent groups |256 |Deterministic bounded key set
 |Adaptation decision records |1024 |FIFO retained diagnostics
 |Generation pending queue |8 |Bounded worker queue; one provider job is in flight
+|Speech observation speakers |64 |Hard cap (`SpeechObservationConfig::max_speakers`); a new speaker at the cap is rejected, idle speakers are evicted after 5 minutes of logical time; each holds one activity state and one turn-end score (#92)
 |===
 
 All limits are configurable through +AIVTUBER_RETENTION_*+ environment variables in +crates/app/src/main.rs+.
@@ -54,6 +55,7 @@ All limits are configurable through +AIVTUBER_RETENTION_*+ environment variables
 |Working-memory compaction history |Bounded RAM |Oldest diagnostic records are evicted
 |Adaptation feedback/recent groups |Bounded RAM |Logical recency determines deterministic eviction
 |Adaptation decisions |Bounded RAM |Oldest decision detail is evicted
+|Speech observation per-speaker state |Bounded count + logical TTL |No audio, PCM or transcript is retained; metrics expose speakers, high water and evictions (#92)
 |Generation queue/completions |Bounded RAM |#121 owns execution semantics; no per-request tombstone history is retained
 |===
 

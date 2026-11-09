@@ -7,6 +7,10 @@
 
 mod cached_playback;
 pub use cached_playback::*;
+mod speech_observation;
+pub use speech_observation::*;
+mod speech_replay;
+pub use speech_replay::*;
 
 use aivtuber_domain::{
     AuthenticatedControl, AuthenticatedControlCommand, Capability, EventEnvelope, EventKind,
@@ -196,8 +200,15 @@ impl IngressPolicy {
     }
 
     fn admits(&self, event: &EventEnvelope) -> bool {
-        trust_rank(event.trust_level) <= trust_rank(self.max_trust)
-            && self.allowed_classes & class_bit(event.source_class) != 0
+        self.admits_declared(event.source_class, event.trust_level)
+    }
+
+    /// Whether the ceiling admits an ingress that *the runtime itself* has
+    /// classified (not one a record declared). Used by ingress paths that do not
+    /// carry an `EventEnvelope`, such as speech observation batches (#92).
+    pub fn admits_declared(&self, class: SourceClass, trust: TrustLevel) -> bool {
+        trust_rank(trust) <= trust_rank(self.max_trust)
+            && self.allowed_classes & class_bit(class) != 0
     }
 }
 

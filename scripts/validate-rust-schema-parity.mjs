@@ -19,6 +19,7 @@ addFormats(ajv);
 const eventSchema = ajv.compile(loadJson("schemas/event-envelope.schema.json"));
 const reflexSchema = ajv.compile(loadJson("schemas/reflex-decision.schema.json"));
 const avatarCommandSchema = ajv.compile(loadJson("schemas/avatar-playback-command.schema.json"));
+const speechObservationSchema = ajv.compile(loadJson("schemas/speech-observation.schema.json"));
 
 const output = execFileSync(
   "cargo",
@@ -33,6 +34,13 @@ const avatarOutput = execFileSync(
   { cwd: root, encoding: "utf8" },
 );
 const avatarEmitted = JSON.parse(avatarOutput);
+
+const speechOutput = execFileSync(
+  "cargo",
+  ["run", "--locked", "--quiet", "-p", "aivtuber-domain", "--example", "speech_observation_parity"],
+  { cwd: root, encoding: "utf8" },
+);
+const speechEmitted = JSON.parse(speechOutput);
 
 let failures = 0;
 function check(label, validator, value) {
@@ -57,6 +65,14 @@ for (const [index, decision] of emitted.reflex_decisions.entries()) {
 for (const [index, command] of avatarEmitted.commands.entries()) {
   check(`Rust AvatarPlaybackCommand[${index}] (${command.kind}) -> JSON Schema`, avatarCommandSchema, command);
 }
+for (const [index, batch] of speechEmitted.batches.entries()) {
+  check(`Rust SpeechObservationBatch[${index}] -> JSON Schema`, speechObservationSchema, batch);
+}
+if (speechEmitted.batches.length < 4) {
+  failures += 1;
+  console.error("FAIL      expected at least 4 Rust SpeechObservationBatch samples");
+}
+
 if (!avatarEmitted.commands.some((command) => command.kind === "reset")) {
   failures += 1;
   console.error("FAIL      expected a Rust AvatarPlaybackCommand::Reset sample");
@@ -71,6 +87,6 @@ if (emitted.reflex_decisions.length < 1) {
   console.error("FAIL      expected at least one Rust ReflexDecision sample");
 }
 
-const total = emitted.events.length + emitted.reflex_decisions.length + avatarEmitted.commands.length;
+const total = emitted.events.length + emitted.reflex_decisions.length + avatarEmitted.commands.length + speechEmitted.batches.length;
 console.log(`\n${total - failures} passed, ${failures} failed`);
 process.exit(failures > 0 ? 1 : 0);
