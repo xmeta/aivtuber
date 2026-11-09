@@ -103,6 +103,17 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace
 
+      # Issue #92 S2: the Silero VAD v6 sidecar (tract inference) sits behind the
+      # silero-vad feature so the default build does not compile an inference
+      # runtime. No microphone is used (the mic-capture feature needs ALSA headers
+      # and is exercised locally). The tests fetch the pinned model and verify its
+      # SHA-256; the model is never committed.
+      - name: Clippy speech sidecar
+        run: cargo clippy --locked -p aivtuber-adapters --features silero-vad --all-targets -- -D warnings
+
+      - name: Test speech sidecar
+        run: cargo test --locked -p aivtuber-adapters --features silero-vad --test speech_vad_sidecar
+
       - name: Build
         run: cargo build --locked --workspace
 

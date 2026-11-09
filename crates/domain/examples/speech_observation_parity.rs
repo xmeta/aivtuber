@@ -11,6 +11,7 @@ use std::error::Error;
 fn main() -> Result<(), Box<dyn Error>> {
     let fixtures = [
         include_str!("../../../examples/speech-observations/valid/activity-edges.json"),
+        include_str!("../../../examples/speech-observations/valid/silero-sidecar-edges.json"),
         include_str!("../../../examples/speech-observations/valid/turn-end-score-nowcast.json"),
         include_str!("../../../examples/speech-observations/valid/turn-end-score-predicted.json"),
     ];

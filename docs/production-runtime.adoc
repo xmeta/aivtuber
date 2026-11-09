@@ -137,7 +137,7 @@ Tests: `cargo test --locked -p aivtuber-adapters --lib twitch` (mapping fixtures
 
 `schemas/speech-observation.schema.json` is the contract for raw speech-activity edges and an optional turn-end score from a VAD or turn provider. It carries no audio, PCM or transcript text, and no source class, plane, trust or priority field: the receiving ingress assigns them. A microphone speaker, including the operator's own, is always `speech` / `content` / `untrusted` (`SpeechObservationProvenance`); it cannot mint authority, and priority comes from configuration.
 
-Observations do not ride the stdin `EventEnvelope` pipe. An envelope kind would send them through the content queue and the scheduler's `Conversation` priority, and a signal is not content. They enter `SpeechObservationTracker::ingest_bytes` (size-bounded, schema-validated), which first applies the same operator ceiling as the stdin ingress (`IngressPolicy::admits_declared`): if `AIVTUBER_INGRESS_SOURCE_CLASSES` excludes `speech`, every batch is rejected and counted before parsing. If a later sidecar pipes batches over stdin, the same policy applies.
+Observations do not ride the stdin `EventEnvelope` pipe. An envelope kind would send them through the content queue and the scheduler's `Conversation` priority, and a signal is not content. They enter `SpeechObservationTracker::ingest_bytes` (size-bounded, schema-validated), which first applies the same operator ceiling as the stdin ingress (`IngressPolicy::admits_declared`): if `AIVTUBER_INGRESS_SOURCE_CLASSES` excludes `speech`, every batch is rejected and counted before parsing. The S2 sidecar uses a separate child-process pipe (see Speech sidecar below), never the stdin content pipe, and the same policy applies to it.
 
 * *Stale rejection.* An activity edge older than `max_age_ms` (160), a turn-end score older than `turn_end_max_age_ms` (400), or any observation past its `expires_at_ms` is rejected and counted by reason (`stale_age`, `expired`, `future_dated`, `out_of_order`, `speaker_capacity`). Ordering uses observed time, never arrival, and nothing blocks.
 * *Raw edges.* No debounce: a 32 ms fragment is an edge and restarts the silence clock (ADR-0005).
@@ -145,6 +145,60 @@ Observations do not ride the stdin `EventEnvelope` pipe. An envelope kind would 
 * *Fallback.* `fallback_turn_signal(state, now, config)` is a pure function that reports `turn_end_eligible` after 800 ms of silence. `SpeakerView` says why it applies (`no_turn_end_provider`, `unsupported_language`, `turn_end_stale`). Language is declared by configuration, never inferred. A speaker still active after 60 s without an edge is `activity_stale`. No floor decision is made here; `FloorAction` is #81.
 * *Metrics.* `SpeechObservationMetrics` (observation age, rejects by reason, speaker high water, fallback signals per silence episode, provider unavailable) appears as `RuntimeRetentionSnapshot::speech` when `ProductionApp::with_speech_observations` is composed; it is absent by default.
 * *Replay.* `examples/speech-observations/replay/*.json` run through `SpeechReplayFixture` with logical time and no microphone or model; `cargo test --locked -p aivtuber-runtime speech`.
+
+== Speech sidecar (issue #92, S2)
+
+`speech-vad-sidecar` (crates/adapters, `src/bin/speech-vad-sidecar.rs`) turns a local microphone, or `--input-wav`, into `speech-observation` batches on stdout, one JSON line per raw speech edge. The app spawns it as a child process when `AIVTUBER_SPEECH_SIDECAR` is set; it is off by default.
+
+Pipeline: capture (cpal) -> mono -> rubato sinc resample to 16 kHz -> 512-sample (32 ms) frames -> Silero VAD v6 probability -> start/end hysteresis (0.5 / 0.35, the EXP-0001 values) -> raw edge -> stamp on the runtime timeline -> bounded stdout writer. There is no debounce and no minimum-speech filter (ADR-0005): one frame above the start threshold is an edge. No turn-end score is emitted (Smart Turn is not adopted); `language` is declared with `--language`, never inferred.
+
+=== Build and run
+
+[source,sh]
+----
+# Fetch the pinned model once (sha256 is checked again at every start).
+curl -L -o silero_vad_op18_ifless.onnx \
+  https://raw.githubusercontent.com/snakers4/silero-vad/v6.2.3/src/silero_vad/data/silero_vad_op18_ifless.onnx
+sha256sum silero_vad_op18_ifless.onnx   # 7671cd04b004e9076da0d4a7b1a5aec36adf161c39230c1cb94a4fd5db6bbd28
+
+cargo build --release --locked -p aivtuber-adapters --features silero-vad,mic-capture --bin speech-vad-sidecar
+export AIVTUBER_SPEECH_SIDECAR=target/release/speech-vad-sidecar
+export AIVTUBER_SPEECH_SIDECAR_ARGS="--model silero_vad_op18_ifless.onnx --language ja"
+cargo run --locked -p aivtuber-app      # reads content on stdin as usual
+----
+
+* `AIVTUBER_SPEECH_SIDECAR_ARGS` is split on whitespace and passed without a shell (paths with spaces are not supported; at most 32 arguments). `AIVTUBER_SPEECH_SIDECAR_RESYNC_MS` (default 5000, 250 to 60000) sets the steady-state clock re-sync. The child's environment has every `AIVTUBER_*` variable removed.
+* Sidecar flags: `--model`, `--language` (required), `--speaker-id` (default `mic-local`), `--input-device NAME` (substring match; `--list-devices` prints names to stderr), `--input-wav FILE [--pace realtime|max]`, `--preroll-ms` (default 300, at most 2000), `--start-threshold` / `--end-threshold`, `--clock sync|local`, `--sync-timeout-ms`, `--duration-secs`, `--stats-secs`, `--clock-probe-ms` (model-free clock measurement mode).
+* `mic-capture` is a separate feature because cpal needs ALSA development headers on Linux. Without it `--input-wav` still works. The default workspace build compiles neither feature.
+* Manual smoke and clock measurement: `cargo run --release --locked -p aivtuber-app --bin speech-sidecar-check -- --wide --duration-secs 30 -- <sidecar and its flags>` prints every edge with its signed lag (`now_ms - observed_at_ms`) and the tracker metrics. `--wide` widens the tracker limits to 1 s so every edge is measured.
+
+=== Runtime model decision (adopt tract; ort not needed)
+
+Silero VAD v6.2.3 runs through `tract-onnx` 0.23.10 (pure Rust, MIT OR Apache-2.0, no build-time network, no native library). The standard `silero_vad.onnx` cannot be loaded by tract (it analyses both branches of the sample-rate `If` node and fails on the 8 kHz branch), so the pinned asset is the same release's `silero_vad_op18_ifless.onnx` (16 kHz only, no `If`; MIT, snakers4/silero-vad tag v6.2.3, sha256 `7671cd04b004e9076da0d4a7b1a5aec36adf161c39230c1cb94a4fd5db6bbd28`). Measured on 9 EXP-0001 inputs (3 Common Voice ja clips, 3 clean and 3 noisy synthesized streams; 1620 frames), maximum absolute difference of per-frame probability against onnxruntime 1.31.1 running the standard v6 model: ifless export on onnxruntime 4.8e-7, tract on the ifless export 8.7e-7, 0 of 1620 frames differing at the 0.5 threshold. (The probabilities were printed to six decimals, so the true differences are smaller.) tract takes about 0.14 ms per 32 ms frame on the development host (release build of the probe, 130 frames in 18.8 ms), the same order as the 0.22 ms onnxruntime figure in EXP-0001. Decision: adopt (tract, project-owned frame/edge logic). Fallback, if a later Silero export tract cannot load: `ort` with dynamic loading of an operator-installed, pinned onnxruntime (no build-time download). Scores are Silero v6 only: the sherpa-onnx release asset (a v4 export) behaved badly under noise in EXP-0001 and must not be substituted. The model file is never committed; `provider_version` records the model release, the export and the runtime (`silero-vad-v6.2.3-ifless-tract-0.23.10`) because both can move scores.
+
+=== Privacy
+
+* Audio stays in process memory. The sidecar opens no file for writing and no socket; the only output is the observation lines (edges, times, an optional frame confidence), which cannot carry samples. `--input-wav` only reads.
+* The only audio kept beyond the frame being scored is `PreRoll`, a bounded in-memory ring of the most recent 16 kHz mono samples (`--preroll-ms`, default 300, hard cap 2000). It is the hook S3 transcription will read to recover onset the VAD reports late (EXP-0001: 12.7% of clean utterances had onset lag above 100 ms). Nothing reads it in S2, it is cleared on a capture gap, and its `Debug` output shows lengths only.
+* Tests that need a WAV generate synthetic signals in memory and write them under the cargo test temp directory; no recorded audio and no model is committed.
+
+=== Timeline and clock mapping
+
+The app writes `{"clock_sync":{"runtime_now_ms":N}}` (its own monotonic `now_ms`) to the child's stdin at spawn, every 50 ms for the first 10 s (a line written at spawn is read only after the child starts and loads its model, so the first lines are stale by the startup time; measured 11 to 18 ms with no model, longer with one), then every `AIVTUBER_SPEECH_SIDECAR_RESYNC_MS`. The sidecar keeps `offset = runtime_now - local_receipt_time` over its last 8 syncs and uses the maximum, because pipe delay only ever lowers a sample. Capture positions are mapped to local time by the least-delayed recent chunk arrival (a min filter over the last 256 callbacks), which also tracks drift between the audio device clock and the monotonic clock. Without a first sync the sidecar exits instead of stamping (`--clock local` is for standalone runs). When stdin closes the sidecar exits.
+
+Measured (A-SPEECH-OBS-001): see the assumption entry. Stamp-to-arrival lag of a model-free probe edge, after the warm-up, median 0.3 ms and maximum 0.9 ms in repeated runs (one run showed a single 25 ms scheduling outlier); the lag includes the pipe latency, so it upper-bounds the offset error. Real edges lag their stamp by about 38 ms (32 ms frame start plus the 10 ms capture chunk, then inference), against the 160 ms activity age limit. Not measured: acoustic and device-buffer latency before the callback runs, which needs a loopback rig; the sidecar stamps at callback arrival. The floor therefore sees edges slightly later than the sound, and never earlier.
+
+=== Failure and bounds
+
+* The child's stdout is read by a dedicated thread through the same bounded line reader as the stdin ingress (`pump_bounded_records`; lines over 16 KiB are drained and dropped, at most 64 lines queued, newest dropped and counted). Each poll ingests at most 64 lines, so a flooding child cannot starve the loop.
+* The app counts `provider_unavailable` once and stops expecting observations when the child exits, closes stdout, cannot be started, or sends 32 consecutive rejected lines (garbage, or batches refused by the operator ingress ceiling, which applies to `speech` exactly as in S1). There is no automatic restart. A silent child is not a failure: silence is normal. A child that hangs without exiting is not detected (the sidecar has no heartbeat; recorded as a limitation).
+* Inside the sidecar: the audio callback uses a bounded channel and counts dropped chunks; a drop closes any open segment, resets the model, resampler and clock, and restarts the stream, so a gap is never spliced. Output goes through a 64-line bounded writer (drop-newest, counted); a closed stdout ends the process.
+
+=== Tests
+
+* `cargo test --locked -p aivtuber-adapters --lib speech_vad` (no features): hysteresis and no-debounce, resampler band-limiting and chunk invariance, pre-roll bound, clock map and handshake reader (junk and 5 MiB line flood), stamper schema validity, bounded output under a stalled reader, pipeline mechanics on synthetic signals with a stand-in scorer.
+* `cargo test --locked -p aivtuber-adapters --features silero-vad --test speech_vad_sidecar`: the real binary and the real model (fetched with a SHA-256 check, or `AIVTUBER_SILERO_MODEL`): silence emits nothing, a synthetic vowel emits one raw start/end pair that parses as a valid batch, a very short burst is still an edge pair, 48 kHz stereo input, the clock handshake and its lag measurement, re-sync, exit on stdin close, refusal to stamp without a sync, refusal of an unpinned model. CI runs this in the same job as the workspace tests.
+* `cargo test --locked -p aivtuber-app --test speech_sidecar_e2e`: supervisor against `speech-sidecar-double` (handshake, crash, garbage flood, valid flood, oversize lines, silent child, operator ceiling).
 
 == Audio output
 
