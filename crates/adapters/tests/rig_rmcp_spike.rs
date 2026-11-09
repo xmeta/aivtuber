@@ -1,5 +1,5 @@
 use rig_core::tool::{DynamicTool, ManagedToolSink, ManagedToolToken};
-use rig_rmcp::{McpClientHandler, rmcp::model::ClientInfo};
+use rig_rmcp::{McpClientHandler, rmcp::model::ClientConfig};
 use rmcp::{
     ServiceExt,
     model::{CallToolResult, ContentBlock},
@@ -42,7 +42,7 @@ impl ManagedToolSink for RecordingSink {
         let mut stored = self.tools.lock().expect("recording sink lock");
         let mut tokens = HashMap::new();
         for tool in tools.into_iter().filter(DynamicTool::is_live) {
-            let name = tool.name().to_owned();
+            let name = tool.name().as_str().to_owned();
             let token = ManagedToolToken::new();
             stored.insert(name.clone(), (tool, token.clone()));
             tokens.insert(name, token);
@@ -81,7 +81,7 @@ async fn rig_rmcp_can_register_and_invoke_a_bounded_mcp_tool() {
     });
 
     let sink = RecordingSink::default();
-    let service = McpClientHandler::new(ClientInfo::default(), sink.clone())
+    let service = McpClientHandler::new(ClientConfig::default(), sink.clone())
         .with_timeout(Duration::from_secs(1))
         .with_refresh_timeout(Duration::from_secs(1))
         .connect(client_transport)
@@ -91,7 +91,7 @@ async fn rig_rmcp_can_register_and_invoke_a_bounded_mcp_tool() {
     let tool = sink
         .tool("read_fixture")
         .expect("Rig registers the discovered MCP tool");
-    let output = tool.execute(json!({})).await.expect("Rig invokes MCP tool");
+    let output = tool.run(json!({})).await.expect("Rig invokes MCP tool");
     assert_eq!(output.as_text(), Some("rig-ok"));
 
     drop(service);
