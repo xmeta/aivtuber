@@ -706,6 +706,7 @@ fn replay_asset() -> impl Strategy<Value = ReplayAsset> {
                         amplitude_pct: 0.0,
                         start_delay_ms,
                     },
+                    phrase: None,
                 }
             },
         )

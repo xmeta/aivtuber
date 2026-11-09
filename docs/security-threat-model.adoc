@@ -258,6 +258,18 @@ This separates "compute started" from "permission to publish".
 
 The production generation worker follows this rule directly. It receives only immutable request/fallback data, a cancellation token, and a cloneable side-effect-free public-output policy snapshot. It does not receive Scheduler/AssetStore mutation authority or authenticated control capability. A completed result is revalidated on the composition thread before hot-cache insertion or scheduling, and shutdown/cancellation/supersession fences late completions locally.
 
+=== 11.2 Phrase-level commit is an irreversible boundary (#83)
+
+With phrase mode (`AIVTUBER_PHRASE_MODE`) a generated reply is committed one complete phrase at a time. Each committed phrase is already spoken: a later rejection, failure or cancellation can end the reply, never unspeak it. The invariants:
+
+* the whole reply is evaluated by the publication-containment gate before any phrase is synthesized, so a policy that refuses or redacts any part of it decides while nothing is irreversible; the gate is then applied again to each phrase's own display text, on the worker before synthesis and on the composition thread immediately before that phrase's scheduler commit;
+* the composition thread commits a phrase only when its generation is still current, uncancelled and not shut down, and only when the worker's gate decision is for exactly the phrase text and the current policy still publishes exactly that text;
+* a phrase that fails any check ends the reply after the previous phrase, with a typed counted cause; it is not retried, a delivered phrase is never replayed, and the reply is never recorded as complete (`PhraseResponseEnd::Partial`);
+* partial text or audio cannot reach the scheduler: the only handoff type, `PhraseUnit`, exists only for a phrase that is gated, completely synthesized and compiled into a validated asset;
+* operator stop and mute, barge-in and supersession cancel the response, so no later phrase is committed, independent of any model or TTS path.
+
+For risky contexts buffered whole-reply mode remains available and is the default outside the `local` profile.
+
 == 12. Audit and replay
 
 Audit records include:

@@ -16,20 +16,22 @@ use aivtuber_app::{
     AdaptationRuntime, AdapterHealth, AvatarOutput, BargeInConfig, BargeInMetrics,
     CompositionProfile, GenerativeBudgetPolicy, GenerativeRuntime, IntentRoutePlanner,
     IntentShadowPolicy, LocalAvatarOutput, LocalRoutePlanner, NoopAvatarOutput, NoopStreamOutput,
-    ObsStreamOutput, OperatorControlServer, OperatorRateLimiter, ProductionApp, ProfileSummary,
-    RawIngressConfig, RawIngressMetrics, RawIngressMetricsSnapshot, RoutePlanner,
-    RuntimeRetentionPolicy, SHADOW_ORCHESTRATOR_SCHEMA_VERSION, ShadowOrchestratorConfig,
-    ShadowPolicyIdentity, ShadowingRoutePlanner, SpeechConversationConfig,
-    SpeechConversationMetrics, SpeechFloorMetrics, SpeechSidecar, SpeechSidecarConfig,
-    SpeechSidecarStats, StreamOutput, TtsSidecarSettings, VtsAvatarOutput, VtsPlaybackConfig,
-    apply_dispatched_request, pump_bounded_records, stt_sidecar_args,
+    ObsStreamOutput, OperatorControlServer, OperatorRateLimiter, PhraseMetrics, PhraseMode,
+    ProductionApp, ProfileSummary, RawIngressConfig, RawIngressMetrics, RawIngressMetricsSnapshot,
+    RoutePlanner, RuntimeRetentionPolicy, SHADOW_ORCHESTRATOR_SCHEMA_VERSION,
+    ShadowOrchestratorConfig, ShadowPolicyIdentity, ShadowingRoutePlanner,
+    SpeechConversationConfig, SpeechConversationMetrics, SpeechFloorMetrics, SpeechSidecar,
+    SpeechSidecarConfig, SpeechSidecarStats, StreamOutput, TtsSidecarSettings, VtsAvatarOutput,
+    VtsPlaybackConfig, apply_dispatched_request, pump_bounded_records, stt_sidecar_args,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
     AuthorizationMethod, Capability, ControlSecret, EventKind, FloorConfig, LocalControlIngress,
     OperatorCommandInput,
 };
-use aivtuber_generative::{GenerativePipeline, PerformanceCompiler, PerformanceCompilerConfig};
+use aivtuber_generative::{
+    GenerativePipeline, PerformanceCompiler, PerformanceCompilerConfig, PhraseConfig,
+};
 use aivtuber_reflex::{JevAdapter, JevAdapterConfig, JevApiKey, PolicyConfig, ReflexPipeline};
 use aivtuber_runtime::{
     CachedPerformer, CachedPlaybackConfig, IngressPolicy, LocalVisemeStore, SecurityRuntime,
@@ -148,7 +150,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     let startup_summary = ProfileSummary::for_profile(
         profile,
         generative.is_some(),
-        aivtuber_app::config_fingerprint(profile, generative.is_some()),
+        aivtuber_app::config_fingerprint_with_phrases(
+            profile,
+            generative.is_some(),
+            generative
+                .as_ref()
+                .is_some_and(|generative| generative.phrase_mode().is_phrased()),
+        ),
     );
     let active_planner: Box<dyn RoutePlanner> = match profile {
         CompositionProfile::Cached => Box::new(IntentRoutePlanner) as Box<dyn RoutePlanner>,
@@ -344,6 +352,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut speech_barge_in_enabled = false;
     let mut last_floor_metrics = SpeechFloorMetrics::default();
     let mut last_barge_in_metrics = BargeInMetrics::default();
+    let mut last_phrase_metrics = PhraseMetrics::default();
+    let mut last_phrase_response_logged: Option<u64> = None;
     let mut last_conversation_metrics = SpeechConversationMetrics::default();
     if let Some(program) = env_optional("AIVTUBER_SPEECH_SIDECAR") {
         let mut tracker = SpeechObservationTracker::new(
@@ -720,6 +730,53 @@ fn run() -> Result<(), Box<dyn Error>> {
                 );
                 last_barge_in_metrics = metrics;
             }
+            let phrase_metrics = app.phrase_metrics();
+            if phrase_metrics != last_phrase_metrics {
+                eprintln!(
+                    "phrase_metrics: responses={} completed={} partial={} phrases_committed={} gate_rejected_before_first={} gate_rejected_after_commit={} scheduler_rejected={} synthesis_failed_after_commit={} cancelled_after_commit={} underruns={} max_gap_ms={} max_synthesis_ms={} late_dropped={}",
+                    phrase_metrics.responses,
+                    phrase_metrics.completed,
+                    phrase_metrics.partial,
+                    phrase_metrics.phrases_committed,
+                    phrase_metrics.gate_rejected_before_first_commit,
+                    phrase_metrics.gate_rejected_after_commit,
+                    phrase_metrics.scheduler_rejected,
+                    phrase_metrics.synthesis_failed_after_commit,
+                    phrase_metrics.cancelled_after_commit,
+                    phrase_metrics.underruns,
+                    phrase_metrics.max_gap_ms,
+                    phrase_metrics.max_synthesis_ms,
+                    phrase_metrics.late_phrases_dropped
+                );
+                last_phrase_metrics = phrase_metrics;
+            }
+            for record in app.recent_phrase_responses() {
+                if last_phrase_response_logged.is_some_and(|logged| record.response_id <= logged) {
+                    continue;
+                }
+                eprintln!(
+                    "phrase_response: response={} event={} planned={} committed={} end={:?} commits=[{}]",
+                    record.response_id,
+                    record.event_id,
+                    record.planned_phrases,
+                    record.commit_horizon(),
+                    record.end,
+                    record
+                        .commits
+                        .iter()
+                        .map(|commit| format!(
+                            "{}@{}..{}(gap {}, synth {}ms)",
+                            commit.seq,
+                            commit.start_at_ms,
+                            commit.end_at_ms,
+                            commit.gap_before_ms,
+                            commit.synthesis_ms
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                last_phrase_response_logged = Some(record.response_id);
+            }
             report_raw_ingress_metrics(&raw_ingress_metrics, &mut last_raw_ingress_metrics, false);
             next_maintenance_ms = now_ms.saturating_add(1_000);
         }
@@ -1072,10 +1129,50 @@ fn build_generative_runtime(
         None => Arc::new(tts),
     };
     let pipeline = GenerativePipeline::new(Arc::new(thinking), tts, compiler);
+    let phrase_mode = resolve_phrase_mode(profile)?;
+    eprintln!(
+        "generated replies: {}",
+        match phrase_mode {
+            PhraseMode::Buffered => "buffered (one commit per reply)",
+            PhraseMode::Phrased(_) => "phrase mode (one atomic commit per phrase)",
+        }
+    );
     let runtime =
         GenerativeRuntime::with_execution_config(pipeline, retention.generation_execution_config())
+            .map_err(io::Error::other)?
+            .with_phrase_mode(phrase_mode)
             .map_err(io::Error::other)?;
     Ok(Some(runtime))
+}
+
+/// `AIVTUBER_PHRASE_MODE=buffered|phrase|auto` (issue #83 S1). `auto` (the
+/// default) follows the composition profile; `AIVTUBER_PHRASE_TTS_TIMEOUT_MS`
+/// bounds the synthesis of one phrase (default 12000), not of the whole reply.
+fn resolve_phrase_mode(profile: CompositionProfile) -> Result<PhraseMode, Box<dyn Error>> {
+    let phrased = match env_string("AIVTUBER_PHRASE_MODE", "auto")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "auto" => profile.phrased_replies_by_default(),
+        "phrase" => true,
+        "buffered" => false,
+        other => {
+            return Err(format!(
+                "AIVTUBER_PHRASE_MODE must be auto, phrase or buffered (got {other:?})"
+            )
+            .into());
+        }
+    };
+    if !phrased {
+        return Ok(PhraseMode::Buffered);
+    }
+    let config = PhraseConfig {
+        tts_timeout: Duration::from_millis(env_u64("AIVTUBER_PHRASE_TTS_TIMEOUT_MS", 12_000)?),
+        ..PhraseConfig::default()
+    };
+    config.validate()?;
+    Ok(PhraseMode::Phrased(config))
 }
 
 fn build_adaptation_runtime(

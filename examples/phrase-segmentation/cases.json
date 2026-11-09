@@ -1,0 +1,251 @@
+{
+  "cases": [
+    {
+      "expected": [
+        "こんにちは。"
+      ],
+      "name": "ja single short sentence",
+      "text": "こんにちは。"
+    },
+    {
+      "expected": [
+        "こんにちは。今日もいい天気ですね。",
+        "散歩に行きたい気分です。"
+      ],
+      "name": "ja short sentences merge up to the minimum",
+      "text": "こんにちは。今日もいい天気ですね。散歩に行きたい気分です。"
+    },
+    {
+      "expected": [
+        "えっと、それはね、実は面白い話があって、",
+        "聞いてくれる？もちろん長い話になるけどね。"
+      ],
+      "name": "ja clause break cuts only past the clause weight",
+      "text": "えっと、それはね、実は面白い話があって、聞いてくれる？もちろん長い話になるけどね。"
+    },
+    {
+      "expected": [
+        "ありがとう！応援してくれて本当にうれしいよ。",
+        "また明日も配信するから見に来てね！"
+      ],
+      "name": "ja exclamations end sentences",
+      "text": "ありがとう！応援してくれて本当にうれしいよ。また明日も配信するから見に来てね！"
+    },
+    {
+      "expected": [
+        "「ありがとう」と彼は言った。",
+        "「どういたしまして」と私は答えた。"
+      ],
+      "name": "ja quotes close with their sentence",
+      "text": "「ありがとう」と彼は言った。「どういたしまして」と私は答えた。"
+    },
+    {
+      "expected": [
+        "一行目の文章です",
+        "二行目の文章です",
+        "三行目で終わります"
+      ],
+      "name": "ja newline is a hard boundary",
+      "text": "一行目の文章です\n二行目の文章です\n三行目で終わります"
+    },
+    {
+      "expected": [
+        "まず最初に、今日の予定を話しますね、",
+        "そのあとで質問に答えます、最後にお知らせがあります、",
+        "よろしくお願いします。"
+      ],
+      "name": "ja several clause breaks",
+      "text": "まず最初に、今日の予定を話しますね、そのあとで質問に答えます、最後にお知らせがあります、よろしくお願いします。"
+    },
+    {
+      "expected": [
+        "これは句読点がまったくない長い文章で途中に区切りがないためどこかで強制的に切らなければいけない場",
+        "面を想定して作った非常に長いテスト用の文章であり読み上げ時間も長くなる想定ですがそれでも安全に分",
+        "割できることを確認します"
+      ],
+      "name": "ja no punctuation is cut at the preferred ceiling",
+      "text": "これは句読点がまったくない長い文章で途中に区切りがないためどこかで強制的に切らなければいけない場面を想定して作った非常に長いテスト用の文章であり読み上げ時間も長くなる想定ですがそれでも安全に分割できることを確認します"
+    },
+    {
+      "expected": [
+        "あ"
+      ],
+      "name": "ja one word stays one phrase",
+      "text": "あ"
+    },
+    {
+      "expected": [
+        "今日はみんなとゲームをしていてとても楽しいです。よろしく。"
+      ],
+      "name": "ja short tail merges backwards",
+      "text": "今日はみんなとゲームをしていてとても楽しいです。よろしく。"
+    },
+    {
+      "expected": [
+        "えっと…それはその…なんというか、",
+        "ちょっと難しいけど頑張ってみるね。"
+      ],
+      "name": "ja ellipsis is a pause not a sentence end",
+      "text": "えっと…それはその…なんというか、ちょっと難しいけど頑張ってみるね。"
+    },
+    {
+      "expected": [
+        "Hello there! Thanks for joining the stream today.",
+        "I hope you are having a great time."
+      ],
+      "name": "en two sentences",
+      "text": "Hello there! Thanks for joining the stream today. I hope you are having a great time."
+    },
+    {
+      "expected": [
+        "Yes. No. Okay."
+      ],
+      "name": "en short sentences stay together",
+      "text": "Yes. No. Okay."
+    },
+    {
+      "expected": [
+        "Mr. Smith said that the game is great.",
+        "Dr. Jones agreed with him completely about it."
+      ],
+      "name": "en abbreviations are not sentence ends",
+      "text": "Mr. Smith said that the game is great. Dr. Jones agreed with him completely about it."
+    },
+    {
+      "expected": [
+        "The price is 3.14 dollars and the pi value is about 3.14159,",
+        "which is cool to know for sure."
+      ],
+      "name": "en decimals are not sentence ends",
+      "text": "The price is 3.14 dollars and the pi value is about 3.14159, which is cool to know for sure."
+    },
+    {
+      "expected": [
+        "Well... I think that's fine, you know,",
+        "because everything else is also fine,",
+        "honestly speaking here."
+      ],
+      "name": "en clause break past the clause weight",
+      "text": "Well... I think that's fine, you know, because everything else is also fine, honestly speaking here."
+    },
+    {
+      "expected": [
+        "We should visit https://example.com/path?query=1&x=2 for details about the event. It starts soon."
+      ],
+      "name": "en url query is not split",
+      "text": "We should visit https://example.com/path?query=1&x=2 for details about the event. It starts soon."
+    },
+    {
+      "expected": [
+        "this is a very long run of words without any punctuation at all so the segmenter must fall back",
+        "to the word spaces to keep every phrase bounded and readable by the voice model"
+      ],
+      "name": "en long without punctuation falls back to spaces",
+      "text": "this is a very long run of words without any punctuation at all so the segmenter must fall back to the word spaces to keep every phrase bounded and readable by the voice model"
+    },
+    {
+      "expected": [
+        "今日はゲームをやります。",
+        "Minecraftで家を建てるよ。",
+        "Let's go! みんなも一緒に遊ぼうね。"
+      ],
+      "name": "mixed ja en",
+      "text": "今日はゲームをやります。Minecraftで家を建てるよ。Let's go! みんなも一緒に遊ぼうね。"
+    },
+    {
+      "expected": [
+        "Thanks for the super chat!",
+        "本当にありがとう、とてもうれしいです。",
+        "次の曲も聞いてね。"
+      ],
+      "name": "mixed english then japanese",
+      "text": "Thanks for the super chat! 本当にありがとう、とてもうれしいです。次の曲も聞いてね。"
+    },
+    {
+      "expected": [
+        "ありがとう😊 https://example.com/live を見てね。また来てね！"
+      ],
+      "name": "projected url and emoji stay with their sentence",
+      "text": "ありがとう😊 https://example.com/live を見てね。また来てね！"
+    },
+    {
+      "expected": [
+        "今日も配信に来てくれてありがとう！😊",
+        "次の配信は明日の夜だよ。",
+        "楽しみにしていてね(^_^)"
+      ],
+      "name": "trailing emoji belongs to the sentence it closes",
+      "text": "今日も配信に来てくれてありがとう！😊 次の配信は明日の夜だよ。楽しみにしていてね(^_^)"
+    },
+    {
+      "expected": [
+        "ありがとう を見てね。",
+        "次の配信は明日の夜だよ。",
+        "楽しみにしていてね。"
+      ],
+      "name": "already projected text without url or emoji",
+      "text": "ありがとう を見てね。次の配信は明日の夜だよ。楽しみにしていてね。"
+    },
+    {
+      "expected": [
+        "すごい!!本当に?そうなんだ…それは驚きだね。ええっ?!"
+      ],
+      "name": "doubled marks and an interrobang run",
+      "text": "すごい!!本当に?そうなんだ…それは驚きだね。ええっ?!"
+    },
+    {
+      "expected": [
+        "😊😊😊"
+      ],
+      "name": "decoration only is kept as is",
+      "text": "😊😊😊"
+    },
+    {
+      "expected": [
+        "おはよう、今日もよろしくね。\n😊"
+      ],
+      "name": "emoji decoration merges into its neighbour",
+      "text": "おはよう、今日もよろしくね。\n😊"
+    },
+    {
+      "expected": [],
+      "name": "blank input",
+      "text": "   \n  "
+    },
+    {
+      "config": {
+        "clause_weight": 32,
+        "hard_max_weight": 192,
+        "max_phrases": 2,
+        "max_weight": 96,
+        "min_weight": 16
+      },
+      "expected": [
+        "これは長めの一つ目の文です。",
+        "これは長めの二つ目の文です。これは長めの三つ目の文です。これは長めの四つ目の文です。"
+      ],
+      "name": "max phrases merges the tail",
+      "text": "これは長めの一つ目の文です。これは長めの二つ目の文です。これは長めの三つ目の文です。これは長めの四つ目の文です。"
+    },
+    {
+      "config": {
+        "clause_weight": 6,
+        "hard_max_weight": 48,
+        "max_phrases": 16,
+        "max_weight": 24,
+        "min_weight": 4
+      },
+      "expected": [
+        "はい、",
+        "そうです。",
+        "いいえ、",
+        "違います。",
+        "たぶん、",
+        "そうかも。"
+      ],
+      "name": "tight bounds make small phrases",
+      "text": "はい、そうです。いいえ、違います。たぶん、そうかも。"
+    }
+  ],
+  "version": "phrase-seg-v1"
+}

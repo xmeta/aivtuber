@@ -10,6 +10,7 @@ mod memory_sidecar_eval;
 mod moderation_evidence;
 mod operator_control;
 mod outputs;
+mod phrase_commit;
 mod profile;
 mod raw_ingress;
 mod retention;
@@ -39,6 +40,10 @@ pub use memory_sidecar_eval::*;
 pub use moderation_evidence::*;
 pub use operator_control::*;
 pub use outputs::*;
+pub use phrase_commit::{
+    PHRASE_RESPONSE_RECORDS, PHRASE_START_WAIT, PhraseCause, PhraseCommitRecord, PhraseGateOutcome,
+    PhraseMetrics, PhraseMode, PhraseResponseEnd, PhraseResponseRecord,
+};
 pub use profile::*;
 pub use raw_ingress::*;
 pub use retention::*;
@@ -72,7 +77,7 @@ use aivtuber_domain::{
 use aivtuber_generative::{
     CancellationStage, FallbackDirective, GeneratedTextGateDecision,
     GenerationCancellationRegistry, GenerationCancellationToken, GenerationDisposition,
-    GenerationRequest, GenerationResult, GenerationTrace, GenerativePipeline,
+    GenerationRequest, GenerationResult, GenerationTrace, GenerativePipeline, PhraseOptions,
     select_fallback_directive,
 };
 use aivtuber_reflex::{DecisionReplayRecord, ExecutedAction};
@@ -89,11 +94,12 @@ use aivtuber_telemetry::{
     DegradedSubsystem, EventObservation, RouteClass, StageOutcome, StageReason, TelemetryCollector,
     TelemetryRetentionConfig, TraceStage,
 };
+use std::cell::RefCell;
 use std::error::Error;
 use std::fmt;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     mpsc::{self, Receiver, SyncSender, TrySendError},
 };
 use std::thread::{self, JoinHandle};
@@ -400,6 +406,24 @@ struct GenerationCompletionContext {
     correlation_id: String,
 }
 
+impl GenerationCompletionContext {
+    /// A copy for the composition thread's phrase bookkeeping. The budget
+    /// reservation is deliberately not copied: dropping a copy would return
+    /// the concurrency slot a second time.
+    fn without_reservation(&self) -> Self {
+        Self {
+            budget_reservation: None,
+            routing_latency_us: self.routing_latency_us,
+            decision: self.decision.clone(),
+            template_fallback: self.template_fallback,
+            interaction_deadline: self.interaction_deadline,
+            remaining_at_route_ms: self.remaining_at_route_ms,
+            remaining_at_generation_ms: self.remaining_at_generation_ms,
+            correlation_id: self.correlation_id.clone(),
+        }
+    }
+}
+
 struct GenerationWork {
     generation_id: u64,
     request: GenerationRequest,
@@ -409,6 +433,8 @@ struct GenerationWork {
     submitted_at: Instant,
     provider_deadline: Instant,
     context: GenerationCompletionContext,
+    /// Set when this job runs as a phrased reply (issue #83).
+    phrase: Option<phrase_commit::PhraseWork>,
 }
 
 struct GenerationCompletion {
@@ -424,6 +450,25 @@ struct GenerationCompletion {
     completed_at: Instant,
     provider_deadline: Instant,
     context: GenerationCompletionContext,
+}
+
+/// The worker-side output gate: the public-output policy snapshot's verdict as
+/// the pipeline's decision, plus the full verdict for the commit-side check.
+fn gate_generated_text(
+    policy: &PublicOutputPolicy,
+    generated_text: &str,
+) -> (GeneratedTextGateDecision, PublicOutput) {
+    let output = policy.evaluate(generated_text);
+    let decision = if matches!(output.verdict, OutputVerdict::Allow | OutputVerdict::Redact) {
+        output
+            .text
+            .clone()
+            .map(GeneratedTextGateDecision::Publish)
+            .unwrap_or(GeneratedTextGateDecision::Reject)
+    } else {
+        GeneratedTextGateDecision::Reject
+    };
+    (decision, output)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -486,32 +531,66 @@ impl GenerationExecutor {
                     let provider_started = Instant::now();
                     let queue_wait_us = elapsed_us(work.submitted_at);
 
-                    let mut output_decision = None;
-                    let result = pipeline
-                        .run_with_output_gate_and_fallback_deadline(
-                            &work.request,
-                            &work.cancellation,
-                            work.fallback.clone(),
-                            Some(work.provider_deadline),
-                            |generated_text| {
-                                let output = work.output_policy.evaluate(generated_text);
-                                let decision = if matches!(
-                                    output.verdict,
-                                    OutputVerdict::Allow | OutputVerdict::Redact
-                                ) {
-                                    output
-                                        .text
-                                        .clone()
-                                        .map(GeneratedTextGateDecision::Publish)
-                                        .unwrap_or(GeneratedTextGateDecision::Reject)
-                                } else {
-                                    GeneratedTextGateDecision::Reject
-                                };
-                                output_decision = Some(output);
-                                decision
-                            },
-                        )
-                        .map_err(|error| error.to_string());
+                    let (result, output_decision) = match &work.phrase {
+                        None => {
+                            let mut output_decision = None;
+                            let result = pipeline
+                                .run_with_output_gate_and_fallback_deadline(
+                                    &work.request,
+                                    &work.cancellation,
+                                    work.fallback.clone(),
+                                    Some(work.provider_deadline),
+                                    |generated_text| {
+                                        let (decision, output) = gate_generated_text(
+                                            &work.output_policy,
+                                            generated_text,
+                                        );
+                                        output_decision = Some(output);
+                                        decision
+                                    },
+                                )
+                                .map_err(|error| error.to_string());
+                            (result, output_decision)
+                        }
+                        Some(phrase) => {
+                            // The gate's last decision is per phrase: every
+                            // delivered phrase takes it, so the commit side
+                            // checks the decision for exactly that text.
+                            let last_decision = RefCell::new(None);
+                            let mut delivery = phrase_commit::ChannelDelivery {
+                                generation_id: work.generation_id,
+                                work: phrase,
+                                cancellation: &work.cancellation,
+                                last_decision: &last_decision,
+                                submitted_at: work.submitted_at,
+                                provider_started,
+                                queue_wait_us,
+                                shutting_down: &worker_shutdown,
+                            };
+                            let result = pipeline
+                                .run_phrased(
+                                    &work.request,
+                                    &work.cancellation,
+                                    work.fallback.clone(),
+                                    Some(work.provider_deadline),
+                                    &PhraseOptions {
+                                        response_id: work.generation_id,
+                                        config: phrase.config,
+                                    },
+                                    |generated_text| {
+                                        let (decision, output) = gate_generated_text(
+                                            &work.output_policy,
+                                            generated_text,
+                                        );
+                                        *last_decision.borrow_mut() = Some(output);
+                                        decision
+                                    },
+                                    &mut delivery,
+                                )
+                                .map_err(|error| error.to_string());
+                            (result, last_decision.into_inner())
+                        }
+                    };
 
                     let provider_latency_us = elapsed_us(provider_started);
                     let completed_at = Instant::now();
@@ -647,6 +726,11 @@ pub struct GenerativeRuntime {
     cancellation: Arc<GenerationCancellationRegistry>,
     next_generation_id: u64,
     active_generation_id: Option<u64>,
+    /// Buffered whole-reply commit (default) or phrase-level commit (#83).
+    phrase_mode: PhraseMode,
+    phrase_tx: SyncSender<phrase_commit::PhraseMessage>,
+    phrase_rx: Receiver<phrase_commit::PhraseMessage>,
+    phrase: phrase_commit::PhraseBook,
 }
 
 impl GenerativeRuntime {
@@ -659,12 +743,38 @@ impl GenerativeRuntime {
         pipeline: GenerativePipeline,
         config: GenerationExecutionConfig,
     ) -> Result<Self, &'static str> {
+        let (phrase_tx, phrase_rx) = mpsc::sync_channel::<phrase_commit::PhraseMessage>(
+            phrase_commit::PHRASE_MAILBOX_CAPACITY,
+        );
         Ok(Self {
             executor: GenerationExecutor::new(pipeline, config)?,
             cancellation: Arc::new(GenerationCancellationRegistry::default()),
             next_generation_id: 0,
             active_generation_id: None,
+            phrase_mode: PhraseMode::Buffered,
+            phrase_tx,
+            phrase_rx,
+            phrase: phrase_commit::PhraseBook::default(),
         })
+    }
+
+    /// Choose how generated replies are committed. Buffered whole-reply mode
+    /// is the default and stays available; phrase mode commits each complete,
+    /// gated, synthesized phrase atomically (issue #83).
+    pub fn with_phrase_mode(mut self, mode: PhraseMode) -> Result<Self, String> {
+        if let PhraseMode::Phrased(config) = mode {
+            config.validate()?;
+        }
+        self.phrase_mode = mode;
+        Ok(self)
+    }
+
+    pub fn phrase_mode(&self) -> PhraseMode {
+        self.phrase_mode
+    }
+
+    fn try_next_phrase(&self) -> Option<phrase_commit::PhraseMessage> {
+        self.phrase_rx.try_recv().ok()
     }
 
     pub fn cancellation_registry(&self) -> Arc<GenerationCancellationRegistry> {
@@ -697,7 +807,21 @@ impl GenerativeRuntime {
         self.next_generation_id = self.next_generation_id.saturating_add(1);
         let generation_id = self.next_generation_id;
         let source_event = request.source_event.clone();
+        let seed = request.seed;
         let cancellation = GenerationCancellationToken::default();
+        let started = Arc::new(AtomicU32::new(0));
+        let phrase = match self.phrase_mode {
+            PhraseMode::Buffered => None,
+            PhraseMode::Phrased(config) => Some(phrase_commit::PhraseWork {
+                config,
+                mailbox: self.phrase_tx.clone(),
+                started: Arc::clone(&started),
+            }),
+        };
+        // The composition thread keeps its own copy of the context for the
+        // phrase commits that precede the worker's final completion; the
+        // budget reservation stays with the one completion that settles it.
+        let run_context = phrase.is_some().then(|| context.without_reservation());
         let work = GenerationWork {
             generation_id,
             request,
@@ -707,11 +831,24 @@ impl GenerativeRuntime {
             submitted_at: Instant::now(),
             provider_deadline,
             context,
+            phrase,
         };
         match self.executor.try_submit(work) {
             Ok(()) => {
-                self.cancellation.activate(&source_event, cancellation);
+                self.cancellation
+                    .activate(&source_event, cancellation.clone());
                 self.active_generation_id = Some(generation_id);
+                if let Some(run_context) = run_context {
+                    self.phrase.runs.push(phrase_commit::PhraseRun::new(
+                        generation_id,
+                        source_event,
+                        seed,
+                        cancellation,
+                        started,
+                        provider_deadline,
+                        run_context,
+                    ));
+                }
                 Ok(generation_id)
             }
             Err(error) => {
@@ -748,6 +885,7 @@ impl GenerativeRuntime {
     fn shutdown(&mut self) {
         self.cancellation.cancel_active();
         self.active_generation_id = None;
+        self.phrase.runs.clear();
         self.executor.shutdown();
     }
 
@@ -1144,11 +1282,18 @@ where
     pub fn service_barge_in(&mut self, at_ms: u64) -> Option<BargeInRecord> {
         let fade_ms = self.speech_barge_in.as_ref()?.config().fade_ms;
         self.speech_floor.as_ref()?;
-        if !self
-            .performer
-            .scheduler()
-            .playing_items()
-            .any(|item| item.plan.channels.contains(&BlendChannel::Audio))
+        // A phrased reply that already spoke is still "speaking" in the gap
+        // between two phrases, when nothing is audible but more would follow.
+        let phrase_pending = self
+            .generative
+            .as_ref()
+            .is_some_and(|generative| generative.phrase.has_active_spoken_run());
+        if !phrase_pending
+            && !self
+                .performer
+                .scheduler()
+                .playing_items()
+                .any(|item| item.plan.channels.contains(&BlendChannel::Audio))
         {
             return None;
         }
@@ -1204,6 +1349,10 @@ where
             priority_for_event(aivtuber_domain::EventKind::SpeechInput),
             at_ms,
         );
+        // Stopping what is queued is not enough for a phrased reply: its later
+        // phrases are still being synthesized, and the cancellation is what
+        // keeps them from ever being committed (issue #83).
+        let cancelled_phrased = self.cancel_phrased_replies(PhraseCause::BargeIn);
         let mut record = BargeInRecord {
             decision_seq: decision.seq,
             decided_at_ms: decision.at_ms,
@@ -1216,7 +1365,7 @@ where
             avatar_reset: None,
             decision_to_stop_micros: 0,
         };
-        if !stop.is_empty() {
+        if !stop.is_empty() || cancelled_phrased > 0 {
             record.effect = BargeInEffect::Stopped;
             // Commands of the cancelled generations must not dispatch later.
             self.purge_cancelled_pending();
@@ -1235,6 +1384,23 @@ where
         barge_in.mark_handled(&speaker, run_start_ms);
         barge_in.record(record.clone());
         Some(record)
+    }
+
+    /// Counters of phrase-level commits (issue #83); all zero in buffered mode.
+    pub fn phrase_metrics(&self) -> PhraseMetrics {
+        self.generative
+            .as_ref()
+            .map(|generative| generative.phrase.metrics)
+            .unwrap_or_default()
+    }
+
+    /// Bounded recent phrased replies (oldest first): the commit horizon and
+    /// commit order of each, and how it ended. Empty in buffered mode.
+    pub fn recent_phrase_responses(&self) -> Vec<PhraseResponseRecord> {
+        self.generative
+            .as_ref()
+            .map(|generative| generative.phrase.recent())
+            .unwrap_or_default()
     }
 
     /// Floor gate counters; `None` when not enabled.
@@ -2342,6 +2508,18 @@ where
                     cache_level: None,
                 })
             }
+            // A phrased reply is committed phrase by phrase before its final
+            // completion arrives; reaching here means no phrase was committed.
+            GenerationDisposition::Phrased { .. } => {
+                self.record_worker_output_decision(output_decision.as_ref());
+                trace.fallback_reason = FallbackReason::PolicyOverride;
+                Ok(HandledGeneration {
+                    playback: None,
+                    route: RouteClass::NonVerbalFallback,
+                    trace,
+                    cache_level: None,
+                })
+            }
         }
     }
 
@@ -2354,6 +2532,22 @@ where
             let Some(mut completion) = completion else {
                 break;
             };
+
+            // Every phrase the worker handed over before it finished is
+            // committed (or refused) before its final completion is read.
+            self.drain_phrase_messages(now_ms);
+            let phrased_run = self
+                .generative
+                .as_mut()
+                .and_then(|generative| generative.phrase.take_run(completion.generation_id));
+            if let Some(run) = phrased_run
+                && run.first_handled
+            {
+                // Phrase 0 was already observed (committed or refused at the
+                // commit boundary): the final completion only closes the reply.
+                self.complete_phrased_reply(completion, run);
+                continue;
+            }
 
             let event_id = completion.request.source_event.event_id.clone();
             let deadline_expired = remaining_instant(completion.provider_deadline).is_none();
@@ -2792,12 +2986,14 @@ where
     }
 
     pub fn tick(&mut self, now_ms: u64) {
+        self.drain_phrase_messages(now_ms);
         self.drain_generation_completions(now_ms);
         self.drain_shadow_completions();
         if let Some(governor) = self.budget.as_mut() {
             governor.tick(now_ms);
         }
         self.performer.scheduler_mut().advance_to(now_ms);
+        self.update_phrase_progress();
         self.dispatch_audio(now_ms);
         self.dispatch_avatar(now_ms);
     }
@@ -2918,6 +3114,9 @@ where
             outcome,
             ControlOutcome::Stopped { .. } | ControlOutcome::Muted
         );
+        if is_override {
+            self.note_phrase_cancel_cause(PhraseCause::OperatorStop);
+        }
         let generation_cancelled = if is_override {
             self.generative
                 .as_ref()
@@ -3345,6 +3544,8 @@ mod tests {
         ReflexPipeline, TransportError,
     };
     use aivtuber_runtime::{CachedPlaybackConfig, SecurityRuntimeConfig};
+
+    mod phrase_commit_tests;
     use aivtuber_scheduler::SchedulerConfig;
     use aivtuber_telemetry::SecretRedactor;
     use serde_json::json;

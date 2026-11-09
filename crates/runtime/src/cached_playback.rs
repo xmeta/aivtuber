@@ -3,8 +3,8 @@ use aivtuber_asset_store::{
 };
 use aivtuber_domain::{EventEnvelope, EventKind, Viseme};
 use aivtuber_scheduler::{
-    AppliedVariation, BlendChannel, PlannedPerformance, Rejection, Scheduler, SeededRng,
-    VariationSpec as SchedulerVariationSpec, apply_variation, priority_for_event,
+    AppliedVariation, BlendChannel, PhraseLink, PlannedPerformance, Rejection, Scheduler,
+    SeededRng, VariationSpec as SchedulerVariationSpec, apply_variation, priority_for_event,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -288,6 +288,9 @@ pub struct CachedAssetSelection<'a> {
 struct ResolvedPlaybackAsset<'a> {
     asset: &'a PerformanceAsset,
     cache_tier: CacheTier,
+    /// Set for one phrase of a phrased reply (issue #83): the plan is then
+    /// committed through the scheduler's phrase path.
+    phrase: Option<PhraseLink>,
 }
 
 impl Default for CachedPlaybackConfig {
@@ -509,6 +512,7 @@ impl CachedPerformer {
             ResolvedPlaybackAsset {
                 asset: &asset,
                 cache_tier,
+                phrase: None,
             },
             visemes,
             audio,
@@ -560,6 +564,7 @@ impl CachedPerformer {
             ResolvedPlaybackAsset {
                 asset: &asset,
                 cache_tier,
+                phrase: None,
             },
             visemes,
             audio,
@@ -567,6 +572,58 @@ impl CachedPerformer {
         )?;
         self.record_recent(&recent_group, &asset.id);
         Ok(outcome)
+    }
+
+    /// Commit one complete phrase of a phrased generated reply (issue #83)
+    /// through the same scheduler, dispatch and viseme path as any asset.
+    ///
+    /// `link` places the phrase in its response. Phrase 0 is arbitrated like
+    /// an ordinary reaction; later phrases continue the response (see
+    /// [`Scheduler::schedule_phrase_at`]) and are refused with
+    /// `Scheduler(ContinuationBroken)` once the response cannot continue.
+    #[allow(clippy::too_many_arguments)]
+    pub fn handle_phrase_asset_id<R, A, V>(
+        &mut self,
+        event: &EventEnvelope,
+        asset_id: &str,
+        link: PhraseLink,
+        timing: CachedPlaybackTiming,
+        visemes: &R,
+        audio: &mut A,
+        avatar: &mut V,
+    ) -> Result<CachedPlaybackOutcome, CachedPlaybackError>
+    where
+        R: VisemeResolver,
+        A: AudioPlaybackSink,
+        V: AvatarPlaybackSink,
+    {
+        event
+            .validate()
+            .map_err(|error| CachedPlaybackError::InvalidEvent(error.to_string()))?;
+        if event.kind == EventKind::OperatorCommand {
+            return Err(CachedPlaybackError::InvalidEvent(
+                "operator commands use the authenticated control path".to_owned(),
+            ));
+        }
+        if asset_id.trim().is_empty() {
+            return Err(CachedPlaybackError::InvalidEvent(
+                "selected asset id must not be empty".to_owned(),
+            ));
+        }
+
+        let (asset, cache_tier) = self.assets.resolve_with_tier(asset_id)?;
+        self.schedule_asset(
+            event,
+            timing,
+            ResolvedPlaybackAsset {
+                asset: &asset,
+                cache_tier,
+                phrase: Some(link),
+            },
+            visemes,
+            audio,
+            avatar,
+        )
     }
 
     /// Play a semantic selection only if the current compatibility-checked
@@ -620,6 +677,7 @@ impl CachedPerformer {
             ResolvedPlaybackAsset {
                 asset: &asset,
                 cache_tier,
+                phrase: None,
             },
             visemes,
             audio,
@@ -643,7 +701,11 @@ impl CachedPerformer {
         A: AudioPlaybackSink,
         V: AvatarPlaybackSink,
     {
-        let ResolvedPlaybackAsset { asset, cache_tier } = resolved;
+        let ResolvedPlaybackAsset {
+            asset,
+            cache_tier,
+            phrase,
+        } = resolved;
         let viseme_track = resolve_asset_visemes(asset, visemes)?;
         let variation_spec = asset.variation.unwrap_or_default();
         let variation = apply_variation(
@@ -669,7 +731,10 @@ impl CachedPerformer {
             .map(|point| scale_offset(point, variation.speed_factor))
             .collect::<Vec<_>>();
         let plan = PlannedPerformance {
-            event_id: event.event_id.clone(),
+            event_id: phrase.map_or_else(
+                || event.event_id.clone(),
+                |link| link.plan_event_id(&event.event_id),
+            ),
             asset_id: asset.id.clone(),
             priority: priority_for_event(event.kind),
             interruptible: !interrupt_points_ms.is_empty(),
@@ -681,10 +746,11 @@ impl CachedPerformer {
             channels,
         };
 
-        let plan = self
-            .scheduler
-            .schedule_at(timing.at_ms, plan)
-            .map_err(CachedPlaybackError::Scheduler)?;
+        let scheduled = match phrase {
+            Some(link) => self.scheduler.schedule_phrase_at(timing.at_ms, plan, link),
+            None => self.scheduler.schedule_at(timing.at_ms, plan),
+        };
+        let plan = scheduled.map_err(CachedPlaybackError::Scheduler)?;
         let metrics = dispatch_asset(
             asset,
             viseme_track.as_ref(),
