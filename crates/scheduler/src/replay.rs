@@ -1,6 +1,7 @@
 use crate::{
-    AppliedVariation, BlendChannel, HistoryPolicy, PlannedPerformance, Priority, Rejection,
-    ScheduledItem, Scheduler, SchedulerConfig, SeededRng, Status, VariationSpec, apply_variation,
+    AppliedVariation, BlendChannel, HistoryPolicy, PhraseLink, PlannedPerformance, Priority,
+    Rejection, ScheduledItem, Scheduler, SchedulerConfig, SeededRng, Status, VariationSpec,
+    apply_variation,
 };
 use aivtuber_domain::{EventEnvelope, EventKind, FallbackReason};
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,11 @@ pub struct ReplayAsset {
     pub exclusive: bool,
     pub channels: BTreeSet<BlendChannel>,
     pub variation: VariationSpec,
+    /// Set when the asset is one phrase of a phrased reply (issue #83). The
+    /// harness then commits it through the scheduler's phrase path, so the
+    /// recorded trace carries the phrase commit order and horizon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phrase: Option<PhraseLink>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -193,6 +199,7 @@ impl ReplayHarness {
                     let mut rng =
                         SeededRng::new(self.config.seed.wrapping_add(input.event.sequence));
                     let variation = apply_variation(asset.variation, &mut rng);
+                    let phrase = asset.phrase;
                     let plan = PlannedPerformance {
                         event_id: input.event.event_id.clone(),
 
@@ -207,7 +214,11 @@ impl ReplayHarness {
                         channels: asset.channels,
                     };
 
-                    match scheduler.schedule_at(input.at_ms, plan) {
+                    let scheduled = match phrase {
+                        Some(link) => scheduler.schedule_phrase_at(input.at_ms, plan, link),
+                        None => scheduler.schedule_at(input.at_ms, plan),
+                    };
+                    match scheduled {
                         Ok(plan) => steps.push(ReplayStep {
                             at_ms: input.at_ms,
                             event_id: input.event.event_id,
@@ -473,6 +484,7 @@ mod tests {
             exclusive: false,
             channels: channels(&[BlendChannel::Audio, BlendChannel::Face, BlendChannel::Body]),
             variation: VariationSpec::default(),
+            phrase: None,
         }
     }
 
@@ -667,5 +679,98 @@ mod tests {
             result.avatar_actions[0].action,
             SinkActionKind::DegradedStart
         );
+    }
+
+    fn phrase_event(
+        id: &str,
+        sequence: u64,
+        at_ms: u64,
+        duration_ms: u64,
+        link: PhraseLink,
+    ) -> ReplayEvent {
+        let mut phrase = asset(&format!("phrase.{id}"), duration_ms);
+        phrase.channels = channels(&[BlendChannel::Audio]);
+        phrase.interrupt_points_ms = vec![duration_ms];
+        phrase.phrase = Some(link);
+        ReplayEvent {
+            at_ms,
+            event: event(EventKind::ChatMessage, id, sequence),
+            directive: ReplayDirective::Performance { asset: phrase },
+        }
+    }
+
+    fn link(seq: u32, final_phrase: bool) -> PhraseLink {
+        PhraseLink {
+            response_id: 9,
+            seq,
+            final_phrase,
+        }
+    }
+
+    #[test]
+    fn replay_records_the_phrase_commit_order_and_horizon() {
+        // Phrase 0 plays 0..1000, phrase 1 is committed at 400 and queues at
+        // 1000, phrase 2 is committed at 1100 (late): it starts at once.
+        let trace = vec![
+            phrase_event("reply", 1, 0, 1_000, link(0, false)),
+            phrase_event("reply#p1", 2, 400, 800, link(1, false)),
+            phrase_event("reply#p2", 3, 1_100, 500, link(2, true)),
+        ];
+        let result = harness(5).run(&trace).expect("replay");
+        assert!(
+            result
+                .steps
+                .iter()
+                .all(|step| step.outcome == ReplayOutcome::Scheduled)
+        );
+        let order: Vec<(u32, u64, u64)> = result
+            .scheduled_items
+            .iter()
+            .map(|item| {
+                let link = item.phrase.expect("phrase link kept in the trace");
+                (link.seq, item.plan.start_at_ms, item.plan.end_at_ms())
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![(0, 0, 1_000), (1, 1_000, 1_800), (2, 1_800, 2_300)]
+        );
+        assert!(result.scheduled_items[2].phrase.unwrap().final_phrase);
+        assert_eq!(
+            result.to_json_bytes(),
+            harness(5).run(&trace).expect("again").to_json_bytes(),
+            "the phrase trace is byte-deterministic"
+        );
+    }
+
+    #[test]
+    fn replay_refuses_a_phrase_after_an_operator_stop_cancelled_its_predecessor() {
+        let mut stop_event = event(EventKind::OperatorCommand, "operator", 9);
+        stop_event.sequence = 9;
+        let trace = vec![
+            phrase_event("reply", 1, 0, 1_000, link(0, false)),
+            ReplayEvent {
+                at_ms: 300,
+                event: stop_event,
+                directive: ReplayDirective::OperatorStop,
+            },
+            phrase_event("reply#p1", 2, 400, 800, link(1, true)),
+        ];
+        let result = harness(5).run(&trace).expect("replay");
+        let outcomes: Vec<_> = result
+            .steps
+            .iter()
+            .map(|step| step.outcome.clone())
+            .collect();
+        assert_eq!(
+            outcomes,
+            vec![
+                ReplayOutcome::Scheduled,
+                ReplayOutcome::OperatorStop,
+                ReplayOutcome::Rejected(Rejection::ContinuationBroken)
+            ]
+        );
+        assert_eq!(result.scheduled_items.len(), 1);
+        assert_eq!(result.scheduled_items[0].status, Status::Cancelled);
     }
 }

@@ -111,6 +111,37 @@ impl BargeInStop {
     }
 }
 
+/// Position of one atomic phrase inside a phrased generated reply (issue #83).
+///
+/// A phrased reply is a chain of independent scheduler items, one per
+/// complete, gated, synthesized phrase. The link is scheduler-owned replay
+/// data: it says which response a committed item belongs to and where it sits
+/// in the response, never any text or audio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhraseLink {
+    /// Identity of the generated response (the generation attempt), shared by
+    /// every phrase of the reply. Also the cancellation identity.
+    pub response_id: u64,
+    /// Zero-based position in the response.
+    pub seq: u32,
+    /// Whether this is the last phrase of the planned response.
+    pub final_phrase: bool,
+}
+
+impl PhraseLink {
+    /// The scheduler `event_id` of this phrase. Phrase 0 keeps the source
+    /// event's id, so the first-audio path of a phrased reply is the same as a
+    /// buffered one; later phrases derive `{root}#p{seq}` because the
+    /// scheduler admits one live item per `event_id` (issue #198).
+    pub fn plan_event_id(&self, root_event_id: &str) -> String {
+        if self.seq == 0 {
+            root_event_id.to_owned()
+        } else {
+            format!("{root_event_id}#p{}", self.seq)
+        }
+    }
+}
+
 /// A planned performance plus scheduler-owned lifecycle metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduledItem {
@@ -118,6 +149,10 @@ pub struct ScheduledItem {
     pub status: Status,
     /// Deterministic future cancellation boundary for safe-point preemption.
     pub cancel_at_ms: Option<u64>,
+    /// Present only for a phrase of a phrased reply. Absent items serialize
+    /// exactly as they did before phrases existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phrase: Option<PhraseLink>,
 }
 
 impl ScheduledItem {
@@ -147,6 +182,11 @@ pub enum Rejection {
     /// the prior item is terminal the same `event_id` may be scheduled again
     /// and receives a new generation.
     DuplicateEvent,
+    /// A later phrase of a phrased reply could not continue its response: the
+    /// previous phrase was cancelled or is not known, or other work already
+    /// holds the timeline the phrase needs. The reply ends cleanly after the
+    /// last committed phrase; nothing else is cancelled to make room.
+    ContinuationBroken,
 }
 
 /// How terminal (completed/cancelled) items are retained for replay/debugging.
@@ -494,7 +534,105 @@ impl Scheduler {
     pub fn schedule_at(
         &mut self,
         request_at_ms: u64,
+        plan: PlannedPerformance,
+    ) -> Result<PlannedPerformance, Rejection> {
+        self.schedule_inner(request_at_ms, plan, None)
+    }
+
+    /// Commit one atomic phrase of a phrased reply (issue #83).
+    ///
+    /// Phrase 0 is an ordinary schedule request (same arbitration, spacing and
+    /// cooldown) that also records its [`PhraseLink`]. A later phrase is a
+    /// *continuation*: it starts exactly when the previous phrase of the same
+    /// response ends (or now, when that already ended), without the
+    /// reaction-spacing gap, and never preempts or displaces anything. If the
+    /// previous phrase was cancelled, is unknown, or any other live item
+    /// overlaps the interval the phrase needs, the request is refused with
+    /// [`Rejection::ContinuationBroken`] and changes no scheduler state.
+    pub fn schedule_phrase_at(
+        &mut self,
+        request_at_ms: u64,
+        plan: PlannedPerformance,
+        link: PhraseLink,
+    ) -> Result<PlannedPerformance, Rejection> {
+        if link.seq == 0 {
+            return self.schedule_inner(request_at_ms, plan, Some(link));
+        }
+        self.schedule_continuation(request_at_ms, plan, link)
+    }
+
+    fn schedule_continuation(
+        &mut self,
+        request_at_ms: u64,
         mut plan: PlannedPerformance,
+        link: PhraseLink,
+    ) -> Result<PlannedPerformance, Rejection> {
+        self.last_rejection = None;
+        self.advance_to(request_at_ms);
+
+        if self
+            .items
+            .iter()
+            .any(|item| item.plan.event_id == plan.event_id)
+        {
+            return self.refuse(Rejection::DuplicateEvent);
+        }
+
+        let is_predecessor = |phrase: &Option<PhraseLink>| {
+            phrase.is_some_and(|other| {
+                other.response_id == link.response_id && other.seq + 1 == link.seq
+            })
+        };
+        let mut start = plan.start_at_ms.max(request_at_ms).max(self.now_ms);
+        if let Some(previous) = self.items.iter().find(|item| is_predecessor(&item.phrase)) {
+            let preempted = previous
+                .cancel_at_ms
+                .is_some_and(|cancel| cancel < previous.plan.end_at_ms());
+            if preempted {
+                return self.refuse(Rejection::ContinuationBroken);
+            }
+            start = start.max(previous.effective_end_ms());
+        } else {
+            let finished = self
+                .history
+                .iter()
+                .rev()
+                .find(|entry| is_predecessor(&entry.item.phrase));
+            match finished {
+                Some(entry) if entry.item.status == Status::Completed => {}
+                _ => return self.refuse(Rejection::ContinuationBroken),
+            }
+        }
+        plan.start_at_ms = start;
+        normalize_interrupt_points(&mut plan);
+
+        if start < self.cooldowns.get(&plan.asset_id).copied().unwrap_or(0) {
+            return self.refuse(Rejection::Cooldown);
+        }
+        let end = plan.end_at_ms();
+        let blocked = self.items.iter().any(|item| {
+            item.phrase
+                .is_none_or(|other| other.response_id != link.response_id)
+                && plans_conflict(&item.plan, &plan)
+                && intervals_overlap(start, end, item.plan.start_at_ms, item.effective_end_ms())
+        });
+        if blocked {
+            return self.refuse(Rejection::ContinuationBroken);
+        }
+
+        Ok(self.admit(plan, Some(link)))
+    }
+
+    fn refuse(&mut self, rejection: Rejection) -> Result<PlannedPerformance, Rejection> {
+        self.last_rejection = Some(rejection);
+        Err(rejection)
+    }
+
+    fn schedule_inner(
+        &mut self,
+        request_at_ms: u64,
+        mut plan: PlannedPerformance,
+        phrase: Option<PhraseLink>,
     ) -> Result<PlannedPerformance, Rejection> {
         self.last_rejection = None;
         self.advance_to(request_at_ms);
@@ -634,6 +772,16 @@ impl Scheduler {
             }
         }
 
+        Ok(self.admit(plan, phrase))
+    }
+
+    /// Accept an arbitrated plan: assign its generation, reserve its asset
+    /// cooldown and index the new live item.
+    fn admit(
+        &mut self,
+        mut plan: PlannedPerformance,
+        phrase: Option<PhraseLink>,
+    ) -> PlannedPerformance {
         self.generation = self.generation.saturating_add(1);
         plan.generation = self.generation;
 
@@ -655,9 +803,27 @@ impl Scheduler {
             plan: plan.clone(),
             status,
             cancel_at_ms: None,
+            phrase,
         });
 
-        Ok(plan)
+        plan
+    }
+
+    /// Whether phrase `seq` of `response_id` has begun playing or already
+    /// ended (the issue #83 lookahead bound). `None` when no such phrase is
+    /// committed or retained.
+    pub fn phrase_started(&self, response_id: u64, seq: u32) -> Option<bool> {
+        let matches = |phrase: &Option<PhraseLink>| {
+            phrase.is_some_and(|p| p.response_id == response_id && p.seq == seq)
+        };
+        if let Some(item) = self.items.iter().find(|item| matches(&item.phrase)) {
+            return Some(item.status == Status::Playing);
+        }
+        self.history
+            .iter()
+            .rev()
+            .any(|entry| matches(&entry.item.phrase))
+            .then_some(true)
     }
 
     /// Emergency/operator path: stop active work and cancel queued future
@@ -1397,5 +1563,230 @@ mod tests {
         let a: Vec<_> = (0..8).map(|_| first.next_f64()).collect();
         let b: Vec<_> = (0..8).map(|_| second.next_f64()).collect();
         assert_ne!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod phrase_tests {
+    use super::*;
+
+    fn audio() -> BTreeSet<BlendChannel> {
+        BTreeSet::from([BlendChannel::Audio])
+    }
+
+    fn phrase_plan(root: &str, link: PhraseLink, duration_ms: u64) -> PlannedPerformance {
+        PlannedPerformance {
+            event_id: link.plan_event_id(root),
+            asset_id: format!("phrase.{root}.{}", link.seq),
+            priority: Priority::Conversation,
+            interruptible: true,
+            interrupt_points_ms: vec![duration_ms],
+            start_at_ms: 0,
+            duration_ms,
+            generation: 0,
+            exclusive: false,
+            channels: audio(),
+        }
+    }
+
+    fn link(response_id: u64, seq: u32, final_phrase: bool) -> PhraseLink {
+        PhraseLink {
+            response_id,
+            seq,
+            final_phrase,
+        }
+    }
+
+    /// The default 1.5 s reaction spacing must not open a gap inside a reply.
+    fn spaced() -> Scheduler {
+        Scheduler::new(SchedulerConfig::default())
+    }
+
+    fn unspaced() -> Scheduler {
+        Scheduler::new(SchedulerConfig {
+            min_reaction_spacing_ms: 0,
+            ..SchedulerConfig::default()
+        })
+    }
+
+    fn other_event(event_id: &str, priority: Priority, duration_ms: u64) -> PlannedPerformance {
+        PlannedPerformance {
+            event_id: event_id.to_owned(),
+            asset_id: format!("{event_id}.asset"),
+            priority,
+            interruptible: true,
+            interrupt_points_ms: vec![duration_ms],
+            start_at_ms: 100,
+            duration_ms,
+            generation: 0,
+            exclusive: false,
+            channels: audio(),
+        }
+    }
+
+    #[test]
+    fn a_continuation_starts_at_the_previous_phrase_end_without_spacing() {
+        let mut scheduler = spaced();
+        let l0 = link(1, 0, false);
+        let l1 = link(1, 1, false);
+        let first = scheduler
+            .schedule_phrase_at(0, phrase_plan("e", l0, 1_000), l0)
+            .expect("phrase 0");
+        let second = scheduler
+            .schedule_phrase_at(200, phrase_plan("e", l1, 800), l1)
+            .expect("phrase 1 continues phrase 0");
+        assert_eq!(first.start_at_ms, 0);
+        assert_eq!(
+            second.start_at_ms, 1_000,
+            "queued exactly at the previous end"
+        );
+        assert_eq!(second.event_id, "e#p1");
+        assert_eq!(
+            scheduler.live_item_by_event("e#p1").unwrap().status,
+            Status::Queued
+        );
+        // Phrase 0 is untouched by the continuation: no preemption.
+        assert_eq!(
+            scheduler.live_item_by_event("e").unwrap().cancel_at_ms,
+            None
+        );
+    }
+
+    #[test]
+    fn a_late_continuation_starts_now_with_no_spacing_gap() {
+        let mut scheduler = spaced();
+        let l0 = link(1, 0, false);
+        let l1 = link(1, 1, true);
+        scheduler
+            .schedule_phrase_at(0, phrase_plan("e", l0, 500), l0)
+            .expect("phrase 0");
+        // Phrase 1 arrives after phrase 0 ended (slow synthesis): it starts
+        // now, not a reaction-spacing after the previous terminal time.
+        let late = scheduler
+            .schedule_phrase_at(900, phrase_plan("e", l1, 400), l1)
+            .expect("late continuation");
+        assert_eq!(late.start_at_ms, 900);
+    }
+
+    #[test]
+    fn a_continuation_of_a_cancelled_phrase_is_refused_and_changes_nothing() {
+        let mut scheduler = spaced();
+        let l0 = link(1, 0, false);
+        let l1 = link(1, 1, false);
+        scheduler
+            .schedule_phrase_at(0, phrase_plan("e", l0, 1_000), l0)
+            .expect("phrase 0");
+        scheduler.stop_all(300);
+        let generation = scheduler.current_generation();
+        let refused = scheduler.schedule_phrase_at(400, phrase_plan("e", l1, 500), l1);
+        assert_eq!(refused, Err(Rejection::ContinuationBroken));
+        assert_eq!(
+            scheduler.last_rejection(),
+            Some(Rejection::ContinuationBroken)
+        );
+        assert_eq!(
+            scheduler.current_generation(),
+            generation,
+            "no generation consumed"
+        );
+        assert!(scheduler.items().is_empty());
+    }
+
+    #[test]
+    fn a_continuation_without_a_committed_predecessor_is_refused() {
+        let mut scheduler = spaced();
+        let l2 = link(7, 2, false);
+        let refused = scheduler.schedule_phrase_at(0, phrase_plan("e", l2, 500), l2);
+        assert_eq!(refused, Err(Rejection::ContinuationBroken));
+    }
+
+    #[test]
+    fn other_work_on_the_needed_interval_ends_the_reply_instead_of_being_displaced() {
+        let mut scheduler = unspaced();
+        let l0 = link(1, 0, false);
+        let l1 = link(1, 1, false);
+        scheduler
+            .schedule_phrase_at(0, phrase_plan("e", l0, 1_000), l0)
+            .expect("phrase 0");
+        // A same-priority event queues behind phrase 0 (starts at 1000).
+        let other = scheduler
+            .schedule_at(100, other_event("other", Priority::Conversation, 600))
+            .expect("other queues behind");
+        assert_eq!(other.start_at_ms, 1_000);
+        let refused = scheduler.schedule_phrase_at(200, phrase_plan("e", l1, 500), l1);
+        assert_eq!(refused, Err(Rejection::ContinuationBroken));
+        assert!(
+            scheduler.live_item_by_event("other").is_some(),
+            "the other event keeps its reservation"
+        );
+    }
+
+    #[test]
+    fn a_preempted_predecessor_refuses_its_continuation() {
+        let mut scheduler = unspaced();
+        let l0 = link(1, 0, false);
+        let l1 = link(1, 1, false);
+        let mut long = phrase_plan("e", l0, 2_000);
+        long.interrupt_points_ms = vec![500, 2_000];
+        scheduler.schedule_phrase_at(0, long, l0).expect("phrase 0");
+        scheduler
+            .schedule_at(
+                100,
+                other_event("urgent", Priority::HighPriorityInteraction, 300),
+            )
+            .expect("urgent preempts at 500");
+        assert_eq!(
+            scheduler.schedule_phrase_at(150, phrase_plan("e", l1, 400), l1),
+            Err(Rejection::ContinuationBroken)
+        );
+    }
+
+    #[test]
+    fn phrase_started_tracks_queued_playing_and_ended_phrases() {
+        let mut scheduler = spaced();
+        let l0 = link(1, 0, false);
+        let l1 = link(1, 1, true);
+        scheduler
+            .schedule_phrase_at(0, phrase_plan("e", l0, 1_000), l0)
+            .expect("phrase 0");
+        scheduler
+            .schedule_phrase_at(10, phrase_plan("e", l1, 700), l1)
+            .expect("phrase 1");
+        assert_eq!(scheduler.phrase_started(1, 0), Some(true));
+        assert_eq!(scheduler.phrase_started(1, 1), Some(false));
+        assert_eq!(scheduler.phrase_started(1, 2), None);
+        scheduler.advance_to(1_000);
+        assert_eq!(
+            scheduler.phrase_started(1, 0),
+            Some(true),
+            "ended counts as started"
+        );
+        assert_eq!(scheduler.phrase_started(1, 1), Some(true));
+        scheduler.advance_to(5_000);
+        assert_eq!(
+            scheduler.phrase_started(1, 1),
+            Some(true),
+            "history still answers"
+        );
+    }
+
+    #[test]
+    fn a_phrase_link_serializes_only_when_present() {
+        let mut scheduler = spaced();
+        let mut plain = other_event("plain", Priority::Conversation, 100);
+        plain.start_at_ms = 0;
+        scheduler.schedule(plain).expect("plain");
+        let plain = serde_json::to_string(&scheduler.items()[0]).expect("json");
+        assert!(!plain.contains("phrase"), "{plain}");
+        let l0 = link(3, 0, true);
+        scheduler
+            .schedule_phrase_at(5_000, phrase_plan("e", l0, 100), l0)
+            .expect("phrase");
+        let phrased =
+            serde_json::to_string(scheduler.live_item_by_event("e").unwrap()).expect("json");
+        assert!(
+            phrased.contains(r#""phrase":{"response_id":3,"seq":0,"final_phrase":true}"#),
+            "{phrased}"
+        );
     }
 }
