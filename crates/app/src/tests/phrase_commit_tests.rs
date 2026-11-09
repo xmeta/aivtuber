@@ -601,14 +601,14 @@ fn message(unit: PhraseUnit, decision: Option<PublicOutput>) -> phrase_commit::P
 }
 
 fn send(rig: &Rig, message: phrase_commit::PhraseMessage) {
-    rig.app
+    let sent = rig
+        .app
         .generative
         .as_ref()
         .expect("generative runtime")
         .phrase_tx
-        .try_send(message)
-        .ok()
-        .expect("mailbox has room");
+        .try_send(message);
+    assert!(sent.is_ok(), "mailbox has room");
 }
 
 fn finish(rig: &mut Rig, summary: &aivtuber_generative::PhraseSummary) {

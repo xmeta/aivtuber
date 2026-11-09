@@ -72,8 +72,16 @@ impl CompositionProfile {
 
     /// Whether generated replies are committed phrase by phrase unless
     /// `AIVTUBER_PHRASE_MODE` says otherwise (issue #83 S1).
+    ///
+    /// Only the `local` profile: its whole path is loopback and the case for
+    /// it is measured (docs/local-profile-quickstart.adoc, "Phrase mode"):
+    /// whole-reply synthesis is the dominant first-audio latency there and
+    /// long replies approach the sidecar deadline. `full` keeps buffered
+    /// whole-reply commit, which is the more conservative publication
+    /// boundary for remote providers, until it has the same evidence;
+    /// `AIVTUBER_PHRASE_MODE=phrase` opts any profile in.
     pub fn phrased_replies_by_default(self) -> bool {
-        false
+        self == Self::Local
     }
 
     /// Whether every provider endpoint must be loopback (nothing leaves the
@@ -225,8 +233,20 @@ impl ProfileSummary {
 /// Stable fingerprint of the active profile composition for replay/telemetry
 /// records. Hashes only profile-relevant facts, never secrets.
 pub fn config_fingerprint(profile: CompositionProfile, generative_available: bool) -> String {
+    config_fingerprint_with_phrases(profile, generative_available, false)
+}
+
+/// [`config_fingerprint`] that also names phrase-level commit of generated
+/// replies (issue #83), which changes what is committed and in what order.
+/// Buffered composition hashes exactly as before, so existing fingerprints
+/// stay valid.
+pub fn config_fingerprint_with_phrases(
+    profile: CompositionProfile,
+    generative_available: bool,
+    phrased_replies: bool,
+) -> String {
     let summary = ProfileSummary::for_profile(profile, generative_available, String::new());
-    let payload = format!(
+    let mut payload = format!(
         "profile-v1;profile={};semantic={};jev={};template={};generative_available={}",
         summary.profile,
         summary.semantic_retrieval,
@@ -234,6 +254,9 @@ pub fn config_fingerprint(profile: CompositionProfile, generative_available: boo
         summary.template_route,
         summary.generative_available,
     );
+    if phrased_replies {
+        payload.push_str(";phrased_replies=true");
+    }
     // FNV-1a 64-bit: deterministic, dependency-free, fingerprint-only.
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in payload.as_bytes() {
@@ -380,6 +403,31 @@ mod tests {
         );
         assert_ne!(full, reflex);
         assert!(full.starts_with("profile-v1-"));
+    }
+
+    #[test]
+    fn only_the_local_profile_is_phrased_by_default() {
+        for profile in CompositionProfile::ALL {
+            assert_eq!(
+                profile.phrased_replies_by_default(),
+                profile == CompositionProfile::Local
+            );
+        }
+    }
+
+    #[test]
+    fn phrase_mode_changes_the_fingerprint_and_buffered_does_not() {
+        for profile in CompositionProfile::ALL {
+            assert_eq!(
+                config_fingerprint_with_phrases(profile, true, false),
+                config_fingerprint(profile, true),
+                "buffered composition keeps its existing fingerprint"
+            );
+            assert_ne!(
+                config_fingerprint_with_phrases(profile, true, true),
+                config_fingerprint(profile, true)
+            );
+        }
     }
 
     #[test]

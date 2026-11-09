@@ -2542,8 +2542,9 @@ where
                 .and_then(|generative| generative.phrase.take_run(completion.generation_id));
             if let Some(run) = phrased_run
                 && run.first_handled
-                && run.has_committed()
             {
+                // Phrase 0 was already observed (committed or refused at the
+                // commit boundary): the final completion only closes the reply.
                 self.complete_phrased_reply(completion, run);
                 continue;
             }

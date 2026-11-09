@@ -184,8 +184,8 @@ Record the result as one of:
 
 |Phrase/sentence boundary primitives
 |+unicode-segmentation+
-|Evaluate / likely adopt
-|Use Unicode-aware boundary primitives only. aivtuber still owns semantic phrase completeness, public-output gating, TTS completion, irreversible commit horizon, and cancellation.
+|Evaluated in #83 S1: custom (small, fixture-tested)
+|UAX #29 gives strong sentence breaks only, breaks before a trailing emoji or closing mark and after +Mr.+, and adds a dependency without removing the project rules still needed (clause breaks at 、 and +,+, minimum and maximum phrase weights, URL and decimal protection, bounded phrase count). The rules are about 150 lines in +crates/generative/src/phrase.rs+ with fixtures in +examples/phrase-segmentation/cases.json+. Revisit if a third language or full Unicode script coverage is needed. aivtuber still owns semantic phrase completeness, public-output gating, TTS completion, irreversible commit horizon, and cancellation.
 |#83
 
 |Phrase-streaming reference

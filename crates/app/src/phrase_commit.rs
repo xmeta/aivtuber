@@ -437,8 +437,9 @@ where
             return;
         };
         for run in &mut generative.phrase.runs {
-            let mut started = 0_u32;
-            for phrase in &run.committed {
+            // Phrases already counted stay counted; only look at the rest.
+            let mut started = run.started.load(Ordering::Acquire);
+            for phrase in run.committed.iter().skip(started as usize) {
                 // `None` means the item left the retained history: it is long
                 // over, so it no longer holds the worker back.
                 if scheduler
@@ -450,9 +451,7 @@ where
                     break;
                 }
             }
-            if started > run.started.load(Ordering::Acquire) {
-                run.started.store(started, Ordering::Release);
-            }
+            run.started.store(started, Ordering::Release);
         }
     }
 
@@ -873,12 +872,24 @@ where
             },
             Err(_) => None,
         };
-        let chars = self.finish_phrase_run(run, summary.as_ref());
+        let spoke = run.has_committed();
+        let chars = if spoke {
+            self.finish_phrase_run(run, summary.as_ref())
+        } else {
+            // Phrase 0 was refused at the commit boundary: the event was
+            // observed then, and nothing was spoken, so there is no reply to
+            // record.
+            0
+        };
         if let (Some(reservation), Some(governor)) = (
             completion.context.budget_reservation.as_mut(),
             self.budget.as_mut(),
         ) {
-            reservation.settle(governor, chars, 0);
+            if spoke {
+                reservation.settle(governor, chars, 0);
+            } else {
+                reservation.release(governor);
+            }
         }
         if let Some(generative) = self.generative.as_mut() {
             if completion.result.is_err() {

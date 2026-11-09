@@ -141,6 +141,7 @@ Notes that matter:
 * *Do not set* `AIVTUBER_VOICE_MODEL` unless you also have cached assets for that voice. It names the voice the cached pack was authored for (default `example-voice-v1`); a different name makes every cached descriptor incompatible (`indexed=6 usable=0`) and cached reactions silently find nothing. The synthesizer's own identity is recorded separately in the provenance (`model_alias=supertonic-3-int8`).
 * *Floor and barge-in.* `AIVTUBER_SPEECH_FLOOR` requires `AIVTUBER_SPEECH_CONVERSATION`; `AIVTUBER_SPEECH_BARGE_IN` requires the floor. With the floor on, a spoken turn is answered only after the speaker has been silent for 800 ms (`AIVTUBER_SPEECH_FLOOR_TAKE_TURN_SILENCE_MS`, 700 to 1000). A user who speaks over the avatar for 400 ms stops the playing reply (`speech_barge_in:` log line).
 * *Reply length.* Left at its default the model may write several hundred characters, which is over 30 seconds of speech and can exceed the TTS sidecar's 12 s synthesis deadline (`local-tts-sidecar: deadline_exceeded`; the reply degrades to a non-verbal reaction). `AIVTUBER_OPENAI_MAX_OUTPUT_TOKENS=96` kept replies to 5 to 15 seconds of audio on the measured host.
+* *Phrase mode (default for this profile).* A reply is split into phrases and each is gated, synthesized and committed on its own, so the first phrase plays while the second is synthesized and the 12 s synthesis deadline applies to one phrase, not to the whole reply (#83 S1; <<phrase-mode>>). `AIVTUBER_PHRASE_MODE=buffered` returns to one commit per reply; `AIVTUBER_PHRASE_TTS_TIMEOUT_MS` (default 12000) bounds one phrase. The log shows `generated replies: phrase mode` at startup and one `phrase_response` line per reply.
 * *Cached starter audio.* `examples/starter-reaction-pack` carries descriptors but no audio files (`audio://starter/*.opus`); the cached path plays whatever you place under `$AIVTUBER_AUDIO_ROOT/starter/`. Without those files, an `intent` event is accepted and scheduled but nothing is audible.
 * *Cached reactions and the avatar profile.* The pack targets `AIVTUBER_AVATAR_PROFILE` (default `example-live2d-v1`). The local renderer accepts the same commands, so the default works unchanged.
 
@@ -350,6 +351,38 @@ Every socket of the runtime's processes (app, llama-server, both speech children
 |===
 
 The avatar page requested only `http://127.0.0.1:8765` and same-origin `blob:` URLs (21 requests). The runtime's processes never opened a non-loopback socket in any run. A browser can, which is why the browser row is separate and the proxy flag matters. The three start-up refusals of section 6 were also exercised. No firewall or network setting was changed and the machine stayed online, so this is an observation, not a deny rule.
+
+[#phrase-mode]
+=== Phrase mode against buffered mode (#83 S1)
+
+Date 2026-11, issue #83 S1, the same host as above but a *debug* build of the app and a *stubbed Thinking endpoint*. No llama-server binary was available on the machine and none was downloaded, so Thinking was a loopback stub that returns a fixed hand-written Japanese reply after a fixed 0.6 s (the LLM time measured in run 4); it is the same in both modes and cancels out of the comparison. Everything else was real: the app, the supervised `local-tts-sidecar` (Supertonic 3 int8, `AIVTUBER_TTS_SIDECAR_AMPLITUDE_VISEMES=true`), the scheduler and `ffplay` (run at volume 0 through a logging shim; the player started time is the shim's START line). Typed events, so there is no floor wait and no STT. The ten replies are 40 to 60 characters, three sentences each (5 to 10 s of speech), typical of a 96-token reply. One event every 26 s, ten events per mode, buffered first, then `AIVTUBER_PHRASE_MODE=phrase`. The driver and the stub are not in the repository.
+
+[cols="3,2,2",options="header"]
+|===
+|Ten replies, end of event to ... |Buffered |Phrase mode
+
+|first audio (player started), p50 / p95
+|2.54 s / 2.78 s
+|1.50 s / 1.73 s
+
+|end of speech (player of the last clip ended), p50 / p95
+|12.29 s / 13.87 s
+|11.51 s / 12.23 s
+
+|TTS calls per reply (sidecar `total_ms`, p50)
+|1 (1.88 s)
+|2.9 (0.89 s per phrase)
+
+|phrase commits / underruns / scheduler gaps
+|n/a
+|29 / 0 / 0 ms (every phrase started exactly where the previous one ended)
+|===
+
+The first phrase starts about 1.0 s earlier at the median (41 percent), which is the whole-reply TTS time minus the first phrase's TTS time. Completion is not worse (it is a little earlier, the first phrase starts earlier and the per-phrase synthesis stays ahead of playback). Between consecutive phrase clips the player start times were within -24 to +14 ms of the previous clip's audio duration (19 pairs), so phrases are chained to within the process start jitter of `ffplay`; an acoustic gap measurement was not made (no loopback capture), only this timing.
+
+*Long replies.* A 317 character reply: buffered first audio 11.6 s (the sidecar needed 11.0 s of its 12 s deadline), phrase mode 1.6 s. A 458 character reply: buffered hit `local-tts-sidecar: deadline_exceeded chars=458` after 12.6 s and nothing was spoken; phrase mode started speaking after 1.6 s and committed all 16 phrases (`end=Completed`). In that run the cap of 16 phrases merged a 141 character tail into the last phrase, whose 4.9 s synthesis could not hide behind the 2.7 s phrase before it, a single 2.2 s gap (`underruns=1 max_gap_ms=2241`); the default cap is now 32 phrases. A newer event arriving while a long reply was still being spoken ended the first reply after 12 of its 15 phrases (`end=Partial { cause: Superseded }`) with no later phrase committed.
+
+Limits of this evidence: one host, a debug app build, ten replies written by hand, a stub for Thinking (so the real model's reply lengths and any markdown or line breaks are untested here), no microphone (so barge-in was covered by unit and app tests, not by a live run), and `ffplay` process playback, whose per-phrase start cost is hidden only because the player start times were chained from the logical clock.
 
 === Failure behaviour (run 4 and the first run)
 

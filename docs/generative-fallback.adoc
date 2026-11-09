@@ -76,6 +76,36 @@ Remote-provider cancellation is best-effort. The local generation/revision fence
 
 Therefore "provider call completed" is never equivalent to "safe to publish".
 
+== Phrase mode: atomic phrase commit (#83 S1)
+
+Buffered mode commits one asset when the whole reply has been synthesized. For a long reply that makes the audience wait for the slowest stage, whole-reply TTS (measured at 2.3 s for a median 9.7 s reply on the local profile) and can exceed the TTS deadline outright. Phrase mode keeps every rule above and applies it to each phrase of the buffered Thinking reply instead; it is selected with `AIVTUBER_PHRASE_MODE=buffered|phrase|auto` (`auto` follows the composition profile; see <<phrase-default>>), and buffered mode stays available.
+
+[source,text]
+----
+worker:       Thinking (buffered) -> whole-reply gate -> segment ->
+              per phrase [ gate -> projection (+gate) -> TTS -> compile ] -> deliver
+composition:  per phrase  currency + cancellation fence -> gate recheck -> scheduler commit
+----
+
+*Atomic phrase.* `PhraseUnit` (crates/generative, `phrase.rs`) carries the phrase sequence, the complete approved text, the compiled asset (complete audio reference, optional viseme/amplitude track, the interrupt point declared at the end of the phrase, Thinking and TTS provenance), the final flag and the response (generation/cancel) id. It can only be built by the pipeline for a phrase that reached `Compiled`. The state machine is `Planned -> Gated -> Synthesized -> Compiled -> Committed`; failure and cancellation are legal only before `Committed`, and `Committed` is terminal: a committed phrase is history.
+
+*Segmentation* (`phrase-seg-v1`, `segment_reply`). Deterministic Japanese and English rules: sentence ends (`。！？` and ASCII `.!?` only when nothing word-like follows, so `3.14`, `example.com` and `?x=1` do not split; a short abbreviation list), line breaks, and clause breaks (`、` `,` `…`) that cut only past a clause weight. Trailing closers and emoji stay with their sentence. Lengths are weights (ASCII 1, other 2): a phrase is never cut below the minimum (a short tail merges back), a phrase past the preferred maximum is cut at the best earlier boundary (clause, then word space) and only a reply with no boundary at all is cut at the ceiling. The phrase count is bounded; a longer tail is merged into the last phrase. A phrase with nothing speakable (only a URL or emoji) joins its neighbour before delivery starts, so the final flag is fixed up front. The fixtures are `examples/phrase-segmentation/cases.json`. Reuse decision for the boundary primitive: `custom`; `unicode-segmentation` (UAX #29) was evaluated and not adopted because it supplies strong sentence breaks only and still needs these project rules, and it breaks before a trailing emoji or closing mark and after `Mr.`; revisit if a third language is needed.
+
+*Lookahead.* Synthesis of phrase `n` starts only once phrase `n - 1` has started playing, so the synthesis of a phrase overlaps the playback of the one before it and never of older ones. The counter the worker waits on is written only by the composition thread; the wait is bounded (30 s) and ends with cancellation.
+
+*Gate.* The whole reply is evaluated first, so a policy that refuses it decides while nothing is irreversible. Each phrase is then gated again on its own text (and its projection, with the display text through the gate last, as in buffered mode), and the composition thread re-applies the policy and requires the worker's decision to be for exactly that phrase immediately before its commit (docs/security-threat-model.adoc 11.2).
+
+*Scheduler.* The existing shared scheduler executes the phrases. Phrase 0 is an ordinary reaction commit. Phrase `k > 0` is a continuation (`Scheduler::schedule_phrase_at`): it takes the derived event id `{event}#p{k}` (one live item per `event_id`, #198), starts exactly when the previous phrase ends (or at once when that already ended, without the reaction-spacing gap), and never preempts or displaces anything. When the previous phrase was cancelled or another item already holds the interval, the continuation is refused with `ContinuationBroken` and the reply ends. Every committed phrase declares an interrupt point at its end, which is what gives ADR-0005 barge-in and higher-priority preemption a safe boundary at every phrase instead of one at the end of the reply. Only phrase 0 starts the expression; later phrases keep it (cross-phrase continuity proper is #84).
+
+*Failure and cancellation.* Failure before phrase 0 behaves exactly like buffered mode (a typed fallback directive, nothing spoken). Failure of phrase `k > 0` (TTS error or timeout, gate refusal, a refused commit) ends the reply after phrase `k - 1`: no retry, no replay of an earlier phrase, no fallback speech, and a typed counted cause (`PhraseCause`). The reply is recorded as `Partial`, never `Completed`, unless every planned phrase was committed. Operator stop or mute, a confirmed barge-in (including in the gap between two phrases), supersession by a newer generation and shutdown cancel the response, so no later phrase is committed; already committed phrases stop at the safe boundary or through the existing stop and fade path.
+
+*Deadlines.* Phrase 0 is bounded by the interaction deadline like a buffered reply. Each phrase has its own synthesis budget (`AIVTUBER_PHRASE_TTS_TIMEOUT_MS`, default 12000), so a long reply no longer times out as a whole; later phrases are not bound by the interaction deadline because the audience is already hearing the reply.
+
+*Replay and audit.* Every committed item carries a scheduler `PhraseLink` (response id, sequence, final flag) that the replay harness records and replays; items without one serialize exactly as before. `ProductionApp::recent_phrase_responses` keeps a bounded record per phrased reply: the segmentation version, the planned count, the commits in order (scheduler generation, logical commit time, start and end, gap before the phrase, gate outcome) and how the reply ended. The audit log gets `phrase_committed`, `phrase_refused` and `phrase_response_ended` records without text. `phrase_metrics` counts replies, completed and partial replies, committed phrases, gate refusals before the first and after a committed phrase, scheduler refusals, post-commit failures and cancellations, underruns and the largest inter-phrase gap, and TTS time.
+
+[[phrase-default]]
+*Default.* `auto` enables phrase mode for the `local` profile only, on the measured evidence in docs/local-profile-quickstart.adoc (whole-reply TTS is the dominant first-audio latency there, and the whole path is loopback). Every other profile stays buffered, the more conservative publication boundary for remote providers, until it has comparable evidence; `AIVTUBER_PHRASE_MODE=phrase` opts any profile in and `AIVTUBER_PHRASE_MODE=buffered` opts the local profile out. The mode is part of the composition fingerprint (`phrased_replies=true`), so replay and telemetry records name it; buffered composition keeps its existing fingerprint.
+
 == Streaming compilation
 
 `StreamingCompilationSession` is the provider-neutral path for streaming-capable LLM/TTS implementations.

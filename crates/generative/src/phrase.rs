@@ -77,7 +77,7 @@ impl Default for SegmentationConfig {
             clause_weight: 32,
             max_weight: 96,
             hard_max_weight: 192,
-            max_phrases: 16,
+            max_phrases: 32,
         }
     }
 }

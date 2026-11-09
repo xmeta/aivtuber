@@ -150,7 +150,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     let startup_summary = ProfileSummary::for_profile(
         profile,
         generative.is_some(),
-        aivtuber_app::config_fingerprint(profile, generative.is_some()),
+        aivtuber_app::config_fingerprint_with_phrases(
+            profile,
+            generative.is_some(),
+            generative
+                .as_ref()
+                .is_some_and(|generative| generative.phrase_mode().is_phrased()),
+        ),
     );
     let active_planner: Box<dyn RoutePlanner> = match profile {
         CompositionProfile::Cached => Box::new(IntentRoutePlanner) as Box<dyn RoutePlanner>,
