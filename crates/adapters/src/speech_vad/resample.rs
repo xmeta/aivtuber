@@ -1,28 +1,32 @@
 use crate::speech_vad::pipeline::SAMPLE_RATE_HZ;
-use std::collections::VecDeque;
-use std::f64::consts::PI;
+use rubato::audioadapter_buffers::direct::InterleavedSlice;
+use rubato::{Async, FixedAsync, Resampler as _, SincInterpolationParameters, WindowFunction};
 
-/// Zero crossings of the sinc kernel on each side. Twelve gives well over
-/// 60 dB stop-band attenuation with a Hann window, which is far more than a
-/// VAD front end needs.
-const ZERO_CROSSINGS: f64 = 12.0;
+/// Sinc kernel length. 128 taps (BlackmanHarris2 window, automatic cutoff)
+/// keeps aliasing far below what a VAD front end needs at about 1 ms of
+/// delay.
+const SINC_LEN: usize = 128;
 
-/// Streaming windowed-sinc resampler from any input rate to 16 kHz mono.
-///
-/// Chosen over a crate because the need is one fixed output rate and a few
-/// dozen lines; a band-limited kernel (not linear interpolation) is required
-/// so 44.1/48 kHz microphones do not alias speech energy above 8 kHz into the
-/// VAD input. Output sample `k` sits at input time `k * in_rate / 16000`
-/// exactly (zero phase), so timestamps need no latency correction.
-#[derive(Debug)]
+/// Streaming resampler from any input rate to 16 kHz mono, a thin wrapper
+/// over rubato's asynchronous sinc resampler (fixed 10 ms input chunks, no FFT
+/// feature). The wrapper buffers arbitrary push sizes into those chunks and
+/// drops rubato's initial delay so output sample `k` sits at input time
+/// `k * in_rate / 16000` (zero phase): timestamps need no latency correction.
 pub struct Resampler {
-    ratio: f64,
-    scale: f64,
-    half_width: f64,
-    buf: VecDeque<f32>,
-    /// Absolute input index of `buf[0]`.
-    base: u64,
-    next_output: u64,
+    inner: Option<Async<f32>>,
+    chunk: usize,
+    pending: Vec<f32>,
+    out: Vec<f32>,
+    skip: usize,
+}
+
+impl std::fmt::Debug for Resampler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Resampler")
+            .field("chunk", &self.chunk)
+            .field("pending", &self.pending.len())
+            .finish()
+    }
 }
 
 impl Resampler {
@@ -30,79 +34,83 @@ impl Resampler {
         if !(8_000..=192_000).contains(&input_rate_hz) {
             return Err(format!("unsupported input sample rate {input_rate_hz} Hz"));
         }
-        let ratio = f64::from(input_rate_hz) / f64::from(SAMPLE_RATE_HZ);
-        let scale = (1.0 / ratio).min(1.0);
+        if input_rate_hz == SAMPLE_RATE_HZ {
+            return Ok(Self {
+                inner: None,
+                chunk: 0,
+                pending: Vec::new(),
+                out: Vec::new(),
+                skip: 0,
+            });
+        }
+        let chunk = (input_rate_hz / 100) as usize;
+        let params = SincInterpolationParameters::new(SINC_LEN, WindowFunction::BlackmanHarris2);
+        let inner = Async::<f32>::new_sinc(
+            f64::from(SAMPLE_RATE_HZ) / f64::from(input_rate_hz),
+            1.0,
+            &params,
+            chunk,
+            1,
+            FixedAsync::Input,
+        )
+        .map_err(|e| format!("resampler: {e}"))?;
+        let out = vec![0.0; inner.output_frames_max()];
+        let skip = inner.output_delay();
         Ok(Self {
-            ratio,
-            scale,
-            half_width: ZERO_CROSSINGS / scale,
-            buf: VecDeque::new(),
-            base: 0,
-            next_output: 0,
+            inner: Some(inner),
+            chunk,
+            pending: Vec::with_capacity(chunk * 2),
+            out,
+            skip,
         })
     }
 
     pub fn is_passthrough(&self) -> bool {
-        (self.ratio - 1.0).abs() < f64::EPSILON
+        self.inner.is_none()
     }
 
-    /// Append mono input samples and emit every output sample whose kernel
-    /// support is fully available. Retained input is bounded by the kernel
-    /// width plus one chunk.
+    /// Append mono input samples and emit output for every complete 10 ms
+    /// chunk. At most one partial chunk is retained.
     pub fn push(&mut self, input: &[f32], out: &mut Vec<f32>) {
-        if self.is_passthrough() {
+        let Some(inner) = self.inner.as_mut() else {
             out.extend_from_slice(input);
             return;
-        }
-        self.buf.extend(input.iter().copied());
-        let end = self.base + self.buf.len() as u64;
-        loop {
-            let t = self.next_output as f64 * self.ratio;
-            if (t + self.half_width).floor() as u64 >= end {
-                break;
-            }
-            let lo = (t - self.half_width).ceil().max(0.0) as u64;
-            let hi = (t + self.half_width).floor() as u64;
-            let mut acc = 0.0_f64;
-            for j in lo.max(self.base)..=hi {
-                let x = j as f64 - t;
-                acc += f64::from(self.buf[(j - self.base) as usize]) * self.kernel(x);
-            }
-            out.push(acc as f32);
-            self.next_output += 1;
-        }
-        let keep_from = ((self.next_output as f64 * self.ratio) - self.half_width)
-            .floor()
-            .max(0.0) as u64;
-        let drop = keep_from
-            .saturating_sub(self.base)
-            .min(self.buf.len() as u64);
-        self.buf.drain(..drop as usize);
-        self.base += drop;
-    }
-
-    fn kernel(&self, x: f64) -> f64 {
-        let y = self.scale * x;
-        let sinc = if y.abs() < 1e-12 {
-            1.0
-        } else {
-            (PI * y).sin() / (PI * y)
         };
-        let window = 0.5 * (1.0 + (PI * x / self.half_width).cos());
-        self.scale * sinc * window
+        self.pending.extend_from_slice(input);
+        let mut consumed = 0;
+        while self.pending.len() - consumed >= self.chunk {
+            let slice = &self.pending[consumed..consumed + self.chunk];
+            consumed += self.chunk;
+            let (Ok(src), Ok(mut dst)) = (
+                InterleavedSlice::new(slice, 1, self.chunk),
+                InterleavedSlice::new_mut(&mut self.out, 1, inner.output_frames_max()),
+            ) else {
+                continue;
+            };
+            let Ok((_, written)) = inner.process_into_buffer(&src, &mut dst, None) else {
+                continue;
+            };
+            let drop = self.skip.min(written);
+            self.skip -= drop;
+            out.extend_from_slice(&self.out[drop..written]);
+        }
+        self.pending.drain(..consumed);
     }
 
     /// Forget buffered input (capture gap): the stream restarts cleanly.
     pub fn reset(&mut self) {
-        self.buf.clear();
-        self.base = 0;
-        self.next_output = 0;
+        self.pending.clear();
+        if let Some(inner) = self.inner.as_mut() {
+            inner.reset();
+            self.skip = inner.output_delay();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::f64::consts::PI;
 
     fn tone(rate: u32, hz: f64, secs: f64) -> Vec<f32> {
         (0..(rate as f64 * secs) as usize)
@@ -121,7 +129,12 @@ mod tests {
             let mut r = Resampler::new(rate).unwrap();
             let mut out = Vec::new();
             r.push(&tone(rate, 1_000.0, 1.0), &mut out);
-            assert!((out.len() as i64 - 16_000).abs() < 64, "len {}", out.len());
+            // At most one 10 ms chunk is still pending at the end.
+            assert!(
+                (out.len() as i64 - 16_000).abs() <= 200,
+                "len {}",
+                out.len()
+            );
             let rms = rms_interior(&out);
             assert!(
                 (rms - 0.5 / 2f64.sqrt()).abs() < 0.01,
@@ -149,15 +162,35 @@ mod tests {
         let mut b = Vec::new();
         for chunk in input.chunks(333) {
             chunked.push(chunk, &mut b);
-            assert!(chunked.buf.len() < 333 + 2 * (chunked.half_width as usize) + 8);
+            assert!(chunked.pending.len() < chunked.chunk);
         }
         assert_eq!(a.len(), b.len());
         assert!(a.iter().zip(&b).all(|(x, y)| (x - y).abs() < 1e-6));
     }
 
     #[test]
+    fn output_is_zero_phase_so_timestamps_need_no_latency_correction() {
+        for rate in [48_000_u32, 44_100] {
+            let mut r = Resampler::new(rate).unwrap();
+            let at = rate as usize / 2; // 0.5 s
+            let mut input = vec![0.0_f32; rate as usize];
+            input[at] = 1.0;
+            let mut out = Vec::new();
+            r.push(&input, &mut out);
+            let peak = out
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+                .unwrap()
+                .0;
+            assert!((peak as i64 - 8_000).abs() <= 1, "rate {rate} peak {peak}");
+        }
+    }
+
+    #[test]
     fn sixteen_khz_is_a_passthrough_and_odd_rates_are_refused() {
         let mut r = Resampler::new(16_000).unwrap();
+        assert!(r.is_passthrough());
         let mut out = Vec::new();
         r.push(&[0.1, 0.2], &mut out);
         assert_eq!(out, vec![0.1, 0.2]);

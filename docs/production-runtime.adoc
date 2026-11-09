@@ -150,7 +150,7 @@ Observations do not ride the stdin `EventEnvelope` pipe. An envelope kind would 
 
 `speech-vad-sidecar` (crates/adapters, `src/bin/speech-vad-sidecar.rs`) turns a local microphone, or `--input-wav`, into `speech-observation` batches on stdout, one JSON line per raw speech edge. The app spawns it as a child process when `AIVTUBER_SPEECH_SIDECAR` is set; it is off by default.
 
-Pipeline: capture (cpal) -> mono -> windowed-sinc resample to 16 kHz -> 512-sample (32 ms) frames -> Silero VAD v6 probability -> start/end hysteresis (0.5 / 0.35, the EXP-0001 values) -> raw edge -> stamp on the runtime timeline -> bounded stdout writer. There is no debounce and no minimum-speech filter (ADR-0005): one frame above the start threshold is an edge. No turn-end score is emitted (Smart Turn is not adopted); `language` is declared with `--language`, never inferred.
+Pipeline: capture (cpal) -> mono -> rubato sinc resample to 16 kHz -> 512-sample (32 ms) frames -> Silero VAD v6 probability -> start/end hysteresis (0.5 / 0.35, the EXP-0001 values) -> raw edge -> stamp on the runtime timeline -> bounded stdout writer. There is no debounce and no minimum-speech filter (ADR-0005): one frame above the start threshold is an edge. No turn-end score is emitted (Smart Turn is not adopted); `language` is declared with `--language`, never inferred.
 
 === Build and run
 

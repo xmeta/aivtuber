@@ -245,8 +245,19 @@ fn stereo_48k_input_is_downmixed_and_resampled_to_the_same_decision() {
     let wav = write_wav("vowel48k-stereo.wav", 48_000, 2, &stereo);
     let (lines, stderr, ok) = run_wav(&wav, &[]);
     assert!(ok, "{stderr}");
-    let kinds: Vec<_> = parse_edges(&lines).iter().map(|e| e.0).collect();
+    let edges = parse_edges(&lines);
+    let kinds: Vec<_> = edges.iter().map(|e| e.0).collect();
     assert_eq!(kinds, vec![SpeechEdge::Start, SpeechEdge::End], "{lines:?}");
+    // Same decision as the native 16 kHz file, within two frames, so the
+    // resampler adds no material shift or distortion for the VAD.
+    let wav16 = write_wav("vowel16k-ref.wav", 16_000, 1, &mono);
+    let (lines16, stderr16, ok16) = run_wav(&wav16, &[]);
+    assert!(ok16, "{stderr16}");
+    let edges16 = parse_edges(&lines16);
+    let held = edges[1].1 as i64 - edges[0].1 as i64;
+    let held16 = edges16[1].1 as i64 - edges16[0].1 as i64;
+    eprintln!("held 48k stereo {held} ms vs 16k {held16} ms");
+    assert!((held - held16).abs() <= 64, "held {held} vs {held16}");
 }
 
 #[test]

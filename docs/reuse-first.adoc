@@ -89,7 +89,7 @@ Record the result as one of:
 |Microphone capture
 |`cpal`
 |Adopt
-|Already in the lock file through `rodio`; Apache-2.0. Behind the `mic-capture` feature (ALSA headers on Linux). Resampling is a ~60 line windowed-sinc `Resampler` (custom, because a fixed 16 kHz target needs no general resampler crate; linear interpolation would alias).
+|Already in the lock file through `rodio`; Apache-2.0. Behind the `mic-capture` feature (ALSA headers on Linux). Resampling reuses `rubato` 5.0.1 (MIT OR Apache-2.0, `default-features = false`, so no FFT/realfft): the asynchronous sinc `Async` resampler with fixed 10 ms input chunks, wrapped to buffer arbitrary pushes and drop its initial delay (zero-phase output is tested). Adopt / thin wrapper; it replaced a custom windowed-sinc resampler. Adds 7 lock entries (rubato, audioadapter, audioadapter-buffers, audioadapter-sample, audio-codec-algorithms, visibility, windowfunctions).
 |#92
 
 |Agent tool protocol / MCP plumbing
