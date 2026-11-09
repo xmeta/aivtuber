@@ -766,6 +766,68 @@ mod tests {
         (exit, stats, out)
     }
 
+    type Gate = Box<dyn Fn() -> bool + Send>;
+
+    /// Input delivered in stages: a stage's bytes are served only once its gate
+    /// is true. Partials are dropped when the decoder is busy, by design, so a
+    /// test that must observe a partial holds the end of the segment until the
+    /// decoder has demonstrably taken the request, instead of racing it.
+    struct Staged {
+        stages: VecDeque<(Cursor<Vec<u8>>, Gate)>,
+    }
+
+    impl Read for Staged {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            loop {
+                let Some((cursor, gate)) = self.stages.front_mut() else {
+                    return Ok(0);
+                };
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while !gate() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                let n = cursor.read(buf)?;
+                if n > 0 {
+                    return Ok(n);
+                }
+                self.stages.pop_front();
+            }
+        }
+    }
+
+    fn open() -> Gate {
+        Box::new(|| true)
+    }
+
+    fn run_staged(
+        stages: Vec<(Vec<Vec<u8>>, Gate)>,
+        config: &WorkerConfig,
+        decoder: Fake,
+        out: &Shared,
+    ) -> (WorkerExit, WorkerStats) {
+        let input = Staged {
+            stages: stages
+                .into_iter()
+                .map(|(frames, gate)| (Cursor::new(frames.concat()), gate))
+                .collect(),
+        };
+        run_worker(input, out.clone(), move || Ok(decoder), config)
+    }
+
+    fn partial_seen(out: &Shared) -> Gate {
+        let out = out.clone();
+        Box::new(move || {
+            out.transcripts()
+                .iter()
+                .any(|t| t.kind == TranscriptKind::Partial)
+        })
+    }
+
+    fn decodes_started(calls: &Arc<Mutex<Vec<usize>>>, n: usize) -> Gate {
+        let calls = calls.clone();
+        Box::new(move || calls.lock().unwrap().len() >= n)
+    }
+
     fn fake(delay_ms: u64) -> (Fake, Arc<Mutex<Vec<usize>>>) {
         let calls = Arc::new(Mutex::new(Vec::new()));
         (
@@ -788,10 +850,20 @@ mod tests {
     #[test]
     fn a_segment_yields_revisions_then_one_final_that_supersedes_them() {
         let (decoder, _) = fake(0);
-        let mut frames = vec![encode_start(1, 1_000)];
-        frames.extend(audio_ms(2_000));
-        frames.push(encode_end(1, false));
-        let (exit, stats, out) = run(frames, &config(), decoder);
+        let out = Shared::default();
+        // The end of the segment is held until a partial has been emitted: the
+        // first partial request meets an idle decoder, so it is certain.
+        let mut head = vec![encode_start(1, 1_000)];
+        head.extend(audio_ms(2_000));
+        let (exit, stats) = run_staged(
+            vec![
+                (head, open()),
+                (vec![encode_end(1, false)], partial_seen(&out)),
+            ],
+            &config(),
+            decoder,
+            &out,
+        );
         assert_eq!(exit, WorkerExit::InputClosed);
         let t = out.transcripts();
         let finals: Vec<_> = t
@@ -835,10 +907,24 @@ mod tests {
     #[test]
     fn a_slow_decoder_drops_partial_requests_and_the_final_still_arrives() {
         let (decoder, calls) = fake(300);
-        let mut frames = vec![encode_start(9, 0)];
-        frames.extend(audio_ms(3_000));
-        frames.push(encode_end(9, false));
-        let (exit, stats, out) = run(frames, &config(), decoder);
+        let out = Shared::default();
+        // 600 ms of audio starts the first (300 ms) partial decode; the rest of
+        // the segment is fed only once that decode is running, so the later
+        // partial requests meet a busy decoder.
+        let mut head = vec![encode_start(9, 0)];
+        head.extend(audio_ms(600));
+        let (exit, stats) = run_staged(
+            vec![
+                (head, open()),
+                (
+                    [audio_ms(2_400), vec![encode_end(9, false)]].concat(),
+                    decodes_started(&calls, 1),
+                ),
+            ],
+            &config(),
+            decoder,
+            &out,
+        );
         assert_eq!(exit, WorkerExit::InputClosed);
         let t = out.transcripts();
         assert_eq!(t.last().unwrap().kind, TranscriptKind::Final);
@@ -852,13 +938,25 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let decoder = Fake {
             delay: Duration::ZERO,
-            calls,
+            calls: calls.clone(),
             text: Box::new(|_| Ok("同じ".to_owned())),
         };
-        let mut frames = vec![encode_start(1, 0)];
-        frames.extend(audio_ms(2_000));
-        frames.push(encode_end(1, false));
-        let (_, stats, out) = run(frames, &config(), decoder);
+        let out = Shared::default();
+        // Stage by stage so both decodes certainly happen: the first partial is
+        // emitted, then more audio triggers a second decode (same text), and
+        // only then does the segment end.
+        let mut head = vec![encode_start(1, 0)];
+        head.extend(audio_ms(600));
+        let (_, stats) = run_staged(
+            vec![
+                (head, open()),
+                (audio_ms(1_400), partial_seen(&out)),
+                (vec![encode_end(1, false)], decodes_started(&calls, 2)),
+            ],
+            &config(),
+            decoder,
+            &out,
+        );
         let partials = out
             .transcripts()
             .into_iter()
