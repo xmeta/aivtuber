@@ -21,6 +21,10 @@ mic-capture = ["dep:cpal"]
 # scripts/fetch-sherpa-onnx.mjs, otherwise the crate build script downloads
 # unchecked binaries (docs/supply-chain.adoc).
 sherpa-stt = ["dep:sherpa-onnx"]
+# Local Japanese text-to-speech sidecar (#220 S2b): the same official
+# sherpa-onnx crate (offline TTS, Supertonic 3 int8), so no new crate path.
+# The same SHERPA_ONNX_ARCHIVE_DIR rule as sherpa-stt applies to every build.
+sherpa-tts = ["dep:sherpa-onnx"]
 
 [dependencies]
 aivtuber-domain = { path = "../domain" }
@@ -69,6 +73,15 @@ required-features = ["sherpa-stt"]
 [[bin]]
 name = "speech-stt-worker-double"
 path = "src/bin/speech-stt-worker-double.rs"
+
+[[bin]]
+name = "local-tts-sidecar"
+path = "src/bin/local-tts-sidecar.rs"
+required-features = ["sherpa-tts"]
+
+[[bin]]
+name = "local-tts-sidecar-double"
+path = "src/bin/local-tts-sidecar-double.rs"
 
 [[bin]]
 name = "twitch-chat-ingress"

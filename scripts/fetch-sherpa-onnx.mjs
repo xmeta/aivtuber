@@ -18,6 +18,13 @@
 //       to the worker. The worker verifies the same SHA-256 pins again at
 //       every start (crates/adapters/src/speech_stt/pins.rs).
 //
+//   node scripts/fetch-sherpa-onnx.mjs model supertonic-3-int8 <dest-dir>
+//       The local TTS voice (#220 S2b, `sherpa-tts` feature). Same step, same
+//       rule; the sidecar verifies the pins in crates/adapters/src/speech_tts/
+//       pins.rs at every start. LICENCE: the Supertonic 3 weights are
+//       OpenRAIL-M (use restrictions, and the duty to disclose that published
+//       audio is machine-generated); see docs/supply-chain.adoc.
+//
 // A mismatch deletes the partial download and exits non-zero. The pins here
 // are asserted equal to the Rust pins by a unit test (pins.rs), so the two
 // copies cannot drift.
@@ -48,6 +55,24 @@ const LIB_ARCHIVES = {
 };
 
 const MODELS = {
+  "supertonic-3-int8": {
+    // sherpa-onnx tts-models release asset (the tag is mutable, the hash is the pin).
+    archive: {
+      name: "sherpa-onnx-supertonic-3-tts-int8-2026-05-11.tar.bz2",
+      url: `${SHERPA_RELEASE}/tts-models/sherpa-onnx-supertonic-3-tts-int8-2026-05-11.tar.bz2`,
+      sha256: "82fa96f91c4ef8abaae3a14a3f4153facf88bed821d1f7331cec2700f432c427",
+    },
+    innerDir: "sherpa-onnx-supertonic-3-tts-int8-2026-05-11",
+    files: [
+      ["duration_predictor.int8.onnx", "c3eb91414d5ff8a7a239b7fe9e34e7e2bf8a8140d8375ffb14718b1c639325db"],
+      ["text_encoder.int8.onnx", "c7befd5ea8c3119769e8a6c1486c4edc6a3bc8365c67621c881bbb774b9902ff"],
+      ["vector_estimator.int8.onnx", "20cd86fa5c6effedfda0e7cffe5b0569ca401c440a0c3a1d72bf39286c0db3fd"],
+      ["vocoder.int8.onnx", "e923d60f53f95eb1ce235f1dc33ec56d9c057823c96fa6f8acf98f32b0da6152"],
+      ["tts.json", "42078d3aef1cd43ab43021f3c54f47d2d75ceb4e75f627f118890128b06a0d09"],
+      ["unicode_indexer.bin", "8402ca48e5189a8950138580b0fff64db6f072f24ac07cd54ba8b2fbb9883b30"],
+      ["voice.bin", "67d5209b0ee8ce6c74105ffbe12fe6a7628aea3b4ba2fcb308a4a67938a93ce8"],
+    ],
+  },
   "k2v2-int8": {
     files: [
       ["encoder-epoch-99-avg-1.int8.onnx", "2c7bd08a8a99f9ddd0d9e458456577b1f6279214e51426f114f9eced44c54e1d"],
@@ -139,4 +164,4 @@ async function fetchModel(name, dest) {
 const [command, ...rest] = process.argv.slice(2);
 if (command === "lib" && rest.length === 1) await fetchLib(rest[0]);
 else if (command === "model" && rest.length === 2) await fetchModel(rest[0], rest[1]);
-else fail("usage: fetch-sherpa-onnx.mjs lib <dest-dir> | model k2v2-int8|parakeet-ja <dest-dir>");
+else fail("usage: fetch-sherpa-onnx.mjs lib <dest-dir> | model k2v2-int8|parakeet-ja|supertonic-3-int8 <dest-dir>");

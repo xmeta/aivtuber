@@ -1,4 +1,5 @@
-//! Link arguments for the optional `sherpa-stt` worker (issue #92 S3b).
+//! Link arguments for the optional `sherpa-stt` worker (issue #92 S3b) and the
+//! `sherpa-tts` sidecar (#220 S2b).
 //!
 //! `speech-stt-worker` links the sherpa-onnx engine libraries as shared
 //! libraries, so the OS loader resolves them before `main`. The worker then
@@ -20,11 +21,18 @@
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SHERPA_STT");
-    let sherpa = std::env::var_os("CARGO_FEATURE_SHERPA_STT").is_some();
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SHERPA_TTS");
     let linux = std::env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "linux");
-    if sherpa && linux {
-        println!(
-            "cargo:rustc-link-arg-bin=speech-stt-worker=-Wl,--disable-new-dtags,-rpath,$ORIGIN"
-        );
+    if linux {
+        // The same loader rule for the TTS sidecar (#220 S2b), which links the
+        // same engine libraries and pins them beside its own executable.
+        for (feature, bin) in [
+            ("CARGO_FEATURE_SHERPA_STT", "speech-stt-worker"),
+            ("CARGO_FEATURE_SHERPA_TTS", "local-tts-sidecar"),
+        ] {
+            if std::env::var_os(feature).is_some() {
+                println!("cargo:rustc-link-arg-bin={bin}=-Wl,--disable-new-dtags,-rpath,$ORIGIN");
+            }
+        }
     }
 }
