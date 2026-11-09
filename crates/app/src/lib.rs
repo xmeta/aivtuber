@@ -169,6 +169,11 @@ pub struct SpokenFinalReport {
     /// The envelope as built; the runtime admitted or refused exactly this.
     pub event: EventEnvelope,
     pub result: Result<ContentProcessOutcome, AppError>,
+    /// Runtime-timeline milliseconds from the end of the final's covered audio
+    /// to the start of routing. Diagnostics only; no decision reads it.
+    pub final_age_ms: u64,
+    /// Wall time spent in the content path for this final (diagnostics only).
+    pub route_micros: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1049,12 +1054,17 @@ where
             return Vec::new();
         };
         let finals = tracker.take_finals(conversation.config().max_finals_per_tick);
-        let events: Vec<EventEnvelope> = finals
+        let events: Vec<(EventEnvelope, u64)> = finals
             .iter()
-            .filter_map(|spoken| conversation.envelope_for(spoken))
+            .filter_map(|spoken| {
+                conversation
+                    .envelope_for(spoken)
+                    .map(|event| (event, spoken.observed_at_ms))
+            })
             .collect();
         let mut reports = Vec::with_capacity(events.len());
-        for (index, event) in events.into_iter().enumerate() {
+        for (index, (event, observed_at_ms)) in events.into_iter().enumerate() {
+            let route_started = Instant::now();
             let result = serde_json::to_vec(&event)
                 .map_err(|error| AppError::Routing(error.to_string()))
                 .and_then(|raw| {
@@ -1070,7 +1080,15 @@ where
                     Err(_) => metrics.route_errors += 1,
                 }
             }
-            reports.push(SpokenFinalReport { event, result });
+            reports.push(SpokenFinalReport {
+                event,
+                result,
+                final_age_ms: at_ms.saturating_sub(observed_at_ms),
+                route_micros: route_started
+                    .elapsed()
+                    .as_micros()
+                    .min(u128::from(u64::MAX)) as u64,
+            });
         }
         reports
     }

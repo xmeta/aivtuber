@@ -503,7 +503,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                     .map_or(0, |text| text.chars().count());
                 match &report.result {
                     Ok(outcome) => eprintln!(
-                        "speech_conversation: final chars={chars} admission={:?} playback={}",
+                        "speech_conversation: final chars={chars} final_age_ms={} route_micros={} admission={:?} playback={}",
+                        report.final_age_ms,
+                        report.route_micros,
                         outcome.admission,
                         outcome
                             .playback
