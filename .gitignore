@@ -13,3 +13,8 @@ node_modules/
 *.vrm
 /renderer/local-avatar/smoke/.cache/
 /renderer/local-avatar/smoke/out/
+
+# Local TTS sidecar output (issue #220 S2b): generated audio and amplitude viseme
+# tracks under the example pack when it is used as the audio/pack root.
+/examples/starter-reaction-pack/audio/generated/
+/examples/starter-reaction-pack/viseme/generated/
