@@ -112,16 +112,22 @@ fn main() -> ExitCode {
         );
         return ExitCode::from(2);
     };
-    // The loader has already mapped the engine libraries by now, so this
-    // catches a wrong or corrupt library before it is used; the sidecar
-    // checks them before it spawns this process, which is the check that can
-    // still prevent a load.
+    // The engine libraries are loaded from this executable's own directory
+    // (rpath $ORIGIN on Linux, the application directory on Windows; see
+    // build.rs), so this is the very set of files the loader used. The loader
+    // has already run their initializers, so this catches a wrong or corrupt
+    // library before it is *used*; the sidecar checks the same directory
+    // before it spawns this process, which is the check that can still
+    // prevent a load.
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("."));
     if let Err(error) = verify_engine_libs(&exe_dir) {
-        eprintln!("speech-stt-worker: engine libraries: {error}");
+        eprintln!(
+            "speech-stt-worker: engine libraries beside the executable ({}): {error}",
+            exe_dir.display()
+        );
         return ExitCode::from(2);
     }
     if let Err(error) = verify_model_dir(&pin, &args.model_dir) {

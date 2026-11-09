@@ -208,17 +208,54 @@ jobs:
         env:
           SHERPA_ONNX_ARCHIVE_DIR: ${{ runner.temp }}/sherpa-onnx
 
-      # No weights here: an empty model directory must be refused (exit 2)
-      # before anything is loaded, which also exercises the engine library pins.
-      - name: Worker refuses an unpinned model directory
+      # The engine libraries are loaded from the worker's own directory (rpath
+      # $ORIGIN, DT_RPATH so LD_LIBRARY_PATH cannot override it; crates/adapters/
+      # build.rs), and the worker verifies the SHA-256 of exactly those files.
+      # Place the libraries from the verified archive beside the binary, then
+      # show the refusals. No weights here and no model is ever run.
+      - name: Worker refuses an unpinned model and tampered libraries
         shell: bash
         run: |
-          mkdir -p "$RUNNER_TEMP/no-model"
-          set +e
-          target/debug/speech-stt-worker --model k2v2-int8 --model-dir "$RUNNER_TEMP/no-model" --language ja < /dev/null
-          status=$?
-          set -e
+          set -u
+          work="$RUNNER_TEMP/worker-check"
+          mkdir -p "$work/x" "$work/good"
+          tar -xjf "$RUNNER_TEMP"/sherpa-onnx/*.tar.bz2 -C "$work/x"
+          cp "$work"/x/*/lib/libsherpa-onnx-c-api.so "$work"/x/*/lib/libonnxruntime.so "$work/good/"
+          cp target/debug/speech-stt-worker "$work/good/"
+          mkdir -p "$work/no-model"
+          run() { "$@" < /dev/null 2>"$work/stderr" ; echo $?; }
+
+          # (a) genuine libraries beside the binary, empty model directory:
+          # the library check passes and the model check refuses (exit 2).
+          status=$(run "$work/good/speech-stt-worker" --model k2v2-int8 --model-dir "$work/no-model" --language ja)
+          cat "$work/stderr"
           test "$status" -eq 2
+          grep -q "model files" "$work/stderr"
+
+          # (b) a library beside the binary is tampered with (one byte
+          # appended): the loader still loads it, the worker refuses (exit 2).
+          mkdir -p "$work/tampered"
+          cp "$work"/good/* "$work/tampered/"
+          printf '\0' >> "$work/tampered/libonnxruntime.so"
+          status=$(run "$work/tampered/speech-stt-worker" --model k2v2-int8 --model-dir "$work/no-model" --language ja)
+          cat "$work/stderr"
+          test "$status" -eq 2
+          grep -q "engine libraries beside the executable" "$work/stderr"
+
+          # (c) LD_LIBRARY_PATH cannot substitute the libraries: the tampered
+          # set on the library path is ignored and the genuine ones beside the
+          # binary load, so the run reaches the model check, not the library one.
+          status=$(LD_LIBRARY_PATH="$work/tampered" run "$work/good/speech-stt-worker" --model k2v2-int8 --model-dir "$work/no-model" --language ja)
+          test "$status" -eq 2
+          grep -q "model files" "$work/stderr"
+
+          # (d) a missing library cannot be shown as a worker refusal: the
+          # loader refuses first, before main (non-zero, not our exit 2).
+          mkdir -p "$work/missing"
+          cp "$work/good/speech-stt-worker" "$work/good/libsherpa-onnx-c-api.so" "$work/missing/"
+          status=$(run "$work/missing/speech-stt-worker" --model k2v2-int8 --model-dir "$work/no-model" --language ja)
+          cat "$work/stderr"
+          test "$status" -ne 0 && test "$status" -ne 2
 
   regressions:
     name: Bounded property regressions

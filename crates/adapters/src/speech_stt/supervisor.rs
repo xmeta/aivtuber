@@ -160,21 +160,41 @@ impl SttWorker {
             out.send(encode_stt_status_line(SttStatus::Unavailable { reason }));
             Err(message)
         };
+        // The libraries are loaded from the directory of the executable that
+        // runs (rpath $ORIGIN on Linux, the application directory first on
+        // Windows), never from PATH or LD_LIBRARY_PATH. So the verified
+        // directory and the executed file must be one and the same: resolve the
+        // program once (no PATH search, symlinks followed), verify beside that
+        // file, and spawn that exact path.
+        let mut program = config.program.clone();
         if config.verify_engine_libs {
-            let dir = config
-                .program
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .map(std::path::Path::to_path_buf)
-                .unwrap_or_else(|| PathBuf::from("."));
-            if let Err(error) = verify_engine_libs(&dir) {
+            let resolved = std::fs::canonicalize(&config.program).map_err(|error| {
+                format!(
+                    "stt worker {} (give a path, not a name looked up on PATH): {error}",
+                    config.program.display()
+                )
+            });
+            let resolved = match resolved {
+                Ok(resolved) => resolved,
+                Err(message) => {
+                    return announce(SttUnavailableReason::WorkerFailedToStart, message);
+                }
+            };
+            let Some(dir) = resolved.parent() else {
+                return announce(
+                    SttUnavailableReason::WorkerFailedToStart,
+                    "stt worker has no parent directory".to_owned(),
+                );
+            };
+            if let Err(error) = verify_engine_libs(dir) {
                 return announce(
                     SttUnavailableReason::WorkerFailedToStart,
                     format!("stt engine libraries: {error}"),
                 );
             }
+            program = resolved;
         }
-        let mut command = Command::new(&config.program);
+        let mut command = Command::new(&program);
         command
             .args(&config.args)
             .stdin(Stdio::piped())
