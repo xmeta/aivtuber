@@ -1,0 +1,504 @@
+= EXP-0003: Japanese text-to-speech engine bench (#220 S2a)
+
+:toc:
+:toclevels: 2
+
+This is a durable experiment record in the link:README.adoc[Durable Experiment Records] format.
+It is the evaluation slice S2a of #220: it chooses a local Japanese text-to-speech (TTS) engine by measurement before any implementation (S2b).
+It contains measurement and throwaway scripts only: no production code, no new dependency in the repository, no model, binary or audio committed.
+It follows link:EXP-0002-japanese-stt-bench.adoc[EXP-0002] (the STT engine reused here for a round-trip proxy) and link:../adr/0004-speech-lifecycle-and-text-projection.adoc[ADR-0004] (display-to-speech text projection, whose assumption A-SPEECH-002 this bench partly tests).
+
+== 1. Record
+
+[source,text]
+----
+Decision question:
+  Which local, permissively licensed Japanese TTS engine, and which integration path from Rust without
+  build-time network downloads, should #220 S2b implement behind the existing normalized HTTP TTS contract
+  so that the +local+ profile (loopback endpoints only) has a zero-paid-dependency voice?
+
+Context / baseline:
+  The generative pipeline requires a TTS endpoint (+AIVTUBER_TTS_ENDPOINT+, normalized contract: request
+  {text, style, voice_model, viseme_mapping}, response {audio_ref, duration_ms, viseme_ref?}; audio is returned by
+  reference, +audio://+ below +AIVTUBER_AUDIO_ROOT+). S1 of #220 (merged) used a stub TTS. docs/reuse-first.adoc
+  names sherpa-onnx for local speech ("wrap or sidecar; framework license does not imply voice/model license").
+  No SLO exists for TTS latency; the comparison is between candidates and against real time.
+
+Hypothesis / expected outcome (exploratory, no numeric threshold pre-registered):
+  A sherpa-onnx TTS model gives a real-time factor well below 1 on CPU with intelligible Japanese; the
+  Kokoro and VOICEVOX families are more mature for Japanese but cost more to integrate (G2P dependencies,
+  or a separate engine with per-character terms). Expected going in: sherpa-onnx's Kokoro export speaks Japanese.
+  (It does not in 2.0.1: section 5.4.)
+
+Guardrails:
+  Code, weights and voice terms must be read separately; no build-time network download in the integration path;
+  no GPL/AGPL component in a linked or distributed path; deterministic output for replay or an explicit statement
+  that it is not deterministic; synthesis must never sit in the scheduler/frame loop; provider output is data.
+
+Decision-changing evidence:
+  Latency and RTF for ~50 short replies, load time and RSS, determinism, text handling, a round-trip
+  intelligibility proxy through the merged STT, a license table (code / weights / voice terms), Rust integration
+  cost with cargo deny.
+
+Cheapest informative test:
+  CPU runs of each reachable candidate on one fixed text set, one fresh process per run, a license read, and a
+  throwaway Rust build of the leading path compared bit-for-bit with the Python run.
+
+Dataset/workload:
+  50 VTuber-style replies written for this bench (12-43 characters, mean 26; section 4.1) and a 38-item text-handling set.
+
+Commit/base/head:
+  Branch docs/220-s2a-japanese-tts-bench from origin/main 8492d72f (docs and scripts only).
+  Scripts: examples/benchmarks/tts/.
+
+Profile/config fingerprint:
+  CPU only, 4 threads (sherpa-onnx +num_threads+, onnxruntime intra-op threads, VOICEVOX +--cpu_num_threads+).
+  Supertonic 3: language +ja+ passed explicitly, +seed+ 1234, voice +sid+ 0, +num_steps+ 5, default speed.
+  Kokoro: voice +jf_alpha+. VOICEVOX: speaker 3 (ずんだもん, ノーマル), engine defaults.
+
+Seed:
+  1234 for Supertonic (generation noise); the bootstrap seed is 20261110. The text set is fixed, not sampled.
+
+Asset/index/compiler version:
+  Not applicable (no repository assets, replay index or compiler involved).
+
+Provider/model versions:
+  Section 3.
+
+Toolchain:
+  Python 3.13.12, numpy 2.5.4, scipy 1.18.1, soundfile 0.14.0, psutil 7.2.2, RapidFuzz 3.14.6,
+  sherpa-onnx 2.0.1 (Python wheel), kokoro-onnx 0.6.1, onnxruntime 1.31.1, misaki 0.7.4, pyopenjtalk-plus 0.4.1.post10
+  (isolated virtual environments outside the repo); Rust 1.99.1 (the +sherpa-onnx+ crate 2.0.1 probe), cargo-deny 0.20.2.
+
+Other relevant environment:
+  AMD Ryzen 7 3700X class desktop CPU (Zen 2, 8 cores / 16 threads), Windows 11 Pro, a discrete GPU present but unused.
+  Run date 2026-11-10. One machine, one run per configuration (two fresh-process runs where determinism is reported).
+
+Exploratory unknowns:
+  Everything in sections 5-8. No confirmatory criterion was fixed before the results were read.
+
+Confirmatory success/guardrail criteria:
+  None (the question is a selection among candidates).
+  Criterion version / recorded-at: not applicable.
+
+Actual:
+  Sections 2 and 5-8.
+
+Evidence artifacts:
+  Scripts are committed. Per-run outputs (wavs, per-item JSON, transcripts) are local only and not committed;
+  the tables in this record are the retained evidence.
+
+Noise / uncertainty / missing evidence:
+  Section 10. In short: no naturalness or listening test, STT errors count against the TTS, 50 short replies and
+  one annotator, one machine, GPU not measured, several candidates not run.
+
+Expected-vs-actual difference:
+  The sherpa-onnx Kokoro export cannot speak Japanese (no Japanese lexicon; 97.8% CER). The sherpa-onnx
+  Supertonic 3 model can, at RTF 0.24 and 364 MB, and it was the fastest and smallest engine measured.
+  VOICEVOX had the lowest reading error but is a 2.2 GB proprietary-terms download with per-character rules.
+
+Likely explanation:
+  sherpa-onnx 2.0 removed espeak-ng ("language is determined by the lexicon"), and the shipped Kokoro lexicons
+  are English and Chinese only; Supertonic feeds Unicode characters to the model with an explicit language id.
+  Both statements are mechanical (read from the library and the run), the quality ordering is a proxy (section 10).
+
+Decision:
+  Narrow.
+  Carry sherpa-onnx + Supertonic 3 int8 (via the +sherpa-onnx+ crate in a supervised loopback sidecar) into the S2b
+  design as the default local Japanese TTS, with VOICEVOX as an optional second backend behind the same
+  contract; reject sherpa-onnx Kokoro, Kokoro through kokoro-onnx, Style-Bert-VITS2, the Piper ja voice
+  and fish-speech; leave Irodori-TTS, MeloTTS-JP, Qwen3-TTS and others unmeasured. Conditional on the
+  OpenRAIL-M question (section 12, Q1) and the supervisor choices Q2-Q6. This is a recommendation, not a decision.
+
+Follow-up / owning issue:
+  #220 S2b (implementation). Open questions: section 12.
+
+Revisit condition:
+  A listening test or MOS-style comparison, a clarified Supertonic license position, a Japanese-capable
+  sherpa-onnx Kokoro/Matcha model, a GPU target for the avatar machine that frees headroom for a larger model,
+  or the supervisor choosing a character voice (VOICEVOX terms are per character).
+----
+
+== 2. Result summary
+
+All numbers are measured here unless marked as read from a source.
+Latency is the wall time of one synthesis call on CPU (4 threads) over 50 replies, after one first call and three warm-ups.
+No engine delivered audio before the end of the call, so time to first audio equals the call time (section 6.2).
+The round trip is an intelligibility proxy, not naturalness (section 10).
+
+* *Fastest and smallest: sherpa-onnx Supertonic 3 int8.* p50 0.89 s, p95 1.68 s per reply (mean audio 4.18 s, RTF 0.235), load 1.1 s, first call 0.78 s, peak RSS 364 MB (Python process included). Seeded runs were identical in 50 of 50 replies within a process and across two fresh processes.
+* *Lowest reading error: VOICEVOX 0.26.1 (separate CPU engine, ずんだもん).* p50 1.35 s, p95 2.52 s (RTF 0.356), load 3.1 s, peak 714 MB; reading CER 2.3% (95% interval 1.1-4.0) against 4.0% (2.2-6.3) for Supertonic: the intervals overlap. It misread 2 of 32 scored handling items against 6 of 32 for Supertonic. Identical in 50 of 50 replies, in-process and across processes.
+* *Kokoro-82M (kokoro-onnx + misaki ja phonemes, voice jf_alpha)* is usable only with the Open JTalk G2P stack: fp32 p50 1.35 s (RTF 0.43), 751 MB, reading CER 4.1% (2.1-6.8), but 11 of 32 handling misreadings (all 8 English-word items), *not repeatable* (0 of 50 identical, even in-process; lengths differ), and the int8 export took p50 13.6 s (RTF 4.3) on this CPU. The G2P wheels needed a workaround on Windows (section 11) and kokoro-onnx pulls GPL-3.0 espeak-ng components (section 3.2).
+* *sherpa-onnx's own Kokoro export cannot read Japanese:* every reply came out as garbage (CER 97.8%), characters were skipped as out-of-vocabulary. Rejected.
+* *Language must be passed explicitly to sherpa-onnx Supertonic:* the default language is +en+; leaving it unset raised text CER from 8.2% to 14.7% and reading CER from 4.0% to 7.9% (50 replies, intervals overlapping, direction consistent). *Seed must be passed too:* unseeded generation was not repeatable (0 of 50 identical in-process and across processes).
+* *Text handling (32 scored items, section 6.4):* misreadings by the proxy: VOICEVOX 2, Supertonic 6, Kokoro 11. Supertonic's errors were English brand words (+YouTube+, +Twitter+/+X+, +VTuber+) and one kanji word (海老); the others read ordinary numbers and kanji. URLs were spoken as garbled letters by every engine and emoji were silently dropped: ADR-0004 D-5 (drop them before TTS) is therefore required, not optional.
+* *Rust:* the +sherpa-onnx+ 2.0.1 crate drives Supertonic through +OfflineTts::generate_with_config+ (with an +extra+ map for +lang+ and +seed+). A scratch binary built offline in 56 s from the pinned library archive produced *float32 output bit-identical to the Python run in 50 of 50 replies*, load 0.93 s warm, p50 0.90 s. No new crate: the repository's existing +cargo deny --locked --features sherpa-stt check+ passes (advisories, bans, licenses, sources ok).
+* *Licenses (section 3.2):* sherpa-onnx code Apache-2.0; Supertonic weights *OpenRAIL-M* (use-based restrictions including "publish AI-generated content without clearly disclosing it is machine-generated", with flow-down duties) and an MIT sample code license; VOICEVOX engine LGPL-3.0 (dual) with a mandatory *credit line* and *per-character terms* (some characters are non-commercial or need individual contact); Kokoro weights Apache-2.0 but four of five Japanese voices are CC BY and the card says some training audio was synthetic from closed TTS services; Style-Bert-VITS2 code *AGPL-3.0*; the Piper Japanese voice is *CC BY-NC-SA*.
+* *Recommendation:* section 8.
+
+== 3. Setup, pinned versions and license table
+
+=== 3.1 Candidates and pinned artifacts
+
+[cols="2,4,3",options="header"]
+|===
+|Item |Pinned identity |Used for
+
+|sherpa-onnx 2.0.1 (k2-fsa)
+|Python wheel +sherpa-onnx==2.0.1+ (measurements); GitHub release v2.0.1 shared-library archive, SHA-256 +afa4de3c...+ (Rust probe, the pin already used for STT); crate +sherpa-onnx+ 2.0.1 (integration probe)
+|Runtime for the sherpa-onnx rows
+
+|Supertonic 3 int8, sherpa-onnx export
+|sherpa-onnx +tts-models+ release asset +sherpa-onnx-supertonic-3-tts-int8-2026-05-11.tar.bz2+ SHA-256 +82fa96f9...+ (128 MB); upstream HF +Supertone/supertonic-3+ revision +3cadd1ee6394adea1bd021217a0e650ede09a323+ (the export is a third-party conversion; its contents were not compared with the HF files). About 99 M parameters, 10 voice styles, 44.1 kHz, 31 languages including Japanese; the Japanese text goes in as Unicode characters with a language id.
+|Candidate 1
+
+|sherpa-onnx Kokoro multi-lang v1.0 (int8 and fp32)
+|+kokoro-int8-multi-lang-v1_0.tar.bz2+ SHA-256 +72c34723...+, +kokoro-multi-lang-v1_0.tar.bz2+ SHA-256 +60703707...+. Lexicons: English (US/GB) and Chinese only.
+|Candidate 2a (does not speak Japanese)
+
+|Kokoro-82M v1.0 through kokoro-onnx 0.6.1
+|ONNX exports from the kokoro-onnx release +model-files-v1.1+: +kokoro-v1.0.onnx+ SHA-256 +beb0d184...+ (325 MB), +kokoro-v1.0.int8.onnx+ +ae315a79...+ (114 MB), +voices-v1.0.bin+ +bca610b8...+; upstream HF +hexgrad/Kokoro-82M+ revision +f3ff3571791e39611d31c381e3a41a3af07b4987+. Japanese phonemes from misaki 0.7.4 (+ja+, pyopenjtalk-plus 0.4.1.post10, fugashi 1.5.2 with unidic-lite 1.0.8) fed as phonemes; the kokoro-onnx tokenizer (espeak-ng) is bypassed.
+|Candidate 2b
+
+|VOICEVOX engine 0.26.1 (Windows CPU build)
+|GitHub release asset +voicevox_engine-windows-cpu-0.26.1.7z.001+ SHA-256 +2143ab79...+ (1.9 GB, 2.2 GB extracted). Run as a separate process on 127.0.0.1 and driven over HTTP (+/audio_query+, +/synthesis+); nothing is linked. Bundles VOICEVOX CORE, ONNX Runtime 1.23.2, Open JTalk 1.11 and 27 voice-model files (44 characters/speakers in +/speakers+).
+|Candidate 3
+
+|ReazonSpeech k2-v2 int8 (STT for the round trip)
+|HF +reazon-research/reazonspeech-k2-v2+ revision +291488c8...+, files as in EXP-0002 (Apache-2.0 model card; ReazonSpeech corpus caveat of EXP-0002 3.2 applies to this measuring instrument, not to anything shipped by this record)
+|Round-trip proxy
+|===
+
+Full hashes are in +examples/benchmarks/tts/fetch_assets.py+. *Read but not run:* Style-Bert-VITS2, AivisSpeech Engine, Piper ja voice, MeloTTS-JP, Irodori-TTS, Qwen3-TTS, Chatterbox, GPT-SoVITS, fish-speech (section 3.2, reasons in section 8).
+
+=== 3.2 License table (code / weights / voice terms)
+
+Read on 2026-11-10 from the source named in the last column unless marked *not verified*.
+"Voice terms" are the terms attached to the speaker or character, separate from the code and from the weights.
+
+[cols="2,2,3,3,3",options="header"]
+|===
+|Item |Code |Weights |Voice / character / usage terms |Read from
+
+|sherpa-onnx
+|Apache-2.0. In 2.0.x espeak-ng is no longer used (message in the library: "ignored in sherpa-onnx >= v2.0.0. espeak-ng is no longer used"), so the pinned shared library should carry no GPL espeak-ng code. Evidence is thin: a string search of the Python wheel's +sherpa-onnx-c-api.dll+ found only that message, the option names +has_espeak+ / +use_espeak+ and the unrelated +wespeaker+; the build recipe was not read.
+|Not applicable (framework). Does not cover any model.
+|Not applicable.
+|GitHub SPDX; library strings; crate metadata (Apache-2.0)
+
+|*Supertonic 3* (Supertone Inc.)
+|Sample code: MIT (the +LICENSE+ in the sherpa-onnx archive is the MIT text and says nothing about the model).
+|*OpenRAIL-M* (HF card and +LICENSE+ of +Supertone/supertonic-3+). Grants a perpetual, royalty-free, irrevocable copyright and patent license (patent license ends if you sue over the model); distribution of the model *and derivatives* requires including the license and passing the use-based restrictions on to downstream users as enforceable terms; modified files must carry notices; the licensor may restrict use in violation and expects the latest version to be used. *Use-based restrictions (Attachment A):* no violating law, no harming minors, no disinformation, no PII disclosure that harms, *no publishing AI-generated content without clearly disclosing that it is machine-generated*, no defaming or harassing, no impersonation or deepfakes without consent, no fully automated decisions that affect legal rights, no discrimination, no exploiting vulnerable groups, no medical advice, no law-enforcement/justice/immigration uses. Outputs: licensors claim no rights, the user is accountable. Not OSI-approved, not in +deny.toml+ (crates only), not one of the licenses EXP-0002 reviewed.
+|Ten preset voice styles (sid 0-9; the README names M1-M5 and F1-F5, the sid-to-name mapping was not verified); no voice-actor or character terms were found. The "Voice Builder" product is separate and was not used. *Training data: not read* (the card does not describe it). The disclosure restriction applies to a VTuber stream: a visible statement that the voice is synthetic is needed. *Not verified:* whether the sherpa-onnx archive, which ships the MIT text only, passes the OpenRAIL-M terms on; the HF card is the authority.
+|HF +LICENSE+ and card (via the page fetch); archive +LICENSE+ and README
+
+|*VOICEVOX engine* 0.26.1
+|*LGPL-3.0* and, per the engine README, a separate license for use without source disclosure (dual). Bundled: VOICEVOX CORE MIT, ONNX Runtime 1.23.2 MIT, Open JTalk 1.11 modified BSD, pyopenjtalk MIT, HTS voice "Mei" CC BY 3.0, soxr / libsndfile / mpg123 / lame LGPL (from the engine's own +dependency_licenses.json+, 52 entries). Run as a separate process, so the LGPL does not reach aivtuber code; the engine's own redistribution is subject to its terms.
+|The voice models (+.vvm+, 27 files) are *not* under an open license: they come with the *VOICEVOX software terms and the per-character terms* below. No separate weights license text was found.
+|*Engine terms (+terms_of_service.md+ in the engine):* commercial and non-commercial use allowed; embedding and redistribution in an application allowed; generated audio must follow each voice library's terms; whoever grants others use of the audio must pass these terms on; *a credit line showing that VOICEVOX was used is required*; prohibited: reverse engineering and publishing the method, harming the author or third parties, offending public order. *Per character (+policy.md+, all 44 read):* every character requires a credit such as "VOICEVOX:ずんだもん". Commercial and non-commercial use is allowed for most (including ずんだもん, 四国めたん, 春日部つむぎ), but *ぞん子 needs individual contact for commercial use; No.7 and ユーレイちゃん are non-commercial (doujin and streaming income are allowed) with prior confirmation for other commercial use; Voidoll needs individual contact for corporate use; 後鬼, 青山龍星 and もち子 need prior confirmation when a company is involved (もち子 also excludes audio works, audio materials and games).* Each character also links its own full terms page (not read here beyond the summary text).
+|Engine +terms_of_service.md+, +dependency_licenses.json+, +resources/character_info/*/policy.md+ in the 0.26.1 archive; engine and CORE READMEs
+
+|Kokoro-82M (hexgrad)
+|Model code: Apache-2.0 (card). *kokoro-onnx* 0.6.1: MIT per its GitHub SPDX (the installed package metadata has no license field), but it depends on +espeakng-loader+ (no license field in its metadata; it bundles espeak-ng, GPL-3.0-or-later upstream, not re-read here) and *+phonemizer+ 3.6.0 (package metadata: GPLv3+)*. *misaki* 0.7.4: Apache-2.0 (package metadata). Japanese G2P chain, from package metadata: pyopenjtalk-plus 0.4.1.post10 MIT (a fork; upstream +pyopenjtalk+ has an empty SPDX field on GitHub and no Windows wheel; Open JTalk is modified BSD per the VOICEVOX dependency list), fugashi 1.5.2 MIT AND BSD-3-Clause, unidic-lite 1.0.8 MIT (the dictionary data's own terms were not read), jaconv 0.5.0 MIT, mojimoji (not installed; section 11). Several have no Windows wheel (section 11).
+|Apache-2.0 (card): "trained exclusively on permissive/non-copyrighted audio data" plus *synthetic audio from closed TTS models by large providers* (card wording); two CC BY corpora were added in v0.19 (Koniwa tnc, SIWIS).
+|*Japanese voices (VOICES.md):* jf_alpha (grade C+, no source listed), and jf_gongitsune, jf_nezumi, jf_tebukuro, jm_kumo (grades C and C-, *CC BY*, from Koniwa readings): *attribution is required for those four*. The cards put the Japanese data total at 1-10 hours.
+|HF card and +VOICES.md+; PyPI metadata; GitHub SPDX
+
+|Style-Bert-VITS2 (litagin02)
+|*AGPL-3.0* (README; the +text/user_dict+ module is LGPL-3.0 from VOICEVOX).
+|Base models from Bert-VITS2 2.1 / JP-Extra; no separate license stated on the page. The JVNV models (+litagin/style_bert_vits2_jvnv+): *CC BY-SA 4.0*, inherited from the JVNV corpus.
+|Default-model terms of use are in +docs/TERMS_OF_USE.md+ (*not read*); the README forbids political use.
+|GitHub README; HF card
+|===
+
+[cols="2,3,3,3",options="header"]
+|===
+|Other candidates (not run) |Code |Weights |Notes
+
+|AivisSpeech Engine (Aivis Project)
+|LGPL-3.0 (only that half of the VOICEVOX dual license)
+|Per model, +.aivmx+ files each carry their own terms (examples named: ACML, ACML-NC, CC0)
+|VOICEVOX-compatible HTTP API at 127.0.0.1:10101 with documented differences; credit "requested, not required" for the software; needs about 1.5 GB RAM. Same sidecar shape as VOICEVOX with a different (per-model) voice license; not run.
+
+|Piper ja_JP hi_fi_captain (rhasspy)
+|piper (MIT, archived 2025-08); the maintained fork is GPL-3.0
+|MIT label on the repository, but the *model card says CC BY-NC-SA 4.0* (NICT hi-fi-captain corpus)
+|Non-commercial: rejected.
+
+|MeloTTS-Japanese (myshell-ai)
+|MIT
+|MIT (card); training data not stated
+|Not run. Last commit 2024-12; needs a torch stack plus a Japanese tokenizer/G2P chain.
+
+|Irodori-TTS v4.1-Small (Aratako)
+|MIT
+|MIT (card), 0.8 B parameters, Japanese only; codec Semantic-DACVAE-Japanese-32dim MIT (derived from facebook/dacvae-watermarked, whose license was not read); text encoder sbintuitions/modernbert-ja-310m (not read). Card adds ethical restrictions (no impersonation, no deception). Training data not described.
+|Active (last push 2026-11-09). PyTorch, no CPU benchmark published, quantized and few-step (MeanFlow) variants exist. Watermarks output (SilentCipher) when available. *Not run.*
+
+|Qwen3-TTS 12Hz 0.6B/1.7B (Qwen)
+|Apache-2.0
+|Apache-2.0 (cards); Japanese among the listed languages
+|Not run (GPU-class torch model).
+
+|Chatterbox multilingual (Resemble AI)
+|MIT
+|MIT (card)
+|Not run (torch, 0.5 B class, watermarking).
+
+|GPT-SoVITS
+|MIT
+|Depends on the checkpoint and on the reference voice
+|Not run (voice cloning; training data and reference audio provenance would be ours).
+
+|fish-speech / OpenAudio-S1-mini
+|see repository (NOASSERTION)
+|CC BY-NC-SA 4.0 (card)
+|Non-commercial: rejected.
+|===
+
+Findings that need a decision from the project owner:
+
+* *OpenRAIL-M for Supertonic 3* (new to the project): permissive for commercial use but with enforceable use restrictions that must be passed downstream, including a duty to disclose that the voice is machine-generated. Q1.
+* *VOICEVOX:* mandatory credit line and per-character terms; the character must be chosen with the license in view and the persona's relation to that character (a VTuber with her own identity speaking with a third-party mascot's voice) is a product question. Q4.
+* *GPL in the Kokoro path:* the Python tool chain around Kokoro (espeak-ng, phonemizer) is GPL; sherpa-onnx 2.0.1 is not affected. Another reason not to recommend the kokoro-onnx route.
+* *Kokoro's data:* synthetic audio from closed TTS providers is part of its training set per its own card; the terms of those providers' outputs are not stated.
+* *Attribution:* four of the five Kokoro Japanese voices are CC BY; VOICEVOX needs the credit line; the Open JTalk/HTS stack inside VOICEVOX carries a CC BY 3.0 voice ("Mei").
+
+== 4. Workload and method
+
+=== 4.1 Texts
+
+* *Replies:* 50 short VTuber-style Japanese replies (greetings, reactions, thanks, small talk), 12-43 characters (mean 26), written for this bench. The planned range was 5-60 characters; the shortest and longest items are inside it but the bench does not cover the ends (section 11).
+* *Text-handling set:* 38 items: 10 numbers, dates and counters, 8 English words and brands, 14 kanji-reading traps, 2 URLs, 1 symbol string, 3 emoji/kaomoji items. The 32 items of the first three groups have a hand-written expected reading in hiragana (one annotator, not independently reviewed). URL, symbol and emoji items have none: ADR-0004 D-5 drops them before TTS, so the bench only records what a raw engine does.
+
+=== 4.2 What is timed
+
+* *Call time:* wall time of one synthesis call (Python +perf_counter+). For VOICEVOX it is the two HTTP calls (+/audio_query+ then +/synthesis+) over loopback including WAV decoding in the harness. For kokoro-onnx it includes the Open JTalk G2P. *Time to first audio* is the call time: sherpa-onnx's callback fired once per generated chunk and Japanese text of at most 120 characters is a single chunk, so the first callback arrived at the end of the call (median 0.882 s against 0.893 s). Nothing streamed.
+* *RTF* is the sum of call times over the sum of audio durations (below 1 means faster than real time).
+* *Load time:* constructing the engine (for VOICEVOX: spawn until +/version+ answers). *Peak RSS* is the peak resident set of the harness process and its children sampled every 25 ms (Python, numpy and onnxruntime are part of the figure for in-process engines; for VOICEVOX it is the engine process tree). *First call* is the first synthesis after load; three more warm-ups are not recorded.
+* *Determinism:* sha256 of the audio as 16-bit PCM for the same text (a) a second pass in the same process, (b) a fresh process (run1 against run2).
+
+=== 4.3 Round-trip intelligibility proxy
+
+Each wav is resampled to 16 kHz, padded with 0.3 s of silence before and 0.5 s after, and transcribed by sherpa-onnx ReazonSpeech k2-v2 int8 (the engine merged in #272; greedy, 4 threads). Two CERs over the 50 replies, micro-averaged, with a 95% bootstrap interval over replies (2000 resamples, seed 20261110):
+
+. *Text CER:* hypothesis against the input text after the EXP-0002 normalisation (NFKC, lower-case, drop P/S/Z/C categories). It penalises harmless spelling choices (25 against 二十五, kanji against kana).
+. *Reading CER:* both sides converted to katakana readings with Open JTalk (pyopenjtalk g2p), then compared. It ignores spelling but both sides carry Open JTalk's own reading errors, and the STT cannot separate readings that share a spelling (一日 as ついたち or いちにち, 二十歳 as はたち or にじゅっさい).
+
+For the handling set, an item is a *misreading* when the reading CER of the hypothesis against the expected hiragana reading is above 0.25, or the call failed.
+*This measures what the STT recovers from the audio. It is a proxy for intelligibility, not for naturalness, prosody, accent or voice quality, and STT errors count against the TTS.*
+
+== 5. Results
+
+=== 5.1 Latency, cost, determinism and round trip (50 replies, CPU, 4 threads)
+
+[cols="4,1,1,1,1,1,1,1,1,2,2",options="header"]
+|===
+|Engine |p50 s |p95 s |RTF |Load s |First call s |Peak RSS MB |Identical in-process |Identical fresh process |Text CER % (95% CI) |Reading CER % (95% CI)
+
+|sherpa-onnx Supertonic 3 int8, +lang=ja+, seed 1234
+|0.89 |1.68 |0.235 |1.1 |0.78 |364 |50/50 |50/50 |8.2 (5.8-11.1) |4.0 (2.2-6.3)
+
+|sherpa-onnx Supertonic 3 int8, language left at default (+en+), seed 1234
+|0.80 |1.47 |0.248 |1.0 |0.67 |361 |50/50 |not run |14.7 (10.3-19.5) |7.9 (4.2-12.0)
+
+|sherpa-onnx Supertonic 3 int8, +lang=ja+, no seed
+|0.88 |1.70 |0.235 |0.9 |0.79 |364 |0/50 |0/50 |10.4 (7.0-14.1) |6.0 (2.9-10.0)
+
+|VOICEVOX 0.26.1 CPU, ずんだもん ノーマル (separate process)
+|1.35 |2.52 |0.356 |3.1 |2.99 |714 |50/50 |50/50 |12.0 (7.9-17.2) |2.3 (1.1-4.0)
+
+|kokoro-onnx fp32 + misaki ja, jf_alpha
+|1.35 |2.74 |0.431 |7.1 |1.25 |751 |0/50 |0/50 |11.2 (7.8-14.7) |4.1 (2.1-6.8)
+
+|kokoro-onnx int8 + misaki ja, jf_alpha
+|13.55 |26.81 |4.328 |2.5 |12.67 |613 |0/50 |0/50 |12.6 (8.5-17.7) |5.5 (2.4-9.9)
+
+|sherpa-onnx Kokoro multi-lang v1.0 int8 (Japanese text)
+|3.13 |7.29 |1.821 |8.2 |3.14 |472 |0/50 |not run |97.8 (96.7-98.8) |95.6 (94.4-96.6)
+|===
+
+Mean audio per reply: Supertonic 4.18 s, VOICEVOX 4.18 s (the means coincide; the per-reply durations differ), Kokoro 3.57 s, sherpa Kokoro 2.05 s (Japanese text skipped), Supertonic with the default language 3.65 s.
+"Not run" means the configuration was not repeated in a second fresh process.
+
+=== 5.2 Reading the table
+
+* *Latency.* Supertonic is the fastest (RTF 0.24, 0.9 s per reply), VOICEVOX and Kokoro fp32 are about 1.5 times slower (RTF 0.36 and 0.43). All three are comfortably faster than real time for 4-second replies on 4 CPU threads, but none streams, so the time to first sound is the whole synthesis: about 0.9 s (Supertonic), 1.3 s (VOICEVOX) after the text is final. S1 measured 0.51-0.63 s from event to the TTS request, so event-to-sound is roughly 1.5-2 s for these engines before playback starts; this is a sum of separately measured figures, not an end-to-end run.
+* *Cost.* Supertonic is the smallest (about 99 M parameters, 128 MB archive, 364 MB resident), VOICEVOX needs a 2.2 GB install and 714 MB resident (a second process).
+* *The int8 Kokoro export was 10 times slower than fp32* on this CPU (RTF 4.3). The cause was not investigated (this is the onnxruntime CPU provider with 4 intra-op threads); the figure is reported as measured, and it is why fp32 is the Kokoro row that matters.
+* *Intelligibility proxy.* The reading CER of Supertonic, Kokoro fp32 and VOICEVOX is 2-4% and their intervals overlap; VOICEVOX has the lowest point estimate. The text CER (8-13%) is dominated by spelling choices of the STT and does not order the engines. Supertonic's seeded and unseeded runs differ by 2.2 points of text CER (8.2 against 10.4) from generation noise alone, which is the size of the differences between engines: *the ordering among the three is not established*.
+
+=== 5.3 Supertonic needs explicit language and seed
+
+In sherpa-onnx 2.0.1 the Supertonic language comes from +GenerationConfig.extra["lang"]+ and defaults to +en+ (source read: +offline-tts-supertonic-impl.cc+); the seed comes from +extra["seed"]+ and defaults to -1, a fresh random seed (a replay-relevant default). Measured: with +lang+ unset the same Japanese text gave shorter audio (mean 3.65 s against 4.18 s) and the CER rose (14.7% against 8.2% text, 7.9% against 4.0% reading); unseeded runs were identical on 0 of 50 replies in a process and across processes. Seeded runs on the Python wheel and on the Rust crate were bit-identical (section 7).
+
+=== 5.4 sherpa-onnx Kokoro does not speak Japanese
+
+The shipped +kokoro-multi-lang-v1_0+ archive contains +lexicon-us-en.txt+, +lexicon-gb-en.txt+ and +lexicon-zh.txt+ plus +espeak-ng-data+, which sherpa-onnx 2.0.1 no longer uses. With +lang=ja+ the library logged "OOV character skipped" for kana, and the 50 replies came out as 0.7-2 s of unintelligible audio (CER 97.8%, 32 of 32 handling items misread). It is a library and data limitation, not a measurement artefact; a Japanese Kokoro through sherpa-onnx would need a Japanese lexicon or pre-phonemized input (the Rust and Python APIs accept +phoneme_codepoints+, not measured here).
+
+== 6. Text handling, determinism and what the engines do with non-speech text
+
+=== 6.1 Scored items (32; misreading by the proxy of section 4.3)
+
+[cols="3,1,1,1,1",options="header"]
+|===
+|Engine |Numbers (10) |English (8) |Kanji (14) |Total (32)
+|VOICEVOX |1 |1 |0 |2
+|sherpa-onnx Supertonic 3 (+ja+, seeded) |2 |3 |1 |6
+|sherpa-onnx Supertonic 3 (default language) |2 |2 |3 |7
+|sherpa-onnx Supertonic 3 (no seed) |2 |3 |1 |6
+|kokoro-onnx fp32 |2 |8 |1 |11
+|kokoro-onnx int8 |2 |8 |1 |11
+|sherpa-onnx Kokoro (Japanese text) |10 |8 |14 |32
+|===
+
+=== 6.2 Which items
+
+* *Both VOICEVOX and Supertonic:* "1日目" (ついたち-め expected) came back as 一日目 for both: the STT cannot tell the readings apart, so this item is a proxy blind spot, not evidence of a misreading by either engine.
+* *Supertonic (6, +ja+ seeded):* 18.5度 came back as 百八十五度 (expected じゅうはってんごど; Kokoro fp32 gave the same text, so the decimal point is probably spoken without "点" or lost: an item to listen to), 1日目 (see above), +YouTube+ (ゆりゆうび), +Twitter+ and +X+ (トイレル、アイクス), +VTuber+ (BTビル), and the kanji word 海老 (回廊: a real error of the model or of the STT). Ordinary kanji words, dates, counters, prices, years and 二十歳 passed.
+* *VOICEVOX (2):* 1日目 (see above) and "Thank you" (サンクユー, a rendering of the English phrase the proxy scores as a miss).
+* *Kokoro fp32 (11):* the same 18.5度 and 1日目, and all eight English items (+YouTube+, +OpenAI+, +Twitter/X+, +VTuber+, +BGM+, +Discord+, +Thank you+, +AI+) plus one kanji item (今日は昨日より明日 read あす).
+* ADR-0004 assumption A-SPEECH-002 ("a TTS backend's own Japanese frontend reads ordinary kanji correctly enough that the baseline projection need not rewrite ordinary text") is *supported for ordinary kanji by all three Japanese-capable engines* (kanji misreadings 0, 1, 1 of 14) and *not supported for English words and brands* (3, 1, 8 of 8): the lexicon of ADR-0004 stage 1 needs Latin entries, as D-5 already says ("unknown Latin words pass through ... counted"). The proxy is blind to homograph choices, so this is weaker evidence than a listening review.
+
+=== 6.3 Non-speech text (raw engine behaviour)
+
+* *URLs* were *spoken* by every engine and badly: Supertonic "STPSEXIB", VOICEVOX "happSEXUPELコムライブ" (6.1 s of audio for one sentence), Kokoro garbled; VOICEVOX needed 6.1 s and 7.7 s of audio for the two URL sentences against a 4.2 s mean for the replies. ADR-0004 D-5 (URLs are not spoken, dropped from +speech_text+) is *necessary*.
+* *Emoji and kaomoji* were *silently dropped* by every engine tested (no error, no crash; the hypothesis for 🎉🎉🎉 was just "やった"), so a non-deleting projection would not damage audio but the deletion should still be done by the project (an emoji could carry a different tone elsewhere).
+* *Symbols* (&, %, #, @): VOICEVOX read them as words ("えやんど", "パーセント", "アット"), Supertonic partly, Kokoro mostly dropped them.
+
+=== 6.4 Determinism
+
+Seeded Supertonic and VOICEVOX are bit-identical across 50 replies in a process and across two fresh processes (same machine, same thread count; the thread count was not varied for TTS, unlike EXP-0002's STT result, so replay should still pin it). Unseeded Supertonic and both Kokoro runs are not repeatable: for Kokoro fp32 two syntheses of the same sentence differ in length (64463 against 64224 samples) and in samples (maximum absolute difference 0.094 on a peak of 0.44). The cause was not isolated (random duration or excitation noise is the probable mechanism). For replay the project would record the produced +audio_ref+ and its content digest and not rely on re-synthesis, which is what the existing contract already does (the asset carries +audio_ref+); determinism only buys reproducible cache keys and regression tests.
+
+== 7. Integration cost from Rust, without build-time network downloads
+
+Measured and read on 2026-11-10 against this repository's +deny.toml+ and +Cargo.lock+.
+
+[cols="2,3,3,3",options="header"]
+|===
+|Path |Build and network behaviour |+cargo deny+ |Other cost
+
+|*Official crate +sherpa-onnx+ 2.0.1, TTS API* (+OfflineTts+, +GenerationConfig+ with +extra+, +generate_with_config+ with an optional +'static+ callback), the crate the +sherpa-stt+ feature already depends on
+|Same as STT: with +SHERPA_ONNX_ARCHIVE_DIR+ pointing at the SHA-256-pinned archive (+node scripts/fetch-sherpa-onnx.mjs lib <dir>+) a scratch binary using Supertonic *built in 56 s* (cold target, release) and ran; no network access at build time was needed beyond fetching crates. Output was *bit-identical float32 to the Python wheel in 50 of 50 replies* (same model, seed, voice, threads). Warm load 0.93 s (first run 6.6 s, cold file cache), p50 0.90 s, max 1.87 s per reply.
+|*Passes*: +cargo deny --locked --features sherpa-stt check+ on this branch: advisories, bans, licenses, sources ok. *No new crate path*: TTS is in the crate the STT feature already adds, and +serde_json+ is already in the lock file; the scoped +bzip2-1.0.6+ and +MIT-0+ exceptions already in +deny.toml+ are the only licence exceptions.
+|The model files and the engine libraries must be pinned like the STT ones (+crates/adapters/src/speech_stt/pins.rs+ pattern); the library archive and +onnxruntime.dll+ are shared with STT. Seed, language and speed travel in the +extra+ JSON object and are not type-checked by the crate.
+
+|*Loopback HTTP sidecar speaking the existing normalized TTS contract*, implemented as a Rust binary over the crate above (like +speech-stt-worker+)
+|Adds a small HTTP server (no new heavy framework needed for one route, but a server dependency may be; not measured). No build-time download.
+|Not measured; a hand-rolled blocking server over +std::net+ would add no crate.
+|Fits +AIVTUBER_MODE=local+ (loopback only) and the existing adapter unchanged. The adapter's response limit (1 MiB, decoded JSON) is not a problem because audio travels by reference. A supervisor pattern exists for STT.
+
+|*VOICEVOX engine as a separate process*, driven by a thin bridge
+|1.9 GB download pinned by SHA-256; no build step; port 50021 (configurable), loopback by default in its Docker example. Not linked, so the LGPL does not reach our code.
+|No crate.
+|The VOICEVOX API is two calls and returns WAV bytes, not the normalized contract: a bridge must translate (write the WAV under the audio root, return +audio_ref+ and +duration_ms+). The credit line and per-character terms must be surfaced to the operator.
+
+|kokoro-onnx / misaki (Python)
+|Python only; Windows needed a C-compiler-free workaround (section 11).
+|Not applicable (not Rust).
+|Rejected on integration cost and GPL transitives, not benchmarked further.
+|===
+
+*Not measured:* GPU builds of sherpa-onnx; Irodori-TTS, MeloTTS, Qwen3-TTS; any in-process (non-sidecar) use; concurrency (two simultaneous syntheses).
+
+== 8. Recommendation (reuse-first vocabulary)
+
+The recommendation is *conditional on Q1* (OpenRAIL-M) and on Q4 if VOICEVOX is offered.
+Nothing below is a decision; the supervisor owns it.
+
+[cols="3,2,5",options="header"]
+|===
+|Candidate |Mode |Why / revisit
+
+|*sherpa-onnx 2.0.1* (Apache-2.0) with *Supertonic 3 int8* (OpenRAIL-M)
+|*Wrap* (the official crate), inside a supervised loopback sidecar that speaks the existing normalized TTS contract; CPU
+|Fastest and smallest measured (RTF 0.24, 364 MB, load 1 s), deterministic when seeded, same runtime and library pin as the merged STT, reading accuracy in the same band as the best alternative (reading CER 4.0% against 2.3% for VOICEVOX, intervals overlap), no new crate and no new cargo-deny exception. Keep voice choice, projection, deadlines, content-addressed caching, bounds and the model pin project-owned. Revisit if the OpenRAIL-M terms are rejected (Q1), if a listening test finds the voice unacceptable (Q5), or if English brand words matter more than the projection lexicon can cover.
+
+|*VOICEVOX engine* 0.26.1 (LGPL-3.0; voice terms per character)
+|*Sidecar* (it already is a separate HTTP process) behind a bridge to the normalized contract; optional second backend, not the default
+|Lowest reading error and fewest handling misreads (2 of 32), a mature Japanese frontend, many character voices. But: a 2.2 GB install, 714 MB resident, 1.5 times slower than Supertonic, a mandatory credit line, per-character terms (some characters not usable commercially without contact), proprietary voice-model terms, and the persona question (Q4). Offer as an operator-selected option with the credit and terms recorded; do not make it the default.
+
+|*Supertonic 3* through the Python SDK or the HF ONNX files
+|*Reject* as an extra path
+|sherpa-onnx already runs the same model with one runtime pin.
+
+|*Kokoro-82M* via kokoro-onnx + misaki
+|*Reject*
+|Not repeatable, 11 of 32 handling misreadings (English), GPL-3.0 transitives (espeak-ng, phonemizer), a Python tool chain with C-extension wheels missing on Windows, four of five Japanese voices CC BY, synthetic-closed-TTS training data per its card, int8 export 10 times slower than fp32 here. Revisit only for a pure-Rust Open JTalk path and a license read of the G2P chain.
+
+|*sherpa-onnx Kokoro multi-lang v1.0*
+|*Reject (cannot speak Japanese in 2.0.1)*
+|97.8% CER. Revisit when a Japanese lexicon or phonemizer ships.
+
+|*Style-Bert-VITS2*
+|*Reject (license)*
+|Code AGPL-3.0: linking or embedding would copyleft aivtuber, and offering it as a service raises the network-use clause for any modified version; the model licenses are separate (JVNV models CC BY-SA 4.0, default terms not read). As a pure separate process it is not impossible, but it adds nothing over VOICEVOX or Supertonic for the measured cost.
+
+|*AivisSpeech Engine* (LGPL-3.0, per-model voice licenses)
+|*Benchmark first*; same sidecar shape as VOICEVOX; not run
+|VOICEVOX-compatible API, voice models with their own terms (ACML, ACML-NC, CC0 examples). Worth a follow-up only if a specific voice is wanted.
+
+|*Piper ja_JP hi_fi_captain*, *fish-speech / OpenAudio*
+|*Reject (non-commercial voice/weights)*
+|CC BY-NC-SA 4.0.
+
+|*Irodori-TTS*, *MeloTTS-JP*, *Qwen3-TTS*, *Chatterbox*, *GPT-SoVITS*
+|*Benchmark first / reference only*; not run
+|Permissive code (MIT, Apache-2.0) but PyTorch stacks of 0.5-1.7 B parameters with no published CPU figures; none is a first slice for a CPU-first local profile. Irodori-TTS (Japanese-only, MIT, active, a few-step MeanFlow and quantized variants) is the one worth a GPU-optional follow-up if naturalness (Q5) beats Supertonic.
+
+|*Own thin FFI* to the sherpa-onnx C API, *+sherpa-rs+*
+|*Not needed / reject*
+|The official crate already covers the TTS call; +sherpa-rs+ failed the license gate in EXP-0002.
+|===
+
+== 9. Proposed integration shape (for S2b; not decided here)
+
+. *Adapter unchanged.* The production +NormalizedHttpTtsAdapter+ stays the client. +AIVTUBER_TTS_ENDPOINT=http://127.0.0.1:<port>/...+ satisfies the +local+ profile's loopback-only rule and the adapter's "HTTPS or localhost HTTP" check; no TTS credential (the adapter's key is optional).
+. *Sidecar binary* (name tentative, +speech-tts-sidecar+) in +crates/adapters+, behind an off-by-default feature that reuses the +sherpa-stt+ pins and the supervised-child pattern of +speech-stt-worker+. One loaded model, a bounded request queue (reject with a typed non-200 when full, which the adapter already maps), one synthesis at a time (concurrency not measured).
+. *Request:* the adapter's body {+text+, +style+, +voice_model+, +viseme_mapping+}. +text+ is the ADR-0004 +speech_text+ (projection and output gate done upstream; the sidecar never sees a URL or an emoji). +voice_model+ selects the Supertonic voice index; +style+ is not used in the first slice (open: Q6).
+. *Response:* the sidecar writes the audio as +<AUDIO_ROOT>/generated/<digest>.wav+ (16-bit PCM, 44.1 kHz; the default +ffplay+ audio command plays it) through a temp file and an atomic rename, and answers {+audio_ref+: +audio://generated/<digest>.wav+, +duration_ms+}. +digest+ is a content address of (speech text, language, seed, steps, speed, voice index, model pin): the same request reuses the file, replay and cache keys are stable, and the seed is derived from the text digest so no random seed is used. +viseme_ref+ is absent (Supertonic produces no visemes: Q7).
+. *Bounds:* the generated-audio directory needs a size or age cap and garbage collection (not designed here); text length is bounded by the existing ADR-0004 and output-gate limits (the sidecar should also cap it; Supertonic chunks Japanese text at 120 characters).
+. *Failure:* sidecar down, slow (deadline from the interaction budget), or queue full degrade through the existing typed fallback (non-verbal reaction); the deterministic performer never waits on it.
+. *Model identity* in provenance: +backend_name+ = the sidecar, +model_alias+ = +supertonic-3-int8+, +model_version+ = the pinned archive digest, so +provenance.tts+ stays replayable.
+. *License surface:* the operator-facing startup summary names the voice model and license (OpenRAIL-M, disclosure duty), and for a VOICEVOX backend the credit line to display.
+. *CI:* fixtures and a mock TTS only; no model download in CI (matches #220's acceptance criteria); the sidecar's own test uses a stub engine, the real-model check stays an operator step like the STT model fetch.
+
+== 10. Limitations
+
+. *No naturalness evidence.* There was no listening test, MOS, prosody or accent evaluation, and no human listener. The round-trip CER shows that an STT can recover the words; it says nothing about voice quality, pitch accent or style. The engine ordering by CER is within noise (section 5.2).
+. *STT errors count against the TTS.* The ReazonSpeech STT was tuned on and validated with read speech (EXP-0002: reported CER 10-19% on Common Voice there); its error floor on synthetic speech was not measured, so absolute CER is pessimistic and a different STT would change the numbers.
+. *The reading metric has blind spots:* homograph choices that share a spelling cannot be told apart (1日目, 二十歳), and Open JTalk reads both sides, so an error that Open JTalk makes on both is invisible. The 0.25 threshold for a "misreading" is arbitrary.
+. *Small, synthetic workload:* 50 replies and 38 handling items, written by one author, 12-43 characters, no long monologue, no conversational disfluencies, one voice per engine (Supertonic sid 0 only; the other nine voices and the other VOICEVOX characters were not measured).
+. *Seed variance:* Supertonic's seeded and unseeded runs differed by 2.2 points of text CER; only one seed was run.
+. *One machine and one run per configuration*, Windows only, CPU only, no GPU numbers, no concurrency (a synthesis while STT, the renderer or the LLM run was not measured; the S1 note on contention applies).
+. *Cause of several effects not isolated:* the 10 times slowdown of the int8 Kokoro export, the Kokoro non-determinism, the Supertonic misreading of 海老 and the decimal item.
+. *Licenses were read from cards, READMEs and shipped files, not from legal advice.* The Supertonic model's training data, the Kokoro G2P chain licenses (pyopenjtalk, unidic-lite, mojimoji), Style-Bert-VITS2's default terms, the Irodori codec's upstream license and the per-character full terms pages were not read.
+. *Supertonic export provenance:* the sherpa-onnx int8 archive is a third-party conversion; it was not compared with the HF files.
+. *Not run:* Irodori-TTS, MeloTTS-JP, Qwen3-TTS, Chatterbox, GPT-SoVITS, AivisSpeech Engine, Style-Bert-VITS2, Piper. They were assessed from licenses and cards only.
+
+== 11. Protocol deviations
+
+* *No GPU run.* The brief made GPU optional; nothing was run on the GPU.
+* *Candidates read but not run:* section 8, with reasons (license, or a GPU-class torch stack with no CPU figures).
+* *Reply length:* the planned range was 5-60 characters; the 50 replies span 12-43 characters (section 4.1).
+* *Kokoro Japanese G2P on Windows:* +misaki[ja]+ could not be installed as published (+pyopenjtalk+ has no Windows wheel for Python 3.13 and +mojimoji+ needs a C compiler, which the machine lacked). The bench used +pyopenjtalk-plus+ (a maintained fork with a wheel) and a pure-Python stand-in for the two +mojimoji+ calls misaki 0.7.4 makes (+examples/benchmarks/tts/shims/mojimoji.py+). This may differ from the upstream stack in edge cases and is a reason the Kokoro rows are weaker evidence.
+* *Harness bug fixed and rerun:* the first kokoro-onnx runs failed on all 50 replies (a tuple unpacking of the G2P result); they were fixed and rerun, and only the rerun is reported. The Supertonic and VOICEVOX runs were not affected.
+* *Not every run was repeated:* the default-language Supertonic and the sherpa Kokoro rows have one run (no fresh-process comparison).
+* *Probe hashing detail:* the Rust and Python audio were compared as float32 (bit-identical). A first comparison on 16-bit PCM hashes differed in one sample LSB because of different rounding at exact halves; the float comparison is the one reported.
+* *VOICEVOX models* were not pinned separately from the engine archive; the archive hash pins the whole bundle.
+
+== 12. Open questions
+
+. *Q1 (OpenRAIL-M).* Is the project prepared to ship or recommend a model under OpenRAIL-M, including the enforceable use restrictions passed downstream and the duty to disclose that published audio is machine-generated (relevant to a stream; where would the disclosure live: overlay, stream description, or the startup notice)? If not, the fallbacks are VOICEVOX with the credit, or a benchmark of Irodori-TTS (MIT).
+. *Q2 (default engine).* Is a Supertonic default with VOICEVOX as an optional operator-chosen backend the right split, or should VOICEVOX be the default because its measured reading was best and it has the most Japanese voices?
+. *Q3 (scope of S2b).* Sidecar as a Rust binary over the +sherpa-onnx+ crate (this record's recommendation), or the Python wheel as a stopgap sidecar for the first slice? (The second needs no Rust build but ships a Python dependency; both speak the same contract.)
+. *Q4 (VOICEVOX character).* Which character, if VOICEVOX is offered, and may the persona use a third-party mascot voice? Several characters restrict commercial use.
+. *Q5 (naturalness check).* A human listening comparison (a handful of replies, Supertonic voices against VOICEVOX) is needed before any engine is called good; who listens and with what rubric? Irodori-TTS and other 0.5-2 B models enter only if this check fails.
+. *Q6 (+style+).* The contract carries an optional +style+; Supertonic has none and VOICEVOX has styles per character. Do we map +style+ to a voice/speed preset, or ignore it in the first slice?
+. *Q7 (lip sync).* The renderer path needs visemes or an amplitude envelope; neither engine returns +viseme_ref+. Is amplitude-driven mouth movement from the audio acceptable for the local avatar (#219)?
+. *Q8 (hardware).* Does the target machine have spare CPU for a 4-thread synthesis next to STT and the avatar renderer? Contention was not measured.
+
+== 13. Related
+
+* #220 (local profile), #92 (STT, EXP-0002), #222 and ADR-0004 (text projection), #81 (conversational floor).
+* link:../generative-fallback.adoc[Generative fallback and TTS contract], link:../production-runtime.adoc[Production runtime], link:../reuse-first.adoc[Reuse first], link:../supply-chain.adoc[Supply chain], +examples/benchmarks/tts/README.md+.
