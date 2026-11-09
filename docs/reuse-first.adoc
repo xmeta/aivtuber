@@ -130,7 +130,7 @@ Record the result as one of:
 
 |Local generative inference
 |`llama.cpp` / `llama-server`
-|Local sidecar / OpenAI-compatible adapter
+|Local sidecar / OpenAI-compatible adapter (adopted in #220 S1 as a sidecar behind the existing adapter; no new wire protocol)
 |Use the local Responses-compatible server before adding a second generic inference wire protocol. Explicitly distinguish loopback/self-hosted no-auth policy from remote authenticated endpoints; retain deadlines, cancellation, output gating, model identity, and replay semantics in aivtuber. Model-weight licenses remain separate.
 |#220
 
