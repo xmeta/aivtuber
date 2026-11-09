@@ -68,7 +68,7 @@ use aivtuber_runtime::{
     CachedAssetSelection, CachedPerformer, CachedPlaybackError, CachedPlaybackOutcome,
     CachedPlaybackTiming, ContentAdmitDecision, ControlOutcome, FastPathPreloadReport,
     LocalVisemeStore, OutputVerdict, PublicOutput, PublicOutputPolicy, RuntimeError,
-    SecurityRuntime, SpeechObservationTracker,
+    SecurityRuntime, SpeechObservationTracker, SpeechTranscriptTracker,
 };
 use aivtuber_scheduler::{Scheduler, Status};
 use aivtuber_telemetry::{
@@ -835,6 +835,7 @@ where
     generative: Option<GenerativeRuntime>,
     adaptation: Option<AdaptationRuntime>,
     speech_observations: Option<SpeechObservationTracker>,
+    speech_transcripts: Option<SpeechTranscriptTracker>,
     audio: Box<dyn AudioOutput>,
     avatar: Box<dyn AvatarOutput>,
     stream: Box<dyn StreamOutput>,
@@ -885,6 +886,7 @@ where
             generative: None,
             adaptation: None,
             speech_observations: None,
+            speech_transcripts: None,
             audio,
             avatar,
             stream,
@@ -974,6 +976,33 @@ where
 
     pub fn speech_observations_mut(&mut self) -> Option<&mut SpeechObservationTracker> {
         self.speech_observations.as_mut()
+    }
+
+    /// Opt in to speech transcript tracking (#92 S3b). Transcripts are
+    /// untrusted content: a partial only ever becomes a floor-hold
+    /// observation, and only a final can be taken (`take_finals`) as input for
+    /// the normalizer. Nothing is persisted and no permit is minted here.
+    /// Absent by default, so behaviour is unchanged.
+    pub fn with_speech_transcripts(mut self, tracker: SpeechTranscriptTracker) -> Self {
+        self.speech_transcripts = Some(tracker);
+        self
+    }
+
+    pub fn speech_transcripts_mut(&mut self) -> Option<&mut SpeechTranscriptTracker> {
+        self.speech_transcripts.as_mut()
+    }
+
+    /// Both speech trackers at once, for a sidecar poll that feeds them.
+    pub fn speech_trackers_mut(
+        &mut self,
+    ) -> (
+        Option<&mut SpeechObservationTracker>,
+        Option<&mut SpeechTranscriptTracker>,
+    ) {
+        (
+            self.speech_observations.as_mut(),
+            self.speech_transcripts.as_mut(),
+        )
     }
 
     pub fn with_comparison_mode(mut self, mode: ComparisonMode) -> Self {
@@ -1237,6 +1266,10 @@ where
                 .speech_observations
                 .as_ref()
                 .map(SpeechObservationTracker::metrics),
+            speech_transcripts: self
+                .speech_transcripts
+                .as_ref()
+                .map(SpeechTranscriptTracker::metrics),
             working_memory: self
                 .adaptation
                 .as_ref()

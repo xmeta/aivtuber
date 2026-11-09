@@ -15,6 +15,12 @@ silero-vad = ["dep:tract-onnx", "dep:hound"]
 # Local microphone capture through cpal for the sidecar. Separate from
 # silero-vad because cpal needs ALSA development headers on Linux.
 mic-capture = ["dep:cpal"]
+# Local Japanese speech-to-text worker (#92 S3b): the official sherpa-onnx
+# crate (offline recognizer, shared libraries). Off by default. Every build
+# that enables it MUST set SHERPA_ONNX_ARCHIVE_DIR to an archive verified by
+# scripts/fetch-sherpa-onnx.mjs, otherwise the crate build script downloads
+# unchecked binaries (docs/supply-chain.adoc).
+sherpa-stt = ["dep:sherpa-onnx"]
 
 [dependencies]
 aivtuber-domain = { path = "../domain" }
@@ -32,6 +38,7 @@ tokio = { version = "1.53.1", features = ["sync", "time", "rt", "macros"] }
 tract-onnx = { version = "0.23.10", default-features = false, optional = true }
 hound = { version = "3.5", optional = true }
 cpal = { version = "0.17.3", optional = true }
+sherpa-onnx = { version = "=2.0.1", default-features = false, features = ["shared"], optional = true }
 twitch-irc = { version = "6.1.3", default-features = false, features = ["transport-tcp-native-tls"] }
 rubato = { version = "5", default-features = false }
 
@@ -53,6 +60,15 @@ required-features = ["native-audio-spike"]
 name = "speech-vad-sidecar"
 path = "src/bin/speech-vad-sidecar.rs"
 required-features = ["silero-vad"]
+
+[[bin]]
+name = "speech-stt-worker"
+path = "src/bin/speech-stt-worker.rs"
+required-features = ["sherpa-stt"]
+
+[[bin]]
+name = "speech-stt-worker-double"
+path = "src/bin/speech-stt-worker-double.rs"
 
 [[bin]]
 name = "twitch-chat-ingress"

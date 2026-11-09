@@ -32,7 +32,7 @@ pub use clock::{
     encode_clock_sync_line, parse_clock_sync_line, pump_clock_syncs,
 };
 pub use edges::{EdgeDetector, HysteresisConfig};
-pub use emit::{LineSink, ObservationStamper, SinkStats, StamperConfig};
+pub use emit::{LineHandle, LineSink, ObservationStamper, SinkStats, StamperConfig};
 pub use pipeline::{
     FRAME_MS, FRAME_SAMPLES, FrameScorer, PipelineStats, RawEdge, SAMPLE_RATE_HZ, VadPipeline,
 };

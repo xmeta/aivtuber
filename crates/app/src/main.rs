@@ -14,7 +14,7 @@ use aivtuber_app::{
     RuntimeRetentionPolicy, SHADOW_ORCHESTRATOR_SCHEMA_VERSION, ShadowOrchestratorConfig,
     ShadowPolicyIdentity, ShadowingRoutePlanner, SpeechSidecar, SpeechSidecarConfig,
     SpeechSidecarStats, StreamOutput, VtsAvatarOutput, VtsPlaybackConfig, apply_dispatched_request,
-    pump_bounded_records,
+    pump_bounded_records, stt_sidecar_args,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
@@ -26,6 +26,7 @@ use aivtuber_reflex::{JevAdapter, JevAdapterConfig, JevApiKey, PolicyConfig, Ref
 use aivtuber_runtime::{
     CachedPerformer, CachedPlaybackConfig, IngressPolicy, LocalVisemeStore, SecurityRuntime,
     SecurityRuntimeConfig, SpeechObservationConfig, SpeechObservationTracker,
+    SpeechTranscriptConfig, SpeechTranscriptTracker,
 };
 use aivtuber_scheduler::{Scheduler, SchedulerConfig};
 use aivtuber_telemetry::SecretRedactor;
@@ -325,12 +326,52 @@ fn run() -> Result<(), Box<dyn Error>> {
                 env_optional("AIVTUBER_INGRESS_SOURCE_CLASSES").as_deref(),
             )?,
         )?;
-        let mut config = SpeechSidecarConfig::new(
-            program,
-            env_optional("AIVTUBER_SPEECH_SIDECAR_ARGS")
-                .map(|args| args.split_whitespace().map(str::to_owned).collect())
-                .unwrap_or_default(),
-        );
+        let mut sidecar_args: Vec<String> = env_optional("AIVTUBER_SPEECH_SIDECAR_ARGS")
+            .map(|args| args.split_whitespace().map(str::to_owned).collect())
+            .unwrap_or_default();
+        // Issue #92 S3b: optional local Japanese transcripts. The sidecar
+        // spawns and supervises the worker; transcripts come back on the same
+        // pipe into their own tracker (untrusted content, partials reduced to
+        // a floor-hold observation, only finals surfaced). Off unless
+        // AIVTUBER_SPEECH_STT_WORKER names the worker program.
+        if let Some(worker) = env_optional("AIVTUBER_SPEECH_STT_WORKER") {
+            let model = env_string("AIVTUBER_SPEECH_STT_MODEL", "k2v2-int8");
+            let model_dir = env_optional("AIVTUBER_SPEECH_STT_MODEL_DIR").ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "AIVTUBER_SPEECH_STT_MODEL_DIR is required with AIVTUBER_SPEECH_STT_WORKER",
+                )
+            })?;
+            let threads = match env_optional("AIVTUBER_SPEECH_STT_THREADS") {
+                Some(_) => Some(env_u64("AIVTUBER_SPEECH_STT_THREADS", 4)?),
+                None => None,
+            };
+            sidecar_args.extend(stt_sidecar_args(&worker, &model, &model_dir, threads));
+            let defaults = SpeechTranscriptConfig::default();
+            let transcript_config = SpeechTranscriptConfig {
+                partial_max_age_ms: env_u64(
+                    "AIVTUBER_SPEECH_STT_PARTIAL_MAX_AGE_MS",
+                    defaults.partial_max_age_ms,
+                )?,
+                final_max_age_ms: env_u64(
+                    "AIVTUBER_SPEECH_STT_FINAL_MAX_AGE_MS",
+                    defaults.final_max_age_ms,
+                )?,
+                floor_hold_ms: env_u64(
+                    "AIVTUBER_SPEECH_STT_FLOOR_HOLD_MS",
+                    defaults.floor_hold_ms,
+                )?,
+                ..defaults
+            };
+            app = app.with_speech_transcripts(SpeechTranscriptTracker::new(
+                transcript_config,
+                IngressPolicy::parse(
+                    env_optional("AIVTUBER_INGRESS_MAX_TRUST").as_deref(),
+                    env_optional("AIVTUBER_INGRESS_SOURCE_CLASSES").as_deref(),
+                )?,
+            )?);
+        }
+        let mut config = SpeechSidecarConfig::new(program, sidecar_args);
         config.resync_interval =
             Duration::from_millis(env_u64("AIVTUBER_SPEECH_SIDECAR_RESYNC_MS", 5_000)?);
         match SpeechSidecar::spawn(config, started) {
@@ -408,14 +449,31 @@ fn run() -> Result<(), Box<dyn Error>> {
             let _ = dispatched.respond.send(response);
         }
         if let Some(sidecar) = speech_sidecar.as_mut()
-            && let Some(tracker) = app.speech_observations_mut()
+            && let (Some(tracker), transcripts) = app.speech_trackers_mut()
         {
-            sidecar.poll(tracker, now_ms, |_, _| {});
+            sidecar.poll_with_transcripts(tracker, transcripts, now_ms, |_, _| {}, |_, _| {});
+        }
+        // Finals are the only transcript text that leaves the tracker. Routing
+        // them through the normalizer into Reflex needs the ADR-0004 text
+        // projection and is the next slice; until then they are drained so the
+        // bounded queue never wedges, and only their length is logged (what a
+        // person said is never written to a log).
+        if let Some(tracker) = app.speech_transcripts_mut() {
+            for utterance in tracker.take_finals(16) {
+                eprintln!(
+                    "speech_transcript: final segment={} chars={} (not yet routed to the normalizer)",
+                    utterance.segment_id,
+                    utterance.text.chars().count()
+                );
+            }
         }
         app.tick(now_ms);
         if now_ms >= next_maintenance_ms {
             app.maintain_adapters();
             if let Some(tracker) = app.speech_observations_mut() {
+                tracker.sweep(now_ms);
+            }
+            if let Some(tracker) = app.speech_transcripts_mut() {
                 tracker.sweep(now_ms);
             }
             if let Some(sidecar) = speech_sidecar.as_ref() {

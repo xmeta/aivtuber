@@ -14,11 +14,25 @@
 //! degrades to "no speech observations" and is counted once as provider
 //! unavailable. There is no restart: a restarted sidecar would need a
 //! deliberate operator decision, and the fallback keeps working without it.
+//!
+//! Transcripts (#92 S3b): the sidecar may also supervise a `speech-stt-worker`
+//! child and relay its `speech-transcript` batch lines on the same stdout,
+//! plus one `{"stt":{...}}` status line when the transcript path becomes
+//! unavailable. Lines are routed by their top-level key (`stt`, `transcripts`,
+//! otherwise an observation batch). A failed worker, or 32 consecutive
+//! rejected transcript lines, degrades the *transcript path only*, counted
+//! once as transcript provider unavailable: the VAD edges and the
+//! deterministic floor fallback keep working, and nothing restarts.
 
 use crate::raw_ingress::{RawIngressConfig, RawIngressMetrics, pump_bounded_records};
+use aivtuber_adapters::speech_stt::{SttStatus, SttUnavailableReason, parse_stt_status_line};
 use aivtuber_adapters::speech_vad::encode_clock_sync_line;
-use aivtuber_domain::MAX_SPEECH_OBSERVATION_BATCH_BYTES;
-use aivtuber_runtime::{SpeechBatchReport, SpeechObservationTracker};
+use aivtuber_domain::{MAX_SPEECH_OBSERVATION_BATCH_BYTES, MAX_SPEECH_TRANSCRIPT_BATCH_BYTES};
+use aivtuber_runtime::{
+    SpeechBatchReport, SpeechObservationTracker, SpeechTranscriptTracker, TranscriptBatchReport,
+};
+use serde::Deserialize;
+use serde::de::IgnoredAny;
 use std::io::{self, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -30,6 +44,46 @@ use std::time::{Duration, Instant};
 
 /// Most child arguments accepted from configuration.
 pub const MAX_SPEECH_SIDECAR_ARGS: usize = 32;
+
+/// Routing probe: only which top-level keys are present.
+#[derive(Deserialize)]
+struct LineProbe {
+    #[serde(default)]
+    stt: Option<IgnoredAny>,
+    #[serde(default)]
+    transcripts: Option<IgnoredAny>,
+}
+
+enum LineKind {
+    Status,
+    Transcript,
+    Observation,
+}
+
+fn classify(line: &[u8]) -> LineKind {
+    match serde_json::from_slice::<LineProbe>(line) {
+        Ok(LineProbe { stt: Some(_), .. }) => LineKind::Status,
+        Ok(LineProbe {
+            transcripts: Some(_),
+            ..
+        }) => LineKind::Transcript,
+        // Anything else, including garbage, is judged by the observation
+        // tracker exactly as before S3b.
+        _ => LineKind::Observation,
+    }
+}
+
+/// What the app knows about the transcript path of the sidecar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeechTranscriptPath {
+    /// The sidecar has not reported a transcript worker (none configured, or
+    /// still loading its model).
+    NotReported,
+    /// The worker reported ready (its first heartbeat).
+    Ready,
+    /// No further transcripts: counted once, never restarted.
+    Degraded(SttUnavailableReason),
+}
 /// A sync line sits in the pipe until the child has started and loaded its
 /// model, so the first ones are stale by the child's startup time (measured
 /// 18 ms to the first line with no model; a model load adds hundreds). The
@@ -39,6 +93,30 @@ pub const MAX_SPEECH_SIDECAR_ARGS: usize = 32;
 /// the writer thread, so this is bounded.
 pub const CLOCK_WARMUP: Duration = Duration::from_secs(10);
 pub const CLOCK_WARMUP_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Sidecar arguments that enable the transcript worker, from the app's
+/// `AIVTUBER_SPEECH_STT_*` configuration. The sidecar spawns and supervises
+/// the worker; the app never starts it directly.
+pub fn stt_sidecar_args(
+    worker: &str,
+    model: &str,
+    model_dir: &str,
+    threads: Option<u64>,
+) -> Vec<String> {
+    let mut args = vec![
+        "--stt-worker".to_owned(),
+        worker.to_owned(),
+        "--stt-model".to_owned(),
+        model.to_owned(),
+        "--stt-model-dir".to_owned(),
+        model_dir.to_owned(),
+    ];
+    if let Some(threads) = threads {
+        args.push("--stt-threads".to_owned());
+        args.push(threads.to_string());
+    }
+    args
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpeechSidecarConfig {
@@ -106,6 +184,13 @@ pub struct SpeechSidecarStats {
     pub clock_syncs_sent: u64,
     pub lines_dropped_queue_full: u64,
     pub lines_dropped_oversize: u64,
+    /// Transcript batches the transcript tracker accepted for evaluation.
+    pub transcript_batches_ingested: u64,
+    /// Transcript lines the tracker refused (invalid, oversize or policy).
+    pub transcript_lines_rejected: u64,
+    /// Transcript lines that arrived with no transcript tracker composed, or
+    /// after the transcript path degraded.
+    pub transcript_lines_ignored: u64,
 }
 
 pub struct SpeechSidecar {
@@ -116,6 +201,8 @@ pub struct SpeechSidecar {
     syncs_sent: Arc<AtomicU64>,
     state: SpeechSidecarState,
     consecutive_invalid: u32,
+    consecutive_invalid_transcripts: u32,
+    transcript_path: SpeechTranscriptPath,
     stats: SpeechSidecarStats,
     config: SpeechSidecarConfig,
 }
@@ -149,7 +236,8 @@ impl SpeechSidecar {
         let ingress = RawIngressMetrics::default();
         let reader_metrics = ingress.clone();
         let raw = RawIngressConfig {
-            max_record_bytes: MAX_SPEECH_OBSERVATION_BATCH_BYTES,
+            max_record_bytes: MAX_SPEECH_OBSERVATION_BATCH_BYTES
+                .max(MAX_SPEECH_TRANSCRIPT_BATCH_BYTES),
             queue_capacity: config.queue_capacity,
         };
         thread::spawn(move || {
@@ -171,6 +259,8 @@ impl SpeechSidecar {
             syncs_sent,
             state: SpeechSidecarState::Running,
             consecutive_invalid: 0,
+            consecutive_invalid_transcripts: 0,
+            transcript_path: SpeechTranscriptPath::NotReported,
             stats: SpeechSidecarStats::default(),
             config,
         })
@@ -182,6 +272,10 @@ impl SpeechSidecar {
 
     pub fn is_degraded(&self) -> bool {
         matches!(self.state, SpeechSidecarState::Degraded(_))
+    }
+
+    pub fn transcript_path(&self) -> SpeechTranscriptPath {
+        self.transcript_path
     }
 
     pub fn stats(&self) -> SpeechSidecarStats {
@@ -196,11 +290,27 @@ impl SpeechSidecar {
 
     /// Drain at most `max_lines_per_poll` queued lines into the tracker.
     /// Never blocks. `observe` sees each ingested batch's raw line and report.
+    /// Transcript lines are counted and ignored: use
+    /// [`poll_with_transcripts`](Self::poll_with_transcripts) to consume them.
     pub fn poll(
         &mut self,
         tracker: &mut SpeechObservationTracker,
         now_ms: u64,
+        observe: impl FnMut(&[u8], &SpeechBatchReport),
+    ) {
+        self.poll_with_transcripts(tracker, None, now_ms, observe, |_, _| {});
+    }
+
+    /// Like [`poll`](Self::poll), and routes transcript batches into
+    /// `transcripts` (`observe_transcript` sees each ingested line and its
+    /// report). With `None`, transcript lines are counted and ignored.
+    pub fn poll_with_transcripts(
+        &mut self,
+        tracker: &mut SpeechObservationTracker,
+        mut transcripts: Option<&mut SpeechTranscriptTracker>,
+        now_ms: u64,
         mut observe: impl FnMut(&[u8], &SpeechBatchReport),
+        mut observe_transcript: impl FnMut(&[u8], &TranscriptBatchReport),
     ) {
         if self.is_degraded() {
             return;
@@ -210,6 +320,22 @@ impl SpeechSidecar {
                 Ok(line) => {
                     if line.iter().all(u8::is_ascii_whitespace) {
                         continue;
+                    }
+                    match classify(&line) {
+                        LineKind::Status => {
+                            self.on_status(&line, transcripts.as_deref_mut());
+                            continue;
+                        }
+                        LineKind::Transcript => {
+                            self.on_transcript(
+                                &line,
+                                transcripts.as_deref_mut(),
+                                now_ms,
+                                &mut observe_transcript,
+                            );
+                            continue;
+                        }
+                        LineKind::Observation => {}
                     }
                     match tracker.ingest_bytes(&line, now_ms) {
                         Ok(report) => {
@@ -223,6 +349,7 @@ impl SpeechSidecar {
                             if self.consecutive_invalid >= self.config.max_consecutive_invalid {
                                 self.degrade(
                                     tracker,
+                                    transcripts.as_deref_mut(),
                                     "sidecar sent only rejected batches; stopped".to_owned(),
                                 );
                                 return;
@@ -238,18 +365,96 @@ impl SpeechSidecar {
                         Ok(Some(status)) => format!("sidecar exited ({status})"),
                         _ => "sidecar closed its output".to_owned(),
                     };
-                    self.degrade(tracker, reason);
+                    self.degrade(tracker, transcripts.as_deref_mut(), reason);
                     return;
                 }
             }
         }
     }
 
-    fn degrade(&mut self, tracker: &mut SpeechObservationTracker, reason: String) {
+    /// A health line from the sidecar about its transcript worker.
+    fn on_status(&mut self, line: &[u8], transcripts: Option<&mut SpeechTranscriptTracker>) {
+        match parse_stt_status_line(line) {
+            Some(SttStatus::Ready) => {
+                if self.transcript_path == SpeechTranscriptPath::NotReported {
+                    self.transcript_path = SpeechTranscriptPath::Ready;
+                    eprintln!("speech_sidecar: transcript worker ready");
+                }
+            }
+            Some(SttStatus::Unavailable { reason }) => {
+                self.degrade_transcripts(transcripts, reason);
+            }
+            // A malformed status line says nothing and changes nothing.
+            None => self.stats.lines_rejected += 1,
+        }
+    }
+
+    fn on_transcript(
+        &mut self,
+        line: &[u8],
+        transcripts: Option<&mut SpeechTranscriptTracker>,
+        now_ms: u64,
+        observe: &mut impl FnMut(&[u8], &TranscriptBatchReport),
+    ) {
+        let Some(tracker) = transcripts else {
+            self.stats.transcript_lines_ignored += 1;
+            return;
+        };
+        if matches!(self.transcript_path, SpeechTranscriptPath::Degraded(_)) {
+            self.stats.transcript_lines_ignored += 1;
+            return;
+        }
+        match tracker.ingest_bytes(line, now_ms) {
+            Ok(report) => {
+                self.stats.transcript_batches_ingested += 1;
+                self.consecutive_invalid_transcripts = 0;
+                observe(line, &report);
+            }
+            Err(_) => {
+                self.stats.transcript_lines_rejected += 1;
+                self.consecutive_invalid_transcripts += 1;
+                if self.consecutive_invalid_transcripts >= self.config.max_consecutive_invalid {
+                    self.degrade_transcripts(Some(tracker), SttUnavailableReason::InvalidLines);
+                }
+            }
+        }
+    }
+
+    /// The transcript path ends here, once; the sidecar keeps running.
+    fn degrade_transcripts(
+        &mut self,
+        transcripts: Option<&mut SpeechTranscriptTracker>,
+        reason: SttUnavailableReason,
+    ) {
+        if matches!(self.transcript_path, SpeechTranscriptPath::Degraded(_)) {
+            return;
+        }
+        self.transcript_path = SpeechTranscriptPath::Degraded(reason);
+        if let Some(tracker) = transcripts {
+            tracker.record_provider_unavailable();
+        }
+        eprintln!(
+            "speech_sidecar: transcripts unavailable: {}; no transcripts",
+            reason.name()
+        );
+    }
+
+    fn degrade(
+        &mut self,
+        tracker: &mut SpeechObservationTracker,
+        transcripts: Option<&mut SpeechTranscriptTracker>,
+        reason: String,
+    ) {
         self.stop.store(true, Ordering::Relaxed);
         let _ = self.child.kill();
         let _ = self.child.wait();
         tracker.record_provider_unavailable();
+        // Without the sidecar there is no worker either.
+        if self.transcript_path != SpeechTranscriptPath::NotReported
+            || self.stats.transcript_batches_ingested > 0
+        {
+            self.degrade_transcripts(transcripts, SttUnavailableReason::WorkerExited);
+        }
         eprintln!("speech_sidecar: degraded: {reason}; no speech observations");
         self.state = SpeechSidecarState::Degraded(reason);
     }
@@ -309,6 +514,24 @@ fn clock_writer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stt_arguments_are_plain_tokens_in_a_fixed_order() {
+        assert_eq!(
+            stt_sidecar_args("w", "k2v2-int8", "m", Some(2)),
+            [
+                "--stt-worker",
+                "w",
+                "--stt-model",
+                "k2v2-int8",
+                "--stt-model-dir",
+                "m",
+                "--stt-threads",
+                "2"
+            ]
+        );
+        assert_eq!(stt_sidecar_args("w", "p", "m", None).len(), 6);
+    }
 
     #[test]
     fn configuration_bounds_are_enforced() {

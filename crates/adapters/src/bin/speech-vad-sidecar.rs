@@ -16,13 +16,24 @@
 //! parent; used by tests and for running by hand). When stdin closes the
 //! parent has gone and the sidecar exits.
 //!
-//! Privacy: audio never leaves this process and is never written anywhere.
-//! The bounded pre-roll is memory only and nothing reads it in S2.
+//! Privacy: audio never leaves this process (except, with `--stt-worker`, to
+//! the one local STT child over its stdin pipe) and is never written
+//! anywhere. The bounded pre-roll is memory only.
+//!
+//! Speech-to-text (#92 S3b, optional): with `--stt-worker PROGRAM` the sidecar
+//! spawns `speech-stt-worker` as a separate child, cuts VAD speech into
+//! segments (at least 300 ms of pre-roll, an end-edge tail, a minimum speech
+//! span) and feeds them to it. The worker's `speech-transcript` lines are
+//! relayed on this process's stdout next to the observation lines, with one
+//! `{"stt":{...}}` status line when the transcript path becomes unavailable.
+//! A dead or hung worker costs transcripts only: VAD edges keep flowing.
 
+use aivtuber_adapters::speech_stt::feeder::{FeederConfig, SegmentFeeder};
+use aivtuber_adapters::speech_stt::supervisor::{SttWorker, SttWorkerConfig};
 #[cfg(feature = "mic-capture")]
 use aivtuber_adapters::speech_vad::StreamClock;
 use aivtuber_adapters::speech_vad::{
-    FRAME_MS, HysteresisConfig, LineSink, MAX_PREROLL_MS, ObservationStamper, RawEdge,
+    FRAME_MS, HysteresisConfig, LineSink, MAX_PREROLL_MS, ObservationStamper, PreRoll, RawEdge,
     RuntimeClockMap, SILERO_PROVIDER_VERSION, SileroVad, StamperConfig, VadPipeline,
     pump_clock_syncs,
 };
@@ -51,7 +62,21 @@ enum Pace {
     Max,
 }
 
+/// Speech-to-text options; present only with `--stt-worker`.
+struct SttArgs {
+    worker: String,
+    model: Option<String>,
+    model_dir: Option<String>,
+    threads: Option<String>,
+    extra: Vec<String>,
+    feeder: FeederConfig,
+    startup_timeout: Duration,
+    heartbeat_timeout: Duration,
+    drain: Duration,
+}
+
 struct Args {
+    stt: Option<SttArgs>,
     model: Option<String>,
     language: String,
     speaker_id: String,
@@ -73,12 +98,24 @@ fn usage() -> String {
      [--speaker-id ID] [--input-wav FILE [--pace realtime|max]] [--input-device NAME] \
      [--list-devices] [--clock sync|local] [--sync-timeout-ms N] [--preroll-ms N] \
      [--start-threshold P] [--end-threshold P] [--clock-probe-ms N] [--duration-secs N] \
-     [--stats-secs N]"
+     [--stats-secs N] [--stt-worker PROGRAM [--stt-model k2v2-int8|parakeet-ja \
+     --stt-model-dir DIR] [--stt-threads N] [--stt-preroll-ms N] [--stt-tail-ms N] \
+     [--stt-min-speech-ms N] [--stt-max-segment-ms N] [--stt-startup-timeout-ms N] \
+     [--stt-heartbeat-timeout-ms N] [--stt-drain-ms N] [--stt-arg ARG]...]"
         .to_owned()
 }
 
 fn parse_args() -> Result<Args, String> {
+    let mut stt_worker: Option<String> = None;
+    let mut stt_model = None;
+    let mut stt_model_dir = None;
+    let mut stt_threads = None;
+    let mut stt_extra = Vec::new();
+    let (mut stt_preroll, mut stt_tail, mut stt_min_speech, mut stt_max_segment) =
+        (300_u64, 500_u64, 250_u64, 25_000_u64);
+    let (mut stt_startup, mut stt_heartbeat, mut stt_drain) = (60_000_u64, 5_000_u64, 8_000_u64);
     let mut a = Args {
+        stt: None,
         model: None,
         language: String::new(),
         speaker_id: "mic-local".to_owned(),
@@ -156,11 +193,56 @@ fn parse_args() -> Result<Args, String> {
                 a.stats_every =
                     Duration::from_secs(int(value("--stats-secs")?, "--stats-secs")?.max(1))
             }
+            "--stt-worker" => stt_worker = Some(value("--stt-worker")?),
+            "--stt-model" => stt_model = Some(value("--stt-model")?),
+            "--stt-model-dir" => stt_model_dir = Some(value("--stt-model-dir")?),
+            "--stt-threads" => stt_threads = Some(value("--stt-threads")?),
+            "--stt-arg" => stt_extra.push(value("--stt-arg")?),
+            "--stt-preroll-ms" => {
+                stt_preroll = int(value("--stt-preroll-ms")?, "--stt-preroll-ms")?
+            }
+            "--stt-tail-ms" => stt_tail = int(value("--stt-tail-ms")?, "--stt-tail-ms")?,
+            "--stt-min-speech-ms" => {
+                stt_min_speech = int(value("--stt-min-speech-ms")?, "--stt-min-speech-ms")?
+            }
+            "--stt-max-segment-ms" => {
+                stt_max_segment = int(value("--stt-max-segment-ms")?, "--stt-max-segment-ms")?
+            }
+            "--stt-startup-timeout-ms" => {
+                stt_startup = int(
+                    value("--stt-startup-timeout-ms")?,
+                    "--stt-startup-timeout-ms",
+                )?
+            }
+            "--stt-heartbeat-timeout-ms" => {
+                stt_heartbeat = int(
+                    value("--stt-heartbeat-timeout-ms")?,
+                    "--stt-heartbeat-timeout-ms",
+                )?
+            }
+            "--stt-drain-ms" => stt_drain = int(value("--stt-drain-ms")?, "--stt-drain-ms")?,
             "-h" | "--help" => return Err(usage()),
             other => return Err(format!("unknown argument {other}\n{}", usage())),
         }
     }
     a.hysteresis.validate()?;
+    if let Some(worker) = stt_worker {
+        let feeder = FeederConfig::from_ms(stt_preroll, stt_tail, stt_min_speech, stt_max_segment);
+        feeder.validate()?;
+        a.stt = Some(SttArgs {
+            worker,
+            model: stt_model,
+            model_dir: stt_model_dir,
+            threads: stt_threads,
+            extra: stt_extra,
+            feeder,
+            startup_timeout: Duration::from_millis(stt_startup),
+            heartbeat_timeout: Duration::from_millis(stt_heartbeat),
+            drain: Duration::from_millis(stt_drain),
+        });
+    } else if stt_model.is_some() || stt_model_dir.is_some() || !stt_extra.is_empty() {
+        return Err("--stt-* options need --stt-worker".to_owned());
+    }
     Ok(a)
 }
 
@@ -235,9 +317,33 @@ struct Emitter {
     sink: LineSink,
     edges_emitted: u64,
     stamp_errors: u64,
+    stt: Option<SegmentFeeder<SttWorker>>,
+}
+
+impl Args {
+    /// Length of the pipeline's pre-roll ring: the S2 setting, or what the STT
+    /// segmenter needs to reach back from a deferred segment open.
+    fn ring_ms(&self) -> u64 {
+        self.stt
+            .as_ref()
+            .map_or(self.preroll_ms, |s| self.preroll_ms.max(s.feeder.ring_ms()))
+    }
 }
 
 impl Emitter {
+    /// Edges out, and the STT segmenter stepped on the same stream position.
+    fn step(
+        &mut self,
+        edges: &[RawEdge],
+        ring: &PreRoll,
+        map: impl Fn(u64) -> Result<u64, aivtuber_adapters::speech_vad::ClockError>,
+    ) {
+        self.emit(edges, &map);
+        if let Some(stt) = &mut self.stt {
+            stt.on_step(edges, ring, &map);
+        }
+    }
+
     fn emit(
         &mut self,
         edges: &[RawEdge],
@@ -246,7 +352,7 @@ impl Emitter {
         if edges.is_empty() {
             return;
         }
-        match self.stamper.lines(edges, map) {
+        match self.stamper.lines(edges, &map) {
             Ok(lines) => {
                 self.edges_emitted += edges.len() as u64;
                 for line in lines {
@@ -283,32 +389,97 @@ fn run() -> Result<(), String> {
         sink: LineSink::spawn(std::io::stdout(), OUTPUT_QUEUE),
         edges_emitted: 0,
         stamp_errors: 0,
+        stt: None,
     };
 
     if let Some(interval_ms) = args.clock_probe_ms {
         let timeline = start_clock(&args)?;
         run_clock_probe(&args, interval_ms, &timeline, &mut emitter);
-        return finish(emitter, None);
+        return finish(emitter, None, Duration::ZERO);
     }
+    let drain = args.stt.as_ref().map_or(Duration::ZERO, |s| s.drain);
+    emitter.stt = start_stt(&args, &emitter);
 
     let model = args.model.as_deref().ok_or("--model is required")?;
     let scorer = SileroVad::from_file(std::path::Path::new(model))?;
     let timeline = start_clock(&args)?;
     eprintln!(
-        "speech-vad-sidecar: ready provider_version={SILERO_PROVIDER_VERSION} language={} frame_ms={FRAME_MS} preroll_ms={}",
-        args.language, args.preroll_ms
+        "speech-vad-sidecar: ready provider_version={SILERO_PROVIDER_VERSION} language={} frame_ms={FRAME_MS} preroll_ms={} stt={}",
+        args.language,
+        args.ring_ms(),
+        emitter.stt.is_some()
     );
     let stats = match &args.input_wav {
         Some(path) => run_wav(&args, path, scorer, &timeline, &mut emitter)?,
         None => run_mic(&args, scorer, &timeline, &mut emitter)?,
     };
-    finish(emitter, Some(stats))
+    finish(emitter, Some(stats), drain)
+}
+
+/// Spawn and wire the STT worker when `--stt-worker` was given. A worker that
+/// cannot start has already told the app (an `unavailable` status line); the
+/// sidecar carries on with VAD edges only.
+fn start_stt(args: &Args, emitter: &Emitter) -> Option<SegmentFeeder<SttWorker>> {
+    let stt = args.stt.as_ref()?;
+    let mut worker_args = vec![
+        "--language".to_owned(),
+        args.language.clone(),
+        "--speaker-id".to_owned(),
+        args.speaker_id.clone(),
+    ];
+    for (flag, value) in [
+        ("--model", &stt.model),
+        ("--model-dir", &stt.model_dir),
+        ("--threads", &stt.threads),
+    ] {
+        if let Some(value) = value {
+            worker_args.push(flag.to_owned());
+            worker_args.push(value.clone());
+        }
+    }
+    worker_args.extend(stt.extra.iter().cloned());
+    let mut config = SttWorkerConfig::new(&stt.worker, worker_args);
+    config.startup_timeout = stt.startup_timeout;
+    config.heartbeat_timeout = stt.heartbeat_timeout;
+    // The real worker is always started with --stt-model, and its libraries
+    // are pinned; a worker without a model (a test double) loads no engine.
+    config.verify_engine_libs = stt.model.is_some();
+    let handle = emitter.sink.handle()?;
+    match SttWorker::spawn(config, handle) {
+        Ok(worker) => match SegmentFeeder::new(stt.feeder, worker) {
+            Ok(feeder) => {
+                eprintln!("speech-vad-sidecar: stt worker started; waiting for it to load");
+                Some(feeder)
+            }
+            Err(error) => {
+                eprintln!("speech-vad-sidecar: stt disabled: {error}");
+                None
+            }
+        },
+        Err(error) => {
+            eprintln!("speech-vad-sidecar: stt worker could not start: {error}; no transcripts");
+            None
+        }
+    }
 }
 
 fn finish(
-    emitter: Emitter,
+    mut emitter: Emitter,
     pipeline: Option<aivtuber_adapters::speech_vad::PipelineStats>,
+    drain: Duration,
 ) -> Result<(), String> {
+    // Let the worker finish the open segment and the relay carry its lines
+    // before the output queue is closed.
+    if let Some(feeder) = emitter.stt.take() {
+        let feeder_stats = feeder.stats();
+        let mut worker = feeder.into_sink();
+        worker.shutdown(drain);
+        eprintln!(
+            "speech-vad-sidecar: stt feeder={feeder_stats:?} worker={:?} failure={:?}",
+            worker.stats(),
+            worker.failure()
+        );
+    }
     let edges = emitter.edges_emitted;
     let stamp_errors = emitter.stamp_errors;
     let sink = emitter.sink.finish(Duration::from_secs(2));
@@ -390,7 +561,7 @@ fn run_wav(
         }
         other => return Err(format!("unsupported WAV sample format {other:?}")),
     };
-    let mut pipeline = VadPipeline::new(scorer, rate, args.hysteresis, args.preroll_ms)?;
+    let mut pipeline = VadPipeline::new(scorer, rate, args.hysteresis, args.ring_ms())?;
     // 10 ms of input per step, like a device callback.
     let step = (rate as usize / 100).max(1) * channels;
     let origin_local = timeline.local_ms();
@@ -413,7 +584,7 @@ fn run_wav(
         }
         edges.clear();
         pipeline.push_input(&mono, &mut edges);
-        emitter.emit(&edges, |s| {
+        emitter.step(&edges, pipeline.preroll(), |s| {
             timeline.runtime_ms(origin_local + s as f64 / 16.0)
         });
         if emitter.sink.is_closed() {
@@ -425,6 +596,9 @@ fn run_wav(
     emitter.emit(&edges, |s| {
         timeline.runtime_ms(origin_local + s as f64 / 16.0)
     });
+    if let Some(stt) = &mut emitter.stt {
+        stt.on_finish();
+    }
     Ok(pipeline.stats())
 }
 
@@ -447,7 +621,7 @@ fn run_mic(
         capture.device_name, capture.sample_rate_hz
     );
     let rate = capture.sample_rate_hz;
-    let mut pipeline = VadPipeline::new(scorer, rate, args.hysteresis, args.preroll_ms)?;
+    let mut pipeline = VadPipeline::new(scorer, rate, args.hysteresis, args.ring_ms())?;
     let mut stream_clock = StreamClock::default();
     let mut input_samples = 0_u64;
     let mut seen_dropped = 0_u64;
@@ -479,6 +653,9 @@ fn run_mic(
                     .ok_or(aivtuber_adapters::speech_vad::ClockError::NotSynced)?;
                 timeline.runtime_ms(local)
             });
+            if let Some(stt) = &mut emitter.stt {
+                stt.on_gap();
+            }
             stream_clock.reset();
             input_samples = 0;
         }
@@ -491,7 +668,7 @@ fn run_mic(
         stream_clock.observe_chunk(arrival_local, input_samples, rate);
         edges.clear();
         pipeline.push_input(&chunk.mono, &mut edges);
-        emitter.emit(&edges, |s| {
+        emitter.step(&edges, pipeline.preroll(), |s| {
             let local = stream_clock
                 .sample16_local_ms(s)
                 .ok_or(aivtuber_adapters::speech_vad::ClockError::NotSynced)?;
@@ -517,6 +694,9 @@ fn run_mic(
             .ok_or(aivtuber_adapters::speech_vad::ClockError::NotSynced)?;
         timeline.runtime_ms(local)
     });
+    if let Some(stt) = &mut emitter.stt {
+        stt.on_finish();
+    }
     Ok(pipeline.stats())
 }
 
