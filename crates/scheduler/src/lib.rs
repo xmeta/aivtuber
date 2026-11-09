@@ -1179,7 +1179,7 @@ mod tests {
         assert_eq!(stop.playing.len(), 1);
         assert_eq!(stop.playing[0].event_id, "e1");
         assert!(stop.queued.is_empty());
-        let history: Vec<_> = scheduler.history().iter().collect();
+        let history: Vec<_> = scheduler.history().collect();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].item.status, Status::Cancelled);
         assert_eq!(history[0].item.cancel_at_ms, Some(300));
@@ -1232,7 +1232,7 @@ mod tests {
                 .schedule(plan("e1", "now", Priority::Conversation, 0, 1000))
                 .expect("playing");
             scheduler
-                .schedule_at(100, plan("e2", "next", Priority::Commentary, 1200, 500))
+                .schedule_at(100, plan("e2", "next", Priority::Conversation, 1200, 500))
                 .expect("reserved");
             let stop = scheduler.stop_speaking_for(Priority::Conversation, 400);
             (
