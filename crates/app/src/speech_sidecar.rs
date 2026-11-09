@@ -26,7 +26,7 @@
 
 use crate::raw_ingress::{RawIngressConfig, RawIngressMetrics, pump_bounded_records};
 use aivtuber_adapters::speech_stt::{SttStatus, SttUnavailableReason, parse_stt_status_line};
-use aivtuber_adapters::speech_vad::encode_clock_sync_line;
+use aivtuber_adapters::speech_vad::{encode_clock_sync_line, parse_feed_heartbeat_line};
 use aivtuber_domain::{MAX_SPEECH_OBSERVATION_BATCH_BYTES, MAX_SPEECH_TRANSCRIPT_BATCH_BYTES};
 use aivtuber_runtime::{
     SpeechBatchReport, SpeechObservationTracker, SpeechTranscriptTracker, TranscriptBatchReport,
@@ -52,9 +52,13 @@ struct LineProbe {
     stt: Option<IgnoredAny>,
     #[serde(default)]
     transcripts: Option<IgnoredAny>,
+    #[serde(default)]
+    vad: Option<IgnoredAny>,
 }
 
 enum LineKind {
+    /// `{"vad":{"heartbeat":{...}}}`: feed liveness (#81 S2).
+    FeedHeartbeat,
     Status,
     Transcript,
     Observation,
@@ -67,6 +71,7 @@ fn classify(line: &[u8]) -> LineKind {
             transcripts: Some(_),
             ..
         }) => LineKind::Transcript,
+        Ok(LineProbe { vad: Some(_), .. }) => LineKind::FeedHeartbeat,
         // Anything else, including garbage, is judged by the observation
         // tracker exactly as before S3b.
         _ => LineKind::Observation,
@@ -191,6 +196,8 @@ pub struct SpeechSidecarStats {
     /// Transcript lines that arrived with no transcript tracker composed, or
     /// after the transcript path degraded.
     pub transcript_lines_ignored: u64,
+    /// Well-formed feed-liveness beats received (#81 S2).
+    pub feed_heartbeats: u64,
 }
 
 pub struct SpeechSidecar {
@@ -203,6 +210,10 @@ pub struct SpeechSidecar {
     consecutive_invalid: u32,
     consecutive_invalid_transcripts: u32,
     transcript_path: SpeechTranscriptPath,
+    /// Runtime time at which the newest feed heartbeat was *received*; the
+    /// receipt time, not the child's stamp, so a clock-mapping error cannot
+    /// hide a stalled feed. `None`: the child never reported one.
+    feed_heartbeat_ms: Option<u64>,
     stats: SpeechSidecarStats,
     config: SpeechSidecarConfig,
 }
@@ -261,6 +272,7 @@ impl SpeechSidecar {
             consecutive_invalid: 0,
             consecutive_invalid_transcripts: 0,
             transcript_path: SpeechTranscriptPath::NotReported,
+            feed_heartbeat_ms: None,
             stats: SpeechSidecarStats::default(),
             config,
         })
@@ -276,6 +288,14 @@ impl SpeechSidecar {
 
     pub fn transcript_path(&self) -> SpeechTranscriptPath {
         self.transcript_path
+    }
+
+    /// When the newest feed-liveness beat arrived, on the runtime timeline.
+    /// `None` until the child sends one (it only does with
+    /// `--feed-heartbeat-ms`). The floor treats `None` as "not reported", not
+    /// as "stale".
+    pub fn feed_heartbeat_ms(&self) -> Option<u64> {
+        self.feed_heartbeat_ms
     }
 
     pub fn stats(&self) -> SpeechSidecarStats {
@@ -322,6 +342,18 @@ impl SpeechSidecar {
                         continue;
                     }
                     match classify(&line) {
+                        LineKind::FeedHeartbeat => {
+                            // A malformed beat says nothing and changes
+                            // nothing; it never counts toward degrading.
+                            if parse_feed_heartbeat_line(&line).is_some() {
+                                self.feed_heartbeat_ms =
+                                    Some(self.feed_heartbeat_ms.map_or(now_ms, |p| p.max(now_ms)));
+                                self.stats.feed_heartbeats += 1;
+                            } else {
+                                self.stats.lines_rejected += 1;
+                            }
+                            continue;
+                        }
                         LineKind::Status => {
                             self.on_status(&line, transcripts.as_deref_mut());
                             continue;

@@ -12,6 +12,8 @@
 //! * `oversize`: print lines far above the batch size limit.
 //! * `hang`: neither read nor write nor exit.
 //!
+//! Feed-liveness modes (#81 S2): `beat`, `beat-stall`, `beat-garbage`.
+//!
 //! Transcript modes (#92 S3b), also clocked by the sync lines: `transcripts`
 //! (a ready status, then per segment two partials and a final, each stamped
 //! with the sync time), `stt-fail` (edges, a ready status, then an
@@ -105,6 +107,30 @@ fn main() -> ExitCode {
             });
             ExitCode::SUCCESS
         }
+        // Feed liveness (#81 S2): one `{"vad":{"heartbeat":...}}` line per
+        // sync (`beat`), only the first three (`beat-stall`: the child lives
+        // but its feed has stalled), or malformed ones (`beat-garbage`).
+        "beat" | "beat-stall" => {
+            let stall = mode == "beat-stall";
+            let mut n = 0_u64;
+            let _ = pump_clock_syncs(BufReader::new(io::stdin().lock()), |_| {
+                if !stall || n < 3 {
+                    emit(
+                        &mut out,
+                        &aivtuber_adapters::speech_vad::encode_feed_heartbeat_line(n),
+                    );
+                }
+                n += 1;
+            });
+            ExitCode::SUCCESS
+        }
+        "beat-garbage" => {
+            let _ = pump_clock_syncs(BufReader::new(io::stdin().lock()), |_| {
+                emit(&mut out, "{\"vad\":{\"heartbeat\":{\"seq\":\"x\"}}}\n");
+                emit(&mut out, "{\"vad\":7}\n");
+            });
+            ExitCode::SUCCESS
+        }
         "crash" => {
             let mut first_line = String::new();
             let _ = io::stdin().lock().read_line(&mut first_line);
@@ -127,7 +153,7 @@ fn main() -> ExitCode {
         },
         _ => {
             eprintln!(
-                "usage: speech-sidecar-double clock|crash|garbage|flood|oversize|hang|transcripts|stt-fail|transcript-garbage"
+                "usage: speech-sidecar-double clock|crash|garbage|flood|oversize|hang|transcripts|stt-fail|transcript-garbage|beat|beat-stall|beat-garbage"
             );
             ExitCode::FAILURE
         }

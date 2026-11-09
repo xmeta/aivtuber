@@ -96,6 +96,21 @@ pub enum Status {
     Cancelled,
 }
 
+/// What [`Scheduler::stop_speaking_for`] cancelled.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BargeInStop {
+    /// Audio performances that were playing.
+    pub playing: Vec<PlannedPerformance>,
+    /// Audio performances reserved but not yet started.
+    pub queued: Vec<PlannedPerformance>,
+}
+
+impl BargeInStop {
+    pub fn is_empty(&self) -> bool {
+        self.playing.is_empty() && self.queued.is_empty()
+    }
+}
+
 /// A planned performance plus scheduler-owned lifecycle metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduledItem {
@@ -704,6 +719,49 @@ impl Scheduler {
         Some(plan)
     }
 
+    /// Barge-in stop (issue #81 S2, ADR-0005 S-3): cancel, at `at_ms`, the
+    /// audio-carrying performances an `incoming` priority may preempt. It is
+    /// the same arbitration `schedule` applies (an item with a better rank than
+    /// `incoming`, or one declared non-interruptible, is left alone), minus the
+    /// wait for a declared interrupt point: stopping publishes nothing, so the
+    /// commit barrier that guards starting output does not apply.
+    ///
+    /// Only items on the `Audio` channel are touched; playing and not yet
+    /// started ones are reported separately. It is not an operator path and
+    /// grants nothing: the caller is the app's floor executor, which acts on a
+    /// confirmed barge-in only.
+    pub fn stop_speaking_for(&mut self, incoming: Priority, at_ms: u64) -> BargeInStop {
+        self.advance_to(at_ms);
+        let mut stop = BargeInStop::default();
+        let mut index = 0;
+        while index < self.items.len() {
+            let item = &self.items[index];
+            let stoppable = item.plan.channels.contains(&BlendChannel::Audio)
+                && item.plan.interruptible
+                && incoming.rank() <= item.plan.priority.rank();
+            match (stoppable, item.status) {
+                (true, Status::Playing) => {
+                    let plan = item.plan.clone();
+                    self.items[index].status = Status::Cancelled;
+                    self.items[index].cancel_at_ms = Some(at_ms);
+                    self.last_terminal_at = Some(
+                        self.last_terminal_at
+                            .map_or(at_ms, |previous| previous.max(at_ms)),
+                    );
+                    self.retire(index, at_ms);
+                    stop.playing.push(plan);
+                }
+                (true, Status::Queued) => {
+                    let plan = item.plan.clone();
+                    self.cancel_queued(index, at_ms);
+                    stop.queued.push(plan);
+                }
+                _ => index += 1,
+            }
+        }
+        stop
+    }
+
     /// Finish every remaining reservation at deterministic logical time.
     pub fn complete_all(&mut self) {
         let end = self
@@ -1100,6 +1158,93 @@ mod tests {
                 .iter()
                 .all(|item| item.cancel_at_ms == Some(300))
         );
+    }
+
+    /// Issue #81 S2: a barge-in stop follows the preemption arbitration (it
+    /// never overrides a better-ranked or non-interruptible performance), only
+    /// touches the audio channel, and does not wait for an interrupt point.
+    #[test]
+    fn barge_in_stop_respects_priority_interruptibility_and_channel() {
+        let mut scheduler = no_spacing();
+        // Mid-speech with a single end-of-speech interrupt point: the stop is
+        // immediate, not deferred to 1000.
+        let mut speech = plan("e1", "speech", Priority::Conversation, 0, 1000);
+        speech.interrupt_points_ms = vec![1000];
+        let mut gesture = plan("e2", "gesture", Priority::Conversation, 0, 1000);
+        gesture.channels = channels(&[BlendChannel::Body]);
+        scheduler.schedule(speech).expect("speech");
+        scheduler.schedule(gesture).expect("gesture");
+
+        let stop = scheduler.stop_speaking_for(Priority::Conversation, 300);
+        assert_eq!(stop.playing.len(), 1);
+        assert_eq!(stop.playing[0].event_id, "e1");
+        assert!(stop.queued.is_empty());
+        let history: Vec<_> = scheduler.history().iter().collect();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].item.status, Status::Cancelled);
+        assert_eq!(history[0].item.cancel_at_ms, Some(300));
+        assert_eq!(scheduler.items().len(), 1, "the gesture keeps playing");
+        assert!(
+            scheduler
+                .stop_speaking_for(Priority::Conversation, 301)
+                .is_empty()
+        );
+
+        // A better-ranked reaction is not overridden by conversation speech.
+        let mut scheduler = no_spacing();
+        scheduler
+            .schedule(plan(
+                "e3",
+                "donation",
+                Priority::HighPriorityInteraction,
+                0,
+                1000,
+            ))
+            .expect("donation");
+        assert!(
+            scheduler
+                .stop_speaking_for(Priority::Conversation, 100)
+                .is_empty()
+        );
+        assert_eq!(
+            scheduler.playing().map(|i| i.plan.event_id.as_str()),
+            Some("e3")
+        );
+
+        // Nor is a performance declared non-interruptible.
+        let mut scheduler = no_spacing();
+        let mut pinned = plan("e4", "pinned", Priority::Conversation, 0, 1000);
+        pinned.interruptible = false;
+        scheduler.schedule(pinned).expect("pinned");
+        assert!(
+            scheduler
+                .stop_speaking_for(Priority::Conversation, 100)
+                .is_empty()
+        );
+        assert!(scheduler.playing().is_some());
+    }
+
+    #[test]
+    fn barge_in_stop_also_cancels_a_reserved_audio_reply_and_is_replay_stable() {
+        let run = || {
+            let mut scheduler = no_spacing();
+            scheduler
+                .schedule(plan("e1", "now", Priority::Conversation, 0, 1000))
+                .expect("playing");
+            scheduler
+                .schedule_at(100, plan("e2", "next", Priority::Commentary, 1200, 500))
+                .expect("reserved");
+            let stop = scheduler.stop_speaking_for(Priority::Conversation, 400);
+            (
+                stop.playing.len(),
+                stop.queued.len(),
+                scheduler.items().len(),
+                scheduler.metrics(),
+            )
+        };
+        let first = run();
+        assert_eq!((first.0, first.1, first.2), (1, 1, 0));
+        assert_eq!(first, run());
     }
 
     /// Regression (issue #52): retire() swap-removes slots, so stop_all must

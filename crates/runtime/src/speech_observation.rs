@@ -460,6 +460,11 @@ impl SpeechObservationTracker {
         self.metrics.speakers_evicted += (before - self.speakers.len()) as u64;
     }
 
+    /// Tracked speaker ids, in order. Bounded by `max_speakers`.
+    pub fn speaker_ids(&self) -> impl Iterator<Item = &str> {
+        self.speakers.keys().map(String::as_str)
+    }
+
     /// Read-only view; counts nothing.
     pub fn view(&self, speaker_id: &str, now_ms: u64) -> Option<SpeakerView> {
         self.speakers

@@ -1,14 +1,15 @@
 use aivtuber_domain::{EngineError, EngineErrorKind};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 #[cfg(all(windows, feature = "native-audio-spike"))]
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player};
 #[cfg(all(windows, feature = "native-audio-spike"))]
 use std::fs::File;
-#[cfg(all(windows, feature = "native-audio-spike"))]
-use std::sync::Mutex;
 
 const AUDIO_SCHEME: &str = "audio://";
 
@@ -43,13 +44,51 @@ pub struct AudioPlayRequest {
     pub speed_factor: f64,
 }
 
+/// Largest fade a stop request may ask for (ADR-0005 S-3).
+pub const MAX_AUDIO_STOP_FADE_MS: u32 = 150;
+
+/// What an [`AudioPlayer::stop`] request did, so the caller can report it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioStopOutcome {
+    /// Nothing was audible or tracked.
+    NothingPlaying,
+    /// The volume ramps to silence over `fade_ms`, then playback ends. The
+    /// call itself returned at once.
+    Faded { fade_ms: u32 },
+    /// Playback was ended abruptly: the backend cannot ramp (an external
+    /// player process) or no fade was requested.
+    HardStopped,
+    /// The backend has no stop; audio already started plays out.
+    Unsupported,
+}
+
 pub trait AudioPlayer: Send + Sync {
     fn play(&self, request: &AudioPlayRequest) -> Result<(), EngineError>;
+
+    /// Stop what this player started, fading over at most `fade_ms` when the
+    /// backend can. It carries no authority: callers (the app's own cancel
+    /// path) decide when to call it. The default is "cannot stop".
+    fn stop(&self, fade_ms: u32) -> Result<AudioStopOutcome, EngineError> {
+        let _ = fade_ms;
+        Ok(AudioStopOutcome::Unsupported)
+    }
+}
+
+/// Playback processes still alive, so a stop can end them. Bounded.
+const MAX_TRACKED_PROCESSES: usize = 16;
+const REAP_POLL: Duration = Duration::from_millis(20);
+
+#[derive(Debug)]
+struct Tracked {
+    id: u64,
+    child: Child,
 }
 
 #[derive(Debug, Clone)]
 pub struct ProcessAudioPlayer {
     config: ProcessAudioConfig,
+    running: Arc<Mutex<Vec<Tracked>>>,
+    next_id: Arc<AtomicU64>,
 }
 
 impl ProcessAudioPlayer {
@@ -72,7 +111,11 @@ impl ProcessAudioPlayer {
                 "audio player args must contain {audio}",
             ));
         }
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            running: Arc::new(Mutex::new(Vec::new())),
+            next_id: Arc::new(AtomicU64::new(0)),
+        })
     }
 
     pub fn config(&self) -> &ProcessAudioConfig {
@@ -130,12 +173,69 @@ impl ProcessAudioPlayer {
 
 impl AudioPlayer for ProcessAudioPlayer {
     fn play(&self, request: &AudioPlayRequest) -> Result<(), EngineError> {
-        let mut child = self.start_tracked(request)?;
+        let child = self.start_tracked(request)?;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut running = lock_running(&self.running);
+            running.retain_mut(|tracked| matches!(tracked.child.try_wait(), Ok(None)));
+            // Never more than the bound: the oldest is ended rather than
+            // left running untracked.
+            while running.len() >= MAX_TRACKED_PROCESSES {
+                let mut oldest = running.remove(0);
+                let _ = oldest.child.kill();
+                reap(oldest.child);
+            }
+            running.push(Tracked { id, child });
+        }
+        // The waiter that used to own the child now only reaps it when it
+        // exits on its own; a stop takes it out of the list first.
+        let running = Arc::clone(&self.running);
         thread::spawn(move || {
-            let _ = child.wait();
+            loop {
+                thread::sleep(REAP_POLL);
+                let mut running = lock_running(&running);
+                let Some(position) = running.iter().position(|tracked| tracked.id == id) else {
+                    return;
+                };
+                if !matches!(running[position].child.try_wait(), Ok(None)) {
+                    running.remove(position);
+                    return;
+                }
+            }
         });
         Ok(())
     }
+
+    /// An external player process cannot be faded from outside: it is killed
+    /// (measured 2.0 ms p50 for kill and wait, docs/audio-backend-spike.adoc)
+    /// and reaped off-thread, and the outcome says so.
+    fn stop(&self, fade_ms: u32) -> Result<AudioStopOutcome, EngineError> {
+        let _ = fade_ms;
+        let taken: Vec<Tracked> = std::mem::take(&mut *lock_running(&self.running));
+        let mut ended = false;
+        for mut tracked in taken {
+            if matches!(tracked.child.try_wait(), Ok(None)) {
+                let _ = tracked.child.kill();
+                ended = true;
+            }
+            reap(tracked.child);
+        }
+        Ok(if ended {
+            AudioStopOutcome::HardStopped
+        } else {
+            AudioStopOutcome::NothingPlaying
+        })
+    }
+}
+
+fn lock_running(running: &Mutex<Vec<Tracked>>) -> std::sync::MutexGuard<'_, Vec<Tracked>> {
+    running.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+fn reap(mut child: Child) {
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 #[cfg(all(windows, feature = "native-audio-spike"))]
@@ -234,6 +334,44 @@ impl AudioPlayer for RodioAudioPlayer {
             previous.stop();
         }
         Ok(())
+    }
+
+    /// A real fade: the volume ramps linearly to zero in 10 ms steps on a
+    /// short-lived thread, then the player stops. The call returns at once;
+    /// a new `play` is independent of the fading player.
+    fn stop(&self, fade_ms: u32) -> Result<AudioStopOutcome, EngineError> {
+        let player = {
+            let mut current = self.current.lock().map_err(|_| {
+                engine_error(
+                    EngineErrorKind::Unavailable,
+                    "native audio state lock was poisoned",
+                )
+            })?;
+            current.take()
+        };
+        let Some(player) = player else {
+            return Ok(AudioStopOutcome::NothingPlaying);
+        };
+        if player.empty() {
+            player.stop();
+            return Ok(AudioStopOutcome::NothingPlaying);
+        }
+        let fade_ms = fade_ms.min(MAX_AUDIO_STOP_FADE_MS);
+        if fade_ms == 0 {
+            player.stop();
+            return Ok(AudioStopOutcome::HardStopped);
+        }
+        thread::spawn(move || {
+            const STEP_MS: u32 = 10;
+            let steps = (fade_ms / STEP_MS).max(1);
+            let start = player.volume();
+            for step in 1..=steps {
+                thread::sleep(Duration::from_millis(u64::from(fade_ms / steps)));
+                player.set_volume(start * (1.0 - step as f32 / steps as f32));
+            }
+            player.stop();
+        });
+        Ok(AudioStopOutcome::Faded { fade_ms })
     }
 }
 

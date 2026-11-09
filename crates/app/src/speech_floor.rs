@@ -12,10 +12,44 @@
 //!   absent unless composed, so the default path is unchanged;
 //! * reads logical time only (`at_ms`).
 
-use aivtuber_domain::{FloorAction, FloorConfig, FloorDecision, FloorInput};
-use aivtuber_runtime::SurfacedFinal;
-use aivtuber_scheduler::{FloorMetrics, FloorPolicy};
+use aivtuber_domain::{
+    FloorAction, FloorConfig, FloorDecision, FloorInput, TranscriptHold, UserSpeechEvidence,
+};
+use aivtuber_runtime::{
+    FloorHold, SpeechObservationTracker, SpeechTranscriptTracker, SurfacedFinal,
+};
+use aivtuber_scheduler::{FloorMetrics, FloorPolicy, evaluate};
 use std::collections::VecDeque;
+
+/// What the raw VAD feed says about one speaker, with the feed's liveness.
+/// `feed_age_ms` is `None` when the sidecar reports no liveness (D6 then
+/// stays dormant and the S1 behaviour applies).
+pub(crate) fn floor_evidence(
+    observations: Option<&SpeechObservationTracker>,
+    speaker: &str,
+    at_ms: u64,
+    feed_age_ms: Option<u64>,
+) -> Option<UserSpeechEvidence> {
+    observations
+        .and_then(|tracker| tracker.view(speaker, at_ms))
+        .map(|view| UserSpeechEvidence {
+            signal: view.fallback,
+            last_edge_ms: view.last_edge_ms,
+            feed_age_ms,
+        })
+}
+
+pub(crate) fn transcript_hold(
+    transcripts: &SpeechTranscriptTracker,
+    speaker: &str,
+    at_ms: u64,
+) -> TranscriptHold {
+    match transcripts.floor_hold(speaker, at_ms) {
+        FloorHold::None => TranscriptHold::None,
+        FloorHold::Holding { .. } => TranscriptHold::Holding,
+        FloorHold::Stale { .. } => TranscriptHold::Stale,
+    }
+}
 
 /// Counters for the gate (the policy has its own `FloorMetrics`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -69,6 +103,22 @@ impl SpeechFloor {
 
     pub(crate) fn recent(&self) -> Vec<FloorDecision> {
         self.policy.recent().copied().collect()
+    }
+
+    /// A confirmed barge-in, if `input` is one (ADR-0005 S-3). Evaluates
+    /// without recording; only a `Yield` that has not already been acted on
+    /// for this run (`already_handled`) is sequenced into the decision ring,
+    /// so tentative and held evaluations at tick rate neither flood the ring
+    /// nor leave speculation in it.
+    pub(crate) fn confirm_barge_in(
+        &mut self,
+        input: &FloorInput,
+        already_handled: bool,
+    ) -> Option<FloorDecision> {
+        if already_handled || evaluate(self.policy.config(), input).action != FloorAction::Yield {
+            return None;
+        }
+        Some(self.policy.decide(input))
     }
 
     /// Take the finals that may be routed now (oldest first, at most

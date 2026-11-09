@@ -7,15 +7,15 @@ use aivtuber_adapters::{
     ProcessAudioConfig, ProcessAudioPlayer, SecretString, VTubeStudioAdapter, VTubeStudioConfig,
 };
 use aivtuber_app::{
-    AdaptationRuntime, AdapterHealth, AvatarOutput, CompositionProfile, GenerativeBudgetPolicy,
-    GenerativeRuntime, IntentRoutePlanner, IntentShadowPolicy, LocalAvatarOutput, NoopAvatarOutput,
-    NoopStreamOutput, ObsStreamOutput, OperatorControlServer, OperatorRateLimiter, ProductionApp,
-    ProfileSummary, RawIngressConfig, RawIngressMetrics, RawIngressMetricsSnapshot, RoutePlanner,
-    RuntimeRetentionPolicy, SHADOW_ORCHESTRATOR_SCHEMA_VERSION, ShadowOrchestratorConfig,
-    ShadowPolicyIdentity, ShadowingRoutePlanner, SpeechConversationConfig,
-    SpeechConversationMetrics, SpeechFloorMetrics, SpeechSidecar, SpeechSidecarConfig,
-    SpeechSidecarStats, StreamOutput, VtsAvatarOutput, VtsPlaybackConfig, apply_dispatched_request,
-    pump_bounded_records, stt_sidecar_args,
+    AdaptationRuntime, AdapterHealth, AvatarOutput, BargeInConfig, CompositionProfile,
+    GenerativeBudgetPolicy, GenerativeRuntime, IntentRoutePlanner, IntentShadowPolicy,
+    LocalAvatarOutput, NoopAvatarOutput, NoopStreamOutput, ObsStreamOutput, OperatorControlServer,
+    OperatorRateLimiter, ProductionApp, ProfileSummary, RawIngressConfig, RawIngressMetrics,
+    RawIngressMetricsSnapshot, RoutePlanner, RuntimeRetentionPolicy,
+    SHADOW_ORCHESTRATOR_SCHEMA_VERSION, ShadowOrchestratorConfig, ShadowPolicyIdentity,
+    ShadowingRoutePlanner, SpeechConversationConfig, SpeechConversationMetrics, SpeechFloorMetrics,
+    SpeechSidecar, SpeechSidecarConfig, SpeechSidecarStats, StreamOutput, VtsAvatarOutput,
+    VtsPlaybackConfig, apply_dispatched_request, pump_bounded_records, stt_sidecar_args,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
@@ -321,6 +321,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut speech_sidecar: Option<SpeechSidecar> = None;
     let mut speech_conversation_enabled = false;
     let mut speech_floor_enabled = false;
+    let mut speech_barge_in_enabled = false;
     let mut last_floor_metrics = SpeechFloorMetrics::default();
     let mut last_conversation_metrics = SpeechConversationMetrics::default();
     if let Some(program) = env_optional("AIVTUBER_SPEECH_SIDECAR") {
@@ -423,6 +424,19 @@ fn run() -> Result<(), Box<dyn Error>> {
                         "speech_floor: enabled take_turn_silence_ms={} max_defer_ms={} max_deferred={}",
                         floor.take_turn_silence_ms, floor.max_defer_ms, floor.max_deferred
                     );
+                    // Issue #81 S2: a confirmed barge-in stops the performer's
+                    // speech with a bounded fade. Off unless
+                    // AIVTUBER_SPEECH_BARGE_IN is true; layered on the floor.
+                    if env_bool("AIVTUBER_SPEECH_BARGE_IN", false)? {
+                        let fade_ms = u32::try_from(env_u64(
+                            "AIVTUBER_SPEECH_BARGE_IN_FADE_MS",
+                            u64::from(BargeInConfig::default().fade_ms),
+                        )?)
+                        .unwrap_or(u32::MAX);
+                        app = app.with_barge_in(BargeInConfig { fade_ms })?;
+                        speech_barge_in_enabled = true;
+                        eprintln!("speech_barge_in: enabled fade_ms={fade_ms}");
+                    }
                 }
                 eprintln!(
                     "speech_conversation: enabled max_finals_per_tick={} max_text_chars={}",
@@ -442,6 +456,20 @@ fn run() -> Result<(), Box<dyn Error>> {
                 "AIVTUBER_SPEECH_FLOOR requires AIVTUBER_SPEECH_CONVERSATION",
             )
             .into());
+        }
+        if env_bool("AIVTUBER_SPEECH_BARGE_IN", false)? && !speech_barge_in_enabled {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "AIVTUBER_SPEECH_BARGE_IN requires AIVTUBER_SPEECH_FLOOR",
+            )
+            .into());
+        }
+        // Issue #81 S2: with the floor on, the sidecar reports feed liveness
+        // so a stalled feed is told from a quiet room (ADR-0005 D6). An
+        // explicit --feed-heartbeat-ms in the sidecar arguments wins.
+        if speech_floor_enabled && !sidecar_args.iter().any(|arg| arg == "--feed-heartbeat-ms") {
+            sidecar_args.push("--feed-heartbeat-ms".to_owned());
+            sidecar_args.push("64".to_owned());
         }
         let mut config = SpeechSidecarConfig::new(program, sidecar_args);
         config.resync_interval =
@@ -524,6 +552,30 @@ fn run() -> Result<(), Box<dyn Error>> {
             && let (Some(tracker), transcripts) = app.speech_trackers_mut()
         {
             sidecar.poll_with_transcripts(tracker, transcripts, now_ms, |_, _| {}, |_, _| {});
+        }
+        // Issue #81 S2: feed liveness first, then the confirmed barge-in, so a
+        // stalled feed is already stale when the barge-in is judged. Only
+        // lengths and counts are logged.
+        if let Some(beat_ms) = speech_sidecar
+            .as_ref()
+            .and_then(SpeechSidecar::feed_heartbeat_ms)
+        {
+            app.note_speech_feed_heartbeat(beat_ms);
+        }
+        if speech_barge_in_enabled && let Some(record) = app.service_barge_in(now_ms) {
+            eprintln!(
+                "speech_barge_in: decision_seq={} at_ms={} effect={:?} cancelled_playing={} cancelled_queued={} fade_ms={} audio={:?} audio_error={} avatar_reset={:?} decision_to_stop_micros={}",
+                record.decision_seq,
+                record.decided_at_ms,
+                record.effect,
+                record.cancelled_playing,
+                record.cancelled_queued,
+                record.fade_ms,
+                record.audio,
+                record.audio_error,
+                record.avatar_reset,
+                record.decision_to_stop_micros
+            );
         }
         // Finals are the only transcript text that leaves the tracker. With
         // AIVTUBER_SPEECH_CONVERSATION they go through process_content_bytes

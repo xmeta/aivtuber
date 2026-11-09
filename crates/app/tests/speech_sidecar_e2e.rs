@@ -401,3 +401,71 @@ fn a_dead_sidecar_with_no_reported_worker_counts_one_failure() {
     }
     assert_eq!(observations.metrics().provider_unavailable, 1);
 }
+
+// ---- Issue #81 S2: feed liveness through the same supervisor ----
+
+/// Beats are routed by their `vad` key, never offered to the observation
+/// tracker, and stamped with the app's receipt time.
+#[test]
+fn feed_heartbeats_are_routed_by_key_and_stamped_with_receipt_time() {
+    let started = Instant::now();
+    let mut observations = tracker(1_000);
+    let mut sidecar = spawn("beat", 250, started);
+    assert_eq!(
+        sidecar.feed_heartbeat_ms(),
+        None,
+        "no beat before the child sends one"
+    );
+    let done = run_until(Duration::from_secs(10), || {
+        poll_both(&mut sidecar, &mut observations, None, started);
+        sidecar.stats().feed_heartbeats >= 3
+    });
+    assert!(done, "{:?}", sidecar.stats());
+    let stamp = sidecar.feed_heartbeat_ms().expect("a receipt time");
+    assert!(stamp <= started.elapsed().as_millis() as u64);
+    let stats = sidecar.stats();
+    assert_eq!((stats.lines_rejected, stats.batches_ingested), (0, 0));
+    assert_eq!(observations.metrics().batches_rejected_invalid, 0);
+    assert!(!sidecar.is_degraded());
+}
+
+/// A child that lives but stops beating leaves the receipt time where it was,
+/// so the age the floor sees keeps growing. The supervisor does not decide
+/// what that means, and does not degrade (the policy owns D6).
+#[test]
+fn a_stalled_feed_stops_advancing_the_heartbeat_while_the_child_lives() {
+    let started = Instant::now();
+    let mut observations = tracker(1_000);
+    let mut sidecar = spawn("beat-stall", 250, started);
+    let done = run_until(Duration::from_secs(10), || {
+        poll_both(&mut sidecar, &mut observations, None, started);
+        sidecar.stats().feed_heartbeats >= 3
+    });
+    assert!(done, "{:?}", sidecar.stats());
+    // Let more syncs go by: the child answers each with nothing.
+    std::thread::sleep(Duration::from_millis(400));
+    poll_both(&mut sidecar, &mut observations, None, started);
+    let frozen = sidecar.feed_heartbeat_ms();
+    assert!(frozen.is_some());
+    assert_eq!(sidecar.stats().feed_heartbeats, 3);
+    std::thread::sleep(Duration::from_millis(200));
+    poll_both(&mut sidecar, &mut observations, None, started);
+    assert_eq!(sidecar.feed_heartbeat_ms(), frozen);
+    assert!(!sidecar.is_degraded());
+}
+
+/// Malformed beats say nothing: no receipt time, and they never count toward
+/// the 32 consecutive invalid batches that stop the child.
+#[test]
+fn malformed_beats_neither_count_as_liveness_nor_degrade() {
+    let started = Instant::now();
+    let mut observations = tracker(1_000);
+    let mut sidecar = spawn("beat-garbage", 250, started);
+    let done = run_until(Duration::from_secs(10), || {
+        poll_both(&mut sidecar, &mut observations, None, started);
+        sidecar.stats().lines_rejected >= 80
+    });
+    assert!(done, "{:?}", sidecar.stats());
+    assert_eq!(sidecar.feed_heartbeat_ms(), None);
+    assert!(!sidecar.is_degraded());
+}
