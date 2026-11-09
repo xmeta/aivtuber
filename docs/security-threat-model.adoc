@@ -124,6 +124,39 @@ scheduler/audio stop
 
 No Jev, LLM, semantic retrieval, or remote TTS dependency is permitted on this path.
 
+=== 6.1 What an operator stop or mute guarantees per output
+
+An authenticated +stop+ or +mute+ (the only two actions that override output) does the following, in this order, on the runtime thread. None of it sits behind a feature flag, and none of it reads or waits for the content queue, the speech floor, barge-in, or any model/TTS path.
+
+. Cancels the scheduler (+stop+) and cancels the active generation, as before. +stop+ also purges pending audio/avatar commands of the cancelled generations; +mute+ latches suppression of every later audio and avatar dispatch.
+. Calls the single +AudioOutput::stop(0)+ primitive (a hard stop, no fade) on the audio output. The barge-in path calls the same primitive with a short fade; there is no second implementation.
+. Sends the avatar a +Reset+ (neutral) through its normal output.
+. Appends an audit record that names the per-output result.
+
+[cols="1,3"]
+|===
+|Audio output |Guarantee
+
+|+ProcessAudioPlayer+ (ffplay)
+|Every tracked playback process is killed (about 2 ms) and reaped off-thread. Reported +hard_stopped+, or +nothing_playing+ when nothing was running.
+
+|Backend with a stop that cannot ramp from outside
+|Reported +hard_stopped+.
+
+|Backend without a stop (the +AudioOutput+ default, or a player whose adapter has none)
+|Audio that already started plays out. Reported +unsupported+. The record is +operator_audio_stop_unconfirmed+ and never claims success.
+
+|Backend whose stop returns an error
+|Reported +failed+ (+operator_audio_stop_unconfirmed+); the adapter health shows the audio error.
+
+|Backend whose stop does not answer within 100 ms (stuck driver)
+|The control handler returns anyway; the stop runs on a worker thread and is reported +unconfirmed+. Audio may still be audible. Dispatch never blocks on the stuck output, and a repeated stop does not start a second worker.
+|===
+
+Audit records use the +Authorization+ category with decision +operator_audio_stopped+ (the backend confirmed a hard stop or nothing playing) or +operator_audio_stop_unconfirmed+ (anything else), and a detail of tokens only: +audio_stop=<hard_stopped|nothing_playing|unsupported|failed|unconfirmed> avatar_reset=<ok|failed>+. The operator response carries the same tokens. Only a non-serializable +AuthenticatedControl+ minted by +LocalControlIngress+ reaches this path: a wrong secret, a chat message, and a serialized +operator.command+ with an +authorization+ claim do not.
+
+Mute is a latch, not a one-off: after it, audio commands and avatar commands are dropped at dispatch, so the neutral avatar is not re-animated.
+
 == 7. Prompt injection containment
 
 Prompt injection is treated as a data-flow problem.
