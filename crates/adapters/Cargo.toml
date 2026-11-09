@@ -8,6 +8,13 @@ publish.workspace = true
 [features]
 default = []
 native-audio-spike = ["dep:rodio"]
+# Silero VAD v6 inference (pure Rust, tract) and WAV input for the
+# speech-vad-sidecar binary (#92 S2). Off by default so the workspace build
+# does not compile an inference runtime.
+silero-vad = ["dep:tract-onnx", "dep:hound"]
+# Local microphone capture through cpal for the sidecar. Separate from
+# silero-vad because cpal needs ALSA development headers on Linux.
+mic-capture = ["dep:cpal"]
 
 [dependencies]
 aivtuber-domain = { path = "../domain" }
@@ -22,6 +29,9 @@ url = "2.5.8"
 rodio = { version = "0.22.2", default-features = false, features = ["wav"], optional = true }
 rmcp = { version = "3.5.0", default-features = false, features = ["client", "server", "macros", "transport-async-rw"] }
 tokio = { version = "1.53.1", features = ["sync", "time", "rt", "macros"] }
+tract-onnx = { version = "0.23.10", default-features = false, optional = true }
+hound = { version = "3.5", optional = true }
+cpal = { version = "0.17.3", optional = true }
 twitch-irc = { version = "6.1.3", default-features = false, features = ["transport-tcp-native-tls"] }
 
 [target.'cfg(windows)'.dependencies]
@@ -37,6 +47,11 @@ tokio = { version = "1.53.1", features = ["rt", "macros", "time", "io-util"] }
 name = "audio-backend-benchmark"
 path = "src/bin/audio-backend-benchmark.rs"
 required-features = ["native-audio-spike"]
+
+[[bin]]
+name = "speech-vad-sidecar"
+path = "src/bin/speech-vad-sidecar.rs"
+required-features = ["silero-vad"]
 
 [[bin]]
 name = "twitch-chat-ingress"
