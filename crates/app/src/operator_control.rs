@@ -461,13 +461,18 @@ pub fn apply_dispatched_request<R: RoutePlanner>(
         }
     };
 
-    match app.handle_control(&command, now_ms) {
-        Ok(outcome) => {
-            let detail = match outcome {
+    match app.handle_control_reporting(&command, now_ms) {
+        Ok((outcome, stop_report)) => {
+            let mut detail = match outcome {
                 ControlOutcome::Stopped { cancelled } => format!("stopped {cancelled} items"),
                 ControlOutcome::Muted => "muted".to_owned(),
                 ControlOutcome::AuthenticatedOther => "authenticated".to_owned(),
             };
+            // Per-output result of ending already-started audio (#277): the
+            // operator sees an unsupported/unconfirmed stop as such.
+            if let Some(report) = stop_report {
+                detail = format!("{detail}; {}", report.detail());
+            }
             app.audit_operator_action(&request_id, &request.action, &detail, true);
             OperatorResponse {
                 request_id,

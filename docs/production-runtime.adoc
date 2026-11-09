@@ -261,7 +261,7 @@ Audio stop per output (a stop request is a request, the outcome says what happen
 |Any other `AudioOutput`/`AudioPlayer`|`Unsupported` by default: audio that already started plays out, the scheduler cancellation, purge and avatar `Reset` still happen, and `audio_stop_unsupported` is counted.
 |===
 +
-Known limits: the operator stop path (`handle_control`) still does not stop an already started audio process (it cancels the scheduler and purges pending commands only); that predates this slice and is unchanged. An in-flight generation is not cancelled by a barge-in. Backchannels, early preparation and phrase-level interrupt points (#83) are not part of this slice.
+Operator stop (`handle_control`) is independent of this path and ends started audio itself (#277, see the operator control section). An in-flight generation is not cancelled by a barge-in. Backchannels, early preparation and phrase-level interrupt points (#83) are not part of this slice.
 * Sidecar flags (also usable by hand): `--feed-heartbeat-ms N` (0 = off, the default; 16 to 1000), `--stt-worker PROGRAM`, `--stt-model`, `--stt-model-dir`, `--stt-threads`, `--stt-preroll-ms` (default 300, at least 300), `--stt-tail-ms` (500), `--stt-min-speech-ms` (250), `--stt-max-segment-ms` (25000, split below the worker's 30 s cap), `--stt-startup-timeout-ms` (60000), `--stt-heartbeat-timeout-ms` (5000), `--stt-drain-ms` (8000), `--stt-wait-ready-ms` (for `--input-wav` only: wait for the model before reading the file), `--stt-arg ARG` (raw passthrough to the worker, for test doubles). The pipeline's pre-roll ring grows to the pre-roll plus the minimum speech plus 300 ms when STT is on.
 * The pre-roll hook S2 left unread is read here: a segment opens once the speech span reaches the minimum (a cough never reaches the worker), starts `--stt-preroll-ms` before the first start edge (EXP-0001 onset lag p90 was 112 to 144 ms, EXP-0002 6.5), continues across a pause shorter than the tail and closes when the tail runs out. Raw VAD edges still go out unchanged and undebounced.
 
@@ -407,13 +407,21 @@ Actions:
 |Secret verification only (constant time); no control authority is minted.
 
 |+stop+
-|Stops and cancels current and queued performer work through +SecurityRuntime::handle_control_with_scheduler+.
+|Stops and cancels current and queued performer work through +SecurityRuntime::handle_control_with_scheduler+, ends audio that already started (+AudioOutput::stop(0)+, hard stop) and resets the avatar to neutral.
 |+performer.stop+ capability.
 
 |+mute+
-|Latches the operator mute state; scheduled audio dispatch is suppressed while muted.
+|Latches the operator mute state; scheduled audio and avatar dispatch is suppressed while muted. Like +stop+, it also ends audio that already started and resets the avatar to neutral.
 |+performer.mute+ capability.
 |===
+
+*Ending started audio (#277).* +stop+ and +mute+ call +AudioOutput::stop(0)+ and an avatar +Reset+ with no feature flag: it works with the speech floor, barge-in and speech features off, with the content queue saturated, and with the model provider failed. The result per output is in the response detail and in an audit record (+operator_audio_stopped+ or +operator_audio_stop_unconfirmed+), for example +stopped 1 items; audio_stop=hard_stopped avatar_reset=ok+:
+
+* +ProcessAudioPlayer+ kills and reaps its playback processes: +hard_stopped+ (or +nothing_playing+).
+* An output with no stop primitive reports +unsupported+; already started audio plays out and the record says so. An output whose stop fails reports +failed+.
+* The stop runs on a worker thread and the handler waits at most 100 ms (+AUDIO_STOP_BOUND+). A stuck backend yields +unconfirmed+ and cannot wedge the control handler; the app keeps dispatching without blocking on that output, and repeated stops do not pile up workers.
+
+Full guarantees: docs/security-threat-model.adoc section 6.1.
 
 *Unmute is intentionally not supported.* Mute is a latching emergency state: resuming output requires restarting the daemon with a verified configuration. This is a deliberate choice so a compromised operator session cannot silently re-enable output.
 
