@@ -184,6 +184,22 @@ Do not record secrets, private user data, or raw provider credentials.
 
 *Related:* #58, #83, #101.
 
+=== A-SPEECH-OBS-001 -- Adapter observation times map onto the runtime timeline within a small skew
+
+*Subsystem:* speech observation (#92)
+
+*Status:* Needs validation
+
+*Statement:* A speech adapter can stamp `observed_at_ms` on the same monotonic (or replay logical) timeline the runtime uses for `now_ms`, to within `max_future_skew_ms` (default 50 ms). The contract carries no clock-offset negotiation. Defaults of 160 ms (activity max age, from ADR-0005's stalled-feed measurement), 400 ms (turn-end score max age, unmeasured; must exceed model inference p99 plus polling cadence) and 800 ms (fallback silence, EXP-0001, synthetic pauses) are not validated on real dialogue.
+
+*Evidence:* EXP-0001 section 7, ADR-0005; executable: `speech_observation` and `speech_replay` tests in +crates/runtime+.
+
+*Consequence if false:* A mis-mapped timeline makes every observation stale (rejected, counted as `stale_age`) or future-dated, so the floor sees no speech and the deterministic fallback stays at `no_speech`; nothing blocks.
+
+*Revisit when:* the S2 sidecar measures its real clock mapping, or a real labelled Japanese dialogue set exists (EXP-0001 11.1 item 1).
+
+*Related:* #81, #92, ADR-0005.
+
 === A-RESEARCH-001 -- External benchmark results do not define aivtuber production thresholds
 
 *Subsystem:* research / evaluation

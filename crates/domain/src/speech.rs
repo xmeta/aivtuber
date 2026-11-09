@@ -510,6 +510,29 @@ mod tests {
         }
     }
 
+    /// Fixture -> Rust parity: the same files `bun run validate` checks against
+    /// the schema must be accepted/rejected identically by the Rust validator.
+    #[test]
+    fn schema_fixtures_agree_with_the_rust_validator() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/speech-observations");
+        for (dir, should_pass) in [("valid", true), ("invalid", false), ("inconsistent", false)] {
+            let mut count = 0;
+            for entry in std::fs::read_dir(base.join(dir)).expect("fixture dir") {
+                let path = entry.expect("entry").path();
+                let bytes = std::fs::read(&path).expect("read");
+                assert_eq!(
+                    SpeechObservationBatch::from_json_bytes(&bytes).is_ok(),
+                    should_pass,
+                    "{}",
+                    path.display()
+                );
+                count += 1;
+            }
+            assert!(count > 0, "{dir} has fixtures");
+        }
+    }
+
     #[test]
     fn fallback_signal_is_a_pure_function_of_state_and_now() {
         let config = FallbackTurnConfig::default();

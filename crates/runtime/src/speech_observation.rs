@@ -493,11 +493,7 @@ impl SpeechObservationTracker {
     }
 
     fn view_of(&self, entry: &SpeakerEntry, now_ms: u64) -> SpeakerView {
-        let supported = self
-            .config
-            .turn_end_languages
-            .iter()
-            .any(|language| *language == entry.language);
+        let supported = self.config.turn_end_languages.contains(&entry.language);
         let fresh = entry.turn_end.as_ref().filter(|score| {
             now_ms.saturating_sub(score.observed_at_ms) <= self.config.turn_end_max_age_ms
                 && entry
