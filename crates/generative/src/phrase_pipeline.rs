@@ -245,7 +245,7 @@ impl GenerativePipeline {
             };
             tts_chars = tts_chars.saturating_add(chars as u64);
 
-            match delivery.deliver(unit) {
+            match delivery.deliver(unit, &trace) {
                 Delivery::Accepted => delivered += 1,
                 Delivery::Closed => {
                     let end = PhraseEnd::Cancelled {
@@ -557,7 +557,7 @@ mod tests {
             }
         }
 
-        fn deliver(&mut self, unit: PhraseUnit) -> Delivery {
+        fn deliver(&mut self, unit: PhraseUnit, _trace: &GenerationTrace) -> Delivery {
             if self.close_after == Some(self.units.len()) {
                 return Delivery::Closed;
             }

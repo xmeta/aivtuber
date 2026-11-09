@@ -32,6 +32,7 @@
 
 use crate::CancellationStage;
 use crate::GenerationCancellationToken;
+use crate::GenerationTrace;
 use crate::speech_text::is_emoji_part;
 use aivtuber_asset_store::PerformanceAsset;
 use aivtuber_domain::FallbackReason;
@@ -606,9 +607,10 @@ pub trait PhraseDelivery {
     /// the one before it, never of the ones before that.
     fn wait_for_slot(&mut self, seq: u32, cancellation: &GenerationCancellationToken) -> SlotWait;
 
-    /// Hand over one complete phrase. May block when the commit side is
+    /// Hand over one complete phrase with the trace so far (the LLM call it
+    /// belongs to is audited from it). May block when the commit side is
     /// behind (bounded hand-off).
-    fn deliver(&mut self, unit: PhraseUnit) -> Delivery;
+    fn deliver(&mut self, unit: PhraseUnit, trace: &GenerationTrace) -> Delivery;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

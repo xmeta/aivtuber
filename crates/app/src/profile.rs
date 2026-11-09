@@ -70,6 +70,12 @@ impl CompositionProfile {
         matches!(self, Self::Full | Self::Local)
     }
 
+    /// Whether generated replies are committed phrase by phrase unless
+    /// `AIVTUBER_PHRASE_MODE` says otherwise (issue #83 S1).
+    pub fn phrased_replies_by_default(self) -> bool {
+        false
+    }
+
     /// Whether every provider endpoint must be loopback (nothing leaves the
     /// machine). Enforced by [`Self::validate_provider_endpoints`].
     pub fn loopback_only(self) -> bool {
