@@ -13,13 +13,13 @@ use aivtuber_app::{
     ProfileSummary, RawIngressConfig, RawIngressMetrics, RawIngressMetricsSnapshot, RoutePlanner,
     RuntimeRetentionPolicy, SHADOW_ORCHESTRATOR_SCHEMA_VERSION, ShadowOrchestratorConfig,
     ShadowPolicyIdentity, ShadowingRoutePlanner, SpeechConversationConfig,
-    SpeechConversationMetrics, SpeechSidecar, SpeechSidecarConfig, SpeechSidecarStats,
-    StreamOutput, VtsAvatarOutput, VtsPlaybackConfig, apply_dispatched_request,
+    SpeechConversationMetrics, SpeechFloorMetrics, SpeechSidecar, SpeechSidecarConfig,
+    SpeechSidecarStats, StreamOutput, VtsAvatarOutput, VtsPlaybackConfig, apply_dispatched_request,
     pump_bounded_records, stt_sidecar_args,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
-    AuthorizationMethod, Capability, ControlSecret, EventKind, LocalControlIngress,
+    AuthorizationMethod, Capability, ControlSecret, EventKind, FloorConfig, LocalControlIngress,
     OperatorCommandInput,
 };
 use aivtuber_generative::{GenerativePipeline, PerformanceCompiler, PerformanceCompilerConfig};
@@ -320,6 +320,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     // observations and never blocks this loop.
     let mut speech_sidecar: Option<SpeechSidecar> = None;
     let mut speech_conversation_enabled = false;
+    let mut speech_floor_enabled = false;
+    let mut last_floor_metrics = SpeechFloorMetrics::default();
     let mut last_conversation_metrics = SpeechConversationMetrics::default();
     if let Some(program) = env_optional("AIVTUBER_SPEECH_SIDECAR") {
         let mut tracker = SpeechObservationTracker::new(
@@ -393,6 +395,35 @@ fn run() -> Result<(), Box<dyn Error>> {
                 };
                 app = app.with_speech_conversation(conversation)?;
                 speech_conversation_enabled = true;
+                // Issue #81 S1: deterministic conversational floor. Off unless
+                // AIVTUBER_SPEECH_FLOOR is true. A final then waits, bounded
+                // and counted, while the user holds the floor. Needs the
+                // conversation route; touches no scheduler or operator path.
+                if env_bool("AIVTUBER_SPEECH_FLOOR", false)? {
+                    let defaults = FloorConfig::default();
+                    let floor = FloorConfig {
+                        take_turn_silence_ms: env_u64(
+                            "AIVTUBER_SPEECH_FLOOR_TAKE_TURN_SILENCE_MS",
+                            defaults.take_turn_silence_ms,
+                        )?,
+                        max_defer_ms: env_u64(
+                            "AIVTUBER_SPEECH_FLOOR_MAX_DEFER_MS",
+                            defaults.max_defer_ms,
+                        )?,
+                        max_deferred: usize::try_from(env_u64(
+                            "AIVTUBER_SPEECH_FLOOR_MAX_DEFERRED",
+                            defaults.max_deferred as u64,
+                        )?)
+                        .unwrap_or(usize::MAX),
+                        ..defaults
+                    };
+                    app = app.with_speech_floor(floor)?;
+                    speech_floor_enabled = true;
+                    eprintln!(
+                        "speech_floor: enabled take_turn_silence_ms={} max_defer_ms={} max_deferred={}",
+                        floor.take_turn_silence_ms, floor.max_defer_ms, floor.max_deferred
+                    );
+                }
                 eprintln!(
                     "speech_conversation: enabled max_finals_per_tick={} max_text_chars={}",
                     conversation.max_finals_per_tick, conversation.max_text_chars
@@ -402,6 +433,13 @@ fn run() -> Result<(), Box<dyn Error>> {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "AIVTUBER_SPEECH_CONVERSATION requires AIVTUBER_SPEECH_STT_WORKER",
+            )
+            .into());
+        }
+        if env_bool("AIVTUBER_SPEECH_FLOOR", false)? && !speech_floor_enabled {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "AIVTUBER_SPEECH_FLOOR requires AIVTUBER_SPEECH_CONVERSATION",
             )
             .into());
         }
@@ -565,6 +603,28 @@ fn run() -> Result<(), Box<dyn Error>> {
                     metrics.route_errors
                 );
                 last_conversation_metrics = metrics;
+            }
+            if let Some(metrics) = app.speech_floor_metrics()
+                && (metrics.policy != last_floor_metrics.policy
+                    || metrics.deferred != last_floor_metrics.deferred
+                    || metrics.dropped_expired != last_floor_metrics.dropped_expired
+                    || metrics.dropped_overflow != last_floor_metrics.dropped_overflow)
+            {
+                eprintln!(
+                    "speech_floor_metrics: decisions={} take_turn={} wait={} hold={} yield_recorded={} fallback_take_turn={} deferred={} released={} dropped_expired={} dropped_overflow={} queued={}",
+                    metrics.policy.decisions,
+                    metrics.policy.take_turn,
+                    metrics.policy.wait,
+                    metrics.policy.hold,
+                    metrics.policy.yielded,
+                    metrics.policy.fallback_take_turn,
+                    metrics.deferred,
+                    metrics.released_after_deferral,
+                    metrics.dropped_expired,
+                    metrics.dropped_overflow,
+                    metrics.queued
+                );
+                last_floor_metrics = metrics;
             }
             report_raw_ingress_metrics(&raw_ingress_metrics, &mut last_raw_ingress_metrics, false);
             next_maintenance_ms = now_ms.saturating_add(1_000);

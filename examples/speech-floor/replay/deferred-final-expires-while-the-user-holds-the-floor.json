@@ -1,0 +1,63 @@
+{
+  "schema_version": "0.1.0",
+  "name": "a final deferred longer than max_defer_ms is dropped and counted, never answered over the user",
+  "language": "ja",
+  "floor": {
+    "max_defer_ms": 1000
+  },
+  "conversation": {},
+  "steps": [
+    {
+      "now_ms": 1000,
+      "vad": [
+        {
+          "speaker_id": "mic-local",
+          "edge": "start",
+          "observed_at_ms": 1000
+        }
+      ]
+    },
+    {
+      "now_ms": 1100,
+      "transcripts": [
+        {
+          "speaker_id": "mic-local",
+          "segment_id": 1,
+          "revision": 0,
+          "kind": "final",
+          "text": "長い話",
+          "covered_audio_ms": 500,
+          "observed_at_ms": 1050
+        }
+      ]
+    },
+    {
+      "now_ms": 1100,
+      "route": true,
+      "expect": [],
+      "expect_floor": {
+        "deferred": 1,
+        "released_after_deferral": 0,
+        "dropped_expired": 0,
+        "dropped_overflow": 0,
+        "queued": 1
+      },
+      "expect_decision": {
+        "action": "wait",
+        "reason": "user_speaking"
+      }
+    },
+    {
+      "now_ms": 2200,
+      "route": true,
+      "expect": [],
+      "expect_floor": {
+        "deferred": 1,
+        "released_after_deferral": 0,
+        "dropped_expired": 1,
+        "dropped_overflow": 0,
+        "queued": 0
+      }
+    }
+  ]
+}

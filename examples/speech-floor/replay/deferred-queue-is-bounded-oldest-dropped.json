@@ -1,0 +1,136 @@
+{
+  "schema_version": "0.1.0",
+  "name": "at most max_deferred finals wait; the oldest is dropped and counted; FIFO release after the turn ends",
+  "language": "ja",
+  "floor": {
+    "max_deferred": 2
+  },
+  "conversation": {
+    "max_finals_per_tick": 1
+  },
+  "steps": [
+    {
+      "now_ms": 1000,
+      "vad": [
+        {
+          "speaker_id": "mic-local",
+          "edge": "start",
+          "observed_at_ms": 1000
+        }
+      ]
+    },
+    {
+      "now_ms": 1100,
+      "transcripts": [
+        {
+          "speaker_id": "mic-local",
+          "segment_id": 1,
+          "revision": 0,
+          "kind": "final",
+          "text": "一",
+          "covered_audio_ms": 500,
+          "observed_at_ms": 1050
+        }
+      ]
+    },
+    {
+      "now_ms": 1100,
+      "route": true,
+      "expect": [],
+      "expect_floor": {
+        "deferred": 1,
+        "released_after_deferral": 0,
+        "dropped_expired": 0,
+        "dropped_overflow": 0,
+        "queued": 1
+      }
+    },
+    {
+      "now_ms": 1200,
+      "transcripts": [
+        {
+          "speaker_id": "mic-local",
+          "segment_id": 2,
+          "revision": 0,
+          "kind": "final",
+          "text": "二",
+          "covered_audio_ms": 500,
+          "observed_at_ms": 1150
+        }
+      ]
+    },
+    {
+      "now_ms": 1200,
+      "route": true,
+      "expect": [],
+      "expect_floor": {
+        "deferred": 2,
+        "released_after_deferral": 0,
+        "dropped_expired": 0,
+        "dropped_overflow": 0,
+        "queued": 2
+      }
+    },
+    {
+      "now_ms": 1300,
+      "transcripts": [
+        {
+          "speaker_id": "mic-local",
+          "segment_id": 3,
+          "revision": 0,
+          "kind": "final",
+          "text": "三",
+          "covered_audio_ms": 500,
+          "observed_at_ms": 1250
+        }
+      ]
+    },
+    {
+      "now_ms": 1300,
+      "route": true,
+      "expect": [],
+      "expect_floor": {
+        "deferred": 3,
+        "released_after_deferral": 0,
+        "dropped_expired": 0,
+        "dropped_overflow": 1,
+        "queued": 2
+      }
+    },
+    {
+      "now_ms": 1400,
+      "vad": [
+        {
+          "speaker_id": "mic-local",
+          "edge": "end",
+          "observed_at_ms": 1400
+        }
+      ]
+    },
+    {
+      "now_ms": 2200,
+      "route": true,
+      "expect": [
+        {
+          "event_id": "evt-speech-0000000001",
+          "observed_at": "1970-01-01T00:00:01.150Z",
+          "actor_id": "speaker:mic-local",
+          "text": "二",
+          "admission": "Queued",
+          "playback": "reaction.agree.01"
+        }
+      ],
+      "expect_floor": {
+        "deferred": 3,
+        "released_after_deferral": 1,
+        "dropped_expired": 0,
+        "dropped_overflow": 1,
+        "queued": 1
+      },
+      "expect_decision": {
+        "action": "take_turn",
+        "reason": "user_turn_ended"
+      }
+    }
+  ]
+}

@@ -1,0 +1,130 @@
+{
+  "schema_version": "0.1.0",
+  "name": "silence says the turn is over but a fresh partial of the next segment holds the floor; the stale partial stops holding it",
+  "language": "ja",
+  "floor": {},
+  "conversation": {},
+  "steps": [
+    {
+      "now_ms": 1000,
+      "vad": [
+        {
+          "speaker_id": "mic-local",
+          "edge": "start",
+          "observed_at_ms": 1000
+        }
+      ]
+    },
+    {
+      "now_ms": 1100,
+      "vad": [
+        {
+          "speaker_id": "mic-local",
+          "edge": "end",
+          "observed_at_ms": 1100
+        }
+      ]
+    },
+    {
+      "now_ms": 1200,
+      "transcripts": [
+        {
+          "speaker_id": "mic-local",
+          "segment_id": 1,
+          "revision": 0,
+          "kind": "final",
+          "text": "一つ目",
+          "covered_audio_ms": 500,
+          "observed_at_ms": 1150
+        }
+      ]
+    },
+    {
+      "now_ms": 1300,
+      "route": true,
+      "expect": [],
+      "expect_floor": {
+        "deferred": 1,
+        "released_after_deferral": 0,
+        "dropped_expired": 0,
+        "dropped_overflow": 0,
+        "queued": 1
+      },
+      "expect_decision": {
+        "action": "wait",
+        "reason": "silence_below_threshold"
+      }
+    },
+    {
+      "now_ms": 1850,
+      "transcripts": [
+        {
+          "speaker_id": "mic-local",
+          "segment_id": 2,
+          "revision": 0,
+          "kind": "partial",
+          "text": "それで",
+          "covered_audio_ms": 500,
+          "observed_at_ms": 1850
+        }
+      ]
+    },
+    {
+      "now_ms": 1900,
+      "route": true,
+      "expect": [],
+      "expect_floor": {
+        "deferred": 1,
+        "released_after_deferral": 0,
+        "dropped_expired": 0,
+        "dropped_overflow": 0,
+        "queued": 1
+      },
+      "expect_decision": {
+        "action": "wait",
+        "reason": "partial_transcript_holding"
+      }
+    },
+    {
+      "now_ms": 3300,
+      "route": true,
+      "expect": [],
+      "expect_floor": {
+        "deferred": 1,
+        "released_after_deferral": 0,
+        "dropped_expired": 0,
+        "dropped_overflow": 0,
+        "queued": 1
+      },
+      "expect_decision": {
+        "action": "wait",
+        "reason": "partial_transcript_holding"
+      }
+    },
+    {
+      "now_ms": 3400,
+      "route": true,
+      "expect": [
+        {
+          "event_id": "evt-speech-0000000001",
+          "observed_at": "1970-01-01T00:00:01.150Z",
+          "actor_id": "speaker:mic-local",
+          "text": "一つ目",
+          "admission": "Queued",
+          "playback": "reaction.agree.01"
+        }
+      ],
+      "expect_floor": {
+        "deferred": 1,
+        "released_after_deferral": 1,
+        "dropped_expired": 0,
+        "dropped_overflow": 0,
+        "queued": 0
+      },
+      "expect_decision": {
+        "action": "take_turn",
+        "reason": "user_turn_ended"
+      }
+    }
+  ]
+}

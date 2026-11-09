@@ -1,0 +1,49 @@
+{
+  "schema_version": "0.1.0",
+  "name": "without a VAD tracker the policy is on the text-only path: the final is routed at once, as with the floor off",
+  "language": "ja",
+  "floor": {},
+  "conversation": {},
+  "vad_tracker": false,
+  "steps": [
+    {
+      "now_ms": 1000,
+      "transcripts": [
+        {
+          "speaker_id": "mic-local",
+          "segment_id": 1,
+          "revision": 0,
+          "kind": "final",
+          "text": "テキストだけ",
+          "covered_audio_ms": 500,
+          "observed_at_ms": 950
+        }
+      ]
+    },
+    {
+      "now_ms": 1000,
+      "route": true,
+      "expect": [
+        {
+          "event_id": "evt-speech-0000000001",
+          "observed_at": "1970-01-01T00:00:00.950Z",
+          "actor_id": "speaker:mic-local",
+          "text": "テキストだけ",
+          "admission": "Queued",
+          "playback": "reaction.agree.01"
+        }
+      ],
+      "expect_floor": {
+        "deferred": 0,
+        "released_after_deferral": 0,
+        "dropped_expired": 0,
+        "dropped_overflow": 0,
+        "queued": 0
+      },
+      "expect_decision": {
+        "action": "take_turn",
+        "reason": "no_speech_evidence"
+      }
+    }
+  ]
+}

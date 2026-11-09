@@ -5,6 +5,8 @@
 
 #![forbid(unsafe_code)]
 
+mod floor;
+pub use floor::*;
 mod replay;
 pub use replay::*;
 
