@@ -146,7 +146,9 @@ async function fetchModel(name, dest) {
     const archivePath = join(dest, model.archive.name);
     await download(model.archive.url, archivePath, model.archive.sha256);
     // System tar reads bz2 on Linux, macOS and Windows 10+.
-    execFileSync("tar", ["-xjf", archivePath, "-C", dest], { stdio: "inherit" });
+    // Windows: use the system bsdtar; a GNU tar earlier on PATH (Git Bash) reads "I:\x" as host "I".
+    const tar = process.platform === "win32" ? join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe") : "tar";
+    execFileSync(tar, ["-xjf", model.archive.name, "-C", "."], { stdio: "inherit", cwd: dest });
     const dir = join(dest, model.innerDir);
     for (const [file, sha256] of model.files) {
       const actual = await sha256Of(join(dir, file));

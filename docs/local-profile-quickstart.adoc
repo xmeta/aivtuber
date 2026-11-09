@@ -1,0 +1,363 @@
+= Local profile quickstart (zero paid dependencies)
+:toc:
+
+Issue #220 (S3). This is the operator guide for running the whole performer on one machine with no paid service, no billable API, no SaaS account and no remote credential:
+
+[source,text]
+----
+chat on stdin / microphone
+   -> VAD + Japanese STT sidecar   (Silero VAD, sherpa-onnx ReazonSpeech k2-v2)   127.0.0.1, child processes
+   -> floor policy + barge-in      (deterministic, in the app)
+   -> local ThinkingEngine         (llama.cpp llama-server, Qwen3-4B-Instruct-2507)  127.0.0.1:18080
+   -> local TTS sidecar            (Supertonic 3 int8 via sherpa-onnx)               127.0.0.1:8770
+   -> local audio                  (ffplay)
+   -> local VRM avatar renderer    (browser page / OBS Browser Source)               127.0.0.1:8765
+----
+
+Everything listens on loopback only. A network connection is needed once, to fetch the pinned model and library files (step 1). After that the run needs none, and step 6 shows how to check that.
+
+Design and policy live elsewhere; this page is the procedure. Read `docs/production-runtime.adoc` for every variable's full semantics, `docs/supply-chain.adoc` for the pins and licences, `docs/vts-obs-adapters.adoc` section 6 for the avatar renderer, `docs/provider-conformance.adoc` for the verified llama.cpp / model pair, and `docs/experiments/EXP-0003-japanese-tts-bench.adoc` for the voice choice.
+
+== 0. What you need
+
+* Windows 11 x64 or Linux x64. Only these two platforms have pinned engine libraries. *This guide was run end to end on Windows only.* The Linux commands are the same files with the other pinned archive names; the differences are marked, and they were not executed.
+* A Rust toolchain (the version in `rust-toolchain.toml`; `rustup` picks it), Node 20 or newer, Bun (`renderer/local-avatar/package.json` pins `bun@1.3.14`), `git`, and `ffplay` from FFmpeg on `PATH` (the default audio player).
+* A browser for the avatar page (Chrome or Edge), or OBS Studio (free, GPL) with its Browser Source.
+* About 6 GB of disk for downloads (the LLM is 2.5 GB) and about 1.5 GB of build output.
+* Hardware. The measured configuration is in <<measured>>: a desktop with an 8 GB discrete GPU and 16 logical CPUs. The LLM can run on the CPU (`--llama-flavor cpu`, leave out `-ngl`), but then it competes with speech recognition and synthesis for the same cores and the measurements below do not apply. There is no guarantee below the measured hardware.
+
+Linux additionally needs ALSA development headers if you build the `mic-capture` feature (a live microphone). `--input-wav` does not need it.
+
+== 1. Fetch the pinned assets (network needed once)
+
+`scripts/fetch-local-profile.mjs` downloads and SHA-256-verifies everything and extracts it under one directory. It adds the three pins that did not exist before (llama.cpp release `b12224`, the Qwen3-4B Q4_K_M GGUF, the Silero VAD model) and *calls* `scripts/fetch-sherpa-onnx.mjs` (engine libraries, STT model, TTS model) and `renderer/local-avatar/smoke/fetch-model.mjs` (sample VRM), so no digest is kept twice. A mismatch deletes the partial file and stops.
+
+[source,sh]
+----
+node scripts/fetch-local-profile.mjs /path/to/local-assets          # Windows default: the Vulkan llama.cpp build
+node scripts/fetch-local-profile.mjs /path/to/local-assets --llama-flavor cpu   # Linux default: CPU build; Vulkan build: --llama-flavor vulkan
+----
+
+The last lines print the absolute paths the next steps use (`LLAMA_SERVER`, `LLM_GGUF`, `VAD_MODEL`, `SHERPA_ONNX_ARCHIVE_DIR`, `STT_MODEL_DIR`, `TTS_MODEL_DIR`, `AVATAR_VRM`). `--skip llama,llm,vad,sherpa-lib,stt,tts,avatar` omits steps you already have. Re-running is cheap: files that already match their pin are kept.
+
+On Windows the script extracts with the system `tar.exe`; an earlier GNU `tar` on `PATH` (Git Bash) cannot read zip files and reads `I:\path` as a remote host, which is why it does not use whatever `tar` is first.
+
+If you prefer the individual steps, they are `node scripts/fetch-sherpa-onnx.mjs lib|model ...` (see its header), `node renderer/local-avatar/smoke/fetch-model.mjs`, and the downloads recorded in `docs/provider-conformance.adoc` (llama.cpp, GGUF) and `docs/production-runtime.adoc` (Silero VAD).
+
+=== Replace the sample avatar
+
+The sample VRM is a pixiv test model for checking the pipeline. Before you stream, use a model you have the right to broadcast (see `docs/vts-obs-adapters.adoc`, "Model and rights"). Copy it to `renderer/local-avatar/dist/model.vrm` in step 2.
+
+== 2. Build
+
+[source,sh]
+----
+export SHERPA_ONNX_ARCHIVE_DIR=/path/to/local-assets/sherpa-lib     # mandatory: without it the crate downloads unchecked binaries
+cargo build --release --locked -p aivtuber-adapters \
+  --features silero-vad,mic-capture,sherpa-stt,sherpa-tts \
+  --bin speech-vad-sidecar --bin speech-stt-worker --bin local-tts-sidecar
+cargo build --release --locked -p aivtuber-app --bin aivtuber-app
+
+cd renderer/local-avatar
+bun install --frozen-lockfile --ignore-scripts
+bun run build                                   # writes renderer/local-avatar/dist
+cp /path/to/local-assets/avatar/VRM1_Constraint_Twist_Sample.vrm dist/model.vrm
+cd ../..
+----
+
+PowerShell: `$env:SHERPA_ONNX_ARCHIVE_DIR = "D:\local-assets\sherpa-lib"`, and `Copy-Item` for the model. `--locked` is required by the repository (do not refresh `Cargo.lock`). Cold release builds took about 4 minutes (the speech features) plus 1 minute (the app) on the measured host.
+
+The default workspace build compiles none of the speech features and needs no model. The binaries land in `target/release/`. On Windows the `sherpa-onnx` and `onnxruntime` DLLs are placed beside the sidecar executables by the build; the sidecars check them against their SHA-256 pins at every start and refuse to run if they do not match. On Linux the sidecars are linked with `$ORIGIN` rpath, so the libraries must stay beside them.
+
+`mic-capture` is only needed for a live microphone. Leave it out if you will feed a WAV file.
+
+== 3. Start llama-server on loopback
+
+[source,sh]
+----
+/path/to/local-assets/llama/bin/llama-server -m /path/to/local-assets/llm/Qwen3-4B-Instruct-2507-Q4_K_M.gguf \
+  --host 127.0.0.1 --port 18080 --alias qwen3-4b-instruct-2507 -c 4096 -ngl 99
+----
+
+`--host 127.0.0.1` is the point: llama-server defaults to loopback, and the app refuses any other endpoint in the local profile. `-ngl 99` offloads every layer to the GPU (Vulkan on Windows, or `--llama-flavor vulkan` on Linux); drop it on a CPU-only build. The port is your choice (8080 was in use on the measured host, so 18080 is used here). Wait until `curl http://127.0.0.1:18080/health` answers. The first request after start can take several seconds (model load, shader compile); later ones are sub-second to first token.
+
+llama-server prints a warning that no API key is set and that CORS allows all origins. Both are acceptable *only because the listener is loopback*. Do not bind it to another address; if you must serve other machines, that is a different (non-local) deployment that this profile will refuse.
+
+== 4. Configure and start the app
+
+The app is configured entirely by environment variables. The block below is the complete set for the full local path. It contains no key: there is none to set.
+
+[source,sh]
+----
+# profile and Thinking (llama-server)
+export AIVTUBER_MODE=local
+export AIVTUBER_GENERATIVE_ENABLED=true
+export AIVTUBER_OPENAI_AUTH=unauthenticated-loopback          # explicit; allowed for a loopback endpoint only; no key may be set
+export AIVTUBER_OPENAI_ENDPOINT=http://127.0.0.1:18080/v1/responses
+export AIVTUBER_OPENAI_MODEL=qwen3-4b-instruct-2507           # must equal --alias
+export AIVTUBER_OPENAI_MODEL_VERSION=Q4_K_M
+export AIVTUBER_OPENAI_BACKEND_NAME=llama-server
+export AIVTUBER_OPENAI_MAX_OUTPUT_TOKENS=96                   # see "Reply length" below
+
+# required by every profile
+export AIVTUBER_MEMORY_PSEUDONYM_KEY_HEX=<64 hex characters>  # e.g. openssl rand -hex 32; keep it local
+export AIVTUBER_CONTROL_SECRET=<exactly 32 characters>        # the avatar/operator authority; never commit it
+
+# pack, audio
+export AIVTUBER_PACK_ROOT=/path/to/your/pack-copy             # a directory you own: cp -r examples/starter-reaction-pack ...
+export AIVTUBER_AUDIO_ROOT=/path/to/audio                     # must exist; generated/ is created below it
+
+# local TTS (supervised child)
+export AIVTUBER_TTS_ENDPOINT=http://127.0.0.1:8770/v1/synthesize
+export AIVTUBER_TTS_SIDECAR=target/release/local-tts-sidecar
+export AIVTUBER_TTS_SIDECAR_MODEL_DIR=/path/to/local-assets/supertonic/sherpa-onnx-supertonic-3-tts-int8-2026-05-11
+export AIVTUBER_TTS_SIDECAR_AMPLITUDE_VISEMES=true            # mouth movement from the audio envelope
+
+# speech input (supervised children): live microphone
+export AIVTUBER_SPEECH_SIDECAR=target/release/speech-vad-sidecar
+export AIVTUBER_SPEECH_SIDECAR_ARGS="--model /path/to/local-assets/vad/silero_vad_op18_ifless.onnx --language ja --stt-wait-ready-ms 90000"
+export AIVTUBER_SPEECH_STT_WORKER=target/release/speech-stt-worker
+export AIVTUBER_SPEECH_STT_MODEL_DIR=/path/to/local-assets/k2v2
+export AIVTUBER_SPEECH_CONVERSATION=true
+export AIVTUBER_SPEECH_FLOOR=true
+export AIVTUBER_SPEECH_BARGE_IN=true
+
+# local avatar
+export AIVTUBER_AVATAR_OUTPUT=local
+export AIVTUBER_LOCAL_AVATAR_PORT=8765
+export AIVTUBER_LOCAL_AVATAR_PAGE_DIR=renderer/local-avatar/dist
+
+# untrusted-input ceiling (recommended for anything that takes public text)
+export AIVTUBER_INGRESS_MAX_TRUST=untrusted
+export AIVTUBER_INGRESS_SOURCE_CLASSES=public_chat,speech
+
+cargo run --release --locked -p aivtuber-app --bin aivtuber-app
+----
+
+Notes that matter:
+
+* *Paths with spaces* are not supported in `AIVTUBER_SPEECH_SIDECAR_ARGS` (split on whitespace). Use a path without spaces.
+* *No microphone yet?* Add `--input-wav FILE.wav --pace realtime` to `AIVTUBER_SPEECH_SIDECAR_ARGS` (a PCM WAV; the sidecar mixes down and resamples to 16 kHz mono, tests cover 48 kHz stereo). It goes through the same VAD, STT, floor and routing as the microphone; there is no shortcut around the untrusted ingress. When the file ends the sidecar exits and the app logs `speech_sidecar: degraded: sidecar exited` and carries on with typed chat. For a microphone, use `--list-devices` to see names and `--input-device NAME`.
+* *Do not set* `AIVTUBER_VOICE_MODEL` unless you also have cached assets for that voice. It names the voice the cached pack was authored for (default `example-voice-v1`); a different name makes every cached descriptor incompatible (`indexed=6 usable=0`) and cached reactions silently find nothing. The synthesizer's own identity is recorded separately in the provenance (`model_alias=supertonic-3-int8`).
+* *Floor and barge-in.* `AIVTUBER_SPEECH_FLOOR` requires `AIVTUBER_SPEECH_CONVERSATION`; `AIVTUBER_SPEECH_BARGE_IN` requires the floor. With the floor on, a spoken turn is answered only after the speaker has been silent for 800 ms (`AIVTUBER_SPEECH_FLOOR_TAKE_TURN_SILENCE_MS`, 700 to 1000). A user who speaks over the avatar for 400 ms stops the playing reply (`speech_barge_in:` log line).
+* *Reply length.* Left at its default the model may write several hundred characters, which is over 30 seconds of speech and can exceed the TTS sidecar's 12 s synthesis deadline (`local-tts-sidecar: deadline_exceeded`; the reply degrades to a non-verbal reaction). `AIVTUBER_OPENAI_MAX_OUTPUT_TOKENS=96` kept replies to 5 to 15 seconds of audio on the measured host.
+* *Cached starter audio.* `examples/starter-reaction-pack` carries descriptors but no audio files (`audio://starter/*.opus`); the cached path plays whatever you place under `$AIVTUBER_AUDIO_ROOT/starter/`. Without those files, an `intent` event is accepted and scheduled but nothing is audible.
+* *Cached reactions and the avatar profile.* The pack targets `AIVTUBER_AVATAR_PROFILE` (default `example-live2d-v1`). The local renderer accepts the same commands, so the default works unchanged.
+
+On start the app prints, among others (nothing secret): the OpenRAIL-M voice notice, `tts_sidecar: ready ...`, `thinking: endpoint=http://127.0.0.1:18080 auth=unauthenticated-loopback backend=llama-server`, `composition profile: profile=local ... fallback=deterministic_local`, `aivtuber-app ready: indexed=6 usable=6 preloaded=6`, the floor, barge-in and conversation lines, `speech_sidecar: started`, `speech-stt-worker: ready`, and `local avatar renderer URL ...`.
+
+== 5. Open the avatar, then talk to it
+
+*Avatar.* Copy the `local avatar renderer URL` from the app's stderr (`http://127.0.0.1:8765/?token=...`) into a browser, or into an OBS Browser Source (width and height of your canvas, "Shutdown source when not visible" off). The URL carries a per-launch secret: do not paste it into issues or shared logs. The token changes on every start. A missing or broken `model.vrm` shows as `disconnected` and the reason is in the page's console. See `docs/vts-obs-adapters.adoc` section 6 for OBS and for the security properties.
+
+*Typed chat* is one Event Envelope per line on the app's stdin. For example:
+
+[source,json]
+----
+{"schema_version":"0.2.0","event_id":"evt-1","correlation_id":"corr-1","sequence":1,"observed_at":"2026-11-10T12:00:00Z","source":"local-smoke","source_class":"public_chat","plane":"content","trust_level":"untrusted","kind":"chat.message","actor_id":"viewer:1","priority_hint":null,"payload":{"text":"こんにちは！今日は何をして遊ぶ？"}}
+----
+
+Free text (no `intent`) goes to the local Thinking engine; `"intent":"reaction.agree"` in the payload takes the cached path. Use a fresh `event_id` and a rising `sequence` per line. Text must be UTF-8: on Windows, pipe from a program that writes UTF-8 (a PowerShell 5 pipe re-encodes it and llama-server rejects it as `ill-formed UTF-8`; PowerShell 7 or a Node/Python writer is fine). When stdin closes the app shuts down and its supervised children exit with it.
+
+For a real stream, put chat in front of it with `twitch-chat-ingress` (`docs/production-runtime.adoc`, "Twitch chat sidecar"); it is anonymous and read-only, and a Twitch connection is of course a remote connection, so it is outside the "no network" check below.
+
+*Speech.* Speak into the microphone, or use `--input-wav`. Expect, in the log, `speech_conversation: final chars=N final_age_ms=...` when the app has a transcript and the floor lets the turn through, then `local-tts-sidecar: ok chars=N audio_ms=...`, and the avatar's mouth moving while `ffplay` plays the reply.
+
+*Emergency stop.* `aivtuberctl` stops or mutes through the authenticated operator endpoint independent of every model path (`docs/production-runtime.adoc`, "Operator control").
+
+[#verify-loopback]
+== 6. Verify that nothing leaves the machine
+
+Do this while the system is running and a reply has been spoken, so every process has opened its sockets.
+
+[source,powershell]
+----
+# Windows: every socket of the runtime's processes that is not loopback (expected output: nothing)
+$p = (Get-Process aivtuber-app, llama-server, speech-vad-sidecar, speech-stt-worker, local-tts-sidecar -ErrorAction SilentlyContinue).Id
+Get-NetTCPConnection | Where-Object { $p -contains $_.OwningProcess -and $_.State -ne 'Bound' } |
+  Where-Object { $_.RemoteAddress -notin '127.0.0.1', '::1', '0.0.0.0', '::' -or $_.LocalAddress -notin '127.0.0.1', '::1' }
+Get-NetUDPEndpoint | Where-Object { $p -contains $_.OwningProcess }      # expected: nothing (these processes use no UDP)
+----
+
+[source,sh]
+----
+# Linux: sockets of the runtime's processes; every Local/Peer address must be 127.0.0.1 or [::1]
+ss -tanpH | grep -E 'aivtuber-app|llama-server|speech-vad|speech-stt|local-tts'
+ss -uanpH | grep -E 'aivtuber-app|llama-server|speech-vad|speech-stt|local-tts'     # expected: nothing
+----
+
+Expected: listeners on `127.0.0.1` only (llama-server 18080, the TTS sidecar 8770, the avatar host 8765, and the app's connections between them). On Windows the app also shows `Bound` rows with local address `0.0.0.0` and no peer; they are not listeners and not connections, and the check above excludes them (a `Listen` row on a non-loopback address would still be reported).
+
+*The browser is not part of the runtime.* A general-purpose browser makes its own background connections to its vendor even when headless. In the measured runs an unrestricted Edge held connections to remote addresses while showing the avatar page, and Edge kept one of them even with a proxy flag; the avatar page itself requested only `http://127.0.0.1:8765` and same-origin `blob:` URLs (its CSP is `default-src 'self'`). A Chromium started with `--proxy-server=http://127.0.0.1:9 --proxy-bypass-list="127.0.0.1;localhost"` (a proxy that goes nowhere) held no external socket at all; OBS Browser Source was not checked; or disconnect the network. All of these were observed and are recorded in <<measured>>. The PowerShell check above was validated with a negative control: a throwaway Node listener on `0.0.0.0` is reported by it.
+
+*The profile refuses remote endpoints.* A non-loopback Thinking or TTS endpoint, or a missing authentication choice for a remote Thinking endpoint, stops the app at start-up before any connection is made (checked on the measured build):
+
+[source,text]
+----
+profile "local" is loopback-only but the thinking endpoint is not a loopback address; point it at 127.0.0.1/[::1]/localhost or select the "full" profile
+profile "local" is loopback-only but the tts endpoint is not a loopback address; point it at 127.0.0.1/[::1]/localhost or select the "full" profile
+Authentication: Thinking endpoint requires an API key; set AIVTUBER_OPENAI_API_KEY, or explicitly set AIVTUBER_OPENAI_AUTH=unauthenticated-loopback for a loopback-only endpoint
+----
+
+For the strongest check, disconnect the machine from the network (or block outbound traffic with your own firewall rule) *after* step 1 and run the whole path. This guide did not change any firewall or network setting; the evidence above is observation of sockets, not a deny rule.
+
+== 7. What happens when a local process fails
+
+All of these were exercised in the measured run (<<measured>>) and none of them stops the app or the avatar.
+
+[cols="2,3,3",options="header"]
+|===
+|Failure |What you see |What keeps working
+|llama-server dies or is unreachable |A free-text event is accepted (`content: admission=Queued playback=none`) and produces *nothing*: the typed fallback is `NonVerbalReaction`, which carries no playback, and the local profile names no cached fallback family. There is no log line saying that Thinking failed (known gap, see <<measured>>). llama-server can simply be restarted; the app reconnects per request. |Cached `intent` reactions (measured 0.13 to 0.15 s from the event to the player launch with llama-server and the TTS sidecar both dead), speech input, the avatar, operator control.
+|TTS sidecar dies |`tts_sidecar: exited; speech degrades to non-verbal reactions (no restart; restart the app to retry)`; later replies degrade at once. |Cached reactions that have audio on disk, the avatar, Thinking.
+|STT worker or the VAD sidecar dies, or the WAV ends |`speech_sidecar: transcripts unavailable: ...` or `degraded: sidecar exited`; no restart. |Typed chat, cached reactions, the avatar.
+|Renderer page closed or reloaded |`disconnected` health; commands for the old connection are dropped, never replayed; the page returns to neutral and reconnects. |Audio, Thinking, everything else.
+|Reply too long for the TTS deadline |`local-tts-sidecar: deadline_exceeded`; that reply is a non-verbal reaction, and the next request can see `503 Overloaded` if the engine is still busy. Lower `AIVTUBER_OPENAI_MAX_OUTPUT_TOKENS`. |Everything else.
+|===
+
+== 8. Licences, credits and what you must disclose
+
+None of these is bundled or redistributed by this repository; you fetch them in step 1 and the pins are recorded in `docs/supply-chain.adoc` and `docs/provider-conformance.adoc`. This is a practical summary, not legal advice.
+
+[cols="2,2,4",options="header"]
+|===
+|Component |Licence |What it asks of you
+|llama.cpp `b12224` |MIT |Keep the licence notice if you redistribute the binaries.
+|Qwen3-4B-Instruct-2507 Q4_K_M (unsloth GGUF) |Apache-2.0 |Keep the notice if you redistribute the weights. Model output is your responsibility.
+|sherpa-onnx 2.0.1 libraries |Apache-2.0 |As above.
+|Silero VAD v6 |MIT |As above.
+|ReazonSpeech k2-v2 int8 (default STT) |Weights Apache-2.0 per the model card |*Provenance note:* trained on the ReazonSpeech corpus (Japanese TV broadcasts), which is gated; access to the corpus is conditional on using it solely for information analysis under Article 30-4 of the Japanese Copyright Act. That is a term of the dataset, not stated as a restriction on the released weights. This project does not redistribute the weights and records the provenance in `docs/supply-chain.adoc`; revisit if the publisher states a restriction.
+|NVIDIA parakeet-tdt_ctc-0.6b-ja int8 (optional STT, `AIVTUBER_SPEECH_STT_MODEL=parakeet-ja`) |CC-BY-4.0 |*Attribution required* if you select it: "Contains NVIDIA parakeet-tdt_ctc-0.6b-ja (NVIDIA, CC-BY-4.0, https://huggingface.co/nvidia/parakeet-tdt_ctc-0.6b-ja), converted to ONNX by the sherpa-onnx project (k2-fsa)." (Not fetched by `fetch-local-profile.mjs`; `node scripts/fetch-sherpa-onnx.mjs model parakeet-ja <dir>`.)
+|Supertonic 3 weights (TTS voice) |OpenRAIL-M (the sample code in the archive is MIT) |*Disclose that the voice is machine-generated.* One of the use restrictions is to publish AI-generated content without clearly disclosing it. Keep an "AI-generated voice" line where viewers see it (channel or stream description, or an overlay text); the runtime cannot show it for you and only prints a start-up notice. The other restrictions (no unlawful use, no harm to minors, no disinformation, no harassment or discrimination, no impersonation or deepfakes without consent, no fully automated legal/medical/law-enforcement decisions) pass on to you. The licensor claims no rights in the audio; you are accountable for it.
+|VOICEVOX (optional, not shipped) |Per-character terms |No default character ships. If you add one, you are responsible for its terms and credit line.
+|three.js, `@pixiv/three-vrm`, Vite (renderer) |MIT, exact-pinned, allowlist-checked in CI |See `docs/supply-chain.adoc` section 8.
+|Sample VRM (`VRM1_Constraint_Twist_Sample.vrm`) |Embedded VRM 1.0 metadata: pixiv Inc., avatar permission everyone, credit notation unnecessary, no hateful use |Test model only. Check the embedded licence of whatever model you stream; the page logs its metadata at load.
+|FFmpeg `ffplay` |LGPL/GPL depending on your build |Installed by you; not bundled.
+|===
+
+Also yours to supply on a stream: an indication that the performer is an AI (platform rules often require it separately from the voice licence).
+
+== 9. Troubleshooting
+
+[cols="2,4",options="header"]
+|===
+|Symptom |Cause and fix
+|`tar: Cannot connect to I: resolve failed` or `This does not look like a tar archive` while fetching |A GNU `tar` (Git Bash) is first on `PATH`. The fetch scripts now call the system `tar.exe` on Windows; update to the current scripts. Running from PowerShell also avoids it.
+|llama-server: `couldn't bind HTTP server socket` |The port is taken (8080 often is). Pick another and change `AIVTUBER_OPENAI_ENDPOINT` to match. A `/health` check against a port you did not start can be answered by someone else's server, so check the log of the one you started.
+|`aivtuber-app: AIVTUBER_CONTROL_SECRET is required when VTube Studio output is enabled` |Also needed by the local avatar output. Set a 32-character secret.
+|`profile "local" is loopback-only ...` |Thinking or TTS endpoint is not `127.0.0.1`, `[::1]` or `localhost`. That is by design.
+|`Authentication: Thinking endpoint requires an API key` |Set `AIVTUBER_OPENAI_AUTH=unauthenticated-loopback` (explicit, loopback only) and do not set a key.
+|llama-server: `ill-formed UTF-8` |The chat line reached it in a legacy code page. Send UTF-8 (PowerShell 7, Node, Python, or `chcp 65001` with a UTF-8 writer).
+|`aivtuber-app ready: indexed=6 usable=0` |The cached pack is incompatible with the configured voice, avatar profile, viseme mapping or motion library. Unset `AIVTUBER_VOICE_MODEL` (or set matching values) and check `AIVTUBER_AVATAR_PROFILE`.
+|`content rejected: asset "variant_group:..." was not found in L0 or L1` |The `intent` has no usable cached asset (see the previous row, or the intent is not in your pack).
+|An `intent` reaction is accepted but silent |The pack has no audio files. Place `audio://starter/*.opus` files under `$AIVTUBER_AUDIO_ROOT/starter/` (the repository ships none).
+|`tts_sidecar: unavailable: ...` at start |A library or model file does not match its pin, the model directory is wrong, or the port is busy. The message names the check. Re-run step 1, or build with the same `SHERPA_ONNX_ARCHIVE_DIR`.
+|`local-tts-sidecar: deadline_exceeded` |The reply was too long for 12 s of synthesis. Lower `AIVTUBER_OPENAI_MAX_OUTPUT_TOKENS`; raise `--synth-deadline-ms` through `AIVTUBER_TTS_SIDECAR_ARGS` only if your CPU is slower than the measured one and the replies must stay long.
+|`speech-vad-sidecar` or `speech-stt-worker` refuses to start with a pin message |Library or model mismatch (exit 2). Rebuild with `SHERPA_ONNX_ARCHIVE_DIR` set; re-fetch the model.
+|Speech is heard but no reply |Check the log: `speech_floor_metrics` with a growing `wait` means the floor is waiting for silence (a noisy room keeps the VAD active); `AIVTUBER_INGRESS_SOURCE_CLASSES` must include `speech`; `AIVTUBER_SPEECH_CONVERSATION=true` is required to route transcripts.
+|Avatar page says disconnected or stays blank |Use the exact URL of this run (the token changes). Check `model.vrm` is in the served directory; read the page console. Only one page may connect (a second gets HTTP 409).
+|Reply is cut off when you start talking |That is barge-in working (`speech_barge_in: ... effect=Stopped`). Turn it off with `AIVTUBER_SPEECH_BARGE_IN=false`, or raise nothing else: the confirm time is fixed at 400 ms of user speech.
+|English brand words are read wrongly (YouTube, VTuber) |Known limitation until the ADR-0004 lexicon; see "Text that is not spoken" in `docs/production-runtime.adoc`.
+|===
+
+[#measured]
+== 10. Measured on one host
+
+Date 2026-11, issue #220 S3. One Windows 11 desktop that was also running other desktop software (system CPU was about 30% and the GPU about 35% busy with none of these processes working, so every figure below includes background load; this is not a quiet-machine benchmark). CPU: an 8-core, 16-thread 3.6 GHz-class part from 2019; 32 GB RAM; an 8 GB discrete GPU from 2019; Windows 11 x64. Release builds of the commit that carries this page; llama.cpp `b12224` Vulkan with every layer on the GPU and a 4096-token context; STT and TTS on 4 CPU threads each; `ffplay` for audio; the renderer page in headless Chromium 153 (1280 by 720, WebGL on the GPU through Direct3D 11) showing the sample VRM. All of the processes of section 4 were running at once for the whole run, with the floor and barge-in on.
+
+*Input.* Spoken input: 10 Common Voice ja clips (the EXP-0002 sample of `examples/benchmarks/stt`: seeded, CC0, 16 kHz mono, trimmed to the voiced part, 2.6 to 7.8 s), concatenated with 14 s of silence between them and fed through the sidecar's `--input-wav ... --pace realtime`, which is the same VAD, STT, floor and routing path as a microphone. A live microphone was not used. Typed chat: 8 envelopes on stdin (5 during the silent lead-in of the speech file, 3 after it ended, for the failure rows). The harness (a Node driver, a 1 Hz PowerShell sampler and a log analysis script, written for this run) is not in the repository.
+
+*What was measured.* End of speech is the end of the VAD segment (the covered audio of the final minus the 500 ms segment tail; the clip schedule gave the same figures to within 0.2 s). Audio ready is the moment the generated WAV appears under `$AIVTUBER_AUDIO_ROOT/generated/` (an atomic rename). Player started is the moment the app launched the audio player process (a small shim logged it and then ran `ffplay` unchanged); the sound itself starts a little after that (process start and device open), which was not measured.
+
+=== Latency, 10 spoken turns per run, four runs
+
+[cols="3,1,2,2,2",options="header"]
+|===
+|Run |n |End of speech to audio ready p50 / p90 / max (s) |End of speech to player started p50 / max (s) |Configuration difference
+
+|1
+|10
+|3.50 / 4.41 / 4.76
+|3.54 / 4.79
+|Edge without a proxy; default reply cap (256 tokens); `AIVTUBER_VOICE_MODEL` overridden
+|2
+|10
+|3.18 / 4.79 / 6.02
+|3.22 / 6.05
+|Edge through a black-hole proxy; reply cap 96
+|3
+|10
+|2.97 / 4.06 / 5.32
+|3.01 / 5.36
+|Chromium through a black-hole proxy; reply cap 96
+|*4*
+|10
+|*3.80 / 4.96 / 5.47*
+|*3.83 / 5.51*
+|As run 3, sampler also following the browser. The runs below quote this one.
+|===
+
+Runs 3 and 4 have identical configuration, so the spread between them (p50 3.0 against 3.8 s) is run-to-run variation on a shared machine, driven mostly by how long the replies were (see the split). Run 4, per stage, p50 / p90 / max:
+
+[cols="3,3",options="header"]
+|===
+|Stage |Time
+|End of speech to the final being routed (the floor waits for 800 ms of silence; a longer transcript adds up to 0.27 s) |0.80 / 0.99 / 1.07 s
+|Routed to reply text ready (llama-server, 29 to 89 characters) |0.62 / 0.85 / 0.95 s (S1 measured 0.51 to 0.63 s)
+|Reply text to WAV ready (TTS, `local-tts-sidecar: ok ... total_ms`) |2.34 / 3.30 / 3.53 s for replies of 6.7 to 15.2 s of audio, a real-time factor of 0.24, the same as the isolated bench (EXP-0003)
+|WAV ready to player started |0.04 / 0.04 / 0.05 s
+|===
+
+The 0.8 s floor wait is a policy choice (`AIVTUBER_SPEECH_FLOOR_TAKE_TURN_SILENCE_MS`, 700 to 1000), not compute. The rest, about 3 s at the median, is the LLM plus the synthesis of the whole reply: the voice speaks about 5 characters a second, so the median reply (50 characters) is 9.7 s of audio and takes 2.3 s to synthesize *before the first sound*. Shorter replies (a lower `AIVTUBER_OPENAI_MAX_OUTPUT_TOKENS`, or a prompt that asks for one sentence) are the lever; sentence-level streaming synthesis does not exist yet.
+
+Typed chat, event on stdin to WAV ready: 2.4, 3.6, 3.9 and 5.1 s (run 4; the first one is the first request to that llama-server, started about 30 s earlier). A cached `intent` event, to the player, with the performer idle: 0.11 to 0.14 s (it took 4.6 s once, while the performer was still speaking an earlier reply: the scheduler does not talk over itself).
+
+=== Resources with everything running (run 4)
+
+Windows performance counters once about every two seconds (the sampler, which itself costs CPU, took about two seconds per round), from the first typed message to the point where llama-server was stopped (about 4.5 minutes, 128 samples). CPU is a percentage of one logical core, so 400 means four cores. Memory is the working set (it includes memory-mapped files, so llama-server's 2.8 GiB is mostly the mapped weights; its compute is on the GPU).
+
+[cols="3,1,1,1,2",options="header"]
+|===
+|Process |CPU mean |CPU max |Memory max |Note
+|`local-tts-sidecar` |42 |414 |314 MiB |4 threads, busy only while synthesizing
+|`speech-stt-worker` |22 |277 |351 MiB |4 threads, bursts at each decode
+|`llama-server` |4 |53 |2.8 GiB |GPU does the generation
+|renderer browser (all of its processes) |31 |70 |665 MiB |26% mean with nothing happening
+|`aivtuber-app` |1.4 |17 |10 MiB |
+|`speech-vad-sidecar` |2.4 |13 |16 MiB |
+|`ffplay` |0.7 |13 |40 MiB |
+|*System* |*37% mean, 82% max* |  |  |*30% mean idle before the first message*
+|*GPU* |*33% mean, 80% max* |  |*6156 MiB in use* |*35% mean and 6063 MiB at idle: the display, other programs and the loaded model*
+|===
+
+*Contention (decision Q8).* Synthesis ran at the same real-time factor (0.24) as in the isolated EXP-0003 bench while the recognizer, the LLM and the renderer were running, so on this 16-thread machine no stage was visibly slowed by the others. That is *not* a statement about smaller CPUs: TTS and STT each use four threads in bursts, and a 4-core machine was not tried.
+
+*Frame rate.* `requestAnimationFrame` callbacks per second in the renderer page: idle mean 60.0 (min 59.2); with everything running mean 60.0, 5th percentile 59.5, minimum 57.2, over 276 one-second samples. The page is limited by the 60 Hz refresh, so this shows that its main thread kept up, not how much GPU time a frame costs. Run 2 (Edge) had one 3-second dip to 19 to 22 fps with nothing attributable in the process samples; it did not recur in runs 1, 3 and 4. The avatar host sent 854 sequenced commands in run 4 and the page reported no error; the mouth opened (`aa` up to 0.77) during speech and expressions followed the generated reply.
+
+=== Network
+
+Every socket of the runtime's processes (app, llama-server, both speech children, the TTS sidecar, `ffplay`) and of the browser, sampled the whole run (about 1500 rows in run 4):
+
+[cols="3,2",options="header"]
+|===
+|Run and browser |Non-loopback sockets
+|Run 4 (Chromium, black-hole proxy) |*none* (every listener is `127.0.0.1`, every connection is `127.0.0.1` to `127.0.0.1`)
+|Run 3 (same, browser not sampled) |none from the runtime's processes
+|Run 2 (Edge, black-hole proxy) |one from the browser's main process to a remote address (the vendor's, it appears); reproduced with `about:blank`, so Edge ignores `--proxy-server` for its own service connection
+|Run 1 (Edge, no proxy) |six from the browser to remote addresses (not looked up; they appear to belong to the browser vendor and a CDN); none from the runtime's processes
+|Probe, Chromium without a proxy, `about:blank` |four to remote addresses that appear to be Google's
+|Probe, Chromium with the black-hole proxy, `about:blank` |none
+|===
+
+The avatar page requested only `http://127.0.0.1:8765` and same-origin `blob:` URLs (21 requests). The runtime's processes never opened a non-loopback socket in any run. A browser can, which is why the browser row is separate and the proxy flag matters. The three start-up refusals of section 6 were also exercised. No firewall or network setting was changed and the machine stayed online, so this is an observation, not a deny rule.
+
+=== Failure behaviour (run 4 and the first run)
+
+* *llama-server stopped, then a free-text line:* accepted, nothing spoken and no avatar command (`lastSeq` did not move); no log line says why. *This is a gap*: the local profile's route names no cached fallback family and the typed fallback (`NonVerbalReaction`) carries no playback, so the viewer sees nothing. The app and avatar kept running.
+* *Then a cached `intent` line, with llama-server dead:* played 0.14 s after the event.
+* *TTS sidecar killed, then a cached `intent` line:* `tts_sidecar: exited; speech degrades to non-verbal reactions ...` was logged and the cached reaction played 0.11 s after the event.
+* *Barge-in:* in every run two replies were still playing when the next clip began (the replies are long); each was stopped by the confirmed barge-in, 0.39 to 0.55 ms (8 events in 4 runs) from the decision to the stop command, `HardStopped` (the `ffplay` process is killed), the avatar reset, and the new turn was answered.
+* *A reply of 396 characters* (run 1, default cap) exceeded the sidecar's 12 s synthesis deadline (`deadline_exceeded`); the next request saw the engine still busy and was dropped. With the cap of 96 tokens it did not recur in three runs.
+* *The WAV ended:* `speech_sidecar: degraded: sidecar exited`, then typed chat continued.
+* *Shutdown:* closing stdin ended the app with exit code 0, and no runtime process survived it (checked in all four runs).
+* *Not exercised live:* killing the VAD sidecar or the STT worker in the middle of a turn, a live microphone, OBS Browser Source, a Linux host, a CPU-only llama.cpp, and a machine with fewer than 16 threads. The supervisor tests cover the first.
