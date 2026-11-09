@@ -19,9 +19,11 @@
 //! Privacy: audio never leaves this process and is never written anywhere.
 //! The bounded pre-roll is memory only and nothing reads it in S2.
 
+#[cfg(feature = "mic-capture")]
+use aivtuber_adapters::speech_vad::StreamClock;
 use aivtuber_adapters::speech_vad::{
     FRAME_MS, HysteresisConfig, LineSink, MAX_PREROLL_MS, ObservationStamper, RawEdge,
-    RuntimeClockMap, SILERO_PROVIDER_VERSION, SileroVad, StamperConfig, StreamClock, VadPipeline,
+    RuntimeClockMap, SILERO_PROVIDER_VERSION, SileroVad, StamperConfig, VadPipeline,
     pump_clock_syncs,
 };
 use aivtuber_domain::SpeechEdge;

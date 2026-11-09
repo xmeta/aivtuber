@@ -12,8 +12,9 @@ use aivtuber_app::{
     NoopStreamOutput, ObsStreamOutput, OperatorControlServer, OperatorRateLimiter, ProductionApp,
     ProfileSummary, RawIngressConfig, RawIngressMetrics, RawIngressMetricsSnapshot, RoutePlanner,
     RuntimeRetentionPolicy, SHADOW_ORCHESTRATOR_SCHEMA_VERSION, ShadowOrchestratorConfig,
-    ShadowPolicyIdentity, ShadowingRoutePlanner, StreamOutput, VtsAvatarOutput, VtsPlaybackConfig,
-    apply_dispatched_request, pump_bounded_records,
+    ShadowPolicyIdentity, ShadowingRoutePlanner, SpeechSidecar, SpeechSidecarConfig,
+    SpeechSidecarStats, StreamOutput, VtsAvatarOutput, VtsPlaybackConfig, apply_dispatched_request,
+    pump_bounded_records,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
@@ -24,7 +25,7 @@ use aivtuber_generative::{GenerativePipeline, PerformanceCompiler, PerformanceCo
 use aivtuber_reflex::{JevAdapter, JevAdapterConfig, JevApiKey, PolicyConfig, ReflexPipeline};
 use aivtuber_runtime::{
     CachedPerformer, CachedPlaybackConfig, IngressPolicy, LocalVisemeStore, SecurityRuntime,
-    SecurityRuntimeConfig,
+    SecurityRuntimeConfig, SpeechObservationConfig, SpeechObservationTracker,
 };
 use aivtuber_scheduler::{Scheduler, SchedulerConfig};
 use aivtuber_telemetry::SecretRedactor;
@@ -310,6 +311,41 @@ fn run() -> Result<(), Box<dyn Error>> {
     });
 
     let started = Instant::now();
+    // Issue #92 S2: optional local speech-activity sidecar. Off unless
+    // AIVTUBER_SPEECH_SIDECAR names the program. Its observations feed the S1
+    // tracker only (untrusted content-plane data, no scheduler or output
+    // path); a sidecar that cannot start or later fails degrades to no speech
+    // observations and never blocks this loop.
+    let mut speech_sidecar: Option<SpeechSidecar> = None;
+    if let Some(program) = env_optional("AIVTUBER_SPEECH_SIDECAR") {
+        let mut tracker = SpeechObservationTracker::new(
+            SpeechObservationConfig::default(),
+            IngressPolicy::parse(
+                env_optional("AIVTUBER_INGRESS_MAX_TRUST").as_deref(),
+                env_optional("AIVTUBER_INGRESS_SOURCE_CLASSES").as_deref(),
+            )?,
+        )?;
+        let mut config = SpeechSidecarConfig::new(
+            program,
+            env_optional("AIVTUBER_SPEECH_SIDECAR_ARGS")
+                .map(|args| args.split_whitespace().map(str::to_owned).collect())
+                .unwrap_or_default(),
+        );
+        config.resync_interval =
+            Duration::from_millis(env_u64("AIVTUBER_SPEECH_SIDECAR_RESYNC_MS", 5_000)?);
+        match SpeechSidecar::spawn(config, started) {
+            Ok(sidecar) => {
+                eprintln!("speech_sidecar: started");
+                speech_sidecar = Some(sidecar);
+            }
+            Err(error) => {
+                eprintln!("speech_sidecar: could not start: {error}; no speech observations");
+                tracker.record_provider_unavailable();
+            }
+        }
+        app = app.with_speech_observations(tracker);
+    }
+    let mut last_speech_stats = SpeechSidecarStats::default();
     let mut sequence_seed = 0_u64;
     let mut next_maintenance_ms = 0_u64;
     let mut last_raw_ingress_metrics = RawIngressMetricsSnapshot::default();
@@ -354,6 +390,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                 );
                 let now_ms = elapsed_ms(started);
                 app.shutdown(now_ms);
+                if let Some(sidecar) = speech_sidecar.as_mut() {
+                    sidecar.shutdown();
+                }
                 break;
             }
         }
@@ -368,9 +407,33 @@ fn run() -> Result<(), Box<dyn Error>> {
                 apply_dispatched_request(&operator_ingress, &mut app, &dispatched, now_ms);
             let _ = dispatched.respond.send(response);
         }
+        if let Some(sidecar) = speech_sidecar.as_mut()
+            && let Some(tracker) = app.speech_observations_mut()
+        {
+            sidecar.poll(tracker, now_ms, |_, _| {});
+        }
         app.tick(now_ms);
         if now_ms >= next_maintenance_ms {
             app.maintain_adapters();
+            if let Some(tracker) = app.speech_observations_mut() {
+                tracker.sweep(now_ms);
+            }
+            if let Some(sidecar) = speech_sidecar.as_ref() {
+                let stats = sidecar.stats();
+                if stats.lines_dropped_queue_full != last_speech_stats.lines_dropped_queue_full
+                    || stats.lines_dropped_oversize != last_speech_stats.lines_dropped_oversize
+                    || stats.lines_rejected != last_speech_stats.lines_rejected
+                {
+                    eprintln!(
+                        "speech_sidecar_metrics: ingested={} rejected={} dropped_queue_full={} dropped_oversize={}",
+                        stats.batches_ingested,
+                        stats.lines_rejected,
+                        stats.lines_dropped_queue_full,
+                        stats.lines_dropped_oversize
+                    );
+                    last_speech_stats = stats;
+                }
+            }
             report_raw_ingress_metrics(&raw_ingress_metrics, &mut last_raw_ingress_metrics, false);
             next_maintenance_ms = now_ms.saturating_add(1_000);
         }
