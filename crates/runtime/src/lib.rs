@@ -11,6 +11,10 @@ mod speech_observation;
 pub use speech_observation::*;
 mod speech_replay;
 pub use speech_replay::*;
+mod speech_transcript;
+pub use speech_transcript::*;
+mod speech_transcript_replay;
+pub use speech_transcript_replay::*;
 
 use aivtuber_domain::{
     AuthenticatedControl, AuthenticatedControlCommand, Capability, EventEnvelope, EventKind,

@@ -1,0 +1,18 @@
+{
+  "schema_version": "0.1.0",
+  "provider_id": "speech-stt-worker",
+  "provider_version": "sherpa-onnx-2.0.1",
+  "language": "ja",
+  "transcripts": [
+    {
+      "speaker_id": "mic-local",
+      "segment_id": 3,
+      "revision": 2,
+      "kind": "partial",
+      "text": "こんにちは",
+      "covered_audio_ms": 1500,
+      "observed_at_ms": 7300,
+      "complete": false
+    }
+  ]
+}

@@ -13,6 +13,8 @@
 //   avatar-playback-command.schema.json; .../invalid must REJECT
 // - examples/speech-observations/valid must conform to speech-observation.schema.json;
 //   .../invalid and .../inconsistent (cross-field) must REJECT; .../replay fixtures must carry schema-valid batches (#92)
+// - examples/speech-transcripts/valid must conform to speech-transcript.schema.json;
+//   .../invalid must REJECT; .../replay fixtures must carry schema-valid batches (#92 S3b)
 // - examples/evaluation/reaction-quality/*.json must conform to the reaction-quality dataset schema
 //   and development/holdout partitions must not share case IDs or leakage groups.
 // - examples/evaluation/reaction-quality-review/*.json must conform to the pairwise-review schema
@@ -90,6 +92,7 @@ const faultOverlay = validators["schemas/fault-overlay.schema.json"];
 const visemeTrack = validators["schemas/viseme-track.schema.json"];
 const avatarCommand = validators["schemas/avatar-playback-command.schema.json"];
 const speechObservation = validators["schemas/speech-observation.schema.json"];
+const speechTranscript = validators["schemas/speech-transcript.schema.json"];
 
 function report(ok, label, validator) {
   if (ok) {
@@ -173,6 +176,7 @@ for (const [validator, validDirs, invalidDir] of [
   [visemeTrack, ["examples/viseme-tracks/valid", "examples/starter-reaction-pack/viseme"], "examples/viseme-tracks/invalid"],
   [avatarCommand, ["examples/avatar-playback-commands/valid"], "examples/avatar-playback-commands/invalid"],
   [speechObservation, ["examples/speech-observations/valid"], "examples/speech-observations/invalid"],
+  [speechTranscript, ["examples/speech-transcripts/valid"], "examples/speech-transcripts/invalid"],
 ]) {
   if (!validator) continue;
   for (const dir of validDirs) {
@@ -260,6 +264,63 @@ if (speechObservation) {
   }
   for (const file of listJson("examples/speech-observations/replay")) {
     const problems = speechReplayProblems(loadJson(join(root, file)));
+    if (problems.length === 0) {
+      passes += 1;
+      console.log(`ok        ${file}`);
+    } else {
+      failures += 1;
+      console.error(`FAIL      ${file}`);
+      for (const problem of problems) console.error(`          ${problem}`);
+    }
+  }
+}
+
+// Speech transcript replay fixtures (#92 S3b): every delivered batch must
+// conform to the transcript schema, and the step structure must be replayable
+// (exactly one of deliver/poll_floor/take_finals per step, logical time never
+// decreasing). Outcome, floor and final expectations are executed by the Rust
+// replay runner, not re-implemented here.
+const TRANSCRIPT_REPLAY_STEP_KEYS = new Set([
+  "now_ms", "deliver", "poll_floor", "take_finals", "expect_outcomes", "expect_floor", "expect_finals",
+]);
+const TRANSCRIPT_OUTCOMES = new Set([
+  "accepted_partial", "accepted_final", "accepted_final_unsurfaced", "stale_age", "future_dated",
+  "stale_revision", "out_of_order", "after_final", "speaker_capacity",
+]);
+const TRANSCRIPT_FLOORS = new Set(["none", "holding", "stale"]);
+function speechTranscriptReplayProblems(doc) {
+  const problems = [];
+  if (doc.schema_version !== "0.1.0") problems.push("schema_version must be 0.1.0");
+  if (!Array.isArray(doc.steps) || doc.steps.length === 0 || doc.steps.length > 4096) {
+    return [...problems, "steps must be 1..=4096 items"];
+  }
+  let previous = 0;
+  doc.steps.forEach((step, index) => {
+    const where = `steps[${index}]`;
+    for (const key of Object.keys(step)) {
+      if (!TRANSCRIPT_REPLAY_STEP_KEYS.has(key)) problems.push(`${where}.${key} is not allowed`);
+    }
+    if (!Number.isInteger(step.now_ms) || step.now_ms < previous) problems.push(`${where}.now_ms must be an integer that does not decrease`);
+    else previous = step.now_ms;
+    const actions = [step.deliver !== undefined, step.poll_floor !== undefined, step.take_finals === true];
+    if (actions.filter(Boolean).length !== 1 || step.take_finals === false) {
+      problems.push(`${where} needs exactly one of deliver, poll_floor or take_finals`);
+    }
+    if (step.deliver !== undefined) {
+      if (!speechTranscript(step.deliver)) problems.push(`${where}.deliver does not conform to speech-transcript.schema.json`);
+      for (const name of step.expect_outcomes ?? []) {
+        if (!TRANSCRIPT_OUTCOMES.has(name)) problems.push(`${where}.expect_outcomes has unknown outcome ${name}`);
+      }
+    }
+    if (step.expect_floor !== undefined && !TRANSCRIPT_FLOORS.has(step.expect_floor)) {
+      problems.push(`${where}.expect_floor is not a floor hold name`);
+    }
+  });
+  return problems;
+}
+if (speechTranscript) {
+  for (const file of listJson("examples/speech-transcripts/replay")) {
+    const problems = speechTranscriptReplayProblems(loadJson(join(root, file)));
     if (problems.length === 0) {
       passes += 1;
       console.log(`ok        ${file}`);

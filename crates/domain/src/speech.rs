@@ -227,7 +227,10 @@ fn validate_unit(field: &'static str, value: f64) -> Result<(), DomainValidation
 }
 
 /// ASCII token: first byte lowercase alphanumeric, rest `[a-z0-9._-]`.
-fn validate_provider_token(field: &'static str, value: &str) -> Result<(), DomainValidationError> {
+pub(crate) fn validate_provider_token(
+    field: &'static str,
+    value: &str,
+) -> Result<(), DomainValidationError> {
     let lower = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
     validate_charset(field, value, MAX_PROVIDER_TOKEN_LEN, |b| {
         lower(b) || matches!(b, b'.' | b'_' | b'-')
@@ -243,7 +246,7 @@ fn validate_provider_token(field: &'static str, value: &str) -> Result<(), Domai
 }
 
 /// Length in 1..=max, ASCII only, every byte allowed, first byte alphanumeric.
-fn validate_charset(
+pub(crate) fn validate_charset(
     field: &'static str,
     value: &str,
     max: usize,
@@ -266,7 +269,7 @@ fn validate_charset(
 }
 
 /// `^[a-z]{2,3}(-[A-Za-z0-9]{2,8}){0,3}$`, at most 35 bytes.
-fn validate_language(value: &str) -> Result<(), DomainValidationError> {
+pub(crate) fn validate_language(value: &str) -> Result<(), DomainValidationError> {
     let invalid = || DomainValidationError::new("language", "must be a BCP 47-style language tag");
     if value.len() > MAX_LANGUAGE_LEN {
         return Err(invalid());
@@ -290,7 +293,7 @@ fn validate_language(value: &str) -> Result<(), DomainValidationError> {
 }
 
 /// Reject an explicit JSON `null` for an optional field, as the schema does.
-fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+pub(crate) fn deserialize_present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,

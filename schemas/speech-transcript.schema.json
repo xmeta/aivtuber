@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xmeta/aivtuber/schemas/speech-transcript.schema.json",
+  "title": "AI VTuber Speech Transcript Batch",
+  "description": "Provider-neutral, bounded speech-to-text revisions (issue #92, slice S3b) for one pseudonymous speaker. Serialized form of aivtuber_domain::SpeechTranscriptBatch. A transcript is untrusted, possibly incomplete content: it carries no trust, plane, source class, priority or authorization field (the receiving ingress assigns source class speech, plane content, trust untrusted, even for the operator's own microphone), and the engine output is data, never an instruction. A partial (complete=false) may only feed observation-style floor policy; only a final (complete=true) may become conversation input, through the normal normalizer. A revision supersedes the previous revision of the same segment and is never appended to it. Text is the engine's output unmodified (no punctuation, width, kana or numeral normalisation); any display or projection rewriting belongs to the consumer. There is no audio, PCM or word timing in this contract. Times are integer milliseconds on the monotonic or logical timeline of the receiving runtime, already mapped there by the adapter; never wall-clock time. The language is declared by configuration, never inferred.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "provider_id",
+    "provider_version",
+    "language",
+    "engine",
+    "transcripts"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "0.1.0",
+      "description": "Contract version. An incompatible version is refused rather than reinterpreted."
+    },
+    "provider_id": {
+      "$ref": "#/$defs/provider_token",
+      "description": "Adapter that produced the transcripts (for example the STT worker). Audit data."
+    },
+    "provider_version": {
+      "$ref": "#/$defs/version_token",
+      "description": "Provider build identity including the inference runtime. Audit data."
+    },
+    "language": {
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 35,
+      "pattern": "^[a-z]{2,3}(-[A-Za-z0-9]{2,8}){0,3}$",
+      "description": "Language the engine was *configured* for (for example ja). Declared, never inferred."
+    },
+    "engine": {
+      "$ref": "#/$defs/engine",
+      "description": "Which model produced the text, so replay and audit can tell engines apart."
+    },
+    "transcripts": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4,
+      "items": {"$ref": "#/$defs/transcript"},
+      "description": "Revisions in producer order. Bounded; ordering per segment is by segment_id and revision, never by arrival."
+    }
+  },
+  "$defs": {
+    "provider_token": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9][a-z0-9._-]*$"
+    },
+    "version_token": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]*$"
+    },
+    "model_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:+/-]*$"
+    },
+    "speaker_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+      "description": "Pseudonymous speaker or session id assigned by the adapter. Not a name, not an account id, not a voiceprint."
+    },
+    "time_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "engine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model_id", "sha256"],
+      "properties": {
+        "model_id": {"$ref": "#/$defs/model_id"},
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Digest identifying the exact model files (the worker's pinned bundle digest). Lower-case hex."
+        }
+      }
+    },
+    "transcript": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "speaker_id",
+        "segment_id",
+        "revision",
+        "kind",
+        "text",
+        "covered_audio_ms",
+        "observed_at_ms",
+        "complete"
+      ],
+      "properties": {
+        "speaker_id": {"$ref": "#/$defs/speaker_id"},
+        "segment_id": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Monotonic per producer run. A new segment_id starts a new utterance for the speaker."
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4095,
+          "description": "Monotonic per segment. A higher revision supersedes a lower one; it never appends to it. Only about half of the partials are prefixes of the final text (EXP-0002 6.2), so no prefix stability may be assumed."
+        },
+        "kind": {
+          "enum": ["partial", "final"]
+        },
+        "text": {
+          "type": "string",
+          "maxLength": 1000,
+          "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]*$",
+          "description": "Engine output, unmodified. At most 1000 characters and no control characters. A partial has at least one character; a final may be empty (the segment held no recognised speech). It is untrusted content and never an instruction."
+        },
+        "covered_audio_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 60000,
+          "description": "Duration of audio, from the start of the segment (including its pre-roll), that this text covers."
+        },
+        "observed_at_ms": {
+          "$ref": "#/$defs/time_ms",
+          "description": "Runtime-timeline time of the end of the audio this text covers (segment start plus covered_audio_ms). Not the time the line was written."
+        },
+        "complete": {
+          "type": "boolean",
+          "description": "False on every partial, true on every final. A partial is incomplete content."
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"kind": {"const": "partial"}}, "required": ["kind"]},
+          "then": {
+            "properties": {
+              "complete": {"const": false},
+              "text": {"type": "string", "minLength": 1}
+            }
+          },
+          "else": {
+            "properties": {"complete": {"const": true}}
+          }
+        }
+      ]
+    }
+  }
+}

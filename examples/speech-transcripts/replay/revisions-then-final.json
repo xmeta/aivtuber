@@ -1,0 +1,156 @@
+{
+  "schema_version": "0.1.0",
+  "name": "partials revise and hold the floor; only the final surfaces text",
+  "config": {},
+  "steps": [
+    {
+      "now_ms": 700,
+      "deliver": {
+        "schema_version": "0.1.0",
+        "provider_id": "speech-stt-worker",
+        "provider_version": "sherpa-onnx-2.0.1",
+        "language": "ja",
+        "engine": {
+          "model_id": "reazonspeech-k2-v2-int8",
+          "sha256": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+        },
+        "transcripts": [
+          {
+            "speaker_id": "mic-local",
+            "segment_id": 5,
+            "revision": 0,
+            "kind": "partial",
+            "text": "きょう",
+            "covered_audio_ms": 500,
+            "observed_at_ms": 600,
+            "complete": false
+          }
+        ]
+      },
+      "expect_outcomes": [
+        "accepted_partial"
+      ]
+    },
+    {
+      "now_ms": 700,
+      "poll_floor": "mic-local",
+      "expect_floor": "holding"
+    },
+    {
+      "now_ms": 1200,
+      "deliver": {
+        "schema_version": "0.1.0",
+        "provider_id": "speech-stt-worker",
+        "provider_version": "sherpa-onnx-2.0.1",
+        "language": "ja",
+        "engine": {
+          "model_id": "reazonspeech-k2-v2-int8",
+          "sha256": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+        },
+        "transcripts": [
+          {
+            "speaker_id": "mic-local",
+            "segment_id": 5,
+            "revision": 1,
+            "kind": "partial",
+            "text": "今日は",
+            "covered_audio_ms": 1000,
+            "observed_at_ms": 1100,
+            "complete": false
+          }
+        ]
+      },
+      "expect_outcomes": [
+        "accepted_partial"
+      ]
+    },
+    {
+      "now_ms": 1700,
+      "deliver": {
+        "schema_version": "0.1.0",
+        "provider_id": "speech-stt-worker",
+        "provider_version": "sherpa-onnx-2.0.1",
+        "language": "ja",
+        "engine": {
+          "model_id": "reazonspeech-k2-v2-int8",
+          "sha256": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+        },
+        "transcripts": [
+          {
+            "speaker_id": "mic-local",
+            "segment_id": 5,
+            "revision": 2,
+            "kind": "partial",
+            "text": "今日はいい天気",
+            "covered_audio_ms": 1500,
+            "observed_at_ms": 1600,
+            "complete": false
+          }
+        ]
+      },
+      "expect_outcomes": [
+        "accepted_partial"
+      ]
+    },
+    {
+      "now_ms": 1800,
+      "poll_floor": "mic-local",
+      "expect_floor": "holding"
+    },
+    {
+      "now_ms": 1800,
+      "take_finals": true,
+      "expect_finals": []
+    },
+    {
+      "now_ms": 3400,
+      "poll_floor": "mic-local",
+      "expect_floor": "stale"
+    },
+    {
+      "now_ms": 3700,
+      "deliver": {
+        "schema_version": "0.1.0",
+        "provider_id": "speech-stt-worker",
+        "provider_version": "sherpa-onnx-2.0.1",
+        "language": "ja",
+        "engine": {
+          "model_id": "reazonspeech-k2-v2-int8",
+          "sha256": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+        },
+        "transcripts": [
+          {
+            "speaker_id": "mic-local",
+            "segment_id": 5,
+            "revision": 3,
+            "kind": "final",
+            "text": "今日はいい天気ですね",
+            "covered_audio_ms": 3000,
+            "observed_at_ms": 3600,
+            "complete": true
+          }
+        ]
+      },
+      "expect_outcomes": [
+        "accepted_final"
+      ]
+    },
+    {
+      "now_ms": 3700,
+      "poll_floor": "mic-local",
+      "expect_floor": "none"
+    },
+    {
+      "now_ms": 3700,
+      "take_finals": true,
+      "expect_finals": [
+        "今日はいい天気ですね"
+      ]
+    },
+    {
+      "now_ms": 3800,
+      "take_finals": true,
+      "expect_finals": []
+    }
+  ]
+}
