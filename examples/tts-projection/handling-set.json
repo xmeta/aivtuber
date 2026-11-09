@@ -1,0 +1,192 @@
+[
+ {
+  "category": "number",
+  "text": "今日は3月5日です。",
+  "expected": "今日は3月5日です。"
+ },
+ {
+  "category": "number",
+  "text": "チャンネル登録者が1000人を超えました。",
+  "expected": "チャンネル登録者が1000人を超えました。"
+ },
+ {
+  "category": "number",
+  "text": "あと25分で始まるよ。",
+  "expected": "あと25分で始まるよ。"
+ },
+ {
+  "category": "number",
+  "text": "気温は18.5度だって。",
+  "expected": "気温は18.5度だって。"
+ },
+ {
+  "category": "number",
+  "text": "二十歳の誕生日をお祝いするね。",
+  "expected": "二十歳の誕生日をお祝いするね。"
+ },
+ {
+  "category": "number",
+  "text": "100円のスパチャありがとう。",
+  "expected": "100円のスパチャありがとう。"
+ },
+ {
+  "category": "number",
+  "text": "1日目はここまでにしよう。",
+  "expected": "1日目はここまでにしよう。"
+ },
+ {
+  "category": "number",
+  "text": "今月の目標は5万円です。",
+  "expected": "今月の目標は5万円です。"
+ },
+ {
+  "category": "number",
+  "text": "3人で遊ぶよ。",
+  "expected": "3人で遊ぶよ。"
+ },
+ {
+  "category": "number",
+  "text": "2026年11月10日の配信です。",
+  "expected": "2026年11月10日の配信です。"
+ },
+ {
+  "category": "english",
+  "text": "今日はYouTubeでライブをするよ。",
+  "expected": "今日はYouTubeでライブをするよ。"
+ },
+ {
+  "category": "english",
+  "text": "OpenAIの新しいモデルが出たらしい。",
+  "expected": "OpenAIの新しいモデルが出たらしい。"
+ },
+ {
+  "category": "english",
+  "text": "Twitterじゃなくて今はXって呼ぶんだよ。",
+  "expected": "Twitterじゃなくて今はXって呼ぶんだよ。"
+ },
+ {
+  "category": "english",
+  "text": "VTuberになって三年が経ちました。",
+  "expected": "VTuberになって三年が経ちました。"
+ },
+ {
+  "category": "english",
+  "text": "このゲームのBGMが好き。",
+  "expected": "このゲームのBGMが好き。"
+ },
+ {
+  "category": "english",
+  "text": "Discordのサーバーに入ってね。",
+  "expected": "Discordのサーバーに入ってね。"
+ },
+ {
+  "category": "english",
+  "text": "Thank you、また来てね。",
+  "expected": "Thank you、また来てね。"
+ },
+ {
+  "category": "english",
+  "text": "AIとおしゃべりするのは楽しいね。",
+  "expected": "AIとおしゃべりするのは楽しいね。"
+ },
+ {
+  "category": "kanji",
+  "text": "今日は昨日より明日が楽しみ。",
+  "expected": "今日は昨日より明日が楽しみ。"
+ },
+ {
+  "category": "kanji",
+  "text": "上手にできたと思う。",
+  "expected": "上手にできたと思う。"
+ },
+ {
+  "category": "kanji",
+  "text": "人気者になりたいな。",
+  "expected": "人気者になりたいな。"
+ },
+ {
+  "category": "kanji",
+  "text": "大人気のゲームを遊ぶよ。",
+  "expected": "大人気のゲームを遊ぶよ。"
+ },
+ {
+  "category": "kanji",
+  "text": "行ったことがない場所に行きたい。",
+  "expected": "行ったことがない場所に行きたい。"
+ },
+ {
+  "category": "kanji",
+  "text": "生物の授業を思い出した。",
+  "expected": "生物の授業を思い出した。"
+ },
+ {
+  "category": "kanji",
+  "text": "辛い物が好きです。",
+  "expected": "辛い物が好きです。"
+ },
+ {
+  "category": "kanji",
+  "text": "最後まで見ていってね。",
+  "expected": "最後まで見ていってね。"
+ },
+ {
+  "category": "kanji",
+  "text": "風邪をひかないように気をつけて。",
+  "expected": "風邪をひかないように気をつけて。"
+ },
+ {
+  "category": "kanji",
+  "text": "一人で歌うのは少し寂しい。",
+  "expected": "一人で歌うのは少し寂しい。"
+ },
+ {
+  "category": "kanji",
+  "text": "海老の天ぷらが食べたい。",
+  "expected": "海老の天ぷらが食べたい。"
+ },
+ {
+  "category": "kanji",
+  "text": "彼女は笑顔で手を振った。",
+  "expected": "彼女は笑顔で手を振った。"
+ },
+ {
+  "category": "kanji",
+  "text": "東京タワーに行ってきたよ。",
+  "expected": "東京タワーに行ってきたよ。"
+ },
+ {
+  "category": "kanji",
+  "text": "雰囲気がとても良い配信だね。",
+  "expected": "雰囲気がとても良い配信だね。"
+ },
+ {
+  "category": "url",
+  "text": "詳しくは https://example.com/live を見てね。",
+  "expected": "詳しくは を見てね。"
+ },
+ {
+  "category": "url",
+  "text": "概要欄のリンクはこちら www.example.jp です。",
+  "expected": "概要欄のリンクはこちら です。"
+ },
+ {
+  "category": "symbol",
+  "text": "A&B、100%、#タグ、@メンション。",
+  "expected": "A&B、100%、#タグ、@メンション。"
+ },
+ {
+  "category": "emoji",
+  "text": "ありがとう😊また来てね✨",
+  "expected": "ありがとうまた来てね"
+ },
+ {
+  "category": "emoji",
+  "text": "やったー🎉🎉🎉",
+  "expected": "やったー"
+ },
+ {
+  "category": "emoji",
+  "text": "えへへ(´▽`)照れるなあ。",
+  "expected": "えへへ照れるなあ。"
+ }
+]
