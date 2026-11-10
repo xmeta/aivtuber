@@ -101,21 +101,13 @@ Do not record secrets, private user data, or raw provider credentials.
 
 *Subsystem:* app / adaptation
 
-*Status:* Verified
+*Status:* Retired (#306)
 
-*Statement:* At `main` `b9efb0f5`, +ProductionApp::remember_working_memory+ and +remember_durable_memory*+ are called only by tests, hardening soaks and evaluation runners, never by +main.rs+ or other production code in +crates/app/src+. Cross-session continuity therefore has no current producer, and the expected benefit of persistence today is zero.
+*Statement:* At `main` `b9efb0f5`, +ProductionApp::remember_working_memory+ and +remember_durable_memory*+ were called only by tests, hardening soaks and evaluation runners. Cross-session continuity therefore had no producer.
 
-*Evidence:*
+*Retirement:* ADR-0008 Q1 landed in #306: the app's post-turn consolidation step (+crates/app/src/memory_writer.rs+) writes stream-level performer facts under a runtime-minted permit when +AIVTUBER_MEMORY_WRITER+ is enabled (default off). Continuity has a producer behind an opt-in switch, and the ADR-0008 Q4 falsifier is runnable from the +memory_writer_metrics+ counters. The assumption no longer holds, so it is removed from the active set; the ADR-0008 need test stays valid only for viewer-attributed persistence, which this writer does not produce.
 
-* +crates/app/src/lib.rs+ (+remember_working_memory+, +remember_durable_memory*+; callers inside +#[cfg(test)]+ only)
-* +crates/hardening/src/soak.rs+, +crates/app/src/memory_eval.rs+, +crates/app/src/memory_sidecar_eval.rs+
-* +docs/adr/0008-cross-session-memory-persistence.adoc+ section 1.2
-
-*Consequence if false:* If a production writer already exists, restart loss is real today and the ADR-0008 need test and slice order must be redone.
-
-*Revisit when:* A production writer (ADR-0008 Q1) lands; this assumption is then retired and the Q4 falsifier becomes runnable.
-
-*Related:* #282, #105.
+*Related:* #282, #105, #306.
 
 === A-VTS-001 -- Reconnect does not justify stale avatar-command replay
 
