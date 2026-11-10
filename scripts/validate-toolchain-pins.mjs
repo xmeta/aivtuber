@@ -6,7 +6,11 @@ const read = (path) => readFileSync(resolve(root, path), "utf8");
 
 const rustToolchain = read("rust-toolchain.toml");
 const packageJson = JSON.parse(read("package.json"));
-const ci = read(".github/workflows/ci.yml");
+const ciOnly = read(".github/workflows/ci.yml");
+// The release workflow (#294) builds the shipped binaries, so its Rust and Bun
+// pins are held to the same single-channel rule. The reproducibility-gate
+// command checks below stay about ci.yml only.
+const ci = `${ciOnly}\n${read(".github/workflows/release.yml")}`;
 
 const rustMatch = rustToolchain.match(/^channel\s*=\s*"([^"]+)"$/m);
 if (!rustMatch) {
@@ -62,7 +66,7 @@ for (const command of [
   "cargo test --locked --workspace",
   "cargo build --locked --workspace",
 ]) {
-  if (!ci.includes(command)) {
+  if (!ciOnly.includes(command)) {
     throw new Error(`CI is missing reproducibility gate: ${command}`);
   }
 }
