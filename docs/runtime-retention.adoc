@@ -57,6 +57,9 @@ All limits are configurable through +AIVTUBER_RETENTION_*+ environment variables
 |Adaptation decisions |Bounded RAM |Oldest decision detail is evicted
 |Speech observation per-speaker state |Bounded count + logical TTL |No audio, PCM or transcript is retained; metrics expose speakers, high water and evictions (#92)
 |Burst micro-batcher pending batch, ready queue, density ring, actor cooldowns |Bounded count/bytes + logical time |Hard-capped in +BurstConfig::validate+; a full ready queue sheds its oldest batch with terminal accounting; cooldowns evict deterministically (#78)
+|Chat-burst lane held comments (#78 S2) |Bounded count + logical time |Only comments the engine still holds (pending batch plus at most +max_ready_batches+ ready batches, hard-capped in +BurstConfig::validate+); each is removed when its batch resolves, is erased or is cancelled by operator stop. Metrics: +held+, +held_high_water+, +in_flight+
+|Deferred-reply inbox (#75 S1) |Bounded count + logical expiry |At most +capacity+ (cap 256) held envelopes, +per_actor_cap+ per (source, actor), expiry at most +max_ttl_ms+ (cap 10 min) ahead on the caller's monotonic clock, measured from comment arrival; a full inbox evicts the item that would expire first with an explicit outcome. Erasure (#305), operator stop and shutdown remove items. Held envelopes are RAM-only, never persisted, and never logged
+|Chat-burst terminal records and deferred-reply reports (#75 S1) |Bounded ring |256 records (event id, logical time, outcome) and 64 reports; oldest dropped and counted in +records_dropped+/+reports_dropped+
 |Perception observation state (#90, S1a) |Bounded count + logical TTL |Latest observation per (enabled source, kind), at most 8 allowlisted and 2 enabled sources by default, a text-free diagnostic ring of 8, idle TTL 5 minutes; no frame, image or durable write exists. `PerceptionTracker` is not composed into the production app yet, so it has no `RuntimeRetentionPolicy` row or environment variable until S1b
 |Generation queue/completions |Bounded RAM |#121 owns execution semantics; no per-request tombstone history is retained
 |===
@@ -90,7 +93,8 @@ Deterministic survivors therefore depend on recorded input order, logical timest
 * hot static/dynamic asset and promotion-metadata counters;
 * cached-playback recent-group counters;
 * working-memory and adaptation current/high-water/evicted counters;
-* generation pending/in-flight/awaiting-drain/high-water/saturation/cancellation counters.
+* generation pending/in-flight/awaiting-drain/high-water/saturation/cancellation counters;
+* chat-burst and deferred-reply counters (+chat_burst+, present only when +AIVTUBER_CHAT_BURST_MODE+ is on): admitted, terminal outcomes by category, held/in-flight, inbox offered/pending/high-water and terminal outcomes, logical wait, invariant violations.
 
 These are bounded aggregate counters; observability does not retain an unbounded per-event history.
 
