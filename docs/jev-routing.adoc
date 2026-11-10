@@ -315,3 +315,69 @@ semantic retrieval + Jev adapter boundary: 28.4 us/op
 ----
 
 These numbers are diagnostic rather than a cross-machine performance guarantee.
+
+== 12. Burst micro-batching (issue #78, S1)
+
+A per-comment Jev call does not survive a chat burst, and the local profile runs without Jev at all. `aivtuber_reflex::BurstEngine` (`crates/reflex/src/burst.rs`) groups admitted public chat into small bounded batches _only while chat is bursting_, selects a Top-K deterministically, and gives every admitted comment exactly one terminal outcome. S1 is a library plus its falsifier; it is not yet wired into `process_content_bytes` (see 12.6).
+
+=== 12.1 Lanes
+
+Lane choice uses only the structure the normalizer assigned, never what a payload or hint claims.
+
+[cols="2,3",options="header"]
+|===
+|Event |Disposition
+|Control or system plane |`Immediate`: never delayed by, queued behind or counted in a batch
+|Content non-chat (donation, game, speech) |`Immediate(NonChatKind)`: existing per-event path
+|Content plane carrying an authorization claim, an operator kind or an operator source class |`Refused`: content cannot claim a bypass, and the claim is not promoted
+|`chat.message` while chat is quiet |`QuietPassthrough`: no wait, nothing held
+|`chat.message` while bursting |`Batched`
+|===
+
+A viewer-supplied `priority_hint` is ignored for ranking (and counted in `priority_claims_ignored`), so untrusted text cannot self-escalate into the Top-K.
+
+=== 12.2 Adaptive window and flush reasons
+
+Chat is "bursting" once `burst_enter_count` arrivals fall inside `window_ms` (a bounded ring of arrival instants). The engine owns no clock, thread or timer: every instant is a caller-supplied monotonic millisecond value, and a regressing value is clamped and counted. Flush reasons are derived from event time, sequence and configuration only:
+
+* `count`: the pending batch reached `max_candidates`;
+* `bytes`: the next candidate would exceed `max_bytes` of retained bytes;
+* `window`: `opened + window_ms` elapsed. The batch is stamped with that logical deadline, not the poll instant, so replay records do not depend on polling cadence;
+* `shutdown`: `shutdown()` flushes the partial batch and resolves everything without consulting a ranker, so a partial batch cannot deadlock shutdown.
+
+=== 12.3 Request, ranking seam and fairness
+
+`BatchEngagementRequest` carries the shared `ReflexContext` once, at most `request_candidates` (hard cap 16) bounded candidates (text truncated to 256 bytes on a UTF-8 boundary, identifiers at most 256 bytes) and a `CapacityEnvelope`. It is `Serialize`-only and Rust-internal: S1 defines no JSON Schema or provider DTO, so it cannot become a second implicit wire contract. The Jev batch prompt/adapter is a later slice.
+
+`BatchRanker` is the seam behind the reflex boundary. Its answer is only an ordering suggestion: ids outside the request or repeated are ignored, and the deterministic policy then re-applies Top-K, the per-batch actor cap and the per-actor cooldown. A ranker can therefore neither add a candidate nor revive a suppressed one; any ranker failure falls back to the deterministic order (`ranking_source = ranker_fallback`).
+
+The deterministic order is local score (a caller-supplied `0..=1000` value such as retrieval similarity), then arrival sequence.
+
+=== 12.4 Terminal outcomes
+
+Each admitted comment ends in exactly one of: `selected{rank}`, `quiet_passthrough`, `not_selected_capacity`, `suppressed_actor_cooldown`, `suppressed_actor_batch_cap`, `shed_pending_overflow`. `BurstMetrics::invariant_violations` counts any observation of `admitted != terminal + pending + ready` and must be zero.
+
+=== 12.5 Configuration (`BurstConfig`) and metrics
+
+Every field is validated, never clamped.
+
+[cols="2,1,3",options="header"]
+|===
+|Field |Default (hard cap) |Meaning
+|`window_ms` |1500 (5000) |Longest a candidate waits; also the burst-density window
+|`burst_enter_count` |4 (64) |Arrivals inside the window that start batching; at least 2 so quiet chat never waits
+|`max_candidates` |32 (64) |Count flush bound
+|`max_bytes` |16 KiB (32 KiB) |Retained-byte flush bound
+|`max_ready_batches` |4 (16) |Flushed batches awaiting resolution; the oldest is shed with terminal accounting beyond it
+|`top_k` |3 |Comments selected per batch (at most `request_candidates`)
+|`max_per_actor` |1 |Selected comments per actor per batch (at most `top_k`)
+|`actor_cooldown_ms` |10000 |Logical time before an actor can be selected again; `0` disables
+|`request_candidates` |12 (16) |Candidates shown to a ranker
+|`max_tracked_actors` |1024 (4096) |Remembered cooldowns; the oldest stamp is evicted deterministically
+|===
+
+Metrics (`BurstMetrics`): `ranker_calls_per_comment()` (a per-comment design is 1.0), flush counts by reason, candidate wait (`wait_ms_total`, `wait_ms_max`, `mean_wait_ms()`), observational ranker wall time, shed batches, high-water marks and the terminal counters.
+
+=== 12.6 Not in S1
+
+Live wiring of the engine into the composition root (it needs deferred playback for batched comments), a Jev batch prompt, #79 audience aggregation, #80 topic features and #58 cost comparison are deferred.
