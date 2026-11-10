@@ -24,6 +24,7 @@ mod shadow_orchestrator;
 mod speech_barge_in;
 mod speech_conversation;
 mod speech_floor;
+mod speech_resynthesis;
 mod speech_sidecar;
 mod support_bundle;
 mod task_plane;
@@ -69,7 +70,7 @@ pub use tts_sidecar::*;
 pub use voicevox_bridge::*;
 
 use aivtuber_adaptation::{
-    AdaptationEngine, AppliedAdaptation, MemoryEntry, MemoryEvidence, WorkingMemory,
+    AdaptationEngine, AppliedAdaptation, ErasureReport, MemoryEntry, MemoryEvidence, WorkingMemory,
 };
 use aivtuber_adapters::AudioStopOutcome;
 use aivtuber_asset_store::CacheTier;
@@ -89,10 +90,13 @@ use aivtuber_runtime::{
     AudioPlaybackCommand, AudioPlaybackSink, AvatarPlaybackCommand, AvatarPlaybackSink,
     CachedAssetSelection, CachedPerformer, CachedPlaybackError, CachedPlaybackOutcome,
     CachedPlaybackTiming, ContentAdmitDecision, ControlOutcome, FastPathPreloadReport,
-    LocalVisemeStore, OutputVerdict, PublicOutput, PublicOutputPolicy, RuntimeError,
-    SecurityRuntime, SpeechObservationTracker, SpeechTranscriptTracker,
+    LocalVisemeStore, MemoryErasePermit, OutputVerdict, PublicOutput, PublicOutputPolicy,
+    RuntimeError, SecurityRuntime, SpeechObservationTracker, SpeechTranscriptTracker,
+    ViewerEraseDecision,
 };
-use aivtuber_scheduler::{BlendChannel, Scheduler, Status, priority_for_event};
+use aivtuber_scheduler::{
+    BlendChannel, OutputFailureKind, OutputObservation, Scheduler, Status, priority_for_event,
+};
 use aivtuber_telemetry::{
     CacheLevel, CausalTraceCollector, CausalTraceRetentionConfig, ComparisonMode,
     DegradedSubsystem, EventObservation, RouteClass, StageOutcome, StageReason, TelemetryCollector,
@@ -210,6 +214,11 @@ pub struct SpokenFinalReport {
 pub struct ContentProcessOutcome {
     pub admission: ContentAdmitDecision,
     pub playback: Option<CachedPlaybackOutcome>,
+    /// Set when the admitted event was a viewer self-erase request (#305): the
+    /// event was consumed as a command, never routed as content. `None` when
+    /// the request could not be honoured (no asserted actor, no memory
+    /// configured) or the event was ordinary content.
+    pub memory_erasure: Option<ErasureReport>,
 }
 
 #[derive(Debug, Default)]
@@ -489,6 +498,10 @@ struct GenerationExecutor {
     counters: Arc<GenerationExecutionCounters>,
     shutting_down: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    /// Lazy re-synthesis of stale generated speech (#222 S2, ADR-0004 D-4).
+    resynthesis: speech_resynthesis::ResynthesisWorker,
+    /// The projection identity the pipeline uses now.
+    projection_key: String,
 }
 
 impl GenerationExecutor {
@@ -511,6 +524,8 @@ impl GenerationExecutor {
         let shutting_down = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutting_down);
         let pipeline = Arc::new(pipeline);
+        let projection_key = pipeline.speech_lexicon().identity().key();
+        let resynthesis = speech_resynthesis::ResynthesisWorker::spawn(Arc::clone(&pipeline));
 
         let worker = thread::Builder::new()
             .name("aivtuber-generation-worker".to_owned())
@@ -641,6 +656,8 @@ impl GenerationExecutor {
             counters,
             shutting_down,
             worker: Some(worker),
+            resynthesis,
+            projection_key,
         })
     }
 
@@ -703,6 +720,7 @@ impl GenerationExecutor {
 
     fn shutdown(&mut self) {
         self.shutting_down.store(true, Ordering::Release);
+        self.resynthesis.shutdown();
         self.work_tx.take();
     }
 
@@ -890,6 +908,11 @@ impl GenerativeRuntime {
 
     fn try_next_completion(&self) -> Option<GenerationCompletion> {
         self.executor.try_recv()
+    }
+
+    /// The projection identity generated speech is produced under now.
+    pub fn speech_projection_key(&self) -> &str {
+        &self.executor.projection_key
     }
 
     fn note_cancelled_or_stale(&self) {
@@ -1150,6 +1173,10 @@ where
     }
 
     pub fn with_generation(mut self, generative: GenerativeRuntime) -> Self {
+        // D-4: assets recorded under another projection are stale-but-playable.
+        self.performer
+            .speech_freshness_mut()
+            .set_current(Some(generative.speech_projection_key().to_owned()));
         self.generative = Some(generative);
         self.comparison_mode = ComparisonMode::FullGenerative;
         self
@@ -1696,6 +1723,63 @@ where
             .map_err(|error| AppError::Adaptation(error.to_string()))
     }
 
+    /// Operator erase of retained memory (#305, ADR-0008 S1). Requires the
+    /// authenticated `memory.admin` capability, names an actor
+    /// `(source namespace, raw actor id)` and/or retained memory ids, and
+    /// returns the typed report including every remnant the runtime cannot
+    /// prove erased. The raw actor id is hashed to its pseudonym and never
+    /// retained. Not rate-limited here; the authenticated control path owns
+    /// its own limiter.
+    pub fn erase_memory_operator(
+        &mut self,
+        request_id: &str,
+        authority: &AuthenticatedControl,
+        actor: Option<(&str, &str)>,
+        memory_ids: &[u64],
+        now_ms: u64,
+    ) -> Result<ErasureReport, AppError> {
+        let permit = self
+            .security
+            .authorize_operator_memory_erase(request_id, authority, actor, memory_ids)?;
+        self.apply_memory_erase(&permit, now_ms)?.ok_or_else(|| {
+            AppError::Adaptation(
+                "memory erase requested without configured adaptation runtime".to_owned(),
+            )
+        })
+    }
+
+    /// Run a permitted erase and audit its outcome for the operator, without
+    /// claim text or raw ids. `None` when no memory store is configured: there
+    /// is nothing retained to erase.
+    fn apply_memory_erase(
+        &mut self,
+        permit: &MemoryErasePermit,
+        now_ms: u64,
+    ) -> Result<Option<ErasureReport>, AppError> {
+        let Some(adaptation) = self.adaptation.as_mut() else {
+            return Ok(None);
+        };
+        let report = adaptation
+            .memory
+            .erase(permit, now_ms)
+            .map_err(|error| AppError::Adaptation(error.to_string()))?;
+        let record = self.security.redactor_record(
+            Some(&report.request_id),
+            aivtuber_telemetry::AuditCategory::Memory,
+            format!("erase_{:?}", report.outcome).to_lowercase(),
+            format!(
+                "requester={:?} scope={:?} entries_removed={} links_removed={} verified={}",
+                report.requester,
+                report.scope_kind,
+                report.entries_removed,
+                report.links_removed,
+                report.verified
+            ),
+        );
+        self.security.push_external_audit(record);
+        Ok(Some(report))
+    }
+
     pub fn label_generated_asset_quality(
         &mut self,
         asset_id: &str,
@@ -1839,6 +1923,8 @@ where
                 .generative
                 .as_ref()
                 .map(GenerativeRuntime::execution_snapshot),
+            speech_lifecycle: self.performer.scheduler().speech_lifecycle().metrics(),
+            speech_freshness: self.performer.speech_freshness().metrics(),
         }
     }
 
@@ -1896,12 +1982,35 @@ where
             return Ok(ContentProcessOutcome {
                 admission,
                 playback: None,
+                memory_erasure: None,
             });
         }
 
         let event = self.security.pop_content().ok_or_else(|| {
             AppError::Routing("queued content was unavailable for dispatch".to_owned())
         })?;
+        // #305: an exact viewer self-erase command is consumed here, before
+        // routing, so it can neither be spoken, remembered, nor reach a model.
+        // The scope is the envelope's own pseudonym (the runtime mints the
+        // permit); the command only ever reduces retained data.
+        match self.security.authorize_viewer_memory_erase(&event) {
+            ViewerEraseDecision::NotACommand => {}
+            ViewerEraseDecision::Denied(_) => {
+                return Ok(ContentProcessOutcome {
+                    admission,
+                    playback: None,
+                    memory_erasure: None,
+                });
+            }
+            ViewerEraseDecision::Permitted(permit) => {
+                let memory_erasure = self.apply_memory_erase(&permit, at_ms)?;
+                return Ok(ContentProcessOutcome {
+                    admission,
+                    playback: None,
+                    memory_erasure,
+                });
+            }
+        }
         let event_id = event.event_id.clone();
         let interaction_deadline = self
             .interaction_deadlines
@@ -1929,6 +2038,7 @@ where
         Ok(ContentProcessOutcome {
             admission,
             playback,
+            memory_erasure: None,
         })
     }
 
@@ -3084,10 +3194,106 @@ where
         if let Some(governor) = self.budget.as_mut() {
             governor.tick(now_ms);
         }
+        // A command that is already too late to be dispatched is a speech unit
+        // whose audio never reaches the speaker: record that before the
+        // timeline advance can report it finished (ADR-0004 truth rules).
+        self.account_undeliverable_audio(now_ms);
         self.performer.scheduler_mut().advance_to(now_ms);
         self.update_phrase_progress();
         self.dispatch_audio(now_ms);
         self.dispatch_avatar(now_ms);
+        self.drive_resynthesis();
+    }
+
+    /// Report, to the speech lifecycle, the pending audio commands that
+    /// `dispatch_audio` is about to drop as late or muted.
+    fn account_undeliverable_audio(&mut self, now_ms: u64) {
+        let muted = self.security.is_muted();
+        for command in &self.pending_audio.commands {
+            if command.at_ms > now_ms {
+                continue;
+            }
+            let kind = if now_ms.saturating_sub(command.at_ms) > self.max_dispatch_lateness_ms {
+                Some(OutputFailureKind::StaleOrLate)
+            } else if muted {
+                Some(OutputFailureKind::Muted)
+            } else {
+                None
+            };
+            if let Some(kind) = kind {
+                self.performer.scheduler_mut().report_speech_output(
+                    command.generation,
+                    OutputObservation::Failed(kind),
+                    now_ms,
+                );
+            }
+        }
+    }
+
+    /// Apply a finished re-synthesis and start the next queued one, if any
+    /// (ADR-0004 D-4). One job at a time, off the composition thread; every
+    /// failure only marks the request failed, so a stale asset stays playable.
+    fn drive_resynthesis(&mut self) {
+        let Some(generative) = self.generative.as_mut() else {
+            return;
+        };
+        if let Some(done) = generative.executor.resynthesis.poll() {
+            let applied = match done.result {
+                Ok(asset) => self
+                    .performer
+                    .assets_mut()
+                    .replace_generated_asset(asset)
+                    .is_ok(),
+                Err(_) => false,
+            };
+            let freshness = self.performer.speech_freshness_mut();
+            if applied {
+                freshness.complete(&done.asset_id);
+            } else {
+                freshness.fail(&done.asset_id);
+            }
+        }
+        if generative.executor.resynthesis.is_busy() || generative.is_shutting_down() {
+            return;
+        }
+        let Some(asset_id) = self.performer.speech_freshness_mut().next_request() else {
+            return;
+        };
+        let asset = self.performer.assets_mut().resolve(&asset_id).ok();
+        let submitted = asset.is_some_and(|asset| {
+            generative
+                .executor
+                .resynthesis
+                .submit((*asset).clone(), self.security.public_output_policy())
+        });
+        if !submitted {
+            self.performer.speech_freshness_mut().fail(&asset_id);
+        }
+    }
+
+    /// Operator action (ADR-0004 D-4): force every generated asset whose
+    /// display text contains the lexicon `surface` to be re-synthesized before
+    /// it is played again. Composition-root and startup configuration only; no
+    /// event, chat or model path reaches it.
+    pub fn invalidate_speech_surface(
+        &mut self,
+        surface: &str,
+    ) -> aivtuber_runtime::SurfaceInvalidation {
+        self.performer.invalidate_speech_surface(surface)
+    }
+
+    /// Remove and return up to `max` queued speech lifecycle events in `seq`
+    /// order (ADR-0004 D5). A consumer that sees a `seq` gap re-synchronizes
+    /// from [`Self::speech_lifecycle_snapshot`].
+    pub fn drain_speech_lifecycle(
+        &mut self,
+        max: usize,
+    ) -> Vec<aivtuber_domain::SpeechLifecycleEvent> {
+        self.performer.scheduler_mut().drain_speech_lifecycle(max)
+    }
+
+    pub fn speech_lifecycle_snapshot(&self) -> aivtuber_scheduler::SpeechLifecycleSnapshot {
+        self.performer.scheduler().speech_lifecycle().snapshot()
     }
 
     fn dispatch_audio(&mut self, now_ms: u64) {
@@ -3114,9 +3320,21 @@ where
             }
 
             match self.audio.execute(&command) {
-                Ok(()) => self.health.audio_error = None,
+                Ok(()) => {
+                    self.health.audio_error = None;
+                    self.performer.scheduler_mut().report_speech_output(
+                        command.generation,
+                        OutputObservation::Accepted,
+                        now_ms,
+                    );
+                }
                 Err(error) => {
                     self.health.audio_error = Some(error.to_string());
+                    self.performer.scheduler_mut().report_speech_output(
+                        command.generation,
+                        OutputObservation::Failed(OutputFailureKind::AdapterError),
+                        now_ms,
+                    );
                     self.mark_degraded(&command.event_id, DegradedSubsystem::Audio);
                 }
             }
@@ -3354,7 +3572,9 @@ where
         // a shadow worker running cannot satisfy "no shadow work running after
         // shutdown", so this blocks until the pool has actually stopped.
         self.router.shutdown_shadow();
-        self.performer.scheduler_mut().stop_all(at_ms);
+        self.performer
+            .scheduler_mut()
+            .stop_all_for(at_ms, aivtuber_domain::SpeechCancelReason::Shutdown);
         self.purge_cancelled_pending();
         self.tick(at_ms);
     }
@@ -3641,6 +3861,7 @@ mod tests {
 
     mod local_thinking_fallback_tests;
     mod phrase_commit_tests;
+    mod speech_lifecycle_tests;
     mod streaming_thinking_tests;
     mod voicevox_tts_tests;
     use aivtuber_scheduler::SchedulerConfig;
@@ -4807,6 +5028,102 @@ mod tests {
             aivtuber_adaptation::MemoryGateDecision::AllowedMemoryAdmin
         );
         assert_eq!(app.adaptation().expect("adaptation").memory().len(), 2);
+    }
+
+    #[test]
+    fn viewer_forget_command_erases_only_the_requesters_memory_before_routing() {
+        let mut app = app(
+            FixedSilentRoute,
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        )
+        .with_adaptation(adaptation_runtime(PromotionPolicy::default()));
+        app.startup().expect("startup");
+        let own = chat_event(40);
+        let mut other = chat_event(41);
+        other.actor_id = Some("viewer:other".to_owned());
+        app.remember_working_memory(&own, "viewer likes Rust", Some("coding"), 10)
+            .expect("own memory");
+        app.remember_working_memory(&other, "other likes Go", Some("coding"), 11)
+            .expect("other memory");
+
+        let mut command = chat_event(42);
+        command
+            .payload
+            .insert("text".to_owned(), serde_json::json!("!forgetme"));
+        command.payload.remove("intent");
+        let raw = serde_json::to_vec(&command).expect("serialize");
+        let outcome = app
+            .process_content_bytes(&raw, 50, 1)
+            .expect("command consumed");
+        assert!(outcome.playback.is_none(), "the command is never routed");
+        let report = outcome.memory_erasure.expect("erasure report");
+        assert_eq!(report.entries_removed, 1);
+        assert_eq!(
+            report.requester,
+            aivtuber_adaptation::ErasureRequester::Viewer
+        );
+        let memory = app.adaptation().expect("adaptation").memory();
+        assert_eq!(memory.len(), 1, "the other viewer's memory is untouched");
+        assert_eq!(memory.retention_metrics().erasures_completed, 1);
+        assert!(
+            app.security()
+                .audit()
+                .iter()
+                .any(|record| record.decision.starts_with("erase_erased")),
+            "the operator sees an audit record"
+        );
+
+        // A second command inside the window is rate limited and changes nothing.
+        app.remember_working_memory(&own, "viewer again", Some("coding"), 60)
+            .expect("own memory");
+        let mut again = command.clone();
+        again.event_id = "evt-43".to_owned();
+        again.sequence = 43;
+        let raw = serde_json::to_vec(&again).expect("serialize");
+        let limited = app
+            .process_content_bytes(&raw, 70, 1)
+            .expect("command consumed")
+            .memory_erasure
+            .expect("report");
+        assert_eq!(
+            limited.outcome,
+            aivtuber_adaptation::ErasureOutcome::RateLimited
+        );
+        assert_eq!(app.adaptation().expect("adaptation").memory().len(), 2);
+    }
+
+    #[test]
+    fn operator_memory_erase_needs_memory_admin_and_reports_remnants() {
+        let mut app = app(
+            FixedSilentRoute,
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        )
+        .with_adaptation(adaptation_runtime(PromotionPolicy::default()));
+        app.startup().expect("startup");
+        let event = chat_event(50);
+        app.remember_working_memory(&event, "viewer likes Rust", Some("coding"), 10)
+            .expect("memory");
+
+        let admin = memory_admin_authority();
+        let report = app
+            .erase_memory_operator(
+                "op-erase-1",
+                &admin,
+                Some(("test-chat", "viewer:test")),
+                &[],
+                100,
+            )
+            .expect("operator erase");
+        assert_eq!(report.entries_removed, 1);
+        assert_eq!(
+            report.unprovable_remnants,
+            aivtuber_adaptation::ErasureRemnant::ALL.to_vec()
+        );
+        assert!(app.adaptation().expect("adaptation").memory().is_empty());
     }
 
     #[test]

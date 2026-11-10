@@ -7,6 +7,8 @@
 
 mod cached_playback;
 pub use cached_playback::*;
+mod speech_freshness;
+pub use speech_freshness::*;
 mod perception;
 pub use perception::*;
 mod perception_replay;
@@ -302,6 +304,88 @@ impl MemoryWritePermit {
     pub fn source_claim(&self) -> Option<&str> {
         self.source_claim.as_deref()
     }
+}
+
+/// The only chat text that asks to erase the requester's own memory (#305,
+/// ADR-0008 D-Q7). Deliberately an explicit, exact command: a viewer sentence
+/// that merely mentions forgetting is ordinary content, never an erase.
+pub const VIEWER_ERASE_COMMAND: &str = "!forgetme";
+
+/// Upper bound on explicit memory ids one operator erase may name.
+pub const MAX_ERASE_MEMORY_IDS: usize = 32;
+
+/// Who asked for an erasure. Recorded in the report for audit; it is not an
+/// authority claim, the permit's construction is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryEraseAuthority {
+    Operator,
+    Viewer,
+}
+
+/// Non-serializable proof that the deterministic erase gate authorized one
+/// concrete erasure (#305). Only `SecurityRuntime` constructs one:
+///
+/// * an operator permit requires the authenticated `memory.admin` capability
+///   and may name an actor and/or retained memory ids;
+/// * a viewer permit is derived only from the platform-asserted `actor_id` and
+///   `source` of the requester's own chat envelope, so it can name no other
+///   actor and no memory id.
+///
+/// An erase only reduces retained data; this permit cannot read or write.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MemoryErasePermit {
+    request_id: String,
+    authority: MemoryEraseAuthority,
+    source_namespace: Option<String>,
+    actor_id: Option<String>,
+    memory_ids: Vec<u64>,
+}
+
+impl fmt::Debug for MemoryErasePermit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The raw actor id is identifying; debug output never carries it.
+        f.debug_struct("MemoryErasePermit")
+            .field("request_id", &self.request_id)
+            .field("authority", &self.authority)
+            .field("source_namespace", &self.source_namespace)
+            .field("actor_id", &self.actor_id.as_ref().map(|_| "[REDACTED]"))
+            .field("memory_ids", &self.memory_ids)
+            .finish()
+    }
+}
+
+impl MemoryErasePermit {
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    pub fn authority(&self) -> MemoryEraseAuthority {
+        self.authority
+    }
+
+    /// The `(namespace, actor)` pair whose pseudonym is erased, when the
+    /// request names an actor.
+    pub fn actor(&self) -> Option<(&str, &str)> {
+        self.source_namespace
+            .as_deref()
+            .zip(self.actor_id.as_deref())
+    }
+
+    /// Explicit retained memory ids (operator only), sorted and deduplicated.
+    pub fn memory_ids(&self) -> &[u64] {
+        &self.memory_ids
+    }
+}
+
+/// Result of classifying one content event as a viewer self-erase request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViewerEraseDecision {
+    /// Ordinary content; route it normally.
+    NotACommand,
+    /// The event used the command but cannot be honoured (no platform-asserted
+    /// actor). It is consumed, never routed as content, and audited.
+    Denied(&'static str),
+    Permitted(MemoryErasePermit),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -674,6 +758,8 @@ impl SecurityRuntime {
             "mute" | "performer.mute" => {
                 require_capability(authority, Capability::PerformerMute)?;
                 self.muted = true;
+                self.scheduler
+                    .cancel_all_speech(at_ms, aivtuber_domain::SpeechCancelReason::Muted);
                 ControlOutcome::Muted
             }
             _ => ControlOutcome::AuthenticatedOther,
@@ -716,6 +802,7 @@ impl SecurityRuntime {
             "mute" | "performer.mute" => {
                 require_capability(authority, Capability::PerformerMute)?;
                 self.muted = true;
+                scheduler.cancel_all_speech(at_ms, aivtuber_domain::SpeechCancelReason::Muted);
                 ControlOutcome::Muted
             }
             _ => ControlOutcome::AuthenticatedOther,
@@ -802,6 +889,104 @@ impl SecurityRuntime {
                     .map(str::to_owned),
             });
         (decision, permit)
+    }
+
+    /// Operator erase through the authenticated control capability (#305).
+    /// Requires `memory.admin`; the scope must name an actor and/or at least
+    /// one memory id, within [`MAX_ERASE_MEMORY_IDS`]. The decision is audited
+    /// without the raw actor id.
+    pub fn authorize_operator_memory_erase(
+        &mut self,
+        request_id: &str,
+        authority: &AuthenticatedControl,
+        actor: Option<(&str, &str)>,
+        memory_ids: &[u64],
+    ) -> Result<MemoryErasePermit, RuntimeError> {
+        if !authority.has_capability(Capability::MemoryAdmin) {
+            self.push_audit(self.redactor.record(
+                Some(request_id),
+                AuditCategory::Memory,
+                "erase_denied",
+                "operator memory erase requires memory.admin",
+            ));
+            return Err(RuntimeError::UnauthorizedControl(
+                "memory erase requires memory.admin",
+            ));
+        }
+        let mut ids: Vec<u64> = memory_ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        let invalid = request_id.is_empty()
+            || ids.len() > MAX_ERASE_MEMORY_IDS
+            || ids.contains(&0)
+            || (actor.is_none() && ids.is_empty())
+            || actor.is_some_and(|(namespace, id)| namespace.is_empty() || id.is_empty());
+        if invalid {
+            return Err(RuntimeError::InvalidConfiguration(
+                "memory erase needs a request id and an actor and/or 1..=32 non-zero memory ids",
+            ));
+        }
+        self.push_audit(self.redactor.record(
+            Some(request_id),
+            AuditCategory::Memory,
+            "erase_authorized_operator",
+            format!("actor_scope={} memory_ids={}", actor.is_some(), ids.len()),
+        ));
+        Ok(MemoryErasePermit {
+            request_id: request_id.to_owned(),
+            authority: MemoryEraseAuthority::Operator,
+            source_namespace: actor.map(|(namespace, _)| namespace.to_owned()),
+            actor_id: actor.map(|(_, id)| id.to_owned()),
+            memory_ids: ids,
+        })
+    }
+
+    /// Classify an admitted content event as a viewer self-erase request
+    /// (#305, ADR-0008 D-Q7). The scope is taken only from the envelope's own
+    /// `source` and platform-asserted `actor_id`, never from the text, so a
+    /// viewer can erase only their own pseudonym; the text cannot name anyone
+    /// else. Only `public_chat` on the content plane with no embedded
+    /// authorization qualifies, and the text must be exactly
+    /// [`VIEWER_ERASE_COMMAND`] (trimmed, ASCII case-insensitive). The
+    /// per-actor rate limit is applied by the store, which owns the pseudonym
+    /// (the runtime never keeps raw actor ids for it).
+    pub fn authorize_viewer_memory_erase(&mut self, event: &EventEnvelope) -> ViewerEraseDecision {
+        if event.plane != SecurityPlane::Content
+            || event.source_class != SourceClass::PublicChat
+            || event.authorization.is_some()
+        {
+            return ViewerEraseDecision::NotACommand;
+        }
+        let is_command = event
+            .payload
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| text.trim().eq_ignore_ascii_case(VIEWER_ERASE_COMMAND));
+        if !is_command {
+            return ViewerEraseDecision::NotACommand;
+        }
+        let Some(actor) = event.actor_id.as_deref().filter(|actor| !actor.is_empty()) else {
+            self.push_audit(self.redactor.record(
+                Some(&event.event_id),
+                AuditCategory::Memory,
+                "erase_denied",
+                "viewer erase needs a platform-asserted actor id",
+            ));
+            return ViewerEraseDecision::Denied("viewer erase needs a platform-asserted actor id");
+        };
+        self.push_audit(self.redactor.record(
+            Some(&event.event_id),
+            AuditCategory::Memory,
+            "erase_authorized_viewer",
+            "own pseudonym only",
+        ));
+        ViewerEraseDecision::Permitted(MemoryErasePermit {
+            request_id: event.event_id.clone(),
+            authority: MemoryEraseAuthority::Viewer,
+            source_namespace: Some(event.source.clone()),
+            actor_id: Some(actor.to_owned()),
+            memory_ids: Vec::new(),
+        })
     }
 
     fn consume_token(&mut self, source: &str, now_ms: u64) -> bool {
@@ -1412,5 +1597,81 @@ mod tests {
         );
         assert!(debug.contains("[REDACTED]"), "{debug}");
         assert!(debug.contains("evt-memory"), "{debug}");
+    }
+
+    #[test]
+    fn viewer_erase_scope_comes_from_the_envelope_never_the_text() {
+        let mut runtime = runtime_with(SecurityRuntimeConfig::default(), &[]);
+        let mut event = chat_event("evt-erase", 1, "chat-a", "  !ForgetMe ");
+        event.actor_id = Some("viewer-a".to_owned());
+        let ViewerEraseDecision::Permitted(permit) = runtime.authorize_viewer_memory_erase(&event)
+        else {
+            panic!("exact command must be permitted");
+        };
+        assert_eq!(permit.authority(), MemoryEraseAuthority::Viewer);
+        assert_eq!(permit.actor(), Some((event.source.as_str(), "viewer-a")));
+        assert!(permit.memory_ids().is_empty());
+        assert!(!format!("{permit:?}").contains("viewer-a"));
+
+        // Text naming someone else is not the command at all.
+        let mut other = chat_event("evt-erase-2", 2, "chat-a", "!forgetme viewer-b");
+        other.actor_id = Some("viewer-a".to_owned());
+        assert_eq!(
+            runtime.authorize_viewer_memory_erase(&other),
+            ViewerEraseDecision::NotACommand
+        );
+    }
+
+    #[test]
+    fn viewer_erase_is_refused_without_an_asserted_actor_or_outside_public_chat() {
+        let mut runtime = runtime_with(SecurityRuntimeConfig::default(), &[]);
+        let mut anonymous = chat_event("evt-erase", 1, "chat-a", "!forgetme");
+        anonymous.actor_id = None;
+        assert!(matches!(
+            runtime.authorize_viewer_memory_erase(&anonymous),
+            ViewerEraseDecision::Denied(_)
+        ));
+
+        let mut donation = chat_event("evt-erase-2", 2, "chat-a", "!forgetme");
+        donation.actor_id = Some("viewer-a".to_owned());
+        donation.source_class = SourceClass::Donation;
+        assert_eq!(
+            runtime.authorize_viewer_memory_erase(&donation),
+            ViewerEraseDecision::NotACommand
+        );
+    }
+
+    #[test]
+    fn operator_erase_requires_memory_admin_and_a_bounded_scope() {
+        let mut runtime = runtime_with(SecurityRuntimeConfig::default(), &[]);
+        let stop = authenticated(Capability::PerformerStop, "performer.stop");
+        assert!(matches!(
+            runtime.authorize_operator_memory_erase(
+                "req-1",
+                stop.authority(),
+                Some(("public-chat", "viewer-a")),
+                &[]
+            ),
+            Err(RuntimeError::UnauthorizedControl(_))
+        ));
+
+        let admin = authenticated(Capability::MemoryAdmin, "memory.admin");
+        assert!(
+            runtime
+                .authorize_operator_memory_erase("req-2", admin.authority(), None, &[])
+                .is_err(),
+            "an empty scope is refused"
+        );
+        let too_many: Vec<u64> = (1..=(MAX_ERASE_MEMORY_IDS as u64 + 1)).collect();
+        assert!(
+            runtime
+                .authorize_operator_memory_erase("req-3", admin.authority(), None, &too_many)
+                .is_err()
+        );
+        let permit = runtime
+            .authorize_operator_memory_erase("req-4", admin.authority(), None, &[5, 3, 5])
+            .expect("operator permit");
+        assert_eq!(permit.memory_ids(), &[3, 5]);
+        assert_eq!(permit.authority(), MemoryEraseAuthority::Operator);
     }
 }

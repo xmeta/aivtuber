@@ -5,6 +5,9 @@
 //! This crate owns policy/state only. SecurityRuntime owns memory-write authority,
 //! while AssetStore owns validated persistence primitives.
 
+mod erasure;
+pub use erasure::*;
+
 use aivtuber_asset_store::{AssetStore, AssetStoreError, PerformanceAsset};
 use aivtuber_domain::{EventEnvelope, SourceClass, TrustLevel};
 use aivtuber_runtime::{MemoryWriteDecision, MemoryWritePermit};
@@ -386,6 +389,15 @@ pub struct WorkingMemoryRetentionMetrics {
     pub compactions_evicted: u64,
     pub links: usize,
     pub links_high_water: usize,
+    /// Completed erase transactions, and what they removed (#305).
+    pub erasures_completed: u64,
+    pub erasure_entries_removed: u64,
+    pub erasure_links_removed: u64,
+    /// Open transactions: scopes revoked but not yet reported. Non-zero at
+    /// rest means an erase did not finish.
+    pub erasures_pending: usize,
+    /// Viewer erase requests refused by the per-pseudonym rate limit.
+    pub erasures_rate_limited: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -410,6 +422,8 @@ pub struct WorkingMemory {
     /// Next node identity to hand out; starts at 1 so `0` stays the marker
     /// for "not inserted yet".
     next_memory_id: u64,
+    /// Targeted-erase transactions, reports and rate limiter (#305).
+    erasure: erasure::ErasureBook,
 }
 
 impl WorkingMemory {
@@ -448,6 +462,7 @@ impl WorkingMemory {
             compactions_high_water: 0,
             compactions_evicted: 0,
             next_memory_id: 1,
+            erasure: erasure::ErasureBook::default(),
         })
     }
 
@@ -483,7 +498,11 @@ impl WorkingMemory {
         let visible: HashSet<u64> = self
             .entries
             .iter()
-            .filter(|entry| entry.expires_at_ms > now_ms && entry.created_at_ms <= now_ms)
+            .filter(|entry| {
+                entry.expires_at_ms > now_ms
+                    && entry.created_at_ms <= now_ms
+                    && !self.is_revoked(entry)
+            })
             .map(|entry| entry.memory_id)
             .collect();
         MemoryLinkSnapshot {
@@ -514,6 +533,11 @@ impl WorkingMemory {
             compactions_evicted: self.compactions_evicted,
             links: self.links.len(),
             links_high_water: self.links_high_water,
+            erasures_completed: self.erasure.completed,
+            erasure_entries_removed: self.erasure.entries_removed,
+            erasure_links_removed: self.erasure.links_removed,
+            erasures_pending: self.erasure.pending_len(),
+            erasures_rate_limited: self.erasure.rate_limited,
         }
     }
 
@@ -794,7 +818,9 @@ impl WorkingMemory {
             .entries
             .iter()
             .filter(|entry| {
-                entry.source.event_id == id && entry.retention == RetentionClass::Durable
+                entry.source.event_id == id
+                    && entry.retention == RetentionClass::Durable
+                    && !self.is_revoked(entry)
             })
             .collect();
         if retained.is_empty() {
@@ -1021,7 +1047,11 @@ impl WorkingMemory {
         let mut ranked = self
             .entries
             .iter()
-            .filter(|entry| entry.expires_at_ms > now_ms && entry.created_at_ms <= now_ms)
+            .filter(|entry| {
+                entry.expires_at_ms > now_ms
+                    && entry.created_at_ms <= now_ms
+                    && !self.is_revoked(entry)
+            })
             .map(|entry| {
                 let actor_match = u8::from(
                     actor.as_ref().is_some()
@@ -1116,7 +1146,11 @@ impl WorkingMemory {
         let live: HashSet<u64> = self
             .entries
             .iter()
-            .filter(|entry| entry.expires_at_ms > now_ms && entry.created_at_ms <= now_ms)
+            .filter(|entry| {
+                entry.expires_at_ms > now_ms
+                    && entry.created_at_ms <= now_ms
+                    && !self.is_revoked(entry)
+            })
             .map(|entry| entry.memory_id)
             .collect();
 
@@ -1257,8 +1291,9 @@ impl WorkingMemory {
         let actor_scope =
             actor_id.map(|actor| self.pseudonymizer.pseudonymize(source_namespace, actor));
         let normalized_topic = topic.map(normalize);
-        let live =
-            |entry: &MemoryEntry| entry.expires_at_ms > now_ms && entry.created_at_ms <= now_ms;
+        let live = |entry: &MemoryEntry| {
+            entry.expires_at_ms > now_ms && entry.created_at_ms <= now_ms && !self.is_revoked(entry)
+        };
         let matches_topic = |entry: &MemoryEntry| {
             normalized_topic.as_deref().is_some()
                 && normalized_topic.as_deref() == entry.topic.as_deref().map(normalize).as_deref()

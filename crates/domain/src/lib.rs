@@ -15,6 +15,7 @@ mod reflex;
 pub mod scenario;
 mod sidecar;
 mod speech;
+mod speech_lifecycle;
 mod speech_transcript;
 mod task;
 
@@ -68,6 +69,7 @@ pub use speech::{
     SpeakerActivityState, SpeechActivityObservation, SpeechEdge, SpeechObservation,
     SpeechObservationBatch, TurnEndFallbackReason, TurnEndScoreObservation, fallback_turn_signal,
 };
+pub use speech_lifecycle::*;
 pub use speech_transcript::*;
 pub use task::{
     AgentTask, MAX_TASK_ID_BYTES, MAX_TASK_LIFETIME_MS_HARD, MAX_TASK_OBSERVATIONS_HARD,

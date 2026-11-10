@@ -1,0 +1,17 @@
+{
+  "schema_version": "0.1.0",
+  "seq": 3,
+  "at_ms": 1000,
+  "basis": "logical_timeline",
+  "speech": {
+    "event_id": "evt-greeting-1",
+    "phrase": 0,
+    "final_phrase": true,
+    "asset_id": "gen-asset-1",
+    "speech_text_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "projection": "rules:1|lexicon:starter@1+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "phase": {
+    "kind": "started"
+  }
+}

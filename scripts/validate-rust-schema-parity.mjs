@@ -21,6 +21,7 @@ const reflexSchema = ajv.compile(loadJson("schemas/reflex-decision.schema.json")
 const avatarCommandSchema = ajv.compile(loadJson("schemas/avatar-playback-command.schema.json"));
 const speechObservationSchema = ajv.compile(loadJson("schemas/speech-observation.schema.json"));
 const speechTranscriptSchema = ajv.compile(loadJson("schemas/speech-transcript.schema.json"));
+const speechLifecycleSchema = ajv.compile(loadJson("schemas/speech-lifecycle.schema.json"));
 const perceptionObservationSchema = ajv.compile(loadJson("schemas/perception-observation.schema.json"));
 
 const output = execFileSync(
@@ -51,6 +52,12 @@ const transcriptOutput = execFileSync(
 );
 const transcriptEmitted = JSON.parse(transcriptOutput);
 
+const lifecycleOutput = execFileSync(
+  "cargo",
+  ["run", "--locked", "--quiet", "-p", "aivtuber-domain", "--example", "speech_lifecycle_parity"],
+  { cwd: root, encoding: "utf8" },
+);
+const lifecycleEmitted = JSON.parse(lifecycleOutput);
 const perceptionOutput = execFileSync(
   "cargo",
   ["run", "--locked", "--quiet", "-p", "aivtuber-domain", "--example", "perception_observation_parity"],
@@ -97,6 +104,13 @@ if (transcriptEmitted.batches.length < 6) {
   console.error("FAIL      expected at least 6 Rust SpeechTranscriptBatch samples");
 }
 
+for (const [index, event] of lifecycleEmitted.events.entries()) {
+  check(`Rust SpeechLifecycleEvent[${index}] (${event.phase.kind}) -> JSON Schema`, speechLifecycleSchema, event);
+}
+if (lifecycleEmitted.events.length < 25) {
+  failures += 1;
+  console.error("FAIL      expected at least 25 Rust SpeechLifecycleEvent samples");
+}
 for (const [index, batch] of perceptionEmitted.batches.entries()) {
   check(`Rust PerceptionObservationBatch[${index}] -> JSON Schema`, perceptionObservationSchema, batch);
 }
@@ -119,6 +133,6 @@ if (emitted.reflex_decisions.length < 1) {
   console.error("FAIL      expected at least one Rust ReflexDecision sample");
 }
 
-const total = emitted.events.length + emitted.reflex_decisions.length + avatarEmitted.commands.length + speechEmitted.batches.length + transcriptEmitted.batches.length + perceptionEmitted.batches.length;
+const total = emitted.events.length + emitted.reflex_decisions.length + avatarEmitted.commands.length + speechEmitted.batches.length + transcriptEmitted.batches.length + lifecycleEmitted.events.length + perceptionEmitted.batches.length;
 console.log(`\n${total - failures} passed, ${failures} failed`);
 process.exit(failures > 0 ? 1 : 0);
