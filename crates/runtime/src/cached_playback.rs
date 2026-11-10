@@ -1,10 +1,15 @@
+use crate::speech_freshness::{
+    Freshness, MAX_INVALIDATION_SCAN, SpeechFreshness, text_contains_surface,
+    valid_invalidation_surface,
+};
 use aivtuber_asset_store::{
     AssetClass, AssetStore, AssetStoreError, CacheTier, IndexReport, PerformanceAsset,
 };
 use aivtuber_domain::{EventEnvelope, EventKind, Viseme};
 use aivtuber_scheduler::{
     AppliedVariation, BlendChannel, PhraseLink, PlannedPerformance, Rejection, Scheduler,
-    SeededRng, VariationSpec as SchedulerVariationSpec, apply_variation, priority_for_event,
+    SeededRng, SpeechPrepared, VariationSpec as SchedulerVariationSpec, apply_variation,
+    priority_for_event,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -12,6 +17,8 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+
+use sha2::{Digest, Sha256};
 
 pub const VISEME_TRACK_SCHEMA_VERSION: &str = "0.1.0";
 
@@ -328,6 +335,9 @@ pub enum CachedPlaybackError {
         actual: String,
     },
     Scheduler(Rejection),
+    /// The operator forced this asset to be re-synthesized and it has not
+    /// been yet (ADR-0004 D-4); it is not played in the meantime.
+    MustResynthesize(String),
     InvalidVisemeReference(String),
     InvalidVisemeTrack(String),
     InvalidAvatarCommand(String),
@@ -363,6 +373,10 @@ impl fmt::Display for CachedPlaybackError {
                 "asset {asset_id:?} identity changed after retrieval: expected {expected:?}, got {actual:?}"
             ),
             Self::Scheduler(reason) => write!(f, "scheduler rejected cached playback: {reason:?}"),
+            Self::MustResynthesize(asset_id) => write!(
+                f,
+                "asset {asset_id:?} is operator-invalidated until it is re-synthesized"
+            ),
             Self::InvalidVisemeReference(reference) => {
                 write!(f, "invalid local viseme reference: {reference:?}")
             }
@@ -405,6 +419,15 @@ impl From<AssetStoreError> for CachedPlaybackError {
     }
 }
 
+/// SHA-256 (lowercase hex) of the text that was sent to TTS: the projected
+/// `speech_text` when the asset carries one, else the display text.
+fn speech_text_digest(asset: &PerformanceAsset) -> Option<String> {
+    let speech = asset.speech.as_ref()?;
+    let text = speech.speech_text.as_deref().or(speech.text.as_deref())?;
+    let digest = Sha256::digest(text.as_bytes());
+    Some(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 #[derive(Debug)]
 pub struct CachedPerformer {
     assets: AssetStore,
@@ -415,7 +438,22 @@ pub struct CachedPerformer {
     next_recent_group_touch: u64,
     recent_groups_high_water: usize,
     recent_groups_evicted: u64,
+    freshness: SpeechFreshness,
 }
+
+/// What an operator surface invalidation did (ADR-0004 D-4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SurfaceInvalidation {
+    /// Assets examined (bounded by `MAX_INVALIDATION_SCAN`).
+    pub scanned: usize,
+    /// Assets now forced to be re-synthesized.
+    pub forced: usize,
+    /// Matching assets that cannot be re-synthesized (not generated).
+    pub skipped_not_generated: usize,
+    /// The scan stopped at the bound or the forced set was full.
+    pub truncated: bool,
+}
+
 impl CachedPerformer {
     pub fn new(assets: AssetStore, scheduler: Scheduler, config: CachedPlaybackConfig) -> Self {
         Self {
@@ -427,7 +465,83 @@ impl CachedPerformer {
             next_recent_group_touch: 0,
             recent_groups_high_water: 0,
             recent_groups_evicted: 0,
+            freshness: SpeechFreshness::default(),
         }
+    }
+
+    /// Projection freshness state (read-only).
+    pub fn speech_freshness(&self) -> &SpeechFreshness {
+        &self.freshness
+    }
+
+    /// Projection freshness state. Composition-root and operator use only.
+    pub fn speech_freshness_mut(&mut self) -> &mut SpeechFreshness {
+        &mut self.freshness
+    }
+
+    /// Operator action (ADR-0004 D-4): force every generated asset whose
+    /// display text contains `surface` and whose audio was not produced under
+    /// the current projection to be re-synthesized before it is played again.
+    /// An asset already synthesized under the current projection is left
+    /// alone, so the call is idempotent across restarts. Bounded by
+    /// `MAX_INVALIDATION_SCAN`. Not reachable from events or chat.
+    pub fn invalidate_speech_surface(&mut self, surface: &str) -> SurfaceInvalidation {
+        let mut report = SurfaceInvalidation::default();
+        if !valid_invalidation_surface(surface) {
+            return report;
+        }
+        let mut candidates: Vec<(String, Option<PathBuf>)> = self
+            .assets
+            .hot_ids()
+            .map(|id| (id.to_owned(), None))
+            .collect();
+        let hot: BTreeSet<String> = candidates.iter().map(|(id, _)| id.clone()).collect();
+        candidates.extend(
+            self.assets
+                .indexed_entries()
+                .filter(|(id, _)| !hot.contains(*id))
+                .map(|(id, entry)| (id.to_owned(), Some(entry.path.clone()))),
+        );
+        for (id, path) in candidates {
+            if report.scanned >= MAX_INVALIDATION_SCAN {
+                report.truncated = true;
+                break;
+            }
+            report.scanned += 1;
+            let asset = match path {
+                None => self.assets.hot_get(&id),
+                Some(path) => aivtuber_asset_store::load_asset_file(path)
+                    .ok()
+                    .map(std::sync::Arc::new),
+            };
+            let Some(asset) = asset else { continue };
+            let matches = asset
+                .speech
+                .as_ref()
+                .and_then(|speech| speech.text.as_deref())
+                .is_some_and(|text| text_contains_surface(text, surface));
+            let affected = matches
+                && (asset.compatibility.speech_projection.is_none()
+                    || asset
+                        .compatibility
+                        .speech_projection_is_stale(self.freshness.current()));
+            if !affected {
+                continue;
+            }
+            let generated = asset
+                .provenance
+                .as_ref()
+                .is_some_and(|provenance| provenance.generated == Some(true));
+            if !generated {
+                report.skipped_not_generated += 1;
+            } else if self.freshness.force(&id) {
+                report.forced += 1;
+            } else {
+                report.truncated = true;
+                break;
+            }
+        }
+        report
     }
 
     pub fn assets(&self) -> &AssetStore {
@@ -706,6 +820,11 @@ impl CachedPerformer {
             cache_tier,
             phrase,
         } = resolved;
+        // ADR-0004 D-4: stale-but-playable assets are played and a bounded
+        // re-synthesis is queued; operator-forced ones are not played.
+        if self.freshness.classify(asset) == Freshness::MustResynthesize {
+            return Err(CachedPlaybackError::MustResynthesize(asset.id.clone()));
+        }
         let viseme_track = resolve_asset_visemes(asset, visemes)?;
         let variation_spec = asset.variation.unwrap_or_default();
         let variation = apply_variation(
@@ -746,6 +865,22 @@ impl CachedPerformer {
             channels,
         };
 
+        if plan.channels.contains(&BlendChannel::Audio) {
+            // The asset's audio is resolved: that is `Prepared`. The scheduler
+            // writes everything after it. Digest and projection identity, never
+            // the text (ADR-0004 Q14).
+            self.scheduler.note_speech_prepared(
+                timing.at_ms,
+                SpeechPrepared {
+                    event_id: plan.event_id.clone(),
+                    asset_id: asset.id.clone(),
+                    phrase: phrase.map_or(0, |link| link.seq),
+                    final_phrase: phrase.is_none_or(|link| link.final_phrase),
+                    speech_text_digest: speech_text_digest(asset),
+                    projection: asset.compatibility.speech_projection.clone(),
+                },
+            );
+        }
         let scheduled = match phrase {
             Some(link) => self.scheduler.schedule_phrase_at(timing.at_ms, plan, link),
             None => self.scheduler.schedule_at(timing.at_ms, plan),
@@ -1417,5 +1552,204 @@ mod tests {
         let mut sink = RecordingAvatarSink::default();
         sink.schedule_avatar(reset.clone());
         assert_eq!(sink.commands, vec![reset]);
+    }
+
+    // --- #222 S2: speech lifecycle and projection freshness -------------
+
+    const OLD_PROJECTION: &str = "rules:1|lexicon:none";
+    const NEW_PROJECTION: &str = "rules:2|lexicon:none";
+
+    /// A generated copy of a starter reaction that recorded projection.
+    fn generated_asset(id: &str, text: &str, projection: Option<&str>) -> PerformanceAsset {
+        let mut asset = aivtuber_asset_store::load_asset_file(
+            pack_root().join("descriptors/reaction-surprise-01.json"),
+        )
+        .expect("starter asset");
+        asset.id = id.to_owned();
+        asset.variant_group = None;
+        asset.speech.as_mut().expect("speech").text = Some(text.to_owned());
+        asset.compatibility.speech_projection = projection.map(str::to_owned);
+        if projection.is_some() {
+            asset.schema_version = "0.2.0".to_owned();
+        }
+        asset.provenance = Some(aivtuber_asset_store::Provenance {
+            generated: Some(true),
+            generator: Some("test".to_owned()),
+            created_at: Some("2026-11-10T00:00:00Z".to_owned()),
+            thinking_backend: Some("think".to_owned()),
+            thinking_model_alias: None,
+            thinking_model_version: None,
+            tts_backend: Some("tts".to_owned()),
+            tts_model_alias: None,
+            tts_model_version: None,
+            routing_reason: Some("test".to_owned()),
+        });
+        asset
+    }
+
+    fn play(
+        performer: &mut CachedPerformer,
+        asset_id: &str,
+        sequence: u64,
+    ) -> Result<CachedPlaybackOutcome, CachedPlaybackError> {
+        performer.handle_asset_id(
+            &chat_event(sequence, "x"),
+            asset_id,
+            CachedPlaybackTiming {
+                at_ms: sequence * 100_000,
+                seed: 1,
+            },
+            &LocalVisemeStore::new(pack_root()),
+            &mut RecordingAudioSink::default(),
+            &mut RecordingAvatarSink::default(),
+        )
+    }
+
+    #[test]
+    fn playback_reports_prepared_with_a_digest_and_projection_never_text() {
+        let mut performer = performer();
+        performer
+            .assets_mut()
+            .insert_hot(generated_asset("gen.1", "こんにちは", Some(OLD_PROJECTION)))
+            .unwrap();
+        play(&mut performer, "gen.1", 1).unwrap();
+        performer.scheduler_mut().complete_all();
+        let events = performer.scheduler_mut().drain_speech_lifecycle(64);
+        let prepared = &events[0];
+        assert_eq!(prepared.phase, aivtuber_domain::SpeechPhase::Prepared);
+        assert_eq!(prepared.speech.asset_id, "gen.1");
+        assert_eq!(prepared.speech.projection.as_deref(), Some(OLD_PROJECTION));
+        // sha256("こんにちは"), lowercase hex.
+        let digest = prepared.speech.speech_text_digest.as_deref().unwrap();
+        assert_eq!(digest.len(), 64);
+        assert!(
+            !serde_json::to_string(prepared)
+                .unwrap()
+                .contains("こんにちは")
+        );
+        assert_eq!(
+            events.last().unwrap().phase,
+            aivtuber_domain::SpeechPhase::Finished
+        );
+        // The projected speech text, when present, is what is digested.
+        let mut projected = generated_asset("gen.2", "こんにちは", Some(OLD_PROJECTION));
+        projected.speech.as_mut().unwrap().speech_text = Some("こんばんは".to_owned());
+        assert_ne!(
+            speech_text_digest(&projected).as_deref(),
+            Some(digest),
+            "speech_text wins over the display text"
+        );
+    }
+
+    #[test]
+    fn a_stale_asset_is_played_counted_and_queued_for_resynthesis_once() {
+        let mut performer = performer();
+        performer
+            .assets_mut()
+            .insert_hot(generated_asset("gen.stale", "やあ", Some(OLD_PROJECTION)))
+            .unwrap();
+        performer
+            .speech_freshness_mut()
+            .set_current(Some(NEW_PROJECTION.to_owned()));
+        play(&mut performer, "gen.stale", 1).expect("stale but playable");
+        play(&mut performer, "gen.stale", 2).expect("still playable");
+        let metrics = performer.speech_freshness().metrics();
+        assert_eq!(metrics.projection_stale_played, 2);
+        assert_eq!(metrics.resynthesis_requested, 1);
+        assert_eq!(
+            performer.speech_freshness_mut().next_request().as_deref(),
+            Some("gen.stale")
+        );
+    }
+
+    #[test]
+    fn an_operator_forced_asset_is_not_played_until_resynthesized() {
+        let mut performer = performer();
+        performer
+            .assets_mut()
+            .insert_hot(generated_asset(
+                "gen.forced",
+                "星乃です",
+                Some(OLD_PROJECTION),
+            ))
+            .unwrap();
+        performer
+            .speech_freshness_mut()
+            .set_current(Some(NEW_PROJECTION.to_owned()));
+        let report = performer.invalidate_speech_surface("星乃");
+        assert_eq!((report.forced, report.skipped_not_generated), (1, 0));
+        let refused = play(&mut performer, "gen.forced", 1);
+        assert!(matches!(
+            refused,
+            Err(CachedPlaybackError::MustResynthesize(ref id)) if id == "gen.forced"
+        ));
+        assert!(
+            performer.scheduler().items().is_empty(),
+            "nothing was scheduled"
+        );
+        performer.speech_freshness_mut().complete("gen.forced");
+        play(&mut performer, "gen.forced", 2).expect("playable after re-synthesis");
+    }
+
+    #[test]
+    fn invalidation_only_touches_affected_generated_assets_and_is_idempotent() {
+        let mut performer = performer();
+        let assets = [
+            generated_asset("gen.affected", "OpenAIの話", Some(OLD_PROJECTION)),
+            generated_asset("gen.unprojected", "openai again", None),
+            generated_asset("gen.fresh", "OpenAI now", Some(NEW_PROJECTION)),
+            generated_asset("gen.other", "関係ない", Some(OLD_PROJECTION)),
+        ];
+        for asset in assets {
+            performer.assets_mut().insert_hot(asset).unwrap();
+        }
+        performer
+            .speech_freshness_mut()
+            .set_current(Some(NEW_PROJECTION.to_owned()));
+        let report = performer.invalidate_speech_surface("OPENAI");
+        assert_eq!(
+            report.forced, 2,
+            "affected and unprojected, not fresh or other"
+        );
+        // Re-running changes nothing (already forced; fresh stays untouched).
+        assert_eq!(performer.invalidate_speech_surface("OPENAI").forced, 2);
+        assert_eq!(performer.speech_freshness().metrics().forced, 2);
+        // Invalid surfaces are ignored.
+        assert_eq!(
+            performer.invalidate_speech_surface(""),
+            SurfaceInvalidation::default()
+        );
+        // A non-generated (authored) asset cannot be re-synthesized.
+        let mut authored = generated_asset("gen.authored", "OpenAI", None);
+        authored.provenance = None;
+        performer.assets_mut().insert_hot(authored).unwrap();
+        assert_eq!(
+            performer
+                .invalidate_speech_surface("openai")
+                .skipped_not_generated,
+            1
+        );
+    }
+
+    #[test]
+    fn muting_cancels_live_speech_lifecycle_without_stopping_the_timeline() {
+        let mut performer = performer();
+        performer
+            .assets_mut()
+            .insert_hot(generated_asset("gen.m", "やあ", None))
+            .unwrap();
+        play(&mut performer, "gen.m", 1).unwrap();
+        performer
+            .scheduler_mut()
+            .cancel_all_speech(100_000, aivtuber_domain::SpeechCancelReason::Muted);
+        let events = performer.scheduler_mut().drain_speech_lifecycle(64);
+        assert!(matches!(
+            events.last().unwrap().phase,
+            aivtuber_domain::SpeechPhase::Cancelled {
+                reason: aivtuber_domain::SpeechCancelReason::Muted,
+                ..
+            }
+        ));
+        assert_eq!(performer.scheduler().items().len(), 1);
     }
 }
