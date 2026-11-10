@@ -273,6 +273,33 @@ Record the result as one of:
 |#100
 |===
 
+=== First-run setup command record (#294 S2)
+
+[source,text]
+----
+Problem:     A streamer with only the release archive needs the pinned models and engine pieces
+             fetched, verified, extracted, configured and started without Node, Bun or Cargo.
+Candidate 1: scripts/fetch-local-profile.mjs + scripts/fetch-sherpa-onnx.mjs (project, Node).
+Decision:    wrap the pins, replace the runtime. The pins move to one manifest
+             (packaging/local-profile-pins.json) that the scripts keep reading; the Rust command is the
+             archive user's path. Node would be an install requirement on the target machine.
+Candidate 2: cargo-dist installers / a generic installer builder (Velopack, WiX, Inno Setup).
+Decision:    reference only (see the S1 record): they install programs but do not own our verified
+             fetch-and-license step, and signing/installer choice is a separate #294 decision.
+Candidate 3: HTTP and archive crates for the Rust command.
+Decision:    adopt ureq 3.4 (already the HTTP client of crates/adapters), plus tar, flate2, bzip2 0.6
+             (pure Rust) and zip 9.5 (deflate only). All were already in Cargo.lock, so no new package
+             enters the supply-chain gate. reqwest/hyper rejected: a second HTTP stack and an async
+             runtime for a sequential downloader. Shelling out to tar/unzip/curl rejected: absent or
+             different on target machines (the Git Bash tar problem of the fetch scripts) and it moves
+             the traversal and size checks outside our tests.
+Custom:      the download loop (Range segments, size-exact cap, SHA-256 gate, manual redirect checks),
+             the safe extractor and the setup flow, because the project-owned rules are the point: HTTPS
+             only, exact pinned sizes, no partial file at its final name, no writes outside the
+             destination. None of the adopted crates provides these policies.
+Revisit:     if the pin count grows past a manifest a person can review, or an installer is chosen (#205).
+----
+
 === Release packaging record (#294 S1)
 
 [source,text]

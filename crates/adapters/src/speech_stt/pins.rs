@@ -4,7 +4,7 @@
 //! library, the same pattern as the Silero model pin in S2: a recognizer that
 //! silently changes is a different recognizer, and its text feeds the
 //! conversation. The pins are compiled in; the files are fetched by an
-//! operator step (`scripts/fetch-sherpa-onnx.mjs`, `docs/supply-chain.adoc`)
+//! operator step (`aivtuber-setup local`, `scripts/fetch-sherpa-onnx.mjs`, `docs/supply-chain.adoc`)
 //! and are never redistributed or committed.
 //!
 //! Library pins have a limit worth stating: the engine libraries are linked
@@ -257,16 +257,16 @@ mod tests {
         );
     }
 
-    /// The operator fetch script carries its own copy of the model pins; the
+    /// The shared download manifest carries its own copy of the model pins; the
     /// two must not drift.
     #[test]
-    fn the_fetch_script_pins_the_same_model_digests() {
-        let script = include_str!("../../../../scripts/fetch-sherpa-onnx.mjs");
+    fn the_download_manifest_pins_the_same_model_digests() {
+        let manifest = include_str!("../../../../packaging/local-profile-pins.json");
         for pin in [K2V2_INT8, PARAKEET_JA_INT8] {
             for file in pin.files {
                 assert!(
-                    script.contains(file.sha256) && script.contains(file.file_name),
-                    "scripts/fetch-sherpa-onnx.mjs does not pin {} ({})",
+                    manifest.contains(file.sha256) && manifest.contains(file.file_name),
+                    "packaging/local-profile-pins.json does not pin {} ({})",
                     file.file_name,
                     file.sha256
                 );

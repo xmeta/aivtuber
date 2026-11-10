@@ -43,12 +43,13 @@ allow = [
 confidence-threshold = 0.8
 
 # Scoped exceptions for the build-time-only dependencies of the optional
-# `sherpa-stt` feature (issue #92 S3b, decision Q4). They are reachable only
-# through `sherpa-onnx-sys`'s build script (archive extraction through `zip`),
-# never linked into a runtime binary, and are not global allowlist additions:
+# `sherpa-stt` feature (issue #92 S3b, decision Q4). They are reachable through
+# `sherpa-onnx-sys`'s build script (archive extraction through `zip`); since
+# #294 S2 `libbz2-rs-sys` is also linked into `aivtuber-setup` (bzip2 model
+# archives). They are not global allowlist additions:
 # any other crate under these licenses is still rejected. The default
-# `cargo deny check` graph does not include them (the feature is off), so they
-# report as unused there; `cargo deny --features sherpa-stt check` (the CI job
+# `cargo deny check` graph includes `libbz2-rs-sys` (through `aivtuber-setup`) but not `ppmd-rust` (the feature is off), so that one reports as
+# unused there; `cargo deny --features sherpa-stt check` (the CI job
 # for the feature) exercises them. Reason and revisit condition:
 # docs/supply-chain.adoc, "sherpa-onnx (feature sherpa-stt)".
 [[licenses.exceptions]]

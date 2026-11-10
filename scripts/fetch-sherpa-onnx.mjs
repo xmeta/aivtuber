@@ -25,9 +25,9 @@
 //       OpenRAIL-M (use restrictions, and the duty to disclose that published
 //       audio is machine-generated); see docs/supply-chain.adoc.
 //
-// A mismatch deletes the partial download and exits non-zero. The pins here
-// are asserted equal to the Rust pins by a unit test (pins.rs), so the two
-// copies cannot drift.
+// A mismatch deletes the partial download and exits non-zero. The pins come
+// from packaging/local-profile-pins.json and are asserted equal to the Rust
+// pins by unit tests (pins.rs), so the copies cannot drift.
 
 import { createHash } from "node:crypto";
 import { createReadStream, createWriteStream, existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
@@ -35,66 +35,20 @@ import { dirname, join, resolve } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { Readable } from "node:stream";
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
-const SHERPA_RELEASE = "https://github.com/k2-fsa/sherpa-onnx/releases/download";
-const HF = "https://huggingface.co";
-const RZ_REV = "291488c8151be24d7da4bf7af26e533fad96e407"; // reazon-research/reazonspeech-k2-v2
-
-// Engine library archives, sherpa-onnx v2.0.1, `shared` flavour (what the
-// crate's build script asks for with its `shared` feature). SHA-256 values were
-// verified by downloading each archive, and equal the digests GitHub publishes.
-const LIB_ARCHIVES = {
-  "linux-x64": {
-    name: "sherpa-onnx-v2.0.1-linux-x64-shared-lib.tar.bz2",
-    sha256: "532c45bbd41036d83cd70606797529aa8086c2053395a58967736c727625b120",
-  },
-  "win32-x64": {
-    name: "sherpa-onnx-v2.0.1-win-x64-shared-MT-Release-lib.tar.bz2",
-    sha256: "afa4de3ca4ab0afd53bb4aab40d28ee15608364b549ffc0fe0caf6489bfc39a5",
-  },
-};
-
-const MODELS = {
-  "supertonic-3-int8": {
-    // sherpa-onnx tts-models release asset (the tag is mutable, the hash is the pin).
-    archive: {
-      name: "sherpa-onnx-supertonic-3-tts-int8-2026-05-11.tar.bz2",
-      url: `${SHERPA_RELEASE}/tts-models/sherpa-onnx-supertonic-3-tts-int8-2026-05-11.tar.bz2`,
-      sha256: "82fa96f91c4ef8abaae3a14a3f4153facf88bed821d1f7331cec2700f432c427",
-    },
-    innerDir: "sherpa-onnx-supertonic-3-tts-int8-2026-05-11",
-    files: [
-      ["duration_predictor.int8.onnx", "c3eb91414d5ff8a7a239b7fe9e34e7e2bf8a8140d8375ffb14718b1c639325db"],
-      ["text_encoder.int8.onnx", "c7befd5ea8c3119769e8a6c1486c4edc6a3bc8365c67621c881bbb774b9902ff"],
-      ["vector_estimator.int8.onnx", "20cd86fa5c6effedfda0e7cffe5b0569ca401c440a0c3a1d72bf39286c0db3fd"],
-      ["vocoder.int8.onnx", "e923d60f53f95eb1ce235f1dc33ec56d9c057823c96fa6f8acf98f32b0da6152"],
-      ["tts.json", "42078d3aef1cd43ab43021f3c54f47d2d75ceb4e75f627f118890128b06a0d09"],
-      ["unicode_indexer.bin", "8402ca48e5189a8950138580b0fff64db6f072f24ac07cd54ba8b2fbb9883b30"],
-      ["voice.bin", "67d5209b0ee8ce6c74105ffbe12fe6a7628aea3b4ba2fcb308a4a67938a93ce8"],
-    ],
-  },
-  "k2v2-int8": {
-    files: [
-      ["encoder-epoch-99-avg-1.int8.onnx", "2c7bd08a8a99f9ddd0d9e458456577b1f6279214e51426f114f9eced44c54e1d"],
-      ["decoder-epoch-99-avg-1.int8.onnx", "8f0bff94d38797b03b762634ed03211a8e303d06cc4603cdd0cf4199d6eb1485"],
-      ["joiner-epoch-99-avg-1.int8.onnx", "49cc7ea1d3d35a40a27442db5e89996da64bf0e683a903dce76e99e57a12e4de"],
-      ["tokens.txt", "2c3ac659818a48a0c04010e0593bbc4d7c8a24a054340b01131499c05fd52def"],
-    ].map(([file, sha256]) => ({ file, sha256, url: `${HF}/reazon-research/reazonspeech-k2-v2/resolve/${RZ_REV}/${file}` })),
-  },
-  "parakeet-ja": {
-    // One archive; its two files are pinned inside the worker.
-    archive: {
-      name: "sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8.tar.bz2",
-      url: `${SHERPA_RELEASE}/asr-models/sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8.tar.bz2`,
-      sha256: "4b0a800ef29f4f4c8667339bf6f60d5bfdc2852ddc9dc5741aea65b6f8d1306b",
-    },
-    innerDir: "sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8",
-    files: [
-      ["model.int8.onnx", "3addd00ef5bd1742078389e540b77394e4a508bdf2f4c9ad1b4a76d93e76598e"],
-      ["tokens.txt", "732f64c53909f2620c713f4106b487d92e6f54a6915b3cd3d1dbd32f9f4f392a"],
-    ],
-  },
-};
+// Every pin (URL, SHA-256, size) lives in packaging/local-profile-pins.json, the
+// single source shared with `aivtuber-setup local` (crates/setup) and the other
+// fetch scripts. Nothing is repeated here.
+const PINS = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "packaging", "local-profile-pins.json"), "utf8"));
+const LIB_ARCHIVES = PINS.sherpa_lib.assets;
+const MODELS = Object.fromEntries(
+  Object.entries(PINS.models).map(([name, m]) => [
+    name,
+    { archive: m.archive, innerDir: m.inner_dir, files: m.files.map((f) => (m.archive ? [f.file, f.sha256] : f)) },
+  ]),
+);
 
 function fail(message) {
   console.error(`fetch-sherpa-onnx: ${message}`);
@@ -135,7 +89,7 @@ async function fetchLib(dest) {
   if (!archive) {
     fail(`no pinned sherpa-onnx library archive for ${key} (pinned: ${Object.keys(LIB_ARCHIVES).join(", ")})`);
   }
-  await download(`${SHERPA_RELEASE}/v2.0.1/${archive.name}`, join(dest, archive.name), archive.sha256);
+  await download(archive.url, join(dest, archive.file), archive.sha256);
   console.log(`\nSHERPA_ONNX_ARCHIVE_DIR=${resolve(dest)}`);
 }
 
@@ -143,12 +97,12 @@ async function fetchModel(name, dest) {
   const model = MODELS[name];
   if (!model) fail(`unknown model ${name} (${Object.keys(MODELS).join(", ")})`);
   if (model.archive) {
-    const archivePath = join(dest, model.archive.name);
+    const archivePath = join(dest, model.archive.file);
     await download(model.archive.url, archivePath, model.archive.sha256);
     // System tar reads bz2 on Linux, macOS and Windows 10+.
     // Windows: use the system bsdtar; a GNU tar earlier on PATH (Git Bash) reads "I:\x" as host "I".
     const tar = process.platform === "win32" ? join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe") : "tar";
-    execFileSync(tar, ["-xjf", model.archive.name, "-C", "."], { stdio: "inherit", cwd: dest });
+    execFileSync(tar, ["-xjf", model.archive.file, "-C", "."], { stdio: "inherit", cwd: dest });
     const dir = join(dest, model.innerDir);
     for (const [file, sha256] of model.files) {
       const actual = await sha256Of(join(dir, file));

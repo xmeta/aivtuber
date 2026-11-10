@@ -154,7 +154,7 @@ impl PackReadiness {
         }
         if self.missing_audio > 0 {
             lines.push(format!(
-                "pack_readiness: audio: {} referenced audio file(s) not found under {}; run `node scripts/synthesize-starter-audio.mjs` (docs/local-profile-quickstart.adoc) or supply them",
+                "pack_readiness: audio: {} referenced audio file(s) not found under {}; run `aivtuber-setup local` (release archive) or `node scripts/synthesize-starter-audio.mjs` (source checkout; docs/local-profile-quickstart.adoc), or supply them",
                 self.missing_audio,
                 audio_root.display()
             ));
@@ -238,7 +238,7 @@ mod tests {
         );
         assert!(lines[0].contains("missing_audio=6 voice_model_mismatch=0"));
         assert_eq!(lines.len(), 2);
-        assert!(lines[1].contains("synthesize-starter-audio"));
+        assert!(lines[1].contains("aivtuber-setup local"));
     }
 
     #[test]

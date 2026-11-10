@@ -3,7 +3,7 @@ Third-party notices: bundled engine libraries
 
 These binary libraries are redistributed unmodified from the sherpa-onnx
 v2.0.1 "shared" library archive published by the k2-fsa project. The archive
-is identified by its SHA-256 in scripts/fetch-sherpa-onnx.mjs, and the files
+is identified by its SHA-256 in packaging/local-profile-pins.json, and the files
 are identified by SHA-256 in crates/adapters/src/speech_stt/pins.rs.
 
 sherpa-onnx C API (sherpa-onnx-c-api.dll / libsherpa-onnx-c-api.so)
