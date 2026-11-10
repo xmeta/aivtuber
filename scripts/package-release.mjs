@@ -60,6 +60,7 @@ export const BINARIES = [
   "speech-stt-worker",
   "local-tts-sidecar",
   "twitch-chat-ingress",
+  "youtube-chat-ingress",
 ];
 
 // Node scripts shipped for the model fetch step. Paths are repository-relative

@@ -62,6 +62,13 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
+      # A public release needs the repository owner's project licence. Dry runs
+      # (workflow_dispatch) are unaffected.
+      - name: Tag release requires a LICENSE file
+        if: github.ref_type == 'tag'
+        run: |
+          test -f LICENSE || { echo "::error::no LICENSE file at the repository root; the owner must add one before a release is tagged"; exit 1; }
+
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
@@ -107,7 +114,7 @@ jobs:
           cargo build --release --locked -p aivtuber-adapters
           --features "$ADAPTER_FEATURES"
           --bin speech-vad-sidecar --bin speech-stt-worker
-          --bin local-tts-sidecar --bin twitch-chat-ingress
+          --bin local-tts-sidecar --bin twitch-chat-ingress --bin youtube-chat-ingress
 
       - name: Build the app and operator tool
         run: cargo build --release --locked -p aivtuber-app --bin aivtuber-app --bin aivtuberctl

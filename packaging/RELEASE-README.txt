@@ -15,6 +15,7 @@ What is here
   speech-stt-worker       Japanese speech recognition (sherpa-onnx)
   local-tts-sidecar       Japanese speech synthesis (sherpa-onnx)
   twitch-chat-ingress     Twitch chat input
+  youtube-chat-ingress    YouTube Live chat input
   *.dll / lib*.so         the pinned sherpa-onnx and ONNX Runtime engine libraries.
                           They must stay in this directory, beside the programs:
                           each sidecar verifies their SHA-256 at every start and

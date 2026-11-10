@@ -35,6 +35,7 @@ const programs = [
   "speech-stt-worker",
   "local-tts-sidecar",
   "twitch-chat-ingress",
+  "youtube-chat-ingress",
 ];
 
 const tar = win ? join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe") : "tar";
@@ -134,7 +135,7 @@ try {
   // or a crash is a different code and prints no usage). Reaching main at all
   // means the OS loader found every linked library, including the engine
   // libraries beside the executable.
-  const probes = ["speech-vad-sidecar", "speech-stt-worker", "local-tts-sidecar", "twitch-chat-ingress", "aivtuberctl"];
+  const probes = ["speech-vad-sidecar", "speech-stt-worker", "local-tts-sidecar", "twitch-chat-ingress", "youtube-chat-ingress", "aivtuberctl"];
   for (const program of probes) {
     check(`${program} --help starts and prints usage`, () => {
       const { status, out } = run(join(root, program + exe), ["--help"], root);
