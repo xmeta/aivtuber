@@ -64,6 +64,8 @@ An asset identity must include compatibility-relevant versions:
 
 A change that breaks timing or parameter semantics requires regeneration or migration.
 
+* speech projection (schema 0.2.0, ADR-0004): `compatibility.speech_projection` records the rules version and the reading-lexicon identity that produced the audio, and `speech.speech_text` the text that was synthesized. A mismatch makes an asset *stale but playable*, not incompatible (ADR-0004 D-4); `AssetIdentity` includes it, so cache keys separate projections. Schema `0.1.0` assets remain readable and cannot carry these fields. See docs/production-runtime.adoc, "Text that is not spoken, and how words are read".
+
 == 5. Promotion
 
 Generated outputs may be promoted into reusable assets.

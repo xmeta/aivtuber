@@ -735,6 +735,16 @@ pub struct GenerativeRuntime {
     phrase_tx: SyncSender<phrase_commit::PhraseMessage>,
     phrase_rx: Receiver<phrase_commit::PhraseMessage>,
     phrase: phrase_commit::PhraseBook,
+    speech_projection: SpeechProjectionMetrics,
+}
+
+/// Cumulative display-to-speech projection counters (ADR-0004, #222). Counts
+/// only; `passthrough_latin` is `projection_passthrough_latin`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SpeechProjectionMetrics {
+    pub replies: u64,
+    pub lexicon_hits: u64,
+    pub passthrough_latin: u64,
 }
 
 impl GenerativeRuntime {
@@ -759,6 +769,7 @@ impl GenerativeRuntime {
             phrase_tx,
             phrase_rx,
             phrase: phrase_commit::PhraseBook::default(),
+            speech_projection: SpeechProjectionMetrics::default(),
         })
     }
 
@@ -1420,6 +1431,15 @@ where
         barge_in.mark_handled(&speaker, run_start_ms);
         barge_in.record(record.clone());
         Some(record)
+    }
+
+    /// Reading-lexicon counters (issue #222): replies projected, readings
+    /// applied, Latin words left to the TTS. All zero when generation is off.
+    pub fn speech_projection_metrics(&self) -> SpeechProjectionMetrics {
+        self.generative
+            .as_ref()
+            .map(|generative| generative.speech_projection)
+            .unwrap_or_default()
     }
 
     /// Counters of phrase-level commits (issue #83); all zero in buffered mode.
@@ -2405,6 +2425,16 @@ where
     }
 
     fn record_generation_calls(&mut self, trace: &GenerationTrace) {
+        if let (Some(projection), Some(generative)) =
+            (&trace.speech_projection, self.generative.as_mut())
+        {
+            let metrics = &mut generative.speech_projection;
+            metrics.replies = metrics.replies.saturating_add(1);
+            metrics.lexicon_hits = metrics.lexicon_hits.saturating_add(projection.lexicon_hits);
+            metrics.passthrough_latin = metrics
+                .passthrough_latin
+                .saturating_add(projection.passthrough_latin);
+        }
         for call in &trace.llm_calls {
             self.security.record_generation_call(
                 &call.event_id,
@@ -3529,6 +3559,7 @@ fn template_performance_asset(
         variant_group: None,
         speech: Some(SpeechTrack {
             text: Some(text.to_owned()),
+            speech_text: None,
             audio_ref: Some(format!("audio://template/{template_id}.opus")),
             duration_ms: Some(duration_ms),
             viseme_ref: None,
@@ -3543,11 +3574,12 @@ fn template_performance_asset(
         interrupt_points_ms: vec![duration_ms],
         variation: None,
         compatibility: AssetCompatibility {
-            compiler_version: aivtuber_asset_store::PERFORMANCE_ASSET_SCHEMA_VERSION.to_owned(),
+            compiler_version: aivtuber_asset_store::DEFAULT_COMPILER_VERSION.to_owned(),
             voice_model: None,
             avatar_profile: None,
             viseme_mapping: None,
             motion_library: None,
+            speech_projection: None,
         },
         semantic_embedding: None,
         provenance: Some(Provenance {

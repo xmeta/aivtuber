@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xmeta/aivtuber/schemas/speech-lexicon.schema.json",
+  "title": "AI VTuber speech reading lexicon",
+  "description": "Operator-owned display-to-speech reading entries (ADR-0004 D3). Readings are kana only: a lexicon can change how a word is said, never what is said. Bounds mirror crates/generative/src/speech_lexicon.rs.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "lexicon_id", "revision", "entries"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1.0"},
+    "lexicon_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,62}$"},
+    "revision": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,32}$"},
+    "entries": {
+      "type": "array",
+      "maxItems": 2048,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["surface", "reading", "source"],
+        "properties": {
+          "surface": {"type": "string", "minLength": 1, "maxLength": 32},
+          "reading": {"type": "string", "pattern": "^[\\u3041-\\u3096\\u30A1-\\u30FA\\u30FC]{1,64}$"},
+          "source": {"type": "string", "minLength": 1, "maxLength": 64},
+          "case_sensitive": {"type": "boolean"},
+          "note": {"type": "string", "maxLength": 128}
+        }
+      }
+    }
+  }
+}

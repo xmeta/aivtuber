@@ -446,11 +446,42 @@ export AIVTUBER_TTS_SIDECAR_MODEL_DIR=/path/to/supertonic
 * *Bounded.* Body 16 KiB (413), text 500 characters (422), 4 simultaneous connections, a per-request read deadline (408), one synthesis at a time (a second is refused at once with 503, which the adapter maps to `Overloaded`; nothing queues), a synthesis deadline (504, the late result is discarded), and 256 MiB of generated audio (oldest removed first). Log lines carry counts and timings, never the text.
 * *WAV files* are written through a temp file and an atomic rename under `AIVTUBER_AUDIO_ROOT/generated/`; the reference is `audio://generated/<digest>.wav`, which `ProcessAudioPlayer` resolves under the same root with its existing traversal rules.
 
-=== Text that is not spoken (ADR-0004 D-5)
+=== Text that is not spoken, and how words are read (ADR-0004, issue #222 S1)
 
-Before the TTS request, the generative pipeline projects the gated display text to speech text by *deletion only*: URLs (`http://`, `https://`, `ftp://`, `www.`), emoji (with their joiners and selectors) and parenthesised kaomoji such as `(´▽`)` are not spoken. The display text, and the asset compiled from it, are unchanged. Measured in EXP-0003: every engine speaks a URL as letter noise (6 s of audio for one link) and drops or misreads emoji. If a reply has nothing left to speak (only emoji or a link) the result is the typed non-verbal fallback, with no TTS call. Fixture tests: `examples/tts-projection/handling-set.json` (the EXP-0003 handling set).
+Before the TTS request, the generative pipeline projects the gated display text to speech text in two deterministic stages. The display text, and the asset compiled from it, are never changed; the output gate sees the display text, then the projected text when it differs, then the display text again last (the app commits only when the gate's last decision is for the display text). In phrase mode each phrase is projected on its own.
 
-*Known limitations, not handled yet:* English brand-word readings (`YouTube`, `Twitter`, `VTuber` are misread; they pass through and wait for the ADR-0004 lexicon), symbols such as `&`, `%`, `#`, `@`, kaomoji that contain letters or digits, and bare domains without a scheme or `www.`.
+*Stage 1, deletion (D-5).* URLs (`http://`, `https://`, `ftp://`, `www.`), emoji (with their joiners and selectors) and parenthesised kaomoji such as `(´▽`)` are not spoken. Measured in EXP-0003: every engine speaks a URL as letter noise (6 s of audio for one link) and drops or misreads emoji. If a reply has nothing left to speak (only emoji or a link) the result is the typed non-verbal fallback, with no TTS call.
+
+*Stage 2, reading lexicon.* A bounded, versioned, project-owned list of `surface -> reading` entries is applied to the stage 1 output, so a reading can never bring back a URL or an emoji. It exists because EXP-0003 measured the shipped engine misreading `YouTube`, `Twitter` and `VTuber`. There is no morphological analyzer in this stage (ADR-0004 D-1): numbers, counters and ordinary kanji are left to the TTS engine, and so is every word the lexicon does not list.
+
+* *Starter lexicon.* `crates/generative/data/default-speech-lexicon.json`, compiled into the binary: about 45 streamer and tech words (YouTube, YouTuber, Twitter, `Twitter/X`, VTuber, Twitch, OBS, Discord, AI, LLM, TTS, GPT, OpenAI, VRM, BGM, SNS, ...). Every entry's `source` is `self-authored`: the readings were written for this project, and no third-party dictionary was copied.
+* `AIVTUBER_SPEECH_LEXICON`: path of an operator lexicon (same format) merged *over* the starter lexicon, for the persona's name, community words and corrections. `AIVTUBER_SPEECH_LEXICON_DEFAULTS=false` (default true) drops the starter lexicon, which is also the rollback to display text for the words it covers. A missing file, malformed JSON or a bound violation is a *startup error* that names the entry (`AIVTUBER_SPEECH_LEXICON: speech lexicon entries[3].reading: ...`); the app never starts speaking without a lexicon the operator asked for. The file is read once at start; restart to change it. Startup prints `speech lexicon: <n> entries, projection <identity>`.
+* *Authority.* Only the operator can add or change entries (an environment path read at start). Chat, Jev, the LLM and the TTS provider cannot; a model-suggested correction is a proposal for the operator to put in the file.
+* *Format* (`schemas/speech-lexicon.schema.json`, fixtures in `examples/speech-lexicons/`):
++
+[source,json]
+----
+{
+  "schema_version": "0.1.0",
+  "lexicon_id": "my-persona",
+  "revision": "2026-11-10.1",
+  "entries": [
+    {"surface": "Claude", "reading": "クロード", "source": "operator"},
+    {"surface": "AI", "reading": "アイ", "source": "operator", "case_sensitive": true, "note": "this persona is named Ai"}
+  ]
+}
+----
+* *Bounds* (a file that violates one is rejected whole): at most 2048 entries and 131072 bytes per file; `surface` 1 to 32 characters without control characters or surrounding whitespace; `reading` 1 to 64 hiragana, katakana or `ー` characters (so an entry can change how a word sounds and never what is said); `source` 1 to 64 and `note` at most 128 characters; unique surfaces (compared ignoring ASCII case); at most 4 layers merged. Text longer than 4096 characters is projected by stage 1 only.
+* *Matching.* Longest match first. ASCII letters match case-insensitively unless the entry sets `"case_sensitive": true`; fullwidth Latin (`ＹｏｕＴｕｂｅ`) matches its halfwidth surface. An entry whose first (last) character is an ASCII letter or digit only matches when the character before (after) it is not an ASCII letter, digit or `_`, so `AI` is read in `AIの話` and `(AI)` and not in `MAIL`, `RAINBOW` or `AIs`; add an entry such as `AIs` when you want the plural. Entries that start or end with Japanese characters or symbols match anywhere.
+* *Precedence.* Layers are merged starter first, operator file after; an operator entry replaces the starter entry with the same surface (ignoring ASCII case). Within one file, order does not matter.
+* *Identity.* `rules:<rules version>|lexicon:<id@revision;...>+<sha256>` where the hash covers the effective merged entries (surface, reading, case flag), not the file bytes, so line endings and entry order do not change it and any changed reading does. It is recorded in `compatibility.speech_projection` of every generated asset (performance asset schema 0.2.0, below), and the startup line and `GenerationTrace.speech_projection` carry it.
+* *Metrics.* The loop logs `speech_projection: replies=.. lexicon_hits=.. projection_passthrough_latin=..` when they change. `projection_passthrough_latin` counts Latin words of two or more letters that no entry covered and that therefore went to the TTS as written: it is the list of words to add next. Counts only, never text.
+
+*Asset schema 0.2.0 (ADR-0004 D-3).* Generated assets now carry `speech.speech_text` (what was sent to TTS) and `compatibility.speech_projection` (the identity above). Schema 0.1.0 assets stay readable and are not rewritten; they cannot carry the new fields (the schema and the Rust validator both reject that), and a reader that only knows 0.1.0 will refuse a 0.2.0 asset, so upgrade readers first. The default compiler version was spelled with the schema version constant; the two are now independent (`DEFAULT_COMPILER_VERSION` stays `0.1.0`), so the bump does not make cached assets incompatible. *Staleness (D-4):* a recorded projection that differs from the current one makes an asset *stale but playable*: `AssetCompatibility::speech_projection_is_stale` says so and `check` does not turn it into an incompatibility. Nothing re-synthesizes lazily yet, and the operator-forced invalidation of one entry is not built; both are S2 work.
+
+*Known limitations, not handled yet:* symbols such as `&`, `%`, `#`, `@`, kaomoji that contain letters or digits, bare domains without a scheme or `www.`, any word the lexicon does not list (the engine reads it its own way), and anything that needs context to read (homographs).
+
+Fixture tests: `examples/tts-projection/handling-set.json` (the EXP-0003 handling set plus the brand-word items; `expected` is the stage 1 result and `expected_speech` the stage 1 and 2 result, written by hand) and `cargo test --locked -p aivtuber-generative speech_lexicon`.
 
 === Mouth movement
 
