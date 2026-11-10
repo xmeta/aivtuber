@@ -225,7 +225,7 @@ The Supertonic 3 *weights* are licensed under OpenRAIL-M (the `LICENSE` of `Supe
 * *Starter pack audio (#289).* The starter reaction pack's speech audio is not committed or shipped. `scripts/synthesize-starter-audio.mjs` synthesizes it on the operator's machine with this sidecar and records model, bundle digest, seed rule and this notice in `PROVENANCE.json` beside the files; broadcasting it carries the same disclosure duty.
 * *Revisit* if the licence text is revised (OpenRAIL-M expects the latest version), if the project starts bundling weights, or if legal review reads a restriction differently.
 
-Not adopted, recorded so they are not re-proposed without new evidence (EXP-0003 section 8): VOICEVOX (optional second backend, a later slice; per-character terms and a credit line), Kokoro, Style-Bert-VITS2 (AGPL-3.0), Piper ja (CC BY-NC-SA).
+Not adopted, recorded so they are not re-proposed without new evidence (EXP-0003 section 8): VOICEVOX as a *default* (it is an optional second backend since #295, run by the operator as a separate loopback process and not bundled; per-character terms and a required credit line; no new crate, `Cargo.lock` unchanged), Kokoro, Style-Bert-VITS2 (AGPL-3.0), Piper ja (CC BY-NC-SA).
 
 === Verification (2026-11)
 
