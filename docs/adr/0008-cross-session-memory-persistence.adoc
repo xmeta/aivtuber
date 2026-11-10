@@ -26,7 +26,7 @@ Inputs: link:../memory-adaptation.adoc[Memory and Adaptation Runtime] (sections 
 == Assumptions
 
 * A-MEM-001 (invariant, unchanged).
-* New, to be added to `docs/assumptions.adoc` if this ADR is accepted: *A-MEM-002* durable retained memory volume stays in the low thousands of entries per installation; the trigger that reopens this is in "Revisit conditions". *A-MEM-003* no production code path currently writes durable memory, so cross-session continuity has no current producer (section 1.3).
+* New, recorded in link:../assumptions.adoc[the register]: *A-MEM-002* durable retained memory volume stays in the low thousands of entries per installation; the trigger that reopens this is in "Revisit conditions". *A-MEM-003* no production code path currently writes durable memory, so cross-session continuity has no current producer (section 1.3).
 
 == 1. Current-state inventory (against the Rust code)
 
@@ -528,5 +528,5 @@ S1, the RAM-only erase primitive plus the erasure report, becomes its own implem
 == Related
 
 * Issue: #282; parent #105; related #51, #220, #280, #281, #283, #284
-* Assumptions: A-MEM-001 (existing), A-MEM-002 and A-MEM-003 (proposed above)
+* Assumptions: A-MEM-001 (existing), A-MEM-002 and A-MEM-003 (added to the register)
 * Other ADRs: none; ADR-0007 (perception) is independent
