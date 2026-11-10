@@ -8,8 +8,8 @@
 //!   data streams), no NUL;
 //! * nothing is ever written through a symbolic link: if any existing ancestor
 //!   of the target is a link, the entry is refused;
-//! * a symbolic-link entry is allowed only on Unix, only with a relative
-//!   target that stays inside the destination once `..` is resolved lexically
+//! * a symbolic-link entry is allowed only on Unix, only with a target that is a
+//!   single plain file name in the same directory (no separator, `.` or `..`)
 //!   (the Linux llama.cpp archive ships `libfoo.so -> libfoo.so.0` links);
 //! * hard links, devices, FIFOs and any other entry type are refused;
 //! * entry count and total expanded bytes are bounded (decompression bombs).
@@ -96,26 +96,15 @@ pub fn safe_relative(name: &str) -> Result<PathBuf, ExtractError> {
     Ok(out)
 }
 
-/// Resolves `target` (relative to the directory holding `entry`) lexically and
-/// says whether it stays inside the destination.
-fn link_stays_inside(entry: &Path, target: &str) -> bool {
-    if target.is_empty() || target.starts_with('/') || target.contains(['\\', '\0', ':']) {
-        return false;
-    }
-    let mut depth = entry.components().count() as i64 - 1; // directories above the link
-    for part in target.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                depth -= 1;
-                if depth < 0 {
-                    return false;
-                }
-            }
-            _ => depth += 1,
-        }
-    }
-    true
+/// A link target is accepted only as a single plain file name in the link's own
+/// directory (`libfoo.so -> libfoo.so.0`). Anything with a separator, `.` or
+/// `..` is refused: lexical resolution of longer targets is unsound because a
+/// chain of links (`d -> ..`, then `l -> d/../..`) escapes the destination.
+fn link_target_is_sibling(target: &str) -> bool {
+    !target.is_empty()
+        && target != "."
+        && target != ".."
+        && !target.contains(['/', '\\', ':', '\0'])
 }
 
 struct Sink<'a> {
@@ -208,7 +197,7 @@ impl<'a> Sink<'a> {
         self.count()?;
         let rel = safe_relative(name)?;
         self.check_ancestors(&rel, name)?;
-        if !link_stays_inside(&rel, link_target) {
+        if !link_target_is_sibling(link_target) {
             return Err(ExtractError::UnsafeLink {
                 entry: name.to_owned(),
                 target: link_target.to_owned(),
@@ -394,6 +383,56 @@ mod tests {
             let outside = dest.parent().unwrap().join("evil.txt");
             assert!(!outside.exists(), "{name} escaped");
         }
+    }
+
+    #[test]
+    fn only_a_plain_sibling_file_name_is_an_acceptable_link_target() {
+        for ok in ["libx.so.0", "a", "lib-x_1.so"] {
+            assert!(link_target_is_sibling(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "b/c",
+            "d/../..",
+            "../x",
+            "/etc/passwd",
+            "a\\b",
+            "c:x",
+            "a\0b",
+            "./a",
+        ] {
+            assert!(!link_target_is_sibling(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_link_chain_cannot_reach_outside_the_destination() {
+        for (name, target) in [
+            ("sub/d", ".."),
+            ("a", "b/c"),
+            ("a", ".."),
+            ("sub/l", "d/../.."),
+        ] {
+            let dest = scratch("chain");
+            let bytes = raw_tar(&[(name, tar::EntryType::Symlink, b"", target)]);
+            let err = run_tar(bytes, &dest).unwrap_err();
+            assert!(
+                matches!(err, ExtractError::UnsafeLink { .. }),
+                "{name} -> {target}: {err:?}"
+            );
+        }
+        // The whole chain is refused at its first link.
+        let dest = scratch("chain-full");
+        let bytes = raw_tar(&[
+            ("sub/d", tar::EntryType::Symlink, b"", ".."),
+            ("sub/l", tar::EntryType::Symlink, b"", "d/../.."),
+        ]);
+        assert!(matches!(
+            run_tar(bytes, &dest),
+            Err(ExtractError::UnsafeLink { .. })
+        ));
     }
 
     #[test]
