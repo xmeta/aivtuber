@@ -433,7 +433,7 @@ Profiles:
 * `cached` (default) — exact/preselected cached playback via `IntentRoutePlanner` only. No semantic retrieval, Jev, templates, or generation.
 * `reflex` — semantic retrieval + Jev + curated template decisions via `ReflexRoutePlanner` with the starter template pack. No generative fallback.
 * `full` — the reflex route graph plus the LLM/TTS generative fallback.
-* `local` (#220) — zero-paid-dependency composition: explicit `intent` events take the deterministic cached path (`LocalRoutePlanner`), free-text chat/donation/speech goes to the Thinking engine, everything else is `Silent`. No Jev, semantic retrieval, or templates. Every provider endpoint (Thinking and TTS) must be loopback; when Thinking fails the existing typed fallback yields a non-verbal reaction. Generated text still passes the same output gate, TTS, compilation, and scheduler path as `full`.
+* `local` (#220) — zero-paid-dependency composition: explicit `intent` events take the deterministic cached path (`LocalRoutePlanner`), free-text chat/donation/speech goes to the Thinking engine, everything else is `Silent`. No Jev, semantic retrieval, or templates. Every provider endpoint (Thinking and TTS) must be loopback; when Thinking fails, or its reply is refused, the route's fallback group `reaction.neutral` plays a speechless expression-and-nod reaction from the starter pack through the avatar output, and the daemon logs `generation_fallback: reason=...` (docs/generative-fallback.adoc, #288). Generated text still passes the same output gate, TTS, compilation, and scheduler path as `full`.
 
 Profiles fail fast on misleading configurations before composition:
 

@@ -1,0 +1,56 @@
+{
+  "schema_version": "0.1.0",
+  "id": "reaction.neutral.01",
+  "intent": "reaction.neutral",
+  "class": "reaction",
+  "variant_group": "reaction.neutral",
+  "expression": {
+    "preset": "calm_soft",
+    "intensity": 0.6
+  },
+  "gesture": {
+    "preset": "nod_small",
+    "amplitude": 0.8
+  },
+  "gaze": "camera",
+  "timeline": [
+    {
+      "at_ms": 0,
+      "event": "expression.start",
+      "payload": {
+        "preset": "calm_soft"
+      }
+    },
+    {
+      "at_ms": 120,
+      "event": "gesture.start",
+      "payload": {
+        "preset": "nod_small"
+      }
+    },
+    {
+      "at_ms": 900,
+      "event": "reaction.end"
+    }
+  ],
+  "interrupt_points_ms": [
+    900
+  ],
+  "variation": {
+    "speed_pct": 6,
+    "amplitude_pct": 6,
+    "start_delay_ms": 60
+  },
+  "compatibility": {
+    "compiler_version": "0.1.0",
+    "voice_model": null,
+    "avatar_profile": "example-live2d-v1",
+    "viseme_mapping": null,
+    "motion_library": "starter-v1"
+  },
+  "provenance": {
+    "generated": false,
+    "generator": null,
+    "created_at": "2026-11-10T00:00:00Z"
+  }
+}

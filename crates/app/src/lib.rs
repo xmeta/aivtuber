@@ -821,7 +821,9 @@ impl GenerativeRuntime {
         // The composition thread keeps its own copy of the context for the
         // phrase commits that precede the worker's final completion; the
         // budget reservation stays with the one completion that settles it.
-        let run_context = phrase.is_some().then(|| context.without_reservation());
+        let run_context = phrase
+            .is_some()
+            .then(|| (context.without_reservation(), fallback.clone()));
         let work = GenerationWork {
             generation_id,
             request,
@@ -838,7 +840,7 @@ impl GenerativeRuntime {
                 self.cancellation
                     .activate(&source_event, cancellation.clone());
                 self.active_generation_id = Some(generation_id);
-                if let Some(run_context) = run_context {
+                if let Some((run_context, run_fallback)) = run_context {
                     self.phrase.runs.push(phrase_commit::PhraseRun::new(
                         generation_id,
                         source_event,
@@ -847,6 +849,7 @@ impl GenerativeRuntime {
                         started,
                         provider_deadline,
                         run_context,
+                        run_fallback,
                     ));
                 }
                 Ok(generation_id)
@@ -982,6 +985,33 @@ struct HandledEvent {
     correlation_id: Option<String>,
 }
 
+/// Counted generation fallbacks (issue #288): every generated reply that
+/// ended on a typed fallback instead of speech. Keyed by the closed
+/// `fallback_reason_name` vocabulary (`timeout`, `unavailable`,
+/// `policy_override`, ...), so the map is bounded by that set; no provider
+/// text, URL or error message is ever stored.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GenerationFallbackCounts {
+    pub by_reason: std::collections::BTreeMap<&'static str, u64>,
+    /// Fallbacks that put a cached reaction on the avatar (and audio, if the
+    /// asset has any).
+    pub visible: u64,
+    /// Fallbacks that produced nothing because the pack has no usable asset
+    /// for the fallback group (the typed `NonVerbalReaction` carries none).
+    pub silent: u64,
+}
+
+impl GenerationFallbackCounts {
+    fn note(&mut self, reason: &'static str, visible: bool) {
+        *self.by_reason.entry(reason).or_insert(0) += 1;
+        if visible {
+            self.visible += 1;
+        } else {
+            self.silent += 1;
+        }
+    }
+}
+
 struct HandledGeneration {
     playback: Option<CachedPlaybackOutcome>,
     route: RouteClass,
@@ -1028,6 +1058,7 @@ where
     health: AdapterHealth,
     telemetry: TelemetryCollector,
     causal_traces: CausalTraceCollector,
+    generation_fallbacks: GenerationFallbackCounts,
     comparison_mode: ComparisonMode,
     /// Bounded #164 shadow evidence drained from the orchestrator. Retained for
     /// operator diagnostics; never a production output path.
@@ -1080,6 +1111,7 @@ where
             health: AdapterHealth::default(),
             telemetry: TelemetryCollector::default(),
             causal_traces: CausalTraceCollector::default(),
+            generation_fallbacks: GenerationFallbackCounts::default(),
             comparison_mode: ComparisonMode::DeterministicOnly,
             shadow_comparisons: Vec::new(),
             composition_profile: "unknown".to_owned(),
@@ -1673,6 +1705,12 @@ where
             .map(GenerativeRuntime::cancellation_registry)
     }
 
+    /// Counted generation fallbacks by typed reason (issue #288). The daemon
+    /// logs a line when this changes; tests assert it directly.
+    pub fn generation_fallback_counts(&self) -> &GenerationFallbackCounts {
+        &self.generation_fallbacks
+    }
+
     pub fn generation_execution_snapshot(&self) -> Option<GenerationExecutionSnapshot> {
         self.generative
             .as_ref()
@@ -2246,9 +2284,10 @@ where
                         ..GenerationTrace::default()
                     },
                     disposition: GenerationDisposition::Fallback {
-                        directive: fallback,
+                        directive: fallback.clone(),
                     },
                 },
+                &fallback,
                 None,
                 at_ms,
                 seed,
@@ -2291,9 +2330,10 @@ where
                         GenerationResult {
                             trace,
                             disposition: GenerationDisposition::Fallback {
-                                directive: fallback,
+                                directive: fallback.clone(),
                             },
                         },
+                        &fallback,
                         None,
                         at_ms,
                         seed,
@@ -2343,9 +2383,10 @@ where
                     GenerationResult {
                         trace,
                         disposition: GenerationDisposition::Fallback {
-                            directive: fallback,
+                            directive: fallback.clone(),
                         },
                     },
+                    &fallback,
                     None,
                     at_ms,
                     seed,
@@ -2377,10 +2418,52 @@ where
         }
     }
 
+    /// Perform the typed fallback chosen before submission: a cached reaction
+    /// from the pack goes through the normal cached performer path (scheduler,
+    /// operator stop/mute, avatar and audio sinks); the typed non-verbal
+    /// directive, which is only chosen when the pack has no usable asset for
+    /// the group, carries no playback (issue #288).
+    fn play_fallback_directive(
+        &mut self,
+        event: &EventEnvelope,
+        directive: &FallbackDirective,
+        trace: GenerationTrace,
+        at_ms: u64,
+        seed: u64,
+    ) -> Result<HandledGeneration, AppError> {
+        match directive {
+            FallbackDirective::CachedReaction { asset_id, .. } => {
+                let outcome = self.performer.handle_asset_id(
+                    event,
+                    asset_id,
+                    CachedPlaybackTiming { at_ms, seed },
+                    &self.visemes,
+                    &mut self.pending_audio,
+                    &mut self.pending_avatar,
+                )?;
+                let cache_level = cache_level(Some(outcome.cache_tier));
+                Ok(HandledGeneration {
+                    playback: Some(outcome),
+                    route: RouteClass::CachedFallback,
+                    trace,
+                    cache_level,
+                })
+            }
+            FallbackDirective::NonVerbalReaction { .. } => Ok(HandledGeneration {
+                playback: None,
+                route: RouteClass::NonVerbalFallback,
+                trace,
+                cache_level: None,
+            }),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn commit_generation_result(
         &mut self,
         event: &EventEnvelope,
         result: GenerationResult,
+        fallback: &FallbackDirective,
         output_decision: Option<PublicOutput>,
         at_ms: u64,
         seed: u64,
@@ -2419,12 +2502,7 @@ where
                 if !initial_gate_matches {
                     self.record_worker_output_decision(output_decision.as_ref());
                     trace.fallback_reason = FallbackReason::PolicyOverride;
-                    return Ok(HandledGeneration {
-                        playback: None,
-                        route: RouteClass::NonVerbalFallback,
-                        trace,
-                        cache_level: None,
-                    });
+                    return self.play_fallback_directive(event, fallback, trace, at_ms, seed);
                 }
 
                 let generated_text = generated_text.expect("checked above");
@@ -2441,12 +2519,7 @@ where
                 if !recheck_allows_same_text {
                     self.security.record_public_output_decision(&rechecked);
                     trace.fallback_reason = FallbackReason::PolicyOverride;
-                    return Ok(HandledGeneration {
-                        playback: None,
-                        route: RouteClass::NonVerbalFallback,
-                        trace,
-                        cache_level: None,
-                    });
+                    return self.play_fallback_directive(event, fallback, trace, at_ms, seed);
                 }
 
                 self.record_worker_output_decision(output_decision.as_ref());
@@ -2473,31 +2546,7 @@ where
             }
             GenerationDisposition::Fallback { directive } => {
                 self.record_worker_output_decision(output_decision.as_ref());
-                match directive {
-                    FallbackDirective::CachedReaction { asset_id, .. } => {
-                        let outcome = self.performer.handle_asset_id(
-                            event,
-                            &asset_id,
-                            CachedPlaybackTiming { at_ms, seed },
-                            &self.visemes,
-                            &mut self.pending_audio,
-                            &mut self.pending_avatar,
-                        )?;
-                        let cache_level = cache_level(Some(outcome.cache_tier));
-                        Ok(HandledGeneration {
-                            playback: Some(outcome),
-                            route: RouteClass::CachedFallback,
-                            trace,
-                            cache_level,
-                        })
-                    }
-                    FallbackDirective::NonVerbalReaction { .. } => Ok(HandledGeneration {
-                        playback: None,
-                        route: RouteClass::NonVerbalFallback,
-                        trace,
-                        cache_level: None,
-                    }),
-                }
+                self.play_fallback_directive(event, &directive, trace, at_ms, seed)
             }
             GenerationDisposition::Cancelled { .. } => {
                 self.record_worker_output_decision(output_decision.as_ref());
@@ -2627,7 +2676,7 @@ where
                             ..GenerationTrace::default()
                         },
                         disposition: GenerationDisposition::Fallback {
-                            directive: completion.fallback,
+                            directive: completion.fallback.clone(),
                         },
                     }
                 }
@@ -2636,6 +2685,7 @@ where
             let handled_generation = self.commit_generation_result(
                 &completion.request.source_event,
                 result,
+                &completion.fallback,
                 completion.output_decision,
                 now_ms,
                 completion.request.seed,
@@ -2801,6 +2851,14 @@ where
                 observation.fallback_reason = Some(reason.to_owned());
             }
             observation.budget_denial_reason = trace.budget_denial_reason.clone();
+            if matches!(
+                handled.route,
+                RouteClass::CachedFallback | RouteClass::NonVerbalFallback
+            ) && let Some(reason) = fallback_reason_name(trace.fallback_reason)
+            {
+                self.generation_fallbacks
+                    .note(reason, handled.playback.is_some());
+            }
         }
 
         self.telemetry.record(observation);
@@ -3545,6 +3603,7 @@ mod tests {
     };
     use aivtuber_runtime::{CachedPlaybackConfig, SecurityRuntimeConfig};
 
+    mod local_thinking_fallback_tests;
     mod phrase_commit_tests;
     use aivtuber_scheduler::SchedulerConfig;
     use aivtuber_telemetry::SecretRedactor;
@@ -6368,7 +6427,7 @@ mod tests {
         );
 
         let report = app.startup().expect("startup");
-        assert_eq!(report.indexed.usable, 6);
+        assert_eq!(report.indexed.usable, 8);
         assert!(app.health().stream_error.is_some());
 
         let raw = serde_json::to_vec(&chat_event(1)).expect("event json");

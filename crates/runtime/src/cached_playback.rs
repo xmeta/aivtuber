@@ -1077,9 +1077,9 @@ mod tests {
             .index_and_preload_fast_path()
             .expect("index and preload starter pack");
 
-        assert_eq!(report.indexed.indexed, 6);
-        assert_eq!(report.indexed.usable, 6);
-        assert_eq!(report.preloaded, 6);
+        assert_eq!(report.indexed.indexed, 8);
+        assert_eq!(report.indexed.usable, 8);
+        assert_eq!(report.preloaded, 8);
 
         for id in [
             "reaction.surprise.01",
@@ -1088,6 +1088,8 @@ mod tests {
             "reaction.agree.02",
             "filler.thinking.01",
             "filler.thinking.02",
+            "reaction.neutral.01",
+            "reaction.neutral.02",
         ] {
             assert_eq!(performer.assets().tier(id), Some(CacheTier::Memory));
         }

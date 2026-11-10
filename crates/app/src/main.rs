@@ -14,15 +14,16 @@ use aivtuber_adapters::{
 };
 use aivtuber_app::{
     AdaptationRuntime, AdapterHealth, AvatarOutput, BargeInConfig, BargeInMetrics,
-    CompositionProfile, GenerativeBudgetPolicy, GenerativeRuntime, IntentRoutePlanner,
-    IntentShadowPolicy, LocalAvatarOutput, LocalRoutePlanner, NoopAvatarOutput, NoopStreamOutput,
-    ObsStreamOutput, OperatorControlServer, OperatorRateLimiter, PhraseMetrics, PhraseMode,
-    ProductionApp, ProfileSummary, RawIngressConfig, RawIngressMetrics, RawIngressMetricsSnapshot,
-    RoutePlanner, RuntimeRetentionPolicy, SHADOW_ORCHESTRATOR_SCHEMA_VERSION,
-    ShadowOrchestratorConfig, ShadowPolicyIdentity, ShadowingRoutePlanner,
-    SpeechConversationConfig, SpeechConversationMetrics, SpeechFloorMetrics, SpeechSidecar,
-    SpeechSidecarConfig, SpeechSidecarStats, StreamOutput, TtsSidecarSettings, VtsAvatarOutput,
-    VtsPlaybackConfig, apply_dispatched_request, pump_bounded_records, stt_sidecar_args,
+    CompositionProfile, GenerationFallbackCounts, GenerativeBudgetPolicy, GenerativeRuntime,
+    IntentRoutePlanner, IntentShadowPolicy, LocalAvatarOutput, LocalRoutePlanner, NoopAvatarOutput,
+    NoopStreamOutput, ObsStreamOutput, OperatorControlServer, OperatorRateLimiter, PhraseMetrics,
+    PhraseMode, ProductionApp, ProfileSummary, RawIngressConfig, RawIngressMetrics,
+    RawIngressMetricsSnapshot, RoutePlanner, RuntimeRetentionPolicy,
+    SHADOW_ORCHESTRATOR_SCHEMA_VERSION, ShadowOrchestratorConfig, ShadowPolicyIdentity,
+    ShadowingRoutePlanner, SpeechConversationConfig, SpeechConversationMetrics, SpeechFloorMetrics,
+    SpeechSidecar, SpeechSidecarConfig, SpeechSidecarStats, StreamOutput, TtsSidecarSettings,
+    VtsAvatarOutput, VtsPlaybackConfig, apply_dispatched_request, pump_bounded_records,
+    stt_sidecar_args,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
@@ -518,6 +519,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         app = app.with_speech_observations(tracker);
     }
     let mut last_speech_stats = SpeechSidecarStats::default();
+    let mut last_generation_fallbacks = GenerationFallbackCounts::default();
     let mut sequence_seed = 0_u64;
     let mut next_maintenance_ms = 0_u64;
     let mut last_raw_ingress_metrics = RawIngressMetricsSnapshot::default();
@@ -652,6 +654,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
         }
         app.tick(now_ms);
+        report_generation_fallbacks(
+            app.generation_fallback_counts(),
+            &mut last_generation_fallbacks,
+        );
         if now_ms >= next_maintenance_ms {
             app.maintain_adapters();
             if let Some(tracker) = app.speech_observations_mut() {
@@ -783,6 +789,29 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+/// One line per newly counted generation fallback, naming the typed reason
+/// (`timeout`, `unavailable`, `policy_override`, ...) from the closed
+/// fallback vocabulary. Bounded by construction: it prints only when a counter
+/// moved, never carries provider text or error messages, and the totals are
+/// the process-lifetime counters (issue #288).
+fn report_generation_fallbacks(
+    current: &GenerationFallbackCounts,
+    previous: &mut GenerationFallbackCounts,
+) {
+    if current == previous {
+        return;
+    }
+    for (reason, count) in &current.by_reason {
+        if previous.by_reason.get(reason) != Some(count) {
+            eprintln!(
+                "generation_fallback: reason={reason} count={count} visible_total={} unseen_total={}",
+                current.visible, current.silent
+            );
+        }
+    }
+    previous.clone_from(current);
 }
 
 fn elapsed_ms(started: Instant) -> u64 {

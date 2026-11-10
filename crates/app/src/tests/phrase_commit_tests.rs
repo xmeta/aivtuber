@@ -4,8 +4,8 @@
 
 use super::*;
 use aivtuber_generative::{
-    Delivery, GenerationDisposition, GenerativePipeline, PhraseConfig, PhraseDelivery, PhraseEnd,
-    PhraseUnit, SlotWait,
+    Delivery, FallbackDirective, GenerationDisposition, GenerativePipeline, PhraseConfig,
+    PhraseDelivery, PhraseEnd, PhraseUnit, SlotWait,
 };
 use std::sync::atomic::AtomicBool;
 
@@ -557,6 +557,18 @@ fn allow(text: &str) -> Option<PublicOutput> {
 
 fn register_run(rig: &mut Rig, event: &EventEnvelope) -> GenerationCancellationToken {
     let token = GenerationCancellationToken::default();
+    // The same selection production makes at submission: the pack's silent
+    // acknowledgement is available, so only the commit rules decide whether
+    // it may play (issue #288).
+    let fallback = FallbackDirective::CachedReaction {
+        variant_group: "reaction.neutral".to_owned(),
+        asset_id: rig
+            .app
+            .performer()
+            .assets()
+            .select_variant_id("reaction.neutral", 7, &[])
+            .expect("starter pack carries reaction.neutral"),
+    };
     let generative = rig.app.generative.as_mut().expect("generative runtime");
     generative.cancellation.activate(event, token.clone());
     generative.active_generation_id = Some(1);
@@ -583,6 +595,7 @@ fn register_run(rig: &mut Rig, event: &EventEnvelope) -> GenerationCancellationT
         Arc::new(AtomicU32::new(0)),
         Instant::now() + Duration::from_secs(60),
         context,
+        fallback,
     ));
     token
 }
@@ -668,10 +681,17 @@ fn a_gate_refusal_of_phrase_two_after_phrase_one_played_ends_the_reply_at_the_ho
     let metrics = rig.app.phrase_metrics();
     assert_eq!(metrics.gate_rejected_after_commit, 1);
     assert_eq!(metrics.gate_rejected_before_first_commit, 0);
+    // A cached fallback was available, yet a reply that already spoke ends
+    // after its last committed phrase with no fallback playback (issue #288).
+    assert_eq!(rig.app.performer().scheduler().items().len(), 1);
+    assert_eq!(
+        rig.app.generation_fallback_counts(),
+        &GenerationFallbackCounts::default()
+    );
 }
 
 #[test]
-fn a_gate_refusal_of_phrase_one_speaks_nothing_and_is_observed_as_a_policy_override() {
+fn a_gate_refusal_of_phrase_one_speaks_nothing_and_plays_the_visible_fallback() {
     let event = chat_event(30);
     let (mut units, _summary) = make_units(&event);
     let mut rig = rig_with(phrased(), "unused", PhraseTts::new());
@@ -682,15 +702,27 @@ fn a_gate_refusal_of_phrase_one_speaks_nothing_and_is_observed_as_a_policy_overr
     rig.app.tick(0);
 
     assert!(token.is_cancelled());
+    // Nothing was spoken: the pack's silent acknowledgement plays instead
+    // (issue #288), exactly as for a buffered reply the gate refused.
     assert_eq!(audio_count(&rig), 0);
-    assert!(rig.app.performer().scheduler().items().is_empty());
+    assert_eq!(phrase_items(&rig).len(), 0);
+    let items = rig.app.performer().scheduler().items();
+    assert_eq!(items.len(), 1);
+    assert!(items[0].plan.asset_id.starts_with("reaction.neutral."));
     assert_eq!(
         rig.app.phrase_metrics().gate_rejected_before_first_commit,
         1
     );
     let observations = rig.app.telemetry().events();
     assert_eq!(observations.len(), 1);
-    assert_eq!(observations[0].route, RouteClass::NonVerbalFallback);
+    assert_eq!(observations[0].route, RouteClass::CachedFallback);
+    assert_eq!(
+        observations[0].fallback_reason.as_deref(),
+        Some("policy_override")
+    );
+    let counts = rig.app.generation_fallback_counts();
+    assert_eq!(counts.by_reason.get("policy_override"), Some(&1));
+    assert_eq!((counts.visible, counts.silent), (1, 0));
 }
 
 #[test]
