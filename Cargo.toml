@@ -11,6 +11,7 @@ members = [
     "crates/adaptation",
     "crates/hardening",
     "crates/app",
+    "crates/setup",
 ]
 # The fuzz crate is intentionally NOT a member (issue #146). It needs a nightly
 # compiler and `libfuzzer-sys`; as a member it would be resolved by

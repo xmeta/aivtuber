@@ -10,7 +10,10 @@
 //   * the STT worker and the TTS sidecar verify the bundled engine libraries
 //     and then refuse an empty (unpinned) model directory with exit 2;
 //   * a tampered library beside a program is refused with exit 2;
-//   * the avatar page files are present.
+//   * the avatar page files are present;
+//   * the first-run command (aivtuber-setup, issue #294 S2) prints its plan with
+//     --dry-run and refuses --offline when nothing is fetched, without touching
+//     the network or writing a file.
 // Exit 0 when all pass, 1 otherwise. Runs on Windows x64 and Linux x64.
 import { spawnSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, appendFileSync, readdirSync, rmSync, statSync } from "node:fs";
@@ -31,6 +34,7 @@ const libs = win
 const programs = [
   "aivtuber-app",
   "aivtuberctl",
+  "aivtuber-setup",
   "speech-vad-sidecar",
   "speech-stt-worker",
   "local-tts-sidecar",
@@ -102,15 +106,9 @@ try {
     assert(assets.some((f) => f.endsWith(".js")), "renderer/local-avatar/dist/assets has no script bundle");
   });
 
-  check("operator fetch scripts are present", () => {
-    for (const rel of [
-      "scripts/fetch-local-profile.mjs",
-      "scripts/fetch-sherpa-onnx.mjs",
-      "scripts/synthesize-starter-audio.mjs",
-      "renderer/local-avatar/smoke/fetch-model.mjs",
-    ]) {
-      assert(existsSync(join(root, rel)), `missing ${rel}`);
-    }
+  check("no Node script ships: the first-run command replaces them", () => {
+    assert(!existsSync(join(root, "scripts")), "scripts/ must not ship");
+    assert(!existsSync(join(root, "renderer", "local-avatar", "smoke")), "renderer smoke scripts must not ship");
   });
 
   check("starter pack has descriptors and no audio", () => {
@@ -135,7 +133,7 @@ try {
   // or a crash is a different code and prints no usage). Reaching main at all
   // means the OS loader found every linked library, including the engine
   // libraries beside the executable.
-  const probes = ["speech-vad-sidecar", "speech-stt-worker", "local-tts-sidecar", "twitch-chat-ingress", "youtube-chat-ingress", "aivtuberctl"];
+  const probes = ["aivtuber-setup", "speech-vad-sidecar", "speech-stt-worker", "local-tts-sidecar", "twitch-chat-ingress", "youtube-chat-ingress", "aivtuberctl"];
   for (const program of probes) {
     check(`${program} --help starts and prints usage`, () => {
       const { status, out } = run(join(root, program + exe), ["--help"], root);
@@ -144,6 +142,30 @@ try {
       return `exit ${status}`;
     });
   }
+
+  // First-run command: the plan, offline. Nothing may be fetched or written.
+  const listing = () => readdirSync(root, { recursive: true }).map(String).sort().join("\n");
+  check("aivtuber-setup local --dry-run prints the plan and touches nothing", () => {
+    const before = listing();
+    const assets = join(work, "setup-assets");
+    const { status, out } = run(join(root, "aivtuber-setup" + exe), ["local", "--dry-run", "--assets", assets], root);
+    assert(status === 0, `exit ${status}: ${out.trim().slice(0, 400)}`);
+    for (const needle of ["dry run", "Qwen3-4B-Instruct-2507-Q4_K_M.gguf", "Supertonic 3", "OpenRAIL-M", "machine-generated", "ReazonSpeech", "start"]) {
+      assert(out.includes(needle), `plan lacks "${needle}": ${out.trim().slice(0, 400)}`);
+    }
+    assert(!existsSync(assets), "dry run created the assets directory");
+    assert(listing() === before, "dry run changed the unpacked directory");
+  });
+  check("aivtuber-setup local --offline fails closed and writes no env file", () => {
+    const { status, out } = run(join(root, "aivtuber-setup" + exe), ["local", "--offline", "--assets", join(work, "setup-assets-2")], root);
+    assert(status === 1, `exit ${status}: ${out.trim().slice(0, 400)}`);
+    assert(/--offline: missing/.test(out), `no offline refusal: ${out.trim().slice(0, 400)}`);
+    assert(!existsSync(join(root, "local-profile.env")), "an env file was written");
+  });
+  check("aivtuber-setup start --dry-run without an env file points at the setup step", () => {
+    const { status, out } = run(join(root, "aivtuber-setup" + exe), ["start", "--dry-run"], root);
+    assert(status === 1 && /aivtuber-setup local/.test(out), `exit ${status}: ${out.trim().slice(0, 400)}`);
+  });
 
   // The app has no --help: with no configuration it must stop with an error
   // naming a missing setting, not start serving or hang.

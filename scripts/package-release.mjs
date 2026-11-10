@@ -8,7 +8,7 @@
 //
 // Platform is the platform this script runs on (win32-x64 or linux-x64): the
 // engine libraries are the ones pinned for that platform in
-// scripts/fetch-sherpa-onnx.mjs and in the Rust pins
+// packaging/local-profile-pins.json and in the Rust pins
 // (crates/adapters/src/speech_stt/pins.rs), so no other platform is packaged.
 //
 // Output: <out>/aivtuber-local-<version>-<windows|linux>-x64.<zip|tar.gz>
@@ -56,21 +56,12 @@ const PLATFORMS = {
 export const BINARIES = [
   "aivtuber-app",
   "aivtuberctl",
+  "aivtuber-setup",
   "speech-vad-sidecar",
   "speech-stt-worker",
   "local-tts-sidecar",
   "twitch-chat-ingress",
   "youtube-chat-ingress",
-];
-
-// Node scripts shipped for the model fetch step. Paths are repository-relative
-// and kept, because the scripts locate each other relative to the repository
-// root; the quickstart commands then run unchanged from the unpacked directory.
-const OPERATOR_SCRIPTS = [
-  "scripts/fetch-local-profile.mjs",
-  "scripts/fetch-sherpa-onnx.mjs",
-  "scripts/synthesize-starter-audio.mjs",
-  "renderer/local-avatar/smoke/fetch-model.mjs",
 ];
 
 // The renderer's shipped runtime closure (docs/supply-chain.adoc section 8).
@@ -200,18 +191,13 @@ function main() {
     scan(pageDir);
     if (stray.length) fail(`refusing to package model-like files in the page build: ${stray.join(", ")}`);
 
-    // 4. Starter reaction pack (descriptors only; audio is generated locally)
-    // and the operator fetch/synthesis scripts, in the repository's layout.
-    // They need Node 20+ only; until the first-run command (#294 S2) this is
-    // how the models are fetched.
+    // 4. Starter reaction pack (descriptors only; audio is generated locally by
+    // `aivtuber-setup local`, which also fetches the models; no Node scripts
+    // ship, the pins are embedded in that binary).
     cpSync(join(repo, "examples", "starter-reaction-pack"), join(stage, "examples", "starter-reaction-pack"), {
       recursive: true,
       filter: (src) => !/[\\/]generated([\\/]|$)/.test(src),
     });
-    for (const script of OPERATOR_SCRIPTS) {
-      mkdirSync(dirname(join(stage, script)), { recursive: true });
-      cpSync(join(repo, script), join(stage, script));
-    }
 
     // 5. Licences and notices.
     if (existsSync(join(repo, "LICENSE"))) cpSync(join(repo, "LICENSE"), join(stage, "LICENSE"));

@@ -2030,10 +2030,11 @@ for (const file of trackedFiles) {
       `ci.yml renderer job runs "${needle}"`,
     );
   }
-  const model = readFileSync(join(rendererDir, "smoke/fetch-model.mjs"), "utf8");
+  // The pin lives in the shared manifest (issue #294 S2); the script only reads it.
+  const pins = JSON.parse(readFileSync(join(root, "packaging/local-profile-pins.json"), "utf8"));
   rendererCheck(
-    /commit: "[0-9a-f]{40}"/.test(model) && /sha256: "[0-9a-f]{64}"/.test(model),
-    "sample model is pinned to a commit and a SHA-256",
+    /^[0-9a-f]{40}$/.test(pins.avatar?.commit ?? "") && /^[0-9a-f]{64}$/.test(pins.avatar?.sha256 ?? ""),
+    "sample model is pinned to a commit and a SHA-256 in packaging/local-profile-pins.json",
   );
 }
 

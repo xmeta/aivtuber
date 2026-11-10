@@ -114,8 +114,13 @@ jobs:
           --bin speech-vad-sidecar --bin speech-stt-worker
           --bin local-tts-sidecar --bin twitch-chat-ingress --bin youtube-chat-ingress
 
-      - name: Build the app and operator tool
-        run: cargo build --release --locked -p aivtuber-app --bin aivtuber-app --bin aivtuberctl
+      # aivtuber-setup is the first-run command (issue #294 S2): it fetches the
+      # models and writes the configuration, so the archive needs no Node/Bun/Cargo.
+      - name: Build the app, operator tool and first-run command
+        run: >
+          cargo build --release --locked
+          -p aivtuber-app --bin aivtuber-app --bin aivtuberctl
+          -p aivtuber-setup --bin aivtuber-setup
 
       # Exact pins, committed lock, no install hooks (docs/supply-chain.adoc section 8).
       - name: Build the avatar page
@@ -152,7 +157,8 @@ jobs:
   # touches nothing but the downloaded archive (and the smoke script): it shows
   # that the unpacked archive is self-contained, that every program starts, and
   # that the bundled engine libraries load and verify from beside the
-  # executables. No model is fetched or run.
+  # executables. aivtuber-setup is exercised offline (--dry-run, --offline).
+  # No model is fetched or run.
   smoke:
     name: Smoke ${{ matrix.label }}
     needs: build
@@ -243,7 +249,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cat > "$RUNNER_TEMP/notes.md" <<'EOF'
-          Prebuilt local profile for Windows x64 and Linux x64. No model weights, voice files or avatar model are included: fetch them with the pinned fetch step (see the quickstart).
+          Prebuilt local profile for Windows x64 and Linux x64. No model weights, voice files or avatar model are included: the first-run command `aivtuber-setup local` fetches and verifies them (no Node, Bun or Cargo needed).
 
           Verify the download against `SHA256SUMS` before you unpack it:
 
@@ -251,6 +257,8 @@ jobs:
           - Linux: `sha256sum -c SHA256SUMS --ignore-missing`
 
           The programs are not code-signed. Windows SmartScreen may warn on first start.
+
+          Then, from the unpacked folder: `aivtuber-setup local`, then `aivtuber-setup start`.
 
           Guide: docs/local-profile-quickstart.adoc ("Download a release").
           EOF

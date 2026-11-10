@@ -4,7 +4,7 @@
 //   node scripts/fetch-local-profile.mjs <dest-dir> [--llama-flavor vulkan|cpu] [--skip llm,llama,...]
 //
 // It adds only what no existing script covers (the llama.cpp release, the LLM
-// GGUF and the Silero VAD model, each pinned by SHA-256 below). The sherpa-onnx
+// GGUF and the Silero VAD model, each pinned by SHA-256 in the manifest). The sherpa-onnx
 // libraries and the STT/TTS models are fetched by running
 // scripts/fetch-sherpa-onnx.mjs, and the sample VRM by
 // renderer/local-avatar/smoke/fetch-model.mjs, so no pin is duplicated here.
@@ -17,7 +17,7 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, renameSync, rmSync } from "node:fs";
+import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -26,30 +26,13 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const repo = resolve(here, "..");
 
-// llama.cpp release b12224 (MIT). SHA-256 values equal the digests GitHub
-// publishes for the release assets; the Windows Vulkan one is the build that
-// docs/provider-conformance.adoc records as verified.
-const LLAMA_TAG = "b12224";
-const LLAMA = {
-  "win32-x64-vulkan": { name: "llama-b12224-bin-win-vulkan-x64.zip", sha256: "abb2363a8cf2fa622a40f80330828806fb9f344b483074f29478303a5b76fc27" },
-  "win32-x64-cpu": { name: "llama-b12224-bin-win-cpu-x64.zip", sha256: "d7a7a3e014a02dbfce46977f9da6d9b58196b9c83b80bcf6ef2337134103c3d6" },
-  "linux-x64-vulkan": { name: "llama-b12224-bin-ubuntu-vulkan-x64.tar.gz", sha256: "14a722b31c87f7216d89171ac6d5ec9fbeae278ccbfdf008ac956092f405d3b6" },
-  "linux-x64-cpu": { name: "llama-b12224-bin-ubuntu-x64.tar.gz", sha256: "e3f9e11e61b8bcecccc4b7522d131cc6d3ec18fc3f31f6caa58ddda63801bbd5" },
-};
-
-// Qwen3-4B-Instruct-2507 Q4_K_M (Apache-2.0), unsloth quantization, pinned revision.
-const GGUF = {
-  name: "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
-  url: "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/a06e946bb6b655725eafa393f4a9745d460374c9/Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
-  sha256: "3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597",
-};
-
-// Silero VAD v6.2.3 (MIT), the 16 kHz If-less export tract can load.
-const VAD = {
-  name: "silero_vad_op18_ifless.onnx",
-  url: "https://raw.githubusercontent.com/snakers4/silero-vad/v6.2.3/src/silero_vad/data/silero_vad_op18_ifless.onnx",
-  sha256: "7671cd04b004e9076da0d4a7b1a5aec36adf161c39230c1cb94a4fd5db6bbd28",
-};
+// Pins (URL, SHA-256, size) come from packaging/local-profile-pins.json, the single
+// source shared with `aivtuber-setup local` (crates/setup).
+const PINS = JSON.parse(readFileSync(join(repo, "packaging", "local-profile-pins.json"), "utf8"));
+const LLAMA_TAG = PINS.llama.tag;
+const LLAMA = PINS.llama.assets;
+const GGUF = PINS.llm;
+const VAD = PINS.vad;
 
 function fail(message) {
   console.error(`fetch-local-profile: ${message}`);
@@ -101,26 +84,26 @@ if (!skip.has("llama")) {
   const asset = LLAMA[`${platform}-${flavor}`];
   if (!asset) fail(`no pinned llama.cpp asset for ${platform} ${flavor} (pinned: ${Object.keys(LLAMA).join(", ")})`);
   const dir = join(root, "llama");
-  const archive = join(dir, asset.name);
-  await download(`https://github.com/ggml-org/llama.cpp/releases/download/${LLAMA_TAG}/${asset.name}`, archive, asset.sha256);
+  const archive = join(dir, asset.file);
+  await download(asset.url, archive, asset.sha256);
   const bin = join(dir, "bin");
   mkdirSync(bin, { recursive: true });
   // Windows: the system bsdtar reads zip; a GNU tar earlier on PATH (Git Bash) cannot, and reads "I:\x" as host "I".
   const tar = process.platform === "win32" ? join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe") : "tar";
-  execFileSync(tar, ["-xf", join("..", asset.name), "-C", "."], { stdio: "inherit", cwd: bin });
+  execFileSync(tar, ["-xf", join("..", asset.file), "-C", "."], { stdio: "inherit", cwd: bin });
   const exe = process.platform === "win32" ? "llama-server.exe" : "llama-server";
   // The Linux archive nests a build-<tag> directory; the Windows one is flat.
   const found = existsSync(join(bin, exe)) ? join(bin, exe) : readdirSync(bin, { withFileTypes: true }).map((e) => join(bin, e.name, exe)).find(existsSync);
-  if (!found) fail(`${exe} not found after extracting ${asset.name}`);
+  if (!found) fail(`${exe} not found after extracting ${asset.file}`);
   out.LLAMA_SERVER = found;
 }
 if (!skip.has("llm")) {
-  const path = join(root, "llm", GGUF.name);
+  const path = join(root, "llm", GGUF.file);
   await download(GGUF.url, path, GGUF.sha256);
   out.LLM_GGUF = path;
 }
 if (!skip.has("vad")) {
-  const path = join(root, "vad", VAD.name);
+  const path = join(root, "vad", VAD.file);
   await download(VAD.url, path, VAD.sha256);
   out.VAD_MODEL = path;
 }

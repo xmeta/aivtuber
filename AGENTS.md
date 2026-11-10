@@ -35,6 +35,7 @@ Do not open a normal PR for incomplete implementation. For interrupted work, pus
 
 - crates/: production-target Rust implementation.
 - crates/app: production composition root and lifecycle ownership.
+- crates/setup: first-run `aivtuber-setup local|start` for release archives (verified downloads, safe extraction, starter audio, env file); pins come from packaging/local-profile-pins.json.
 - crates/domain: provider-neutral bounded/versioned domain contracts.
 - crates/runtime: security enforcement and runtime boundaries.
 - crates/reflex: semantic retrieval and Jev/System One decision path.
