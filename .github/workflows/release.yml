@@ -17,8 +17,6 @@ name: Release archives
 
 on:
   push:
-    branches:
-      - feat/294-s1-release-archives # TEMPORARY dry-run trigger; removed before merge
     tags:
       - "v*"
   workflow_dispatch:
