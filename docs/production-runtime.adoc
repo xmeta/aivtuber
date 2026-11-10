@@ -660,6 +660,8 @@ Actions:
 
 Full guarantees: docs/security-threat-model.adoc section 6.1.
 
+*Memory erase (issue #305).* Retained viewer memory can be erased on request. The library entry point is +ProductionApp::erase_memory_operator+, which requires the authenticated +memory.admin+ capability, takes an actor +(source namespace, raw actor id)+ and/or up to 32 retained memory ids, and returns an +ErasureReport+ that lists what was removed and every remnant the runtime cannot prove erased (sidecar copies, Hindsight +retire+, generated assets, spoken output, provider and audit logs, backups). It is RAM-only and not yet an +aivtuberctl+ action; the current operator socket grants only +performer.stop+ and +performer.mute+. Viewers can ask to be forgotten by sending exactly +!forgetme+ in public chat; only their own pseudonym is erased, at most once per 60 seconds, and the line is consumed before routing. Each erase writes an audit record (+erase_erased+, +erase_noop+ or +erase_ratelimited+) without claim text or raw ids. Details: docs/memory-adaptation.adoc section 13.1 and ADR-0008.
+
 *Unmute is intentionally not supported.* Mute is a latching emergency state: resuming output requires restarting the daemon with a verified configuration. This is a deliberate choice so a compromised operator session cannot silently re-enable output.
 
 CLI client (clap-based):
