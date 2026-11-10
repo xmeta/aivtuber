@@ -13,6 +13,9 @@ the command line or the environment, never from the repository.
 `both`  Thinking and VLM resident together: VRAM, Thinking first-token latency idle, then with the VLM job
         running back-to-back, every 5 s and every 10 s.
 `f3`    injection frames: raw model output kept for leakage review and for the Rust replay check.
+`reply` EXP-0004b: 30 local-profile-shaped Thinking requests (reply_prompts.py) to one server; replies and first-token latency.
+`mux`   EXP-0004b: ONE server (a multimodal model) serves Thinking and captions; Thinking first-token latency alone and
+        with captions at 10 s / 5 s, with and without the "yield to Thinking" admission gate; caption latency and validity.
 """
 import argparse
 import base64
@@ -396,9 +399,142 @@ def cmd_both(a):
     print(json.dumps(brief, indent=1))
 
 
+# ---- EXP-0004b: single resident model -------------------------------------------------------------
+
+def load_prompts():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("reply_prompts", Path(__file__).with_name("reply_prompts.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.build()
+
+
+def chat_stream(port, prompt, max_tokens=96, seed=1234):
+    """Local-profile-like call: one user message, default sampling, max 96 tokens. Returns (ttft, total, text)."""
+    body = {"messages": [{"role": "user", "content": prompt}], "stream": True, "max_tokens": max_tokens, "seed": seed, "cache_prompt": False}
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    t0, first, text = time.perf_counter(), None, ""
+    with urllib.request.urlopen(req, timeout=180) as r:
+        for line in r:
+            line = line.strip()
+            if not line.startswith(b"data:") or line == b"data: [DONE]":
+                continue
+            d = json.loads(line[5:])
+            ch = d["choices"][0]["delta"].get("content") if d.get("choices") else None
+            if ch:
+                if first is None:
+                    first = time.perf_counter() - t0
+                text += ch
+    return first, time.perf_counter() - t0, text
+
+
+def probe_ms(port, n=3):
+    """Latency probe for spill detection: a fixed 16-token generation, median of n, after one discarded call."""
+    chat_stream(port, "Say OK.", 16)
+    xs = sorted(chat_stream(port, "Reply with the single word OK.", 16)[1] for _ in range(n))
+    return xs[len(xs) // 2] * 1000
+
+
+def cmd_reply(a):
+    prompts = load_prompts()
+    res = {"model": Path(a.model).name, "mmproj": Path(a.mmproj).name if a.mmproj else None, "vram_before_mib": vram_used_mib()}
+    with Server(a.server, a.port, a.model, a.mmproj, a.ctx) as s, VramSampler() as vs:
+        res["load_s"] = s.wait_ready()
+        res["vram_idle_mib"] = vram_used_mib()
+        res["probe_ms"] = probe_ms(a.port)
+        rows = []
+        for name, prompt in prompts:
+            first, total, text = chat_stream(a.port, prompt)
+            rows.append({"case": name, "ttft_s": first, "total_s": total, "text": text})
+            time.sleep(a.gap)
+        res["vram_peak_mib"] = vs.peak
+        res["rows"] = rows
+        res["ttft_s"] = summarize([r["ttft_s"] for r in rows if r["ttft_s"] is not None])
+        res["total_s"] = summarize([r["total_s"] for r in rows])
+    Path(a.out).write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
+    print(json.dumps({k: res[k] for k in ("model", "load_s", "vram_before_mib", "vram_idle_mib", "vram_peak_mib", "probe_ms", "ttft_s", "total_s")}, indent=1))
+
+
+def mux_background(port, files, lang, s1a, msch, interval, stop, spans, rows, gate):
+    """Caption job loop on the shared server. With gate, a tick is skipped while a Thinking request is in flight."""
+    k, seq = 0, 1
+    while not stop.is_set():
+        s = time.monotonic()
+        if gate is not None and gate["busy"]:
+            rows.append({"skipped": True})
+        else:
+            f = files[k % len(files)]
+            try:
+                text, dt, _, _ = vlm_call(port, f["path"], lang)
+                v, ans = check(text, seq, s1a, msch)
+                rows.append({"latency_s": dt, "valid": v, "truth": f["scene_class"], "scene": ans.get("scene_class") if isinstance(ans, dict) else None})
+                spans.append((s, time.monotonic()))
+            except Exception as e:
+                rows.append({"error": str(e)})
+            k += 1
+            seq += 1
+        stop.wait(max(0.0, interval - (time.monotonic() - s)))
+
+
+def think_series_gated(port, prompts, n, gap_s, gate):
+    out = []
+    for k in range(n):
+        if gate is not None:
+            gate["busy"] = True
+        s = time.monotonic()
+        first, total, _ = chat_stream(port, prompts[k % len(prompts)][1])
+        if gate is not None:
+            gate["busy"] = False
+        out.append({"start": s, "end": time.monotonic(), "ttft_s": first, "total_s": total})
+        time.sleep(gap_s)
+    return out
+
+
+def cmd_mux(a):
+    s1a, msch = load_validators()
+    files = files_for(a.frames, "benign")
+    prompts = load_prompts()
+    res = {"model": Path(a.model).name, "parallel": a.parallel, "ctx": a.ctx, "vram_before_mib": vram_used_mib()}
+    with Server(a.server, a.port, a.model, a.mmproj, a.ctx, ["--parallel", str(a.parallel)]) as srv, VramSampler() as vs:
+        res["load_s"] = srv.wait_ready()
+        res["vram_idle_mib"] = vram_used_mib()
+        res["probe_ms_idle"] = probe_ms(a.port)
+        vlm_pass(a.port, files[:2], a.lang, s1a, msch)
+        think_series(a.port, 2)
+        conds = {}
+        rows = think_series_gated(a.port, prompts, a.n, a.gap, None)
+        conds["thinking_alone"] = {"ttft_s": tsum(rows), "total_s": summarize([r["total_s"] for r in rows]), "rows": rows}
+        for name, interval, gated in (("captions_10s", 10.0, False), ("captions_10s_yield", 10.0, True), ("captions_5s", 5.0, False)):
+            gate = {"busy": False} if gated else None
+            stop, spans, crows = threading.Event(), [], []
+            t = threading.Thread(target=mux_background, args=(a.port, files, a.lang, s1a, msch, interval, stop, spans, crows, gate))
+            t.start()
+            time.sleep(0.2)
+            rows = think_series_gated(a.port, prompts, a.n, a.gap, gate)
+            stop.set()
+            t.join()
+            ok = [r for r in crows if "latency_s" in r]
+            ov = [r for r in rows if overlap(r, spans)]
+            no = [r for r in rows if not overlap(r, spans)]
+            rate = lambda key: (sum(1 for r in ok if r["valid"][key]) / len(ok)) if ok else None
+            conds[name] = {"thinking_ttft_s_all": tsum(rows), "n_overlap": len(ov), "ttft_s_overlap": tsum(ov), "ttft_s_no_overlap": tsum(no),
+                           "caption_jobs": len(ok), "caption_skipped": sum(1 for r in crows if r.get("skipped")), "caption_errors": sum(1 for r in crows if "error" in r),
+                           "caption_latency_s": summarize([r["latency_s"] for r in ok]),
+                           "caption_json_rate": rate("json"), "caption_s1a_raw_rate": rate("s1a"), "caption_s1a_repaired_rate": rate("s1a_after_repair"),
+                           "scene_agreement": (sum(1 for r in ok if r["scene"] == r["truth"]) / len(ok)) if ok else None, "rows": rows}
+        res["probe_ms_after"] = probe_ms(a.port)
+        res["vram_peak_mib"] = vs.peak
+        res["conditions"] = conds
+    Path(a.out).write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
+    brief = {k: v for k, v in res.items() if k != "conditions"}
+    brief["conditions"] = {k: {kk: vv for kk, vv in v.items() if kk != "rows"} for k, v in res["conditions"].items()}
+    print(json.dumps(brief, indent=1))
+
+
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("cmd", choices=["vlm", "think", "both", "f3"])
+    p.add_argument("cmd", choices=["vlm", "think", "both", "f3", "reply", "mux"])
+    p.add_argument("--parallel", type=int, default=1, help="llama-server slots for mux")
     p.add_argument("--server", required=True, help="llama-server binary")
     p.add_argument("--model", help="VLM (or Thinking for 'think') gguf")
     p.add_argument("--mmproj")
@@ -414,7 +550,7 @@ def main():
     p.add_argument("--n", type=int, default=20, help="Thinking requests per condition")
     p.add_argument("--gap", type=float, default=2.5, help="seconds between Thinking requests under load")
     a = p.parse_args()
-    {"vlm": cmd_vlm, "f3": cmd_f3, "think": cmd_think, "both": cmd_both}[a.cmd](a)
+    {"vlm": cmd_vlm, "f3": cmd_f3, "think": cmd_think, "both": cmd_both, "reply": cmd_reply, "mux": cmd_mux}[a.cmd](a)
 
 
 if __name__ == "__main__":
