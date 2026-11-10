@@ -1,0 +1,509 @@
+= ADR-0008: Cross-session memory persistence and end-to-end erasure
+:status: Proposed
+:date: 2026-11-10
+:toc:
+
+== Context
+
+Issue #282 (parent #105, `status:design-ready`) asks whether, and how, approved memory should survive a process restart and long gaps between streams, without giving up bounded retention, pseudonymous viewer isolation, or verifiable erasure. It forbids presuming SQLite or long-lived storage.
+
+This ADR is design only. It authorizes no production database, no new dependency, no schema change and no production code. Code line references are to `main` at `b9efb0f5`. The statements about SQLite behaviour in section 3.3 come from one disposable experiment described there; nothing else in this ADR was run.
+
+Inputs: link:../memory-adaptation.adoc[Memory and Adaptation Runtime] (sections 2-3, 10-12), link:../runtime-retention.adoc[Runtime Retention], link:../security-threat-model.adoc[Security Threat Model] section 8, link:../assumptions.adoc[A-MEM-001], link:../competitive-landscape.adoc[Competitive landscape] gap 5 (OLV removed long-term memory, AIRI's is unchecked, so this is parity against two competitors and a gap against two), link:../reuse-first.adoc[Reuse-first] (agent memory services row), link:../research-register.adoc[Research register].
+
+== Hard constraints
+
+* Durable memory writes need the non-serializable `MemoryWritePermit`; public chat cannot mint one (A-MEM-001, `docs/security-threat-model.adoc` section 8). Persistence must not become a second write path: a stored record loaded at boot is not a new authorization, so loading must go through a path that cannot widen what the original write gate admitted.
+* Model, Jev and generated output are data; a consolidation or erasure *proposal* from a model is never an erasure or a write.
+* No raw viewer id and no pseudonym key in any persisted memory artifact. Source/provider namespace stays in the pseudonym domain; cross-provider identity matching is not assumed (`docs/domain-contract.adoc` section 11).
+* Every retained structure is explicitly bounded (`docs/runtime-retention.adoc`), including anything on disk: disk growth must plateau.
+* Replay-relevant decisions use logical/monotonic ordering, not wall clock. Expiry across a restart must therefore be an explicit recorded input, not an ambient clock read.
+* Zero-paid, local-first baseline (#220): the minimal profile must not require a database server, a remote service or a provider key. Any remote sidecar is explicit opt-in.
+* Operator emergency control and the deterministic performer must not depend on the memory store: any store failure degrades to "no memory context", never to a frozen performer.
+* Fail closed: when visibility or erasure state cannot be established, viewer-attributed memory is unreadable.
+
+== Assumptions
+
+* A-MEM-001 (invariant, unchanged).
+* New, to be added to `docs/assumptions.adoc` if this ADR is accepted: *A-MEM-002* durable retained memory volume stays in the low thousands of entries per installation; the trigger that reopens this is in "Revisit conditions". *A-MEM-003* no production code path currently writes durable memory, so cross-session continuity has no current producer (section 1.3).
+
+== 1. Current-state inventory (against the Rust code)
+
+=== 1.1 What exists and where it lives
+
+[cols="3,3,3"]
+|===
+|State |Location |Survives a process restart?
+
+|Working and durable `MemoryEntry` list
+|`WorkingMemory::entries: VecDeque<MemoryEntry>`, `crates/adaptation/src/lib.rs:400`; entry shape `:56`
+|*No.* Constructed empty by `WorkingMemory::new` (`:416`) from `build_adaptation_runtime` (`crates/app/src/main.rs:1287-1299`). `WorkingMemory` derives only `Debug, Clone` (`:399`); there is no snapshot, load or save API.
+
+|Memory links (`memory-link-v2`)
+|`WorkingMemory::links`, `:470`
+|No; pruned with their endpoint nodes in `compact` (`:967`).
+
+|Node identity counter
+|`next_memory_id`, starts at 1 (`:416` ff.)
+|No. A persistence design must persist it or links and tombstones can collide after restart.
+
+|Compaction diagnostics
+|`WorkingMemory::compactions`
+|No (bounded RAM ring).
+
+|Pseudonym key and version
+|Environment `AIVTUBER_MEMORY_PSEUDONYM_KEY_HEX` / `_VERSION` (`main.rs:1294-1297`); first-run `setup` writes the key into the operator's `local-profile.env` (`crates/setup/src/config.rs:84`)
+|Yes, but as an operator-owned secret outside any memory artifact. It is the only thing that lets a raw viewer id be mapped to stored pseudonyms.
+
+|Adaptation feedback, decisions, recent-variant groups
+|`AdaptationEngine` (`lib.rs:1609`)
+|No.
+
+|Generated L1 asset descriptors
+|`AssetStore::persist_generated_descriptor`, `crates/asset-store/src/lib.rs:1360` (temp file, `sync_all`, rename, `:1408-1412`); removed by `invalidate_generated_asset` (`:1432`)
+|Yes. Not memory, but *derived from memory-enriched replies* and carrying no memory provenance: `Provenance` (`:148`) has backend/model/routing fields only. See remnants, section 6.
+
+|Telemetry and security audit detail
+|Bounded RAM (`docs/runtime-retention.adoc`)
+|No.
+
+|External sidecar copies (Hindsight)
+|Only via the evaluation runner `memory_sidecar_eval.rs`; port `MemorySidecar`, `crates/domain/src/sidecar.rs:187-207`; adapter `crates/adapters/src/hindsight.rs`
+|The service's own store survives; the project has no production caller (below).
+|===
+
+=== 1.2 The "24 hour" gap, stated accurately
+
+The issue says the default durable TTL is 24 hours (`AIVTUBER_MEMORY_DURABLE_TTL_MS`, `main.rs:1289`; default `WorkingMemoryConfig`, `lib.rs:358-371`). That is true and it is the *smaller* gap. Three independent gaps exist:
+
+. *G1 - no persistence at all.* The TTL is a ceiling on in-process retention; a restart empties the store regardless of TTL. "Durable" is a retention *class* (`RetentionClass::Durable`, `:21`) and a write-authority statement, not a storage promise.
+. *G2 - no production writer.* `ProductionApp::remember_working_memory` (`crates/app/src/lib.rs:1593`) and `remember_durable_memory*` (`:1615`, `:1633`, `:1661`) are not called by `main.rs` or by any non-test code in `crates/app/src`. Their callers are tests in `lib.rs`, the hardening soaks (`crates/hardening/src/soak.rs:656`, `scenario_soak.rs:375`) and the evaluation runners (`memory_eval.rs:1024`, `memory_sidecar_eval.rs:180`). A live process never stores a memory today, so there is currently nothing for persistence to preserve. Only *reads* are wired: `attach_memory_context` (`lib.rs`, called for every generated reply) injects whatever the store holds.
+. *G3 - no targeted erasure.* The only removals are TTL expiry and capacity eviction in `compact` (`:967`) and `push_bounded` (`:1468`). There is no delete-by-actor, delete-by-claim or revoke. `deletion_prunes_by_node_identity...` (`:5018`) tests edge pruning when a node *expires*, not operator-requested deletion. A viewer who asks to be forgotten can only wait for TTL.
+
+=== 1.3 Who could ever produce durable memory (use-case test, part 1)
+
+By A-MEM-001 only two producers can obtain a permit: an allowed *system* source, or an authenticated `memory.admin` operator. Public chat never can. So the population of durable memory is:
+
+* operator-curated facts (lore, schedule, "the boss is immune to fire" entered by the operator);
+* system/game/stream observations from trusted adapters.
+
+Viewer-attributed durable memory ("remember that Alice likes Rust next week") needs a *new product decision and a new, consent-bearing admission path* that does not exist. Therefore "restart-safe viewer memory" is not a storage problem first; it is a missing producer plus a missing consent policy.
+
+== 2. Does the need exist? (tested, not assumed)
+
+Evidence available without a production database, in decreasing strength:
+
+. *Static, repository evidence (done).* G2 above: zero production writers. Expected user benefit of persistence today is exactly zero, because the persisted set is empty.
+. *Volume argument (analytic, not measured).* Worst-case entry size is bounded by config: claim 1,024 B + topic 128 B + source/pseudonym/class fields roughly 300-400 B, about 1.6 KiB; 256 entries about 0.4 MiB; 2,048 links at tens of bytes about 0.1 MiB. Even 100 actors x 64 entries is about 10 MiB. Volume does not drive an engine choice; a single bounded file would hold it. The only retrieval today is a linear scan (`relevant`, `:1003`) over at most 256 entries, so FTS is not justified by scale either (#283 owns the lexical-retrieval measurement).
+. *Counterfactual on the existing fixture (reasoning, not a new run).* `examples/memory-long-range/cases.json` measures `current_fact_correctness` 1.0 with state present. Inserting a restart (empty store) before the query makes the required claims undeliverable by construction, so the restart loss is real *conditional on a writer having stored them*. That shows the loss exists; it does not show that claims will be written or recalled after >24 h. Reported as reasoning, not as a result.
+. *Competitor signal.* Mixed: OLV removed long-term memory, AIRI's is unchecked; Lumi_Nox/AITuberKit/aituber-onair ship persistent memory or bond points (`docs/competitive-landscape.adoc`). It supports "viewers notice continuity", not "this project needs a database".
+. *Cheaper substitute for the operator-fact case.* Operator-owned facts can be reloaded at boot from an operator file through the existing permit-gated path, with no viewer data, no erasure surface and no database; this follows the precedent of `AIVTUBER_SPEECH_LEXICON` (`main.rs:1241`). If most of the value is operator facts, option A1 below captures it.
+
+*Conclusion of the need test:* the benefit of viewer-attributed persistence is currently *unproven and unreachable* (no producer, no consent path). The benefit of operator-fact continuity is plausible and cheap to serve without a database. The decision follows from that; the falsifier in section 9 is the experiment that would change it.
+
+== 3. Retention classes, quotas and the deterministic contract
+
+=== 3.1 Classes
+
+[cols="1,3,2,2"]
+|===
+|Class |Content |Storage |Owner / erasable by viewer
+
+|R0 Working
+|Short-lived normalized entries incl. untrusted public text (today's `Working`)
+|RAM only, never persisted. TTL 15 min, 256 entries (existing)
+|Runtime; yes (expires; erase request purges)
+
+|R1 Approved episodic
+|Permit-gated durable claims (`Durable`), epistemic class and link metadata
+|RAM today. Disk only if a later slice is approved, and then operator-approved (non-actor) entries only until Q2 is decided
+|Runtime under the permit; viewer-attributed entries erasable by their actor
+
+|R2 Operator-owned persona/config/seed
+|Persona, lexicon, curated facts file, notice text
+|Operator files under operator control; versioned in the operator's own repo or profile
+|Operator; MUST contain no viewer data (an entry naming an actor is refused at load)
+
+|R3 Derived
+|Links, any FTS/vector index, summaries, caches, consolidation proposals (#281), sidecar copies
+|Rebuildable from R1; never a source of truth; never persisted unless R1 is, and always erased with it
+|Runtime; erased by the same transaction as R1
+|===
+
+=== 3.2 Quotas (proposed; Q5)
+
+Defaults apply only if disk persistence is enabled; all are validated positive and derived from the unified retention policy (#51).
+
+[cols="2,2,3"]
+|===
+|Bound |Proposed default |Rule
+
+|Per-actor entries / claim bytes
+|32 / 32 KiB
+|Existing claim (1,024 B) and topic (128 B) bounds stay. A write over the per-actor cap evicts that actor's oldest entry first (never another actor's).
+|Global durable entries
+|2,048
+|After per-actor eviction, evict by the deterministic key below.
+|Durable TTL
+|24 h default (unchanged); persistence opt-in may raise to at most 30 days; hard ceiling 90 days
+|TTL is a deployment setting, never per-claim model output.
+|Links
+|2,048 total, 8 per write (existing)
+|Unchanged; links are R3.
+|On-disk footprint
+|16 MiB hard cap for canonical + journal + ledger + backups the runtime itself creates
+|Reaching 90 percent raises a metric; reaching the cap refuses *new viewer-attributed* writes (fail closed), never evicts the erasure ledger.
+|===
+
+=== 3.3 Deterministic eviction and replay contract
+
+* Eviction order is the total order `(expires_at_ms, created_at_ms, memory_id)` ascending, after per-actor caps. No wall-clock, hash-iteration or thread-timing input.
+* `memory_id` is monotonic across restarts (persisted counter); an id is never reused, so a tombstone or link can never name a different later entry.
+* *Time across restarts.* Persisted records use the logical timebase of the run that wrote them. At boot the runtime records one explicit input, `memory.session_boundary { prev_epoch, wall_gap_ms }`, derived from a wall-clock reading at the adapter edge; expiry across the gap is computed from that recorded input. Replays consume the same recorded input and reach the same survivors. The wall reading is audit data, not a replay-time clock call (Q6).
+* A snapshot is loaded through the permit-checked constructor path (the entries record their original `write_decision` and epistemic version; a record whose class/version is unknown or whose decision is not `Allowed*` is dropped and counted, never promoted).
+* Load never mints authority: a file edited on disk cannot create a `VerifiedFact`, because the class is only accepted if it matches the recorded gate decision and source class combination the derivation rule allows (`docs/memory-adaptation.adoc` section 3.1). A mismatch drops the record.
+
+*Evidence for erase-on-disk behaviour (disposable experiment, not committed).* A throwaway script (CPython 3.13 `sqlite3`, SQLite 3.50.4, kept in the scratchpad, outside the repository) wrote one marker claim plus 50 filler rows to a WAL-mode table with an FTS5 external-content index, deleted the marker row, checkpointed with `TRUNCATE`, and searched the database file for the marker:
+
+[cols="2,2,2,2"]
+|===
+|`secure_delete` |after `VACUUM`? |plaintext marker in file |lowercased FTS token in file
+
+|OFF |no |present |present
+|OFF |yes |absent |present
+|ON |no |absent |present
+|ON |yes |absent |present
+|===
+
+Only an FTS5 `rebuild` after the canonical delete cleared the tokenized copy in both settings. Conclusions: a plain `DELETE` does not erase (free pages), `secure_delete` and `VACUUM` do not clean the FTS segments, and an erase of a SQLite-backed store needs `secure_delete` *and* an FTS rebuild *and* a WAL checkpoint-truncate. It says nothing about SSD wear levelling, backups or other filesystems. Not re-run on SQLCipher.
+
+== 4. Consent, notice, opt-out, deletion, export
+
+These MUST exist before any viewer-attributed record is persisted to disk (Q2, Q12).
+
+* *Default.* Persistence is off. Viewer-attributed memory stays R0/RAM-R1 and expires.
+* *Operator opt-in and notice.* Enabling viewer-attributed persistence requires an explicit operator setting *and* a non-empty operator-supplied notice string (shown on stream/channel description per operator practice). Startup refuses the combination "persist viewers on, notice empty".
+* *Viewer consent.* Per-viewer opt-in is a typed request, not an inferred behaviour. A viewer's chat line is data; it can at most produce a *consent request event* that an authenticated operator or a system-class policy admits, after which a permit may be minted by the existing gate. Public chat never mints the permit. Without recorded consent a viewer-attributed claim stays R0.
+* *Operator opt-out.* One global off switch and a per-namespace (provider) switch; turning either off immediately revokes read visibility of the affected R1/R3 and starts an erasure transaction for the affected scope (section 5).
+* *Viewer deletion.* A viewer may request erasure of their own pseudonym only. The request is *data*, bound to the platform-asserted actor id of the envelope, rate-limited, and it can only reduce retained data (it cannot read, write or widen). The operator is notified. Operators may also erase by raw id + provider namespace (the runtime derives the pseudonym; the raw id is never stored). Q7.
+* *Export.* Per-actor export is operator-only (never to chat), schema `memory-export-v1`: claim text, epistemic class, timestamps, retention class; no pseudonym key, no links to other actors. The operator is responsible for verifying the requester out of band.
+* *Expiry.* TTL expiry is the default deletion path and runs the same visibility rule: an expired entry is invisible at read time even before the physical purge.
+* *Namespace isolation.* Actor matching requires the (namespace, actor) pair (existing rule, `docs/memory-adaptation.adoc` section 2); the on-disk layout keys by pseudonym and never merges namespaces.
+
+== 5. Pseudonym handling and key rotation
+
+* Persist only the keyed pseudonym string already produced by `ActorPseudonymizer` (`lib.rs:248`, full 256-bit HMAC with key version prefix). Never the raw actor id, never the key, never the namespace-to-raw mapping.
+* The key stays in the operator environment (`config.rs:84`). A backup of the memory store MUST NOT travel with the key; documentation says so. Deleting the key unlinks pseudonyms from raw ids (it does *not* erase content: claim text can itself identify someone).
+* *Rotation.* A new key version produces new pseudonyms; existing records stay under the old version and become unlinkable to the same person, expiring by TTL. Because an erase request starts from a raw id, records under an old version cannot be located without the old key. Therefore rotation keeps a bounded *erase-only key ring*: old key versions are retained (operator env) for at most the maximum TTL after rotation, used only to derive pseudonyms for erase/export, never for new writes or reads into generation. Fallback: `purge-version vN` removes every record of a version whose key was lost (Q10).
+* Cross-provider identity is not matched. The same human on two platforms has two unlinked pseudonym sets; an erase request is per (namespace, actor).
+
+== 6. Erasure transaction
+
+=== 6.1 Principle
+
+Revoke visibility first, then delete, then prove. Visibility revocation is a small, durable, append-only record consulted *before* any index or store is read. Derived structures are never trusted to be gone until verified; until then reads stay revoked (fail closed).
+
+=== 6.2 State machine
+
+[source,text]
+----
+Requested
+  -> ReadRevoked        tombstone for scope (pseudonym | version | namespace) durably recorded;
+                        every read path (relevant, relevant_linked, context_for, sidecar recall,
+                        export) filters through the tombstone set first
+  -> CanonicalDeleted   R1 rows for the scope removed (memory_id set recorded in the journal)
+  -> EdgesPruned        every link touching those memory_ids removed (existing prune-by-node-identity rule)
+  -> IndexesPurged      FTS/vector indexes rebuilt or entries deleted; physical purge
+                        (secure_delete + checkpoint-truncate + rebuild) when disk-backed
+  -> CachesPurged       retained_memory_context inputs, in-flight ThinkingRequest context not yet sent
+                        are dropped; generation queue entries carrying the scope's claims are cancelled
+  -> SourcesPurged      any retained source copy (none retained by the runtime today)
+  -> ProposalsPurged    consolidation/Dreaming proposals (#281) derived from the scope
+  -> SidecarPurged      sidecar copies removed (see 6.4); probe recall returns nothing for the scope
+  -> Verified           post-condition scan: no canonical row, edge, index posting, cache entry,
+                        proposal or sidecar item references the scope
+  -> Reported           ErasureReport written: proven list + unprovable remnants (6.3)
+----
+
+* Each step is idempotent and records completion in a small *erasure journal* (request id, scope kind, state, memory_id set, step results). The journal holds no claim text and no raw id.
+* Any step failure leaves the request in the last good state with reads still revoked, increments an `erasure_pending` age metric, and retries with bounded backoff; after a configured number of failures it surfaces `erasure_stuck` to the operator. It never advances past an unverified step and never silently re-enables reads.
+* `ReadRevoked` is the commit point for the viewer-visible guarantee; `Verified` is the commit point for the physical one. Between them the system reports "revoked, purge pending".
+
+=== 6.3 Erasure report and unprovable remnants
+
+Every completed request reports what was proven and what cannot be:
+
+[cols="3,2,3"]
+|===
+|Remnant class |Provable erased? |Why / mitigation
+
+|Canonical store, edges, FTS/vector index, caches, runtime-held proposals
+|Yes (by post-condition scan)
+|The runtime owns them.
+
+|Database file free pages, WAL
+|Only with `secure_delete`, checkpoint-truncate and index rebuild (experiment above)
+|Plain `DELETE` leaves plaintext recoverable. The report states which of the three physical steps ran.
+
+|Filesystem/SSD wear levelling, OS page cache, swap, crash dumps
+|No
+|Mitigation is operator-level full-disk encryption and, if ever needed, crypto-erase of a per-store key. Reported as unprovable.
+
+|External backups and snapshots (including operator backups)
+|No
+|The runtime cannot reach them. The erasure ledger (below) is replayed after any restore so a restored older snapshot does not silently resurrect erased scopes; the report lists "backups not covered".
+
+|Sidecar copies (Hindsight)
+|Per-claim: No. Per-scope: Yes
+|The adapter's `retire` PATCHes `state: invalidated` and the adapter documents that the service keeps the claim for its own audit (`hindsight.rs:367-378`); only `close_scope` is a `DELETE` of the bank (`:386-389`). The sidecar also receives the pseudonym and claim text in metadata (`metadata_for`). Therefore an erase on a sidecar means scope delete plus reseeding surviving claims, or per-actor scopes; invalidation is *not* erasure.
+
+|Model-derived remnants: LLM-provider request logs, Hindsight observations/mental models, consolidation summaries
+|No
+|A claim that reached a remote Thinking provider or a sidecar's reflective layer may exist in derived text. Local-only providers are provable only by the runtime's own retention. Reported as unprovable when any remote/derived path was enabled.
+
+|Generated assets and spoken/streamed output
+|No
+|A reply that used the claim may have been persisted as an L1 generated asset (`asset-store/src/lib.rs:1360`) with no provenance linking it to a memory (`Provenance`, `:148`), and was broadcast (VODs, clips). Erasure removes the memory, not what was already said. S1 should add a link from generated assets to the memory ids that fed them only if a measured need appears; otherwise the report lists this class.
+
+|Telemetry/audit
+|Bounded RAM; claim text not designed to be present
+|Not re-verified in this ADR; the conformance suite adds a scan.
+|===
+
+*Erasure ledger.* Separate from the journal, a monotonic, bounded-by-TTL ledger of `(scope hash, erased_at)` records survives snapshot restore and is applied to any loaded snapshot before reads open. It holds no content or raw id. If the ledger is lost with the store, the report downgrades to "cannot prove no resurrection".
+
+=== 6.4 Sidecar position
+
+The sidecar port has `retire` (stop recalling) and `close_scope` (drop everything), no per-claim delete (`sidecar.rs:187-207`). A production sidecar would need a `purge` operation with delete semantics, and its scopes would need to be partitioned so a purge is cheap. This is a precondition for any non-evaluation use, not part of this slice (Q8).
+
+== 7. Crash recovery, migrations, corruption, encryption
+
+* *Crash safety (if a snapshot file ever exists).* Single file written to a temporary file in the same directory, `sync_all`, then atomic rename, the same pattern as `persist_generated_descriptor` (`asset-store/src/lib.rs:1408-1412`). A torn write leaves the previous snapshot intact. The erasure journal and ledger use append-with-fsync records with a per-record checksum; a torn tail record is ignored.
+* *Recovery at boot.* (1) Load ledger and journal; (2) open reads *revoked for every scope with an unfinished erasure*; (3) resume unfinished requests; (4) load the snapshot, drop entries whose scope is in the ledger, drop entries failing the load validation; (5) only then open reads. If the ledger or journal cannot be read, viewer-attributed reads stay closed and the failure is reported; operator-owned R2 content is unaffected.
+* *Migrations.* The snapshot carries `memory-store-v1`, the epistemic vocabulary version and the link vocabulary version already stored per entry (`MemoryEntry::epistemic_version`, `memory-link-v2`). An unknown *newer* store version is refused (read-closed, reported), never best-effort loaded. Migration is offline, explicit, copy-forward (write a new file, verify, atomically replace, keep the old file only until the next successful boot, then delete it); an old version file is never mutated in place. Because the key version is embedded in each pseudonym, a store never needs a rewrite on key rotation.
+* *Corruption.* Failed checksum or schema validation means: quarantine the file (rename aside, count it), open an empty store, report `memory_store_corrupt`. The quarantined file is subject to the same retention bound and operator deletion, and is listed as a remnant location in erasure reports. No silent repair.
+* *Encryption at rest.* Baseline: operator full-disk encryption, documented, not implemented. Options if viewer persistence is approved (Q9): file-level encryption of the snapshot (`age`, BSD-3-Clause, 24k stars, pushed 2026-08-29), or SQLCipher if SQLite is ever adopted (`libsqlite3-sys` exposes `bundled-sqlcipher`; SQLCipher is BSD-3-Clause, pushed 2026-10-27). Key rules: a store key is separate from the pseudonym key, never serialized into replay/telemetry, and stored by the operator, not beside the store. The project does not write its own cipher.
+* *Backup/snapshot.* The runtime creates no backups. Operator backups are out of scope but are named in every erasure report; the recommended practice is to exclude the store from default backups or accept the listed limitation.
+
+== 8. Options considered
+
+Facts below are from upstream GitHub metadata read on 2026-11-10 unless marked.
+
+[cols="2,2,2,2,2,2",options="header"]
+|===
+|Option |Licence / maintenance |Fit for local-first, zero-paid |Erasure provability |Replay / determinism |Verdict
+
+|A0 No disk persistence + in-RAM erase primitive (status quo plus G3 fix)
+|n/a
+|Perfect; no new dependency
+|Full for RAM; nothing on disk to chase
+|Unchanged
+|*Selected now* (S1)
+
+|A1 Operator-owned seed file loaded at boot through the permit path (read-only, R2 to R1)
+|n/a; precedent `AIVTUBER_SPEECH_LEXICON`
+|Perfect; no viewer data
+|Not applicable (no viewer data); operator edits the file
+|Deterministic (file content is an input, hashed)
+|*Selected as the cheapest benefit test* (S2 candidate)
+
+|A2 Versioned snapshot file (single file, bounded, atomic rename), operator-approved entries only
+|n/a (existing `serde` types; no new crate)
+|Good; one file, no server
+|Provable by rewrite-and-fsync; no index to chase
+|Good with recorded session-boundary input
+|Conditional (S3), only after the falsifier passes
+
+|A3 `rusqlite` + bundled SQLite + FTS5
+|rusqlite MIT, 4.5k stars, release v0.41.1 (2026-10-28), pushed 2026-11-09; `libsqlite3-sys` bundled build enables `SQLITE_ENABLE_FTS5` (read in its `build.rs`); not in `Cargo.lock` today (checked: zero matches), so a new C dependency and a `cargo deny` review (#100)
+|Good (embedded); C toolchain on every release target
+|Hard: free pages, WAL and FTS segments leak after `DELETE` (experiment, section 3.3); needs `secure_delete` + rebuild + checkpoint truncate
+|Fine with explicit ordering; FTS rank is not part of the replay contract
+|*Not now.* Revisit if #283 shows lexical retrieval is needed beyond a linear scan, or entries exceed about 5,000
+
+|A4 `redb`
+|Apache-2.0, 4.9k stars, v4.5.0 (2026-11-05), pushed 2026-11-10; README: stable file format, ACID, crash-safe, pure Rust
+|Good; no C
+|Copy-on-write B-tree; freed pages are not scrubbed, so plaintext remnants are plausible (not measured here)
+|Good (ordered KV)
+|*Not now.* Best embedded candidate if a KV store is needed; no FTS
+
+|A5 `sled`; `fjall`
+|sled Apache-2.0, last push 2026-04-04; its own README says "sled is beta", the on-disk format will need manual migrations before 1.0, and a rewrite is in progress. fjall Apache-2.0, v1.2.0 (2026-11-03), LSM
+|sled: poor (unstable format). fjall: ok
+|LSM tombstones persist until compaction; erase needs forced compaction (not measured)
+|OK
+|*Rejected* sled (unstable format); fjall *not preferred* (tombstone semantics work against erasure)
+
+|A6 Hindsight sidecar (opt-in)
+|MIT, 60k stars, v0.31.2 (2026-10-20), pushed 2026-11-10; README: server in Docker or embedded Postgres, 25+ LLM providers
+|Poor for the minimal profile: a service, a store and an LLM provider
+|Poor per claim: `retire` is invalidate, service retains for audit; per-scope delete only; derived observations
+|Not deterministic (model-written consolidation)
+|*Not adopted.* The 2026-10-25 measurement is `rejected` (`absent_violations` 3, `truncated_claims` 1, `temporal_order_errors` 14 against 2). Stays an optional evaluation backend (#280)
+
+|A7 Graphiti / mem0 / Letta
+|Graphiti Apache-2.0, 32.7k stars, pushed 2026-11-09, needs Neo4j/FalkorDB/Neptune (Kuzu marked deprecated in its README); mem0 Apache-2.0, 68.7k stars; Letta Apache-2.0, 25.4k stars, pushed 2026-10-18
+|Poor: a graph database or a service plus LLM
+|Same class of problem as A6, not measured here
+|Not deterministic
+|*Reference only.* Graphiti stays #105's second sidecar candidate; mem0/Letta stay reference (`docs/reuse-first.adoc`)
+|===
+
+Reuse-first classification: A0/A1/A2 custom (the semantics are project-owned: permit, epistemic class, bounded state, replay) with no new dependency; A3/A4 *benchmark first / wrap* only on the trigger above; A5 reject; A6/A7 sidecar, opt-in, benchmark first.
+
+== 9. Decision
+
+*Do not implement durable viewer-attributed storage, and adopt no database or memory sidecar, now.* The need is unproven (no producer, G2) and the verifiable-erasure cost of an on-disk viewer store is high (section 3.3 experiment, section 6.3).
+
+Specifically:
+
+. *Accept this ADR's contract as normative* for any future persistence: classes, quotas, deterministic eviction, consent/notice/opt-out/erase/export rules, pseudonym rules, erasure state machine and fail-closed recovery.
+. *Implement S1 now* (small, valuable with or without disk): the erase primitive and report, RAM only.
+. *Build the cheapest benefit test (S2)* instead of a store: an operator-owned, read-only seed file for operator facts, plus the single production writer gap (G2) acknowledged as its prerequisite.
+. *Defer A2/A3/A4* behind a falsifier; *defer viewer-attributed persistence* behind Q2 and Q12.
+
+=== 9.1 Recommended slices
+
+* *S1 - erase primitive and erasure report (RAM only).* In `crates/adaptation`: `WorkingMemory::revoke_scope` (tombstone set consulted by every read path, fail closed), `erase_scope` for a (namespace, actor), version or memory-id set, link pruning by node identity (existing), and a typed `ErasureReport` (proven list + named unprovable classes). Synthetic conformance cases: erase leaves no entry/edge/context for the scope; revoke-then-fault leaves reads closed; partial-delete resumes idempotently from a fault injected after each state; an erase for another actor changes nothing; an erase of an unknown scope is a reported no-op. Reuses the existing `memory-long-range-eval` runner for a "post-erase delivers nothing" case. No new dependency. Acceptance is its own issue; this ADR owns the contract.
+* *S2 - operator seed file (the benefit test).* Boot-time load of an operator-owned file of approved facts through the permit-gated path, with a content hash recorded as a replay input, a bounded entry count, and refusal of any entry naming an actor. Prerequisite for meaningful measurement: a production writer or this loader (G2).
+* *S3 - snapshot store (A2), only if the falsifier passes.* Single bounded file, operator-approved entries only, erasure journal and ledger, recovery order of section 7. Still no viewer-attributed entries.
+
+=== 9.2 Cheapest falsifier
+
+Question: *do restart and a >24 h gap actually discard memory that would have been used?*
+
+Experiment: after S2 exists, run at least five streams with operator facts loaded and a restart plus a gap longer than 24 h between consecutive streams; count, per stream, the retained claims that were delivered into a generated request (`retained_memory_context` already reports the delivered set). Compare against the same streams with the file reloaded (the A1 path). Persistence beyond A1 (S3) is justified only if claims *not reproducible from the operator file* are delivered in at least 20 percent of streams. Otherwise the decision stays "no snapshot store". The 20 percent threshold is a proposal (Q4); no result exists yet.
+
+Second, independent falsifier for any SQLite adoption: extend the 14-case fixture to a synthetic 5,000-entry store and measure whether linear-scan `relevant` exceeds the retrieval latency budget; absent that, A3 stays rejected.
+
+== 10. Observable failure modes
+
+Counters and events are bounded aggregates, like the existing retention snapshot.
+
+[cols="3,3,3",options="header"]
+|===
+|Failure |Observable |Behaviour
+|Store/snapshot unreadable or newer version
+|`memory_store_open_failed`, `memory_store_version_refused`
+|Empty/closed memory; performer and operator control unaffected.
+|Corruption detected
+|`memory_store_corrupt`, quarantine count
+|Quarantine, empty store, no repair.
+|Ledger or journal unreadable
+|`memory_visibility_failclosed`
+|Viewer-attributed reads closed; operator R2 unaffected.
+|Erasure incomplete
+|`erasure_pending` (age), `erasure_stuck`
+|Reads stay revoked; retries bounded; operator notified.
+|Quota reached
+|`memory_quota_evictions`, `memory_disk_high_water`
+|Deterministic eviction; at the disk cap refuse new viewer-attributed writes.
+|Load validation drop
+|`memory_load_dropped{reason}`
+|Record dropped, never promoted.
+|Sidecar purge unsupported/failed
+|`erasure_sidecar_unprovable`
+|Report lists sidecar as unprovable; reads revoked.
+|Clock gap input missing
+|`memory_session_boundary_missing`
+|Treat as maximum gap (entries expire); never as zero gap.
+|===
+
+== 11. Consequences
+
+=== Positive
+
+* No new dependency, no viewer data on disk, no new erasure surface while the need is unproven.
+* G3 (no way to erase) is closed with a testable primitive that any later store reuses.
+* The erasure and recovery contract exists before storage does, so a later store cannot define it by accident.
+
+=== Costs / trade-offs
+
+* No viewer continuity across restarts yet; competitors with persistent memory have it.
+* Operator facts must be maintained in a file (R2) rather than by chat.
+* The contract is larger than the first implementation; several rules (ledger, key ring) are specified but unbuilt.
+
+=== Known limitations
+
+* The need test is static and analytic; no live data exists because no production writer exists.
+* Volume and per-entry sizes are analytic estimates, not measured.
+* The SQLite remnant experiment covers one SQLite version and one filesystem class; redb, fjall and SQLCipher erase behaviour were not tested.
+* Remote provider and sidecar remnants are unprovable by construction.
+
+== 12. Staging and rollback
+
+S1 is additive and RAM-only; revert is deleting the API. S2 is feature-gated by presence of the seed file setting; absent setting means today's behaviour. S3 would be opt-in per deployment; rollback is deleting the snapshot and honoring the ledger. The point after which rollback is expensive is the first viewer-attributed disk record, which this ADR does not authorize.
+
+== 13. Open decisions (need a supervisor answer)
+
+[cols="1,3,3",options="header"]
+|===
+|ID |Question |Recommendation
+
+|Q1
+|Add a production writer (an authenticated `memory.admin` ingress) before any persistence?
+|Yes, as its own issue; persistence has no benefit without it (G2).
+
+|Q2
+|May viewer-attributed entries ever be persisted to disk?
+|Not in S1-S3. Revisit only with consent UX (Q12) and an accepted erasure suite.
+
+|Q3
+|If a store is built, JSON snapshot or embedded database?
+|Single JSON snapshot (A2). Embedded database (`redb` first, `rusqlite` if FTS is measured) only on the trigger in section 8.
+
+|Q4
+|Falsifier threshold for building S3.
+|At least 20 percent of streams deliver claims not reproducible from the operator file, over at least five streams.
+
+|Q5
+|Quota values (section 3.2).
+|Adopt as proposed; revisit with measured sizes.
+
+|Q6
+|Representation of time across restarts.
+|A recorded `memory.session_boundary` input; missing input means maximum gap.
+
+|Q7
+|Self-service viewer erasure through chat.
+|Yes: own pseudonym only, request-as-data, rate-limited, operator notified; export is operator-only.
+
+|Q8
+|Sidecar erasure.
+|No production sidecar until the port has a `purge` with delete semantics and per-scope partitioning; invalidation is never reported as erasure.
+
+|Q9
+|Encryption at rest.
+|Document operator full-disk encryption now; revisit `age`/SQLCipher only if viewer persistence (Q2) is approved. No project-authored crypto.
+
+|Q10
+|Erase after key rotation.
+|Operator-held erase-only key ring for at most the maximum TTL, plus a `purge-version` fallback.
+
+|Q11
+|Backups.
+|Runtime creates none; ledger-wins-on-restore; every report names backups as not covered.
+
+|Q12
+|Notice and opt-out surface.
+|Operator-supplied notice string is required before enabling viewer persistence; global and per-namespace off switches revoke and erase.
+
+|Q13
+|Generated-asset provenance to memory ids.
+|Do not add now; list as an unprovable remnant; add only if a measured need appears.
+|===
+
+== Revisit conditions
+
+* A production writer exists and the falsifier (section 9.2) has run.
+* Entries exceed about 5,000, or #283 shows a lexical/semantic retrieval need a linear scan cannot meet.
+* A requirement for viewer-attributed continuity is accepted (Q2) with consent UX.
+* `redb`, `rusqlite` or a sidecar changes erase semantics, licence or maintenance status; a `cargo deny` advisory lands.
+* A local regulation or platform policy changes the notice/erase obligations.
+
+== Related
+
+* Issue: #282; parent #105; related #51, #220, #280, #281, #283, #284
+* Assumptions: A-MEM-001 (existing), A-MEM-002 and A-MEM-003 (proposed above)
+* Other ADRs: none; ADR-0007 (perception) is independent

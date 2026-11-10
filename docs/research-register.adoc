@@ -129,7 +129,7 @@ Graphiti (temporal graph + experimental MCP server);
 Letta
 |Benchmark an external memory sidecar before custom graph infrastructure; combine semantic/keyword/temporal/graph retrieval only after MemoryWriteGate; distinguish VerifiedFact, ViewerClaim, Observation, Experience, Opinion
 |#105, #193
-|Whether external memory beats exact/simple retrieval at current scale; deletion/privacy enforcement; provenance-aware wording; sidecar/MCP latency and dependency/runtime cost
+|Whether external memory beats exact/simple retrieval at current scale; deletion/privacy enforcement; provenance-aware wording; sidecar/MCP latency and dependency/runtime cost. Persistence and erasure semantics: link:adr/0008-cross-session-memory-persistence.adoc[ADR-0008] (Proposed; #282; one SQLite remnant experiment, otherwise design only)
 
 |Agent tool execution / MCP
 |official MCP Rust SDK (+rmcp+);
