@@ -516,6 +516,20 @@ Rollback is cheap until audio is generated and cached with projected text (asset
 . *Q13 (dictionary distribution)*: Download at install with hash verification, or bundle in releases? Bundling requires reproducing NAIST, UniDic and NITech notices and a decision on the NEologd pointer and on the ICOT compliance clause in mecab-ipadic-derived data. Per D-2 this only needs an answer if a mecab-ipadic-derived or SudachiDict dictionary is reconsidered.
 . *Q14 (replay)*: Record the projected +speech_text+ (proposed) or its digest only, given the retention-class rule for raw text in docs/domain-contract.adoc?
 
+== Implementation notes
+
+=== Issue #222 S1: text projection and lexicon (implemented)
+
+Decisions D-1 to D-5 were implemented as decided; the operator-facing description is in docs/production-runtime.adoc ("Text that is not spoken, and how words are read"). Where the code differs from the candidate design above:
+
+* *Projection type.* +SpeechTextProjection+ carries +display_text+, +speech_text+, +identity+ and a counts-only +report+. The +spans+ list and the +outcome+ field of D2 are not built: derivability is tested by projecting again, and the typed +Fallback(reason)+ outcomes stay the existing +PolicyOverride+ fallback (nothing speakable, or the gate rejecting the projected text). They belong with the lifecycle work (S2) if a consumer needs them.
+* *Identity.* +rules:<v>|lexicon:<id@revision;...>+<sha256>+ (or +lexicon:none+); no analyzer or dictionary component because Stage 2 is deferred (D-1). The hash covers the effective merged entries, not the file bytes.
+* *Lexicon bounds.* As proposed in D3 (2048 entries, 131072 bytes, surface 1 to 32, reading 1 to 64 kana), with at most 4 merged layers. The per-entry +source+ field is required so provenance of every reading is recorded; the starter lexicon is self-authored and copies no third-party dictionary.
+* *Rule layer.* Only the D-5 deletion rules and the lexicon exist. The ALLCAPS acronym spelling, symbol and unit rules of D3 are not implemented; unknown Latin words pass through and are counted as +projection_passthrough_latin+ (D-5).
+* *Asset schema.* 0.2.0 as in D-3 (+speech.speech_text+, +compatibility.speech_projection+). 0.1.0 assets stay readable (a reader needs the 0.1.0 shape only for fields it does not use), which is a deliberate softening of "incompatible": the writer emits 0.2.0, new readers accept both, old readers refuse 0.2.0. The default compiler version was decoupled from the schema version constant so the bump did not invalidate cached assets.
+* *D-4.* +AssetCompatibility::speech_projection_is_stale+ implements stale-but-playable as a pure predicate. Lazy re-synthesis and its counter, and operator-forced invalidation per entry, are not built (S2).
+* *Order.* The gate sees display, projected (only when something changed) and display again last, per reply and per phrase; this keeps the #286 commit-barrier contract.
+
 == Related
 
 * Issue: #222 (parent #94). Consumers: #81, #83, #84, #92, #93. Related design issues: #106 (commit barrier), #219/#220 (local-first baseline).

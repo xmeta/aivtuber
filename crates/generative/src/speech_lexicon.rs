@@ -409,7 +409,7 @@ impl SpeechLexicon {
         let mut hasher = Sha256::new();
         hasher.update(b"aivtuber-speech-lexicon/1\0");
         let mut entries = Vec::with_capacity(merged.len());
-        for (_, entry) in &merged {
+        for entry in merged.values() {
             for part in [entry.surface.as_str(), entry.reading.as_str()] {
                 hasher.update((part.len() as u32).to_be_bytes());
                 hasher.update(part.as_bytes());
