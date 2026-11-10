@@ -86,6 +86,8 @@ export AIVTUBER_MEMORY_PSEUDONYM_KEY_VERSION='v1'
 cargo run -p aivtuber-app
 ----
 
+Optional performer memory writer (#306, ADR-0008 Q1): +AIVTUBER_MEMORY_WRITER+ (default off) enables the permit-gated post-turn writer that retains stream-level performer facts (commitments, running jokes, segment recaps) from committed public output only, never viewer-attributed content. +AIVTUBER_MEMORY_WRITER_MAX_LIVE_ENTRIES+ (default 32, 1 to 128) bounds the live entries. Counters are logged as +memory_writer_metrics+. See +docs/memory-adaptation.adoc+ section 13.0.
+
 The actor pseudonymization key is mandatory for the production composition root and is independent of the operator-control secret. Generate and store it as deployment secret material; do not place it in fixtures, replay metadata, logs, or model context. Rotating key/version intentionally breaks historical actor correlation unless records are explicitly migrated.
 
 The process reads one Event Envelope JSON document per stdin line. Raw stdin is bounded before `SecurityRuntime`: the pre-runtime channel uses `sync_channel` with capacity equal to `SecurityRuntimeConfig::content_queue_limit`, and the line reader retains at most `max_envelope_bytes + 1` bytes while determining whether a record is oversized. An oversized record is drained through its newline and dropped; a record arriving while the raw queue is full is also dropped rather than blocking the reader. Both outcomes are exposed through `RawIngressMetricsSnapshot` and reported by the executable. Valid records retain input order.

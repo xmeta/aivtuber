@@ -654,6 +654,7 @@ where
         };
 
         // Accepted: this phrase is now history.
+        self.consolidate_committed_reply(&event, &text, now_ms);
         let plan = &outcome.plan;
         let scheduler_generation = plan.generation;
         let (end_at_ms, start_at_ms) = (plan.end_at_ms(), plan.start_at_ms);
