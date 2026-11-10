@@ -3,10 +3,20 @@
 //! Event-driven reflex routing, semantic retrieval, deterministic policy,
 //! and the TypeSafe System One (Jev) adapter.
 
+mod burst;
 mod jev;
 mod pipeline;
 mod retrieval;
 
+pub use burst::{
+    BATCH_ENGAGEMENT_SCHEMA_VERSION, BatchCandidate, BatchEngagementRequest, BatchRankFailure,
+    BatchRanker, BatchReplayRecord, BatchRequestError, BatchResolution, BurstConfig,
+    BurstConfigError, BurstEngine, BurstMetrics, CandidateOutcome, CapacityEnvelope, Disposition,
+    FlushReason, ImmediateReason, MAX_BATCH_BYTES, MAX_BATCH_CANDIDATES,
+    MAX_BATCH_REQUEST_CANDIDATES, MAX_BATCH_WINDOW_MS, MAX_BURST_ENTER_COUNT,
+    MAX_CANDIDATE_TEXT_BYTES, MAX_READY_BATCHES, MAX_TRACKED_ACTORS, RankingSource, RefusalReason,
+    RequestCandidate, TerminalOutcome,
+};
 pub use jev::{
     HttpResponse, HttpTransport, JevAdapter, JevAdapterConfig, JevApiKey, JevCallEvidence,
     JevCallFailure, JevCancellationToken, JevUsage, NormalizedAnswer, NormalizedResponse,

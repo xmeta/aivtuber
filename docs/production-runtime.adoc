@@ -66,6 +66,10 @@ OBS remains an independent control adapter. Its availability never owns schedule
 * Operator control (issue #56) terminates in +LocalControlIngress+ on its own local-socket transport; the presented secret is verified in constant time before any +AuthenticatedControl+ is minted, every privileged action is capability-checked, and accepted/rejected actions are audited. The control endpoint never shares the untrusted content queue.
 * VTube Studio and OBS connection failure is degraded state, not scheduler failure.
 
+== Burst selection (issue #78, S1)
+
++aivtuber_reflex::BurstEngine+ is the deterministic micro-batcher for normal-priority admitted chat. It is a pure, caller-clocked library: quiet chat is never delayed, control/system-plane events bypass it, bursts are batched under hard count/byte/window/queue bounds, and every admitted comment gets one terminal outcome. It is not yet composed into +process_content_bytes+. Contract, configuration and metrics: +docs/jev-routing.adoc+ section 12.
+
 == Runtime retention
 
 Long-running production state is governed by the shared +RuntimeRetentionPolicy+. Safe defaults, subsystem classification, logical-time eviction rules, observability, and the high-volume plateau verification are documented in +docs/runtime-retention.adoc+.
