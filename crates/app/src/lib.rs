@@ -8,6 +8,7 @@ mod memory_compare;
 mod memory_context;
 mod memory_eval;
 mod memory_sidecar_eval;
+mod memory_writer;
 mod moderation_evidence;
 mod operator_control;
 mod outputs;
@@ -45,6 +46,10 @@ pub use memory_compare::*;
 pub use memory_context::*;
 pub use memory_eval::*;
 pub use memory_sidecar_eval::*;
+pub use memory_writer::{
+    MEMORY_WRITER_EVENT_PREFIX, MEMORY_WRITER_MAX_LIVE_ENTRIES_CEILING, MemoryWriterConfig,
+    MemoryWriterMetrics,
+};
 pub use moderation_evidence::*;
 pub use operator_control::*;
 pub use outputs::*;
@@ -1086,6 +1091,8 @@ where
     router: R,
     generative: Option<GenerativeRuntime>,
     adaptation: Option<AdaptationRuntime>,
+    /// Post-turn memory consolidation (#306); `None` (default) writes nothing.
+    memory_writer: Option<memory_writer::MemoryWriter>,
     speech_observations: Option<SpeechObservationTracker>,
     speech_transcripts: Option<SpeechTranscriptTracker>,
     speech_conversation: Option<speech_conversation::SpeechConversation>,
@@ -1146,6 +1153,7 @@ where
             router,
             generative: None,
             adaptation: None,
+            memory_writer: None,
             speech_observations: None,
             speech_transcripts: None,
             speech_conversation: None,
@@ -1235,6 +1243,82 @@ where
     pub fn with_adaptation(mut self, adaptation: AdaptationRuntime) -> Self {
         self.adaptation = Some(adaptation);
         self
+    }
+
+    /// Enable the permit-gated production memory writer (#306, ADR-0008 Q1).
+    /// Off unless called. It writes only through the adaptation runtime, so
+    /// without one it retains nothing.
+    pub fn with_memory_writer(mut self, config: MemoryWriterConfig) -> Result<Self, String> {
+        self.memory_writer = Some(memory_writer::MemoryWriter::new(config)?);
+        Ok(self)
+    }
+
+    /// Writer counters for the ADR-0008 Q4 falsifier; `None` when disabled.
+    pub fn memory_writer_metrics(&self) -> Option<MemoryWriterMetrics> {
+        self.memory_writer.as_ref().map(|writer| writer.metrics())
+    }
+
+    /// Post-turn consolidation: retain stream-level facts from reply text the
+    /// output gate already admitted and playback already committed. The
+    /// candidate source is `committed_text` only; `event` supplies identifiers
+    /// that can only remove viewer-naming sentences. Never fails the turn.
+    fn consolidate_committed_reply(
+        &mut self,
+        event: &EventEnvelope,
+        committed_text: &str,
+        now_ms: u64,
+    ) {
+        let Some(mut writer) = self.memory_writer.take() else {
+            return;
+        };
+        if let Some(adaptation) = self.adaptation.as_mut() {
+            writer.sweep(&adaptation.memory, now_ms);
+            writer.note_texts_considered();
+            let mut viewer_names: Vec<String> = event.actor_id.iter().cloned().collect();
+            for key in [
+                "display_name",
+                "author",
+                "author_name",
+                "username",
+                "user",
+                "name",
+            ] {
+                if let Some(value) = event.payload.get(key).and_then(serde_json::Value::as_str) {
+                    viewer_names.push(value.to_owned());
+                }
+            }
+            let extraction =
+                memory_writer::extract_candidates(committed_text, &viewer_names, &writer.config());
+            writer.note_extraction_rejections(&extraction);
+            for candidate in extraction.candidates {
+                if writer.quota_full() {
+                    writer.reject_quota();
+                    continue;
+                }
+                if writer.is_duplicate(&adaptation.memory, &candidate.claim, now_ms) {
+                    writer.reject_duplicate();
+                    continue;
+                }
+                let event_id = writer.next_event_id();
+                let Some(permit) = self
+                    .security
+                    .authorize_performer_output_memory_write(&event_id, &candidate.claim)
+                else {
+                    writer.reject_gate();
+                    continue;
+                };
+                match adaptation.memory.remember_durable(
+                    &permit,
+                    &candidate.claim,
+                    Some(candidate.kind.topic()),
+                    now_ms,
+                ) {
+                    Ok(entry) => writer.record_written(entry.memory_id, entry.expires_at_ms),
+                    Err(_) => writer.reject_store(),
+                }
+            }
+        }
+        self.memory_writer = Some(writer);
     }
 
     /// Opt in to speech observation tracking (#92). Observations are untrusted
@@ -2402,6 +2486,19 @@ where
         if context.is_empty() {
             return;
         }
+        if let Some(writer) = self.memory_writer.as_mut() {
+            writer.sweep(&adaptation.memory, at_ms);
+            writer.note_retrieved(
+                context
+                    .iter()
+                    .filter(|item| {
+                        item.event_id
+                            .as_deref()
+                            .is_some_and(|id| id.starts_with(MEMORY_WRITER_EVENT_PREFIX))
+                    })
+                    .count(),
+            );
+        }
         generation.thinking.curated_context = context;
         if generation.thinking.validate().is_err() {
             // Fail closed to "no memory context" rather than failing the event:
@@ -2959,16 +3056,16 @@ where
                     return self.play_fallback_directive(event, fallback, trace, at_ms, seed);
                 }
 
-                let generated_text = generated_text.expect("checked above");
+                let generated_text = generated_text.expect("checked above").to_owned();
                 let rechecked = self
                     .security
                     .public_output_policy()
-                    .evaluate(generated_text);
+                    .evaluate(&generated_text);
                 let recheck_allows_same_text = matches!(
                     rechecked.verdict,
                     OutputVerdict::Allow | OutputVerdict::Redact
                 ) && rechecked.text.as_deref()
-                    == Some(generated_text);
+                    == Some(generated_text.as_str());
 
                 if !recheck_allows_same_text {
                     self.security.record_public_output_decision(&rechecked);
@@ -2991,6 +3088,9 @@ where
                     &mut self.pending_audio,
                     &mut self.pending_avatar,
                 )?;
+                // The reply is gated and scheduled: consolidation reads that
+                // committed text, never the viewer's event.
+                self.consolidate_committed_reply(event, &generated_text, at_ms);
                 Ok(HandledGeneration {
                     playback: Some(outcome),
                     route: RouteClass::Generated,
@@ -4180,6 +4280,7 @@ mod tests {
 
     mod chat_burst_tests;
     mod local_thinking_fallback_tests;
+    mod memory_writer_tests;
     mod phrase_commit_tests;
     mod speech_lifecycle_tests;
     mod streaming_thinking_tests;

@@ -15,15 +15,16 @@ use aivtuber_adapters::{
 use aivtuber_app::{
     AdaptationRuntime, AdapterHealth, AvatarOutput, BargeInConfig, BargeInMetrics, ChatBurstConfig,
     CompositionProfile, GenerationFallbackCounts, GenerativeBudgetPolicy, GenerativeRuntime,
-    IntentRoutePlanner, IntentShadowPolicy, LocalAvatarOutput, LocalRoutePlanner, NoopAvatarOutput,
-    NoopStreamOutput, ObsStreamOutput, OperatorControlServer, OperatorRateLimiter, PhraseMetrics,
-    PhraseMode, ProductionApp, ProfileSummary, RawIngressConfig, RawIngressMetrics,
-    RawIngressMetricsSnapshot, RoutePlanner, RuntimeRetentionPolicy,
-    SHADOW_ORCHESTRATOR_SCHEMA_VERSION, ShadowOrchestratorConfig, ShadowPolicyIdentity,
-    ShadowingRoutePlanner, SpeechConversationConfig, SpeechConversationMetrics, SpeechFloorMetrics,
-    SpeechSidecar, SpeechSidecarConfig, SpeechSidecarStats, StreamOutput, TtsSidecarSettings,
-    VoicevoxBridge, VoicevoxSettings, VtsAvatarOutput, VtsPlaybackConfig, apply_dispatched_request,
-    audit_pack_readiness, pump_bounded_records, stt_sidecar_args,
+    IntentRoutePlanner, IntentShadowPolicy, LocalAvatarOutput, LocalRoutePlanner,
+    MemoryWriterConfig, MemoryWriterMetrics, NoopAvatarOutput, NoopStreamOutput, ObsStreamOutput,
+    OperatorControlServer, OperatorRateLimiter, PhraseMetrics, PhraseMode, ProductionApp,
+    ProfileSummary, RawIngressConfig, RawIngressMetrics, RawIngressMetricsSnapshot, RoutePlanner,
+    RuntimeRetentionPolicy, SHADOW_ORCHESTRATOR_SCHEMA_VERSION, ShadowOrchestratorConfig,
+    ShadowPolicyIdentity, ShadowingRoutePlanner, SpeechConversationConfig,
+    SpeechConversationMetrics, SpeechFloorMetrics, SpeechSidecar, SpeechSidecarConfig,
+    SpeechSidecarStats, StreamOutput, TtsSidecarSettings, VoicevoxBridge, VoicevoxSettings,
+    VtsAvatarOutput, VtsPlaybackConfig, apply_dispatched_request, audit_pack_readiness,
+    pump_bounded_records, stt_sidecar_args,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
@@ -235,6 +236,18 @@ fn run() -> Result<(), Box<dyn Error>> {
     if let Some(generative) = generative {
         app = app.with_generation(generative);
     }
+    // #306: the production memory writer is opt-in. Default off writes nothing.
+    if env_bool("AIVTUBER_MEMORY_WRITER", false)? {
+        app = app
+            .with_memory_writer(MemoryWriterConfig {
+                max_live_entries: env_usize(
+                    "AIVTUBER_MEMORY_WRITER_MAX_LIVE_ENTRIES",
+                    MemoryWriterConfig::default().max_live_entries,
+                )?,
+                ..MemoryWriterConfig::default()
+            })
+            .map_err(|error| format!("AIVTUBER_MEMORY_WRITER: {error}"))?;
+    }
     // Issue #69: generative resource budgets are opt-in (disabled by default
     // so existing deployments keep identical behavior). All limits are
     // optional; an enabled budget with no limits records nothing enforced.
@@ -432,6 +445,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut last_floor_metrics = SpeechFloorMetrics::default();
     let mut last_barge_in_metrics = BargeInMetrics::default();
     let mut last_phrase_metrics = PhraseMetrics::default();
+    let mut last_memory_writer_metrics = MemoryWriterMetrics::default();
     let mut last_projection_metrics = aivtuber_app::SpeechProjectionMetrics::default();
     let mut last_phrase_response_logged: Option<u64> = None;
     let mut last_conversation_metrics = SpeechConversationMetrics::default();
@@ -833,6 +847,26 @@ fn run() -> Result<(), Box<dyn Error>> {
                     projection_metrics.passthrough_latin
                 );
                 last_projection_metrics = projection_metrics;
+            }
+            if let Some(metrics) = app.memory_writer_metrics()
+                && metrics != last_memory_writer_metrics
+            {
+                eprintln!(
+                    "memory_writer_metrics: considered={} written={} retrieved_used={} expired={} removed_early={} live={} rejected_viewer_attributed={} rejected_oversize={} rejected_quota={} rejected_duplicate={} rejected_gate={} rejected_store={}",
+                    metrics.texts_considered,
+                    metrics.written,
+                    metrics.retrieved_used,
+                    metrics.expired,
+                    metrics.removed_early,
+                    metrics.live,
+                    metrics.rejected_viewer_attributed,
+                    metrics.rejected_oversize,
+                    metrics.rejected_quota,
+                    metrics.rejected_duplicate,
+                    metrics.rejected_gate,
+                    metrics.rejected_store
+                );
+                last_memory_writer_metrics = metrics;
             }
             let phrase_metrics = app.phrase_metrics();
             if phrase_metrics != last_phrase_metrics {
