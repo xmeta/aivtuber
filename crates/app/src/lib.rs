@@ -10,6 +10,7 @@ mod memory_sidecar_eval;
 mod moderation_evidence;
 mod operator_control;
 mod outputs;
+mod pack_readiness;
 mod phrase_commit;
 mod profile;
 mod raw_ingress;
@@ -40,6 +41,7 @@ pub use memory_sidecar_eval::*;
 pub use moderation_evidence::*;
 pub use operator_control::*;
 pub use outputs::*;
+pub use pack_readiness::{PackReadiness, audit as audit_pack_readiness};
 pub use phrase_commit::{
     PHRASE_RESPONSE_RECORDS, PHRASE_START_WAIT, PhraseCause, PhraseCommitRecord, PhraseGateOutcome,
     PhraseMetrics, PhraseMode, PhraseResponseEnd, PhraseResponseRecord,
