@@ -60,6 +60,28 @@ pub trait JsonHttpRequestTransport: Send + Sync {
     ) -> Result<HttpResponse, HttpTransportError>;
 }
 
+/// Response whose body is read incrementally (server-sent events).
+pub struct HttpStreamResponse {
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub body: Box<dyn Read + Send>,
+}
+
+/// A transport that returns the response body as a bounded reader instead of
+/// buffering it (issue #83 S2). The endpoint policy is identical to
+/// [`JsonHttpTransport`]; `timeout` bounds the whole exchange including the
+/// body, and `max_body_bytes` bounds the decoded stream.
+pub trait StreamingHttpTransport: Send + Sync {
+    fn post_json_stream(
+        &self,
+        endpoint: &str,
+        bearer_token: Option<&str>,
+        body: &[u8],
+        timeout: Duration,
+        max_body_bytes: u64,
+    ) -> Result<HttpStreamResponse, HttpTransportError>;
+}
+
 #[derive(Clone)]
 pub struct UreqJsonTransport {
     agent: ureq::Agent,
@@ -176,6 +198,58 @@ impl JsonHttpRequestTransport for UreqJsonTransport {
             status,
             body,
             content_type,
+        })
+    }
+}
+
+impl StreamingHttpTransport for UreqJsonTransport {
+    fn post_json_stream(
+        &self,
+        endpoint: &str,
+        bearer_token: Option<&str>,
+        body: &[u8],
+        timeout: Duration,
+        max_body_bytes: u64,
+    ) -> Result<HttpStreamResponse, HttpTransportError> {
+        if !is_secure_provider_endpoint(endpoint) {
+            return Err(HttpTransportError::Unavailable(
+                "provider endpoint must use HTTPS or loopback HTTP without embedded credentials"
+                    .to_owned(),
+            ));
+        }
+        let mut config = self
+            .agent
+            .post(endpoint)
+            .config()
+            .timeout_global(Some(timeout))
+            .http_status_as_error(false)
+            .max_redirects(0);
+        if url::Url::parse(endpoint).is_ok_and(|url| is_loopback_host(&url)) {
+            config = config.proxy(None);
+        }
+        let mut request = config.build();
+        request = request
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream");
+        if let Some(token) = bearer_token {
+            request = request.header("authorization", &format!("Bearer {token}"));
+        }
+        let response = request.send(body).map_err(map_ureq_error)?;
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let reader = response
+            .into_body()
+            .into_with_config()
+            .limit(max_body_bytes)
+            .reader();
+        Ok(HttpStreamResponse {
+            status,
+            content_type,
+            body: Box::new(reader),
         })
     }
 }

@@ -166,6 +166,8 @@ pub enum PhraseCause {
     CompileFailed,
     NothingSpeakable,
     LookaheadStalled,
+    /// The provider token stream failed after phrases were committed.
+    StreamFailed(FallbackReason),
 }
 
 impl PhraseCause {
@@ -182,6 +184,7 @@ impl PhraseCause {
             Self::CompileFailed => "compile_failed",
             Self::NothingSpeakable => "nothing_speakable",
             Self::LookaheadStalled => "lookahead_stalled",
+            Self::StreamFailed(_) => "stream_failed",
         }
     }
 
@@ -193,6 +196,7 @@ impl PhraseCause {
             PhraseFailure::Compile => Self::CompileFailed,
             PhraseFailure::SchedulerRejected => Self::SchedulerRejected(Rejection::Priority),
             PhraseFailure::LookaheadStalled => Self::LookaheadStalled,
+            PhraseFailure::Stream(reason) => Self::StreamFailed(reason),
         }
     }
 }
@@ -997,6 +1001,7 @@ where
                         PhraseCause::SynthesisFailed(_)
                         | PhraseCause::CompileFailed
                         | PhraseCause::LookaheadStalled
+                        | PhraseCause::StreamFailed(_)
                         | PhraseCause::NothingSpeakable => {
                             metrics.synthesis_failed_after_commit += 1;
                         }

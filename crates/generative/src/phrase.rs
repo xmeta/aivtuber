@@ -253,15 +253,27 @@ pub(crate) fn has_content(text: &str) -> bool {
 /// already saw.
 pub fn segment_reply(text: &str, config: &SegmentationConfig) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
+    segment_ranges(&chars, config)
+        .into_iter()
+        .map(|(from, to)| chars[from..to].iter().collect::<String>())
+        .map(|phrase| phrase.trim().to_owned())
+        .filter(|phrase| !phrase.is_empty())
+        .collect()
+}
+
+/// The character ranges [`segment_reply`] cuts `chars` into (before trimming).
+/// Shared with the incremental segmenter so streamed and buffered replies use
+/// exactly the same rules.
+pub(crate) fn segment_ranges(chars: &[char], config: &SegmentationConfig) -> Vec<(usize, usize)> {
     let total = chars.len();
     // prefix[i] = weight of chars[..i]
     let mut prefix = Vec::with_capacity(total + 1);
     prefix.push(0_usize);
-    for &c in &chars {
+    for &c in chars {
         prefix.push(prefix[prefix.len() - 1] + weight(c));
     }
     let span = |from: usize, to: usize| prefix[to] - prefix[from];
-    let cuts = boundaries(&chars);
+    let cuts = boundaries(chars);
 
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     let mut start = 0;
@@ -311,15 +323,9 @@ pub fn segment_reply(text: &str, config: &SegmentationConfig) -> Vec<String> {
         start = end;
     }
 
-    merge_small_ranges(&chars, &prefix, &mut ranges, config);
+    merge_small_ranges(chars, &prefix, &mut ranges, config);
     cap_phrase_count(&mut ranges, config.max_phrases);
-
     ranges
-        .into_iter()
-        .map(|(from, to)| chars[from..to].iter().collect::<String>())
-        .map(|phrase| phrase.trim().to_owned())
-        .filter(|phrase| !phrase.is_empty())
-        .collect()
 }
 
 /// A tail shorter than the minimum, and any phrase with nothing speakable in
@@ -384,6 +390,9 @@ pub enum PhraseFailure {
     SchedulerRejected,
     /// The previous phrase never started playing within the wait bound.
     LookaheadStalled,
+    /// The provider token stream failed after earlier phrases were already
+    /// committed (issue #83 S2): the incomplete remainder is dropped.
+    Stream(FallbackReason),
 }
 
 impl PhraseFailure {
@@ -395,6 +404,7 @@ impl PhraseFailure {
             Self::Compile => "compile_failed",
             Self::SchedulerRejected => "scheduler_rejected",
             Self::LookaheadStalled => "lookahead_stalled",
+            Self::Stream(_) => "stream_failed",
         }
     }
 }
@@ -620,6 +630,27 @@ pub struct PhraseConfig {
     /// a long reply no longer times out as a whole; the first phrase is also
     /// capped by the interaction deadline.
     pub tts_timeout: Duration,
+    /// Token streaming of the Thinking reply (issue #83 S2). `None` keeps the
+    /// buffered Thinking call; it also applies only when the engine streams.
+    pub stream: Option<StreamPolicy>,
+}
+
+/// Bounds of a streamed Thinking reply that live in the pipeline (the
+/// per-event, per-reply and idle bounds live in the provider adapter).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamPolicy {
+    /// Wall-clock bound of the whole stream, including time the pipeline
+    /// spends synthesizing and waiting for lookahead slots. The first phrase
+    /// is separately held to the interaction deadline.
+    pub max_duration: Duration,
+}
+
+impl Default for StreamPolicy {
+    fn default() -> Self {
+        Self {
+            max_duration: Duration::from_secs(120),
+        }
+    }
 }
 
 impl Default for PhraseConfig {
@@ -627,6 +658,7 @@ impl Default for PhraseConfig {
         Self {
             segmentation: SegmentationConfig::default(),
             tts_timeout: Duration::from_secs(12),
+            stream: None,
         }
     }
 }
@@ -636,6 +668,12 @@ impl PhraseConfig {
         self.segmentation.validate()?;
         if self.tts_timeout.is_zero() {
             return Err("phrase tts_timeout must be greater than zero".to_owned());
+        }
+        if self
+            .stream
+            .is_some_and(|stream| stream.max_duration.is_zero())
+        {
+            return Err("stream max_duration must be greater than zero".to_owned());
         }
         Ok(())
     }

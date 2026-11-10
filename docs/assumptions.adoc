@@ -78,6 +78,45 @@ Do not record secrets, private user data, or raw provider credentials.
 
 *Related:* #51, #105, #114.
 
+=== A-MEM-002 -- Durable retained memory stays in the low thousands of entries
+
+*Subsystem:* adaptation / persistence
+
+*Status:* Needs validation
+
+*Statement:* Approved durable memory per installation stays within the bounds of link:adr/0008-cross-session-memory-persistence.adoc[ADR-0008] section 3.2 (2,048 entries, about 1.6 KiB worst case each, 16 MiB on disk), so a bounded single file and a linear scan suffice and no embedded database or full-text index is justified by volume.
+
+*Evidence:*
+
+* +docs/adr/0008-cross-session-memory-persistence.adoc+ (analytic size estimate from the configured claim/topic bounds; not measured)
+* +crates/adaptation/src/lib.rs+ (+WorkingMemoryConfig+ bounds; linear-scan +relevant+)
+
+*Consequence if false:* A linear scan or single-file snapshot could miss its retrieval latency or write budget, and the database/sidecar options rejected in ADR-0008 would need reassessment.
+
+*Revisit when:* Retained entries exceed about 5,000; #283 shows a lexical or semantic retrieval need a linear scan cannot meet; or measured entry sizes differ materially from the estimate.
+
+*Related:* #282, #105, #283.
+
+=== A-MEM-003 -- No production path writes durable memory yet
+
+*Subsystem:* app / adaptation
+
+*Status:* Verified
+
+*Statement:* At `main` `b9efb0f5`, +ProductionApp::remember_working_memory+ and +remember_durable_memory*+ are called only by tests, hardening soaks and evaluation runners, never by +main.rs+ or other production code in +crates/app/src+. Cross-session continuity therefore has no current producer, and the expected benefit of persistence today is zero.
+
+*Evidence:*
+
+* +crates/app/src/lib.rs+ (+remember_working_memory+, +remember_durable_memory*+; callers inside +#[cfg(test)]+ only)
+* +crates/hardening/src/soak.rs+, +crates/app/src/memory_eval.rs+, +crates/app/src/memory_sidecar_eval.rs+
+* +docs/adr/0008-cross-session-memory-persistence.adoc+ section 1.2
+
+*Consequence if false:* If a production writer already exists, restart loss is real today and the ADR-0008 need test and slice order must be redone.
+
+*Revisit when:* A production writer (ADR-0008 Q1) lands; this assumption is then retired and the Q4 falsifier becomes runnable.
+
+*Related:* #282, #105.
+
 === A-VTS-001 -- Reconnect does not justify stale avatar-command replay
 
 *Subsystem:* VTube Studio adapter / output freshness

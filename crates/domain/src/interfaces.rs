@@ -401,8 +401,51 @@ pub trait DecisionEngine: Send + Sync {
     fn decide<'a>(&'a self, request: &'a ReflexRequest) -> EngineFuture<'a, ReflexDecision>;
 }
 
+/// What a [`ReplyDeltaSink`] wants the stream to do after a delta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaFlow {
+    Continue,
+    /// Stop reading now (cancellation, a bound reached, or a downstream
+    /// failure). The engine returns an error; the sink already knows why.
+    Stop,
+}
+
+/// Provider-neutral receiver of incremental reply text (issue #83 S2).
+///
+/// Provider wire events (SSE frames, JSON deltas) are parsed inside the
+/// adapter; only plain text deltas cross this boundary. Generated text is data
+/// the sink must gate before use, never authority.
+pub trait ReplyDeltaSink {
+    fn push(&mut self, delta: &str) -> DeltaFlow;
+
+    /// Polled by the engine while it waits for the next chunk, so that a
+    /// cancellation does not have to wait for the provider to speak again.
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
 pub trait ThinkingEngine: Send + Sync {
     fn generate<'a>(&'a self, request: &'a ThinkingRequest) -> EngineFuture<'a, GeneratedReply>;
+
+    /// True when [`Self::generate_streaming`] is available and enabled.
+    fn streams(&self) -> bool {
+        false
+    }
+
+    /// Optional incremental generation. Blocks the calling (worker) thread
+    /// until the stream ends, fails, hits a bound or the sink stops it, and
+    /// returns the full accumulated reply on success. `timeout` bounds the
+    /// whole stream. `None` means the engine does not stream; callers use
+    /// [`Self::generate`] instead.
+    fn generate_streaming(
+        &self,
+        _request: &ThinkingRequest,
+        _timeout: Duration,
+        _sink: &mut dyn ReplyDeltaSink,
+    ) -> Option<Result<GeneratedReply, EngineError>> {
+        None
+    }
 
     fn generate_with_timeout<'a>(
         &'a self,
