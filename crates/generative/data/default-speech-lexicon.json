@@ -1,0 +1,240 @@
+{
+ "schema_version": "0.1.0",
+ "lexicon_id": "default-streamer",
+ "revision": "2026-11-10.1",
+ "entries": [
+  {
+   "surface": "YouTube",
+   "reading": "ユーチューブ",
+   "source": "self-authored"
+  },
+  {
+   "surface": "YouTubers",
+   "reading": "ユーチューバーたち",
+   "source": "self-authored"
+  },
+  {
+   "surface": "YouTuber",
+   "reading": "ユーチューバー",
+   "source": "self-authored"
+  },
+  {
+   "surface": "Twitter/X",
+   "reading": "ツイッターエックス",
+   "source": "self-authored"
+  },
+  {
+   "surface": "Twitter",
+   "reading": "ツイッター",
+   "source": "self-authored"
+  },
+  {
+   "surface": "VTubers",
+   "reading": "ブイチューバーたち",
+   "source": "self-authored"
+  },
+  {
+   "surface": "VTuber",
+   "reading": "ブイチューバー",
+   "source": "self-authored"
+  },
+  {
+   "surface": "Twitch",
+   "reading": "ツイッチ",
+   "source": "self-authored"
+  },
+  {
+   "surface": "OBS",
+   "reading": "オービーエス",
+   "source": "self-authored"
+  },
+  {
+   "surface": "Discord",
+   "reading": "ディスコード",
+   "source": "self-authored"
+  },
+  {
+   "surface": "LLM",
+   "reading": "エルエルエム",
+   "source": "self-authored"
+  },
+  {
+   "surface": "TTS",
+   "reading": "ティーティーエス",
+   "source": "self-authored"
+  },
+  {
+   "surface": "STT",
+   "reading": "エスティーティー",
+   "source": "self-authored"
+  },
+  {
+   "surface": "GPT",
+   "reading": "ジーピーティー",
+   "source": "self-authored"
+  },
+  {
+   "surface": "ChatGPT",
+   "reading": "チャットジーピーティー",
+   "source": "self-authored"
+  },
+  {
+   "surface": "OpenAI",
+   "reading": "オープンエーアイ",
+   "source": "self-authored"
+  },
+  {
+   "surface": "Instagram",
+   "reading": "インスタグラム",
+   "source": "self-authored"
+  },
+  {
+   "surface": "TikTok",
+   "reading": "ティックトック",
+   "source": "self-authored"
+  },
+  {
+   "surface": "Steam",
+   "reading": "スチーム",
+   "source": "self-authored"
+  },
+  {
+   "surface": "Google",
+   "reading": "グーグル",
+   "source": "self-authored"
+  },
+  {
+   "surface": "Amazon",
+   "reading": "アマゾン",
+   "source": "self-authored"
+  },
+  {
+   "surface": "Apple",
+   "reading": "アップル",
+   "source": "self-authored"
+  },
+  {
+   "surface": "Microsoft",
+   "reading": "マイクロソフト",
+   "source": "self-authored"
+  },
+  {
+   "surface": "Windows",
+   "reading": "ウィンドウズ",
+   "source": "self-authored"
+  },
+  {
+   "surface": "Android",
+   "reading": "アンドロイド",
+   "source": "self-authored"
+  },
+  {
+   "surface": "iPhone",
+   "reading": "アイフォン",
+   "source": "self-authored"
+  },
+  {
+   "surface": "GitHub",
+   "reading": "ギットハブ",
+   "source": "self-authored"
+  },
+  {
+   "surface": "Spotify",
+   "reading": "スポティファイ",
+   "source": "self-authored"
+  },
+  {
+   "surface": "Wi-Fi",
+   "reading": "ワイファイ",
+   "source": "self-authored"
+  },
+  {
+   "surface": "Live2D",
+   "reading": "ライブツーディー",
+   "source": "self-authored"
+  },
+  {
+   "surface": "VRM",
+   "reading": "ブイアールエム",
+   "source": "self-authored"
+  },
+  {
+   "surface": "BGM",
+   "reading": "ビージーエム",
+   "source": "self-authored"
+  },
+  {
+   "surface": "SNS",
+   "reading": "エスエヌエス",
+   "source": "self-authored"
+  },
+  {
+   "surface": "URL",
+   "reading": "ユーアールエル",
+   "source": "self-authored"
+  },
+  {
+   "surface": "API",
+   "reading": "エーピーアイ",
+   "source": "self-authored"
+  },
+  {
+   "surface": "GPU",
+   "reading": "ジーピーユー",
+   "source": "self-authored"
+  },
+  {
+   "surface": "CPU",
+   "reading": "シーピーユー",
+   "source": "self-authored"
+  },
+  {
+   "surface": "AI",
+   "reading": "エーアイ",
+   "source": "self-authored",
+   "case_sensitive": true
+  },
+  {
+   "surface": "PC",
+   "reading": "ピーシー",
+   "source": "self-authored",
+   "case_sensitive": true
+  },
+  {
+   "surface": "VR",
+   "reading": "ブイアール",
+   "source": "self-authored",
+   "case_sensitive": true
+  },
+  {
+   "surface": "LINE",
+   "reading": "ライン",
+   "source": "self-authored",
+   "case_sensitive": true
+  },
+  {
+   "surface": "OK",
+   "reading": "オーケー",
+   "source": "self-authored",
+   "case_sensitive": true
+  },
+  {
+   "surface": "GG",
+   "reading": "ジージー",
+   "source": "self-authored",
+   "case_sensitive": true
+  },
+  {
+   "surface": "MV",
+   "reading": "エムブイ",
+   "source": "self-authored",
+   "case_sensitive": true
+  },
+  {
+   "surface": "PV",
+   "reading": "ピーブイ",
+   "source": "self-authored",
+   "case_sensitive": true
+  }
+ ]
+}

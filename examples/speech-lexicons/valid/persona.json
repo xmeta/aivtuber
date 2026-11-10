@@ -1,0 +1,19 @@
+{
+ "schema_version": "0.1.0",
+ "lexicon_id": "example-persona",
+ "revision": "1",
+ "entries": [
+  {
+   "surface": "Claude",
+   "reading": "クロード",
+   "source": "operator"
+  },
+  {
+   "surface": "AI",
+   "reading": "アイ",
+   "source": "operator",
+   "case_sensitive": true,
+   "note": "overrides the default AI reading"
+  }
+ ]
+}
