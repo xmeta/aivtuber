@@ -1,4 +1,7 @@
-use crate::{DomainValidationError, EventEnvelope, EventKind, SourceClass, TrustLevel};
+use crate::{
+    DomainValidationError, EventEnvelope, EventKind, MAX_SCREEN_OBSERVATION_THINKING_BYTES,
+    SourceClass, TrustLevel,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -234,6 +237,10 @@ pub enum ThinkingContextSource {
     Memory,
     StreamState,
     OperatorCurated,
+    /// One bounded, delimited, untrusted caption derived from a screen
+    /// observation (ADR-0007 D-Q7). Never memory-eligible, never TTS or Reflex
+    /// input.
+    ScreenObservation,
 }
 
 /// What kind of knowledge a retained claim represents (#105 §3.1).
@@ -337,6 +344,28 @@ impl ThinkingContent {
                 "current_event content requires event_id, event_kind, and source_class",
             ));
         }
+        if self.source == ThinkingContextSource::ScreenObservation {
+            // ADR-0007 D-Q7: perceived text is untrusted by construction, is
+            // not an event or a retained claim, and stays small.
+            if self.trust_level != TrustLevel::Untrusted
+                || self.event_id.is_some()
+                || self.event_kind.is_some()
+                || self.source_class.is_some()
+            {
+                return Err(DomainValidationError::new(
+                    field,
+                    "screen_observation content must be untrusted and carry no event identity",
+                ));
+            }
+            if self.text.len() > MAX_SCREEN_OBSERVATION_THINKING_BYTES {
+                return Err(DomainValidationError::new(
+                    field,
+                    format!(
+                        "screen_observation text must contain at most {MAX_SCREEN_OBSERVATION_THINKING_BYTES} UTF-8 bytes"
+                    ),
+                ));
+            }
+        }
         match (self.source, self.epistemic_class) {
             (ThinkingContextSource::Memory, None) => {
                 return Err(DomainValidationError::new(
@@ -410,6 +439,17 @@ impl ThinkingRequest {
         }
 
         let mut total_bytes = self.input.text.len();
+        let screen_items = self
+            .curated_context
+            .iter()
+            .filter(|item| item.source == ThinkingContextSource::ScreenObservation)
+            .count();
+        if screen_items > 1 {
+            return Err(DomainValidationError::new(
+                "thinking_request.curated_context",
+                "must contain at most one screen_observation item",
+            ));
+        }
         for item in &self.curated_context {
             item.validate("thinking_request.curated_context")?;
             if item.source == ThinkingContextSource::CurrentEvent {
@@ -783,6 +823,61 @@ mod tests {
                 .validate()
                 .expect_err("current event must not be duplicated")
                 .field(),
+            "thinking_request.curated_context"
+        );
+    }
+
+    fn screen_item(text: String) -> ThinkingContent {
+        ThinkingContent {
+            source: ThinkingContextSource::ScreenObservation,
+            event_id: None,
+            event_kind: None,
+            source_class: None,
+            trust_level: TrustLevel::Untrusted,
+            privacy: PrivacyClass::Private,
+            epistemic_class: None,
+            text,
+        }
+    }
+
+    #[test]
+    fn screen_observation_context_is_untrusted_small_identity_free_and_single() {
+        let mut request = thinking_request();
+        request
+            .curated_context
+            .push(screen_item("a menu".to_owned()));
+        request.validate().expect("one bounded untrusted item");
+
+        // Round trips under its snake_case wire name.
+        let encoded = serde_json::to_value(request.curated_context.last().unwrap()).unwrap();
+        assert_eq!(encoded["source"], "screen_observation");
+
+        let mut trusted = screen_item("a menu".to_owned());
+        trusted.trust_level = TrustLevel::Trusted;
+        assert!(trusted.validate("item").is_err());
+        let mut with_event = screen_item("a menu".to_owned());
+        with_event.event_id = Some("evt-1".to_owned());
+        assert!(with_event.validate("item").is_err());
+        let mut with_class = screen_item("a menu".to_owned());
+        with_class.epistemic_class = Some(EpistemicClass::Observation);
+        assert!(with_class.validate("item").is_err());
+
+        assert!(
+            screen_item("x".repeat(MAX_SCREEN_OBSERVATION_THINKING_BYTES))
+                .validate("item")
+                .is_ok()
+        );
+        assert!(
+            screen_item("x".repeat(MAX_SCREEN_OBSERVATION_THINKING_BYTES + 1))
+                .validate("item")
+                .is_err()
+        );
+
+        request
+            .curated_context
+            .push(screen_item("another".to_owned()));
+        assert_eq!(
+            request.validate().expect_err("one screen item").field(),
             "thinking_request.curated_context"
         );
     }

@@ -7,10 +7,12 @@
 
 mod floor;
 pub use floor::*;
+mod lifecycle;
+pub use lifecycle::*;
 mod replay;
 pub use replay::*;
 
-use aivtuber_domain::EventKind;
+use aivtuber_domain::{EventKind, SpeechCancelReason};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -294,6 +296,29 @@ pub struct Scheduler {
     now_ms: u64,
     last_terminal_at: Option<u64>,
     terminal_evicted: usize,
+    /// The speech lifecycle truth for items on the audio channel (ADR-0004).
+    lifecycle: SpeechLifecycleLog,
+}
+
+/// How a retired item ended, for the speech lifecycle.
+#[derive(Debug, Clone, Copy)]
+enum Retired {
+    Natural,
+    Cancelled(SpeechCancelReason),
+}
+
+/// An item that ran to its effective end either finished or, when a safe-point
+/// cancellation cut it short, was preempted.
+fn retired_after_run(cut_short: bool) -> Retired {
+    if cut_short {
+        Retired::Cancelled(SpeechCancelReason::Preempted)
+    } else {
+        Retired::Natural
+    }
+}
+
+fn carries_speech(plan: &PlannedPerformance) -> bool {
+    plan.channels.contains(&BlendChannel::Audio)
 }
 
 impl Scheduler {
@@ -312,6 +337,7 @@ impl Scheduler {
             now_ms: 0,
             last_terminal_at: None,
             terminal_evicted: 0,
+            lifecycle: SpeechLifecycleLog::default(),
         }
     }
 
@@ -409,10 +435,11 @@ impl Scheduler {
     /// liveness-index entries atomically, and swap-remove the slot from the
     /// live collection. The previously-last item is re-indexed at `index` so
     /// both indexes stay consistent with the compacted live collection.
-    fn retire(&mut self, index: usize, terminal_at_ms: u64) {
+    fn retire(&mut self, index: usize, terminal_at_ms: u64, outcome: Retired) {
         let item = self.items.swap_remove(index);
         self.live_by_generation.remove(&item.plan.generation);
         self.live_by_event.remove(&item.plan.event_id);
+        self.note_speech_retired(&item, terminal_at_ms, outcome);
 
         self.history.push_back(HistoryEntry {
             terminal_at_ms,
@@ -447,6 +474,10 @@ impl Scheduler {
             .cooldowns_expired
             .saturating_add(cooldowns_before.saturating_sub(self.cooldowns.len()) as u64);
 
+        // Slot order is not time order, so the lifecycle events of this advance
+        // are emitted in logical order when the batch closes.
+        self.lifecycle.begin_batch();
+
         // Retiring items swap-removes slots, so re-check the slot at the same
         // index (without bumping `index`) after every terminal transition.
         let mut index = 0;
@@ -456,6 +487,7 @@ impl Scheduler {
 
             match self.items[index].status {
                 Status::Playing => {
+                    self.note_speech_progress(index, target.min(effective_end));
                     if effective_end <= target {
                         let cancelled = self.items[index]
                             .cancel_at_ms
@@ -469,7 +501,7 @@ impl Scheduler {
                             self.last_terminal_at
                                 .map_or(effective_end, |previous| previous.max(effective_end)),
                         );
-                        self.retire(index, effective_end);
+                        self.retire(index, effective_end, retired_after_run(cancelled));
                         continue;
                     }
                 }
@@ -477,11 +509,16 @@ impl Scheduler {
                     if self.items[index].cancel_at_ms.is_some_and(|cancel| {
                         cancel < self.items[index].plan.start_at_ms && cancel <= target
                     }) {
-                        self.retire(index, target);
+                        self.retire(
+                            index,
+                            target,
+                            Retired::Cancelled(SpeechCancelReason::Preempted),
+                        );
                         continue;
                     }
 
                     if self.items[index].plan.start_at_ms <= target {
+                        self.note_speech_progress(index, target.min(effective_end));
                         if effective_end <= target {
                             let cancelled = self.items[index]
                                 .cancel_at_ms
@@ -495,7 +532,7 @@ impl Scheduler {
                                 self.last_terminal_at
                                     .map_or(effective_end, |previous| previous.max(effective_end)),
                             );
-                            self.retire(index, effective_end);
+                            self.retire(index, effective_end, retired_after_run(cancelled));
                             continue;
                         } else {
                             self.items[index].status = Status::Playing;
@@ -508,6 +545,7 @@ impl Scheduler {
             index += 1;
         }
 
+        self.lifecycle.end_batch();
         self.now_ms = target;
     }
 
@@ -536,7 +574,10 @@ impl Scheduler {
         request_at_ms: u64,
         plan: PlannedPerformance,
     ) -> Result<PlannedPerformance, Rejection> {
-        self.schedule_inner(request_at_ms, plan, None)
+        let event_id = plan.event_id.clone();
+        let result = self.schedule_inner(request_at_ms, plan, None);
+        self.note_speech_rejection(&event_id, request_at_ms, &result);
+        result
     }
 
     /// Commit one atomic phrase of a phrased reply (issue #83).
@@ -555,10 +596,14 @@ impl Scheduler {
         plan: PlannedPerformance,
         link: PhraseLink,
     ) -> Result<PlannedPerformance, Rejection> {
-        if link.seq == 0 {
-            return self.schedule_inner(request_at_ms, plan, Some(link));
-        }
-        self.schedule_continuation(request_at_ms, plan, link)
+        let event_id = plan.event_id.clone();
+        let result = if link.seq == 0 {
+            self.schedule_inner(request_at_ms, plan, Some(link))
+        } else {
+            self.schedule_continuation(request_at_ms, plan, link)
+        };
+        self.note_speech_rejection(&event_id, request_at_ms, &result);
+        result
     }
 
     fn schedule_continuation(
@@ -752,7 +797,7 @@ impl Scheduler {
             for index in queued_indices {
                 let queued_rank = self.items[index].plan.priority.rank();
                 if incoming_rank < queued_rank {
-                    self.cancel_queued(index, request_at_ms);
+                    self.cancel_queued(index, request_at_ms, SpeechCancelReason::Superseded);
                     changed = true;
                     continue;
                 }
@@ -805,8 +850,174 @@ impl Scheduler {
             cancel_at_ms: None,
             phrase,
         });
+        self.note_speech_committed(index, phrase);
 
         plan
+    }
+
+    // --- Speech lifecycle (ADR-0004 D5, issue #222 S2) -------------------
+    //
+    // Only items on the audio channel are speech. Every hook below is a
+    // consequence of a scheduler transition that already happened; none of
+    // them can change scheduling. A refused lifecycle call is counted in the
+    // log's metrics and otherwise ignored, so a lifecycle fault can never stop
+    // the deterministic performer.
+
+    /// The speech lifecycle log (read-only).
+    pub fn speech_lifecycle(&self) -> &SpeechLifecycleLog {
+        &self.lifecycle
+    }
+
+    /// Remove and return up to `max` queued lifecycle events in `seq` order.
+    pub fn drain_speech_lifecycle(
+        &mut self,
+        max: usize,
+    ) -> Vec<aivtuber_domain::SpeechLifecycleEvent> {
+        self.lifecycle.drain(max)
+    }
+
+    /// Audio for a unit was prepared: a cached asset was resolved, or TTS
+    /// completed. Reporters call this before scheduling; the scheduler then
+    /// writes `Committed` (or `Cancelled(SchedulerRejected)`) itself. A unit
+    /// that was never reported is prepared implicitly at commit, without a
+    /// digest. Refused silently when a live item already carries the id.
+    pub fn note_speech_prepared(&mut self, at_ms: u64, prepared: SpeechPrepared) {
+        if self.live_by_event.contains_key(&prepared.event_id) {
+            return;
+        }
+        let _ = self.lifecycle.prepared(at_ms.max(self.now_ms), prepared);
+    }
+
+    /// Cancel a prepared-but-never-committed unit (for example the output gate
+    /// or the generation attempt refused it after synthesis). A unit that is
+    /// already committed is left to the scheduler's own transitions.
+    pub fn cancel_prepared_speech(
+        &mut self,
+        at_ms: u64,
+        event_id: &str,
+        reason: SpeechCancelReason,
+    ) {
+        if self.lifecycle.stage(event_id) == Some(SpeechStage::Prepared) {
+            let _ = self
+                .lifecycle
+                .cancelled(at_ms.max(self.now_ms), event_id, reason);
+        }
+    }
+
+    /// An output adapter observed something about the command of `generation`.
+    /// A failure cancels the unit's lifecycle (the performer's own timeline is
+    /// untouched); acceptance or drain only strengthens the `basis` of its
+    /// `Finished`. A report for a generation that is no longer live is counted
+    /// as late.
+    pub fn report_speech_output(
+        &mut self,
+        generation: u64,
+        observation: OutputObservation,
+        at_ms: u64,
+    ) {
+        let Some(event_id) = self
+            .live_by_generation
+            .get(&generation)
+            .and_then(|index| self.items.get(*index))
+            .map(|item| item.plan.event_id.clone())
+        else {
+            // Retired already: the scheduler's own Finished/Cancelled stands.
+            self.lifecycle.note_late_output_report();
+            return;
+        };
+        let _ = self
+            .lifecycle
+            .observe_output(at_ms.max(self.now_ms), &event_id, observation);
+    }
+
+    /// Cancel every live speech unit's lifecycle without touching the
+    /// timeline (operator mute: the scheduler keeps running, the audio does
+    /// not).
+    pub fn cancel_all_speech(&mut self, at_ms: u64, reason: SpeechCancelReason) {
+        let at_ms = at_ms.max(self.now_ms);
+        let ids: Vec<String> = self.lifecycle.live_ids().cloned().collect();
+        for id in ids {
+            let _ = self.lifecycle.cancelled(at_ms, &id, reason);
+        }
+    }
+
+    fn note_speech_committed(&mut self, index: usize, phrase: Option<PhraseLink>) {
+        let item = &self.items[index];
+        if !carries_speech(&item.plan) {
+            return;
+        }
+        let (event_id, generation) = (item.plan.event_id.clone(), item.plan.generation);
+        if !self.lifecycle.is_live(&event_id) {
+            let implicit = SpeechPrepared {
+                event_id: event_id.clone(),
+                asset_id: item.plan.asset_id.clone(),
+                phrase: phrase.map_or(0, |link| link.seq),
+                final_phrase: phrase.is_none_or(|link| link.final_phrase),
+                speech_text_digest: None,
+                projection: None,
+            };
+            let _ = self.lifecycle.prepared(self.now_ms, implicit);
+        }
+        let _ = self.lifecycle.committed(self.now_ms, &event_id, generation);
+        self.note_speech_progress(index, self.now_ms);
+    }
+
+    /// Write `Started` (when the unit's logical start has passed) and every
+    /// declared safe point up to `up_to_ms`. The end of the unit is not a
+    /// boundary: it is `Finished`.
+    fn note_speech_progress(&mut self, index: usize, up_to_ms: u64) {
+        let item = &self.items[index];
+        if !carries_speech(&item.plan) || item.plan.start_at_ms > up_to_ms {
+            return;
+        }
+        let event_id = item.plan.event_id.clone();
+        let start = item.plan.start_at_ms;
+        if self.lifecycle.stage(&event_id) == Some(SpeechStage::Committed) {
+            let _ = self.lifecycle.started(start, &event_id);
+        }
+        if self.lifecycle.stage(&event_id) != Some(SpeechStage::Started) {
+            return;
+        }
+        let duration = item.plan.duration_ms;
+        let already = self.lifecycle.boundaries_emitted(&event_id);
+        let pending: Vec<u64> = item
+            .plan
+            .interrupt_points_ms
+            .iter()
+            .copied()
+            .filter(|offset| *offset < duration)
+            .skip(already)
+            .take_while(|offset| start.saturating_add(*offset) <= up_to_ms)
+            .collect();
+        for offset in pending {
+            let _ = self
+                .lifecycle
+                .boundary(start.saturating_add(offset), &event_id, offset);
+        }
+    }
+
+    fn note_speech_retired(&mut self, item: &ScheduledItem, at_ms: u64, outcome: Retired) {
+        if !carries_speech(&item.plan) {
+            return;
+        }
+        let event_id = &item.plan.event_id;
+        let _ = match outcome {
+            Retired::Natural => self.lifecycle.finished(at_ms, event_id),
+            Retired::Cancelled(reason) => self.lifecycle.cancelled(at_ms, event_id, reason),
+        };
+    }
+
+    fn note_speech_rejection(
+        &mut self,
+        event_id: &str,
+        at_ms: u64,
+        result: &Result<PlannedPerformance, Rejection>,
+    ) {
+        // A duplicate's id belongs to the live item that caused the refusal;
+        // every other refusal ends a unit that was only ever prepared.
+        if matches!(result, Err(rejection) if *rejection != Rejection::DuplicateEvent) {
+            self.cancel_prepared_speech(at_ms, event_id, SpeechCancelReason::SchedulerRejected);
+        }
     }
 
     /// Whether phrase `seq` of `response_id` has begun playing or already
@@ -831,6 +1042,16 @@ impl Scheduler {
     /// same pass, so no stale generation/event entry survives a stop and no
     /// stale audio/avatar action can remain live afterwards.
     pub fn stop_all(&mut self, at_ms: u64) -> Vec<PlannedPerformance> {
+        self.stop_all_for(at_ms, SpeechCancelReason::OperatorStop)
+    }
+
+    /// [`Self::stop_all`] with the reason the speech lifecycle records (for
+    /// example `Shutdown`). The scheduling effect is identical.
+    pub fn stop_all_for(
+        &mut self,
+        at_ms: u64,
+        reason: SpeechCancelReason,
+    ) -> Vec<PlannedPerformance> {
         self.advance_to(at_ms);
         let mut stopped = Vec::new();
 
@@ -847,12 +1068,12 @@ impl Scheduler {
                         self.last_terminal_at
                             .map_or(at_ms, |previous| previous.max(at_ms)),
                     );
-                    self.retire(index, at_ms);
+                    self.retire(index, at_ms, Retired::Cancelled(reason));
                     stopped.push(plan);
                 }
                 Status::Queued => {
                     let plan = self.items[index].plan.clone();
-                    self.cancel_queued(index, at_ms);
+                    self.cancel_queued(index, at_ms, reason);
                     stopped.push(plan);
                 }
                 Status::Completed | Status::Cancelled => {
@@ -881,7 +1102,11 @@ impl Scheduler {
             self.last_terminal_at
                 .map_or(at_ms, |previous| previous.max(at_ms)),
         );
-        self.retire(index, at_ms);
+        self.retire(
+            index,
+            at_ms,
+            Retired::Cancelled(SpeechCancelReason::OperatorStop),
+        );
         Some(plan)
     }
 
@@ -914,12 +1139,16 @@ impl Scheduler {
                         self.last_terminal_at
                             .map_or(at_ms, |previous| previous.max(at_ms)),
                     );
-                    self.retire(index, at_ms);
+                    self.retire(
+                        index,
+                        at_ms,
+                        Retired::Cancelled(SpeechCancelReason::BargeIn),
+                    );
                     stop.playing.push(plan);
                 }
                 (true, Status::Queued) => {
                     let plan = item.plan.clone();
-                    self.cancel_queued(index, at_ms);
+                    self.cancel_queued(index, at_ms, SpeechCancelReason::BargeIn);
                     stop.queued.push(plan);
                 }
                 _ => index += 1,
@@ -943,7 +1172,7 @@ impl Scheduler {
     /// Cancel one queued reservation and retire it atomically: the slot is
     /// removed, its liveness-index entries are invalidated, and the item
     /// moves to bounded history.
-    fn cancel_queued(&mut self, index: usize, at_ms: u64) {
+    fn cancel_queued(&mut self, index: usize, at_ms: u64, reason: SpeechCancelReason) {
         let planned_cooldown = self.items[index]
             .plan
             .end_at_ms()
@@ -956,7 +1185,7 @@ impl Scheduler {
         if self.cooldowns.get(&asset_id).copied() == Some(planned_cooldown) {
             self.cooldowns.remove(&asset_id);
         }
-        self.retire(index, at_ms);
+        self.retire(index, at_ms, Retired::Cancelled(reason));
     }
 }
 

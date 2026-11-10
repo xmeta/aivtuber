@@ -7,6 +7,12 @@
 
 mod cached_playback;
 pub use cached_playback::*;
+mod speech_freshness;
+pub use speech_freshness::*;
+mod perception;
+pub use perception::*;
+mod perception_replay;
+pub use perception_replay::*;
 mod speech_observation;
 pub use speech_observation::*;
 mod speech_replay;
@@ -670,6 +676,8 @@ impl SecurityRuntime {
             "mute" | "performer.mute" => {
                 require_capability(authority, Capability::PerformerMute)?;
                 self.muted = true;
+                self.scheduler
+                    .cancel_all_speech(at_ms, aivtuber_domain::SpeechCancelReason::Muted);
                 ControlOutcome::Muted
             }
             _ => ControlOutcome::AuthenticatedOther,
@@ -712,6 +720,7 @@ impl SecurityRuntime {
             "mute" | "performer.mute" => {
                 require_capability(authority, Capability::PerformerMute)?;
                 self.muted = true;
+                scheduler.cancel_all_speech(at_ms, aivtuber_domain::SpeechCancelReason::Muted);
                 ControlOutcome::Muted
             }
             _ => ControlOutcome::AuthenticatedOther,

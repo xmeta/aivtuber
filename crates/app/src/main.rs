@@ -302,6 +302,19 @@ fn run() -> Result<(), Box<dyn Error>> {
     {
         eprintln!("{line}");
     }
+    // #222 S2 (ADR-0004 D-4): operator-forced invalidation. Operator
+    // configuration only, read once at start like the lexicon itself.
+    for surface in env_string("AIVTUBER_SPEECH_INVALIDATE", "")
+        .split(',')
+        .map(str::trim)
+        .filter(|surface| !surface.is_empty())
+    {
+        let report = app.invalidate_speech_surface(surface);
+        eprintln!(
+            "speech invalidate {surface:?}: scanned={} forced={} skipped_not_generated={} truncated={}",
+            report.scanned, report.forced, report.skipped_not_generated, report.truncated
+        );
+    }
     report_degraded(app.avatar_output_name(), app.health());
     eprintln!(
         "raw_ingress: max_record_bytes={} queue_capacity={}",

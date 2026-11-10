@@ -1,0 +1,36 @@
+{
+  "schema_version": "0.1.0",
+  "provider_id": "vision-sidecar",
+  "provider_version": "0.1.0",
+  "observations": [
+    {
+      "kind": "screen_caption",
+      "observation_id": "obs-1",
+      "source": {
+        "alias": "game-main"
+      },
+      "frame": {
+        "capture_seq": 1,
+        "captured_at_ms": 1100,
+        "width": 768,
+        "height": 432
+      },
+      "observed_at_ms": 1200,
+      "expires_at_ms": 21200,
+      "producer": {
+        "model_id": "qwen3-vl:4b-instruct-q4_k_m",
+        "config_digest": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+        "prompt_version": "describe-v1"
+      },
+      "privacy": "private",
+      "redaction": {
+        "policy_version": "redact-v1",
+        "secret_hits": 0,
+        "truncated": false
+      },
+      "payload": {
+        "caption": "safe ‮evil"
+      }
+    }
+  ]
+}
