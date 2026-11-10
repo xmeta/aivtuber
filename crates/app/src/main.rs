@@ -22,8 +22,8 @@ use aivtuber_app::{
     SHADOW_ORCHESTRATOR_SCHEMA_VERSION, ShadowOrchestratorConfig, ShadowPolicyIdentity,
     ShadowingRoutePlanner, SpeechConversationConfig, SpeechConversationMetrics, SpeechFloorMetrics,
     SpeechSidecar, SpeechSidecarConfig, SpeechSidecarStats, StreamOutput, TtsSidecarSettings,
-    VtsAvatarOutput, VtsPlaybackConfig, apply_dispatched_request, audit_pack_readiness,
-    pump_bounded_records, stt_sidecar_args,
+    VoicevoxBridge, VoicevoxSettings, VtsAvatarOutput, VtsPlaybackConfig, apply_dispatched_request,
+    audit_pack_readiness, pump_bounded_records, stt_sidecar_args,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
@@ -87,6 +87,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         Some(mode) => CompositionProfile::parse(&mode)?,
         None => CompositionProfile::Cached,
     };
+    // #295: optional VOICEVOX backend through the in-process loopback bridge.
+    // Held for the whole run; dropping it stops the listener. Resolved before
+    // the sidecar so a conflicting setting fails before a child is spawned.
+    let voicevox_bridge = start_voicevox_bridge(profile, &audio_root, &pack_root)?;
     // #220 S2b: optional supervised local TTS sidecar (local profile only).
     let mut tts_sidecar = start_tts_sidecar(profile, &audio_root, &pack_root)?;
     let generative_configured = build_generative_runtime(
@@ -94,6 +98,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         retention,
         profile,
         tts_sidecar.as_ref().map(|handle| handle.alive.clone()),
+        voicevox_bridge.as_ref(),
     )?;
     let jev_api_key_present =
         env_optional("AIVTUBER_JEV_API_KEY").is_some_and(|key| !key.trim().is_empty());
@@ -1071,11 +1076,34 @@ fn start_tts_sidecar(
     }
 }
 
+/// `AIVTUBER_TTS_BACKEND=voicevox` (off by default): validate the settings and
+/// start the in-process bridge to a separately started VOICEVOX ENGINE.
+/// Misconfiguration (no speaker, non-loopback engine, ...) is a startup error;
+/// an engine that is not running yet is not.
+fn start_voicevox_bridge(
+    profile: CompositionProfile,
+    audio_root: &std::path::Path,
+    pack_root: &std::path::Path,
+) -> Result<Option<VoicevoxBridge>, Box<dyn Error>> {
+    let generative = env_bool("AIVTUBER_GENERATIVE_ENABLED", false)?;
+    let Some(settings) =
+        VoicevoxSettings::resolve(&|name| env_optional(name), profile, generative)?
+    else {
+        return Ok(None);
+    };
+    let bridge = VoicevoxBridge::start(settings, audio_root, pack_root)?;
+    for line in bridge.startup_lines() {
+        eprintln!("{line}");
+    }
+    Ok(Some(bridge))
+}
+
 fn build_generative_runtime(
     compatibility: &RuntimeCompatibility,
     retention: RuntimeRetentionPolicy,
     profile: CompositionProfile,
     supervised_tts: Option<Arc<AtomicBool>>,
+    voicevox: Option<&VoicevoxBridge>,
 ) -> Result<Option<GenerativeRuntime>, Box<dyn Error>> {
     if !env_bool("AIVTUBER_GENERATIVE_ENABLED", false)? {
         return Ok(None);
@@ -1107,7 +1135,10 @@ fn build_generative_runtime(
         env_optional("AIVTUBER_OPENAI_AUTH").as_deref(),
         env_optional("AIVTUBER_OPENAI_API_KEY"),
     )?;
-    let tts_endpoint = required_env("AIVTUBER_TTS_ENDPOINT")?;
+    let tts_endpoint = match voicevox {
+        Some(bridge) => bridge.tts_endpoint().to_owned(),
+        None => required_env("AIVTUBER_TTS_ENDPOINT")?,
+    };
     // The loopback-only profile must not be pointed at a remote provider.
     let resolver = SystemHostResolver;
     profile.validate_provider_endpoints(&[
@@ -1142,6 +1173,12 @@ fn build_generative_runtime(
             Some(aivtuber_adapters::speech_stt::pins::bundle_sha256(
                 &SUPERTONIC_3_INT8,
             )),
+        )
+    } else if let Some(bridge) = voicevox {
+        (
+            aivtuber_adapters::speech_tts::voicevox::BACKEND_NAME,
+            Some(bridge.settings().model_alias()),
+            None,
         )
     } else {
         ("normalized-http-tts", None, None)

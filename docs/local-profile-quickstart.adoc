@@ -201,6 +201,40 @@ It writes six Opus files and `PROVENANCE.json` under `<pack>/audio/starter/` (th
 
 Decision (#289): the audio is generated on the operator's machine, not committed. The weights are OpenRAIL-M and this project does not redistribute them or audio made with them, generated media is never committed here, and the step reuses the pinned sidecar so the voice is exactly the one used for replies. The disclosure duty in section 8 applies to this audio when you broadcast it.
 
+=== Optional voice: VOICEVOX instead of Supertonic (issue #295)
+
+Supertonic stays the default. If you prefer a VOICEVOX character voice, run the VOICEVOX ENGINE yourself and let the app talk to it through a built-in loopback bridge. The engine is a separate program (LGPL-3.0, or a separate licence from its authors): this repository neither links nor bundles it, and the release archives do not contain it.
+
+. Download and start the engine from https://voicevox.hiroshiba.jp/ (or https://github.com/VOICEVOX/voicevox_engine) so that it listens on loopback, normally `http://127.0.0.1:50021`.
+. Pick a speaker id. `curl http://127.0.0.1:50021/speakers` lists every character and its styles; the `id` of the style you want is the value to use. *There is no default character*, and the app refuses to start without one.
+. Read the terms of the character you chose (see <<voicevox-terms>>) and decide what credit line you must show.
+. Replace the `# local TTS (supervised child)` block of step 4 with:
+
+[source,sh]
+----
+export AIVTUBER_TTS_BACKEND=voicevox
+export AIVTUBER_VOICEVOX_ENDPOINT=http://127.0.0.1:50021    # loopback http:// origin only
+export AIVTUBER_VOICEVOX_SPEAKER=3                          # the style id from /speakers: required, no default
+export AIVTUBER_VOICEVOX_CREDIT="VOICEVOX:ずんだもん"        # required: the credit line your character's terms ask for
+# optional
+export AIVTUBER_VOICEVOX_TIMEOUT_MS=12000                   # total budget for one synthesis (default 12000)
+export AIVTUBER_VOICEVOX_AMPLITUDE_VISEMES=true             # mouth movement from the audio envelope (default off)
+----
+
+Do not set `AIVTUBER_TTS_ENDPOINT` or `AIVTUBER_TTS_SIDECAR` with it (the app says so and stops). The app starts a bridge on an ephemeral loopback port inside its own process, and the existing TTS adapter talks to that: the bridge turns each request into `POST /audio_query` and then `POST /synthesis` on the engine, writes the WAV under `AIVTUBER_AUDIO_ROOT/generated/`, and answers with the same contract the Supertonic sidecar uses. At start it logs the engine origin, the speaker, the credit line and a terms notice (the spoken text is never logged). The engine does not have to be running at that moment: a synthesis that cannot reach it, gets a non-2xx answer or exceeds the timeout fails like any TTS failure, and the viewer sees the non-verbal reaction (#291) while the performer carries on. Phrase mode (#83) works unchanged: each phrase is one bridge call. The same text projection as for Supertonic runs first, so URLs and emoji are never sent to the engine (ADR-0004 D-5).
+
+[#voicevox-terms]
+==== VOICEVOX terms and credit (yours to follow)
+
+* The VOICEVOX software terms: https://voicevox.hiroshiba.jp/term/ . They require a credit line showing VOICEVOX was used, and require you to pass the terms on to anyone you give the audio to.
+* *Every character has its own terms and credit line*, in the form `VOICEVOX:<character name>` (for example `VOICEVOX:ずんだもん`). Some characters are non-commercial, or need prior confirmation or individual contact for commercial or corporate use. Each character's page (linked from the VOICEVOX site and from the engine's `/speakers` data) is the authority; EXP-0003 section 3.2 summarises the ones it read, and that summary can be out of date.
+* The runtime cannot show the credit on your stream. Put the configured line where viewers see it (stream description or an overlay text), and keep the AI-generated-voice disclosure as well.
+* Whether an AI persona with her own identity should speak with a third-party mascot's voice is a product decision. The project ships no default for it.
+
+==== What is deterministic
+
+EXP-0003 synthesized the same text repeatedly with one engine build (0.26.1, CPU), one character and default parameters, and got byte-identical audio in 50 of 50 replies, in one process and across processes. VOICEVOX has no seed. Treat this as an observation of that build, not a guarantee: another engine version, voice library, hardware backend or parameter can change the audio. The bridge's audio cache is keyed by the text and the speaker id, not by the engine version, so delete `AIVTUBER_AUDIO_ROOT/generated/` after you upgrade the engine or its voice libraries. The bridge never changes the engine's speed, pitch or intonation parameters (it only makes the output mono).
+
 == 5. Open the avatar, then talk to it
 
 *Avatar.* Copy the `local avatar renderer URL` from the app's stderr (`http://127.0.0.1:8765/?token=...`) into a browser, or into an OBS Browser Source (width and height of your canvas, "Shutdown source when not visible" off). The URL carries a per-launch secret: do not paste it into issues or shared logs. The token changes on every start. A missing or broken `model.vrm` shows as `disconnected` and the reason is in the page's console. See `docs/vts-obs-adapters.adoc` section 6 for OBS and for the security properties.
@@ -284,7 +318,7 @@ No model, voice file or avatar model is bundled or redistributed by this reposit
 |ReazonSpeech k2-v2 int8 (default STT) |Weights Apache-2.0 per the model card |*Provenance note:* trained on the ReazonSpeech corpus (Japanese TV broadcasts), which is gated; access to the corpus is conditional on using it solely for information analysis under Article 30-4 of the Japanese Copyright Act. That is a term of the dataset, not stated as a restriction on the released weights. This project does not redistribute the weights and records the provenance in `docs/supply-chain.adoc`; revisit if the publisher states a restriction.
 |NVIDIA parakeet-tdt_ctc-0.6b-ja int8 (optional STT, `AIVTUBER_SPEECH_STT_MODEL=parakeet-ja`) |CC-BY-4.0 |*Attribution required* if you select it: "Contains NVIDIA parakeet-tdt_ctc-0.6b-ja (NVIDIA, CC-BY-4.0, https://huggingface.co/nvidia/parakeet-tdt_ctc-0.6b-ja), converted to ONNX by the sherpa-onnx project (k2-fsa)." (Not fetched by `fetch-local-profile.mjs`; `node scripts/fetch-sherpa-onnx.mjs model parakeet-ja <dir>`.)
 |Supertonic 3 weights (TTS voice) |OpenRAIL-M (the sample code in the archive is MIT) |*Disclose that the voice is machine-generated.* One of the use restrictions is to publish AI-generated content without clearly disclosing it. Keep an "AI-generated voice" line where viewers see it (channel or stream description, or an overlay text); the runtime cannot show it for you and only prints a start-up notice. The other restrictions (no unlawful use, no harm to minors, no disinformation, no harassment or discrimination, no impersonation or deepfakes without consent, no fully automated legal/medical/law-enforcement decisions) pass on to you. The licensor claims no rights in the audio; you are accountable for it.
-|VOICEVOX (optional, not shipped) |Per-character terms |No default character ships. If you add one, you are responsible for its terms and credit line.
+|VOICEVOX ENGINE and voices (optional, not shipped; `AIVTUBER_TTS_BACKEND=voicevox`) |Engine LGPL-3.0 (or separate licence), run as a separate process; voices under the VOICEVOX terms plus per-character terms |No default character ships; you choose the speaker. *Show the credit line* (`VOICEVOX:<character name>`) and follow your character's own terms; see <<voicevox-terms>>. The startup log prints the credit line you configured.
 |three.js, `@pixiv/three-vrm`, Vite (renderer) |MIT, exact-pinned, allowlist-checked in CI |See `docs/supply-chain.adoc` section 8.
 |Sample VRM (`VRM1_Constraint_Twist_Sample.vrm`) |Embedded VRM 1.0 metadata: pixiv Inc., avatar permission everyone, credit notation unnecessary, no hateful use |Test model only. Check the embedded licence of whatever model you stream; the page logs its metadata at load.
 |FFmpeg `ffplay` |LGPL/GPL depending on your build |Installed by you; not bundled.

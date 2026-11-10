@@ -70,7 +70,7 @@ fn scripted_server(script: Script) -> (String, std::thread::JoinHandle<()>) {
 /// (SYN retries), so the adapter timeout for those tests must be longer.
 const REFUSED_TIMEOUT: Duration = Duration::from_secs(8);
 
-fn wait_until_quiescent(app: &mut ProductionApp<LocalRoutePlanner>) {
+pub(super) fn wait_until_quiescent(app: &mut ProductionApp<LocalRoutePlanner>) {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         app.tick(0);
@@ -94,7 +94,7 @@ fn wait_until_quiescent(app: &mut ProductionApp<LocalRoutePlanner>) {
 
 /// Advance the logical clock in small steps so every scheduled avatar command
 /// is dispatched inside its lateness window.
-fn play_out(app: &mut ProductionApp<LocalRoutePlanner>) {
+pub(super) fn play_out(app: &mut ProductionApp<LocalRoutePlanner>) {
     for now_ms in (0..=1_500).step_by(10) {
         app.tick(now_ms);
     }
@@ -111,11 +111,11 @@ fn refused_endpoint() -> String {
     endpoint
 }
 
-struct LocalRig {
-    app: ProductionApp<LocalRoutePlanner>,
-    tts_calls: Arc<Mutex<Vec<String>>>,
-    audio: Arc<Mutex<Vec<AudioPlaybackCommand>>>,
-    avatar: Arc<Mutex<Vec<AvatarPlaybackCommand>>>,
+pub(super) struct LocalRig {
+    pub(super) app: ProductionApp<LocalRoutePlanner>,
+    pub(super) tts_calls: Arc<Mutex<Vec<String>>>,
+    pub(super) audio: Arc<Mutex<Vec<AudioPlaybackCommand>>>,
+    pub(super) avatar: Arc<Mutex<Vec<AvatarPlaybackCommand>>>,
 }
 
 fn local_rig(endpoint: String, timeout: Duration, mode: PhraseMode) -> LocalRig {
@@ -141,6 +141,40 @@ fn local_rig_with_pack(
     .with_backend_name("llama-server");
     let tts = MockTts::default();
     let tts_calls = Arc::clone(&tts.texts);
+    build_local_rig(thinking, tts, tts_calls, mode, descriptors)
+}
+
+/// The `local` profile composition with caller-supplied engines (issue #295
+/// drives a real TTS adapter through the VOICEVOX bridge this way).
+pub(super) fn local_rig_with_engines<Thinking, Tts>(
+    thinking: Thinking,
+    tts: Tts,
+    mode: PhraseMode,
+) -> LocalRig
+where
+    Thinking: ThinkingEngine + 'static,
+    Tts: TtsEngine + 'static,
+{
+    build_local_rig(
+        thinking,
+        tts,
+        Arc::new(Mutex::new(Vec::new())),
+        mode,
+        &pack_root().join("descriptors"),
+    )
+}
+
+fn build_local_rig<Thinking, Tts>(
+    thinking: Thinking,
+    tts: Tts,
+    tts_calls: Arc<Mutex<Vec<String>>>,
+    mode: PhraseMode,
+    descriptors: &Path,
+) -> LocalRig
+where
+    Thinking: ThinkingEngine + 'static,
+    Tts: TtsEngine + 'static,
+{
     let audio = RecordingAudio::default();
     let audio_log = Arc::clone(&audio.commands);
     let avatar = RecordingAvatar::default();
@@ -188,7 +222,8 @@ fn local_rig_with_pack(
     }
 }
 
-fn free_text_line(rig: &mut LocalRig, sequence: u64) {
+/// Submit one free-text chat line and return without waiting for the reply.
+pub(super) fn submit_free_text_line(rig: &mut LocalRig, sequence: u64) {
     let mut event = chat_event(sequence);
     event.payload = BTreeMap::from([
         ("text".to_owned(), json!("昨日もまた負けてたよねｗ")),
@@ -200,13 +235,17 @@ fn free_text_line(rig: &mut LocalRig, sequence: u64) {
         .process_content_bytes(&raw, 0, sequence)
         .expect("generation submission");
     assert!(outcome.playback.is_none(), "the reply is deferred");
+}
+
+pub(super) fn free_text_line(rig: &mut LocalRig, sequence: u64) {
+    submit_free_text_line(rig, sequence);
     wait_until_quiescent(&mut rig.app);
 }
 
 /// The visible reaction: the pack's `reaction.neutral` expression and nod
 /// reach the avatar output through the normal dispatch, with no audio and no
 /// TTS call, and the fallback is counted under `reason`.
-fn assert_visible_fallback(rig: &mut LocalRig, reason: &'static str) {
+pub(super) fn assert_visible_fallback(rig: &mut LocalRig, reason: &'static str) {
     let plan = last_scheduled_plan(&rig.app);
     assert!(
         plan.asset_id.starts_with("reaction.neutral."),
@@ -251,7 +290,7 @@ fn assert_visible_fallback(rig: &mut LocalRig, reason: &'static str) {
     assert_eq!(observations[0].fallback_reason.as_deref(), Some(reason));
 }
 
-fn both_modes() -> [PhraseMode; 2] {
+pub(super) fn both_modes() -> [PhraseMode; 2] {
     [
         PhraseMode::Buffered,
         PhraseMode::Phrased(PhraseConfig::default()),

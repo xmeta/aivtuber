@@ -200,6 +200,22 @@ Do not record secrets, private user data, or raw provider credentials.
 
 *Related:* #220, A-LLM-002, A-TTS-001.
 
+=== A-TTS-003 -- A loopback VOICEVOX ENGINE run by the operator is a sufficient boundary for the optional VOICEVOX voice
+
+*Subsystem:* VOICEVOX bridge / `local` composition profile (issue #295)
+
+*Status:* Needs validation (the engine was driven by EXP-0003 on one host; the bridge is tested against a fake engine only)
+
+*Statement:* The bridge accepts a loopback `http://` engine origin only, with no credentials, path or query, and never follows a redirect or uses a proxy. The engine is trusted to be the VOICEVOX ENGINE the operator started; it is not authenticated, so another local process listening on that port could answer instead. Its answers are treated as data: the query JSON is passed back as an opaque object (with only `outputStereo` set) and the WAV is parsed strictly (16-bit PCM, mono, bounded size and rate) and re-encoded by the sidecar server. The credit line is the operator's configuration; the runtime logs it but cannot make it visible to viewers.
+
+*Evidence:* `crates/adapters/src/speech_tts/voicevox.rs` tests (loopback validation, bounds, strict WAV, failures never carrying text or URL), `crates/app/src/tests/voicevox_tts_tests.rs`, EXP-0003 sections 3.2 and 7 for the engine's terms and its measured repeatability.
+
+*Consequence if false:* A local process on the engine port could feed bounded audio into the voice path (never a command: audio is data and plays only through the generation result that named it). A stale audio cache after an engine or voice-library upgrade would replay old audio for the same text and speaker, because the cache key does not contain the engine version.
+
+*Revisit when:* the engine is not on this host, a character's terms change, the cache key must include the engine version (probe `/version`), or EXP-0003's determinism result stops holding for a newer engine.
+
+*Related:* #220, #295, A-TTS-001, A-TTS-002.
+
 === A-AUDIO-001 -- Current process-player startup cost is acceptable until measured otherwise
 
 *Subsystem:* audio output
