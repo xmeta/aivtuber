@@ -57,6 +57,7 @@ Reports include:
 * degraded audio/avatar/stream observation counts;
 * semantic reuse accepted/rejected counts;
 * Jev attempt counts and typed fallback reasons;
+* batch ranker (Jev) calls per admitted comment, batch flush reasons, candidate wait, and terminal outcome counts for micro-batched chat bursts (+BurstMetrics+, issue #78; see +docs/jev-routing.adoc+ section 12);
 * LLM calls per event and avoidance rate versus a one-LLM-call-per-event reference;
 * TTS calls per event and avoidance rate versus a one-TTS-call-per-event reference;
 * operator overrides and cancellations;
