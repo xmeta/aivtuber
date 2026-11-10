@@ -6,9 +6,12 @@ use aivtuber_adaptation::{
 use aivtuber_asset_store::{HotCacheConfig, HotCacheMetrics};
 use aivtuber_runtime::{
     CachedPlaybackConfig, CachedPlaybackRetentionMetrics, SecurityRetentionMetrics,
-    SecurityRuntimeConfig, SpeechObservationMetrics, SpeechTranscriptMetrics,
+    SecurityRuntimeConfig, SpeechFreshnessMetrics, SpeechObservationMetrics,
+    SpeechTranscriptMetrics,
 };
-use aivtuber_scheduler::{HistoryPolicy, SchedulerConfig, SchedulerMetrics};
+use aivtuber_scheduler::{
+    HistoryPolicy, SchedulerConfig, SchedulerMetrics, SpeechLifecycleMetrics,
+};
 use aivtuber_telemetry::{
     CausalTraceRetentionConfig, CausalTraceRetentionMetrics, TelemetryRetentionConfig,
     TelemetryRetentionMetrics,
@@ -142,6 +145,12 @@ pub struct RuntimeRetentionSnapshot {
     pub working_memory: Option<WorkingMemoryRetentionMetrics>,
     pub adaptation: Option<AdaptationRetentionMetrics>,
     pub generation: Option<GenerationExecutionSnapshot>,
+    /// Speech lifecycle counters (#222 S2): emitted/dropped/rejected events and
+    /// per-phase totals. Always present; all zero before the first speech.
+    pub speech_lifecycle: SpeechLifecycleMetrics,
+    /// Projection freshness counters (#222 S2, ADR-0004 D-4):
+    /// `projection_stale_played`, re-synthesis queue and outcomes.
+    pub speech_freshness: SpeechFreshnessMetrics,
 }
 
 #[cfg(test)]
