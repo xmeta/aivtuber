@@ -223,6 +223,17 @@ Observations do not ride the stdin `EventEnvelope` pipe. An envelope kind would 
 * *Metrics.* `SpeechObservationMetrics` (observation age, rejects by reason, speaker high water, fallback signals per silence episode, provider unavailable) appears as `RuntimeRetentionSnapshot::speech` when `ProductionApp::with_speech_observations` is composed; it is absent by default.
 * *Replay.* `examples/speech-observations/replay/*.json` run through `SpeechReplayFixture` with logical time and no microphone or model; `cargo test --locked -p aivtuber-runtime speech`.
 
+== Perception observations (issue #90, S1a)
+
+`schemas/perception-observation.schema.json` is the contract for derived screen observations (a closed scene class with closed-vocabulary labels, or one caption of at most 240 bytes); see ADR-0007 and `docs/domain-contract.adoc` section 4.2. `PerceptionTracker` (`crates/runtime/src/perception.rs`) is the ingress. It is a library component only in S1a: nothing in the composition root constructs it, no capture or model exists, and the default is off.
+
+* *Untrusted.* Plane `content`, trust `untrusted`, no source class; a payload with any trust, plane, source class, priority or authorization field is invalid.
+* *Opt-in.* `enable_source(&AuthenticatedControl, alias, now_ms)` needs `obs.control` and an alias in `PerceptionConfig::source_privacy_floors` (empty by default, so nothing can be enabled). With nothing enabled, `ingest_bytes` refuses before parsing.
+* *Bounds.* 16 KiB per batch, 8 observations per batch, at most 8 allowlisted and 2 enabled sources (defaults), latest observation per (source, kind) and a text-free diagnostic ring of 8. Observation age limit 10 s (unmeasured), validity at most 30 s, label vocabulary at most 64 tokens.
+* *Rejections* are counted per reason in `PerceptionMetrics` (`disabled`, `future_dated`, `stale_age`, `expired`, `out_of_order`, `redaction_failed`, batch `oversize`/`invalid`/`disabled`) with disagreement, out-of-vocabulary label, redaction and age counters; no caption text is in any metric.
+* *Consumers.* `scene_snapshot` (closed vocabulary only), `resolve_scene` (source hierarchy) and `thinking_caption_item` (one untrusted, delimited, at most 512 byte item). The caption never reaches memory, TTS or Reflex.
+* *Replay.* `examples/perception-observations/replay/*.json` through `PerceptionReplayFixture`; `cargo test --locked -p aivtuber-runtime perception`.
+
 == Speech sidecar (issue #92, S2)
 
 `speech-vad-sidecar` (crates/adapters, `src/bin/speech-vad-sidecar.rs`) turns a local microphone, or `--input-wav`, into `speech-observation` batches on stdout, one JSON line per raw speech edge. The app spawns it as a child process when `AIVTUBER_SPEECH_SIDECAR` is set; it is off by default.

@@ -1,0 +1,130 @@
+{
+  "schema_version": "0.1.0",
+  "name": "scene and caption: perception fills gaps, never overrides a higher source, and expires",
+  "config": {
+    "allowlist": {
+      "game-main": "private"
+    }
+  },
+  "steps": [
+    {
+      "now_ms": 0,
+      "enable": "game-main"
+    },
+    {
+      "now_ms": 1000,
+      "poll": "game-main",
+      "expect_scene_source": "unknown",
+      "expect_thinking_item": false,
+      "expect_availability": "healthy"
+    },
+    {
+      "now_ms": 2000,
+      "deliver": {
+        "schema_version": "0.1.0",
+        "provider_id": "vision-sidecar",
+        "provider_version": "0.1.0",
+        "observations": [
+          {
+            "kind": "screen_scene",
+            "observation_id": "obs-scene-1",
+            "source": {
+              "alias": "game-main"
+            },
+            "frame": {
+              "capture_seq": 1,
+              "captured_at_ms": 1800,
+              "width": 768,
+              "height": 432
+            },
+            "observed_at_ms": 1900,
+            "expires_at_ms": 21900,
+            "producer": {
+              "model_id": "qwen3-vl:4b-instruct-q4_k_m",
+              "config_digest": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+              "prompt_version": "describe-v1"
+            },
+            "privacy": "private",
+            "redaction": {
+              "policy_version": "redact-v1",
+              "secret_hits": 0,
+              "truncated": false
+            },
+            "payload": {
+              "scene_class": "menu",
+              "labels": [
+                "settings"
+              ]
+            }
+          },
+          {
+            "kind": "screen_caption",
+            "observation_id": "obs-caption-1",
+            "source": {
+              "alias": "game-main"
+            },
+            "frame": {
+              "capture_seq": 1,
+              "captured_at_ms": 1800,
+              "width": 768,
+              "height": 432
+            },
+            "observed_at_ms": 1900,
+            "expires_at_ms": 21900,
+            "producer": {
+              "model_id": "qwen3-vl:4b-instruct-q4_k_m",
+              "config_digest": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+              "prompt_version": "describe-v1"
+            },
+            "privacy": "private",
+            "redaction": {
+              "policy_version": "redact-v1",
+              "secret_hits": 0,
+              "truncated": false
+            },
+            "payload": {
+              "caption": "settings menu is open"
+            }
+          }
+        ]
+      },
+      "expect_outcomes": [
+        "accepted",
+        "accepted"
+      ]
+    },
+    {
+      "now_ms": 2500,
+      "poll": "game-main",
+      "expect_scene_source": "perception",
+      "expect_thinking_item": true,
+      "expect_scene_disagreement": false
+    },
+    {
+      "now_ms": 3000,
+      "poll": "game-main",
+      "higher": {
+        "scene_class": "gameplay",
+        "labels": [
+          "combat"
+        ]
+      },
+      "expect_scene_source": "higher_ranked",
+      "expect_thinking_item": true,
+      "expect_scene_disagreement": true
+    },
+    {
+      "now_ms": 40000,
+      "poll": "game-main",
+      "expect_scene_source": "unknown",
+      "expect_thinking_item": false,
+      "expect_availability": "healthy"
+    },
+    {
+      "now_ms": 70000,
+      "poll": "game-main",
+      "expect_thinking_item": false,
+      "expect_availability": "unavailable"
+    }
+  ]
+}

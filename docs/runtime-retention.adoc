@@ -56,6 +56,7 @@ All limits are configurable through +AIVTUBER_RETENTION_*+ environment variables
 |Adaptation feedback/recent groups |Bounded RAM |Logical recency determines deterministic eviction
 |Adaptation decisions |Bounded RAM |Oldest decision detail is evicted
 |Speech observation per-speaker state |Bounded count + logical TTL |No audio, PCM or transcript is retained; metrics expose speakers, high water and evictions (#92)
+|Perception observation state (#90, S1a) |Bounded count + logical TTL |Latest observation per (enabled source, kind), at most 8 allowlisted and 2 enabled sources by default, a text-free diagnostic ring of 8, idle TTL 5 minutes; no frame, image or durable write exists. `PerceptionTracker` is not composed into the production app yet, so it has no `RuntimeRetentionPolicy` row or environment variable until S1b
 |Generation queue/completions |Bounded RAM |#121 owns execution semantics; no per-request tombstone history is retained
 |===
 
