@@ -22,8 +22,8 @@ use aivtuber_app::{
     SHADOW_ORCHESTRATOR_SCHEMA_VERSION, ShadowOrchestratorConfig, ShadowPolicyIdentity,
     ShadowingRoutePlanner, SpeechConversationConfig, SpeechConversationMetrics, SpeechFloorMetrics,
     SpeechSidecar, SpeechSidecarConfig, SpeechSidecarStats, StreamOutput, TtsSidecarSettings,
-    VtsAvatarOutput, VtsPlaybackConfig, apply_dispatched_request, pump_bounded_records,
-    stt_sidecar_args,
+    VtsAvatarOutput, VtsPlaybackConfig, apply_dispatched_request, audit_pack_readiness,
+    pump_bounded_records, stt_sidecar_args,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
@@ -132,7 +132,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     )?);
 
     let mut audio_config = ProcessAudioConfig {
-        root: audio_root,
+        root: audio_root.clone(),
         ..ProcessAudioConfig::default()
     };
     if let Some(program) = env_optional("AIVTUBER_AUDIO_PROGRAM") {
@@ -290,6 +290,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         "aivtuber-app ready: indexed={} usable={} preloaded={}",
         preload.indexed.indexed, preload.indexed.usable, preload.preloaded
     );
+    // #289: one counted warning when cached reactions would be silent or skipped.
+    for line in audit_pack_readiness(app.performer().assets(), &audio_root)
+        .warning_lines(compatibility.voice_model.as_deref(), &audio_root)
+    {
+        eprintln!("{line}");
+    }
     report_degraded(app.avatar_output_name(), app.health());
     eprintln!(
         "raw_ingress: max_record_bytes={} queue_capacity={}",

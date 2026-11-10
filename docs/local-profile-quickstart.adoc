@@ -138,14 +138,30 @@ Notes that matter:
 
 * *Paths with spaces* are not supported in `AIVTUBER_SPEECH_SIDECAR_ARGS` (split on whitespace). Use a path without spaces.
 * *No microphone yet?* Add `--input-wav FILE.wav --pace realtime --stt-wait-ready-ms 90000` to `AIVTUBER_SPEECH_SIDECAR_ARGS` (a PCM WAV; the sidecar mixes down and resamples to 16 kHz mono, tests cover 48 kHz stereo; the last flag makes it wait for the STT model before reading the file, so the first clip is not skipped). It goes through the same VAD, STT, floor and routing as the microphone; there is no shortcut around the untrusted ingress. When the file ends the sidecar exits and the app logs `speech_sidecar: degraded: sidecar exited` and carries on with typed chat. For a microphone, use `--list-devices` to see names and `--input-device NAME`.
-* *Do not set* `AIVTUBER_VOICE_MODEL` unless you also have cached assets for that voice. It names the voice the cached pack was authored for (default `example-voice-v1`); a different name makes every cached descriptor incompatible (`indexed=8 usable=0`) and cached reactions silently find nothing. The synthesizer's own identity is recorded separately in the provenance (`model_alias=supertonic-3-int8`).
+* *Do not set* `AIVTUBER_VOICE_MODEL` unless you also have cached assets for that voice. It names the voice the cached pack was authored for (default `example-voice-v1`); a different name makes every cached descriptor that names a voice incompatible and cached reactions find nothing. The app warns about this at start (`pack_readiness: WARNING ... voice_model_mismatch=N`, naming the voice the descriptors expect and the one configured). The synthesizer's own identity is recorded separately in the provenance (`model_alias=supertonic-3-int8`).
 * *Floor and barge-in.* `AIVTUBER_SPEECH_FLOOR` requires `AIVTUBER_SPEECH_CONVERSATION`; `AIVTUBER_SPEECH_BARGE_IN` requires the floor. With the floor on, a spoken turn is answered only after the speaker has been silent for 800 ms (`AIVTUBER_SPEECH_FLOOR_TAKE_TURN_SILENCE_MS`, 700 to 1000). A user who speaks over the avatar for 400 ms stops the playing reply (`speech_barge_in:` log line).
 * *Reply length.* Left at its default the model may write several hundred characters, which is over 30 seconds of speech and can exceed the TTS sidecar's 12 s synthesis deadline (`local-tts-sidecar: deadline_exceeded`; the reply degrades to a non-verbal reaction). `AIVTUBER_OPENAI_MAX_OUTPUT_TOKENS=96` kept replies to 5 to 15 seconds of audio on the measured host.
 * *Phrase mode (default for this profile).* A reply is split into phrases and each is gated, synthesized and committed on its own, so the first phrase plays while the second is synthesized and the 12 s synthesis deadline applies to one phrase, not to the whole reply (#83 S1; <<phrase-mode>>). `AIVTUBER_PHRASE_MODE=buffered` returns to one commit per reply; `AIVTUBER_PHRASE_TTS_TIMEOUT_MS` (default 12000) bounds one phrase. The log shows `generated replies: phrase mode` at startup and one `phrase_response` line per reply.
-* *Cached starter audio.* `examples/starter-reaction-pack` carries descriptors but no audio files (`audio://starter/*.opus`); the cached path plays whatever you place under `$AIVTUBER_AUDIO_ROOT/starter/`. Without those files, an `intent` event is accepted and scheduled but nothing is audible.
+* *Cached starter audio.* `examples/starter-reaction-pack` carries descriptors but no audio files (`audio://starter/*.opus`); the cached path plays whatever is under `$AIVTUBER_AUDIO_ROOT/starter/`. Generate them once with the sidecar you built, as described in <<starter-audio>> (one command). Without them an `intent` event is accepted and scheduled but nothing is audible, and the app says so at start (`pack_readiness: WARNING ...`).
 * *Cached reactions and the avatar profile.* The pack targets `AIVTUBER_AVATAR_PROFILE` (default `example-live2d-v1`). The local renderer accepts the same commands, so the default works unchanged.
 
 On start the app prints, among others (nothing secret): the OpenRAIL-M voice notice, `tts_sidecar: ready ...`, `thinking: endpoint=http://127.0.0.1:18080 auth=unauthenticated-loopback backend=llama-server`, `composition profile: profile=local ... fallback=deterministic_local`, `aivtuber-app ready: indexed=8 usable=8 preloaded=8`, the floor, barge-in and conversation lines, `speech_sidecar: started`, `speech-stt-worker: ready`, and `local avatar renderer URL ...`.
+
+[[starter-audio]]
+=== Starter reaction audio (once, after the build)
+
+The starter pack is descriptors only. This one command speaks each descriptor's `speech.text` with the sidecar you just built (the pinned Supertonic 3 int8 model, language `ja`, the text-derived seed of `speech_tts::text_seed`, speaker 0) and encodes the result to the `audio://starter/*.opus` files the descriptors name. It needs `ffmpeg` with libopus (the same FFmpeg that provides `ffplay`).
+
+[source,sh]
+----
+node scripts/synthesize-starter-audio.mjs \
+  --sidecar target/release/local-tts-sidecar \
+  --model-dir /path/to/local-assets/supertonic/sherpa-onnx-supertonic-3-tts-int8-2026-05-11
+----
+
+It writes six Opus files and `PROVENANCE.json` under `<pack>/audio/starter/` (the app's default audio root, ignored by the repository; pass `--audio-root DIR` and export the same `AIVTUBER_AUDIO_ROOT` to put them elsewhere). The provenance records the model alias and bundle digest, speaker, the seed rule, the SHA-256 of every WAV and Opus file, and the OpenRAIL-M notice; it holds no timestamp, so the same model bundle and FFmpeg build reproduce it byte for byte. `reaction.neutral` is speechless and needs no file. The voice identity is unchanged: descriptors expect `example-voice-v1`, which is the default `AIVTUBER_VOICE_MODEL`, so leave that variable unset and the next start reports no `pack_readiness` warning.
+
+Decision (#289): the audio is generated on the operator's machine, not committed. The weights are OpenRAIL-M and this project does not redistribute them or audio made with them, generated media is never committed here, and the step reuses the pinned sidecar so the voice is exactly the one used for replies. The disclosure duty in section 8 applies to this audio when you broadcast it.
 
 == 5. Open the avatar, then talk to it
 
@@ -249,9 +265,10 @@ Also yours to supply on a stream: an indication that the performer is an AI (pla
 |`profile "local" is loopback-only ...` |Thinking or TTS endpoint is not `127.0.0.1`, `[::1]` or `localhost`. That is by design.
 |`Authentication: Thinking endpoint requires an API key` |Set `AIVTUBER_OPENAI_AUTH=unauthenticated-loopback` (explicit, loopback only) and do not set a key.
 |llama-server: `ill-formed UTF-8` |The chat line reached it in a legacy code page. Send UTF-8 (PowerShell 7, Node, Python, or `chcp 65001` with a UTF-8 writer).
+|`pack_readiness: WARNING N of M descriptors are unusable ...` |One counted warning after the `ready` line. `missing_audio` is the number of descriptors whose `audio://` file is absent (run <<starter-audio>>); `voice_model_mismatch` is the number whose voice differs from `AIVTUBER_VOICE_MODEL` (unset it); `other_incompatible` names any other field.
 |`aivtuber-app ready: indexed=8 usable=0` |The cached pack is incompatible with the configured voice, avatar profile, viseme mapping or motion library. Unset `AIVTUBER_VOICE_MODEL` (or set matching values) and check `AIVTUBER_AVATAR_PROFILE`.
 |`content rejected: asset "variant_group:..." was not found in L0 or L1` |The `intent` has no usable cached asset (see the previous row, or the intent is not in your pack).
-|An `intent` reaction is accepted but silent |The pack has no audio files. Place `audio://starter/*.opus` files under `$AIVTUBER_AUDIO_ROOT/starter/` (the repository ships none).
+|An `intent` reaction is accepted but silent |The pack has no audio files (see the `pack_readiness` warning). Run <<starter-audio>>; the repository ships none.
 |`tts_sidecar: unavailable: ...` at start |A library or model file does not match its pin, the model directory is wrong, or the port is busy. The message names the check. Re-run step 1, or build with the same `SHERPA_ONNX_ARCHIVE_DIR`.
 |`local-tts-sidecar: deadline_exceeded` |The reply was too long for 12 s of synthesis. Lower `AIVTUBER_OPENAI_MAX_OUTPUT_TOKENS`; raise `--synth-deadline-ms` through `AIVTUBER_TTS_SIDECAR_ARGS` only if your CPU is slower than the measured one and the replies must stay long.
 |`speech-vad-sidecar` or `speech-stt-worker` refuses to start with a pin message |Library or model mismatch (exit 2). Rebuild with `SHERPA_ONNX_ARCHIVE_DIR` set; re-fetch the model.

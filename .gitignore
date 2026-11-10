@@ -18,3 +18,6 @@ node_modules/
 # tracks under the example pack when it is used as the audio/pack root.
 /examples/starter-reaction-pack/audio/generated/
 /examples/starter-reaction-pack/viseme/generated/
+
+# Starter pack speech audio materialized locally by scripts/synthesize-starter-audio.mjs (issue #289).
+/examples/starter-reaction-pack/audio/starter/
