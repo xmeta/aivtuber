@@ -15,6 +15,7 @@
 //   .../invalid and .../inconsistent (cross-field) must REJECT; .../replay fixtures must carry schema-valid batches (#92)
 // - examples/speech-lexicons/valid, .../inconsistent (cross-field, rejected by the Rust loader) and the shipped
 //   crates/generative/data default lexicon must conform to speech-lexicon.schema.json; .../invalid must REJECT (#222)
+// - examples/speech-lifecycle/valid must conform to speech-lifecycle.schema.json; .../invalid must REJECT (#222 S2)
 // - examples/speech-transcripts/valid must conform to speech-transcript.schema.json;
 //   .../invalid must REJECT; .../replay fixtures must carry schema-valid batches (#92 S3b)
 // - examples/evaluation/reaction-quality/*.json must conform to the reaction-quality dataset schema
@@ -96,6 +97,7 @@ const avatarCommand = validators["schemas/avatar-playback-command.schema.json"];
 const speechObservation = validators["schemas/speech-observation.schema.json"];
 const speechTranscript = validators["schemas/speech-transcript.schema.json"];
 const speechLexicon = validators["schemas/speech-lexicon.schema.json"];
+const speechLifecycle = validators["schemas/speech-lifecycle.schema.json"];
 
 function report(ok, label, validator) {
   if (ok) {
@@ -180,6 +182,7 @@ for (const [validator, validDirs, invalidDir] of [
   [avatarCommand, ["examples/avatar-playback-commands/valid"], "examples/avatar-playback-commands/invalid"],
   [speechObservation, ["examples/speech-observations/valid"], "examples/speech-observations/invalid"],
   [speechTranscript, ["examples/speech-transcripts/valid"], "examples/speech-transcripts/invalid"],
+  [speechLifecycle, ["examples/speech-lifecycle/valid"], "examples/speech-lifecycle/invalid"],
   [speechLexicon, ["examples/speech-lexicons/valid", "examples/speech-lexicons/inconsistent", "crates/generative/data"], "examples/speech-lexicons/invalid"],
 ]) {
   if (!validator) continue;
