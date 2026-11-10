@@ -12,8 +12,10 @@ The scripts contain no machine paths; every path is a command-line argument.
 | File | Purpose |
 |---|---|
 | `frames.py` | Pillow-rendered 768x432 frames: 30 benign (6 each of menu, loading, cutscene, gameplay, result) and 8 prompt-injection frames (F3) with invented secret-like strings. Needs a Japanese-capable font for the Japanese strings: set `VISION_BENCH_FONT`. |
-| `vision_bench.py` | Starts loopback-only `llama-server` children and measures: `vlm` (F1, VLM alone), `think` (Thinking first-token baseline), `both` (Thinking and VLM resident together, with the VLM job idle, every 10 s, every 5 s and back-to-back), `f3` (injection frames, raw answers kept). |
+| `vision_bench.py` | Starts loopback-only `llama-server` children and measures: `vlm` (F1, VLM alone), `think` (Thinking first-token baseline), `both` (Thinking and VLM resident together, with the VLM job idle, every 10 s, every 5 s and back-to-back), `f3` (injection frames, raw answers kept), `reply` (EXP-0004b: the 30 Thinking requests to one server, replies and first-token latency), `mux` (EXP-0004b: one multimodal server serving Thinking and captions, `--parallel N`). |
 | `f3_replay.py` | Turns the F3 raw answers into a perception replay fixture (the format of `examples/perception-observations/replay`) so the Rust `PerceptionTracker` can be run over real model output. |
+| `reply_prompts.py` | EXP-0004b: 30 maintainer-written Japanese Thinking requests shaped like the local profile's (instruction plus compact ThinkingRequest JSON). |
+| `pair_view.py` | EXP-0004b: blind A/B presentation of two models' replies with a seed-shuffled key file, tally, and mechanical reply statistics. |
 | `obs_f2.py` | F2 procedure: polls `GetSourceScreenshot` from obs-websocket 5 at a fixed interval and records OBS `GetStats` deltas. Needs an OBS instance you own, its websocket password in `OBS_WS_PASSWORD`, and a recording or stream you started yourself. |
 
 ## Environment
@@ -47,3 +49,13 @@ Settings that matter: temperature 0, seed 1234, `max_tokens` 96, `cache_prompt` 
 `response_format` json_schema (the grammar-constrained model-side schema in `vision_bench.py`), `--parallel 1`,
 `-ngl 99`, context 4096, loopback `127.0.0.1` only. Latency is wall time of one `/v1/chat/completions` call including
 the base64 PNG upload and image encoding; the sidecar-to-OBS capture latency is not included.
+
+EXP-0004b (single resident multimodal model):
+
+```sh
+$B reply --server "$LLAMA/llama-server" --model "$LLM" --out "$OUT/reply-qwen3-4b.json"
+$B reply --server "$LLAMA/llama-server" --model "$QWEN" --mmproj "$QWEN_MMPROJ" --out "$OUT/reply-qwen3vl-4b.json"
+python -I -X utf8 pair_view.py show "$OUT/reply-qwen3-4b.json" "$OUT/reply-qwen3vl-4b.json" "$OUT/key.json"   # judge blind, write verdicts.json
+python -I -X utf8 pair_view.py score "$OUT/key.json" "$OUT/verdicts.json"
+$B mux --server "$LLAMA/llama-server" --model "$QWEN" --mmproj "$QWEN_MMPROJ" --frames "$OUT/frames" --out "$OUT/mux-p2.json" --n 30 --parallel 2 --ctx 8192
+```

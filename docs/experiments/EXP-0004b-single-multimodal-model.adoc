@@ -1,0 +1,247 @@
+= EXP-0004b: Single resident multimodal model (#90, follow-up to EXP-0004)
+
+:toc:
+:toclevels: 2
+
+This is a durable experiment record in the link:README.adoc[Durable Experiment Records] format.
+It follows link:EXP-0004-screen-vision-vlm-bench.adoc[EXP-0004], whose F1 killed a *second* resident VLM next to the Thinking model on an 8 GB GPU (spill under WDDM, Thinking first-token p95 +360% to +460%).
+The supervisor's follow-up question (issue #90) is whether Qwen3-VL-4B-Instruct can be the *only* resident model, serving both Thinking replies and screen captions on one llama-server.
+Scripts only (`examples/benchmarks/vision/`, extended minimally): no production code, dependency, model or image is committed.
+
+== 1. Record
+
+[source,text]
+----
+Decision question:
+  Can Qwen3-VL-4B-Instruct (Q4_K_M, projector Q8_0) replace Qwen3-4B-Instruct-2507 as the single resident
+  local-profile model, serving Thinking replies and screen captions time-multiplexed, without worse Japanese
+  Thinking quality, with Thinking first-token p95 within about 1.5x of the current model's, and without VRAM spill?
+
+Context / baseline:
+  EXP-0004 (F1 killed for a second resident VLM; F3 held). ADR-0007 D-Q3 names a single multimodal model as the
+  fallback "only if VRAM forces it and F1 shows no Thinking regression". Baseline: Qwen3-4B-Instruct-2507 Q4_K_M
+  alone, -c 4096 -ngl 99, llama.cpp b12224 Vulkan, same host and prompts.
+
+Hypothesis / expected outcome:
+  Qwen3-VL-4B is the same size class and family, so text replies are comparable and one resident model saves about
+  3 GB against two models. Expected going in: Thinking latency regresses when a caption job occupies the only slot.
+
+Guardrails:
+  Loopback only; invented viewer text only; no model, image or result committed; spill judged by a latency probe
+  and by Thinking first-token latency, not by free VRAM; model output stays data.
+
+Decision-changing evidence:
+  Blind pairwise read of 30 replies; Thinking first-token p50/p95 alone and while captions run at 10 s and 5 s, with
+  and without the "yield to Thinking" gate, with one and two server slots; caption latency, JSON validity and S1a
+  validity under multiplexing; memory and a latency probe.
+
+Cheapest informative test:
+  Two llama-server runs (Qwen3-4B, Qwen3-VL-4B) over the same 30 requests, then a multiplexing run per slot count.
+
+Dataset/workload:
+  30 maintainer-written Japanese viewer inputs (greetings, persona questions, game reactions, teasing, donations,
+  speech input, support, off-topic, three hostile lines, three with a screen-observation item), wrapped exactly as the
+  local profile wraps a ThinkingRequest (crates/adapters/src/openai.rs: fixed instruction plus the compact request JSON,
+  one user message, max output tokens 96, no system prompt, server-default sampling, fixed seed 1234). The JSON
+  shape was taken from a serialisation of the real domain type. 30 benign frames of EXP-0004 for captions.
+  Thinking requests 2.5 s apart (n=30 per condition).
+
+Commit/base/head:
+  Branch docs/90-exp-0004b-single-model, cut from docs/90-exp-0004-vlm-bench (PR #312 had not merged).
+
+Profile/config fingerprint:
+  Thinking: -c 4096 -ngl 99 (as the quickstart). Single multimodal server: Qwen3VL-4B-Instruct-Q4_K_M plus
+  mmproj Q8_0, -ngl 99, --parallel 1 with -c 4096, and --parallel 2 with -c 8192 (4096 per slot). Captions: the
+  describe-v1 prompt, temperature 0, max_tokens 96, json_schema grammar, 768x432 frames, 10 s or 5 s cadence.
+
+Seed:
+  1234 (llama.cpp); A/B shuffle seed 20261111.
+
+Asset/index/compiler version:
+  Not applicable.
+
+Provider/model versions:
+  As EXP-0004 section 3.1 (the same files, digests and licences; Apache-2.0 per card metadata).
+
+Toolchain:
+  Python 3.13 (Pillow, jsonschema), llama.cpp b12224, nvidia-smi.
+
+Other relevant environment:
+  As EXP-0004: Windows 11 desktop, 8 GB discrete NVIDIA GPU (WDDM), other software holding 2.2 to 2.3 GB of GPU memory
+  before each server started. Run date 2026-11-11. One machine. The STT and TTS sidecars and the avatar renderer
+  were not running (section 5).
+
+Exploratory unknowns:
+  Reply quality differences other than the go criterion; effect of the slot count; Japanese caption validity.
+
+Confirmatory success/guardrail criteria (supervisor, issue #90):
+  Thinking quality not worse than Qwen3-4B; Thinking first-token p95 at or below about 1.5x the Qwen3-4B value;
+  no spill.
+  Criterion version / recorded-at: supervisor comment on #90, 2026-11-11; applied unchanged.
+
+Actual:
+  Sections 2 to 6.
+
+Evidence artifacts:
+  Scripts committed. Raw replies, the A/B key and per-run JSON are local only; the tables here are the retained evidence.
+
+Noise / uncertainty / missing evidence:
+  Section 8.
+
+Expected-vs-actual difference:
+  Quality was not worse (11 wins, 10 ties, 9 losses for Qwen3-VL-4B in a blind read). The latency cost depends on the
+  slot count: with one slot Thinking p95 rose to 3.5x the baseline (a caption job blocks the only slot); with two slots
+  it was 1.4x at a 10 s cadence and 1.0x with the yield gate. Nothing spilled on this host without the sidecars and the renderer.
+
+Likely explanation:
+  One slot serialises a 1.4 to 1.8 s caption in front of a Thinking request that arrives during it; two slots let
+  llama.cpp batch both and cost 0.5 GB more memory. EXP-0004's regression came from two processes contending for an
+  over-committed GPU, which a single process avoids.
+
+Decision:
+  Expand (conditional go). Qwen3-VL-4B-Instruct as the single resident model with --parallel 2, a 10 s cadence and
+  the yield gate meets all three criteria on this host; S1b may be re-planned around it, with the two unmeasured
+  gates of section 7 run first. Not a go for one slot, nor for a 5 s cadence.
+
+Follow-up / owning issue:
+  #90 (S1b re-plan; ADR-0007 status and A-PERCEPT-002 wording are the supervisor's).
+
+Revisit condition:
+  Real game frames, the full local profile running (renderer and sidecars), a larger or different multimodal model, or a
+  llama.cpp build that changes slot scheduling.
+----
+
+== 2. Result summary
+
+* *Quality (criterion 1): not worse.* Blind pairwise read of 30 replies: Qwen3-VL-4B preferred in 11, Qwen3-4B in 9, 10 ties (sign test on the 20 decided pairs, 11 to 9: not distinguishable from equal). One rater, who is a language model; method and limits in section 3.
+* *First token alone (criterion 2a):* Qwen3-VL-4B p50 0.323 s, p95 0.361 s against Qwen3-4B p50 0.296 s, p95 0.386 s on the same 30 requests (0.94x at p95).
+* *First token while captions run (criterion 2b), p95 of 30 requests:* one slot 1.365 s at a 10 s cadence (3.5x the 0.386 s baseline; fails), 1.255 s with the yield gate (fails); two slots 0.548 s (1.42x; passes), 0.378 s with the yield gate (0.98x; passes), 0.603 s at a 5 s cadence (1.56x; fails narrowly).
+* *Captions while multiplexed:* latency p50 1.4 to 1.7 s, p95 2.0 to 2.5 s, max 2.9 s; JSON valid 100% in every condition; scene class correct 100% (30-frame synthetic set); S1a-valid 29% to 44% raw and 100% after the producer repair of EXP-0004 section 5.
+* *Memory and spill (criterion 3):* Qwen3-VL-4B adds about 4.0 GB (one slot) or 4.5 GB (two slots, -c 8192) against Qwen3-4B's 2.9 GB; peak 6.9 GB of the 8.2 GB with the desktop's 2.2 GB. Latency probe 59 to 86 ms before and after the runs (no growth); first-token latency alone the same as the baseline. No spill signal. The sidecars and the renderer were not loaded, so the headroom is about 1.3 GB before them (section 7).
+* *Net:* one resident multimodal model removes EXP-0004's contention failure, at the cost of about 1.6 GB more memory than today's profile and a Thinking tail that is acceptable only with two slots, a 10 s cadence and the yield gate.
+
+== 3. Thinking quality (criterion 1)
+
+Method: both models answered the same 30 requests with the same seed and server-default sampling (the local profile sets none), Qwen3-VL-4B with its projector loaded. A script presented each pair as A and B in a per-case fixed-seed shuffle, writing the A/B key to a file that was not opened until the 30 verdicts were written. The verdict per pair was "better reply for a Japanese VTuber stream": natural, correct Japanese, answers the viewer, concise for speech, stays in persona, no language drift or markup, does not echo control words, and handles hostile lines safely.
+
+[cols="3,1",options="header"]
+|===
+|Outcome |Cases
+
+|Qwen3-VL-4B preferred |11
+|Qwen3-4B-Instruct-2507 preferred |9
+|Tie |10
+|===
+
+Mechanical statistics (30 replies each, max 96 tokens):
+
+[cols="3,2,2",options="header"]
+|===
+|Measure |Qwen3-4B |Qwen3-VL-4B
+
+|Mean / max characters |54 / 115 |52 / 174
+|No sentence-final punctuation (includes endings in an emoji and cuts at 96 tokens) |22 |5
+|Replies with a line break |0 |3
+|Replies without any kana (language drift) |1 (a Chinese reply to a support request) |1 (an English refusal to the URL request)
+|Mean Latin letters per reply |0.9 |7.2
+|URL in the reply |0 |0
+|===
+
+Observations: neither model is clearly better. Qwen3-4B once answered a support request in Chinese, wrote two long replies (a self-made "recommendation" for the game question and a long chocolate-cake answer); Qwen3-VL-4B once answered the URL request in English, used more emoji and some English ("Together"), cut the Python answer inside a code block, and, for the fake operator line, answered by telling the viewer to run `performer.stop`, an echo of a control word that Qwen3-4B did not make (both treated the text as data, neither executed anything: a reply is data). The two models' lengths are alike (mean 54 and 52 characters); the "no final punctuation" row counts replies that end in an emoji as well as cuts at 96 tokens, so it is not a truncation count. One sample per case and default sampling mean a second draw could change individual verdicts.
+
+Limits: a single rater, and that rater is a language model from the same vendor family as both candidates; no native-speaker review; 30 requests, ties included; no confidence beyond "no sign of a difference". A native-speaker pairwise review of the same file would be the confirming test.
+
+== 4. Thinking first-token latency (criterion 2)
+
+Thinking requests are the 30 local-profile-shaped prompts (about 500 prompt tokens each, `cache_prompt` false so every request pays full prefill), 2.5 s apart, max 96 tokens. The 2.5 s spacing keeps the GPU out of its slowest clock state; EXP-0004 section 4.2 showed that spacing matters, and every row here uses it. "Overlapped" means the request's span intersected a caption job.
+
+=== 4.1 Alone
+
+[cols="3,1,1,1,1,1",options="header"]
+|===
+|Server |p50 s |p95 s |max s |Total reply p50 s |Memory added (MiB)
+
+|Qwen3-4B-Instruct-2507 (baseline, reply run) |0.296 |0.386 |0.395 |0.661 |~2,940
+|Qwen3-VL-4B, one process (reply run) |0.323 |0.361 |-- |-- |~3,900
+|Qwen3-VL-4B, mux run, one slot |0.300 |0.357 |0.370 |0.619 |~4,000
+|Qwen3-VL-4B, mux run, two slots (-c 8192) |0.284 |0.337 |0.370 |0.592 |~4,500
+|===
+
+The criterion value is the Qwen3-4B p95 of 0.386 s; 1.5x is 0.58 s.
+
+=== 4.2 While captions run (same server)
+
+[cols="3,1,1,1,1,2,2",options="header"]
+|===
+|Slots / condition |p50 s |p95 s |max s |p95 vs 0.386 s |Overlapped (n of 30): p50 / p95 s |Caption jobs (skipped ticks)
+
+|1 slot, captions every 10 s |0.313 |1.365 |1.595 |3.5x |10: 0.806 / 1.493 |11 (0)
+|1 slot, every 10 s, yield gate |0.348 |1.255 |1.595 |3.3x |6: 0.860 / 1.543 |9 (2)
+|1 slot, every 5 s |0.317 |1.523 |1.647 |3.9x |17: 0.395 / 1.589 |21 (0)
+|*2 slots, every 10 s* |0.326 |*0.548* |0.620 |*1.42x* |10: 0.320 / 0.611 |11 (0)
+|*2 slots, every 10 s, yield gate* |0.306 |*0.378* |0.399 |*0.98x* |7: 0.241 / 0.358 |10 (2 skipped by the gate or an in-flight job)
+|2 slots, every 5 s |0.337 |0.603 |0.624 |1.56x |12: 0.411 / 0.618 |21 (0)
+|===
+
+The yield gate is ADR-0007 D-6's admission rule implemented client-side: a caption tick is skipped while a Thinking request is in flight. It cannot prevent a viewer message arriving while a caption job is running, which is why one slot still fails with it: the Thinking request waits for the rest of a 1.4 to 2.6 s caption. With two slots the server decodes both together and the wait mostly disappears. A p95 from 30 requests is the 28th to 29th value; the 10 s two-slot result (0.548 s against a 0.58 s limit) is inside that noise, the yield-gate result (0.378 s) is not.
+
+== 5. Captions while multiplexed (criterion 4)
+
+[cols="3,1,1,1,1,1,1",options="header"]
+|===
+|Condition |Caption latency p50 s |p95 s |max s |JSON valid |S1a valid raw / repaired |Scene correct
+
+|1 slot, every 10 s |1.56 |1.83 |1.85 |100% (11) |36% / 100% |100%
+|1 slot, every 10 s, yield gate |1.43 |2.17 |2.64 |100% (9) |44% / 100% |100%
+|1 slot, every 5 s |1.54 |1.86 |2.02 |100% (21) |33% / 100% |100%
+|2 slots, every 10 s |1.68 |2.17 |2.20 |100% (11) |36% / 100% |100%
+|2 slots, every 10 s, yield gate |1.44 |2.54 |2.91 |100% (10) |40% / 100% |100%
+|2 slots, every 5 s |1.61 |2.03 |2.06 |100% (21) |29% / 100% |100%
+|===
+
+Captions stay under ADR-0007's 3 s deadline in every condition but with little margin at the tail (2.9 s maximum). Alone, the same model took p50 1.37 s, p95 1.58 s (EXP-0004). Raw S1a validity is low for the reason in EXP-0004 section 5 (duplicate labels the grammar cannot forbid); the producer repair makes it 100%. Counts of jobs are 9 to 21, so the rates are coarse.
+
+== 6. Memory and spill (criterion 3)
+
+[cols="3,1,1,1",options="header"]
+|===
+|Configuration |Before (MiB) |After load (MiB) |Peak (MiB)
+
+|Qwen3-4B alone (-c 4096) |2,311 |5,254 |5,285
+|Qwen3-VL-4B, one slot (-c 4096) |2,230 |6,234 |6,336
+|Qwen3-VL-4B, two slots (-c 8192) |2,222 |6,725 |6,883
+|===
+
+The card has 8,192 MiB; the other software on the desktop held about 2.2 GB. Peak with two slots was 6.9 GB, 1.3 GB below the limit.
+Spill detection used a latency probe, as EXP-0004 requires (a fixed 16-token generation, median of three, after a discarded call): Qwen3-4B 65 ms; Qwen3-VL-4B 69 ms alone, and in the mux runs 86 ms then 59 ms (one slot) and 77 ms then 68 ms (two slots), i.e. no growth over a run that included hundreds of captions and Thinking requests. Thinking first-token latency alone matched the baseline. No spill signal appeared. In EXP-0004 the same probes of the two-model case showed a 5 to 6x slowdown, so the probe is sensitive to the failure it is for.
+
+== 7. Not measured: sidecars, renderer, full profile
+
+* *STT and TTS sidecars were not loaded.* This host has no release archive or the speech models in place, and installing them was outside this experiment. Both are CPU engines (sherpa-onnx: ReazonSpeech k2 int8, Supertonic 3 int8; EXP-0002 and EXP-0003 ran CPU only; the quickstart's measured table lists no GPU memory for them), so they should add system RAM and CPU load but no VRAM; that is an inference from the docs, not a measurement here. Their CPU contention with a second slot's decode was not measured.
+* *The avatar renderer was not running.* The quickstart's full-profile measurement (issue #220 S3) shows 6,156 MiB of GPU memory in use with everything running and the 2.9 GB Qwen3-4B resident, so the renderer and desktop together took about 3.2 GB. With Qwen3-VL-4B on two slots (4.5 GB) that would be about 7.7 GB of 8.2 GB: roughly 0.5 GB of headroom, which is an extrapolation and is thin. This is the main open risk. It is the first gate for S1b: run the full local profile with the multimodal server and repeat the latency probe and the 10 s cadence.
+* *The 12 GB option* is untouched by this record.
+
+== 8. Decision and recommendation
+
+Against the supervisor's criteria on this host (all with the full chain absent, section 7):
+
+[cols="3,4,2",options="header"]
+|===
+|Criterion |Result |Verdict
+
+|Thinking quality not worse |11 preferred, 9 against, 10 ties (single LM rater) |Met
+|Thinking first-token p95 at most about 1.5x of Qwen3-4B (0.58 s) |one slot: 3.5x, 3.3x with gate; two slots: 1.42x at 10 s, 0.98x with gate, 1.56x at 5 s |Met only with two slots and a 10 s cadence (the yield gate gives margin)
+|No spill |probe flat, latency alone equal; 6.9 GB peak of 8.2 GB without sidecars or renderer |Met on this host; thin with the renderer (extrapolated)
+|===
+
+*Conditional go.* Re-plan S1b as: one llama-server running Qwen3-VL-4B-Instruct Q4_K_M with the Q8_0 projector, `--parallel 2` and a context large enough for two slots (-c 8192 here), timer-driven captions every 10 s (not 5 s) behind the yield gate, with the sidecar requirements already carried from EXP-0004 (producer-side `uniqueItems` and NFKC repair, generic URL and secret redaction, a latency probe at start and periodically, the dedicated `perception.control` capability). Before any live S1b code: (a) repeat section 6 with the renderer and the speech sidecars running, and treat a failed probe or a Thinking p95 above 0.58 s as a stop; (b) have a native Japanese speaker read the 30 reply pairs, since the quality evidence here is one language-model reader; (c) repeat the caption part on real captured frames. Replacing the resident model is a profile change for every local-profile user, including those who never enable perception: keep Qwen3-4B as the default and offer Qwen3-VL-4B only as an opt-in "perception profile" unless (b) shows it is at least equal.
+
+Limits:
+
+* One machine, one run per configuration, 30 Thinking requests per cell, 6 to 17 of them overlapped with a caption job in each loaded cell; p95s are crude and the 1.42x two-slot figure is within noise of the 1.5x line.
+* Quality: single rater (a language model), one sample per prompt, default sampling, Japanese only, 30 invented prompts; no judgement of voice or character.
+* Latency excludes OBS capture and the downscale, and the live app's own request path (the profile talks to llama-server through the app, with streaming, which was not exercised here).
+* The Thinking requests came from one Python process, evenly spaced; live chat is bursty, so overlap exposure in practice is unmeasured (a burst during a caption job is the bad case).
+* Synthetic frames only; the scene-agreement 100% is for a 30-frame stylised set.
+* Memory is total-used deltas from nvidia-smi on a shared desktop, not per-process counters.
+* A llama.cpp slot scheduler change or another build could change section 4.
