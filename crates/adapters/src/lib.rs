@@ -20,6 +20,7 @@ mod transport;
 mod tts_http;
 mod twitch_chat;
 mod vts;
+mod youtube_chat;
 
 pub use audio::*;
 pub use hindsight::*;
@@ -32,6 +33,7 @@ pub use transport::*;
 pub use tts_http::*;
 pub use twitch_chat::*;
 pub use vts::*;
+pub use youtube_chat::*;
 
 use aivtuber_domain::{EngineError, EngineErrorKind};
 use serde_json::Value;

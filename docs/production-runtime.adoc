@@ -133,6 +133,83 @@ Options: `--channel` (repeatable, at most 8), `--queue N` (writer queue, default
 
 Tests: `cargo test --locked -p aivtuber-adapters --lib twitch` (mapping fixtures, bursts, backoff) and `cargo test --locked -p aivtuber-app --test twitch_ingress_e2e` (stdin path, ceiling, forged message). A live run needs network access and is manual: `--duration-secs 120` against a busy public channel, piped into the app with the ceiling set.
 
+=== YouTube Live chat sidecar (issue #293)
+
+`youtube-chat-ingress` (`crates/adapters`) is a second read-only ingress with the same shape as the Twitch one: a separate process, the existing Event Envelope on stdout, one JSON line per record, no new wire contract. Provider types stay in `crates/adapters/src/youtube_chat.rs`. It uses the official YouTube Data API v3 only; there is no innertube or other unofficial path.
+
+[source,sh]
+----
+export YOUTUBE_API_KEY=...            # never a command-line argument
+export AIVTUBER_INGRESS_MAX_TRUST=untrusted
+export AIVTUBER_INGRESS_SOURCE_CLASSES=public_chat,donation
+cargo run --locked -p aivtuber-adapters --bin youtube-chat-ingress -- --video-id <11-char id> \
+  | cargo run --locked -p aivtuber-app
+----
+
+Pass exactly one of `--video-id` (resolved once through `videos.list?part=liveStreamingDetails`, field `activeLiveChatId`, 1 quota unit) or `--live-chat-id`. Other options: `--min-poll-ms N` (operator floor, default 5000), `--queue N`, `--stats-secs N`, `--duration-secs N`, `--include-backlog` (see below), `--api-base URL` (tests only; HTTPS or loopback HTTP). Diagnostics and counters go to stderr; stdout carries records only. Exit code 2 means misconfiguration (missing or invalid key, unknown chat, other non-retryable 4xx); 0 means the run deadline passed, stdout closed, or the chat ended.
+
+==== Setup: API key
+
+. In the Google Cloud console create or choose a project and enable *YouTube Data API v3* (APIs and Services, Library).
+. Create an *API key* (APIs and Services, Credentials). Restrict it to the YouTube Data API v3. If the sidecar runs from a fixed address, add an IP restriction.
+. Put it in the `YOUTUBE_API_KEY` environment variable of the sidecar process only. The key is public-data read access; it cannot post, moderate or read private data. No OAuth is used.
+
+The key is sent in the `x-goog-api-key` request header, so it is never part of a URL; it is wrapped in a type with redacted `Debug` and has no `Display`; and it is scrubbed from transport error text. The sidecar never prints it or any response body, only the HTTP status and a short `error.errors[].reason`.
+
+==== API facts the design rests on
+
+Checked against the Google documentation on 2026-11-10:
+
+* `liveChatMessages.list` (https://developers.google.com/youtube/v3/live/docs/liveChatMessages/list): 5 quota units per call; `part=snippet,authorDetails`; `maxResults` 200 to 2000 (the sidecar asks for the minimum, 200); the response carries `nextPageToken`, `pollingIntervalMillis` (how long to wait before the next call) and, only when the stream is offline, `offlineAt`. Errors used: `liveChatEnded` (403), `liveChatNotFound` (404), `rateLimitExceeded` (403).
+* Message resource and `snippet.type` values (https://developers.google.com/youtube/v3/live/docs/liveChatMessages): `textMessageEvent`, `superChatEvent`, `superStickerEvent`, `newSponsorEvent`, `memberMilestoneChatEvent`, `membershipGiftingEvent`, `giftMembershipReceivedEvent`, `chatEndedEvent`, `tombstone`, `userBannedEvent`, `sponsorOnlyModeStartedEvent`, `sponsorOnlyModeEndedEvent`, `pollDetails`, `giftEvent`.
+* `liveChatMessages.streamList` (https://developers.google.com/youtube/v3/live/streaming-live-chat) exists and accepts an API key, but it is a *gRPC* server-streaming RPC to `youtube.googleapis.com:443` (proto `StreamList`), with no REST streaming form. It costs 5 units per call like `list`. It is not used: it would add a gRPC/protobuf stack (tonic, prost, generated protos) and its supply-chain surface for a latency gain of a few seconds that chat reactions do not need. Revisit if chat latency becomes a measured problem; the poller is behind a small `YoutubeHttp` trait and the mapper is independent of the transport.
+* Quota (https://developers.google.com/youtube/v3/determine_quota_cost): the default allocation is 10,000 units per day per Cloud project; `liveChatMessages.list` costs 5 and `videos.list` costs 1. The daily quota resets at midnight Pacific Time.
+
+==== Quota math
+
+Each poll costs 5 units, so a stream consumes `5 * duration / interval`. The sidecar waits `max(pollingIntervalMillis, --min-poll-ms)` between calls, never less than the interval the API returns:
+
+[cols="1,1,1,1"]
+|===
+|Effective interval |Calls in 2 h |Units (2 h) |Share of 10,000/day
+
+|5 s (default floor)
+|1,440
+|7,200 (+1 for `videos.list`)
+|72 %
+
+|6 s
+|1,200
+|6,000
+|60 %
+
+|10 s
+|720
+|3,600
+|36 %
+|===
+
+One 2-hour stream at the default floor fits the default daily quota; a second stream the same day, or a shorter interval, does not. If `pollingIntervalMillis` is larger than the floor (the API's value wins) the cost is lower. To run longer or more than once per day, raise `--min-poll-ms` or request a quota extension from Google. These numbers are arithmetic from the documented costs, not a measurement; no live stream has been run.
+
+==== Behaviour and bounds
+
+* *Trust.* Every text message is `chat.message` / `public_chat` / `content` / `untrusted` with no `authorization`, exactly as for Twitch. `isChatOwner`, `isChatModerator`, `isChatSponsor` and `isVerified` are carried as `payload.author_flags` for audit only; nothing reads them, so a viewer who is the channel owner or a moderator gains no capability, and still cannot write memory. The `AIVTUBER_INGRESS_*` ceiling is what makes the app enforce this.
+* *Viewer identity.* `actor_id` is the author's channel id. Display name and avatar URL are not emitted. Pseudonymization happens in the app (`ActorPseudonymizer`, namespaced by `source`, which is the constant `youtube:live-chat`) when working memory is written; the sidecar never holds that key. Do not `tee` the pipe to a file you intend to keep.
+* *Paid events.* `superChatEvent` and `superStickerEvent` map to the existing `chat.donation` kind (`source_class=donation`, `plane=content`, `trust_level=untrusted`, never `semi_trusted`): `payload.amount` (`amountMicros / 1,000,000`), `currency`, `message` (the comment, or the sticker alt text), `paid_kind`, optionally `tier` and `amount_display`. Because the class is `donation`, the operator must list it in `AIVTUBER_INGRESS_SOURCE_CLASSES` (as in the example above); with `public_chat` alone the app rejects each one as `rejected_ingress_policy` and counts it, which is the safe default.
+* *Membership events.* `newSponsorEvent`, `memberMilestoneChatEvent`, `membershipGiftingEvent` and `giftMembershipReceivedEvent` are *not* emitted: the domain has no membership event kind and this change adds none. They are counted (`membership_unmapped`). Future work: a membership kind in `schemas/event-envelope.schema.json` and the domain types, then a mapping here.
+* *Other items.* Tombstones (deleted messages), bans, sponsor-mode changes, polls and gifts are counted as `not_chat`; as with Twitch deletions, a record already piped cannot be recalled.
+* *Backlog.* The first poll returns messages already in chat. They are marked seen and counted (`skipped_backlog`) but not emitted, so a mid-stream start does not answer old chat; `--include-backlog` emits them.
+* *Bounds.* Message text over 500 characters (YouTube allows 200), a record over 64 KiB or a payload over 16 KiB is rejected whole, never truncated, and counted (`dropped_oversize`); the record and payload limits match `SecurityRuntimeConfig` and a test pins them. Items with a missing id, text, author or timestamp are counted (`dropped_malformed`). A response that is not valid JSON is counted (`malformed_responses`) and backed off. Message ids are deduplicated in a set of 4,096 ids, oldest evicted first (`duplicates`). A response over 2 MiB is refused. The writer queue is bounded as for Twitch (`dropped_queue_full`). Sequence numbers are a logical counter and are not consumed by rejected items.
+* *Backoff.* 5xx and transport errors: 2 s doubling to 2 min. Quota or rate-limit 403 (`quotaExceeded`, `dailyLimitExceeded`, `rateLimitExceeded`, `userRateLimitExceeded`) and 429: 1 min doubling to 15 min. Success resets the schedule. While backing off no chat flows but the performer keeps running; the app never waits on this process.
+* *Ending.* `liveChatEnded`, a `chatEndedEvent` item, or `offlineAt` in a response stops the sidecar cleanly with a final stats line.
+* *Redirects and TLS.* No redirects are followed; remote hosts require HTTPS, plain HTTP is allowed for loopback only (the test server). Proxy environment variables are honoured for the real API host and ignored for loopback.
+
+==== Terms of service notes
+
+Use is subject to the https://developers.google.com/youtube/terms/api-services-terms-of-service[YouTube API Services Terms of Service] and the https://developers.google.com/youtube/terms/developer-policies[Developer Policies]. Points that matter here: you must stay within your project's quota and not circumvent it (for example by rotating keys across projects); the sidecar retains no API data of its own, and the app stores only pseudonymous actor ids and bounded working memory, but you remain responsible for your own privacy notice and for deleting data when YouTube requires it; read-only use of public live chat does not need user authorization. Scraping or using the unofficial innertube endpoints is not offered here because it is outside the API terms and breaks without notice.
+
+Tests: `cargo test --locked -p aivtuber-adapters --test youtube_chat_ingress` (a loopback fake of the API: paging, polling interval, dedupe, malformed and oversized items, quota backoff, chat end, key redaction), `cargo test --locked -p aivtuber-adapters --lib youtube`, and `cargo test --locked -p aivtuber-app --test youtube_ingress_e2e` (stdin path, ceiling, forged message, donation class). CI needs no network. A live run needs a key and a real stream and is manual; none has been performed.
+
 == Speech observations (issue #92, S1)
 
 `schemas/speech-observation.schema.json` is the contract for raw speech-activity edges and an optional turn-end score from a VAD or turn provider. It carries no audio, PCM or transcript text, and no source class, plane, trust or priority field: the receiving ingress assigns them. A microphone speaker, including the operator's own, is always `speech` / `content` / `untrusted` (`SpeechObservationProvenance`); it cannot mint authority, and priority comes from configuration.

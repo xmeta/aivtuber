@@ -212,6 +212,12 @@ Record the result as one of:
 |Reuse Helix HTTP/API types and endpoint mechanics. Recommendation/execution split, ModerationAuthority, approval, idempotency/freshness, and audit stay in aivtuber.
 |#76
 
+|YouTube Live chat ingress
+|+google-youtube3+, +liveChatMessages.streamList+ (gRPC), unofficial innertube libraries
+|Custom (thin), reject the rest
+|Two read-only REST calls (+liveChatMessages.list+, +videos.list+) over the +ureq+ client the adapters already use add no dependency; +google-youtube3+ would pull the whole generated API plus hyper/OAuth for two GETs. +streamList+ is gRPC-only and needs a tonic/prost stack for a latency gain chat does not need. Innertube scraping is outside the API terms and is not offered. Trust ceiling, pseudonymization, bounds and backoff stay project-owned; see docs/production-runtime.adoc.
+|#293
+
 |YouTube moderation API
 |+google-youtube3+
 |Wrap
