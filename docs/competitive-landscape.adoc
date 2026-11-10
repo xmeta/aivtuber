@@ -230,7 +230,7 @@ Impact means what a streamer or a viewer notices first when comparing with AIRI 
 |AIRI Electron (README 191); OLV desktop client (README 69).
 
 |5
-|*Only one chat platform (Twitch, read-only).* No YouTube, Discord or Telegram; no live run recorded for Twitch.
+|*Two chat platforms (Twitch and YouTube Live, read-only).* No Discord or Telegram; no live run recorded for either. YouTube ingress: https://github.com/xmeta/aivtuber/issues/293[#293].
 |No open issue for further platforms; Twitch was https://github.com/xmeta/aivtuber/issues/257[#257] (closed). Moderation actions: https://github.com/xmeta/aivtuber/issues/76[#76] (P1, no status label).
 |aituber-onair YouTube and Twitch (README 53, 470); AIRI Discord and Telegram (README 245-246).
 
