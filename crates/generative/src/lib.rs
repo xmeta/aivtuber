@@ -7,8 +7,9 @@
 //! Asset, so cancellation or partial backend output cannot corrupt playback.
 
 use aivtuber_asset_store::{
-    AssetClass, AssetCompatibility, AssetStore, ExpressionTrack, GazeTarget,
-    PERFORMANCE_ASSET_SCHEMA_VERSION, PerformanceAsset, Provenance, SpeechTrack, TimelineEvent,
+    AssetClass, AssetCompatibility, AssetStore, DEFAULT_COMPILER_VERSION, ExpressionTrack,
+    GazeTarget, PERFORMANCE_ASSET_SCHEMA_VERSION, PerformanceAsset, Provenance, SpeechTrack,
+    TimelineEvent,
 };
 use aivtuber_domain::{
     BackendIdentity, EngineError, EngineErrorKind, EventEnvelope, FallbackReason, SpeechArtifact,
@@ -23,6 +24,7 @@ use std::error::Error;
 use std::fmt;
 mod phrase;
 mod phrase_pipeline;
+mod speech_lexicon;
 mod speech_text;
 pub use phrase::{
     Delivery, MAX_PHRASES_CEILING, PHRASE_SEGMENTATION_VERSION, PhraseConfig, PhraseDelivery,
@@ -30,6 +32,11 @@ pub use phrase::{
     PhraseTransitionError, PhraseUnit, SegmentationConfig, SlotWait, segment_reply,
 };
 pub use phrase_pipeline::wait_for_started;
+pub use speech_lexicon::{
+    LexiconEntry, LexiconLayer, MAX_LEXICON_BYTES, MAX_LEXICON_ENTRIES, MAX_LEXICON_INPUT_CHARS,
+    MAX_LEXICON_LAYERS, MAX_READING_CHARS, MAX_SURFACE_CHARS, ProjectionIdentity,
+    SPEECH_RULES_VERSION, SpeechLexicon, SpeechLexiconError, SpeechTextProjection,
+};
 pub use speech_text::{SpeechProjection, SpeechProjectionReport, project_speech_text};
 use std::sync::{
     Arc, Mutex,
@@ -101,6 +108,39 @@ pub struct GenerationTrace {
     /// admission was denied before provider work began.
     #[serde(default)]
     pub budget_denial_reason: Option<String>,
+    /// Display-to-speech projection of this reply (all phrases summed), for
+    /// the replay identity and the `projection_passthrough_latin` metric.
+    #[serde(default)]
+    pub speech_projection: Option<SpeechProjectionTrace>,
+}
+
+/// Counts and identity of the speech projections made for one reply. Never
+/// contains text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeechProjectionTrace {
+    /// [`ProjectionIdentity::key`] of the lexicon the projections used.
+    pub projection: String,
+    pub lexicon_hits: u64,
+    /// Latin words left unprojected (ADR-0004 D-5): what the lexicon lacks.
+    pub passthrough_latin: u64,
+}
+
+impl GenerationTrace {
+    pub(crate) fn record_speech_projection(&mut self, projection: &SpeechTextProjection) {
+        let entry = self
+            .speech_projection
+            .get_or_insert_with(|| SpeechProjectionTrace {
+                projection: projection.identity.key(),
+                lexicon_hits: 0,
+                passthrough_latin: 0,
+            });
+        entry.lexicon_hits = entry
+            .lexicon_hits
+            .saturating_add(projection.report.lexicon_hits as u64);
+        entry.passthrough_latin = entry
+            .passthrough_latin
+            .saturating_add(projection.report.passthrough_latin as u64);
+    }
 }
 
 impl Default for GenerationTrace {
@@ -116,6 +156,7 @@ impl Default for GenerationTrace {
             fallback_reason: FallbackReason::None,
             cancelled_stage: None,
             budget_denial_reason: None,
+            speech_projection: None,
         }
     }
 }
@@ -175,7 +216,7 @@ pub struct PerformanceCompilerConfig {
 impl Default for PerformanceCompilerConfig {
     fn default() -> Self {
         Self {
-            compiler_version: PERFORMANCE_ASSET_SCHEMA_VERSION.to_owned(),
+            compiler_version: DEFAULT_COMPILER_VERSION.to_owned(),
             avatar_profile: None,
             motion_library: None,
             expression_preset: Some("speaking.neutral".to_owned()),
@@ -528,6 +569,7 @@ impl PerformanceCompiler {
             variant_group: None,
             speech: Some(SpeechTrack {
                 text: Some(reply_text.to_owned()),
+                speech_text: None,
                 audio_ref: Some(speech.audio_ref.clone()),
                 duration_ms: Some(speech.duration_ms),
                 viseme_ref: speech.viseme_ref.clone(),
@@ -544,6 +586,7 @@ impl PerformanceCompiler {
                 avatar_profile: self.config.avatar_profile.clone(),
                 viseme_mapping: tts.viseme_mapping.clone(),
                 motion_library: self.config.motion_library.clone(),
+                speech_projection: None,
             },
             semantic_embedding: None,
             provenance: Some(Provenance {
@@ -678,6 +721,9 @@ pub struct GenerativePipeline {
     thinking: Arc<dyn ThinkingEngine>,
     tts: Arc<dyn TtsEngine>,
     compiler: PerformanceCompiler,
+    /// Display-to-speech projection lexicon (ADR-0004, issue #222). The
+    /// committed starter lexicon unless the composition root supplies another.
+    speech_lexicon: Arc<SpeechLexicon>,
 }
 
 impl fmt::Debug for GenerativePipeline {
@@ -700,7 +746,19 @@ impl GenerativePipeline {
             thinking,
             tts,
             compiler,
+            speech_lexicon: Arc::new(SpeechLexicon::builtin()),
         }
+    }
+
+    /// Replace the projection lexicon (operator configuration; never model or
+    /// chat output).
+    pub fn with_speech_lexicon(mut self, lexicon: Arc<SpeechLexicon>) -> Self {
+        self.speech_lexicon = lexicon;
+        self
+    }
+
+    pub fn speech_lexicon(&self) -> &SpeechLexicon {
+        &self.speech_lexicon
     }
 
     /// One complete TTS call (streaming when the engine streams, buffered
@@ -840,19 +898,22 @@ impl GenerativePipeline {
             }
         };
 
-        // ADR-0004 D-5: what is spoken is projected from the gated display
-        // text by deletion (URLs, emoji, kaomoji). The display text, and the
+        // ADR-0004 D-5 and the reading lexicon (#222): what is spoken is
+        // projected from the gated display text (URLs, emoji and kaomoji
+        // deleted, then lexicon readings spliced in). The display text, and the
         // asset compiled from it below, stay as the gate published them.
-        let projection = project_speech_text(&gated_reply_text);
+        let projection = self.speech_lexicon.project(&gated_reply_text);
+        trace.record_speech_projection(&projection);
         let speech_text = if projection.report.changed() {
-            // Deletion can join what the gate saw apart, so the gate sees the
-            // projected string too (only when something was deleted). The
+            // Deletion can join what the gate saw apart, and a reading is text
+            // the gate has not seen, so the gate sees the projected string too
+            // (only when something changed). The
             // production gate records the last decision it saw and the app
             // commits only when that decision is for the published display
             // text, so the display text goes through once more, last. Found
             // by the local end-to-end run: without it every reply that
             // contained an emoji or a URL was dropped at commit.
-            let decision = output_gate(&projection.text);
+            let decision = output_gate(&projection.speech_text);
             let _ = output_gate(&gated_reply_text);
             match decision {
                 GeneratedTextGateDecision::Publish(text) => text,
@@ -898,13 +959,18 @@ impl GenerativePipeline {
             return Ok(cancelled_result(trace, CancellationStage::AfterTts));
         }
 
-        let asset = match self.compiler.compile(
-            request,
-            &gated_reply_text,
-            &speech,
-            &thinking_identity,
-            &tts_identity,
-        ) {
+        let asset = match self
+            .compiler
+            .compile(
+                request,
+                &gated_reply_text,
+                &speech,
+                &thinking_identity,
+                &tts_identity,
+            )
+            .map(|asset| {
+                asset.with_speech_projection(speech_request.text.clone(), projection.identity.key())
+            }) {
             Ok(asset) => asset,
             Err(_) => {
                 trace.fallback_reason = FallbackReason::InvalidRequest;
@@ -1353,9 +1419,7 @@ mod tests {
 
     #[test]
     fn plain_replies_reach_tts_byte_for_byte() {
-        let thinking = Arc::new(MockThinking::success(
-            "今日はYouTubeでライブだよ。A&B、100%。",
-        ));
+        let thinking = Arc::new(MockThinking::success("今日はライブだよ。A&B、100%。"));
         let tts = Arc::new(MockTts::success());
         let pipeline = GenerativePipeline::new(thinking, tts.clone(), compiler());
         pipeline
@@ -1367,7 +1431,139 @@ mod tests {
             .expect("generation");
         assert_eq!(
             tts.spoken.lock().unwrap().as_slice(),
-            ["今日はYouTubeでライブだよ。A&B、100%。"]
+            ["今日はライブだよ。A&B、100%。"]
+        );
+    }
+
+    #[test]
+    fn lexicon_readings_reach_tts_while_the_asset_keeps_the_display_text_and_records_identity() {
+        let display = "今日はYouTubeでAIとVTuberの話だよ。";
+        let tts = Arc::new(MockTts::success());
+        let pipeline = GenerativePipeline::new(
+            Arc::new(MockThinking::success(display)),
+            tts.clone(),
+            compiler(),
+        );
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let result = pipeline
+            .run_with_output_gate(
+                &generation_request(34),
+                &GenerationCancellationToken::default(),
+                None,
+                move |text| {
+                    recorder.lock().unwrap().push(text.to_owned());
+                    GeneratedTextGateDecision::Publish(text.to_owned())
+                },
+            )
+            .expect("generation");
+        let spoken = "今日はユーチューブでエーアイとブイチューバーの話だよ。";
+        assert_eq!(tts.spoken.lock().unwrap().as_slice(), [spoken]);
+        // The gate saw the display text, the projected text, and the display
+        // text last (the app commits only when its last decision is for the
+        // display text).
+        assert_eq!(seen.lock().unwrap().as_slice(), [display, spoken, display]);
+        let counts = result
+            .trace
+            .speech_projection
+            .clone()
+            .expect("trace counts");
+        assert_eq!(
+            counts.projection,
+            pipeline.speech_lexicon().identity().key()
+        );
+        assert_eq!((counts.lexicon_hits, counts.passthrough_latin), (3, 0));
+        let GenerationDisposition::Generated { asset } = result.disposition else {
+            panic!("expected generated asset");
+        };
+        asset.validate().expect("0.2.0 asset is valid");
+        let speech = asset.speech.as_ref().unwrap();
+        assert_eq!(speech.text.as_deref(), Some(display));
+        assert_eq!(speech.speech_text.as_deref(), Some(spoken));
+        assert_eq!(asset.schema_version, "0.2.0");
+        assert_eq!(
+            asset.compatibility.speech_projection.as_deref(),
+            Some(pipeline.speech_lexicon().identity().key().as_str())
+        );
+    }
+
+    #[test]
+    fn a_gate_that_rejects_the_reading_text_stops_the_reply_before_tts() {
+        let tts = Arc::new(MockTts::success());
+        let pipeline = GenerativePipeline::new(
+            Arc::new(MockThinking::success("YouTubeだよ")),
+            tts.clone(),
+            compiler(),
+        );
+        let mut calls = 0;
+        let result = pipeline
+            .run_with_output_gate(
+                &generation_request(35),
+                &GenerationCancellationToken::default(),
+                None,
+                |text| {
+                    calls += 1;
+                    if calls == 2 {
+                        GeneratedTextGateDecision::Reject
+                    } else {
+                        GeneratedTextGateDecision::Publish(text.to_owned())
+                    }
+                },
+            )
+            .expect("generation");
+        assert_eq!(tts.calls.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(result.trace.fallback_reason, FallbackReason::PolicyOverride);
+    }
+
+    #[test]
+    fn an_operator_lexicon_replaces_the_starter_one_and_an_empty_one_speaks_the_display_text() {
+        let operator = LexiconLayer::parse(
+            r#"{"schema_version":"0.1.0","lexicon_id":"persona","revision":"1","entries":[
+                {"surface":"YouTube","reading":"ようつべ","source":"operator"}]}"#,
+        )
+        .unwrap();
+        let lexicon =
+            Arc::new(SpeechLexicon::from_layers(&[LexiconLayer::builtin(), operator]).unwrap());
+        let tts = Arc::new(MockTts::success());
+        let pipeline = GenerativePipeline::new(
+            Arc::new(MockThinking::success("YouTubeとAI")),
+            tts.clone(),
+            compiler(),
+        )
+        .with_speech_lexicon(lexicon);
+        pipeline
+            .run(
+                &generation_request(36),
+                &GenerationCancellationToken::default(),
+                None,
+            )
+            .expect("generation");
+        assert_eq!(
+            tts.spoken.lock().unwrap().as_slice(),
+            ["ようつべとエーアイ"]
+        );
+
+        let tts = Arc::new(MockTts::success());
+        let pipeline = GenerativePipeline::new(
+            Arc::new(MockThinking::success("YouTubeとAI")),
+            tts.clone(),
+            compiler(),
+        )
+        .with_speech_lexicon(Arc::new(SpeechLexicon::empty()));
+        let result = pipeline
+            .run(
+                &generation_request(37),
+                &GenerationCancellationToken::default(),
+                None,
+            )
+            .expect("generation");
+        assert_eq!(tts.spoken.lock().unwrap().as_slice(), ["YouTubeとAI"]);
+        let GenerationDisposition::Generated { asset } = result.disposition else {
+            panic!("expected generated asset");
+        };
+        assert_eq!(
+            asset.compatibility.speech_projection.as_deref(),
+            Some("rules:1|lexicon:none")
         );
     }
 

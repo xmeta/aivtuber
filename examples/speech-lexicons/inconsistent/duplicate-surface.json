@@ -1,0 +1,17 @@
+{
+ "schema_version": "0.1.0",
+ "lexicon_id": "bad",
+ "revision": "1",
+ "entries": [
+  {
+   "surface": "Foo",
+   "reading": "フー",
+   "source": "x"
+  },
+  {
+   "surface": "foo",
+   "reading": "フー",
+   "source": "x"
+  }
+ ]
+}

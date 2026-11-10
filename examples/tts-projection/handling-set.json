@@ -2,191 +2,331 @@
  {
   "category": "number",
   "text": "今日は3月5日です。",
-  "expected": "今日は3月5日です。"
+  "expected": "今日は3月5日です。",
+  "expected_speech": "今日は3月5日です。"
  },
  {
   "category": "number",
   "text": "チャンネル登録者が1000人を超えました。",
-  "expected": "チャンネル登録者が1000人を超えました。"
+  "expected": "チャンネル登録者が1000人を超えました。",
+  "expected_speech": "チャンネル登録者が1000人を超えました。"
  },
  {
   "category": "number",
   "text": "あと25分で始まるよ。",
-  "expected": "あと25分で始まるよ。"
+  "expected": "あと25分で始まるよ。",
+  "expected_speech": "あと25分で始まるよ。"
  },
  {
   "category": "number",
   "text": "気温は18.5度だって。",
-  "expected": "気温は18.5度だって。"
+  "expected": "気温は18.5度だって。",
+  "expected_speech": "気温は18.5度だって。"
  },
  {
   "category": "number",
   "text": "二十歳の誕生日をお祝いするね。",
-  "expected": "二十歳の誕生日をお祝いするね。"
+  "expected": "二十歳の誕生日をお祝いするね。",
+  "expected_speech": "二十歳の誕生日をお祝いするね。"
  },
  {
   "category": "number",
   "text": "100円のスパチャありがとう。",
-  "expected": "100円のスパチャありがとう。"
+  "expected": "100円のスパチャありがとう。",
+  "expected_speech": "100円のスパチャありがとう。"
  },
  {
   "category": "number",
   "text": "1日目はここまでにしよう。",
-  "expected": "1日目はここまでにしよう。"
+  "expected": "1日目はここまでにしよう。",
+  "expected_speech": "1日目はここまでにしよう。"
  },
  {
   "category": "number",
   "text": "今月の目標は5万円です。",
-  "expected": "今月の目標は5万円です。"
+  "expected": "今月の目標は5万円です。",
+  "expected_speech": "今月の目標は5万円です。"
  },
  {
   "category": "number",
   "text": "3人で遊ぶよ。",
-  "expected": "3人で遊ぶよ。"
+  "expected": "3人で遊ぶよ。",
+  "expected_speech": "3人で遊ぶよ。"
  },
  {
   "category": "number",
   "text": "2026年11月10日の配信です。",
-  "expected": "2026年11月10日の配信です。"
+  "expected": "2026年11月10日の配信です。",
+  "expected_speech": "2026年11月10日の配信です。"
  },
  {
   "category": "english",
   "text": "今日はYouTubeでライブをするよ。",
-  "expected": "今日はYouTubeでライブをするよ。"
+  "expected": "今日はYouTubeでライブをするよ。",
+  "expected_speech": "今日はユーチューブでライブをするよ。"
  },
  {
   "category": "english",
   "text": "OpenAIの新しいモデルが出たらしい。",
-  "expected": "OpenAIの新しいモデルが出たらしい。"
+  "expected": "OpenAIの新しいモデルが出たらしい。",
+  "expected_speech": "オープンエーアイの新しいモデルが出たらしい。"
  },
  {
   "category": "english",
   "text": "Twitterじゃなくて今はXって呼ぶんだよ。",
-  "expected": "Twitterじゃなくて今はXって呼ぶんだよ。"
+  "expected": "Twitterじゃなくて今はXって呼ぶんだよ。",
+  "expected_speech": "ツイッターじゃなくて今はXって呼ぶんだよ。"
  },
  {
   "category": "english",
   "text": "VTuberになって三年が経ちました。",
-  "expected": "VTuberになって三年が経ちました。"
+  "expected": "VTuberになって三年が経ちました。",
+  "expected_speech": "ブイチューバーになって三年が経ちました。"
  },
  {
   "category": "english",
   "text": "このゲームのBGMが好き。",
-  "expected": "このゲームのBGMが好き。"
+  "expected": "このゲームのBGMが好き。",
+  "expected_speech": "このゲームのビージーエムが好き。"
  },
  {
   "category": "english",
   "text": "Discordのサーバーに入ってね。",
-  "expected": "Discordのサーバーに入ってね。"
+  "expected": "Discordのサーバーに入ってね。",
+  "expected_speech": "ディスコードのサーバーに入ってね。"
  },
  {
   "category": "english",
   "text": "Thank you、また来てね。",
-  "expected": "Thank you、また来てね。"
+  "expected": "Thank you、また来てね。",
+  "expected_speech": "Thank you、また来てね。"
  },
  {
   "category": "english",
   "text": "AIとおしゃべりするのは楽しいね。",
-  "expected": "AIとおしゃべりするのは楽しいね。"
+  "expected": "AIとおしゃべりするのは楽しいね。",
+  "expected_speech": "エーアイとおしゃべりするのは楽しいね。"
  },
  {
   "category": "kanji",
   "text": "今日は昨日より明日が楽しみ。",
-  "expected": "今日は昨日より明日が楽しみ。"
+  "expected": "今日は昨日より明日が楽しみ。",
+  "expected_speech": "今日は昨日より明日が楽しみ。"
  },
  {
   "category": "kanji",
   "text": "上手にできたと思う。",
-  "expected": "上手にできたと思う。"
+  "expected": "上手にできたと思う。",
+  "expected_speech": "上手にできたと思う。"
  },
  {
   "category": "kanji",
   "text": "人気者になりたいな。",
-  "expected": "人気者になりたいな。"
+  "expected": "人気者になりたいな。",
+  "expected_speech": "人気者になりたいな。"
  },
  {
   "category": "kanji",
   "text": "大人気のゲームを遊ぶよ。",
-  "expected": "大人気のゲームを遊ぶよ。"
+  "expected": "大人気のゲームを遊ぶよ。",
+  "expected_speech": "大人気のゲームを遊ぶよ。"
  },
  {
   "category": "kanji",
   "text": "行ったことがない場所に行きたい。",
-  "expected": "行ったことがない場所に行きたい。"
+  "expected": "行ったことがない場所に行きたい。",
+  "expected_speech": "行ったことがない場所に行きたい。"
  },
  {
   "category": "kanji",
   "text": "生物の授業を思い出した。",
-  "expected": "生物の授業を思い出した。"
+  "expected": "生物の授業を思い出した。",
+  "expected_speech": "生物の授業を思い出した。"
  },
  {
   "category": "kanji",
   "text": "辛い物が好きです。",
-  "expected": "辛い物が好きです。"
+  "expected": "辛い物が好きです。",
+  "expected_speech": "辛い物が好きです。"
  },
  {
   "category": "kanji",
   "text": "最後まで見ていってね。",
-  "expected": "最後まで見ていってね。"
+  "expected": "最後まで見ていってね。",
+  "expected_speech": "最後まで見ていってね。"
  },
  {
   "category": "kanji",
   "text": "風邪をひかないように気をつけて。",
-  "expected": "風邪をひかないように気をつけて。"
+  "expected": "風邪をひかないように気をつけて。",
+  "expected_speech": "風邪をひかないように気をつけて。"
  },
  {
   "category": "kanji",
   "text": "一人で歌うのは少し寂しい。",
-  "expected": "一人で歌うのは少し寂しい。"
+  "expected": "一人で歌うのは少し寂しい。",
+  "expected_speech": "一人で歌うのは少し寂しい。"
  },
  {
   "category": "kanji",
   "text": "海老の天ぷらが食べたい。",
-  "expected": "海老の天ぷらが食べたい。"
+  "expected": "海老の天ぷらが食べたい。",
+  "expected_speech": "海老の天ぷらが食べたい。"
  },
  {
   "category": "kanji",
   "text": "彼女は笑顔で手を振った。",
-  "expected": "彼女は笑顔で手を振った。"
+  "expected": "彼女は笑顔で手を振った。",
+  "expected_speech": "彼女は笑顔で手を振った。"
  },
  {
   "category": "kanji",
   "text": "東京タワーに行ってきたよ。",
-  "expected": "東京タワーに行ってきたよ。"
+  "expected": "東京タワーに行ってきたよ。",
+  "expected_speech": "東京タワーに行ってきたよ。"
  },
  {
   "category": "kanji",
   "text": "雰囲気がとても良い配信だね。",
-  "expected": "雰囲気がとても良い配信だね。"
+  "expected": "雰囲気がとても良い配信だね。",
+  "expected_speech": "雰囲気がとても良い配信だね。"
  },
  {
   "category": "url",
   "text": "詳しくは https://example.com/live を見てね。",
-  "expected": "詳しくは を見てね。"
+  "expected": "詳しくは を見てね。",
+  "expected_speech": "詳しくは を見てね。"
  },
  {
   "category": "url",
   "text": "概要欄のリンクはこちら www.example.jp です。",
-  "expected": "概要欄のリンクはこちら です。"
+  "expected": "概要欄のリンクはこちら です。",
+  "expected_speech": "概要欄のリンクはこちら です。"
  },
  {
   "category": "symbol",
   "text": "A&B、100%、#タグ、@メンション。",
-  "expected": "A&B、100%、#タグ、@メンション。"
+  "expected": "A&B、100%、#タグ、@メンション。",
+  "expected_speech": "A&B、100%、#タグ、@メンション。"
  },
  {
   "category": "emoji",
   "text": "ありがとう😊また来てね✨",
-  "expected": "ありがとうまた来てね"
+  "expected": "ありがとうまた来てね",
+  "expected_speech": "ありがとうまた来てね"
  },
  {
   "category": "emoji",
   "text": "やったー🎉🎉🎉",
-  "expected": "やったー"
+  "expected": "やったー",
+  "expected_speech": "やったー"
  },
  {
   "category": "emoji",
   "text": "えへへ(´▽`)照れるなあ。",
-  "expected": "えへへ照れるなあ。"
+  "expected": "えへへ照れるなあ。",
+  "expected_speech": "えへへ照れるなあ。"
+ },
+ {
+  "category": "brand",
+  "text": "TwitchとYouTubeで同時配信するよ。",
+  "expected": "TwitchとYouTubeで同時配信するよ。",
+  "expected_speech": "ツイッチとユーチューブで同時配信するよ。"
+ },
+ {
+  "category": "brand",
+  "text": "OBSの設定を見直したよ。",
+  "expected": "OBSの設定を見直したよ。",
+  "expected_speech": "オービーエスの設定を見直したよ。"
+ },
+ {
+  "category": "brand",
+  "text": "LLMとTTSを使って喋っています。",
+  "expected": "LLMとTTSを使って喋っています。",
+  "expected_speech": "エルエルエムとティーティーエスを使って喋っています。"
+ },
+ {
+  "category": "brand",
+  "text": "ChatGPTとGPTの違いは何？",
+  "expected": "ChatGPTとGPTの違いは何？",
+  "expected_speech": "チャットジーピーティーとジーピーティーの違いは何？"
+ },
+ {
+  "category": "brand",
+  "text": "Twitter/Xでお知らせしました。",
+  "expected": "Twitter/Xでお知らせしました。",
+  "expected_speech": "ツイッターエックスでお知らせしました。"
+ },
+ {
+  "category": "brand",
+  "text": "MAILとRAINBOWとFAIRにAIは入っていない。",
+  "expected": "MAILとRAINBOWとFAIRにAIは入っていない。",
+  "expected_speech": "MAILとRAINBOWとFAIRにエーアイは入っていない。"
+ },
+ {
+  "category": "brand",
+  "text": "ＹｏｕＴｕｂｅのライブを見てね。",
+  "expected": "ＹｏｕＴｕｂｅのライブを見てね。",
+  "expected_speech": "ユーチューブのライブを見てね。"
+ },
+ {
+  "category": "brand",
+  "text": "Live2DのモデルをVRMに変換した。",
+  "expected": "Live2DのモデルをVRMに変換した。",
+  "expected_speech": "ライブツーディーのモデルをブイアールエムに変換した。"
+ },
+ {
+  "category": "brand",
+  "text": "Instagramでも告知します。",
+  "expected": "Instagramでも告知します。",
+  "expected_speech": "インスタグラムでも告知します。"
+ },
+ {
+  "category": "brand",
+  "text": "PCのGPUはRTXです。",
+  "expected": "PCのGPUはRTXです。",
+  "expected_speech": "ピーシーのジーピーユーはRTXです。"
+ },
+ {
+  "category": "brand",
+  "text": "SNSでURLを共有しないでね。",
+  "expected": "SNSでURLを共有しないでね。",
+  "expected_speech": "エスエヌエスでユーアールエルを共有しないでね。"
+ },
+ {
+  "category": "brand",
+  "text": "VTuberのYouTuberさんがDiscordに来た。",
+  "expected": "VTuberのYouTuberさんがDiscordに来た。",
+  "expected_speech": "ブイチューバーのユーチューバーさんがディスコードに来た。"
+ },
+ {
+  "category": "brand",
+  "text": "Wi-Fiが切れたかも。",
+  "expected": "Wi-Fiが切れたかも。",
+  "expected_speech": "ワイファイが切れたかも。"
+ },
+ {
+  "category": "brand",
+  "text": "OKです、GGでした。",
+  "expected": "OKです、GGでした。",
+  "expected_speech": "オーケーです、ジージーでした。"
+ },
+ {
+  "category": "brand",
+  "text": "youtubeとTWITCHは小文字でも大文字でも読むよ。",
+  "expected": "youtubeとTWITCHは小文字でも大文字でも読むよ。",
+  "expected_speech": "ユーチューブとツイッチは小文字でも大文字でも読むよ。"
+ },
+ {
+  "category": "brand",
+  "text": "Ai と ai は名前や日本語なので読まない。",
+  "expected": "Ai と ai は名前や日本語なので読まない。",
+  "expected_speech": "Ai と ai は名前や日本語なので読まない。"
+ },
+ {
+  "category": "emoji",
+  "text": "YouTube😊 https://youtube.com/watch?v=1 も見てね✨",
+  "expected": "YouTube も見てね",
+  "expected_speech": "ユーチューブ も見てね"
  }
 ]

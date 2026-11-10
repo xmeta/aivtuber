@@ -15,7 +15,19 @@ use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-pub const PERFORMANCE_ASSET_SCHEMA_VERSION: &str = "0.1.0";
+/// Current performance asset schema (ADR-0004 D-3): 0.2.0 added
+/// `speech.speech_text` and `compatibility.speech_projection`.
+pub const PERFORMANCE_ASSET_SCHEMA_VERSION: &str = "0.2.0";
+/// The previous schema. Assets at this version stay readable (they carry no
+/// projection fields, so nothing is lost) but must not carry the new ones.
+pub const LEGACY_PERFORMANCE_ASSET_SCHEMA_VERSION: &str = "0.1.0";
+/// Default compiler version. It was once spelled with the schema constant by
+/// accident; the two are independent, so a schema bump must not change which
+/// cached assets a runtime accepts.
+pub const DEFAULT_COMPILER_VERSION: &str = "0.1.0";
+/// Longest `speech.speech_text` and the longest projection key, in characters.
+pub const MAX_SPEECH_TEXT_CHARS: usize = 8192;
+pub const MAX_SPEECH_PROJECTION_KEY_CHARS: usize = 256;
 pub const MAX_SEMANTIC_EMBEDDING_DIMENSIONS: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,6 +63,10 @@ pub enum GazeTarget {
 pub struct SpeechTrack {
     #[serde(default)]
     pub text: Option<String>,
+    /// What was sent to TTS when it differs from the display `text`
+    /// (ADR-0004; schema 0.2.0).
+    #[serde(default)]
+    pub speech_text: Option<String>,
     #[serde(default)]
     pub audio_ref: Option<String>,
     #[serde(default)]
@@ -106,6 +122,11 @@ pub struct AssetCompatibility {
     pub viseme_mapping: Option<String>,
     #[serde(default)]
     pub motion_library: Option<String>,
+    /// Identity of the display-to-speech projection that produced the audio
+    /// (schema 0.2.0). A mismatch makes the asset stale, not incompatible
+    /// (ADR-0004 D-4); see [`AssetCompatibility::speech_projection_is_stale`].
+    #[serde(default)]
+    pub speech_projection: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -214,11 +235,12 @@ impl PerformanceAsset {
     pub fn validate(&self) -> Result<(), AssetValidationError> {
         let mut issues = Vec::new();
 
-        if self.schema_version != PERFORMANCE_ASSET_SCHEMA_VERSION {
+        let legacy = self.schema_version == LEGACY_PERFORMANCE_ASSET_SCHEMA_VERSION;
+        if self.schema_version != PERFORMANCE_ASSET_SCHEMA_VERSION && !legacy {
             issues.push(ValidationIssue::new(
                 "schema_version",
                 format!(
-                    "expected {PERFORMANCE_ASSET_SCHEMA_VERSION}, got {}",
+                    "expected {PERFORMANCE_ASSET_SCHEMA_VERSION} or {LEGACY_PERFORMANCE_ASSET_SCHEMA_VERSION}, got {}",
                     self.schema_version
                 ),
             ));
@@ -236,6 +258,22 @@ impl PerformanceAsset {
 
         if let Some(speech) = &self.speech {
             validate_optional_nonempty("speech.text", speech.text.as_deref(), &mut issues);
+            if let Some(speech_text) = speech.speech_text.as_deref() {
+                if legacy {
+                    issues.push(ValidationIssue::new(
+                        "speech.speech_text",
+                        "requires schema_version 0.2.0",
+                    ));
+                }
+                if speech_text.trim().is_empty()
+                    || speech_text.chars().count() > MAX_SPEECH_TEXT_CHARS
+                {
+                    issues.push(ValidationIssue::new(
+                        "speech.speech_text",
+                        format!("must be 1 to {MAX_SPEECH_TEXT_CHARS} characters"),
+                    ));
+                }
+            }
             if let Some(audio_ref) = speech.audio_ref.as_deref() {
                 validate_media_ref("speech.audio_ref", audio_ref, &mut issues);
                 if speech.duration_ms.is_none() {
@@ -367,6 +405,20 @@ impl PerformanceAsset {
             self.compatibility.motion_library.as_deref(),
             &mut issues,
         );
+        if let Some(key) = self.compatibility.speech_projection.as_deref() {
+            if legacy {
+                issues.push(ValidationIssue::new(
+                    "compatibility.speech_projection",
+                    "requires schema_version 0.2.0",
+                ));
+            }
+            if !is_valid_speech_projection_key(key) {
+                issues.push(ValidationIssue::new(
+                    "compatibility.speech_projection",
+                    "must be rules:<version>|lexicon:none or rules:<version>|lexicon:<layers>+<sha256 hex>",
+                ));
+            }
+        }
 
         if let Some(provenance) = &self.provenance {
             validate_optional_nonempty(
@@ -584,7 +636,66 @@ impl CompatibilityStatus {
     }
 }
 
+/// `rules:<[a-z0-9._-]{1,16}>|lexicon:(none|<[^|+]{1,160}>+<64 lowercase hex>)`;
+/// the same pattern as `schemas/performance-asset.schema.json`.
+pub fn is_valid_speech_projection_key(key: &str) -> bool {
+    if key.chars().count() > MAX_SPEECH_PROJECTION_KEY_CHARS {
+        return false;
+    }
+    let Some(rest) = key.strip_prefix("rules:") else {
+        return false;
+    };
+    let Some((rules, lexicon)) = rest.split_once("|lexicon:") else {
+        return false;
+    };
+    let rules_ok = (1..=16).contains(&rules.len())
+        && rules.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+        });
+    if !rules_ok {
+        return false;
+    }
+    if lexicon == "none" {
+        return true;
+    }
+    let Some((layers, digest)) = lexicon.rsplit_once('+') else {
+        return false;
+    };
+    (1..=160).contains(&layers.chars().count())
+        && !layers.contains(['|', '+'])
+        && digest.len() == 64
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+impl PerformanceAsset {
+    /// Record the display-to-speech projection that produced this asset's
+    /// audio (ADR-0004 D2/D4): the projected `speech.speech_text` and the
+    /// projection identity key. The display `speech.text` is untouched.
+    pub fn with_speech_projection(mut self, speech_text: String, projection_key: String) -> Self {
+        self.schema_version = PERFORMANCE_ASSET_SCHEMA_VERSION.to_owned();
+        if let Some(speech) = self.speech.as_mut() {
+            speech.speech_text = Some(speech_text);
+        }
+        self.compatibility.speech_projection = Some(projection_key);
+        self
+    }
+}
+
 impl AssetCompatibility {
+    /// ADR-0004 D-4: an asset whose recorded projection differs from the one
+    /// the runtime would use now is *stale but playable*. Its audio still
+    /// carries the meaning; the caller re-synthesizes lazily and counts the
+    /// event. This is deliberately not part of [`Self::check`], which decides
+    /// usability. An asset that recorded no projection (schema 0.1.0, or a
+    /// recorded take) is not reported stale: its provenance is unknown.
+    pub fn speech_projection_is_stale(&self, current: Option<&str>) -> bool {
+        self.speech_projection
+            .as_deref()
+            .is_some_and(|recorded| Some(recorded) != current)
+    }
+
     pub fn check(&self, runtime: &RuntimeCompatibility) -> CompatibilityStatus {
         let mut mismatches = Vec::new();
 
@@ -654,6 +765,7 @@ pub struct AssetIdentity {
     pub avatar_profile: Option<String>,
     pub viseme_mapping: Option<String>,
     pub motion_library: Option<String>,
+    pub speech_projection: Option<String>,
 }
 
 impl From<&PerformanceAsset> for AssetIdentity {
@@ -666,6 +778,7 @@ impl From<&PerformanceAsset> for AssetIdentity {
             avatar_profile: asset.compatibility.avatar_profile.clone(),
             viseme_mapping: asset.compatibility.viseme_mapping.clone(),
             motion_library: asset.compatibility.motion_library.clone(),
+            speech_projection: asset.compatibility.speech_projection.clone(),
         }
     }
 }
@@ -680,6 +793,7 @@ impl AssetIdentity {
         append_identity_component(&mut output, "avatar", self.avatar_profile.as_deref());
         append_identity_component(&mut output, "viseme", self.viseme_mapping.as_deref());
         append_identity_component(&mut output, "motion", self.motion_library.as_deref());
+        append_identity_component(&mut output, "projection", self.speech_projection.as_deref());
         output
     }
 }
@@ -1549,6 +1663,82 @@ mod tests {
 
     fn valid_asset() -> PerformanceAsset {
         load_asset_file(fixture("valid/reaction-surprise.json")).expect("valid fixture")
+    }
+
+    #[test]
+    fn schema_0_2_0_projection_fixture_loads_and_legacy_assets_stay_readable() {
+        let asset = load_asset_file(fixture("valid/generated-speech-projection.json"))
+            .expect("0.2.0 fixture");
+        assert_eq!(asset.schema_version, "0.2.0");
+        assert_eq!(
+            asset.speech.as_ref().and_then(|s| s.speech_text.as_deref()),
+            Some("今日はユーチューブで配信します")
+        );
+        assert!(asset.compatibility.speech_projection.is_some());
+        // A 0.1.0 asset is still valid.
+        let legacy = load_asset_file(fixture("valid/generated-dynamic.json")).expect("0.1.0");
+        assert_eq!(legacy.schema_version, "0.1.0");
+        assert!(legacy.compatibility.speech_projection.is_none());
+    }
+
+    #[test]
+    fn projection_fields_are_rejected_where_the_schema_rejects_them() {
+        for name in [
+            "invalid/v0-1-with-speech-projection.json",
+            "invalid/speech-projection-bad-key.json",
+            "invalid/speech-text-empty.json",
+        ] {
+            assert!(load_asset_file(fixture(name)).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn projection_mismatch_is_stale_but_still_compatible_and_changes_identity() {
+        let asset = load_asset_file(fixture("valid/generated-speech-projection.json")).unwrap();
+        let recorded = asset.compatibility.speech_projection.clone().unwrap();
+        assert!(
+            !asset
+                .compatibility
+                .speech_projection_is_stale(Some(&recorded))
+        );
+        let other = format!("{}{}", &recorded[..recorded.len() - 1], "2");
+        assert!(asset.compatibility.speech_projection_is_stale(Some(&other)));
+        assert!(asset.compatibility.speech_projection_is_stale(None));
+        // D-4: staleness never makes the asset unusable.
+        assert!(asset.compatibility.check(&generated_runtime()).is_usable());
+        let mut changed = asset.clone();
+        changed.compatibility.speech_projection = Some(other);
+        assert_ne!(
+            asset.identity().stable_key(),
+            changed.identity().stable_key()
+        );
+        // An asset that recorded no projection is not reported stale.
+        let legacy = load_asset_file(fixture("valid/generated-dynamic.json")).unwrap();
+        assert!(
+            !legacy
+                .compatibility
+                .speech_projection_is_stale(Some(&recorded))
+        );
+    }
+
+    #[test]
+    fn projection_key_format_matches_the_schema_pattern() {
+        let digest = "a".repeat(64);
+        assert!(is_valid_speech_projection_key("rules:1|lexicon:none"));
+        assert!(is_valid_speech_projection_key(&format!(
+            "rules:1|lexicon:a@1;b@2+{digest}"
+        )));
+        for bad in [
+            "",
+            "rules:|lexicon:none",
+            "rules:1|lexicon:",
+            "rules:1|lexicon:a@1+short",
+            "rules:1|lexicon:a@1+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "rules:1|lexicon:+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "lexicon:none",
+        ] {
+            assert!(!is_valid_speech_projection_key(bad), "{bad:?}");
+        }
     }
 
     struct TestDir(PathBuf);

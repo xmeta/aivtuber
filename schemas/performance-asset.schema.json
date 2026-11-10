@@ -12,10 +12,22 @@
     "compatibility",
     "timeline"
   ],
+  "allOf": [
+    {
+      "description": "0.2.0 (ADR-0004 D-3) added speech.speech_text and compatibility.speech_projection; 0.1.0 assets stay readable but cannot carry them.",
+      "if": {"properties": {"schema_version": {"const": "0.1.0"}}},
+      "then": {
+        "properties": {
+          "speech": {"type": ["object", "null"], "properties": {"speech_text": false}},
+          "compatibility": {"type": "object", "properties": {"speech_projection": false}}
+        }
+      }
+    }
+  ],
   "properties": {
     "schema_version": {
       "type": "string",
-      "const": "0.1.0"
+      "enum": ["0.1.0", "0.2.0"]
     },
     "id": {
       "type": "string",
@@ -37,6 +49,7 @@
       "additionalProperties": false,
       "properties": {
         "text": {"type": "string"},
+        "speech_text": {"type": "string", "minLength": 1, "maxLength": 8192},
         "audio_ref": {"type": "string"},
         "duration_ms": {"type": "integer", "minimum": 0},
         "viseme_ref": {"type": ["string", "null"]}
@@ -100,7 +113,12 @@
         "voice_model": {"type": ["string", "null"]},
         "avatar_profile": {"type": ["string", "null"]},
         "viseme_mapping": {"type": ["string", "null"]},
-        "motion_library": {"type": ["string", "null"]}
+        "motion_library": {"type": ["string", "null"]},
+        "speech_projection": {
+          "type": ["string", "null"],
+          "maxLength": 256,
+          "pattern": "^rules:[a-z0-9._-]{1,16}[|]lexicon:(none|[^|+]{1,160}[+][0-9a-f]{64})$"
+        }
       }
     },
     "semantic_embedding": {
