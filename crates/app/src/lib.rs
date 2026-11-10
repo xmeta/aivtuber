@@ -2,6 +2,7 @@
 
 mod audio_stop;
 mod budget;
+mod chat_burst;
 mod deadline;
 mod memory_compare;
 mod memory_context;
@@ -35,6 +36,10 @@ mod voicevox_bridge;
 pub use aivtuber_domain::scenario::*;
 pub use audio_stop::{AUDIO_STOP_BOUND, AudioStopReport, OperatorStopReport};
 pub use budget::*;
+pub use chat_burst::{
+    ChatBurstConfig, ChatBurstConfigError, ChatBurstMetrics, ChatBurstRecord, ChatOutcome,
+    DeferredReplyReport, MAX_CHAT_BURST_RECORDS, MAX_DEFERRED_REPORTS, MAX_REPLY_TTL_MS,
+};
 pub use deadline::*;
 pub use memory_compare::*;
 pub use memory_context::*;
@@ -89,13 +94,14 @@ use aivtuber_reflex::{DecisionReplayRecord, ExecutedAction};
 use aivtuber_runtime::{
     AudioPlaybackCommand, AudioPlaybackSink, AvatarPlaybackCommand, AvatarPlaybackSink,
     CachedAssetSelection, CachedPerformer, CachedPlaybackError, CachedPlaybackOutcome,
-    CachedPlaybackTiming, ContentAdmitDecision, ControlOutcome, FastPathPreloadReport,
-    LocalVisemeStore, MemoryErasePermit, OutputVerdict, PublicOutput, PublicOutputPolicy,
-    RuntimeError, SecurityRuntime, SpeechObservationTracker, SpeechTranscriptTracker,
-    ViewerEraseDecision,
+    CachedPlaybackTiming, ContentAdmitDecision, ControlOutcome, DeferredRevalidation,
+    FastPathPreloadReport, LocalVisemeStore, MemoryErasePermit, OutputVerdict, PublicOutput,
+    PublicOutputPolicy, RuntimeError, SecurityRuntime, SpeechObservationTracker,
+    SpeechTranscriptTracker, ViewerEraseDecision,
 };
 use aivtuber_scheduler::{
-    BlendChannel, OutputFailureKind, OutputObservation, Scheduler, Status, priority_for_event,
+    BlendChannel, BusyCause, DeferredOutcome, OutputFailureKind, OutputObservation,
+    ReplyAvailability, Scheduler, Status, priority_for_event,
 };
 use aivtuber_telemetry::{
     CacheLevel, CausalTraceCollector, CausalTraceRetentionConfig, ComparisonMode,
@@ -894,6 +900,11 @@ impl GenerativeRuntime {
         }
     }
 
+    /// A generated reply is in flight (trusted busy state for #75).
+    fn is_generating(&self) -> bool {
+        self.active_generation_id.is_some()
+    }
+
     fn is_current(&self, generation_id: u64, event_id: &str) -> bool {
         self.active_generation_id == Some(generation_id)
             && self.cancellation.active_event_id().as_deref() == Some(event_id)
@@ -1080,6 +1091,9 @@ where
     speech_conversation: Option<speech_conversation::SpeechConversation>,
     speech_floor: Option<speech_floor::SpeechFloor>,
     speech_barge_in: Option<speech_barge_in::BargeIn>,
+    /// Live chat-burst selection and deferred replies (#75 S1, #78 S2); `None`
+    /// unless composed, so the default per-event path is unchanged.
+    chat_burst: Option<chat_burst::ChatBurstLane>,
     /// Runtime time the VAD sidecar's newest feed-liveness beat arrived.
     speech_feed_heartbeat_ms: Option<u64>,
     audio: audio_stop::AudioChannel,
@@ -1137,6 +1151,7 @@ where
             speech_conversation: None,
             speech_floor: None,
             speech_barge_in: None,
+            chat_burst: None,
             speech_feed_heartbeat_ms: None,
             audio: audio_stop::AudioChannel::new(audio),
             avatar,
@@ -1756,6 +1771,11 @@ where
         permit: &MemoryErasePermit,
         now_ms: u64,
     ) -> Result<Option<ErasureReport>, AppError> {
+        // A held or deferred reply of an erasing actor must never dispatch
+        // later, whether or not a memory store is composed.
+        if let (Some(lane), Some((source, actor))) = (self.chat_burst.as_mut(), permit.actor()) {
+            lane.erase_actor(source, actor, now_ms);
+        }
         let Some(adaptation) = self.adaptation.as_mut() else {
             return Ok(None);
         };
@@ -1925,6 +1945,7 @@ where
                 .map(GenerativeRuntime::execution_snapshot),
             speech_lifecycle: self.performer.scheduler().speech_lifecycle().metrics(),
             speech_freshness: self.performer.speech_freshness().metrics(),
+            chat_burst: self.chat_burst_metrics(),
         }
     }
 
@@ -2011,6 +2032,35 @@ where
                 });
             }
         }
+        if self.chat_burst.is_some() {
+            return self.process_through_chat_burst(
+                admission,
+                event,
+                at_ms,
+                seed,
+                interaction_started,
+            );
+        }
+        let playback = self.dispatch_admitted_event(event, at_ms, seed, interaction_started)?;
+        Ok(ContentProcessOutcome {
+            admission,
+            playback,
+            memory_erasure: None,
+        })
+    }
+
+    /// Route one admitted, non-command content event through the per-event
+    /// path: deadline, generation cancellation, routing and playback. This is
+    /// the single dispatch point for immediate chat, selected burst replies
+    /// and deferred replies, so scheduler, operator stop, mute and output
+    /// gates apply identically to all of them.
+    fn dispatch_admitted_event(
+        &mut self,
+        event: EventEnvelope,
+        at_ms: u64,
+        seed: u64,
+        interaction_started: Instant,
+    ) -> Result<Option<CachedPlaybackOutcome>, AppError> {
         let event_id = event.event_id.clone();
         let interaction_deadline = self
             .interaction_deadlines
@@ -2034,12 +2084,272 @@ where
         if !handled.deferred_generation {
             self.record_handled_event(&event_id, &handled, at_ms);
         }
-        let playback = handled.playback;
+        Ok(handled.playback)
+    }
+
+    /// Opt in to live chat-burst selection and deferred replies (#75 S1,
+    /// #78 S2). Off by default: without this call `process_content_bytes` is
+    /// exactly the per-event path.
+    ///
+    /// With it, public chat that arrives in a burst is batched and a bounded
+    /// Top-K is selected deterministically; a selected (or quiet) comment is
+    /// answered at once while the performer is available and otherwise waits
+    /// in a bounded inbox until the performer frees up or the reply expires.
+    /// Every comment that enters the lane ends in exactly one terminal
+    /// outcome (see [`ChatOutcome`]). Busy state comes only from the
+    /// scheduler/speech lifecycle, the generation runtime and the operator
+    /// mute flag, never from chat.
+    pub fn with_chat_burst(mut self, config: ChatBurstConfig) -> Result<Self, AppError> {
+        self.chat_burst = Some(
+            chat_burst::ChatBurstLane::new(config)
+                .map_err(|error| AppError::Routing(error.to_string()))?,
+        );
+        Ok(self)
+    }
+
+    /// Chat-burst and deferred-reply counters; `None` when not composed.
+    pub fn chat_burst_metrics(&self) -> Option<ChatBurstMetrics> {
+        self.chat_burst
+            .as_ref()
+            .map(chat_burst::ChatBurstLane::metrics)
+    }
+
+    /// Remove and return up to `max` terminal records (event id, logical
+    /// time, outcome) in the order they happened.
+    pub fn take_chat_burst_records(&mut self, max: usize) -> Vec<ChatBurstRecord> {
+        self.chat_burst
+            .as_mut()
+            .map(|lane| lane.take_records(max))
+            .unwrap_or_default()
+    }
+
+    /// Remove and return up to `max` reports of replies dispatched from the
+    /// deferred inbox.
+    pub fn take_deferred_reply_reports(&mut self, max: usize) -> Vec<DeferredReplyReport> {
+        self.chat_burst
+            .as_mut()
+            .map(|lane| lane.take_reports(max))
+            .unwrap_or_default()
+    }
+
+    /// Whether the performer can take a reply now. Built only from trusted
+    /// runtime state: the operator mute flag, the scheduler's speech
+    /// lifecycle and the generation runtime. No event field is an input.
+    fn reply_availability(&self) -> ReplyAvailability {
+        if self.security.is_muted() {
+            ReplyAvailability::Busy(BusyCause::Muted)
+        } else if self.performer.scheduler().speech_lifecycle().metrics().live > 0 {
+            ReplyAvailability::Busy(BusyCause::Speaking)
+        } else if self
+            .generative
+            .as_ref()
+            .is_some_and(GenerativeRuntime::is_generating)
+        {
+            ReplyAvailability::Busy(BusyCause::Generating)
+        } else {
+            ReplyAvailability::Available
+        }
+    }
+
+    /// Chat-burst lane entry (see [`Self::with_chat_burst`]).
+    fn process_through_chat_burst(
+        &mut self,
+        admission: ContentAdmitDecision,
+        event: EventEnvelope,
+        at_ms: u64,
+        seed: u64,
+        interaction_started: Instant,
+    ) -> Result<ContentProcessOutcome, AppError> {
+        let current_id = event.event_id.clone();
+        // Older deferred replies go first once the performer is available.
+        self.drain_deferred_replies(at_ms, seed);
+
+        let mut current: Option<Result<Option<CachedPlaybackOutcome>, AppError>> = None;
+        let offer = self
+            .chat_burst
+            .as_mut()
+            .map(|lane| lane.offer(event, at_ms))
+            .ok_or_else(|| AppError::Routing("chat burst lane is not composed".to_owned()))?;
+        match offer {
+            chat_burst::Offer::Bypass(event) => {
+                // Not a batchable chat comment (donation, game event, ...): the
+                // unchanged per-event path, never held and never deferred.
+                current =
+                    Some(self.dispatch_admitted_event(event, at_ms, seed, interaction_started));
+            }
+            chat_burst::Offer::Quiet(candidate) => {
+                let id = candidate.event.event_id.clone();
+                let result = self.reply_now_or_defer(candidate, at_ms, seed, interaction_started);
+                if id == current_id {
+                    current = result;
+                }
+            }
+            chat_burst::Offer::Held | chat_burst::Offer::Refused => {}
+        }
+
+        // Flush a due window and resolve ready batches; selected comments
+        // reply now or wait, everything else is accounted by the lane.
+        let selected = self
+            .chat_burst
+            .as_mut()
+            .map(|lane| lane.resolve_ready(at_ms))
+            .unwrap_or_default();
+        for (index, candidate) in selected.into_iter().enumerate() {
+            let id = candidate.event.event_id.clone();
+            let result = self.reply_now_or_defer(
+                candidate,
+                at_ms,
+                seed.wrapping_add(1 + index as u64),
+                Instant::now(),
+            );
+            match result {
+                Some(result) if id == current_id => current = Some(result),
+                Some(result) => self.report_selected_dispatch(&id, at_ms, &result),
+                None => {}
+            }
+        }
+
+        let playback = match current {
+            Some(result) => result?,
+            None => {
+                self.tick(at_ms);
+                None
+            }
+        };
         Ok(ContentProcessOutcome {
             admission,
             playback,
             memory_erasure: None,
         })
+    }
+
+    /// Reply now when the performer is available, otherwise defer. `None`
+    /// means deferred; `Some` is the dispatch result.
+    fn reply_now_or_defer(
+        &mut self,
+        candidate: chat_burst::Candidate,
+        at_ms: u64,
+        seed: u64,
+        interaction_started: Instant,
+    ) -> Option<Result<Option<CachedPlaybackOutcome>, AppError>> {
+        // A comment that went stale while it waited in a batch is never
+        // answered late; the lane accounts it.
+        if !self
+            .chat_burst
+            .as_mut()
+            .is_none_or(|lane| lane.still_fresh(&candidate, at_ms))
+        {
+            return None;
+        }
+        match self.reply_availability() {
+            ReplyAvailability::Busy(cause) => {
+                if let Some(lane) = self.chat_burst.as_mut() {
+                    lane.defer(candidate, at_ms, cause);
+                }
+                None
+            }
+            ReplyAvailability::Available => {
+                let event = candidate.event;
+                let id = event.event_id.clone();
+                let result = self.dispatch_admitted_event(event, at_ms, seed, interaction_started);
+                if let Some(lane) = self.chat_burst.as_mut() {
+                    lane.dispatched_now(&id, at_ms, result.is_ok());
+                }
+                Some(result)
+            }
+        }
+    }
+
+    fn report_selected_dispatch(
+        &mut self,
+        event_id: &str,
+        at_ms: u64,
+        result: &Result<Option<CachedPlaybackOutcome>, AppError>,
+    ) {
+        if let Some(lane) = self.chat_burst.as_mut() {
+            lane.push_report(DeferredReplyReport {
+                event_id: event_id.to_owned(),
+                at_ms,
+                asset_id: result
+                    .as_ref()
+                    .ok()
+                    .and_then(|playback| playback.as_ref())
+                    .map(|playback| playback.asset_id.clone()),
+                dispatched: result.is_ok(),
+            });
+        }
+    }
+
+    /// Dispatch deferred replies while the performer stays available. Expired
+    /// items are swept first, and every item is revalidated (security gate
+    /// re-run, availability re-read) immediately before it dispatches.
+    fn drain_deferred_replies(&mut self, at_ms: u64, seed: u64) {
+        let bound = self
+            .chat_burst
+            .as_ref()
+            .map_or(0, |lane| lane.pending_deferred().saturating_add(1));
+        for step in 0..bound {
+            let availability = self.reply_availability();
+            let Some(ready) = self
+                .chat_burst
+                .as_mut()
+                .and_then(|lane| lane.poll_inbox(at_ms, availability))
+            else {
+                break;
+            };
+            let event = ready.item.payload.clone();
+            if self.security.revalidate_deferred_content(&event) != DeferredRevalidation::Permitted
+            {
+                if let Some(lane) = self.chat_burst.as_mut() {
+                    lane.complete_deferred(ready, DeferredOutcome::RevalidationRefused, at_ms);
+                }
+                continue;
+            }
+            let result = self.dispatch_admitted_event(
+                event,
+                at_ms,
+                seed.wrapping_add(step as u64),
+                Instant::now(),
+            );
+            let outcome = if result.is_ok() {
+                DeferredOutcome::Dispatched
+            } else {
+                DeferredOutcome::DispatchFailed
+            };
+            let event_id = ready.item.id.clone();
+            if let Some(lane) = self.chat_burst.as_mut() {
+                lane.complete_deferred(ready, outcome, at_ms);
+            }
+            self.report_selected_dispatch(&event_id, at_ms, &result);
+        }
+    }
+
+    /// Loop hook for the daemon: sweep deferred-reply expiry, flush a due
+    /// burst window and dispatch deferred replies once the performer is
+    /// available. Bounded by the inbox capacity, touches no operator path and
+    /// is a no-op unless chat-burst mode is composed. Call it after draining
+    /// operator requests so emergency control is never queued behind it.
+    pub fn service_chat_burst(&mut self, now_ms: u64, seed: u64) {
+        if self.chat_burst.is_none() {
+            return;
+        }
+        self.drain_deferred_replies(now_ms, seed);
+        let selected = self
+            .chat_burst
+            .as_mut()
+            .map(|lane| lane.resolve_ready(now_ms))
+            .unwrap_or_default();
+        for (index, candidate) in selected.into_iter().enumerate() {
+            let id = candidate.event.event_id.clone();
+            if let Some(result) = self.reply_now_or_defer(
+                candidate,
+                now_ms,
+                seed.wrapping_add(1 + index as u64),
+                Instant::now(),
+            ) {
+                self.report_selected_dispatch(&id, now_ms, &result);
+            }
+        }
     }
 
     /// Fill a generation route's curated context with bounded retained memory
@@ -3436,6 +3746,12 @@ where
         };
         if matches!(outcome, ControlOutcome::Stopped { .. }) {
             self.purge_cancelled_pending();
+            // Operator stop cancels every held and deferred reply with an
+            // explicit outcome; nothing queued before the stop may speak
+            // after it.
+            if let Some(lane) = self.chat_burst.as_mut() {
+                lane.cancel_all(at_ms);
+            }
         }
         let stop_report = is_override.then(|| {
             let report = OperatorStopReport {
@@ -3565,6 +3881,9 @@ where
     }
 
     pub fn shutdown(&mut self, at_ms: u64) {
+        if let Some(lane) = self.chat_burst.as_mut() {
+            lane.shutdown(at_ms);
+        }
         if let Some(generative) = self.generative.as_mut() {
             generative.shutdown();
         }
@@ -3859,6 +4178,7 @@ mod tests {
     };
     use aivtuber_runtime::{CachedPlaybackConfig, SecurityRuntimeConfig};
 
+    mod chat_burst_tests;
     mod local_thinking_fallback_tests;
     mod phrase_commit_tests;
     mod speech_lifecycle_tests;
