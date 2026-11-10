@@ -24,6 +24,9 @@
 //!   directory.
 //! * The sidecar never sees a URL or an emoji: the runtime projects display
 //!   text to speech text before the TTS request (ADR-0004 D-5).
+//! * `voicevox` is an optional second [`Synthesizer`] (issue #295): it drives a
+//!   separately started VOICEVOX ENGINE on loopback behind this same server, so
+//!   the app's TTS wire contract stays one.
 //! * Nothing is downloaded at build or run time; the model files and the engine
 //!   libraries must match SHA-256 pins ([`pins`], `speech_stt::pins`).
 
@@ -34,6 +37,8 @@ pub mod server;
 #[cfg(feature = "sherpa-tts")]
 pub mod sherpa;
 pub mod supervisor;
+pub mod voicevox;
+pub mod voicevox_fake;
 pub mod wav;
 
 use sha2::{Digest, Sha256};
