@@ -146,6 +146,12 @@ Record the result as one of:
 |Use a separate bounded realtime media/data plane for PCM/video rather than the control queue. Prefer same-machine local speech first; Pipecat is reference/optional orchestration and LiveKit is only for cases that need WebRTC/SFU transport. Hosted media is never required. Normalize observations into aivtuber-owned floor/commit policy; external frameworks must not directly own scheduler cancellation or irreversible publication.
 |#90, #92, #93, #106
 
+|Screen vision / perception
+|llama.cpp +llama-server+ multimodal (second loopback instance); OBS +GetSourceScreenshot+ through the existing adapter; xcap/scap for OS capture
+|Sidecar (llama.cpp) / wrap (OBS adapter) / reference only (xcap, scap) / benchmark first (Qwen3-VL-4B, SmolVLM-500M)
+|Perception output is untrusted bounded data with required expiry; capture and inference stay outside core; model weights are not redistributed. Licence traps: Qwen2.5-VL-3B is +qwen-research+ (a mirror tags it Apache-2.0), Gemma 3 uses custom terms. Keep observation contract, trust assignment, source hierarchy, retention and replay project-owned. See link:adr/0007-perception-plane.adoc[ADR-0007].
+|#90, #88
+
 |Local speech inference
 |sherpa-onnx
 |Wrap or sidecar; conformance/benchmark first
@@ -272,6 +278,33 @@ Record the result as one of:
 |Use for licenses, advisories, bans/duplicates, and sources. Repository policy defines exceptions/revisit conditions.
 |#100
 |===
+
+=== First-run setup command record (#294 S2)
+
+[source,text]
+----
+Problem:     A streamer with only the release archive needs the pinned models and engine pieces
+             fetched, verified, extracted, configured and started without Node, Bun or Cargo.
+Candidate 1: scripts/fetch-local-profile.mjs + scripts/fetch-sherpa-onnx.mjs (project, Node).
+Decision:    wrap the pins, replace the runtime. The pins move to one manifest
+             (packaging/local-profile-pins.json) that the scripts keep reading; the Rust command is the
+             archive user's path. Node would be an install requirement on the target machine.
+Candidate 2: cargo-dist installers / a generic installer builder (Velopack, WiX, Inno Setup).
+Decision:    reference only (see the S1 record): they install programs but do not own our verified
+             fetch-and-license step, and signing/installer choice is a separate #294 decision.
+Candidate 3: HTTP and archive crates for the Rust command.
+Decision:    adopt ureq 3.4 (already the HTTP client of crates/adapters), plus tar, flate2, bzip2 0.6
+             (pure Rust) and zip 9.5 (deflate only). All were already in Cargo.lock, so no new package
+             enters the supply-chain gate. reqwest/hyper rejected: a second HTTP stack and an async
+             runtime for a sequential downloader. Shelling out to tar/unzip/curl rejected: absent or
+             different on target machines (the Git Bash tar problem of the fetch scripts) and it moves
+             the traversal and size checks outside our tests.
+Custom:      the download loop (Range segments, size-exact cap, SHA-256 gate, manual redirect checks),
+             the safe extractor and the setup flow, because the project-owned rules are the point: HTTPS
+             only, exact pinned sizes, no partial file at its final name, no writes outside the
+             destination. None of the adopted crates provides these policies.
+Revisit:     if the pin count grows past a manifest a person can review, or an installer is chosen (#205).
+----
 
 === Release packaging record (#294 S1)
 

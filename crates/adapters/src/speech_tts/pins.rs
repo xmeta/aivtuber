@@ -102,15 +102,15 @@ mod tests {
         assert_eq!(bundle_sha256(&SUPERTONIC_3_INT8).len(), 64);
     }
 
-    /// The operator fetch script carries its own copy of the model pins; the
+    /// The shared download manifest carries its own copy of the model pins; the
     /// two must not drift.
     #[test]
-    fn the_fetch_script_pins_the_same_model_digests() {
-        let script = include_str!("../../../../scripts/fetch-sherpa-onnx.mjs");
+    fn the_download_manifest_pins_the_same_model_digests() {
+        let manifest = include_str!("../../../../packaging/local-profile-pins.json");
         for file in SUPERTONIC_3_INT8.files {
             assert!(
-                script.contains(file.sha256) && script.contains(file.file_name),
-                "scripts/fetch-sherpa-onnx.mjs does not pin {} ({})",
+                manifest.contains(file.sha256) && manifest.contains(file.file_name),
+                "packaging/local-profile-pins.json does not pin {} ({})",
                 file.file_name,
                 file.sha256
             );

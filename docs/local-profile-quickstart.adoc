@@ -18,10 +18,12 @@ Everything listens on loopback only. A network connection is needed once, to fet
 
 Design and policy live elsewhere; this page is the procedure. Read `docs/production-runtime.adoc` for every variable's full semantics, `docs/supply-chain.adoc` for the pins and licences, `docs/vts-obs-adapters.adoc` section 6 for the avatar renderer, `docs/provider-conformance.adoc` for the verified llama.cpp / model pair, and `docs/experiments/EXP-0003-japanese-tts-bench.adoc` for the voice choice.
 
-== 0. What you need
+== 0. What you need (build from source)
+
+Using a release archive? Skip to <<download-a-release>>: it needs none of the toolchains below, and `aivtuber-setup local` replaces steps 1, 2 and the starter-audio step.
 
 * Windows 11 x64 or Linux x64. Only these two platforms have pinned engine libraries. *This guide was run end to end on Windows only.* The Linux commands are the same files with the other pinned archive names; the differences are marked, and they were not executed.
-* A Rust toolchain (the version in `rust-toolchain.toml`; `rustup` picks it), Node 20 or newer, Bun (`renderer/local-avatar/package.json` pins `bun@1.3.14`), `git`, and `ffplay` from FFmpeg on `PATH` (the default audio player).
+* To build: a Rust toolchain (the version in `rust-toolchain.toml`; `rustup` picks it), Node 20 or newer, Bun (`renderer/local-avatar/package.json` pins `bun@1.3.14`), `git`, and `ffplay` from FFmpeg on `PATH` (the default audio player).
 * A browser for the avatar page (Chrome or Edge), or OBS Studio (free, GPL) with its Browser Source.
 * About 6 GB of disk for downloads (the LLM is 2.5 GB) and about 1.5 GB of build output.
 * Hardware. The measured configuration is in <<measured>>: a desktop with an 8 GB discrete GPU and 16 logical CPUs. The LLM can run on the CPU (`--llama-flavor cpu`, leave out `-ngl`), but then it competes with speech recognition and synthesis for the same cores and the measurements below do not apply. There is no guarantee below the measured hardware.
@@ -29,11 +31,20 @@ Design and policy live elsewhere; this page is the procedure. Read `docs/product
 Linux additionally needs ALSA development headers if you build the `mic-capture` feature (a live microphone). `--input-wav` does not need it.
 
 [#download-a-release]
-== Download a release (no Rust, no Bun)
+== Download a release (no Rust, no Node, no Bun)
 
-Issue #294 (S1). Tagged releases publish prebuilt archives for Windows x64 (`aivtuber-local-<version>-windows-x64.zip`) and Linux x64 (`aivtuber-local-<version>-linux-x64.tar.gz`) with a `SHA256SUMS` file beside them. If you use one, you skip the Rust, Bun and C-toolchain requirements of section 0 and the whole of step 2 (build). You still need Node 20 or newer for the model fetch (step 1) until the first-run command exists, `ffplay`, and a browser or OBS. Build from source (steps 0 to 2) if you want a different revision or platform.
+Issues #294 S1 and S2. This is the whole path for a streamer who only wants to run the performer: download, verify, set up, start. Tagged releases publish prebuilt archives for Windows x64 (`aivtuber-local-<version>-windows-x64.zip`) and Linux x64 (`aivtuber-local-<version>-linux-x64.tar.gz`) with a `SHA256SUMS` file beside them. Nothing below needs a Rust toolchain, Node, Bun, git or a C compiler; steps 0 to 2 of this guide are the build-from-source path for a different revision or platform.
 
-*What the archive contains:* `aivtuber-app`, `aivtuberctl`, `speech-vad-sidecar` (Silero VAD, microphone), `speech-stt-worker`, `local-tts-sidecar`, `twitch-chat-ingress`, `youtube-chat-ingress`; the pinned sherpa-onnx and ONNX Runtime libraries beside them (leave them there: the sidecars refuse to run if they are missing or changed); the avatar page at `renderer/local-avatar/dist`; the starter reaction pack at `examples/starter-reaction-pack`; the four fetch/synthesis scripts at their repository paths; `README.txt` and the third-party licence files. *It contains no model weights, voice files or avatar model.*
+*What the archive contains:* `aivtuber-setup` (the first-run command, below), `aivtuber-app`, `aivtuberctl`, `speech-vad-sidecar` (Silero VAD, microphone), `speech-stt-worker`, `local-tts-sidecar`, `twitch-chat-ingress`, `youtube-chat-ingress`; the pinned sherpa-onnx and ONNX Runtime libraries beside them (leave them there: the sidecars refuse to run if they are missing or changed); the avatar page at `renderer/local-avatar/dist`; the starter reaction pack at `examples/starter-reaction-pack`; `README.txt` and the third-party licence files. *It contains no model weights, voice files or avatar model*: `aivtuber-setup local` fetches them, each verified against its pinned SHA-256.
+
+*You need:*
+
+* Windows 11 x64 or Linux x64, about 6 GB of free disk (the language model alone is 2.4 GiB), and a network connection for the first run only.
+* FFmpeg with `ffplay` and `ffmpeg` on `PATH`. Windows: `winget install Gyan.FFmpeg`, then open a new terminal. Linux: `sudo apt install ffmpeg`. (`ffplay` plays the voice; `ffmpeg` encodes the starter reaction audio. Setup warns, and tells you the command, if either is missing.)
+* A browser (Chrome or Edge), or OBS Studio with a Browser Source, to show the avatar.
+* A GPU with a Vulkan driver is optional. Without one the language model runs on the CPU and the measurements in <<measured>> do not apply.
+
+=== The steps
 
 1. Download the archive for your platform and `SHA256SUMS` from the Releases page.
 2. Verify the archive *before* unpacking it.
@@ -54,20 +65,75 @@ Linux:
 ----
 sha256sum -c SHA256SUMS --ignore-missing     # must print: aivtuber-local-<version>-linux-x64.tar.gz: OK
 ----
-3. Unpack and work from the unpacked directory (`Expand-Archive .\<archive>.zip .` on Windows; `tar -xzf <archive>.tar.gz` on Linux). Every relative path in this guide (`renderer/local-avatar/dist`, `examples/starter-reaction-pack`, `scripts/...`) then resolves as written.
-4. Do step 1 with one change: the libraries are already in the archive, so leave out the library step: `node scripts/fetch-local-profile.mjs /path/to/local-assets --skip sherpa-lib`.
-5. Skip step 2 (build). In steps 3 and 4, wherever a path starts with `target/release/` (`AIVTUBER_TTS_SIDECAR`, `AIVTUBER_SPEECH_SIDECAR`, `AIVTUBER_SPEECH_STT_WORKER`, the `aivtuber-app` command), use the program in the unpacked directory instead; start the app with `./aivtuber-app` (`.\aivtuber-app.exe`) instead of `cargo run`. Everything else, including the starter audio step, is unchanged. Do not set `SHERPA_ONNX_ARCHIVE_DIR`: it only matters to a build.
+3. Unpack and work from the unpacked directory: `Expand-Archive .\<archive>.zip .` then `cd` into the new folder (Windows), or `tar -xzf <archive>.tar.gz` then `cd` (Linux). Choose a location whose path has no spaces (the speech sidecar's arguments are split on whitespace).
+4. Optional: see the plan without any network or file change.
++
+[source,sh]
+----
+./aivtuber-setup local --dry-run        # Windows: .\aivtuber-setup.exe local --dry-run
+----
+5. Run the setup once. It downloads about 2.8 GB, so it takes a while on a slow line, and it can be interrupted and run again: a finished file is kept, a half-finished one resumes.
++
+[source,sh]
+----
+./aivtuber-setup local                  # Windows: .\aivtuber-setup.exe local
+----
+6. Start everything. This runs llama-server on loopback, waits for it, then runs the app in the foreground; type chat lines in that terminal (or use the microphone), and Ctrl+C stops both.
++
+[source,sh]
+----
+./aivtuber-setup start                  # Windows: .\aivtuber-setup.exe start
+----
+7. Open `http://127.0.0.1:8765` in the browser (or add it to OBS as a Browser Source). The first answer after start can take several seconds while the model loads.
+8. Before you stream: replace the sample avatar (`renderer/local-avatar/dist/model.vrm`) with a model you have the right to broadcast, and put the disclosures that setup printed (section 8) where viewers see them.
+
+=== What `aivtuber-setup local` does
+
+Each step is skipped if its result is already on disk and matches its pin, so the command is safe to re-run after a failure or to repair a damaged file.
+
+. Checks `ffplay`, `ffmpeg` and a Vulkan loader. A missing one is a warning with the fix, never a failure; run the command again after you fix it. With Vulkan present it fetches the GPU build of llama.cpp (`-ngl 99`), otherwise the CPU build.
+. Downloads and verifies, into `local-assets/` beside the programs: llama.cpp `b12224`, the Qwen3-4B Q4_K_M model, the Silero VAD model, the ReazonSpeech k2-v2 int8 speech model, the Supertonic 3 int8 voice, and the sample VRM (placed at `renderer/local-avatar/dist/model.vrm` unless a file is already there). Every URL is HTTPS; every file has an exact pinned size and SHA-256; a redirect to plain HTTP is refused; a mismatch deletes the partial file and stops. Archives are unpacked by the program itself with path-traversal and symbolic-link checks and size limits; there is no `tar`, `unzip` or script involved.
+. Speaks the six starter reaction lines with the bundled `local-tts-sidecar` and encodes them with `ffmpeg` to `examples/starter-reaction-pack/audio/starter/`, with `PROVENANCE.json` (the same step as <<starter-audio>>).
+. Writes `local-profile.env` (the variables of step 4 of this guide, with a fresh random pseudonym key and control secret) and never overwrites an existing one unless you pass `--force`. The file holds secrets: do not share it.
+. Prints the licence and disclosure duties of what it fetched (the OpenRAIL-M voice disclosure, the ReazonSpeech provenance note, the avatar's licence) and the exact start command.
+
+[cols="2,5",options="header"]
+|===
+|Option |Meaning
+|`--dry-run` |Print the plan, the duties and the start command. No network, nothing written.
+|`--offline` |No network. Verifies what is on disk, makes the starter audio, writes the env file. Fails and lists what is missing.
+|`--force` |Replace an existing `local-profile.env` (new secrets).
+|`--llama-flavor vulkan\|cpu` |Override the GPU detection.
+|`--skip llama,llm,vad,stt,tts,avatar,audio` |Leave steps out (a model you already have, for example).
+|`--assets DIR` |Where the downloads go (default `local-assets` beside the programs; no spaces in the path).
+|`--env-file FILE`, `--root DIR`, `--llama-port N` |Env file location, the unpacked directory, the llama-server port (default 18080).
+|===
+
+`aivtuber-setup start --env-file FILE --dry-run` prints the llama-server and app commands it would run. The same pins are in one file, `packaging/local-profile-pins.json`, which the setup binary embeds and `scripts/fetch-local-profile.mjs` (the source-build path) reads, so the two can not drift (`docs/supply-chain.adoc` section 11).
+
+=== If something goes wrong
+
+[cols="2,4",options="header"]
+|===
+|Message |Fix
+|`sha256 mismatch` |The download was corrupted or the upstream file changed. Run the command again (a bad partial file is deleted); if it repeats, do not work around it: report it with the file name.
+|`ffplay was not found` / `ffmpeg was not found` |Install FFmpeg as above, open a new terminal, run `aivtuber-setup local` again. Without `ffplay` nothing is audible; without `ffmpeg` the cached reactions have no audio.
+|`no Vulkan loader was found` |It runs on the CPU. Update the GPU driver (Windows) or install `libvulkan1` and a Vulkan driver (Linux), then `aivtuber-setup local --llama-flavor vulkan`.
+|`port 18080 is already in use` |Another program listens there. Stop it, or change `AIVTUBER_SETUP_LLAMA_PORT` and the port in `AIVTUBER_OPENAI_ENDPOINT` in `local-profile.env`.
+|Windows SmartScreen "protected your PC" |The programs are not code-signed. The checksum in step 2 is how you know the file is the one the release built.
+|`does not look like an extracted release archive` |Run `aivtuber-setup` from the unpacked folder, or pass `--root`.
+|===
 
 *Known limitations of the archives:*
 
-* *Not code-signed.* The Windows programs are unsigned, so Windows SmartScreen may show "Windows protected your PC" on first start; macOS is not built. The checksum above is how you know the file is the one the release built. Code signing and installers are a later decision (#294), not part of these archives.
+* *Not code-signed.* The Windows programs are unsigned; macOS is not built. Code signing and installers are a later decision (#294), not part of these archives.
 * The Linux programs need the system libraries `libasound2` (microphone) and `libssl3` (Twitch chat), and a glibc at least as new as the build host's (Ubuntu 22.04).
-* Each archive is smoke-tested in CI on the platform it was built for (every program starts, the sidecars verify the bundled libraries and refuse an unpinned model directory). A full spoken conversation run from an archive (models fetched, avatar showing) is not yet part of those checks; it belongs to the first-run command slice (#294 S2).
+* Each archive is smoke-tested in CI on the platform it was built for: every program starts, the sidecars verify the bundled libraries and refuse an unpinned model directory, and `aivtuber-setup` prints its plan offline and refuses `--offline` with nothing fetched. *The full path from a downloaded archive to a spoken reply on a clean Windows machine has not been run end to end by CI*: the setup steps were run against the real hosts from a development machine (downloads, extraction, starter audio), and a clean-machine run is the remaining #294 check.
 * The licence and disclosure duties of section 8 apply unchanged. The archive's `THIRD-PARTY-*` files cover only what it contains.
 
 == 1. Fetch the pinned assets (network needed once)
 
-`scripts/fetch-local-profile.mjs` downloads and SHA-256-verifies everything and extracts it under one directory. It adds the three pins that did not exist before (llama.cpp release `b12224`, the Qwen3-4B Q4_K_M GGUF, the Silero VAD model) and *calls* `scripts/fetch-sherpa-onnx.mjs` (engine libraries, STT model, TTS model) and `renderer/local-avatar/smoke/fetch-model.mjs` (sample VRM), so no digest is kept twice. A mismatch deletes the partial file and stops.
+(Source-build path; a release archive uses `aivtuber-setup local` instead, which reads the same pins.) `scripts/fetch-local-profile.mjs` downloads and SHA-256-verifies everything and extracts it under one directory. Every pin (URL, SHA-256, exact size) is read from `packaging/local-profile-pins.json`, the single source shared with `aivtuber-setup local`; the script *calls* `scripts/fetch-sherpa-onnx.mjs` (engine libraries, STT model, TTS model) and `renderer/local-avatar/smoke/fetch-model.mjs` (sample VRM), which read the same file, so no digest is kept twice. A mismatch deletes the partial file and stops.
 
 [source,sh]
 ----
@@ -189,7 +255,7 @@ On start the app prints, among others (nothing secret): the OpenRAIL-M voice not
 [[starter-audio]]
 === Starter reaction audio (once, after the build)
 
-The starter pack is descriptors only. This one command speaks each descriptor's `speech.text` with the sidecar you just built (the pinned Supertonic 3 int8 model, language `ja`, the text-derived seed of `speech_tts::text_seed`, speaker 0) and encodes the result to the `audio://starter/*.opus` files the descriptors name. It needs `ffmpeg` with libopus (the same FFmpeg that provides `ffplay`).
+The starter pack is descriptors only. (A release archive does this inside `aivtuber-setup local`; the command below is the source-build equivalent and writes the same files.) This one command speaks each descriptor's `speech.text` with the sidecar you just built (the pinned Supertonic 3 int8 model, language `ja`, the text-derived seed of `speech_tts::text_seed`, speaker 0) and encodes the result to the `audio://starter/*.opus` files the descriptors name. It needs `ffmpeg` with libopus (the same FFmpeg that provides `ffplay`).
 
 [source,sh]
 ----

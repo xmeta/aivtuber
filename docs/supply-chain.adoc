@@ -134,7 +134,7 @@ The optional local Japanese speech-to-text worker wraps the official `sherpa-onn
 
 === Scoped license exceptions
 
-The crate's build script pulls in two crates whose licenses are not in the global `allow` list. Both are permissive, both are build-time only (they reach the graph through `sherpa-onnx-sys` -> `zip` -> `bzip2`/`ppmd-rust`, archive extraction inside the build script) and neither can be switched off. They are *scoped exceptions*, pinned to the exact crate version, not global allowlist additions: any other crate under these licenses is still rejected.
+The crate's build script pulls in two crates whose licenses are not in the global `allow` list. Both are permissive. Both reach the graph through `sherpa-onnx-sys` -> `zip` -> `bzip2`/`ppmd-rust` (archive extraction inside the build script), which cannot be switched off. Since #294 S2 `libbz2-rs-sys` is also linked at run time by `aivtuber-setup` (the pure-Rust bzip2 decoder for the `.tar.bz2` model archives); `ppmd-rust` is not. They are *scoped exceptions*, pinned to the exact crate version, not global allowlist additions: any other crate under these licenses is still rejected.
 
 [cols="2,2,3",options="header"]
 |===
@@ -142,7 +142,7 @@ The crate's build script pulls in two crates whose licenses are not in the globa
 
 |`libbz2-rs-sys` 0.2.6
 |`bzip2-1.0.6`
-|The bzip2 / libbzip2 license (BSD-style permissive). Build-time only. Revisit when `sherpa-onnx-sys` drops `zip`/`bzip2` from its build dependencies, or when the crate version changes (the exception names the version, so an upgrade reopens the review).
+|The bzip2 / libbzip2 license (BSD-style permissive). Build-time in `sherpa-onnx-sys`, and run-time in `aivtuber-setup` (section 11). Revisit when the crate version changes (the exception names the version, so an upgrade reopens the review) or when `aivtuber-setup` stops decoding bzip2.
 
 |`ppmd-rust` 1.5.2
 |`MIT-0`
@@ -231,7 +231,7 @@ Not adopted, recorded so they are not re-proposed without new evidence (EXP-0003
 
 `cargo deny --locked check`, `cargo deny --locked --features sherpa-tts check` and `cargo deny --locked --features sherpa-stt,sherpa-tts check` pass on this branch (advisories, bans, licenses, sources ok); `Cargo.lock` has no change. The feature builds from the verified archive on Windows x64 (release build of `local-tts-sidecar` 1 m 22 s with a warm registry). The CI job `speech-tts` runs the Linux build, lint, model-free tests and the refusal checks.
 
-== 11. Release archives (issue #294 S1)
+== 11. Release archives and the first-run command (issue #294 S1, S2)
 
 Workflow: `.github/workflows/release.yml`. Assembly: `scripts/package-release.mjs`. Smoke: `scripts/smoke-release-archive.mjs`. Static inputs: `packaging/` (`about.toml`, `about.hbs`, `RELEASE-README.txt`, `ENGINE-LIBRARIES-NOTICE.txt`). The reuse decision (plain Actions matrix; cargo-dist reference only; cargo-about adopted for notices) is recorded in `docs/reuse-first.adoc`, "Release packaging record".
 
@@ -240,9 +240,18 @@ Workflow: `.github/workflows/release.yml`. Assembly: `scripts/package-release.mj
 * *Triggers.* A tag matching `v*` (builds, smoke-tests, creates a *draft* GitHub release with the archives and `SHA256SUMS`; a person publishes it) and `workflow_dispatch` (a dry run: the same build and smoke, artifacts only, nothing released). The workflow never runs for pull requests. Only the `publish` job has `contents: write`, and it refuses a tag whose commit is not reachable from `main`.
 * *Targets.* Windows x64 (`windows-latest`) and Linux x64 (`ubuntu-22.04`, the oldest hosted image, for a low glibc floor). macOS is not built.
 * *Locked, verified inputs.* Every cargo step uses `--locked`; the renderer uses `bun install --frozen-lockfile --ignore-scripts`; `SHERPA_ONNX_ARCHIVE_DIR` is the output of `node scripts/fetch-sherpa-onnx.mjs lib` (SHA-256 verified), so the crate's unchecked download path (section 9) never runs. There is no build cache: a release is built from the tag's sources and the verified engine archive alone. `cargo deny --locked --features silero-vad,mic-capture,sherpa-stt,sherpa-tts check` runs in the job, before the build, with the scoped exceptions of section 9.
-* *Contents.* `aivtuber-app`, `aivtuberctl`, `speech-vad-sidecar`, `speech-stt-worker`, `local-tts-sidecar`, `twitch-chat-ingress`, `youtube-chat-ingress`; the pinned engine libraries beside them (copied from the verified archive, only the file names pinned in `speech_stt::pins`); the renderer page at `renderer/local-avatar/dist`; the starter reaction pack and the four operator fetch/synthesis scripts at their repository paths; `README.txt`; licence files. The Cargo feature set is the one the quickstart builds (`silero-vad,mic-capture,sherpa-stt,sherpa-tts`).
+* *Contents.* `aivtuber-app`, `aivtuberctl`, `aivtuber-setup`, `speech-vad-sidecar`, `speech-stt-worker`, `local-tts-sidecar`, `twitch-chat-ingress`, `youtube-chat-ingress`; the pinned engine libraries beside them (copied from the verified archive, only the file names pinned in `speech_stt::pins`); the renderer page at `renderer/local-avatar/dist`; the starter reaction pack; `README.txt`; licence files. No Node script ships any more (S2): `aivtuber-setup` embeds the pins. The Cargo feature set is the one the quickstart builds (`silero-vad,mic-capture,sherpa-stt,sherpa-tts`).
 * *Never bundled:* model weights, voice files, avatar models, generated audio. `package-release.mjs` refuses a `.vrm`/`.gguf`/`.onnx`/`.bin` file in the page build, and the smoke test fails on any model-like file anywhere in the archive. This keeps the section 9 and 10 position that weights are fetched by the operator with their licence and disclosure handling intact.
 * *Checksums.* `SHA256SUMS` is computed over the final archives in the `checksums` job (after the smoke jobs pass) and published beside them. The `tar.gz` is reproducible (sorted entries, fixed owner and mtime, `gzip -n`; `SOURCE_DATE_EPOCH` or 0); the zip is not byte-reproducible (bsdtar stores file times), so the published checksum is of the released bytes.
+
+=== The pin manifest and the first-run command (S2)
+
+* *One source for every download pin.* `packaging/local-profile-pins.json` holds, for each third-party download of the local profile, the HTTPS URL, the exact size in bytes and the SHA-256, plus the licence and disclosure text that `aivtuber-setup local` prints. It is read by the Rust command (embedded with `include_str!`, so a shipped binary has no loose file to swap), by `scripts/fetch-local-profile.mjs`, `scripts/fetch-sherpa-onnx.mjs` and `renderer/local-avatar/smoke/fetch-model.mjs`. The scripts contain no digest or download host (asserted by `tests/fetch-local-profile.test.mjs` and by a unit test in `crates/setup`). The runtime pins the sidecars verify at every start (`speech_stt::pins`, `speech_tts::pins`) stay in the adapters crate and are asserted equal, digest and size, to the manifest by unit tests in both crates. Changing a pin means editing one file and the Rust runtime pin if it is a model file; a test fails if they disagree. Adding or bumping a third-party download still follows the review rules of sections 9 and 10 (licence, provenance, digest of the downloaded bytes).
+* *What `aivtuber-setup` may do on the network.* HTTPS only, to the hosts in the manifest (GitHub releases and raw, Hugging Face). Plain HTTP is accepted only for a loopback host and only through a test-only configuration field that no command-line option or environment variable reaches. Redirects are followed by hand, at most five, and every hop is re-checked, so an HTTPS URL can not redirect to HTTP. A file is fetched in `Range` segments appended to `<file>.part` with a per-segment timeout; the manifest size is an exact cap (more bytes than pinned is refused, fewer is a failure); retries are bounded; only a file whose SHA-256 equals its pin is renamed to its final name, and a mismatch deletes the partial file. The program sends no credential, no user identifier and no request body.
+* *Archive extraction.* In process, no `tar`/`unzip`: `.zip`, `.tar.gz` and `.tar.bz2`. An entry name must be relative with plain components (no `..`, root, drive, `\`, `:`); nothing is written through an existing link; a link entry is allowed only on Unix, only to a single plain sibling file name in the same directory (no separator, `.` or `..`, so link chains can not escape); hard links, devices and other entry types are refused; entry count and expanded bytes are capped per archive (`max_extracted_bytes` in the manifest). Tests cover traversal, absolute names, escaping links, writing through a link and expansion bombs.
+* *Dependencies.* `crates/setup` adds *no new package*: `bzip2` 0.6.1, `flate2`, `tar`, `zip` 9.5 (deflate only), `ureq` 3.4 (the HTTP client the adapters already use, rustls), `sha2`, `getrandom`, `clap`, `serde`, `url` were already in `Cargo.lock` (through `sherpa-onnx-sys`'s build script, the adapters and the app). The only `Cargo.lock` change is the new workspace member entry. `libbz2-rs-sys` is the one crate whose licence exception (section 9) now also covers a run-time dependency. `cargo deny --locked check` passes.
+* *Secrets.* The env file holds a random 256-bit pseudonym key and a random 128-bit control secret generated from the operating system's randomness; it is created owner-only on Unix, never overwritten without `--force`, and never printed or logged.
+* *Signing.* `aivtuber-setup` is unsigned like the other programs (section 11, known limitations).
 
 === Licence notices in the archive
 
@@ -259,6 +268,7 @@ Workflow: `.github/workflows/release.yml`. Assembly: `scripts/package-release.mj
 
 === Known limitations
 
+* *Not run end to end on a clean machine by CI.* The release smoke test runs `aivtuber-setup` offline (`--dry-run`, `--offline`, `start --dry-run`); the real downloads, extraction and starter audio were run from a development machine against the real hosts. A clean Windows VM run from a downloaded archive remains the #294 acceptance check.
 * *Unsigned binaries.* No Authenticode signing and no notarisation. Windows SmartScreen may warn; the published checksums are the integrity channel. Signing needs a certificate (cost, identity and key custody) and is a later decision under #294.
 * Linux archives depend on the system `libasound2` and `libssl3` and on a glibc no older than the build host's.
 * The engine libraries are loaded from the install directory and checked by SHA-256 (section 9's residual risk applies unchanged).

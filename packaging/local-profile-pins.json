@@ -1,0 +1,200 @@
+{
+  "schema": "local-profile-pins/1",
+  "note": "Single source of every third-party download pin for the local profile (issue #294 S2). Read by crates/setup (embedded at build time), scripts/fetch-local-profile.mjs, scripts/fetch-sherpa-onnx.mjs and renderer/local-avatar/smoke/fetch-model.mjs. `size` is the exact byte length: a download is refused past it and after it ends short. The sidecars re-verify the model file digests at every start (crates/adapters/src/speech_stt/pins.rs, speech_tts/pins.rs); unit tests keep the copies equal. Licence and disclosure text here is what `aivtuber-setup local` prints; docs/supply-chain.adoc and docs/local-profile-quickstart.adoc section 8 explain it.",
+  "llama": {
+    "tag": "b12224",
+    "licence": "MIT",
+    "assets": {
+      "win32-x64-vulkan": {
+        "file": "llama-b12224-bin-win-vulkan-x64.zip",
+        "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12224/llama-b12224-bin-win-vulkan-x64.zip",
+        "sha256": "abb2363a8cf2fa622a40f80330828806fb9f344b483074f29478303a5b76fc27",
+        "size": 37847334,
+        "max_extracted_bytes": 1073741824
+      },
+      "win32-x64-cpu": {
+        "file": "llama-b12224-bin-win-cpu-x64.zip",
+        "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12224/llama-b12224-bin-win-cpu-x64.zip",
+        "sha256": "d7a7a3e014a02dbfce46977f9da6d9b58196b9c83b80bcf6ef2337134103c3d6",
+        "size": 24887408,
+        "max_extracted_bytes": 1073741824
+      },
+      "linux-x64-vulkan": {
+        "file": "llama-b12224-bin-ubuntu-vulkan-x64.tar.gz",
+        "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12224/llama-b12224-bin-ubuntu-vulkan-x64.tar.gz",
+        "sha256": "14a722b31c87f7216d89171ac6d5ec9fbeae278ccbfdf008ac956092f405d3b6",
+        "size": 35926491,
+        "max_extracted_bytes": 1073741824
+      },
+      "linux-x64-cpu": {
+        "file": "llama-b12224-bin-ubuntu-x64.tar.gz",
+        "url": "https://github.com/ggml-org/llama.cpp/releases/download/b12224/llama-b12224-bin-ubuntu-x64.tar.gz",
+        "sha256": "e3f9e11e61b8bcecccc4b7522d131cc6d3ec18fc3f31f6caa58ddda63801bbd5",
+        "size": 23109432,
+        "max_extracted_bytes": 1073741824
+      }
+    }
+  },
+  "llm": {
+    "file": "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+    "url": "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/a06e946bb6b655725eafa393f4a9745d460374c9/Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+    "sha256": "3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597",
+    "size": 2497281120,
+    "licence": "Apache-2.0"
+  },
+  "vad": {
+    "file": "silero_vad_op18_ifless.onnx",
+    "url": "https://raw.githubusercontent.com/snakers4/silero-vad/v6.2.3/src/silero_vad/data/silero_vad_op18_ifless.onnx",
+    "sha256": "7671cd04b004e9076da0d4a7b1a5aec36adf161c39230c1cb94a4fd5db6bbd28",
+    "size": 2845718,
+    "licence": "MIT"
+  },
+  "avatar": {
+    "file": "VRM1_Constraint_Twist_Sample.vrm",
+    "repo": "pixiv/three-vrm",
+    "commit": "3caf7a21ee68f0d5dfa363ab3d577450bbf60136",
+    "path": "packages/three-vrm/examples/models/VRM1_Constraint_Twist_Sample.vrm",
+    "url": "https://raw.githubusercontent.com/pixiv/three-vrm/3caf7a21ee68f0d5dfa363ab3d577450bbf60136/packages/three-vrm/examples/models/VRM1_Constraint_Twist_Sample.vrm",
+    "sha256": "12c2b97e95e700783a6a550dc0eee2d7880aeedccef9ae67bc4c5a2f0f2631a2",
+    "size": 10776032
+  },
+  "sherpa_lib": {
+    "version": "2.0.1",
+    "licence": "Apache-2.0",
+    "assets": {
+      "linux-x64": {
+        "file": "sherpa-onnx-v2.0.1-linux-x64-shared-lib.tar.bz2",
+        "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/sherpa-onnx-v2.0.1-linux-x64-shared-lib.tar.bz2",
+        "sha256": "532c45bbd41036d83cd70606797529aa8086c2053395a58967736c727625b120",
+        "size": 9710131
+      },
+      "win32-x64": {
+        "file": "sherpa-onnx-v2.0.1-win-x64-shared-MT-Release-lib.tar.bz2",
+        "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/sherpa-onnx-v2.0.1-win-x64-shared-MT-Release-lib.tar.bz2",
+        "sha256": "afa4de3ca4ab0afd53bb4aab40d28ee15608364b549ffc0fe0caf6489bfc39a5",
+        "size": 7899712
+      }
+    }
+  },
+  "models": {
+    "supertonic-3-int8": {
+      "archive": {
+        "file": "sherpa-onnx-supertonic-3-tts-int8-2026-05-11.tar.bz2",
+        "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/sherpa-onnx-supertonic-3-tts-int8-2026-05-11.tar.bz2",
+        "sha256": "82fa96f91c4ef8abaae3a14a3f4153facf88bed821d1f7331cec2700f432c427",
+        "size": 128774318,
+        "max_extracted_bytes": 536870912
+      },
+      "inner_dir": "sherpa-onnx-supertonic-3-tts-int8-2026-05-11",
+      "files": [
+        { "file": "duration_predictor.int8.onnx", "sha256": "c3eb91414d5ff8a7a239b7fe9e34e7e2bf8a8140d8375ffb14718b1c639325db", "size": 3700147 },
+        { "file": "text_encoder.int8.onnx", "sha256": "c7befd5ea8c3119769e8a6c1486c4edc6a3bc8365c67621c881bbb774b9902ff", "size": 36416150 },
+        { "file": "vector_estimator.int8.onnx", "sha256": "20cd86fa5c6effedfda0e7cffe5b0569ca401c440a0c3a1d72bf39286c0db3fd", "size": 78400833 },
+        { "file": "vocoder.int8.onnx", "sha256": "e923d60f53f95eb1ce235f1dc33ec56d9c057823c96fa6f8acf98f32b0da6152", "size": 25991073 },
+        { "file": "tts.json", "sha256": "42078d3aef1cd43ab43021f3c54f47d2d75ceb4e75f627f118890128b06a0d09", "size": 8253 },
+        { "file": "unicode_indexer.bin", "sha256": "8402ca48e5189a8950138580b0fff64db6f072f24ac07cd54ba8b2fbb9883b30", "size": 262144 },
+        { "file": "voice.bin", "sha256": "67d5209b0ee8ce6c74105ffbe12fe6a7628aea3b4ba2fcb308a4a67938a93ce8", "size": 517168 }
+      ]
+    },
+    "k2v2-int8": {
+      "files": [
+        {
+          "file": "encoder-epoch-99-avg-1.int8.onnx",
+          "url": "https://huggingface.co/reazon-research/reazonspeech-k2-v2/resolve/291488c8151be24d7da4bf7af26e533fad96e407/encoder-epoch-99-avg-1.int8.onnx",
+          "sha256": "2c7bd08a8a99f9ddd0d9e458456577b1f6279214e51426f114f9eced44c54e1d",
+          "size": 154670139
+        },
+        {
+          "file": "decoder-epoch-99-avg-1.int8.onnx",
+          "url": "https://huggingface.co/reazon-research/reazonspeech-k2-v2/resolve/291488c8151be24d7da4bf7af26e533fad96e407/decoder-epoch-99-avg-1.int8.onnx",
+          "sha256": "8f0bff94d38797b03b762634ed03211a8e303d06cc4603cdd0cf4199d6eb1485",
+          "size": 2959337
+        },
+        {
+          "file": "joiner-epoch-99-avg-1.int8.onnx",
+          "url": "https://huggingface.co/reazon-research/reazonspeech-k2-v2/resolve/291488c8151be24d7da4bf7af26e533fad96e407/joiner-epoch-99-avg-1.int8.onnx",
+          "sha256": "49cc7ea1d3d35a40a27442db5e89996da64bf0e683a903dce76e99e57a12e4de",
+          "size": 2696970
+        },
+        {
+          "file": "tokens.txt",
+          "url": "https://huggingface.co/reazon-research/reazonspeech-k2-v2/resolve/291488c8151be24d7da4bf7af26e533fad96e407/tokens.txt",
+          "sha256": "2c3ac659818a48a0c04010e0593bbc4d7c8a24a054340b01131499c05fd52def",
+          "size": 45754
+        }
+      ]
+    },
+    "parakeet-ja": {
+      "archive": {
+        "file": "sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8.tar.bz2",
+        "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8.tar.bz2",
+        "sha256": "4b0a800ef29f4f4c8667339bf6f60d5bfdc2852ddc9dc5741aea65b6f8d1306b",
+        "size": 489389564,
+        "max_extracted_bytes": 1073741824
+      },
+      "inner_dir": "sherpa-onnx-nemo-parakeet-tdt_ctc-0.6b-ja-35000-int8",
+      "files": [
+        { "file": "model.int8.onnx", "sha256": "3addd00ef5bd1742078389e540b77394e4a508bdf2f4c9ad1b4a76d93e76598e", "size": 655542604 },
+        { "file": "tokens.txt", "sha256": "732f64c53909f2620c713f4106b487d92e6f54a6915b3cd3d1dbd32f9f4f392a", "size": 28557 }
+      ]
+    }
+  },
+  "disclosures": [
+    {
+      "id": "supertonic-3-weights",
+      "component": "Supertonic 3 weights (TTS voice)",
+      "licence": "OpenRAIL-M",
+      "applies_to": ["tts"],
+      "duty": "Disclose that the voice is machine-generated: one of the use restrictions is publishing AI-generated content without clear disclosure. Keep an \"AI-generated voice\" line where viewers see it (channel or stream description, or an overlay); the runtime only prints a start-up notice. The other restrictions (no unlawful use, no harm to minors, no disinformation, no harassment or discrimination, no impersonation or deepfakes without consent, no fully automated legal, medical or law-enforcement decisions) pass on to you."
+    },
+    {
+      "id": "reazonspeech-k2-v2",
+      "component": "ReazonSpeech k2-v2 int8 (speech-to-text)",
+      "licence": "Weights Apache-2.0 per the model card",
+      "applies_to": ["stt"],
+      "duty": "Provenance note: trained on the ReazonSpeech corpus (Japanese TV broadcasts), whose access terms limit corpus use to information analysis under Article 30-4 of the Japanese Copyright Act. That is a term of the dataset, not stated as a restriction on the released weights; revisit if the publisher states one (docs/supply-chain.adoc)."
+    },
+    {
+      "id": "parakeet-ja",
+      "component": "NVIDIA parakeet-tdt_ctc-0.6b-ja int8 (optional speech-to-text)",
+      "licence": "CC-BY-4.0",
+      "applies_to": ["stt-parakeet"],
+      "duty": "Attribution required if you select it: \"Contains NVIDIA parakeet-tdt_ctc-0.6b-ja (NVIDIA, CC-BY-4.0, https://huggingface.co/nvidia/parakeet-tdt_ctc-0.6b-ja), converted to ONNX by the sherpa-onnx project (k2-fsa).\""
+    },
+    {
+      "id": "llama-cpp",
+      "component": "llama.cpp b12224",
+      "licence": "MIT",
+      "applies_to": ["llama"],
+      "duty": "Keep the licence notice if you redistribute the binaries."
+    },
+    {
+      "id": "qwen3-4b",
+      "component": "Qwen3-4B-Instruct-2507 Q4_K_M (unsloth GGUF)",
+      "licence": "Apache-2.0",
+      "applies_to": ["llm"],
+      "duty": "Keep the notice if you redistribute the weights. Model output is your responsibility."
+    },
+    {
+      "id": "silero-vad",
+      "component": "Silero VAD v6",
+      "licence": "MIT",
+      "applies_to": ["vad"],
+      "duty": "Keep the licence notice if you redistribute the model."
+    },
+    {
+      "id": "sample-vrm",
+      "component": "Sample VRM (VRM1_Constraint_Twist_Sample.vrm)",
+      "licence": "Embedded VRM 1.0 metadata: pixiv Inc., avatar permission everyone, credit notation unnecessary, no hateful use",
+      "applies_to": ["avatar"],
+      "duty": "Test model only. Check the embedded licence of whatever model you stream and replace this one (copy yours to renderer/local-avatar/dist/model.vrm)."
+    },
+    {
+      "id": "ai-performer",
+      "component": "AI performer indication",
+      "licence": "Platform rules",
+      "applies_to": ["always"],
+      "duty": "Indicate on your stream that the performer is an AI; platforms often require this separately from the voice licence."
+    }
+  ]
+}
