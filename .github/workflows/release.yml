@@ -17,6 +17,8 @@ name: Release archives
 
 on:
   push:
+    branches:
+      - feat/294-s1-release-archives # TEMPORARY dry-run trigger; removed before merge
     tags:
       - "v*"
   workflow_dispatch:
@@ -37,7 +39,7 @@ env:
   # One Cargo feature set for every bundled sidecar (docs/local-profile-quickstart.adoc step 2).
   ADAPTER_FEATURES: silero-vad,mic-capture,sherpa-stt,sherpa-tts
   # Archive names and the embedded README carry this label.
-  RELEASE_VERSION: ${{ github.event_name == 'push' && github.ref_name || format('{0}-{1}', inputs.version, github.run_number) }}
+  RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || format('{0}-{1}', inputs.version || 'dry-run', github.run_number) }}
 
 jobs:
   build:
@@ -212,7 +214,7 @@ jobs:
   # reads the notes and the checksums before it becomes public.
   publish:
     name: Draft release
-    if: github.event_name == 'push'
+    if: github.ref_type == 'tag'
     needs: checksums
     runs-on: ubuntu-latest
     timeout-minutes: 10
