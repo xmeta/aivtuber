@@ -1,6 +1,7 @@
 = ADR-0008: Cross-session memory persistence and end-to-end erasure
-:status: Proposed
+:status: Accepted
 :date: 2026-11-10
+:accepted: 2026-11-10
 :toc:
 
 == Context
@@ -435,11 +436,11 @@ Counters and events are bounded aggregates, like the existing retention snapshot
 
 S1 is additive and RAM-only; revert is deleting the API. S2 is feature-gated by presence of the seed file setting; absent setting means today's behaviour. S3 would be opt-in per deployment; rollback is deleting the snapshot and honoring the ledger. The point after which rollback is expensive is the first viewer-attributed disk record, which this ADR does not authorize.
 
-== 13. Open decisions (need a supervisor answer)
+== 13. Decision register (Q1-Q13: all DECIDED as recommended)
 
 [cols="1,3,3",options="header"]
 |===
-|ID |Question |Recommendation
+|ID |Question |Decision (as recommended)
 
 |Q1
 |Add a production writer (an authenticated `memory.admin` ingress) before any persistence?
@@ -493,6 +494,28 @@ S1 is additive and RAM-only; revert is deleting the API. S2 is feature-gated by 
 |Generated-asset provenance to memory ids.
 |Do not add now; list as an unprovable remnant; add only if a measured need appears.
 |===
+
+== 14. Decisions (supervisor, 2026-11-10)
+
+Q1-Q13 are DECIDED as recommended in section 13.
+
+* D-Q1 (DECIDED): the production writer becomes its own issue. No production path writes durable memory (G2), so persistence has nothing to preserve and the erase primitive cannot be exercised on real data.
+* D-Q2 (DECIDED): no viewer-attributed disk persistence in S1-S3. Erasure is not provable today, so persisting viewer data before the S1 erase primitive would be unsafe.
+* D-Q3 (DECIDED): single JSON snapshot if a store is ever built; an embedded database only on the section 8 trigger. Volume does not justify an engine.
+* D-Q4 (DECIDED): falsifier threshold of 20 percent of at least 5 streams. The S2 seed file is the cheapest benefit test and must pass this before any disk store is built.
+* D-Q5 (DECIDED): adopt the section 3.2 quotas; revisit with measured sizes.
+* D-Q6 (DECIDED): recorded session-boundary input, maximum gap if missing. Keeps expiry across restarts replay-deterministic.
+* D-Q7 (DECIDED): viewer self-erase is allowed only for the requester's own pseudonym, rate-limited, and routed through the normalizer. Chat can never mint a durable-write permit; erase is the opposite direction (it only reduces data) and is acceptable.
+* D-Q8 (DECIDED): no production sidecar until the port has a delete-semantics `purge`; invalidation is never reported as erasure.
+* D-Q9 (DECIDED): rely on documented operator full-disk encryption; no project-written crypto.
+* D-Q10 (DECIDED): operator-held erase-only key ring for at most the maximum TTL, plus `purge-version`. Without it, old-version records cannot be located for erase.
+* D-Q11 (DECIDED): the runtime creates no backups; the ledger wins on restore; reports name backups as not covered.
+* D-Q12 (DECIDED): an operator notice string and global/per-namespace off switches are required before any viewer persistence.
+* D-Q13 (DECIDED): no generated-asset-to-memory provenance now; listed as an unprovable remnant.
+
+=== Next slices
+
+S1, the RAM-only erase primitive plus the erasure report, becomes its own implementation issue under #105. Q1, the production writer, also becomes its own issue. S2 follows the writer; S3 stays blocked on the Q4 falsifier.
 
 == Revisit conditions
 
