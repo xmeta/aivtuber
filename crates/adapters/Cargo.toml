@@ -89,3 +89,7 @@ path = "src/bin/local-tts-sidecar-double.rs"
 [[bin]]
 name = "twitch-chat-ingress"
 path = "src/bin/twitch-chat-ingress.rs"
+
+[[bin]]
+name = "youtube-chat-ingress"
+path = "src/bin/youtube-chat-ingress.rs"
