@@ -1,0 +1,438 @@
+= ADR-0007: Bounded perception plane, screen vision first
+:status: Proposed
+:date: 2026-11-10
+
+== Context
+
+Issue #90 asks for an optional perception plane: a bounded, typed boundary for observations that structured adapters do not provide (what is on the streamer's screen, later co-host turn cues and tone), so that perception models can inform decisions without gaining authority and without pushing raw state into Jev/Thinking. The issue is +status:design-ready+. The competitive review (link:../competitive-landscape.adoc[gap 8]) records that competitors ship screen or camera vision (OLV README 72, AITuberKit README 69 and 91) and that this repository has no capture or image path.
+
+This ADR records a candidate design, a reuse review and a first slice with a falsifier. It authorizes no production code, no schema change and no dependency. *Nothing was run or measured for this ADR*; every number below is a proposed bound or an unverified expectation. External facts were read on 2026-11-10 (sources in the reuse table).
+
+What exists on +main+ that this builds on:
+
+* Speech observations (#92, +crates/domain/src/speech.rs+, +crates/runtime/src/speech_observation.rs+, +schemas/speech-observation.schema.json+): the closest precedent. A wire form with no source class, plane, trust, priority or authorization field; +deny_unknown_fields+; a required-in-practice expiry capped at +MAX_OBSERVATION_VALIDITY_MS+ (60 s); a batch byte cap enforced before parsing; ingress that assigns provenance and applies an +IngressPolicy+ ceiling; reject reasons counted per reason (+stale_age+, +expired+, +future_dated+, +out_of_order+, capacity); bounded per-speaker state with idle TTL; no audio or text retained.
+* Thinking context (+crates/domain/src/context.rs+): +ThinkingContent+ with +trust_level+ and +PrivacyClass+ (+public+, +pseudonymous+, +private+); +ThinkingContextSource+ has no perception variant; bounds +MAX_THINKING_CONTEXT_ITEMS = 12+, +MAX_THINKING_TEXT_BYTES = 4 KiB+.
+* OBS adapter (+crates/adapters/src/obs.rs+): a private +request(...) -> Result<Value, EngineError>+ already returns the response body, but the only public entry is +execute_sync(&AuthorizedStreamAction)+ (control plane, a fixed list of mutating requests). No screenshot request exists. The obs-websocket 5 protocol has +GetSourceScreenshot+ (below).
+* Local profile (+docs/local-profile-quickstart.adoc+): one loopback +llama-server+ build +b12224+ hosting Qwen3-4B-Instruct-2507 Q4_K_M on an 8 GB GPU, next to VAD, STT, TTS and the avatar. Loopback-only unauthenticated endpoints are accepted by A-LLM-002 and A-TTS-002.
+* Retention (+docs/runtime-retention.adoc+): every retained structure needs a derived bound; speech observations are the model row.
+* #88 (typed scene/game snapshots, source priority telemetry, then OBS state, then trusted timers, then bounded inference from perception, then unknown) and #221 (ActionWindow, availability not authority) are the two issues that most need to know what perception may and may not do.
+
+== Hard constraints
+
+* Model, Jev and generated output are data, never runtime authority (AGENTS.md). A vision model is a model: its output, and the pixels it reads, are untrusted content-plane data. Serialized fields are never authority.
+* The ingress assigns source class, trust and plane; a payload cannot self-escalate (security threat model section 4; ADR-0005 S-7 for the speech equivalent).
+* Raw frames and audio are not domain state, are not carried on the control queue, and are not retained by default (#90, #51, ADR-0005).
+* Bounded retained state with derived limits; expiry and ordering use logical or monotonic time, not wall clock, in replay-sensitive code.
+* Jev and LLM never run in the frame/motor loop; perception failure, slowness or saturation must not freeze the performer, the scheduler or operator emergency control.
+* Baseline deployment is local and self-hosted with no paid service (A-LLM-002 class of boundary). Remote or cloud vision is an optional adapter, never default, and a local-profile refusal like the one for non-loopback LLM endpoints applies.
+* Schema-first wire changes with positive and negative fixtures and Rust/TypeScript parity (AGENTS.md "Schema/domain change order"). Provider-specific wire DTOs (OBS, llama-server) stay behind adapters.
+* No dependency without the #100 gate (license, maintenance, advisories, determinism, bounded state).
+
+== Assumptions
+
+Existing: A-PERCEPT-001 (turn cues need local Japanese/product validation; unchanged and still unvalidated), A-LLM-001, A-LLM-002, A-OBS-001 (no stale OBS action replay).
+
+Proposed new assumptions (add to the link:../assumptions.adoc[Assumption Register] if this ADR is accepted; none is validated here):
+
+* A-PERCEPT-002: a small local vision-language model, run at one frame per 5 to 10 s through a second loopback +llama-server+, fits next to the resident Thinking model on the measured 8 GB GPU and answers within the deadline without regressing Thinking first-token latency. Falsifier: the S1 experiment below (VRAM, co-resident latency, Thinking regression).
+* A-PERCEPT-003: asking OBS for one downscaled source screenshot every 5 to 10 s costs the OBS render path nothing visible (no dropped or skipped frames in OBS stats). Falsifier: experiment F2. The protocol rates the request complexity 4/5 and calls the parallel batch type's main use case this request; the cost on the OBS side is unmeasured.
+* A-PERCEPT-004: a one-sentence caption plus a few closed-vocabulary labels carry enough game-state signal to improve reply timing or topicality over #88 structured context alone, for a Japanese streamer. Falsifier: blinded comparison in #59 with and without the observation (replayed, section "Replay"); if no uplift, perception stays a spike.
+
+== Alternatives considered
+
+. *Status quo*: no capture path. Rejected as the long-term answer (gap 8) but it remains the baseline and the degradation target.
+. *Feed the image straight to the Thinking model* (one multimodal model for everything, the AITuberKit "game commentary" shape). Rejected for the contract: it makes pixels part of the Thinking request, couples vision failure and image-token cost to every reply, and gives injected on-screen text a direct path into the reply model. Kept as a deployment option behind the same observation boundary (Q3).
+. *Structured telemetry only* (#88 without perception). The preferred source wherever it exists (see "Source hierarchy"); insufficient for games with no plugin or API.
+. *Perception plane with a bounded derived observation* (this ADR): a capture step, a vision sidecar, validation and trust assignment in the runtime, bounded snapshots to consumers.
+. *General always-on video understanding.* Rejected by the issue non-goals (no continuous high-FPS analysis, no default full-resolution upload).
+
+== Decision
+
+=== D-1 Shape: capture and inference are a sidecar; only a validated observation crosses into core
+
+[source,text]
+----
+operator opt-in (control plane, non-serializable capability)
+        |
+capture step (OBS GetSourceScreenshot of one operator-chosen source, downscaled)
+        |   frame lives in one in-memory slot, never on the control queue
+vision sidecar (local llama-server + VLM, json_schema-constrained output)
+        |   derived JSON only
+PerceptionObservationBatch  (wire form: no trust, plane, source class, priority, authorization)
+        |
+perception ingress in +crates/runtime+ : size cap -> parse -> validate -> assign provenance -> IngressPolicy ceiling -> stale/expiry -> bounded store
+        |
+bounded snapshots to #88 SceneContext (rank 4), Thinking context (one untrusted item), #92 (turn cues, later)
+----
+
+The frame never leaves the capture and sidecar processes' memory. The media/data-plane rule from #90 holds: independent bounded queues, drop on overload, never block operator control or the scheduler.
+
+=== D-2 The PerceptionObservation contract (to be specified in a schema-first PR)
+
+Normative form will be +schemas/perception-observation.schema.json+ (does not exist yet; *this PR changes no schema*). Following the speech observation precedent: an envelope (+schema_version+, +provider_id+, +provider_version+, one +observations+ array, batch cap 16 KiB checked before parsing, at most 8 observations per batch) and a tagged observation with +deny_unknown_fields+.
+
+[cols="2,4,3"]
+|===
+|Field |Meaning and bound |Why
+
+|+kind+
+|Closed tagged enum. S1: +screen_scene+, +screen_caption+. Reserved, not specified here: +face_expression_turn_cue+, +head_pose_turn_cue+, +gaze_turn_cue+, +speech_tone+ (turn cues per the #90 addendum; S3).
+|Adding a kind is a schema change with fixtures; no free-form kind string.
+
+|+observation_id+
+|Label, 1..64 bytes, unique per producer session.
+|Replay and metrics correlation.
+
+|+source+
+|+{ alias }+ where +alias+ is an operator-configured label (1..64 bytes), never a window title, process name or file path.
+|Titles and process names leak private information; the operator maps alias to the real OBS source.
+
+|+frame+
+|+{ capture_seq: u64 monotonic per source, captured_at_ms, width, height }+ (width and height are the downscaled size, each at most 4096).
+|Identity of the frame the observation came from; no pixels, hash or thumbnail.
+
+|+observed_at_ms+, +expires_at_ms+
+|Mapped to the runtime's logical/monotonic clock by the adapter. +expires_at_ms+ is *required*. Maximum validity: 30 s for screen kinds (proposed), 2 s for turn cues (reserved).
+|A stale caption of a game that has since changed is worse than none. The speech observation allows 60 s; vision changes slower than a turn but must not outlive the scene it describes.
+
+|+confidence+
+|Optional number in 0..1. Uncalibrated unless a +calibrated+ flag says otherwise (same rule as +TurnEndScoreObservation+).
+|A VLM's self-reported confidence is not a probability.
+
+|+producer+
+|+{ provider, provider_version, model_id, config_digest, prompt_version }+, bounded tokens. +config_digest+ covers mmproj, quantization, sampling and image size.
+|Non-deterministic live producers must be identifiable for replay and A/B (#90 Replay).
+
+|+privacy+
+|Reuses +PrivacyClass+. Producers declare +private+ for anything derived from a screen unless the operator's source profile says +public+ (a dedicated game-capture source with no overlays). The ingress may only raise, never lower, it.
+|Chat overlays, DMs and notifications can appear on screen.
+
+|+redaction+
+|Counters only: +{ policy_version, secret_hits, truncated }+.
+|Says that redaction ran and what it did, without keeping the removed text.
+
+|payload for +screen_scene+
+|+scene_class+: closed enum (provisional list: +gameplay+, +menu+, +loading+, +cutscene+, +result+, +desktop+, +unknown+; #88 owns the final vocabulary and perception must use its subset); +labels+: at most 8 entries, each a token from the operator profile's +label_vocabulary+ (at most 64 entries, each at most 32 bytes); a token outside the vocabulary is dropped and counted.
+|Closed vocabularies cannot carry instructions. They are the only perception output Reflex or Jev may ever see.
+
+|payload for +screen_caption+
+|+caption+: one UTF-8 string, 1..240 bytes, NFKC-normalized, no control or bidi-override characters. Always carries the implicit marker *untrusted text*: it is rendered only inside a delimited untrusted slot.
+|The only free text, deliberately short. 240 bytes limits both injection surface and data exfiltration from the screen.
+|===
+
+Excluded by design: raw or encoded images, embeddings, bounding boxes (revisit with a bound if #88 needs a region), OCR transcripts, arbitrary JSON or key/value maps, identity or demographic attributes of any person, and any field named trust, plane, source class, priority, authorization or capability (rejected by +deny_unknown_fields+, as for speech).
+
+The ingress, not the producer, assigns: +SecurityPlane::Content+, +TrustLevel::Untrusted+, priority from configuration, and the operator's +IngressPolicy+ ceiling. Whether the observation type gets a +SourceClass+ at all is Q1 (recommendation: no; it is not an +EventEnvelope+ event).
+
+Reject reasons, each counted separately (mirrors +SpeechRejectReason+): +oversize+, +invalid+ (schema or vocabulary violation, unknown field), +stale_age+, +expired+, +future_dated+, +out_of_order+ (by +capture_seq+ and observed time, never arrival), +source_capacity+, +disabled+ (no active operator opt-in for that alias).
+
+=== D-3 Source hierarchy
+
+Per field, the highest-ranked *fresh* source wins; a lower source may fill a field only when every higher source is absent, expired or has declared the field unknown. On disagreement the higher source wins and a disagreement counter increments; the perception value is not blended.
+
+[cols="1,3,3"]
+|===
+|Rank |Source |Notes
+
+|1 |Trusted game telemetry/plugin (#88) |Authoritative for the facts it covers. Perception must not duplicate it (#90 non-goal).
+|2 |Known OBS state (current scene, source visibility) |Already structured. It also tells perception which source is on air.
+|3 |Trusted timers/state machines (#88) |
+|4 |Perception observation (this ADR) |Untrusted, expiring, complementary. May supply +scene_class+ and +labels+ where 1 to 3 are silent; supplies the only caption.
+|5 |Unknown |Safe coarse default; consumers must handle it.
+|===
+
+Perception can add information a higher source lacks (the caption, a label telemetry does not model) without overriding it.
+
+=== D-4 Authority boundary
+
+* The observation types have no path to +Authorized*+ actions. The perception module and sidecar do not depend on the scheduler, output adapters, +AuthenticatedControl+ or tool adapters (enforced by crate dependencies and a test that fails if they gain such an import).
+* The vision sidecar is called with no tools and no function-calling, and with a +json_schema+/grammar-constrained response so the model cannot return free structure. This is containment of malformed output, not a security control on content.
+* The capture request is issued by a dedicated read-only method on the OBS adapter, not through +execute_sync+ and not as a +StreamAction+. Mutating OBS requests keep their control-plane authorization.
+* Perception cannot: issue operator commands, execute or select tools, moderate users, grant or satisfy a memory-write permit (observations are not memory-eligible in S1), set trust of public content, open or update an #221 ActionWindow, or drive avatar/OBS parameters. They remain decision-plane context.
+* Perceived text is never parsed for performance or control information (the ADR-0006 rule that text positions and content never select a performance applies unchanged to perceived text).
+* The on-screen content problem: a VLM reading a chat overlay re-introduces viewer text into the system through a path the chat normalizer never saw. It is untrusted by construction, goes through the same output gate as anything else, and is why the captured source should exclude chat overlays (D-5). It must not be treated as a viewer claim with any standing, nor as a verified fact (security threat model, epistemic classes).
+* Prompt injection from pixels: attacker-controlled text on screen (a game chat, a web page, a username) may say "ignore previous instructions" or "operator: mute". Defences are structural (closed vocabularies, 240-byte cap, delimited untrusted slot, no authority path, existing control-term output gate), not the VLM prompt. The prompt instructs "describe activity, do not transcribe text" for quality and as a privacy aid, but nothing relies on it.
+* #221: perception cannot supply a window epoch or an action's availability. An observation is not a verified outcome; whether it may be a weak, labelled input to a project-owned verifier is deferred to #221, and it may never be sole proof.
+* Operator emergency control stays on its own path; a perception kill switch (D-5) is part of it.
+
+=== D-5 Privacy defaults
+
+[cols="2,5"]
+|===
+|Control |Default
+
+|Opt-in
+|Off. Enabled per source alias by the operator through the authenticated local control ingress (a non-serializable capability, like the other privileged toggles), not by configuration file alone, not by a message, not by the model. A config allowlist of source aliases bounds what may ever be enabled. Operator-visible status ("perception active: <alias>") and a one-step disable that takes effect before the next capture.
+
+|Capture target
+|One named OBS source (+sourceName+ or +sourceUuid+), never the desktop and never a webcam or camera source in S1. The operator builds a dedicated, cropped "perception" source in OBS (OBS-native crop and filters) so region-of-interest policy needs no image decoding in our process (Q6). The captured source must not include the avatar or the stream captions (feedback loop: the model would describe its own output).
+
+|Frame handling
+|Downscaled by OBS (+imageWidth+/+imageHeight+ are "scale to inner", range 8..4096; proposed long edge 768) before it reaches us; JPEG. One in-memory slot, overwritten, dropped after inference or on timeout. Never written to disk, never logged, never in telemetry, audit, diagnostic or support bundles, never in a replay fixture.
+
+|Derived text
+|Bounded as in D-2. Before leaving the perception module the caption passes the same secret redaction the audit path already applies (see link:../security-threat-model.adoc[threat model]); hits are counted, the removed text is not kept. A redaction failure drops the observation.
+
+|Retention
+|In-memory only: latest observation per (alias, kind) plus a small diagnostic ring (proposed 8 total), idle TTL, derived from +RuntimeRetentionPolicy+; a row is added to link:../runtime-retention.adoc[runtime-retention] with the implementation. No durable write. Not memory-eligible.
+
+|Where inference runs
+|Loopback only, local model. The local profile refuses a non-loopback vision endpoint, exactly as it does for Thinking. A remote vision provider would be a separate adapter, a separate operator opt-in per provider, and its own ADR.
+
+|People
+|No identity, demographic or sensitive-trait inference. Webcam, co-host and audience media are out of S1; turn-cue kinds need their own opt-in and ADR amendment.
+
+|Recording
+|Recording derived observations for replay is a separate, default-off operator option (Q8) because captions are derived from private content. Test fixtures are synthetic or authored by the maintainers.
+|===
+
+=== D-6 Cadence and budget
+
+Proposed defaults, all configurable within hard ceilings, none measured:
+
+* one capture every 10 s, never faster than every 5 s (hard floor 2 s), per source, and at most 2 sources;
+* at most one capture-plus-inference in flight; an overdue tick is dropped, not queued; no catch-up burst after a stall;
+* inference deadline 3 s and +max_tokens+ 96, the answer is discarded after the deadline (late results are stale by construction);
+* compute budget: cumulative inference time at most 10% of wall time over a sliding minute; beyond it, ticks are skipped and counted;
+* admission yields to Thinking: do not start a perception job while a Thinking request is in flight on the same GPU (best effort, counted);
+* an unchanged scene should not cost a model call: a cheap change check on the downscaled frame is a later optimization, not S1.
+
+Timer-driven only in S1. A reply-triggered refresh would put the VLM on the latency path of a reply; it is rejected until a measured need (Q9).
+
+=== D-7 Failure and degradation
+
+Typed states: +disabled+, +healthy+, +degraded+ (observations arriving but late or low rate), +unavailable+ (OBS disconnected, sidecar down, deadline repeatedly missed). The consumer contract is simply "no fresh observation": #88 falls back to its coarser context, Thinking omits the item, routing uses what it has. No retry queue; a circuit breaker with exponential backoff (the existing adapter reconnect policy shape) stops hammering a dead sidecar. OBS reconnect never replays a capture request (A-OBS-001 posture). A saturated or dead perception path cannot block ingress, the scheduler or operator control because it shares no queue with them.
+
+=== D-8 Replay
+
+Replay never calls OBS or a model. Recorded *normalized* observations (the wire form plus runtime-assigned provenance and logical timestamps) are fed through the same ingress as live ones, so staleness, expiry and rejection behave identically. A live run records +producer+ identity (model, mmproj, quantization, prompt version, sampling), not the image. Sampling is temperature 0 with a fixed seed for the producer where the backend allows it, which reduces but does not guarantee reproducibility (to be measured); replay correctness does not depend on it because the observation, not the model, is the replay input. A scenario fixture kind for observations is added with the contract (extend +schemas/stream-scenario.schema.json+ at that time).
+
+=== D-9 Metrics
+
+Per source and kind: capture latency, inference latency and observation age at consumption (p50/p95/p99); frames captured, dropped (overdue, in-flight, budget, Thinking-busy), observations accepted and rejected by reason; model calls and compute-seconds; disagreement with structured sources; time in each availability state and fallback rate; consumption count and, where attributable, whether a decision used it (#65 causal trace); caption redaction hits and truncations; privacy counters (frames written to disk, which must be 0, and observations retained beyond TTL, which must be 0); OBS-side impact (dropped/skipped frames while enabled versus disabled); Thinking first-token latency with and without perception active. Aggregates only; no caption text in metrics.
+
+=== D-10 Consumers
+
+* #88: SceneContext may take +scene_class+ and labels at rank 4 and the caption as an optional hint, with a confidence label and age, never as a trusted transition and never to drive busy/interruptibility on its own where rank 1 to 3 say otherwise. Perception does not define the scene vocabulary; #88 does.
+* Thinking: at most one caption item, at most 512 bytes after delimiters, as a new +ThinkingContextSource+ variant (a schema change for the consumer PR) with +trust_level: untrusted+, +privacy+ from the observation, an explicit age, and delimiter text that marks it as observed screen content rather than instruction. Never in memory, never in TTS input, never in the Reflex request as raw text.
+* Reflex/Jev: closed-vocabulary labels and +scene_class+ only, via the #88 snapshot.
+* #92: reserved turn-cue kinds feed the same fusion as audio-only observations, as optional evidence, with their own opt-in; not part of S1.
+* #221: no direct consumption (see D-4).
+
+== Reuse / Adapt / Build comparison
+
+Pattern and component reuse. Facts read 2026-11-10 (GitHub API for repositories; Hugging Face API for model cards; the llama.cpp +docs/multimodal.md+ page; the obs-websocket generated protocol document; project READMEs). Vocabulary: adopt / wrap / sidecar / partial reuse / reference only / benchmark first / reject / custom.
+
+[cols="3,2,4,2"]
+|===
+|Candidate and licence |Health (read 2026-11-10) |Fit and caveats |Mode
+
+|*ggml-org/llama.cpp* (+llama-server+ with +libmtmd+), MIT
+|133,869 stars; pushed 2026-11-10
+|Already our Thinking host. +docs/multimodal.md+ lists vision models loaded with +-m+ plus +--mmproj+ (or +-hf+), projector offloaded to the GPU by default (+--no-mmproj-offload+ keeps it on CPU), through the OpenAI-compatible +/chat/completions+ API. The image request format (a base64 +image_url+) is *not* shown on that page and was not re-read; S1 step 0 checks it on the pinned +b12224+ build. Whether +b12224+ loads each model below was not tested.
+|Sidecar (a second server instance; same adapter style as Thinking)
+
+|*OBS +GetSourceScreenshot+ via obs-websocket 5* (obsproject/obs-websocket), GPL-2.0 plugin repository
+|4,386 stars; pushed 2026-10-08
+|Fields: +sourceName+ or +sourceUuid+, +imageFormat+, optional +imageWidth+/+imageHeight+ (8..4096, scale-to-inner), +imageCompressionQuality+; response +imageData+ base64; "compatible with inputs and scenes"; complexity 4/5. Downscaling happens in OBS, so full resolution never reaches us. We only speak the protocol to an OBS the operator runs (same position as the existing adapter; licence implications were not assessed beyond that). Our adapter already returns response bodies (+request+); it needs a bounded read-only capture method and a response-size cap (+MAX_RESPONSE_MESSAGES+ bounds message count, not size). OBS-side cost is unmeasured (A-PERCEPT-003).
+|Wrap (extend the existing adapter)
+
+|*nashaofu/xcap* (Rust OS capture), Apache-2.0
+|1,034 stars; pushed 2026-11-09
+|Windows, macOS, Linux X11 capture; Wayland marked not fully supported on its page. Captures whole monitors and windows: widest privacy exposure (notifications, other windows), native build dependencies on Linux, an extra dependency to vet. Useful only for non-OBS users.
+|Reference only for S1; benchmark first if a no-OBS user appears
+
+|*CapSoftware/scap* (Rust capture), MIT
+|651 stars; last push 2025-08-05
+|Older and quieter than xcap; same privacy exposure.
+|Reject for S1 (revisit only if xcap fails)
+
+|*Qwen3-VL-4B-Instruct-GGUF* (official Qwen repository on Hugging Face), weights Apache-2.0 per card
+|Card modified 2025-11-01; GGUF includes Q4_K_M and Q8_0 plus mmproj
+|Same family as our Thinking model; Japanese capability expected but *unverified*. The llama.cpp page fetched did not list Qwen3-VL; whether +b12224+ supports it is unverified.
+|Benchmark first (primary candidate)
+
+|*ggml-org/SmolVLM-500M-Instruct-GGUF*, Apache-2.0
+|Card modified 2025-04-30; repo total 0.82 GB across Q8_0 and f16 files plus mmproj
+|Smallest listed option and a floor for latency/VRAM; Japanese quality is likely poor (unverified). Listed on the llama.cpp page.
+|Benchmark first (floor candidate)
+
+|*ggml-org/Qwen2.5-VL-7B-Instruct-GGUF*, Apache-2.0 per card
+|Card modified 2025-04-30
+|Listed on the llama.cpp page. A 7B model plus projector is unlikely to co-reside with Qwen3-4B on 8 GB (unmeasured). *Licence trap:* the 3B sibling's upstream card states +qwen-research+ (non-commercial research licence); the ggml-org mirror of the 3B tags Apache-2.0, which contradicts upstream and must not be relied on.
+|Reject for the 8 GB profile; never use the 3B
+
+|*ggml-org/gemma-3-4b-it-GGUF*, Gemma terms of use (+license:gemma+ tag)
+|Card modified 2025-05-21
+|Capable and listed, but under Google's custom terms with use restrictions that the project's own license allowlist and #100 gate have not reviewed.
+|Reject by default pending a licence review
+
+|*ggml-org/moondream2-20250414-GGUF*, Apache-2.0 (m87-labs/moondream repository: Apache-2.0, 10,155 stars, pushed 2026-04-20)
+|Card shows GGUF total 2.84 GB
+|Captioning-oriented; English-centric (unverified). Newer moondream releases carry different terms that were not read.
+|Reference only
+
+|*moeru-ai/airi*, MIT
+|51,243 stars; pushed 2026-11-10
+|README lists game co-play efforts (Minecraft bot, Factorio and Dome Keeper in separate repositories, Helldivers 2 WIP) and a +services/computer-use-mcp+ directory. It states no capture cadence, model or privacy policy; code was not read for this ADR.
+|Reference only
+
+|*Open-LLM-VTuber*, README states MIT (GitHub shows no detected licence)
+|14,663 stars; pushed 2026-05-15
+|README lists camera, screen recording and screenshots as perception features; it does not say whether capture is continuous, how images reach the model, or whether it can stay local. Code not read.
+|Reference only
+
+|*tegnike/aituber-kit*, licence per the competitive-landscape entry
+|see link:../competitive-landscape.adoc[competitive landscape]
+|Game-commentary mode from periodic screen capture (README 69 and 91 per the landscape document); the periodic-capture shape matches D-6, and the lack of a bounded, typed observation boundary is the gap this ADR addresses. Code not read.
+|Reference only
+
+|*Neuro-sama / VedalAI neuro-sdk*
+|MIT, 893 stars (landscape)
+|The SDK is an action-registration protocol (#221), not vision. No public description of Neuro's vision cadence or prompting was found or read.
+|Not applicable to this ADR
+|===
+
+Competitor cadence, prompting and privacy practice could not be established from READMEs; the cadence, prompt and privacy choices above are therefore this repository's own, justified by the bounds and threat model, not copied.
+
+== Evidence
+
+* Authoritative/spec: obs-websocket protocol (+GetSourceScreenshot+ fields and "scale to inner" semantics); llama.cpp +docs/multimodal.md+ (supported models, +--mmproj+, projector offload).
+* Repository executable evidence: the speech observation types and ingress (#92) demonstrate every structural device reused here; the OBS adapter's +request+ returns response bodies; the Thinking context carries trust and privacy per item.
+* Not evidence: no capture, no vision model and no screenshot from this repository was run for this ADR. Model licence and size facts come from Hugging Face cards, whose mirrors can disagree with upstream (the Qwen2.5-VL-3B case).
+
+== Consequences
+
+=== Positive
+
+* A bounded, replayable observation type exists before any vision integration, as #90 requires.
+* The structural defences (closed vocabularies, byte cap, untrusted slot, no authority path) hold even if the VLM follows an injected instruction.
+* No new dependency in S1: llama.cpp is already the host, the OBS adapter is extended.
+* Failure is a missing optional input, not a degraded performer.
+
+=== Costs / trade-offs
+
+* A second model process and its VRAM; contention with Thinking on a single 8 GB GPU is the central risk.
+* The operator must set up an OBS "perception" source (crop, exclude overlays); this trades convenience for privacy.
+* Closed label vocabularies limit what vision can express; richer meaning has to go through the short caption.
+
+=== Known limitations
+
+* Japanese-language on-screen text and Japanese captions are unverified for every candidate model.
+* No evidence yet that vision beats #88 structured context for reply quality (A-PERCEPT-004).
+* Cropping happens in OBS only; no in-process region of interest.
+* No webcam, co-host or audience media; turn cues and speech tone are reserved kinds only.
+
+== Staging and rollback
+
+. *S0 (this PR)*: ADR only.
+. *S1a, contract and ingress, no live model*: +schemas/perception-observation.schema.json+ with positive and negative fixtures (including the injection and secret cases below), Rust domain types and validation, Rust/TypeScript parity, a runtime ingress modeled on +speech_observation.rs+, a retention row, replay of recorded observations into a stub consumer. Revertible; no runtime behavior change while disabled.
+. *S1b, live path behind a default-off flag* (the recommended first vertical slice, below).
+. *S2*: #88 consumption at rank 4; Thinking caption item (+ThinkingContextSource+ addition).
+. *S3*: reserved turn-cue kinds for #92, after A-PERCEPT-001 evidence; webcam is a separate opt-in ADR amendment.
+
+Rollback: every step is behind the operator opt-in and a build/config flag; removing the sidecar returns the system to the status quo. Rollback becomes expensive only once the Thinking context variant and the #88 rank-4 consumer are released.
+
+== Recommended first slice S1 (operator-opt-in OBS screenshot, local VLM, bounded observation, low cadence)
+
+*Deliverable.* With perception enabled for one OBS source alias by the operator: every 10 s the capture step asks OBS for a 768 px JPEG of that source, the sidecar (a second loopback +llama-server+ with a small VLM and a +json_schema+) returns +{ scene_class, labels, caption }+, the adapter wraps it as a +PerceptionObservation+ batch, the runtime ingress validates, assigns untrusted content-plane provenance and stores it; the Thinking context builder may include the latest unexpired caption as one untrusted, aged, delimited item. Default off; disabling is immediate.
+
+*Out of S1.* Webcam/faces, turn cues, OS capture, in-process ROI, remote vision, durable recording, reply-triggered capture, #88 consumption (S2).
+
+*Acceptance (security tests, all deterministic, no model needed for them).*
+
+* a caption or label containing +obs.control+, +tool.grant+, +memory.admin+, +performer.stop+, +performer.mute+, role markers, "ignore previous instructions", a nested fake observation or operator-command JSON causes no state change anywhere except a bounded, delimited Thinking item, and the existing output gate still replaces or suppresses a reply that echoes control terms;
+* an observation with +trust+, +plane+, +source_class+, +priority+, +authorization+ or any unknown field is rejected;
+* oversize, over-long caption, bidi/control characters, label outside the vocabulary, missing +expires_at_ms+, validity above the cap, stale, future-dated, out-of-order and replayed expired observations are each rejected by their own counted reason;
+* secret-shaped strings in a caption are redacted and counted, and an unredactable one drops the observation;
+* flood of observations and of source aliases stays within the retention bound; a stalled sidecar produces +unavailable+ and no growth;
+* with perception disabled or the sidecar killed, the scheduler, operator stop and reflex path behave exactly as in the baseline (soak and the existing failure-injection harness);
+* a counter proves zero frames written to disk, to logs or to a bundle.
+
+*Cheapest falsifier (run before S1b; no aivtuber code, scratch directory only, synthetic or maintainer-owned frames, nothing committed).* Experiment EXP-0004 (to be written) with three parts:
+
+. *F1, model fit.* On the measured local-profile host, run a second +llama-server+ on the pinned +b12224+ with Qwen3-VL-4B-Instruct and SmolVLM-500M GGUF plus mmproj, next to the resident Qwen3-4B. Send about 30 saved frames of a game (menu, loading, cutscene, gameplay, result) at 768 px. Measure load success, VRAM, end-to-end latency p50/p95, JSON-validity rate under +json_schema+, scene-class agreement with hand labels, and Thinking first-token p95 with and without the vision job running. Proposed kill criteria (unvalidated): the model does not load on +b12224+; it cannot co-reside in VRAM; p95 above 3 s; Thinking first-token p95 regresses by more than 10%; JSON validity below 99% with the grammar; scene-class agreement not clearly above a majority-class baseline. Any kill: perception stays structured-telemetry-only for this hardware class, and the ADR moves to Rejected or Deferred.
+. *F2, OBS cost.* Poll +GetSourceScreenshot+ every 10 s and every 2 s for ten minutes with a live game capture and a recording or stream running; compare OBS dropped, skipped and lagged frame counters with polling off. Kill: any statistically visible increase at 10 s.
+. *F3, injection smoke.* Frames containing on-screen text such as a fake system message, an operator command and a control term; confirm the closed vocabulary and byte cap contain the output and that nothing but a bounded caption reaches the Thinking context. Not a security proof; it checks that the structural bounds do what D-2 says.
+
+Only if F1 to F3 survive does S1b start, and A-PERCEPT-004 (uplift over structured context) is then tested with replayed recorded observations in the #59 harness before S2.
+
+== Relation to #88 and #221
+
+* #88 owns the scene/game vocabulary, the snapshot, and rank 1 to 3 sources. Perception is rank 4 and is a producer of optional inputs to that snapshot; the snapshot never requires it. Observation expiry, age and confidence travel into the snapshot so consumers can discount it. Perception labels must be a subset of the #88 vocabulary.
+* #221 owns "which actions are valid now". Window transitions come from structured telemetry (#88 says so explicitly). Perception cannot open, supersede or satisfy a window, and is not proof that an action's outcome happened.
+* #92 consumes reserved turn-cue kinds later as optional evidence; #81 consumes them only through #92.
+
+== Open decisions
+
+Each needs a supervisor answer before S1a; the recommendation is the default if none is given.
+
+[cols="1,4,4"]
+|===
+|# |Question |Recommendation
+
+|Q1
+|Is an observation an +EventEnvelope+ event with a new +SourceClass::Perception+, or a separate observation batch like speech (no source class; ingress assigns plane and trust)?
+|Separate batch, as for #92. Observations are not events, an +EventEnvelope+ change widens the central schema for every consumer, and the speech precedent already proves the pattern.
+
+|Q2
+|Trust level for perception output.
+|Everything untrusted, content plane. Closed-vocabulary labels may be used for routing hints but never raise trust. No +semi_trusted+ tier in S1.
+
+|Q3
+|Where does the VLM run: a separate sidecar, or the Thinking server swapped to a multimodal model?
+|Separate loopback sidecar. Isolation of failure and latency from Thinking; revisit a single multimodal Thinking model only if VRAM forces it and F1 shows no Thinking regression.
+
+|Q4
+|Which models enter the F1 benchmark?
+|Qwen3-VL-4B-Instruct (primary) and SmolVLM-500M (floor). Exclude Gemma 3 pending licence review and every +qwen-research+ checkpoint.
+
+|Q5
+|Capture path.
+|OBS +GetSourceScreenshot+ of an operator-chosen source only. No OS desktop capture in S1; xcap deferred to a demonstrated non-OBS need.
+
+|Q6
+|Region of interest in S1.
+|OBS-native crop via a dedicated source built by the operator; in-process ROI (needs image decode and a dependency review) deferred.
+
+|Q7
+|May the free-text caption reach Thinking?
+|Yes, one item at most 512 bytes in an untrusted, aged, delimited slot (S2); never to memory, TTS or Reflex. Labels only if the Thinking variant is judged too risky.
+
+|Q8
+|Recording derived observations for replay in production.
+|Off by default; an explicit operator option with visible status and the same retention rules. Maintainer-authored synthetic fixtures for all tests.
+
+|Q9
+|Cadence and trigger.
+|Timer-driven, 10 s default, 5 s floor, one in flight, drop on overload, 10% compute duty, yield to Thinking. No reply-triggered capture until a measured need.
+
+|Q10
+|Order against turn-taking cues. #90 itself says narrow turn cues should come before general scene understanding when the need is conversational timing.
+|Keep the contract generic (kind-tagged) so both fit, but start with screen vision: the product gap (game commentary, gap 8) is about topicality, webcam/face media carries the heaviest privacy cost, and A-PERCEPT-001 is unvalidated. Turn cues follow as S3 once #92 audio-only baselines exist. Reverse the order if the supervisor judges co-host timing the more urgent product need.
+
+|Q11
+|Initial label and scene-class vocabulary.
+|Provisional list in D-2 inside the S1a schema; #88 owns the final one. Do not block S1a on it.
+
+|Q12
+|Maximum observation validity.
+|30 s for screen kinds, 2 s for turn cues; shorter if F1 shows the scene changes faster than that in the target games.
+|===
+
+== Revisit conditions
+
+* F1, F2 or F3 fails, or A-PERCEPT-004 shows no uplift: demote perception to a documented spike.
+* The pinned llama.cpp build gains or loses vision model support, or a model's licence changes.
+* A game with a structured telemetry/plugin makes vision redundant for its fields (use rank 1).
+* A privacy incident or a secret appearing in a retained or logged observation.
+* Turn-cue evidence (A-PERCEPT-001) justifies webcam inputs; that is a separate privacy review.
+* A non-OBS user population appears (reopen the xcap/scap decision).
+
+== Related
+
+* Issue: #90. Consumers and neighbours: #88, #221, #92 (ADR-0005 for #81), #93, #51, #58, #59, #61, #65, #66, #67, #69, #100.
+* PR: none yet; this ADR is the design deliverable.
+* Assumptions: A-PERCEPT-001 (existing); A-PERCEPT-002 to 004 proposed above; A-LLM-001/002, A-OBS-001.
+* Other ADRs: link:0005-conversational-floor-policy.adoc[ADR-0005], link:0006-performance-intent.adoc[ADR-0006] (text is never parsed for control), link:0003-local-vrm-renderer.adoc[ADR-0003].
+* Experiment to write before S1b: EXP-0004 (perception model fit, OBS capture cost, injection smoke).
