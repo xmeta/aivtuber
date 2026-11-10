@@ -24,12 +24,13 @@ use std::error::Error;
 use std::fmt;
 mod phrase;
 mod phrase_pipeline;
+mod phrase_stream;
 mod speech_lexicon;
 mod speech_text;
 pub use phrase::{
     Delivery, MAX_PHRASES_CEILING, PHRASE_SEGMENTATION_VERSION, PhraseConfig, PhraseDelivery,
     PhraseEnd, PhraseFailure, PhraseOptions, PhraseState, PhraseStep, PhraseSummary,
-    PhraseTransitionError, PhraseUnit, SegmentationConfig, SlotWait, segment_reply,
+    PhraseTransitionError, PhraseUnit, SegmentationConfig, SlotWait, StreamPolicy, segment_reply,
 };
 pub use phrase_pipeline::wait_for_started;
 pub use speech_lexicon::{

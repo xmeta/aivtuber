@@ -3641,6 +3641,7 @@ mod tests {
 
     mod local_thinking_fallback_tests;
     mod phrase_commit_tests;
+    mod streaming_thinking_tests;
     mod voicevox_tts_tests;
     use aivtuber_scheduler::SchedulerConfig;
     use aivtuber_telemetry::SecretRedactor;
