@@ -146,6 +146,12 @@ Record the result as one of:
 |Use a separate bounded realtime media/data plane for PCM/video rather than the control queue. Prefer same-machine local speech first; Pipecat is reference/optional orchestration and LiveKit is only for cases that need WebRTC/SFU transport. Hosted media is never required. Normalize observations into aivtuber-owned floor/commit policy; external frameworks must not directly own scheduler cancellation or irreversible publication.
 |#90, #92, #93, #106
 
+|Screen vision / perception
+|llama.cpp +llama-server+ multimodal (second loopback instance); OBS +GetSourceScreenshot+ through the existing adapter; xcap/scap for OS capture
+|Sidecar (llama.cpp) / wrap (OBS adapter) / reference only (xcap, scap) / benchmark first (Qwen3-VL-4B, SmolVLM-500M)
+|Perception output is untrusted bounded data with required expiry; capture and inference stay outside core; model weights are not redistributed. Licence traps: Qwen2.5-VL-3B is +qwen-research+ (a mirror tags it Apache-2.0), Gemma 3 uses custom terms. Keep observation contract, trust assignment, source hierarchy, retention and replay project-owned. See link:adr/0007-perception-plane.adoc[ADR-0007].
+|#90, #88
+
 |Local speech inference
 |sherpa-onnx
 |Wrap or sidecar; conformance/benchmark first

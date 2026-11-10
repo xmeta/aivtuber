@@ -75,6 +75,12 @@ LiveKit Agents / Pipecat
 |#90, #92, #93
 |Incremental value over audio-only observations; privacy/cost; cue age and confidence thresholds
 
+|Screen vision / local VLM perception
+|llama.cpp multimodal (+libmtmd+) with Qwen3-VL / SmolVLM class models; OBS +GetSourceScreenshot+; AIRI, Open-LLM-VTuber and AITuberKit vision features (README level only)
+|Operator-opt-in single-source capture, downscaled in OBS, local VLM sidecar, bounded closed-vocabulary plus short untrusted caption observation at low cadence; structured telemetry outranks it
+|#90, #88, #221
+|Co-resident VRAM/latency on the 8 GB profile; Japanese quality; OBS render cost; injection containment; uplift over structured context. Proposed decision, reuse review and falsifier for #90: link:adr/0007-perception-plane.adoc[ADR-0007] (Proposed; nothing run or measured)
+
 |Full-duplex evaluation
 |Full-Duplex-Bench v1/v1.5/v3
 |Evaluate pause handling, backchannels, interruption, overlap, side speech, disfluency, self-correction, and v3 multi-step tool use
