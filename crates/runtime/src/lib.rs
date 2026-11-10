@@ -7,6 +7,10 @@
 
 mod cached_playback;
 pub use cached_playback::*;
+mod perception;
+pub use perception::*;
+mod perception_replay;
+pub use perception_replay::*;
 mod speech_observation;
 pub use speech_observation::*;
 mod speech_replay;
