@@ -22,6 +22,7 @@ const avatarCommandSchema = ajv.compile(loadJson("schemas/avatar-playback-comman
 const speechObservationSchema = ajv.compile(loadJson("schemas/speech-observation.schema.json"));
 const speechTranscriptSchema = ajv.compile(loadJson("schemas/speech-transcript.schema.json"));
 const speechLifecycleSchema = ajv.compile(loadJson("schemas/speech-lifecycle.schema.json"));
+const perceptionObservationSchema = ajv.compile(loadJson("schemas/perception-observation.schema.json"));
 
 const output = execFileSync(
   "cargo",
@@ -57,6 +58,12 @@ const lifecycleOutput = execFileSync(
   { cwd: root, encoding: "utf8" },
 );
 const lifecycleEmitted = JSON.parse(lifecycleOutput);
+const perceptionOutput = execFileSync(
+  "cargo",
+  ["run", "--locked", "--quiet", "-p", "aivtuber-domain", "--example", "perception_observation_parity"],
+  { cwd: root, encoding: "utf8" },
+);
+const perceptionEmitted = JSON.parse(perceptionOutput);
 
 let failures = 0;
 function check(label, validator, value) {
@@ -104,6 +111,13 @@ if (lifecycleEmitted.events.length < 25) {
   failures += 1;
   console.error("FAIL      expected at least 25 Rust SpeechLifecycleEvent samples");
 }
+for (const [index, batch] of perceptionEmitted.batches.entries()) {
+  check(`Rust PerceptionObservationBatch[${index}] -> JSON Schema`, perceptionObservationSchema, batch);
+}
+if (perceptionEmitted.batches.length < 7) {
+  failures += 1;
+  console.error("FAIL      expected at least 7 Rust PerceptionObservationBatch samples");
+}
 
 if (!avatarEmitted.commands.some((command) => command.kind === "reset")) {
   failures += 1;
@@ -119,6 +133,6 @@ if (emitted.reflex_decisions.length < 1) {
   console.error("FAIL      expected at least one Rust ReflexDecision sample");
 }
 
-const total = emitted.events.length + emitted.reflex_decisions.length + avatarEmitted.commands.length + speechEmitted.batches.length + transcriptEmitted.batches.length + lifecycleEmitted.events.length;
+const total = emitted.events.length + emitted.reflex_decisions.length + avatarEmitted.commands.length + speechEmitted.batches.length + transcriptEmitted.batches.length + lifecycleEmitted.events.length + perceptionEmitted.batches.length;
 console.log(`\n${total - failures} passed, ${failures} failed`);
 process.exit(failures > 0 ? 1 : 0);
