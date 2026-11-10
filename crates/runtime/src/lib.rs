@@ -109,6 +109,22 @@ pub enum ContentAdmitDecision {
     RejectedIngressPolicy,
 }
 
+/// Result of re-running the content gate for a deferred event just before
+/// dispatch (#75).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferredRevalidation {
+    Permitted,
+    /// The envelope no longer validates.
+    InvalidEnvelope,
+    /// Control/system plane, operator kind or an authorization claim: content
+    /// can never carry control authority, however long it waited.
+    NonContent,
+    /// The declared trust/source class exceeds the ingress ceiling.
+    IngressPolicy,
+    /// The payload exceeds the admitted payload cap.
+    PayloadBytes,
+}
+
 /// Operator-configured ceiling for the stdin content ingress (#257).
 ///
 /// A record's `source` is producer-chosen and spoofable, so the ceiling is a
@@ -730,6 +746,49 @@ impl SecurityRuntime {
         self.content_queue.push_back(event);
         self.content_queue_high_water = self.content_queue_high_water.max(self.content_queue.len());
         Ok(ContentAdmitDecision::Queued)
+    }
+
+    /// Re-run the structural content gate for an event that was admitted
+    /// earlier and held (#75). It consumes no rate token and no queue slot (it
+    /// was already charged at admission) and never admits anything new: it can
+    /// only refuse. A refusal is audited without payload content.
+    pub fn revalidate_deferred_content(&mut self, event: &EventEnvelope) -> DeferredRevalidation {
+        let refusal = if event.validate().is_err() {
+            Some((
+                DeferredRevalidation::InvalidEnvelope,
+                "deferred_revalidation_invalid",
+            ))
+        } else if event.plane != SecurityPlane::Content
+            || event.kind == EventKind::OperatorCommand
+            || event.authorization.is_some()
+        {
+            Some((
+                DeferredRevalidation::NonContent,
+                "deferred_revalidation_non_content",
+            ))
+        } else if !self.ingress_policy.admits(event) {
+            Some((
+                DeferredRevalidation::IngressPolicy,
+                "deferred_revalidation_ingress_policy",
+            ))
+        } else if serde_json::to_vec(&event.payload)
+            .map(|bytes| bytes.len() > self.config.max_payload_bytes)
+            .unwrap_or(true)
+        {
+            Some((
+                DeferredRevalidation::PayloadBytes,
+                "deferred_revalidation_payload_bytes",
+            ))
+        } else {
+            None
+        };
+        match refusal {
+            None => DeferredRevalidation::Permitted,
+            Some((verdict, decision)) => {
+                self.record_ingress(event, decision, "refused before deferred dispatch");
+                verdict
+            }
+        }
     }
 
     /// Authenticated emergency/control path. It bypasses content queues and
@@ -1673,5 +1732,46 @@ mod tests {
             .expect("operator permit");
         assert_eq!(permit.memory_ids(), &[3, 5]);
         assert_eq!(permit.authority(), MemoryEraseAuthority::Operator);
+    }
+
+    #[test]
+    fn deferred_revalidation_only_refuses_and_charges_nothing() {
+        let mut runtime = runtime_with(SecurityRuntimeConfig::default(), &[]);
+        let event = chat_event("evt-held", 1, "chat-a", "hello");
+        assert_eq!(
+            runtime.revalidate_deferred_content(&event),
+            DeferredRevalidation::Permitted
+        );
+        assert_eq!(runtime.content_len(), 0, "no queue slot is taken");
+
+        let mut control = event.clone();
+        control.plane = SecurityPlane::Control;
+        assert_ne!(
+            runtime.revalidate_deferred_content(&control),
+            DeferredRevalidation::Permitted
+        );
+        let mut claimed = event.clone();
+        claimed.kind = EventKind::OperatorCommand;
+        assert_ne!(
+            runtime.revalidate_deferred_content(&claimed),
+            DeferredRevalidation::Permitted
+        );
+
+        let tight = SecurityRuntimeConfig {
+            max_payload_bytes: 8,
+            ..SecurityRuntimeConfig::default()
+        };
+        let mut small = runtime_with(tight, &[]);
+        assert_eq!(
+            small.revalidate_deferred_content(&chat_event("evt-big", 2, "chat-a", "far too long")),
+            DeferredRevalidation::PayloadBytes
+        );
+        assert!(
+            small
+                .audit()
+                .iter()
+                .any(|record| record.decision == "deferred_revalidation_payload_bytes"),
+            "a refusal is audited"
+        );
     }
 }

@@ -7,6 +7,8 @@
 
 mod floor;
 pub use floor::*;
+mod deferred;
+pub use deferred::*;
 mod lifecycle;
 pub use lifecycle::*;
 mod replay;
