@@ -200,14 +200,7 @@ impl<'a> Sink<'a> {
             });
         }
         self.bytes += copied;
-        #[cfg(unix)]
-        if let Some(mode) = unix_mode {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&target, fs::Permissions::from_mode(mode & 0o755))
-                .map_err(io_err)?;
-        }
-        #[cfg(not(unix))]
-        let _ = unix_mode;
+        set_mode(&target, unix_mode)?;
         Ok(())
     }
 
@@ -235,6 +228,24 @@ impl<'a> Sink<'a> {
             kind: "symbolic link (not supported on this platform)".to_owned(),
         })
     }
+}
+
+/// Keeps the owner/group/other read and execute bits of a regular file (so an
+/// extracted `llama-server` stays runnable); write bits are never widened.
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: Option<u32>) -> Result<(), ExtractError> {
+    use std::os::unix::fs::PermissionsExt;
+    match mode {
+        Some(mode) => {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o755)).map_err(io_err)
+        }
+        None => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: Option<u32>) -> Result<(), ExtractError> {
+    Ok(())
 }
 
 /// Extracts `archive` (chosen by file extension) into `dest`.

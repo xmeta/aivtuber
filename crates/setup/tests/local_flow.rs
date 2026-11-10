@@ -4,7 +4,7 @@
 mod common;
 
 use aivtuber_setup::download::DownloadConfig;
-use aivtuber_setup::local::{self, LocalOptions, exe, host_platform};
+use aivtuber_setup::local::{self, LocalOptions, exe};
 use aivtuber_setup::manifest::Manifest;
 use aivtuber_setup::prereq::{Report, Vulkan};
 use common::*;
@@ -13,6 +13,16 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// The two pinned platforms; independent of the machine the test runs on.
+fn platform() -> String {
+    if cfg!(windows) {
+        "win32-x64"
+    } else {
+        "linux-x64"
+    }
+    .to_owned()
+}
 
 fn zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
     let mut cursor = std::io::Cursor::new(Vec::new());
@@ -68,7 +78,7 @@ struct Fixture {
 /// `evil_llama`: the llama archive carries a path-traversal entry.
 fn fixture(tag: &str, evil_llama: bool) -> Fixture {
     let mut b = Behavior::default();
-    let platform = host_platform().unwrap();
+    let platform = platform();
     let llama_name = if cfg!(windows) {
         "llama.zip"
     } else {
@@ -185,7 +195,7 @@ fn options(f: &Fixture) -> LocalOptions {
         offline: false,
         force: false,
         llama_port: 18080,
-        platform: host_platform().unwrap(),
+        platform: platform(),
         download: DownloadConfig {
             allow_loopback_http: true,
             connect_timeout: Duration::from_secs(2),
