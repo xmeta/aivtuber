@@ -230,3 +230,35 @@ Not adopted, recorded so they are not re-proposed without new evidence (EXP-0003
 === Verification (2026-11)
 
 `cargo deny --locked check`, `cargo deny --locked --features sherpa-tts check` and `cargo deny --locked --features sherpa-stt,sherpa-tts check` pass on this branch (advisories, bans, licenses, sources ok); `Cargo.lock` has no change. The feature builds from the verified archive on Windows x64 (release build of `local-tts-sidecar` 1 m 22 s with a warm registry). The CI job `speech-tts` runs the Linux build, lint, model-free tests and the refusal checks.
+
+== 11. Release archives (issue #294 S1)
+
+Workflow: `.github/workflows/release.yml`. Assembly: `scripts/package-release.mjs`. Smoke: `scripts/smoke-release-archive.mjs`. Static inputs: `packaging/` (`about.toml`, `about.hbs`, `RELEASE-README.txt`, `ENGINE-LIBRARIES-NOTICE.txt`). The reuse decision (plain Actions matrix; cargo-dist reference only; cargo-about adopted for notices) is recorded in `docs/reuse-first.adoc`, "Release packaging record".
+
+=== What is built and from what
+
+* *Triggers.* A tag matching `v*` (builds, smoke-tests, creates a *draft* GitHub release with the archives and `SHA256SUMS`; a person publishes it) and `workflow_dispatch` (a dry run: the same build and smoke, artifacts only, nothing released). The workflow never runs for pull requests. Only the `publish` job has `contents: write`, and it refuses a tag whose commit is not reachable from `main`.
+* *Targets.* Windows x64 (`windows-latest`) and Linux x64 (`ubuntu-22.04`, the oldest hosted image, for a low glibc floor). macOS is not built.
+* *Locked, verified inputs.* Every cargo step uses `--locked`; the renderer uses `bun install --frozen-lockfile --ignore-scripts`; `SHERPA_ONNX_ARCHIVE_DIR` is the output of `node scripts/fetch-sherpa-onnx.mjs lib` (SHA-256 verified), so the crate's unchecked download path (section 9) never runs. There is no build cache: a release is built from the tag's sources and the verified engine archive alone. `cargo deny --locked --features silero-vad,mic-capture,sherpa-stt,sherpa-tts check` runs in the job, before the build, with the scoped exceptions of section 9.
+* *Contents.* `aivtuber-app`, `aivtuberctl`, `speech-vad-sidecar`, `speech-stt-worker`, `local-tts-sidecar`, `twitch-chat-ingress`; the pinned engine libraries beside them (copied from the verified archive, only the file names pinned in `speech_stt::pins`); the renderer page at `renderer/local-avatar/dist`; the starter reaction pack and the four operator fetch/synthesis scripts at their repository paths; `README.txt`; licence files. The Cargo feature set is the one the quickstart builds (`silero-vad,mic-capture,sherpa-stt,sherpa-tts`).
+* *Never bundled:* model weights, voice files, avatar models, generated audio. `package-release.mjs` refuses a `.vrm`/`.gguf`/`.onnx`/`.bin` file in the page build, and the smoke test fails on any model-like file anywhere in the archive. This keeps the section 9 and 10 position that weights are fetched by the operator with their licence and disclosure handling intact.
+* *Checksums.* `SHA256SUMS` is computed over the final archives in the `checksums` job (after the smoke jobs pass) and published beside them. The `tar.gz` is reproducible (sorted entries, fixed owner and mtime, `gzip -n`; `SOURCE_DATE_EPOCH` or 0); the zip is not byte-reproducible (bsdtar stores file times), so the published checksum is of the released bytes.
+
+=== Licence notices in the archive
+
+* *Rust crates:* `cargo about generate --locked --workspace --features <release features> -c packaging/about.toml packaging/about.hbs`, for the two target triples, build and dev dependencies excluded. cargo-about only generates the notice file; the policy gate stays cargo-deny, and `packaging/about.toml` mirrors the `deny.toml` allow list plus the two scoped exceptions, so generation fails on a licence cargo-deny would also reject.
+* *Engine libraries:* `packaging/ENGINE-LIBRARIES-NOTICE.txt` (sherpa-onnx Apache-2.0; ONNX Runtime MIT, with the licence text). *Known gap:* the sherpa-onnx library archive carries no licence files, and ONNX Runtime embeds further permissive components whose notices are published upstream in its `ThirdPartyNotices.txt`; the notice file points there rather than copying a text that is not pinned here. Revisit if a pinned copy of those notices is added to the engine pin set.
+* *Avatar page:* `scripts/package-release.mjs` concatenates the licence files of the renderer's runtime closure (`three`, `@pixiv/three-vrm` and their dependencies, all MIT per section 8) from `node_modules` after the section 8 licence gate has run in the same job.
+* *Project licence:* the repository has no `LICENSE` file at the time of this slice. The archive includes `LICENSE` when one exists and otherwise ships none; the choice of the project's own licence is outside this slice and must be made before the first public release.
+
+=== Tooling installed by the release workflow but absent from every lock file
+
+* *cargo-deny 0.20.2* (the same pin as `ci.yml`) and *cargo-about 0.9.3* (EmbarkStudios, MIT OR Apache-2.0), installed by `taiki-e/install-action` as prebuilt, checksum-verified binaries. Build/notice tooling only; neither links into a shipped binary. *Owner:* #294. *Revisit:* when cargo-about changes the output of an accepted licence or a pin moves; keep the cargo-deny pin equal to `ci.yml`.
+* *Third-party actions* are pinned to a commit SHA in `release.yml` (the existing workflows use major-version tags; pinning them is a separate change). Only `dtolnay/rust-toolchain`, `oven-sh/setup-bun` and `taiki-e/install-action` are third-party; the release itself is created with the runner's `gh` CLI, not a release action. Bump a pin deliberately and say why.
+* The Rust and Bun pins in `release.yml` are asserted equal to `rust-toolchain.toml` and `package.json` by `scripts/validate-toolchain-pins.mjs`.
+
+=== Known limitations
+
+* *Unsigned binaries.* No Authenticode signing and no notarisation. Windows SmartScreen may warn; the published checksums are the integrity channel. Signing needs a certificate (cost, identity and key custody) and is a later decision under #294.
+* Linux archives depend on the system `libasound2` and `libssl3` and on a glibc no older than the build host's.
+* The engine libraries are loaded from the install directory and checked by SHA-256 (section 9's residual risk applies unchanged).

@@ -260,12 +260,60 @@ Record the result as one of:
 |Current exact cosine Top-K is simple and deterministic. Approximate indexing adds tuning, serialization/versioning, and replay concerns. Introduce only when #58 proves retrieval is material.
 |#58
 
+|Release archives (Windows/Linux x64)
+|+cargo-dist+, then a plain GitHub Actions matrix
+|Plain matrix chosen; +cargo-dist+ reference only; +cargo-about+ adopted for notices
+|The archive carries project-verified engine libraries, a separately built page, and one verified-archive build rule. See "Release packaging record" below.
+|#294
+
 |Rust dependency policy
 |+cargo-deny+
 |Preferred supply-chain gate
 |Use for licenses, advisories, bans/duplicates, and sources. Repository policy defines exceptions/revisit conditions.
 |#100
 |===
+
+=== Release packaging record (#294 S1)
+
+[source,text]
+----
+Problem:     Ship prebuilt Windows x64 / Linux x64 archives of the local profile (app, VAD/STT/TTS
+             sidecars, engine libraries beside the executables, renderer page build, licences,
+             SHA256SUMS) so a streamer needs no Rust/Node/Bun.
+Candidate 1: cargo-dist (axodotdev/cargo-dist, Apache-2.0; active, v0.34.0 released 2026-11-02).
+Decision:    reference only (not adopted). Evaluated from its documentation and release state; not trialled.
+Why not:     (a) Its unit is one archive per Cargo package. Ours must merge two packages
+             (aivtuber-app and aivtuber-adapters) into one archive, so every file beyond one
+             package's binaries would ride on its generic `include` of repository paths.
+             (b) The deliverable is not just binaries: the verified engine libraries (fetched by our
+             pinned script, not the crate's unchecked download), the Vite page build, notices and
+             README must be assembled between build and archive. That is exactly the part cargo-dist
+             leaves to injected "build setup" steps, which would hold the real logic anyway.
+             (c) It generates and owns the workflow file (a regeneration check, plus its own action
+             pins), which conflicts with pinning every third-party action to a commit SHA in a file
+             we review by hand. (d) The features it adds (installers, Homebrew/npm publishing, update
+             receipts) are out of S1 scope (installers are a separate decision, see #294).
+Candidate 2: plain GitHub Actions matrix: first-party artifact actions plus the preinstalled `gh` CLI.
+Decision:    adopt. `scripts/package-release.mjs` (assembly, ~250 lines, Node only) and
+             `scripts/smoke-release-archive.mjs` are project-owned; they embed our verification rules.
+             The release is created with `gh release create` rather than a third-party release
+             action, so the only third-party actions are those CI already uses
+             (dtolnay/rust-toolchain, oven-sh/setup-bun, taiki-e/install-action), plus
+             actions/{checkout,setup-node,upload-artifact,download-artifact}. All are pinned to a
+             commit SHA in release.yml.
+Candidate 3: cargo-about (EmbarkStudios, MIT OR Apache-2.0, v0.9.3 2026-10-26) vs `cargo deny` licence listing.
+Decision:    adopt cargo-about for the third-party notice file only. cargo-deny stays the policy gate
+             (it decides allowed/denied, but does not produce licence texts); cargo-about reads the same
+             Cargo.lock for the same feature set and produces the texts, with `packaging/about.toml`
+             mirroring deny.toml's allow list. Installed as a pinned prebuilt binary by
+             taiki-e/install-action; recorded in docs/supply-chain.adoc section 11.
+License:     all tools above are permissive; none links into a shipped binary.
+Determinism: the Linux tar.gz is made reproducible (sorted, fixed owner and mtime, gzip -n). The zip is
+             bsdtar's and carries file times; the SHA256SUMS describe the released bytes either way.
+Fallback:    delete release.yml; nothing else depends on it.
+Revisit:     when installers, signing/notarisation or macOS are decided (#205 or a later #294 slice),
+             re-evaluate cargo-dist or an installer builder with new evidence.
+----
 
 == 3. Areas intentionally kept project-owned
 

@@ -95,14 +95,25 @@ try {
   });
 
   check("avatar page files are present", () => {
-    const page = join(root, "avatar-page");
-    assert(existsSync(join(page, "index.html")), "avatar-page/index.html missing");
+    const page = join(root, "renderer", "local-avatar", "dist");
+    assert(existsSync(join(page, "index.html")), "renderer/local-avatar/dist/index.html missing");
     const assets = existsSync(join(page, "assets")) ? readdirSync(join(page, "assets")) : [];
-    assert(assets.some((f) => f.endsWith(".js")), "avatar-page/assets has no script bundle");
+    assert(assets.some((f) => f.endsWith(".js")), "renderer/local-avatar/dist/assets has no script bundle");
+  });
+
+  check("operator fetch scripts are present", () => {
+    for (const rel of [
+      "scripts/fetch-local-profile.mjs",
+      "scripts/fetch-sherpa-onnx.mjs",
+      "scripts/synthesize-starter-audio.mjs",
+      "renderer/local-avatar/smoke/fetch-model.mjs",
+    ]) {
+      assert(existsSync(join(root, rel)), `missing ${rel}`);
+    }
   });
 
   check("starter pack has descriptors and no audio", () => {
-    assert(readdirSync(join(root, "starter-reaction-pack", "descriptors")).length > 0, "no descriptors");
+    assert(readdirSync(join(root, "examples", "starter-reaction-pack", "descriptors")).length > 0, "no descriptors");
   });
 
   check("no model weights, voice files or avatar models are bundled", () => {

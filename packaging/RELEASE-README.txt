@@ -19,9 +19,14 @@ What is here
                           They must stay in this directory, beside the programs:
                           each sidecar verifies their SHA-256 at every start and
                           refuses to run if they are missing or changed.
-  avatar-page/            the browser page for the avatar (served by the app, or
-                          used as an OBS Browser Source). No avatar model inside.
-  starter-reaction-pack/  cached reaction descriptors (no audio; generated locally)
+  renderer/local-avatar/dist/
+                          the browser page for the avatar (served by the app, shown in a
+                          browser or an OBS Browser Source). No avatar model inside.
+  examples/starter-reaction-pack/
+                          cached reaction descriptors (no audio; generated locally)
+  scripts/, renderer/local-avatar/smoke/fetch-model.mjs
+                          the pinned, SHA-256-verifying fetch scripts for the models
+                          (they need Node 20 or newer; nothing else)
   THIRD-PARTY-*           licence texts of everything bundled
 
 Verify the download

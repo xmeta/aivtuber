@@ -62,6 +62,16 @@ export const BINARIES = [
   "twitch-chat-ingress",
 ];
 
+// Node scripts shipped for the model fetch step. Paths are repository-relative
+// and kept, because the scripts locate each other relative to the repository
+// root; the quickstart commands then run unchanged from the unpacked directory.
+const OPERATOR_SCRIPTS = [
+  "scripts/fetch-local-profile.mjs",
+  "scripts/fetch-sherpa-onnx.mjs",
+  "scripts/synthesize-starter-audio.mjs",
+  "renderer/local-avatar/smoke/fetch-model.mjs",
+];
+
 // The renderer's shipped runtime closure (docs/supply-chain.adoc section 8).
 const RENDERER_ROOT_DEPS = ["three", "@pixiv/three-vrm"];
 
@@ -176,7 +186,8 @@ function main() {
 
     // 3. Renderer page build. A VRM model is operator-supplied and never shipped.
     if (!existsSync(join(rendererDist, "index.html"))) fail(`renderer build missing: ${rendererDist}/index.html (run bun run build)`);
-    cpSync(rendererDist, join(stage, "avatar-page"), { recursive: true });
+    const pageDir = join(stage, "renderer", "local-avatar", "dist");
+    cpSync(rendererDist, pageDir, { recursive: true });
     const stray = [];
     const scan = (dir) => {
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -185,14 +196,21 @@ function main() {
         else if (/\.(vrm|gguf|onnx|bin)$/i.test(entry.name)) stray.push(p);
       }
     };
-    scan(join(stage, "avatar-page"));
+    scan(pageDir);
     if (stray.length) fail(`refusing to package model-like files in the page build: ${stray.join(", ")}`);
 
-    // 4. Starter reaction pack (descriptors only; audio is generated locally).
-    cpSync(join(repo, "examples", "starter-reaction-pack"), join(stage, "starter-reaction-pack"), {
+    // 4. Starter reaction pack (descriptors only; audio is generated locally)
+    // and the operator fetch/synthesis scripts, in the repository's layout.
+    // They need Node 20+ only; until the first-run command (#294 S2) this is
+    // how the models are fetched.
+    cpSync(join(repo, "examples", "starter-reaction-pack"), join(stage, "examples", "starter-reaction-pack"), {
       recursive: true,
       filter: (src) => !/[\\/]generated([\\/]|$)/.test(src),
     });
+    for (const script of OPERATOR_SCRIPTS) {
+      mkdirSync(dirname(join(stage, script)), { recursive: true });
+      cpSync(join(repo, script), join(stage, script));
+    }
 
     // 5. Licences and notices.
     if (existsSync(join(repo, "LICENSE"))) cpSync(join(repo, "LICENSE"), join(stage, "LICENSE"));
