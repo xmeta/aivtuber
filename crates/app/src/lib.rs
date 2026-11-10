@@ -24,6 +24,7 @@ mod shadow_orchestrator;
 mod speech_barge_in;
 mod speech_conversation;
 mod speech_floor;
+mod speech_resynthesis;
 mod speech_sidecar;
 mod support_bundle;
 mod task_plane;
@@ -92,7 +93,9 @@ use aivtuber_runtime::{
     LocalVisemeStore, OutputVerdict, PublicOutput, PublicOutputPolicy, RuntimeError,
     SecurityRuntime, SpeechObservationTracker, SpeechTranscriptTracker,
 };
-use aivtuber_scheduler::{BlendChannel, Scheduler, Status, priority_for_event};
+use aivtuber_scheduler::{
+    BlendChannel, OutputFailureKind, OutputObservation, Scheduler, Status, priority_for_event,
+};
 use aivtuber_telemetry::{
     CacheLevel, CausalTraceCollector, CausalTraceRetentionConfig, ComparisonMode,
     DegradedSubsystem, EventObservation, RouteClass, StageOutcome, StageReason, TelemetryCollector,
@@ -489,6 +492,10 @@ struct GenerationExecutor {
     counters: Arc<GenerationExecutionCounters>,
     shutting_down: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    /// Lazy re-synthesis of stale generated speech (#222 S2, ADR-0004 D-4).
+    resynthesis: speech_resynthesis::ResynthesisWorker,
+    /// The projection identity the pipeline uses now.
+    projection_key: String,
 }
 
 impl GenerationExecutor {
@@ -511,6 +518,8 @@ impl GenerationExecutor {
         let shutting_down = Arc::new(AtomicBool::new(false));
         let worker_shutdown = Arc::clone(&shutting_down);
         let pipeline = Arc::new(pipeline);
+        let projection_key = pipeline.speech_lexicon().identity().key();
+        let resynthesis = speech_resynthesis::ResynthesisWorker::spawn(Arc::clone(&pipeline));
 
         let worker = thread::Builder::new()
             .name("aivtuber-generation-worker".to_owned())
@@ -641,6 +650,8 @@ impl GenerationExecutor {
             counters,
             shutting_down,
             worker: Some(worker),
+            resynthesis,
+            projection_key,
         })
     }
 
@@ -703,6 +714,7 @@ impl GenerationExecutor {
 
     fn shutdown(&mut self) {
         self.shutting_down.store(true, Ordering::Release);
+        self.resynthesis.shutdown();
         self.work_tx.take();
     }
 
@@ -890,6 +902,11 @@ impl GenerativeRuntime {
 
     fn try_next_completion(&self) -> Option<GenerationCompletion> {
         self.executor.try_recv()
+    }
+
+    /// The projection identity generated speech is produced under now.
+    pub fn speech_projection_key(&self) -> &str {
+        &self.executor.projection_key
     }
 
     fn note_cancelled_or_stale(&self) {
@@ -1150,6 +1167,10 @@ where
     }
 
     pub fn with_generation(mut self, generative: GenerativeRuntime) -> Self {
+        // D-4: assets recorded under another projection are stale-but-playable.
+        self.performer
+            .speech_freshness_mut()
+            .set_current(Some(generative.speech_projection_key().to_owned()));
         self.generative = Some(generative);
         self.comparison_mode = ComparisonMode::FullGenerative;
         self
@@ -1839,6 +1860,8 @@ where
                 .generative
                 .as_ref()
                 .map(GenerativeRuntime::execution_snapshot),
+            speech_lifecycle: self.performer.scheduler().speech_lifecycle().metrics(),
+            speech_freshness: self.performer.speech_freshness().metrics(),
         }
     }
 
@@ -3084,10 +3107,106 @@ where
         if let Some(governor) = self.budget.as_mut() {
             governor.tick(now_ms);
         }
+        // A command that is already too late to be dispatched is a speech unit
+        // whose audio never reaches the speaker: record that before the
+        // timeline advance can report it finished (ADR-0004 truth rules).
+        self.account_undeliverable_audio(now_ms);
         self.performer.scheduler_mut().advance_to(now_ms);
         self.update_phrase_progress();
         self.dispatch_audio(now_ms);
         self.dispatch_avatar(now_ms);
+        self.drive_resynthesis();
+    }
+
+    /// Report, to the speech lifecycle, the pending audio commands that
+    /// `dispatch_audio` is about to drop as late or muted.
+    fn account_undeliverable_audio(&mut self, now_ms: u64) {
+        let muted = self.security.is_muted();
+        for command in &self.pending_audio.commands {
+            if command.at_ms > now_ms {
+                continue;
+            }
+            let kind = if now_ms.saturating_sub(command.at_ms) > self.max_dispatch_lateness_ms {
+                Some(OutputFailureKind::StaleOrLate)
+            } else if muted {
+                Some(OutputFailureKind::Muted)
+            } else {
+                None
+            };
+            if let Some(kind) = kind {
+                self.performer.scheduler_mut().report_speech_output(
+                    command.generation,
+                    OutputObservation::Failed(kind),
+                    now_ms,
+                );
+            }
+        }
+    }
+
+    /// Apply a finished re-synthesis and start the next queued one, if any
+    /// (ADR-0004 D-4). One job at a time, off the composition thread; every
+    /// failure only marks the request failed, so a stale asset stays playable.
+    fn drive_resynthesis(&mut self) {
+        let Some(generative) = self.generative.as_mut() else {
+            return;
+        };
+        if let Some(done) = generative.executor.resynthesis.poll() {
+            let applied = match done.result {
+                Ok(asset) => self
+                    .performer
+                    .assets_mut()
+                    .replace_generated_asset(asset)
+                    .is_ok(),
+                Err(_) => false,
+            };
+            let freshness = self.performer.speech_freshness_mut();
+            if applied {
+                freshness.complete(&done.asset_id);
+            } else {
+                freshness.fail(&done.asset_id);
+            }
+        }
+        if generative.executor.resynthesis.is_busy() || generative.is_shutting_down() {
+            return;
+        }
+        let Some(asset_id) = self.performer.speech_freshness_mut().next_request() else {
+            return;
+        };
+        let asset = self.performer.assets_mut().resolve(&asset_id).ok();
+        let submitted = asset.is_some_and(|asset| {
+            generative
+                .executor
+                .resynthesis
+                .submit((*asset).clone(), self.security.public_output_policy())
+        });
+        if !submitted {
+            self.performer.speech_freshness_mut().fail(&asset_id);
+        }
+    }
+
+    /// Operator action (ADR-0004 D-4): force every generated asset whose
+    /// display text contains the lexicon `surface` to be re-synthesized before
+    /// it is played again. Composition-root and startup configuration only; no
+    /// event, chat or model path reaches it.
+    pub fn invalidate_speech_surface(
+        &mut self,
+        surface: &str,
+    ) -> aivtuber_runtime::SurfaceInvalidation {
+        self.performer.invalidate_speech_surface(surface)
+    }
+
+    /// Remove and return up to `max` queued speech lifecycle events in `seq`
+    /// order (ADR-0004 D5). A consumer that sees a `seq` gap re-synchronizes
+    /// from [`Self::speech_lifecycle_snapshot`].
+    pub fn drain_speech_lifecycle(
+        &mut self,
+        max: usize,
+    ) -> Vec<aivtuber_domain::SpeechLifecycleEvent> {
+        self.performer.scheduler_mut().drain_speech_lifecycle(max)
+    }
+
+    pub fn speech_lifecycle_snapshot(&self) -> aivtuber_scheduler::SpeechLifecycleSnapshot {
+        self.performer.scheduler().speech_lifecycle().snapshot()
     }
 
     fn dispatch_audio(&mut self, now_ms: u64) {
@@ -3114,9 +3233,21 @@ where
             }
 
             match self.audio.execute(&command) {
-                Ok(()) => self.health.audio_error = None,
+                Ok(()) => {
+                    self.health.audio_error = None;
+                    self.performer.scheduler_mut().report_speech_output(
+                        command.generation,
+                        OutputObservation::Accepted,
+                        now_ms,
+                    );
+                }
                 Err(error) => {
                     self.health.audio_error = Some(error.to_string());
+                    self.performer.scheduler_mut().report_speech_output(
+                        command.generation,
+                        OutputObservation::Failed(OutputFailureKind::AdapterError),
+                        now_ms,
+                    );
                     self.mark_degraded(&command.event_id, DegradedSubsystem::Audio);
                 }
             }
@@ -3354,7 +3485,9 @@ where
         // a shadow worker running cannot satisfy "no shadow work running after
         // shutdown", so this blocks until the pool has actually stopped.
         self.router.shutdown_shadow();
-        self.performer.scheduler_mut().stop_all(at_ms);
+        self.performer
+            .scheduler_mut()
+            .stop_all_for(at_ms, aivtuber_domain::SpeechCancelReason::Shutdown);
         self.purge_cancelled_pending();
         self.tick(at_ms);
     }
@@ -3641,6 +3774,7 @@ mod tests {
 
     mod local_thinking_fallback_tests;
     mod phrase_commit_tests;
+    mod speech_lifecycle_tests;
     mod streaming_thinking_tests;
     mod voicevox_tts_tests;
     use aivtuber_scheduler::SchedulerConfig;

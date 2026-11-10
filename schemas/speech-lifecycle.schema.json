@@ -1,0 +1,183 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xmeta/aivtuber/schemas/speech-lifecycle.schema.json",
+  "title": "AI VTuber Speech Lifecycle Event",
+  "description": "Provider-neutral speech lifecycle record (issue #222 S2, ADR-0004 D5): what the scheduler/audio execution path knows about one spoken unit (a reply, or one phrase of a phrased reply). Serialized form of aivtuber_domain::SpeechLifecycleEvent. Audit and replay data only: it carries no authority, source class, trust or capability, and no free text (digests and identities only). The scheduler owns the truth: a TTS provider reporting synthesis done is `prepared`, never `finished`. `basis` says how a fact was observed; a consumer must not treat `logical_timeline` as audible (ADR-0004 D-6). Times are integer milliseconds on the scheduler's logical timeline, never wall-clock; ordering is by `seq`.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "seq", "at_ms", "basis", "speech", "phase"],
+  "properties": {
+    "schema_version": {
+      "const": "0.1.0",
+      "description": "Contract version. An incompatible version is refused rather than reinterpreted."
+    },
+    "seq": {
+      "$ref": "#/$defs/safe_int",
+      "description": "Per-process monotonic sequence assigned by the log. A gap tells a slow consumer that events were dropped."
+    },
+    "at_ms": {
+      "$ref": "#/$defs/safe_int",
+      "description": "Scheduler logical time of the fact. Not wall-clock; not globally monotonic across units."
+    },
+    "basis": {
+      "enum": ["logical_timeline", "output_accepted", "output_drained"],
+      "description": "How the fact was observed. Only finished and cancelled may carry an output-observed basis."
+    },
+    "speech": {"$ref": "#/$defs/speech_ref"},
+    "phase": {
+      "oneOf": [
+        {"$ref": "#/$defs/phase_unit"},
+        {"$ref": "#/$defs/phase_boundary"},
+        {"$ref": "#/$defs/phase_cancelled"}
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "description": "A unit that has not been committed has no scheduler generation yet.",
+      "if": {
+        "required": ["phase"],
+        "properties": {"phase": {"type": "object", "required": ["kind"], "properties": {"kind": {"const": "prepared"}}}}
+      },
+      "then": {"properties": {"speech": {"type": "object", "not": {"required": ["generation"]}}}}
+    },
+    {
+      "description": "Committed, started, boundary and finished events always carry the generation.",
+      "if": {
+        "required": ["phase"],
+        "properties": {"phase": {"type": "object", "required": ["kind"], "properties": {"kind": {"enum": ["committed", "started", "boundary", "finished"]}}}}
+      },
+      "then": {"properties": {"speech": {"type": "object", "required": ["generation"]}}}
+    },
+    {
+      "description": "A cancellation before commit has no generation; one after commit has it.",
+      "if": {
+        "required": ["phase"],
+        "properties": {"phase": {"type": "object", "required": ["kind", "reached"], "properties": {"kind": {"const": "cancelled"}, "reached": {"const": "before_commit"}}}}
+      },
+      "then": {"properties": {"speech": {"type": "object", "not": {"required": ["generation"]}}}}
+    },
+    {
+      "if": {
+        "required": ["phase"],
+        "properties": {"phase": {"type": "object", "required": ["kind", "reached"], "properties": {"kind": {"const": "cancelled"}, "reached": {"enum": ["committed", "started"]}}}}
+      },
+      "then": {"properties": {"speech": {"type": "object", "required": ["generation"]}}}
+    },
+    {
+      "description": "Only finished and cancelled may carry an output-observed basis.",
+      "if": {
+        "required": ["phase"],
+        "properties": {"phase": {"type": "object", "required": ["kind"], "properties": {"kind": {"enum": ["prepared", "committed", "started", "boundary"]}}}}
+      },
+      "then": {"properties": {"basis": {"const": "logical_timeline"}}}
+    }
+  ],
+  "$defs": {
+    "safe_int": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "label": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$",
+      "description": "An identity or audit label: no control characters."
+    },
+    "speech_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event_id", "phrase", "final_phrase", "asset_id"],
+      "properties": {
+        "event_id": {
+          "$ref": "#/$defs/label",
+          "description": "The scheduler item's event id (phrases after the first derive {root}#p{seq}); clipped by the producer. generation and seq identify the unit exactly."
+        },
+        "generation": {
+          "$ref": "#/$defs/safe_int",
+          "description": "The scheduler attempt id. Present exactly once the unit has been committed. Not the generative pipeline's generation attempt (ADR-0004 D-7)."
+        },
+        "phrase": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4095,
+          "description": "Zero-based phrase position; a reply that is not phrased is phrase 0."
+        },
+        "final_phrase": {
+          "type": "boolean",
+          "description": "Whether this is the last phrase of the planned reply."
+        },
+        "asset_id": {"$ref": "#/$defs/label"},
+        "speech_text_digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "SHA-256 of the text sent to TTS (speech_text when it differs from the display text, else the display text). Never the text itself (retention rule in docs/domain-contract.adoc)."
+        },
+        "projection": {
+          "$ref": "#/$defs/label",
+          "description": "The projection identity recorded in the asset (compatibility.speech_projection), when it carries one."
+        }
+      }
+    },
+    "phase_unit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": {"enum": ["prepared", "committed", "started", "finished"]}
+      }
+    },
+    "phase_boundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "offset_ms"],
+      "properties": {
+        "kind": {"const": "boundary"},
+        "offset_ms": {
+          "$ref": "#/$defs/safe_int",
+          "description": "Declared safe-interrupt point, in milliseconds from the unit's start."
+        }
+      }
+    },
+    "phase_cancelled": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "reason", "reached"],
+      "properties": {
+        "kind": {"const": "cancelled"},
+        "reason": {
+          "enum": [
+            "operator_stop",
+            "muted",
+            "preempted",
+            "superseded",
+            "barge_in",
+            "scheduler_rejected",
+            "stale_or_late",
+            "generation_cancelled",
+            "output_failure",
+            "shutdown",
+            "gate_rejected"
+          ]
+        },
+        "reached": {
+          "enum": ["before_commit", "committed", "started"],
+          "description": "How far the unit had got; computed by the log, never supplied by a reporter."
+        },
+        "spoken_ms": {
+          "$ref": "#/$defs/safe_int",
+          "description": "Present exactly when reached is started: logical milliseconds between the start and the cancellation."
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"reached": {"const": "started"}}},
+          "then": {"required": ["spoken_ms"]},
+          "else": {"not": {"required": ["spoken_ms"]}}
+        }
+      ]
+    }
+  }
+}
