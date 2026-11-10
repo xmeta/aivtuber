@@ -1,0 +1,208 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xmeta/aivtuber/schemas/perception-observation.schema.json",
+  "title": "AI VTuber Perception Observation Batch",
+  "description": "Provider-neutral, bounded perception observations (issue #90, ADR-0007, slice S1a): a closed scene class with closed-vocabulary labels, or one short caption, derived from one operator-chosen screen source. Serialized form of aivtuber_domain::PerceptionObservationBatch. Observation data only: it carries no authority, no priority and no trust claim (the receiving ingress assigns plane and trust: perception is always untrusted content-plane input, and it has no source class because it is not an event envelope event, ADR-0007 D-Q1). There is no image, pixel, hash, embedding, bounding box, OCR transcript or free-form map in this contract. Times are integer milliseconds on the monotonic or logical timeline of the receiving runtime, already mapped there by the adapter; never wall-clock time. expires_at_ms is required. The cross-field rules (captured_at_ms <= observed_at_ms, expires_at_ms after observed_at_ms and within 30000 ms, unique observation_id per batch, caption at most 240 UTF-8 bytes) are not expressible in JSON Schema; the Rust validator and scripts/validate.mjs enforce them. NFKC normalization of the caption is the producer's duty; the pattern and the Rust validator reject the characters NFKC would rewrite in the ranges that matter for Japanese and ASCII input (full-width and half-width forms, the ideographic space).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "provider_id", "provider_version", "observations"],
+  "properties": {
+    "schema_version": {
+      "const": "0.1.0",
+      "description": "Contract version. An incompatible version is refused rather than reinterpreted."
+    },
+    "provider_id": {
+      "$ref": "#/$defs/provider_token",
+      "description": "Adapter or sidecar that produced the observations. Audit data, never read for a decision."
+    },
+    "provider_version": {
+      "$ref": "#/$defs/version_token",
+      "description": "Provider build identity. Audit data."
+    },
+    "observations": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": {"$ref": "#/$defs/observation"},
+      "description": "Observations in producer order. Bounded. Per-source ordering is by capture_seq and observed_at_ms, never by arrival."
+    }
+  },
+  "$defs": {
+    "provider_token": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9][a-z0-9._-]*$"
+    },
+    "version_token": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]*$"
+    },
+    "model_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:+/-]*$"
+    },
+    "label": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "time_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "unit_interval": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alias"],
+      "properties": {
+        "alias": {
+          "$ref": "#/$defs/label",
+          "description": "Operator-configured label for the captured OBS source. Never a window title, process name or file path: the operator maps the alias to the real source."
+        }
+      }
+    },
+    "frame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capture_seq", "captured_at_ms", "width", "height"],
+      "description": "Identity of the frame the observation was derived from. No pixels, hash or thumbnail.",
+      "properties": {
+        "capture_seq": {
+          "$ref": "#/$defs/time_ms",
+          "description": "Monotonic per source and producer run."
+        },
+        "captured_at_ms": {"$ref": "#/$defs/time_ms"},
+        "width": {"type": "integer", "minimum": 1, "maximum": 4096, "description": "Downscaled size."},
+        "height": {"type": "integer", "minimum": 1, "maximum": 4096, "description": "Downscaled size."}
+      }
+    },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model_id", "config_digest", "prompt_version"],
+      "description": "Identity of the non-deterministic producer, so replay and A/B comparison can tell runs apart. The provider identity itself is the batch envelope's.",
+      "properties": {
+        "model_id": {"$ref": "#/$defs/model_id"},
+        "config_digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Lower-case hex SHA-256 over the projector, quantization, sampling and image-size configuration."
+        },
+        "prompt_version": {"$ref": "#/$defs/version_token"}
+      }
+    },
+    "redaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policy_version", "secret_hits", "truncated"],
+      "description": "Counters only: says that producer-side redaction ran and what it did, without keeping the removed text.",
+      "properties": {
+        "policy_version": {"$ref": "#/$defs/version_token"},
+        "secret_hits": {"type": "integer", "minimum": 0, "maximum": 1000},
+        "truncated": {"type": "boolean"}
+      }
+    },
+    "scene_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scene_class", "labels"],
+      "properties": {
+        "scene_class": {
+          "enum": ["gameplay", "menu", "loading", "cutscene", "result", "desktop", "unknown"],
+          "description": "Provisional closed vocabulary (ADR-0007 D-Q11); the scene context (#88) owns the final one and perception will use its subset. unknown means the producer could not tell and never overrides another source."
+        },
+        "labels": {
+          "type": "array",
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32,
+            "pattern": "^[a-z][a-z0-9_]*$"
+          },
+          "description": "Closed-vocabulary tokens. The ingress drops, and counts, any token outside the operator profile's label vocabulary (at most 64 entries); the wire form only bounds the shape."
+        }
+      }
+    },
+    "caption_payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["caption"],
+      "properties": {
+        "caption": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240,
+          "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f\\u061c\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u2069\\u3000\\ufeff\\uff00-\\uffff]+$",
+          "description": "The only free text. At most 240 UTF-8 bytes (checked by the Rust validator and scripts/validate.mjs; maxLength counts characters), no control, bidi, zero-width, line-separator or NFKC-unstable compatibility characters. Always untrusted text about a screen, rendered only inside a delimited untrusted slot, never an instruction, never parsed for control or performance information."
+        }
+      }
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind", "observation_id", "source", "frame", "observed_at_ms", "expires_at_ms",
+        "producer", "privacy", "redaction", "payload"
+      ],
+      "properties": {
+        "kind": {
+          "enum": ["screen_scene", "screen_caption"],
+          "description": "Closed tagged kind. Turn-cue kinds are reserved for a later slice (ADR-0007) and are not part of this version."
+        },
+        "observation_id": {
+          "$ref": "#/$defs/label",
+          "description": "Unique per batch and per producer session. For replay and metrics correlation."
+        },
+        "source": {"$ref": "#/$defs/source"},
+        "frame": {"$ref": "#/$defs/frame"},
+        "observed_at_ms": {"$ref": "#/$defs/time_ms"},
+        "expires_at_ms": {
+          "$ref": "#/$defs/time_ms",
+          "description": "Required absolute expiry on the same timeline; after observed_at_ms and at most 30000 ms later. A stale description of a game that has moved on is worse than none."
+        },
+        "confidence": {
+          "$ref": "#/$defs/unit_interval",
+          "description": "Optional. A vision model's self-reported confidence is not a probability unless calibrated is true."
+        },
+        "calibrated": {
+          "type": "boolean",
+          "default": false
+        },
+        "producer": {"$ref": "#/$defs/producer"},
+        "privacy": {
+          "enum": ["public", "pseudonymous", "private"],
+          "description": "Declared by the producer. The ingress may only raise it to the operator source profile's floor, never lower it."
+        },
+        "redaction": {"$ref": "#/$defs/redaction"},
+        "payload": {
+          "description": "Shape fixed by kind.",
+          "oneOf": [
+            {"$ref": "#/$defs/scene_payload"},
+            {"$ref": "#/$defs/caption_payload"}
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"kind": {"const": "screen_scene"}}, "required": ["kind"]},
+          "then": {"properties": {"payload": {"$ref": "#/$defs/scene_payload"}}},
+          "else": {"properties": {"payload": {"$ref": "#/$defs/caption_payload"}}}
+        }
+      ]
+    }
+  }
+}

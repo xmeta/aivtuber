@@ -10,6 +10,7 @@ mod error;
 mod event;
 mod floor;
 mod interfaces;
+mod perception;
 mod reflex;
 pub mod scenario;
 mod sidecar;
@@ -48,6 +49,7 @@ pub use interfaces::{
     ToolResultClass, ToolVerificationOutcome, ToolVerificationRule, TtsBackendIdentity, TtsEngine,
     authorize_avatar_action, authorize_stream_action, authorize_tool_action, verify_tool_result,
 };
+pub use perception::*;
 pub use reflex::{
     AttentionTarget, BackendIdentity, FallbackReason, REFLEX_SCHEMA_VERSION, ReflexDecision,
     ResponseRoute, RouteDecision,

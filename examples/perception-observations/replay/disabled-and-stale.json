@@ -1,0 +1,195 @@
+{
+  "schema_version": "0.1.0",
+  "name": "disabled, expired, stale and out-of-order observations are rejected by their own reason",
+  "config": {
+    "allowlist": {
+      "game-main": "private",
+      "game-aux": "public"
+    }
+  },
+  "steps": [
+    {
+      "now_ms": 0,
+      "enable": "game-main"
+    },
+    {
+      "now_ms": 10000,
+      "deliver": {
+        "schema_version": "0.1.0",
+        "provider_id": "vision-sidecar",
+        "provider_version": "0.1.0",
+        "observations": [
+          {
+            "kind": "screen_caption",
+            "observation_id": "obs-first",
+            "source": {
+              "alias": "game-main"
+            },
+            "frame": {
+              "capture_seq": 5,
+              "captured_at_ms": 9900,
+              "width": 768,
+              "height": 432
+            },
+            "observed_at_ms": 10000,
+            "expires_at_ms": 30000,
+            "producer": {
+              "model_id": "qwen3-vl:4b-instruct-q4_k_m",
+              "config_digest": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+              "prompt_version": "describe-v1"
+            },
+            "privacy": "private",
+            "redaction": {
+              "policy_version": "redact-v1",
+              "secret_hits": 0,
+              "truncated": false
+            },
+            "payload": {
+              "caption": "ボス戦の途中で体力が半分ほどです"
+            }
+          }
+        ]
+      },
+      "expect_outcomes": [
+        "accepted"
+      ]
+    },
+    {
+      "now_ms": 10100,
+      "deliver": {
+        "schema_version": "0.1.0",
+        "provider_id": "vision-sidecar",
+        "provider_version": "0.1.0",
+        "observations": [
+          {
+            "kind": "screen_caption",
+            "observation_id": "obs-aux",
+            "source": {
+              "alias": "game-aux"
+            },
+            "frame": {
+              "capture_seq": 1,
+              "captured_at_ms": 9900,
+              "width": 768,
+              "height": 432
+            },
+            "observed_at_ms": 10000,
+            "expires_at_ms": 30000,
+            "producer": {
+              "model_id": "qwen3-vl:4b-instruct-q4_k_m",
+              "config_digest": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+              "prompt_version": "describe-v1"
+            },
+            "privacy": "private",
+            "redaction": {
+              "policy_version": "redact-v1",
+              "secret_hits": 0,
+              "truncated": false
+            },
+            "payload": {
+              "caption": "ボス戦の途中で体力が半分ほどです"
+            }
+          },
+          {
+            "kind": "screen_caption",
+            "observation_id": "obs-expired",
+            "source": {
+              "alias": "game-main"
+            },
+            "frame": {
+              "capture_seq": 6,
+              "captured_at_ms": 9900,
+              "width": 768,
+              "height": 432
+            },
+            "observed_at_ms": 10000,
+            "expires_at_ms": 10050,
+            "producer": {
+              "model_id": "qwen3-vl:4b-instruct-q4_k_m",
+              "config_digest": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+              "prompt_version": "describe-v1"
+            },
+            "privacy": "private",
+            "redaction": {
+              "policy_version": "redact-v1",
+              "secret_hits": 0,
+              "truncated": false
+            },
+            "payload": {
+              "caption": "ボス戦の途中で体力が半分ほどです"
+            }
+          },
+          {
+            "kind": "screen_caption",
+            "observation_id": "obs-stale",
+            "source": {
+              "alias": "game-main"
+            },
+            "frame": {
+              "capture_seq": 7,
+              "captured_at_ms": 0,
+              "width": 768,
+              "height": 432
+            },
+            "observed_at_ms": 50,
+            "expires_at_ms": 30000,
+            "producer": {
+              "model_id": "qwen3-vl:4b-instruct-q4_k_m",
+              "config_digest": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+              "prompt_version": "describe-v1"
+            },
+            "privacy": "private",
+            "redaction": {
+              "policy_version": "redact-v1",
+              "secret_hits": 0,
+              "truncated": false
+            },
+            "payload": {
+              "caption": "ボス戦の途中で体力が半分ほどです"
+            }
+          },
+          {
+            "kind": "screen_caption",
+            "observation_id": "obs-old-seq",
+            "source": {
+              "alias": "game-main"
+            },
+            "frame": {
+              "capture_seq": 4,
+              "captured_at_ms": 9950,
+              "width": 768,
+              "height": 432
+            },
+            "observed_at_ms": 10050,
+            "expires_at_ms": 30050,
+            "producer": {
+              "model_id": "qwen3-vl:4b-instruct-q4_k_m",
+              "config_digest": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+              "prompt_version": "describe-v1"
+            },
+            "privacy": "private",
+            "redaction": {
+              "policy_version": "redact-v1",
+              "secret_hits": 0,
+              "truncated": false
+            },
+            "payload": {
+              "caption": "ボス戦の途中で体力が半分ほどです"
+            }
+          }
+        ]
+      },
+      "expect_outcomes": [
+        "disabled",
+        "expired",
+        "stale_age",
+        "out_of_order"
+      ]
+    },
+    {
+      "now_ms": 10200,
+      "poll": "game-main",
+      "expect_thinking_item": true
+    }
+  ]
+}

@@ -13,6 +13,8 @@
 //   avatar-playback-command.schema.json; .../invalid must REJECT
 // - examples/speech-observations/valid must conform to speech-observation.schema.json;
 //   .../invalid and .../inconsistent (cross-field) must REJECT; .../replay fixtures must carry schema-valid batches (#92)
+// - examples/perception-observations/valid must conform to perception-observation.schema.json;
+//   .../invalid and .../inconsistent (cross-field) must REJECT; .../replay fixtures must carry schema-valid batches (#90)
 // - examples/speech-lexicons/valid, .../inconsistent (cross-field, rejected by the Rust loader) and the shipped
 //   crates/generative/data default lexicon must conform to speech-lexicon.schema.json; .../invalid must REJECT (#222)
 // - examples/speech-transcripts/valid must conform to speech-transcript.schema.json;
@@ -96,6 +98,7 @@ const avatarCommand = validators["schemas/avatar-playback-command.schema.json"];
 const speechObservation = validators["schemas/speech-observation.schema.json"];
 const speechTranscript = validators["schemas/speech-transcript.schema.json"];
 const speechLexicon = validators["schemas/speech-lexicon.schema.json"];
+const perceptionObservation = validators["schemas/perception-observation.schema.json"];
 
 function report(ok, label, validator) {
   if (ok) {
@@ -180,6 +183,7 @@ for (const [validator, validDirs, invalidDir] of [
   [avatarCommand, ["examples/avatar-playback-commands/valid"], "examples/avatar-playback-commands/invalid"],
   [speechObservation, ["examples/speech-observations/valid"], "examples/speech-observations/invalid"],
   [speechTranscript, ["examples/speech-transcripts/valid"], "examples/speech-transcripts/invalid"],
+  [perceptionObservation, ["examples/perception-observations/valid"], "examples/perception-observations/invalid"],
   [speechLexicon, ["examples/speech-lexicons/valid", "examples/speech-lexicons/inconsistent", "crates/generative/data"], "examples/speech-lexicons/invalid"],
 ]) {
   if (!validator) continue;
@@ -325,6 +329,104 @@ function speechTranscriptReplayProblems(doc) {
 if (speechTranscript) {
   for (const file of listJson("examples/speech-transcripts/replay")) {
     const problems = speechTranscriptReplayProblems(loadJson(join(root, file)));
+    if (problems.length === 0) {
+      passes += 1;
+      console.log(`ok        ${file}`);
+    } else {
+      failures += 1;
+      console.error(`FAIL      ${file}`);
+      for (const problem of problems) console.error(`          ${problem}`);
+    }
+  }
+}
+
+// Perception observation fixtures (#90, ADR-0007): the cross-field rules JSON
+// Schema cannot express, and the replay step structure. Outcome and poll
+// expectations are executed by the Rust replay runner, not re-implemented here.
+const PERCEPTION_REPLAY_STEP_KEYS = new Set([
+  "now_ms", "enable", "disable", "deliver", "poll", "higher", "expect_outcomes", "expect_scene_source",
+  "expect_thinking_item", "expect_availability", "expect_scene_disagreement",
+]);
+const PERCEPTION_OUTCOMES = new Set([
+  "accepted", "disabled", "future_dated", "stale_age", "expired", "out_of_order", "redaction_failed",
+]);
+const PERCEPTION_SCENE_SOURCES = new Set(["higher_ranked", "perception", "unknown"]);
+const PERCEPTION_AVAILABILITY = new Set(["disabled", "healthy", "unavailable"]);
+function perceptionBatchCrossFieldProblems(batch) {
+  const problems = [];
+  const ids = new Set();
+  batch.observations.forEach((observation, index) => {
+    const where = `observations[${index}]`;
+    const at = observation.observed_at_ms;
+    const expires = observation.expires_at_ms;
+    if (!(expires > at && expires - at <= 30000)) {
+      problems.push(`${where}.expires_at_ms must be after observed_at_ms and within 30000 ms`);
+    }
+    if (observation.frame.captured_at_ms > at) problems.push(`${where}.frame.captured_at_ms must not be after observed_at_ms`);
+    if (ids.has(observation.observation_id)) problems.push(`${where}.observation_id must be unique within a batch`);
+    ids.add(observation.observation_id);
+    const caption = observation.payload?.caption;
+    if (typeof caption === "string" && Buffer.byteLength(caption, "utf8") > 240) {
+      problems.push(`${where}.payload.caption must be at most 240 UTF-8 bytes`);
+    }
+  });
+  return problems;
+}
+function perceptionReplayProblems(doc) {
+  const problems = [];
+  if (doc.schema_version !== "0.1.0") problems.push("schema_version must be 0.1.0");
+  if (!Array.isArray(doc.steps) || doc.steps.length === 0 || doc.steps.length > 4096) {
+    return [...problems, "steps must be 1..=4096 items"];
+  }
+  let previous = 0;
+  doc.steps.forEach((step, index) => {
+    const where = `steps[${index}]`;
+    for (const key of Object.keys(step)) {
+      if (!PERCEPTION_REPLAY_STEP_KEYS.has(key)) problems.push(`${where}.${key} is not allowed`);
+    }
+    if (!Number.isInteger(step.now_ms) || step.now_ms < previous) problems.push(`${where}.now_ms must be an integer that does not decrease`);
+    else previous = step.now_ms;
+    const actions = ["enable", "disable", "deliver", "poll"].filter((key) => step[key] !== undefined);
+    if (actions.length !== 1) problems.push(`${where} needs exactly one of enable, disable, deliver or poll`);
+    if (step.deliver !== undefined) {
+      if (!perceptionObservation(step.deliver)) problems.push(`${where}.deliver does not conform to perception-observation.schema.json`);
+      else problems.push(...perceptionBatchCrossFieldProblems(step.deliver).map((p) => `${where}.deliver ${p}`));
+      for (const name of step.expect_outcomes ?? []) {
+        if (!PERCEPTION_OUTCOMES.has(name)) problems.push(`${where}.expect_outcomes has unknown outcome ${name}`);
+      }
+    }
+    if (step.expect_scene_source !== undefined && !PERCEPTION_SCENE_SOURCES.has(step.expect_scene_source)) {
+      problems.push(`${where}.expect_scene_source is not a scene field source name`);
+    }
+    if (step.expect_availability !== undefined && !PERCEPTION_AVAILABILITY.has(step.expect_availability)) {
+      problems.push(`${where}.expect_availability is not an availability name`);
+    }
+  });
+  return problems;
+}
+if (perceptionObservation) {
+  for (const file of listJson("examples/perception-observations/valid")) {
+    const problems = perceptionBatchCrossFieldProblems(loadJson(join(root, file)));
+    if (problems.length > 0) {
+      failures += 1;
+      console.error(`FAIL      ${file}: ${problems.join("; ")}`);
+    }
+  }
+  for (const file of listJson("examples/perception-observations/inconsistent")) {
+    const doc = loadJson(join(root, file));
+    if (!perceptionObservation(doc)) {
+      failures += 1;
+      console.error(`FAIL      ${file} (expected to pass the schema so the cross-field check can judge it)`);
+    } else if (perceptionBatchCrossFieldProblems(doc).length === 0) {
+      failures += 1;
+      console.error(`FAIL      ${file} (expected a contradiction, but every check passed)`);
+    } else {
+      passes += 1;
+      console.log(`ok        ${file} (rejected as intended)`);
+    }
+  }
+  for (const file of listJson("examples/perception-observations/replay")) {
+    const problems = perceptionReplayProblems(loadJson(join(root, file)));
     if (problems.length === 0) {
       passes += 1;
       console.log(`ok        ${file}`);
