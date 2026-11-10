@@ -1,0 +1,33 @@
+# cargo-about configuration for the release archives' Rust third-party licence
+# file (issue #294 S1; docs/supply-chain.adoc section 11). cargo-about only
+# PRODUCES the notices. The licence POLICY gate stays cargo-deny (deny.toml);
+# this list mirrors deny.toml's allow list plus the two scoped exceptions, and
+# generation fails on any crate whose licence is outside it.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "ISC",
+    "0BSD",
+    "Zlib",
+    "Unlicense",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "LGPL-2.1-or-later",
+    "NCSA",
+    "MIT-0",
+    "bzip2-1.0.6",
+]
+
+# The two platforms the archives are built for. Crates reachable only on other
+# targets (for example r-efi, LGPL, UEFI only) are not shipped and not listed.
+targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]
+
+# Only what is linked into the shipped programs.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+
+[private]
+ignore = true

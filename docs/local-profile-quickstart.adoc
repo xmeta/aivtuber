@@ -28,6 +28,43 @@ Design and policy live elsewhere; this page is the procedure. Read `docs/product
 
 Linux additionally needs ALSA development headers if you build the `mic-capture` feature (a live microphone). `--input-wav` does not need it.
 
+[#download-a-release]
+== Download a release (no Rust, no Bun)
+
+Issue #294 (S1). Tagged releases publish prebuilt archives for Windows x64 (`aivtuber-local-<version>-windows-x64.zip`) and Linux x64 (`aivtuber-local-<version>-linux-x64.tar.gz`) with a `SHA256SUMS` file beside them. If you use one, you skip the Rust, Bun and C-toolchain requirements of section 0 and the whole of step 2 (build). You still need Node 20 or newer for the model fetch (step 1) until the first-run command exists, `ffplay`, and a browser or OBS. Build from source (steps 0 to 2) if you want a different revision or platform.
+
+*What the archive contains:* `aivtuber-app`, `aivtuberctl`, `speech-vad-sidecar` (Silero VAD, microphone), `speech-stt-worker`, `local-tts-sidecar`, `twitch-chat-ingress`, `youtube-chat-ingress`; the pinned sherpa-onnx and ONNX Runtime libraries beside them (leave them there: the sidecars refuse to run if they are missing or changed); the avatar page at `renderer/local-avatar/dist`; the starter reaction pack at `examples/starter-reaction-pack`; the four fetch/synthesis scripts at their repository paths; `README.txt` and the third-party licence files. *It contains no model weights, voice files or avatar model.*
+
+1. Download the archive for your platform and `SHA256SUMS` from the Releases page.
+2. Verify the archive *before* unpacking it.
++
+Windows (PowerShell), run in the download folder:
++
+[source,powershell]
+----
+$name = "aivtuber-local-<version>-windows-x64.zip"
+$want = (Select-String -Path .\SHA256SUMS -Pattern ([regex]::Escape($name))).Line.Split(" ")[0]
+$got  = (Get-FileHash ".\$name" -Algorithm SHA256).Hash
+if ($got -ieq $want) { "checksum OK" } else { "CHECKSUM MISMATCH: do not unpack or run this file" }
+----
++
+Linux:
++
+[source,sh]
+----
+sha256sum -c SHA256SUMS --ignore-missing     # must print: aivtuber-local-<version>-linux-x64.tar.gz: OK
+----
+3. Unpack and work from the unpacked directory (`Expand-Archive .\<archive>.zip .` on Windows; `tar -xzf <archive>.tar.gz` on Linux). Every relative path in this guide (`renderer/local-avatar/dist`, `examples/starter-reaction-pack`, `scripts/...`) then resolves as written.
+4. Do step 1 with one change: the libraries are already in the archive, so leave out the library step: `node scripts/fetch-local-profile.mjs /path/to/local-assets --skip sherpa-lib`.
+5. Skip step 2 (build). In steps 3 and 4, wherever a path starts with `target/release/` (`AIVTUBER_TTS_SIDECAR`, `AIVTUBER_SPEECH_SIDECAR`, `AIVTUBER_SPEECH_STT_WORKER`, the `aivtuber-app` command), use the program in the unpacked directory instead; start the app with `./aivtuber-app` (`.\aivtuber-app.exe`) instead of `cargo run`. Everything else, including the starter audio step, is unchanged. Do not set `SHERPA_ONNX_ARCHIVE_DIR`: it only matters to a build.
+
+*Known limitations of the archives:*
+
+* *Not code-signed.* The Windows programs are unsigned, so Windows SmartScreen may show "Windows protected your PC" on first start; macOS is not built. The checksum above is how you know the file is the one the release built. Code signing and installers are a later decision (#294), not part of these archives.
+* The Linux programs need the system libraries `libasound2` (microphone) and `libssl3` (Twitch chat), and a glibc at least as new as the build host's (Ubuntu 22.04).
+* Each archive is smoke-tested in CI on the platform it was built for (every program starts, the sidecars verify the bundled libraries and refuse an unpinned model directory). A full spoken conversation run from an archive (models fetched, avatar showing) is not yet part of those checks; it belongs to the first-run command slice (#294 S2).
+* The licence and disclosure duties of section 8 apply unchanged. The archive's `THIRD-PARTY-*` files cover only what it contains.
+
 == 1. Fetch the pinned assets (network needed once)
 
 `scripts/fetch-local-profile.mjs` downloads and SHA-256-verifies everything and extracts it under one directory. It adds the three pins that did not exist before (llama.cpp release `b12224`, the Qwen3-4B Q4_K_M GGUF, the Silero VAD model) and *calls* `scripts/fetch-sherpa-onnx.mjs` (engine libraries, STT model, TTS model) and `renderer/local-avatar/smoke/fetch-model.mjs` (sample VRM), so no digest is kept twice. A mismatch deletes the partial file and stops.
@@ -234,7 +271,7 @@ All of these were exercised in the measured run (<<measured>>) and none of them 
 
 == 8. Licences, credits and what you must disclose
 
-None of these is bundled or redistributed by this repository; you fetch them in step 1 and the pins are recorded in `docs/supply-chain.adoc` and `docs/provider-conformance.adoc`. This is a practical summary, not legal advice.
+No model, voice file or avatar model is bundled or redistributed by this repository or by the release archives; you fetch them in step 1 and the pins are recorded in `docs/supply-chain.adoc` and `docs/provider-conformance.adoc`. The release archives (<<download-a-release>>) do redistribute the code libraries (the sherpa-onnx, ONNX Runtime, three.js and `@pixiv/three-vrm` rows below, and the Rust crates) together with their licence texts. This is a practical summary, not legal advice.
 
 [cols="2,2,4",options="header"]
 |===

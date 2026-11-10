@@ -1,0 +1,46 @@
+Third-party notices: bundled engine libraries
+=============================================
+
+These binary libraries are redistributed unmodified from the sherpa-onnx
+v2.0.1 "shared" library archive published by the k2-fsa project. The archive
+is identified by its SHA-256 in scripts/fetch-sherpa-onnx.mjs, and the files
+are identified by SHA-256 in crates/adapters/src/speech_stt/pins.rs.
+
+sherpa-onnx C API (sherpa-onnx-c-api.dll / libsherpa-onnx-c-api.so)
+  Project:   https://github.com/k2-fsa/sherpa-onnx
+  Licence:   Apache License 2.0 (the full text is in THIRD-PARTY-LICENSES-RUST.html,
+             under the sherpa-onnx crate entry)
+  Copyright: the sherpa-onnx authors (k2-fsa)
+
+ONNX Runtime (onnxruntime.dll / libonnxruntime.so, onnxruntime_providers_shared.dll)
+  Project:   https://github.com/microsoft/onnxruntime
+  Licence:   MIT
+
+    Copyright (c) Microsoft Corporation
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in
+    all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.
+
+  ONNX Runtime builds statically include further open-source components under
+  their own permissive licences. Their notices are published upstream with the
+  ONNX Runtime release that the sherpa-onnx archive was built from
+  (ThirdPartyNotices.txt in https://github.com/microsoft/onnxruntime).
+
+No model weights are bundled. The licences of the models you fetch separately
+are listed in docs/local-profile-quickstart.adoc, section "Licences, credits
+and what you must disclose".
