@@ -69,7 +69,7 @@ pub use tts_sidecar::*;
 pub use voicevox_bridge::*;
 
 use aivtuber_adaptation::{
-    AdaptationEngine, AppliedAdaptation, MemoryEntry, MemoryEvidence, WorkingMemory,
+    AdaptationEngine, AppliedAdaptation, ErasureReport, MemoryEntry, MemoryEvidence, WorkingMemory,
 };
 use aivtuber_adapters::AudioStopOutcome;
 use aivtuber_asset_store::CacheTier;
@@ -89,8 +89,9 @@ use aivtuber_runtime::{
     AudioPlaybackCommand, AudioPlaybackSink, AvatarPlaybackCommand, AvatarPlaybackSink,
     CachedAssetSelection, CachedPerformer, CachedPlaybackError, CachedPlaybackOutcome,
     CachedPlaybackTiming, ContentAdmitDecision, ControlOutcome, FastPathPreloadReport,
-    LocalVisemeStore, OutputVerdict, PublicOutput, PublicOutputPolicy, RuntimeError,
-    SecurityRuntime, SpeechObservationTracker, SpeechTranscriptTracker,
+    LocalVisemeStore, MemoryErasePermit, OutputVerdict, PublicOutput, PublicOutputPolicy,
+    RuntimeError, SecurityRuntime, SpeechObservationTracker, SpeechTranscriptTracker,
+    ViewerEraseDecision,
 };
 use aivtuber_scheduler::{BlendChannel, Scheduler, Status, priority_for_event};
 use aivtuber_telemetry::{
@@ -210,6 +211,11 @@ pub struct SpokenFinalReport {
 pub struct ContentProcessOutcome {
     pub admission: ContentAdmitDecision,
     pub playback: Option<CachedPlaybackOutcome>,
+    /// Set when the admitted event was a viewer self-erase request (#305): the
+    /// event was consumed as a command, never routed as content. `None` when
+    /// the request could not be honoured (no asserted actor, no memory
+    /// configured) or the event was ordinary content.
+    pub memory_erasure: Option<ErasureReport>,
 }
 
 #[derive(Debug, Default)]
@@ -1696,6 +1702,63 @@ where
             .map_err(|error| AppError::Adaptation(error.to_string()))
     }
 
+    /// Operator erase of retained memory (#305, ADR-0008 S1). Requires the
+    /// authenticated `memory.admin` capability, names an actor
+    /// `(source namespace, raw actor id)` and/or retained memory ids, and
+    /// returns the typed report including every remnant the runtime cannot
+    /// prove erased. The raw actor id is hashed to its pseudonym and never
+    /// retained. Not rate-limited here; the authenticated control path owns
+    /// its own limiter.
+    pub fn erase_memory_operator(
+        &mut self,
+        request_id: &str,
+        authority: &AuthenticatedControl,
+        actor: Option<(&str, &str)>,
+        memory_ids: &[u64],
+        now_ms: u64,
+    ) -> Result<ErasureReport, AppError> {
+        let permit = self
+            .security
+            .authorize_operator_memory_erase(request_id, authority, actor, memory_ids)?;
+        self.apply_memory_erase(&permit, now_ms)?.ok_or_else(|| {
+            AppError::Adaptation(
+                "memory erase requested without configured adaptation runtime".to_owned(),
+            )
+        })
+    }
+
+    /// Run a permitted erase and audit its outcome for the operator, without
+    /// claim text or raw ids. `None` when no memory store is configured: there
+    /// is nothing retained to erase.
+    fn apply_memory_erase(
+        &mut self,
+        permit: &MemoryErasePermit,
+        now_ms: u64,
+    ) -> Result<Option<ErasureReport>, AppError> {
+        let Some(adaptation) = self.adaptation.as_mut() else {
+            return Ok(None);
+        };
+        let report = adaptation
+            .memory
+            .erase(permit, now_ms)
+            .map_err(|error| AppError::Adaptation(error.to_string()))?;
+        let record = self.security.redactor_record(
+            Some(&report.request_id),
+            aivtuber_telemetry::AuditCategory::Memory,
+            format!("erase_{:?}", report.outcome).to_lowercase(),
+            format!(
+                "requester={:?} scope={:?} entries_removed={} links_removed={} verified={}",
+                report.requester,
+                report.scope_kind,
+                report.entries_removed,
+                report.links_removed,
+                report.verified
+            ),
+        );
+        self.security.push_external_audit(record);
+        Ok(Some(report))
+    }
+
     pub fn label_generated_asset_quality(
         &mut self,
         asset_id: &str,
@@ -1896,12 +1959,35 @@ where
             return Ok(ContentProcessOutcome {
                 admission,
                 playback: None,
+                memory_erasure: None,
             });
         }
 
         let event = self.security.pop_content().ok_or_else(|| {
             AppError::Routing("queued content was unavailable for dispatch".to_owned())
         })?;
+        // #305: an exact viewer self-erase command is consumed here, before
+        // routing, so it can neither be spoken, remembered, nor reach a model.
+        // The scope is the envelope's own pseudonym (the runtime mints the
+        // permit); the command only ever reduces retained data.
+        match self.security.authorize_viewer_memory_erase(&event) {
+            ViewerEraseDecision::NotACommand => {}
+            ViewerEraseDecision::Denied(_) => {
+                return Ok(ContentProcessOutcome {
+                    admission,
+                    playback: None,
+                    memory_erasure: None,
+                });
+            }
+            ViewerEraseDecision::Permitted(permit) => {
+                let memory_erasure = self.apply_memory_erase(&permit, at_ms)?;
+                return Ok(ContentProcessOutcome {
+                    admission,
+                    playback: None,
+                    memory_erasure,
+                });
+            }
+        }
         let event_id = event.event_id.clone();
         let interaction_deadline = self
             .interaction_deadlines
@@ -1929,6 +2015,7 @@ where
         Ok(ContentProcessOutcome {
             admission,
             playback,
+            memory_erasure: None,
         })
     }
 
@@ -4806,6 +4893,102 @@ mod tests {
             aivtuber_adaptation::MemoryGateDecision::AllowedMemoryAdmin
         );
         assert_eq!(app.adaptation().expect("adaptation").memory().len(), 2);
+    }
+
+    #[test]
+    fn viewer_forget_command_erases_only_the_requesters_memory_before_routing() {
+        let mut app = app(
+            FixedSilentRoute,
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        )
+        .with_adaptation(adaptation_runtime(PromotionPolicy::default()));
+        app.startup().expect("startup");
+        let own = chat_event(40);
+        let mut other = chat_event(41);
+        other.actor_id = Some("viewer:other".to_owned());
+        app.remember_working_memory(&own, "viewer likes Rust", Some("coding"), 10)
+            .expect("own memory");
+        app.remember_working_memory(&other, "other likes Go", Some("coding"), 11)
+            .expect("other memory");
+
+        let mut command = chat_event(42);
+        command
+            .payload
+            .insert("text".to_owned(), serde_json::json!("!forgetme"));
+        command.payload.remove("intent");
+        let raw = serde_json::to_vec(&command).expect("serialize");
+        let outcome = app
+            .process_content_bytes(&raw, 50, 1)
+            .expect("command consumed");
+        assert!(outcome.playback.is_none(), "the command is never routed");
+        let report = outcome.memory_erasure.expect("erasure report");
+        assert_eq!(report.entries_removed, 1);
+        assert_eq!(
+            report.requester,
+            aivtuber_adaptation::ErasureRequester::Viewer
+        );
+        let memory = app.adaptation().expect("adaptation").memory();
+        assert_eq!(memory.len(), 1, "the other viewer's memory is untouched");
+        assert_eq!(memory.retention_metrics().erasures_completed, 1);
+        assert!(
+            app.security()
+                .audit()
+                .iter()
+                .any(|record| record.decision.starts_with("erase_erased")),
+            "the operator sees an audit record"
+        );
+
+        // A second command inside the window is rate limited and changes nothing.
+        app.remember_working_memory(&own, "viewer again", Some("coding"), 60)
+            .expect("own memory");
+        let mut again = command.clone();
+        again.event_id = "evt-43".to_owned();
+        again.sequence = 43;
+        let raw = serde_json::to_vec(&again).expect("serialize");
+        let limited = app
+            .process_content_bytes(&raw, 70, 1)
+            .expect("command consumed")
+            .memory_erasure
+            .expect("report");
+        assert_eq!(
+            limited.outcome,
+            aivtuber_adaptation::ErasureOutcome::RateLimited
+        );
+        assert_eq!(app.adaptation().expect("adaptation").memory().len(), 2);
+    }
+
+    #[test]
+    fn operator_memory_erase_needs_memory_admin_and_reports_remnants() {
+        let mut app = app(
+            FixedSilentRoute,
+            Box::new(RecordingAudio::default()),
+            Box::new(RecordingAvatar::default()),
+            Box::new(NoopStreamOutput),
+        )
+        .with_adaptation(adaptation_runtime(PromotionPolicy::default()));
+        app.startup().expect("startup");
+        let event = chat_event(50);
+        app.remember_working_memory(&event, "viewer likes Rust", Some("coding"), 10)
+            .expect("memory");
+
+        let admin = memory_admin_authority();
+        let report = app
+            .erase_memory_operator(
+                "op-erase-1",
+                &admin,
+                Some(("test-chat", "viewer:test")),
+                &[],
+                100,
+            )
+            .expect("operator erase");
+        assert_eq!(report.entries_removed, 1);
+        assert_eq!(
+            report.unprovable_remnants,
+            aivtuber_adaptation::ErasureRemnant::ALL.to_vec()
+        );
+        assert!(app.adaptation().expect("adaptation").memory().is_empty());
     }
 
     #[test]

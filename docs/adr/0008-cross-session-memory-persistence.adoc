@@ -517,6 +517,10 @@ Q1-Q13 are DECIDED as recommended in section 13.
 
 S1, the RAM-only erase primitive plus the erasure report, becomes its own implementation issue under #105. Q1, the production writer, also becomes its own issue. S2 follows the writer; S3 stays blocked on the Q4 falsifier.
 
+== Implementation notes
+
+* *S1 (#305), implemented.* `crates/adaptation/src/erasure.rs`: `begin_erase` / `advance_erase` / `erase`, `ErasureReport` (`memory-erasure-v1`), read revocation across `relevant`, `relevant_linked`, `context_for`, `link_snapshot` and supersession target resolution, and bounded RAM bookkeeping. `crates/runtime`: the non-serializable `MemoryErasePermit`, minted by `authorize_operator_memory_erase` (authenticated `memory.admin`) or `authorize_viewer_memory_erase` (the exact `!forgetme` chat command, scope from the envelope's own source and actor). `crates/app`: `ProductionApp::erase_memory_operator` and interception of the viewer command in `process_content_bytes`. D-Q7 rate limit: one accepted viewer erase per pseudonym per 60 s of logical time. Deliberate subsets of section 6.2 for a RAM-only store: the index, source and sidecar states do not exist, and the caches and proposals states are explicit no-ops (no cache and no #281 proposal queue exist); the journal and ledger are not built because nothing survives a restart. The operator socket (`aivtuberctl`) does not expose erase yet; the capability-gated app API is the integration point. See `docs/memory-adaptation.adoc` section 13.1.
+
 == Revisit conditions
 
 * A production writer exists and the falsifier (section 9.2) has run.
