@@ -446,8 +446,7 @@ impl YoutubeRecordMapper {
 
         let mut payload: BTreeMap<String, Value> = BTreeMap::new();
         payload.insert("message_id".to_owned(), json!(id));
-        let event_kind;
-        match kind.as_str() {
+        let event_kind = match kind.as_str() {
             "textMessageEvent" => {
                 let Some(text) = snippet.text.and_then(|t| t.message_text) else {
                     return Skipped(YoutubeSkip::Malformed);
@@ -469,7 +468,7 @@ impl YoutubeRecordMapper {
                         "is_verified": author.is_verified.unwrap_or(false),
                     }),
                 );
-                event_kind = EventKind::ChatMessage;
+                EventKind::ChatMessage
             }
             "superChatEvent" | "superStickerEvent" => {
                 let sticker = kind == "superStickerEvent";
@@ -518,7 +517,7 @@ impl YoutubeRecordMapper {
                 {
                     payload.insert("amount_display".to_owned(), json!(display));
                 }
-                event_kind = EventKind::ChatDonation;
+                EventKind::ChatDonation
             }
             "newSponsorEvent"
             | "memberMilestoneChatEvent"
@@ -526,7 +525,7 @@ impl YoutubeRecordMapper {
             | "giftMembershipReceivedEvent" => return Skipped(YoutubeSkip::Membership),
             "chatEndedEvent" => return Skipped(YoutubeSkip::ChatEnded),
             _ => return Skipped(YoutubeSkip::NotChat),
-        }
+        };
 
         // Author channel id is the only viewer identifier; display name and
         // avatar are never carried. The app pseudonymizes it (namespaced by
