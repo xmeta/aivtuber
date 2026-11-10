@@ -1,5 +1,5 @@
 = ADR-0007: Bounded perception plane, screen vision first
-:status: Proposed
+:status: Accepted
 :date: 2026-11-10
 
 == Context
@@ -325,9 +325,11 @@ Competitor cadence, prompting and privacy practice could not be established from
 
 == Staging and rollback
 
+Decided 2026-11-10: S1a (contract, ingress and replay, no live model, schema-first) is the next implementation slice.
+
 . *S0 (this PR)*: ADR only.
 . *S1a, contract and ingress, no live model*: +schemas/perception-observation.schema.json+ with positive and negative fixtures (including the injection and secret cases below), Rust domain types and validation, Rust/TypeScript parity, a runtime ingress modeled on +speech_observation.rs+, a retention row, replay of recorded observations into a stub consumer. Revertible; no runtime behavior change while disabled.
-. *S1b, live path behind a default-off flag* (the recommended first vertical slice, below).
+. *S1b, live path behind a default-off flag* (the first vertical slice, below; EXP-0004 with its kill criteria must land first).
 . *S2*: #88 consumption at rank 4; Thinking caption item (+ThinkingContextSource+ addition).
 . *S3*: reserved turn-cue kinds for #92, after A-PERCEPT-001 evidence; webcam is a separate opt-in ADR amendment.
 
@@ -365,11 +367,11 @@ Only if F1 to F3 survive does S1b start, and A-PERCEPT-004 (uplift over structur
 
 == Open decisions
 
-Each needs a supervisor answer before S1a; the recommendation is the default if none is given.
+All twelve are DECIDED by the supervisor on 2026-11-10 as recommended below (traceability list after the table).
 
 [cols="1,4,4"]
 |===
-|# |Question |Recommendation
+|# |Question |Decision (DECIDED, as recommended)
 
 |Q1
 |Is an observation an +EventEnvelope+ event with a new +SourceClass::Perception+, or a separate observation batch like speech (no source class; ingress assigns plane and trust)?
@@ -419,6 +421,22 @@ Each needs a supervisor answer before S1a; the recommendation is the default if 
 |Maximum observation validity.
 |30 s for screen kinds, 2 s for turn cues; shorter if F1 shows the scene changes faster than that in the target games.
 |===
+
+
+=== Decisions (supervisor, 2026-11-10)
+
+* D-Q1: separate observation batch, not an +EventEnvelope+ event; no new +SourceClass+.
+* D-Q2: all perception output untrusted, content plane; no semi-trusted tier in S1.
+* D-Q3: separate loopback VLM sidecar, not the Thinking server.
+* D-Q4: shortlist is Qwen3-VL-4B-Instruct and SmolVLM-500M, benchmark first. Gemma 3 and every +qwen-research+ checkpoint are excluded. EXP-0004 (F1 to F3 with the kill criteria above) must land before S1b.
+* D-Q5: OBS +GetSourceScreenshot+ of an operator-chosen source only; no OS capture in S1.
+* D-Q6: region of interest via an operator-built cropped OBS source; in-process ROI deferred.
+* D-Q7: caption may reach Thinking as one untrusted, aged, delimited item of at most 512 bytes (S2); never memory, TTS or Reflex.
+* D-Q8: production recording of observations off by default.
+* D-Q9: timer-driven, 10 s default, 5 s floor, one in flight, drop on overload, 10% compute duty, yield to Thinking.
+* D-Q10: screen vision first behind the generic kind-tagged contract; turn cues are S3. Reason: competitive gap 8 (OLV and AITuberKit already ship screen vision) and #81 already has its own speech-observation path (#92) for turn timing. Revisit if co-host timing becomes the priority.
+* D-Q11: provisional scene vocabulary in the S1a schema; #88 owns the final one.
+* D-Q12: maximum validity 30 s for screen kinds, 2 s for turn cues.
 
 == Revisit conditions
 
