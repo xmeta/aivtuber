@@ -776,3 +776,193 @@ fn first_audio_comes_far_sooner_than_in_buffered_mode_and_both_modes_stay_availa
     assert_eq!(buffered_rig.app.performer().scheduler().items().len(), 1);
     assert!(buffered_rig.app.recent_phrase_responses().is_empty());
 }
+
+// --- #222 S2: lifecycle of the phrased (streamed) path -----------------
+
+fn tick_through(rig: &mut Rig, until_ms: u64) {
+    let mut at = 0;
+    while at <= until_ms {
+        rig.app.tick(at);
+        at += 50;
+        // The worker commits phrases as logical time lets it; give it real time.
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn a_phrased_reply_reports_phrase_sequence_and_final_only_on_the_last_phrase() {
+    let mut rig = rig_with(phrased(), &three_phrase_reply(), PhraseTts::new());
+    submit(&mut rig, 30, 0);
+    tick_through(&mut rig, 6_000);
+    assert!(!rig.app.recent_phrase_responses().is_empty());
+    let events = rig.app.drain_speech_lifecycle(usize::MAX);
+    for event in &events {
+        event.validate().expect("valid lifecycle event");
+    }
+    let phase_of = |kind: aivtuber_domain::SpeechPhase| {
+        events
+            .iter()
+            .filter(|e| e.phase == kind)
+            .map(|e| (e.speech.phrase, e.speech.final_phrase))
+            .collect::<Vec<_>>()
+    };
+    let expected = vec![(0, false), (1, false), (2, true)];
+    assert_eq!(phase_of(aivtuber_domain::SpeechPhase::Started), expected);
+    assert_eq!(phase_of(aivtuber_domain::SpeechPhase::Finished), expected);
+    assert!(
+        events
+            .iter()
+            .all(|e| e.speech.event_id.contains("#p") == (e.speech.phrase > 0))
+    );
+    assert!(events.windows(2).all(|pair| pair[0].seq < pair[1].seq));
+}
+
+#[test]
+fn a_failed_phrase_two_leaves_phrase_one_finished_and_later_phrases_never_spoken() {
+    let mut tts = PhraseTts::new();
+    tts.fail_on_call = Some(1);
+    let mut rig = rig_with(phrased(), &three_phrase_reply(), tts);
+    submit(&mut rig, 30, 0);
+    wait_until(&mut rig, 0, |rig| {
+        !rig.app.recent_phrase_responses().is_empty()
+    });
+    tick_through(&mut rig, 6_000);
+    let events = rig.app.drain_speech_lifecycle(usize::MAX);
+    assert!(events.iter().all(|e| e.speech.phrase == 0));
+    assert_eq!(
+        events.last().map(|e| e.phase),
+        Some(aivtuber_domain::SpeechPhase::Finished)
+    );
+    assert!(
+        events.iter().all(|e| !e.speech.final_phrase),
+        "no phrase of a reply cut short is the final one"
+    );
+}
+
+// --- #222 S2 (ADR-0004 D-4): lazy re-synthesis through the app ---------
+
+fn stale_generated_asset(id: &str, text: &str) -> aivtuber_asset_store::PerformanceAsset {
+    let mut asset = aivtuber_asset_store::load_asset_file(
+        pack_root().join("descriptors/reaction-surprise-01.json"),
+    )
+    .expect("starter asset");
+    asset.schema_version = "0.2.0".to_owned();
+    asset.id = id.to_owned();
+    asset.variant_group = None;
+    // The shape the generative compiler produces.
+    asset.expression = None;
+    asset.gesture = None;
+    asset.timeline = vec![
+        aivtuber_asset_store::TimelineEvent {
+            at_ms: 0,
+            event: "speech.start".to_owned(),
+            payload: None,
+        },
+        aivtuber_asset_store::TimelineEvent {
+            at_ms: 900,
+            event: "speech.end".to_owned(),
+            payload: None,
+        },
+    ];
+    asset.interrupt_points_ms = vec![900];
+    let speech = asset.speech.as_mut().expect("speech");
+    speech.text = Some(text.to_owned());
+    speech.viseme_ref = None;
+    asset.compatibility.speech_projection = Some("rules:1|lexicon:none".to_owned());
+    asset.provenance = Some(aivtuber_asset_store::Provenance {
+        generated: Some(true),
+        generator: Some("test".to_owned()),
+        created_at: Some("2026-11-10T00:00:00Z".to_owned()),
+        thinking_backend: Some("think".to_owned()),
+        thinking_model_alias: None,
+        thinking_model_version: None,
+        tts_backend: Some("tts".to_owned()),
+        tts_model_alias: None,
+        tts_model_version: None,
+        routing_reason: Some("test".to_owned()),
+    });
+    asset
+}
+
+#[test]
+fn a_queued_resynthesis_renews_the_stale_asset_off_the_composition_thread() {
+    let mut rig = rig_with(phrased(), "unused", PhraseTts::new());
+    let old = stale_generated_asset("gen.stale", "YouTubeを見てね");
+    rig.app
+        .performer_mut()
+        .assets_mut()
+        .insert_hot(old)
+        .unwrap();
+    let current = rig
+        .app
+        .performer()
+        .speech_freshness()
+        .current()
+        .expect("generation composed: a current projection")
+        .to_owned();
+    rig.app
+        .performer_mut()
+        .speech_freshness_mut()
+        .request("gen.stale");
+    wait_until(&mut rig, 0, |rig| {
+        rig.app
+            .performer()
+            .speech_freshness()
+            .metrics()
+            .resynthesis_succeeded
+            == 1
+    });
+    let renewed = rig
+        .app
+        .performer_mut()
+        .assets_mut()
+        .resolve("gen.stale")
+        .unwrap();
+    assert_eq!(
+        renewed.compatibility.speech_projection.as_deref(),
+        Some(current.as_str())
+    );
+    assert_eq!(
+        rig.tts_texts.lock().unwrap().last().map(String::as_str),
+        Some("ユーチューブを見てね"),
+        "the lexicon reading, from the display text, with no model call"
+    );
+    assert_eq!(rig.app.retention_snapshot().speech_freshness.pending, 0);
+}
+
+#[test]
+fn a_failed_resynthesis_leaves_the_stale_asset_playable_and_is_not_retried() {
+    let mut tts = PhraseTts::new();
+    tts.fail_on_call = Some(0);
+    let mut rig = rig_with(phrased(), "unused", tts);
+    let old = stale_generated_asset("gen.stale", "YouTubeを見てね");
+    rig.app
+        .performer_mut()
+        .assets_mut()
+        .insert_hot(old)
+        .unwrap();
+    rig.app
+        .performer_mut()
+        .speech_freshness_mut()
+        .request("gen.stale");
+    wait_until(&mut rig, 0, |rig| {
+        rig.app
+            .performer()
+            .speech_freshness()
+            .metrics()
+            .resynthesis_failed
+            == 1
+    });
+    let asset = rig
+        .app
+        .performer_mut()
+        .assets_mut()
+        .resolve("gen.stale")
+        .unwrap();
+    assert_eq!(
+        asset.compatibility.speech_projection.as_deref(),
+        Some("rules:1|lexicon:none"),
+        "unchanged and still resident"
+    );
+    assert_eq!(rig.tts_calls.load(Ordering::SeqCst), 1, "no retry storm");
+}

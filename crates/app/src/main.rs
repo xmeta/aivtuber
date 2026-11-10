@@ -8,7 +8,7 @@ use aivtuber_adapters::speech_tts::supervisor::{LivenessGatedTts, TtsSidecar};
 use aivtuber_adapters::{
     LocalAvatarConfig, LocalAvatarServer, NormalizedHttpTtsAdapter, NormalizedHttpTtsConfig,
     ObsWebSocketAdapter, ObsWebSocketConfig, OpenAiResponsesAdapter, OpenAiResponsesConfig,
-    ProcessAudioConfig, ProcessAudioPlayer, SecretString, SystemHostResolver,
+    ProcessAudioConfig, ProcessAudioPlayer, SecretString, StreamLimits, SystemHostResolver,
     ThinkingAuthentication, VTubeStudioAdapter, VTubeStudioConfig, endpoint_origin,
     verify_loopback_endpoint,
 };
@@ -31,7 +31,8 @@ use aivtuber_domain::{
     OperatorCommandInput,
 };
 use aivtuber_generative::{
-    GenerativePipeline, PerformanceCompiler, PerformanceCompilerConfig, PhraseConfig, SpeechLexicon,
+    GenerativePipeline, PerformanceCompiler, PerformanceCompilerConfig, PhraseConfig,
+    SpeechLexicon, StreamPolicy,
 };
 use aivtuber_reflex::{JevAdapter, JevAdapterConfig, JevApiKey, PolicyConfig, ReflexPipeline};
 use aivtuber_runtime::{
@@ -300,6 +301,19 @@ fn run() -> Result<(), Box<dyn Error>> {
         .warning_lines(compatibility.voice_model.as_deref(), &audio_root)
     {
         eprintln!("{line}");
+    }
+    // #222 S2 (ADR-0004 D-4): operator-forced invalidation. Operator
+    // configuration only, read once at start like the lexicon itself.
+    for surface in env_string("AIVTUBER_SPEECH_INVALIDATE", "")
+        .split(',')
+        .map(str::trim)
+        .filter(|surface| !surface.is_empty())
+    {
+        let report = app.invalidate_speech_surface(surface);
+        eprintln!(
+            "speech invalidate {surface:?}: scanned={} forced={} skipped_not_generated={} truncated={}",
+            report.scanned, report.forced, report.skipped_not_generated, report.truncated
+        );
     }
     report_degraded(app.avatar_output_name(), app.health());
     eprintln!(
@@ -1155,6 +1169,43 @@ fn build_generative_runtime(
     if let Some(name) = env_optional("AIVTUBER_OPENAI_BACKEND_NAME") {
         thinking = thinking.with_backend_name(name);
     }
+    // Issue #83 S2: optional provider token streaming into phrase commit.
+    let mut phrase_mode = resolve_phrase_mode(profile)?;
+    if env_bool("AIVTUBER_THINKING_STREAM", false)? {
+        let PhraseMode::Phrased(config) = &mut phrase_mode else {
+            return Err(
+                "AIVTUBER_THINKING_STREAM=on needs phrase mode (AIVTUBER_PHRASE_MODE=phrase, or                  the local profile)"
+                    .into(),
+            );
+        };
+        let defaults = StreamLimits::default();
+        let limits = StreamLimits {
+            idle_timeout: Duration::from_millis(env_u64(
+                "AIVTUBER_THINKING_STREAM_IDLE_MS",
+                defaults.idle_timeout.as_millis() as u64,
+            )?),
+            max_reply_chars: env_usize(
+                "AIVTUBER_THINKING_STREAM_MAX_REPLY_CHARS",
+                defaults.max_reply_chars,
+            )?,
+            ..defaults
+        };
+        thinking = thinking.with_streaming(limits)?;
+        let policy = StreamPolicy {
+            max_duration: Duration::from_millis(env_u64(
+                "AIVTUBER_THINKING_STREAM_MAX_MS",
+                StreamPolicy::default().max_duration.as_millis() as u64,
+            )?),
+        };
+        config.stream = Some(policy);
+        config.validate()?;
+        eprintln!(
+            "thinking stream: on (idle {} ms, max {} ms, max reply {} chars)",
+            limits.idle_timeout.as_millis(),
+            policy.max_duration.as_millis(),
+            limits.max_reply_chars,
+        );
+    }
     // Non-secret, replay-relevant identity: where Thinking runs and how it is
     // authenticated. Origin only; no path/query that could carry a token.
     eprintln!(
@@ -1214,7 +1265,6 @@ fn build_generative_runtime(
     let speech_lexicon = build_speech_lexicon()?;
     let pipeline = GenerativePipeline::new(Arc::new(thinking), tts, compiler)
         .with_speech_lexicon(Arc::new(speech_lexicon));
-    let phrase_mode = resolve_phrase_mode(profile)?;
     eprintln!(
         "generated replies: {}",
         match phrase_mode {

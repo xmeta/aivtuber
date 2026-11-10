@@ -1428,6 +1428,36 @@ impl AssetStore {
         Ok(destination)
     }
 
+    /// Ids resident in L0, in id order (a bounded diagnostic/scan view).
+    pub fn hot_ids(&self) -> impl Iterator<Item = &str> {
+        self.hot.keys().map(String::as_str)
+    }
+
+    /// Replace a generated asset with a re-synthesized one of the same id
+    /// (ADR-0004 D-4). The old L0 entry is overwritten; when the old asset was
+    /// persisted in L1 its descriptor is rewritten so a restart does not bring
+    /// the stale audio back. Both the old and the new asset must be generated.
+    pub fn replace_generated_asset(
+        &mut self,
+        asset: PerformanceAsset,
+    ) -> Result<Arc<PerformanceAsset>, AssetStoreError> {
+        ensure_generated(&asset)?;
+        let id = asset.id.clone();
+        let persisted = self.local.contains_key(&id);
+        if persisted {
+            self.invalidate_generated_asset(&id)?;
+        } else if let Some(old) = self.hot_get(&id) {
+            ensure_generated(&old)?;
+        } else {
+            return Err(AssetStoreError::NotFound { id });
+        }
+        let inserted = self.insert_hot(asset)?;
+        if persisted {
+            self.persist_generated_descriptor(&id)?;
+        }
+        Ok(inserted)
+    }
+
     /// Remove a generated asset from both L1 and L0 after provenance validation.
     pub fn invalidate_generated_asset(&mut self, id: &str) -> Result<(), AssetStoreError> {
         let local_path = self.local.get(id).map(|entry| entry.path.clone());

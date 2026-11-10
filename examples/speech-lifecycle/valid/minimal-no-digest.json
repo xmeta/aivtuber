@@ -1,0 +1,15 @@
+{
+  "schema_version": "0.1.0",
+  "seq": 10,
+  "at_ms": 0,
+  "basis": "logical_timeline",
+  "speech": {
+    "event_id": "evt-cached-1",
+    "phrase": 0,
+    "final_phrase": true,
+    "asset_id": "starter.hello"
+  },
+  "phase": {
+    "kind": "prepared"
+  }
+}

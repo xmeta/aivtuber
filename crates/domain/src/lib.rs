@@ -10,10 +10,12 @@ mod error;
 mod event;
 mod floor;
 mod interfaces;
+mod perception;
 mod reflex;
 pub mod scenario;
 mod sidecar;
 mod speech;
+mod speech_lifecycle;
 mod speech_transcript;
 mod task;
 
@@ -41,13 +43,15 @@ pub use event::{
 pub use floor::*;
 pub use interfaces::{
     Authorized, AuthorizedAvatarAction, AuthorizedStreamAction, AuthorizedToolAction, AvatarAction,
-    AvatarAdapter, DecisionEngine, EngineError, EngineErrorKind, EngineFuture, GeneratedReply,
-    MAX_TOOL_DESCRIPTOR_BYTES, MAX_TOOL_DISCOVERY_ITEMS, MAX_TOOL_OBSERVATION_BYTES,
-    SpeechArtifact, SpeechProgress, SpeechProgressSink, SpeechRequest, StreamAction, StreamAdapter,
-    ThinkingEngine, ToolAction, ToolAdapter, ToolCommitFence, ToolDescriptor, ToolExecutionResult,
-    ToolResultClass, ToolVerificationOutcome, ToolVerificationRule, TtsBackendIdentity, TtsEngine,
-    authorize_avatar_action, authorize_stream_action, authorize_tool_action, verify_tool_result,
+    AvatarAdapter, DecisionEngine, DeltaFlow, EngineError, EngineErrorKind, EngineFuture,
+    GeneratedReply, MAX_TOOL_DESCRIPTOR_BYTES, MAX_TOOL_DISCOVERY_ITEMS,
+    MAX_TOOL_OBSERVATION_BYTES, ReplyDeltaSink, SpeechArtifact, SpeechProgress, SpeechProgressSink,
+    SpeechRequest, StreamAction, StreamAdapter, ThinkingEngine, ToolAction, ToolAdapter,
+    ToolCommitFence, ToolDescriptor, ToolExecutionResult, ToolResultClass, ToolVerificationOutcome,
+    ToolVerificationRule, TtsBackendIdentity, TtsEngine, authorize_avatar_action,
+    authorize_stream_action, authorize_tool_action, verify_tool_result,
 };
+pub use perception::*;
 pub use reflex::{
     AttentionTarget, BackendIdentity, FallbackReason, REFLEX_SCHEMA_VERSION, ReflexDecision,
     ResponseRoute, RouteDecision,
@@ -65,6 +69,7 @@ pub use speech::{
     SpeakerActivityState, SpeechActivityObservation, SpeechEdge, SpeechObservation,
     SpeechObservationBatch, TurnEndFallbackReason, TurnEndScoreObservation, fallback_turn_signal,
 };
+pub use speech_lifecycle::*;
 pub use speech_transcript::*;
 pub use task::{
     AgentTask, MAX_TASK_ID_BYTES, MAX_TASK_LIFETIME_MS_HARD, MAX_TASK_OBSERVATIONS_HARD,

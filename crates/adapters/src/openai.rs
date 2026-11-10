@@ -1,13 +1,20 @@
-use crate::{HttpTransportError, JsonHttpTransport, SecretString, UreqJsonTransport};
+use crate::{
+    HttpTransportError, JsonHttpTransport, SecretString, StreamingHttpTransport, UreqJsonTransport,
+};
 use aivtuber_domain::{
-    BackendIdentity, EngineError, EngineErrorKind, EngineFuture, GeneratedReply, ThinkingEngine,
-    ThinkingRequest,
+    BackendIdentity, EngineError, EngineErrorKind, EngineFuture, GeneratedReply, ReplyDeltaSink,
+    ThinkingEngine, ThinkingRequest,
 };
 use serde_json::{Value, json};
 use std::fmt;
 use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
+
+mod stream;
+#[cfg(test)]
+mod stream_tests;
+pub use stream::StreamLimits;
 
 /// How the Thinking endpoint is authenticated (issue #220 S1).
 ///
@@ -196,6 +203,8 @@ pub struct OpenAiResponsesAdapter {
     api_key: Option<Arc<SecretString>>,
     backend_name: String,
     transport: Arc<dyn JsonHttpTransport>,
+    /// Token streaming, only when explicitly enabled (issue #83 S2).
+    stream: Option<(Arc<dyn StreamingHttpTransport>, StreamLimits)>,
 }
 
 impl fmt::Debug for OpenAiResponsesAdapter {
@@ -272,7 +281,28 @@ impl OpenAiResponsesAdapter {
             api_key,
             backend_name: DEFAULT_BACKEND_NAME.to_owned(),
             transport,
+            stream: None,
         })
+    }
+
+    /// Enable SSE token streaming over the default HTTP client (ureq).
+    pub fn with_streaming(self, limits: StreamLimits) -> Result<Self, EngineError> {
+        self.with_streaming_transport(Arc::new(UreqJsonTransport::default()), limits)
+    }
+
+    /// Enable SSE token streaming over an explicit transport.
+    pub fn with_streaming_transport(
+        mut self,
+        transport: Arc<dyn StreamingHttpTransport>,
+        limits: StreamLimits,
+    ) -> Result<Self, EngineError> {
+        limits.validate()?;
+        self.stream = Some((transport, limits));
+        Ok(self)
+    }
+
+    pub fn streaming_enabled(&self) -> bool {
+        self.stream.is_some()
     }
 
     /// Override the backend name recorded in audit/provenance (for example
@@ -369,6 +399,19 @@ impl ThinkingEngine for OpenAiResponsesAdapter {
         timeout: Duration,
     ) -> EngineFuture<'a, GeneratedReply> {
         Box::pin(async move { self.generate_sync_with_timeout(request, timeout) })
+    }
+
+    fn streams(&self) -> bool {
+        self.stream.is_some()
+    }
+
+    fn generate_streaming(
+        &self,
+        request: &ThinkingRequest,
+        timeout: Duration,
+        sink: &mut dyn ReplyDeltaSink,
+    ) -> Option<Result<GeneratedReply, EngineError>> {
+        self.stream_reply(request, timeout, sink)
     }
 
     fn identity(&self) -> BackendIdentity {

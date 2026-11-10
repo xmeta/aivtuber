@@ -29,7 +29,7 @@ use futures::executor::block_on;
 use std::time::{Duration, Instant};
 
 /// Why one phrase stopped short of delivery.
-enum PhraseStop {
+pub(crate) enum PhraseStop {
     Cancelled(CancellationStage),
     Failed(PhraseFailure, FallbackReason),
 }
@@ -121,6 +121,24 @@ impl GenerativePipeline {
             routing_reason: request.routing_reason.clone(),
             backend: thinking_identity.clone(),
         });
+        // Token streaming (issue #83 S2): same per-phrase stages, fed as the
+        // provider produces text instead of after the whole reply exists.
+        if let Some(stream) = options.config.stream
+            && self.thinking.streams()
+        {
+            return Ok(self.run_streamed(
+                request,
+                cancellation,
+                fallback,
+                provider_deadline,
+                options,
+                stream,
+                &mut output_gate,
+                delivery,
+                trace,
+                &thinking_identity,
+            ));
+        }
         let thinking = match thinking_timeout {
             Some(timeout) => self
                 .thinking
@@ -266,7 +284,7 @@ impl GenerativePipeline {
     /// Gate, project, synthesize and compile one phrase. Returns the unit and
     /// the number of characters sent to TTS.
     #[allow(clippy::too_many_arguments)]
-    fn prepare_phrase<F>(
+    pub(crate) fn prepare_phrase<F>(
         &self,
         request: &GenerationRequest,
         options: &PhraseOptions,

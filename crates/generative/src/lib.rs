@@ -24,12 +24,13 @@ use std::error::Error;
 use std::fmt;
 mod phrase;
 mod phrase_pipeline;
+mod phrase_stream;
 mod speech_lexicon;
 mod speech_text;
 pub use phrase::{
     Delivery, MAX_PHRASES_CEILING, PHRASE_SEGMENTATION_VERSION, PhraseConfig, PhraseDelivery,
     PhraseEnd, PhraseFailure, PhraseOptions, PhraseState, PhraseStep, PhraseSummary,
-    PhraseTransitionError, PhraseUnit, SegmentationConfig, SlotWait, segment_reply,
+    PhraseTransitionError, PhraseUnit, SegmentationConfig, SlotWait, StreamPolicy, segment_reply,
 };
 pub use phrase_pipeline::wait_for_started;
 pub use speech_lexicon::{
@@ -186,6 +187,32 @@ pub struct GenerationResult {
     pub trace: GenerationTrace,
     pub disposition: GenerationDisposition,
 }
+
+/// Why a re-synthesis produced no asset. The old asset stays as it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResynthesisError {
+    /// Not a generated asset, or it carries no display text.
+    NotResynthesizable,
+    /// The output gate would no longer publish the text (or its projection).
+    GateRejected,
+    NothingSpeakable,
+    Synthesis(String),
+    Invalid(String),
+}
+
+impl fmt::Display for ResynthesisError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotResynthesizable => f.write_str("asset cannot be re-synthesized"),
+            Self::GateRejected => f.write_str("output gate rejected the text"),
+            Self::NothingSpeakable => f.write_str("nothing speakable after projection"),
+            Self::Synthesis(message) => write!(f, "synthesis failed: {message}"),
+            Self::Invalid(message) => write!(f, "re-synthesized asset is invalid: {message}"),
+        }
+    }
+}
+
+impl Error for ResynthesisError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GeneratedTextGateDecision {
@@ -786,6 +813,100 @@ impl GenerativePipeline {
             };
             block_on(synthesis)
         }
+    }
+
+    /// Re-synthesize the speech of an existing generated asset under the
+    /// current projection (ADR-0004 D-4, issue #222 S2). No model is called:
+    /// the display text the asset already carries goes through the same
+    /// ordering as a fresh reply (gate on display, projection, gate on the
+    /// projected text when it changed, display again last), then TTS. The
+    /// result keeps the asset's id and everything but the speech track, the
+    /// timeline's speech end, the voice identity and the projection record.
+    /// Blocking: call it from a worker, never the composition thread.
+    pub fn resynthesize<F>(
+        &self,
+        asset: &PerformanceAsset,
+        timeout: Option<Duration>,
+        mut output_gate: F,
+    ) -> Result<PerformanceAsset, ResynthesisError>
+    where
+        F: FnMut(&str) -> GeneratedTextGateDecision,
+    {
+        let generated = asset
+            .provenance
+            .as_ref()
+            .is_some_and(|provenance| provenance.generated == Some(true));
+        let display = asset
+            .speech
+            .as_ref()
+            .and_then(|speech| speech.text.as_deref())
+            .filter(|text| !text.trim().is_empty());
+        let (true, Some(display)) = (generated, display) else {
+            return Err(ResynthesisError::NotResynthesizable);
+        };
+        match output_gate(display) {
+            GeneratedTextGateDecision::Publish(text) if text == display => {}
+            _ => return Err(ResynthesisError::GateRejected),
+        }
+        let projection = self.speech_lexicon.project(display);
+        let speech_text = if projection.report.changed() {
+            let decision = output_gate(&projection.speech_text);
+            let _ = output_gate(display);
+            match decision {
+                GeneratedTextGateDecision::Publish(text) => text,
+                GeneratedTextGateDecision::Reject => return Err(ResynthesisError::GateRejected),
+            }
+        } else {
+            display.to_owned()
+        };
+        if speech_text.trim().is_empty() {
+            return Err(ResynthesisError::NothingSpeakable);
+        }
+        let tts_identity = self.tts.identity();
+        let request = SpeechRequest {
+            text: speech_text.clone(),
+            style: None,
+        };
+        let speech = self
+            .synthesize(&request, timeout, &mut GenerationTrace::default())
+            .map_err(|error| ResynthesisError::Synthesis(error.to_string()))?;
+        if speech.audio_ref.trim().is_empty() || speech.duration_ms == 0 {
+            return Err(ResynthesisError::Synthesis(
+                "speech artifact requires audio_ref and positive duration_ms".to_owned(),
+            ));
+        }
+
+        let mut renewed = asset.clone();
+        let old_duration = renewed
+            .speech
+            .as_ref()
+            .and_then(|track| track.duration_ms)
+            .unwrap_or(0);
+        if let Some(track) = renewed.speech.as_mut() {
+            track.audio_ref = Some(speech.audio_ref.clone());
+            track.duration_ms = Some(speech.duration_ms);
+            track.viseme_ref = speech.viseme_ref.clone();
+        }
+        for event in &mut renewed.timeline {
+            if event.event == "speech.end" {
+                event.at_ms = speech.duration_ms;
+            }
+        }
+        if renewed.interrupt_points_ms == [old_duration] {
+            renewed.interrupt_points_ms = vec![speech.duration_ms];
+        }
+        renewed.compatibility.voice_model = tts_identity.voice_model.clone();
+        renewed.compatibility.viseme_mapping = tts_identity.viseme_mapping.clone();
+        if let Some(provenance) = renewed.provenance.as_mut() {
+            provenance.tts_backend = Some(tts_identity.backend.name.clone());
+            provenance.tts_model_alias = tts_identity.backend.model_alias.clone();
+            provenance.tts_model_version = tts_identity.backend.model_version.clone();
+        }
+        let renewed = renewed.with_speech_projection(speech_text, projection.identity.key());
+        renewed
+            .validate()
+            .map_err(|error| ResynthesisError::Invalid(error.to_string()))?;
+        Ok(renewed)
     }
 
     pub fn run(
@@ -1564,6 +1685,126 @@ mod tests {
         assert_eq!(
             asset.compatibility.speech_projection.as_deref(),
             Some("rules:1|lexicon:none")
+        );
+    }
+
+    fn generated_with(
+        lexicon: Arc<SpeechLexicon>,
+        seq: u64,
+    ) -> (PerformanceAsset, GenerativePipeline) {
+        let pipeline = GenerativePipeline::new(
+            Arc::new(MockThinking::success("YouTubeとAI")),
+            Arc::new(MockTts::success()),
+            compiler(),
+        )
+        .with_speech_lexicon(lexicon);
+        let result = pipeline
+            .run(
+                &generation_request(seq),
+                &GenerationCancellationToken::default(),
+                None,
+            )
+            .expect("generation");
+        let GenerationDisposition::Generated { asset } = result.disposition else {
+            panic!("expected generated asset");
+        };
+        (*asset, pipeline)
+    }
+
+    #[test]
+    fn resynthesis_renews_the_speech_under_the_current_projection_without_a_model_call() {
+        let (old, _) = generated_with(Arc::new(SpeechLexicon::empty()), 40);
+        assert_eq!(
+            old.compatibility.speech_projection.as_deref(),
+            Some("rules:1|lexicon:none")
+        );
+
+        let tts = Arc::new(MockTts::success());
+        let thinking = Arc::new(MockThinking::success("unused"));
+        let current = GenerativePipeline::new(thinking.clone(), tts.clone(), compiler());
+        let mut gate_calls = Vec::new();
+        let renewed = current
+            .resynthesize(&old, None, |text| {
+                gate_calls.push(text.to_owned());
+                GeneratedTextGateDecision::Publish(text.to_owned())
+            })
+            .expect("resynthesis");
+        assert_eq!(
+            thinking.calls.load(AtomicOrdering::SeqCst),
+            0,
+            "no model call"
+        );
+        assert_eq!(renewed.id, old.id, "same asset id");
+        assert_eq!(
+            renewed.speech.as_ref().unwrap().text,
+            old.speech.as_ref().unwrap().text,
+            "display text untouched"
+        );
+        assert_eq!(
+            tts.spoken.lock().unwrap().as_slice(),
+            ["ユーチューブとエーアイ"],
+            "the starter lexicon reads the brand words"
+        );
+        assert!(
+            old.compatibility
+                .speech_projection_is_stale(renewed.compatibility.speech_projection.as_deref())
+        );
+        assert!(
+            !renewed
+                .compatibility
+                .speech_projection_is_stale(Some(&current.speech_lexicon().identity().key()))
+        );
+        // Gate order: display, projected, display again last.
+        assert_eq!(
+            gate_calls,
+            ["YouTubeとAI", "ユーチューブとエーアイ", "YouTubeとAI"]
+        );
+        renewed.validate().unwrap();
+    }
+
+    #[test]
+    fn resynthesis_failures_leave_the_caller_with_a_typed_reason() {
+        let (old, _) = generated_with(Arc::new(SpeechLexicon::empty()), 41);
+        let ok_gate = |text: &str| GeneratedTextGateDecision::Publish(text.to_owned());
+        let pipeline = |tts: MockTts| {
+            GenerativePipeline::new(
+                Arc::new(MockThinking::success("x")),
+                Arc::new(tts),
+                compiler(),
+            )
+        };
+
+        // The gate now refuses the text.
+        assert_eq!(
+            pipeline(MockTts::success())
+                .resynthesize(&old, None, |_| GeneratedTextGateDecision::Reject)
+                .unwrap_err(),
+            ResynthesisError::GateRejected
+        );
+        // The gate rewrites the display text: that is not the published text.
+        assert_eq!(
+            pipeline(MockTts::success())
+                .resynthesize(&old, None, |_| GeneratedTextGateDecision::Publish(
+                    "other".to_owned()
+                ))
+                .unwrap_err(),
+            ResynthesisError::GateRejected
+        );
+        // TTS fails.
+        assert!(matches!(
+            pipeline(MockTts::failure(EngineErrorKind::Unavailable))
+                .resynthesize(&old, None, ok_gate)
+                .unwrap_err(),
+            ResynthesisError::Synthesis(_)
+        ));
+        // Not generated.
+        let mut authored = old.clone();
+        authored.provenance = None;
+        assert_eq!(
+            pipeline(MockTts::success())
+                .resynthesize(&authored, None, ok_gate)
+                .unwrap_err(),
+            ResynthesisError::NotResynthesizable
         );
     }
 
