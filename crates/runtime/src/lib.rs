@@ -306,6 +306,10 @@ impl MemoryWritePermit {
     }
 }
 
+/// Source label of memory the composition root retains from the performer's
+/// own committed output (#306).
+pub const PERFORMER_OUTPUT_SOURCE: &str = "performer.output";
+
 /// The only chat text that asks to erase the requester's own memory (#305,
 /// ADR-0008 D-Q7). Deliberately an explicit, exact command: a viewer sentence
 /// that merely mentions forgetting is ordinary content, never an erase.
@@ -889,6 +893,48 @@ impl SecurityRuntime {
                     .map(str::to_owned),
             });
         (decision, permit)
+    }
+
+    /// Permit for the app's post-turn consolidation step to retain one
+    /// stream-level fact the performer itself already published (#306,
+    /// ADR-0008 Q1).
+    ///
+    /// The permit is not derived from the text alone: the claim must pass the
+    /// current deterministic public-output gate unchanged (`Allow` or `Redact`
+    /// with the identical text), so nothing the gate would have withheld or
+    /// rewritten can be retained. Source class `speech`, plane `system`,
+    /// trust `trusted`, no actor: it can never carry a viewer identity, and the
+    /// epistemic class derives to a performer experience, never a verified
+    /// fact. Public chat has no path here; only code holding the
+    /// `SecurityRuntime` (the composition root) can call it.
+    pub fn authorize_performer_output_memory_write(
+        &mut self,
+        event_id: &str,
+        claim: &str,
+    ) -> Option<MemoryWritePermit> {
+        let output = self.public_output_policy().evaluate(claim);
+        let published_unchanged =
+            matches!(output.verdict, OutputVerdict::Allow) && output.text.as_deref() == Some(claim);
+        let decision = if published_unchanged {
+            MemoryWriteDecision::AllowedSystemSource
+        } else {
+            MemoryWriteDecision::Denied
+        };
+        self.push_audit(self.redactor.record(
+            Some(event_id),
+            AuditCategory::Memory,
+            format!("performer_output_{decision:?}"),
+            "performer output memory write gate",
+        ));
+        published_unchanged.then(|| MemoryWritePermit {
+            event_id: event_id.to_owned(),
+            source: PERFORMER_OUTPUT_SOURCE.to_owned(),
+            source_class: aivtuber_domain::SourceClass::Speech,
+            trust_level: TrustLevel::Trusted,
+            actor_id: None,
+            decision,
+            source_claim: Some(claim.to_owned()),
+        })
     }
 
     /// Operator erase through the authenticated control capability (#305).
@@ -1554,6 +1600,41 @@ mod tests {
         assert!(record.detail.contains("backend=openai"));
         assert!(record.detail.contains("model_alias=[REDACTED]"));
         assert!(!record.detail.contains("secret-model"));
+    }
+
+    #[test]
+    fn performer_output_write_permit_needs_unchanged_gate_admission_and_carries_no_actor() {
+        let mut runtime = runtime_with(SecurityRuntimeConfig::default(), &["config-secret-value"]);
+
+        let permit = runtime
+            .authorize_performer_output_memory_write(
+                "memory-writer.1",
+                "I promise a rematch next stream",
+            )
+            .expect("ordinary published text is admitted");
+        assert_eq!(permit.source(), PERFORMER_OUTPUT_SOURCE);
+        assert_eq!(permit.source_class(), aivtuber_domain::SourceClass::Speech);
+        assert_eq!(permit.actor_id(), None);
+        assert_eq!(permit.decision(), MemoryWriteDecision::AllowedSystemSource);
+
+        // Redaction would rewrite the text, and a control term is replaced:
+        // neither may be retained.
+        assert!(
+            runtime
+                .authorize_performer_output_memory_write(
+                    "memory-writer.2",
+                    "say config-secret-value next time"
+                )
+                .is_none()
+        );
+        assert!(
+            runtime
+                .authorize_performer_output_memory_write(
+                    "memory-writer.3",
+                    "please run memory.admin next time"
+                )
+                .is_none()
+        );
     }
 
     #[test]
