@@ -31,7 +31,7 @@ use aivtuber_domain::{
     OperatorCommandInput,
 };
 use aivtuber_generative::{
-    GenerativePipeline, PerformanceCompiler, PerformanceCompilerConfig, PhraseConfig,
+    GenerativePipeline, PerformanceCompiler, PerformanceCompilerConfig, PhraseConfig, SpeechLexicon,
 };
 use aivtuber_reflex::{JevAdapter, JevAdapterConfig, JevApiKey, PolicyConfig, ReflexPipeline};
 use aivtuber_runtime::{
@@ -360,6 +360,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut last_floor_metrics = SpeechFloorMetrics::default();
     let mut last_barge_in_metrics = BargeInMetrics::default();
     let mut last_phrase_metrics = PhraseMetrics::default();
+    let mut last_projection_metrics = aivtuber_app::SpeechProjectionMetrics::default();
     let mut last_phrase_response_logged: Option<u64> = None;
     let mut last_conversation_metrics = SpeechConversationMetrics::default();
     if let Some(program) = env_optional("AIVTUBER_SPEECH_SIDECAR") {
@@ -741,6 +742,16 @@ fn run() -> Result<(), Box<dyn Error>> {
                     metrics.max_decision_to_stop_micros
                 );
                 last_barge_in_metrics = metrics;
+            }
+            let projection_metrics = app.speech_projection_metrics();
+            if projection_metrics != last_projection_metrics {
+                eprintln!(
+                    "speech_projection: replies={} lexicon_hits={} projection_passthrough_latin={}",
+                    projection_metrics.replies,
+                    projection_metrics.lexicon_hits,
+                    projection_metrics.passthrough_latin
+                );
+                last_projection_metrics = projection_metrics;
             }
             let phrase_metrics = app.phrase_metrics();
             if phrase_metrics != last_phrase_metrics {
@@ -1163,7 +1174,9 @@ fn build_generative_runtime(
         Some(alive) => Arc::new(LivenessGatedTts::new(Arc::new(tts), alive)),
         None => Arc::new(tts),
     };
-    let pipeline = GenerativePipeline::new(Arc::new(thinking), tts, compiler);
+    let speech_lexicon = build_speech_lexicon()?;
+    let pipeline = GenerativePipeline::new(Arc::new(thinking), tts, compiler)
+        .with_speech_lexicon(Arc::new(speech_lexicon));
     let phrase_mode = resolve_phrase_mode(profile)?;
     eprintln!(
         "generated replies: {}",
@@ -1178,6 +1191,26 @@ fn build_generative_runtime(
             .with_phrase_mode(phrase_mode)
             .map_err(io::Error::other)?;
     Ok(Some(runtime))
+}
+
+/// ADR-0004 / issue #222 S1: the reading lexicon applied between the gated
+/// display text and TTS. `AIVTUBER_SPEECH_LEXICON` names an operator lexicon
+/// file (schema `speech-lexicon.schema.json`) merged over the committed starter
+/// lexicon, which `AIVTUBER_SPEECH_LEXICON_DEFAULTS=false` turns off. A file that
+/// cannot be read or violates a bound is a startup error naming the entry;
+/// speech never silently runs without the lexicon the operator asked for.
+fn build_speech_lexicon() -> Result<SpeechLexicon, Box<dyn Error>> {
+    let include_builtin = env_bool("AIVTUBER_SPEECH_LEXICON_DEFAULTS", true)?;
+    let operator_file = env_path("AIVTUBER_SPEECH_LEXICON");
+    let lexicon = SpeechLexicon::load(include_builtin, operator_file.as_deref())
+        .map_err(|error| format!("AIVTUBER_SPEECH_LEXICON: {error}"))?;
+    // The identity is not secret and is replay-relevant; entries are not logged.
+    eprintln!(
+        "speech lexicon: {} entries, projection {}",
+        lexicon.len(),
+        lexicon.identity().key()
+    );
+    Ok(lexicon)
 }
 
 /// `AIVTUBER_PHRASE_MODE=buffered|phrase|auto` (issue #83 S1). `auto` (the

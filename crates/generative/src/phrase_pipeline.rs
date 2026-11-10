@@ -302,9 +302,10 @@ impl GenerativePipeline {
         // ADR-0004 D-5, per phrase: deletion-only projection, gated again when
         // it changed anything, with the display text through the gate last so
         // the gate's last decision is the one for the text being committed.
-        let projection = project_speech_text(&approved);
+        let projection = self.speech_lexicon.project(&approved);
+        trace.record_speech_projection(&projection);
         let speech_text = if projection.report.changed() {
-            let decision = output_gate(&projection.text);
+            let decision = output_gate(&projection.speech_text);
             let _ = output_gate(&approved);
             match decision {
                 GeneratedTextGateDecision::Publish(text) => text,
@@ -371,6 +372,9 @@ impl GenerativePipeline {
                 thinking_identity,
                 tts_identity,
             )
+            .map(|asset| {
+                asset.with_speech_projection(speech_request.text.clone(), projection.identity.key())
+            })
             .map_err(|_| {
                 PhraseStop::Failed(PhraseFailure::Compile, FallbackReason::InvalidRequest)
             })?;
@@ -898,6 +902,49 @@ mod tests {
         assert_eq!(seen[1], first_display);
         assert!(!seen[2].contains('😊'));
         assert_eq!(seen[3], first_display, "the display text is gated last");
+    }
+
+    #[test]
+    fn every_phrase_is_projected_with_the_lexicon_and_records_the_projection_identity() {
+        let reply = "今日はYouTubeでライブをします。AIとVTuberの話をたくさんしますので、最後まで見ていってくださいね。";
+        let tts = ScriptedTts::new();
+        let spoken = Arc::clone(&tts.spoken);
+        let pipeline = pipeline(reply, tts);
+        let mut delivery = RecordingDelivery::default();
+        let result = run(
+            &pipeline,
+            &GenerationCancellationToken::default(),
+            publish,
+            &mut delivery,
+        );
+        assert!(summary(&result).completed());
+        assert!(delivery.units.len() >= 2, "{:?}", delivery.units.len());
+        let key = pipeline.speech_lexicon().identity().key();
+        for (unit, sent) in delivery.units.iter().zip(spoken.lock().unwrap().iter()) {
+            let asset = unit.asset();
+            asset.validate().expect("valid 0.2.0 asset");
+            let speech = asset.speech.as_ref().unwrap();
+            assert_eq!(speech.text.as_deref(), Some(unit.display_text()));
+            assert_eq!(speech.speech_text.as_deref(), Some(sent.as_str()));
+            assert_eq!(
+                asset.compatibility.speech_projection.as_deref(),
+                Some(key.as_str())
+            );
+            assert!(
+                !sent.contains("YouTube") && !sent.contains("VTuber"),
+                "{sent}"
+            );
+        }
+        let all: String = spoken.lock().unwrap().join("");
+        assert!(
+            all.contains("ユーチューブ")
+                && all.contains("エーアイ")
+                && all.contains("ブイチューバー")
+        );
+        assert!(
+            delivery.units[0].display_text().contains("YouTube"),
+            "display text keeps the Latin brand word"
+        );
     }
 
     #[test]

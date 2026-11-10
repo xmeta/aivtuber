@@ -13,14 +13,20 @@ export interface PerformanceAsset {
   intent: string;
   class: "filler" | "reaction" | "phrase" | "template" | "dynamic";
   variant_group?: string | null;
-  speech?: { text: string; audio_ref: string; duration_ms: number; viseme_ref?: string | null } | null;
+  speech?: { text: string; speech_text?: string; audio_ref: string; duration_ms: number; viseme_ref?: string | null } | null;
   expression?: { preset: string; intensity: number } | null;
   gesture?: { preset: string; amplitude: number } | null;
   gaze?: "camera" | "chat" | "game" | "speaker" | "away" | null;
   timeline: { at_ms: number; event: string; payload?: unknown }[];
   interrupt_points_ms: number[];
   variation?: Variation;
-  compatibility: { compiler_version: string; voice_model?: string | null; avatar_profile?: string | null };
+  compatibility: {
+    compiler_version: string;
+    voice_model?: string | null;
+    avatar_profile?: string | null;
+    /** Schema 0.2.0 (ADR-0004): identity of the display-to-speech projection. A mismatch is stale, not incompatible. */
+    speech_projection?: string | null;
+  };
   provenance?: { generated: boolean; generator?: string | null; created_at?: string | null };
 }
 

@@ -13,10 +13,13 @@
 //!
 //! The display text is never changed, nothing is ever inserted, and the
 //! function is pure and deterministic (ADR-0004 derivability: every character
-//! of the output is a character of the input). Everything else passes through
-//! unchanged, including Latin brand words, whose readings are a known
-//! limitation until the ADR-0004 lexicon exists (EXP-0003: YouTube, Twitter,
-//! VTuber are misread), and symbols such as `&`, `%`, `#`, `@`.
+//! of the output is a character of the input) for *this stage*. Everything else
+//! passes through unchanged here, and symbols such as `&`, `%`, `#`, `@` still
+//! do. Latin brand words (EXP-0003: YouTube, Twitter, VTuber are misread) are
+//! handled by the next stage, the reading lexicon in `speech_lexicon`, which
+//! runs on this stage's output; that stage inserts kana readings from an
+//! operator-owned lexicon, so the "no insertion" statement above holds for the
+//! deletion rules only.
 //!
 //! Limits, stated so they are not mistaken for coverage: kaomoji that contain
 //! letters or digits (`(T_T)`, `m(_ _)m`) and kaomoji without parentheses are
@@ -29,11 +32,16 @@ pub struct SpeechProjectionReport {
     pub dropped_urls: usize,
     pub dropped_emoji: usize,
     pub dropped_kaomoji: usize,
+    /// Lexicon readings spliced in (ADR-0004 D3); zero from the deletion rules alone.
+    pub lexicon_hits: usize,
+    /// Latin words of two or more letters left for the TTS to read
+    /// (`projection_passthrough_latin`, ADR-0004 D-5): the lexicon's to-do list.
+    pub passthrough_latin: usize,
 }
 
 impl SpeechProjectionReport {
     pub fn changed(&self) -> bool {
-        self.dropped_urls + self.dropped_emoji + self.dropped_kaomoji > 0
+        self.dropped_urls + self.dropped_emoji + self.dropped_kaomoji + self.lexicon_hits > 0
     }
 }
 
@@ -222,7 +230,11 @@ mod tests {
     #[test]
     fn the_exp_0003_handling_set_projects_as_adr_0004_d5_requires() {
         let items = handling_set();
-        assert_eq!(items.len(), 38, "the whole EXP-0003 handling set");
+        assert_eq!(
+            items.len(),
+            55,
+            "the EXP-0003 handling set (38) plus the brand-word items (17)"
+        );
         for item in &items {
             let projection = project_speech_text(&item.text);
             assert_eq!(
