@@ -133,7 +133,7 @@ impl Drop for FakeVoicevoxEngine {
     }
 }
 
-fn read_request(stream: &mut TcpStream) -> Option<RecordedRequest> {
+pub(super) fn read_request(stream: &mut TcpStream) -> Option<RecordedRequest> {
     stream.set_nonblocking(false).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
     let mut buffer = Vec::new();
@@ -183,13 +183,19 @@ fn read_request(stream: &mut TcpStream) -> Option<RecordedRequest> {
     })
 }
 
-fn reply(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) {
+pub(super) fn reply(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) {
     let reason = match status {
         200 => "OK",
         307 => "Temporary Redirect",
+        401 => "Unauthorized",
+        402 => "Payment Required",
+        403 => "Forbidden",
         404 => "Not Found",
         422 => "Unprocessable Entity",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        529 => "Overloaded",
         _ => "Status",
     };
     let mut head = format!(

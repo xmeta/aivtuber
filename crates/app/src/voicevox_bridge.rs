@@ -21,6 +21,7 @@
 //! | `AIVTUBER_VOICEVOX_AMPLITUDE_VISEMES` | derive a mouth track from the audio, default off |
 
 use crate::CompositionProfile;
+use aivtuber_adapters::speech_tts::Synthesizer;
 use aivtuber_adapters::speech_tts::server::{DEFAULT_PATH, ServerConfig, ServerHandle, TtsServer};
 use aivtuber_adapters::speech_tts::voicevox::{
     self, VoicevoxConfig, VoicevoxConfigError, VoicevoxSynthesizer,
@@ -62,7 +63,7 @@ impl std::fmt::Display for VoicevoxSettingsError {
         match self {
             Self::UnknownBackend(value) => write!(
                 f,
-                "{TTS_BACKEND_VAR} must be voicevox or http (got {value:?})"
+                "{TTS_BACKEND_VAR} must be voicevox, aivis-cloud or http (got {value:?})"
             ),
             Self::NotLocalProfile => write!(
                 f,
@@ -133,6 +134,8 @@ impl VoicevoxSettings {
             .as_deref()
         {
             None | Some("http") | Some("normalized-http") => return Ok(None),
+            // Another in-process backend (issue #327) owns this selection.
+            Some(name) if crate::aivis_bridge::is_aivis_backend_name(name) => return Ok(None),
             Some("voicevox") => {}
             Some(other) => return Err(VoicevoxSettingsError::UnknownBackend(other.to_owned())),
         }
@@ -188,6 +191,34 @@ impl VoicevoxSettings {
     }
 }
 
+/// Bind the `local-tts-sidecar` server for `synth` on an ephemeral loopback
+/// port and return its handle and the normalized-contract endpoint. Shared by
+/// every in-process TTS backend (VOICEVOX, Aivis Cloud) so there is one bridge
+/// lifecycle and one wire contract.
+pub(crate) fn start_loopback_bridge(
+    synth: impl Synthesizer,
+    synth_timeout: Duration,
+    amplitude_visemes: bool,
+    audio_root: &Path,
+    pack_root: &Path,
+) -> Result<(ServerHandle, String), String> {
+    std::fs::create_dir_all(audio_root).map_err(|error| {
+        format!(
+            "cannot create the audio root {}: {error}",
+            audio_root.display()
+        )
+    })?;
+    let mut config =
+        ServerConfig::new("127.0.0.1:0".parse().expect("loopback literal"), audio_root);
+    config.synth_deadline = synth_timeout;
+    if amplitude_visemes {
+        config.viseme_root = Some(pack_root.to_path_buf());
+    }
+    let server = TtsServer::bind(config, Arc::new(synth))?;
+    let tts_endpoint = format!("http://{}{DEFAULT_PATH}", server.local_addr());
+    Ok((server.spawn(), tts_endpoint))
+}
+
 /// The running in-process bridge. Dropping it stops the listener.
 pub struct VoicevoxBridge {
     handle: ServerHandle,
@@ -205,22 +236,15 @@ impl VoicevoxBridge {
         pack_root: &Path,
     ) -> Result<Self, String> {
         let synth = VoicevoxSynthesizer::new(&settings.config).map_err(|e| e.to_string())?;
-        std::fs::create_dir_all(audio_root).map_err(|error| {
-            format!(
-                "cannot create the audio root {}: {error}",
-                audio_root.display()
-            )
-        })?;
-        let mut config =
-            ServerConfig::new("127.0.0.1:0".parse().expect("loopback literal"), audio_root);
-        config.synth_deadline = settings.synth_timeout;
-        if settings.amplitude_visemes {
-            config.viseme_root = Some(pack_root.to_path_buf());
-        }
-        let server = TtsServer::bind(config, Arc::new(synth))?;
-        let tts_endpoint = format!("http://{}{DEFAULT_PATH}", server.local_addr());
+        let (handle, tts_endpoint) = start_loopback_bridge(
+            synth,
+            settings.synth_timeout,
+            settings.amplitude_visemes,
+            audio_root,
+            pack_root,
+        )?;
         Ok(Self {
-            handle: server.spawn(),
+            handle,
             tts_endpoint,
             settings,
         })

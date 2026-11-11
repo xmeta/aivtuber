@@ -231,6 +231,8 @@ Secrets must not appear in:
 
 Adapter configuration references secret identifiers; it does not copy secret values into domain state. Rust control secrets use redacted `Debug`, and telemetry/public-output paths apply a configured `SecretRedactor` before emitting text.
 
+Outbound provider egress: the local profile is loopback-only except the opt-in Aivis Cloud TTS backend (#327, assumption A-TTS-004), which sends only projected reply text to an HTTPS origin, holds its key (`AIVIS_API`) as a redacted `SecretString`, never follows a redirect, and never logs the key or the spoken text.
+
 == 11. Publication containment gate
 
 Before public speech/display, generated output passes a deterministic publication-containment policy.

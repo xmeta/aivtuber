@@ -333,6 +333,36 @@ Do not set `AIVTUBER_TTS_ENDPOINT` or `AIVTUBER_TTS_SIDECAR` with it (the app sa
 
 EXP-0003 synthesized the same text repeatedly with one engine build (0.26.1, CPU), one character and default parameters, and got byte-identical audio in 50 of 50 replies, in one process and across processes. VOICEVOX has no seed. Treat this as an observation of that build, not a guarantee: another engine version, voice library, hardware backend or parameter can change the audio. The bridge's audio cache is keyed by the text and the speaker id, not by the engine version, so delete `AIVTUBER_AUDIO_ROOT/generated/` after you upgrade the engine or its voice libraries. The bridge never changes the engine's speed, pitch or intonation parameters (it only makes the output mono).
 
+=== Optional voice: Aivis Cloud API (issue #327)
+
+If you would rather use an AivisHub voice without running an engine, the app can call the Aivis Cloud API through the same built-in loopback bridge. *This is the one setting that sends data off your machine:* each reply's spoken text (after URLs and emoji are removed) is sent to Aivis Cloud, an internet service, over HTTPS. Nothing else leaves, and the key and the text are never logged. Supertonic and VOICEVOX stay local; choose this only if that trade is acceptable for your stream.
+
+. Create an Aivis Cloud API key and credits at https://api.aivis-project.com/ and pick a model from AivisHub. Read that model's licence and decide what credit line you must show. *There is no default voice*, and the app refuses to start without a model and a credit line.
+. Put the key in the `AIVIS_API` environment variable (not in a file in the repository).
+. Replace the `# local TTS (supervised child)` block of step 4 with:
+
+[source,sh]
+----
+export AIVTUBER_TTS_BACKEND=aivis-cloud                      # or: aivis
+# AIVIS_API is your API key, already set in the environment (never printed)
+export AIVTUBER_AIVIS_MODEL_UUID=<model uuid or ak_... key>  # required, no default voice
+export AIVTUBER_AIVIS_CREDIT="<credit line your model asks for>"   # required
+# optional
+export AIVTUBER_AIVIS_SPEAKER_UUID=<uuid>                    # multi-speaker models
+export AIVTUBER_AIVIS_STYLE_ID=0                             # 0 to 31
+export AIVTUBER_AIVIS_TIMEOUT_MS=12000                       # budget for one synthesis (default 12000)
+export AIVTUBER_AIVIS_AMPLITUDE_VISEMES=true                 # mouth movement from the audio envelope (default off)
+# export AIVTUBER_AIVIS_ENDPOINT=https://api.aivis-project.com   # default; https:// only
+----
+
+Do not set `AIVTUBER_TTS_ENDPOINT` or `AIVTUBER_TTS_SIDECAR` with it. At start the app logs the origin, the model, your credit line and a notice that reply text is sent to Aivis Cloud (never the key). A rejected key, exhausted credits (HTTP 402), a rate limit, an outage or a timeout fails like any TTS failure: the viewer sees the non-verbal reaction (#291) and the performer carries on. The `AIVIS_API` key is secret: anyone who has it spends your credits.
+
+==== Aivis terms, credit, cost and determinism
+
+* The Aivis Cloud API terms apply (see https://api.aivis-project.com/), and *every AivisHub model has its own licence and credit requirements*. You choose the model, so you own the compliance, including the credit line you configured and any commercial-use limits. The runtime cannot show the credit on your stream; put it in the stream description or an overlay, and keep the AI-generated-voice disclosure as well.
+* Each uncached synthesis spends credits. Identical sentences are served from the audio cache without a call; phrase mode makes one call per phrase.
+* Not guaranteed byte-identical: the service gives no determinism promise, and a model update on the service side is invisible to the app. The audio cache key includes the model, speaker and style (so switching voice never replays old audio) but not a service version, so delete `AIVTUBER_AUDIO_ROOT/generated/` after you change the model or the provider updates it.
+
 === Optional: let her see the game (screen perception, issue #90)
 
 Off by default, and not for every machine. The "perception profile" runs one `llama-server` with a multimodal model (Qwen3-VL-4B-Instruct Q4_K_M and its projector) that serves both the Thinking replies and one short screen caption every 10 seconds. **It needs about 12 GB of VRAM** for the whole local stack (model, renderer, speech sidecars, desktop). On an 8 GB card the measurements (EXP-0004c) showed a run that fit and an identical run that spilled into system memory, with captions taking 12 s and speech getting slower; that card class stays on structured telemetry only. If you try it anyway, the app measures this for you: a latency probe at start and every minute suspends perception, and `aivtuberctl status` says why, instead of letting the stream stutter.
@@ -461,6 +491,7 @@ No model, voice file or avatar model is bundled or redistributed by this reposit
 |NVIDIA parakeet-tdt_ctc-0.6b-ja int8 (optional STT, `AIVTUBER_SPEECH_STT_MODEL=parakeet-ja`) |CC-BY-4.0 |*Attribution required* if you select it: "Contains NVIDIA parakeet-tdt_ctc-0.6b-ja (NVIDIA, CC-BY-4.0, https://huggingface.co/nvidia/parakeet-tdt_ctc-0.6b-ja), converted to ONNX by the sherpa-onnx project (k2-fsa)." (Not fetched by `fetch-local-profile.mjs`; `node scripts/fetch-sherpa-onnx.mjs model parakeet-ja <dir>`.)
 |Supertonic 3 weights (TTS voice) |OpenRAIL-M (the sample code in the archive is MIT) |*Disclose that the voice is machine-generated.* One of the use restrictions is to publish AI-generated content without clearly disclosing it. Keep an "AI-generated voice" line where viewers see it (channel or stream description, or an overlay text); the runtime cannot show it for you and only prints a start-up notice. The other restrictions (no unlawful use, no harm to minors, no disinformation, no harassment or discrimination, no impersonation or deepfakes without consent, no fully automated legal/medical/law-enforcement decisions) pass on to you. The licensor claims no rights in the audio; you are accountable for it.
 |VOICEVOX ENGINE and voices (optional, not shipped; `AIVTUBER_TTS_BACKEND=voicevox`) |Engine LGPL-3.0 (or separate licence), run as a separate process; voices under the VOICEVOX terms plus per-character terms |No default character ships; you choose the speaker. *Show the credit line* (`VOICEVOX:<character name>`) and follow your character's own terms; see <<voicevox-terms>>. The startup log prints the credit line you configured.
+|Aivis Cloud API and AivisHub models (optional, not shipped; `AIVTUBER_TTS_BACKEND=aivis-cloud`) |Aivis Cloud API terms; each model under its own AivisHub licence |*Reply text is sent to the service.* No default voice ships; you choose the model, own its licence and credit line (`AIVTUBER_AIVIS_CREDIT`, printed at start) and pay for the credits used. See the Aivis Cloud section above.
 |three.js, `@pixiv/three-vrm`, Vite (renderer) |MIT, exact-pinned, allowlist-checked in CI |See `docs/supply-chain.adoc` section 8.
 |Sample VRM (`VRM1_Constraint_Twist_Sample.vrm`) |Embedded VRM 1.0 metadata: pixiv Inc., avatar permission everyone, credit notation unnecessary, no hateful use |Test model only. Check the embedded licence of whatever model you stream; the page logs its metadata at load.
 |FFmpeg `ffplay` |LGPL/GPL depending on your build |Installed by you; not bundled.
