@@ -27,9 +27,14 @@
 //! * `voicevox` is an optional second [`Synthesizer`] (issue #295): it drives a
 //!   separately started VOICEVOX ENGINE on loopback behind this same server, so
 //!   the app's TTS wire contract stays one.
+//! * `aivis_cloud` is an optional third [`Synthesizer`] (issue #327) and the
+//!   only one that talks to the internet: the Aivis Cloud API over HTTPS, as an
+//!   explicit operator opt-in, behind the same server and wire contract.
 //! * Nothing is downloaded at build or run time; the model files and the engine
 //!   libraries must match SHA-256 pins ([`pins`], `speech_stt::pins`).
 
+pub mod aivis_cloud;
+pub mod aivis_cloud_fake;
 pub mod envelope;
 pub mod pins;
 pub mod runner;

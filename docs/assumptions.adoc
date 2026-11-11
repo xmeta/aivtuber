@@ -247,6 +247,22 @@ Do not record secrets, private user data, or raw provider credentials.
 
 *Related:* #220, #295, A-TTS-001, A-TTS-002.
 
+=== A-TTS-004 -- An explicit, operator-opted HTTPS egress to Aivis Cloud is an acceptable exception to the loopback-only local profile
+
+*Subsystem:* Aivis Cloud bridge / `local` composition profile (issue #327)
+
+*Status:* Needs validation (one live synthesis recorded in the pull request; otherwise tested against a loopback fake)
+
+*Statement:* The local profile is otherwise loopback-only. `AIVTUBER_TTS_BACKEND=aivis-cloud` is the single exception: it sends the projected speech text of each reply (never raw chat, never memory, never the key in any log) to the Aivis Cloud API over TLS, only when the operator selects it, and the app says so at start. The synthesizer accepts an `https://` origin (or loopback `http://` for test fakes), no credentials, path or query, and never follows a redirect, so the bearer key cannot be forwarded. The key is a `SecretString` read from `AIVIS_API`. The service's audio is data: it is parsed strictly (16-bit PCM mono, bounded size and rate) and re-encoded by the sidecar server. The loopback profile check still sees only the loopback bridge; the egress is bounded by this one synthesizer, not by a generic provider allowlist.
+
+*Evidence:* `crates/adapters/src/speech_tts/aivis_cloud.rs` tests (origin rules, bearer header, `use_ssml=false`, status mapping, bounds, redaction, no redirect), `crates/app/src/aivis_bridge.rs` and `crates/app/src/tests/aivis_cloud_tts_tests.rs`, and the live smoke.
+
+*Consequence if false:* Reply text, which can quote a viewer, reaches a third party the operator did not intend; a leaked key spends the operator's credits. Credits exhausted or the service down degrade the voice to the visible non-verbal fallback, never the performer. The audio cache key does not contain a service-side model version, so a silent model update can leave stale cached audio.
+
+*Revisit when:* a second cloud provider is added (then a typed egress allowlist is warranted instead of one synthesizer), the service's terms or data handling change, replies could carry content the operator does not want sent out, or the cache key must carry a service model version.
+
+*Related:* #220, #295, #327, A-TTS-001, A-TTS-003.
+
 === A-AUDIO-001 -- Current process-player startup cost is acceptable until measured otherwise
 
 *Subsystem:* audio output

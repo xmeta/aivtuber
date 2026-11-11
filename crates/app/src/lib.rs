@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod aivis_bridge;
 mod audio_stop;
 mod budget;
 mod chat_burst;
@@ -37,6 +38,7 @@ mod tool_execution;
 mod tts_sidecar;
 mod voicevox_bridge;
 
+pub use aivis_bridge::*;
 pub use aivtuber_domain::scenario::*;
 pub use audio_stop::{AUDIO_STOP_BOUND, AudioStopReport, OperatorStopReport};
 pub use budget::*;
@@ -4670,6 +4672,7 @@ mod tests {
     };
     use aivtuber_runtime::{CachedPlaybackConfig, SecurityRuntimeConfig};
 
+    mod aivis_cloud_tts_tests;
     mod chat_burst_tests;
     mod local_thinking_fallback_tests;
     mod memory_seed_tests;
