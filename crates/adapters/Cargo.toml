@@ -29,6 +29,9 @@ sherpa-tts = ["dep:sherpa-onnx"]
 [dependencies]
 aivtuber-domain = { path = "../domain" }
 base64 = "0.23.1"
+# NFKC for the screen-caption producer (#90 S1b). Already in Cargo.lock through
+# url -> idna; no new package, only a direct edge (docs/supply-chain.adoc).
+icu_normalizer = { version = "2.3.0", default-features = false, features = ["compiled_data"] }
 getrandom = "0.4.3"
 # Request-head parsing for the local TTS sidecar server (#220 S2b): already in
 # Cargo.lock through tungstenite; pinned to that exact version.

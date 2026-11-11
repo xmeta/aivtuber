@@ -460,6 +460,19 @@ impl SpeechObservationTracker {
         self.metrics.speakers_evicted += (before - self.speakers.len()) as u64;
     }
 
+    /// Whether any tracked speaker currently has an active speech edge
+    /// (read-only, counts nothing). Used by the perception yield gate (#90):
+    /// a screen caption must not compete with a person talking. A stalled
+    /// feed cannot hold this forever: speakers with no accepted observation
+    /// for `speaker_idle_ttl_ms` are evicted by [`Self::sweep`].
+    pub fn any_speaker_active(&self) -> bool {
+        self.speakers.values().any(|entry| {
+            entry
+                .state
+                .is_some_and(|state| state.activity == SpeakerActivity::Active)
+        })
+    }
+
     /// Tracked speaker ids, in order. Bounded by `max_speakers`.
     pub fn speaker_ids(&self) -> impl Iterator<Item = &str> {
         self.speakers.keys().map(String::as_str)

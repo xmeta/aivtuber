@@ -50,6 +50,11 @@ enum Command {
     /// Capture a bounded, redacted diagnostic/support bundle (issue #68).
     /// Uses the status path (secret verification only, no control authority).
     Diagnose,
+    /// Enable opt-in live screen perception (issue #90). Needs the daemon to
+    /// run with AIVTUBER_PERCEPTION=true; starts with a latency probe.
+    PerceptionOn,
+    /// Disable live screen perception. Takes effect before the next capture.
+    PerceptionOff,
 }
 
 fn action_name(command: &Command) -> &'static str {
@@ -58,6 +63,8 @@ fn action_name(command: &Command) -> &'static str {
         Command::Stop => "stop",
         Command::Mute => "mute",
         Command::Diagnose => "diagnose",
+        Command::PerceptionOn => "perception.enable",
+        Command::PerceptionOff => "perception.disable",
     }
 }
 
@@ -135,6 +142,21 @@ fn print_response(response: &OperatorResponse) {
             status.scheduler_items,
             status.generation_active,
         );
+        if let Some(perception) = &status.perception {
+            println!(
+                "perception status={} suspend_reason={:?} availability={} last_probe_ms={:?} captures_ok={} captures_failed={} captures_late={} yielded_thinking={} yielded_speech={} observations_accepted={}",
+                perception.status,
+                perception.suspend_reason,
+                perception.availability,
+                perception.last_probe_ms,
+                perception.captures_ok,
+                perception.captures_failed,
+                perception.captures_late,
+                perception.yielded_thinking,
+                perception.yielded_speech,
+                perception.observations_accepted,
+            );
+        }
     } else {
         println!("{}", response.detail);
     }

@@ -302,6 +302,37 @@ Do not set `AIVTUBER_TTS_ENDPOINT` or `AIVTUBER_TTS_SIDECAR` with it (the app sa
 
 EXP-0003 synthesized the same text repeatedly with one engine build (0.26.1, CPU), one character and default parameters, and got byte-identical audio in 50 of 50 replies, in one process and across processes. VOICEVOX has no seed. Treat this as an observation of that build, not a guarantee: another engine version, voice library, hardware backend or parameter can change the audio. The bridge's audio cache is keyed by the text and the speaker id, not by the engine version, so delete `AIVTUBER_AUDIO_ROOT/generated/` after you upgrade the engine or its voice libraries. The bridge never changes the engine's speed, pitch or intonation parameters (it only makes the output mono).
 
+=== Optional: let her see the game (screen perception, issue #90)
+
+Off by default, and not for every machine. The "perception profile" runs one `llama-server` with a multimodal model (Qwen3-VL-4B-Instruct Q4_K_M and its projector) that serves both the Thinking replies and one short screen caption every 10 seconds. **It needs about 12 GB of VRAM** for the whole local stack (model, renderer, speech sidecars, desktop). On an 8 GB card the measurements (EXP-0004c) showed a run that fit and an identical run that spilled into system memory, with captions taking 12 s and speech getting slower; that card class stays on structured telemetry only. If you try it anyway, the app measures this for you: a latency probe at start and every minute suspends perception, and `aivtuberctl status` says why, instead of letting the stream stutter.
+
+. Start the multimodal server instead of the default model (loopback only, two slots so a caption never blocks a reply):
++
+[source,sh]
+----
+llama-server -m Qwen3VL-4B-Instruct-Q4_K_M.gguf --mmproj mmproj-Qwen3VL-4B-Instruct-Q8_0.gguf \
+  --host 127.0.0.1 --port 8081 --parallel 2 -c 8192 -ngl 99
+----
+. In OBS, note the exact name of the one source to read (for example your game capture) and enable obs-websocket on `127.0.0.1` with a password.
+. Add to the app's environment (`AIVTUBER_MODE=local` is required; everything stays on loopback):
++
+[source,sh]
+----
+AIVTUBER_PERCEPTION=true
+AIVTUBER_PERCEPTION_OBS_SOURCE="Game Capture"
+AIVTUBER_PERCEPTION_VLM_ENDPOINT=http://127.0.0.1:8081/v1/chat/completions
+AIVTUBER_OBS_PASSWORD=...        # your obs-websocket password
+----
+. Start the app, then turn it on from the console: `aivtuberctl perception-on` (and `aivtuberctl perception-off` to stop it; it takes effect before the next capture). `aivtuberctl status` shows `status` (`off`, `probing`, `active`, `suspended`), why it was suspended, and how often a capture waited for Thinking or speech.
+
+What you should know before enabling it:
+
+* Frames are read from OBS (downscaled by OBS to 768x432), held in memory for one model call and discarded. Nothing is written to disk or to the log, and nothing leaves the machine.
+* The caption is untrusted text the model read off your screen. URLs and credential-looking strings are removed, it is at most 240 bytes, and it is only ever offered to Thinking inside a delimited "untrusted" slot. In this release the caption is collected and bounded but not yet given to Thinking (ADR-0007 S2), so enabling perception does not change what she says yet.
+* She does not capture while she is thinking, speaking, or hearing you speak, and never more often than every 5 seconds (default 10).
+* A native Japanese read of the captions and a run on a 12 GB card are still manual checks; treat it as experimental.
+* Not covered by this quickstart: webcam capture (out of scope), per-window capture (one OBS source only).
+
 == 5. Open the avatar, then talk to it
 
 *Avatar.* Copy the `local avatar renderer URL` from the app's stderr (`http://127.0.0.1:8765/?token=...`) into a browser, or into an OBS Browser Source (width and height of your canvas, "Shutdown source when not visible" off). The URL carries a per-launch secret: do not paste it into issues or shared logs. The token changes on every start. A missing or broken `model.vrm` shows as `disconnected` and the reason is in the page's console. See `docs/vts-obs-adapters.adoc` section 6 for OBS and for the security properties.

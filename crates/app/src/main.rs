@@ -6,25 +6,27 @@ use aivtuber_adapters::speech_tts::pins::{
 };
 use aivtuber_adapters::speech_tts::supervisor::{LivenessGatedTts, TtsSidecar};
 use aivtuber_adapters::{
-    LocalAvatarConfig, LocalAvatarServer, NormalizedHttpTtsAdapter, NormalizedHttpTtsConfig,
-    ObsWebSocketAdapter, ObsWebSocketConfig, OpenAiResponsesAdapter, OpenAiResponsesConfig,
-    ProcessAudioConfig, ProcessAudioPlayer, SecretString, StreamLimits, SystemHostResolver,
-    ThinkingAuthentication, VTubeStudioAdapter, VTubeStudioConfig, endpoint_origin,
-    verify_loopback_endpoint,
+    AdapterClock, CaptionLanguage, LocalAvatarConfig, LocalAvatarServer, NormalizedHttpTtsAdapter,
+    NormalizedHttpTtsConfig, ObsScreenSource, ObsScreenshotRequest, ObsWebSocketAdapter,
+    ObsWebSocketConfig, OpenAiResponsesAdapter, OpenAiResponsesConfig, ProcessAudioConfig,
+    ProcessAudioPlayer, ScreenDescriber, ScreenDescriberConfig, ScreenImageFormat,
+    ScreenObservationProducer, ScreenProducerConfig, SecretString, StreamLimits,
+    SystemHostResolver, ThinkingAuthentication, VTubeStudioAdapter, VTubeStudioConfig,
+    endpoint_origin, verify_loopback_endpoint,
 };
 use aivtuber_app::{
     AdaptationRuntime, AdapterHealth, AvatarOutput, BargeInConfig, BargeInMetrics, ChatBurstConfig,
     CompositionProfile, GenerationFallbackCounts, GenerativeBudgetPolicy, GenerativeRuntime,
     IntentRoutePlanner, IntentShadowPolicy, LocalAvatarOutput, LocalRoutePlanner,
     MemoryWriterConfig, MemoryWriterMetrics, NoopAvatarOutput, NoopStreamOutput, ObsStreamOutput,
-    OperatorControlServer, OperatorRateLimiter, PhraseMetrics, PhraseMode, ProductionApp,
-    ProfileSummary, RawIngressConfig, RawIngressMetrics, RawIngressMetricsSnapshot, RoutePlanner,
-    RuntimeRetentionPolicy, SHADOW_ORCHESTRATOR_SCHEMA_VERSION, ShadowOrchestratorConfig,
-    ShadowPolicyIdentity, ShadowingRoutePlanner, SpeechConversationConfig,
-    SpeechConversationMetrics, SpeechFloorMetrics, SpeechSidecar, SpeechSidecarConfig,
-    SpeechSidecarStats, StreamOutput, TtsSidecarSettings, VoicevoxBridge, VoicevoxSettings,
-    VtsAvatarOutput, VtsPlaybackConfig, apply_dispatched_request, audit_pack_readiness,
-    pump_bounded_records, stt_sidecar_args,
+    OperatorControlServer, OperatorRateLimiter, PerceptionService, PerceptionServiceConfig,
+    PhraseMetrics, PhraseMode, ProducerWorker, ProductionApp, ProfileSummary, RawIngressConfig,
+    RawIngressMetrics, RawIngressMetricsSnapshot, RoutePlanner, RuntimeRetentionPolicy,
+    SHADOW_ORCHESTRATOR_SCHEMA_VERSION, ShadowOrchestratorConfig, ShadowPolicyIdentity,
+    ShadowingRoutePlanner, SpeechConversationConfig, SpeechConversationMetrics, SpeechFloorMetrics,
+    SpeechSidecar, SpeechSidecarConfig, SpeechSidecarStats, StreamOutput, TtsSidecarSettings,
+    VoicevoxBridge, VoicevoxSettings, VtsAvatarOutput, VtsPlaybackConfig, apply_dispatched_request,
+    audit_pack_readiness, pump_bounded_records, stt_sidecar_args,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
@@ -39,9 +41,10 @@ use aivtuber_reflex::{
     BurstConfig, JevAdapter, JevAdapterConfig, JevApiKey, PolicyConfig, ReflexPipeline,
 };
 use aivtuber_runtime::{
-    CachedPerformer, CachedPlaybackConfig, IngressPolicy, LocalVisemeStore, SecurityRuntime,
-    SecurityRuntimeConfig, SpeechObservationConfig, SpeechObservationTracker,
-    SpeechTranscriptConfig, SpeechTranscriptTracker,
+    CachedPerformer, CachedPlaybackConfig, IngressPolicy, LocalVisemeStore,
+    PerceptionGovernorConfig, PerceptionStatus, SecurityRuntime, SecurityRuntimeConfig,
+    SpeechObservationConfig, SpeechObservationTracker, SpeechTranscriptConfig,
+    SpeechTranscriptTracker,
 };
 use aivtuber_scheduler::{DeferredConfig, Scheduler, SchedulerConfig};
 use aivtuber_telemetry::SecretRedactor;
@@ -349,8 +352,14 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     };
     let operator_endpoint = env_string("AIVTUBER_CONTROL_ENDPOINT", "aivtuber-operator-control");
-    let (operator_server, mut operator_receiver) =
-        OperatorControlServer::new(&operator_endpoint, operator_secret)?;
+    // #90 S1b: live screen perception is opt-in. Only then does the operator
+    // endpoint's ingress also hold `perception.control`.
+    let perception_opt_in = env_bool("AIVTUBER_PERCEPTION", false)?;
+    let (operator_server, mut operator_receiver) = OperatorControlServer::with_perception_control(
+        &operator_endpoint,
+        operator_secret,
+        perception_opt_in,
+    )?;
     let operator_ingress = operator_server.ingress();
     let operator_rate = Arc::new(Mutex::new(OperatorRateLimiter::new(16, 8)));
     {
@@ -611,6 +620,23 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         app = app.with_speech_observations(tracker);
     }
+    // #90 S1b: opt-in live screen perception ("perception" local profile).
+    // Composed disabled; the operator turns it on with the authenticated
+    // control endpoint (`aivtuberctl perception-on`) or, only when the
+    // operator asks for it in configuration, AIVTUBER_PERCEPTION_AUTOSTART.
+    let mut last_perception_status: Option<(PerceptionStatus, Option<String>)> = None;
+    if perception_opt_in {
+        let service = build_perception_service(profile, started)?;
+        app = app.with_perception(service);
+        if env_bool("AIVTUBER_PERCEPTION_AUTOSTART", false)? {
+            let authority = perception_authority("runtime:perception-autostart")?;
+            let now_ms = elapsed_ms(started);
+            match app.apply_perception_control(&authority, true, now_ms) {
+                Ok(detail) => eprintln!("perception: autostart: {detail}"),
+                Err(detail) => eprintln!("perception: autostart refused: {detail}"),
+            }
+        }
+    }
     let mut last_speech_stats = SpeechSidecarStats::default();
     let mut last_chat_burst_accounted = 0_u64;
     let mut last_generation_fallbacks = GenerationFallbackCounts::default();
@@ -657,6 +683,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                     true,
                 );
                 let now_ms = elapsed_ms(started);
+                if let Some(service) = app.perception_mut() {
+                    service.shutdown();
+                }
                 app.shutdown(now_ms);
                 if let Some(sidecar) = speech_sidecar.as_mut() {
                     sidecar.shutdown();
@@ -677,6 +706,34 @@ fn run() -> Result<(), Box<dyn Error>> {
             let response =
                 apply_dispatched_request(&operator_ingress, &mut app, &dispatched, now_ms);
             let _ = dispatched.respond.send(response);
+        }
+        // #90 S1b: after the operator drain, so a disable is already in effect
+        // before the next capture is considered. Never blocks: the slow OBS and
+        // model work is on the perception worker thread.
+        app.service_perception(now_ms);
+        if let Some(service) = app.perception() {
+            let report = service.report(now_ms);
+            let key = (
+                report.governor.status,
+                report
+                    .governor
+                    .suspend_reason
+                    .map(|reason| reason.name().to_owned()),
+            );
+            if last_perception_status.as_ref() != Some(&key) {
+                eprintln!(
+                    "perception: status={} suspend_reason={:?} last_probe_ms={:?} captures_ok={} captures_failed={} captures_late={} yielded_thinking={} yielded_speech={}",
+                    report.governor.status.name(),
+                    key.1,
+                    report.governor.last_probe_ms,
+                    report.governor.metrics.captures_ok,
+                    report.governor.metrics.captures_failed,
+                    report.governor.metrics.captures_late,
+                    report.governor.metrics.yielded_thinking,
+                    report.governor.metrics.yielded_speech,
+                );
+                last_perception_status = Some(key);
+            }
         }
         if let Some(sidecar) = speech_sidecar.as_mut()
             && let (Some(tracker), transcripts) = app.speech_trackers_mut()
@@ -1591,6 +1648,203 @@ fn build_stream_output() -> Result<Box<dyn StreamOutput>, Box<dyn Error>> {
     config.password = env_optional("AIVTUBER_OBS_PASSWORD").map(SecretString::new);
     let adapter = ObsWebSocketAdapter::new(config)?;
     Ok(Box::new(ObsStreamOutput::new(adapter)))
+}
+
+/// Monotonic clock on the main loop's `started` base, shared with the
+/// perception worker so observation stamps and the loop's `now_ms` agree.
+struct LoopClock(Instant);
+
+impl AdapterClock for LoopClock {
+    fn now_ms(&self) -> u64 {
+        elapsed_ms(self.0)
+    }
+}
+
+/// An authority holding only `perception.control`, minted from a fresh random
+/// secret that exists only inside this process. It is the adapter-boundary
+/// proof for the capture session and the stand-in for the operator's own
+/// configuration when `AIVTUBER_PERCEPTION_AUTOSTART` is set. It cannot be
+/// minted by anything read from content, models or OBS.
+fn perception_authority(
+    principal: &str,
+) -> Result<aivtuber_domain::AuthenticatedControl, Box<dyn Error>> {
+    let mut secret = [0_u8; 32];
+    fill_random(&mut secret);
+    let ingress = LocalControlIngress::new(
+        "local-runtime-perception",
+        principal,
+        AuthorizationMethod::SignedLocalApi,
+        BTreeSet::from([Capability::PerceptionControl]),
+        ControlSecret::new(secret),
+    )?;
+    let command = ingress.authenticate(
+        OperatorCommandInput {
+            event_id: "bootstrap-perception-authority".to_owned(),
+            correlation_id: "bootstrap-runtime".to_owned(),
+            sequence: 0,
+            observed_at: "1970-01-01T00:00:00Z".to_owned(),
+            action: "perception.control".to_owned(),
+            payload: BTreeMap::new(),
+        },
+        &secret,
+    )?;
+    Ok(command.authority().clone())
+}
+
+fn loopback_ws(endpoint: &str) -> bool {
+    verify_loopback_endpoint(
+        &endpoint.replacen("ws://", "http://", 1),
+        &SystemHostResolver,
+    )
+    .is_ok()
+}
+
+/// #90 S1b: build the opt-in perception service (never enabled here).
+///
+/// Needs the local profile (loopback-only), a loopback OBS websocket and a
+/// loopback multimodal model server; anything else is a startup error. The
+/// vision model needs about 12 GB of VRAM next to the local stack
+/// (docs/local-profile-quickstart.adoc, EXP-0004c); the runtime latency probe
+/// turns a spill into a visible `suspended` status rather than a stall.
+fn build_perception_service(
+    profile: CompositionProfile,
+    started: Instant,
+) -> Result<PerceptionService, Box<dyn Error>> {
+    if profile != CompositionProfile::Local {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "AIVTUBER_PERCEPTION requires AIVTUBER_MODE=local (the loopback-only profile)",
+        )
+        .into());
+    }
+    let alias = env_string("AIVTUBER_PERCEPTION_ALIAS", "game-main");
+    let obs_source = env_optional("AIVTUBER_PERCEPTION_OBS_SOURCE").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "AIVTUBER_PERCEPTION_OBS_SOURCE (the one OBS source to capture) is required with AIVTUBER_PERCEPTION",
+        )
+    })?;
+    let vlm_endpoint = env_optional("AIVTUBER_PERCEPTION_VLM_ENDPOINT").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "AIVTUBER_PERCEPTION_VLM_ENDPOINT (loopback chat-completions URL of the multimodal server) is required with AIVTUBER_PERCEPTION",
+        )
+    })?;
+    let mut obs_config = ObsWebSocketConfig::default();
+    obs_config.endpoint = env_string("AIVTUBER_OBS_ENDPOINT", &obs_config.endpoint);
+    obs_config.password = env_optional("AIVTUBER_OBS_PASSWORD").map(SecretString::new);
+    // This session only issues requests; no event stream.
+    obs_config.event_subscriptions = Some(0);
+    profile.validate_provider_endpoints(&[
+        ("perception OBS", loopback_ws(&obs_config.endpoint)),
+        (
+            "perception model",
+            verify_loopback_endpoint(&vlm_endpoint, &SystemHostResolver).is_ok(),
+        ),
+    ])?;
+
+    let format = ScreenImageFormat::parse(&env_string("AIVTUBER_PERCEPTION_IMAGE_FORMAT", "png"))
+        .ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "AIVTUBER_PERCEPTION_IMAGE_FORMAT must be png or jpeg",
+        )
+    })?;
+    let language = CaptionLanguage::parse(&env_string("AIVTUBER_PERCEPTION_LANGUAGE", "ja"))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "AIVTUBER_PERCEPTION_LANGUAGE must be ja or en",
+            )
+        })?;
+    let width = narrow_u32(
+        "AIVTUBER_PERCEPTION_IMAGE_WIDTH",
+        env_u64("AIVTUBER_PERCEPTION_IMAGE_WIDTH", 768)?,
+    )?;
+    let height = narrow_u32(
+        "AIVTUBER_PERCEPTION_IMAGE_HEIGHT",
+        env_u64("AIVTUBER_PERCEPTION_IMAGE_HEIGHT", 432)?,
+    )?;
+
+    let defaults = PerceptionGovernorConfig::default();
+    let governor = PerceptionGovernorConfig {
+        cadence_ms: env_u64("AIVTUBER_PERCEPTION_CADENCE_MS", defaults.cadence_ms)?,
+        gate_settle_ms: env_u64(
+            "AIVTUBER_PERCEPTION_GATE_SETTLE_MS",
+            defaults.gate_settle_ms,
+        )?,
+        caption_deadline_ms: env_u64(
+            "AIVTUBER_PERCEPTION_CAPTION_DEADLINE_MS",
+            defaults.caption_deadline_ms,
+        )?,
+        probe_interval_ms: env_u64(
+            "AIVTUBER_PERCEPTION_PROBE_INTERVAL_MS",
+            defaults.probe_interval_ms,
+        )?,
+        probe_ceiling_ms: env_u64(
+            "AIVTUBER_PERCEPTION_PROBE_CEILING_MS",
+            defaults.probe_ceiling_ms,
+        )?,
+        ..defaults
+    };
+    governor.validate()?;
+    let tracker_defaults = aivtuber_runtime::PerceptionConfig::default();
+    let describer = ScreenDescriber::new(ScreenDescriberConfig {
+        endpoint: vlm_endpoint,
+        model_id: env_string("AIVTUBER_PERCEPTION_MODEL", "qwen3-vl-4b-instruct-q4_k_m"),
+        request_timeout: Duration::from_millis(governor.caption_deadline_ms.saturating_mul(2)),
+        max_tokens: 96,
+        caption_language: language,
+        label_vocabulary: tracker_defaults.label_vocabulary.clone(),
+        image_width: width,
+        image_height: height,
+        image_format: format,
+    })?;
+    let clock: Arc<dyn AdapterClock> = Arc::new(LoopClock(started));
+    let source = ObsScreenSource::new(
+        ObsWebSocketAdapter::new(obs_config)?,
+        perception_authority("runtime:perception-capture")?,
+        ObsScreenshotRequest {
+            source_name: obs_source,
+            format,
+            width,
+            height,
+            compression_quality: -1,
+        },
+    );
+    let producer = ScreenObservationProducer::new(
+        Box::new(source),
+        describer,
+        ScreenProducerConfig {
+            source_alias: alias.clone(),
+            validity_ms: env_u64("AIVTUBER_PERCEPTION_VALIDITY_MS", 20_000)?,
+            provider_version: env!("CARGO_PKG_VERSION").to_owned(),
+        },
+        clock,
+    )?;
+    let known_secrets: Vec<String> = [
+        "AIVTUBER_OBS_PASSWORD",
+        "AIVTUBER_CONTROL_SECRET",
+        "AIVTUBER_JEV_API_KEY",
+        "AIVTUBER_THINKING_API_KEY",
+    ]
+    .iter()
+    .filter_map(|name| env_optional(name))
+    .collect();
+    let service = PerceptionService::start(
+        PerceptionServiceConfig {
+            alias: alias.clone(),
+            governor,
+            label_vocabulary: None,
+        },
+        Box::new(ProducerWorker::new(producer)),
+        aivtuber_telemetry::SecretRedactor::new(known_secrets),
+    )?;
+    eprintln!(
+        "perception: composed (off until enabled) alias={alias} cadence_ms={} probe_ceiling_ms={} requires ~12 GB VRAM for the local stack",
+        governor.cadence_ms, governor.probe_ceiling_ms
+    );
+    Ok(service)
 }
 
 fn runtime_avatar_authority() -> Result<aivtuber_domain::AuthenticatedControl, Box<dyn Error>> {

@@ -10,7 +10,9 @@ pub use cached_playback::*;
 mod speech_freshness;
 pub use speech_freshness::*;
 mod perception;
+mod perception_governor;
 pub use perception::*;
+pub use perception_governor::*;
 mod perception_replay;
 pub use perception_replay::*;
 mod speech_observation;
@@ -443,8 +445,9 @@ pub struct PublicOutputPolicy {
 
 impl PublicOutputPolicy {
     pub fn evaluate(&self, text: &str) -> PublicOutput {
-        const CONTROL_TERMS: [&str; 5] = [
+        const CONTROL_TERMS: [&str; 6] = [
             "obs.control",
+            "perception.control",
             "tool.grant",
             "memory.admin",
             "performer.stop",

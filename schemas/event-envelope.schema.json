@@ -132,7 +132,8 @@
               "obs.control",
               "avatar.control",
               "memory.admin",
-              "tool.grant"
+              "tool.grant",
+              "perception.control"
             ]
           }
         }
