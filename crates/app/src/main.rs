@@ -13,7 +13,7 @@ use aivtuber_adapters::{
     verify_loopback_endpoint,
 };
 use aivtuber_app::{
-    AdaptationRuntime, AdapterHealth, AvatarOutput, BargeInConfig, BargeInMetrics,
+    AdaptationRuntime, AdapterHealth, AvatarOutput, BargeInConfig, BargeInMetrics, ChatBurstConfig,
     CompositionProfile, GenerationFallbackCounts, GenerativeBudgetPolicy, GenerativeRuntime,
     IntentRoutePlanner, IntentShadowPolicy, LocalAvatarOutput, LocalRoutePlanner,
     MemoryWriterConfig, MemoryWriterMetrics, NoopAvatarOutput, NoopStreamOutput, ObsStreamOutput,
@@ -35,13 +35,15 @@ use aivtuber_generative::{
     GenerativePipeline, PerformanceCompiler, PerformanceCompilerConfig, PhraseConfig,
     SpeechLexicon, StreamPolicy,
 };
-use aivtuber_reflex::{JevAdapter, JevAdapterConfig, JevApiKey, PolicyConfig, ReflexPipeline};
+use aivtuber_reflex::{
+    BurstConfig, JevAdapter, JevAdapterConfig, JevApiKey, PolicyConfig, ReflexPipeline,
+};
 use aivtuber_runtime::{
     CachedPerformer, CachedPlaybackConfig, IngressPolicy, LocalVisemeStore, SecurityRuntime,
     SecurityRuntimeConfig, SpeechObservationConfig, SpeechObservationTracker,
     SpeechTranscriptConfig, SpeechTranscriptTracker,
 };
-use aivtuber_scheduler::{Scheduler, SchedulerConfig};
+use aivtuber_scheduler::{DeferredConfig, Scheduler, SchedulerConfig};
 use aivtuber_telemetry::SecretRedactor;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -387,6 +389,57 @@ fn run() -> Result<(), Box<dyn Error>> {
     // observations and never blocks this loop.
     let mut speech_sidecar: Option<SpeechSidecar> = None;
     let mut speech_conversation_enabled = false;
+    let mut chat_burst_enabled = false;
+    // Issues #75 S1 / #78 S2: live chat-burst selection and deferred
+    // replies. Off unless AIVTUBER_CHAT_BURST_MODE is true, so the default
+    // per-event path is unchanged. Every bound is validated, never clamped.
+    if env_bool("AIVTUBER_CHAT_BURST_MODE", false)? {
+        let defaults = ChatBurstConfig::default();
+        let config = ChatBurstConfig {
+            burst: BurstConfig {
+                window_ms: env_u64("AIVTUBER_CHAT_BURST_WINDOW_MS", defaults.burst.window_ms)?,
+                burst_enter_count: env_usize(
+                    "AIVTUBER_CHAT_BURST_ENTER_COUNT",
+                    defaults.burst.burst_enter_count,
+                )?,
+                top_k: env_usize("AIVTUBER_CHAT_BURST_TOP_K", defaults.burst.top_k)?,
+                max_per_actor: env_usize(
+                    "AIVTUBER_CHAT_BURST_MAX_PER_ACTOR",
+                    defaults.burst.max_per_actor,
+                )?,
+                actor_cooldown_ms: env_u64(
+                    "AIVTUBER_CHAT_BURST_ACTOR_COOLDOWN_MS",
+                    defaults.burst.actor_cooldown_ms,
+                )?,
+                ..defaults.burst
+            },
+            deferred: DeferredConfig {
+                capacity: env_usize("AIVTUBER_CHAT_DEFER_CAPACITY", defaults.deferred.capacity)?,
+                per_actor_cap: env_usize(
+                    "AIVTUBER_CHAT_DEFER_PER_ACTOR",
+                    defaults.deferred.per_actor_cap,
+                )?,
+                max_ttl_ms: env_u64(
+                    "AIVTUBER_CHAT_DEFER_MAX_TTL_MS",
+                    defaults.deferred.max_ttl_ms,
+                )?,
+            },
+            reply_ttl_ms: env_u64("AIVTUBER_CHAT_REPLY_TTL_MS", defaults.reply_ttl_ms)?,
+        };
+        app = app.with_chat_burst(config)?;
+        chat_burst_enabled = true;
+        eprintln!(
+            "chat_burst: enabled window_ms={} enter_count={} top_k={} max_per_actor={} actor_cooldown_ms={} defer_capacity={} defer_per_actor={} reply_ttl_ms={}",
+            config.burst.window_ms,
+            config.burst.burst_enter_count,
+            config.burst.top_k,
+            config.burst.max_per_actor,
+            config.burst.actor_cooldown_ms,
+            config.deferred.capacity,
+            config.deferred.per_actor_cap,
+            config.reply_ttl_ms
+        );
+    }
     let mut speech_floor_enabled = false;
     let mut speech_barge_in_enabled = false;
     let mut last_floor_metrics = SpeechFloorMetrics::default();
@@ -559,6 +612,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         app = app.with_speech_observations(tracker);
     }
     let mut last_speech_stats = SpeechSidecarStats::default();
+    let mut last_chat_burst_accounted = 0_u64;
     let mut last_generation_fallbacks = GenerationFallbackCounts::default();
     let mut sequence_seed = 0_u64;
     let mut next_maintenance_ms = 0_u64;
@@ -692,6 +746,14 @@ fn run() -> Result<(), Box<dyn Error>> {
                     utterance.text.chars().count()
                 );
             }
+        }
+        // Issues #75 S1 / #78 S2: flush a due burst window and dispatch deferred
+        // replies once the performer is available. After the operator drain
+        // above, so emergency control is never queued behind it.
+        if chat_burst_enabled {
+            sequence_seed = sequence_seed.saturating_add(32);
+            app.service_chat_burst(now_ms, sequence_seed);
+            report_chat_burst(&mut app, &mut last_chat_burst_accounted);
         }
         app.tick(now_ms);
         report_generation_fallbacks(
@@ -882,6 +944,68 @@ fn report_generation_fallbacks(
         }
     }
     previous.clone_from(current);
+}
+
+/// Drain the bounded chat-burst records and deferred-reply reports and log a
+/// counters line when anything was accounted. Event ids and counts only: what
+/// a viewer wrote is never logged.
+fn report_chat_burst<R: aivtuber_app::RoutePlanner>(
+    app: &mut aivtuber_app::ProductionApp<R>,
+    last_accounted: &mut u64,
+) {
+    for report in app.take_deferred_reply_reports(16) {
+        eprintln!(
+            "chat_burst: deferred reply event_id={} at_ms={} dispatched={} playback={}",
+            report.event_id,
+            report.at_ms,
+            report.dispatched,
+            report.asset_id.as_deref().unwrap_or("none")
+        );
+    }
+    // The terminal ring is bounded; draining it keeps it from dropping.
+    let _ = app.take_chat_burst_records(usize::MAX);
+    let Some(metrics) = app.chat_burst_metrics() else {
+        return;
+    };
+    let accounted = metrics.accounted();
+    if accounted == *last_accounted {
+        return;
+    }
+    *last_accounted = accounted;
+    eprintln!(
+        "chat_burst: admitted={} dispatched={} held={} deferred_pending={} deferred_offered={} expired={} superseded={} erased={} operator_cancelled={} revalidation_refused={} evicted={} actor_capped={} not_selected={} shed={} invariant_violations={}",
+        metrics.admitted,
+        metrics.dispatched(),
+        metrics.held,
+        metrics.deferred.pending,
+        metrics.deferred.offered,
+        metrics
+            .deferred
+            .count(aivtuber_scheduler::DeferredOutcome::Expired),
+        metrics
+            .deferred
+            .count(aivtuber_scheduler::DeferredOutcome::Superseded),
+        metrics
+            .deferred
+            .count(aivtuber_scheduler::DeferredOutcome::Erased),
+        metrics
+            .deferred
+            .count(aivtuber_scheduler::DeferredOutcome::OperatorCancelled),
+        metrics
+            .deferred
+            .count(aivtuber_scheduler::DeferredOutcome::RevalidationRefused),
+        metrics
+            .deferred
+            .count(aivtuber_scheduler::DeferredOutcome::EvictedForCapacity),
+        metrics
+            .deferred
+            .count(aivtuber_scheduler::DeferredOutcome::RejectedActorCap),
+        metrics.terminal[2] + metrics.terminal[3] + metrics.terminal[4],
+        metrics.terminal[5],
+        metrics.invariant_violations
+            + metrics.burst_invariant_violations
+            + metrics.deferred.invariant_violations
+    );
 }
 
 fn elapsed_ms(started: Instant) -> u64 {

@@ -151,6 +151,9 @@ pub struct RuntimeRetentionSnapshot {
     /// Projection freshness counters (#222 S2, ADR-0004 D-4):
     /// `projection_stale_played`, re-synthesis queue and outcomes.
     pub speech_freshness: SpeechFreshnessMetrics,
+    /// Chat-burst and deferred-reply counters (#75 S1, #78 S2); `None` unless
+    /// chat-burst mode was composed.
+    pub chat_burst: Option<crate::ChatBurstMetrics>,
 }
 
 #[cfg(test)]
