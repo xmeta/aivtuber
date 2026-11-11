@@ -1,0 +1,33 @@
+Copyright (c) 2026 xmeta. All rights reserved.
+
+This is a proprietary, source-available notice. It is not an open-source
+licence (it is not approved by the Open Source Initiative).
+
+1. Reference only. The source code in this repository is published for
+   reference only. No open-source licence is granted. You may not copy,
+   modify, redistribute, sublicense or create derivative works of the source
+   code, except as allowed in section 2.
+
+2. Limited grant. You may download the official release archives published
+   by the copyright holder on this repository's GitHub Releases page and run
+   them for your own use, including personal and commercial live streaming
+   and video production. You may not redistribute the archives.
+
+3. Third-party components. Bundled libraries, and model weights or voices
+   fetched by aivtuber-setup, remain under their own licences and terms. See
+   the THIRD-PARTY notices in the release archive and
+   docs/local-profile-quickstart.adoc. Those terms (for example OpenRAIL-M and
+   per-voice credit lines) also apply to you.
+
+4. Contributions. By submitting a contribution you agree that the copyright
+   holder may use it under any terms, including a future open-source licence.
+
+5. Future versions. The copyright holder may license future versions under
+   different terms, including as open source.
+
+6. No warranty. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+   KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+   NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR
+   OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+   ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR ITS USE.
