@@ -156,6 +156,32 @@ class Server:
         time.sleep(1.5)
 
 
+class Attached:
+    """An llama-server somebody else started (EXP-0004c: the full local profile). Never stopped here."""
+
+    def __init__(self, port):
+        self.port, self.load_s = port, None
+        self.vram_before = vram_used_mib()
+
+    def wait_ready(self, timeout=60):
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/health", timeout=timeout) as r:
+            assert r.status == 200
+        return 0.0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        pass
+
+
+def open_server(a, extra):
+    """Start a loopback llama-server, or attach to one with --attach (EXP-0004c)."""
+    if a.attach:
+        return Attached(a.port)
+    return Server(a.server, a.port, a.model, a.mmproj, a.ctx, extra)
+
+
 # ---- VLM call and validation ----------------------------------------------------------------------
 
 def data_uri(path):
@@ -494,8 +520,8 @@ def cmd_mux(a):
     s1a, msch = load_validators()
     files = files_for(a.frames, "benign")
     prompts = load_prompts()
-    res = {"model": Path(a.model).name, "parallel": a.parallel, "ctx": a.ctx, "vram_before_mib": vram_used_mib()}
-    with Server(a.server, a.port, a.model, a.mmproj, a.ctx, ["--parallel", str(a.parallel)]) as srv, VramSampler() as vs:
+    res = {"model": Path(a.model).name if a.model else "attached", "parallel": a.parallel, "ctx": a.ctx, "vram_before_mib": vram_used_mib()}
+    with open_server(a, ["--parallel", str(a.parallel)]) as srv, VramSampler() as vs:
         res["load_s"] = srv.wait_ready()
         res["vram_idle_mib"] = vram_used_mib()
         res["probe_ms_idle"] = probe_ms(a.port)
@@ -531,11 +557,34 @@ def cmd_mux(a):
     print(json.dumps(brief, indent=1))
 
 
+def cmd_captions(a):
+    """EXP-0004c: caption job every --interval seconds for --seconds against an attached server, nothing else.
+    Used as background load while another process (the app) runs speech and typed-chat rounds."""
+    s1a, msch = load_validators()
+    files = files_for(a.frames, "benign")
+    stop, spans, crows = threading.Event(), [], []
+    t = threading.Thread(target=mux_background, args=(a.port, files, a.lang, s1a, msch, a.interval, stop, spans, crows, None))
+    t.start()
+    time.sleep(a.seconds)
+    stop.set()
+    t.join()
+    ok = [r for r in crows if "latency_s" in r]
+    res = {"interval_s": a.interval, "jobs": len(ok), "errors": sum(1 for r in crows if "error" in r),
+           "caption_latency_s": summarize([r["latency_s"] for r in ok]),
+           "json_rate": (sum(1 for r in ok if r["valid"]["json"]) / len(ok)) if ok else None,
+           "spans_s": [(round(x, 3), round(y, 3)) for x, y in spans], "clock": "time.monotonic"}
+    Path(a.out).write_text(json.dumps(res, indent=1), encoding="utf-8")
+    print(json.dumps({k: v for k, v in res.items() if k != "spans_s"}, indent=1))
+
+
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("cmd", choices=["vlm", "think", "both", "f3", "reply", "mux"])
+    p.add_argument("cmd", choices=["vlm", "think", "both", "f3", "reply", "mux", "captions"])
     p.add_argument("--parallel", type=int, default=1, help="llama-server slots for mux")
-    p.add_argument("--server", required=True, help="llama-server binary")
+    p.add_argument("--server", help="llama-server binary (not needed with --attach)")
+    p.add_argument("--attach", action="store_true", help="use the llama-server already listening on --port (EXP-0004c); it is never stopped")
+    p.add_argument("--interval", type=float, default=10.0, help="caption cadence for the captions command")
+    p.add_argument("--seconds", type=float, default=60.0, help="duration of the captions command")
     p.add_argument("--model", help="VLM (or Thinking for 'think') gguf")
     p.add_argument("--mmproj")
     p.add_argument("--llm", help="Thinking gguf for 'both'")
@@ -550,7 +599,7 @@ def main():
     p.add_argument("--n", type=int, default=20, help="Thinking requests per condition")
     p.add_argument("--gap", type=float, default=2.5, help="seconds between Thinking requests under load")
     a = p.parse_args()
-    {"vlm": cmd_vlm, "f3": cmd_f3, "think": cmd_think, "both": cmd_both, "reply": cmd_reply, "mux": cmd_mux}[a.cmd](a)
+    {"vlm": cmd_vlm, "f3": cmd_f3, "think": cmd_think, "both": cmd_both, "reply": cmd_reply, "mux": cmd_mux, "captions": cmd_captions}[a.cmd](a)
 
 
 if __name__ == "__main__":
