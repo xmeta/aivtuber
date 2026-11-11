@@ -21,6 +21,7 @@ mod raw_ingress;
 mod retention;
 mod routing;
 mod scenario;
+mod scene_context;
 mod semantic;
 mod shadow;
 mod shadow_evidence;
@@ -72,6 +73,7 @@ pub use raw_ingress::*;
 pub use retention::*;
 pub use routing::*;
 pub use scenario::*;
+pub use scene_context::*;
 pub use semantic::*;
 pub use shadow::*;
 pub use shadow_evidence::*;
@@ -96,7 +98,7 @@ use aivtuber_asset_store::CacheTier;
 use aivtuber_domain::{
     AuthenticatedControl, AuthenticatedControlCommand, AuthorizedStreamAction,
     DeadlineExhaustionReason, DeadlineStage, EngineError, EventEnvelope, FallbackReason,
-    InteractionDeadline,
+    InteractionDeadline, Interruptibility, SceneContextSnapshot,
 };
 use aivtuber_generative::{
     CancellationStage, FallbackDirective, GeneratedTextGateDecision,
@@ -1107,6 +1109,9 @@ where
     speech_observations: Option<SpeechObservationTracker>,
     /// Opt-in live screen perception (#90 S1b); `None` (default) composes nothing.
     perception: Option<perception_service::PerceptionService>,
+    /// Scene context (#88 S1); `None` (default) composes nothing, and then no
+    /// request carries a scene.
+    scene: Option<scene_context::SceneContextService>,
     speech_transcripts: Option<SpeechTranscriptTracker>,
     speech_conversation: Option<speech_conversation::SpeechConversation>,
     speech_floor: Option<speech_floor::SpeechFloor>,
@@ -1170,6 +1175,7 @@ where
             memory_falsifier: memory_seed::MemoryFalsifier::default(),
             speech_observations: None,
             perception: None,
+            scene: None,
             speech_transcripts: None,
             speech_conversation: None,
             speech_floor: None,
@@ -1507,6 +1513,47 @@ where
     pub fn with_perception(mut self, service: perception_service::PerceptionService) -> Self {
         self.perception = Some(service);
         self
+    }
+
+    /// Opt in to the scene context (#88 S1): the ranked, closed-vocabulary
+    /// snapshot of OBS state and perception. Off by default. Without it no
+    /// request carries a scene, so a runtime without a source is byte-identical
+    /// to one built before scene context existed.
+    pub fn with_scene_context(mut self, service: scene_context::SceneContextService) -> Self {
+        self.scene = Some(service);
+        self
+    }
+
+    pub fn scene_context(&self) -> Option<&scene_context::SceneContextService> {
+        self.scene.as_ref()
+    }
+
+    pub fn scene_context_mut(&mut self) -> Option<&mut scene_context::SceneContextService> {
+        self.scene.as_mut()
+    }
+
+    /// Advance the scene context one loop tick. Never blocks: the OBS read is on
+    /// the service's own thread.
+    pub fn service_scene_context(&mut self, now_ms: u64) {
+        let Some(scene) = self.scene.as_mut() else {
+            return;
+        };
+        let perception = self
+            .perception
+            .as_mut()
+            .map(perception_service::PerceptionService::tracker_and_alias);
+        scene.service(now_ms, perception);
+    }
+
+    /// The scene snapshot a request at `now_ms` carries, or `None` when no
+    /// scene source is composed or none has spoken.
+    fn scene_snapshot_for_request(&mut self, now_ms: u64) -> Option<SceneContextSnapshot> {
+        let scene = self.scene.as_mut()?;
+        let perception = self
+            .perception
+            .as_mut()
+            .map(perception_service::PerceptionService::tracker_and_alias);
+        scene.snapshot_for_request(now_ms, perception)
     }
 
     pub fn perception(&self) -> Option<&perception_service::PerceptionService> {
@@ -2494,7 +2541,7 @@ where
     /// Whether the performer can take a reply now. Built only from trusted
     /// runtime state: the operator mute flag, the scheduler's speech
     /// lifecycle and the generation runtime. No event field is an input.
-    fn reply_availability(&self) -> ReplyAvailability {
+    fn reply_availability(&self, now_ms: u64) -> ReplyAvailability {
         if self.security.is_muted() {
             ReplyAvailability::Busy(BusyCause::Muted)
         } else if self.performer.scheduler().speech_lifecycle().metrics().live > 0 {
@@ -2505,6 +2552,13 @@ where
             .is_some_and(GenerativeRuntime::is_generating)
         {
             ReplyAvailability::Busy(BusyCause::Generating)
+        } else if self.scene.as_ref().is_some_and(|scene| {
+            scene.scheduling_interruptibility(now_ms) == Interruptibility::Uninterruptible
+        }) {
+            // #88: only a trusted scene source (the operator's OBS table, rank
+            // 1 to 3) can say so; a perceived scene yields `unknown` here by
+            // construction and never reaches this branch.
+            ReplyAvailability::Busy(BusyCause::SceneProtected)
         } else {
             ReplyAvailability::Available
         }
@@ -2600,7 +2654,7 @@ where
         {
             return None;
         }
-        match self.reply_availability() {
+        match self.reply_availability(at_ms) {
             ReplyAvailability::Busy(cause) => {
                 if let Some(lane) = self.chat_burst.as_mut() {
                     lane.defer(candidate, at_ms, cause);
@@ -2648,7 +2702,7 @@ where
             .as_ref()
             .map_or(0, |lane| lane.pending_deferred().saturating_add(1));
         for step in 0..bound {
-            let availability = self.reply_availability();
+            let availability = self.reply_availability(at_ms);
             let Some(ready) = self
                 .chat_burst
                 .as_mut()
@@ -2783,6 +2837,57 @@ where
         }
     }
 
+    /// Add the scene context to a generation route (#88 S1, #90 S2).
+    ///
+    /// * `context.scene` is the closed-vocabulary snapshot only: a scene class,
+    ///   closed labels, an interruptibility hint and ranks. It has no free text.
+    /// * The one screen caption is the only free text that can arrive here. It
+    ///   is built by the perception tracker as an untrusted, aged, delimited
+    ///   item of at most 512 bytes, appended to `curated_context` after memory
+    ///   and dropped whole if it does not fit the request budget (memory keeps
+    ///   its room). It is never given to memory, TTS or the memory writer: this
+    ///   function only ever touches the Thinking request.
+    /// * Nothing here reads or sets a scheduling input. Busy and deferral read
+    ///   the scene tracker's trusted interruptibility, which a perceived scene
+    ///   cannot carry.
+    ///
+    /// With no scene service and no perception composed this is a no-op, so the
+    /// request is byte-identical to one built before either existed.
+    fn attach_scene_context(
+        &mut self,
+        route: &mut PlaybackRoute,
+        scene: Option<SceneContextSnapshot>,
+        at_ms: u64,
+    ) {
+        if scene.is_none() && self.perception.is_none() {
+            return;
+        }
+        let PlaybackRoute::Generate(generation) = route else {
+            return;
+        };
+        if let Some(scene) = scene {
+            generation.thinking.context.scene = Some(scene);
+        }
+        let Some(perception) = self.perception.as_mut() else {
+            return;
+        };
+        let Some(caption) = perception.tracker_mut().thinking_caption_item(at_ms) else {
+            return;
+        };
+        generation.thinking.curated_context.push(caption);
+        if generation.thinking.validate().is_err() {
+            // The caption (or the scene) does not fit: keep the request exactly
+            // as the route built it rather than failing the event.
+            generation.thinking.curated_context.pop();
+            if generation.thinking.validate().is_err() {
+                generation.thinking.context.scene = None;
+            }
+            if let Some(scene) = self.scene.as_mut() {
+                scene.note_caption_dropped();
+            }
+        }
+    }
+
     fn handle_event(
         &mut self,
         mut event: EventEnvelope,
@@ -2805,6 +2910,14 @@ where
         // #164: `route_with_budget` only *stages* the shadow job. If the active
         // route fails, the stage is dropped below so no denial and no charge
         // can leak into the next, unrelated event.
+        // #88: the scene snapshot at this event's logical time, handed to the
+        // planner before it decides so a Reflex/Jev request and its replay record
+        // name the snapshot they used. Absent (and the planner untouched) when no
+        // scene source is composed.
+        let scene = self.scene_snapshot_for_request(at_ms);
+        if self.scene.is_some() {
+            self.router.set_scene_context(scene.clone());
+        }
         let mut route = match self.router.route_with_budget(&event, Some(route_budget)) {
             Ok(route) => route,
             Err(error) => {
@@ -2825,6 +2938,9 @@ where
         // it owns both the memory store and the routed request; the planner
         // keeps producing a memory-free request.
         self.attach_memory_context(&event, &mut route, at_ms);
+        // #88 / #90 S2: closed-vocabulary scene for the Reflex and Thinking
+        // context, and at most one untrusted screen caption for Thinking.
+        self.attach_scene_context(&mut route, scene, at_ms);
         let routing_latency_us = elapsed_us(route_started);
         let decision = self.router.decision_record().cloned();
         let template_fallback = self
@@ -4559,6 +4675,7 @@ mod tests {
     mod memory_seed_tests;
     mod memory_writer_tests;
     mod phrase_commit_tests;
+    mod scene_context_tests;
     mod speech_lifecycle_tests;
     mod streaming_thinking_tests;
     mod voicevox_tts_tests;

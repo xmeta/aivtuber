@@ -228,6 +228,12 @@ impl PerceptionService {
         &mut self.tracker
     }
 
+    /// The tracker and the source alias together, for the scene context (#88),
+    /// which needs both and cannot borrow them through two calls.
+    pub fn tracker_and_alias(&mut self) -> (&mut PerceptionTracker, &str) {
+        (&mut self.tracker, &self.alias)
+    }
+
     pub fn report(&self, now_ms: u64) -> PerceptionStatusReport {
         PerceptionStatusReport {
             governor: self.governor.report(),

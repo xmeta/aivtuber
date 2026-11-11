@@ -51,25 +51,10 @@ pub const MAX_PERCEPTION_SECRET_HITS: u32 = 1_000;
 /// included) is at most this many bytes (ADR-0007 D-Q7).
 pub const MAX_SCREEN_OBSERVATION_THINKING_BYTES: usize = 512;
 
-/// Provisional label vocabulary (ADR-0007 D-Q11). The scene context (#88) owns
-/// the final vocabulary; an operator profile may replace this set. A label
-/// outside the configured vocabulary is dropped and counted at ingress.
-pub const PROVISIONAL_LABEL_VOCABULARY: [&str; 12] = [
-    "boss_fight",
-    "combat",
-    "dialogue",
-    "exploration",
-    "inventory",
-    "map",
-    "multiplayer_lobby",
-    "puzzle",
-    "racing",
-    "settings",
-    "title_screen",
-    "victory",
-];
-
-/// Provisional closed scene vocabulary (ADR-0007 D-Q11).
+/// The scene classes perception can report: a subset of the closed
+/// [`crate::SceneClass`] vocabulary (#88), which also holds the stream
+/// segments only trusted OBS state can supply. The label vocabulary is
+/// [`crate::SCENE_LABEL_VOCABULARY`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PerceptionSceneClass {

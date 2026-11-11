@@ -13,6 +13,7 @@ mod interfaces;
 mod perception;
 mod reflex;
 pub mod scenario;
+mod scene;
 mod sidecar;
 mod speech;
 mod speech_lifecycle;
@@ -57,6 +58,7 @@ pub use reflex::{
     ResponseRoute, RouteDecision,
 };
 pub use scenario::*;
+pub use scene::*;
 pub use sidecar::{
     MAX_SIDECAR_CLAIM_BYTES, MAX_SIDECAR_QUERY_BYTES, MAX_SIDECAR_RECALL_ITEMS, MemorySidecar,
     SidecarClaim, SidecarHandle, SidecarRecallItem, SidecarRecallQuery,

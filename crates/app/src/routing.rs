@@ -3,7 +3,8 @@ use crate::shadow::ShadowSubmission;
 use crate::shadow_orchestrator::{ShadowCompletion, ShadowExecutionSnapshot};
 use aivtuber_domain::{
     EventEnvelope, EventKind, MAX_THINKING_TEXT_BYTES, PrivacyClass, ReflexContext, ReflexRequest,
-    RetrievalCandidateContext, RetrievalSnapshot, SourceClass, ThinkingRequest,
+    RetrievalCandidateContext, RetrievalSnapshot, SceneContextSnapshot, SourceClass,
+    ThinkingRequest,
 };
 use aivtuber_generative::GenerationRoutingReason;
 use aivtuber_reflex::{DecisionReplayRecord, ExecutedAction, ReflexPipeline, ReflexPipelineInput};
@@ -259,6 +260,11 @@ pub trait RoutePlanner: Send {
         None
     }
 
+    /// #88: hand the planner the scene snapshot the next decision may use. The
+    /// snapshot is closed-vocabulary and carries no free text; a planner that
+    /// does not use scene context ignores it.
+    fn set_scene_context(&mut self, _scene: Option<SceneContextSnapshot>) {}
+
     /// Deterministic fallback recorded by the most recent Template decision
     /// (`None` when the last decision was not a Template fallback).
     fn template_fallback(&self) -> Option<TemplateFallback> {
@@ -328,6 +334,10 @@ impl RoutePlanner for Box<dyn RoutePlanner> {
 
     fn decision_record(&self) -> Option<&DecisionReplayRecord> {
         (**self).decision_record()
+    }
+
+    fn set_scene_context(&mut self, scene: Option<SceneContextSnapshot>) {
+        (**self).set_scene_context(scene);
     }
 
     fn template_fallback(&self) -> Option<TemplateFallback> {
@@ -631,6 +641,10 @@ where
 {
     fn template_fallback(&self) -> Option<TemplateFallback> {
         self.last_template_fallback
+    }
+
+    fn set_scene_context(&mut self, scene: Option<SceneContextSnapshot>) {
+        self.context.scene = scene;
     }
 
     fn route(&mut self, event: &EventEnvelope) -> Result<PlaybackRoute, AppError> {

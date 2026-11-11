@@ -15,6 +15,10 @@
 //   .../invalid and .../inconsistent (cross-field) must REJECT; .../replay fixtures must carry schema-valid batches (#92)
 // - examples/perception-observations/valid must conform to perception-observation.schema.json;
 //   .../invalid and .../inconsistent (cross-field) must REJECT; .../replay fixtures must carry schema-valid batches (#90)
+// - examples/scene-context/valid and .../inconsistent (cross-field, rejected by the Rust validator) must conform to
+//   scene-context.schema.json; .../invalid must REJECT (#88 S1)
+// - examples/obs-scene-maps/valid and .../inconsistent (cross-field, rejected by the Rust loader) must conform to
+//   obs-scene-map.schema.json; .../invalid must REJECT (#88 S1)
 // - examples/speech-lexicons/valid, .../inconsistent (cross-field, rejected by the Rust loader) and the shipped
 //   crates/generative/data default lexicon must conform to speech-lexicon.schema.json; .../invalid must REJECT (#222)
 // - examples/memory-seeds/valid and .../inconsistent (cross-field, rejected by the Rust loader) must conform to
@@ -104,6 +108,8 @@ const speechLexicon = validators["schemas/speech-lexicon.schema.json"];
 const speechLifecycle = validators["schemas/speech-lifecycle.schema.json"];
 const memorySeed = validators["schemas/memory-seed.schema.json"];
 const perceptionObservation = validators["schemas/perception-observation.schema.json"];
+const sceneContext = validators["schemas/scene-context.schema.json"];
+const obsSceneMap = validators["schemas/obs-scene-map.schema.json"];
 
 function report(ok, label, validator) {
   if (ok) {
@@ -190,6 +196,8 @@ for (const [validator, validDirs, invalidDir] of [
   [speechTranscript, ["examples/speech-transcripts/valid"], "examples/speech-transcripts/invalid"],
   [speechLifecycle, ["examples/speech-lifecycle/valid"], "examples/speech-lifecycle/invalid"],
   [perceptionObservation, ["examples/perception-observations/valid"], "examples/perception-observations/invalid"],
+  [sceneContext, ["examples/scene-context/valid", "examples/scene-context/inconsistent"], "examples/scene-context/invalid"],
+  [obsSceneMap, ["examples/obs-scene-maps/valid", "examples/obs-scene-maps/inconsistent"], "examples/obs-scene-maps/invalid"],
   [memorySeed, ["examples/memory-seeds/valid", "examples/memory-seeds/inconsistent"], "examples/memory-seeds/invalid"],
   [speechLexicon, ["examples/speech-lexicons/valid", "examples/speech-lexicons/inconsistent", "crates/generative/data"], "examples/speech-lexicons/invalid"],
 ]) {
@@ -441,6 +449,51 @@ if (perceptionObservation) {
       failures += 1;
       console.error(`FAIL      ${file}`);
       for (const problem of problems) console.error(`          ${problem}`);
+    }
+  }
+}
+
+// Scene context fixtures (#88 S1): the cross-field rules JSON Schema cannot
+// express. source_ref, confidence and calibrated describe a perceived field, so
+// they may appear only when source_rank or labels_source_rank is perception.
+function sceneContextCrossFieldProblems(snapshot) {
+  const problems = [];
+  const perceived = snapshot.source_rank === "perception" || snapshot.labels_source_rank === "perception";
+  if (!perceived && (snapshot.source_ref !== undefined || snapshot.confidence !== undefined || snapshot.calibrated === true)) {
+    problems.push("source_ref, confidence and calibrated need a perceived field");
+  }
+  return problems;
+}
+function obsSceneMapCrossFieldProblems(doc) {
+  const problems = [];
+  for (const name of Object.keys(doc.scenes)) {
+    if (Buffer.byteLength(name, "utf8") > 128) problems.push("a scene name must be at most 128 UTF-8 bytes");
+  }
+  return problems;
+}
+for (const [validator, dir, check] of [
+  [sceneContext, "examples/scene-context", sceneContextCrossFieldProblems],
+  [obsSceneMap, "examples/obs-scene-maps", obsSceneMapCrossFieldProblems],
+]) {
+  if (!validator) continue;
+  for (const file of listJson(`${dir}/valid`)) {
+    const problems = check(loadJson(join(root, file)));
+    if (problems.length > 0) {
+      failures += 1;
+      console.error(`FAIL      ${file}: ${problems.join("; ")}`);
+    }
+  }
+  for (const file of listJson(`${dir}/inconsistent`)) {
+    const doc = loadJson(join(root, file));
+    if (!validator(doc)) {
+      failures += 1;
+      console.error(`FAIL      ${file} (expected to pass the schema so the cross-field check can judge it)`);
+    } else if (check(doc).length === 0) {
+      failures += 1;
+      console.error(`FAIL      ${file} (expected a contradiction, but every check passed)`);
+    } else {
+      passes += 1;
+      console.log(`ok        ${file} (rejected as intended)`);
     }
   }
 }

@@ -791,6 +791,10 @@ where
         self.active.decision_record()
     }
 
+    fn set_scene_context(&mut self, scene: Option<aivtuber_domain::SceneContextSnapshot>) {
+        self.active.set_scene_context(scene);
+    }
+
     fn template_fallback(&self) -> Option<crate::TemplateFallback> {
         self.active.template_fallback()
     }

@@ -271,6 +271,35 @@ impl ObsWebSocketAdapter {
         )
     }
 
+    /// Read the current program scene name (obs-websocket
+    /// `GetCurrentProgramScene`). Read-only: it mutates nothing in OBS and
+    /// takes no authority, like a state poll. The name is operator-chosen OBS
+    /// state, not content from the audience; the scene context (#88) uses it
+    /// only as a lookup key into the operator's mapping table, so a name longer
+    /// than a table key is refused here rather than carried further.
+    pub fn current_program_scene(&self) -> Result<String, EngineError> {
+        let mut state = self.lock_state()?;
+        self.ensure_connected(&mut state)?;
+        let data = self.request(&mut state, "GetCurrentProgramScene", json!({}))?;
+        let name = data
+            .get("currentProgramSceneName")
+            .or_else(|| data.get("sceneName"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                engine_error(
+                    EngineErrorKind::Backend,
+                    "OBS program scene response is missing the scene name",
+                )
+            })?;
+        if name.is_empty() || name.len() > 256 {
+            return Err(engine_error(
+                EngineErrorKind::Backend,
+                "OBS program scene name is empty or too long",
+            ));
+        }
+        Ok(name.to_owned())
+    }
+
     pub fn set_event_subscriptions(&self, subscriptions: u64) -> Result<(), EngineError> {
         let mut state = self.lock_state()?;
         state.event_subscriptions = Some(subscriptions);
@@ -1354,5 +1383,64 @@ mod tests {
             .capture_source_screenshot(&authority, &screenshot_request())
             .expect_err("bad image");
         assert_eq!(error.kind, EngineErrorKind::Backend);
+    }
+
+    #[test]
+    fn current_program_scene_is_a_read_only_state_request() {
+        let reply = json!({
+            "op": 7,
+            "d": {
+                "requestType": "GetCurrentProgramScene",
+                "requestId": "aivtuber-obs-1",
+                "requestStatus": { "result": true, "code": 100 },
+                "responseData": { "currentProgramSceneName": "Boss Run", "sceneUuid": "u" }
+            }
+        })
+        .to_string();
+        let script = Script::new(vec![Ok(hello(None)), Ok(identified()), Ok(reply)]);
+        let handle = script.handle.clone();
+        let adapter = ObsWebSocketAdapter::with_dependencies(
+            ObsWebSocketConfig {
+                event_subscriptions: Some(0),
+                ..ObsWebSocketConfig::default()
+            },
+            Arc::new(ScriptedConnector::new(vec![Ok(script)])),
+            Arc::new(TestClock::new(0)),
+        )
+        .expect("adapter");
+        assert_eq!(adapter.current_program_scene().expect("scene"), "Boss Run");
+        let sent = handle.sent();
+        let request: Value = serde_json::from_str(sent.last().expect("request")).expect("json");
+        assert_eq!(request["d"]["requestType"], "GetCurrentProgramScene");
+        assert!(!sent.iter().any(|message| message.contains("SetCurrent")));
+    }
+
+    #[test]
+    fn current_program_scene_refuses_a_missing_or_oversize_name() {
+        for body in [
+            json!({}),
+            json!({ "currentProgramSceneName": "" }),
+            json!({ "currentProgramSceneName": "x".repeat(300) }),
+        ] {
+            let reply = json!({
+                "op": 7,
+                "d": {
+                    "requestType": "GetCurrentProgramScene",
+                    "requestId": "aivtuber-obs-1",
+                    "requestStatus": { "result": true, "code": 100 },
+                    "responseData": body
+                }
+            })
+            .to_string();
+            let script = Script::new(vec![Ok(hello(None)), Ok(identified()), Ok(reply)]);
+            let adapter = ObsWebSocketAdapter::with_dependencies(
+                config(),
+                Arc::new(ScriptedConnector::new(vec![Ok(script)])),
+                Arc::new(TestClock::new(0)),
+            )
+            .expect("adapter");
+            let error = adapter.current_program_scene().expect_err("refused");
+            assert_eq!(error.kind, EngineErrorKind::Backend);
+        }
     }
 }
