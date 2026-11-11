@@ -86,6 +86,9 @@ fn help_lists_the_subcommands() {
         "--llama-flavor",
         "--skip",
         "--env-file",
+        "--profile",
+        "--llm-endpoint",
+        "--from-target",
     ] {
         assert!(t.contains(flag), "{flag} missing from: {t}");
     }
@@ -118,6 +121,96 @@ fn dry_run_prints_the_plan_and_the_duties_without_writing_anything() {
     }
     assert!(!assets.exists());
     assert_eq!(listing(&root), before);
+}
+
+#[test]
+fn the_perception_dry_run_names_the_vision_files_the_vram_and_the_extra_duty() {
+    let root = fake_release("cli-dry-perception");
+    let before = listing(&root);
+    let assets = root.parent().unwrap().join("assets");
+    let o = run(&[
+        "local",
+        "--dry-run",
+        "--profile",
+        "perception",
+        "--root",
+        root.to_str().unwrap(),
+        "--assets",
+        assets.to_str().unwrap(),
+    ]);
+    let t = text(&o);
+    assert!(o.status.success(), "{t}");
+    for needle in [
+        "profile  perception",
+        "Qwen3VL-4B-Instruct-Q4_K_M.gguf",
+        "mmproj-Qwen3VL-4B-Instruct-Q8_0.gguf",
+        "at least about 12 GB of VRAM",
+        "Qwen3-VL-4B-Instruct",
+        "screen",
+    ] {
+        assert!(t.contains(needle), "plan lacks {needle:?}: {t}");
+    }
+    assert!(
+        !t.contains("Qwen3-4B-Instruct-2507-Q4_K_M.gguf"),
+        "the default model is not part of this plan: {t}"
+    );
+    assert!(!assets.exists());
+    assert_eq!(listing(&root), before);
+}
+
+#[test]
+fn an_unknown_profile_and_a_remote_llm_endpoint_are_refused() {
+    let root = fake_release("cli-bad-args");
+    let o = run(&[
+        "local",
+        "--dry-run",
+        "--profile",
+        "huge",
+        "--root",
+        root.to_str().unwrap(),
+    ]);
+    assert_eq!(o.status.code(), Some(1));
+    let t = text(&o);
+    assert!(
+        t.contains("unknown profile") && t.contains("perception"),
+        "{t}"
+    );
+    let o = run(&[
+        "local",
+        "--dry-run",
+        "--llm-endpoint",
+        "https://api.example.com/v1/responses",
+        "--root",
+        root.to_str().unwrap(),
+    ]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(text(&o).contains("--llm-endpoint"), "{}", text(&o));
+}
+
+#[test]
+fn a_dry_run_from_a_target_directory_says_what_is_missing() {
+    let root = fake_release("cli-target");
+    let o = run(&[
+        "local",
+        "--dry-run",
+        "--from-target",
+        root.join("nonexistent-target").to_str().unwrap(),
+        "--root",
+        root.to_str().unwrap(),
+    ]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(text(&o).contains("not a built checkout"), "{}", text(&o));
+    // The same directory holding the programs works.
+    let o = run(&[
+        "local",
+        "--dry-run",
+        "--from-target",
+        root.to_str().unwrap(),
+        "--root",
+        root.to_str().unwrap(),
+    ]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("--from-target"));
 }
 
 #[test]

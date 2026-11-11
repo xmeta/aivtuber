@@ -94,6 +94,8 @@ fn fixture(tag: &str, evil_llama: bool) -> Fixture {
     let gguf = pattern(70_000, 11);
     let vad = pattern(3_000, 12);
     let avatar = pattern(5_000, 13);
+    let vlm = pattern(60_000, 14);
+    let mmproj = pattern(9_000, 15);
     let stt: Vec<(String, Vec<u8>)> = ["enc.onnx", "dec.onnx", "join.onnx", "tokens.txt"]
         .iter()
         .enumerate()
@@ -119,6 +121,8 @@ fn fixture(tag: &str, evil_llama: bool) -> Fixture {
         .insert(format!("/{llama_name}"), llama_bytes.clone());
     b.files.insert("/m.gguf".into(), gguf.clone());
     b.files.insert("/vad.onnx".into(), vad.clone());
+    b.files.insert("/vlm.gguf".into(), vlm.clone());
+    b.files.insert("/mmproj.gguf".into(), mmproj.clone());
     b.files.insert("/avatar.vrm".into(), avatar.clone());
     for (n, d) in &stt {
         b.files.insert(format!("/stt/{n}"), d.clone());
@@ -140,6 +144,15 @@ fn fixture(tag: &str, evil_llama: bool) -> Fixture {
         "schema": "local-profile-pins/1",
         "llama": {"tag": "btest", "licence": "MIT", "assets": { format!("{platform}-cpu"): asset(llama_name, &format!("/{llama_name}"), &llama_bytes) }},
         "llm": asset("m.gguf", "/m.gguf", &gguf),
+        "profiles": {
+            "default": {"description": "text", "alias": "text-model", "model_version": "Q4", "context": 4096},
+            "vision": {
+                "description": "multimodal", "alias": "vision-model", "model_version": "Q4_V",
+                "context": 8192, "parallel": 2, "min_vram_gb": 12,
+                "llm": asset("vlm.gguf", "/vlm.gguf", &vlm),
+                "mmproj": asset("mmproj.gguf", "/mmproj.gguf", &mmproj)
+            }
+        },
         "vad": asset("vad.onnx", "/vad.onnx", &vad),
         "avatar": asset("avatar.vrm", "/avatar.vrm", &avatar),
         "sherpa_lib": {"version": "x", "assets": {}},
@@ -149,7 +162,9 @@ fn fixture(tag: &str, evil_llama: bool) -> Fixture {
         },
         "disclosures": [
             {"id": "supertonic-3-weights", "component": "Voice", "licence": "OpenRAIL-M", "applies_to": ["tts"], "duty": "Disclose that the voice is machine-generated."},
-            {"id": "x", "component": "Sample avatar", "licence": "L", "applies_to": ["avatar"], "duty": "Replace it."}
+            {"id": "x", "component": "Sample avatar", "licence": "L", "applies_to": ["avatar"], "duty": "Replace it."},
+            {"id": "text", "component": "Text model", "licence": "L", "applies_to": ["profile:default"], "duty": "Text duty."},
+            {"id": "vision", "component": "Vision model", "licence": "L", "applies_to": ["profile:vision"], "duty": "Vision duty."}
         ]
     });
     let manifest = Manifest::parse(&manifest_json.to_string()).unwrap();
@@ -195,6 +210,9 @@ fn options(f: &Fixture) -> LocalOptions {
         offline: false,
         force: false,
         llama_port: 18080,
+        profile: "default".into(),
+        llm_endpoint: None,
+        bin_dir: None,
         platform: platform(),
         download: DownloadConfig {
             allow_loopback_http: true,
@@ -402,4 +420,241 @@ fn a_directory_that_is_not_a_release_and_a_spaced_asset_path_are_refused() {
     let mut o = options(&f);
     o.skip = BTreeSet::from(["bogus".to_owned()]);
     assert!(go(&f, &o).0.unwrap_err().contains("unknown step"));
+}
+
+fn env_map(path: &Path) -> std::collections::BTreeMap<String, String> {
+    aivtuber_setup::config::parse_env(&fs::read_to_string(path).unwrap())
+        .into_iter()
+        .collect()
+}
+
+#[test]
+fn the_default_profile_env_has_no_projector_and_its_own_duty() {
+    let f = fixture("flow-default-profile", false);
+    let o = options(&f);
+    let (r, out) = go(&f, &o);
+    r.unwrap();
+    let env = env_map(&o.env_file);
+    assert_eq!(env["AIVTUBER_SETUP_PROFILE"], "default");
+    assert_eq!(env["AIVTUBER_SETUP_LLAMA_MODE"], "managed");
+    assert_eq!(env["AIVTUBER_OPENAI_MODEL"], "text-model");
+    assert_eq!(env["AIVTUBER_SETUP_LLAMA_CONTEXT"], "4096");
+    assert!(!env.contains_key("AIVTUBER_SETUP_LLAMA_MMPROJ"));
+    assert!(!env.contains_key("AIVTUBER_SETUP_LLAMA_PARALLEL"));
+    assert!(
+        out.contains("Text duty.") && !out.contains("Vision duty."),
+        "{out}"
+    );
+    assert!(!o.assets.join("llm/vlm.gguf").exists());
+}
+
+#[test]
+fn the_vision_profile_fetches_both_files_and_the_env_follows_it() {
+    let f = fixture("flow-vision", false);
+    let mut o = options(&f);
+    o.profile = "vision".into();
+    let (r, out) = go(&f, &o);
+    let summary = r.unwrap_or_else(|e| panic!("{e}\n{out}"));
+    assert!(summary.provisioned.contains(&"llm"));
+    assert!(o.assets.join("llm/vlm.gguf").is_file());
+    assert!(o.assets.join("llm/mmproj.gguf").is_file());
+    assert!(
+        !o.assets.join("llm/m.gguf").exists(),
+        "the other profile's model is not fetched"
+    );
+    let env = env_map(&o.env_file);
+    assert_eq!(env["AIVTUBER_SETUP_PROFILE"], "vision");
+    assert_eq!(env["AIVTUBER_OPENAI_MODEL"], "vision-model");
+    assert_eq!(env["AIVTUBER_OPENAI_MODEL_VERSION"], "Q4_V");
+    assert_eq!(env["AIVTUBER_SETUP_LLAMA_CONTEXT"], "8192");
+    assert_eq!(env["AIVTUBER_SETUP_LLAMA_PARALLEL"], "2");
+    assert_eq!(env["AIVTUBER_SETUP_LLAMA_ALIAS"], "vision-model");
+    assert_eq!(
+        env["AIVTUBER_SETUP_LLAMA_MMPROJ"],
+        o.assets
+            .join("llm")
+            .join("mmproj.gguf")
+            .display()
+            .to_string()
+    );
+    assert_eq!(
+        env["AIVTUBER_SETUP_LLAMA_GGUF"],
+        o.assets.join("llm").join("vlm.gguf").display().to_string()
+    );
+    assert!(
+        out.contains("REQUIRES") && out.contains("12 GB of VRAM"),
+        "{out}"
+    );
+    assert!(
+        out.contains("Vision duty.") && !out.contains("Text duty."),
+        "{out}"
+    );
+    // The env file drives the real start command.
+    let cmd = match aivtuber_setup::start::llm(&env).unwrap() {
+        aivtuber_setup::start::Llm::Managed(c) => c.args.join(" "),
+        other => panic!("{other:?}"),
+    };
+    for needle in [
+        "--mmproj",
+        "--parallel 2",
+        "-c 8192",
+        "--alias vision-model",
+    ] {
+        assert!(cmd.contains(needle), "{needle}: {cmd}");
+    }
+}
+
+#[test]
+fn an_unknown_profile_is_refused_before_anything_is_fetched() {
+    let f = fixture("flow-bad-profile", false);
+    let mut o = options(&f);
+    o.profile = "nope".into();
+    let err = go(&f, &o).0.unwrap_err();
+    assert!(err.contains("default") && err.contains("vision"), "{err}");
+    assert_eq!(f.server.count(), 0);
+    assert!(!o.env_file.exists());
+}
+
+#[test]
+fn the_vision_dry_run_lists_both_downloads_and_the_requirement_and_writes_nothing() {
+    let f = fixture("flow-vision-dry", false);
+    let mut o = options(&f);
+    o.profile = "vision".into();
+    o.dry_run = true;
+    let before = tree(&f.root);
+    let (r, out) = go(&f, &o);
+    r.unwrap();
+    assert_eq!(f.server.count(), 0);
+    assert!(
+        out.contains("download  vlm.gguf") && out.contains("download  mmproj.gguf"),
+        "{out}"
+    );
+    assert!(
+        out.contains("profile  vision") && out.contains("12 GB of VRAM"),
+        "{out}"
+    );
+    assert!(out.contains("Vision duty."), "{out}");
+    assert!(!o.assets.exists() && !o.env_file.exists());
+    assert_eq!(tree(&f.root), before);
+}
+
+#[test]
+fn skipping_the_model_writes_a_consistent_env_that_start_refuses() {
+    let f = fixture("flow-skip-llm", false);
+    let mut o = options(&f);
+    o.skip.insert("llm".into());
+    let (r, out) = go(&f, &o);
+    r.unwrap_or_else(|e| panic!("{e}\n{out}"));
+    assert!(!o.assets.join("llm").exists());
+    let text = fs::read_to_string(&o.env_file).unwrap();
+    let env = env_map(&o.env_file);
+    assert_eq!(env["AIVTUBER_SETUP_LLAMA_MODE"], "missing");
+    assert!(
+        !env.contains_key("AIVTUBER_SETUP_LLAMA_GGUF"),
+        "no path to a file that is not there"
+    );
+    assert!(text.contains("# AIVTUBER_SETUP_LLAMA_GGUF="));
+    assert!(out.contains("no language model"), "{out}");
+    let err = aivtuber_setup::start::llm(&env).unwrap_err();
+    assert!(
+        err.contains("--llm-endpoint") && err.contains("--skip"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_model_already_on_disk_is_still_managed_after_skipping_its_step() {
+    let f = fixture("flow-skip-after", false);
+    let o = options(&f);
+    go(&f, &o).0.unwrap();
+    let mut again = o.clone();
+    again.skip.insert("llm".into());
+    again.skip.insert("llama".into());
+    again.force = true;
+    go(&f, &again).0.unwrap();
+    assert_eq!(env_map(&o.env_file)["AIVTUBER_SETUP_LLAMA_MODE"], "managed");
+}
+
+#[test]
+fn an_llm_endpoint_fetches_no_model_and_sets_the_endpoint() {
+    let f = fixture("flow-endpoint", false);
+    let mut o = options(&f);
+    o.llm_endpoint = Some("http://127.0.0.1:9100".into());
+    let (r, out) = go(&f, &o);
+    r.unwrap_or_else(|e| panic!("{e}\n{out}"));
+    assert!(!o.assets.join("llm").exists() && !o.assets.join("llama").exists());
+    let env = env_map(&o.env_file);
+    assert_eq!(env["AIVTUBER_SETUP_LLAMA_MODE"], "external");
+    assert_eq!(
+        env["AIVTUBER_OPENAI_ENDPOINT"],
+        "http://127.0.0.1:9100/v1/responses"
+    );
+    assert!(!env.contains_key("AIVTUBER_SETUP_LLAMA_SERVER"));
+    assert!(matches!(
+        aivtuber_setup::start::llm(&env).unwrap(),
+        aivtuber_setup::start::Llm::External
+    ));
+
+    let mut bad = options(&f);
+    bad.llm_endpoint = Some("http://example.com/v1/responses".into());
+    assert!(go(&f, &bad).0.unwrap_err().contains("loopback"));
+}
+
+#[test]
+fn a_source_checkout_uses_the_programs_of_a_target_directory() {
+    let f = fixture("flow-target", false);
+    // A checkout root without executables, and a separate target directory with them.
+    let checkout = f.base.join("checkout");
+    fs::create_dir_all(checkout.join("renderer/local-avatar/dist")).unwrap();
+    fs::write(
+        checkout.join("renderer/local-avatar/dist/index.html"),
+        "<html>",
+    )
+    .unwrap();
+    fs::create_dir_all(checkout.join("examples/starter-reaction-pack/descriptors")).unwrap();
+    let target = f.base.join("target-release");
+    fs::create_dir_all(&target).unwrap();
+    for name in [
+        "aivtuber-app",
+        "speech-vad-sidecar",
+        "speech-stt-worker",
+        "local-tts-sidecar",
+    ] {
+        fs::write(target.join(exe(name)), b"bin").unwrap();
+    }
+    let mut o = options(&f);
+    o.root = checkout.clone();
+    o.assets = f.base.join("assets");
+    o.env_file = checkout.join("local-profile.env");
+    o.bin_dir = Some(target.clone());
+    let (r, out) = go(&f, &o);
+    r.unwrap_or_else(|e| panic!("{e}\n{out}"));
+    let env = env_map(&o.env_file);
+    assert_eq!(
+        env["AIVTUBER_SETUP_APP"],
+        target.join(exe("aivtuber-app")).display().to_string()
+    );
+    assert_eq!(
+        env["AIVTUBER_TTS_SIDECAR"],
+        target.join(exe("local-tts-sidecar")).display().to_string()
+    );
+    assert_eq!(env["AIVTUBER_AVATAR_OUTPUT"], "local");
+    assert!(
+        env["AIVTUBER_LOCAL_AVATAR_PAGE_DIR"].starts_with(&checkout.display().to_string()),
+        "page and pack stay in the checkout"
+    );
+    assert!(out.contains("--from-target"), "{out}");
+    assert!(
+        out.contains(&target.join(exe("aivtuber-setup")).display().to_string()),
+        "{out}"
+    );
+
+    // Without the built programs it says what to build.
+    let mut empty = o.clone();
+    empty.bin_dir = Some(f.base.join("no-target"));
+    let err = go(&f, &empty).0.unwrap_err();
+    assert!(
+        err.contains("not a built checkout") && err.contains("source checkout"),
+        "{err}"
+    );
 }

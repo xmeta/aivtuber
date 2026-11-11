@@ -1,7 +1,7 @@
 // One-step provisioning of every third-party asset the zero-paid-dependency
 // `local` profile needs (issue #220 S3, docs/local-profile-quickstart.adoc).
 //
-//   node scripts/fetch-local-profile.mjs <dest-dir> [--llama-flavor vulkan|cpu] [--skip llm,llama,...]
+//   node scripts/fetch-local-profile.mjs <dest-dir> [--llama-flavor vulkan|cpu] [--profile default|perception] [--skip llm,llama,...]
 //
 // It adds only what no existing script covers (the llama.cpp release, the LLM
 // GGUF and the Silero VAD model, each pinned by SHA-256 in the manifest). The sherpa-onnx
@@ -31,7 +31,6 @@ const repo = resolve(here, "..");
 const PINS = JSON.parse(readFileSync(join(repo, "packaging", "local-profile-pins.json"), "utf8"));
 const LLAMA_TAG = PINS.llama.tag;
 const LLAMA = PINS.llama.assets;
-const GGUF = PINS.llm;
 const VAD = PINS.vad;
 
 function fail(message) {
@@ -71,12 +70,20 @@ const flag = (name) => {
   return i >= 0 ? args[i + 1] : undefined;
 };
 const dest = args.find((a, i) => !a.startsWith("--") && !(i > 0 && args[i - 1].startsWith("--")));
-if (!dest) fail("usage: fetch-local-profile.mjs <dest-dir> [--llama-flavor vulkan|cpu] [--skip llama,llm,vad,sherpa-lib,stt,tts,avatar]");
+if (!dest) fail("usage: fetch-local-profile.mjs <dest-dir> [--llama-flavor vulkan|cpu] [--profile default|perception] [--skip llama,llm,vad,sherpa-lib,stt,tts,avatar]");
 const root = resolve(dest);
 const skip = new Set((flag("--skip") ?? "").split(",").filter(Boolean));
 const platform = `${process.platform}-${process.arch}`;
 const flavor = flag("--llama-flavor") ?? (process.platform === "win32" ? "vulkan" : "cpu");
 const run = (script, ...a) => execFileSync(process.execPath, [join(repo, "scripts", script), ...a], { stdio: "inherit" });
+
+const profileName = flag("--profile") ?? "default";
+const profile = PINS.profiles[profileName];
+if (!profile) fail(`unknown profile ${JSON.stringify(profileName)} (pinned: ${Object.keys(PINS.profiles).join(", ")})`);
+// `default` has no files of its own and uses the top-level "llm" pin.
+const GGUF = profile.llm ?? PINS.llm;
+const MMPROJ = profile.mmproj;
+if (profile.min_vram_gb) console.log(`note: the ${profileName} profile needs at least about ${profile.min_vram_gb} GB of VRAM`);
 
 const out = {};
 
@@ -101,6 +108,14 @@ if (!skip.has("llm")) {
   const path = join(root, "llm", GGUF.file);
   await download(GGUF.url, path, GGUF.sha256);
   out.LLM_GGUF = path;
+  if (MMPROJ) {
+    const mmprojPath = join(root, "llm", MMPROJ.file);
+    await download(MMPROJ.url, mmprojPath, MMPROJ.sha256);
+    out.LLM_MMPROJ = mmprojPath;
+  }
+  out.LLM_ALIAS = profile.alias;
+  out.LLM_CONTEXT = String(profile.context);
+  if (profile.parallel) out.LLM_PARALLEL = String(profile.parallel);
 }
 if (!skip.has("vad")) {
   const path = join(root, "vad", VAD.file);
@@ -124,5 +139,6 @@ if (!skip.has("avatar")) {
   out.AVATAR_VRM = await ensureModel(join(root, "avatar", "VRM1_Constraint_Twist_Sample.vrm"));
 }
 
+const plain = new Set(["LLM_ALIAS", "LLM_CONTEXT", "LLM_PARALLEL"]);
 console.log("\nProvisioned (paths are absolute):");
-for (const [k, v] of Object.entries(out)) console.log(`${k}=${resolve(v)}`);
+for (const [k, v] of Object.entries(out)) console.log(`${k}=${plain.has(k) ? v : resolve(v)}`);
