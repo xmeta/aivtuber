@@ -94,7 +94,7 @@ Deterministic survivors therefore depend on recorded input order, logical timest
 * cached-playback recent-group counters;
 * working-memory and adaptation current/high-water/evicted counters;
 * generation pending/in-flight/awaiting-drain/high-water/saturation/cancellation counters;
-* chat-burst and deferred-reply counters (+chat_burst+, present only when +AIVTUBER_CHAT_BURST_MODE+ is on): admitted, terminal outcomes by category, held/in-flight, inbox offered/pending/high-water and terminal outcomes, logical wait, invariant violations.
+* chat-burst and deferred-reply counters (+chat_burst+, present only when +AIVTUBER_CHAT_BURST_MODE+ is on): admitted, terminal outcomes by category, held/in-flight, inbox offered/pending/high-water and terminal outcomes, logical wait, invariant violations. With +AIVTUBER_CHAT_AUDIENCE_MODE+ (#79) it also carries audience-signal counters: signals produced, comments represented by an aggregate (a terminal outcome), comments the safety guard kept individual, and signals dropped from a bounded ring of 64 (+MAX_AUDIENCE_SIGNALS+; ids, counts and a reviewed family label only, never viewer text or actor identifiers). A batch holds at most 64 candidates, so it yields at most 32 signals, each with at most 3 representative event ids.
 
 These are bounded aggregate counters; observability does not retain an unbounded per-event history.
 
