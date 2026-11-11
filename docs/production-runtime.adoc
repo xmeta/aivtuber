@@ -231,14 +231,42 @@ Observations do not ride the stdin `EventEnvelope` pipe. An envelope kind would 
 
 == Perception observations (issue #90, S1a)
 
-`schemas/perception-observation.schema.json` is the contract for derived screen observations (a closed scene class with closed-vocabulary labels, or one caption of at most 240 bytes); see ADR-0007 and `docs/domain-contract.adoc` section 4.2. `PerceptionTracker` (`crates/runtime/src/perception.rs`) is the ingress. It is a library component only in S1a: nothing in the composition root constructs it, no capture or model exists, and the default is off.
+`schemas/perception-observation.schema.json` is the contract for derived screen observations (a closed scene class with closed-vocabulary labels, or one caption of at most 240 bytes); see ADR-0007 and `docs/domain-contract.adoc` section 4.2. `PerceptionTracker` (`crates/runtime/src/perception.rs`) is the ingress. In S1a it was a library component only; S1b composes it behind `AIVTUBER_PERCEPTION` (next section). The default is off.
 
 * *Untrusted.* Plane `content`, trust `untrusted`, no source class; a payload with any trust, plane, source class, priority or authorization field is invalid.
-* *Opt-in.* `enable_source(&AuthenticatedControl, alias, now_ms)` needs `obs.control` and an alias in `PerceptionConfig::source_privacy_floors` (empty by default, so nothing can be enabled). With nothing enabled, `ingest_bytes` refuses before parsing.
+* *Opt-in.* `enable_source(&AuthenticatedControl, alias, now_ms)` needs the dedicated `perception.control` capability (not `obs.control`) and an alias in `PerceptionConfig::source_privacy_floors` (empty by default, so nothing can be enabled). With nothing enabled, `ingest_bytes` refuses before parsing.
 * *Bounds.* 16 KiB per batch, 8 observations per batch, at most 8 allowlisted and 2 enabled sources (defaults), latest observation per (source, kind) and a text-free diagnostic ring of 8. Observation age limit 10 s (unmeasured), validity at most 30 s, label vocabulary at most 64 tokens.
 * *Rejections* are counted per reason in `PerceptionMetrics` (`disabled`, `future_dated`, `stale_age`, `expired`, `out_of_order`, `redaction_failed`, batch `oversize`/`invalid`/`disabled`) with disagreement, out-of-vocabulary label, redaction and age counters; no caption text is in any metric.
 * *Consumers.* `scene_snapshot` (closed vocabulary only), `resolve_scene` (source hierarchy) and `thinking_caption_item` (one untrusted, delimited, at most 512 byte item). The caption never reaches memory, TTS or Reflex.
 * *Replay.* `examples/perception-observations/replay/*.json` through `PerceptionReplayFixture`; `cargo test --locked -p aivtuber-runtime perception`.
+
+== Live screen perception (issue #90, S1b)
+
+Opt-in and off by default at every level: the profile switch, the operator enable, and the runtime's own suspension. Needs the `local` profile, a loopback obs-websocket and a loopback multimodal `llama-server` (Qwen3-VL-4B-Instruct Q4_K_M with its projector, `--parallel 2`). **It requires about 12 GB of VRAM next to the local stack**; on an 8 GB card the model spills silently (EXP-0004c) and the runtime latency probe will suspend perception. ADR-0007 has the design; `docs/local-profile-quickstart.adoc` has the setup.
+
+[cols="2,1,4"]
+|===
+|Variable |Default |Meaning
+
+|`AIVTUBER_PERCEPTION` |`false` |Compose the perception path (requires `AIVTUBER_MODE=local`). It starts `off`.
+|`AIVTUBER_PERCEPTION_OBS_SOURCE` |required |The one OBS source to capture. The operator's real name; observations only ever carry the alias.
+|`AIVTUBER_PERCEPTION_ALIAS` |`game-main` |Alias for that source in observations and the tracker allowlist.
+|`AIVTUBER_PERCEPTION_VLM_ENDPOINT` |required |Loopback chat-completions URL of the multimodal server. A non-loopback host is a startup error.
+|`AIVTUBER_OBS_ENDPOINT`, `AIVTUBER_OBS_PASSWORD` |`ws://127.0.0.1:4455` |Shared with the OBS stream output; perception opens its own session. Must be loopback.
+|`AIVTUBER_PERCEPTION_MODEL` |`qwen3-vl-4b-instruct-q4_k_m` |Provenance label in observations.
+|`AIVTUBER_PERCEPTION_LANGUAGE` |`ja` |Caption language, `ja` or `en`.
+|`AIVTUBER_PERCEPTION_IMAGE_WIDTH`, `_HEIGHT`, `_IMAGE_FORMAT` |`768`, `432`, `png` |Size OBS downscales to (8 to 4096) and container (`png` or `jpeg`).
+|`AIVTUBER_PERCEPTION_CADENCE_MS` |`10000` |Time from one capture finishing to the next. Floor 5000; a lower value is an error.
+|`AIVTUBER_PERCEPTION_GATE_SETTLE_MS` |`750` |How long Thinking and speech must have been idle before a capture starts.
+|`AIVTUBER_PERCEPTION_CAPTION_DEADLINE_MS` |`3000` |A model call slower than this is late: dropped, and three in a row suspend perception.
+|`AIVTUBER_PERCEPTION_PROBE_INTERVAL_MS` |`60000` |Period of the latency probe (it also runs once at start).
+|`AIVTUBER_PERCEPTION_PROBE_CEILING_MS` |`150` |A probe slower than this, or over twice the start baseline, suspends perception (spill).
+|`AIVTUBER_PERCEPTION_VALIDITY_MS` |`20000` |Observation validity, at most 30000.
+|===
+
+* *Control.* `aivtuberctl perception-on` and `perception-off` go through the authenticated operator endpoint, which holds `perception.control` only when perception is composed. `aivtuberctl status` prints a `perception` line: `status` (`off`, `probing`, `active`, `suspended`), `suspend_reason` (`start_probe_failed`, `start_probe_spill`, `latency_spill`, `slow_captions`, `repeated_failures`), availability, the last probe time and counters including how often a capture yielded to Thinking or speech. A suspended path stays off until `perception-on`. Disabling takes effect before the next capture and drops everything retained.
+* *Privacy.* Frames are held in memory for one model call and are never written to disk or logged; only counters and the bounded tracker state exist. The model and OBS endpoints are loopback only. Captions are untrusted data: URLs and secret shapes are removed, the caption is at most 240 bytes, and it can reach Thinking only as one delimited untrusted item (not yet wired; S2).
+* *Failure.* The model, OBS or the probe failing degrades to "no observations" and a visible status; the deterministic performer is never involved. The capture runs on its own thread, never in the frame or motor loop.
 
 == Speech sidecar (issue #92, S2)
 
@@ -668,7 +696,7 @@ Actions:
 
 Full guarantees: docs/security-threat-model.adoc section 6.1.
 
-*Memory erase (issue #305).* Retained viewer memory can be erased on request. The library entry point is +ProductionApp::erase_memory_operator+, which requires the authenticated +memory.admin+ capability, takes an actor +(source namespace, raw actor id)+ and/or up to 32 retained memory ids, and returns an +ErasureReport+ that lists what was removed and every remnant the runtime cannot prove erased (sidecar copies, Hindsight +retire+, generated assets, spoken output, provider and audit logs, backups). It is RAM-only and not yet an +aivtuberctl+ action; the current operator socket grants only +performer.stop+ and +performer.mute+. Viewers can ask to be forgotten by sending exactly +!forgetme+ in public chat; only their own pseudonym is erased, at most once per 60 seconds, and the line is consumed before routing. Each erase writes an audit record (+erase_erased+, +erase_noop+ or +erase_ratelimited+) without claim text or raw ids. Details: docs/memory-adaptation.adoc section 13.1 and ADR-0008.
+*Memory erase (issue #305).* Retained viewer memory can be erased on request. The library entry point is +ProductionApp::erase_memory_operator+, which requires the authenticated +memory.admin+ capability, takes an actor +(source namespace, raw actor id)+ and/or up to 32 retained memory ids, and returns an +ErasureReport+ that lists what was removed and every remnant the runtime cannot prove erased (sidecar copies, Hindsight +retire+, generated assets, spoken output, provider and audit logs, backups). It is RAM-only and not yet an +aivtuberctl+ action; the operator socket grants +performer.stop+ and +performer.mute+, plus +perception.control+ only when live screen perception is composed (#90). Viewers can ask to be forgotten by sending exactly +!forgetme+ in public chat; only their own pseudonym is erased, at most once per 60 seconds, and the line is consumed before routing. Each erase writes an audit record (+erase_erased+, +erase_noop+ or +erase_ratelimited+) without claim text or raw ids. Details: docs/memory-adaptation.adoc section 13.1 and ADR-0008.
 
 *Unmute is intentionally not supported.* Mute is a latching emergency state: resuming output requires restarting the daemon with a verified configuration. This is a deliberate choice so a compromised operator session cannot silently re-enable output.
 

@@ -98,6 +98,7 @@ describe("normalizeEvent", () => {
       "avatar.control",
       "memory.admin",
       "tool.grant",
+      "perception.control",
     ]);
   });
 });

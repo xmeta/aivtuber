@@ -163,6 +163,7 @@ mod tests {
             Capability::AvatarControl => "avatar.control",
             Capability::MemoryAdmin => "memory.admin",
             Capability::ToolGrant => "tool.grant",
+            Capability::PerceptionControl => "perception.control",
         };
         let secret = [13_u8; 32];
         let ingress = LocalControlIngress::new(

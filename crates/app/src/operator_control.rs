@@ -78,10 +78,52 @@ pub struct OperatorStatusSnapshot {
     pub content_queue: usize,
     pub scheduler_items: usize,
     pub generation_active: bool,
+    /// Live screen perception (#90 S1b). Absent unless perception is composed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub perception: Option<OperatorPerceptionStatus>,
+}
+
+/// Operator-visible, text-free perception status: whether it is running, why
+/// the runtime suspended it, and the counters that explain what it is doing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OperatorPerceptionStatus {
+    /// `off`, `probing`, `active` or `suspended`.
+    pub status: String,
+    /// Why the runtime suspended it (for example `latency_spill`).
+    pub suspend_reason: Option<String>,
+    /// `disabled`, `healthy` or `unavailable`.
+    pub availability: String,
+    pub last_probe_ms: Option<u64>,
+    pub captures_ok: u64,
+    pub captures_failed: u64,
+    pub captures_late: u64,
+    pub yielded_thinking: u64,
+    pub yielded_speech: u64,
+    pub observations_accepted: u64,
+}
+
+impl OperatorPerceptionStatus {
+    fn from_report(report: &crate::PerceptionStatusReport) -> Self {
+        Self {
+            status: report.governor.status.name().to_owned(),
+            suspend_reason: report
+                .governor
+                .suspend_reason
+                .map(|reason| reason.name().to_owned()),
+            availability: report.availability.name().to_owned(),
+            last_probe_ms: report.governor.last_probe_ms,
+            captures_ok: report.governor.metrics.captures_ok,
+            captures_failed: report.governor.metrics.captures_failed,
+            captures_late: report.governor.metrics.captures_late,
+            yielded_thinking: report.governor.metrics.yielded_thinking,
+            yielded_speech: report.governor.metrics.yielded_speech,
+            observations_accepted: report.tracker.observations_accepted,
+        }
+    }
 }
 
 impl OperatorStatusSnapshot {
-    pub fn from_app<R: RoutePlanner>(app: &ProductionApp<R>) -> Self {
+    pub fn from_app<R: RoutePlanner>(app: &ProductionApp<R>, now_ms: u64) -> Self {
         let health: &AdapterHealth = app.health();
         let generation = app.generation_execution_snapshot();
         Self {
@@ -96,6 +138,9 @@ impl OperatorStatusSnapshot {
             generation_active: generation
                 .as_ref()
                 .is_some_and(|snapshot| !snapshot.is_quiescent()),
+            perception: app
+                .perception()
+                .map(|service| OperatorPerceptionStatus::from_report(&service.report(now_ms))),
         }
     }
 }
@@ -192,15 +237,30 @@ impl OperatorControlServer {
         name: &str,
         secret: [u8; 32],
     ) -> Result<(Self, mpsc::Receiver<DispatchedOperatorRequest>), OperatorControlError> {
+        Self::with_perception_control(name, secret, false)
+    }
+
+    /// Like [`Self::new`], and when `perception` is true the endpoint's local
+    /// ingress also holds `perception.control` (#90 S1b), so the operator who
+    /// holds the control secret can enable and disable live screen perception.
+    /// It is only true when perception is composed; nothing else can mint it.
+    pub fn with_perception_control(
+        name: &str,
+        secret: [u8; 32],
+        perception: bool,
+    ) -> Result<(Self, mpsc::Receiver<DispatchedOperatorRequest>), OperatorControlError> {
         let name = name.trim();
         if name.is_empty() {
             return Err(OperatorControlError::InvalidConfiguration("endpoint name"));
         }
 
-        let capabilities = std::collections::BTreeSet::from([
+        let mut capabilities = std::collections::BTreeSet::from([
             aivtuber_domain::Capability::PerformerStop,
             aivtuber_domain::Capability::PerformerMute,
         ]);
+        if perception {
+            capabilities.insert(aivtuber_domain::Capability::PerceptionControl);
+        }
         let ingress = Arc::new(
             LocalControlIngress::new(
                 "operator-control",
@@ -386,6 +446,8 @@ pub fn apply_dispatched_request<R: RoutePlanner>(
         && request.action != "stop"
         && request.action != "mute"
         && request.action != "diagnose"
+        && request.action != "perception.enable"
+        && request.action != "perception.disable"
     {
         let detail = format!("unknown action {}", request.action);
         app.audit_operator_action(&request_id, &request.action, &detail, false);
@@ -411,7 +473,7 @@ pub fn apply_dispatched_request<R: RoutePlanner>(
             return rejection(&request_id, &detail);
         }
         if request.action == "status" {
-            let snapshot = OperatorStatusSnapshot::from_app(app);
+            let snapshot = OperatorStatusSnapshot::from_app(app, now_ms);
             app.audit_operator_action(&request_id, "status", "status", true);
             return OperatorResponse {
                 request_id,
@@ -443,12 +505,18 @@ pub fn apply_dispatched_request<R: RoutePlanner>(
         };
     }
 
+    // The two perception requests share one capability, named by this action.
+    let capability_action = if request.action.starts_with("perception.") {
+        "perception.control".to_owned()
+    } else {
+        request.action.clone()
+    };
     let input = OperatorCommandInput {
         event_id: format!("operator-{request_id}"),
         correlation_id: format!("operator-{request_id}"),
         sequence: 0,
         observed_at: rfc3339_from_ms(now_ms),
-        action: request.action.clone(),
+        action: capability_action,
         payload: std::collections::BTreeMap::new(),
     };
 
@@ -460,6 +528,25 @@ pub fn apply_dispatched_request<R: RoutePlanner>(
             return rejection(&request_id, &detail);
         }
     };
+
+    if request.action.starts_with("perception.") {
+        let enable = request.action == "perception.enable";
+        return match app.apply_perception_control(command.authority(), enable, now_ms) {
+            Ok(detail) => {
+                app.audit_operator_action(&request_id, &request.action, detail, true);
+                OperatorResponse {
+                    request_id,
+                    ok: true,
+                    detail: detail.to_owned(),
+                    status: None,
+                }
+            }
+            Err(detail) => {
+                app.audit_operator_action(&request_id, &request.action, detail, false);
+                rejection(&request_id, detail)
+            }
+        };
+    }
 
     match app.handle_control_reporting(&command, now_ms) {
         Ok((outcome, stop_report)) => {

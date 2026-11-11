@@ -13,7 +13,7 @@
 //! Rules enforced here, not left to callers:
 //! * **Off by default, operator opt-in only.** No source is enabled until an
 //!   authenticated operator capability ([`AuthenticatedControl`] holding
-//!   `obs.control`) enables an allowlisted alias. Nothing in a batch, a
+//!   `perception.control`) enables an allowlisted alias. Nothing in a batch, a
 //!   caption or a model answer can reach [`PerceptionTracker::enable_source`].
 //!   While nothing is enabled, bytes are refused before they are parsed.
 //! * **Bounded and expiring.** Batch bytes are capped before parsing; every
@@ -241,7 +241,8 @@ pub enum PerceptionBatchRejection {
 /// Why an enable or disable request was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PerceptionGateError {
-    /// The authority does not hold `obs.control`.
+    /// The authority does not hold `perception.control` (`obs.control` is a
+    /// different grant and does not suffice).
     Unauthorized,
     /// The alias is not in the operator's configured allowlist.
     NotAllowlisted,
@@ -502,7 +503,7 @@ impl PerceptionTracker {
     }
 
     /// Enable one allowlisted source. Needs the non-serializable authenticated
-    /// operator capability (`obs.control`); a serialized authorization claim,
+    /// operator capability (`perception.control`); a serialized authorization claim,
     /// a batch, a caption or a model answer cannot reach this method.
     pub fn enable_source(
         &mut self,
@@ -546,6 +547,17 @@ impl PerceptionTracker {
         Ok(())
     }
 
+    /// Fail-closed interlock for the runtime itself (for example the latency
+    /// probe seeing the vision model spill): drops every source and its
+    /// retained state like [`Self::disable_all`] but needs no authority,
+    /// because it can only reduce what perception may do. Re-enabling still
+    /// needs the operator capability.
+    pub fn suspend_all(&mut self) {
+        self.enabled.clear();
+        self.sources.clear();
+        self.reset_if_disabled();
+    }
+
     /// One-step kill switch for every source.
     pub fn disable_all(
         &mut self,
@@ -569,7 +581,7 @@ impl PerceptionTracker {
         &mut self,
         authority: &AuthenticatedControl,
     ) -> Result<(), PerceptionGateError> {
-        if authority.has_capability(Capability::ObsControl) {
+        if authority.has_capability(Capability::PerceptionControl) {
             Ok(())
         } else {
             self.metrics.gate_denied += 1;
@@ -990,7 +1002,7 @@ mod tests {
     }
 
     fn operator() -> AuthenticatedControl {
-        authority(Capability::ObsControl, "obs.control")
+        authority(Capability::PerceptionControl, "perception.control")
     }
 
     fn config() -> PerceptionConfig {
@@ -1125,6 +1137,12 @@ mod tests {
     fn enabling_needs_the_authenticated_capability_and_an_allowlisted_alias() {
         let mut tracker = tracker();
         let wrong = authority(Capability::PerformerMute, "performer.mute");
+        // `obs.control` (change what OBS shows) is not `perception.control`.
+        let obs_only = authority(Capability::ObsControl, "obs.control");
+        assert_eq!(
+            tracker.enable_source(&obs_only, "game-main", 0),
+            Err(PerceptionGateError::Unauthorized)
+        );
         assert_eq!(
             tracker.enable_source(&wrong, "game-main", 0),
             Err(PerceptionGateError::Unauthorized)
@@ -1140,7 +1158,7 @@ mod tests {
             tracker.enable_source(&operator(), "game-third", 0),
             Err(PerceptionGateError::CapacityReached)
         );
-        assert_eq!(tracker.metrics().gate_denied, 3);
+        assert_eq!(tracker.metrics().gate_denied, 4);
         assert!(matches!(
             tracker.disable_source(&wrong, "game-main"),
             Err(PerceptionGateError::Unauthorized)

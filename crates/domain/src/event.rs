@@ -67,6 +67,12 @@ pub enum Capability {
     MemoryAdmin,
     #[serde(rename = "tool.grant")]
     ToolGrant,
+    /// Enables or disables live screen perception (#90 S1b). Held only by an
+    /// authenticated local ingress; deliberately separate from `obs.control`
+    /// so changing what OBS shows and letting a vision model read it are
+    /// different grants.
+    #[serde(rename = "perception.control")]
+    PerceptionControl,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

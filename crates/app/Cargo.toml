@@ -24,3 +24,8 @@ serde_json = "1.0"
 tokio = { version = "1.53.1", features = ["rt", "net", "io-util", "time", "macros"] }
 uuid = { version = "1.26.1", features = ["v4"] }
 sha2 = "0.10"
+
+[dev-dependencies]
+# Fake obs-websocket server for the perception integration test (#90 S1b);
+# already in Cargo.lock through aivtuber-adapters.
+tungstenite = "0.30.0"

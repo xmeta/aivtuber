@@ -98,6 +98,7 @@ Initial capabilities:
 * `avatar.control`
 * `memory.admin`
 * `tool.grant`
+* `perception.control`
 
 The requested operation must be allowlisted and covered by the authenticated local authority. `AuthorizationContext` alone cannot authorize an OBS/avatar/tool adapter; Rust privileged adapter helpers require `AuthenticatedControl`.
 
@@ -235,7 +236,7 @@ Before public speech/display, generated output passes a deterministic publicatio
 
 The current production Rust policy is intentionally narrower than general content moderation. It checks only:
 
-* known control-plane command terms (`obs.control`, `tool.grant`, `memory.admin`, `performer.stop`, `performer.mute`), which are replaced with the configured cached reaction or suppressed when no fallback exists;
+* known control-plane command terms (`obs.control`, `perception.control`, `tool.grant`, `memory.admin`, `performer.stop`, `performer.mute`), which are replaced with the configured cached reaction or suppressed when no fallback exists;
 * explicitly configured secret values, which are redacted before publication/TTS.
 
 All other text is allowed by this stage. Passing this gate therefore does *not* establish that output is generally safe, non-toxic, non-harassing, sexually appropriate, brand-safe, or otherwise content-moderated.

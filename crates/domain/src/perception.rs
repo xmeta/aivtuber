@@ -301,8 +301,9 @@ pub fn validate_perception_label_token(
 /// Characters a caption may not contain: controls, bidi controls, zero-width
 /// and separator characters, and the compatibility forms (full-width and
 /// half-width forms, the ideographic space) that NFKC would rewrite. The
-/// schema pattern lists the same ranges.
-fn caption_char_forbidden(c: char) -> bool {
+/// schema pattern lists the same ranges. Public so a producer can repair a
+/// caption with exactly the validator's notion of forbidden.
+pub fn caption_char_forbidden(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
