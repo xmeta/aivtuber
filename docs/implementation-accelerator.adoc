@@ -152,7 +152,7 @@ tgrep -n -t rust 'ShadowComparisonRecord|TraceStage' .
 |+crates/app/src/lib.rs+, runtime retention, #80 contracts
 |Reuse existing bounded queues/retention before introducing a workflow engine
 |One deferred item with expiry, revalidation, and explicit terminal outcome
-|Expired/cancelled item cannot dispatch
+|Expired/cancelled item cannot dispatch (S1 landed with #78 S2: +crates/scheduler/src/deferred.rs+, +crates/app/src/chat_burst.rs+, +SecurityRuntime::revalidate_deferred_content+; reuse decision custom, a small project-owned state machine)
 
 |#76 moderation adapters
 |+crates/domain/src/interfaces.rs+, +crates/runtime+, +crates/adapters+

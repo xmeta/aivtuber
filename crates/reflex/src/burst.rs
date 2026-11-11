@@ -601,6 +601,14 @@ impl BurstEngine {
         self.ready.len()
     }
 
+    /// Forget the retained cooldown of an actor who erased their data (#305).
+    /// Candidates already pending or ready are not edited (that would break
+    /// the exactly-one-outcome accounting); they resolve within one window and
+    /// the caller is expected to refuse any selection of an erased actor.
+    pub fn forget_actor(&mut self, actor_id: &str) -> bool {
+        self.cooldowns.remove(actor_id).is_some()
+    }
+
     /// Offer one admitted event. `local_score_milli` is a caller-computed
     /// deterministic score (for example retrieval similarity) in `0..=1000`;
     /// larger values are clamped. Returns the disposition plus the resolutions
@@ -1099,6 +1107,23 @@ mod tests {
 
     fn engine(config: BurstConfig) -> BurstEngine {
         BurstEngine::new(config).expect("config")
+    }
+
+    #[test]
+    fn forgetting_an_actor_drops_their_retained_cooldown() {
+        let config = BurstConfig {
+            burst_enter_count: 2,
+            max_candidates: 2,
+            ..BurstConfig::default()
+        };
+        let mut engine = engine(config);
+        for seq in 1..=3u64 {
+            engine.offer(&chat(seq, "erased"), seq, 500);
+        }
+        assert!(engine.resolve_next(&ctx(), None).is_some());
+        assert!(engine.forget_actor("erased"), "cooldown was retained");
+        assert!(!engine.forget_actor("erased"), "and is now gone");
+        assert_eq!(engine.metrics().invariant_violations, 0);
     }
 
     #[test]
