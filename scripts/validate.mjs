@@ -17,6 +17,8 @@
 //   .../invalid and .../inconsistent (cross-field) must REJECT; .../replay fixtures must carry schema-valid batches (#90)
 // - examples/speech-lexicons/valid, .../inconsistent (cross-field, rejected by the Rust loader) and the shipped
 //   crates/generative/data default lexicon must conform to speech-lexicon.schema.json; .../invalid must REJECT (#222)
+// - examples/memory-seeds/valid and .../inconsistent (cross-field, rejected by the Rust loader) must conform to
+//   memory-seed.schema.json; .../invalid must REJECT (#321)
 // - examples/speech-lifecycle/valid must conform to speech-lifecycle.schema.json; .../invalid must REJECT (#222 S2)
 // - examples/speech-transcripts/valid must conform to speech-transcript.schema.json;
 //   .../invalid must REJECT; .../replay fixtures must carry schema-valid batches (#92 S3b)
@@ -100,6 +102,7 @@ const speechObservation = validators["schemas/speech-observation.schema.json"];
 const speechTranscript = validators["schemas/speech-transcript.schema.json"];
 const speechLexicon = validators["schemas/speech-lexicon.schema.json"];
 const speechLifecycle = validators["schemas/speech-lifecycle.schema.json"];
+const memorySeed = validators["schemas/memory-seed.schema.json"];
 const perceptionObservation = validators["schemas/perception-observation.schema.json"];
 
 function report(ok, label, validator) {
@@ -187,6 +190,7 @@ for (const [validator, validDirs, invalidDir] of [
   [speechTranscript, ["examples/speech-transcripts/valid"], "examples/speech-transcripts/invalid"],
   [speechLifecycle, ["examples/speech-lifecycle/valid"], "examples/speech-lifecycle/invalid"],
   [perceptionObservation, ["examples/perception-observations/valid"], "examples/perception-observations/invalid"],
+  [memorySeed, ["examples/memory-seeds/valid", "examples/memory-seeds/inconsistent"], "examples/memory-seeds/invalid"],
   [speechLexicon, ["examples/speech-lexicons/valid", "examples/speech-lexicons/inconsistent", "crates/generative/data"], "examples/speech-lexicons/invalid"],
 ]) {
   if (!validator) continue;

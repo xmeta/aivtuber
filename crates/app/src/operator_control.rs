@@ -47,7 +47,8 @@ use uuid::Uuid;
 /// One line-delimited JSON request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OperatorRequest {
-    /// One of `status`, `stop`, `mute`.
+    /// One of `status`, `stop`, `mute`, `diagnose`, `perception.enable`,
+    /// `perception.disable`, `memory.export`.
     pub action: String,
     /// Opaque session secret presented by the operator client.
     pub secret: String,
@@ -66,6 +67,22 @@ pub struct OperatorResponse {
     /// Machine-readable snapshot for `status`; absent for other actions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<OperatorStatusSnapshot>,
+    /// The memory seed export (#321); present only for a successful
+    /// `memory.export`. The daemon returns it and writes nothing: the client
+    /// chooses the destination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_export: Option<OperatorMemoryExport>,
+}
+
+/// A memory seed export in seed-file format (`schemas/memory-seed.schema.json`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OperatorMemoryExport {
+    /// The seed-format JSON document, ready to write byte for byte.
+    pub seed_json: String,
+    pub entries: usize,
+    /// Live writer entries left out because they do not meet the seed bounds.
+    pub skipped: usize,
+    pub content_hash: String,
 }
 
 /// Health/queue snapshot without secret material.
@@ -221,6 +238,15 @@ pub struct DispatchedOperatorRequest {
 /// (or rejects) a dispatched request.
 pub type DispatchOutcome = OperatorResponse;
 
+/// Optional capabilities the operator endpoint's ingress holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OperatorEndpointOptions {
+    /// Live screen perception is composed (#90 S1b): `perception.control`.
+    pub perception: bool,
+    /// The memory writer is composed (#321): `memory.admin` for the export.
+    pub memory_export: bool,
+}
+
 /// Authenticated operator control endpoint.
 pub struct OperatorControlServer {
     name: String,
@@ -237,7 +263,7 @@ impl OperatorControlServer {
         name: &str,
         secret: [u8; 32],
     ) -> Result<(Self, mpsc::Receiver<DispatchedOperatorRequest>), OperatorControlError> {
-        Self::with_perception_control(name, secret, false)
+        Self::with_options(name, secret, OperatorEndpointOptions::default())
     }
 
     /// Like [`Self::new`], and when `perception` is true the endpoint's local
@@ -249,6 +275,29 @@ impl OperatorControlServer {
         secret: [u8; 32],
         perception: bool,
     ) -> Result<(Self, mpsc::Receiver<DispatchedOperatorRequest>), OperatorControlError> {
+        Self::with_options(
+            name,
+            secret,
+            OperatorEndpointOptions {
+                perception,
+                memory_export: false,
+            },
+        )
+    }
+
+    /// Like [`Self::new`], with the optional capabilities the composition
+    /// root opted into. Each is false unless the feature it controls is
+    /// composed, so the endpoint never holds authority for something that is
+    /// not running.
+    pub fn with_options(
+        name: &str,
+        secret: [u8; 32],
+        options: OperatorEndpointOptions,
+    ) -> Result<(Self, mpsc::Receiver<DispatchedOperatorRequest>), OperatorControlError> {
+        let OperatorEndpointOptions {
+            perception,
+            memory_export,
+        } = options;
         let name = name.trim();
         if name.is_empty() {
             return Err(OperatorControlError::InvalidConfiguration("endpoint name"));
@@ -260,6 +309,11 @@ impl OperatorControlServer {
         ]);
         if perception {
             capabilities.insert(aivtuber_domain::Capability::PerceptionControl);
+        }
+        if memory_export {
+            // `memory.admin` is held only so the `memory.export` action can mint
+            // it; no other action maps to it and nothing here writes memory.
+            capabilities.insert(aivtuber_domain::Capability::MemoryAdmin);
         }
         let ingress = Arc::new(
             LocalControlIngress::new(
@@ -448,6 +502,7 @@ pub fn apply_dispatched_request<R: RoutePlanner>(
         && request.action != "diagnose"
         && request.action != "perception.enable"
         && request.action != "perception.disable"
+        && request.action != "memory.export"
     {
         let detail = format!("unknown action {}", request.action);
         app.audit_operator_action(&request_id, &request.action, &detail, false);
@@ -480,6 +535,7 @@ pub fn apply_dispatched_request<R: RoutePlanner>(
                 ok: true,
                 detail: "status".to_owned(),
                 status: Some(snapshot),
+                memory_export: None,
             };
         }
         // Issue #68: capture the bounded support bundle. Generation is
@@ -502,12 +558,16 @@ pub fn apply_dispatched_request<R: RoutePlanner>(
             ok: true,
             detail,
             status: None,
+            memory_export: None,
         };
     }
 
-    // The two perception requests share one capability, named by this action.
+    // The two perception requests share one capability, named by this action;
+    // the memory export is the `memory.admin` capability.
     let capability_action = if request.action.starts_with("perception.") {
         "perception.control".to_owned()
+    } else if request.action == "memory.export" {
+        "memory.admin".to_owned()
     } else {
         request.action.clone()
     };
@@ -539,11 +599,43 @@ pub fn apply_dispatched_request<R: RoutePlanner>(
                     ok: true,
                     detail: detail.to_owned(),
                     status: None,
+                    memory_export: None,
                 }
             }
             Err(detail) => {
                 app.audit_operator_action(&request_id, &request.action, detail, false);
                 rejection(&request_id, detail)
+            }
+        };
+    }
+
+    if request.action == "memory.export" {
+        // Audited without claim text: only the counts and the content hash.
+        return match app.export_memory_seed(command.authority(), now_ms) {
+            Ok(export) => {
+                let detail = format!(
+                    "exported {} entries, skipped {}",
+                    export.seed.len(),
+                    export.skipped
+                );
+                app.audit_operator_action(&request_id, &request.action, &detail, true);
+                OperatorResponse {
+                    request_id,
+                    ok: true,
+                    detail,
+                    status: None,
+                    memory_export: Some(OperatorMemoryExport {
+                        seed_json: export.seed.to_json(),
+                        entries: export.seed.len(),
+                        skipped: export.skipped,
+                        content_hash: export.seed.content_hash(),
+                    }),
+                }
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                app.audit_operator_action(&request_id, &request.action, &detail, false);
+                rejection(&request_id, &detail)
             }
         };
     }
@@ -566,6 +658,7 @@ pub fn apply_dispatched_request<R: RoutePlanner>(
                 ok: true,
                 detail,
                 status: None,
+                memory_export: None,
             }
         }
         Err(error) => {
@@ -582,6 +675,7 @@ fn rejection(request_id: &str, detail: &str) -> OperatorResponse {
         ok: false,
         detail: detail.to_owned(),
         status: None,
+        memory_export: None,
     }
 }
 
@@ -668,6 +762,7 @@ mod tests {
                     ok: true,
                     detail: "test".into(),
                     status: None,
+                    memory_export: None,
                 });
                 break;
             }
