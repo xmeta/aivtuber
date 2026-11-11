@@ -60,12 +60,12 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      # A public release needs the repository owner's project licence. Dry runs
+      # A public release ships the project LICENSE in its archive. Dry runs
       # (workflow_dispatch) are unaffected.
       - name: Tag release requires a LICENSE file
         if: github.ref_type == 'tag'
         run: |
-          test -f LICENSE || { echo "::error::no LICENSE file at the repository root; the owner must add one before a release is tagged"; exit 1; }
+          test -f LICENSE || { echo "::error::no LICENSE file at the repository root; restore LICENSE (it is shipped in the release archive) before a release is tagged"; exit 1; }
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:

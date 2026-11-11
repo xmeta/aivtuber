@@ -4,6 +4,8 @@
 
 AI VTuber runtime focused on low latency, efficient reuse, and graceful degradation.
 
+*Licence:* proprietary, source-available, all rights reserved (see link:LICENSE[LICENSE]). The source is published for reference only. Anyone may download and run the official release archives from GitHub Releases for their own use, including personal and commercial streaming and video production. Third-party components and fetched models keep their own licences (`docs/local-profile-quickstart.adoc` section 8). Open source may be considered later.
+
 The core design separates three time scales:
 
 * *Motor layer*: deterministic animation/audio scheduling.
