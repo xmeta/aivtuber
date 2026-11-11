@@ -393,7 +393,16 @@ fn run() -> Result<(), Box<dyn Error>> {
     // Issues #75 S1 / #78 S2: live chat-burst selection and deferred
     // replies. Off unless AIVTUBER_CHAT_BURST_MODE is true, so the default
     // per-event path is unchanged. Every bound is validated, never clamped.
-    if env_bool("AIVTUBER_CHAT_BURST_MODE", false)? {
+    // Issue #79 S1: audience-signal aggregation of batched chat. Its own
+    // default-off flag; it only has an effect inside the burst lane, so asking
+    // for it without AIVTUBER_CHAT_BURST_MODE refuses startup rather than
+    // silently doing nothing.
+    let audience_requested = env_bool("AIVTUBER_CHAT_AUDIENCE_MODE", false)?;
+    let chat_burst_mode = env_bool("AIVTUBER_CHAT_BURST_MODE", false)?;
+    if audience_requested && !chat_burst_mode {
+        return Err("AIVTUBER_CHAT_AUDIENCE_MODE requires AIVTUBER_CHAT_BURST_MODE=true".into());
+    }
+    if chat_burst_mode {
         let defaults = ChatBurstConfig::default();
         let config = ChatBurstConfig {
             burst: BurstConfig {
@@ -425,6 +434,21 @@ fn run() -> Result<(), Box<dyn Error>> {
                 )?,
             },
             reply_ttl_ms: env_u64("AIVTUBER_CHAT_REPLY_TTL_MS", defaults.reply_ttl_ms)?,
+            audience: if audience_requested {
+                let audience_defaults = aivtuber_reflex::AudienceConfig::default();
+                Some(aivtuber_reflex::AudienceConfig {
+                    min_cluster_size: env_usize(
+                        "AIVTUBER_CHAT_AUDIENCE_MIN_CLUSTER",
+                        audience_defaults.min_cluster_size,
+                    )?,
+                    min_unique_actors: env_usize(
+                        "AIVTUBER_CHAT_AUDIENCE_MIN_ACTORS",
+                        audience_defaults.min_unique_actors,
+                    )?,
+                })
+            } else {
+                None
+            },
         };
         app = app.with_chat_burst(config)?;
         chat_burst_enabled = true;
@@ -439,6 +463,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             config.deferred.per_actor_cap,
             config.reply_ttl_ms
         );
+        if let Some(audience) = config.audience {
+            eprintln!(
+                "chat_burst: audience aggregation enabled min_cluster={} min_actors={}",
+                audience.min_cluster_size, audience.min_unique_actors
+            );
+        }
     }
     let mut speech_floor_enabled = false;
     let mut speech_barge_in_enabled = false;
@@ -962,8 +992,26 @@ fn report_chat_burst<R: aivtuber_app::RoutePlanner>(
             report.asset_id.as_deref().unwrap_or("none")
         );
     }
-    // The terminal ring is bounded; draining it keeps it from dropping.
+    // The terminal and signal rings are bounded; draining them keeps them from
+    // dropping. A signal is logged as ids and counts only.
     let _ = app.take_chat_burst_records(usize::MAX);
+    for signal in app.take_audience_signals(16) {
+        eprintln!(
+            "chat_burst: audience signal batch={} index={} class={:?} method={:?} count={} unique_actors={} intensity_milli={} trend={:?} carrier={}",
+            signal.batch_id,
+            signal.index,
+            signal.class,
+            signal.method,
+            signal.count,
+            signal.unique_actors_estimate,
+            signal.intensity_milli,
+            signal.trend,
+            signal
+                .representative_event_ids
+                .first()
+                .map_or("", String::as_str)
+        );
+    }
     let Some(metrics) = app.chat_burst_metrics() else {
         return;
     };
@@ -1006,6 +1054,15 @@ fn report_chat_burst<R: aivtuber_app::RoutePlanner>(
             + metrics.burst_invariant_violations
             + metrics.deferred.invariant_violations
     );
+    if metrics.audience_signals > 0 || metrics.audience_guarded > 0 {
+        eprintln!(
+            "chat_burst: audience signals={} represented={} guarded={} signals_dropped={}",
+            metrics.audience_signals,
+            metrics.audience_members_represented,
+            metrics.audience_guarded,
+            metrics.audience_signals_dropped
+        );
+    }
 }
 
 fn elapsed_ms(started: Instant) -> u64 {

@@ -3,11 +3,19 @@
 //! Event-driven reflex routing, semantic retrieval, deterministic policy,
 //! and the TypeSafe System One (Jev) adapter.
 
+mod audience;
 mod burst;
 mod jev;
 mod pipeline;
 mod retrieval;
 
+pub use audience::{
+    AUDIENCE_METHOD_VERSION, AUDIENCE_SIGNAL_SCHEMA_VERSION, AggregationMethod, AudienceCluster,
+    AudienceConfig, AudienceConfigError, AudienceInput, AudiencePlan, AudienceSignal,
+    AudienceSignalClass, AudienceTrend, AudienceWindow, GuardReason, MAX_AUDIENCE_MIN_CLUSTER,
+    MAX_DUPLICATE_TEXT_CHARS, MAX_SIGNAL_REPRESENTATIVES, ReactionFamily, guard_text,
+    plan_audience, reaction_family,
+};
 pub use burst::{
     BATCH_ENGAGEMENT_SCHEMA_VERSION, BatchCandidate, BatchEngagementRequest, BatchRankFailure,
     BatchRanker, BatchReplayRecord, BatchRequestError, BatchResolution, BurstConfig,
