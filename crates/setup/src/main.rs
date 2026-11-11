@@ -3,6 +3,8 @@
 //!   aivtuber-setup local [--dry-run] [--offline] [--force] [--llama-flavor vulkan|cpu]
 //!                        [--skip llama,llm,vad,stt,tts,avatar,audio]
 //!                        [--root DIR] [--assets DIR] [--env-file FILE] [--llama-port N]
+//!                        [--profile default|perception] [--llm-endpoint URL]
+//!                        [--from-target CARGO_TARGET_DIR]
 //!   aivtuber-setup start [--env-file FILE] [--dry-run]
 //!
 //! Exit codes: 0 success, 1 a step failed (the message says which and how to
@@ -63,6 +65,19 @@ struct LocalArgs {
     /// Replace an existing env file (it gets new generated secrets).
     #[arg(long)]
     force: bool,
+    /// Model profile: default (Qwen3-4B, text) or perception (Qwen3-VL-4B with its vision
+    /// projector, two slots; needs at least about 12 GB of VRAM).
+    #[arg(long, default_value = aivtuber_setup::manifest::DEFAULT_PROFILE)]
+    profile: String,
+    /// Use a model server you run yourself (an http loopback URL) instead of the pinned one;
+    /// nothing is fetched for llama.cpp or the model, and `start` runs only the app.
+    #[arg(long)]
+    llm_endpoint: Option<String>,
+    /// Developers: run from a source checkout. The executables come from this cargo target
+    /// directory (for example target/release); --root is the checkout (default: the current
+    /// directory) and must hold the built avatar page and the starter pack.
+    #[arg(long)]
+    from_target: Option<PathBuf>,
     /// Loopback port for llama-server.
     #[arg(long, default_value_t = aivtuber_setup::config::DEFAULT_LLAMA_PORT)]
     llama_port: u16,
@@ -86,9 +101,11 @@ fn program_dir() -> Result<PathBuf, String> {
 }
 
 fn run_local(args: LocalArgs) -> Result<(), String> {
-    let root = match args.root {
-        Some(r) => r,
-        None => program_dir()?,
+    let root = match (args.root, &args.from_target) {
+        (Some(r), _) => r,
+        (None, Some(_)) => std::env::current_dir()
+            .map_err(|e| format!("cannot read the current directory: {e}; pass --root"))?,
+        (None, None) => program_dir()?,
     };
     let opts = LocalOptions {
         assets: args.assets.unwrap_or_else(|| root.join("local-assets")),
@@ -102,6 +119,9 @@ fn run_local(args: LocalArgs) -> Result<(), String> {
         offline: args.offline,
         force: args.force,
         llama_port: args.llama_port,
+        profile: args.profile,
+        llm_endpoint: args.llm_endpoint,
+        bin_dir: args.from_target,
         platform: local::host_platform()?,
         download: DownloadConfig::default(),
     };

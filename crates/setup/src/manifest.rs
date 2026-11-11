@@ -14,7 +14,9 @@ pub const SCHEMA: &str = "local-profile-pins/1";
 pub struct Manifest {
     pub schema: String,
     pub llama: Llama,
+    /// The default profile's model (the Node scripts read this key).
     pub llm: Asset,
+    pub profiles: BTreeMap<String, Profile>,
     pub vad: Asset,
     pub avatar: Asset,
     pub sherpa_lib: SherpaLib,
@@ -69,6 +71,39 @@ pub struct Model {
     pub files: Vec<PinnedFile>,
 }
 
+/// A selectable llama-server setup. `default` has no files of its own and uses
+/// the top-level `llm` pin; others carry their own.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Profile {
+    pub description: String,
+    /// Model name the app sends and llama-server serves (`--alias`).
+    pub alias: String,
+    pub model_version: String,
+    /// llama-server `-c`: the total context, shared by the slots.
+    pub context: u32,
+    /// llama-server `--parallel`; absent keeps the server's own default.
+    #[serde(default)]
+    pub parallel: Option<u32>,
+    /// Documented hard requirement, printed before anything is downloaded.
+    #[serde(default)]
+    pub min_vram_gb: Option<u32>,
+    #[serde(default)]
+    pub llm: Option<Asset>,
+    #[serde(default)]
+    pub mmproj: Option<Asset>,
+}
+
+/// A profile with its model files resolved.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedProfile<'a> {
+    pub name: &'a str,
+    pub spec: &'a Profile,
+    pub llm: &'a Asset,
+    pub mmproj: Option<&'a Asset>,
+}
+
+pub const DEFAULT_PROFILE: &str = "default";
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Disclosure {
     pub id: String,
@@ -93,6 +128,25 @@ impl Manifest {
             ));
         }
         Ok(manifest)
+    }
+
+    pub fn profile_names(&self) -> Vec<&str> {
+        self.profiles.keys().map(String::as_str).collect()
+    }
+
+    pub fn profile<'a>(&'a self, name: &str) -> Result<ResolvedProfile<'a>, String> {
+        let (key, spec) = self.profiles.get_key_value(name).ok_or_else(|| {
+            format!(
+                "unknown profile {name:?} (pinned: {})",
+                self.profile_names().join(", ")
+            )
+        })?;
+        Ok(ResolvedProfile {
+            name: key,
+            spec,
+            llm: spec.llm.as_ref().unwrap_or(&self.llm),
+            mmproj: spec.mmproj.as_ref(),
+        })
     }
 
     /// The llama.cpp asset for `platform` (`win32-x64`, `linux-x64`) and `flavor`.
@@ -137,6 +191,9 @@ mod tests {
 
     fn every_asset(m: &Manifest) -> Vec<&Asset> {
         let mut out: Vec<&Asset> = vec![&m.llm, &m.vad, &m.avatar];
+        for p in m.profiles.values() {
+            out.extend(p.llm.iter().chain(p.mmproj.iter()));
+        }
         out.extend(m.llama.assets.values());
         out.extend(m.sherpa_lib.assets.values());
         for model in m.models.values() {
@@ -216,6 +273,40 @@ mod tests {
                 assert_eq!(entry.sha256, file.sha256, "{}", file.file_name);
                 assert_eq!(entry.size, file.size, "{}", file.file_name);
             }
+        }
+    }
+
+    #[test]
+    fn every_profile_resolves_and_perception_is_the_documented_one() {
+        let m = Manifest::embedded();
+        let d = m.profile(DEFAULT_PROFILE).unwrap();
+        assert_eq!(d.llm.file, m.llm.file, "default uses the top-level pin");
+        assert!(d.mmproj.is_none() && d.spec.parallel.is_none());
+        assert_eq!(d.spec.alias, "qwen3-4b-instruct-2507");
+        assert_eq!(d.spec.context, 4096);
+        let p = m.profile("perception").unwrap();
+        assert_eq!(p.spec.alias, "qwen3-vl-4b-instruct");
+        assert_eq!((p.spec.context, p.spec.parallel), (8192, Some(2)));
+        assert_eq!(p.spec.min_vram_gb, Some(12));
+        assert!(p.mmproj.is_some());
+        assert_ne!(p.llm.file, d.llm.file);
+        let err = m.profile("nope").unwrap_err();
+        assert!(
+            err.contains("default") && err.contains("perception"),
+            "{err}"
+        );
+        // Each profile has exactly one disclosure naming it.
+        for name in m.profile_names() {
+            let id = format!("profile:{name}");
+            let n = m
+                .disclosures
+                .iter()
+                .filter(|x| x.applies_to.contains(&id))
+                .count();
+            assert_eq!(n, 1, "{name}");
+        }
+        for a in [p.llm, p.mmproj.unwrap()] {
+            assert_eq!(a.licence.as_deref(), Some("Apache-2.0"), "{}", a.file);
         }
     }
 

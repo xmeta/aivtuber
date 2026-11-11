@@ -83,6 +83,10 @@ fn main() -> ExitCode {
         .ok()
         .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("."));
+    // Reading and hashing the pinned files is disk-bound and is the part of a
+    // start that varies most with a cold file cache, so it is timed apart from
+    // the engine load (`load_ms` covers only the load).
+    let verify_started = std::time::Instant::now();
     if let Err(error) = verify_engine_libs(&exe_dir) {
         return fail(
             2,
@@ -96,6 +100,7 @@ fn main() -> ExitCode {
         return fail(2, format!("model files: {error}"));
     }
 
+    let verify_ms = verify_started.elapsed().as_millis();
     eprintln!("local-tts-sidecar: {VOICE_LICENCE_NOTICE}");
     eprintln!(
         "local-tts-sidecar: loading model={} language=ja speaker_id={} steps={} threads={threads} style=ignored",
@@ -121,7 +126,7 @@ fn main() -> ExitCode {
         Err(error) => return fail(2, error),
     };
     eprintln!(
-        "local-tts-sidecar: ready listen={} load_ms={} audio_root={} visemes={}",
+        "local-tts-sidecar: ready listen={} verify_ms={verify_ms} load_ms={} audio_root={} visemes={}",
         server.local_addr(),
         started.elapsed().as_millis(),
         config.audio_root.display(),

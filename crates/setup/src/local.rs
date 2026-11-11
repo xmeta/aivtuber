@@ -7,11 +7,16 @@
 //! * default: fetch what is missing, verify, extract, synthesize the starter
 //!   audio, write the env file, print the duties and the start command;
 //! * `--dry-run`: print the plan; no network, no file written;
+//! * `--profile NAME`: the pinned model profile (`default`, or the opt-in
+//!   `perception`); the env file and `start` follow it;
+//! * `--llm-endpoint URL`: you run the model server; nothing is fetched for it;
+//! * `--from-target DIR`: run from a source checkout (`--root`) with the
+//!   executables of a cargo target directory instead of an extracted archive;
 //! * `--offline`: no network; verifies what is on disk, synthesizes audio and
 //!   writes the env file; fails and lists what is missing.
 
 use crate::audio;
-use crate::config::{self, Paths, Secrets, WriteOutcome};
+use crate::config::{self, LlmMode, LlmSetup, Paths, Secrets, WriteOutcome};
 use crate::download::{self, DownloadConfig, Outcome, matches_pin};
 use crate::extract::{self, Limits};
 use crate::manifest::{Asset, Manifest};
@@ -40,6 +45,14 @@ pub struct LocalOptions {
     pub offline: bool,
     pub force: bool,
     pub llama_port: u16,
+    /// A pinned model profile of the manifest (`default`, `perception`).
+    pub profile: String,
+    /// A model server the operator runs (loopback `http` URL). Implies
+    /// `--skip llama,llm`: nothing is fetched for a model nobody will run.
+    pub llm_endpoint: Option<String>,
+    /// Where the executables are when they are not in `root` (a cargo target
+    /// directory, for a developer running from a source checkout).
+    pub bin_dir: Option<PathBuf>,
     /// `win32-x64` or `linux-x64`.
     pub platform: String,
     pub download: DownloadConfig,
@@ -192,7 +205,14 @@ pub fn run<W: Write>(
     probe: &prereq::Report,
     out: &mut W,
 ) -> Result<Summary, String> {
-    let skip = |id: &str| opts.skip.contains(id);
+    let endpoint = opts
+        .llm_endpoint
+        .as_deref()
+        .map(config::normalize_llm_endpoint)
+        .transpose()?;
+    let skip =
+        |id: &str| opts.skip.contains(id) || (endpoint.is_some() && matches!(id, "llama" | "llm"));
+    let profile = manifest.profile(&opts.profile)?;
     for s in &opts.skip {
         if !STEPS.contains(&s.as_str()) {
             return Err(format!(
@@ -207,27 +227,47 @@ pub fn run<W: Write>(
             opts.assets.display()
         ));
     }
-    // Is this an extracted release?
+    // Is this an extracted release (or, with --from-target, a built checkout)?
     let root = &opts.root;
-    let required = [
-        exe("aivtuber-app"),
-        exe("speech-vad-sidecar"),
-        exe("speech-stt-worker"),
-        exe("local-tts-sidecar"),
-        "renderer/local-avatar/dist/index.html".to_owned(),
-        "examples/starter-reaction-pack/descriptors".to_owned(),
-    ];
-    let absent: Vec<_> = required.iter().filter(|r| !root.join(r).exists()).collect();
+    let bin = opts.bin_dir.as_deref().unwrap_or(root);
+    let missing_of = |base: &Path, names: &[String]| -> Vec<String> {
+        names
+            .iter()
+            .filter(|n| !base.join(n).exists())
+            .map(|n| base.join(n).display().to_string())
+            .collect()
+    };
+    let mut absent = missing_of(
+        bin,
+        &[
+            exe("aivtuber-app"),
+            exe("speech-vad-sidecar"),
+            exe("speech-stt-worker"),
+            exe("local-tts-sidecar"),
+        ],
+    );
+    absent.extend(missing_of(
+        root,
+        &[
+            "renderer/local-avatar/dist/index.html".to_owned(),
+            "examples/starter-reaction-pack/descriptors".to_owned(),
+        ],
+    ));
     if !absent.is_empty() {
-        return Err(format!(
-            "{} does not look like an extracted release archive (missing: {}); run aivtuber-setup from the unpacked folder, or pass --root",
-            root.display(),
-            absent
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
+        return Err(if opts.bin_dir.is_some() {
+            format!(
+                "{} with executables from {} is not a built checkout (missing: {}); build the speech binaries and the avatar page first (docs/local-profile-quickstart.adoc, \"Run from a source checkout\"), or pass --root",
+                root.display(),
+                bin.display(),
+                absent.join(", ")
+            )
+        } else {
+            format!(
+                "{} does not look like an extracted release archive (missing: {}); run aivtuber-setup from the unpacked folder, or pass --root",
+                root.display(),
+                absent.join(", ")
+            )
+        });
     }
 
     let flavor = match (&opts.flavor, &probe.vulkan) {
@@ -254,10 +294,28 @@ pub fn run<W: Write>(
     ctx.say(format!("  install  {}", root.display()));
     ctx.say(format!("  assets   {}", opts.assets.display()));
     ctx.say(format!("  env file {}", opts.env_file.display()));
+    if let Some(dir) = &opts.bin_dir {
+        ctx.say(format!("  programs {} (--from-target)", dir.display()));
+    }
     ctx.say(format!(
         "  llama.cpp {} build {flavor} on {}",
         manifest.llama.tag, opts.platform
     ));
+    ctx.say(format!(
+        "  profile  {} ({})",
+        profile.name, profile.spec.description
+    ));
+    if let Some(gb) = profile.spec.min_vram_gb {
+        ctx.say(format!(
+            "  REQUIRES  at least about {gb} GB of VRAM for the {} profile; on a smaller GPU the model spills to system memory and replies slow down badly (EXP-0004c). Use the default profile there.",
+            profile.name
+        ));
+    }
+    if let Some(url) = &endpoint {
+        ctx.say(format!(
+            "  model    your own server at {url}; llama.cpp and the model are not fetched, and `start` will not start a server"
+        ));
+    }
 
     ctx.say("\nPrerequisites");
     for (name, found) in [("ffplay", &probe.ffplay), ("ffmpeg", &probe.ffmpeg)] {
@@ -322,18 +380,23 @@ pub fn run<W: Write>(
         }
     }
 
-    // GGUF
-    let llm_path = assets.join("llm").join(&manifest.llm.file);
-    if !skip("llm")
-        && ctx.ensure_file(
-            &manifest.llm.file,
-            &manifest.llm.url,
+    // GGUF (and the vision projector of a multimodal profile)
+    let llm_path = assets.join("llm").join(&profile.llm.file);
+    let mmproj_path = profile.mmproj.map(|m| assets.join("llm").join(&m.file));
+    if !skip("llm") {
+        let mut all = ctx.ensure_file(
+            &profile.llm.file,
+            &profile.llm.url,
             &llm_path,
-            &manifest.llm.sha256,
-            manifest.llm.size,
-        )?
-    {
-        summary.provisioned.push("llm");
+            &profile.llm.sha256,
+            profile.llm.size,
+        )?;
+        if let (Some(m), Some(path)) = (profile.mmproj, &mmproj_path) {
+            all &= ctx.ensure_file(&m.file, &m.url, path, &m.sha256, m.size)?;
+        }
+        if all {
+            summary.provisioned.push("llm");
+        }
     }
 
     // VAD
@@ -460,7 +523,7 @@ pub fn run<W: Write>(
     // Starter audio
     let pack_root = root.join("examples").join("starter-reaction-pack");
     let audio_root = pack_root.join("audio");
-    let sidecar = root.join(exe("local-tts-sidecar"));
+    let sidecar = bin.join(exe("local-tts-sidecar"));
     if !skip("audio") {
         ctx.say("\nStarter reaction audio");
         if audio::starter_audio_present(&pack_root, &audio_root) {
@@ -501,16 +564,31 @@ pub fn run<W: Write>(
 
     // Env file
     ctx.say("\nConfiguration");
+    let on_disk = |p: &Path, a: &Asset| fs::metadata(p).is_ok_and(|m| m.len() == a.size);
+    let mode = match &endpoint {
+        Some(url) => LlmMode::External(url.clone()),
+        None if llama_server.is_file()
+            && on_disk(&llm_path, profile.llm)
+            && match (&mmproj_path, profile.mmproj) {
+                (Some(p), Some(a)) => on_disk(p, a),
+                _ => true,
+            } =>
+        {
+            LlmMode::Managed
+        }
+        None => LlmMode::Missing,
+    };
     let paths = Paths {
         llama_server,
         llm_gguf: llm_path,
+        llm_mmproj: mmproj_path,
         vad_model: vad_path,
         stt_model_dir: stt_dir,
         tts_model_dir: tts_dir,
         tts_sidecar: sidecar,
-        speech_sidecar: root.join(exe("speech-vad-sidecar")),
-        stt_worker: root.join(exe("speech-stt-worker")),
-        app: root.join(exe("aivtuber-app")),
+        speech_sidecar: bin.join(exe("speech-vad-sidecar")),
+        stt_worker: bin.join(exe("speech-stt-worker")),
+        app: bin.join(exe("aivtuber-app")),
         pack_root,
         audio_root,
         avatar_page_dir: page_dir,
@@ -526,7 +604,18 @@ pub fn run<W: Write>(
     } else {
         let secrets = Secrets::generate()?;
         let gpu_layers = if flavor == "vulkan" { 99 } else { 0 };
-        let text = config::render(&paths, &secrets, opts.llama_port, gpu_layers);
+        let llm_setup = LlmSetup {
+            profile: profile.name.to_owned(),
+            alias: profile.spec.alias.clone(),
+            model_version: profile.spec.model_version.clone(),
+            context: profile.spec.context,
+            parallel: profile.spec.parallel,
+            mode: mode.clone(),
+        };
+        let text = config::render(&paths, &secrets, opts.llama_port, gpu_layers, &llm_setup);
+        if mode == LlmMode::Missing {
+            ctx.say("  NOTE      no language model is provisioned (skipped, or not on disk): `start` will refuse until you run this command again without --skip, or pass --llm-endpoint <loopback url>");
+        }
         let outcome = config::write_env(&opts.env_file, &text, opts.force)?;
         match outcome {
             WriteOutcome::Written => ctx.say(format!("  wrote     {}", opts.env_file.display())),
@@ -541,11 +630,15 @@ pub fn run<W: Write>(
     // Duties and start command
     ctx.say("\nLicences and what you must disclose");
     // A dry run provisions nothing, so it lists the duties of every step it would run.
-    let covered: Vec<&str> = if opts.dry_run {
+    let profile_id = format!("profile:{}", profile.name);
+    let mut covered: Vec<&str> = if opts.dry_run {
         STEPS.iter().copied().filter(|s| !skip(s)).collect()
     } else {
         summary.provisioned.clone()
     };
+    if covered.contains(&"llm") {
+        covered.push(&profile_id);
+    }
     for d in manifest.disclosures_for(&covered) {
         ctx.say(format!(
             "  * {} [{}]\n    {}",
@@ -558,7 +651,7 @@ pub fn run<W: Write>(
     } else {
         "\nStart"
     });
-    ctx.say(format!("  {}", start_command(root, &opts.env_file)));
+    ctx.say(format!("  {}", start_command(bin, &opts.env_file)));
     ctx.say(format!(
         "  then open http://127.0.0.1:{} (or add it to OBS as a Browser Source)",
         config::AVATAR_PORT

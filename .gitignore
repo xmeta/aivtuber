@@ -21,3 +21,7 @@ node_modules/
 
 # Starter pack speech audio materialized locally by scripts/synthesize-starter-audio.mjs (issue #289).
 /examples/starter-reaction-pack/audio/starter/
+
+# Local profile written by `aivtuber-setup local --from-target` in a checkout.
+/local-profile.env
+/local-assets/
