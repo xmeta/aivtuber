@@ -121,6 +121,49 @@ type Script = Vec<(Duration, Vec<u8>)>;
 
 /// One scripted connection: after the request is read, each step writes its
 /// bytes after its delay; the connection then closes.
+/// Reads one full HTTP request (head plus `content-length` body). A server
+/// that answers before consuming the request body makes the OS reset the
+/// connection on close, which can discard a response the client has not read
+/// yet; fixtures therefore always consume the whole request first.
+fn read_request(stream: &mut std::net::TcpStream) -> Option<Vec<u8>> {
+    let mut seen = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    let mut body_start = None;
+    let mut content_length = 0_usize;
+    loop {
+        let n = stream.read(&mut buffer).unwrap_or(0);
+        if n == 0 {
+            return None;
+        }
+        seen.extend_from_slice(&buffer[..n]);
+        if body_start.is_none()
+            && let Some(at) = seen.windows(4).position(|w| w == b"\r\n\r\n")
+        {
+            body_start = Some(at + 4);
+            let head = String::from_utf8_lossy(&seen[..at]).to_ascii_lowercase();
+            content_length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0);
+        }
+        if let Some(start) = body_start
+            && seen.len() >= start + content_length
+        {
+            return Some(seen);
+        }
+    }
+}
+
+/// Holds the connection open until the client has read the response and
+/// closed it, so no reset can race the response. The timeout only bounds a
+/// misbehaving client; it is not part of the asserted behaviour.
+fn hold_until_client_closes(stream: &mut std::net::TcpStream) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+    let mut sink = [0_u8; 256];
+    while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
+}
+
 fn serve(steps: Script) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let address = listener.local_addr().unwrap();
@@ -128,33 +171,9 @@ fn serve(steps: Script) -> String {
         let Ok((mut stream, _)) = listener.accept() else {
             return;
         };
-        let mut seen = Vec::new();
-        let mut buffer = [0_u8; 1024];
-        let mut body_start = None;
-        let mut content_length = 0_usize;
-        loop {
-            let n = stream.read(&mut buffer).unwrap_or(0);
-            if n == 0 {
-                return;
-            }
-            seen.extend_from_slice(&buffer[..n]);
-            if body_start.is_none()
-                && let Some(at) = seen.windows(4).position(|w| w == b"\r\n\r\n")
-            {
-                body_start = Some(at + 4);
-                let head = String::from_utf8_lossy(&seen[..at]).to_ascii_lowercase();
-                content_length = head
-                    .lines()
-                    .find_map(|line| line.strip_prefix("content-length:"))
-                    .and_then(|value| value.trim().parse().ok())
-                    .unwrap_or(0);
-            }
-            if let Some(start) = body_start
-                && seen.len() >= start + content_length
-            {
-                break;
-            }
-        }
+        let Some(seen) = read_request(&mut stream) else {
+            return;
+        };
         let request_text = String::from_utf8_lossy(&seen).to_string();
         assert!(request_text.contains("\"stream\":true"), "{request_text}");
         let _ = stream.write_all(
@@ -390,11 +409,11 @@ fn a_non_success_status_maps_like_the_buffered_call() {
     let endpoint = format!("http://{}/v1/responses", listener.local_addr().unwrap());
     std::thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
-            let mut buffer = [0_u8; 4096];
-            let _ = stream.read(&mut buffer);
+            let _ = read_request(&mut stream);
             let _ = stream.write_all(
                 b"HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
             );
+            hold_until_client_closes(&mut stream);
         }
     });
     let mut sink = Collect::default();
