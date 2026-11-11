@@ -39,7 +39,8 @@ pub use audio_stop::{AUDIO_STOP_BOUND, AudioStopReport, OperatorStopReport};
 pub use budget::*;
 pub use chat_burst::{
     ChatBurstConfig, ChatBurstConfigError, ChatBurstMetrics, ChatBurstRecord, ChatOutcome,
-    DeferredReplyReport, MAX_CHAT_BURST_RECORDS, MAX_DEFERRED_REPORTS, MAX_REPLY_TTL_MS,
+    DeferredReplyReport, MAX_AUDIENCE_SIGNALS, MAX_CHAT_BURST_RECORDS, MAX_DEFERRED_REPORTS,
+    MAX_REPLY_TTL_MS,
 };
 pub use deadline::*;
 pub use memory_compare::*;
@@ -2204,6 +2205,16 @@ where
         self.chat_burst
             .as_mut()
             .map(|lane| lane.take_records(max))
+            .unwrap_or_default()
+    }
+
+    /// Remove and return up to `max` audience signals (#79) produced by
+    /// aggregating batched chat, oldest first. Empty unless
+    /// [`ChatBurstConfig::audience`] is set. Ids and counts only.
+    pub fn take_audience_signals(&mut self, max: usize) -> Vec<aivtuber_reflex::AudienceSignal> {
+        self.chat_burst
+            .as_mut()
+            .map(|lane| lane.take_audience_signals(max))
             .unwrap_or_default()
     }
 
