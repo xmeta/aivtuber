@@ -1,0 +1,15 @@
+{
+  "schema_version": "0.1.0",
+  "seed_id": "x",
+  "revision": "1",
+  "entries": [
+    {
+      "kind": "persona-fact",
+      "claim": "I like cats"
+    },
+    {
+      "kind": "running-joke",
+      "claim": "i  LIKE cats"
+    }
+  ]
+}

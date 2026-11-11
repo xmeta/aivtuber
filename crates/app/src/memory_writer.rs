@@ -234,20 +234,32 @@ pub(crate) fn extract_candidates(
     out
 }
 
-fn fold(text: &str) -> String {
+pub(crate) fn fold(text: &str) -> String {
     text.split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
 }
 
+/// One live writer entry. The store keeps a case- and whitespace-normalized
+/// claim, so the writer keeps the sentence as the performer said it (at most
+/// `max_claim_bytes`, within `max_live_entries`) for the operator export
+/// (#321), which the operator reviews before promoting it by hand.
+#[derive(Debug)]
+struct LedgerEntry {
+    memory_id: u64,
+    expires_at_ms: u64,
+    topic: &'static str,
+    claim: String,
+}
+
 #[derive(Debug)]
 pub(crate) struct MemoryWriter {
     config: MemoryWriterConfig,
     next_seq: u64,
-    /// `(memory_id, expires_at_ms)` of live writer entries, bounded by
-    /// `max_live_entries`; the source of the expired / removed-early counters.
-    ledger: VecDeque<(u64, u64)>,
+    /// Live writer entries, bounded by `max_live_entries`; the source of the
+    /// expired / removed-early counters and of the export.
+    ledger: VecDeque<LedgerEntry>,
     metrics: MemoryWriterMetrics,
 }
 
@@ -290,11 +302,15 @@ impl MemoryWriter {
     /// turn, in ledger order.
     pub(crate) fn sweep(&mut self, memory: &WorkingMemory, now_ms: u64) {
         let metrics = &mut self.metrics;
-        self.ledger.retain(|(id, expires_at_ms)| {
-            if *expires_at_ms <= now_ms {
+        self.ledger.retain(|live| {
+            if live.expires_at_ms <= now_ms {
                 metrics.expired += 1;
                 false
-            } else if memory.entries().iter().all(|entry| entry.memory_id != *id) {
+            } else if memory
+                .entries()
+                .iter()
+                .all(|entry| entry.memory_id != live.memory_id)
+            {
                 metrics.removed_early += 1;
                 false
             } else {
@@ -322,9 +338,28 @@ impl MemoryWriter {
         id
     }
 
-    pub(crate) fn record_written(&mut self, memory_id: u64, expires_at_ms: u64) {
-        self.ledger.push_back((memory_id, expires_at_ms));
+    pub(crate) fn record_written(
+        &mut self,
+        memory_id: u64,
+        expires_at_ms: u64,
+        kind: FactKind,
+        claim: &str,
+    ) {
+        self.ledger.push_back(LedgerEntry {
+            memory_id,
+            expires_at_ms,
+            topic: kind.topic(),
+            claim: claim.to_owned(),
+        });
         self.metrics.written += 1;
+    }
+
+    /// Live writer entries in write order as `(topic, claim as said)`. Call
+    /// [`Self::sweep`] first so erased and expired entries are gone.
+    pub(crate) fn live_claims(&self) -> impl Iterator<Item = (&'static str, &str)> {
+        self.ledger
+            .iter()
+            .map(|live| (live.topic, live.claim.as_str()))
     }
 
     pub(crate) fn reject_quota(&mut self) {
