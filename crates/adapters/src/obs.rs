@@ -51,6 +51,12 @@ impl fmt::Debug for ObsWebSocketConfig {
     }
 }
 
+/// The operator's authenticated `perception.control` authority, lent to the
+/// capture session only while perception is enabled. Nothing mints it from
+/// configuration: the service fills it from the authority passed to its
+/// `enable` and empties it on disable, suspend and shutdown.
+pub type CaptureGrant = Arc<Mutex<Option<AuthenticatedControl>>>;
+
 /// One screenshot request (issue #90 S1b). `source_name` is the operator's
 /// real OBS source; the alias the runtime and observations use is separate and
 /// never carries it.
@@ -70,10 +76,12 @@ pub struct ObsScreenshotRequest {
 /// OBS as a [`crate::ScreenFrameSource`]: its own obs-websocket session
 /// (separate from the stream output's, so a slow screenshot never delays a
 /// scene switch) restricted to one allowlisted source. Holds the
-/// `perception.control` authority it was constructed with.
+/// `perception.control` authority only while the operator's authenticated
+/// enable has put one in its [`CaptureGrant`]; with an empty grant every
+/// capture is refused.
 pub struct ObsScreenSource {
     adapter: ObsWebSocketAdapter,
-    authority: AuthenticatedControl,
+    grant: CaptureGrant,
     request: ObsScreenshotRequest,
 }
 
@@ -82,12 +90,12 @@ impl ObsScreenSource {
     /// (`event_subscriptions: Some(0)`): this session only issues requests.
     pub fn new(
         adapter: ObsWebSocketAdapter,
-        authority: AuthenticatedControl,
+        grant: CaptureGrant,
         request: ObsScreenshotRequest,
     ) -> Self {
         Self {
             adapter,
-            authority,
+            grant,
             request,
         }
     }
@@ -103,8 +111,19 @@ impl fmt::Debug for ObsScreenSource {
 
 impl crate::ScreenFrameSource for ObsScreenSource {
     fn capture(&mut self) -> Result<ScreenFrame, EngineError> {
+        let authority = self
+            .grant
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .ok_or_else(|| {
+                engine_error(
+                    EngineErrorKind::Unauthorized,
+                    "perception capture is not enabled by the operator",
+                )
+            })?;
         self.adapter
-            .capture_source_screenshot(&self.authority, &self.request)
+            .capture_source_screenshot(&authority, &self.request)
     }
 }
 

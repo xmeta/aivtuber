@@ -24,7 +24,9 @@
 //!   bounded state only; frames live in the worker's single slot and are gone
 //!   after each model call.
 
-use aivtuber_adapters::{ProducedObservation, ProducerError, ScreenObservationProducer};
+use aivtuber_adapters::{
+    CaptureGrant, ProducedObservation, ProducerError, ScreenObservationProducer,
+};
 use aivtuber_domain::{AuthenticatedControl, PerceptionObservationBatch};
 use aivtuber_runtime::{
     JobOutcome, PerceptionAvailability, PerceptionConfig, PerceptionGateError, PerceptionGates,
@@ -148,6 +150,7 @@ pub struct PerceptionService {
     live_epoch: Arc<AtomicU64>,
     jobs: Option<SyncSender<(PerceptionJob, u64)>>,
     results: Receiver<JobReport>,
+    grant: CaptureGrant,
     metrics: PerceptionServiceMetrics,
 }
 
@@ -167,6 +170,7 @@ impl PerceptionService {
         config: PerceptionServiceConfig,
         mut worker: Box<dyn PerceptionWorker>,
         redactor: SecretRedactor,
+        grant: CaptureGrant,
     ) -> Result<Self, RuntimeError> {
         let mut tracker_config = PerceptionConfig::default();
         if let Some(vocabulary) = config.label_vocabulary {
@@ -201,6 +205,7 @@ impl PerceptionService {
             live_epoch,
             jobs: Some(job_tx),
             results: result_rx,
+            grant,
             metrics: PerceptionServiceMetrics::default(),
         })
     }
@@ -232,6 +237,12 @@ impl PerceptionService {
         }
     }
 
+    fn set_grant(&self, authority: Option<AuthenticatedControl>) {
+        if let Ok(mut slot) = self.grant.lock() {
+            *slot = authority;
+        }
+    }
+
     fn publish_epoch(&self) {
         self.live_epoch
             .store(self.governor.epoch(), Ordering::SeqCst);
@@ -246,6 +257,7 @@ impl PerceptionService {
         now_ms: u64,
     ) -> Result<(), PerceptionGateError> {
         self.tracker.enable_source(authority, &self.alias, now_ms)?;
+        self.set_grant(Some(authority.clone()));
         self.governor.enable(now_ms);
         self.publish_epoch();
         Ok(())
@@ -259,6 +271,7 @@ impl PerceptionService {
             return self.tracker.disable_all(authority);
         }
         self.governor.disable();
+        self.set_grant(None);
         self.publish_epoch();
         self.tracker.disable_all(authority)
     }
@@ -266,6 +279,7 @@ impl PerceptionService {
     /// Stop everything and release the worker (process shutdown).
     pub fn shutdown(&mut self) {
         self.governor.disable();
+        self.set_grant(None);
         self.publish_epoch();
         self.tracker.suspend_all();
         self.jobs = None;
@@ -291,6 +305,7 @@ impl PerceptionService {
         if self.governor.status() == PerceptionStatus::Suspended
             && self.tracker.availability(now_ms) != PerceptionAvailability::Disabled
         {
+            self.set_grant(None);
             self.tracker.suspend_all();
         }
         self.publish_epoch();

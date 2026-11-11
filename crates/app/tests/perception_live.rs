@@ -8,9 +8,9 @@
 //! clock, not by sleeping. Only the worker thread's real I/O is waited for.
 
 use aivtuber_adapters::{
-    AdapterClock, CaptionLanguage, ObsScreenSource, ObsScreenshotRequest, ObsWebSocketAdapter,
-    ObsWebSocketConfig, ScreenDescriber, ScreenDescriberConfig, ScreenImageFormat,
-    ScreenObservationProducer, ScreenProducerConfig,
+    AdapterClock, CaptionLanguage, CaptureGrant, ObsScreenSource, ObsScreenshotRequest,
+    ObsWebSocketAdapter, ObsWebSocketConfig, ScreenDescriber, ScreenDescriberConfig,
+    ScreenImageFormat, ScreenObservationProducer, ScreenProducerConfig,
 };
 use aivtuber_app::{PerceptionService, PerceptionServiceConfig, ProducerWorker};
 use aivtuber_domain::{
@@ -265,6 +265,7 @@ struct Harness {
     service: PerceptionService,
     obs: FakeObs,
     vlm: FakeVlm,
+    grant: CaptureGrant,
 }
 
 impl Harness {
@@ -336,6 +337,7 @@ fn harness(caption: &str, governor: PerceptionGovernorConfig) -> Harness {
         image_format: ScreenImageFormat::Png,
     })
     .expect("describer");
+    let grant: CaptureGrant = Arc::new(Mutex::new(None));
     let source = ObsScreenSource::new(
         ObsWebSocketAdapter::new(ObsWebSocketConfig {
             endpoint: obs.endpoint.clone(),
@@ -343,7 +345,7 @@ fn harness(caption: &str, governor: PerceptionGovernorConfig) -> Harness {
             ..ObsWebSocketConfig::default()
         })
         .expect("obs adapter"),
-        operator(),
+        grant.clone(),
         ObsScreenshotRequest {
             source_name: "Game Capture".to_owned(),
             format: ScreenImageFormat::Png,
@@ -371,6 +373,7 @@ fn harness(caption: &str, governor: PerceptionGovernorConfig) -> Harness {
         },
         Box::new(ProducerWorker::new(producer)),
         SecretRedactor::default(),
+        grant.clone(),
     )
     .expect("service");
     Harness {
@@ -378,6 +381,7 @@ fn harness(caption: &str, governor: PerceptionGovernorConfig) -> Harness {
         service,
         obs,
         vlm,
+        grant,
     }
 }
 
@@ -752,5 +756,54 @@ fn status_and_debug_output_never_carry_pixels_or_caption_text() {
     assert!(!debug.contains("dragon"), "no caption text");
     for diagnostic in h.service.tracker().diagnostics() {
         assert!(!format!("{diagnostic:?}").contains("dragon"));
+    }
+}
+
+/// No configuration combination enables capture: governor settings (including
+/// the fastest cadence and the most permissive probe), service construction and
+/// elapsed time never contact OBS or the model, and the capture session holds
+/// no authority until the operator's authenticated enable lends it one.
+#[test]
+fn no_configuration_enables_capture_without_the_authenticated_control_action() {
+    let variants = [
+        config(),
+        PerceptionGovernorConfig {
+            cadence_ms: 5_000,
+            gate_settle_ms: 0,
+            probe_ceiling_ms: 60_000,
+            probe_interval_ms: 5_000,
+            late_strikes_to_suspend: 100,
+            failure_strikes_to_suspend: 100,
+            ..PerceptionGovernorConfig::default()
+        },
+        PerceptionGovernorConfig::default(),
+    ];
+    for governor in variants {
+        let mut h = harness("A knight fights.", governor);
+        assert!(
+            h.grant.lock().expect("lock").is_none(),
+            "no authority at construction"
+        );
+        h.clock.advance(600_000);
+        h.pump_for(OPEN, QUIET);
+        assert_eq!(h.service.status(), PerceptionStatus::Off);
+        assert_eq!((h.shots(), h.probes(), h.describes()), (0, 0, 0));
+
+        // A refused enable leaves the grant empty and capture off.
+        let now = h.now();
+        assert!(
+            h.service
+                .enable(&authority(Capability::ObsControl, "obs.control"), now)
+                .is_err()
+        );
+        assert!(h.grant.lock().expect("lock").is_none());
+        h.pump_for(OPEN, QUIET);
+        assert_eq!((h.shots(), h.probes(), h.describes()), (0, 0, 0));
+
+        // Only the authenticated enable lends the authority, and disable takes it back.
+        h.enable();
+        assert!(h.grant.lock().expect("lock").is_some());
+        h.service.disable(&operator()).expect("disable");
+        assert!(h.grant.lock().expect("lock").is_none());
     }
 }

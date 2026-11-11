@@ -262,7 +262,6 @@ Opt-in and off by default at every level: the profile switch, the operator enabl
 |`AIVTUBER_PERCEPTION_PROBE_INTERVAL_MS` |`60000` |Period of the latency probe (it also runs once at start).
 |`AIVTUBER_PERCEPTION_PROBE_CEILING_MS` |`150` |A probe slower than this, or over twice the start baseline, suspends perception (spill).
 |`AIVTUBER_PERCEPTION_VALIDITY_MS` |`20000` |Observation validity, at most 30000.
-|`AIVTUBER_PERCEPTION_AUTOSTART` |`false` |Enable at startup without `perception-on`. This is the operator's own configuration speaking; leave it off if you want an explicit console action.
 |===
 
 * *Control.* `aivtuberctl perception-on` and `perception-off` go through the authenticated operator endpoint, which holds `perception.control` only when perception is composed. `aivtuberctl status` prints a `perception` line: `status` (`off`, `probing`, `active`, `suspended`), `suspend_reason` (`start_probe_failed`, `start_probe_spill`, `latency_spill`, `slow_captions`, `repeated_failures`), availability, the last probe time and counters including how often a capture yielded to Thinking or speech. A suspended path stays off until `perception-on`. Disabling takes effect before the next capture and drops everything retained.

@@ -621,21 +621,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         app = app.with_speech_observations(tracker);
     }
     // #90 S1b: opt-in live screen perception ("perception" local profile).
-    // Composed disabled; the operator turns it on with the authenticated
-    // control endpoint (`aivtuberctl perception-on`) or, only when the
-    // operator asks for it in configuration, AIVTUBER_PERCEPTION_AUTOSTART.
+    // Composed disabled; the only way to turn it on is the authenticated
+    // control endpoint (`aivtuberctl perception-on`). No configuration
+    // enables it (ADR-0007 D-5).
     let mut last_perception_status: Option<(PerceptionStatus, Option<String>)> = None;
     if perception_opt_in {
         let service = build_perception_service(profile, started)?;
         app = app.with_perception(service);
-        if env_bool("AIVTUBER_PERCEPTION_AUTOSTART", false)? {
-            let authority = perception_authority("runtime:perception-autostart")?;
-            let now_ms = elapsed_ms(started);
-            match app.apply_perception_control(&authority, true, now_ms) {
-                Ok(detail) => eprintln!("perception: autostart: {detail}"),
-                Err(detail) => eprintln!("perception: autostart refused: {detail}"),
-            }
-        }
     }
     let mut last_speech_stats = SpeechSidecarStats::default();
     let mut last_chat_burst_accounted = 0_u64;
@@ -1660,37 +1652,6 @@ impl AdapterClock for LoopClock {
     }
 }
 
-/// An authority holding only `perception.control`, minted from a fresh random
-/// secret that exists only inside this process. It is the adapter-boundary
-/// proof for the capture session and the stand-in for the operator's own
-/// configuration when `AIVTUBER_PERCEPTION_AUTOSTART` is set. It cannot be
-/// minted by anything read from content, models or OBS.
-fn perception_authority(
-    principal: &str,
-) -> Result<aivtuber_domain::AuthenticatedControl, Box<dyn Error>> {
-    let mut secret = [0_u8; 32];
-    fill_random(&mut secret);
-    let ingress = LocalControlIngress::new(
-        "local-runtime-perception",
-        principal,
-        AuthorizationMethod::SignedLocalApi,
-        BTreeSet::from([Capability::PerceptionControl]),
-        ControlSecret::new(secret),
-    )?;
-    let command = ingress.authenticate(
-        OperatorCommandInput {
-            event_id: "bootstrap-perception-authority".to_owned(),
-            correlation_id: "bootstrap-runtime".to_owned(),
-            sequence: 0,
-            observed_at: "1970-01-01T00:00:00Z".to_owned(),
-            action: "perception.control".to_owned(),
-            payload: BTreeMap::new(),
-        },
-        &secret,
-    )?;
-    Ok(command.authority().clone())
-}
-
 fn loopback_ws(endpoint: &str) -> bool {
     verify_loopback_endpoint(
         &endpoint.replacen("ws://", "http://", 1),
@@ -1801,9 +1762,11 @@ fn build_perception_service(
         image_format: format,
     })?;
     let clock: Arc<dyn AdapterClock> = Arc::new(LoopClock(started));
+    // Filled only by the operator's authenticated enable; never from config.
+    let grant: aivtuber_adapters::CaptureGrant = Arc::new(Mutex::new(None));
     let source = ObsScreenSource::new(
         ObsWebSocketAdapter::new(obs_config)?,
-        perception_authority("runtime:perception-capture")?,
+        grant.clone(),
         ObsScreenshotRequest {
             source_name: obs_source,
             format,
@@ -1839,6 +1802,7 @@ fn build_perception_service(
         },
         Box::new(ProducerWorker::new(producer)),
         aivtuber_telemetry::SecretRedactor::new(known_secrets),
+        grant,
     )?;
     eprintln!(
         "perception: composed (off until enabled) alias={alias} cadence_ms={} probe_ceiling_ms={} requires ~12 GB VRAM for the local stack",
