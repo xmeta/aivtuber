@@ -391,7 +391,7 @@ impl<T> DeferredInbox<T> {
     }
 
     pub fn metrics(&self) -> DeferredMetrics {
-        let mut metrics = self.metrics.clone();
+        let mut metrics = self.metrics;
         metrics.pending = self.entries.len();
         metrics
     }
@@ -769,30 +769,31 @@ mod tests {
     fn invalid_dispositions_are_rejected_with_a_terminal_outcome() {
         let mut inbox = inbox(4, 4);
         let now = 100;
-        let mut bad = Vec::new();
-        // Not deferrable timings.
-        bad.push(DeferredItem {
-            id: "imm".into(),
-            actor: None,
-            disposition: ResponseDisposition::immediate(TimingReason::PerformerAvailable),
-            payload: (),
-        });
-        bad.push(DeferredItem {
-            id: "no".into(),
-            actor: None,
-            disposition: ResponseDisposition::no_reply(TimingReason::NotSelected),
-            payload: (),
-        });
-        // Already expired, expiring now, and beyond the horizon.
-        bad.push(item("past", None, 50));
-        bad.push(item("now", None, now));
-        bad.push(item("far", None, now + 10_001));
-        // Oversized key.
-        bad.push(item(&"k".repeat(MAX_DEFERRED_KEY_BYTES + 1), None, 5_000));
-        // earliest not before expiry.
         let mut earliest = item("earliest", None, 5_000);
         earliest.disposition.earliest_at_ms = Some(5_000);
-        bad.push(earliest);
+        let bad = vec![
+            // Not deferrable timings.
+            DeferredItem {
+                id: "imm".into(),
+                actor: None,
+                disposition: ResponseDisposition::immediate(TimingReason::PerformerAvailable),
+                payload: (),
+            },
+            DeferredItem {
+                id: "no".into(),
+                actor: None,
+                disposition: ResponseDisposition::no_reply(TimingReason::NotSelected),
+                payload: (),
+            },
+            // Already expired, expiring now, and beyond the horizon.
+            item("past", None, 50),
+            item("now", None, now),
+            item("far", None, now + 10_001),
+            // Oversized key.
+            item(&"k".repeat(MAX_DEFERRED_KEY_BYTES + 1), None, 5_000),
+            // earliest not before expiry.
+            earliest,
+        ];
         let count = bad.len() as u64;
         for item in bad {
             let (result, terminals) = inbox.defer(item, now);

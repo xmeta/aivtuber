@@ -328,7 +328,7 @@ impl ChatBurstLane {
             burst_batches_flushed: burst.batches_flushed,
             burst_invariant_violations: burst.invariant_violations,
             burst_priority_claims_ignored: burst.priority_claims_ignored,
-            ..self.metrics.clone()
+            ..self.metrics
         }
     }
 
