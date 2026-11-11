@@ -1,0 +1,11 @@
+{
+  "schema_version": "0.1.0",
+  "seed_id": "x",
+  "revision": "1",
+  "entries": [
+    {
+      "kind": "persona-fact",
+      "claim": "line one\nline two"
+    }
+  ]
+}

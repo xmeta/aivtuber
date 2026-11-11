@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xmeta/aivtuber/schemas/memory-seed.schema.json",
+  "title": "AI VTuber operator memory seed",
+  "description": "Operator-owned performer-level facts loaded into working memory at startup (ADR-0008 S2, #321). The same format is what `aivtuberctl memory-export` writes. There is deliberately no field that can name a viewer or an actor, and unknown fields are refused. Bounds mirror crates/app/src/memory_seed.rs; the loader additionally requires each claim to be at most 240 UTF-8 bytes, one line, and unique after case and whitespace folding, which JSON Schema cannot express.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "seed_id", "revision", "entries"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "0.1.0"},
+    "seed_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,62}$"},
+    "revision": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,32}$"},
+    "entries": {
+      "type": "array",
+      "maxItems": 128,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "claim"],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": ["persona-fact", "running-joke", "commitment", "segment-summary"]
+          },
+          "claim": {"type": "string", "minLength": 1, "maxLength": 240}
+        }
+      }
+    }
+  }
+}

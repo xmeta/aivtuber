@@ -18,10 +18,11 @@ use aivtuber_app::{
     AdaptationRuntime, AdapterHealth, AvatarOutput, BargeInConfig, BargeInMetrics, ChatBurstConfig,
     CompositionProfile, GenerationFallbackCounts, GenerativeBudgetPolicy, GenerativeRuntime,
     IntentRoutePlanner, IntentShadowPolicy, LocalAvatarOutput, LocalRoutePlanner,
-    MemoryWriterConfig, MemoryWriterMetrics, NoopAvatarOutput, NoopStreamOutput, ObsStreamOutput,
-    OperatorControlServer, OperatorRateLimiter, PerceptionService, PerceptionServiceConfig,
-    PhraseMetrics, PhraseMode, ProducerWorker, ProductionApp, ProfileSummary, RawIngressConfig,
-    RawIngressMetrics, RawIngressMetricsSnapshot, RoutePlanner, RuntimeRetentionPolicy,
+    MemoryFalsifierMetrics, MemorySeed, MemoryWriterConfig, MemoryWriterMetrics, NoopAvatarOutput,
+    NoopStreamOutput, ObsStreamOutput, OperatorControlServer, OperatorEndpointOptions,
+    OperatorRateLimiter, PerceptionService, PerceptionServiceConfig, PhraseMetrics, PhraseMode,
+    ProducerWorker, ProductionApp, ProfileSummary, RawIngressConfig, RawIngressMetrics,
+    RawIngressMetricsSnapshot, RoutePlanner, RuntimeRetentionPolicy,
     SHADOW_ORCHESTRATOR_SCHEMA_VERSION, ShadowOrchestratorConfig, ShadowPolicyIdentity,
     ShadowingRoutePlanner, SpeechConversationConfig, SpeechConversationMetrics, SpeechFloorMetrics,
     SpeechSidecar, SpeechSidecarConfig, SpeechSidecarStats, StreamOutput, TtsSidecarSettings,
@@ -251,6 +252,21 @@ fn run() -> Result<(), Box<dyn Error>> {
             })
             .map_err(|error| format!("AIVTUBER_MEMORY_WRITER: {error}"))?;
     }
+    // #321: the operator memory seed file is opt-in and read-only. It loads
+    // once, through the permit-gated path; an invalid or refused file stops
+    // startup rather than running with silently different memory.
+    if let Some(path) = env_path("AIVTUBER_MEMORY_SEED") {
+        let seed =
+            MemorySeed::load(&path).map_err(|error| format!("AIVTUBER_MEMORY_SEED: {error}"))?;
+        app = app
+            .with_memory_seed(&seed, 0)
+            .map_err(|error| format!("AIVTUBER_MEMORY_SEED: {error}"))?;
+        let identity = seed.identity();
+        eprintln!(
+            "memory_seed: loaded id={} revision={} entries={} content_hash={}",
+            identity.seed_id, identity.revision, identity.entries, identity.content_hash
+        );
+    }
     // Issue #69: generative resource budgets are opt-in (disabled by default
     // so existing deployments keep identical behavior). All limits are
     // optional; an enabled budget with no limits records nothing enforced.
@@ -355,10 +371,15 @@ fn run() -> Result<(), Box<dyn Error>> {
     // #90 S1b: live screen perception is opt-in. Only then does the operator
     // endpoint's ingress also hold `perception.control`.
     let perception_opt_in = env_bool("AIVTUBER_PERCEPTION", false)?;
-    let (operator_server, mut operator_receiver) = OperatorControlServer::with_perception_control(
+    // #321: the memory export needs the writer's live entries, so the endpoint
+    // holds `memory.admin` only when the writer is composed.
+    let (operator_server, mut operator_receiver) = OperatorControlServer::with_options(
         &operator_endpoint,
         operator_secret,
-        perception_opt_in,
+        OperatorEndpointOptions {
+            perception: perception_opt_in,
+            memory_export: app.memory_writer_metrics().is_some(),
+        },
     )?;
     let operator_ingress = operator_server.ingress();
     let operator_rate = Arc::new(Mutex::new(OperatorRateLimiter::new(16, 8)));
@@ -485,6 +506,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut last_barge_in_metrics = BargeInMetrics::default();
     let mut last_phrase_metrics = PhraseMetrics::default();
     let mut last_memory_writer_metrics = MemoryWriterMetrics::default();
+    let mut last_memory_falsifier_metrics = MemoryFalsifierMetrics::default();
     let mut last_projection_metrics = aivtuber_app::SpeechProjectionMetrics::default();
     let mut last_phrase_response_logged: Option<u64> = None;
     let mut last_conversation_metrics = SpeechConversationMetrics::default();
@@ -705,6 +727,19 @@ fn run() -> Result<(), Box<dyn Error>> {
                     true,
                 );
                 let now_ms = elapsed_ms(started);
+                // Final per-stream falsifier counters (#321): one line to
+                // record for the ADR-0008 Q4 procedure.
+                let falsifier = app.memory_falsifier_metrics();
+                eprintln!(
+                    "memory_falsifier_final: seed_entries_loaded={} requests_with_memory={} seed_used={} writer_used_reproducible_from_seed={} writer_only_used={} requests_with_writer_only={} exports={}",
+                    falsifier.seed_entries_loaded,
+                    falsifier.requests_with_memory,
+                    falsifier.seed_used,
+                    falsifier.writer_used_reproducible_from_seed,
+                    falsifier.writer_only_used,
+                    falsifier.requests_with_writer_only,
+                    falsifier.exports
+                );
                 if let Some(service) = app.perception_mut() {
                     service.shutdown();
                 }
@@ -946,6 +981,20 @@ fn run() -> Result<(), Box<dyn Error>> {
                     metrics.rejected_store
                 );
                 last_memory_writer_metrics = metrics;
+            }
+            let falsifier = app.memory_falsifier_metrics();
+            if falsifier != last_memory_falsifier_metrics {
+                eprintln!(
+                    "memory_falsifier_metrics: seed_entries_loaded={} requests_with_memory={} seed_used={} writer_used_reproducible_from_seed={} writer_only_used={} requests_with_writer_only={} exports={}",
+                    falsifier.seed_entries_loaded,
+                    falsifier.requests_with_memory,
+                    falsifier.seed_used,
+                    falsifier.writer_used_reproducible_from_seed,
+                    falsifier.writer_only_used,
+                    falsifier.requests_with_writer_only,
+                    falsifier.exports
+                );
+                last_memory_falsifier_metrics = falsifier;
             }
             let phrase_metrics = app.phrase_metrics();
             if phrase_metrics != last_phrase_metrics {

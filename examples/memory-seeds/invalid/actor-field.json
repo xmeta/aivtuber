@@ -1,0 +1,12 @@
+{
+  "schema_version": "0.1.0",
+  "seed_id": "x",
+  "revision": "1",
+  "entries": [
+    {
+      "kind": "persona-fact",
+      "claim": "hello there",
+      "actor_id": "viewer-1"
+    }
+  ]
+}

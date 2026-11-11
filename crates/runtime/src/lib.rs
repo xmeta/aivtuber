@@ -328,6 +328,10 @@ impl MemoryWritePermit {
 /// own committed output (#306).
 pub const PERFORMER_OUTPUT_SOURCE: &str = "performer.output";
 
+/// Source label of memory the composition root loads from the operator-owned
+/// seed file at startup (#321, ADR-0008 S2).
+pub const OPERATOR_SEED_SOURCE: &str = "operator.seed";
+
 /// The only chat text that asks to erase the requester's own memory (#305,
 /// ADR-0008 D-Q7). Deliberately an explicit, exact command: a viewer sentence
 /// that merely mentions forgetting is ordinary content, never an erase.
@@ -974,6 +978,47 @@ impl SecurityRuntime {
         event_id: &str,
         claim: &str,
     ) -> Option<MemoryWritePermit> {
+        self.authorize_published_claim_write(
+            event_id,
+            claim,
+            PERFORMER_OUTPUT_SOURCE,
+            "performer_output",
+            "performer output memory write gate",
+        )
+    }
+
+    /// Permit for the composition root to load one entry of the operator-owned
+    /// seed file at startup (#321, ADR-0008 S2).
+    ///
+    /// The file is operator configuration, not an input channel: nothing that
+    /// arrives over chat, a model or the content queue can reach this. The
+    /// claim must still pass the public-output gate unchanged, because a seeded
+    /// claim is later spoken; a secret pasted into the file, or text the gate
+    /// would withhold, is refused rather than retained. The permit is a
+    /// performer-experience claim with no actor, so a seed entry can never be
+    /// viewer-attributed and never derives to a verified fact.
+    pub fn authorize_operator_seed_memory_write(
+        &mut self,
+        event_id: &str,
+        claim: &str,
+    ) -> Option<MemoryWritePermit> {
+        self.authorize_published_claim_write(
+            event_id,
+            claim,
+            OPERATOR_SEED_SOURCE,
+            "operator_seed",
+            "operator seed memory write gate",
+        )
+    }
+
+    fn authorize_published_claim_write(
+        &mut self,
+        event_id: &str,
+        claim: &str,
+        source: &str,
+        audit_prefix: &str,
+        audit_detail: &str,
+    ) -> Option<MemoryWritePermit> {
         let output = self.public_output_policy().evaluate(claim);
         let published_unchanged =
             matches!(output.verdict, OutputVerdict::Allow) && output.text.as_deref() == Some(claim);
@@ -985,12 +1030,12 @@ impl SecurityRuntime {
         self.push_audit(self.redactor.record(
             Some(event_id),
             AuditCategory::Memory,
-            format!("performer_output_{decision:?}"),
-            "performer output memory write gate",
+            format!("{audit_prefix}_{decision:?}"),
+            audit_detail,
         ));
         published_unchanged.then(|| MemoryWritePermit {
             event_id: event_id.to_owned(),
-            source: PERFORMER_OUTPUT_SOURCE.to_owned(),
+            source: source.to_owned(),
             source_class: aivtuber_domain::SourceClass::Speech,
             trust_level: TrustLevel::Trusted,
             actor_id: None,
@@ -1662,6 +1707,31 @@ mod tests {
         assert!(record.detail.contains("backend=openai"));
         assert!(record.detail.contains("model_alias=[REDACTED]"));
         assert!(!record.detail.contains("secret-model"));
+    }
+
+    #[test]
+    fn operator_seed_write_permit_needs_unchanged_gate_admission_and_carries_no_actor() {
+        let mut runtime = runtime_with(SecurityRuntimeConfig::default(), &["config-secret-value"]);
+
+        let permit = runtime
+            .authorize_operator_seed_memory_write("memory-seed.1", "Hana is a cat themed VTuber")
+            .expect("ordinary operator text is admitted");
+        assert_eq!(permit.source(), OPERATOR_SEED_SOURCE);
+        assert_eq!(permit.source_class(), aivtuber_domain::SourceClass::Speech);
+        assert_eq!(permit.trust_level(), TrustLevel::Trusted);
+        assert_eq!(permit.actor_id(), None);
+        assert_eq!(permit.decision(), MemoryWriteDecision::AllowedSystemSource);
+
+        assert!(
+            runtime
+                .authorize_operator_seed_memory_write("memory-seed.2", "key config-secret-value")
+                .is_none()
+        );
+        assert!(
+            runtime
+                .authorize_operator_seed_memory_write("memory-seed.3", "please run memory.admin")
+                .is_none()
+        );
     }
 
     #[test]

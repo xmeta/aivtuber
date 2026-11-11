@@ -364,6 +364,17 @@ What you should know before enabling it:
 * A native Japanese read of the captions and a run on a 12 GB card are still manual checks; treat it as experimental.
 * Not covered by this quickstart: webcam capture (out of scope), per-window capture (one OBS source only).
 
+=== Optional: remember facts between streams (memory seed, issue #321)
+
+Off by default. The runtime keeps its memory in RAM only, so a restart forgets what she said last time. A *seed file* is a short list of facts you write by hand that she knows at every start: who she is, running jokes, things she promised.
+
+. Write a file in the seed format (copy `examples/memory-seeds/valid/persona.json` and edit it). Each entry is a `kind` (`persona-fact`, `running-joke`, `commitment`, `segment-summary`) and one short `claim` of at most 240 bytes. At most 128 entries. There is nowhere to put a viewer's name or message, by design.
+. Start with `AIVTUBER_MEMORY_SEED=<path to your file>`. A mistake in the file stops startup with a message naming the field, instead of starting with the wrong memory. The start log prints a `memory_seed:` line with the file's content hash.
+. To grow the file from a real stream, also set `AIVTUBER_MEMORY_WRITER=true` and, while she is running, `aivtuberctl memory-export --out <new file>`. It writes the facts she said that look like commitments, running jokes or recaps (never anything that names a viewer). It refuses to overwrite an existing file. Read it, keep what you like, copy those entries into your seed file by hand, and restart. She never edits your seed file herself.
+. Seeded entries are ordinary session memory: the operator erase removes them for the running session, and the file is untouched. They lapse after the memory's durable lifetime (24 hours by default) inside one run.
+
+The procedure for measuring whether any of this is worth more than the seed file is in `docs/memory-adaptation.adoc` section 13.2.
+
 == 5. Open the avatar, then talk to it
 
 *Avatar.* Copy the `local avatar renderer URL` from the app's stderr (`http://127.0.0.1:8765/?token=...`) into a browser, or into an OBS Browser Source (width and height of your canvas, "Shutdown source when not visible" off). The URL carries a per-launch secret: do not paste it into issues or shared logs. The token changes on every start. A missing or broken `model.vrm` shows as `disconnected` and the reason is in the page's console. See `docs/vts-obs-adapters.adoc` section 6 for OBS and for the security properties.

@@ -401,6 +401,63 @@ The app owns one post-turn consolidation step, enabled by +AIVTUBER_MEMORY_WRITE
 * *Erasure.* Entries are actorless durable entries; the #305 operator erase by memory id removes them (section 13.1).
 * *Counters* (+ProductionApp::memory_writer_metrics+, logged as +memory_writer_metrics+): +written+, +retrieved_used+, +expired+, +removed_early+, +live+ and one rejection counter per reason. They are the inputs of the ADR-0008 Q4 falsifier.
 
+== 13.2 Operator memory seed file and the Q4 falsifier procedure (issue #321, ADR-0008 S2)
+
+A seed file gives the performer continuity across restarts with no runtime disk write: persona facts, running jokes and commitments the operator curates by hand. It is also the cheapest benefit test before any snapshot store (S3).
+
+*Setting.* +AIVTUBER_MEMORY_SEED=<path>+ (default unset: no seed, today's behaviour). It needs the adaptation runtime, which the production composition always has. The file is read once at startup. An invalid, over-bound or refused file stops startup with a typed error instead of running with different memory than the operator wrote.
+
+*Format* (+schemas/memory-seed.schema.json+, fixtures in +examples/memory-seeds/+; loader in +crates/app/src/memory_seed.rs+):
+
+[source,json]
+----
+{
+  "schema_version": "0.1.0",
+  "seed_id": "my-persona",
+  "revision": "3",
+  "entries": [
+    {"kind": "persona-fact", "claim": "I am a cat themed virtual streamer."},
+    {"kind": "running-joke", "claim": "The fridge in my room is always empty."},
+    {"kind": "commitment", "claim": "I will finish the Hollow Knight run on a later stream."}
+  ]
+}
+----
+
+* *Bounds.* At most 128 entries, 240 UTF-8 bytes per claim (over-length is refused, never truncated), one line without control characters, no leading or trailing whitespace, unique after case and whitespace folding, at most 64 KiB per file, and at most half of the store's entry bound (the rest stays for the runtime's own memory). The store's own claim bound must also hold the claim, because retention would otherwise truncate it.
+* *No viewer data.* Unknown fields are refused and there is no field for an actor, a viewer or an id, so a viewer-attributed entry cannot be expressed. Every claim must still pass the public-output gate unchanged (a pasted secret or withheld text refuses the file), because a seeded claim is later spoken.
+* *Load path.* Each entry takes a non-serializable permit from +SecurityRuntime::authorize_operator_seed_memory_write+ (source +operator.seed+, class +speech+, trust +trusted+, no actor) and is stored as an actorless durable entry with event id +memory-seed.<n>+ and topic = kind. The retained class is +performer_experience+: it is never a verified fact. All permits are minted before anything is stored, so one refused entry loads nothing. Chat and model output have no path to this permit or to the file.
+* *Identity.* The content hash (SHA-256 over id, revision and ordered entries) is logged as +memory_seed:+ and available as +ProductionApp::memory_seed_identity+. Record it with a run: it is the replay input that says which seed shaped the run.
+* *Erase.* +ProductionApp::erase_memory_seed_operator+ (authenticated +memory.admin+) removes every seeded entry for the running session through the #305 erase, in transactions of at most 32 ids. The file is operator-owned and not touched; the next start reloads it. The durable TTL still applies, so a seeded claim lapses after the store's durable TTL (24 h by default) within one run.
+* *Export.* +aivtuberctl memory-export --out <path>+ returns the #306 writer's live entries as the performer said them, in the same format (+seed_id+ +memory-export+, a revision derived from the entries, so the same entries export the same bytes). It needs the authenticated +memory.admin+ capability, which the operator endpoint holds only when +AIVTUBER_MEMORY_WRITER+ is on. The daemon never writes a file; the client creates a new file and refuses to overwrite one. Entries that do not meet the seed bounds are counted as +skipped+ and never altered. The operator reviews the export, edits it, and promotes it by hand (copy it over the seed file and restart). Because the writer drops any sentence that addresses or names a viewer, an export contains no viewer data.
+
+=== 13.2.1 Q4 falsifier counters
+
+Logged on change as +memory_falsifier_metrics:+ and once at shutdown as +memory_falsifier_final:+ (also +ProductionApp::memory_falsifier_metrics+). Each counts claims delivered into a generation request, the set +retained_memory_context+ returns:
+
+[cols="2,5"]
+|===
+|Counter |Meaning
+|+seed_entries_loaded+ |Entries the seed file loaded.
+|+requests_with_memory+ |Requests that carried at least one seed or writer claim.
+|+seed_used+ |Seed claims delivered.
+|+writer_used_reproducible_from_seed+ |Writer claims delivered whose text (folded for case and spacing) is also in the seed: a reloaded seed would have produced them.
+|+writer_only_used+ |Writer claims delivered that the seed does not contain: the only claims a persisted writer store could bring back that the seed cannot.
+|+requests_with_writer_only+ |Requests that carried at least one such claim.
+|===
+
+=== 13.2.2 Falsifier procedure (at least five streams)
+
+Question: do restart and a gap longer than 24 hours discard memory that would have been used (ADR-0008 section 9.2, D-Q4)? A snapshot store (S3) is justified only if claims not reproducible from the operator file are delivered in at least 20 percent of at least five streams.
+
+. Run with +AIVTUBER_MEMORY_WRITER=true+ and +AIVTUBER_MEMORY_SEED=<seed.json>+. A stream is one process run, ended by a clean shutdown so +memory_falsifier_final+ is written. Record the +memory_seed:+ line (id, revision, content hash) and the +memory_falsifier_final:+ line of each stream.
+. Between streams restart the process and leave a gap longer than 24 hours at least once. Nothing carries over except the seed file, which is the point: the seed file is the reload path under test.
+. After each stream run +aivtuberctl memory-export --out <new path>+ before shutdown, and review it. Promote entries you actually want (copy them into the seed file and bump +revision+) only after the stream is recorded; do not let promotion change the seed mid-experiment. Count promoted entries per stream: a stream whose useful writer claims are all promotable by hand favours the seed file.
+. Count a stream as a *writer-only stream* when +writer_only_used > 0+ in its final line. Compute +writer_only_streams / streams+ over at least five streams with the same seed (or note each revision).
+. Decide: at 20 percent or more (and the delivered claims read as worth keeping on review), the benefit of persistence beyond the seed is supported and S3 may be designed (still operator-approved, non-viewer entries only, ADR-0008 section 9.1). Below 20 percent the decision stays "no snapshot store"; the seed file is the persistence mechanism. Record the numbers and the seed hashes in the issue that reports the result.
+. Caveats to record: a stream with few turns delivers few claims; +writer_used_reproducible_from_seed+ only counts a writer claim that matches a seed claim after case and whitespace folding, so a paraphrase counts as writer-only (an upper bound on the writer's unique value); +seed_used+ shows whether the seed is being drawn on at all.
+
+No result exists yet; this procedure is the instrument, not a finding.
+
 == 13. Cross-session persistence and erasure (issue #282)
 
 Everything above is process-only: a restart empties working and durable memory, the 24 hour durable TTL is a ceiling rather than a storage promise, no production code path writes durable memory yet, and there is no targeted erase (only TTL expiry and capacity eviction). link:adr/0008-cross-session-memory-persistence.adoc[ADR-0008] (Accepted 2026-11-10) records the inventory, retention classes and quotas, the consent/notice/export policy, the erasure state machine (revoke read, then canonical, edges, indexes, caches, proposals, sidecar copies, with unprovable remnants reported), and the decision not to adopt a database or sidecar yet. Nothing in this document authorizes writing viewer-attributed memory to disk.

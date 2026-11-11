@@ -7,6 +7,7 @@ mod deadline;
 mod memory_compare;
 mod memory_context;
 mod memory_eval;
+mod memory_seed;
 mod memory_sidecar_eval;
 mod memory_writer;
 mod moderation_evidence;
@@ -47,6 +48,11 @@ pub use deadline::*;
 pub use memory_compare::*;
 pub use memory_context::*;
 pub use memory_eval::*;
+pub use memory_seed::{
+    EXPORT_SEED_ID, MAX_SEED_CLAIM_BYTES, MAX_SEED_ENTRIES, MAX_SEED_FILE_BYTES,
+    MEMORY_SEED_EVENT_PREFIX, MEMORY_SEED_SCHEMA_VERSION, MemoryFalsifierMetrics, MemorySeed,
+    MemorySeedError, MemorySeedExport, MemorySeedIdentity, SeedEntry, SeedKind,
+};
 pub use memory_sidecar_eval::*;
 pub use memory_writer::{
     MEMORY_WRITER_EVENT_PREFIX, MEMORY_WRITER_MAX_LIVE_ENTRIES_CEILING, MemoryWriterConfig,
@@ -1096,6 +1102,8 @@ where
     adaptation: Option<AdaptationRuntime>,
     /// Post-turn memory consolidation (#306); `None` (default) writes nothing.
     memory_writer: Option<memory_writer::MemoryWriter>,
+    /// Q4 falsifier counters and the loaded seed's identity (#321).
+    memory_falsifier: memory_seed::MemoryFalsifier,
     speech_observations: Option<SpeechObservationTracker>,
     /// Opt-in live screen perception (#90 S1b); `None` (default) composes nothing.
     perception: Option<perception_service::PerceptionService>,
@@ -1159,6 +1167,7 @@ where
             generative: None,
             adaptation: None,
             memory_writer: None,
+            memory_falsifier: memory_seed::MemoryFalsifier::default(),
             speech_observations: None,
             perception: None,
             speech_transcripts: None,
@@ -1264,6 +1273,165 @@ where
         self.memory_writer.as_ref().map(|writer| writer.metrics())
     }
 
+    /// Load the operator-owned memory seed file (#321, ADR-0008 S2) into
+    /// working memory as operator-trusted, actorless durable entries.
+    ///
+    /// Call once at startup, after `with_adaptation`. Every entry is admitted
+    /// by the security runtime's seed permit (the claim must pass the public
+    /// output gate unchanged), so every permit is minted before anything is
+    /// stored and one refused entry loads nothing. The entries are ordinary
+    /// durable memory: the #305 operator erase removes them for the session
+    /// (`erase_memory_seed_operator`), and the file itself is never touched.
+    pub fn with_memory_seed(
+        mut self,
+        seed: &MemorySeed,
+        now_ms: u64,
+    ) -> Result<Self, MemorySeedError> {
+        self.load_memory_seed(seed, now_ms)?;
+        Ok(self)
+    }
+
+    /// The loading step of [`Self::with_memory_seed`], for a caller that keeps
+    /// the app on refusal. Stores nothing unless every entry is admitted.
+    pub fn load_memory_seed(
+        &mut self,
+        seed: &MemorySeed,
+        now_ms: u64,
+    ) -> Result<(), MemorySeedError> {
+        let Some(adaptation) = self.adaptation.as_ref() else {
+            return Err(MemorySeedError::AdaptationUnavailable);
+        };
+        let config = adaptation.memory.config();
+        // Leave at least half of the store to the runtime's own memory.
+        let limit = (config.max_entries / 2)
+            .min(config.max_entries.saturating_sub(adaptation.memory.len()));
+        if seed.len() > limit {
+            return Err(MemorySeedError::StoreCapacity {
+                entries: seed.len(),
+                limit,
+            });
+        }
+        // Retention truncates an over-long claim; a seeded claim is never
+        // shortened, so a store with a smaller claim bound refuses the seed.
+        if let Some(index) = seed
+            .entries()
+            .iter()
+            .position(|entry| entry.claim.len() > config.max_claim_bytes)
+        {
+            return Err(MemorySeedError::StoreClaimBound {
+                index,
+                limit: config.max_claim_bytes,
+            });
+        }
+        let mut permits = Vec::with_capacity(seed.len());
+        for (index, entry) in seed.entries().iter().enumerate() {
+            let event_id = format!("{MEMORY_SEED_EVENT_PREFIX}{}", index + 1);
+            let permit = self
+                .security
+                .authorize_operator_seed_memory_write(&event_id, &entry.claim)
+                .ok_or(MemorySeedError::Refused { index })?;
+            permits.push(permit);
+        }
+        let adaptation = self
+            .adaptation
+            .as_mut()
+            .ok_or(MemorySeedError::AdaptationUnavailable)?;
+        for (entry, permit) in seed.entries().iter().zip(&permits) {
+            adaptation
+                .memory
+                .remember_durable(permit, &entry.claim, Some(entry.kind.topic()), now_ms)
+                .map_err(|error| MemorySeedError::Store(error.to_string()))?;
+        }
+        self.memory_falsifier.note_seed(seed);
+        Ok(())
+    }
+
+    /// Identity (id, revision, content hash, entry count) of the loaded seed:
+    /// the replay input for runs that loaded one. `None` when none was loaded.
+    pub fn memory_seed_identity(&self) -> Option<&MemorySeedIdentity> {
+        self.memory_falsifier.identity()
+    }
+
+    /// Q4 falsifier counters: seed-file claims versus writer claims the seed
+    /// could not have reproduced, as delivered into generation requests.
+    pub fn memory_falsifier_metrics(&self) -> MemoryFalsifierMetrics {
+        self.memory_falsifier.metrics()
+    }
+
+    /// Operator erase of every seeded entry for the running session (#305).
+    /// Needs the authenticated `memory.admin` capability. Runs one erase
+    /// transaction per `MAX_ERASE_MEMORY_IDS` entries, named
+    /// `{request_id}.{n}`; nothing seeded returns no reports. The seed file is
+    /// operator-owned and untouched, so the next start reloads it.
+    pub fn erase_memory_seed_operator(
+        &mut self,
+        request_id: &str,
+        authority: &AuthenticatedControl,
+        now_ms: u64,
+    ) -> Result<Vec<ErasureReport>, AppError> {
+        let ids: Vec<u64> = self
+            .adaptation
+            .as_ref()
+            .map(|adaptation| {
+                adaptation
+                    .memory
+                    .entries()
+                    .iter()
+                    .filter(|entry| entry.source.source == aivtuber_runtime::OPERATOR_SEED_SOURCE)
+                    .map(|entry| entry.memory_id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut reports = Vec::new();
+        for (chunk_index, chunk) in ids
+            .chunks(aivtuber_runtime::MAX_ERASE_MEMORY_IDS)
+            .enumerate()
+        {
+            reports.push(self.erase_memory_operator(
+                &format!("{request_id}.{chunk_index}"),
+                authority,
+                None,
+                chunk,
+                now_ms,
+            )?);
+        }
+        Ok(reports)
+    }
+
+    /// Export the #306 writer's live entries in seed-file format (#321). Needs
+    /// the authenticated `memory.admin` capability. The runtime only *returns*
+    /// the seed to the authenticated operator command: it never writes a file,
+    /// so promoting an export into a real seed is the operator's own review and
+    /// copy. The export names only the performer's own published sentences, as
+    /// they were said; no entry carries an actor.
+    pub fn export_memory_seed(
+        &mut self,
+        authority: &AuthenticatedControl,
+        now_ms: u64,
+    ) -> Result<MemorySeedExport, MemorySeedError> {
+        if !authority.has_capability(aivtuber_domain::Capability::MemoryAdmin) {
+            return Err(MemorySeedError::Unauthorized);
+        }
+        let Some(mut writer) = self.memory_writer.take() else {
+            return Err(MemorySeedError::WriterDisabled);
+        };
+        let result = match self.adaptation.as_ref() {
+            None => Err(MemorySeedError::AdaptationUnavailable),
+            Some(adaptation) if !adaptation.memory.pending_erasure_ids().is_empty() => {
+                Err(MemorySeedError::ErasePending)
+            }
+            Some(adaptation) => {
+                writer.sweep(&adaptation.memory, now_ms);
+                memory_seed::export_from_claims(writer.live_claims())
+            }
+        };
+        self.memory_writer = Some(writer);
+        if result.is_ok() {
+            self.memory_falsifier.note_export();
+        }
+        result
+    }
+
     /// Post-turn consolidation: retain stream-level facts from reply text the
     /// output gate already admitted and playback already committed. The
     /// candidate source is `committed_text` only; `event` supplies identifiers
@@ -1319,7 +1487,12 @@ where
                     Some(candidate.kind.topic()),
                     now_ms,
                 ) {
-                    Ok(entry) => writer.record_written(entry.memory_id, entry.expires_at_ms),
+                    Ok(entry) => writer.record_written(
+                        entry.memory_id,
+                        entry.expires_at_ms,
+                        candidate.kind,
+                        &candidate.claim,
+                    ),
                     Err(_) => writer.reject_store(),
                 }
             }
@@ -2588,6 +2761,7 @@ where
         if context.is_empty() {
             return;
         }
+        self.memory_falsifier.note_delivered(&context);
         if let Some(writer) = self.memory_writer.as_mut() {
             writer.sweep(&adaptation.memory, at_ms);
             writer.note_retrieved(
@@ -4382,6 +4556,7 @@ mod tests {
 
     mod chat_burst_tests;
     mod local_thinking_fallback_tests;
+    mod memory_seed_tests;
     mod memory_writer_tests;
     mod phrase_commit_tests;
     mod speech_lifecycle_tests;
