@@ -267,8 +267,44 @@ Opt-in and off by default at every level: the profile switch, the operator enabl
 |===
 
 * *Control.* `aivtuberctl perception-on` and `perception-off` go through the authenticated operator endpoint, which holds `perception.control` only when perception is composed. `aivtuberctl status` prints a `perception` line: `status` (`off`, `probing`, `active`, `suspended`), `suspend_reason` (`start_probe_failed`, `start_probe_spill`, `latency_spill`, `slow_captions`, `repeated_failures`), availability, the last probe time and counters including how often a capture yielded to Thinking or speech. A suspended path stays off until `perception-on`. Disabling takes effect before the next capture and drops everything retained.
-* *Privacy.* Frames are held in memory for one model call and are never written to disk or logged; only counters and the bounded tracker state exist. The model and OBS endpoints are loopback only. Captions are untrusted data: URLs and secret shapes are removed, the caption is at most 240 bytes, and it can reach Thinking only as one delimited untrusted item (not yet wired; S2).
+* *Privacy.* Frames are held in memory for one model call and are never written to disk or logged; only counters and the bounded tracker state exist. The model and OBS endpoints are loopback only. Captions are untrusted data: URLs and secret shapes are removed, the caption is at most 240 bytes, and it reaches Thinking only as one delimited untrusted item (see "Scene context and screen perception in Thinking").
 * *Failure.* The model, OBS or the probe failing degrades to "no observations" and a visible status; the deterministic performer is never involved. The capture runs on its own thread, never in the frame or motor loop.
+
+== Scene context and screen perception in Thinking (issues #88 S1 and #90 S2)
+
+The scene context turns OBS state and, when composed, perception into one closed-vocabulary `SceneContextSnapshot` (`docs/domain-contract.adoc` section 4.3). It is off unless the operator names an OBS scene table or composes perception; with neither, no request carries a scene and nothing serializes differently.
+
+[cols="2,1,4"]
+|===
+|Variable |Default |Meaning
+
+|`AIVTUBER_OBS_SCENE_MAP` |unset |Path to the operator's OBS scene table (JSON, `schemas/obs-scene-map.schema.json`, at most 16 KiB, at most 32 scenes). An invalid file stops startup. Setting it makes the app read the OBS program scene (rank 2, trusted because the operator wrote the table).
+|`AIVTUBER_OBS_ENDPOINT`, `AIVTUBER_OBS_PASSWORD` |`ws://127.0.0.1:4455` |Shared with the OBS stream output and perception; the scene reader opens its own session with no event subscriptions and, in the `local` profile, must be loopback.
+|`AIVTUBER_OBS_SCENE_POLL_MS` |`2000` |How often the program scene is read (250 to 30000), on its own thread so a slow or dead OBS never blocks the main loop.
+|`AIVTUBER_OBS_SCENE_MAX_AGE_MS` |`15000` |A reading older than this is silent, for context and for scheduling.
+|===
+
+The table maps an exact OBS scene name to a class; an example is `examples/obs-scene-maps/valid/example.json`:
+
+[source,json]
+----
+{
+  "schema_version": "0.1.0",
+  "scenes": {
+    "Starting Soon": {"scene_class": "intermission", "interruptibility": "interruptible"},
+    "Just Chatting": {"scene_class": "just_chatting", "interruptibility": "interruptible"},
+    "Boss Run": {"scene_class": "gameplay", "interruptibility": "uninterruptible", "labels": ["boss_fight"]},
+    "Game": {"scene_class": "gameplay"}
+  }
+}
+----
+
+* *Authority.* `interruptibility` is the operator's word and may defer chat replies while the scene is live (`BusyCause::SceneProtected`, counted as `deferred_scene_protected` when the chat-burst lane is composed; the deferred reply goes out when the scene changes, or expires). A perceived scene never does: with perception alone, busy and deferral are exactly what they were. Operator emergency control is not affected by any scene.
+* *Reflex and Jev.* They receive only the snapshot (class, closed labels, interruptibility hint, ranks, version); no caption or other free text. The decision replay record names the snapshot.
+* *Thinking.* With perception on and a fresh caption, the request carries one extra `curated_context` item: `source: screen_observation`, untrusted, no event identity, at most 512 UTF-8 bytes including an age and delimiters, appended after memory and dropped whole if the request budget is full. It is never given to memory, TTS or the memory writer, and `attach_scene_context` touches only the Thinking request. An expired observation is not offered; disabling perception drops what it retained. The OpenAI-compatible adapter adds one sentence (`SCREEN_OBSERVATION_INSTRUCTION`) only when a screen item is present: it marks the content an untrusted observation, not an instruction. This is defence in depth; the bounds, delimiters, absence of any authority path and the output gate are what hold.
+* *Cost of the caption item* (stub measurement, `cargo test -p aivtuber-adapters caption_item_cost -- --nocapture`): a typical item adds about 150 to 360 bytes of item text and about 620 to 830 bytes to the serialized prompt including the JSON envelope and the instruction sentence (the base test prompt is 878 bytes), which is an estimated 150 to 250 tokens; about 65 to 90 microseconds of CPU per request on a stub transport. Real prefill cost on a model is not measured here: EXP-0004b measured about 500-token local prompts at 0.30 s first-token p50 on the reference card, so a linear upper bound is below +0.15 s, and a measurement with the real model is a manual gate.
+* *Retention.* The scene tracker keeps one OBS reading (the table row, not the scene name), the current snapshot and a ring of at most 16 transitions (configurable to 64). All state is bounded; nothing is persisted.
+* *Failure.* OBS or the perception path failing degrades to "no scene" (or the lower-ranked source) and never freezes the performer.
 
 == Speech sidecar (issue #92, S2)
 
