@@ -1,0 +1,1 @@
+{"schema_version":"0.1.0","scenes":{"Starting Soon":{"scene_class":"intermission","interruptibility":"interruptible"},"Just Chatting":{"scene_class":"just_chatting","interruptibility":"interruptible"},"Boss Run":{"scene_class":"gameplay","interruptibility":"uninterruptible","labels":["boss_fight"]},"Game":{"scene_class":"gameplay"}}}

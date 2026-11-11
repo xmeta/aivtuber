@@ -149,6 +149,10 @@ pub enum BusyCause {
     Generating,
     /// The operator muted output.
     Muted,
+    /// The live scene is marked uninterruptible by a trusted source (#88: the
+    /// operator's OBS scene table, ADR-0007 rank 1 to 3). Never perception: a
+    /// perceived scene is untrusted model output and cannot reach this cause.
+    SceneProtected,
 }
 
 impl ReplyAvailability {

@@ -15,6 +15,8 @@ pub use perception::*;
 pub use perception_governor::*;
 mod perception_replay;
 pub use perception_replay::*;
+mod scene_context;
+pub use scene_context::*;
 mod speech_observation;
 pub use speech_observation::*;
 mod speech_replay;

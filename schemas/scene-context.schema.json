@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xmeta/aivtuber/schemas/scene-context.schema.json",
+  "title": "AI VTuber Scene Context Snapshot",
+  "description": "Bounded, versioned, provider-neutral scene context (issue #88 S1, ADR-0007 D-3 and D-10). Serialized form of aivtuber_domain::SceneContextSnapshot: a closed scene class, at most 8 closed-vocabulary labels, an interruptibility hint, the source rank each field came from, and a monotonic version. There is no free text, no scene name and no caption in this contract. It is carried as the optional `scene` member of the Reflex context and of the Thinking request context, and recorded in the Reflex decision replay record, so a replayed decision names the exact snapshot it used. Authority rule: only a trusted source (rank 1 to 3: trusted_telemetry, obs_state, trusted_timer) can carry an interruptibility other than unknown; a perceived scene (rank 4) is untrusted model output and can inform a decision but never busy, deferral or interruptibility. Chat cannot assert any field: the snapshot is built by the runtime from OBS state and the perception tracker, never from an event. observed_at_ms is on the monotonic or logical timeline of the runtime, never wall-clock time. The rank, emptiness and interruptibility rules are expressed below and re-checked by the Rust validator; the rule that source_ref, confidence and calibrated appear only when a perceived field exists is not expressible in JSON Schema and is checked by the Rust validator and scripts/validate.mjs.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "version", "scene_class", "labels", "interruptibility",
+    "source_rank", "labels_source_rank", "observed_at_ms"
+  ],
+  "properties": {
+    "schema_version": {"const": "0.1.0"},
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991,
+      "description": "Monotonic per runtime run, starting at 1; increases on every change of any other field."
+    },
+    "scene_class": {
+      "enum": [
+        "gameplay", "menu", "loading", "cutscene", "result", "desktop",
+        "just_chatting", "intermission", "unknown"
+      ],
+      "description": "Closed scene and stream-segment vocabulary. unknown exactly when source_rank is none. Perception can only produce gameplay, menu, loading, cutscene, result and desktop; just_chatting and intermission come from trusted OBS state."
+    },
+    "labels": {
+      "type": "array",
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "boss_fight", "combat", "dialogue", "exploration", "inventory", "map",
+          "multiplayer_lobby", "puzzle", "racing", "settings", "title_screen", "victory"
+        ]
+      },
+      "description": "Closed label vocabulary (final; replaces the ADR-0007 S1a provisional list, same tokens)."
+    },
+    "interruptibility": {
+      "enum": ["interruptible", "uninterruptible", "unknown"],
+      "description": "A hint for trusted scheduling only. Anything but unknown requires a trusted source_rank."
+    },
+    "source_rank": {
+      "$ref": "#/$defs/source_rank",
+      "description": "Rank of the source that supplied scene_class and interruptibility."
+    },
+    "labels_source_rank": {
+      "$ref": "#/$defs/source_rank",
+      "description": "Rank of the source that supplied labels; none exactly when labels is empty."
+    },
+    "source_ref": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9._:-]+$",
+      "description": "Operator alias of the perception source, present only when a field is perceived. Never a scene name, window title or path."
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Self-reported confidence of the perceived part; absent for trusted sources. Not a probability unless calibrated."
+    },
+    "calibrated": {"type": "boolean", "default": false},
+    "observed_at_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991,
+      "description": "Logical time of the newest observation that contributed; 0 when no source did."
+    }
+  },
+  "$defs": {
+    "source_rank": {
+      "enum": ["trusted_telemetry", "obs_state", "trusted_timer", "perception", "none"],
+      "description": "ADR-0007 D-3 rank 1 to 5. trusted_telemetry and trusted_timer are reserved (no source yet)."
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"scene_class": {"const": "unknown"}}, "required": ["scene_class"]},
+      "then": {"properties": {"source_rank": {"const": "none"}}},
+      "else": {"properties": {"source_rank": {"not": {"const": "none"}}}}
+    },
+    {
+      "if": {"properties": {"labels": {"type": "array", "maxItems": 0}}, "required": ["labels"]},
+      "then": {"properties": {"labels_source_rank": {"const": "none"}}},
+      "else": {"properties": {"labels_source_rank": {"not": {"const": "none"}}}}
+    },
+    {
+      "if": {"properties": {"source_rank": {"enum": ["perception", "none"]}}, "required": ["source_rank"]},
+      "then": {"properties": {"interruptibility": {"const": "unknown"}}}
+    }
+  ]
+}

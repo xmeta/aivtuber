@@ -19,20 +19,21 @@ use aivtuber_app::{
     CompositionProfile, GenerationFallbackCounts, GenerativeBudgetPolicy, GenerativeRuntime,
     IntentRoutePlanner, IntentShadowPolicy, LocalAvatarOutput, LocalRoutePlanner,
     MemoryFalsifierMetrics, MemorySeed, MemoryWriterConfig, MemoryWriterMetrics, NoopAvatarOutput,
-    NoopStreamOutput, ObsStreamOutput, OperatorControlServer, OperatorEndpointOptions,
-    OperatorRateLimiter, PerceptionService, PerceptionServiceConfig, PhraseMetrics, PhraseMode,
-    ProducerWorker, ProductionApp, ProfileSummary, RawIngressConfig, RawIngressMetrics,
-    RawIngressMetricsSnapshot, RoutePlanner, RuntimeRetentionPolicy,
-    SHADOW_ORCHESTRATOR_SCHEMA_VERSION, ShadowOrchestratorConfig, ShadowPolicyIdentity,
-    ShadowingRoutePlanner, SpeechConversationConfig, SpeechConversationMetrics, SpeechFloorMetrics,
-    SpeechSidecar, SpeechSidecarConfig, SpeechSidecarStats, StreamOutput, TtsSidecarSettings,
-    VoicevoxBridge, VoicevoxSettings, VtsAvatarOutput, VtsPlaybackConfig, apply_dispatched_request,
-    audit_pack_readiness, pump_bounded_records, stt_sidecar_args,
+    NoopStreamOutput, ObsProgramSceneSource, ObsStreamOutput, OperatorControlServer,
+    OperatorEndpointOptions, OperatorRateLimiter, PerceptionService, PerceptionServiceConfig,
+    PhraseMetrics, PhraseMode, ProducerWorker, ProductionApp, ProfileSummary, RawIngressConfig,
+    RawIngressMetrics, RawIngressMetricsSnapshot, RoutePlanner, RuntimeRetentionPolicy,
+    SHADOW_ORCHESTRATOR_SCHEMA_VERSION, SceneContextService, ShadowOrchestratorConfig,
+    ShadowPolicyIdentity, ShadowingRoutePlanner, SpeechConversationConfig,
+    SpeechConversationMetrics, SpeechFloorMetrics, SpeechSidecar, SpeechSidecarConfig,
+    SpeechSidecarStats, StreamOutput, TtsSidecarSettings, VoicevoxBridge, VoicevoxSettings,
+    VtsAvatarOutput, VtsPlaybackConfig, apply_dispatched_request, audit_pack_readiness,
+    pump_bounded_records, stt_sidecar_args,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
     AuthorizationMethod, Capability, ControlSecret, EventKind, FloorConfig, LocalControlIngress,
-    OperatorCommandInput,
+    MAX_OBS_SCENE_MAP_BYTES, ObsSceneMap, OperatorCommandInput,
 };
 use aivtuber_generative::{
     GenerativePipeline, PerformanceCompiler, PerformanceCompilerConfig, PhraseConfig,
@@ -681,6 +682,17 @@ fn run() -> Result<(), Box<dyn Error>> {
         let service = build_perception_service(profile, started)?;
         app = app.with_perception(service);
     }
+    // #88 S1: the scene context (rank 2 OBS program scene through the
+    // operator's table, rank 4 perception). Composed only when the operator
+    // names a scene table or perception is composed; otherwise nothing changes.
+    let obs_scene_map = match env_path("AIVTUBER_OBS_SCENE_MAP") {
+        Some(path) => Some(load_obs_scene_map(&path)?),
+        None => None,
+    };
+    if obs_scene_map.is_some() || perception_opt_in {
+        let service = build_scene_context_service(profile, obs_scene_map)?;
+        app = app.with_scene_context(service);
+    }
     let mut last_speech_stats = SpeechSidecarStats::default();
     let mut last_chat_burst_accounted = 0_u64;
     let mut last_generation_fallbacks = GenerationFallbackCounts::default();
@@ -768,6 +780,21 @@ fn run() -> Result<(), Box<dyn Error>> {
         // before the next capture is considered. Never blocks: the slow OBS and
         // model work is on the perception worker thread.
         app.service_perception(now_ms);
+        // #88: after perception, so the scene sees this tick's observations.
+        // Never blocks: the OBS scene read is on its own thread. Only a change
+        // of scene class is reported, text-free.
+        app.service_scene_context(now_ms);
+        if let Some(scene) = app.scene_context_mut() {
+            for transition in scene.take_transitions(8) {
+                eprintln!(
+                    "scene: transition from={} to={} rank={} version={}",
+                    transition.from.name(),
+                    transition.to.name(),
+                    transition.source_rank.name(),
+                    transition.version
+                );
+            }
+        }
         if let Some(service) = app.perception() {
             let report = service.report(now_ms);
             let key = (
@@ -1764,6 +1791,67 @@ fn loopback_ws(endpoint: &str) -> bool {
         &SystemHostResolver,
     )
     .is_ok()
+}
+
+/// Load the operator's OBS scene table (#88). Bounded before parsing; an
+/// invalid file stops startup rather than running with a different mapping.
+fn load_obs_scene_map(path: &std::path::Path) -> Result<ObsSceneMap, Box<dyn Error>> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| format!("AIVTUBER_OBS_SCENE_MAP: cannot read the file: {error}"))?;
+    if metadata.len() > MAX_OBS_SCENE_MAP_BYTES as u64 {
+        return Err(format!(
+            "AIVTUBER_OBS_SCENE_MAP: the file exceeds {MAX_OBS_SCENE_MAP_BYTES} bytes"
+        )
+        .into());
+    }
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("AIVTUBER_OBS_SCENE_MAP: cannot read the file: {error}"))?;
+    let map = ObsSceneMap::from_json_bytes(&bytes)
+        .map_err(|error| format!("AIVTUBER_OBS_SCENE_MAP: {error}"))?;
+    eprintln!(
+        "scene_context: obs scene table loaded scenes={}",
+        map.scenes.len()
+    );
+    Ok(map)
+}
+
+/// #88 S1: build the scene context service. With a scene table it also reads
+/// the OBS program scene (read-only, its own loopback-checked session without
+/// an event stream, polled off the main loop).
+fn build_scene_context_service(
+    profile: CompositionProfile,
+    obs_scene_map: Option<ObsSceneMap>,
+) -> Result<SceneContextService, Box<dyn Error>> {
+    let mut config = aivtuber_runtime::SceneContextConfig::default();
+    config.obs_max_age_ms = env_u64("AIVTUBER_OBS_SCENE_MAX_AGE_MS", config.obs_max_age_ms)?;
+    let Some(map) = obs_scene_map.filter(|map| !map.scenes.is_empty()) else {
+        return Ok(SceneContextService::new(config)?);
+    };
+    config.obs_map = map;
+    let mut obs_config = ObsWebSocketConfig::default();
+    obs_config.endpoint = env_string("AIVTUBER_OBS_ENDPOINT", &obs_config.endpoint);
+    obs_config.password = env_optional("AIVTUBER_OBS_PASSWORD").map(SecretString::new);
+    // This session only reads the program scene; no event stream.
+    obs_config.event_subscriptions = Some(0);
+    profile
+        .validate_provider_endpoints(&[("scene context OBS", loopback_ws(&obs_config.endpoint))])?;
+    let poll_ms = env_u64("AIVTUBER_OBS_SCENE_POLL_MS", 2_000)?;
+    if !(250..=30_000).contains(&poll_ms) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "AIVTUBER_OBS_SCENE_POLL_MS must be in 250..=30000",
+        )
+        .into());
+    }
+    let service = SceneContextService::with_obs_source(
+        config,
+        Box::new(ObsProgramSceneSource::new(ObsWebSocketAdapter::new(
+            obs_config,
+        )?)),
+        Duration::from_millis(poll_ms),
+    )?;
+    eprintln!("scene_context: composed obs_poll_ms={poll_ms}");
+    Ok(service)
 }
 
 /// #90 S1b: build the opt-in perception service (never enabled here).

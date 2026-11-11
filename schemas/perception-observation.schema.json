@@ -121,7 +121,7 @@
       "properties": {
         "scene_class": {
           "enum": ["gameplay", "menu", "loading", "cutscene", "result", "desktop", "unknown"],
-          "description": "Provisional closed vocabulary (ADR-0007 D-Q11); the scene context (#88) owns the final one and perception will use its subset. unknown means the producer could not tell and never overrides another source."
+          "description": "The scene classes perception can report: a subset of the closed scene-context vocabulary (#88, schemas/scene-context.schema.json), which also holds the stream segments only trusted OBS state supplies. unknown means the producer could not tell and never overrides another source."
         },
         "labels": {
           "type": "array",

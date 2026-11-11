@@ -15,8 +15,7 @@ use crate::{
     PerceptionGateError, PerceptionMetrics, PerceptionTracker, SceneFieldSource,
 };
 use aivtuber_domain::{
-    AuthenticatedControl, PerceptionObservationBatch, PerceptionSceneClass, PrivacyClass,
-    ThinkingContent,
+    AuthenticatedControl, PerceptionObservationBatch, PrivacyClass, SceneClass, ThinkingContent,
 };
 use aivtuber_telemetry::SecretRedactor;
 use serde::Deserialize;
@@ -47,7 +46,7 @@ pub struct PerceptionReplayConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PerceptionReplayHigher {
-    pub scene_class: Option<PerceptionSceneClass>,
+    pub scene_class: Option<SceneClass>,
     pub labels: Option<Vec<String>>,
 }
 
@@ -88,7 +87,7 @@ pub struct PerceptionReplayFixture {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PerceptionReplayPoll {
     pub now_ms: u64,
-    pub scene_class: PerceptionSceneClass,
+    pub scene_class: SceneClass,
     pub scene_class_source: SceneFieldSource,
     pub scene_disagreement: bool,
     pub availability: PerceptionAvailability,

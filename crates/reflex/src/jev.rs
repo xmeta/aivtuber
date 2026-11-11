@@ -680,7 +680,7 @@ fn compact_state(request: &ReflexRequest, candidates: &[String]) -> Value {
         .take(candidates.len())
         .collect::<Vec<_>>();
 
-    json!({
+    let mut state = json!({
         "request_schema_version": request.schema_version,
         "event": {
             "kind": request.event.kind,
@@ -699,7 +699,13 @@ fn compact_state(request: &ReflexRequest, candidates: &[String]) -> Value {
         "retrieval": {
             "candidates": retrieval,
         }
-    })
+    });
+    // #88: the closed-vocabulary scene snapshot only; no free text can ride it.
+    // Omitted when absent so a runtime without a scene source sends the same bytes.
+    if let Some(scene) = &request.context.scene {
+        state["runtime"]["scene"] = json!(scene);
+    }
+    state
 }
 
 fn build_questions(candidates: &[String]) -> BTreeMap<String, Value> {

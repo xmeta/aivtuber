@@ -172,6 +172,7 @@ Controls:
 . Treat retrieved web/document content as untrusted unless explicitly elevated by policy.
 . Record the origin and trust level of memory candidates.
 . Require a separate memory-write gate.
+. Treat text read off the screen by a vision model (ADR-0007) as untrusted observation: at most one delimited item of at most 512 bytes in a Thinking request, never memory, TTS or Reflex input; a perceived scene (rank 4) may inform context but can never set busy, deferral or interruptibility, which only a trusted source (OBS state through the operator-owned scene table, rank 1 to 3) may do (`SceneContextSnapshot`, #88).
 
 == 8. Memory poisoning
 

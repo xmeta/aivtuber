@@ -1,6 +1,6 @@
 use crate::{
     DomainValidationError, EventEnvelope, EventKind, MAX_SCREEN_OBSERVATION_THINKING_BYTES,
-    SourceClass, TrustLevel,
+    SceneContextSnapshot, SourceClass, TrustLevel,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -161,6 +161,11 @@ pub struct ReflexContext {
     pub stream: StreamSnapshot,
     pub recent: RecentInteractionSnapshot,
     pub now_ms: Option<u64>,
+    /// What the stream shows (#88). Closed vocabulary only, never free text.
+    /// Absent unless a scene source exists, and then omitted from the wire form,
+    /// so a runtime with no scene source serializes exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene: Option<SceneContextSnapshot>,
 }
 
 impl Default for ReflexContext {
@@ -171,6 +176,7 @@ impl Default for ReflexContext {
             stream: StreamSnapshot::default(),
             recent: RecentInteractionSnapshot::default(),
             now_ms: None,
+            scene: None,
         }
     }
 }
@@ -185,7 +191,11 @@ impl ReflexContext {
         }
         self.performer.validate()?;
         self.stream.validate()?;
-        self.recent.validate()
+        self.recent.validate()?;
+        if let Some(scene) = &self.scene {
+            scene.validate()?;
+        }
+        Ok(())
     }
 }
 

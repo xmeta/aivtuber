@@ -38,10 +38,10 @@ use crate::RuntimeError;
 use aivtuber_domain::{
     AuthenticatedControl, Capability, DomainValidationError, MAX_PERCEPTION_ALIAS_BYTES,
     MAX_PERCEPTION_BATCH_BYTES, MAX_PERCEPTION_CAPTION_BYTES, MAX_PERCEPTION_LABEL_VOCABULARY,
-    MAX_SCREEN_OBSERVATION_THINKING_BYTES, PROVISIONAL_LABEL_VOCABULARY, PerceptionKind,
-    PerceptionObservation, PerceptionObservationBatch, PerceptionPayload, PerceptionSceneClass,
-    PrivacyClass, SecurityPlane, ThinkingContent, ThinkingContextSource, TrustLevel,
-    validate_perception_label_token,
+    MAX_SCREEN_OBSERVATION_THINKING_BYTES, PerceptionKind, PerceptionObservation,
+    PerceptionObservationBatch, PerceptionPayload, PerceptionSceneClass, PrivacyClass,
+    SCENE_LABEL_VOCABULARY, SceneClass, SecurityPlane, ThinkingContent, ThinkingContextSource,
+    TrustLevel, validate_perception_label_token,
 };
 use aivtuber_telemetry::SecretRedactor;
 use serde::Serialize;
@@ -91,7 +91,7 @@ impl Default for PerceptionConfig {
             source_idle_ttl_ms: 5 * 60 * 1_000,
             unavailable_after_ms: 60_000,
             diagnostic_ring: 8,
-            label_vocabulary: PROVISIONAL_LABEL_VOCABULARY
+            label_vocabulary: SCENE_LABEL_VOCABULARY
                 .iter()
                 .map(|label| (*label).to_owned())
                 .collect(),
@@ -375,7 +375,7 @@ pub struct PerceptionSceneSnapshot {
 /// the source is absent, expired or declared the field unknown.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HigherRankedScene {
-    pub scene_class: Option<PerceptionSceneClass>,
+    pub scene_class: Option<SceneClass>,
     pub labels: Option<Vec<String>>,
 }
 
@@ -403,7 +403,7 @@ impl SceneFieldSource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SceneResolution {
-    pub scene_class: PerceptionSceneClass,
+    pub scene_class: SceneClass,
     pub scene_class_source: SceneFieldSource,
     pub labels: Vec<String>,
     pub labels_source: SceneFieldSource,
@@ -854,7 +854,8 @@ impl PerceptionTracker {
         let perceived_class = perceived
             .as_ref()
             .map(|snapshot| snapshot.scene_class)
-            .filter(|class| *class != PerceptionSceneClass::Unknown);
+            .filter(|class| *class != PerceptionSceneClass::Unknown)
+            .map(SceneClass::from);
 
         let (scene_class, scene_class_source, scene_disagreement) =
             match (higher.scene_class, perceived_class) {
@@ -864,11 +865,7 @@ impl PerceptionTracker {
                     perceived.is_some_and(|class| class != authoritative),
                 ),
                 (None, Some(class)) => (class, SceneFieldSource::Perception, false),
-                (None, None) => (
-                    PerceptionSceneClass::Unknown,
-                    SceneFieldSource::Unknown,
-                    false,
-                ),
+                (None, None) => (SceneClass::Unknown, SceneFieldSource::Unknown, false),
             };
 
         let perceived_labels = perceived
@@ -1557,12 +1554,12 @@ mod tests {
         let resolution = tracker.resolve_scene(
             "game-main",
             &HigherRankedScene {
-                scene_class: Some(PerceptionSceneClass::Gameplay),
+                scene_class: Some(SceneClass::Gameplay),
                 labels: Some(vec!["combat".to_owned()]),
             },
             200,
         );
-        assert_eq!(resolution.scene_class, PerceptionSceneClass::Gameplay);
+        assert_eq!(resolution.scene_class, SceneClass::Gameplay);
         assert_eq!(
             resolution.scene_class_source,
             SceneFieldSource::HigherRanked
@@ -1574,7 +1571,7 @@ mod tests {
         let resolution = tracker.resolve_scene(
             "game-main",
             &HigherRankedScene {
-                scene_class: Some(PerceptionSceneClass::Menu),
+                scene_class: Some(SceneClass::Menu),
                 labels: Some(vec!["settings".to_owned()]),
             },
             200,
@@ -1583,13 +1580,13 @@ mod tests {
 
         // Silent higher sources: perception fills the gap.
         let resolution = tracker.resolve_scene("game-main", &HigherRankedScene::default(), 200);
-        assert_eq!(resolution.scene_class, PerceptionSceneClass::Menu);
+        assert_eq!(resolution.scene_class, SceneClass::Menu);
         assert_eq!(resolution.scene_class_source, SceneFieldSource::Perception);
         assert_eq!(resolution.labels, ["settings"]);
 
         // Expired perception fills nothing.
         let resolution = tracker.resolve_scene("game-main", &HigherRankedScene::default(), 100_000);
-        assert_eq!(resolution.scene_class, PerceptionSceneClass::Unknown);
+        assert_eq!(resolution.scene_class, SceneClass::Unknown);
         assert_eq!(resolution.scene_class_source, SceneFieldSource::Unknown);
 
         let m = tracker.metrics();
@@ -1618,7 +1615,7 @@ mod tests {
         let resolution = tracker.resolve_scene(
             "game-main",
             &HigherRankedScene {
-                scene_class: Some(PerceptionSceneClass::Gameplay),
+                scene_class: Some(SceneClass::Gameplay),
                 labels: None,
             },
             100,

@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xmeta/aivtuber/schemas/obs-scene-map.schema.json",
+  "title": "AI VTuber OBS Scene Mapping Table",
+  "description": "Operator-owned table from an exact OBS program scene name to a scene class (issue #88 S1, ADR-0007 D-3 rank 2). Serialized form of aivtuber_domain::ObsSceneMap. It is configuration written by the operator, hence trusted; the OBS scene name is only a lookup key and is never copied into a snapshot, a request or a log line. A scene the table does not name is silence, not a guess. Unknown fields are refused. At most 32 scenes; a scene name is at most 128 UTF-8 bytes with no control character (the schema counts characters, the Rust loader counts bytes, so a name of 65 two-byte characters is rejected only by the loader). The whole table is at most 16 KiB, checked before parsing.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "scenes"],
+  "properties": {
+    "schema_version": {"const": "0.1.0"},
+    "scenes": {
+      "type": "object",
+      "maxProperties": 32,
+      "propertyNames": {
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[^\\u0000-\\u001f\\u007f-\\u009f]+$"
+      },
+      "additionalProperties": {"$ref": "#/$defs/entry"}
+    }
+  },
+  "$defs": {
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scene_class"],
+      "properties": {
+        "scene_class": {
+          "enum": [
+            "gameplay", "menu", "loading", "cutscene", "result", "desktop",
+            "just_chatting", "intermission"
+          ],
+          "description": "unknown is not a mapping: it would only be silence."
+        },
+        "interruptibility": {
+          "enum": ["interruptible", "uninterruptible", "unknown"],
+          "default": "unknown",
+          "description": "What the operator says about interrupting the performer while this scene is live. The operator wrote it, so it may affect busy/deferral (#75); a perceived scene never can."
+        },
+        "labels": {
+          "type": "array",
+          "maxItems": 8,
+          "uniqueItems": true,
+          "default": [],
+          "items": {
+            "enum": [
+              "boss_fight", "combat", "dialogue", "exploration", "inventory", "map",
+              "multiplayer_lobby", "puzzle", "racing", "settings", "title_screen", "victory"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

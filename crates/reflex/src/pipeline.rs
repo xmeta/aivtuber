@@ -59,6 +59,11 @@ pub struct DecisionReplayRecord {
     pub event_id: String,
     pub request_schema_version: String,
     pub context_schema_version: String,
+    /// The scene snapshot (#88) this decision used, so replay can name it.
+    /// Omitted when no scene source existed, which keeps the record
+    /// byte-identical to one written before scene context existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene: Option<aivtuber_domain::SceneContextSnapshot>,
     pub evidence: DecisionEvidence,
     pub policy: PolicyDecision,
     pub executed: ExecutedDecision,
@@ -209,6 +214,7 @@ impl ReflexPipeline {
             event_id: input.request.event.event_id,
             request_schema_version: input.request.schema_version,
             context_schema_version: input.request.context.schema_version,
+            scene: input.request.context.scene,
             evidence,
             policy,
             executed,
@@ -523,6 +529,103 @@ mod tests {
         .expect("adapter");
         ReflexPipeline::new(index(), adapter, PolicyConfig::default(), 2).expect("pipeline")
     }
+    /// Records the request body Jev would receive.
+    #[derive(Debug, Default)]
+    struct CaptureTransport {
+        bodies: Mutex<Vec<Vec<u8>>>,
+        response: Mutex<Option<HttpResponse>>,
+    }
+
+    impl HttpTransport for CaptureTransport {
+        fn post_json(
+            &self,
+            _endpoint: &str,
+            _bearer_token: &str,
+            body: &[u8],
+            _timeout: Duration,
+        ) -> Result<HttpResponse, TransportError> {
+            self.bodies.lock().expect("bodies").push(body.to_vec());
+            self.response
+                .lock()
+                .expect("response")
+                .take()
+                .ok_or_else(|| TransportError::Unavailable("empty script".to_owned()))
+        }
+    }
+
+    fn run_capturing(request: ReflexRequest) -> (DecisionReplayRecord, String) {
+        let transport = Arc::new(CaptureTransport::default());
+        *transport.response.lock().expect("response") = Some(success(0.94, "asset.a"));
+        let adapter = JevAdapter::with_transport(
+            JevAdapterConfig {
+                deadline: Duration::from_millis(100),
+                initial_backoff: Duration::ZERO,
+                ..JevAdapterConfig::default()
+            },
+            JevApiKey::new("test-key").expect("key"),
+            transport.clone(),
+        )
+        .expect("adapter");
+        let record = ReflexPipeline::new(index(), adapter, PolicyConfig::default(), 2)
+            .expect("pipeline")
+            .run(ReflexPipelineInput {
+                request,
+                query_embedding: vec![1.0, 0.0],
+            })
+            .expect("record");
+        let body = String::from_utf8(transport.bodies.lock().expect("bodies")[0].clone())
+            .expect("utf8 body");
+        (record, body)
+    }
+
+    fn scene_snapshot() -> aivtuber_domain::SceneContextSnapshot {
+        aivtuber_domain::SceneContextSnapshot {
+            schema_version: aivtuber_domain::SCENE_CONTEXT_SCHEMA_VERSION.to_owned(),
+            version: 3,
+            scene_class: aivtuber_domain::SceneClass::Gameplay,
+            labels: vec!["boss_fight".to_owned()],
+            interruptibility: aivtuber_domain::Interruptibility::Unknown,
+            source_rank: aivtuber_domain::SceneSourceRank::Perception,
+            labels_source_rank: aivtuber_domain::SceneSourceRank::Perception,
+            source_ref: Some("game-main".to_owned()),
+            confidence: Some(0.6),
+            calibrated: false,
+            observed_at_ms: 90,
+        }
+    }
+
+    /// #88: the decision names the exact scene snapshot it used, and a request
+    /// with no scene source is byte-identical to what it was before.
+    #[test]
+    fn scene_snapshot_is_sent_and_recorded_only_when_present() {
+        let (plain, plain_body) = run_capturing(request());
+        assert!(plain.scene.is_none());
+        assert!(!plain_body.contains("scene"));
+        assert!(
+            !String::from_utf8(plain.to_json_bytes())
+                .unwrap()
+                .contains("scene")
+        );
+
+        let mut with_scene = request();
+        with_scene.context.scene = Some(scene_snapshot());
+        let (record, body) = run_capturing(with_scene);
+        assert_eq!(record.scene, Some(scene_snapshot()));
+        assert!(body.contains("boss_fight") && body.contains("\"version\":3"));
+        // The scene is data about the screen, never a different decision.
+        assert_eq!(record.policy, plain.policy);
+        assert_eq!(record.executed, plain.executed);
+    }
+
+    #[test]
+    fn an_invalid_scene_snapshot_refuses_the_request() {
+        let mut hostile = request();
+        let mut scene = scene_snapshot();
+        scene.interruptibility = aivtuber_domain::Interruptibility::Uninterruptible;
+        hostile.context.scene = Some(scene);
+        assert!(hostile.validate().is_err(), "perceived interruptibility");
+    }
+
     #[test]
     fn evidence_policy_and_execution_are_recorded_as_separate_stages() {
         let pipeline = pipeline(vec![Ok(success(0.94, "asset.a"))]);
