@@ -41,6 +41,10 @@
 //! no JSON Schema) so it cannot become a second implicit wire contract before
 //! the adapter slice defines one.
 
+use crate::audience::{
+    AudienceConfig, AudienceConfigError, AudienceInput, AudienceSignal, AudienceWindow,
+    GuardReason, plan_audience,
+};
 use aivtuber_domain::{
     EventEnvelope, EventKind, MAX_SNAPSHOT_STRING_BYTES, ReflexContext, SecurityPlane, SourceClass,
 };
@@ -240,6 +244,10 @@ pub enum TerminalOutcome {
     SuppressedActorBatchCap,
     /// Its batch was shed because resolution fell behind.
     ShedPendingOverflow,
+    /// #79: absorbed into the batch's audience signal `signal` (an index
+    /// into [`BatchReplayRecord::audience_signals`]). The cluster's carrier
+    /// stands for the crowd in selection and has its own outcome.
+    RepresentedByAggregate { signal: usize },
 }
 
 impl TerminalOutcome {
@@ -251,6 +259,7 @@ impl TerminalOutcome {
             Self::SuppressedActorCooldown => 3,
             Self::SuppressedActorBatchCap => 4,
             Self::ShedPendingOverflow => 5,
+            Self::RepresentedByAggregate { .. } => 6,
         }
     }
 }
@@ -312,6 +321,10 @@ pub struct RequestCandidate {
     pub sequence: u64,
     pub text: String,
     pub local_score_milli: u16,
+    /// #79: set when this candidate stands for a crowd of that many comments.
+    /// Its `actor_id` is then `None`: a crowd has no single actor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub represents: Option<u32>,
 }
 
 /// Limits the deterministic policy will enforce on whatever comes back.
@@ -427,6 +440,11 @@ pub struct BatchReplayRecord {
     pub selected: Vec<String>,
     /// Every candidate's terminal outcome, in arrival order.
     pub outcomes: Vec<CandidateOutcome>,
+    /// #79: aggregated clusters of this batch. Omitted from the encoding when
+    /// empty, so records of batches without aggregation are byte-identical to
+    /// those produced before aggregation existed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub audience_signals: Vec<AudienceSignal>,
 }
 
 impl BatchReplayRecord {
@@ -448,8 +466,8 @@ pub struct BurstMetrics {
     /// Chat offered into the batching lane (quiet or batched).
     pub admitted: u64,
     /// Terminal outcomes by category: selected, quiet, capacity, cooldown,
-    /// per-batch cap, shed.
-    pub terminal: [u64; 6],
+    /// per-batch cap, shed, represented by aggregate.
+    pub terminal: [u64; 7],
     pub immediate: u64,
     pub refused: u64,
     pub priority_claims_ignored: u64,
@@ -472,6 +490,13 @@ pub struct BurstMetrics {
     /// Observational wall-clock time spent inside rankers.
     pub ranker_wall_us_total: u64,
     pub ranker_wall_us_max: u64,
+    /// #79: signals produced, members they absorbed, carriers that stood for
+    /// them, and candidates the safety guard kept individual (by reason).
+    pub audience_signals: u64,
+    pub audience_members_represented: u64,
+    pub audience_carriers: u64,
+    pub audience_below_threshold: u64,
+    pub audience_guarded: BTreeMap<GuardReason, u64>,
     pub pending_candidates_high_water: usize,
     pub pending_bytes_high_water: usize,
     pub ready_batches_high_water: usize,
@@ -561,6 +586,7 @@ pub struct BurstEngine {
     ready: VecDeque<FlushedBatch>,
     arrivals: VecDeque<u64>,
     cooldowns: BTreeMap<String, u64>,
+    audience: Option<AudienceConfig>,
     next_batch_id: u64,
     last_ms: u64,
     shut_down: bool,
@@ -576,11 +602,26 @@ impl BurstEngine {
             ready: VecDeque::new(),
             arrivals: VecDeque::new(),
             cooldowns: BTreeMap::new(),
+            audience: None,
             next_batch_id: 1,
             last_ms: 0,
             shut_down: false,
             metrics: BurstMetrics::default(),
         })
+    }
+
+    /// Enable (or disable) #79 audience aggregation for batches resolved from
+    /// now on. Off by default: without it resolution is exactly the pre-#79
+    /// behaviour. Quiet chat is never aggregated (nothing waits to be grouped).
+    pub fn set_audience(
+        &mut self,
+        config: Option<AudienceConfig>,
+    ) -> Result<(), AudienceConfigError> {
+        if let Some(config) = &config {
+            config.validate()?;
+        }
+        self.audience = config;
+        Ok(())
     }
 
     pub fn config(&self) -> &BurstConfig {
@@ -857,17 +898,22 @@ impl BurstEngine {
                 ranking_source: RankingSource::Skipped,
                 selected: Vec::new(),
                 outcomes,
+                audience_signals: Vec::new(),
             },
         }
     }
 
-    /// Deterministic order: local score descending, then arrival sequence.
-    fn deterministic_order(candidates: &[BatchCandidate]) -> Vec<usize> {
-        let mut order: Vec<usize> = (0..candidates.len()).collect();
+    /// Deterministic order over `eligible`: effective score descending, then
+    /// arrival sequence.
+    fn deterministic_order(
+        eligible: Vec<usize>,
+        candidates: &[BatchCandidate],
+        scores: &[u16],
+    ) -> Vec<usize> {
+        let mut order = eligible;
         order.sort_by(|&a, &b| {
-            candidates[b]
-                .local_score_milli
-                .cmp(&candidates[a].local_score_milli)
+            scores[b]
+                .cmp(&scores[a])
                 .then(candidates[a].sequence.cmp(&candidates[b].sequence))
                 .then(a.cmp(&b))
         });
@@ -887,10 +933,61 @@ impl BurstEngine {
             flushed_ms,
             candidates,
         } = batch;
-        let order = Self::deterministic_order(&candidates);
+        let mut outcomes: Vec<Option<TerminalOutcome>> = vec![None; candidates.len()];
+        let mut scores: Vec<u16> = candidates
+            .iter()
+            .map(|candidate| candidate.local_score_milli)
+            .collect();
+        let mut crowd: Vec<Option<u32>> = vec![None; candidates.len()];
+
+        // #79: safety guard and aggregation come before ranking. A cluster
+        // becomes one crowd-level candidate (its carrier); the other members
+        // are represented by it and never ranked. Anything the guard flagged
+        // is not in any cluster and is ranked individually as before.
+        let mut audience_signals: Vec<AudienceSignal> = Vec::new();
+        if let Some(config) = self.audience {
+            let inputs: Vec<AudienceInput<'_>> = candidates
+                .iter()
+                .map(|candidate| AudienceInput {
+                    event_id: &candidate.event_id,
+                    actor_id: candidate.actor_id.as_deref(),
+                    arrival_ms: candidate.arrival_ms,
+                    local_score_milli: candidate.local_score_milli,
+                    text: candidate.text(),
+                })
+                .collect();
+            let plan = plan_audience(
+                &inputs,
+                &config,
+                batch_id,
+                AudienceWindow {
+                    start_ms: opened_ms,
+                    end_ms: flushed_ms,
+                },
+            );
+            for (reason, count) in &plan.guarded {
+                *self.metrics.audience_guarded.entry(*reason).or_insert(0) += count;
+            }
+            self.metrics.audience_below_threshold += plan.below_threshold;
+            for (signal, cluster) in plan.clusters.into_iter().enumerate() {
+                scores[cluster.carrier] = cluster.crowd_score_milli;
+                crowd[cluster.carrier] = Some(cluster.signal.count);
+                for &member in cluster.members.iter().filter(|&&m| m != cluster.carrier) {
+                    outcomes[member] = Some(TerminalOutcome::RepresentedByAggregate { signal });
+                }
+                self.metrics.audience_signals += 1;
+                self.metrics.audience_carriers += 1;
+                self.metrics.audience_members_represented += cluster.members.len() as u64 - 1;
+                audience_signals.push(cluster.signal);
+            }
+        }
+
+        let eligible: Vec<usize> = (0..candidates.len())
+            .filter(|&index| outcomes[index].is_none())
+            .collect();
+        let order = Self::deterministic_order(eligible, &candidates, &scores);
         let shortlist_len = order.len().min(self.config.request_candidates);
         let mut shortlist: Vec<usize> = order[..shortlist_len].to_vec();
-        let mut outcomes: Vec<Option<TerminalOutcome>> = vec![None; candidates.len()];
         // Past the request capacity nothing is ever shown to a ranker, so those
         // candidates are decided without it.
         for &index in &order[shortlist_len..] {
@@ -909,10 +1006,15 @@ impl BurstEngine {
                         let candidate = &candidates[index];
                         RequestCandidate {
                             event_id: candidate.event_id.clone(),
-                            actor_id: candidate.actor_id.clone(),
+                            actor_id: if crowd[index].is_some() {
+                                None
+                            } else {
+                                candidate.actor_id.clone()
+                            },
                             sequence: candidate.sequence,
                             text: candidate.text.clone(),
-                            local_score_milli: candidate.local_score_milli,
+                            local_score_milli: scores[index],
+                            represents: crowd[index],
                         }
                     })
                     .collect(),
@@ -970,9 +1072,16 @@ impl BurstEngine {
         let mut per_actor: BTreeMap<&str, usize> = BTreeMap::new();
         for &index in &shortlist {
             let candidate = &candidates[index];
+            // A crowd candidate has no single actor, so fairness (cap and
+            // cooldown) does not apply to it and it stamps no cooldown.
+            let actor = if crowd[index].is_some() {
+                None
+            } else {
+                candidate.actor_id.as_deref()
+            };
             let outcome = if selected.len() >= self.config.top_k {
                 TerminalOutcome::NotSelectedCapacity
-            } else if let Some(actor) = candidate.actor_id.as_deref() {
+            } else if let Some(actor) = actor {
                 let cooling = self.config.actor_cooldown_ms > 0
                     && self
                         .cooldowns
@@ -999,6 +1108,9 @@ impl BurstEngine {
             outcomes[index] = Some(outcome);
         }
         for &index in &selected {
+            if crowd[index].is_some() {
+                continue;
+            }
             if let Some(actor) = candidates[index].actor_id.clone() {
                 self.stamp_cooldown(actor, flushed_ms);
             }
@@ -1027,6 +1139,7 @@ impl BurstEngine {
                     .map(|&index| candidates[index].event_id.clone())
                     .collect(),
                 outcomes: records,
+                audience_signals,
             },
         }
     }

@@ -13,6 +13,7 @@ mod moderation_evidence;
 mod operator_control;
 mod outputs;
 mod pack_readiness;
+mod perception_service;
 mod phrase_commit;
 mod profile;
 mod raw_ingress;
@@ -39,7 +40,8 @@ pub use audio_stop::{AUDIO_STOP_BOUND, AudioStopReport, OperatorStopReport};
 pub use budget::*;
 pub use chat_burst::{
     ChatBurstConfig, ChatBurstConfigError, ChatBurstMetrics, ChatBurstRecord, ChatOutcome,
-    DeferredReplyReport, MAX_CHAT_BURST_RECORDS, MAX_DEFERRED_REPORTS, MAX_REPLY_TTL_MS,
+    DeferredReplyReport, MAX_AUDIENCE_SIGNALS, MAX_CHAT_BURST_RECORDS, MAX_DEFERRED_REPORTS,
+    MAX_REPLY_TTL_MS,
 };
 pub use deadline::*;
 pub use memory_compare::*;
@@ -54,6 +56,7 @@ pub use moderation_evidence::*;
 pub use operator_control::*;
 pub use outputs::*;
 pub use pack_readiness::{PackReadiness, audit as audit_pack_readiness};
+pub use perception_service::*;
 pub use phrase_commit::{
     PHRASE_RESPONSE_RECORDS, PHRASE_START_WAIT, PhraseCause, PhraseCommitRecord, PhraseGateOutcome,
     PhraseMetrics, PhraseMode, PhraseResponseEnd, PhraseResponseRecord,
@@ -1094,6 +1097,8 @@ where
     /// Post-turn memory consolidation (#306); `None` (default) writes nothing.
     memory_writer: Option<memory_writer::MemoryWriter>,
     speech_observations: Option<SpeechObservationTracker>,
+    /// Opt-in live screen perception (#90 S1b); `None` (default) composes nothing.
+    perception: Option<perception_service::PerceptionService>,
     speech_transcripts: Option<SpeechTranscriptTracker>,
     speech_conversation: Option<speech_conversation::SpeechConversation>,
     speech_floor: Option<speech_floor::SpeechFloor>,
@@ -1155,6 +1160,7 @@ where
             adaptation: None,
             memory_writer: None,
             speech_observations: None,
+            perception: None,
             speech_transcripts: None,
             speech_conversation: None,
             speech_floor: None,
@@ -1319,6 +1325,92 @@ where
             }
         }
         self.memory_writer = Some(writer);
+    }
+
+    /// Opt in to live screen perception (#90 S1b). The service starts
+    /// **disabled**; only the authenticated `perception.control` capability can
+    /// turn it on (`apply_perception_control`). Its observations are untrusted
+    /// content-plane data; the service holds no scheduler or output handle.
+    pub fn with_perception(mut self, service: perception_service::PerceptionService) -> Self {
+        self.perception = Some(service);
+        self
+    }
+
+    pub fn perception(&self) -> Option<&perception_service::PerceptionService> {
+        self.perception.as_ref()
+    }
+
+    pub fn perception_mut(&mut self) -> Option<&mut perception_service::PerceptionService> {
+        self.perception.as_mut()
+    }
+
+    /// The yield-gate inputs for perception: whether Thinking is generating, or
+    /// speech (performer playback, a speaking user, a spoken final waiting for
+    /// its answer) is active. Read-only and text-free.
+    pub fn perception_gates(&self) -> aivtuber_runtime::PerceptionGates {
+        let thinking_generating = self
+            .generation_execution_snapshot()
+            .is_some_and(|snapshot| !snapshot.is_quiescent());
+        let speech_active = !self.performer.scheduler().items().is_empty()
+            || self
+                .speech_observations
+                .as_ref()
+                .is_some_and(SpeechObservationTracker::any_speaker_active)
+            || self
+                .speech_transcripts
+                .as_ref()
+                .is_some_and(|tracker| tracker.pending_finals() > 0);
+        aivtuber_runtime::PerceptionGates {
+            thinking_generating,
+            speech_active,
+        }
+    }
+
+    /// Advance perception one loop tick: drain a finished capture into the
+    /// tracker and start the next one if cadence, yield gate and latency probe
+    /// allow. Never blocks (the slow work is on the service's worker thread).
+    /// Call it after the operator control drain so a disable is already in
+    /// effect before the next capture is considered.
+    pub fn service_perception(&mut self, now_ms: u64) {
+        if self.perception.is_none() {
+            return;
+        }
+        let gates = self.perception_gates();
+        if let Some(service) = self.perception.as_mut() {
+            service.service(now_ms, gates);
+        }
+    }
+
+    /// Apply an operator enable/disable of perception. `authority` must be the
+    /// authenticated local ingress capability; anything else is refused and
+    /// counted. Returns a short, text-free outcome for the operator.
+    pub fn apply_perception_control(
+        &mut self,
+        authority: &AuthenticatedControl,
+        enable: bool,
+        now_ms: u64,
+    ) -> Result<&'static str, &'static str> {
+        let Some(service) = self.perception.as_mut() else {
+            return Err("perception is not configured");
+        };
+        let result = if enable {
+            service.enable(authority, now_ms)
+        } else {
+            service.disable(authority)
+        };
+        match result {
+            Ok(()) if enable => Ok("perception enabled (probing)"),
+            Ok(()) => Ok("perception disabled"),
+            Err(aivtuber_runtime::PerceptionGateError::Unauthorized) => {
+                Err("perception control is not authorized")
+            }
+            Err(aivtuber_runtime::PerceptionGateError::NotAllowlisted) => {
+                Err("perception source is not allowlisted")
+            }
+            Err(aivtuber_runtime::PerceptionGateError::CapacityReached) => {
+                Err("perception source capacity reached")
+            }
+        }
     }
 
     /// Opt in to speech observation tracking (#92). Observations are untrusted
@@ -2204,6 +2296,16 @@ where
         self.chat_burst
             .as_mut()
             .map(|lane| lane.take_records(max))
+            .unwrap_or_default()
+    }
+
+    /// Remove and return up to `max` audience signals (#79) produced by
+    /// aggregating batched chat, oldest first. Empty unless
+    /// [`ChatBurstConfig::audience`] is set. Ids and counts only.
+    pub fn take_audience_signals(&mut self, max: usize) -> Vec<aivtuber_reflex::AudienceSignal> {
+        self.chat_burst
+            .as_mut()
+            .map(|lane| lane.take_audience_signals(max))
             .unwrap_or_default()
     }
 
@@ -6878,7 +6980,7 @@ mod tests {
             "an undrained completion must keep the runtime non-quiescent"
         );
         assert!(
-            OperatorStatusSnapshot::from_app(&app).generation_active,
+            OperatorStatusSnapshot::from_app(&app, 0).generation_active,
             "an undrained completion must not report an idle runtime"
         );
         assert!(

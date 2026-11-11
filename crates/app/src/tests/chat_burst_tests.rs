@@ -746,3 +746,188 @@ fn deferred_inbox_capacity_and_actor_caps_bound_a_flood_from_one_viewer() {
     );
     assert_eq!(metrics.invariant_violations, 0);
 }
+
+// ---------------------------------------------------------------------------
+// #79 S1: audience-signal aggregation through the live burst path.
+// ---------------------------------------------------------------------------
+
+fn audience_config() -> ChatBurstConfig {
+    ChatBurstConfig {
+        burst: BurstConfig {
+            burst_enter_count: 2,
+            top_k: 8,
+            max_per_actor: 2,
+            ..BurstConfig::default()
+        },
+        audience: Some(aivtuber_reflex::AudienceConfig::default()),
+        ..config()
+    }
+}
+
+/// One repeated-topic cluster (laughter from five viewers) plus three
+/// outliers: a threat, a scam link and a genuine question.
+fn audience_trace() -> Vec<(u64, EventEnvelope)> {
+    [
+        ("viewer:0", "hello everyone"),
+        ("viewer:1", "草"),
+        ("viewer:2", "ww"),
+        ("viewer:3", "i will find you and kill you"),
+        ("viewer:4", "wwww"),
+        (
+            "viewer:5",
+            "free bitcoin giveaway http://scam.example/claim",
+        ),
+        ("viewer:6", "草草"),
+        ("viewer:7", "how did you beat that boss?"),
+        ("viewer:8", "lol"),
+    ]
+    .iter()
+    .enumerate()
+    .map(|(index, (actor, text))| (index as u64 * 40, chat(index as u64 + 1, actor, text)))
+    .collect()
+}
+
+struct AudienceRun {
+    terminals: BTreeMap<String, Vec<ChatOutcome>>,
+    signals: Vec<aivtuber_reflex::AudienceSignal>,
+    metrics: ChatBurstMetrics,
+}
+
+fn run_audience(cfg: ChatBurstConfig) -> AudienceRun {
+    let mut app = burst_app(cfg);
+    let mut terminals: BTreeMap<String, Vec<ChatOutcome>> = BTreeMap::new();
+    let mut signals = Vec::new();
+    let mut drain = |app: &mut ProductionApp<CyclingRoute>| {
+        for record in app.take_chat_burst_records(usize::MAX) {
+            terminals
+                .entry(record.event_id)
+                .or_default()
+                .push(record.outcome);
+        }
+        signals.extend(app.take_audience_signals(usize::MAX));
+        let _ = app.take_deferred_reply_reports(usize::MAX);
+    };
+    for (at, event) in audience_trace() {
+        send(&mut app, &event, at);
+        app.service_chat_burst(at, at);
+        drain(&mut app);
+    }
+    // Flush the window, let every wait expire, then shut down.
+    for end in [5_000, 200_000] {
+        app.tick(end);
+        app.service_chat_burst(end, end);
+        drain(&mut app);
+    }
+    app.shutdown(200_001);
+    drain(&mut app);
+    let metrics = app.chat_burst_metrics().expect("metrics");
+    AudienceRun {
+        terminals,
+        signals,
+        metrics,
+    }
+}
+
+#[test]
+fn audience_cluster_is_aggregated_while_outliers_keep_their_own_outcome() {
+    let run = run_audience(audience_config());
+    assert_eq!(run.signals.len(), 1, "one repeated-topic cluster");
+    let signal = &run.signals[0];
+    assert_eq!((signal.count, signal.unique_actors_estimate), (5, 5));
+    // evt-2 is the first laughter comment: the carrier of the crowd.
+    assert_eq!(signal.representative_event_ids[0], "evt-2");
+
+    let represented: Vec<&str> = run
+        .terminals
+        .iter()
+        .filter(|(_, outcomes)| outcomes == &&vec![ChatOutcome::RepresentedByAggregate])
+        .map(|(id, _)| id.as_str())
+        .collect();
+    assert_eq!(represented, ["evt-3", "evt-5", "evt-7", "evt-9"]);
+    // Outliers (threat, scam, question) are individual candidates.
+    for id in ["evt-4", "evt-6", "evt-8"] {
+        assert!(
+            !run.terminals[id].contains(&ChatOutcome::RepresentedByAggregate),
+            "{id} must not be absorbed"
+        );
+    }
+    // Exact accounting: every comment that entered the lane ended exactly once.
+    assert_eq!(run.terminals.len(), 9);
+    assert!(run.terminals.values().all(|outcomes| outcomes.len() == 1));
+    let metrics = run.metrics;
+    assert_eq!(metrics.admitted, 9);
+    assert_eq!(metrics.accounted(), metrics.admitted);
+    assert_eq!(metrics.terminal[10], 4);
+    assert_eq!(metrics.audience_members_represented, 4);
+    assert_eq!(metrics.audience_signals, 1);
+    assert_eq!(metrics.audience_guarded, 2, "threat and scam link guarded");
+    assert_eq!(metrics.held, 0);
+    assert_eq!(
+        metrics.invariant_violations + metrics.burst_invariant_violations,
+        0
+    );
+}
+
+#[test]
+fn audience_aggregation_replays_deterministically() {
+    let encode = |run: &AudienceRun| {
+        let terminals = serde_json::to_vec(&run.terminals).expect("terminals");
+        let signals: Vec<String> = run.signals.iter().map(|s| format!("{s:?}")).collect();
+        (terminals, signals)
+    };
+    let first = run_audience(audience_config());
+    let second = run_audience(audience_config());
+    assert_eq!(encode(&first), encode(&second));
+    assert_eq!(first.metrics.terminal, second.metrics.terminal);
+}
+
+#[test]
+fn audience_is_off_by_default_and_changes_nothing() {
+    let off = run_audience(ChatBurstConfig {
+        audience: None,
+        ..audience_config()
+    });
+    assert!(off.signals.is_empty());
+    assert_eq!(off.metrics.terminal[10], 0);
+    assert_eq!(off.metrics.audience_signals, 0);
+    assert!(
+        off.terminals
+            .values()
+            .all(|outcomes| !outcomes.contains(&ChatOutcome::RepresentedByAggregate))
+    );
+    assert_eq!(off.metrics.accounted(), off.metrics.admitted);
+}
+
+#[test]
+fn audience_config_is_validated_never_clamped() {
+    let bad = ChatBurstConfig {
+        audience: Some(aivtuber_reflex::AudienceConfig {
+            min_cluster_size: 1,
+            min_unique_actors: 1,
+        }),
+        ..config()
+    };
+    assert!(bad.validate().is_err());
+}
+
+/// #79: the same 100x burst with audience aggregation on keeps the #75/#78
+/// guarantees (exact accounting, no late reply, operator stop independent).
+#[test]
+fn the_100x_burst_with_audience_aggregation_is_fully_accounted() {
+    let metrics = falsify_burst(
+        ChatBurstConfig {
+            reply_ttl_ms: 4_000,
+            audience: Some(aivtuber_reflex::AudienceConfig::default()),
+            ..config()
+        },
+        Some(400),
+    );
+    assert_eq!(
+        metrics.terminal[10], metrics.audience_members_represented,
+        "represented members are accounted as one more terminal category"
+    );
+    // The scenario events carry an intent but no free text, so there is
+    // nothing to absorb: the guard keeps text-less comments individual.
+    assert_eq!(metrics.audience_signals, 0);
+    assert!(metrics.audience_guarded > 0);
+}

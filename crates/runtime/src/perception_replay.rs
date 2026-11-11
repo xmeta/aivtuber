@@ -310,7 +310,7 @@ mod tests {
             "local-test",
             "operator:test",
             AuthorizationMethod::OperatorHotkey,
-            BTreeSet::from([Capability::ObsControl]),
+            BTreeSet::from([Capability::PerceptionControl]),
             ControlSecret::new(secret),
         )
         .expect("ingress")
@@ -320,7 +320,7 @@ mod tests {
                 correlation_id: "corr-replay".to_owned(),
                 sequence: 1,
                 observed_at: "2026-11-10T00:00:00Z".to_owned(),
-                action: "obs.control".to_owned(),
+                action: "perception.control".to_owned(),
                 payload: BTreeMap::new(),
             },
             &secret,

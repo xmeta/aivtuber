@@ -3,8 +3,10 @@ use crate::{
     ReconnectState, SecretString, TransportError, TungsteniteConnector, WebSocketConnector,
     WebSocketTransport, default_clock, error_breaks_session, receive_text_with_deadline,
 };
+use crate::{ScreenFrame, ScreenImageFormat};
 use aivtuber_domain::{
-    AuthorizedStreamAction, EngineError, EngineErrorKind, EngineFuture, StreamAdapter,
+    AuthenticatedControl, AuthorizedStreamAction, Capability, EngineError, EngineErrorKind,
+    EngineFuture, StreamAdapter,
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -46,6 +48,82 @@ impl fmt::Debug for ObsWebSocketConfig {
             .field("event_subscriptions", &self.event_subscriptions)
             .field("reconnect", &self.reconnect)
             .finish()
+    }
+}
+
+/// The operator's authenticated `perception.control` authority, lent to the
+/// capture session only while perception is enabled. Nothing mints it from
+/// configuration: the service fills it from the authority passed to its
+/// `enable` and empties it on disable, suspend and shutdown.
+pub type CaptureGrant = Arc<Mutex<Option<AuthenticatedControl>>>;
+
+/// One screenshot request (issue #90 S1b). `source_name` is the operator's
+/// real OBS source; the alias the runtime and observations use is separate and
+/// never carries it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObsScreenshotRequest {
+    pub source_name: String,
+    pub format: ScreenImageFormat,
+    /// Downscaled width, asked of OBS so the full-resolution frame is never
+    /// transferred.
+    pub width: u32,
+    pub height: u32,
+    /// obs-websocket `imageCompressionQuality`: -1 for the format default, or
+    /// 0..=100.
+    pub compression_quality: i32,
+}
+
+/// OBS as a [`crate::ScreenFrameSource`]: its own obs-websocket session
+/// (separate from the stream output's, so a slow screenshot never delays a
+/// scene switch) restricted to one allowlisted source. Holds the
+/// `perception.control` authority only while the operator's authenticated
+/// enable has put one in its [`CaptureGrant`]; with an empty grant every
+/// capture is refused.
+pub struct ObsScreenSource {
+    adapter: ObsWebSocketAdapter,
+    grant: CaptureGrant,
+    request: ObsScreenshotRequest,
+}
+
+impl ObsScreenSource {
+    /// The adapter should be configured without event subscriptions
+    /// (`event_subscriptions: Some(0)`): this session only issues requests.
+    pub fn new(
+        adapter: ObsWebSocketAdapter,
+        grant: CaptureGrant,
+        request: ObsScreenshotRequest,
+    ) -> Self {
+        Self {
+            adapter,
+            grant,
+            request,
+        }
+    }
+}
+
+impl fmt::Debug for ObsScreenSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ObsScreenSource")
+            .field("adapter", &self.adapter)
+            .finish_non_exhaustive()
+    }
+}
+
+impl crate::ScreenFrameSource for ObsScreenSource {
+    fn capture(&mut self) -> Result<ScreenFrame, EngineError> {
+        let authority = self
+            .grant
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .ok_or_else(|| {
+                engine_error(
+                    EngineErrorKind::Unauthorized,
+                    "perception capture is not enabled by the operator",
+                )
+            })?;
+        self.adapter
+            .capture_source_screenshot(&authority, &self.request)
     }
 }
 
@@ -132,6 +210,65 @@ impl ObsWebSocketAdapter {
         self.ensure_connected(&mut state)?;
         self.request(&mut state, request_type, request_data)?;
         Ok(())
+    }
+
+    /// Capture one downscaled screenshot of one operator-allowlisted OBS source
+    /// (issue #90 S1b). Needs the authenticated `perception.control`
+    /// capability at the adapter boundary as well as at the runtime gate, so a
+    /// caller holding only `obs.control` (or nothing) cannot read the screen.
+    /// OBS does the downscale (`imageWidth`/`imageHeight`); the frame is
+    /// returned in memory and is never written anywhere by this adapter.
+    pub fn capture_source_screenshot(
+        &self,
+        authority: &AuthenticatedControl,
+        request: &ObsScreenshotRequest,
+    ) -> Result<ScreenFrame, EngineError> {
+        if !authority.has_capability(Capability::PerceptionControl) {
+            return Err(engine_error(
+                EngineErrorKind::Unauthorized,
+                "OBS screenshot requires the perception.control capability",
+            ));
+        }
+        if request.source_name.trim().is_empty() {
+            return Err(engine_error(
+                EngineErrorKind::InvalidRequest,
+                "OBS screenshot requires a source name",
+            ));
+        }
+        if !(8..=4096).contains(&request.width) || !(8..=4096).contains(&request.height) {
+            return Err(engine_error(
+                EngineErrorKind::InvalidRequest,
+                "OBS screenshot size must be 8..=4096 per edge",
+            ));
+        }
+        let mut state = self.lock_state()?;
+        self.ensure_connected(&mut state)?;
+        let data = self.request(
+            &mut state,
+            "GetSourceScreenshot",
+            json!({
+                "sourceName": request.source_name,
+                "imageFormat": request.format.obs_name(),
+                "imageWidth": request.width,
+                "imageHeight": request.height,
+                "imageCompressionQuality": request.compression_quality,
+            }),
+        )?;
+        let image = data
+            .get("imageData")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                engine_error(
+                    EngineErrorKind::Backend,
+                    "OBS screenshot response is missing imageData",
+                )
+            })?;
+        ScreenFrame::from_obs_image_data(
+            image.to_owned(),
+            request.format,
+            request.width,
+            request.height,
+        )
     }
 
     pub fn set_event_subscriptions(&self, subscriptions: u64) -> Result<(), EngineError> {
@@ -1099,5 +1236,123 @@ mod tests {
             })
             .expect("scheduler remains operational");
         assert_eq!(scheduled.generation, 1);
+    }
+
+    fn perception_authority(capability: Capability, action: &str) -> AuthenticatedControl {
+        let secret = [9_u8; 32];
+        LocalControlIngress::new(
+            "local-ui",
+            "operator:local",
+            AuthorizationMethod::OperatorUi,
+            BTreeSet::from([capability]),
+            ControlSecret::new(secret),
+        )
+        .expect("ingress")
+        .authenticate(
+            OperatorCommandInput {
+                event_id: "evt-perception".to_owned(),
+                correlation_id: "corr-perception".to_owned(),
+                sequence: 1,
+                observed_at: "2026-11-10T00:00:00Z".to_owned(),
+                action: action.to_owned(),
+                payload: BTreeMap::new(),
+            },
+            &secret,
+        )
+        .expect("authenticated")
+        .authority()
+        .clone()
+    }
+
+    fn screenshot_request() -> ObsScreenshotRequest {
+        ObsScreenshotRequest {
+            source_name: "Game Capture".to_owned(),
+            format: ScreenImageFormat::Png,
+            width: 768,
+            height: 432,
+            compression_quality: -1,
+        }
+    }
+
+    #[test]
+    fn screenshot_asks_obs_to_downscale_one_named_source() {
+        let screenshot = json!({
+            "op": 7,
+            "d": {
+                "requestType": "GetSourceScreenshot",
+                "requestId": "aivtuber-obs-1",
+                "requestStatus": { "result": true, "code": 100 },
+                "responseData": { "imageData": "data:image/png;base64,iVBORw0KGgo=" }
+            }
+        })
+        .to_string();
+        let script = Script::new(vec![Ok(hello(None)), Ok(identified()), Ok(screenshot)]);
+        let handle = script.handle.clone();
+        let adapter = ObsWebSocketAdapter::with_dependencies(
+            ObsWebSocketConfig {
+                event_subscriptions: Some(0),
+                ..ObsWebSocketConfig::default()
+            },
+            Arc::new(ScriptedConnector::new(vec![Ok(script)])),
+            Arc::new(TestClock::new(0)),
+        )
+        .expect("adapter");
+        let authority = perception_authority(Capability::PerceptionControl, "perception.control");
+        let frame = adapter
+            .capture_source_screenshot(&authority, &screenshot_request())
+            .expect("frame");
+        assert_eq!((frame.width(), frame.height()), (768, 432));
+        let sent = handle.sent();
+        let request: Value = serde_json::from_str(sent.last().expect("request")).expect("json");
+        assert_eq!(request["d"]["requestType"], "GetSourceScreenshot");
+        assert_eq!(request["d"]["requestData"]["sourceName"], "Game Capture");
+        assert_eq!(request["d"]["requestData"]["imageWidth"], 768);
+        assert_eq!(request["d"]["requestData"]["imageFormat"], "png");
+    }
+
+    #[test]
+    fn screenshot_needs_perception_control_not_obs_control() {
+        let adapter = ObsWebSocketAdapter::with_dependencies(
+            config(),
+            Arc::new(ScriptedConnector::new(vec![])),
+            Arc::new(TestClock::new(0)),
+        )
+        .expect("adapter");
+        for (capability, action) in [
+            (Capability::ObsControl, "obs.control"),
+            (Capability::PerformerStop, "performer.stop"),
+        ] {
+            let authority = perception_authority(capability, action);
+            let error = adapter
+                .capture_source_screenshot(&authority, &screenshot_request())
+                .expect_err("refused");
+            assert_eq!(error.kind, EngineErrorKind::Unauthorized);
+        }
+    }
+
+    #[test]
+    fn screenshot_with_a_malformed_response_is_a_backend_error() {
+        let bad = json!({
+            "op": 7,
+            "d": {
+                "requestType": "GetSourceScreenshot",
+                "requestId": "aivtuber-obs-1",
+                "requestStatus": { "result": true, "code": 100 },
+                "responseData": { "imageData": "http://example.test/x.png" }
+            }
+        })
+        .to_string();
+        let script = Script::new(vec![Ok(hello(None)), Ok(identified()), Ok(bad)]);
+        let adapter = ObsWebSocketAdapter::with_dependencies(
+            config(),
+            Arc::new(ScriptedConnector::new(vec![Ok(script)])),
+            Arc::new(TestClock::new(0)),
+        )
+        .expect("adapter");
+        let authority = perception_authority(Capability::PerceptionControl, "perception.control");
+        let error = adapter
+            .capture_source_screenshot(&authority, &screenshot_request())
+            .expect_err("bad image");
+        assert_eq!(error.kind, EngineErrorKind::Backend);
     }
 }

@@ -46,6 +46,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hound",
  "httparse",
+ "icu_normalizer",
  "rig-core",
  "rig-rmcp",
  "rmcp",
@@ -83,6 +84,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tokio",
+ "tungstenite",
  "uuid",
 ]
 

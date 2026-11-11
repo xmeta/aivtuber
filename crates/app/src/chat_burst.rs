@@ -30,7 +30,10 @@
 //!   what is still held, and a violation is counted, never repaired silently.
 
 use aivtuber_domain::{EventEnvelope, ReflexContext};
-use aivtuber_reflex::{BurstConfig, BurstConfigError, BurstEngine, Disposition, TerminalOutcome};
+use aivtuber_reflex::{
+    AudienceConfig, AudienceConfigError, AudienceSignal, BurstConfig, BurstConfigError,
+    BurstEngine, Disposition, TerminalOutcome,
+};
 use aivtuber_scheduler::{
     BusyCause, DeferredConfig, DeferredConfigError, DeferredInbox, DeferredItem, DeferredMetrics,
     DeferredOutcome, DeferredTerminal, ReadyDeferred, ReplyAvailability, ResponseDisposition,
@@ -45,6 +48,8 @@ pub const MAX_REPLY_TTL_MS: u64 = aivtuber_scheduler::MAX_DEFERRED_TTL_MS;
 pub const MAX_CHAT_BURST_RECORDS: usize = 256;
 /// Retained dispatch reports for deferred replies (oldest dropped, counted).
 pub const MAX_DEFERRED_REPORTS: usize = 64;
+/// Retained audience signals (#79; oldest dropped, counted).
+pub const MAX_AUDIENCE_SIGNALS: usize = 64;
 
 /// Operator-facing configuration. Validated, never clamped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +58,9 @@ pub struct ChatBurstConfig {
     pub deferred: DeferredConfig,
     /// How long a selected reply may wait for the performer.
     pub reply_ttl_ms: u64,
+    /// #79: audience-signal aggregation of batched chat. `None` (the default)
+    /// leaves batch resolution exactly as it was.
+    pub audience: Option<AudienceConfig>,
 }
 
 impl Default for ChatBurstConfig {
@@ -61,6 +69,7 @@ impl Default for ChatBurstConfig {
             burst: BurstConfig::default(),
             deferred: DeferredConfig::default(),
             reply_ttl_ms: 20_000,
+            audience: None,
         }
     }
 }
@@ -83,6 +92,12 @@ impl From<BurstConfigError> for ChatBurstConfigError {
     }
 }
 
+impl From<AudienceConfigError> for ChatBurstConfigError {
+    fn from(error: AudienceConfigError) -> Self {
+        Self(error.to_string())
+    }
+}
+
 impl From<DeferredConfigError> for ChatBurstConfigError {
     fn from(error: DeferredConfigError) -> Self {
         Self(error.to_string())
@@ -93,6 +108,9 @@ impl ChatBurstConfig {
     pub fn validate(&self) -> Result<(), ChatBurstConfigError> {
         self.burst.validate()?;
         self.deferred.validate()?;
+        if let Some(audience) = &self.audience {
+            audience.validate()?;
+        }
         if self.reply_ttl_ms == 0 || self.reply_ttl_ms > self.deferred.max_ttl_ms {
             return Err(ChatBurstConfigError(
                 "invalid chat burst configuration: reply_ttl_ms".to_owned(),
@@ -128,12 +146,15 @@ pub enum ChatOutcome {
     /// Selected (or quiet) but already older than the reply time-to-live when
     /// the performer path was reached: never answered late.
     ExpiredBeforeDispatch,
+    /// #79: absorbed into an audience signal; the cluster's carrier comment
+    /// stands for the crowd and has its own outcome.
+    RepresentedByAggregate,
     /// It was deferred and reached the inbox's terminal outcome.
     Deferred(DeferredOutcome),
 }
 
 impl ChatOutcome {
-    const IMMEDIATE_COUNT: usize = 10;
+    const IMMEDIATE_COUNT: usize = 11;
 
     /// Category among the outcomes the lane itself accounts. `Deferred(_)`
     /// outcomes are accounted by the inbox.
@@ -149,6 +170,7 @@ impl ChatOutcome {
             Self::CancelledBeforeSelection => 7,
             Self::ShutdownBeforeSelection => 8,
             Self::ExpiredBeforeDispatch => 9,
+            Self::RepresentedByAggregate => 10,
             Self::Deferred(_) => return None,
         })
     }
@@ -179,7 +201,8 @@ pub struct ChatBurstMetrics {
     pub admitted: u64,
     /// Terminal outcomes the lane accounts itself, indexed like
     /// [`ChatOutcome`] (dispatched now, failed, capacity, cooldown, batch cap,
-    /// shed, erased, cancelled, shutdown, expired before dispatch).
+    /// shed, erased, cancelled, shutdown, expired before dispatch,
+    /// represented by aggregate).
     pub terminal: [u64; ChatOutcome::IMMEDIATE_COUNT],
     /// Not batchable (donation, game event, ...): the unchanged per-event path.
     pub bypassed: u64,
@@ -208,6 +231,14 @@ pub struct ChatBurstMetrics {
     pub burst_batches_flushed: u64,
     pub burst_invariant_violations: u64,
     pub burst_priority_claims_ignored: u64,
+    /// #79 audience aggregation: signals produced, comments they absorbed
+    /// (their terminal outcome is `represented_by_aggregate`), and comments
+    /// the safety guard kept individual.
+    pub audience_signals: u64,
+    pub audience_members_represented: u64,
+    pub audience_guarded: u64,
+    /// Signals dropped because their bounded ring was full.
+    pub audience_signals_dropped: u64,
 }
 
 impl ChatBurstMetrics {
@@ -266,6 +297,7 @@ pub(crate) struct ChatBurstLane {
     metrics: ChatBurstMetrics,
     records: VecDeque<ChatBurstRecord>,
     reports: VecDeque<DeferredReplyReport>,
+    signals: VecDeque<AudienceSignal>,
     last_ms: u64,
 }
 
@@ -308,14 +340,17 @@ pub(crate) fn local_score_milli(text: &str) -> u16 {
 impl ChatBurstLane {
     pub(crate) fn new(config: ChatBurstConfig) -> Result<Self, ChatBurstConfigError> {
         config.validate()?;
+        let mut engine = BurstEngine::new(config.burst)?;
+        engine.set_audience(config.audience)?;
         Ok(Self {
-            engine: BurstEngine::new(config.burst)?,
+            engine,
             held: BTreeMap::new(),
             inbox: DeferredInbox::new(config.deferred)?,
             reply_ttl_ms: config.reply_ttl_ms,
             metrics: ChatBurstMetrics::default(),
             records: VecDeque::new(),
             reports: VecDeque::new(),
+            signals: VecDeque::new(),
             last_ms: 0,
         })
     }
@@ -328,6 +363,9 @@ impl ChatBurstLane {
             burst_batches_flushed: burst.batches_flushed,
             burst_invariant_violations: burst.invariant_violations,
             burst_priority_claims_ignored: burst.priority_claims_ignored,
+            audience_signals: burst.audience_signals,
+            audience_members_represented: burst.audience_members_represented,
+            audience_guarded: burst.audience_guarded.values().sum(),
             ..self.metrics
         }
     }
@@ -340,6 +378,13 @@ impl ChatBurstLane {
     pub(crate) fn take_reports(&mut self, max: usize) -> Vec<DeferredReplyReport> {
         let take = max.min(self.reports.len());
         self.reports.drain(..take).collect()
+    }
+
+    /// Remove and return up to `max` audience signals (#79), oldest first.
+    /// Signals hold ids and counts only, never viewer text.
+    pub(crate) fn take_audience_signals(&mut self, max: usize) -> Vec<AudienceSignal> {
+        let take = max.min(self.signals.len());
+        self.signals.drain(..take).collect()
     }
 
     pub(crate) fn push_report(&mut self, report: DeferredReplyReport) {
@@ -467,6 +512,13 @@ impl ChatBurstLane {
         mut selected: Option<&mut Vec<Candidate>>,
     ) {
         for record in records {
+            for signal in &record.audience_signals {
+                if self.signals.len() >= MAX_AUDIENCE_SIGNALS {
+                    self.signals.pop_front();
+                    self.metrics.audience_signals_dropped += 1;
+                }
+                self.signals.push_back(signal.clone());
+            }
             let order: BTreeMap<&str, usize> = record
                 .selected
                 .iter()
@@ -505,6 +557,9 @@ impl ChatBurstLane {
                     }
                     (_, TerminalOutcome::ShedPendingOverflow) => {
                         Some(ChatOutcome::ShedPendingOverflow)
+                    }
+                    (_, TerminalOutcome::RepresentedByAggregate { .. }) => {
+                        Some(ChatOutcome::RepresentedByAggregate)
                     }
                     // A quiet passthrough is never held, and a selected
                     // comment without its envelope cannot happen: the lane
