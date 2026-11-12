@@ -18,7 +18,8 @@
 
 use aivtuber_domain::{
     DomainValidationError, FallbackTurnSignal, FloorAction, FloorConfig, FloorDecision,
-    FloorHolder, FloorInput, FloorReason, OwnSpeech, TranscriptHold, TurnState, UserSpeechEvidence,
+    FloorHolder, FloorInput, FloorReason, Interruptibility, OwnSpeech, TranscriptHold, TurnState,
+    UserSpeechEvidence,
 };
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -82,6 +83,8 @@ pub struct FloorEvaluation {
 /// Pure floor decision. See the crate-level table in ADR-0005 D2/D3/D5/D6/D7.
 pub fn evaluate(config: &FloorConfig, input: &FloorInput) -> FloorEvaluation {
     let view = user_view(config, input.user.as_ref(), input.now_ms);
+    let take_turn_silence_ms = config.effective_take_turn_silence_ms(input.scene);
+    let barge_in_confirm_ms = config.effective_barge_in_confirm_ms(input.scene);
     let silence_ms = match view {
         UserView::Silent { silence_ms } => Some(silence_ms),
         _ => None,
@@ -90,7 +93,7 @@ pub fn evaluate(config: &FloorConfig, input: &FloorInput) -> FloorEvaluation {
         UserView::Absent | UserView::FeedLost | UserView::LostEdge => TurnState::Idle,
         UserView::Stale => TurnState::UserPaused,
         UserView::Speaking { .. } => TurnState::UserSpeaking,
-        UserView::Silent { silence_ms } if silence_ms >= config.take_turn_silence_ms => {
+        UserView::Silent { silence_ms } if silence_ms >= take_turn_silence_ms => {
             TurnState::UserEnded
         }
         UserView::Silent { .. } => TurnState::UserPaused,
@@ -105,7 +108,7 @@ pub fn evaluate(config: &FloorConfig, input: &FloorInput) -> FloorEvaluation {
 
     if input.own == OwnSpeech::Speaking {
         return match view {
-            UserView::Speaking { run_ms } if run_ms >= config.barge_in_confirm_ms => done(
+            UserView::Speaking { run_ms } if run_ms >= barge_in_confirm_ms => done(
                 FloorAction::Yield,
                 FloorReason::UserBargeInConfirmed,
                 FloorHolder::User,
@@ -151,12 +154,15 @@ pub fn evaluate(config: &FloorConfig, input: &FloorInput) -> FloorEvaluation {
                 FloorHolder::Nobody,
             );
         }
-        UserView::Silent { silence_ms } if silence_ms < config.take_turn_silence_ms => {
-            return done(
-                FloorAction::Wait,
-                FloorReason::SilenceBelowThreshold,
-                FloorHolder::User,
-            );
+        UserView::Silent { silence_ms } if silence_ms < take_turn_silence_ms => {
+            // Past the configured silence but inside the scene's longer one:
+            // the scene, not the user, is what holds the reply back.
+            let reason = if silence_ms >= config.take_turn_silence_ms {
+                FloorReason::SceneProtected
+            } else {
+                FloorReason::SilenceBelowThreshold
+            };
+            return done(FloorAction::Wait, reason, FloorHolder::User);
         }
         _ => {}
     }
@@ -164,6 +170,15 @@ pub fn evaluate(config: &FloorConfig, input: &FloorInput) -> FloorEvaluation {
         return done(
             FloorAction::Wait,
             FloorReason::NoReplyPending,
+            FloorHolder::Nobody,
+        );
+    }
+    if input.scene.get() == Interruptibility::Uninterruptible && !input.reply_inbox {
+        // Nothing downstream would hold the reply: keep it waiting here (it
+        // expires under `max_defer_ms` like any held final, never spoken).
+        return done(
+            FloorAction::Wait,
+            FloorReason::SceneProtected,
             FloorHolder::Nobody,
         );
     }
@@ -248,6 +263,7 @@ impl FloorPolicy {
             holder: evaluation.holder,
             turn: evaluation.turn,
             silence_ms: evaluation.silence_ms,
+            scene: input.scene.get(),
         };
         let m = &mut self.metrics;
         m.decisions += 1;
@@ -312,6 +328,8 @@ mod tests {
             hold: TranscriptHold::None,
             own: OwnSpeech::Idle,
             reply_waiting: true,
+            scene: TrustedInterruptibility::unknown(),
+            reply_inbox: false,
         }
     }
 
@@ -405,6 +423,8 @@ mod tests {
                                 hold,
                                 own,
                                 reply_waiting: false,
+                                scene: TrustedInterruptibility::unknown(),
+                                reply_inbox: false,
                             };
                             assert_ne!(evaluate(&config(), &i).action, FloorAction::TakeTurn);
                         }
@@ -431,6 +451,8 @@ mod tests {
                     hold: TranscriptHold::None,
                     own: OwnSpeech::Idle,
                     reply_waiting: true,
+                    scene: TrustedInterruptibility::unknown(),
+                    reply_inbox: false,
                 };
                 assert_ne!(evaluate(&config(), &i).action, FloorAction::TakeTurn);
             }
@@ -619,5 +641,214 @@ mod tests {
             ),
             (1, 1, 1, 1)
         );
+    }
+
+    // ---- #83 S3b: trusted scene interruptibility -------------------------
+
+    use aivtuber_domain::{
+        SCENE_CONTEXT_SCHEMA_VERSION, SceneClass, SceneContextSnapshot, SceneSourceRank,
+        TrustedInterruptibility,
+    };
+
+    fn snapshot_from(
+        rank: SceneSourceRank,
+        interruptibility: Interruptibility,
+    ) -> SceneContextSnapshot {
+        SceneContextSnapshot {
+            schema_version: SCENE_CONTEXT_SCHEMA_VERSION.to_owned(),
+            version: 1,
+            scene_class: SceneClass::Gameplay,
+            labels: Vec::new(),
+            interruptibility,
+            source_rank: rank,
+            labels_source_rank: SceneSourceRank::None,
+            source_ref: None,
+            confidence: None,
+            calibrated: false,
+            observed_at_ms: 0,
+        }
+    }
+
+    fn scene(interruptibility: Interruptibility) -> TrustedInterruptibility {
+        TrustedInterruptibility::from_snapshot(&snapshot_from(
+            SceneSourceRank::ObsState,
+            interruptibility,
+        ))
+    }
+
+    fn scened(
+        now_ms: u64,
+        user: Option<UserSpeechEvidence>,
+        scene: TrustedInterruptibility,
+        own: OwnSpeech,
+        inbox: bool,
+    ) -> FloorInput {
+        FloorInput {
+            own,
+            scene,
+            reply_inbox: inbox,
+            ..input(now_ms, user)
+        }
+    }
+
+    #[test]
+    fn only_a_trusted_source_yields_a_scene_reading_and_rank_four_is_ignored() {
+        // A rank-4 snapshot that even claims a value (which the snapshot
+        // validation refuses) still produces `unknown`.
+        for rank in [SceneSourceRank::Perception, SceneSourceRank::None] {
+            for claimed in [
+                Interruptibility::Uninterruptible,
+                Interruptibility::Interruptible,
+            ] {
+                let reading = TrustedInterruptibility::from_snapshot(&snapshot_from(rank, claimed));
+                assert_eq!(
+                    reading.get(),
+                    Interruptibility::Unknown,
+                    "{rank:?} {claimed:?}"
+                );
+                // ...so the floor decides exactly as it does with no scene.
+                let user = Some(evidence(SpeakerActivity::Inactive, 0, 800));
+                let with = scened(800, user, reading, OwnSpeech::Idle, false);
+                let without = input(800, user);
+                assert_eq!(evaluate(&config(), &with), evaluate(&config(), &without));
+            }
+        }
+        for rank in [
+            SceneSourceRank::TrustedTelemetry,
+            SceneSourceRank::ObsState,
+            SceneSourceRank::TrustedTimer,
+        ] {
+            let reading = TrustedInterruptibility::from_snapshot(&snapshot_from(
+                rank,
+                Interruptibility::Uninterruptible,
+            ));
+            assert_eq!(reading.get(), Interruptibility::Uninterruptible);
+        }
+    }
+
+    #[test]
+    fn interruptible_unknown_and_missing_scenes_keep_the_default_decisions() {
+        for level in [Interruptibility::Interruptible, Interruptibility::Unknown] {
+            let reading = scene(level);
+            for (now, edge) in [(800, 0), (1_000, 0), (1_500, 1_100)] {
+                for activity in [SpeakerActivity::Inactive, SpeakerActivity::Active] {
+                    let user = Some(evidence(activity, edge, now));
+                    for own in [OwnSpeech::Idle, OwnSpeech::Speaking] {
+                        let with = scened(now, user, reading, own, true);
+                        let mut default = input(now, user);
+                        default.own = own;
+                        assert_eq!(evaluate(&config(), &with), evaluate(&config(), &default));
+                    }
+                }
+            }
+        }
+        let cfg = config();
+        assert_eq!(
+            cfg.effective_take_turn_silence_ms(TrustedInterruptibility::unknown()),
+            cfg.take_turn_silence_ms
+        );
+        assert_eq!(
+            cfg.effective_barge_in_confirm_ms(TrustedInterruptibility::unknown()),
+            cfg.barge_in_confirm_ms
+        );
+    }
+
+    #[test]
+    fn an_uninterruptible_scene_makes_the_performer_slower_to_start() {
+        let protected = scene(Interruptibility::Uninterruptible);
+        // 800 ms of silence takes the turn by default, not in a protected scene.
+        let user = Some(evidence(SpeakerActivity::Inactive, 0, 800));
+        assert_eq!(eval(&input(800, user)).0, FloorAction::TakeTurn);
+        assert_eq!(
+            eval(&scened(800, user, protected, OwnSpeech::Idle, true)),
+            (FloorAction::Wait, FloorReason::SceneProtected)
+        );
+        // At the top of the configured range the turn is handed on when an
+        // inbox exists (which then defers it for the scene).
+        let user = Some(evidence(SpeakerActivity::Inactive, 0, 1_000));
+        assert_eq!(
+            eval(&scened(1_000, user, protected, OwnSpeech::Idle, true)).0,
+            FloorAction::TakeTurn
+        );
+        // Without an inbox the floor itself keeps the reply waiting.
+        assert_eq!(
+            eval(&scened(1_000, user, protected, OwnSpeech::Idle, false)),
+            (FloorAction::Wait, FloorReason::SceneProtected)
+        );
+        // The text-only path (no speech evidence) is held too.
+        assert_eq!(
+            eval(&scened(1_000, None, protected, OwnSpeech::Idle, false)),
+            (FloorAction::Wait, FloorReason::SceneProtected)
+        );
+        // Nothing here can trigger a reply that was not waiting.
+        let mut idle = scened(2_000, None, protected, OwnSpeech::Idle, true);
+        idle.reply_waiting = false;
+        assert_eq!(evaluate(&config(), &idle).action, FloorAction::Wait);
+    }
+
+    #[test]
+    fn an_uninterruptible_scene_makes_barge_in_easier_but_still_confirmed() {
+        let protected = scene(Interruptibility::Uninterruptible);
+        let cfg = config();
+        assert_eq!(cfg.effective_barge_in_confirm_ms(protected), 256);
+        // A 300 ms run over the performer: tentative by default, confirmed here.
+        let user = Some(evidence(SpeakerActivity::Active, 9_700, 10_000));
+        assert_eq!(
+            eval(&scened(
+                10_000,
+                user,
+                TrustedInterruptibility::unknown(),
+                OwnSpeech::Speaking,
+                true
+            ))
+            .0,
+            FloorAction::Hold
+        );
+        assert_eq!(
+            eval(&scened(10_000, user, protected, OwnSpeech::Speaking, true)).0,
+            FloorAction::Yield
+        );
+        // Below the validated minimum run it is still tentative.
+        let user = Some(evidence(SpeakerActivity::Active, 9_800, 10_000));
+        assert_eq!(
+            eval(&scened(10_000, user, protected, OwnSpeech::Speaking, true)).0,
+            FloorAction::Hold
+        );
+        // The scene never raises the confirm run above its configuration.
+        let high = FloorConfig {
+            barge_in_confirm_ms: 800,
+            ..cfg
+        };
+        assert_eq!(high.effective_barge_in_confirm_ms(protected), 400);
+        let low = FloorConfig {
+            barge_in_confirm_ms: 256,
+            ..cfg
+        };
+        assert_eq!(low.effective_barge_in_confirm_ms(protected), 256);
+    }
+
+    #[test]
+    fn scene_modulated_decisions_are_deterministic_and_record_their_input() {
+        let run = || {
+            let mut policy = FloorPolicy::new(config()).expect("policy");
+            let mut out = Vec::new();
+            for (now, level) in [
+                (800, Interruptibility::Uninterruptible),
+                (1_000, Interruptibility::Uninterruptible),
+                (1_100, Interruptibility::Unknown),
+                (1_200, Interruptibility::Interruptible),
+            ] {
+                let user = Some(evidence(SpeakerActivity::Inactive, 0, now));
+                out.push(policy.decide(&scened(now, user, scene(level), OwnSpeech::Idle, true)));
+            }
+            out
+        };
+        let first = run();
+        assert_eq!(first, run());
+        assert_eq!(first[0].scene, Interruptibility::Uninterruptible);
+        assert_eq!(first[0].reason, FloorReason::SceneProtected);
+        assert_eq!(first[2].scene, Interruptibility::Unknown);
+        assert_eq!(first[2].action, FloorAction::TakeTurn);
+        assert_eq!(first[3].scene, Interruptibility::Interruptible);
     }
 }
