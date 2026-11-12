@@ -1033,6 +1033,7 @@ fn scale_offset(offset_ms: u64, speed_factor: f64) -> u64 {
     ((offset_ms as f64) * speed_factor).round() as u64
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_asset<A, V>(
     asset: &PerformanceAsset,
     visemes: Option<&VisemeTrack>,
