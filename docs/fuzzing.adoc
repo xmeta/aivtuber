@@ -179,7 +179,7 @@ All three use the pinned stable toolchain; nightly is needed only to *run* a
 campaign, not to format, lint or audit it. Adding these steps is what caught a
 `bool_assert_comparison` lint in two targets, three missing trailing newlines,
 and — for `cargo deny` — the `NCSA` license that `libfuzzer-sys` requires,
-now recorded as a documented entry in `deny.toml`.
+now recorded as a scoped exception for `libfuzzer-sys` in `deny.toml` (not a global allowance, #349).
 
 The `cargo deny` step matters because the exclusion has a supply-chain cost
 too. `fuzz/Cargo.lock` is a second lock file, and without this step every CI job

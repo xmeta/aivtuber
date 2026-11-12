@@ -7,40 +7,52 @@ is identified by its SHA-256 in packaging/local-profile-pins.json, and the files
 are identified by SHA-256 in crates/adapters/src/speech_stt/pins.rs.
 
 sherpa-onnx C API (sherpa-onnx-c-api.dll / libsherpa-onnx-c-api.so)
-  Project:   https://github.com/k2-fsa/sherpa-onnx
-  Licence:   Apache License 2.0 (the full text is in THIRD-PARTY-LICENSES-RUST.html,
-             under the sherpa-onnx crate entry)
+  Project:   https://github.com/k2-fsa/sherpa-onnx (tag v2.0.1)
+  Licence:   Apache License 2.0 (full text below)
   Copyright: the sherpa-onnx authors (k2-fsa)
 
-ONNX Runtime (onnxruntime.dll / libonnxruntime.so, onnxruntime_providers_shared.dll)
-  Project:   https://github.com/microsoft/onnxruntime
-  Licence:   MIT
+  The library statically contains the following components. The versions are
+  the ones sherpa-onnx v2.0.1 downloads in its cmake/*.cmake files; the licence
+  text of each is reproduced below, taken from the upstream tag or commit named
+  in the "Source:" line above that text.
+    kaldi-native-fbank 1.22.4         Apache-2.0
+    kaldi-decoder 0.3.0               Apache-2.0
+    OpenFst 1.8.5-2026-07-09          Apache-2.0
+    simple-sentencepiece (ssentencepiece) 0.7   Apache-2.0
+    utf8proc 2.12.0                   MIT (with Unicode data licences)
+    Eigen 5.0.1                       MPL-2.0 (plus BSD, Apache-2.0 and
+                                      MINPACK parts; see the Eigen texts)
+  Eigen is a header-only library that sherpa-onnx sources include
+  (sherpa-onnx/csrc/math.h). It is listed here although it could not be
+  confirmed from the published sources whether the shipped binaries still
+  contain compiled Eigen code.
 
-    Copyright (c) Microsoft Corporation
+ONNX Runtime 1.28.2 (onnxruntime.dll / libonnxruntime.so,
+onnxruntime_providers_shared.dll)
+  Project:   https://github.com/microsoft/onnxruntime (tag v1.28.2)
+  Licence:   MIT (text below)
+  Copyright: Microsoft Corporation
+  The version is the one sherpa-onnx v2.0.1 downloads for linux-x64 and
+  win-x64 (cmake/onnxruntime-linux-x86_64.cmake and onnxruntime-win-x64.cmake).
+  ONNX Runtime bundles further third-party components (BSD-3-Clause,
+  Apache-2.0, MIT and other licences, and Eigen under MPL-2.0). Their notices
+  are ONNX Runtime's own ThirdPartyNotices.txt of that tag, reproduced in full
+  below.
 
-    Permission is hereby granted, free of charge, to any person obtaining a
-    copy of this software and associated documentation files (the "Software"),
-    to deal in the Software without restriction, including without limitation
-    the rights to use, copy, modify, merge, publish, distribute, sublicense,
-    and/or sell copies of the Software, and to permit persons to whom the
-    Software is furnished to do so, subject to the following conditions:
-
-    The above copyright notice and this permission notice shall be included in
-    all copies or substantial portions of the Software.
-
-    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-    DEALINGS IN THE SOFTWARE.
-
-  ONNX Runtime builds statically include further open-source components under
-  their own permissive licences. Their notices are published upstream with the
-  ONNX Runtime release that the sherpa-onnx archive was built from
-  (ThirdPartyNotices.txt in https://github.com/microsoft/onnxruntime).
+Eigen (MPL-2.0) source code
+  The Eigen sources that correspond to the Eigen code in these libraries are
+  available at no charge from the upstream projects, as MPL-2.0 section 3.2
+  requires:
+    Eigen 5.0.1 (used by sherpa-onnx):
+      https://gitlab.com/libeigen/eigen/-/archive/5.0.1/eigen-5.0.1.tar.gz
+      (commit bc3b39870ecb690a623a3f49149a358b95c5781d)
+    Eigen as pinned by ONNX Runtime 1.28.2 (cmake/deps.txt of that tag):
+      https://github.com/eigen-mirror/eigen/archive/1d8b82b0740839c0de7f1242a3585e3390ff5f33/eigen-1d8b82b0740839c0de7f1242a3585e3390ff5f33.zip
+  The libraries are redistributed unmodified; this archive contains no Eigen
+  source and no modification of Eigen.
 
 No model weights are bundled. The licences of the models you fetch separately
 are listed in docs/local-profile-quickstart.adoc, section "Licences, credits
 and what you must disclose".
+
+The licence and notice texts follow, each introduced by a line "==== <file> ====".

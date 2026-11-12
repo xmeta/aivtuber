@@ -17,14 +17,12 @@ ignore = [
 # This section is considered when running `cargo deny check licenses`.
 [licenses]
 version = 2
-# Permissive licenses only. Copyleft (GPL/AGPL) is not allowed; LGPL-2.1 in
-# r-efi and CDLA-Permissive-2.0 in webpki-roots are documented exceptions
-# below until the crates drop out of the graph.
-#
-# NCSA arrives only via libfuzzer-sys, which is reachable solely from the
-# excluded fuzz/ crate (issue #146). It is OSI-approved and required by the
-# libFuzzer runtime, so there is no action to take; the entry exists so the
-# fuzz lock file can pass the same license gate as the workspace lock file.
+# Permissive licenses only. Copyleft (GPL/AGPL/LGPL) is not allowed.
+# CDLA-Permissive-2.0 (webpki-roots) is a documented permissive addition until
+# that crate drops out of the graph. r-efi is "MIT OR Apache-2.0 OR
+# LGPL-2.1-or-later": the OR is satisfied by MIT, so LGPL stays out (issue #349).
+# NCSA (libfuzzer-sys, excluded fuzz/ crate only, issue #146) is a scoped
+# exception below, not a global allowance.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -37,8 +35,6 @@ allow = [
     "Unlicense",
     "Unicode-3.0",
     "CDLA-Permissive-2.0",
-    "LGPL-2.1-or-later",
-    "NCSA",
 ]
 confidence-threshold = 0.8
 
@@ -60,6 +56,14 @@ allow = ["bzip2-1.0.6"]
 [[licenses.exceptions]]
 crate = "ppmd-rust@1.5.2"
 allow = ["MIT-0"]
+
+# libfuzzer-sys is "(MIT OR Apache-2.0) AND NCSA" and is reachable only from the
+# excluded fuzz/ crate (issue #146), which CI gates with
+# `cargo deny --manifest-path fuzz/Cargo.toml --locked check`. The default
+# workspace graph does not contain it, so this reports as unused there.
+[[licenses.exceptions]]
+crate = "libfuzzer-sys@0.4.13"
+allow = ["NCSA"]
 
 [licenses.private]
 # Workspace crates are internal and not published; skip their license check.
