@@ -1,0 +1,171 @@
+= EXP-0005: Streamed against buffered phrase mode on a real llama-server (#83 S3c)
+
+:toc:
+:toclevels: 2
+
+This is a durable experiment record in the link:README.adoc[Durable Experiment Records] format.
+It is the measurement that #83 S2 (#303) left open: the streaming default was held at off because streamed phrase mode had been verified against a stub SSE server only.
+Test code only (an `#[ignore]` manual test in `crates/app/src/tests/streaming_thinking_tests.rs`); no model, binary or prompt file is committed.
+
+== 1. Record
+
+[source,text]
+----
+Decision question:
+  Should AIVTUBER_THINKING_STREAM default to on for the `local` profile?
+
+Context / baseline:
+  #303 measured time to first audio against a scripted SSE stub (25 ms per 3-character delta, stub TTS):
+  p50 634 ms buffered phrase mode, 387 ms streamed. The stub has a made-up token cadence and cannot show SSE
+  parse problems, so the default stayed off until one run against the real server.
+
+Hypothesis / expected outcome:
+  Streamed reaches the first committed phrase sooner whenever the reply has more than one phrase, and is no worse
+  for a one-phrase reply. Expected gain on this hardware: well under the stub's 250 ms, because replies are short (a guess
+  before the run).
+
+Guardrails:
+  Loopback only; the pinned llama.cpp and model only (SHA-256 verified); no unpinned artifact; invented or
+  repository-fixture text only; nothing committed except the test and this record.
+
+Decision-changing evidence:
+  Time to first committed phrase and time to first audio, p50, p90 and max, streamed against buffered, on the real
+  server; every reply ending Completed with no stream failure or fallback; the same phrases from both modes.
+
+Cheapest informative test:
+  Both modes against one llama-server, 50 prompts, alternating which mode runs first.
+
+Dataset/workload:
+  A: the 50 REPLIES lines of examples/benchmarks/tts/corpus.py, sent as viewer chat lines (language ja). They are
+     short VTuber-style sentences, so the model answers in one or two phrases (median 20 characters).
+  B: 20 open-ended Japanese requests written for this record ("explain", "list", "tell me about ..."), to see the
+     multi-phrase regime (median 52 characters, up to 6 phrases). Not committed: the lines are listed in section 3.
+
+Commit/base/head:
+  origin/main at 7c97306c (#353) plus the test added by this branch.
+
+Profile/config fingerprint:
+  llama.cpp b12224 Vulkan (win32-x64-vulkan pin), gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf (pin, SHA-256 verified by
+  scripts/fetch-local-profile.mjs), alias gemma-4-e4b-it-qat, flags
+  `-c 4096 --reasoning off -ngl 99 --temp 0 --seed 42 --host 127.0.0.1`; the other flags are llama-server's
+  defaults (8 CPU threads, 4 slots, flash attention off on this Vulkan device). The app side is the real local-profile
+  composition (real OpenAI-compatible adapter, gate, phrase pipeline, scheduler), AIVTUBER_OPENAI_MAX_OUTPUT_TOKENS
+  96, StreamLimits and StreamPolicy defaults, phrase mode with the default PhraseConfig. TTS is the fixed-latency stub
+  used by the #303 test (40 ms + 4 ms per character).
+
+Seed:
+  llama.cpp seed 42, temperature 0 (the profile sets neither: the adapter sends no sampling parameters, so these are
+  server defaults set for repeatability; see section 4 for what they did and did not give).
+
+Toolchain:
+  cargo test --locked, a DEBUG (unoptimized) build of the app crate.
+
+Other relevant environment:
+  AMD Ryzen 7 3700X (8 cores, 16 logical), NVIDIA GeForce RTX 2070 SUPER 8 GB, all layers on the GPU through Vulkan,
+  Windows 11, other desktop software resident (6.3 GB of the GPU in use in total with the model loaded). 2026-11-13, one machine.
+
+Confirmatory criteria (supervisor, issue #83 S3c):
+  Default on for `local` only if streamed is better at p50 and p90 with no correctness issue; otherwise keep off.
+
+Actual:
+  Sections 2 and 3. Streamed was not slower at p50, p90 or max in any of the four runs. For one-phrase replies the
+  difference is a few milliseconds (noise); for multi-phrase replies it is about 200 ms at p50 and p90. 140 replies per
+  mode finished Completed, with no stream failure, no SSE parse error and no fallback.
+
+Expected-vs-actual difference:
+  The gain is smaller than the stub's (250 ms) on short replies and about equal on longer ones (202 ms at p50 against
+  the stub's 247 ms).
+
+Likely explanation:
+  The real model produces a short reply in 300 to 400 ms, so when the whole reply is one phrase there is nothing to
+  overlap; when there are several phrases, buffered waits for all of them.
+
+Decision:
+  Keep (the change): default on for the `local` profile.
+
+Follow-up / owning issue:
+  #83 (remaining: #84 continuity, #58 wiring).
+
+Revisit condition:
+  A different local model or server, a GPU-less host, a real TTS in the loop, or a stream failure seen in the field.
+----
+
+== 2. Result summary
+
+* *Workload A (50 short replies), two runs.* Time to first committed phrase, p50 / p90 / max in milliseconds:
+  buffered 335 / 432 / 541 and 343 / 484 / 546; streamed 317 / 376 / 458 and 335 / 417 / 507.
+  Streamed is lower in every cell, by 8 to 18 ms at p50 and 56 to 67 ms at p90, but 32 of the 50 replies are a single phrase,
+  where the two paths should be equal (paired median difference over the 50 prompts: 4.5 ms; streamed ahead in 30 pairs, behind in 19). Treat the p50 as a tie and the p90 and max as small and unproven.
+* *Workload B (20 open-ended requests), two runs.* Buffered 595 / 743 / 1,286 and 577 / 716 / 1,609 ms; streamed 393 / 502 / 558 and 394 / 474 / 574 ms.
+  That is 183 to 202 ms at p50 and 241 to 242 ms at p90, and the worst buffered replies (1.3 to 1.6 s) are streamed at about 0.6 s.
+  Paired over the 20 prompts: median 152.5 ms in favour of streaming, 16 wins and 4 losses.
+* *Correctness.* All 280 runs (2 modes x 70 prompts x 2 runs) ended `Completed`, with no `stream_failed`, no fallback and no
+  SSE parse error; llama-server logged no error from the app. Where the two modes returned the same text, the committed phrase lists were identical:
+  45 of 50 prompts in A and 15 of 20 in B, in both runs.
+* *The recommendation* is in section 5.
+
+== 3. Method and numbers
+
+`aivtuber-app` has a manual test, `real_llama_server_time_to_first_audio_buffered_against_streamed`, `#[ignore]`d so CI never runs it:
+
+[source,sh]
+----
+llama-server -m gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf --host 127.0.0.1 --port 18080 \
+  --alias gemma-4-e4b-it-qat -c 4096 --reasoning off -ngl 99 --temp 0 --seed 42
+AIVTUBER_TTFA_PROMPTS=prompts.json AIVTUBER_TTFA_OUT=samples.json \
+  cargo test --locked -p aivtuber-app --lib real_llama_server -- --ignored --nocapture
+----
+
+`AIVTUBER_TTFA_PROMPTS` is a JSON array of at least 20 strings, `AIVTUBER_TTFA_ENDPOINT` and `AIVTUBER_TTFA_MODEL` override the loopback endpoint and the alias, and `AIVTUBER_TTFA_OUT` writes every sample.
+Each prompt is sent through the real local composition (`process_content_bytes`, the generative runtime, the OpenAI-compatible adapter with the real SSE parser, the gate and the phrase pipeline, the scheduler).
+For each prompt the test runs buffered phrase mode and streamed phrase mode, alternating which goes first, one unmeasured warm-up request first.
+It records:
+
+* *first commit*: from the submission to the first phrase reaching synthesis (the first phrase has been gated and committed to TTS). This does not depend on any TTS;
+* *first audio*: the same plus the stub TTS (40 ms plus 4 ms per character) and the dispatch of the audio command, using the real elapsed time as the scheduler clock;
+* how the reply ended, the fallback counts and the phrases the TTS received.
+
+TTS: the local Supertonic sidecar was *not* run (it needs the sherpa-onnx libraries, the voice model and a speech-feature build); the stub means "first audio" here is first commit plus about 100 ms (stub synthesis of one phrase and dispatch), not a real synthesis time.
+Real synthesis would add the same time to both modes, so it does not change the difference; the first-commit numbers are the TTS-independent figure.
+
+Workload B prompts (written for this record, sent as given): 自己紹介をしてもらえますか？好きなことも詳しく教えてください。 / 今日の配信では何をする予定なのか、順番に説明してほしいです。 / 最近ハマっているゲームについて、どこが面白いのか語ってください。 / 初見なんですが、このチャンネルの楽しみ方を教えてください。 / 休日はどんなふうに過ごしているのか、一日の流れを聞きたいな。 / 好きな食べ物とその理由をいくつか挙げて、それぞれ説明してください。 / 配信を始めたきっかけと、今までで一番嬉しかった出来事を教えて。 / おすすめのゲームを三つ、理由つきで紹介してほしいです。 / 雨の日の過ごし方について、アイデアをたくさん出してください。 / ゲームが上達するコツを、初心者向けにやさしく教えてほしい。 / 今年やりたいことを、目標として順番に話してください。 / 眠れない夜にどうしているか、具体的に教えてもらえますか？ / もし一日だけ好きな場所に行けるなら、どこで何をしたいですか？ / 配信中に失敗してしまった話を、できるだけ詳しく聞かせてください。 / 好きな音楽のジャンルと、おすすめの曲についてお話しください。 / リスナーの皆さんに伝えたいことを、まとめて話してもらえますか？ / 家で簡単に作れる料理を、手順といっしょに教えてください。 / 緊張したときの落ち着き方を、いくつかのコツに分けて教えて。 / このあとの配信の流れと、最後にやる企画について説明してください。 / 一年前と今で変わったところを、いくつか比べて話してほしいです。
+
+[cols="3,2,2,2,2,2,2",options="header"]
+|===
+|Workload, run (n per mode) |Mode |First commit p50 |p90 |max |First audio p50 / p90 |max
+
+|A, run 1 (50) |buffered |335 |432 |541 |442 / 561 |623
+|A, run 1 (50) |streamed |317 |376 |458 |418 / 484 |600
+|A, run 2 (50) |buffered |343 |484 |546 |447 / 610 |640
+|A, run 2 (50) |streamed |335 |417 |507 |434 / 521 |622
+|B, run 1 (20) |buffered |595 |743 |1,286 |719 / 872 |1,392
+|B, run 1 (20) |streamed |393 |502 |558 |508 / 677 |727
+|B, run 2 (20) |buffered |577 |716 |1,609 |721 / 859 |1,715
+|B, run 2 (20) |streamed |394 |474 |574 |507 / 641 |754
+|===
+
+All values in milliseconds, nearest-rank percentiles.
+Phrases per reply: A has 32 one-phrase and 18 two-phrase replies; B has between 1 and 6 (4, 8, 5, 2 and 1 replies with 1, 2, 3, 4 and 6 phrases in run 1).
+
+== 4. Limits
+
+* *One machine, one model, two runs per workload*, with other desktop software resident on the GPU. The p90 of 50 samples is the fifth worst; the p50 of workload A is inside the run-to-run spread (335 against 343 ms buffered).
+* *The app is a debug build*, which adds a little to both modes equally; the model and the network path dominate.
+* *Repeatability is only partial.* `--temp 0 --seed 42` did not make the replies identical across the two modes: in 5 of 50 (A) and 5 of 20 (B) prompts the two modes wrote different text (identical prompt, second request reuses the cached prompt, and Vulkan arithmetic is not bit-stable across a cache hit). Different text means different phrase boundaries, so only the pairs with equal text prove that the incremental cut equals the buffered cut; those pairs (45 and 15) all match, and the incremental segmenter is separately tested against the buffered one for every chunk size (#303). The latency comparison does not depend on the text being equal, only the cut check does.
+* *Prompt cache.* The second mode to run a prompt hits the server's prompt cache for a few prompt tokens; alternating the order balances that: first-run against second-run medians differ by 4 to 30 ms in both modes, and in no consistent direction (buffered ran slower when first in A and faster when first in B).
+* *Workload A is not chat.* Its lines are VTuber-style replies reused as viewer lines (no committed fixture holds 20 Japanese viewer comments); workload B is invented for this record and written to elicit several phrases. Real streams sit somewhere between: the quickstart's median reply is 50 characters (workload B), a short answer to a one-line comment is 20 (workload A).
+* *No real TTS and no audio device.* Time to first sound in a real run adds synthesis of phrase 0 and the player start, equal in both modes.
+* *No other model or host.* A CPU-only llama-server, which generates more slowly, should favour streaming more (more time to overlap); this was not measured.
+* *The stream gate is not free of a policy difference.* Streaming has no whole-reply gate before phrase 0; the cumulative-prefix gate from #83 S3a stands in for it from phrase 1. That is a property of the feature, not of the measurement, and is why the default stays off outside `local` (docs/security-threat-model.adoc 11.2).
+
+== 5. Recommendation and decision
+
+Streamed phrase mode is not slower than buffered at p50, p90 or max in any of the four runs, is clearly faster when the reply has several phrases (about 200 ms at p50 and p90, and the 1.3 to 1.6 s buffered tail is gone), is a tie for one-phrase replies, and showed no correctness problem in 140 replies per mode (all Completed, no fallback, no parse error, equal phrases for equal text).
+That meets the supervisor's criterion, so this record makes `AIVTUBER_THINKING_STREAM` default to *on for the `local` profile*, while replies are phrased, and keeps it off for every other profile:
+
+* code: `CompositionProfile::thinking_stream_by_default` (true for `local`), used by the app when the variable is unset; `AIVTUBER_PHRASE_MODE=buffered` on `local` still gives buffered replies without an error, and an explicit `AIVTUBER_THINKING_STREAM=on` with buffered replies is still a startup error;
+* `aivtuber-setup local` writes `AIVTUBER_THINKING_STREAM=on` for the pinned llama-server with the default model, and `off` for `--llm-endpoint` and for the perception profile, whose server and model were not measured (a server that does not stream would otherwise turn every reply into a fallback until the line is removed);
+* docs/production-runtime.adoc and docs/local-profile-quickstart.adoc say so.
+
+The gain on one-phrase replies is not a reason by itself; the reason is the multi-phrase tail and the absence of any regression or failure.
+Revisit if a field stream failure is reported (`phrase_response` ending `stream_failed`), or after a measurement with the real TTS, a CPU-only host or another model.

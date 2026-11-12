@@ -131,12 +131,19 @@ fn serve(reply: Reply, connections: usize) -> String {
 struct DelayTts {
     texts: Arc<Mutex<Vec<String>>>,
     calls: Arc<AtomicUsize>,
+    /// When the first phrase reached synthesis: the TTS-independent half of
+    /// time to first audio (#83 S3c).
+    first_call: Arc<Mutex<Option<Instant>>>,
 }
 
 impl TtsEngine for DelayTts {
     fn synthesize<'a>(&'a self, request: &'a SpeechRequest) -> EngineFuture<'a, SpeechArtifact> {
         let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.texts.lock().unwrap().push(request.text.clone());
+        self.first_call
+            .lock()
+            .unwrap()
+            .get_or_insert_with(Instant::now);
         let chars = request.text.chars().count() as u64;
         std::thread::sleep(Duration::from_millis(40 + 4 * chars));
         Box::pin(async move {
@@ -164,6 +171,7 @@ impl TtsEngine for DelayTts {
 struct Run {
     rig: LocalRig,
     texts: Arc<Mutex<Vec<String>>>,
+    first_tts_call: Arc<Mutex<Option<Instant>>>,
     started: Instant,
 }
 
@@ -191,15 +199,18 @@ fn rig_with_secrets(endpoint: String, streaming: bool, secrets: &[&str]) -> Run 
         config.stream = Some(StreamPolicy::default());
     }
     let texts = Arc::new(Mutex::new(Vec::new()));
+    let first_tts_call = Arc::new(Mutex::new(None));
     let tts = DelayTts {
         texts: Arc::clone(&texts),
         calls: Arc::new(AtomicUsize::new(0)),
+        first_call: Arc::clone(&first_tts_call),
     };
     let rig =
         local_rig_with_engines_and_secrets(thinking, tts, PhraseMode::Phrased(config), secrets);
     Run {
         rig,
         texts,
+        first_tts_call,
         started: Instant::now(),
     }
 }
@@ -458,4 +469,212 @@ fn a_clean_streamed_reply_gets_one_agreeing_whole_reply_audit() {
     assert_eq!(metrics.stream_whole_reply_gate_audits, 1);
     assert_eq!(metrics.stream_whole_reply_gate_rejected_after_commit, 0);
     assert_eq!(metrics.stream_cumulative_gate_rejected, 0);
+}
+
+// --- #83 S3c: the same measurement against a real llama-server ---------
+
+/// One measured reply against a real server.
+struct Sample {
+    first_commit_ms: Option<u128>,
+    first_audio_ms: Option<u128>,
+    end: String,
+    phrases: Vec<String>,
+}
+
+fn real_server_sample(
+    endpoint: &str,
+    model: &str,
+    streaming: bool,
+    prompt: &str,
+    n: u64,
+) -> Sample {
+    let mut thinking = OpenAiResponsesAdapter::with_authentication(
+        OpenAiResponsesConfig {
+            endpoint: endpoint.to_owned(),
+            model_alias: model.to_owned(),
+            timeout: Duration::from_secs(60),
+            max_output_tokens: 96,
+            ..OpenAiResponsesConfig::default()
+        },
+        aivtuber_adapters::ThinkingAuthentication::UnauthenticatedLoopback,
+    )
+    .expect("loopback adapter")
+    .with_backend_name("llama-server");
+    let mut config = PhraseConfig::default();
+    if streaming {
+        thinking = thinking
+            .with_streaming(StreamLimits::default())
+            .expect("stream limits");
+        config.stream = Some(StreamPolicy::default());
+    }
+    let texts = Arc::new(Mutex::new(Vec::new()));
+    let first_call = Arc::new(Mutex::new(None));
+    let tts = DelayTts {
+        texts: Arc::clone(&texts),
+        calls: Arc::new(AtomicUsize::new(0)),
+        first_call: Arc::clone(&first_call),
+    };
+    let rig = local_rig_with_engines_and_secrets(thinking, tts, PhraseMode::Phrased(config), &[]);
+    let mut run = Run {
+        rig,
+        texts,
+        first_tts_call: first_call,
+        started: Instant::now(),
+    };
+    let mut event = chat_event(n);
+    event.payload = BTreeMap::from([
+        ("text".to_owned(), json!(prompt)),
+        ("language".to_owned(), json!("ja")),
+    ]);
+    let raw = serde_json::to_vec(&event).expect("event json");
+    run.started = Instant::now();
+    run.rig
+        .app
+        .process_content_bytes(&raw, 0, n)
+        .expect("generation submission");
+    let started = run.started;
+    let mut first_audio_ms = None;
+    drive(&mut run, Duration::from_secs(90), |rig| {
+        if first_audio_ms.is_none() && !rig.audio.lock().unwrap().is_empty() {
+            first_audio_ms = Some(started.elapsed().as_millis());
+        }
+        !rig.app.recent_phrase_responses().is_empty()
+    });
+    let end = run
+        .rig
+        .app
+        .recent_phrase_responses()
+        .first()
+        .map(|record| format!("{:?}", record.end))
+        .unwrap_or_else(|| "no_record".to_owned());
+    let fallbacks = run.rig.app.generation_fallback_counts().by_reason.clone();
+    let end = if fallbacks.is_empty() {
+        end
+    } else {
+        format!("{end} fallback={fallbacks:?}")
+    };
+    let first_commit_ms = run
+        .first_tts_call
+        .lock()
+        .unwrap()
+        .map(|at| at.duration_since(started).as_millis());
+    let phrases = run.texts.lock().unwrap().clone();
+    Sample {
+        first_commit_ms,
+        first_audio_ms,
+        end,
+        phrases,
+    }
+}
+
+fn percentile(sorted: &[u128], q: f64) -> u128 {
+    // Nearest rank.
+    let rank = ((q * sorted.len() as f64).ceil() as usize).clamp(1, sorted.len());
+    sorted[rank - 1]
+}
+
+fn summarize(label: &str, mut values: Vec<u128>) {
+    values.sort_unstable();
+    if values.is_empty() {
+        eprintln!("  {label}: no samples");
+        return;
+    }
+    eprintln!(
+        "  {label}: n={} p50 {} ms, p90 {} ms, max {} ms",
+        values.len(),
+        percentile(&values, 0.5),
+        percentile(&values, 0.9),
+        values[values.len() - 1]
+    );
+}
+
+/// Manual measurement (#83 S3c), never run in CI. Needs a loopback
+/// llama-server and a JSON array of viewer lines:
+///
+///   AIVTUBER_TTFA_ENDPOINT   default http://127.0.0.1:18080/v1/responses
+///   AIVTUBER_TTFA_MODEL      default gemma-4-e4b-it-qat (the server alias)
+///   AIVTUBER_TTFA_PROMPTS    path to the JSON array of strings (required)
+///   AIVTUBER_TTFA_OUT        optional path for the raw samples as JSON
+///
+/// `cargo test --locked -p aivtuber-app --lib real_llama_server -- --ignored --nocapture`
+///
+/// Each prompt runs in both modes, the order alternating per prompt so the
+/// server's prompt cache favours neither. TTS is the fixed-latency stub, so
+/// "first commit" (first phrase reaching synthesis) is the TTS-independent
+/// figure and "first audio" adds the stub's 40 ms + 4 ms per character.
+#[test]
+#[ignore = "needs a running loopback llama-server; manual measurement for #83 S3c"]
+fn real_llama_server_time_to_first_audio_buffered_against_streamed() {
+    let endpoint = std::env::var("AIVTUBER_TTFA_ENDPOINT")
+        .unwrap_or_else(|_| "http://127.0.0.1:18080/v1/responses".to_owned());
+    let model =
+        std::env::var("AIVTUBER_TTFA_MODEL").unwrap_or_else(|_| "gemma-4-e4b-it-qat".to_owned());
+    let path = std::env::var("AIVTUBER_TTFA_PROMPTS").expect("AIVTUBER_TTFA_PROMPTS");
+    let prompts: Vec<String> =
+        serde_json::from_slice(&std::fs::read(path).expect("prompts file")).expect("prompts json");
+    assert!(prompts.len() >= 20, "at least 20 prompts");
+
+    // Load the weights and warm the shared prefix; not measured.
+    let _ = real_server_sample(&endpoint, &model, false, &prompts[0], 1);
+
+    let mut raw = Vec::new();
+    // (first commit, first audio, end) per run.
+    let mut buffered = Vec::new();
+    let mut streamed = Vec::new();
+    for (index, prompt) in prompts.iter().enumerate() {
+        let order = if index % 2 == 0 {
+            [false, true]
+        } else {
+            [true, false]
+        };
+        let mut pair = Vec::new();
+        for (slot, streaming) in order.into_iter().enumerate() {
+            let n = 100 + (index * 2 + slot) as u64;
+            let sample = real_server_sample(&endpoint, &model, streaming, prompt, n);
+            eprintln!(
+                "RUN {index:02} {} commit {:?} audio {:?} end {} phrases {:?}",
+                if streaming { "streamed " } else { "buffered " },
+                sample.first_commit_ms,
+                sample.first_audio_ms,
+                sample.end,
+                sample.phrases
+            );
+            pair.push((streaming, sample));
+        }
+        let identical = pair[0].1.phrases == pair[1].1.phrases;
+        for (streaming, sample) in pair {
+            raw.push(json!({
+                "prompt_index": index,
+                "mode": if streaming { "streamed" } else { "buffered" },
+                "first_commit_ms": sample.first_commit_ms,
+                "first_audio_ms": sample.first_audio_ms,
+                "end": sample.end,
+                "phrases": sample.phrases,
+                "phrases_identical_across_modes": identical,
+            }));
+            let target = if streaming {
+                &mut streamed
+            } else {
+                &mut buffered
+            };
+            target.push((sample.first_commit_ms, sample.first_audio_ms, sample.end));
+        }
+    }
+    eprintln!(
+        "MEASUREMENT real llama-server, {} prompts per mode",
+        prompts.len()
+    );
+    for (label, samples) in [("buffered", &buffered), ("streamed", &streamed)] {
+        eprintln!("{label}:");
+        summarize("first commit", samples.iter().filter_map(|s| s.0).collect());
+        summarize("first audio", samples.iter().filter_map(|s| s.1).collect());
+        let bad = samples
+            .iter()
+            .filter(|s| !s.2.starts_with("Completed") || s.2.contains("fallback"))
+            .count();
+        eprintln!("  replies not ending Completed (or with a fallback): {bad}");
+    }
+    if let Ok(out) = std::env::var("AIVTUBER_TTFA_OUT") {
+        std::fs::write(out, serde_json::to_vec_pretty(&raw).unwrap()).expect("write samples");
+    }
 }
