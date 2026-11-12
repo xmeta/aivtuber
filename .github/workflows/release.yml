@@ -146,13 +146,24 @@ jobs:
           -o "$RUNNER_TEMP/third-party-rust.html"
           packaging/about.hbs
 
+      # The pinned llama.cpp Windows build imports the Visual C++ runtime and
+      # does not ship it; a clean Windows has none. The DLLs come from the
+      # runner's own Visual Studio redistributable folder (vswhere), no download,
+      # and ship app-local in runtime/msvc (docs/supply-chain.adoc section 11).
+      - name: Collect the Visual C++ runtime DLLs (Windows)
+        if: runner.os == 'Windows'
+        run: node scripts/collect-msvc-runtime.mjs "$RUNNER_TEMP/msvc-runtime"
+
       - name: Assemble the archive
-        run: >
-          node scripts/package-release.mjs
-          --version "$RELEASE_VERSION"
-          --out "$RUNNER_TEMP/out"
-          --sherpa-archive-dir "$RUNNER_TEMP/sherpa-onnx"
-          --rust-notices "$RUNNER_TEMP/third-party-rust.html"
+        run: |
+          extra=()
+          if [ "$RUNNER_OS" = "Windows" ]; then extra=(--msvc-runtime-dir "$RUNNER_TEMP/msvc-runtime"); fi
+          node scripts/package-release.mjs \
+            --version "$RELEASE_VERSION" \
+            --out "$RUNNER_TEMP/out" \
+            --sherpa-archive-dir "$RUNNER_TEMP/sherpa-onnx" \
+            --rust-notices "$RUNNER_TEMP/third-party-rust.html" \
+            "${extra[@]}"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -189,6 +200,7 @@ jobs:
           sparse-checkout: |
             scripts/smoke-release-archive.mjs
             scripts/pe-imports.mjs
+            packaging/local-profile-pins.json
           sparse-checkout-cone-mode: false
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4

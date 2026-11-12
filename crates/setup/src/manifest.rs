@@ -42,6 +42,8 @@ pub struct Asset {
 pub struct Llama {
     pub tag: String,
     pub licence: String,
+    /// Visual C++ runtime DLLs the Windows zips import but do not ship.
+    pub windows_runtime_dlls: Vec<String>,
     /// Keyed `<platform>-<arch>-<flavor>`, for example `win32-x64-vulkan`.
     pub assets: BTreeMap<String, Asset>,
 }
@@ -225,6 +227,10 @@ mod tests {
         }
         for a in m.llama.assets.values() {
             assert!(a.max_extracted_bytes.is_some(), "{}", a.file);
+        }
+        assert!(!m.llama.windows_runtime_dlls.is_empty());
+        for d in &m.llama.windows_runtime_dlls {
+            assert!(d.ends_with(".dll") && !d.contains(['/', '\\']), "{d}");
         }
     }
 
