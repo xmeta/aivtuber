@@ -38,6 +38,7 @@ fn request() -> AudioPlayRequest {
     AudioPlayRequest {
         audio_ref: "audio://clip.opus".to_owned(),
         speed_factor: 1.0,
+        continuation: false,
     }
 }
 
@@ -112,7 +113,7 @@ fn the_default_stop_is_unsupported() {
 
 /// Native backend fade (Windows, `native-audio-spike`): needs a real output
 /// device, so it is opt-in (`--ignored`). Plays 2 s of silent PCM.
-#[cfg(all(windows, feature = "native-audio-spike"))]
+#[cfg(feature = "native-audio-spike")]
 #[test]
 #[ignore = "needs a default audio output device"]
 fn the_native_backend_fades_and_returns_at_once() {
@@ -141,6 +142,7 @@ fn the_native_backend_fades_and_returns_at_once() {
             .play(&AudioPlayRequest {
                 audio_ref: "audio://silence.wav".to_owned(),
                 speed_factor: 1.0,
+                continuation: false,
             })
             .expect("play")
     };

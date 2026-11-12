@@ -7,6 +7,8 @@
 //! for replay after a disconnect, and secrets use redacted debug output.
 
 mod audio;
+#[cfg(feature = "gapless-queue")]
+mod audio_native;
 mod hindsight;
 mod http;
 mod local_avatar;
@@ -25,6 +27,8 @@ mod vts;
 mod youtube_chat;
 
 pub use audio::*;
+#[cfg(feature = "gapless-queue")]
+pub use audio_native::*;
 pub use hindsight::*;
 pub use http::*;
 pub use local_avatar::*;

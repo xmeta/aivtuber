@@ -6,11 +6,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-#[cfg(all(windows, feature = "native-audio-spike"))]
-use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player};
-#[cfg(all(windows, feature = "native-audio-spike"))]
-use std::fs::File;
-
 const AUDIO_SCHEME: &str = "audio://";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +37,10 @@ impl Default for ProcessAudioConfig {
 pub struct AudioPlayRequest {
     pub audio_ref: String,
     pub speed_factor: f64,
+    /// A later phrase of a reply that is already playing (#83 S3d). A backend
+    /// that queues gaplessly appends it behind the audio in flight; every
+    /// other backend treats it like any other request.
+    pub continuation: bool,
 }
 
 /// Largest fade a stop request may ask for (ADR-0005 S-3).
@@ -71,6 +70,15 @@ pub trait AudioPlayer: Send + Sync {
     fn stop(&self, fade_ms: u32) -> Result<AudioStopOutcome, EngineError> {
         let _ = fade_ms;
         Ok(AudioStopOutcome::Unsupported)
+    }
+
+    /// Whether this backend can be handed a continuation phrase *before* the
+    /// previous one has ended and then start it sample-exactly behind it
+    /// (#83 S3d). Only then may the app release continuation commands a short
+    /// lookahead early. The default is `false`: the command is handed over at
+    /// its logical start, as for the process player.
+    fn supports_gapless_queue(&self) -> bool {
+        false
     }
 }
 
@@ -245,144 +253,10 @@ fn reap(mut child: Child) {
     });
 }
 
-#[cfg(all(windows, feature = "native-audio-spike"))]
-pub struct RodioAudioPlayer {
-    root: PathBuf,
-    _stream: MixerDeviceSink,
-    current: Mutex<Option<Player>>,
-}
-
-#[cfg(all(windows, feature = "native-audio-spike"))]
-impl std::fmt::Debug for RodioAudioPlayer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RodioAudioPlayer")
-            .field("root", &self.root)
-            .finish_non_exhaustive()
-    }
-}
-
-#[cfg(all(windows, feature = "native-audio-spike"))]
-impl RodioAudioPlayer {
-    pub fn new(root: impl Into<PathBuf>) -> Result<Self, EngineError> {
-        let root = root.into();
-        if root.as_os_str().is_empty() {
-            return Err(engine_error(
-                EngineErrorKind::InvalidRequest,
-                "audio root must not be empty",
-            ));
-        }
-        let stream = DeviceSinkBuilder::open_default_sink().map_err(|error| {
-            engine_error(
-                EngineErrorKind::Unavailable,
-                format!("failed to open default native audio stream: {error}"),
-            )
-        })?;
-        Ok(Self {
-            root,
-            _stream: stream,
-            current: Mutex::new(None),
-        })
-    }
-
-    pub fn resolve_reference(&self, audio_ref: &str) -> Result<PathBuf, EngineError> {
-        resolve_audio_reference(&self.root, audio_ref)
-    }
-
-    pub fn stop(&self) {
-        if let Ok(mut current) = self.current.lock()
-            && let Some(sink) = current.take()
-        {
-            sink.stop();
-        }
-    }
-
-    pub fn is_idle(&self) -> bool {
-        self.current
-            .lock()
-            .map(|current| current.as_ref().is_none_or(Player::empty))
-            .unwrap_or(true)
-    }
-}
-
-#[cfg(all(windows, feature = "native-audio-spike"))]
-impl AudioPlayer for RodioAudioPlayer {
-    fn play(&self, request: &AudioPlayRequest) -> Result<(), EngineError> {
-        if !request.speed_factor.is_finite() || request.speed_factor <= 0.0 {
-            return Err(engine_error(
-                EngineErrorKind::InvalidRequest,
-                "audio speed_factor must be finite and positive",
-            ));
-        }
-        let candidate = self.resolve_reference(&request.audio_ref)?;
-        let path = validate_audio_path(&self.root, &candidate)?;
-        let file = File::open(&path).map_err(|error| {
-            engine_error(
-                EngineErrorKind::Unavailable,
-                format!("failed to open native audio file: {error}"),
-            )
-        })?;
-        let source = Decoder::try_from(file).map_err(|error| {
-            engine_error(
-                EngineErrorKind::InvalidRequest,
-                format!("failed to decode native audio file: {error}"),
-            )
-        })?;
-        let sink = Player::connect_new(self._stream.mixer());
-        sink.set_speed((1.0 / request.speed_factor) as f32);
-        sink.append(source);
-
-        let mut current = self.current.lock().map_err(|_| {
-            engine_error(
-                EngineErrorKind::Unavailable,
-                "native audio state lock was poisoned",
-            )
-        })?;
-        if let Some(previous) = current.replace(sink) {
-            previous.stop();
-        }
-        Ok(())
-    }
-
-    /// A real fade: the volume ramps linearly to zero in 10 ms steps on a
-    /// short-lived thread, then the player stops. The call returns at once;
-    /// a new `play` is independent of the fading player.
-    fn stop(&self, fade_ms: u32) -> Result<AudioStopOutcome, EngineError> {
-        let player = {
-            let mut current = self.current.lock().map_err(|_| {
-                engine_error(
-                    EngineErrorKind::Unavailable,
-                    "native audio state lock was poisoned",
-                )
-            })?;
-            current.take()
-        };
-        let Some(player) = player else {
-            return Ok(AudioStopOutcome::NothingPlaying);
-        };
-        if player.empty() {
-            player.stop();
-            return Ok(AudioStopOutcome::NothingPlaying);
-        }
-        let fade_ms = fade_ms.min(MAX_AUDIO_STOP_FADE_MS);
-        if fade_ms == 0 {
-            player.stop();
-            return Ok(AudioStopOutcome::HardStopped);
-        }
-        thread::spawn(move || {
-            const STEP_MS: u32 = 10;
-            let steps = (fade_ms / STEP_MS).max(1);
-            let start = player.volume();
-            for step in 1..=steps {
-                thread::sleep(Duration::from_millis(u64::from(fade_ms / steps)));
-                player.set_volume(start * (1.0 - step as f32 / steps as f32));
-            }
-            player.stop();
-        });
-        Ok(AudioStopOutcome::Faded { fade_ms })
-    }
-}
-
-fn resolve_audio_reference(root: &Path, audio_ref: &str) -> Result<PathBuf, EngineError> {
+pub(crate) fn resolve_audio_reference(
+    root: &Path,
+    audio_ref: &str,
+) -> Result<PathBuf, EngineError> {
     let relative = audio_ref.strip_prefix(AUDIO_SCHEME).ok_or_else(|| {
         engine_error(
             EngineErrorKind::InvalidRequest,
@@ -412,7 +286,7 @@ fn resolve_audio_reference(root: &Path, audio_ref: &str) -> Result<PathBuf, Engi
     Ok(root.join(relative_path))
 }
 
-fn validate_audio_path(root: &Path, path: &Path) -> Result<PathBuf, EngineError> {
+pub(crate) fn validate_audio_path(root: &Path, path: &Path) -> Result<PathBuf, EngineError> {
     let root = root.canonicalize().map_err(|error| {
         engine_error(
             EngineErrorKind::Unavailable,
@@ -440,7 +314,7 @@ fn validate_audio_path(root: &Path, path: &Path) -> Result<PathBuf, EngineError>
     Ok(resolved)
 }
 
-fn engine_error(kind: EngineErrorKind, message: impl Into<String>) -> EngineError {
+pub(crate) fn engine_error(kind: EngineErrorKind, message: impl Into<String>) -> EngineError {
     EngineError::new(kind, message)
 }
 

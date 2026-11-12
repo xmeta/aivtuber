@@ -329,6 +329,7 @@ fn websocket_and_audio_faults_are_independent() {
         .play(&AudioPlayRequest {
             audio_ref: "audio://missing.opus".to_owned(),
             speed_factor: 1.0,
+            continuation: false,
         })
         .expect_err("audio unavailable");
     assert_eq!(error.kind, EngineErrorKind::Unavailable);
