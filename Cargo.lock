@@ -22,7 +22,7 @@ dependencies = [
 
 [[package]]
 name = "aivtuber-adaptation"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aivtuber-asset-store",
  "aivtuber-domain",
@@ -37,7 +37,7 @@ dependencies = [
 
 [[package]]
 name = "aivtuber-adapters"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aivtuber-domain",
  "aivtuber-scheduler",
@@ -66,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "aivtuber-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aivtuber-adaptation",
  "aivtuber-adapters",
@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "aivtuber-asset-store"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "aivtuber-domain"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -106,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "aivtuber-generative"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aivtuber-asset-store",
  "aivtuber-domain",
@@ -119,7 +119,7 @@ dependencies = [
 
 [[package]]
 name = "aivtuber-hardening"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aivtuber-adaptation",
  "aivtuber-adapters",
@@ -135,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "aivtuber-reflex"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aivtuber-domain",
  "serde",
@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "aivtuber-runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aivtuber-asset-store",
  "aivtuber-domain",
@@ -159,7 +159,7 @@ dependencies = [
 
 [[package]]
 name = "aivtuber-scheduler"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aivtuber-domain",
  "proptest",
@@ -169,7 +169,7 @@ dependencies = [
 
 [[package]]
 name = "aivtuber-setup"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aivtuber-adapters",
  "aivtuber-domain",
@@ -188,7 +188,7 @@ dependencies = [
 
 [[package]]
 name = "aivtuber-telemetry"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aivtuber-domain",
  "serde",
