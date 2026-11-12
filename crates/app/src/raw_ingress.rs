@@ -115,6 +115,8 @@ impl std::error::Error for RawIngressError {
     }
 }
 
+const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+
 enum BoundedRecord {
     Eof,
     Record(Vec<u8>),
@@ -133,6 +135,7 @@ pub fn pump_bounded_records<R: BufRead>(
     metrics: &RawIngressMetrics,
 ) -> Result<RawIngressExit, RawIngressError> {
     config.validate()?;
+    let mut first_record = true;
 
     loop {
         let record = match read_bounded_record(&mut reader, config.max_record_bytes, metrics) {
@@ -143,6 +146,7 @@ pub fn pump_bounded_records<R: BufRead>(
             }
         };
 
+        let is_first = std::mem::take(&mut first_record);
         match record {
             BoundedRecord::Eof => return Ok(RawIngressExit::Eof),
             BoundedRecord::Oversized => {
@@ -151,20 +155,27 @@ pub fn pump_bounded_records<R: BufRead>(
                     .dropped_oversize
                     .fetch_add(1, Ordering::Relaxed);
             }
-            BoundedRecord::Record(record) => match sender.try_send(record) {
-                Ok(()) => {
-                    metrics.state.enqueued.fetch_add(1, Ordering::Relaxed);
+            BoundedRecord::Record(mut record) => {
+                // Windows PowerShell 5.1 pipes start with a UTF-8 BOM. Drop
+                // exactly one, and only on the stream's first record.
+                if is_first && record.starts_with(UTF8_BOM) {
+                    record.drain(..UTF8_BOM.len());
                 }
-                Err(TrySendError::Full(_)) => {
-                    metrics
-                        .state
-                        .dropped_queue_full
-                        .fetch_add(1, Ordering::Relaxed);
+                match sender.try_send(record) {
+                    Ok(()) => {
+                        metrics.state.enqueued.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(TrySendError::Full(_)) => {
+                        metrics
+                            .state
+                            .dropped_queue_full
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        return Ok(RawIngressExit::ReceiverDisconnected);
+                    }
                 }
-                Err(TrySendError::Disconnected(_)) => {
-                    return Ok(RawIngressExit::ReceiverDisconnected);
-                }
-            },
+            }
         }
     }
 }
@@ -279,6 +290,44 @@ mod tests {
         assert_eq!(snapshot.enqueued, 2);
         assert_eq!(snapshot.dropped_queue_full, 2);
         assert_eq!(snapshot.dropped_oversize, 0);
+    }
+
+    #[test]
+    fn exactly_one_leading_bom_is_stripped_from_the_first_record_only() {
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let metrics = RawIngressMetrics::default();
+        let mut input = b"\xef\xbb\xbf{\"a\":1}\n".to_vec();
+        input.extend_from_slice(b"\xef\xbb\xbf{\"b\":2}\n\xef\xbb\xbf\xef\xbb\xbf{}\n");
+
+        pump_bounded_records(
+            BufReader::new(Cursor::new(input)),
+            &sender,
+            config(64, 8),
+            &metrics,
+        )
+        .expect("pump");
+        drop(sender);
+
+        assert_eq!(
+            receiver.into_iter().collect::<Vec<_>>(),
+            vec![
+                b"{\"a\":1}".to_vec(),
+                b"\xef\xbb\xbf{\"b\":2}".to_vec(),
+                b"\xef\xbb\xbf\xef\xbb\xbf{}".to_vec(),
+            ]
+        );
+
+        // A double BOM on the first record loses just one.
+        let (sender, receiver) = mpsc::sync_channel(2);
+        pump_bounded_records(
+            BufReader::new(Cursor::new(b"\xef\xbb\xbf\xef\xbb\xbfx\n".to_vec())),
+            &sender,
+            config(64, 2),
+            &RawIngressMetrics::default(),
+        )
+        .expect("pump");
+        drop(sender);
+        assert_eq!(receiver.recv().unwrap(), b"\xef\xbb\xbfx".to_vec());
     }
 
     #[test]

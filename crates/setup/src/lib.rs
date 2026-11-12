@@ -11,6 +11,7 @@
 //! shared with the Node fetch scripts.
 
 pub mod audio;
+pub mod chat;
 pub mod config;
 pub mod download;
 pub mod extract;

@@ -11,6 +11,7 @@ description = "First-run setup command for the local profile (issue #294 S2): ve
 # adds no new package to the supply-chain gate. See docs/supply-chain.adoc
 # section 11.
 [dependencies]
+aivtuber-domain = { path = "../domain" }
 bzip2 = "0.6.1"
 clap = { version = "4.6.7", features = ["derive"] }
 flate2 = "1.1"

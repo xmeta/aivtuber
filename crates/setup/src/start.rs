@@ -3,7 +3,8 @@
 //!
 //! It starts llama-server on loopback, waits for `/health`, then runs
 //! `aivtuber-app` with the env file's variables in the foreground (chat is read
-//! from this terminal's stdin, exactly as when the app is started by hand), and
+//! from this terminal's stdin and forwarded: plain text is wrapped as untrusted
+//! public chat, envelope JSON lines pass through), and
 //! stops llama-server when the app exits.
 
 use crate::config::{LLAMA_ALIAS, LLAMA_DEFAULT_CONTEXT, parse_env};
@@ -195,12 +196,8 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
         }
     }
     let Llm::Managed(llama) = llm else {
-        println!("starting the app (type chat lines here; Ctrl+C stops it)");
-        let status = Command::new(&app)
-            .envs(env.iter())
-            .status()
-            .map_err(|e| format!("cannot start {}: {e}", app.display()))?;
-        return Ok(status.code().unwrap_or(1));
+        println!("starting the app ({CHAT_HINT}; Ctrl+C stops it)");
+        return run_app(&app, &env);
     };
     if port_in_use(llama.port) {
         return Err(format!(
@@ -245,13 +242,37 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
         std::thread::sleep(Duration::from_millis(500));
     }
     let _guard = KillOnDrop(child);
-    println!(
-        "llama-server ready; starting the app (type chat lines here; Ctrl+C stops everything)"
-    );
-    let status = Command::new(&app)
+    println!("llama-server ready; starting the app ({CHAT_HINT}; Ctrl+C stops everything)");
+    run_app(&app, &env)
+}
+
+const CHAT_HINT: &str = "type chat as plain text, or paste Event Envelope JSON lines";
+
+/// Runs the app in the foreground with its stdin fed from this terminal through
+/// the plain-text wrapper (see `chat`). EOF here closes the app's stdin, which
+/// is its clean-shutdown signal, exactly as before.
+fn run_app(app: &Path, env: &BTreeMap<String, String>) -> Result<i32, String> {
+    let mut child = Command::new(app)
         .envs(env.iter())
-        .status()
+        .stdin(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("cannot start {}: {e}", app.display()))?;
+    if let Some(mut app_stdin) = child.stdin.take() {
+        // Detached on purpose: it blocks on the terminal read and ends with
+        // this process once the app has exited.
+        std::thread::spawn(move || {
+            let mut wrapper = crate::chat::ChatWrapper::new();
+            crate::chat::pump(
+                std::io::stdin().lock(),
+                &mut app_stdin,
+                std::io::stderr(),
+                &mut wrapper,
+            );
+        });
+    }
+    let status = child
+        .wait()
+        .map_err(|e| format!("waiting for {}: {e}", app.display()))?;
     Ok(status.code().unwrap_or(1))
 }
 

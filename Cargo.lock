@@ -172,6 +172,7 @@ name = "aivtuber-setup"
 version = "0.1.0"
 dependencies = [
  "aivtuber-adapters",
+ "aivtuber-domain",
  "bzip2 0.6.1",
  "clap",
  "flate2",
