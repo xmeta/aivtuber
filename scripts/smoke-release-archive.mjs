@@ -10,6 +10,10 @@
 //     built with the static CRT and the bundled engine DLLs are the "MT" build
 //     (a CI runner has the runtime installed, so imports are checked, not
 //     whether the program runs);
+//   * on Windows, runtime/msvc holds the Visual C++ DLLs that the pinned
+//     llama.cpp build imports and does not ship (the list is in
+//     packaging/local-profile-pins.json); they are excluded from the scan above
+//     because they sit outside the top directory;
 //   * every program starts and answers its probe (usage / --help), which also
 //     shows the loader found the bundled engine libraries beside it;
 //   * the STT worker and the TTS sidecar verify the bundled engine libraries
@@ -21,11 +25,13 @@
 //     the network or writing a file.
 // Exit 0 when all pass, 1 otherwise. Runs on Windows x64 and Linux x64.
 import { spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, appendFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, appendFileSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { peImports } from "./pe-imports.mjs";
 
+const scriptDir = dirname(fileURLToPath(import.meta.url));
 const archive = process.argv[2] ? resolve(process.argv[2]) : null;
 if (!archive || !existsSync(archive)) {
   console.error("usage: node scripts/smoke-release-archive.mjs <archive.zip|archive.tar.gz>");
@@ -116,6 +122,28 @@ try {
       assert(scanned >= programs.length + libs.length, `scanned only ${scanned} files`);
       assert(bad.length === 0, `needs a runtime a clean Windows lacks: ${bad.join("; ")}`);
       return `${scanned} files scanned`;
+    });
+  }
+
+  // The llama.cpp zip that setup fetches imports these and does not ship them
+  // (found by scanning every .exe/.dll of both pinned Windows zips with
+  // pe-imports.mjs); the archive carries them app-local in runtime/msvc and
+  // setup copies them beside llama-server. The list is the pins file's.
+  if (win) {
+    check("runtime/msvc holds the Visual C++ DLLs the pinned llama.cpp build needs", () => {
+      const pins = JSON.parse(readFileSync(join(scriptDir, "..", "packaging", "local-profile-pins.json"), "utf8"));
+      const needed = pins.llama.windows_runtime_dlls;
+      assert(Array.isArray(needed) && needed.length > 0, "pins file lists no windows_runtime_dlls");
+      const dir = join(root, "runtime", "msvc");
+      for (const name of [...needed, "REDIST-VERSION.txt"]) {
+        assert(existsSync(join(dir, name)), `runtime/msvc/${name} missing`);
+      }
+      for (const name of needed) {
+        assert(statSync(join(dir, name)).size > 10_000, `runtime/msvc/${name} is implausibly small`);
+        peImports(join(dir, name)); // throws unless it is a real x64 PE file
+      }
+      assert(/redist \d+\.\d+\.\d+/.test(readFileSync(join(dir, "REDIST-VERSION.txt"), "utf8")), "REDIST-VERSION.txt records no version");
+      return needed.join(", ");
     });
   }
 

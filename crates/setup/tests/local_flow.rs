@@ -142,7 +142,7 @@ fn fixture(tag: &str, evil_llama: bool) -> Fixture {
     let asset = |file: &str, path: &str, d: &[u8]| serde_json::json!({"file": file, "url": u(path), "sha256": sha256_hex(d), "size": d.len(), "max_extracted_bytes": 1_000_000});
     let manifest_json = serde_json::json!({
         "schema": "local-profile-pins/1",
-        "llama": {"tag": "btest", "licence": "MIT", "assets": { format!("{platform}-cpu"): asset(llama_name, &format!("/{llama_name}"), &llama_bytes) }},
+        "llama": {"tag": "btest", "licence": "MIT", "windows_runtime_dlls": ["vca140.dll", "vcb140.dll"], "assets": { format!("{platform}-cpu"): asset(llama_name, &format!("/{llama_name}"), &llama_bytes) }},
         "llm": asset("m.gguf", "/m.gguf", &gguf),
         "profiles": {
             "default": {"description": "text", "alias": "text-model", "model_version": "Q4", "context": 4096},
@@ -657,4 +657,74 @@ fn a_source_checkout_uses_the_programs_of_a_target_directory() {
         err.contains("not a built checkout") && err.contains("source checkout"),
         "{err}"
     );
+}
+
+/// The Windows llama.cpp zip does not ship the Visual C++ runtime; the release
+/// archive does, in runtime/msvc, and setup places it beside llama-server.
+fn bundle_runtime(f: &Fixture, names: &[&str]) {
+    let rt = f.root.join("runtime").join("msvc");
+    fs::create_dir_all(&rt).unwrap();
+    for n in names {
+        fs::write(rt.join(n), n.as_bytes()).unwrap();
+    }
+}
+
+#[test]
+fn the_bundled_vc_runtime_is_placed_beside_llama_server_on_windows() {
+    if platform() != "win32-x64" {
+        return;
+    }
+    let f = fixture("flow-vcrt", false);
+    bundle_runtime(&f, &["vca140.dll", "vcb140.dll"]);
+    let o = options(&f);
+    let (r, out) = go(&f, &o);
+    r.unwrap_or_else(|e| panic!("{e}\n{out}"));
+    let bin = o.assets.join("llama").join("bin");
+    assert_eq!(fs::read(bin.join("vca140.dll")).unwrap(), b"vca140.dll");
+    assert!(bin.join("vcb140.dll").is_file());
+    assert!(out.contains("Visual C++ runtime placed"), "{out}");
+    // A rerun (stamp present, nothing downloaded) keeps them and says so.
+    let (r, out) = go(&f, &o);
+    r.unwrap();
+    assert!(out.contains("have      Visual C++ runtime"), "{out}");
+}
+
+#[test]
+fn an_archive_missing_a_runtime_dll_fails_naming_the_file() {
+    if platform() != "win32-x64" {
+        return;
+    }
+    let f = fixture("flow-vcrt-missing", false);
+    bundle_runtime(&f, &["vca140.dll"]);
+    let (r, _) = go(&f, &options(&f));
+    assert!(r.unwrap_err().contains("vcb140.dll"));
+}
+
+#[test]
+fn a_checkout_without_the_runtime_dir_warns_and_continues() {
+    if platform() != "win32-x64" {
+        return;
+    }
+    let f = fixture("flow-vcrt-dev", false);
+    let (r, out) = go(&f, &options(&f));
+    r.unwrap_or_else(|e| panic!("{e}\n{out}"));
+    assert!(out.contains("not a release archive"), "{out}");
+}
+
+#[test]
+fn the_dry_run_prints_the_runtime_step_and_writes_nothing() {
+    if platform() != "win32-x64" {
+        return;
+    }
+    let f = fixture("flow-vcrt-dry", false);
+    bundle_runtime(&f, &["vca140.dll", "vcb140.dll"]);
+    let mut o = options(&f);
+    o.dry_run = true;
+    let (r, out) = go(&f, &o);
+    r.unwrap();
+    assert!(
+        out.contains("runtime   copy the Visual C++ runtime"),
+        "{out}"
+    );
+    assert!(!o.assets.exists());
 }
