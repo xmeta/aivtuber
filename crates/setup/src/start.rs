@@ -104,6 +104,10 @@ pub fn llama_command(env: &BTreeMap<String, String>) -> Result<LlamaCommand, Str
         alias,
         "-c",
         &context.to_string(),
+        // Reasoning models otherwise spend the whole reply budget on hidden
+        // thinking and return empty text (#340); harmless for other templates.
+        "--reasoning",
+        "off",
     ]
     .iter()
     .map(|s| (*s).to_owned())
@@ -295,6 +299,7 @@ mod tests {
         let joined = c.args.join(" ");
         assert!(joined.contains("--host 127.0.0.1"));
         assert!(joined.contains(&format!("--alias {LLAMA_ALIAS}")));
+        assert!(joined.contains("--reasoning off"), "{joined}");
         assert!(joined.ends_with("-ngl 99"));
         assert!(
             !llama_command(&env("0"))

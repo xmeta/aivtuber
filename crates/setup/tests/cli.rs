@@ -111,7 +111,7 @@ fn dry_run_prints_the_plan_and_the_duties_without_writing_anything() {
     assert!(o.status.success(), "{t}");
     for needle in [
         "dry run",
-        "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+        "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf",
         "machine-generated",
         "Article 30-4",
         "aivtuber-setup",
@@ -151,7 +151,7 @@ fn the_perception_dry_run_names_the_vision_files_the_vram_and_the_extra_duty() {
         assert!(t.contains(needle), "plan lacks {needle:?}: {t}");
     }
     assert!(
-        !t.contains("Qwen3-4B-Instruct-2507-Q4_K_M.gguf"),
+        !t.contains("gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf"),
         "the default model is not part of this plan: {t}"
     );
     assert!(!assets.exists());

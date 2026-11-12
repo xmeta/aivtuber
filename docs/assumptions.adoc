@@ -364,6 +364,22 @@ S2 measurement (`speech-vad-sidecar`, see the Speech sidecar section of `docs/pr
 
 *Related:* #90, #92.
 
+=== A-THINK-001 -- Reasoning is disabled server-side and the reply prompt names the reply language
+
+*Subsystem:* local profile Thinking model (llama-server, +crates/setup+, +compact_generation_input+)
+
+*Status:* Validated on one machine
+
+*Statement:* With Gemma 4 E4B QAT as the default local Thinking model, +llama-server --reasoning off+ and the generation-prompt sentence "Write the reply in the same language as the input text." together yield non-empty replies in the viewer's language.
+
+*Evidence:* #318 comments, EXP-0004b 27 Japanese text cases (llama.cpp b12224 Vulkan, RTX 2070 SUPER): Gemma 4 with the instruction and +--reasoning off+ answered 0/27 in a non-Japanese language and 0 empty (p50 412 ms, about 2.6 GB VRAM). Without the instruction 9/27 replies were English. With reasoning on, 27/27 replies were empty because reasoning used the whole 96-token budget. Qwen3-4B-Instruct-2507 answered 1/27 in Chinese. One run, one machine, one language.
+
+*Consequence if false:* Replies are empty (reasoning on) or in the wrong language, and the performer falls back to canned behavior or speaks the wrong language.
+
+*Revisit when:* the pinned llama.cpp or model changes, a non-Japanese audience is supported, +--reasoning+ semantics change, or a wider language sample shows drift.
+
+*Related:* #340, #318.
+
 == Adding or updating an assumption
 
 Use the following compact form:

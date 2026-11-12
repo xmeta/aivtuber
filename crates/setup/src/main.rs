@@ -65,7 +65,7 @@ struct LocalArgs {
     /// Replace an existing env file (it gets new generated secrets).
     #[arg(long)]
     force: bool,
-    /// Model profile: default (Qwen3-4B, text) or perception (Qwen3-VL-4B with its vision
+    /// Model profile: default (Gemma 4 E4B, text) or perception (Qwen3-VL-4B with its vision
     /// projector, two slots; needs at least about 12 GB of VRAM).
     #[arg(long, default_value = aivtuber_setup::manifest::DEFAULT_PROFILE)]
     profile: String,
