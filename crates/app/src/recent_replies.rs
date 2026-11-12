@@ -7,6 +7,7 @@
 //! passed the publication-containment gate (docs/security-threat-model.adoc
 //! section 11); this view does not gate again and gives no authority.
 
+use aivtuber_scheduler::PhraseLink;
 use serde::Serialize;
 use std::collections::VecDeque;
 
@@ -31,14 +32,28 @@ pub struct RecentReplies {
 }
 
 impl RecentReplies {
+    /// Records one spoken phrase. A phrased reply plays as several items whose
+    /// ids are `{root}#p{seq}` (scheduler `PhraseLink`); they are kept under
+    /// the root id and joined into one entry, so a consumer matching the
+    /// source event id sees the whole reply, not only its first phrase.
     pub fn record(&mut self, event_id: &str, text: &str) {
         let text = text.trim();
         if text.is_empty() {
             return;
         }
-        let mut shown: String = text.chars().take(RECENT_REPLY_MAX_CHARS).collect();
-        if text.chars().count() > RECENT_REPLY_MAX_CHARS {
-            shown.push('…');
+        let root: String = PhraseLink::root_event_id(event_id)
+            .chars()
+            .take(96)
+            .collect();
+        if let Some(last) = self.items.back_mut()
+            && last.event_id == root
+        {
+            if !last.text.ends_with('…') {
+                last.text = bounded(&format!("{}{text}", last.text));
+            }
+            self.next_seq += 1;
+            last.seq = self.next_seq;
+            return;
         }
         if self.items.len() == RECENT_REPLY_CAPACITY {
             self.items.pop_front();
@@ -46,8 +61,8 @@ impl RecentReplies {
         self.next_seq += 1;
         self.items.push_back(ReplyRecord {
             seq: self.next_seq,
-            event_id: event_id.chars().take(96).collect(),
-            text: shown,
+            event_id: root,
+            text: bounded(text),
         });
     }
 
@@ -64,9 +79,50 @@ impl RecentReplies {
     }
 }
 
+/// `text` cut to [`RECENT_REPLY_MAX_CHARS`] and marked when cut.
+fn bounded(text: &str) -> String {
+    let mut shown: String = text.chars().take(RECENT_REPLY_MAX_CHARS).collect();
+    if text.chars().count() > RECENT_REPLY_MAX_CHARS {
+        shown.push('…');
+    }
+    shown
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phrases_of_one_reply_are_joined_under_the_source_event_id() {
+        // Regression: phrases after the first carried `{root}#p{seq}` ids, so
+        // the panel (matching the source id) showed only the first phrase.
+        let mut replies = RecentReplies::default();
+        replies.record("panel-chat-2", "好きな食べ物は、");
+        replies.record("panel-chat-2#p1", "ラーメンです！");
+        replies.record("panel-chat-2#p2", "毎日でも食べたい✨");
+        replies.record("panel-chat-3", "大丈夫？");
+        let items: Vec<_> = replies.items().collect();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].event_id, "panel-chat-2");
+        assert_eq!(
+            items[0].text,
+            "好きな食べ物は、ラーメンです！毎日でも食べたい✨"
+        );
+        assert_eq!(items[1].event_id, "panel-chat-3");
+        assert!(items[0].seq < items[1].seq);
+    }
+
+    #[test]
+    fn a_joined_reply_stays_bounded() {
+        let mut replies = RecentReplies::default();
+        replies.record("e", &"あ".repeat(RECENT_REPLY_MAX_CHARS - 1));
+        replies.record("e#p1", "いいい");
+        replies.record("e#p2", "ううう");
+        let text = &replies.items().next().unwrap().text;
+        assert_eq!(text.chars().count(), RECENT_REPLY_MAX_CHARS + 1);
+        assert!(text.ends_with('…'));
+        assert_eq!(replies.len(), 1);
+    }
 
     #[test]
     fn it_keeps_only_the_newest_capacity_entries() {

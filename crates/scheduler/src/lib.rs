@@ -144,6 +144,23 @@ impl PhraseLink {
             format!("{root_event_id}#p{}", self.seq)
         }
     }
+
+    /// Inverse of [`Self::plan_event_id`]: the source event id a phrase item
+    /// answers. An id without a `#p<seq>` suffix (seq >= 1) is returned as is.
+    /// Display/grouping only: it confers no identity or authority.
+    pub fn root_event_id(event_id: &str) -> &str {
+        match event_id.rsplit_once("#p") {
+            Some((root, seq))
+                if !root.is_empty()
+                    && !seq.is_empty()
+                    && seq.bytes().all(|b| b.is_ascii_digit())
+                    && seq.parse::<u32>().is_ok_and(|n| n >= 1) =>
+            {
+                root
+            }
+            _ => event_id,
+        }
+    }
 }
 
 /// A planned performance plus scheduler-owned lifecycle metadata.
@@ -1267,6 +1284,23 @@ pub fn apply_variation(spec: VariationSpec, rng: &mut SeededRng) -> AppliedVaria
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_event_id_inverts_plan_event_id() {
+        for seq in [0, 1, 2, 17] {
+            let link = PhraseLink {
+                response_id: 1,
+                seq,
+                final_phrase: false,
+            };
+            let id = link.plan_event_id("panel-chat-2");
+            assert_eq!(PhraseLink::root_event_id(&id), "panel-chat-2", "{id}");
+        }
+        for kept in ["e", "e#p", "e#p0", "e#px", "#p1", "e#p1x", "e#p99999999999"] {
+            assert_eq!(PhraseLink::root_event_id(kept), kept);
+        }
+        assert_eq!(PhraseLink::root_event_id("a#p1#p2"), "a#p1");
+    }
 
     fn channels(values: &[BlendChannel]) -> BTreeSet<BlendChannel> {
         values.iter().copied().collect()
