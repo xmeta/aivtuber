@@ -230,8 +230,8 @@ export AIVTUBER_MODE=local
 export AIVTUBER_GENERATIVE_ENABLED=true
 export AIVTUBER_OPENAI_AUTH=unauthenticated-loopback          # explicit; allowed for a loopback endpoint only; no key may be set
 export AIVTUBER_OPENAI_ENDPOINT=http://127.0.0.1:18080/v1/responses
-export AIVTUBER_OPENAI_MODEL=gemma-4-e4b-it-qat           # must equal --alias
-export AIVTUBER_OPENAI_MODEL_VERSION=Q4_K_M
+export AIVTUBER_OPENAI_MODEL=gemma-4-e4b-it-qat               # must equal --alias
+export AIVTUBER_OPENAI_MODEL_VERSION=UD-Q4_K_XL
 export AIVTUBER_OPENAI_BACKEND_NAME=llama-server
 export AIVTUBER_OPENAI_MAX_OUTPUT_TOKENS=96                   # see "Reply length" below
 
