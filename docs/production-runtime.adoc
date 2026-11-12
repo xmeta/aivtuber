@@ -704,6 +704,12 @@ cargo run -p aivtuber-app
 
 Startup prints `thinking: endpoint=<origin> auth=<policy> backend=<name>` (origin only, never a path, query, or key) next to the profile line, so the Thinking location and authentication mode are observable; model alias/version and backend name are recorded in generation audit and asset provenance.
 
+*Thinking warm-up (#333).* A cold local server evaluates its first prompt for longer than `AIVTUBER_OPENAI_TIMEOUT_MS` (measured 19.4 s against 15 s on a CPU-only host; the second request took about 2 s with the prompt prefix cached), so the first real chat line used to fall back with `reason=timeout`. The app therefore issues one warm-up completion at startup (`OpenAiResponsesAdapter::warm_up`, driven by `thinking_warmup.rs`). It is built by the same request builder and instruction prefix as a real request, with a fixed internal user line, `max_output_tokens` 1 and its own timeout. It runs on a background thread, never on the frame/motor loop or the performer, and readiness, chat ingress and operator control do not wait for it. The adapter never reads the output text, so the reply cannot reach speech, display, memory or history and is never authority. Failure or timeout only logs. State is one bounded value (the instant the in-flight warm-up must end). A real request that overlaps the warm-up is not blocked: it is sent normally, may queue on a single-slot server, and its transport timeout is extended by the warm-up's remaining time, still capped by the interaction budget (30 s for conversation). Token streaming has its own idle timeout and does not get the extension; it benefits from the cached prefix once the warm-up has finished.
+
+* `AIVTUBER_THINKING_WARMUP`: `auto` (default; on only for `AIVTUBER_OPENAI_AUTH=unauthenticated-loopback` with `AIVTUBER_OPENAI_BACKEND_NAME=llama-server`, off for remote or paid endpoints), `on`, `off`.
+* `AIVTUBER_THINKING_WARMUP_TIMEOUT_MS`: default 120000, accepted 1000 to 600000.
+* Log lines: `thinking_warmup: started timeout_ms=N`, `thinking_warmup: ok ms=N prompt_tokens=N` (tokens only when the server reports usage), `thinking_warmup: failed reason=<timeout|unavailable|...>`, `thinking_warmup: skipped reason=<disabled|not_local_llama_server|thread_unavailable>`.
+
 All profiles still require `AIVTUBER_MEMORY_PSEUDONYM_KEY_HEX`; VTube Studio/OBS and the remaining tuning variables apply unchanged to every profile.
 
 == Operator control (issue #56)

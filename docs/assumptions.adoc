@@ -199,6 +199,22 @@ Do not record secrets, private user data, or raw provider credentials.
 
 *Related:* #220, A-LLM-001.
 
+=== A-LLM-003 -- One warm-up request makes the first real Thinking request fit its timeout on a local llama-server
+
+*Subsystem:* Thinking warm-up / `local` composition profile (#333)
+
+*Status:* Needs validation (the cold-start cost is measured; the fix is pinned by tests against a fake slow loopback server, not yet re-measured against a real llama-server)
+
+*Statement:* The first request to a cold llama-server spends most of its time loading and evaluating the prompt (19.4 s against a 15 s timeout on a CPU-only host); the next request reuses the cached prompt prefix and takes about 2 s. One internal request built by the same request builder, sent at startup, pays the cold cost once. A real request that overlaps it queues behind it on a single-slot server and is given the warm-up's remaining time.
+
+*Evidence:* The #333 timings; `crates/app/src/tests/thinking_warmup_tests.rs` and `crates/adapters/src/openai/warmup_tests.rs`.
+
+*Consequence if false:* The first reply falls back on timeout as before (typed, visible, counted); nothing else is affected because the warm-up output is discarded and its failure is only logged. A server with several slots, or one that evicts the cache, may still be cold for a real line.
+
+*Revisit when:* The default prompt or model changes (the cached prefix changes), the server runs without prompt caching, or `AIVTUBER_OPENAI_TIMEOUT_MS` defaults change.
+
+*Related:* #333, #294, A-LLM-001.
+
 === A-TTS-001 -- TTS streaming/prosody controls are provider-specific
 
 *Subsystem:* TTS adapters / performance compilation
