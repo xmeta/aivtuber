@@ -133,7 +133,8 @@
               "avatar.control",
               "memory.admin",
               "tool.grant",
-              "perception.control"
+              "perception.control",
+              "model.select"
             ]
           }
         }

@@ -9,8 +9,10 @@
 //!   ingress compares them): the constant-time secret check in
 //!   `LocalControlIngress`, the capability mint, the output stop and the audit
 //!   record are the existing ones (the audit id is `operator-panel-ctl-N`). The
-//!   panel can ask for exactly two actions; it cannot reach perception, memory
-//!   export or diagnose even though the ingress could mint them;
+//!   panel can ask for exactly three actions (stop, mute and the Thinking model
+//!   selection of #357, `model.select`, whose alias must be in the allowlist
+//!   the launcher passed in); it cannot reach perception, memory export or
+//!   diagnose even though the ingress could mint them;
 //! * a chat line becomes a `chat.message` envelope whose source, source class,
 //!   plane and trust are fixed here (`local-panel`, `public_chat`, `content`,
 //!   `untrusted`) and is admitted by [`ProductionApp::process_content_bytes`],
@@ -205,9 +207,14 @@ impl PanelService {
     ) {
         let mut changed = false;
         for command in self.inbox.drain_control(CONTROL_PER_TICK) {
-            let action = match command.request {
+            let mut argument: Option<&str> = None;
+            let action = match &command.request {
                 PanelRequest::Stop => "stop",
                 PanelRequest::Mute => "mute",
+                PanelRequest::SelectModel(alias) => {
+                    argument = Some(alias);
+                    "model.select"
+                }
                 // Chat arrives on its own queue; refuse anything else.
                 PanelRequest::Chat(_) => {
                     command.respond(false, "not a control request");
@@ -220,6 +227,7 @@ impl PanelService {
                 app,
                 &format!("panel-ctl-{}", self.control_seq),
                 action,
+                argument,
                 &self.control_secret.0,
                 now_ms,
             );

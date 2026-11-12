@@ -73,6 +73,11 @@ pub enum Capability {
     /// different grants.
     #[serde(rename = "perception.control")]
     PerceptionControl,
+    /// Switches which local Thinking model answers (#357). Held only by an
+    /// authenticated local ingress and only when a model catalog is composed;
+    /// the choice is bounded to an allowlist the operator's launcher passed in.
+    #[serde(rename = "model.select")]
+    ModelSelect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

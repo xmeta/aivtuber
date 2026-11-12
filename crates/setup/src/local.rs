@@ -48,6 +48,10 @@ pub struct LocalOptions {
     pub llama_port: u16,
     /// A pinned model profile of the manifest (`default`, `perception`).
     pub profile: String,
+    /// Optional Thinking models to install next to the default one
+    /// (`--with-model`, ids from the manifest's `optional_models`). Nothing is
+    /// downloaded for a model that is not named here.
+    pub with_models: Vec<String>,
     /// A model server the operator runs (loopback `http` URL). Implies
     /// `--skip llama,llm`: nothing is fetched for a model nobody will run.
     pub llm_endpoint: Option<String>,
@@ -214,6 +218,25 @@ pub fn run<W: Write>(
     let skip =
         |id: &str| opts.skip.contains(id) || (endpoint.is_some() && matches!(id, "llama" | "llm"));
     let profile = manifest.profile(&opts.profile)?;
+    let mut extra_models = Vec::new();
+    for id in &opts.with_models {
+        if extra_models.iter().any(|(seen, _)| seen == id) {
+            continue;
+        }
+        extra_models.push((id.clone(), manifest.optional_model(id)?));
+    }
+    if !extra_models.is_empty() {
+        if opts.profile != crate::manifest::DEFAULT_PROFILE {
+            return Err(format!(
+                "--with-model adds a model to switch to from the operation panel and applies to the {} profile only, not {}",
+                crate::manifest::DEFAULT_PROFILE,
+                opts.profile
+            ));
+        }
+        if endpoint.is_some() {
+            return Err("--with-model cannot be combined with --llm-endpoint: nothing is fetched or started for a model server you run yourself".to_owned());
+        }
+    }
     for s in &opts.skip {
         if !STEPS.contains(&s.as_str()) {
             return Err(format!(
@@ -312,6 +335,17 @@ pub fn run<W: Write>(
             profile.name
         ));
     }
+    for (id, model) in &extra_models {
+        ctx.say(format!(
+            "  model    {id}: {} ({} alias {})",
+            model.description, model.model_version, model.alias
+        ));
+        if let Some(gb) = model.min_vram_gb {
+            ctx.say(format!(
+                "  REQUIRES  at least about {gb} GB of VRAM for {id}; on a smaller GPU it spills to system memory and replies slow down badly."
+            ));
+        }
+    }
     if let Some(url) = &endpoint {
         ctx.say(format!(
             "  model    your own server at {url}; llama.cpp and the model are not fetched, and `start` will not start a server"
@@ -407,6 +441,25 @@ pub fn run<W: Write>(
         }
         if all {
             summary.provisioned.push("llm");
+        }
+    }
+
+    // Optional Thinking models (--with-model): fetched only when named, then
+    // picked up by `start`, which serves every one it finds next to the
+    // default (llama-server router mode) and offers them in the panel.
+    let mut extra_ready: Vec<String> = Vec::new();
+    if !skip("llm") {
+        for (id, model) in &extra_models {
+            let path = assets.join("llm").join(&model.llm.file);
+            if ctx.ensure_file(
+                &model.llm.file,
+                &model.llm.url,
+                &path,
+                &model.llm.sha256,
+                model.llm.size,
+            )? {
+                extra_ready.push(format!("model:{id}"));
+            }
         }
     }
 
@@ -650,6 +703,13 @@ pub fn run<W: Write>(
     if covered.contains(&"llm") {
         covered.push(&profile_id);
     }
+    if opts.dry_run {
+        extra_ready = extra_models
+            .iter()
+            .map(|(id, _)| format!("model:{id}"))
+            .collect();
+    }
+    covered.extend(extra_ready.iter().map(String::as_str));
     for d in manifest.disclosures_for(&covered) {
         ctx.say(format!(
             "  * {} [{}]\n    {}",

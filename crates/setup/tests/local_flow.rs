@@ -95,6 +95,7 @@ fn fixture(tag: &str, evil_llama: bool) -> Fixture {
     let vad = pattern(3_000, 12);
     let avatar = pattern(5_000, 13);
     let vlm = pattern(60_000, 14);
+    let alt = pattern(50_000, 16);
     let mmproj = pattern(9_000, 15);
     let stt: Vec<(String, Vec<u8>)> = ["enc.onnx", "dec.onnx", "join.onnx", "tokens.txt"]
         .iter()
@@ -122,6 +123,7 @@ fn fixture(tag: &str, evil_llama: bool) -> Fixture {
     b.files.insert("/m.gguf".into(), gguf.clone());
     b.files.insert("/vad.onnx".into(), vad.clone());
     b.files.insert("/vlm.gguf".into(), vlm.clone());
+    b.files.insert("/alt.gguf".into(), alt.clone());
     b.files.insert("/mmproj.gguf".into(), mmproj.clone());
     b.files.insert("/avatar.vrm".into(), avatar.clone());
     for (n, d) in &stt {
@@ -153,6 +155,12 @@ fn fixture(tag: &str, evil_llama: bool) -> Fixture {
                 "mmproj": asset("mmproj.gguf", "/mmproj.gguf", &mmproj)
             }
         },
+        "optional_models": {
+            "alt": {
+                "description": "second text model", "alias": "alt-model", "model_version": "Q4_A",
+                "context": 2048, "llm": asset("alt.gguf", "/alt.gguf", &alt)
+            }
+        },
         "vad": asset("vad.onnx", "/vad.onnx", &vad),
         "avatar": asset("avatar.vrm", "/avatar.vrm", &avatar),
         "sherpa_lib": {"version": "x", "assets": {}},
@@ -164,7 +172,8 @@ fn fixture(tag: &str, evil_llama: bool) -> Fixture {
             {"id": "supertonic-3-weights", "component": "Voice", "licence": "OpenRAIL-M", "applies_to": ["tts"], "duty": "Disclose that the voice is machine-generated."},
             {"id": "x", "component": "Sample avatar", "licence": "L", "applies_to": ["avatar"], "duty": "Replace it."},
             {"id": "text", "component": "Text model", "licence": "L", "applies_to": ["profile:default"], "duty": "Text duty."},
-            {"id": "vision", "component": "Vision model", "licence": "L", "applies_to": ["profile:vision"], "duty": "Vision duty."}
+            {"id": "vision", "component": "Vision model", "licence": "L", "applies_to": ["profile:vision"], "duty": "Vision duty."},
+            {"id": "alt", "component": "Alt model", "licence": "L", "applies_to": ["model:alt"], "duty": "Alt duty."}
         ]
     });
     let manifest = Manifest::parse(&manifest_json.to_string()).unwrap();
@@ -211,6 +220,7 @@ fn options(f: &Fixture) -> LocalOptions {
         force: false,
         llama_port: 18080,
         profile: "default".into(),
+        with_models: Vec::new(),
         llm_endpoint: None,
         bin_dir: None,
         platform: platform(),
@@ -298,6 +308,78 @@ fn the_happy_path_provisions_everything_writes_the_env_file_and_prints_duties() 
     // Warnings carry remedies.
     assert!(out.contains("ffmpeg was not found"));
     assert!(!summary.warnings.is_empty());
+}
+
+#[test]
+fn an_optional_model_is_fetched_only_when_asked_for_and_its_duty_is_printed() {
+    // Not asked for: nothing is downloaded and its duty is not printed.
+    let f = fixture("flow-alt-no", false);
+    let o = options(&f);
+    let (r, out) = go(&f, &o);
+    r.unwrap();
+    assert!(!o.assets.join("llm/alt.gguf").exists());
+    assert!(!out.contains("Alt duty."), "{out}");
+
+    // Asked for: downloaded next to the default and verified, with its duty.
+    let f = fixture("flow-alt-yes", false);
+    let mut o = options(&f);
+    o.with_models = vec!["alt".to_owned(), "alt".to_owned()];
+    let (r, out) = go(&f, &o);
+    r.unwrap_or_else(|e| panic!("{e}\n{out}"));
+    assert!(o.assets.join("llm/alt.gguf").is_file());
+    assert!(o.assets.join("llm/m.gguf").is_file());
+    assert!(out.contains("Alt duty."), "{out}");
+    assert_eq!(out.matches("download  alt.gguf").count(), 1, "{out}");
+    // The env file still names the default model: the switch is a start-time
+    // and panel concern, not a setup-time one.
+    let env = fs::read_to_string(&o.env_file).unwrap();
+    assert!(env.contains("AIVTUBER_OPENAI_MODEL=text-model"), "{env}");
+    assert!(!env.contains("alt-model"), "{env}");
+
+    // A second run fetches nothing more.
+    let requests = f.server.count();
+    go(&f, &o).0.unwrap();
+    assert_eq!(f.server.count(), requests);
+}
+
+#[test]
+fn a_dry_run_with_a_model_plans_its_download_and_writes_nothing() {
+    let f = fixture("flow-alt-dry", false);
+    let mut o = options(&f);
+    o.dry_run = true;
+    o.with_models = vec!["alt".to_owned()];
+    let (r, out) = go(&f, &o);
+    r.unwrap();
+    assert!(out.contains("download  alt.gguf"), "{out}");
+    assert!(out.contains("Alt duty."), "{out}");
+    assert_eq!(f.server.count(), 0);
+    assert!(!o.assets.exists());
+}
+
+#[test]
+fn an_unknown_model_or_an_unsupported_combination_is_refused_before_any_download() {
+    let f = fixture("flow-alt-bad", false);
+    let mut o = options(&f);
+    o.with_models = vec!["nope".to_owned()];
+    let (r, _) = go(&f, &o);
+    let err = r.unwrap_err();
+    assert!(
+        err.contains("unknown model") && err.contains("alt"),
+        "{err}"
+    );
+
+    let mut o = options(&f);
+    o.with_models = vec!["alt".to_owned()];
+    o.profile = "vision".to_owned();
+    let err = go(&f, &o).0.unwrap_err();
+    assert!(err.contains("default profile only"), "{err}");
+
+    let mut o = options(&f);
+    o.with_models = vec!["alt".to_owned()];
+    o.llm_endpoint = Some("http://127.0.0.1:9000".to_owned());
+    let err = go(&f, &o).0.unwrap_err();
+    assert!(err.contains("--llm-endpoint"), "{err}");
+    assert_eq!(f.server.count(), 0, "nothing was fetched");
 }
 
 #[test]

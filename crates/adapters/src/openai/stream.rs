@@ -320,7 +320,7 @@ impl OpenAiResponsesAdapter {
         let started = Instant::now();
         let input = compact_generation_input(request)?;
         let body = serde_json::to_vec(&json!({
-            "model": self.config.model_alias,
+            "model": self.active_model().alias,
             "input": input,
             "max_output_tokens": self.config.max_output_tokens,
             "stream": true,

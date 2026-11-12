@@ -85,7 +85,7 @@ sha256sum -c SHA256SUMS --ignore-missing     # must print: aivtuber-local-<versi
 ----
 ./aivtuber-setup start                  # Windows: .\aivtuber-setup.exe start
 ----
-7. Open the operation panel. The app prints one line, `local operation panel URL (contains a per-launch secret, do not share or log): http://127.0.0.1:8766/#token=...`; paste that URL into Chrome or Edge. The panel shows the runtime status, has a box to type to the performer (the reply appears as text under your line, and is spoken), and has the *emergency stop* and *mute* buttons. The secret is in the part after `#`, which the browser never sends to any server; the page keeps it in memory and removes it from the address bar, so do not bookmark the page (the secret changes on every start). Mute is latched: it lasts until you restart the app. The panel listens on `127.0.0.1` only and can be turned off with `AIVTUBER_PANEL=false`.
+7. Open the operation panel. The app prints one line, `local operation panel URL (contains a per-launch secret, do not share or log): http://127.0.0.1:8766/#token=...`; paste that URL into Chrome or Edge. The panel shows the runtime status, has a box to type to the performer (the reply appears as text under your line, and is spoken), and has the *emergency stop* and *mute* buttons, and, when another model is installed (<<model-switch>>), a selector for the Thinking model. The secret is in the part after `#`, which the browser never sends to any server; the page keeps it in memory and removes it from the address bar, so do not bookmark the page (the secret changes on every start). Mute is latched: it lasts until you restart the app. The panel listens on `127.0.0.1` only and can be turned off with `AIVTUBER_PANEL=false`.
 8. Open the avatar: the panel has an "アバター画面を開く" link, or open the `local avatar renderer URL` that `start` printed (`http://127.0.0.1:8765/?token=...`; the token changes on every start and is required for the avatar to connect) in the browser, or add it to OBS as a Browser Source. Do not share that URL. The first answer after start can take several seconds while the model loads.
 9. Before you stream: replace the sample avatar (`renderer/local-avatar/dist/model.vrm`) with a model you have the right to broadcast, and put the disclosures that setup printed (section 8) where viewers see them.
 
@@ -107,6 +107,7 @@ Each step is skipped if its result is already on disk and matches its pin, so th
 |`--force` |Replace an existing `local-profile.env` (new secrets).
 |`--llama-flavor vulkan\|cpu` |Override the GPU detection.
 |`--profile default\|perception` |The model profile (next section). Default: `default`.
+|`--with-model ID` |Also download an optional Thinking model (repeatable; today `qwen3-4b`, Qwen3-4B-Instruct-2507 Q4_K_M, 2.5 GB, Apache-2.0), with the same verified download and the licence duty printed. Nothing optional is downloaded unless you name it. See <<model-switch>>.
 |`--llm-endpoint URL` |Use a model server you run yourself (an `http://` loopback URL; a bare host and port gets `/v1/responses`). Nothing is fetched for llama.cpp or the model, and `start` runs only the app. The model name in the env file is the profile's alias; edit `AIVTUBER_OPENAI_MODEL` if your server names it differently.
 |`--from-target DIR` |Developers: run from a source checkout, see <<from-source-checkout>>.
 |`--skip llama,llm,vad,stt,tts,avatar,audio` |Leave steps out (a model you already have, for example). With `llm` or `llama` skipped and no `--llm-endpoint`, the env file records `AIVTUBER_SETUP_LLAMA_MODE=missing` with the model paths commented out, and `aivtuber-setup start` refuses with the way out instead of pointing at a file that is not there. A model that is already on disk still counts, so `--skip llm` on a second run keeps a working env file.
@@ -129,6 +130,24 @@ Each step is skipped if its result is already on disk and matches its pin, so th
 *The perception profile needs at least about 12 GB of VRAM.* It was measured with the whole local stack on an 8 GB GPU and spilled to system memory under load, which slows every reply (EXP-0004c); the 8 GB class stays on `default`. Screen capture is operator-enabled only, via `aivtuberctl perception-on`, for one allowlisted OBS source; frames stay in memory; observations do not yet influence replies (#90 S2). Until you enable it the profile only serves the same text Thinking as `default` with a model that can also read images. The disclosure printed with it (and in section 8): a caption describes what is on that source, which can include other people's text and private windows, so choose a source you are willing to have a model read.
 
 The pins are in `packaging/local-profile-pins.json` under `profiles`; the source-build fetch script of step 1 takes the same `--profile` option and reads the same ones.
+
+[#model-switch]
+=== Switching the Thinking model from the panel
+
+Gemma 4 E4B stays the default and is always installed. To be able to switch to another model without restarting, install it once:
+
+[source,sh]
+----
+aivtuber-setup local --with-model qwen3-4b
+----
+
+`local` keeps your existing `local-profile.env` (no `--force` needed) and only fetches the extra file into `local-assets/llm/`. `aivtuber-setup start` then looks for every optional model whose file is on disk and, when there is more than one model, runs llama-server in *router mode*: `--models-preset llama-models.ini` (written beside the env file at every start; one section per installed model with the same `ctx-size`, GPU layers and `reasoning = off` as the single-model launch) and `--models-max 1`, so only one model is in VRAM at a time. With only the default model installed, nothing changes: the same single-model command runs, and the panel's selector shows that one model.
+
+The operation panel then has a *応答モデル* section with a list of the installed models, the one in use, and a "切り替える" button. A switch points the next request at the chosen model at once and the app runs the Thinking warm-up for it in the background, so the weights load off the reply path. Measured on an RTX 2070 SUPER (8 GB): about 5 s with the file in the operating system's cache, 20 to 60 s from a cold disk. Chat lines that arrive while the model loads wait up to the normal Thinking timeout and then use the typed fallback reaction (as on a cold start), and the panel says "切り替え中". If the load fails, the app goes back to the previous model and the panel says so. `aivtuberctl model <alias>` does the same from a terminal, and `aivtuberctl status` prints a `thinking_model` line with the aliases.
+
+The choice is remembered in `local-model.json` beside the env file (one alias, nothing else) and `start` uses it next time if that model is still installed; a missing, oversized or unknown value is ignored and the default is used. Closing `start` ends llama-server and the model processes the router started (on Windows the whole process tree is ended).
+
+Only models that are installed are offered, and the app refuses any name outside the list `start` passed it (`AIVTUBER_OPENAI_MODEL_CHOICES`, `alias:version,...`). llama-server's router also lists models it finds in a local Hugging Face cache; b12224 has no flag to turn that off, so the allowlist in the app is what limits the choice (the app never sends another name). Streaming Thinking stays as the env file set it. The `perception` profile has no model switch.
 
 [#from-source-checkout]
 === Run from a source checkout

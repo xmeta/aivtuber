@@ -19,7 +19,7 @@ use aivtuber_app::{
     BargeInMetrics, ChatBurstConfig, CompositionProfile, DEFAULT_WARMUP_TIMEOUT_MS,
     GenerationFallbackCounts, GenerativeBudgetPolicy, GenerativeRuntime, IntentRoutePlanner,
     IntentShadowPolicy, LocalAvatarOutput, LocalRoutePlanner, MemoryFalsifierMetrics, MemorySeed,
-    MemoryWriterConfig, MemoryWriterMetrics, NoopAvatarOutput, NoopStreamOutput,
+    MemoryWriterConfig, MemoryWriterMetrics, ModelSwitcher, NoopAvatarOutput, NoopStreamOutput,
     ObsProgramSceneSource, ObsStreamOutput, OperatorControlServer, OperatorEndpointOptions,
     OperatorRateLimiter, PanelService, PerceptionService, PerceptionServiceConfig, PhraseMetrics,
     PhraseMode, ProducerWorker, ProductionApp, ProfileSummary, RawIngressConfig, RawIngressMetrics,
@@ -34,7 +34,7 @@ use aivtuber_app::{
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
     AuthorizationMethod, Capability, ControlSecret, EventKind, FloorConfig, LocalControlIngress,
-    MAX_OBS_SCENE_MAP_BYTES, ObsSceneMap, OperatorCommandInput,
+    MAX_OBS_SCENE_MAP_BYTES, ObsSceneMap, OperatorCommandInput, ThinkingModelCatalog,
 };
 use aivtuber_generative::{
     GenerativePipeline, PerformanceCompiler, PerformanceCompilerConfig, PhraseConfig,
@@ -105,7 +105,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let aivis_bridge = start_aivis_bridge(profile, &audio_root, &pack_root)?;
     // #220 S2b: optional supervised local TTS sidecar (local profile only).
     let mut tts_sidecar = start_tts_sidecar(profile, &audio_root, &pack_root)?;
-    let generative_configured = build_generative_runtime(
+    let (generative_configured, model_switcher) = build_generative_runtime(
         &compatibility,
         retention,
         profile,
@@ -124,6 +124,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     } else {
         None
     };
+    // #357: the model selector only exists next to a composed generative path.
+    let model_switcher = model_switcher.filter(|_| generative.is_some());
     let adaptation = build_adaptation_runtime(retention)?;
     let scheduler_config = retention.scheduler_config(SchedulerConfig::default());
     let security_config = retention.security_config(SecurityRuntimeConfig::default());
@@ -245,6 +247,14 @@ fn run() -> Result<(), Box<dyn Error>> {
         );
     if let Some(generative) = generative {
         app = app.with_generation(generative);
+    }
+    if let Some(switcher) = model_switcher {
+        eprintln!(
+            "thinking model: {} (switchable: {})",
+            switcher.status().active,
+            switcher.catalog().render_choices()
+        );
+        app = app.with_model_switcher(switcher);
     }
     // #306: the production memory writer is opt-in. Default off writes nothing.
     if env_bool("AIVTUBER_MEMORY_WRITER", false)? {
@@ -385,6 +395,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         OperatorEndpointOptions {
             perception: perception_opt_in,
             memory_export: app.memory_writer_metrics().is_some(),
+            // #357: `model.select` only when a model allowlist is composed.
+            model_select: app.thinking_model_status().is_some(),
         },
     )?;
     let operator_ingress = operator_server.ingress();
@@ -790,6 +802,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                 apply_dispatched_request(&operator_ingress, &mut app, &dispatched, now_ms);
             let _ = dispatched.respond.send(response);
         }
+        // #357: pick up a finished model warm-up. Never blocks: the load runs
+        // on its own thread.
+        app.service_model_switch();
         // #335: panel stop/mute (the same operator path) and chat lines (the
         // same admission as a stdin line), after the operator endpoint drain.
         if let Some(panel) = panel.as_mut() {
@@ -1504,9 +1519,9 @@ fn build_generative_runtime(
     supervised_tts: Option<Arc<AtomicBool>>,
     voicevox: Option<&VoicevoxBridge>,
     aivis: Option<&AivisBridge>,
-) -> Result<Option<GenerativeRuntime>, Box<dyn Error>> {
+) -> Result<(Option<GenerativeRuntime>, Option<ModelSwitcher>), Box<dyn Error>> {
     if !env_bool("AIVTUBER_GENERATIVE_ENABLED", false)? {
-        return Ok(None);
+        return Ok((None, None));
     }
 
     let mut thinking_config = OpenAiResponsesConfig::default();
@@ -1673,6 +1688,9 @@ fn build_generative_runtime(
         DEFAULT_WARMUP_TIMEOUT_MS,
     )?)?;
     let warmup_adapter = thinking.clone();
+    // #357: a clone shares the adapter's model slot, so a switch made through
+    // the selector is seen by the pipeline's copy.
+    let model_switcher = build_model_switcher(&warmup_adapter, warmup_timeout)?;
     let pipeline = GenerativePipeline::new(Arc::new(thinking), tts, compiler)
         .with_speech_lexicon(Arc::new(speech_lexicon));
     eprintln!(
@@ -1691,7 +1709,34 @@ fn build_generative_runtime(
     // running. Background only; readiness and ingress never wait for it.
     let backend = aivtuber_domain::ThinkingEngine::identity(&warmup_adapter).name;
     let _ = start_thinking_warmup(warmup_mode, &warmup_adapter, &backend, warmup_timeout);
-    Ok(Some(runtime))
+    Ok((Some(runtime), model_switcher))
+}
+
+/// #357: the Thinking model allowlist (`AIVTUBER_OPENAI_MODEL_CHOICES`, set by
+/// `aivtuber-setup start` from the models it serves) and the file that
+/// remembers the choice (`AIVTUBER_OPENAI_MODEL_SETTINGS`). Only a loopback
+/// unauthenticated endpoint (a local llama-server) can be switched: a bearer
+/// credential names one provider model, and the router is a local-server
+/// feature.
+fn build_model_switcher(
+    adapter: &OpenAiResponsesAdapter,
+    timeout: Duration,
+) -> Result<Option<ModelSwitcher>, Box<dyn Error>> {
+    let Some(choices) = env_optional("AIVTUBER_OPENAI_MODEL_CHOICES") else {
+        return Ok(None);
+    };
+    if adapter.authentication_label() != "unauthenticated-loopback" {
+        return Err("AIVTUBER_OPENAI_MODEL_CHOICES needs AIVTUBER_OPENAI_AUTH=unauthenticated-loopback (a local llama-server)".into());
+    }
+    let catalog = ThinkingModelCatalog::parse_choices(&choices)
+        .map_err(|error| format!("AIVTUBER_OPENAI_MODEL_CHOICES: {error}"))?;
+    let settings = env_optional("AIVTUBER_OPENAI_MODEL_SETTINGS").map(PathBuf::from);
+    Ok(Some(ModelSwitcher::new(
+        catalog,
+        adapter.clone(),
+        settings,
+        timeout,
+    )?))
 }
 
 /// ADR-0004 / issue #222 S1: the reading lexicon applied between the gated

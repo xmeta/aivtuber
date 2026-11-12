@@ -79,6 +79,7 @@ fn authenticated(capability: Capability) -> aivtuber_domain::AuthenticatedContro
         Capability::MemoryAdmin => "memory.admin",
         Capability::ToolGrant => "tool.grant",
         Capability::PerceptionControl => "perception.control",
+        Capability::ModelSelect => "model.select",
     };
     let secret = [11_u8; 32];
     let ingress = LocalControlIngress::new(

@@ -250,6 +250,15 @@ try {
     assert(!existsSync(assets), "dry run created the assets directory");
     assert(listing() === before, "dry run changed the unpacked directory");
   });
+  check("aivtuber-setup local --dry-run --with-model plans the optional model and refuses an unknown one", () => {
+    const assets = join(work, "setup-assets-3");
+    const ok = run(join(root, "aivtuber-setup" + exe), ["local", "--dry-run", "--with-model", "qwen3-4b", "--assets", assets], root);
+    assert(ok.status === 0, `exit ${ok.status}: ${ok.out.trim().slice(0, 400)}`);
+    assert(ok.out.includes("Qwen3-4B-Instruct-2507-Q4_K_M.gguf"), `plan lacks the optional model: ${ok.out.trim().slice(0, 400)}`);
+    const bad = run(join(root, "aivtuber-setup" + exe), ["local", "--dry-run", "--with-model", "nope", "--assets", assets], root);
+    assert(bad.status === 1 && /unknown model/.test(bad.out), `exit ${bad.status}: ${bad.out.trim().slice(0, 400)}`);
+    assert(!existsSync(assets), "dry run created the assets directory");
+  });
   check("aivtuber-setup local --offline fails closed and writes no env file", () => {
     const { status, out } = run(join(root, "aivtuber-setup" + exe), ["local", "--offline", "--assets", join(work, "setup-assets-2")], root);
     assert(status === 1, `exit ${status}: ${out.trim().slice(0, 400)}`);

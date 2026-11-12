@@ -5,6 +5,7 @@ import {
   type ChatEntry,
   type PanelState,
   checkChat,
+  modelView,
   otherReplies,
   parseState,
   pushChat,
@@ -25,6 +26,7 @@ history.replaceState(null, "", location.pathname);
 let state: PanelState | null = null;
 let chat: ChatEntry[] = [];
 let connection = "接続中…";
+let connectionLost = false;
 let pollTimer: ReturnType<typeof setInterval> | undefined;
 
 const $ = <T extends HTMLElement>(id: string): T => {
@@ -76,6 +78,7 @@ function render(): void {
       rows.append(item);
     }
   }
+  renderModel();
   const link = $<HTMLAnchorElement>("avatar-link");
   const url = safeAvatarUrl(state?.avatar_url);
   link.hidden = url === null;
@@ -112,6 +115,51 @@ function render(): void {
   $("other-wrap").hidden = others.childElementCount === 0;
 }
 
+let modelKey = "";
+
+/** The model selector. Rebuilt only when the option list changes, so a poll
+ * never closes a dropdown the streamer has open. */
+function renderModel(): void {
+  const view = modelView(state);
+  $("model-section").hidden = view === null;
+  if (view === null) return;
+  const select = $<HTMLSelectElement>("model-select");
+  const key = view.options.map((o) => o.alias).join("|");
+  if (key !== modelKey) {
+    modelKey = key;
+    select.replaceChildren(
+      ...view.options.map((o) => {
+        const option = document.createElement("option");
+        option.value = o.alias;
+        option.textContent = o.label;
+        return option;
+      }),
+    );
+  }
+  if (document.activeElement !== select || view.disabled) select.value = view.selected;
+  select.disabled = view.disabled;
+  $<HTMLButtonElement>("model-apply").disabled = view.disabled || connectionLost;
+  const message = $("model-state");
+  message.textContent = view.message;
+  message.className = view.health === "warn" ? "error" : "";
+}
+
+async function selectModel(): Promise<void> {
+  const alias = $<HTMLSelectElement>("model-select").value;
+  if (state?.status.thinking_model?.active === alias) return;
+  $<HTMLButtonElement>("model-apply").disabled = true;
+  try {
+    const { status, json } = await api("/api/model", { method: "POST", body: JSON.stringify({ model: alias }) });
+    const body = (json ?? {}) as { ok?: boolean; detail?: string };
+    $("model-state").textContent =
+      status === 200 && body.ok ? `${body.detail}` : `切り替えできませんでした: ${body.detail ?? status}`;
+  } catch {
+    $("model-state").textContent = "切り替えできませんでした(アプリに接続できません)";
+  } finally {
+    void poll();
+  }
+}
+
 async function poll(): Promise<void> {
   try {
     const { status, json } = await api("/api/state");
@@ -119,6 +167,7 @@ async function poll(): Promise<void> {
       // The secret is per launch, so a 401 never heals: this page belongs to an
       // earlier run. Stop polling instead of filling the app log with refusals.
       clearInterval(pollTimer);
+      connectionLost = true;
       setBusy(true);
       connection = "トークンが無効です。aivtuber-setup start が表示したURLを開き直してください";
     } else if (status === 200) {
@@ -192,11 +241,13 @@ $("chat-input").addEventListener("keydown", (event) => {
     void send();
   }
 });
+$("model-apply").addEventListener("click", () => void selectModel());
 $("stop").addEventListener("click", () => void control("stop"));
 $("mute").addEventListener("click", () => void control("mute"));
 
 if (token === null) {
   connection = "トークンがありません。aivtuber-setup start が表示したURLをそのまま開いてください";
+  connectionLost = true;
   setBusy(true);
   render();
 } else {

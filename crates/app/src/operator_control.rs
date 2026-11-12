@@ -48,13 +48,17 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OperatorRequest {
     /// One of `status`, `stop`, `mute`, `diagnose`, `perception.enable`,
-    /// `perception.disable`, `memory.export`.
+    /// `perception.disable`, `memory.export`, `model.select`.
     pub action: String,
     /// Opaque session secret presented by the operator client.
     pub secret: String,
     /// Optional client-provided id; the server assigns one when absent.
     #[serde(default)]
     pub request_id: Option<String>,
+    /// The one argument an action may take: the model alias for
+    /// `model.select`. Ignored by every other action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argument: Option<String>,
 }
 
 /// One line-delimited JSON response.
@@ -98,6 +102,9 @@ pub struct OperatorStatusSnapshot {
     /// Live screen perception (#90 S1b). Absent unless perception is composed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perception: Option<OperatorPerceptionStatus>,
+    /// The local Thinking model selector (#357). Absent unless composed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_model: Option<crate::ThinkingModelStatus>,
 }
 
 /// Operator-visible, text-free perception status: whether it is running, why
@@ -158,6 +165,7 @@ impl OperatorStatusSnapshot {
             perception: app
                 .perception()
                 .map(|service| OperatorPerceptionStatus::from_report(&service.report(now_ms))),
+            thinking_model: app.thinking_model_status(),
         }
     }
 }
@@ -245,6 +253,8 @@ pub struct OperatorEndpointOptions {
     pub perception: bool,
     /// The memory writer is composed (#321): `memory.admin` for the export.
     pub memory_export: bool,
+    /// A Thinking model allowlist is composed (#357): `model.select`.
+    pub model_select: bool,
 }
 
 /// Authenticated operator control endpoint.
@@ -280,7 +290,7 @@ impl OperatorControlServer {
             secret,
             OperatorEndpointOptions {
                 perception,
-                memory_export: false,
+                ..OperatorEndpointOptions::default()
             },
         )
     }
@@ -297,6 +307,7 @@ impl OperatorControlServer {
         let OperatorEndpointOptions {
             perception,
             memory_export,
+            model_select,
         } = options;
         let name = name.trim();
         if name.is_empty() {
@@ -309,6 +320,11 @@ impl OperatorControlServer {
         ]);
         if perception {
             capabilities.insert(aivtuber_domain::Capability::PerceptionControl);
+        }
+        if model_select {
+            // `model.select` is held only so the `model.select` action can mint
+            // it; the app still checks the alias against its allowlist.
+            capabilities.insert(aivtuber_domain::Capability::ModelSelect);
         }
         if memory_export {
             // `memory.admin` is held only so the `memory.export` action can mint
@@ -516,6 +532,7 @@ pub fn apply_operator_request<R: RoutePlanner>(
         && request.action != "perception.enable"
         && request.action != "perception.disable"
         && request.action != "memory.export"
+        && request.action != "model.select"
     {
         let detail = format!("unknown action {}", request.action);
         app.audit_operator_action(&request_id, &request.action, &detail, false);
@@ -530,7 +547,15 @@ pub fn apply_operator_request<R: RoutePlanner>(
     }
     let mut presented = [0_u8; 32];
     presented.copy_from_slice(secret_bytes);
-    apply_with_presented_secret(ingress, app, request_id, &request.action, presented, now_ms)
+    apply_with_presented_secret(
+        ingress,
+        app,
+        request_id,
+        &request.action,
+        request.argument.as_deref(),
+        presented,
+        now_ms,
+    )
 }
 
 /// Like [`apply_operator_request`] with the secret as the raw 32 bytes the
@@ -543,10 +568,11 @@ pub fn apply_operator_action<R: RoutePlanner>(
     app: &mut ProductionApp<R>,
     request_id: &str,
     action: &str,
+    argument: Option<&str>,
     presented: &[u8; 32],
     now_ms: u64,
 ) -> OperatorResponse {
-    if !matches!(action, "stop" | "mute") {
+    if !matches!(action, "stop" | "mute" | "model.select") {
         let detail = format!("unknown action {action}");
         app.audit_operator_action(request_id, action, &detail, false);
         return rejection(request_id, &detail);
@@ -556,6 +582,7 @@ pub fn apply_operator_action<R: RoutePlanner>(
         app,
         request_id.to_owned(),
         action,
+        argument,
         *presented,
         now_ms,
     )
@@ -566,6 +593,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
     app: &mut ProductionApp<R>,
     request_id: String,
     action: &str,
+    argument: Option<&str>,
     presented: [u8; 32],
     now_ms: u64,
 ) -> OperatorResponse {
@@ -656,6 +684,35 @@ fn apply_with_presented_secret<R: RoutePlanner>(
             Err(detail) => {
                 app.audit_operator_action(&request_id, action, detail, false);
                 rejection(&request_id, detail)
+            }
+        };
+    }
+
+    if action == "model.select" {
+        // The alias is audited only when it has the shape of one (bounded,
+        // a-z 0-9 . _ -): a refusal never echoes arbitrary text.
+        let alias = argument.unwrap_or("");
+        let shown = if aivtuber_domain::is_valid_model_alias(alias) {
+            alias
+        } else {
+            "(invalid alias)"
+        };
+        return match app.select_thinking_model(command.authority(), alias) {
+            Ok(detail) => {
+                let detail = format!("{shown}: {detail}");
+                app.audit_operator_action(&request_id, action, &detail, true);
+                OperatorResponse {
+                    request_id,
+                    ok: true,
+                    detail,
+                    status: None,
+                    memory_export: None,
+                }
+            }
+            Err(detail) => {
+                let detail = format!("{shown}: {detail}");
+                app.audit_operator_action(&request_id, action, &detail, false);
+                rejection(&request_id, &detail)
             }
         };
     }

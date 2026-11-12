@@ -4,6 +4,7 @@
 //!                        [--skip llama,llm,vad,stt,tts,avatar,audio]
 //!                        [--root DIR] [--assets DIR] [--env-file FILE] [--llama-port N]
 //!                        [--profile default|perception] [--llm-endpoint URL]
+//!                        [--with-model ID]...
 //!                        [--from-target CARGO_TARGET_DIR]
 //!   aivtuber-setup start [--env-file FILE] [--dry-run]
 //!
@@ -35,7 +36,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Fetch and verify the assets, synthesize the starter audio, write the env file.
-    Local(LocalArgs),
+    Local(Box<LocalArgs>),
     /// Start llama-server and the app from the env file `local` wrote.
     Start(StartArgs),
 }
@@ -70,6 +71,11 @@ struct LocalArgs {
     /// projector, two slots; needs at least about 12 GB of VRAM).
     #[arg(long, default_value = aivtuber_setup::manifest::DEFAULT_PROFILE)]
     profile: String,
+    /// Also download an optional Thinking model (repeatable; for example qwen3-4b). `start` then
+    /// serves it next to the default one and the operation panel can switch between them.
+    /// Nothing optional is downloaded unless named here.
+    #[arg(long = "with-model", value_name = "ID", value_delimiter = ',')]
+    with_models: Vec<String>,
     /// Use a model server you run yourself (an http loopback URL) instead of the pinned one;
     /// nothing is fetched for llama.cpp or the model, and `start` runs only the app.
     #[arg(long)]
@@ -121,6 +127,7 @@ fn run_local(args: LocalArgs) -> Result<(), String> {
         force: args.force,
         llama_port: args.llama_port,
         profile: args.profile,
+        with_models: args.with_models,
         llm_endpoint: args.llm_endpoint,
         bin_dir: args.from_target,
         platform: local::host_platform()?,
@@ -156,7 +163,7 @@ fn run_start(args: StartArgs) -> Result<i32, String> {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Local(args) => run_local(args).map(|()| 0),
+        Command::Local(args) => run_local(*args).map(|()| 0),
         Command::Start(args) => run_start(args),
     };
     match result {

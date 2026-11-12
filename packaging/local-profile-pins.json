@@ -74,6 +74,21 @@
       }
     }
   },
+  "optional_models": {
+    "qwen3-4b": {
+      "description": "Qwen3-4B-Instruct-2507 Q4_K_M, text only (the previous default). About 3 GB of VRAM (2.5 GB download). Installed next to the default model and chosen from the operation panel; only one is in VRAM at a time.",
+      "alias": "qwen3-4b-instruct-2507",
+      "model_version": "Q4_K_M",
+      "context": 4096,
+      "llm": {
+        "file": "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+        "url": "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/a06e946bb6b655725eafa393f4a9745d460374c9/Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+        "sha256": "3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597",
+        "size": 2497281120,
+        "licence": "Apache-2.0"
+      }
+    }
+  },
   "vad": {
     "file": "silero_vad_op18_ifless.onnx",
     "url": "https://raw.githubusercontent.com/snakers4/silero-vad/v6.2.3/src/silero_vad/data/silero_vad_op18_ifless.onnx",
@@ -206,6 +221,13 @@
       "licence": "Apache-2.0",
       "applies_to": ["profile:default"],
       "duty": "Keep the notice if you redistribute the weights. Model output is your responsibility."
+    },
+    {
+      "id": "qwen3-4b",
+      "component": "Qwen3-4B-Instruct-2507 Q4_K_M (unsloth GGUF)",
+      "licence": "Apache-2.0",
+      "applies_to": ["model:qwen3-4b"],
+      "duty": "Keep the notice if you redistribute the weights. Model output is your responsibility. Optional: installed only by `aivtuber-setup local --with-model qwen3-4b`."
     },
     {
       "id": "qwen3-vl-4b",

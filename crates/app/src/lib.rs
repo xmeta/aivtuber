@@ -11,6 +11,7 @@ mod memory_eval;
 mod memory_seed;
 mod memory_sidecar_eval;
 mod memory_writer;
+mod model_switch;
 mod moderation_evidence;
 mod operator_control;
 mod outputs;
@@ -64,6 +65,7 @@ pub use memory_writer::{
     MEMORY_WRITER_EVENT_PREFIX, MEMORY_WRITER_MAX_LIVE_ENTRIES_CEILING, MemoryWriterConfig,
     MemoryWriterMetrics,
 };
+pub use model_switch::{ModelSwitchError, ModelSwitcher, ThinkingModelStatus, WarmFn};
 pub use moderation_evidence::*;
 pub use operator_control::*;
 pub use outputs::*;
@@ -1139,6 +1141,9 @@ where
     speech_observations: Option<SpeechObservationTracker>,
     /// Opt-in live screen perception (#90 S1b); `None` (default) composes nothing.
     perception: Option<perception_service::PerceptionService>,
+    /// Live switching of the local Thinking model (#357); `None` (default)
+    /// composes nothing and the model is whatever the environment named.
+    model_switcher: Option<model_switch::ModelSwitcher>,
     /// Scene context (#88 S1); `None` (default) composes nothing, and then no
     /// request carries a scene.
     scene: Option<scene_context::SceneContextService>,
@@ -1209,6 +1214,7 @@ where
             memory_falsifier: memory_seed::MemoryFalsifier::default(),
             speech_observations: None,
             perception: None,
+            model_switcher: None,
             scene: None,
             speech_transcripts: None,
             speech_conversation: None,
@@ -1666,6 +1672,46 @@ where
             Err(aivtuber_runtime::PerceptionGateError::CapacityReached) => {
                 Err("perception source capacity reached")
             }
+        }
+    }
+
+    /// Opt in to switching the local Thinking model at runtime (#357). Only the
+    /// authenticated `model.select` capability can use it
+    /// (`select_thinking_model`).
+    pub fn with_model_switcher(mut self, switcher: model_switch::ModelSwitcher) -> Self {
+        self.model_switcher = Some(switcher);
+        self
+    }
+
+    /// Apply an operator request to switch the Thinking model. `authority`
+    /// must be the authenticated local ingress capability; the alias must be
+    /// in the allowlist the launcher passed in. Returns a short outcome for
+    /// the operator and the audit record. The model load itself runs on a
+    /// background thread: this never waits for it.
+    pub fn select_thinking_model(
+        &mut self,
+        authority: &AuthenticatedControl,
+        alias: &str,
+    ) -> Result<String, String> {
+        if !authority.has_capability(aivtuber_domain::Capability::ModelSelect) {
+            return Err("model selection is not authorized".to_owned());
+        }
+        let Some(switcher) = self.model_switcher.as_mut() else {
+            return Err("model switching is not configured".to_owned());
+        };
+        switcher.select(alias).map_err(|error| error.to_string())
+    }
+
+    /// The model selector's state for the operator surfaces; `None` when no
+    /// switcher is composed.
+    pub fn thinking_model_status(&self) -> Option<model_switch::ThinkingModelStatus> {
+        self.model_switcher.as_ref().map(|s| s.status())
+    }
+
+    /// Collect a finished model warm-up (#357). Never blocks.
+    pub fn service_model_switch(&mut self) {
+        if let Some(switcher) = self.model_switcher.as_mut() {
+            switcher.poll();
         }
     }
 
@@ -9819,6 +9865,7 @@ mod tests {
                 action: action.to_owned(),
                 secret: String::from_utf8(secret.to_vec()).expect("utf8 secret"),
                 request_id: Some("req-test".to_owned()),
+                argument: None,
             }
         }
 
@@ -10101,6 +10148,173 @@ mod tests {
             );
             app.startup().expect("startup");
             app
+        }
+
+        fn model_ingress() -> LocalControlIngress {
+            LocalControlIngress::new(
+                "operator-control",
+                "operator:local",
+                AuthorizationMethod::SignedLocalApi,
+                BTreeSet::from([
+                    Capability::PerformerStop,
+                    Capability::PerformerMute,
+                    Capability::ModelSelect,
+                ]),
+                ControlSecret::new(SECRET),
+            )
+            .expect("ingress")
+        }
+
+        fn switchable_app(
+            warm_ok: bool,
+        ) -> (
+            ProductionApp<FixedSilentRoute>,
+            aivtuber_adapters::OpenAiResponsesAdapter,
+        ) {
+            let adapter = aivtuber_adapters::OpenAiResponsesAdapter::with_authentication(
+                aivtuber_adapters::OpenAiResponsesConfig {
+                    endpoint: "http://127.0.0.1:9/v1/responses".to_owned(),
+                    model_alias: "alpha".to_owned(),
+                    ..aivtuber_adapters::OpenAiResponsesConfig::default()
+                },
+                aivtuber_adapters::ThinkingAuthentication::UnauthenticatedLoopback,
+            )
+            .expect("adapter");
+            let switcher = ModelSwitcher::with_warmup(
+                aivtuber_domain::ThinkingModelCatalog::parse_choices("alpha:v1,beta:v2")
+                    .expect("catalog"),
+                adapter.clone(),
+                None,
+                std::time::Duration::from_secs(1),
+                Arc::new(move |_| warm_ok),
+            )
+            .expect("switcher");
+            (new_app().with_model_switcher(switcher), adapter)
+        }
+
+        fn model_audit(app: &ProductionApp<FixedSilentRoute>) -> Vec<(String, String)> {
+            app.security()
+                .audit()
+                .iter()
+                .filter(|r| r.detail.starts_with("action=model.select"))
+                .map(|r| (r.decision.clone(), r.detail.clone()))
+                .collect()
+        }
+
+        #[test]
+        fn a_panel_model_switch_takes_the_ingress_path_is_allowlisted_and_audited() {
+            let mut panel = start_panel(model_ingress(), SECRET);
+            let (mut app, adapter) = switchable_app(true);
+
+            let (status, body) = call(&mut panel, &mut app, |p| {
+                post(p, "/api/model", "{\"model\":\"beta\"}")
+            });
+            assert_eq!(status, 200, "{body}");
+            assert!(body.contains("switching to beta"), "{body}");
+            // Requests name the new model at once; the audit id is the panel's.
+            assert_eq!(adapter.active_model().alias, "beta");
+            assert_eq!(
+                app.thinking_model_status().map(|s| s.target),
+                Some(Some("beta".to_owned()))
+            );
+            let audit = model_audit(&app);
+            assert_eq!(audit.len(), 1, "{audit:?}");
+            assert_eq!(audit[0].0, "operator_accepted");
+            assert_eq!(
+                audit[0].1,
+                "action=model.select decision=beta: switching to beta (loading)"
+            );
+            assert!(
+                app.security()
+                    .audit()
+                    .iter()
+                    .any(|r| r.event_id.as_deref() == Some("operator-panel-ctl-1")),
+            );
+
+            // The warm-up finishes on its own thread; the loop only polls.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while app.thinking_model_status().map(|s| s.state) != Some("ready".to_owned()) {
+                assert!(std::time::Instant::now() < deadline);
+                app.service_model_switch();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_eq!(app.thinking_model_status().unwrap().active, "beta");
+        }
+
+        #[test]
+        fn a_model_outside_the_allowlist_is_refused_audited_and_changes_nothing() {
+            let mut panel = start_panel(model_ingress(), SECRET);
+            let (mut app, adapter) = switchable_app(true);
+            let (status, body) = call(&mut panel, &mut app, |p| {
+                post(p, "/api/model", "{\"model\":\"gamma\"}")
+            });
+            assert_eq!(status, 409, "{body}");
+            assert!(body.contains("\"ok\":false"), "{body}");
+            assert!(body.contains("not installed"), "{body}");
+            assert_eq!(adapter.active_model().alias, "alpha");
+            assert_eq!(app.thinking_model_status().unwrap().state, "ready");
+            let audit = model_audit(&app);
+            assert_eq!(
+                audit,
+                [(
+                    "operator_rejected".to_owned(),
+                    "action=model.select decision=gamma: refused: that model is not installed"
+                        .to_owned()
+                )]
+            );
+        }
+
+        #[test]
+        fn without_the_model_capability_or_a_switcher_nothing_is_selected() {
+            // The ingress was not composed with `model.select`: it cannot mint it.
+            let mut panel = start_panel(operator_ingress(), SECRET);
+            let (mut app, adapter) = switchable_app(true);
+            let (status, body) = call(&mut panel, &mut app, |p| {
+                post(p, "/api/model", "{\"model\":\"beta\"}")
+            });
+            assert_eq!(status, 409, "{body}");
+            assert!(body.contains("authentication failed"), "{body}");
+            assert_eq!(adapter.active_model().alias, "alpha");
+
+            // Capability held, but no switcher composed.
+            let mut panel = start_panel(model_ingress(), SECRET);
+            let mut bare = new_app();
+            let (status, body) = call(&mut panel, &mut bare, |p| {
+                post(p, "/api/model", "{\"model\":\"beta\"}")
+            });
+            assert_eq!(status, 409, "{body}");
+            assert!(body.contains("not configured"), "{body}");
+            assert!(bare.thinking_model_status().is_none());
+        }
+
+        #[test]
+        fn aivtuberctl_and_the_panel_share_the_model_action() {
+            use super::operator_control_helpers::*;
+            let ingress = model_ingress();
+            let (mut app, adapter) = switchable_app(true);
+            let mut ask = |secret: &[u8], argument: Option<&str>| {
+                let mut req = request("model.select", secret);
+                req.argument = argument.map(str::to_owned);
+                apply_dispatched_request(&ingress, &mut app, &dispatched(req), 10)
+            };
+            assert!(!ask(&[0x41; 32], Some("beta")).ok, "wrong secret");
+            assert!(!ask(&SECRET, None).ok, "no alias");
+            assert!(!ask(&SECRET, Some("../beta")).ok, "malformed alias");
+            assert_eq!(adapter.active_model().alias, "alpha");
+            let ok = ask(&SECRET, Some("beta"));
+            assert!(ok.ok, "{}", ok.detail);
+            assert_eq!(adapter.active_model().alias, "beta");
+            // The status carries the selector state (and nothing secret).
+            let status = OperatorStatusSnapshot::from_app(&app, 20);
+            let model = status.thinking_model.expect("model status");
+            assert_eq!(model.available.len(), 2);
+            assert_eq!(model.state, "switching");
+            // The malformed alias was audited without being echoed.
+            assert!(
+                model_audit(&app)
+                    .iter()
+                    .any(|(_, d)| d.contains("(invalid alias)") && !d.contains("../")),
+            );
         }
 
         #[test]

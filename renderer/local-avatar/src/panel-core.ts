@@ -13,12 +13,32 @@ export interface PanelState {
     content_queue: number;
     scheduler_items: number;
     generation_active: boolean;
+    /** The local Thinking model selector (#357); absent unless the app composed it. */
+    thinking_model?: ThinkingModelState | null;
   };
   replies: { seq: number; event_id: string; text: string }[];
   avatar_url: string | null;
 }
 
+export interface ModelOption {
+  alias: string;
+  version: string;
+}
+
+export interface ThinkingModelState {
+  active: string;
+  active_version: string;
+  state: "ready" | "switching" | "failed";
+  /** The model being loaded, or the one that failed to load. */
+  target: string | null;
+  available: ModelOption[];
+}
+
 export const STATE_SCHEMA = "local-panel/1";
+/** Mirrors `MAX_THINKING_MODEL_CHOICES` and the alias shape in crates/domain. */
+export const MAX_MODEL_CHOICES = 8;
+const MODEL_ALIAS = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+const MODEL_VERSION = /^[A-Za-z0-9._-]{1,32}$/;
 export const MAX_CHAT_CHARS = 500;
 /** Chat lines kept in the page. Bounded like everything on the Rust side. */
 export const MAX_CHAT_LOG = 30;
@@ -33,6 +53,77 @@ export function tokenFromHash(hash: string): string | null {
   return match?.[1] ?? null;
 }
 
+/**
+ * The selector state, only if it has exactly the documented shape. Anything
+ * else (a newer or older app, a malformed document) yields `null`, which hides
+ * the selector rather than offering a model the app would refuse.
+ */
+export function parseModelState(value: unknown): ThinkingModelState | null {
+  if (typeof value !== "object" || value === null) return null;
+  const v = value as Record<string, unknown>;
+  const { active, active_version, state, target, available } = v;
+  if (typeof active !== "string" || !MODEL_ALIAS.test(active)) return null;
+  if (typeof active_version !== "string" || !MODEL_VERSION.test(active_version)) return null;
+  if (state !== "ready" && state !== "switching" && state !== "failed") return null;
+  if (target !== null && (typeof target !== "string" || !MODEL_ALIAS.test(target))) return null;
+  if (!Array.isArray(available) || available.length === 0 || available.length > MAX_MODEL_CHOICES) return null;
+  const options: ModelOption[] = [];
+  for (const entry of available) {
+    if (typeof entry !== "object" || entry === null) return null;
+    const { alias, version } = entry as Record<string, unknown>;
+    if (typeof alias !== "string" || !MODEL_ALIAS.test(alias)) return null;
+    if (typeof version !== "string" || !MODEL_VERSION.test(version)) return null;
+    if (options.some((o) => o.alias === alias)) return null;
+    options.push({ alias, version });
+  }
+  return { active, active_version, state, target: target ?? null, available: options };
+}
+
+export interface ModelView {
+  options: { alias: string; label: string }[];
+  /** Alias to show as chosen: the one being loaded while switching. */
+  selected: string;
+  /** Switching is in progress, or there is nothing to switch to. */
+  disabled: boolean;
+  message: string;
+  health: Health;
+}
+
+/** What the model selector shows, or `null` when the app has no selector. */
+export function modelView(state: PanelState | null): ModelView | null {
+  const m = state?.status.thinking_model ?? null;
+  if (m === null) return null;
+  const options = m.available.map((o) => ({ alias: o.alias, label: `${o.alias} (${o.version})` }));
+  if (m.state === "switching") {
+    return {
+      options,
+      selected: m.target ?? m.active,
+      disabled: true,
+      message: `切り替え中: ${m.target ?? m.active} を読み込んでいます。数秒から1分ほどかかり、その間の返答は定型の返しになります`,
+      health: "warn",
+    };
+  }
+  if (m.state === "failed") {
+    return {
+      options,
+      selected: m.active,
+      disabled: options.length < 2,
+      message: `${m.target ?? "モデル"} への切り替えに失敗しました。${m.active} のままです`,
+      health: "warn",
+    };
+  }
+  return {
+    options,
+    selected: m.active,
+    disabled: options.length < 2,
+    message:
+      options.length < 2
+        ? `使用中: ${m.active}(モデルは1つだけインストールされています。追加するには aivtuber-setup local --with-model qwen3-4b)`
+        : `使用中: ${m.active}`,
+    health: "ok",
+  };
+}
+
 /** A state document is only trusted if it has the shape this page was built for. */
 export function parseState(value: unknown): PanelState | null {
   if (typeof value !== "object" || value === null) return null;
@@ -40,7 +131,9 @@ export function parseState(value: unknown): PanelState | null {
   if (v.schema !== STATE_SCHEMA || typeof v.status !== "object" || v.status === null) return null;
   if (!Array.isArray(v.replies) || typeof v.uptime_ms !== "number") return null;
   if (typeof v.status.muted !== "boolean") return null;
-  return v as PanelState;
+  // An absent or malformed selector is dropped, not fatal: the rest still works.
+  const thinkingModel = parseModelState(v.status.thinking_model);
+  return { ...(v as PanelState), status: { ...v.status, thinking_model: thinkingModel } };
 }
 
 /** Only an http(s) link to the loopback avatar page is offered as a link. */
