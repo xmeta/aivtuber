@@ -34,6 +34,7 @@ mod speech_resynthesis;
 mod speech_sidecar;
 mod support_bundle;
 mod task_plane;
+mod thinking_warmup;
 mod tool_execution;
 mod tts_sidecar;
 mod voicevox_bridge;
@@ -88,6 +89,10 @@ pub use speech_floor::SpeechFloorMetrics;
 pub use speech_sidecar::*;
 pub use support_bundle::*;
 pub use task_plane::*;
+pub use thinking_warmup::{
+    DEFAULT_WARMUP_TIMEOUT_MS, WarmupDecision, WarmupMode, decide as decide_thinking_warmup,
+    run as run_thinking_warmup, start as start_thinking_warmup, warmup_timeout,
+};
 pub use tool_execution::*;
 pub use tts_sidecar::*;
 pub use voicevox_bridge::*;
@@ -4681,6 +4686,7 @@ mod tests {
     mod scene_context_tests;
     mod speech_lifecycle_tests;
     mod streaming_thinking_tests;
+    mod thinking_warmup_tests;
     mod voicevox_tts_tests;
     use aivtuber_scheduler::SchedulerConfig;
     use aivtuber_telemetry::SecretRedactor;

@@ -16,19 +16,20 @@ use aivtuber_adapters::{
 };
 use aivtuber_app::{
     AdaptationRuntime, AdapterHealth, AivisBridge, AivisSettings, AvatarOutput, BargeInConfig,
-    BargeInMetrics, ChatBurstConfig, CompositionProfile, GenerationFallbackCounts,
-    GenerativeBudgetPolicy, GenerativeRuntime, IntentRoutePlanner, IntentShadowPolicy,
-    LocalAvatarOutput, LocalRoutePlanner, MemoryFalsifierMetrics, MemorySeed, MemoryWriterConfig,
-    MemoryWriterMetrics, NoopAvatarOutput, NoopStreamOutput, ObsProgramSceneSource,
-    ObsStreamOutput, OperatorControlServer, OperatorEndpointOptions, OperatorRateLimiter,
-    PerceptionService, PerceptionServiceConfig, PhraseMetrics, PhraseMode, ProducerWorker,
-    ProductionApp, ProfileSummary, RawIngressConfig, RawIngressMetrics, RawIngressMetricsSnapshot,
-    RoutePlanner, RuntimeRetentionPolicy, SHADOW_ORCHESTRATOR_SCHEMA_VERSION, SceneContextService,
-    ShadowOrchestratorConfig, ShadowPolicyIdentity, ShadowingRoutePlanner,
-    SpeechConversationConfig, SpeechConversationMetrics, SpeechFloorMetrics, SpeechSidecar,
-    SpeechSidecarConfig, SpeechSidecarStats, StreamOutput, TtsSidecarSettings, VoicevoxBridge,
-    VoicevoxSettings, VtsAvatarOutput, VtsPlaybackConfig, apply_dispatched_request,
-    audit_pack_readiness, pump_bounded_records, stt_sidecar_args,
+    BargeInMetrics, ChatBurstConfig, CompositionProfile, DEFAULT_WARMUP_TIMEOUT_MS,
+    GenerationFallbackCounts, GenerativeBudgetPolicy, GenerativeRuntime, IntentRoutePlanner,
+    IntentShadowPolicy, LocalAvatarOutput, LocalRoutePlanner, MemoryFalsifierMetrics, MemorySeed,
+    MemoryWriterConfig, MemoryWriterMetrics, NoopAvatarOutput, NoopStreamOutput,
+    ObsProgramSceneSource, ObsStreamOutput, OperatorControlServer, OperatorEndpointOptions,
+    OperatorRateLimiter, PerceptionService, PerceptionServiceConfig, PhraseMetrics, PhraseMode,
+    ProducerWorker, ProductionApp, ProfileSummary, RawIngressConfig, RawIngressMetrics,
+    RawIngressMetricsSnapshot, RoutePlanner, RuntimeRetentionPolicy,
+    SHADOW_ORCHESTRATOR_SCHEMA_VERSION, SceneContextService, ShadowOrchestratorConfig,
+    ShadowPolicyIdentity, ShadowingRoutePlanner, SpeechConversationConfig,
+    SpeechConversationMetrics, SpeechFloorMetrics, SpeechSidecar, SpeechSidecarConfig,
+    SpeechSidecarStats, StreamOutput, TtsSidecarSettings, VoicevoxBridge, VoicevoxSettings,
+    VtsAvatarOutput, VtsPlaybackConfig, WarmupMode, apply_dispatched_request, audit_pack_readiness,
+    pump_bounded_records, start_thinking_warmup, stt_sidecar_args, warmup_timeout,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
@@ -1639,6 +1640,12 @@ fn build_generative_runtime(
         None => Arc::new(tts),
     };
     let speech_lexicon = build_speech_lexicon()?;
+    let warmup_mode = WarmupMode::parse(env_optional("AIVTUBER_THINKING_WARMUP").as_deref())?;
+    let warmup_timeout = warmup_timeout(env_u64(
+        "AIVTUBER_THINKING_WARMUP_TIMEOUT_MS",
+        DEFAULT_WARMUP_TIMEOUT_MS,
+    )?)?;
+    let warmup_adapter = thinking.clone();
     let pipeline = GenerativePipeline::new(Arc::new(thinking), tts, compiler)
         .with_speech_lexicon(Arc::new(speech_lexicon));
     eprintln!(
@@ -1653,6 +1660,10 @@ fn build_generative_runtime(
             .map_err(io::Error::other)?
             .with_phrase_mode(phrase_mode)
             .map_err(io::Error::other)?;
+    // Last step, so a configuration error above never leaves a warm-up
+    // running. Background only; readiness and ingress never wait for it.
+    let backend = aivtuber_domain::ThinkingEngine::identity(&warmup_adapter).name;
+    let _ = start_thinking_warmup(warmup_mode, &warmup_adapter, &backend, warmup_timeout);
     Ok(Some(runtime))
 }
 

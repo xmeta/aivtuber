@@ -15,6 +15,10 @@ mod stream;
 #[cfg(test)]
 mod stream_tests;
 pub use stream::StreamLimits;
+mod warmup;
+#[cfg(test)]
+mod warmup_tests;
+pub use warmup::{WARMUP_USER_LINE, WarmupReport};
 
 /// How the Thinking endpoint is authenticated (issue #220 S1).
 ///
@@ -205,6 +209,8 @@ pub struct OpenAiResponsesAdapter {
     transport: Arc<dyn JsonHttpTransport>,
     /// Token streaming, only when explicitly enabled (issue #83 S2).
     stream: Option<(Arc<dyn StreamingHttpTransport>, StreamLimits)>,
+    /// In-flight warm-up deadline, shared by clones (issue #333).
+    warmup: warmup::WarmupGate,
 }
 
 impl fmt::Debug for OpenAiResponsesAdapter {
@@ -282,6 +288,7 @@ impl OpenAiResponsesAdapter {
             backend_name: DEFAULT_BACKEND_NAME.to_owned(),
             transport,
             stream: None,
+            warmup: warmup::WarmupGate::default(),
         })
     }
 
@@ -342,7 +349,10 @@ impl OpenAiResponsesAdapter {
                 "OpenAI-compatible call has no remaining interaction budget",
             ));
         }
-        let effective_timeout = self.config.timeout.min(timeout);
+        // A request that overlaps a warm-up may queue behind it on the server,
+        // so it gets the warm-up's remaining time on top of its own timeout;
+        // the caller's interaction budget still caps the total.
+        let effective_timeout = (self.config.timeout + self.warmup.grace()).min(timeout);
         let input = compact_generation_input(request)?;
         let body = serde_json::to_vec(&json!({
             "model": self.config.model_alias,
