@@ -35,6 +35,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { VENDORED_NOTICES, heading, readVendoredNotice } from "./release-notices.mjs";
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -111,7 +112,7 @@ function resolveDep(name, fromDir, stop) {
 
 /// Licence texts of the renderer's runtime closure (what is bundled into the
 /// page): walks dependencies from the two pinned production roots.
-function rendererNotices(rendererRoot) {
+export function rendererNotices(rendererRoot) {
   const seen = new Map();
   const walk = (dir) => {
     const pkg = readJson(join(dir, "package.json"));
@@ -133,9 +134,10 @@ function rendererNotices(rendererRoot) {
   const sections = [];
   for (const [dir, pkg] of [...seen].sort((a, b) => a[1].name.localeCompare(b[1].name))) {
     const files = licenseFiles(dir);
-    const text = files.length
-      ? files.map((f) => readFileSync(join(dir, f), "utf8").trim()).join("\n\n")
-      : `(no licence file shipped in the package; declared licence: ${pkg.license ?? "unknown"})`;
+    // A package without a licence file cannot meet its notice duty: fail, so a
+    // person decides (vendor the text or drop the dependency), never a stub.
+    if (!files.length) throw new Error(`renderer package ${pkg.name} ${pkg.version} ships no licence file; add its upstream licence text deliberately`);
+    const text = files.map((f) => readFileSync(join(dir, f), "utf8").trim()).join("\n\n");
     sections.push(`${pkg.name} ${pkg.version} (${pkg.license ?? "unknown"})\n${"-".repeat(60)}\n${text}\n`);
   }
   return sections.join("\n");
@@ -224,14 +226,31 @@ function main() {
     // 5. Licences and notices.
     if (existsSync(join(repo, "LICENSE"))) cpSync(join(repo, "LICENSE"), join(stage, "LICENSE"));
     cpSync(rustNotices, join(stage, "THIRD-PARTY-LICENSES-RUST.html"));
-    let engine = readFileSync(join(repo, "packaging", "ENGINE-LIBRARIES-NOTICE.txt"), "utf8");
+    // Engine libraries: the notice file, then every vendored upstream text
+    // (release-notices.mjs). A missing text fails the build; nothing is stubbed.
+    let engine = readFileSync(join(repo, "packaging", "ENGINE-LIBRARIES-NOTICE.txt"), "utf8").trimEnd();
+    for (const notice of VENDORED_NOTICES) {
+      let text;
+      try {
+        text = readVendoredNotice(notice);
+      } catch (error) {
+        fail(error.message);
+      }
+      engine += `\n\n${heading(notice)}\n\n${text}`;
+    }
     if (process.platform === "win32") {
       engine += `\n\n${readFileSync(join(repo, "packaging", "MSVC-RUNTIME-NOTICE.txt"), "utf8")}\n${readFileSync(join(stage, "runtime", "msvc", "REDIST-VERSION.txt"), "utf8")}`;
     }
     const rendererRoot = join(repo, "renderer", "local-avatar");
+    let renderer;
+    try {
+      renderer = rendererNotices(rendererRoot);
+    } catch (error) {
+      fail(error.message);
+    }
     writeFileSync(
       join(stage, "THIRD-PARTY-NOTICES.txt"),
-      `${engine}\n\n==== Avatar page (renderer/local-avatar bundle) ====\n\n${rendererNotices(rendererRoot)}`,
+      `${engine}\n\n==== Avatar page (renderer/local-avatar bundle) ====\n\n${renderer}`,
     );
 
     // 6. README.
