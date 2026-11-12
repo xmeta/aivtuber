@@ -44,12 +44,20 @@ jobs:
     name: Build ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 75
+    env:
+      # Release builds only; dev and CI builds are unchanged. Empty on Linux.
+      RUSTFLAGS: ${{ matrix.rustflags }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          # Static C runtime for every Rust program: a clean Windows has no
+          # Visual C++ runtime (issue #294: VCRUNTIME140.dll not found). The
+          # bundled engine DLLs are the "MT" build and import none either; the
+          # smoke job checks the import tables of every shipped exe and dll.
           - label: windows-x64
             os: windows-latest
+            rustflags: -C target-feature=+crt-static
           # Built on the oldest hosted Ubuntu so the glibc floor stays low; the
           # smoke job below runs the archive on a newer image.
           - label: linux-x64
