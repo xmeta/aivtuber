@@ -17,7 +17,7 @@ Process baseline::
 `ProcessAudioPlayer` resolves `audio://` under the configured root and starts `ffplay` for each playback. Production behavior is unchanged. A tracked-start helper exposes the child only to the benchmark so process spawn and stop can be measured without duplicating validation logic.
 
 Native candidate::
-`RodioAudioPlayer` is available only on Windows when the `native-audio-spike` feature is enabled. It opens one default output stream, decodes a file per playback, and creates a player attached to the persistent mixer. It remains an `AudioPlayer`; no device handle enters domain/replay state.
+`RodioAudioPlayer` is available when the `native-audio-spike` feature is enabled (it is no longer Windows-gated, see "Device and deployment behavior"). It opens one default output stream and keeps *one persistent `Player`* on its mixer (#83 S3d, see "Phrase continuity"). It remains an `AudioPlayer`; no device handle enters domain/replay state.
 
 == Measurement setup
 
@@ -82,15 +82,58 @@ The native candidate exposes local `stop()` over the currently active player. Th
 
 The current `AudioPlayer` production interface remains intentionally authority-free. Operator stop/mute is still decided by the application/security/scheduler path; a native audio object does not receive `AuthenticatedControl`.
 
-The handoff proxy favors the persistent native stream, but this spike does not measure the actual DAC/speaker gap between waveforms. Phrase-level continuity for #83 therefore remains an explicit revisit condition rather than a completed claim.
+The handoff proxy favors the persistent native stream, but the #101 spike did not measure the gap between waveforms. #83 S3d adds that measurement for the part that is deterministic; see the next section for what it does and does not establish.
+
+== Phrase continuity (#83 S3d)
+
+Decision (supervisor, #83): wrap rodio 0.22.2 (already in `Cargo.lock`). Rejected: kira (a second cpal and symphonia, and its own clock would be a second timing authority beside the scheduler), web-audio-api-rs (too heavy), oddio (unmaintained since 2023). A custom cpal ring buffer stays the fallback if the falsifier below fails; it did not.
+
+Design::
+* `RodioAudioPlayer` keeps one `Player`. A continuation phrase (phrase seq > 0 of a phrased reply, carried as `AudioPlaybackCommand::continuation` and `AudioPlayRequest::continuation`) is `append`ed behind the audio in flight. rodio's queue then starts it on the sample after the previous source ends, with no per-phrase player creation or stop.
+* The queue is bounded: at most `MAX_QUEUED_PHRASES` (3) phrases, playing plus queued. A fourth is refused with `EngineErrorKind::Overloaded` and counted (`refused_queue_full()`); nothing already queued is dropped.
+* Speed is applied to each source (`Source::speed`), not to the player, so a continuation at another speed does not retune the phrase already playing.
+* A fresh (non-continuation) request replaces what still plays, as before; a drained player is reused.
+* The app releases a continuation command to a backend that declares `AudioPlayer::supports_gapless_queue()` (`AudioOutput::gapless_queue()`) `AUDIO_LOOKAHEAD_MS` (250 ms, a constant) before its logical `at_ms`. `ProcessAudioPlayer` does not declare it and keeps the hand-over at the logical start.
+* The logical clock is unchanged (ADR-0004 D-6): `Started` is written by the scheduler at the logical `at_ms`; backend acceptance during the lookahead strengthens only the basis of `Finished` and never emits `Started`.
+* Operator stop and barge-in end the shared player through the existing `AudioOutput::stop` primitive inside the 100 ms `AUDIO_STOP_BOUND`: queued-ahead phrases are dropped at the instant of the call (a source that has not produced a sample yet yields nothing), the audible phrase fades, the player is dropped, and the next `play` builds a new player. `Player::clear` is never called (it blocks until the queue drains) and nothing is appended to a stopped player (`append` blocks then too). The scheduler cancels the queued-ahead phrases as `Cancelled` (reached `committed`) in the speech lifecycle.
+
+Measured (device-free, `cargo test --locked -p aivtuber-adapters --features gapless-queue --test gapless_queue -- --nocapture`; the queue runs on rodio's offline mixer and the test pulls it sample by sample, so the numbers are exact, not timed):
+
+[cols="3,2"]
+|===
+|Case |Result
+|Two mono 48 kHz WAVs A (4800 samples of 0.25) and B (3600 samples of -0.5), B appended as a continuation
+|A occupies indices 0..4799, B's first sample is at index 4800: *0 samples between them*; B is intact (3600) and silence follows
+|Three phrases (1000, 777, 2001 samples)
+|no zero sample anywhere in the 3778-sample chain; each value appears exactly its length
+|Contrast: the second phrase handed over 736 samples after the first one ended (what a hand-over at the logical start does)
+|1024 samples (21.3 ms) of silence before it starts: the arrival delay plus up to one 1024-sample idle span of rodio's queue; the detector is able to see a gap
+|Bound
+|the 4th request is refused with `Overloaded`, counted once, queue still 3
+|Stop with a 120 ms fade, two phrases queued ahead
+|call returns in 88 microseconds (offline mixer; on a device 58 microseconds in `audio_stop`); neither queued phrase produces a sample; silent after the fade; the next play is audible on a new player
+|Speed 0.5 on the continuation
+|phrase A intact (4800); B starts immediately behind it and plays at about half its length (rodio's resampler: 2400 expected, 2656 observed in a probe), so exactness is claimed at speed 1.0 only
+|===
+
+What this establishes: with the next phrase already appended, rodio's queue plus mixer introduce no silence at the boundary *in the sample stream*, for 16-bit mono WAV at 48 kHz and a sink at the same rate, and the lookahead makes "already appended" the normal case. It also establishes the stop semantics above against the real queue code.
+
+What it does not establish (needs a manual DAC-level measurement, see the PR for #83 S3d):
+
+* the gap at the *speaker*: cpal's callback buffering, the host API (WASAPI shared mode) and the driver sit after the mixer; a loopback or microphone capture of two chained phrases is needed to confirm zero gap there;
+* Opus/other codecs (only WAV was used; a decoder that reports a different span length could add padding);
+* sample-rate conversion cases (phrase rate different from the device rate, speed other than 1.0);
+* drift between the logical timeline and the device: a phrase's logical end is `start + duration_ms` as reported by TTS, while the device plays the actual samples, so a phrase whose file is longer or shorter than its reported duration shifts the audible chain relative to the logical one (`Started` is logical by design; no drift correction exists);
+* the stop latency to silence at the speaker (the call returns at once and the fade is at most 150 ms, but the device buffer after it is not measured);
+* a preemption that cancels a queued continuation inside its 250 ms window: the already handed-over phrase is not recalled (operator stop and barge-in are handled because they stop the whole player).
 
 == Device and deployment behavior
 
 Windows::
-The feature build and live benchmark succeeded against the default Windows output device. `RodioAudioPlayer::new` fails with an unavailable error when the default stream cannot be opened. The current spike does not automatically rebuild the stream after device removal/default-device change; production adoption would need an explicit reconnect/reconstruction policy.
+The feature build and live benchmark succeeded against the default Windows output device. `RodioAudioPlayer::new` fails with an unavailable error when the default stream cannot be opened. Device-loss reconnect is a *known gap*: nothing rebuilds the stream after device removal or a default-device change (a play then keeps appending to a player whose device is gone). It must be closed before the native backend can become the default.
 
-WSL/Linux development::
-The WSL environment used during the spike has WSLg/PulseAudio endpoints and `ffplay`, but no `aplay` command or ALSA development package visible through `pkg-config`. To keep deterministic CI and normal WSL builds independent of host audio development libraries, the native playback implementation is Windows-gated and the rodio dependency is optional.
+Features and other platforms::
+Two opt-in features, neither in a default build. `gapless-queue` enables rodio *without* its `playback` feature: the device-free `GaplessQueue`, which builds and tests on any host with no ALSA headers (CI runs its clippy and the falsifier). `native-audio-spike` adds rodio's `playback` (cpal) and `RodioAudioPlayer`/the benchmark; cpal needs ALSA development headers on Linux exactly like `mic-capture`, so default CI does not build it. The Windows-only gate was removed from the code in #83 S3d, but `native-audio-spike` has been built and run on Windows only; Linux and macOS device behavior is unverified.
 
 Fallback::
 The process backend remains available and remains the production default. Failure of the optional native experiment therefore does not remove the existing operational path.
@@ -127,7 +170,7 @@ The benchmark output is intentionally a checked-in evidence snapshot; fresh loca
 Reconsider replacing the process default when at least one of these produces new evidence:
 
 * #58 shows audio backend startup is material in the end-to-end latency budget;
-* #83 needs phrase-level gap/continuity below what process playback can provide;
+* #83 needs phrase-level gap/continuity below what process playback can provide (the sample-stream part is now measured, see "Phrase continuity"; the DAC-level part is not);
 * an acoustic loopback/microphone measurement confirms the proxy advantage at first audible output;
 * production device-loss/reconnect tests establish a robust persistent-stream lifecycle;
 * isolated CPU/memory measurements reveal a material regression or advantage.
