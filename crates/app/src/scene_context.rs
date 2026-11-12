@@ -177,6 +177,10 @@ impl SceneContextService {
         self.tracker.scheduling_interruptibility(now_ms)
     }
 
+    pub fn scheduling_context(&self, now_ms: u64) -> aivtuber_domain::TrustedInterruptibility {
+        self.tracker.scheduling_context(now_ms)
+    }
+
     pub fn take_transitions(&mut self, max: usize) -> Vec<SceneTransition> {
         self.tracker.take_transitions(max)
     }
