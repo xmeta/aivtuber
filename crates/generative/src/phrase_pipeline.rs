@@ -15,7 +15,7 @@
 use crate::PHRASE_SEGMENTATION_VERSION;
 use crate::phrase::{
     Delivery, PhraseDelivery, PhraseEnd, PhraseFailure, PhraseOptions, PhraseState, PhraseStep,
-    PhraseSummary, PhraseUnit, SlotWait, has_content, segment_reply,
+    PhraseSummary, PhraseUnit, SlotWait, WholeReplyAudit, has_content, segment_reply,
 };
 use crate::{
     CancellationStage, FallbackDirective, GeneratedTextGateDecision, GenerationCancellationToken,
@@ -27,6 +27,37 @@ use crate::{
 use aivtuber_domain::{FallbackReason, SpeechRequest};
 use futures::executor::block_on;
 use std::time::{Duration, Instant};
+
+/// The already-committed display text a streamed phrase is gated together
+/// with, and the hard bound on the joined text (issue #83 S3a).
+#[derive(Clone, Copy)]
+pub(crate) struct CumulativeGate<'a> {
+    pub(crate) prefix: &'a str,
+    pub(crate) max_chars: usize,
+}
+
+/// Concatenate committed display text and the next phrase the way the reply
+/// read before it was cut: phrases are trimmed, so a single space is restored
+/// only between two ASCII non-space boundary characters (`Hello.` `World`);
+/// Japanese and other unspaced text joins directly. Approximate by design: a
+/// separator the segmenter trimmed cannot be recovered exactly.
+pub(crate) fn join_display(prefix: &str, next: &str) -> String {
+    let mut joined = String::with_capacity(prefix.len() + next.len() + 1);
+    joined.push_str(prefix);
+    let spaced = prefix
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_ascii() && !c.is_whitespace())
+        && next
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii() && !c.is_whitespace());
+    if spaced {
+        joined.push(' ');
+    }
+    joined.push_str(next);
+    joined
+}
 
 /// Why one phrase stopped short of delivery.
 pub(crate) enum PhraseStop {
@@ -188,6 +219,7 @@ impl GenerativePipeline {
             delivered_phrases: delivered,
             end,
             tts_chars,
+            whole_reply_audit: WholeReplyAudit::NotRun,
         };
         let phrased = |trace: GenerationTrace, summary: PhraseSummary| GenerationResult {
             trace,
@@ -241,6 +273,7 @@ impl GenerativePipeline {
                 (&thinking_identity, &tts_identity),
                 cancellation,
                 &mut trace,
+                None,
             );
             let (unit, chars) = match prepared {
                 Ok(prepared) => prepared,
@@ -299,6 +332,7 @@ impl GenerativePipeline {
         ),
         cancellation: &GenerationCancellationToken,
         trace: &mut GenerationTrace,
+        cumulative: Option<CumulativeGate<'_>>,
     ) -> Result<(PhraseUnit, usize), PhraseStop>
     where
         F: FnMut(&str) -> GeneratedTextGateDecision,
@@ -317,6 +351,41 @@ impl GenerativePipeline {
             }
         };
 
+        // Streamed replies (issue #83 S3a): no whole-reply gate ran before
+        // phrase 0, so a violation that only exists across phrases is caught
+        // here, before this phrase is synthesized or committed. It sits right
+        // after the per-phrase display gate and before the projection step; the
+        // display text is put through the gate once more afterwards so the
+        // gate's last decision is still the one for the text being committed
+        // (the commit barrier re-checks exactly that, #286).
+        let mut cumulative_ran = false;
+        if let Some(cumulative) = cumulative {
+            let joined = join_display(cumulative.prefix, &approved);
+            if joined.chars().count() > cumulative.max_chars {
+                return Err(PhraseStop::Failed(
+                    PhraseFailure::CumulativeGateRejected,
+                    FallbackReason::PolicyOverride,
+                ));
+            }
+            if !cumulative.prefix.is_empty() {
+                cumulative_ran = true;
+                match output_gate(&joined) {
+                    GeneratedTextGateDecision::Publish(text) if text.trim() == joined.trim() => {}
+                    // A refusal, and equally a redaction: the earlier phrases
+                    // are already spoken, so text that would have to change
+                    // cannot be published by dropping only this phrase's part.
+                    // The refusing decision stays the gate's last one, so it is
+                    // the one audited.
+                    _ => {
+                        return Err(PhraseStop::Failed(
+                            PhraseFailure::CumulativeGateRejected,
+                            FallbackReason::PolicyOverride,
+                        ));
+                    }
+                }
+            }
+        }
+
         // ADR-0004 D-5, per phrase: deletion-only projection, gated again when
         // it changed anything, with the display text through the gate last so
         // the gate's last decision is the one for the text being committed.
@@ -330,6 +399,9 @@ impl GenerativePipeline {
                 GeneratedTextGateDecision::Reject => String::new(),
             }
         } else {
+            if cumulative_ran {
+                let _ = output_gate(&approved);
+            }
             approved.clone()
         };
         if speech_text.trim().is_empty() {
@@ -908,6 +980,11 @@ mod tests {
             &mut delivery,
         );
         assert!(summary(&result).completed());
+        assert_eq!(
+            summary(&result).whole_reply_audit,
+            WholeReplyAudit::NotRun,
+            "buffered mode gates the whole reply before phrase 0 and has no audit pass"
+        );
         let first_display = delivery.units[0].display_text().to_owned();
         assert!(first_display.contains('😊'), "display text keeps the emoji");
         assert!(

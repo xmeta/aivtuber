@@ -1045,13 +1045,16 @@ fn run() -> Result<(), Box<dyn Error>> {
             let phrase_metrics = app.phrase_metrics();
             if phrase_metrics != last_phrase_metrics {
                 eprintln!(
-                    "phrase_metrics: responses={} completed={} partial={} phrases_committed={} gate_rejected_before_first={} gate_rejected_after_commit={} scheduler_rejected={} synthesis_failed_after_commit={} cancelled_after_commit={} underruns={} max_gap_ms={} max_synthesis_ms={} late_dropped={}",
+                    "phrase_metrics: responses={} completed={} partial={} phrases_committed={} gate_rejected_before_first={} gate_rejected_after_commit={} stream_cumulative_gate_rejected={} stream_whole_reply_gate_audits={} stream_whole_reply_gate_rejected_after_commit={} scheduler_rejected={} synthesis_failed_after_commit={} cancelled_after_commit={} underruns={} max_gap_ms={} max_synthesis_ms={} late_dropped={}",
                     phrase_metrics.responses,
                     phrase_metrics.completed,
                     phrase_metrics.partial,
                     phrase_metrics.phrases_committed,
                     phrase_metrics.gate_rejected_before_first_commit,
                     phrase_metrics.gate_rejected_after_commit,
+                    phrase_metrics.stream_cumulative_gate_rejected,
+                    phrase_metrics.stream_whole_reply_gate_audits,
+                    phrase_metrics.stream_whole_reply_gate_rejected_after_commit,
                     phrase_metrics.scheduler_rejected,
                     phrase_metrics.synthesis_failed_after_commit,
                     phrase_metrics.cancelled_after_commit,
@@ -1582,6 +1585,9 @@ fn build_generative_runtime(
                 "AIVTUBER_THINKING_STREAM_MAX_MS",
                 StreamPolicy::default().max_duration.as_millis() as u64,
             )?),
+            // The streamed-reply gate input is bounded by the same cap the
+            // adapter enforces on the stream (#83 S3a).
+            max_reply_chars: limits.max_reply_chars,
         };
         config.stream = Some(policy);
         config.validate()?;
