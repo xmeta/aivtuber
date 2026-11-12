@@ -575,7 +575,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
         // authority. All privileged actions go through `authenticate` below.
         if !ingress.verify_secret(&presented) {
             let detail = "authentication failed".to_owned();
-            app.audit_operator_action(&request_id, &action, &detail, false);
+            app.audit_operator_action(&request_id, action, &detail, false);
             return rejection(&request_id, &detail);
         }
         if action == "status" {
@@ -620,7 +620,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
     } else if action == "memory.export" {
         "memory.admin".to_owned()
     } else {
-        action.clone()
+        action.to_owned()
     };
     let input = OperatorCommandInput {
         event_id: format!("operator-{request_id}"),
@@ -635,7 +635,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
         Ok(command) => command,
         Err(_) => {
             let detail = "authentication failed".to_owned();
-            app.audit_operator_action(&request_id, &action, &detail, false);
+            app.audit_operator_action(&request_id, action, &detail, false);
             return rejection(&request_id, &detail);
         }
     };
@@ -644,7 +644,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
         let enable = action == "perception.enable";
         return match app.apply_perception_control(command.authority(), enable, now_ms) {
             Ok(detail) => {
-                app.audit_operator_action(&request_id, &action, detail, true);
+                app.audit_operator_action(&request_id, action, detail, true);
                 OperatorResponse {
                     request_id,
                     ok: true,
@@ -654,7 +654,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
                 }
             }
             Err(detail) => {
-                app.audit_operator_action(&request_id, &action, detail, false);
+                app.audit_operator_action(&request_id, action, detail, false);
                 rejection(&request_id, detail)
             }
         };
@@ -669,7 +669,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
                     export.seed.len(),
                     export.skipped
                 );
-                app.audit_operator_action(&request_id, &action, &detail, true);
+                app.audit_operator_action(&request_id, action, &detail, true);
                 OperatorResponse {
                     request_id,
                     ok: true,
@@ -685,7 +685,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
             }
             Err(error) => {
                 let detail = error.to_string();
-                app.audit_operator_action(&request_id, &action, &detail, false);
+                app.audit_operator_action(&request_id, action, &detail, false);
                 rejection(&request_id, &detail)
             }
         };
@@ -703,7 +703,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
             if let Some(report) = stop_report {
                 detail = format!("{detail}; {}", report.detail());
             }
-            app.audit_operator_action(&request_id, &action, &detail, true);
+            app.audit_operator_action(&request_id, action, &detail, true);
             OperatorResponse {
                 request_id,
                 ok: true,
@@ -714,7 +714,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
         }
         Err(error) => {
             let detail = format!("rejected: {error}");
-            app.audit_operator_action(&request_id, &action, &detail, false);
+            app.audit_operator_action(&request_id, action, &detail, false);
             rejection(&request_id, &detail)
         }
     }

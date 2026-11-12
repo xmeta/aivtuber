@@ -9825,7 +9825,7 @@ mod tests {
             // The generated secret is 32 raw random bytes (not hex, not text):
             // the panel presents the bytes themselves, so nothing restricts
             // its entropy to a text alphabet.
-            let raw = [0xFF_u8, 0xFE, 0x80, 0x00, 0xC3, 0x28, 0xA0, 0xA1]
+            let raw: [u8; 32] = [0xFF_u8, 0xFE, 0x80, 0x00, 0xC3, 0x28, 0xA0, 0xA1]
                 .repeat(4)
                 .try_into()
                 .expect("32 bytes");
