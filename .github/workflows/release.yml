@@ -200,6 +200,9 @@ jobs:
           sparse-checkout: |
             scripts/smoke-release-archive.mjs
             scripts/pe-imports.mjs
+            scripts/release-notices.mjs
+            packaging/third-party/
+            packaging/MSVC-RUNTIME-NOTICE.txt
             packaging/local-profile-pins.json
           sparse-checkout-cone-mode: false
 

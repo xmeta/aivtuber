@@ -18,7 +18,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-pub const OPENRAIL_NOTICE: &str = "Supertonic 3 weights are OpenRAIL-M: use restrictions apply, including the duty to disclose that published audio is machine-generated (docs/supply-chain.adoc section 10).";
+pub const OPENRAIL_NOTICE: &str = "Supertonic 3 weights are OpenRAIL-M: use restrictions apply, including the duty to disclose that published audio is machine-generated (docs/supply-chain.adoc section 10). Licence text at the pinned revision 3cadd1ee6394adea1bd021217a0e650ede09a323: https://huggingface.co/Supertone/supertonic-3/blob/3cadd1ee6394adea1bd021217a0e650ede09a323/LICENSE";
 pub const SEED_RULE: &str = "lang=ja; seed = little-endian u32 of sha256(utf8 text)[0..4] & 0x7fffffff (speech_tts::text_seed); no random seed";
 
 pub fn text_seed(text: &str) -> u32 {

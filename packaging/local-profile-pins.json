@@ -177,7 +177,7 @@
       "component": "Supertonic 3 weights (TTS voice)",
       "licence": "OpenRAIL-M",
       "applies_to": ["tts"],
-      "duty": "Disclose that the voice is machine-generated: one of the use restrictions is publishing AI-generated content without clear disclosure. Keep an \"AI-generated voice\" line where viewers see it (channel or stream description, or an overlay); the runtime only prints a start-up notice. The other restrictions (no unlawful use, no harm to minors, no disinformation, no harassment or discrimination, no impersonation or deepfakes without consent, no fully automated legal, medical or law-enforcement decisions) pass on to you."
+      "duty": "Disclose that the voice is machine-generated: one of the use restrictions is publishing AI-generated content without clear disclosure. Keep an \"AI-generated voice\" line where viewers see it (channel or stream description, or an overlay); the runtime only prints a start-up notice. The other restrictions (no unlawful use, no harm to minors, no disinformation, no harassment or discrimination, no impersonation or deepfakes without consent, no fully automated legal, medical or law-enforcement decisions) pass on to you. Licence (BigScience OpenRAIL-M), pinned revision 3cadd1ee6394adea1bd021217a0e650ede09a323 of Supertone/supertonic-3: https://huggingface.co/Supertone/supertonic-3/blob/3cadd1ee6394adea1bd021217a0e650ede09a323/LICENSE"
     },
     {
       "id": "reazonspeech-k2-v2",

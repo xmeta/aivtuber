@@ -5,6 +5,9 @@
 // Unpacks the archive into a fresh directory and uses nothing else (no Cargo,
 // no Bun, no model, no network). It checks:
 //   * the expected files are present and no model weights or voice files are;
+//   * THIRD-PARTY-NOTICES.txt holds every vendored engine licence text in full
+//     (packaging/third-party/, issue #349), on Windows also the Visual C++
+//     runtime notice, and never the missing-licence stub;
 //   * on Windows, no shipped .exe or .dll imports the Visual C++ runtime or the
 //     universal CRT: a clean Windows has none of them, so the Rust programs are
 //     built with the static CRT and the bundled engine DLLs are the "MT" build
@@ -31,6 +34,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { peImports } from "./pe-imports.mjs";
+import { MISSING_LICENCE_STUB, VENDORED_NOTICES, heading, readVendoredNotice } from "./release-notices.mjs";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
 const archive = process.argv[2] ? resolve(process.argv[2]) : null;
@@ -153,6 +157,33 @@ try {
       assert(existsSync(join(root, name)) && statSync(join(root, name)).size > 1000, `missing or empty ${name}`);
     }
   });
+
+  // Issue #349: the engine libraries' upstream licence texts (ONNX Runtime's
+  // ThirdPartyNotices, the sherpa-onnx static dependencies, Eigen's MPL-2.0) must
+  // be in the archive in full, not pointed to, and no stub may stand in for a
+  // missing renderer licence. The expected texts are the vendored files this
+  // archive was built from (packaging/third-party/).
+  check("third-party notices carry every vendored engine text and no stub", () => {
+    const notices = readFileSync(join(root, "THIRD-PARTY-NOTICES.txt"), "utf8").replace(/\r\n/g, "\n");
+    for (const name of VENDORED_NOTICES) {
+      const section = `${heading(name)}\n\n${readVendoredNotice(name)}`;
+      assert(notices.includes(section), `THIRD-PARTY-NOTICES.txt lacks the full text of packaging/third-party/${name}`);
+    }
+    assert(notices.includes("Eigen (MPL-2.0) source code"), "THIRD-PARTY-NOTICES.txt lacks the Eigen MPL-2.0 source pointer");
+    assert(notices.includes("==== Avatar page"), "THIRD-PARTY-NOTICES.txt lacks the avatar page section");
+    assert(!notices.includes(MISSING_LICENCE_STUB), `THIRD-PARTY-NOTICES.txt contains the missing-licence stub "${MISSING_LICENCE_STUB}"`);
+    return `${VENDORED_NOTICES.length} texts`;
+  });
+
+  if (win) {
+    check("third-party notices carry the Visual C++ runtime notice and redistributable version", () => {
+      const notices = readFileSync(join(root, "THIRD-PARTY-NOTICES.txt"), "utf8").replace(/\r\n/g, "\n");
+      const notice = readFileSync(join(scriptDir, "..", "packaging", "MSVC-RUNTIME-NOTICE.txt"), "utf8").replace(/\r\n/g, "\n").trimEnd();
+      assert(notices.includes(notice), "THIRD-PARTY-NOTICES.txt lacks packaging/MSVC-RUNTIME-NOTICE.txt");
+      const redist = readFileSync(join(root, "runtime", "msvc", "REDIST-VERSION.txt"), "utf8").replace(/\r\n/g, "\n").trimEnd();
+      assert(notices.includes(redist), "THIRD-PARTY-NOTICES.txt lacks runtime/msvc/REDIST-VERSION.txt");
+    });
+  }
 
   check("avatar page files are present", () => {
     const page = join(root, "renderer", "local-avatar", "dist");
