@@ -16,7 +16,7 @@ use crate::speech_stt::pins::{ModelPin, PinnedFile};
 /// restrictions include publishing AI-generated content without clearly
 /// disclosing that it is machine-generated; docs/supply-chain.adoc passes the
 /// restrictions on.
-pub const VOICE_LICENCE_NOTICE: &str = "voice model Supertonic 3 (Supertone Inc.) is licensed under OpenRAIL-M: its use restrictions apply, including the duty to disclose that published audio is machine-generated; keep an \"AI-generated voice\" disclosure on stream (docs/supply-chain.adoc)";
+pub const VOICE_LICENCE_NOTICE: &str = "voice model Supertonic 3 (Supertone Inc.) is licensed under OpenRAIL-M: its use restrictions apply, including the duty to disclose that published audio is machine-generated; keep an \"AI-generated voice\" disclosure on stream; licence text at the pinned revision: https://huggingface.co/Supertone/supertonic-3/blob/3cadd1ee6394adea1bd021217a0e650ede09a323/LICENSE (docs/supply-chain.adoc)";
 
 /// `model_alias` recorded in TTS provenance.
 pub const SUPERTONIC_MODEL_ALIAS: &str = "supertonic-3-int8";
