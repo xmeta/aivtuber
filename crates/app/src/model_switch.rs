@@ -29,14 +29,28 @@
 
 use aivtuber_adapters::OpenAiResponsesAdapter;
 use aivtuber_domain::{
-    ThinkingModel, ThinkingModelCatalog, ThinkingModelError, write_model_settings,
+    ThinkingModel, ThinkingModelCatalog, ThinkingModelError, render_model_settings,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::Duration;
+
+/// Replaces the settings file with `alias` (temp file in the same directory,
+/// then rename, so a crash leaves the old or the new file, never half of one).
+pub(crate) fn write_model_settings(path: &Path, alias: &str) -> std::io::Result<()> {
+    let text = render_model_settings(alias)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let mut temp = path.as_os_str().to_owned();
+    temp.push(".tmp");
+    let temp = PathBuf::from(temp);
+    std::fs::write(&temp, text)?;
+    std::fs::rename(&temp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temp);
+    })
+}
 
 /// How the warm-up that follows a switch is run: `true` when the model
 /// answered. Injected so tests need no model server; production runs the
@@ -307,6 +321,23 @@ mod tests {
             s.poll();
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    #[test]
+    fn the_settings_file_is_replaced_atomically_and_only_with_an_alias() {
+        let dir = std::env::temp_dir().join(format!("aivtuber-settings-w-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.json");
+        write_model_settings(&path, "alpha").unwrap();
+        write_model_settings(&path, "beta").unwrap();
+        let saved = std::fs::read(&path).unwrap();
+        assert_eq!(
+            aivtuber_domain::parse_model_settings(&saved).as_deref(),
+            Some("beta")
+        );
+        assert!(!dir.join("model.json.tmp").exists());
+        assert!(write_model_settings(&path, "../x").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

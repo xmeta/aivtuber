@@ -15,8 +15,11 @@
 
 use crate::config::{LLAMA_ALIAS, LLAMA_DEFAULT_CONTEXT, parse_env};
 use crate::manifest::{DEFAULT_PROFILE, Manifest};
-use aivtuber_domain::{ThinkingModel, ThinkingModelCatalog, read_model_settings};
+use aivtuber_domain::{
+    MAX_MODEL_SETTINGS_BYTES, ThinkingModel, ThinkingModelCatalog, parse_model_settings,
+};
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -253,6 +256,20 @@ pub fn plan_models(
     }))
 }
 
+/// The remembered choice, if the file exists, is small, well formed and names a
+/// model still in `catalog`. Every other case (missing, oversized, garbage,
+/// unknown or uninstalled alias) is `None`, so the caller falls back to its
+/// default; a bad file never stops a start.
+pub fn read_model_settings(path: &Path, catalog: &ThinkingModelCatalog) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_MODEL_SETTINGS_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let alias = parse_model_settings(&bytes)?;
+    catalog.get(&alias).map(|m| m.alias.clone())
+}
+
 /// The router's preset file: one `[alias]` section per model with the same
 /// per-model flags the single-model launch passes (context, GPU layers, hidden
 /// reasoning off). Keys are the long llama-server flags without the dashes.
@@ -349,6 +366,16 @@ fn healthy(port: u16) -> bool {
         .is_ok_and(|r| r.status().as_u16() == 200)
 }
 
+/// `taskkill` by absolute path under `%SystemRoot%`, so a copy in the current
+/// directory, next to this program or earlier on PATH is never run instead.
+#[cfg(windows)]
+fn taskkill_path() -> PathBuf {
+    let root = std::env::var_os("SystemRoot")
+        .filter(|v| !v.is_empty())
+        .map_or_else(|| PathBuf::from("C:\\Windows"), PathBuf::from);
+    root.join("System32").join("taskkill.exe")
+}
+
 struct KillOnDrop(Child);
 
 impl Drop for KillOnDrop {
@@ -356,7 +383,7 @@ impl Drop for KillOnDrop {
         // The router spawns one llama-server per loaded model. On Windows a
         // killed parent leaves them running, so end the whole tree.
         #[cfg(windows)]
-        let _ = Command::new("taskkill")
+        let _ = Command::new(taskkill_path())
             .args(["/PID", &self.0.id().to_string(), "/T", "/F"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -670,7 +697,11 @@ mod tests {
         assert_eq!(p.models[1].gguf, PathBuf::from("/x").join(QWEN_FILE));
         assert_eq!(p.initial, LLAMA_ALIAS, "no saved choice: the default");
         // A saved choice that is installed is used...
-        aivtuber_domain::write_model_settings(&settings, "qwen3-4b-instruct-2507").unwrap();
+        std::fs::write(
+            &settings,
+            aivtuber_domain::render_model_settings("qwen3-4b-instruct-2507").unwrap(),
+        )
+        .unwrap();
         let p = plan(&env("99"), &settings, true).unwrap();
         assert_eq!(p.initial, "qwen3-4b-instruct-2507");
         let pairs = app_model_env(&p, &settings);
@@ -693,6 +724,24 @@ mod tests {
             plan(&env("99"), &settings, true).unwrap().initial,
             LLAMA_ALIAS
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_saved_choice_is_read_boundedly_and_only_while_installed() {
+        let dir = temp_dir("read");
+        let path = dir.join(MODEL_SETTINGS_FILE);
+        let both = ThinkingModelCatalog::parse_choices("a:v1,b:v2").unwrap();
+        assert_eq!(read_model_settings(&path, &both), None, "missing file");
+        let doc = aivtuber_domain::render_model_settings("b").unwrap();
+        std::fs::write(&path, &doc).unwrap();
+        assert_eq!(read_model_settings(&path, &both).as_deref(), Some("b"));
+        let only_a = ThinkingModelCatalog::parse_choices("a:v1").unwrap();
+        assert_eq!(read_model_settings(&path, &only_a), None, "uninstalled");
+        std::fs::write(&path, "x".repeat(10_000)).unwrap();
+        assert_eq!(read_model_settings(&path, &both), None, "oversized");
+        std::fs::write(&path, b"\xff\xfe").unwrap();
+        assert_eq!(read_model_settings(&path, &both), None, "garbage");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

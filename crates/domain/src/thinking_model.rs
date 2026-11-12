@@ -6,12 +6,12 @@
 //! outside it. Both sides share this module so they cannot disagree about what
 //! a valid alias is. The settings file holds an alias and nothing else: never a
 //! path, never free text, and it is only ever trusted after it has been
-//! checked against the catalog the launcher computed for this run.
+//! checked against the catalog the launcher computed for this run. This module
+//! only parses and renders the document; reading and writing the file is done
+//! by the app (write) and the launcher (read), not by the domain.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::io::Read;
-use std::path::Path;
 
 pub const MAX_THINKING_MODEL_ALIAS_CHARS: usize = 64;
 pub const MAX_THINKING_MODEL_VERSION_CHARS: usize = 32;
@@ -195,34 +195,6 @@ pub fn render_model_settings(alias: &str) -> Result<String, ThinkingModelError> 
     Ok(text)
 }
 
-/// The remembered choice, if the file exists, is small, well formed and names a
-/// model still in `catalog`. Every other case (missing, oversized, garbage,
-/// unknown or uninstalled alias) is `None`, so the caller falls back to its
-/// default; a bad file never stops a start.
-pub fn read_model_settings(path: &Path, catalog: &ThinkingModelCatalog) -> Option<String> {
-    let file = std::fs::File::open(path).ok()?;
-    let mut bytes = Vec::new();
-    file.take(MAX_MODEL_SETTINGS_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    let alias = parse_model_settings(&bytes)?;
-    catalog.get(&alias).map(|m| m.alias.clone())
-}
-
-/// Replaces the settings file with `alias` (temp file in the same directory,
-/// then rename, so a crash leaves the old or the new file, never half of one).
-pub fn write_model_settings(path: &Path, alias: &str) -> std::io::Result<()> {
-    let text = render_model_settings(alias)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let mut temp = path.as_os_str().to_owned();
-    temp.push(".tmp");
-    let temp = std::path::PathBuf::from(temp);
-    std::fs::write(&temp, text)?;
-    std::fs::rename(&temp, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&temp);
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,35 +303,5 @@ mod tests {
         );
         assert_eq!(parse_model_settings(huge.as_bytes()), None);
         assert!(render_model_settings("Bad Alias").is_err());
-    }
-
-    #[test]
-    fn a_saved_choice_is_honoured_only_while_it_is_installed() {
-        let dir =
-            std::env::temp_dir().join(format!("aivtuber-model-settings-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("model.json");
-        let c = catalog();
-        assert_eq!(read_model_settings(&path, &c), None, "missing file");
-        write_model_settings(&path, "qwen3-4b-instruct-2507").unwrap();
-        assert_eq!(
-            read_model_settings(&path, &c).as_deref(),
-            Some("qwen3-4b-instruct-2507")
-        );
-        // The model was uninstalled since: the default applies.
-        let only_default =
-            ThinkingModelCatalog::parse_choices("gemma-4-e4b-it-qat:UD-Q4_K_XL").unwrap();
-        assert_eq!(read_model_settings(&path, &only_default), None);
-        // Replaced in place, and garbage or oversize is ignored.
-        write_model_settings(&path, "gemma-4-e4b-it-qat").unwrap();
-        assert_eq!(
-            read_model_settings(&path, &c).as_deref(),
-            Some("gemma-4-e4b-it-qat")
-        );
-        std::fs::write(&path, "x".repeat(10_000)).unwrap();
-        assert_eq!(read_model_settings(&path, &c), None);
-        std::fs::write(&path, b"\xff\xfe").unwrap();
-        assert_eq!(read_model_settings(&path, &c), None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
