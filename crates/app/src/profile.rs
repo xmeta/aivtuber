@@ -84,6 +84,21 @@ impl CompositionProfile {
         self == Self::Local
     }
 
+    /// Whether a phrased reply streams the provider's tokens into phrase
+    /// commit unless `AIVTUBER_THINKING_STREAM` says otherwise (issue #83
+    /// S3c).
+    ///
+    /// Only the `local` profile, on the measurement against a real
+    /// llama-server (docs/experiments/EXP-0005-streaming-ttfa.adoc): streamed
+    /// was not slower at p50, p90 or max on either workload and reached the
+    /// first phrase much sooner for multi-phrase replies. Every other profile
+    /// stays buffered: its Thinking provider is remote or unmeasured, and a
+    /// stream has no whole-reply gate before phrase 0. It still needs phrase
+    /// mode, so the default applies only when the reply is phrased.
+    pub fn thinking_stream_by_default(self) -> bool {
+        self == Self::Local
+    }
+
     /// Whether every provider endpoint must be loopback (nothing leaves the
     /// machine). Enforced by [`Self::validate_provider_endpoints`].
     pub fn loopback_only(self) -> bool {
@@ -412,6 +427,21 @@ mod tests {
                 profile.phrased_replies_by_default(),
                 profile == CompositionProfile::Local
             );
+        }
+    }
+
+    #[test]
+    fn only_the_local_profile_streams_thinking_by_default() {
+        for profile in CompositionProfile::ALL {
+            assert_eq!(
+                profile.thinking_stream_by_default(),
+                profile == CompositionProfile::Local
+            );
+            // Streaming feeds phrase commit, so it never defaults on where
+            // phrase mode is off.
+            if profile.thinking_stream_by_default() {
+                assert!(profile.phrased_replies_by_default());
+            }
         }
     }
 

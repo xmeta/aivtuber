@@ -1560,7 +1560,13 @@ fn build_generative_runtime(
     }
     // Issue #83 S2: optional provider token streaming into phrase commit.
     let mut phrase_mode = resolve_phrase_mode(profile)?;
-    if env_bool("AIVTUBER_THINKING_STREAM", false)? {
+    // #83 S3c: on by default for the local profile, only while replies are
+    // phrased (AIVTUBER_PHRASE_MODE=buffered there turns it off with it);
+    // an explicit AIVTUBER_THINKING_STREAM=on with buffered replies stays an
+    // error.
+    let stream_default =
+        profile.thinking_stream_by_default() && matches!(phrase_mode, PhraseMode::Phrased(_));
+    if env_bool("AIVTUBER_THINKING_STREAM", stream_default)? {
         let PhraseMode::Phrased(config) = &mut phrase_mode else {
             return Err(
                 "AIVTUBER_THINKING_STREAM=on needs phrase mode (AIVTUBER_PHRASE_MODE=phrase, or                  the local profile)"

@@ -147,6 +147,15 @@ pub fn render(
     push(&mut t, "AIVTUBER_OPENAI_MODEL_VERSION", &llm.model_version);
     push(&mut t, "AIVTUBER_OPENAI_BACKEND_NAME", "llama-server");
     push(&mut t, "AIVTUBER_OPENAI_MAX_OUTPUT_TOKENS", "96");
+    // Token streaming (#83 S3c) is on where it was measured: the pinned
+    // llama-server with the default model. A server you run yourself, or the
+    // other model profile, was not measured and keeps whole-reply Thinking.
+    let streamed = matches!(llm.mode, LlmMode::Managed) && llm.alias == LLAMA_ALIAS;
+    push(
+        &mut t,
+        "AIVTUBER_THINKING_STREAM",
+        if streamed { "on" } else { "off" },
+    );
     push(
         &mut t,
         "AIVTUBER_MEMORY_PSEUDONYM_KEY_HEX",
@@ -361,6 +370,7 @@ mod tests {
             "http://127.0.0.1:18080/v1/responses"
         );
         assert_eq!(map["AIVTUBER_OPENAI_MODEL"], LLAMA_ALIAS);
+        assert_eq!(map["AIVTUBER_THINKING_STREAM"], "on");
         assert_eq!(
             map["AIVTUBER_SPEECH_SIDECAR_ARGS"],
             "--model /a/vad.onnx --language ja"
@@ -403,6 +413,8 @@ mod tests {
         assert_eq!(map["AIVTUBER_SETUP_LLAMA_MMPROJ"], "/a/mmproj.gguf");
         assert_eq!(map["AIVTUBER_SETUP_LLAMA_CONTEXT"], "8192");
         assert_eq!(map["AIVTUBER_SETUP_LLAMA_PARALLEL"], "2");
+        // Not the measured model: whole-reply Thinking.
+        assert_eq!(map["AIVTUBER_THINKING_STREAM"], "off");
     }
 
     #[test]
@@ -427,6 +439,8 @@ mod tests {
         assert_eq!(map["AIVTUBER_SETUP_LLAMA_MODE"], "external");
         assert_eq!(map["AIVTUBER_OPENAI_ENDPOINT"], url);
         assert!(!map.contains_key("AIVTUBER_SETUP_LLAMA_SERVER"));
+        // A server you run yourself was not measured, may not stream.
+        assert_eq!(map["AIVTUBER_THINKING_STREAM"], "off");
     }
 
     #[test]
