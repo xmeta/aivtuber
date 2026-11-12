@@ -35,7 +35,7 @@ use crate::{HigherRankedScene, PerceptionTracker, RuntimeError, SceneFieldSource
 use aivtuber_domain::{
     Interruptibility, MAX_SCENE_LABELS, ObsSceneMap, ObsSceneMapEntry,
     SCENE_CONTEXT_SCHEMA_VERSION, SceneClass, SceneContextSnapshot, SceneSourceRank,
-    SceneTransition, is_scene_label,
+    SceneTransition, TrustedInterruptibility, is_scene_label,
 };
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -187,13 +187,19 @@ impl SceneContextTracker {
     /// (rank 1 to 3) and still fresh source ever yields anything but
     /// `unknown`: perception cannot reach this answer.
     pub fn scheduling_interruptibility(&self, now_ms: u64) -> Interruptibility {
+        self.scheduling_context(now_ms).get()
+    }
+
+    /// Same answer as [`Self::scheduling_interruptibility`], as the type the
+    /// floor accepts. Built through
+    /// [`TrustedInterruptibility::from_snapshot`], so the rank check is in the
+    /// type, not only here; missing or stale readings are `unknown`.
+    pub fn scheduling_context(&self, now_ms: u64) -> TrustedInterruptibility {
         match &self.current {
-            Some(snapshot)
-                if snapshot.source_rank.is_trusted() && now_ms < self.trusted_until_ms =>
-            {
-                snapshot.interruptibility
+            Some(snapshot) if now_ms < self.trusted_until_ms => {
+                TrustedInterruptibility::from_snapshot(snapshot)
             }
-            _ => Interruptibility::Unknown,
+            _ => TrustedInterruptibility::unknown(),
         }
     }
 

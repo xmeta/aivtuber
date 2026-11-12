@@ -13,13 +13,18 @@
 //! recommendation to the scheduler/app, not an authority and not a
 //! capability; it can only delay or allow a reply, never trigger one.
 
-use crate::{DomainValidationError, FallbackTurnSignal};
+use crate::{DomainValidationError, FallbackTurnSignal, Interruptibility, TrustedInterruptibility};
 use serde::Serialize;
 
 /// Upper bound on the retained decision ring (`FloorConfig::decision_log`).
 pub const MAX_FLOOR_DECISION_LOG: usize = 256;
 /// Upper bound on finals deferred behind the floor (`FloorConfig::max_deferred`).
 pub const MAX_FLOOR_DEFERRED: usize = 32;
+
+/// Validated range of `FloorConfig::take_turn_silence_ms`.
+pub const TAKE_TURN_SILENCE_RANGE_MS: (u64, u64) = (700, 1_000);
+/// Validated range of `FloorConfig::barge_in_confirm_ms`.
+pub const BARGE_IN_CONFIRM_RANGE_MS: (u64, u64) = (256, 800);
 
 /// Who has the floor after a decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -101,6 +106,10 @@ pub enum FloorReason {
     UserSpeechUnconfirmed,
     /// The user's raw run reached `barge_in_confirm_ms` over the performer.
     UserBargeInConfirmed,
+    /// A trusted scene says the performer must not be interrupted (#83 S3b):
+    /// a reply that the default policy would start waits, or is handed on to
+    /// the deferred-reply inbox, which holds it until the scene ends.
+    SceneProtected,
 }
 
 impl FloorReason {
@@ -118,6 +127,7 @@ impl FloorReason {
             Self::PerformerSpeaking => "performer_speaking",
             Self::UserSpeechUnconfirmed => "user_speech_unconfirmed",
             Self::UserBargeInConfirmed => "user_barge_in_confirmed",
+            Self::SceneProtected => "scene_protected",
         }
     }
 }
@@ -134,6 +144,9 @@ pub struct FloorDecision {
     pub turn: TurnState,
     /// Silence since the user's last `end` edge, when known.
     pub silence_ms: Option<u64>,
+    /// The trusted interruptibility this decision used (`unknown` when no
+    /// trusted, fresh scene source spoke), so replay names its input.
+    pub scene: Interruptibility,
 }
 
 /// What the raw VAD feed says about the one speaker whose reply is waiting.
@@ -185,6 +198,13 @@ pub struct FloorInput {
     pub own: OwnSpeech,
     /// A final transcript is waiting to be answered.
     pub reply_waiting: bool,
+    /// Trusted scene interruptibility (#83 S3b). The type cannot carry a
+    /// perceived (rank 4) value; `unknown` is the default behaviour.
+    pub scene: TrustedInterruptibility,
+    /// A reply the floor lets through in an uninterruptible scene is held by
+    /// the app's deferred-reply inbox (#75), so the floor need not keep it
+    /// waiting itself (where it would expire after `max_defer_ms`).
+    pub reply_inbox: bool,
 }
 
 /// Validated floor configuration. Every value has a range; out-of-range is
@@ -224,6 +244,34 @@ impl Default for FloorConfig {
 }
 
 impl FloorConfig {
+    /// Silence before taking the turn, modulated by the trusted scene (#83
+    /// S3b). No new knob: an uninterruptible scene uses the top of the
+    /// validated `take_turn_silence_ms` range (never below the configured
+    /// value), so the performer is slower to start; every other reading,
+    /// including `unknown`, is the configured value.
+    pub fn effective_take_turn_silence_ms(&self, scene: TrustedInterruptibility) -> u64 {
+        match scene.get() {
+            Interruptibility::Uninterruptible => {
+                self.take_turn_silence_ms.max(TAKE_TURN_SILENCE_RANGE_MS.1)
+            }
+            _ => self.take_turn_silence_ms,
+        }
+    }
+
+    /// Continuous user speech that confirms a barge-in, modulated by the
+    /// trusted scene. An uninterruptible scene halves the configured value,
+    /// never below the bottom of the validated `barge_in_confirm_ms` range:
+    /// the human wins the floor sooner. Everything else is the configured
+    /// value.
+    pub fn effective_barge_in_confirm_ms(&self, scene: TrustedInterruptibility) -> u64 {
+        match scene.get() {
+            Interruptibility::Uninterruptible => {
+                (self.barge_in_confirm_ms / 2).max(BARGE_IN_CONFIRM_RANGE_MS.0)
+            }
+            _ => self.barge_in_confirm_ms,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), DomainValidationError> {
         fn range(
             field: &'static str,
@@ -243,10 +291,15 @@ impl FloorConfig {
         range(
             "take_turn_silence_ms",
             self.take_turn_silence_ms,
-            700,
-            1_000,
+            TAKE_TURN_SILENCE_RANGE_MS.0,
+            TAKE_TURN_SILENCE_RANGE_MS.1,
         )?;
-        range("barge_in_confirm_ms", self.barge_in_confirm_ms, 256, 800)?;
+        range(
+            "barge_in_confirm_ms",
+            self.barge_in_confirm_ms,
+            BARGE_IN_CONFIRM_RANGE_MS.0,
+            BARGE_IN_CONFIRM_RANGE_MS.1,
+        )?;
         range("observation_stale_ms", self.observation_stale_ms, 96, 320)?;
         range("vad_loss_ms", self.vad_loss_ms, 1_000, 60_000)?;
         range("max_defer_ms", self.max_defer_ms, 1_000, 60_000)?;
@@ -347,6 +400,7 @@ mod tests {
             holder: FloorHolder::Performer,
             turn: TurnState::UserEnded,
             silence_ms: Some(800),
+            scene: Interruptibility::Unknown,
         };
         let value = serde_json::to_value(decision).expect("json");
         assert_eq!(value["action"], "take_turn");

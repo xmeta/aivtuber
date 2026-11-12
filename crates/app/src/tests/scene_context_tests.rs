@@ -697,3 +697,40 @@ fn the_reflex_decision_record_names_the_scene_it_used() {
     let request = last_request(&thinking);
     assert_eq!(request.context.scene.as_ref(), Some(recorded));
 }
+
+/// #83 S3b: the floor reads the scene only through the trusted accessor.
+#[test]
+fn the_floor_scene_is_trusted_fresh_and_never_perceived() {
+    let mut app = app(
+        FixedAssetRoute("reaction.agree.01"),
+        Box::new(RecordingAudio::default()),
+        Box::new(RecordingAvatar::default()),
+        Box::new(NoopStreamOutput),
+    )
+    .with_scene_context(scene_service(true));
+    app.startup().expect("startup");
+    // Missing context: the default behaviour.
+    assert_eq!(app.floor_scene(0).get(), Interruptibility::Unknown);
+
+    let tracker = app.scene_context_mut().expect("scene").tracker_mut();
+    tracker.observe_obs_program_scene("Boss", 1_000);
+    app.service_scene_context(1_000);
+    assert_eq!(
+        app.floor_scene(1_000).get(),
+        Interruptibility::Uninterruptible
+    );
+    // Stale: back to the default without a refresh.
+    let max_age = SceneContextConfig::default().obs_max_age_ms;
+    assert_eq!(
+        app.floor_scene(1_000 + max_age).get(),
+        Interruptibility::Unknown
+    );
+    // An interruptible trusted scene is the default behaviour too.
+    let tracker = app.scene_context_mut().expect("scene").tracker_mut();
+    tracker.observe_obs_program_scene("Chat", 2_000);
+    app.service_scene_context(2_000);
+    assert_eq!(
+        app.floor_scene(2_000).get(),
+        Interruptibility::Interruptible
+    );
+}

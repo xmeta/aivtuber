@@ -114,7 +114,7 @@ use aivtuber_asset_store::CacheTier;
 use aivtuber_domain::{
     AuthenticatedControl, AuthenticatedControlCommand, AuthorizedStreamAction,
     DeadlineExhaustionReason, DeadlineStage, EngineError, EventEnvelope, FallbackReason,
-    InteractionDeadline, Interruptibility, SceneContextSnapshot,
+    InteractionDeadline, Interruptibility, SceneContextSnapshot, TrustedInterruptibility,
 };
 use aivtuber_generative::{
     CancellationStage, FallbackDirective, GeneratedTextGateDecision,
@@ -1807,6 +1807,9 @@ where
         let beat_ms = self.speech_feed_heartbeat_ms?;
         let feed_age_ms = Some(at_ms.saturating_sub(beat_ms));
         let started = Instant::now();
+        // #83 S3b: only the trusted scene accessor reaches the floor.
+        let scene = self.floor_scene(at_ms);
+        let reply_inbox = self.chat_burst.is_some();
         let speakers: Vec<String> = self
             .speech_observations
             .as_ref()?
@@ -1833,6 +1836,8 @@ where
                     }),
                 own: aivtuber_domain::OwnSpeech::Speaking,
                 reply_waiting: false,
+                scene,
+                reply_inbox,
             };
             let handled = self
                 .speech_barge_in
@@ -1955,6 +1960,13 @@ where
             // own playing state. Missing evidence degrades to the text-only
             // path inside the policy, i.e. to the unchanged behaviour.
             let own = floor.own_tracker().own();
+            let scene = self
+                .scene
+                .as_ref()
+                .map_or(TrustedInterruptibility::unknown(), |scene| {
+                    scene.scheduling_context(at_ms)
+                });
+            let reply_inbox = self.chat_burst.is_some();
             let observations = self.speech_observations.as_ref();
             let transcripts: &SpeechTranscriptTracker = tracker;
             // Feed liveness (#81 S2): `None` until the sidecar reports beats.
@@ -1968,6 +1980,8 @@ where
                     hold: speech_floor::transcript_hold(transcripts, speaker, at_ms),
                     own,
                     reply_waiting: true,
+                    scene,
+                    reply_inbox,
                 }
             });
         }
@@ -2552,6 +2566,16 @@ where
             .as_mut()
             .map(|lane| lane.take_reports(max))
             .unwrap_or_default()
+    }
+
+    /// The scene reading the floor may use: trusted (rank 1 to 3) and fresh,
+    /// otherwise `unknown`. The single path from scene context to the floor.
+    fn floor_scene(&self, now_ms: u64) -> TrustedInterruptibility {
+        self.scene
+            .as_ref()
+            .map_or(TrustedInterruptibility::unknown(), |scene| {
+                scene.scheduling_context(now_ms)
+            })
     }
 
     /// Whether the performer can take a reply now. Built only from trusted

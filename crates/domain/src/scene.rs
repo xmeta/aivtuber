@@ -117,6 +117,39 @@ pub enum Interruptibility {
     Unknown,
 }
 
+/// The interruptibility scheduling and the conversational floor may read
+/// (#88 S1, ADR-0007 D-10; #83 S3b).
+///
+/// The inner value is private and the only way to a non-`unknown` one is
+/// [`Self::from_snapshot`], which yields `unknown` for any snapshot whose
+/// source is not rank 1 to 3. A perceived (rank 4) scene therefore cannot be
+/// turned into this type with a scheduling meaning, whatever its fields say,
+/// and the floor API accepts nothing else. There is deliberately no
+/// `Deserialize`, no `From<Interruptibility>` and no public constructor taking
+/// a bare value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub struct TrustedInterruptibility(Interruptibility);
+
+impl TrustedInterruptibility {
+    /// Nothing trusted is known: every consumer keeps its default behaviour.
+    pub const fn unknown() -> Self {
+        Self(Interruptibility::Unknown)
+    }
+
+    /// The snapshot's interruptibility if and only if its source is trusted.
+    pub fn from_snapshot(snapshot: &SceneContextSnapshot) -> Self {
+        if snapshot.source_rank.is_trusted() {
+            Self(snapshot.interruptibility)
+        } else {
+            Self::unknown()
+        }
+    }
+
+    pub const fn get(self) -> Interruptibility {
+        self.0
+    }
+}
+
 /// ADR-0007 D-3 source rank. Lower is more authoritative.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -522,5 +555,27 @@ mod tests {
             }
             assert!(count > 0, "obs-scene-maps/{dir} has fixtures");
         }
+    }
+
+    #[test]
+    fn a_perceived_snapshot_cannot_become_a_trusted_interruptibility() {
+        // Even a hand-built, invalid rank-4 snapshot that claims a value.
+        let mut perceived = snapshot();
+        perceived.interruptibility = Interruptibility::Uninterruptible;
+        assert!(perceived.validate().is_err());
+        assert_eq!(
+            TrustedInterruptibility::from_snapshot(&perceived).get(),
+            Interruptibility::Unknown
+        );
+        let mut trusted = perceived.clone();
+        trusted.source_rank = SceneSourceRank::ObsState;
+        assert_eq!(
+            TrustedInterruptibility::from_snapshot(&trusted).get(),
+            Interruptibility::Uninterruptible
+        );
+        assert_eq!(
+            TrustedInterruptibility::default().get(),
+            Interruptibility::Unknown
+        );
     }
 }
