@@ -20,6 +20,18 @@
 //!   yet). Every phrase is gated on its own text immediately before its own
 //!   commit, exactly as in the buffered path, and a refusal ends the reply
 //!   after the last delivered phrase.
+//! * Cumulative-prefix gate (#83 S3a): from phrase 1 on, the phrase is also
+//!   gated joined to every already-delivered display text, right after its
+//!   own display gate and before projection/TTS, so a violation that exists
+//!   only across phrases stops before the offending phrase is spoken
+//!   (`PhraseFailure::CumulativeGateRejected`; delivered phrases stand). The
+//!   joined text is bounded by `StreamPolicy::max_reply_chars`, and a gate
+//!   that would change it counts as a refusal. Cost: one extra gate call per
+//!   phrase over at most that many characters, so at most
+//!   `max_phrases * max_reply_chars` characters scanned per reply.
+//! * When the stream completes with two or more delivered phrases, the whole
+//!   committed reply is gated once more for audit and telemetry only
+//!   ([`WholeReplyAudit`]); it cannot unspeak anything.
 //! * The plan is not known up front. A phrase is delivered `final` only when it
 //!   is cut at the end of the stream; a phrase cut earlier is delivered
 //!   non-final even if the remainder later turns out to project to nothing.
@@ -30,9 +42,9 @@
 
 use crate::phrase::{
     Delivery, PhraseDelivery, PhraseEnd, PhraseFailure, PhraseOptions, PhraseSummary, SlotWait,
-    StreamPolicy, has_content, segment_ranges,
+    StreamPolicy, WholeReplyAudit, has_content, segment_ranges,
 };
-use crate::phrase_pipeline::PhraseStop;
+use crate::phrase_pipeline::{CumulativeGate, PhraseStop, join_display};
 use crate::{
     CancellationStage, FallbackDirective, GeneratedTextGateDecision, GenerationCancellationToken,
     GenerationDisposition, GenerationRequest, GenerationResult, GenerationTrace,
@@ -126,6 +138,10 @@ struct StreamSink<'a, F, D> {
     carry: String,
     next_seq: u32,
     tts_chars: u64,
+    /// Display text of every delivered phrase, joined (bounded by
+    /// `max_reply_chars`: the cumulative gate refuses to grow it past that).
+    committed: String,
+    max_reply_chars: usize,
     stop: Option<Stop>,
     deadline_hit: Cell<bool>,
 }
@@ -140,6 +156,24 @@ where
             && self
                 .provider_deadline
                 .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    /// The stream completed: gate the whole committed reply once, for audit and
+    /// telemetry only. Every phrase is already committed, so the answer cannot
+    /// change what was spoken; a disagreement with the per-phrase and
+    /// cumulative decisions is counted by the caller. A single phrase is not
+    /// re-gated (the per-phrase gate saw exactly that text). The gate's last
+    /// decision (this one) is what the completion audits.
+    fn audit_whole_reply(&mut self) -> WholeReplyAudit {
+        if self.next_seq < 2 || self.committed.chars().count() > self.max_reply_chars {
+            return WholeReplyAudit::NotRun;
+        }
+        match (self.gate)(&self.committed) {
+            GeneratedTextGateDecision::Publish(text) if text.trim() == self.committed.trim() => {
+                WholeReplyAudit::Agreed
+            }
+            _ => WholeReplyAudit::RejectedAfterCommit,
+        }
     }
 
     /// Run one complete phrase through the stages. Returns false when the
@@ -199,6 +233,10 @@ where
             self.identities,
             self.cancellation,
             self.trace,
+            Some(CumulativeGate {
+                prefix: &self.committed,
+                max_chars: self.max_reply_chars,
+            }),
         );
         let (unit, chars) = match prepared {
             Ok(prepared) => prepared,
@@ -216,8 +254,10 @@ where
             }
         };
         self.tts_chars = self.tts_chars.saturating_add(chars as u64);
+        let display = join_display(&self.committed, unit.display_text());
         match self.delivery.deliver(unit, self.trace) {
             Delivery::Accepted => {
+                self.committed = display;
                 self.next_seq += 1;
                 true
             }
@@ -288,7 +328,7 @@ impl GenerativePipeline {
             trace.thinking_timeout_ms = Some(duration_ms_ceil(remaining));
         }
 
-        let (outcome, stop, delivered, tts_chars, deadline_hit) = {
+        let (outcome, stop, delivered, tts_chars, deadline_hit, whole_reply_audit) = {
             let mut sink = StreamSink {
                 pipeline: self,
                 request,
@@ -303,6 +343,8 @@ impl GenerativePipeline {
                 carry: String::new(),
                 next_seq: 0,
                 tts_chars: 0,
+                committed: String::new(),
+                max_reply_chars: stream.max_reply_chars,
                 stop: None,
                 deadline_hit: Cell::new(false),
             };
@@ -320,12 +362,18 @@ impl GenerativePipeline {
                 }
                 outcome = Some(Ok(()));
             }
+            let audit = if matches!(outcome, Some(Ok(()))) && sink.stop.is_none() {
+                sink.audit_whole_reply()
+            } else {
+                WholeReplyAudit::NotRun
+            };
             (
                 outcome,
                 sink.stop.take(),
                 sink.next_seq,
                 sink.tts_chars,
                 sink.deadline_hit.get(),
+                audit,
             )
         };
 
@@ -336,6 +384,11 @@ impl GenerativePipeline {
             delivered_phrases: delivered,
             end,
             tts_chars,
+            whole_reply_audit: if end == PhraseEnd::Completed {
+                whole_reply_audit
+            } else {
+                WholeReplyAudit::NotRun
+            },
         };
         let phrased = |trace: GenerationTrace, summary: PhraseSummary| GenerationResult {
             trace,
@@ -705,10 +758,19 @@ mod tests {
         gate: impl FnMut(&str) -> GeneratedTextGateDecision,
         recorder: &mut Recorder,
     ) -> GenerationResult {
+        run_stream_with(rig, StreamPolicy::default(), gate, recorder)
+    }
+
+    fn run_stream_with(
+        rig: &Rig,
+        policy: StreamPolicy,
+        gate: impl FnMut(&str) -> GeneratedTextGateDecision,
+        recorder: &mut Recorder,
+    ) -> GenerationResult {
         let options = PhraseOptions {
             response_id: 9,
             config: PhraseConfig {
-                stream: Some(StreamPolicy::default()),
+                stream: Some(policy),
                 ..PhraseConfig::default()
             },
         };
@@ -910,5 +972,289 @@ mod tests {
         let result = run_stream(&rig, publish, &mut recorder);
         assert!(recorder.delivered.is_empty());
         assert_eq!(result.trace.fallback_reason, FallbackReason::PolicyOverride);
+    }
+
+    // -- cumulative-prefix gate and completed-reply audit (#83 S3a) ----------
+
+    /// A violation that exists only across phrases A and B: neither contains
+    /// it alone, their concatenation does.
+    const SPLIT: &str = "ございます。このあと";
+
+    fn splitting_gate(
+        log: &Arc<Mutex<Vec<String>>>,
+    ) -> impl FnMut(&str) -> GeneratedTextGateDecision + use<> {
+        let log = Arc::clone(log);
+        move |text| {
+            log.lock().unwrap().push(text.to_owned());
+            if text.contains(SPLIT) {
+                GeneratedTextGateDecision::Reject
+            } else {
+                publish(text)
+            }
+        }
+    }
+
+    fn abc_steps(chunk: usize) -> Vec<Step> {
+        let chars: Vec<char> = format!("{A}{B}{C}").chars().collect();
+        let mut steps: Vec<Step> = chars
+            .chunks(chunk)
+            .map(|part| Step::Delta(part.iter().collect()))
+            .collect();
+        steps.push(Step::Done);
+        steps
+    }
+
+    #[test]
+    fn a_violation_across_two_phrases_stops_before_the_second_is_spoken() {
+        assert!(!A.contains(SPLIT) && !B.contains(SPLIT) && !C.contains(SPLIT));
+        let rig = rig(abc_steps(3), true, "");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut recorder = Recorder::default();
+        let result = run_stream(&rig, splitting_gate(&log), &mut recorder);
+
+        assert_eq!(rig.spoken.lock().unwrap().as_slice(), [A], "B never spoken");
+        assert_eq!(recorder.delivered.len(), 1, "phrase 0 stands");
+        let summary = summary_of(&result);
+        assert_eq!(
+            (summary.planned_phrases, summary.delivered_phrases),
+            (2, 1),
+            "exact accounting: one committed, the refused one is the second planned"
+        );
+        assert_eq!(
+            summary.end,
+            PhraseEnd::Failed {
+                seq: 1,
+                failure: PhraseFailure::CumulativeGateRejected
+            }
+        );
+        assert!(!summary.completed());
+        assert_eq!(summary.whole_reply_audit, WholeReplyAudit::NotRun);
+        assert_eq!(summary.tts_chars, A.chars().count() as u64);
+        // Committed phrases stand: no #291 fallback replaces them.
+        assert!(matches!(
+            result.disposition,
+            GenerationDisposition::Phrased { .. }
+        ));
+        let calls = log.lock().unwrap();
+        assert_eq!(
+            calls.last().map(String::as_str),
+            Some(format!("{A}{B}").as_str()),
+            "the refusing decision is the gate's last, so it is the one audited"
+        );
+        assert!(
+            calls.iter().all(|text| !text.contains(C)),
+            "the rest of the reply was cancelled, never gated"
+        );
+    }
+
+    #[test]
+    fn the_cumulative_gate_sits_after_the_display_gate_and_leaves_the_display_text_last() {
+        let rig = rig(abc_steps(3), true, "");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut recorder = Recorder::default();
+        let result = run_stream(
+            &rig,
+            {
+                let log = Arc::clone(&log);
+                move |text: &str| {
+                    log.lock().unwrap().push(text.to_owned());
+                    publish(text)
+                }
+            },
+            &mut recorder,
+        );
+        let summary = summary_of(&result);
+        assert!(summary.completed());
+        assert_eq!(summary.whole_reply_audit, WholeReplyAudit::Agreed);
+        let ab = format!("{A}{B}");
+        let abc = format!("{A}{B}{C}");
+        let expected: Vec<String> = [
+            // phrase 0: nothing committed yet, so no cumulative decision.
+            A, // phrase 1: display, cumulative, display again (last).
+            B, &ab, B, // phrase 2.
+            C, &abc, C, // completion: one whole-reply audit decision.
+            &abc,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        assert_eq!(*log.lock().unwrap(), expected);
+    }
+
+    #[test]
+    fn the_completed_reply_audit_counts_a_disagreement_but_cannot_unspeak() {
+        // A stateful gate that refuses the whole reply the second time it
+        // sees it: the cumulative decision for the last phrase passed, the
+        // completion audit does not.
+        let rig = rig(abc_steps(3), true, "");
+        let abc = format!("{A}{B}{C}");
+        let mut seen_whole = 0;
+        let mut recorder = Recorder::default();
+        let result = run_stream(
+            &rig,
+            |text| {
+                if text == abc {
+                    seen_whole += 1;
+                    if seen_whole == 2 {
+                        return GeneratedTextGateDecision::Reject;
+                    }
+                }
+                publish(text)
+            },
+            &mut recorder,
+        );
+        let summary = summary_of(&result);
+        assert!(summary.completed(), "audit only: the reply still completes");
+        assert_eq!(
+            summary.whole_reply_audit,
+            WholeReplyAudit::RejectedAfterCommit
+        );
+        assert_eq!(rig.spoken.lock().unwrap().as_slice(), [A, B, C]);
+        assert_eq!(recorder.delivered.len(), 3);
+    }
+
+    #[test]
+    fn a_redacting_audit_gate_counts_as_a_disagreement() {
+        let rig = rig(abc_steps(3), true, "");
+        let abc = format!("{A}{B}{C}");
+        let mut seen_whole = 0;
+        let mut recorder = Recorder::default();
+        let result = run_stream(
+            &rig,
+            |text| {
+                if text == abc {
+                    seen_whole += 1;
+                    if seen_whole == 2 {
+                        return GeneratedTextGateDecision::Publish("[REDACTED]".to_owned());
+                    }
+                }
+                publish(text)
+            },
+            &mut recorder,
+        );
+        assert_eq!(
+            summary_of(&result).whole_reply_audit,
+            WholeReplyAudit::RejectedAfterCommit
+        );
+    }
+
+    #[test]
+    fn a_cumulative_gate_that_would_redact_is_a_refusal() {
+        let rig = rig(abc_steps(3), true, "");
+        let mut recorder = Recorder::default();
+        let result = run_stream(
+            &rig,
+            |text| {
+                if text.contains(SPLIT) {
+                    GeneratedTextGateDecision::Publish(text.replace(SPLIT, "[REDACTED]"))
+                } else {
+                    publish(text)
+                }
+            },
+            &mut recorder,
+        );
+        assert_eq!(rig.spoken.lock().unwrap().as_slice(), [A]);
+        assert!(matches!(
+            summary_of(&result).end,
+            PhraseEnd::Failed {
+                seq: 1,
+                failure: PhraseFailure::CumulativeGateRejected
+            }
+        ));
+    }
+
+    #[test]
+    fn a_single_phrase_reply_has_no_audit_pass() {
+        let rig = rig(vec![delta(A), Step::Done], true, "");
+        let mut recorder = Recorder::default();
+        let result = run_stream(&rig, publish, &mut recorder);
+        let summary = summary_of(&result);
+        assert!(summary.completed());
+        assert_eq!(summary.whole_reply_audit, WholeReplyAudit::NotRun);
+    }
+
+    #[test]
+    fn the_gate_input_is_bounded_by_the_reply_cap() {
+        let cap = A.chars().count() + 5;
+        let rig = rig(abc_steps(3), true, "");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut recorder = Recorder::default();
+        let result = run_stream_with(
+            &rig,
+            StreamPolicy {
+                max_reply_chars: cap,
+                ..StreamPolicy::default()
+            },
+            {
+                let seen = Arc::clone(&seen);
+                move |text: &str| {
+                    seen.lock().unwrap().push(text.chars().count());
+                    publish(text)
+                }
+            },
+            &mut recorder,
+        );
+        assert_eq!(rig.spoken.lock().unwrap().as_slice(), [A]);
+        assert_eq!(
+            summary_of(&result).end,
+            PhraseEnd::Failed {
+                seq: 1,
+                failure: PhraseFailure::CumulativeGateRejected
+            }
+        );
+        assert!(
+            seen.lock().unwrap().iter().all(|chars| *chars <= cap),
+            "no gate input ever exceeds the cap: {:?}",
+            seen.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_first_phrase_over_the_cap_is_the_visible_fallback() {
+        let rig = rig(abc_steps(3), true, "");
+        let mut recorder = Recorder::default();
+        let result = run_stream_with(
+            &rig,
+            StreamPolicy {
+                max_reply_chars: 4,
+                ..StreamPolicy::default()
+            },
+            publish,
+            &mut recorder,
+        );
+        assert!(recorder.delivered.is_empty());
+        assert!(rig.spoken.lock().unwrap().is_empty());
+        assert!(matches!(
+            result.disposition,
+            GenerationDisposition::Fallback { .. }
+        ));
+        assert_eq!(result.trace.fallback_reason, FallbackReason::PolicyOverride);
+    }
+
+    #[test]
+    fn gate_decisions_and_the_summary_do_not_depend_on_how_the_stream_is_chunked() {
+        let run_with = |chunk: usize| {
+            let rig = rig(abc_steps(chunk), true, "");
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let mut recorder = Recorder::default();
+            let result = run_stream(&rig, splitting_gate(&log), &mut recorder);
+            let spoken = rig.spoken.lock().unwrap().clone();
+            let calls = log.lock().unwrap().clone();
+            (summary_of(&result).clone(), spoken, calls)
+        };
+        let baseline = run_with(1);
+        for chunk in [2, 3, 7, 1000] {
+            assert_eq!(run_with(chunk), baseline, "chunk size {chunk}");
+        }
+        assert_eq!(run_with(1), baseline, "a repeated run is identical");
+    }
+
+    #[test]
+    fn join_restores_a_space_only_between_ascii_boundaries() {
+        use crate::phrase_pipeline::join_display;
+        assert_eq!(join_display("", "Hello."), "Hello.");
+        assert_eq!(join_display("Hello.", "World"), "Hello. World");
+        assert_eq!(join_display("ありがとう。", "次"), "ありがとう。次");
+        assert_eq!(join_display("Hi!", "次"), "Hi!次");
     }
 }
