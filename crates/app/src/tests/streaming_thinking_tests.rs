@@ -9,7 +9,7 @@
 //! request: `cargo test -p aivtuber-app --lib streaming_thinking -- --nocapture`.
 
 use super::local_thinking_fallback_tests::{
-    LocalRig, assert_visible_fallback, free_text_line, local_rig_with_engines,
+    LocalRig, assert_visible_fallback, free_text_line, local_rig_with_engines_and_secrets,
     submit_free_text_line,
 };
 use super::*;
@@ -168,6 +168,10 @@ struct Run {
 }
 
 fn rig(endpoint: String, streaming: bool) -> Run {
+    rig_with_secrets(endpoint, streaming, &[])
+}
+
+fn rig_with_secrets(endpoint: String, streaming: bool, secrets: &[&str]) -> Run {
     let mut thinking = OpenAiResponsesAdapter::with_authentication(
         OpenAiResponsesConfig {
             endpoint,
@@ -191,7 +195,8 @@ fn rig(endpoint: String, streaming: bool) -> Run {
         texts: Arc::clone(&texts),
         calls: Arc::new(AtomicUsize::new(0)),
     };
-    let rig = local_rig_with_engines(thinking, tts, PhraseMode::Phrased(config));
+    let rig =
+        local_rig_with_engines_and_secrets(thinking, tts, PhraseMode::Phrased(config), secrets);
     Run {
         rig,
         texts,
@@ -352,4 +357,105 @@ fn a_stream_that_fails_before_any_phrase_plays_the_visible_fallback() {
     let mut run = rig(endpoint, true);
     free_text_line(&mut run.rig, 73);
     assert_visible_fallback(&mut run.rig, "unavailable");
+}
+
+/// A secret that only exists across phrases A and B: neither phrase contains
+/// it, so the per-phrase gate passes both, but the reply as a whole would be
+/// redacted.
+const CROSS_PHRASE_SECRET: &str = "ございます。このあと";
+
+#[test]
+fn a_secret_spanning_two_streamed_phrases_is_stopped_before_the_second_is_spoken() {
+    assert!(!PHRASE_A.contains(CROSS_PHRASE_SECRET) && !PHRASE_B.contains(CROSS_PHRASE_SECRET));
+    let reply = Reply {
+        text: full_reply(),
+        token_gap: Duration::from_millis(5),
+        ending: Ending::Completed,
+    };
+
+    // Streaming: phrase A is committed and stands, B is refused, C is never
+    // gated or spoken, and the partial end carries the gate-rejected cause.
+    let mut run = rig_with_secrets(serve(reply.clone(), 1), true, &[CROSS_PHRASE_SECRET]);
+    run.rig.app = run.rig.app.with_speech_lifecycle_recorder(64);
+    run.started = Instant::now();
+    submit_free_text_line(&mut run.rig, 73);
+    assert!(
+        drive(&mut run, Duration::from_secs(20), |rig| !rig
+            .app
+            .recent_phrase_responses()
+            .is_empty()),
+        "the reply never ended"
+    );
+    let record = run.rig.app.recent_phrase_responses().remove(0);
+    assert_eq!(record.commits.len(), 1, "phrase 0 stands");
+    assert_eq!(
+        record.end,
+        PhraseResponseEnd::Partial {
+            cause: PhraseCause::GateRejected
+        }
+    );
+    assert_eq!(
+        run.texts.lock().unwrap().as_slice(),
+        [PHRASE_A],
+        "the offending phrase and the rest were never spoken"
+    );
+    // Lifecycle (#308/#347): the refused phrase was never prepared or
+    // committed, so it has no events at all; the committed phrase's unit is
+    // the only speech and nothing is cancelled (it stands).
+    let events = run.rig.app.speech_lifecycle_records();
+    assert!(!events.is_empty());
+    assert!(
+        events.iter().all(|event| event.speech.phrase == 0
+            && !matches!(event.phase, aivtuber_domain::SpeechPhase::Cancelled { .. })),
+        "{events:?}"
+    );
+    let metrics = run.rig.app.phrase_metrics();
+    assert_eq!(metrics.stream_cumulative_gate_rejected, 1);
+    assert_eq!(metrics.stream_whole_reply_gate_audits, 0);
+    assert_eq!(
+        run.rig.app.generation_fallback_counts().by_reason.len(),
+        0,
+        "something was spoken, so no fallback reaction replaces it"
+    );
+
+    // Buffered phrase mode: the whole reply is gated before phrase 0, and the
+    // gate redacts the secret in place, so what is spoken never contains it.
+    // (Streaming cannot rewrite text that is already spoken, so it refuses.)
+    let mut buffered = rig_with_secrets(serve(reply, 1), false, &[CROSS_PHRASE_SECRET]);
+    buffered.started = Instant::now();
+    submit_free_text_line(&mut buffered.rig, 74);
+    assert!(drive(&mut buffered, Duration::from_secs(20), |rig| !rig
+        .app
+        .recent_phrase_responses()
+        .is_empty()));
+    let spoken = buffered.texts.lock().unwrap().clone();
+    assert!(!spoken.is_empty());
+    assert!(
+        spoken
+            .iter()
+            .all(|text| !text.contains(CROSS_PHRASE_SECRET))
+    );
+}
+
+#[test]
+fn a_clean_streamed_reply_gets_one_agreeing_whole_reply_audit() {
+    let endpoint = serve(
+        Reply {
+            text: full_reply(),
+            token_gap: Duration::from_millis(5),
+            ending: Ending::Completed,
+        },
+        1,
+    );
+    let mut run = rig(endpoint, true);
+    run.started = Instant::now();
+    submit_free_text_line(&mut run.rig, 75);
+    assert!(drive(&mut run, Duration::from_secs(20), |rig| !rig
+        .app
+        .recent_phrase_responses()
+        .is_empty()));
+    let metrics = run.rig.app.phrase_metrics();
+    assert_eq!(metrics.stream_whole_reply_gate_audits, 1);
+    assert_eq!(metrics.stream_whole_reply_gate_rejected_after_commit, 0);
+    assert_eq!(metrics.stream_cumulative_gate_rejected, 0);
 }

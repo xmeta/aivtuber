@@ -274,6 +274,14 @@ With phrase mode (`AIVTUBER_PHRASE_MODE`) a generated reply is committed one com
 * partial text or audio cannot reach the scheduler: the only handoff type, `PhraseUnit`, exists only for a phrase that is gated, completely synthesized and compiled into a validated asset;
 * operator stop and mute, barge-in and supersession cancel the response, so no later phrase is committed, independent of any model or TTS path.
 
+Streamed replies (`AIVTUBER_THINKING_STREAM`, #83 S3a) cannot gate the whole reply before phrase 0. They use a cumulative-prefix gate instead:
+
+* from phrase 1 on, the candidate phrase is gated joined to the display text of every already-committed phrase, after its own display gate and before projection and synthesis, so a violation that exists only across phrases is stopped before the offending phrase is spoken;
+* the joined text is bounded by the reply cap (`StreamPolicy::max_reply_chars`, equal to the adapter's stream cap); a reply that would exceed it is stopped fail-closed, never gated in part;
+* a refusal or a redaction of the joined text ends the reply: committed phrases stand, the rest is never synthesized, the end is a `gate_rejected` partial and the output-gate audit records the refusing decision;
+* a final whole-reply gate at completion is audit and telemetry only and cannot unspeak anything; a disagreement is counted (`stream_whole_reply_gate_rejected_after_commit`);
+* the gate sees phrases re-joined from trimmed text (a space is restored only between two ASCII boundary characters), so separator-sensitive patterns that span a boundary are matched approximately; risky contexts should keep buffered mode.
+
 For risky contexts buffered whole-reply mode remains available and is the default outside the `local` profile.
 
 == 12. Audit and replay

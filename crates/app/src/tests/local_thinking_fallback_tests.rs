@@ -141,7 +141,14 @@ fn local_rig_with_pack(
     .with_backend_name("llama-server");
     let tts = MockTts::default();
     let tts_calls = Arc::clone(&tts.texts);
-    build_local_rig(thinking, tts, tts_calls, mode, descriptors)
+    build_local_rig(
+        thinking,
+        tts,
+        tts_calls,
+        mode,
+        descriptors,
+        SecretRedactor::default(),
+    )
 }
 
 /// The `local` profile composition with caller-supplied engines (issue #295
@@ -161,6 +168,29 @@ where
         Arc::new(Mutex::new(Vec::new())),
         mode,
         &pack_root().join("descriptors"),
+        SecretRedactor::default(),
+    )
+}
+
+/// As [`local_rig_with_engines`], with configured secrets the public-output
+/// gate redacts (#83 S3a drives a secret that only exists across phrases).
+pub(super) fn local_rig_with_engines_and_secrets<Thinking, Tts>(
+    thinking: Thinking,
+    tts: Tts,
+    mode: PhraseMode,
+    secrets: &[&str],
+) -> LocalRig
+where
+    Thinking: ThinkingEngine + 'static,
+    Tts: TtsEngine + 'static,
+{
+    build_local_rig(
+        thinking,
+        tts,
+        Arc::new(Mutex::new(Vec::new())),
+        mode,
+        &pack_root().join("descriptors"),
+        SecretRedactor::new(secrets.iter().copied()),
     )
 }
 
@@ -170,6 +200,7 @@ fn build_local_rig<Thinking, Tts>(
     tts_calls: Arc<Mutex<Vec<String>>>,
     mode: PhraseMode,
     descriptors: &Path,
+    redactor: SecretRedactor,
 ) -> LocalRig
 where
     Thinking: ThinkingEngine + 'static,
@@ -185,7 +216,7 @@ where
             min_reaction_spacing_ms: 0,
             ..SchedulerConfig::default()
         },
-        SecretRedactor::default(),
+        redactor,
         None,
     )
     .expect("security runtime");

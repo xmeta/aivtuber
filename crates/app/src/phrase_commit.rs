@@ -31,7 +31,7 @@ use aivtuber_domain::{EventEnvelope, FallbackReason};
 use aivtuber_generative::{
     Delivery, FallbackDirective, GenerationCancellationToken, GenerationDisposition,
     GenerationTrace, PhraseConfig, PhraseDelivery, PhraseEnd, PhraseFailure, PhraseSummary,
-    PhraseUnit, SlotWait, wait_for_started,
+    PhraseUnit, SlotWait, WholeReplyAudit, wait_for_started,
 };
 use aivtuber_runtime::{CachedPlaybackError, CachedPlaybackTiming, OutputVerdict, PublicOutput};
 use aivtuber_scheduler::{PhraseLink, Rejection};
@@ -190,7 +190,12 @@ impl PhraseCause {
 
     fn from_failure(failure: PhraseFailure) -> Self {
         match failure {
-            PhraseFailure::GateRejected => Self::GateRejected,
+            // The cumulative-prefix gate (#83 S3a) is a gate refusal for every
+            // consumer of the cause (accounting, fallback, lifecycle); only the
+            // streaming metrics tell it apart.
+            PhraseFailure::GateRejected | PhraseFailure::CumulativeGateRejected => {
+                Self::GateRejected
+            }
             PhraseFailure::NothingSpeakable => Self::NothingSpeakable,
             PhraseFailure::Synthesis(reason) => Self::SynthesisFailed(reason),
             PhraseFailure::Compile => Self::CompileFailed,
@@ -271,6 +276,16 @@ pub struct PhraseMetrics {
     pub gate_rejected_before_first_commit: u64,
     /// Gate refusal of a later phrase (earlier phrases already spoken).
     pub gate_rejected_after_commit: u64,
+    /// Streamed replies (#83 S3a): phrases refused by the cumulative-prefix gate
+    /// (committed text plus the phrase) or by its reply cap; they are also part
+    /// of the partial `GateRejected` end, and never spoken.
+    pub stream_cumulative_gate_rejected: u64,
+    /// Streamed replies that completed with two or more phrases and so got the
+    /// final whole-reply audit gate.
+    pub stream_whole_reply_gate_audits: u64,
+    /// Audit gate disagreed with the committed reply. Cannot unspeak anything;
+    /// a nonzero value means gate decisions are not a function of the text.
+    pub stream_whole_reply_gate_rejected_after_commit: u64,
     pub scheduler_rejected: u64,
     pub synthesis_failed_after_commit: u64,
     pub cancelled_after_commit: u64,
@@ -994,6 +1009,25 @@ where
         if let Some(generative) = self.generative.as_mut() {
             let metrics = &mut generative.phrase.metrics;
             metrics.responses += 1;
+            if let Some(summary) = summary {
+                if matches!(
+                    summary.end,
+                    PhraseEnd::Failed {
+                        failure: PhraseFailure::CumulativeGateRejected,
+                        ..
+                    }
+                ) {
+                    metrics.stream_cumulative_gate_rejected += 1;
+                }
+                match summary.whole_reply_audit {
+                    WholeReplyAudit::NotRun => {}
+                    WholeReplyAudit::Agreed => metrics.stream_whole_reply_gate_audits += 1,
+                    WholeReplyAudit::RejectedAfterCommit => {
+                        metrics.stream_whole_reply_gate_audits += 1;
+                        metrics.stream_whole_reply_gate_rejected_after_commit += 1;
+                    }
+                }
+            }
             match end {
                 PhraseResponseEnd::Completed => metrics.completed += 1,
                 PhraseResponseEnd::Partial { cause } => {
