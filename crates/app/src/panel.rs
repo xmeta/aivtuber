@@ -35,6 +35,10 @@ const DEFAULT_PORT: u16 = 8766;
 const CONTROL_PER_TICK: usize = 4;
 const CHAT_PER_TICK: usize = 4;
 const PUBLISH_INTERVAL_MS: u64 = 500;
+/// Refusal counts are logged at most this often. A stale page from an earlier
+/// launch polls once a second with an old secret; one line per refusal buried
+/// every other log line.
+const REFUSAL_LOG_INTERVAL_MS: u64 = 30_000;
 /// Source assigned to every panel chat line (see the module documentation).
 pub const PANEL_CHAT_SOURCE: &str = "local-panel";
 pub const PANEL_STATE_SCHEMA: &str = "local-panel/1";
@@ -127,7 +131,27 @@ pub struct PanelService {
     chat_seq: u64,
     control_seq: u64,
     next_publish_ms: u64,
-    last_metrics: PanelMetrics,
+    refusal_log: RefusalLog,
+}
+
+/// When to log the refusal counters: on the first change at once, then at
+/// most every [`REFUSAL_LOG_INTERVAL_MS`]. A change held back is logged at the
+/// next due turn, so the last counts are never lost.
+#[derive(Debug, Default)]
+struct RefusalLog {
+    logged: PanelMetrics,
+    next_ms: u64,
+}
+
+impl RefusalLog {
+    fn due(&mut self, metrics: PanelMetrics, now_ms: u64) -> bool {
+        if metrics == self.logged || now_ms < self.next_ms {
+            return false;
+        }
+        self.logged = metrics;
+        self.next_ms = now_ms.saturating_add(REFUSAL_LOG_INTERVAL_MS);
+        true
+    }
 }
 
 impl fmt::Debug for PanelService {
@@ -161,7 +185,7 @@ impl PanelService {
             chat_seq: 0,
             control_seq: 0,
             next_publish_ms: 0,
-            last_metrics: PanelMetrics::default(),
+            refusal_log: RefusalLog::default(),
         })
     }
 
@@ -234,7 +258,7 @@ impl PanelService {
             self.next_publish_ms = now_ms.saturating_add(PUBLISH_INTERVAL_MS);
         }
         let metrics = self.inbox.metrics();
-        if metrics != self.last_metrics {
+        if self.refusal_log.due(metrics, now_ms) {
             // Counts only: never a header, a body or a secret.
             eprintln!(
                 "panel: refused host={} origin={} auth={} request={} rate_limited={} queue_full={}",
@@ -245,7 +269,6 @@ impl PanelService {
                 metrics.rate_limited,
                 metrics.queue_full
             );
-            self.last_metrics = metrics;
         }
     }
 
@@ -326,6 +349,26 @@ mod tests {
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect();
         move |name| map.get(name).cloned()
+    }
+
+    #[test]
+    fn refusal_counts_are_logged_at_most_every_interval() {
+        let mut log = RefusalLog::default();
+        let auth = |n| PanelMetrics {
+            rejected_auth: n,
+            ..PanelMetrics::default()
+        };
+        assert!(!log.due(PanelMetrics::default(), 0), "nothing refused yet");
+        assert!(log.due(auth(1), 1_000), "first refusal is logged at once");
+        // A stale page polling every second: held back inside the interval.
+        for (n, t) in (2..30).zip((2_000..).step_by(1_000)) {
+            assert!(!log.due(auth(n), t));
+        }
+        assert!(log.due(auth(31), 1_000 + REFUSAL_LOG_INTERVAL_MS));
+        assert!(
+            !log.due(auth(31), 2 * REFUSAL_LOG_INTERVAL_MS + 5_000),
+            "unchanged"
+        );
     }
 
     #[test]
