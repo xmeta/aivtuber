@@ -378,7 +378,9 @@ S2 measurement (`speech-vad-sidecar`, see the Speech sidecar section of `docs/pr
 
 *Revisit when:* the pinned llama.cpp or model changes, a non-Japanese audience is supported, +--reasoning+ semantics change, or a wider language sample shows drift.
 
-*Related:* #340, #318.
+*Related:* #340, #318, #357.
+
+_#357 note:_ the premise now holds per model. +reasoning = off+ is written into every section of the router preset that +aivtuber-setup start+ generates, so a model switched to from the panel gets the same setting as the default. The Qwen3-4B-Instruct-2507 evidence above is the one 1/27 off-language sample; an operator who installs it with +--with-model+ accepts that. Streaming Thinking was measured with Gemma only (EXP-0005); it stays on after a switch because the env file chose it, and this is not separately measured for Qwen3-4B.
 
 == Adding or updating an assumption
 

@@ -8,7 +8,7 @@ use aivtuber_domain::{
 use serde_json::{Value, json};
 use std::fmt;
 use std::net::{IpAddr, ToSocketAddrs};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 mod stream;
@@ -211,6 +211,17 @@ pub struct OpenAiResponsesAdapter {
     stream: Option<(Arc<dyn StreamingHttpTransport>, StreamLimits)>,
     /// In-flight warm-up deadline, shared by clones (issue #333).
     warmup: warmup::WarmupGate,
+    /// The model the next request names. Shared by clones, so a switch made
+    /// through one handle (the operator's model selector, #357) is seen by the
+    /// pipeline's copy of this adapter. Starts as the configured model.
+    model: Arc<RwLock<ActiveModel>>,
+}
+
+/// The model name sent to the server and the version recorded in audit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveModel {
+    pub alias: String,
+    pub version: Option<String>,
 }
 
 impl fmt::Debug for OpenAiResponsesAdapter {
@@ -282,6 +293,10 @@ impl OpenAiResponsesAdapter {
                 None
             }
         };
+        let model = Arc::new(RwLock::new(ActiveModel {
+            alias: config.model_alias.clone(),
+            version: config.model_version.clone(),
+        }));
         Ok(Self {
             config,
             api_key,
@@ -289,6 +304,7 @@ impl OpenAiResponsesAdapter {
             transport,
             stream: None,
             warmup: warmup::WarmupGate::default(),
+            model,
         })
     }
 
@@ -326,6 +342,28 @@ impl OpenAiResponsesAdapter {
         &self.config.endpoint
     }
 
+    /// The model the next request will name.
+    pub fn active_model(&self) -> ActiveModel {
+        self.model.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Point every clone of this adapter at another model of the same server.
+    /// The caller is responsible for the choice being allowed (the app checks
+    /// an operator allowlist first); this only refuses an empty name.
+    pub fn select_model(&self, alias: &str, version: Option<&str>) -> Result<(), EngineError> {
+        if alias.trim().is_empty() {
+            return Err(EngineError::new(
+                EngineErrorKind::InvalidRequest,
+                "model alias must not be empty",
+            ));
+        }
+        *self.model.write().unwrap_or_else(|e| e.into_inner()) = ActiveModel {
+            alias: alias.to_owned(),
+            version: version.map(str::to_owned),
+        };
+        Ok(())
+    }
+
     pub fn authentication_label(&self) -> &'static str {
         if self.api_key.is_some() {
             "bearer"
@@ -355,7 +393,7 @@ impl OpenAiResponsesAdapter {
         let effective_timeout = (self.config.timeout + self.warmup.grace()).min(timeout);
         let input = compact_generation_input(request)?;
         let body = serde_json::to_vec(&json!({
-            "model": self.config.model_alias,
+            "model": self.active_model().alias,
             "input": input,
             "max_output_tokens": self.config.max_output_tokens,
         }))
@@ -425,10 +463,11 @@ impl ThinkingEngine for OpenAiResponsesAdapter {
     }
 
     fn identity(&self) -> BackendIdentity {
+        let model = self.active_model();
         BackendIdentity {
             name: self.backend_name.clone(),
-            model_alias: Some(self.config.model_alias.clone()),
-            model_version: self.config.model_version.clone(),
+            model_alias: Some(model.alias),
+            model_version: model.version,
         }
     }
 }
@@ -638,6 +677,33 @@ mod tests {
         assert_eq!(identity.name, "openai-compatible-responses");
         assert_eq!(identity.model_alias.as_deref(), Some("gpt-5-test"));
         assert_eq!(identity.model_version.as_deref(), Some("2026-09-01"));
+    }
+
+    #[test]
+    fn a_model_switch_reaches_every_clone_the_wire_and_the_identity() {
+        let transport = MockHttpTransport::new(Ok(response("ok")));
+        let adapter = OpenAiResponsesAdapter::with_transport(
+            OpenAiResponsesConfig {
+                model_alias: "first".to_owned(),
+                model_version: Some("v1".to_owned()),
+                ..OpenAiResponsesConfig::default()
+            },
+            SecretString::new("openai-secret-value"),
+            Arc::new(transport.clone()),
+        )
+        .expect("adapter");
+        // The pipeline owns one clone; the operator's selector holds another.
+        let pipeline_copy = adapter.clone();
+        adapter.select_model("second", Some("v2")).expect("switch");
+        pipeline_copy.generate_sync(&request()).expect("reply");
+        let body: Value =
+            serde_json::from_slice(&transport.requests()[0].body).expect("request JSON");
+        assert_eq!(body["model"], "second");
+        let identity = pipeline_copy.identity();
+        assert_eq!(identity.model_alias.as_deref(), Some("second"));
+        assert_eq!(identity.model_version.as_deref(), Some("v2"));
+        assert!(adapter.select_model("  ", None).is_err());
+        assert_eq!(pipeline_copy.active_model().alias, "second");
     }
 
     #[test]

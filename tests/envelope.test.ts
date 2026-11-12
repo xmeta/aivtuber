@@ -99,6 +99,7 @@ describe("normalizeEvent", () => {
       "memory.admin",
       "tool.grant",
       "perception.control",
+      "model.select",
     ]);
   });
 });

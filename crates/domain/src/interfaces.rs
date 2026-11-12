@@ -523,6 +523,7 @@ mod tests {
             Capability::MemoryAdmin => "memory.admin",
             Capability::ToolGrant => "tool.grant",
             Capability::PerceptionControl => "perception.control",
+            Capability::ModelSelect => "model.select",
         };
         let secret = [7_u8; 32];
         let ingress = LocalControlIngress::new(

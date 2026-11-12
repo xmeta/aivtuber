@@ -70,6 +70,14 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Switch the local Thinking model (issue #357), for example
+    /// `aivtuberctl model qwen3-4b-instruct-2507`. The alias must be one the
+    /// launcher listed (`aivtuberctl status` prints them); the operation panel
+    /// sends the same request.
+    Model {
+        /// A model alias from the daemon's allowlist.
+        alias: String,
+    },
 }
 
 fn action_name(command: &Command) -> &'static str {
@@ -81,6 +89,7 @@ fn action_name(command: &Command) -> &'static str {
         Command::PerceptionOn => "perception.enable",
         Command::PerceptionOff => "perception.disable",
         Command::MemoryExport { .. } => "memory.export",
+        Command::Model { .. } => "model.select",
     }
 }
 
@@ -117,10 +126,15 @@ fn main() -> ExitCode {
         }
     };
 
+    let argument = match &cli.command {
+        Command::Model { alias } => Some(alias.clone()),
+        _ => None,
+    };
     let request = OperatorRequest {
         action,
         secret: secret.to_owned(),
         request_id: None,
+        argument,
     };
 
     match runtime.block_on(send_request(&endpoint, &request)) {
@@ -231,6 +245,21 @@ fn print_response(response: &OperatorResponse) {
                 perception.yielded_thinking,
                 perception.yielded_speech,
                 perception.observations_accepted,
+            );
+        }
+        if let Some(model) = &status.thinking_model {
+            println!(
+                "thinking_model active={} version={} state={} target={:?} available={}",
+                model.active,
+                model.active_version,
+                model.state,
+                model.target,
+                model
+                    .available
+                    .iter()
+                    .map(|m| m.alias.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
             );
         }
     } else {

@@ -76,6 +76,9 @@ pub enum PanelRequest {
     Chat(String),
     Stop,
     Mute,
+    /// Switch the local Thinking model (#357). Only the alias, already checked
+    /// for shape; whether it is allowed is decided on the composition thread.
+    SelectModel(String),
 }
 
 /// The composition thread's answer, relayed to the page.
@@ -446,12 +449,18 @@ fn route(
     let content_length = header("content-length");
     let state_changing = matches!(
         (method, path),
-        ("POST", "/api/chat" | "/api/stop" | "/api/mute")
+        (
+            "POST",
+            "/api/chat" | "/api/stop" | "/api/mute" | "/api/model"
+        )
     );
     let readable = method == "GET" && path == "/api/state";
     if !state_changing && !readable {
         // Includes OPTIONS (CORS preflight): refused without CORS headers.
-        return if matches!(path, "/api/chat" | "/api/stop" | "/api/mute" | "/api/state") {
+        return if matches!(
+            path,
+            "/api/chat" | "/api/stop" | "/api/mute" | "/api/model" | "/api/state"
+        ) {
             plain("405 Method Not Allowed")
         } else {
             plain("404 Not Found")
@@ -519,6 +528,13 @@ fn route(
     let (request, queue) = match path {
         "/api/stop" => (PanelRequest::Stop, &shared.control_tx),
         "/api/mute" => (PanelRequest::Mute, &shared.control_tx),
+        "/api/model" => match model_alias(&body) {
+            Ok(alias) => (PanelRequest::SelectModel(alias), &shared.control_tx),
+            Err((status, detail)) => {
+                shared.count(&shared.counters.rejected_request);
+                return json(status, false, detail);
+            }
+        },
         _ => match chat_text(&body) {
             Ok(text) => (PanelRequest::Chat(text), &shared.chat_tx),
             Err((status, detail)) => {
@@ -528,6 +544,23 @@ fn route(
         },
     };
     forward(shared, queue, request)
+}
+
+/// Parses `{"model": "..."}`. Only the shape of the alias is checked here
+/// (bounded, a-z 0-9 . _ -); the allowlist lives with the composition thread.
+fn model_alias(body: &[u8]) -> Result<String, (&'static str, &'static str)> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Body {
+        model: String,
+    }
+    let Ok(parsed) = serde_json::from_slice::<Body>(body) else {
+        return Err(("400 Bad Request", "expected {\"model\": string}"));
+    };
+    if !aivtuber_domain::is_valid_model_alias(&parsed.model) {
+        return Err(("400 Bad Request", "not a model alias"));
+    }
+    Ok(parsed.model)
 }
 
 /// Parses `{"text": "..."}`; the text is trimmed and bounded.
@@ -942,6 +975,67 @@ mod tests {
         });
         assert_eq!(stop.status, 409);
         assert!(stop.body.contains("\"ok\":false"));
+    }
+
+    #[test]
+    fn a_model_request_is_shape_checked_authenticated_and_goes_to_the_control_queue() {
+        let f = fixture();
+        let good = good(&f);
+        let headers = with(&good, "none");
+        // Foreign origin and missing secret never reach the queue.
+        let mut foreign = with(&good, "origin");
+        foreign.push(("Origin", "http://evil.example"));
+        assert_eq!(
+            post(&f, "/api/model", &foreign, "{\"model\":\"a\"}").status,
+            403
+        );
+        assert_eq!(
+            post(
+                &f,
+                "/api/model",
+                &with(&good, "x-panel-token"),
+                "{\"model\":\"a\"}"
+            )
+            .status,
+            401
+        );
+        // A path, markup, an oversized alias, extra fields or a missing field.
+        let long = format!("{{\"model\":\"{}\"}}", "a".repeat(65));
+        for body in [
+            "",
+            "{}",
+            "{\"model\":\"C:\\x.gguf\"}",
+            "{\"model\":\"../x\"}",
+            "{\"model\":\"A\"}",
+            "{\"model\":\"a\",\"path\":\"/x\"}",
+            long.as_str(),
+        ] {
+            assert_eq!(post(&f, "/api/model", &headers, body).status, 400, "{body}");
+        }
+        assert!(f.inbox.drain_control(8).is_empty());
+        let answer = thread::scope(|s| {
+            let handle = s.spawn(|| post(&f, "/api/model", &headers, "{\"model\":\"qwen3-4b\"}"));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut commands = Vec::new();
+            while commands.is_empty() && Instant::now() < deadline {
+                commands = f.inbox.drain_control(4);
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(commands.len(), 1);
+            assert_eq!(
+                commands[0].request,
+                PanelRequest::SelectModel("qwen3-4b".to_owned())
+            );
+            commands
+                .into_iter()
+                .next()
+                .unwrap()
+                .respond(true, "switching");
+            handle.join().unwrap()
+        });
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        // GET is not a state change and is refused with 405.
+        assert_eq!(get(&f, "/api/model", "").status, 405);
     }
 
     #[test]

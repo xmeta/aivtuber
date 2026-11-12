@@ -518,8 +518,8 @@ mod operator_endpoint {
             "aivtuber-seed-endpoint-test",
             SECRET,
             OperatorEndpointOptions {
-                perception: false,
                 memory_export: export_capable,
+                ..OperatorEndpointOptions::default()
             },
         )
         .expect("server");
@@ -529,6 +529,7 @@ mod operator_endpoint {
                 action: "memory.export".to_owned(),
                 secret: secret.to_owned(),
                 request_id: Some("export-1".to_owned()),
+                argument: None,
             },
             respond,
         };

@@ -232,6 +232,7 @@ fn capability_for_action(action: &str) -> Option<Capability> {
         "memory.admin" => Some(Capability::MemoryAdmin),
         "tool.grant" => Some(Capability::ToolGrant),
         "perception.control" => Some(Capability::PerceptionControl),
+        "model.select" => Some(Capability::ModelSelect),
         _ => None,
     }
 }

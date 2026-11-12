@@ -3,8 +3,11 @@ import { describe, expect, test } from "bun:test";
 import {
   MAX_CHAT_CHARS,
   MAX_CHAT_LOG,
+  MAX_MODEL_CHOICES,
   checkChat,
+  modelView,
   otherReplies,
+  parseModelState,
   parseState,
   pushChat,
   repliesFor,
@@ -100,5 +103,94 @@ describe("chat", () => {
     expect(checkChat("   ").ok).toBe(false);
     expect(checkChat("あ".repeat(MAX_CHAT_CHARS)).ok).toBe(true);
     expect(checkChat("あ".repeat(MAX_CHAT_CHARS + 1)).ok).toBe(false);
+  });
+});
+
+const model = (over: Record<string, unknown> = {}) => ({
+  active: "gemma-4-e4b-it-qat",
+  active_version: "UD-Q4_K_XL",
+  state: "ready",
+  target: null,
+  available: [
+    { alias: "gemma-4-e4b-it-qat", version: "UD-Q4_K_XL" },
+    { alias: "qwen3-4b-instruct-2507", version: "Q4_K_M" },
+  ],
+  ...over,
+});
+
+const withModel = (m: unknown) =>
+  state({
+    status: {
+      muted: false,
+      audio_error: null,
+      avatar_error: null,
+      stream_error: null,
+      content_queue: 0,
+      scheduler_items: 0,
+      generation_active: false,
+      thinking_model: m,
+    },
+  });
+
+describe("model selector state", () => {
+  test("a state without the selector has no model view", () => {
+    expect(state()!.status.thinking_model).toBeNull();
+    expect(modelView(state())).toBeNull();
+    expect(modelView(null)).toBeNull();
+  });
+
+  test("parseModelState accepts exactly the documented shape", () => {
+    expect(parseModelState(model())?.available).toHaveLength(2);
+    expect(parseModelState(model({ state: "switching", target: "qwen3-4b-instruct-2507" }))?.state).toBe("switching");
+    for (const bad of [
+      null,
+      "x",
+      model({ active: "C:\\evil.gguf" }),
+      model({ active: "Gemma" }),
+      model({ active_version: "a b" }),
+      model({ state: "loading" }),
+      model({ target: "../x" }),
+      model({ available: [] }),
+      model({ available: [{ alias: "a", version: "v" }, { alias: "a", version: "v" }] }),
+      model({ available: [{ alias: "a", version: "v", path: "/x" }, { alias: "<b>", version: "v" }] }),
+      model({ available: Array.from({ length: MAX_MODEL_CHOICES + 1 }, (_, i) => ({ alias: `m${i}`, version: "v" })) }),
+    ]) {
+      expect(parseModelState(bad)).toBeNull();
+    }
+  });
+
+  test("a malformed selector is dropped without rejecting the whole state", () => {
+    const s = withModel({ active: "<script>", available: [] });
+    expect(s).not.toBeNull();
+    expect(s!.status.thinking_model).toBeNull();
+    expect(modelView(s)).toBeNull();
+  });
+
+  test("ready: two models can be switched between, one cannot", () => {
+    const two = modelView(withModel(model()))!;
+    expect(two.disabled).toBe(false);
+    expect(two.selected).toBe("gemma-4-e4b-it-qat");
+    expect(two.options.map((o) => o.label)).toEqual([
+      "gemma-4-e4b-it-qat (UD-Q4_K_XL)",
+      "qwen3-4b-instruct-2507 (Q4_K_M)",
+    ]);
+    expect(two.health).toBe("ok");
+    const one = modelView(withModel(model({ available: [{ alias: "gemma-4-e4b-it-qat", version: "UD-Q4_K_XL" }] })))!;
+    expect(one.options).toHaveLength(1);
+    expect(one.disabled).toBe(true);
+    expect(one.message).toContain("--with-model");
+  });
+
+  test("switching shows the target and locks the selector; failed says what stayed", () => {
+    const switching = modelView(
+      withModel(model({ active: "qwen3-4b-instruct-2507", active_version: "Q4_K_M", state: "switching", target: "qwen3-4b-instruct-2507" })),
+    )!;
+    expect(switching.disabled).toBe(true);
+    expect(switching.selected).toBe("qwen3-4b-instruct-2507");
+    expect(switching.health).toBe("warn");
+    const failed = modelView(withModel(model({ state: "failed", target: "qwen3-4b-instruct-2507" })))!;
+    expect(failed.selected).toBe("gemma-4-e4b-it-qat");
+    expect(failed.disabled).toBe(false);
+    expect(failed.message).toContain("失敗");
   });
 });

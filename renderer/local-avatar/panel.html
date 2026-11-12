@@ -30,6 +30,15 @@
     <p id="control-result" role="status"></p>
   </section>
 
+  <section id="model-section" aria-labelledby="h-model" hidden>
+    <h2 id="h-model">応答モデル</h2>
+    <div class="buttons">
+      <select id="model-select" aria-label="応答に使うモデル"></select>
+      <button id="model-apply" type="button">切り替える</button>
+    </div>
+    <p id="model-state" role="status"></p>
+  </section>
+
   <section aria-labelledby="h-chat">
     <h2 id="h-chat">話しかける</h2>
     <div id="chat-log" class="log" aria-live="polite"></div>

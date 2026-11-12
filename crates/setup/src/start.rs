@@ -6,8 +6,16 @@
 //! from this terminal's stdin and forwarded: plain text is wrapped as untrusted
 //! public chat, envelope JSON lines pass through), and
 //! stops llama-server when the app exits.
+//!
+//! When optional Thinking models are installed next to the default one
+//! (`aivtuber-setup local --with-model`, #357) llama-server runs in router mode
+//! from a generated preset file (one section per installed model, one model in
+//! VRAM at a time) and the app is told the allowlist and the model to start
+//! with. With only the default model nothing about the launch changes.
 
 use crate::config::{LLAMA_ALIAS, LLAMA_DEFAULT_CONTEXT, parse_env};
+use crate::manifest::{DEFAULT_PROFILE, Manifest};
+use aivtuber_domain::{ThinkingModel, ThinkingModelCatalog, read_model_settings};
 use std::collections::BTreeMap;
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
@@ -134,6 +142,195 @@ pub fn llama_command(env: &BTreeMap<String, String>) -> Result<LlamaCommand, Str
     })
 }
 
+/// File beside the env file that remembers the model chosen in the panel. The
+/// app writes it; `start` reads it back (alias only, checked against what is
+/// installed).
+pub const MODEL_SETTINGS_FILE: &str = "local-model.json";
+/// Generated router preset, rewritten at every start.
+pub const PRESET_FILE: &str = "llama-models.ini";
+
+/// One model llama-server can serve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServedModel {
+    pub alias: String,
+    pub version: String,
+    pub gguf: PathBuf,
+    pub context: u32,
+}
+
+/// The models `start` serves and the one the app begins with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelPlan {
+    /// The default model first, then every installed optional model.
+    pub models: Vec<ServedModel>,
+    pub catalog: ThinkingModelCatalog,
+    /// Alias to start on: the saved choice while it is still installed,
+    /// otherwise the default.
+    pub initial: String,
+}
+
+impl ModelPlan {
+    /// Router mode is needed only when there is something to switch to.
+    pub fn is_router(&self) -> bool {
+        self.models.len() > 1
+    }
+}
+
+/// Decides which models are served. `None` for a profile that has no model
+/// switching (perception, or anything with a vision projector). An optional
+/// model counts as installed when its file exists with its pinned size
+/// (`aivtuber-setup local` verified the digest when it downloaded it).
+pub fn plan_models(
+    env: &BTreeMap<String, String>,
+    manifest: &Manifest,
+    settings: &Path,
+    size_of: &dyn Fn(&Path) -> Option<u64>,
+) -> Result<Option<ModelPlan>, String> {
+    let profile = env
+        .get("AIVTUBER_SETUP_PROFILE")
+        .map_or(DEFAULT_PROFILE, String::as_str);
+    if profile != DEFAULT_PROFILE
+        || env
+            .get("AIVTUBER_SETUP_LLAMA_MMPROJ")
+            .is_some_and(|v| !v.is_empty())
+    {
+        return Ok(None);
+    }
+    let gguf = PathBuf::from(need(env, "AIVTUBER_SETUP_LLAMA_GGUF")?);
+    let default_profile = manifest.profile(DEFAULT_PROFILE)?;
+    let alias = env
+        .get("AIVTUBER_SETUP_LLAMA_ALIAS")
+        .filter(|v| !v.is_empty())
+        .map_or(LLAMA_ALIAS, String::as_str);
+    let version = env
+        .get("AIVTUBER_OPENAI_MODEL_VERSION")
+        .filter(|v| !v.is_empty())
+        .map_or(default_profile.spec.model_version.as_str(), String::as_str);
+    let context = env
+        .get("AIVTUBER_SETUP_LLAMA_CONTEXT")
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(LLAMA_DEFAULT_CONTEXT);
+    let dir = gguf.parent().map(Path::to_path_buf).unwrap_or_default();
+    let mut models = vec![ServedModel {
+        alias: alias.to_owned(),
+        version: version.to_owned(),
+        gguf: gguf.clone(),
+        context,
+    }];
+    for (id, optional) in &manifest.optional_models {
+        let path = dir.join(&optional.llm.file);
+        if optional.alias == alias || size_of(&path) != Some(optional.llm.size) {
+            continue;
+        }
+        if !path
+            .to_str()
+            .is_some_and(|p| !p.contains(['\n', '\r']) && !p.is_empty())
+        {
+            return Err(format!("the path of model {id} is not usable"));
+        }
+        models.push(ServedModel {
+            alias: optional.alias.clone(),
+            version: optional.model_version.clone(),
+            gguf: path,
+            context: optional.context,
+        });
+    }
+    let catalog = ThinkingModelCatalog::new(
+        models
+            .iter()
+            .map(|m| {
+                ThinkingModel::new(&m.alias, &m.version).map_err(|e| format!("{}: {e}", m.alias))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    )
+    .map_err(|e| e.to_string())?;
+    let initial = read_model_settings(settings, &catalog).unwrap_or_else(|| alias.to_owned());
+    Ok(Some(ModelPlan {
+        models,
+        catalog,
+        initial,
+    }))
+}
+
+/// The router's preset file: one `[alias]` section per model with the same
+/// per-model flags the single-model launch passes (context, GPU layers, hidden
+/// reasoning off). Keys are the long llama-server flags without the dashes.
+/// Paths use forward slashes, which Windows accepts, so no escaping is needed.
+pub fn router_preset(models: &[ServedModel], gpu_layers: u32) -> String {
+    let mut text = String::from(
+        "# Generated by `aivtuber-setup start`; rewritten at every start. Do not edit.\nversion = 1\n",
+    );
+    for model in models {
+        text.push_str(&format!(
+            "\n[{}]\nmodel = {}\nctx-size = {}\n",
+            model.alias,
+            model.gguf.display().to_string().replace('\\', "/"),
+            model.context
+        ));
+        if gpu_layers > 0 {
+            text.push_str(&format!("n-gpu-layers = {gpu_layers}\n"));
+        }
+        // Reasoning models otherwise spend the whole reply budget on hidden
+        // thinking and return empty text (#340); harmless for other templates.
+        text.push_str("reasoning = off\n");
+    }
+    text
+}
+
+/// The router command: loopback only, one model resident at a time (the
+/// previous one is unloaded on a switch, so VRAM holds one).
+pub fn router_command(
+    env: &BTreeMap<String, String>,
+    preset: &Path,
+) -> Result<LlamaCommand, String> {
+    let port: u16 = need(env, "AIVTUBER_SETUP_LLAMA_PORT")?
+        .parse()
+        .map_err(|_| "AIVTUBER_SETUP_LLAMA_PORT is not a port number".to_owned())?;
+    let args = [
+        "--models-preset",
+        &preset.display().to_string(),
+        "--models-max",
+        "1",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &port.to_string(),
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    Ok(LlamaCommand {
+        program: PathBuf::from(need(env, "AIVTUBER_SETUP_LLAMA_SERVER")?),
+        args,
+        port,
+    })
+}
+
+/// What the app needs to offer the switch: the allowlist, the model to start
+/// on and where to remember the choice. Layered over the env file's values.
+pub fn app_model_env(plan: &ModelPlan, settings: &Path) -> Vec<(String, String)> {
+    let initial = plan
+        .catalog
+        .get(&plan.initial)
+        .unwrap_or(&plan.catalog.models()[0]);
+    vec![
+        ("AIVTUBER_OPENAI_MODEL".to_owned(), initial.alias.clone()),
+        (
+            "AIVTUBER_OPENAI_MODEL_VERSION".to_owned(),
+            initial.version.clone(),
+        ),
+        (
+            "AIVTUBER_OPENAI_MODEL_CHOICES".to_owned(),
+            plan.catalog.render_choices(),
+        ),
+        (
+            "AIVTUBER_OPENAI_MODEL_SETTINGS".to_owned(),
+            settings.display().to_string(),
+        ),
+    ]
+}
+
 fn port_in_use(port: u16) -> bool {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
@@ -156,6 +353,15 @@ struct KillOnDrop(Child);
 
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
+        // The router spawns one llama-server per loaded model. On Windows a
+        // killed parent leaves them running, so end the whole tree.
+        #[cfg(windows)]
+        let _ = Command::new("taskkill")
+            .args(["/PID", &self.0.id().to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
@@ -166,6 +372,22 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
     let env = load_env(&opts.env_file)?;
     let llm = llm(&env)?;
     let app = PathBuf::from(need(&env, "AIVTUBER_SETUP_APP")?);
+    let settings = opts.env_file.with_file_name(MODEL_SETTINGS_FILE);
+    let preset = opts.env_file.with_file_name(PRESET_FILE);
+    let mut env = env;
+    let plan = match &llm {
+        Llm::Managed(_) => plan_models(&env, &Manifest::embedded(), &settings, &|p| {
+            std::fs::metadata(p).ok().map(|m| m.len())
+        })?,
+        Llm::External => None,
+    };
+    let mut llm = llm;
+    if let (Some(plan), Llm::Managed(llama)) = (&plan, &mut llm) {
+        env.extend(app_model_env(plan, &settings));
+        if plan.is_router() {
+            *llama = router_command(&env, &preset)?;
+        }
+    }
     match &llm {
         Llm::Managed(llama) => println!(
             "llama-server: {} {}",
@@ -177,6 +399,18 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
             env.get("AIVTUBER_OPENAI_ENDPOINT")
                 .map_or("?", String::as_str)
         ),
+    }
+    if let Some(plan) = &plan {
+        println!(
+            "models:       {} (starting on {}){}",
+            plan.catalog.render_choices(),
+            plan.initial,
+            if plan.is_router() {
+                format!("; router preset {}", preset.display())
+            } else {
+                " (only the default is installed; add one with `aivtuber-setup local --with-model qwen3-4b`)".to_owned()
+            }
+        );
     }
     println!(
         "app:          {} (environment from {})",
@@ -220,23 +454,33 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
             opts.env_file.display()
         ));
     }
+    if let Some(plan) = plan.as_ref().filter(|p| p.is_router()) {
+        let gpu_layers: u32 = env
+            .get("AIVTUBER_SETUP_LLAMA_GPU_LAYERS")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        std::fs::write(&preset, router_preset(&plan.models, gpu_layers))
+            .map_err(|e| format!("cannot write {}: {e}", preset.display()))?;
+    }
     let log_path = opts.env_file.with_file_name("llama-server.log");
     let log = std::fs::File::create(&log_path)
         .map_err(|e| format!("cannot create {}: {e}", log_path.display()))?;
-    let mut child = Command::new(&llama.program)
-        .args(&llama.args)
-        .stdin(Stdio::null())
-        .stdout(log.try_clone().map_err(|e| e.to_string())?)
-        .stderr(log)
-        .spawn()
-        .map_err(|e| format!("cannot start llama-server: {e}"))?;
+    let mut guard = KillOnDrop(
+        Command::new(&llama.program)
+            .args(&llama.args)
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().map_err(|e| e.to_string())?)
+            .stderr(log)
+            .spawn()
+            .map_err(|e| format!("cannot start llama-server: {e}"))?,
+    );
     println!(
         "waiting for llama-server (model load can take a minute; log: {})",
         log_path.display()
     );
     let deadline = Instant::now() + opts.health_timeout;
     loop {
-        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+        if let Some(status) = guard.0.try_wait().map_err(|e| e.to_string())? {
             return Err(format!(
                 "llama-server exited ({status}); see {}",
                 log_path.display()
@@ -246,7 +490,6 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
             break;
         }
         if Instant::now() > deadline {
-            let _ = child.kill();
             return Err(format!(
                 "llama-server was not healthy within {} s; see {}",
                 opts.health_timeout.as_secs(),
@@ -255,7 +498,6 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    let _guard = KillOnDrop(child);
     println!("llama-server ready; starting the app ({CHAT_HINT}; Ctrl+C stops everything)");
     run_app(&app, &env)
 }
@@ -361,6 +603,143 @@ mod tests {
         assert!(llm(&e).is_err());
         // Env files written before profiles existed have no mode key.
         assert!(matches!(llm(&env("0")).unwrap(), Llm::Managed(_)));
+    }
+
+    const QWEN_FILE: &str = "Qwen3-4B-Instruct-2507-Q4_K_M.gguf";
+
+    fn qwen_size() -> u64 {
+        Manifest::embedded().optional_models["qwen3-4b"].llm.size
+    }
+
+    fn plan(
+        e: &BTreeMap<String, String>,
+        settings: &Path,
+        qwen_on_disk: bool,
+    ) -> Option<ModelPlan> {
+        plan_models(e, &Manifest::embedded(), settings, &|p: &Path| {
+            (qwen_on_disk && p.file_name().is_some_and(|n| n == QWEN_FILE)).then(qwen_size)
+        })
+        .unwrap()
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("aivtuber-start-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn only_the_default_model_keeps_the_single_model_launch() {
+        let settings = temp_dir("single").join(MODEL_SETTINGS_FILE);
+        let p = plan(&env("99"), &settings, false).unwrap();
+        assert!(!p.is_router());
+        assert_eq!(p.initial, LLAMA_ALIAS);
+        assert_eq!(p.catalog.models().len(), 1, "the selector shows one model");
+        let env_pairs = app_model_env(&p, &settings);
+        let get = |k: &str| {
+            env_pairs
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("AIVTUBER_OPENAI_MODEL"), Some(LLAMA_ALIAS));
+        assert_eq!(
+            get("AIVTUBER_OPENAI_MODEL_CHOICES"),
+            Some(&*format!("{LLAMA_ALIAS}:UD-Q4_K_XL"))
+        );
+        assert!(
+            get("AIVTUBER_OPENAI_MODEL_SETTINGS")
+                .unwrap()
+                .ends_with(MODEL_SETTINGS_FILE)
+        );
+    }
+
+    #[test]
+    fn an_installed_optional_model_turns_on_the_router_and_the_saved_choice_is_validated() {
+        let dir = temp_dir("router");
+        let settings = dir.join(MODEL_SETTINGS_FILE);
+        let p = plan(&env("99"), &settings, true).unwrap();
+        assert!(p.is_router());
+        assert_eq!(
+            p.models
+                .iter()
+                .map(|m| m.alias.as_str())
+                .collect::<Vec<_>>(),
+            [LLAMA_ALIAS, "qwen3-4b-instruct-2507"]
+        );
+        assert_eq!(p.models[1].gguf, PathBuf::from("/x").join(QWEN_FILE));
+        assert_eq!(p.initial, LLAMA_ALIAS, "no saved choice: the default");
+        // A saved choice that is installed is used...
+        aivtuber_domain::write_model_settings(&settings, "qwen3-4b-instruct-2507").unwrap();
+        let p = plan(&env("99"), &settings, true).unwrap();
+        assert_eq!(p.initial, "qwen3-4b-instruct-2507");
+        let pairs = app_model_env(&p, &settings);
+        assert!(pairs.contains(&(
+            "AIVTUBER_OPENAI_MODEL_VERSION".to_owned(),
+            "Q4_K_M".to_owned()
+        )));
+        // ...but not once the file is gone, and a bad file is ignored.
+        assert_eq!(
+            plan(&env("99"), &settings, false).unwrap().initial,
+            LLAMA_ALIAS
+        );
+        std::fs::write(&settings, "C:\\evil.gguf").unwrap();
+        assert_eq!(
+            plan(&env("99"), &settings, true).unwrap().initial,
+            LLAMA_ALIAS
+        );
+        std::fs::write(&settings, "x".repeat(100_000)).unwrap();
+        assert_eq!(
+            plan(&env("99"), &settings, true).unwrap().initial,
+            LLAMA_ALIAS
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_perception_profile_has_no_model_switch() {
+        let mut e = env("99");
+        e.insert("AIVTUBER_SETUP_PROFILE".into(), "perception".into());
+        assert_eq!(plan(&e, Path::new("/s.json"), true), None);
+        let mut e = env("99");
+        e.insert("AIVTUBER_SETUP_LLAMA_MMPROJ".into(), "/x/mm.gguf".into());
+        assert_eq!(plan(&e, Path::new("/s.json"), true), None);
+    }
+
+    #[test]
+    fn the_preset_lists_every_model_with_the_single_model_flags() {
+        let p = plan(&env("99"), Path::new("/none.json"), true).unwrap();
+        let ini = router_preset(&p.models, 99);
+        assert!(ini.contains("version = 1"));
+        assert!(ini.contains(&format!("[{LLAMA_ALIAS}]\nmodel = /x/m.gguf\nctx-size = 4096\nn-gpu-layers = 99\nreasoning = off\n")), "{ini}");
+        assert!(ini.contains("[qwen3-4b-instruct-2507]"), "{ini}");
+        assert!(ini.contains(&format!("model = /x/{QWEN_FILE}")), "{ini}");
+        // CPU only: no GPU layers key. Windows paths use forward slashes.
+        let cpu = router_preset(
+            &[ServedModel {
+                alias: "a".into(),
+                version: "v".into(),
+                gguf: PathBuf::from("C:\\llm\\a.gguf"),
+                context: 2048,
+            }],
+            0,
+        );
+        assert!(!cpu.contains("n-gpu-layers"));
+        assert!(cpu.contains("model = C:/llm/a.gguf"), "{cpu}");
+    }
+
+    #[test]
+    fn the_router_command_is_loopback_with_one_resident_model() {
+        let c = router_command(&env("99"), Path::new("/x/llama-models.ini")).unwrap();
+        assert_eq!(c.port, 18080);
+        let joined = c.args.join(" ");
+        assert!(joined.contains("--models-preset"), "{joined}");
+        assert!(joined.contains("--models-max 1"), "{joined}");
+        assert!(joined.contains("--host 127.0.0.1"), "{joined}");
+        assert!(
+            !joined.contains(" -m "),
+            "router mode takes no single model: {joined}"
+        );
     }
 
     #[test]

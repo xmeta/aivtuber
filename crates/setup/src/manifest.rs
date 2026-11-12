@@ -17,6 +17,11 @@ pub struct Manifest {
     /// The default profile's model (the Node scripts read this key).
     pub llm: Asset,
     pub profiles: BTreeMap<String, Profile>,
+    /// Extra Thinking models for the default profile, downloaded only on
+    /// request (`aivtuber-setup local --with-model <id>`) and switchable from
+    /// the operation panel (#357). Keyed by the id `--with-model` takes.
+    #[serde(default)]
+    pub optional_models: BTreeMap<String, OptionalModel>,
     pub vad: Asset,
     pub avatar: Asset,
     pub sherpa_lib: SherpaLib,
@@ -95,6 +100,21 @@ pub struct Profile {
     pub mmproj: Option<Asset>,
 }
 
+/// An opt-in Thinking model served next to the default one by llama-server's
+/// router mode. Same per-model flags as the default profile.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OptionalModel {
+    pub description: String,
+    /// Model name the app sends and the router serves (the preset section).
+    pub alias: String,
+    pub model_version: String,
+    /// llama-server `ctx-size` for this model.
+    pub context: u32,
+    #[serde(default)]
+    pub min_vram_gb: Option<u32>,
+    pub llm: Asset,
+}
+
 /// A profile with its model files resolved.
 #[derive(Debug, Clone, Copy)]
 pub struct ResolvedProfile<'a> {
@@ -130,6 +150,23 @@ impl Manifest {
             ));
         }
         Ok(manifest)
+    }
+
+    pub fn optional_model(&self, id: &str) -> Result<&OptionalModel, String> {
+        self.optional_models.get(id).ok_or_else(|| {
+            format!(
+                "unknown model {id:?} for --with-model (available: {})",
+                if self.optional_models.is_empty() {
+                    "none".to_owned()
+                } else {
+                    self.optional_models
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            )
+        })
     }
 
     pub fn profile_names(&self) -> Vec<&str> {
@@ -196,6 +233,7 @@ mod tests {
         for p in m.profiles.values() {
             out.extend(p.llm.iter().chain(p.mmproj.iter()));
         }
+        out.extend(m.optional_models.values().map(|o| &o.llm));
         out.extend(m.llama.assets.values());
         out.extend(m.sherpa_lib.assets.values());
         for model in m.models.values() {
@@ -314,6 +352,40 @@ mod tests {
         for a in [p.llm, p.mmproj.unwrap()] {
             assert_eq!(a.licence.as_deref(), Some("Apache-2.0"), "{}", a.file);
         }
+    }
+
+    #[test]
+    fn the_optional_models_are_pinned_aliased_and_disclosed() {
+        let m = Manifest::embedded();
+        let qwen = m.optional_model("qwen3-4b").unwrap();
+        assert_eq!(qwen.alias, "qwen3-4b-instruct-2507");
+        assert_eq!(qwen.model_version, "Q4_K_M");
+        assert_eq!(qwen.llm.licence.as_deref(), Some("Apache-2.0"));
+        let default = m.profile(DEFAULT_PROFILE).unwrap();
+        assert_ne!(qwen.alias, default.spec.alias);
+        assert_ne!(qwen.llm.file, default.llm.file);
+        let err = m.optional_model("nope").unwrap_err();
+        assert!(err.contains("qwen3-4b"), "{err}");
+        for (id, o) in &m.optional_models {
+            // The same shape the panel and the app accept: a switch can never
+            // name an alias the app would refuse.
+            assert!(
+                aivtuber_domain::is_valid_model_alias(&o.alias)
+                    && aivtuber_domain::is_valid_model_version(&o.model_version),
+                "{id}"
+            );
+            let tag = format!("model:{id}");
+            let n = m
+                .disclosures
+                .iter()
+                .filter(|d| d.applies_to.contains(&tag))
+                .count();
+            assert_eq!(n, 1, "{id} needs exactly one disclosure");
+        }
+        assert!(
+            m.optional_models.len() < aivtuber_domain::MAX_THINKING_MODEL_CHOICES,
+            "room for the default model in the catalog"
+        );
     }
 
     #[test]
