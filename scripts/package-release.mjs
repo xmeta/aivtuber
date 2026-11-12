@@ -194,8 +194,12 @@ function main() {
       }
     }
 
-    // 3. Renderer page build. A VRM model is operator-supplied and never shipped.
+    // 3. Renderer page build (avatar page and operation panel). A VRM model is
+    // operator-supplied and never shipped.
     if (!existsSync(join(rendererDist, "index.html"))) fail(`renderer build missing: ${rendererDist}/index.html (run bun run build)`);
+    // The local operation panel (#335) is a second page of the same build; the app
+    // serves it from this directory (AIVTUBER_PANEL_PAGE_DIR defaults to it).
+    if (!existsSync(join(rendererDist, "panel.html"))) fail(`panel page missing: ${rendererDist}/panel.html (the renderer build must include it)`);
     const pageDir = join(stage, "renderer", "local-avatar", "dist");
     cpSync(rendererDist, pageDir, { recursive: true });
     const stray = [];

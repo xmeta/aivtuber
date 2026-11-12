@@ -316,3 +316,50 @@ The baseline regression fixtures are:
 They conform to `schemas/security-regression-case.schema.json`.
 
 The runtime implementation should load these fixtures and assert the expected authorization, memory-write, and model-dependency outcomes.
+
+== 15. Local operation panel (loopback web surface, issue #335)
+
+The panel is a browser page and four JSON endpoints served by +aivtuber-app+ on +127.0.0.1+ next to the avatar renderer server (+crates/adapters/src/local_avatar/panel.rs+, +crates/app/src/panel.rs+; operation: docs/production-runtime.adoc). It is new network surface that can stop and mute the performer, so it is held to the control-plane rules above.
+
+=== 15.1 What it is allowed to do
+
+It holds no authority. It validates an HTTP envelope and forwards typed requests (+Chat+, +Stop+, +Mute+) over bounded queues to the composition thread. There:
+
+* stop and mute are turned into the same +OperatorRequest+ +aivtuberctl+ sends and go through the existing verification: constant-time secret comparison inside +LocalControlIngress+, the +performer.stop+ / +performer.mute+ capability mint, the output stop of section 6.1, and the audit records of section 12. The panel is an authenticated client of the operator endpoint that happens to live in the same process; it cannot reach +perception.control+, +memory.admin+ or diagnose, and has no unmute. A serialized claim from the page is never read: the page sends no authorization field and the body parser rejects unknown fields;
+* a chat line is normalized by the composition root, not by the page: source +local-panel+, source class +public_chat+, plane +content+, trust +untrusted+, no +authorization+, admitted by the call a stdin line goes through. It can influence what the performer says exactly as a viewer's chat line can, and nothing more (section 2). A line that looks like +operator.command+ stays chat text (section 4);
+* status is read-only: the +aivtuberctl status+ snapshot plus a bounded view of recent spoken replies. Reply text is output that already passed section 11 (or a cached pack line); it is shown with +textContent+, never as markup.
+
+=== 15.2 Attackers considered and the controls
+
+[cols="2,4"]
+|===
+|Attacker |Control (each has a negative test)
+
+|A web page in the streamer's own browser that sends requests to +127.0.0.1+ (CSRF)
+|State-changing requests need +Origin+ equal to the panel origin (a missing +Origin+ is refused), +Content-Type: application/json+ (no form post), and a secret in a custom header. No CORS header is ever sent and +OPTIONS+ is refused, so a cross-origin page can neither pass a preflight nor read a response.
+
+|A web page that rebinds its own DNS name to 127.0.0.1 (DNS rebinding)
+|The +Host+ header must equal the exact +127.0.0.1:port+ for every route, including the page; +localhost+, a bare IP and other ports are refused. A rebinding page's requests carry its own name and are refused before anything else is read.
+
+|Anything that learns the URL from a log, a screenshot or a request line
+|The secret is only in the URL fragment, which no server or proxy receives, and is never in a query string; a query-string token is ignored (401). The page keeps it in a JavaScript variable (not in storage or a cookie) and removes it from the address bar. The URL is printed to the operator's console only, like the avatar URL, and the app never logs it. The secret is 256 bits, minted per launch from OS entropy, different from the control secret and the avatar token, and compared in constant time.
+
+|A peer on the network
+|There is no bind-address option; the listener is +127.0.0.1+ only and +AIVTUBER_PANEL_BIND+ / +_HOST+ / +_ADDR+ are refused at startup rather than ignored.
+
+|A flooding client, a slow client, an oversized request
+|Request heads are capped (8 KiB, 2 s), bodies (4 KiB, a declared +Content-Length+ above it is refused unread, chunked bodies are refused), chat text (500 characters, control characters refused), connections (16), authenticated calls (token bucket) and the queues (chat 8, control 4, state 64 KiB). A full queue answers 503; it never blocks the composition thread or grows. Stop and mute have a queue of their own and are served before chat, so content saturation cannot delay them (section 6).
+
+|Script injection through the page
+|Server strings are rendered with +textContent+; the page is served with +default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'+, +X-Frame-Options: DENY+, +Referrer-Policy: no-referrer+ and +nosniff+. Only +panel.html+ and +assets/+ are served from the page directory (not the avatar page or any model).
+|===
+
+=== 15.3 Residual risk and assumptions
+
+* *Another local process or user.* Loopback is reachable by every process on the machine. Such a process still needs the secret; it is shown only in the operator's terminal and the browser the operator opened. A process that can read that terminal, the browser's memory or its history can use it, as it could use +AIVTUBER_CONTROL_SECRET+ for +aivtuberctl+. The secret is per launch, so a stale URL is useless after a restart.
+* *The authenticated panel exposes the avatar URL.* The state document includes the avatar page URL with its own token (display authority only: a second renderer connection is refused while one is active, and it can only receive avatar commands). Anyone who can use the panel could already stop and mute.
+* *The control secret is in the same process.* The panel presents it to +LocalControlIngress+ on the operator's behalf and never sends it to the page; the state document does not contain it. A compromise of the +aivtuber-app+ process is out of scope here, as it is for the control endpoint.
+* *Browser history.* A browser may record the URL with its fragment before the page replaces it. The secret does not survive a restart.
+* *Plain HTTP.* Loopback HTTP is not exposed to the network; no TLS is used or needed for that scope, and none must be added in a way that implies the panel may be reached remotely. Remote exposure remains out of scope (a reverse proxy would defeat the +Host+ and +Origin+ rules and must not be put in front of it).
+
+Revisit if the panel gains any action beyond stop, mute and chat (for example settings, issue #335 S2): each new action needs its own capability decision, an audit record and a negative test, and anything that writes configuration must be validated and must not be reachable by a request that only carries the status secret.

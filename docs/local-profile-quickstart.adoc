@@ -85,8 +85,9 @@ sha256sum -c SHA256SUMS --ignore-missing     # must print: aivtuber-local-<versi
 ----
 ./aivtuber-setup start                  # Windows: .\aivtuber-setup.exe start
 ----
-7. Open the `local avatar renderer URL` that `start` printed (`http://127.0.0.1:8765/?token=...`; the token changes on every start and is required for the avatar to connect) in the browser, or add it to OBS as a Browser Source. Do not share that URL. The first answer after start can take several seconds while the model loads.
-8. Before you stream: replace the sample avatar (`renderer/local-avatar/dist/model.vrm`) with a model you have the right to broadcast, and put the disclosures that setup printed (section 8) where viewers see them.
+7. Open the operation panel. The app prints one line, `local operation panel URL (contains a per-launch secret, do not share or log): http://127.0.0.1:8766/#token=...`; paste that URL into Chrome or Edge. The panel shows the runtime status, has a box to type to the performer (the reply appears as text under your line, and is spoken), and has the *emergency stop* and *mute* buttons. The secret is in the part after `#`, which the browser never sends to any server; the page keeps it in memory and removes it from the address bar, so do not bookmark the page (the secret changes on every start). Mute is latched: it lasts until you restart the app. The panel listens on `127.0.0.1` only and can be turned off with `AIVTUBER_PANEL=false`.
+8. Open the avatar: the panel has an "アバター画面を開く" link, or open the `local avatar renderer URL` that `start` printed (`http://127.0.0.1:8765/?token=...`; the token changes on every start and is required for the avatar to connect) in the browser, or add it to OBS as a Browser Source. Do not share that URL. The first answer after start can take several seconds while the model loads.
+9. Before you stream: replace the sample avatar (`renderer/local-avatar/dist/model.vrm`) with a model you have the right to broadcast, and put the disclosures that setup printed (section 8) where viewers see them.
 
 === What `aivtuber-setup local` does
 
@@ -261,6 +262,11 @@ export AIVTUBER_SPEECH_BARGE_IN=true
 export AIVTUBER_AVATAR_OUTPUT=local
 export AIVTUBER_LOCAL_AVATAR_PORT=8765
 export AIVTUBER_LOCAL_AVATAR_PAGE_DIR=renderer/local-avatar/dist
+
+# local operation panel (on by default in the local profile; loopback only)
+export AIVTUBER_PANEL=true
+export AIVTUBER_PANEL_PORT=8766
+export AIVTUBER_PANEL_PAGE_DIR=renderer/local-avatar/dist   # defaults to the avatar page directory
 
 # untrusted-input ceiling (recommended for anything that takes public text)
 export AIVTUBER_INGRESS_MAX_TRUST=untrusted

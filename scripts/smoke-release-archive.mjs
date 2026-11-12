@@ -19,7 +19,8 @@
 //   * the STT worker and the TTS sidecar verify the bundled engine libraries
 //     and then refuse an empty (unpinned) model directory with exit 2;
 //   * a tampered library beside a program is refused with exit 2;
-//   * the avatar page files are present;
+//   * the avatar page files and the operation panel page (#335) are present, and
+//     the panel page loads no script or style from anywhere but its own files;
 //   * the first-run command (aivtuber-setup, issue #294 S2) prints its plan with
 //     --dry-run and refuses --offline when nothing is fetched, without touching
 //     the network or writing a file.
@@ -158,6 +159,25 @@ try {
     assert(existsSync(join(page, "index.html")), "renderer/local-avatar/dist/index.html missing");
     const assets = existsSync(join(page, "assets")) ? readdirSync(join(page, "assets")) : [];
     assert(assets.some((f) => f.endsWith(".js")), "renderer/local-avatar/dist/assets has no script bundle");
+  });
+
+  check("operation panel page is present and loads only its own files", () => {
+    const page = join(root, "renderer", "local-avatar", "dist");
+    assert(existsSync(join(page, "panel.html")), "renderer/local-avatar/dist/panel.html missing");
+    const html = readFileSync(join(page, "panel.html"), "utf8");
+    // The server's CSP is script-src 'self'; an inline script or a remote URL would be dead on arrival.
+    const scripts = [...html.matchAll(/<script\b[^>]*>/g)].map((m) => m[0]);
+    assert(scripts.length >= 1 && scripts.every((s) => /\ssrc="\.\/assets\/[^"]+\.js"/.test(s)), `unexpected script tags: ${scripts.join(" ")}`);
+    assert(!/(?:src|href)="(?:https?:)?\/\//.test(html), "panel.html references a remote URL");
+    const asset = (re) => [...html.matchAll(re)].map((m) => m[1]);
+    for (const file of [...asset(/src="\.\/(assets\/[^"]+)"/g), ...asset(/href="\.\/(assets\/[^"]+)"/g)]) {
+      assert(existsSync(join(page, file)), `panel.html references missing ${file}`);
+    }
+    // The page must send the secret only in a header, never to a URL it builds.
+    const bundle = readdirSync(join(page, "assets")).filter((f) => f.startsWith("panel-") && f.endsWith(".js"));
+    assert(bundle.length === 1, `expected one panel bundle, got ${bundle.join(", ")}`);
+    const js = readFileSync(join(page, "assets", bundle[0]), "utf8");
+    assert(js.includes("X-Panel-Token") && !/[?&]token=/.test(js), "panel bundle does not use the header-only secret");
   });
 
   check("no Node script ships: the first-run command replaces them", () => {

@@ -373,11 +373,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             // presents it like aivtuberctl would).
             let mut random = [0_u8; 32];
             fill_random(&mut random);
+            let hex: String = random[..16].iter().map(|b| format!("{b:02x}")).collect();
             let mut generated = [0_u8; 32];
-            for (pair, byte) in generated.chunks_exact_mut(2).zip(random) {
-                pair[0] = b"0123456789abcdef"[usize::from(byte >> 4)];
-                pair[1] = b"0123456789abcdef"[usize::from(byte & 0x0f)];
-            }
+            generated.copy_from_slice(hex.as_bytes());
             generated
         }
     };

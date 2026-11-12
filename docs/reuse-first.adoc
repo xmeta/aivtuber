@@ -306,6 +306,31 @@ Custom:      the download loop (Range segments, size-exact cap, SHA-256 gate, ma
 Revisit:     if the pin count grows past a manifest a person can review, or an installer is chosen (#205).
 ----
 
+=== Local operation panel record (#335 S1)
+
+[source,text]
+----
+Problem:     A streamer who installed the release archive needs status, a chat box, stop and mute
+             without a terminal, over the existing control surfaces and with no new authority.
+Candidate 1: the project's own loopback server (crates/adapters/src/local_avatar/server.rs).
+Decision:    wrap. The panel module sits beside it and reuses its head peeking, constant-time compare,
+             entropy token, connection cap and static-file rules (now pub(crate)); std::net, no async
+             runtime, no new crate. It adds only the Host/Origin/header-secret envelope and four JSON routes.
+Candidate 2: an HTTP framework (axum/hyper/actix, tiny_http).
+Decision:    reject. A second HTTP stack for four routes; the existing server already carries the
+             project's bounds and tests, and a framework's default CORS/extractor behaviour is the part
+             this surface must control by hand.
+Candidate 3: a UI framework or component library (React, Svelte, Tauri webview, AITuberKit/AIRI UI).
+Decision:    reject for S1. The page is ~6 kB of plain TypeScript and CSS, built by the Vite/tsc setup the
+             avatar renderer already has as a second entry (panel.html), so there is no new package, no
+             lockfile change, no new licence in the shipped closure and no Node at runtime. The desktop
+             app (#205) can host the same page in a webview later instead of building a second UI.
+Custom:      the Host/Origin/secret rules, the typed queues to the composition thread and the fixed chat
+             envelope, because they are the project's authority and trust boundary (security threat
+             model section 15); no generic mechanism carries them.
+Revisit:     S2 (settings) may justify a form helper; re-evaluate then with the page size as evidence.
+----
+
 === Release packaging record (#294 S1)
 
 [source,text]
