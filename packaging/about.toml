@@ -1,7 +1,7 @@
 # cargo-about configuration for the release archives' Rust third-party licence
 # file (issue #294 S1; docs/supply-chain.adoc section 11). cargo-about only
 # PRODUCES the notices. The licence POLICY gate stays cargo-deny (deny.toml);
-# this list mirrors deny.toml's allow list plus the two scoped exceptions, and
+# this list mirrors deny.toml's allow list plus the two scoped exceptions (the NCSA exception is fuzz-only and not in the release graph), and
 # generation fails on any crate whose licence is outside it.
 accepted = [
     "MIT",
@@ -15,8 +15,6 @@ accepted = [
     "Unlicense",
     "Unicode-3.0",
     "CDLA-Permissive-2.0",
-    "LGPL-2.1-or-later",
-    "NCSA",
     "MIT-0",
     "bzip2-1.0.6",
 ]
