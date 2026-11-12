@@ -9821,6 +9821,31 @@ mod tests {
         }
 
         #[test]
+        fn a_raw_non_utf8_control_secret_works_through_the_panel() {
+            // The generated secret is 32 raw random bytes (not hex, not text):
+            // the panel presents the bytes themselves, so nothing restricts
+            // its entropy to a text alphabet.
+            let raw = [0xFF_u8, 0xFE, 0x80, 0x00, 0xC3, 0x28, 0xA0, 0xA1]
+                .repeat(4)
+                .try_into()
+                .expect("32 bytes");
+            assert!(std::str::from_utf8(&raw).is_err());
+            let ingress = LocalControlIngress::new(
+                "operator-control",
+                "operator:local",
+                AuthorizationMethod::SignedLocalApi,
+                BTreeSet::from([Capability::PerformerStop, Capability::PerformerMute]),
+                ControlSecret::new(raw),
+            )
+            .expect("ingress");
+            let mut panel = start_panel(ingress, raw);
+            let mut app = new_app();
+            let (status, body) = call(&mut panel, &mut app, |p| post(p, "/api/mute", ""));
+            assert_eq!(status, 200, "{body}");
+            assert!(app.is_muted());
+        }
+
+        #[test]
         fn panel_control_is_verified_by_the_ingress_not_trusted() {
             // The ingress holds a different secret than the panel presents (a
             // misconfiguration, or a tampered panel): nothing is stopped, and

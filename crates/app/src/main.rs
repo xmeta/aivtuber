@@ -368,14 +368,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let operator_secret = match env_optional("AIVTUBER_CONTROL_SECRET") {
         Some(_) => fixed_control_secret("AIVTUBER_CONTROL_SECRET")?,
         None => {
-            // 128 bits of entropy as 32 hex characters, so the secret is the
-            // 32 UTF-8 bytes the control request carries (the local panel
-            // presents it like aivtuberctl would).
-            let mut random = [0_u8; 32];
-            fill_random(&mut random);
-            let hex: String = random[..16].iter().map(|b| format!("{b:02x}")).collect();
             let mut generated = [0_u8; 32];
-            generated.copy_from_slice(hex.as_bytes());
+            fill_random(&mut generated);
             generated
         }
     };

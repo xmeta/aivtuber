@@ -244,6 +244,12 @@ fn serve_static(stream: &mut TcpStream, shared: &Shared, method: &str, path: &st
     if !host_ok {
         return respond(stream, "403 Forbidden", "text/plain", b"", head_only);
     }
+    // The operation panel (#335) is a second page of the same build, served
+    // only by its own server: this one serves the avatar entry and nothing of
+    // the panel's.
+    if path == "/panel.html" || path.starts_with("/assets/panel-") {
+        return respond(stream, "404 Not Found", "text/plain", b"", head_only);
+    }
     let Some(file) = resolve(shared.config.page_dir.as_deref(), path) else {
         return respond(stream, "404 Not Found", "text/plain", b"", head_only);
     };

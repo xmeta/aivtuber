@@ -4,8 +4,9 @@
 //! no authority. This module is the only place its requests turn into effects,
 //! on the composition thread:
 //!
-//! * `stop` / `mute` become the same [`OperatorRequest`] `aivtuberctl` sends and
-//!   go through [`apply_operator_request`]: the constant-time secret check in
+//! * `stop` / `mute` are the same operator actions `aivtuberctl` sends and
+//!   go through [`apply_operator_action`] (the raw 32 secret bytes, as the
+//!   ingress compares them): the constant-time secret check in
 //!   `LocalControlIngress`, the capability mint, the output stop and the audit
 //!   record are the existing ones (the audit id is `operator-panel-ctl-N`). The
 //!   panel can ask for exactly two actions; it cannot reach perception, memory
@@ -19,9 +20,7 @@
 //!   round trip (and without an audit record per poll), next to the bounded
 //!   recent replies.
 
-use crate::{
-    OperatorRequest, OperatorStatusSnapshot, ProductionApp, RoutePlanner, apply_operator_request,
-};
+use crate::{OperatorStatusSnapshot, ProductionApp, RoutePlanner, apply_operator_action};
 use aivtuber_adapters::{
     LocalPanelConfig, LocalPanelServer, PanelInbox, PanelMetrics, PanelRequest,
 };
@@ -99,7 +98,7 @@ pub fn panel_settings(
 }
 
 /// The control secret, as the request type carries it. Redacted `Debug`.
-struct ControlSecret(String);
+struct ControlSecret([u8; 32]);
 
 impl fmt::Debug for ControlSecret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -148,8 +147,6 @@ impl PanelService {
         control_secret: &[u8; 32],
         avatar_url: Option<String>,
     ) -> Result<Self, String> {
-        let secret = String::from_utf8(control_secret.to_vec())
-            .map_err(|_| "the control secret is not UTF-8, so the panel cannot present it")?;
         let (server, inbox) = LocalPanelServer::start(LocalPanelConfig {
             port: settings.port,
             page_dir: settings.page_dir.clone(),
@@ -159,7 +156,7 @@ impl PanelService {
             server,
             inbox,
             ingress,
-            control_secret: ControlSecret(secret),
+            control_secret: ControlSecret(*control_secret),
             avatar_url,
             chat_seq: 0,
             control_seq: 0,
@@ -194,12 +191,14 @@ impl PanelService {
                 }
             };
             self.control_seq += 1;
-            let request = OperatorRequest {
-                action: action.to_owned(),
-                secret: self.control_secret.0.clone(),
-                request_id: Some(format!("panel-ctl-{}", self.control_seq)),
-            };
-            let response = apply_operator_request(&self.ingress, app, &request, now_ms);
+            let response = apply_operator_action(
+                &self.ingress,
+                app,
+                &format!("panel-ctl-{}", self.control_seq),
+                action,
+                &self.control_secret.0,
+                now_ms,
+            );
             eprintln!(
                 "panel: {action} ok={} detail={:?}",
                 response.ok, response.detail
@@ -410,7 +409,7 @@ mod tests {
 
     #[test]
     fn the_secret_is_never_printed() {
-        let secret = ControlSecret("0123456789abcdef0123456789abcdef".to_owned());
-        assert!(!format!("{secret:?}").contains("0123"));
+        let secret = ControlSecret([0x30; 32]);
+        assert!(!format!("{secret:?}").contains("30"));
     }
 }
