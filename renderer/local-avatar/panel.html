@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<link rel="icon" href="data:,">
+<title>aivtuber 操作パネル</title>
+<link rel="stylesheet" href="/src/panel.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1>aivtuber 操作パネル</h1>
+    <p id="connection" role="status">接続中…</p>
+  </header>
+
+  <section aria-labelledby="h-status">
+    <h2 id="h-status">状態</h2>
+    <div id="status" class="rows"></div>
+    <p><a id="avatar-link" href="about:blank" target="_blank" rel="noopener noreferrer" hidden>アバター画面を開く</a></p>
+  </section>
+
+  <section aria-labelledby="h-control">
+    <h2 id="h-control">緊急操作</h2>
+    <div class="buttons">
+      <button id="stop" type="button" class="danger">緊急停止</button>
+      <button id="mute" type="button" class="danger">ミュート</button>
+    </div>
+    <p id="control-result" role="status"></p>
+  </section>
+
+  <section aria-labelledby="h-chat">
+    <h2 id="h-chat">話しかける</h2>
+    <div id="chat-log" class="log" aria-live="polite"></div>
+    <textarea id="chat-input" rows="3" maxlength="500" placeholder="ここに入力(Ctrl+Enterで送信)"></textarea>
+    <div class="buttons"><button id="send" type="button">送信</button></div>
+    <p id="chat-error" class="error" role="alert"></p>
+    <div id="other-wrap" hidden>
+      <h3>最近の発話(ほかの入力への返答)</h3>
+      <ul id="other-replies"></ul>
+    </div>
+  </section>
+</main>
+<script type="module" src="/src/panel.ts"></script>
+</body>
+</html>

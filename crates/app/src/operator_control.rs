@@ -490,7 +490,20 @@ pub fn apply_dispatched_request<R: RoutePlanner>(
     dispatched: &DispatchedOperatorRequest,
     now_ms: u64,
 ) -> OperatorResponse {
-    let request = &dispatched.request;
+    apply_operator_request(ingress, app, &dispatched.request, now_ms)
+}
+
+/// The same verification, capability minting and audit for a request that did
+/// not arrive over the control socket. The local operation panel (#335) calls
+/// this for stop and mute with the control secret the daemon already holds, so
+/// a panel button is exactly an `aivtuberctl` invocation and no second
+/// authority path exists.
+pub fn apply_operator_request<R: RoutePlanner>(
+    ingress: &LocalControlIngress,
+    app: &mut ProductionApp<R>,
+    request: &OperatorRequest,
+    now_ms: u64,
+) -> OperatorResponse {
     let request_id = request
         .request_id
         .clone()
@@ -517,17 +530,55 @@ pub fn apply_dispatched_request<R: RoutePlanner>(
     }
     let mut presented = [0_u8; 32];
     presented.copy_from_slice(secret_bytes);
+    apply_with_presented_secret(ingress, app, request_id, &request.action, presented, now_ms)
+}
 
-    if request.action == "status" || request.action == "diagnose" {
+/// Like [`apply_operator_request`] with the secret as the raw 32 bytes the
+/// ingress compares, for an in-process caller that holds them (the local
+/// panel, #335). A secret that is not valid UTF-8 (the generated one is raw
+/// 256-bit entropy) cannot be carried by the text wire form, so it must not
+/// be squeezed through it.
+pub fn apply_operator_action<R: RoutePlanner>(
+    ingress: &LocalControlIngress,
+    app: &mut ProductionApp<R>,
+    request_id: &str,
+    action: &str,
+    presented: &[u8; 32],
+    now_ms: u64,
+) -> OperatorResponse {
+    if !matches!(action, "stop" | "mute") {
+        let detail = format!("unknown action {action}");
+        app.audit_operator_action(request_id, action, &detail, false);
+        return rejection(request_id, &detail);
+    }
+    apply_with_presented_secret(
+        ingress,
+        app,
+        request_id.to_owned(),
+        action,
+        *presented,
+        now_ms,
+    )
+}
+
+fn apply_with_presented_secret<R: RoutePlanner>(
+    ingress: &LocalControlIngress,
+    app: &mut ProductionApp<R>,
+    request_id: String,
+    action: &str,
+    presented: [u8; 32],
+    now_ms: u64,
+) -> OperatorResponse {
+    if action == "status" || action == "diagnose" {
         // `status` and `diagnose` only read non-secret runtime state, so they
         // use constant-time secret verification without minting control
         // authority. All privileged actions go through `authenticate` below.
         if !ingress.verify_secret(&presented) {
             let detail = "authentication failed".to_owned();
-            app.audit_operator_action(&request_id, &request.action, &detail, false);
+            app.audit_operator_action(&request_id, action, &detail, false);
             return rejection(&request_id, &detail);
         }
-        if request.action == "status" {
+        if action == "status" {
             let snapshot = OperatorStatusSnapshot::from_app(app, now_ms);
             app.audit_operator_action(&request_id, "status", "status", true);
             return OperatorResponse {
@@ -564,12 +615,12 @@ pub fn apply_dispatched_request<R: RoutePlanner>(
 
     // The two perception requests share one capability, named by this action;
     // the memory export is the `memory.admin` capability.
-    let capability_action = if request.action.starts_with("perception.") {
+    let capability_action = if action.starts_with("perception.") {
         "perception.control".to_owned()
-    } else if request.action == "memory.export" {
+    } else if action == "memory.export" {
         "memory.admin".to_owned()
     } else {
-        request.action.clone()
+        action.to_owned()
     };
     let input = OperatorCommandInput {
         event_id: format!("operator-{request_id}"),
@@ -584,16 +635,16 @@ pub fn apply_dispatched_request<R: RoutePlanner>(
         Ok(command) => command,
         Err(_) => {
             let detail = "authentication failed".to_owned();
-            app.audit_operator_action(&request_id, &request.action, &detail, false);
+            app.audit_operator_action(&request_id, action, &detail, false);
             return rejection(&request_id, &detail);
         }
     };
 
-    if request.action.starts_with("perception.") {
-        let enable = request.action == "perception.enable";
+    if action.starts_with("perception.") {
+        let enable = action == "perception.enable";
         return match app.apply_perception_control(command.authority(), enable, now_ms) {
             Ok(detail) => {
-                app.audit_operator_action(&request_id, &request.action, detail, true);
+                app.audit_operator_action(&request_id, action, detail, true);
                 OperatorResponse {
                     request_id,
                     ok: true,
@@ -603,13 +654,13 @@ pub fn apply_dispatched_request<R: RoutePlanner>(
                 }
             }
             Err(detail) => {
-                app.audit_operator_action(&request_id, &request.action, detail, false);
+                app.audit_operator_action(&request_id, action, detail, false);
                 rejection(&request_id, detail)
             }
         };
     }
 
-    if request.action == "memory.export" {
+    if action == "memory.export" {
         // Audited without claim text: only the counts and the content hash.
         return match app.export_memory_seed(command.authority(), now_ms) {
             Ok(export) => {
@@ -618,7 +669,7 @@ pub fn apply_dispatched_request<R: RoutePlanner>(
                     export.seed.len(),
                     export.skipped
                 );
-                app.audit_operator_action(&request_id, &request.action, &detail, true);
+                app.audit_operator_action(&request_id, action, &detail, true);
                 OperatorResponse {
                     request_id,
                     ok: true,
@@ -634,7 +685,7 @@ pub fn apply_dispatched_request<R: RoutePlanner>(
             }
             Err(error) => {
                 let detail = error.to_string();
-                app.audit_operator_action(&request_id, &request.action, &detail, false);
+                app.audit_operator_action(&request_id, action, &detail, false);
                 rejection(&request_id, &detail)
             }
         };
@@ -652,7 +703,7 @@ pub fn apply_dispatched_request<R: RoutePlanner>(
             if let Some(report) = stop_report {
                 detail = format!("{detail}; {}", report.detail());
             }
-            app.audit_operator_action(&request_id, &request.action, &detail, true);
+            app.audit_operator_action(&request_id, action, &detail, true);
             OperatorResponse {
                 request_id,
                 ok: true,
@@ -663,7 +714,7 @@ pub fn apply_dispatched_request<R: RoutePlanner>(
         }
         Err(error) => {
             let detail = format!("rejected: {error}");
-            app.audit_operator_action(&request_id, &request.action, &detail, false);
+            app.audit_operator_action(&request_id, action, &detail, false);
             rejection(&request_id, &detail)
         }
     }

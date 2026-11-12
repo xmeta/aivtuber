@@ -487,6 +487,10 @@ fn listens_on_loopback_only_and_serves_static_pages_safely() {
     let dir = std::env::temp_dir().join(format!("local-avatar-test-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("dir");
     std::fs::write(dir.join("index.html"), "<!doctype html><title>t</title>").expect("index");
+    std::fs::write(dir.join("panel.html"), "<title>panel</title>").expect("panel");
+    std::fs::create_dir_all(dir.join("assets")).expect("assets");
+    std::fs::write(dir.join("assets").join("panel-abc.js"), "1").expect("panel js");
+    std::fs::write(dir.join("assets").join("index-abc.js"), "2").expect("index js");
     let secret_outside = dir
         .parent()
         .expect("parent")
@@ -521,6 +525,10 @@ fn listens_on_loopback_only_and_serves_static_pages_safely() {
     assert!(get("/../local-avatar-outside.txt", &host).starts_with("HTTP/1.1 404"));
     assert!(get("/%2e%2e/local-avatar-outside.txt", &host).starts_with("HTTP/1.1 404"));
     assert!(get("/missing.js", &host).starts_with("HTTP/1.1 404"));
+    // Each server serves only its own entry: not the operation panel's page.
+    assert!(get("/panel.html", &host).starts_with("HTTP/1.1 404"));
+    assert!(get("/assets/panel-abc.js", &host).starts_with("HTTP/1.1 404"));
+    assert!(get("/assets/index-abc.js", &host).starts_with("HTTP/1.1 200"));
     // DNS-rebinding guard: a foreign Host header is refused.
     assert!(get("/", "evil.example").starts_with("HTTP/1.1 403"));
 

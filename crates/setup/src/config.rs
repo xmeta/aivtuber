@@ -60,6 +60,8 @@ pub const TTS_READY_TIMEOUT_MS: u64 = 180_000;
 pub const DEFAULT_LLAMA_PORT: u16 = 18080;
 pub const TTS_PORT: u16 = 8770;
 pub const AVATAR_PORT: u16 = 8765;
+/// The local operation panel (#335), next to the avatar page.
+pub const PANEL_PORT: u16 = 8766;
 
 fn push(text: &mut String, key: &str, value: &str) {
     text.push_str(key);
@@ -198,6 +200,14 @@ pub fn render(
     push(
         &mut t,
         "AIVTUBER_LOCAL_AVATAR_PAGE_DIR",
+        &p(&paths.avatar_page_dir),
+    );
+    t.push_str("\n# local operation panel (loopback only; the app prints its URL, the secret is in the fragment)\n");
+    push(&mut t, "AIVTUBER_PANEL", "true");
+    push(&mut t, "AIVTUBER_PANEL_PORT", &PANEL_PORT.to_string());
+    push(
+        &mut t,
+        "AIVTUBER_PANEL_PAGE_DIR",
         &p(&paths.avatar_page_dir),
     );
     t.push_str("\n# untrusted-input ceiling\n");
@@ -359,6 +369,10 @@ mod tests {
             map["AIVTUBER_MEMORY_PSEUDONYM_KEY_HEX"],
             secrets.pseudonym_key_hex
         );
+        assert_eq!(map["AIVTUBER_PANEL"], "true");
+        assert_eq!(map["AIVTUBER_PANEL_PORT"], PANEL_PORT.to_string());
+        assert_eq!(map["AIVTUBER_PANEL_PAGE_DIR"], "/r/page");
+        assert!(!map.keys().any(|k| k.starts_with("AIVTUBER_PANEL_BIND")));
         assert_eq!(map["AIVTUBER_SETUP_LLAMA_GPU_LAYERS"], "99");
         assert_eq!(map["AIVTUBER_SETUP_LLAMA_MODE"], "managed");
         assert_eq!(map["AIVTUBER_SETUP_LLAMA_CONTEXT"], "4096");

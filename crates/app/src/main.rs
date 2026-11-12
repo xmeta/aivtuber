@@ -21,15 +21,15 @@ use aivtuber_app::{
     IntentShadowPolicy, LocalAvatarOutput, LocalRoutePlanner, MemoryFalsifierMetrics, MemorySeed,
     MemoryWriterConfig, MemoryWriterMetrics, NoopAvatarOutput, NoopStreamOutput,
     ObsProgramSceneSource, ObsStreamOutput, OperatorControlServer, OperatorEndpointOptions,
-    OperatorRateLimiter, PerceptionService, PerceptionServiceConfig, PhraseMetrics, PhraseMode,
-    ProducerWorker, ProductionApp, ProfileSummary, RawIngressConfig, RawIngressMetrics,
+    OperatorRateLimiter, PanelService, PerceptionService, PerceptionServiceConfig, PhraseMetrics,
+    PhraseMode, ProducerWorker, ProductionApp, ProfileSummary, RawIngressConfig, RawIngressMetrics,
     RawIngressMetricsSnapshot, RoutePlanner, RuntimeRetentionPolicy,
     SHADOW_ORCHESTRATOR_SCHEMA_VERSION, SceneContextService, ShadowOrchestratorConfig,
     ShadowPolicyIdentity, ShadowingRoutePlanner, SpeechConversationConfig,
     SpeechConversationMetrics, SpeechFloorMetrics, SpeechSidecar, SpeechSidecarConfig,
     SpeechSidecarStats, StreamOutput, TtsSidecarSettings, VoicevoxBridge, VoicevoxSettings,
     VtsAvatarOutput, VtsPlaybackConfig, WarmupMode, apply_dispatched_request, audit_pack_readiness,
-    pump_bounded_records, start_thinking_warmup, stt_sidecar_args, warmup_timeout,
+    panel_settings, pump_bounded_records, start_thinking_warmup, stt_sidecar_args, warmup_timeout,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
@@ -158,7 +158,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     let audio = ProcessAudioPlayer::new(audio_config)?;
 
-    let avatar = build_avatar_output()?;
+    let mut avatar_launch_url: Option<String> = None;
+    let avatar = build_avatar_output(&mut avatar_launch_url)?;
     let stream = build_stream_output()?;
     let max_lateness_ms = env_u64("AIVTUBER_MAX_DISPATCH_LATENESS_MS", 250)?;
 
@@ -387,6 +388,15 @@ fn run() -> Result<(), Box<dyn Error>> {
         },
     )?;
     let operator_ingress = operator_server.ingress();
+    // #335: the local operation panel. Its control actions are the operator
+    // endpoint's own (same ingress, same secret, same audit); the page itself
+    // holds only a separate per-launch panel secret.
+    let mut panel = start_panel(
+        profile,
+        &operator_ingress,
+        &operator_secret,
+        avatar_launch_url,
+    )?;
     let operator_rate = Arc::new(Mutex::new(OperatorRateLimiter::new(16, 8)));
     {
         let rate = operator_rate.clone();
@@ -779,6 +789,11 @@ fn run() -> Result<(), Box<dyn Error>> {
             let response =
                 apply_dispatched_request(&operator_ingress, &mut app, &dispatched, now_ms);
             let _ = dispatched.respond.send(response);
+        }
+        // #335: panel stop/mute (the same operator path) and chat lines (the
+        // same admission as a stdin line), after the operator endpoint drain.
+        if let Some(panel) = panel.as_mut() {
+            panel.service(&mut app, now_ms, &mut sequence_seed);
         }
         // #90 S1b: after the operator drain, so a disable is already in effect
         // before the next capture is considered. Never blocks: the slow OBS and
@@ -1754,19 +1769,23 @@ fn build_adaptation_runtime(
 
 /// `AIVTUBER_AVATAR_OUTPUT=local|vts|none`. Unset keeps the historical
 /// behavior (`AIVTUBER_VTS_ENABLED` selects VTube Studio, otherwise none).
-fn build_avatar_output() -> Result<Box<dyn AvatarOutput>, Box<dyn Error>> {
+fn build_avatar_output(
+    launch_url: &mut Option<String>,
+) -> Result<Box<dyn AvatarOutput>, Box<dyn Error>> {
     match env_optional("AIVTUBER_AVATAR_OUTPUT").as_deref() {
         None => build_vts_avatar_output(env_bool("AIVTUBER_VTS_ENABLED", false)?),
         Some("vts") => build_vts_avatar_output(true),
         Some("none") => Ok(Box::new(NoopAvatarOutput)),
-        Some("local") => build_local_avatar_output(),
+        Some("local") => build_local_avatar_output(launch_url),
         Some(other) => {
             Err(format!("AIVTUBER_AVATAR_OUTPUT must be local, vts or none (got {other:?})").into())
         }
     }
 }
 
-fn build_local_avatar_output() -> Result<Box<dyn AvatarOutput>, Box<dyn Error>> {
+fn build_local_avatar_output(
+    launch_url: &mut Option<String>,
+) -> Result<Box<dyn AvatarOutput>, Box<dyn Error>> {
     let port = env_u64("AIVTUBER_LOCAL_AVATAR_PORT", 8765)?;
     let defaults = LocalAvatarConfig::default();
     let config = LocalAvatarConfig {
@@ -1787,6 +1806,9 @@ fn build_local_avatar_output() -> Result<Box<dyn AvatarOutput>, Box<dyn Error>> 
         "local avatar renderer URL (contains a per-launch secret, do not share or log): {}",
         output.launch_url()
     );
+    // Kept for the local panel's avatar link (#335); it only ever reaches the
+    // page through an authenticated panel call.
+    *launch_url = Some(output.launch_url());
     Ok(Box::new(output))
 }
 
@@ -2050,6 +2072,47 @@ fn build_perception_service(
         governor.cadence_ms, governor.probe_ceiling_ms
     );
     Ok(service)
+}
+
+/// #335: start the local operation panel when enabled (`AIVTUBER_PANEL`; on by
+/// default in the local profile). A panel that is only on by default degrades
+/// to a log line when it cannot start; an explicit request is a startup error.
+fn start_panel(
+    profile: CompositionProfile,
+    ingress: &Arc<LocalControlIngress>,
+    control_secret: &[u8; 32],
+    avatar_launch_url: Option<String>,
+) -> Result<Option<PanelService>, Box<dyn Error>> {
+    let Some(settings) = panel_settings(profile == CompositionProfile::Local, &|name| {
+        env_optional(name)
+    })?
+    else {
+        return Ok(None);
+    };
+    match PanelService::start(
+        &settings,
+        Arc::clone(ingress),
+        control_secret,
+        avatar_launch_url,
+    ) {
+        Ok(service) => {
+            // Deliberate operator console output, like the avatar URL: it
+            // carries the per-launch panel secret in the fragment. Do not
+            // capture stderr into shared logs.
+            eprintln!(
+                "local operation panel URL (contains a per-launch secret, do not share or log): {}",
+                service.launch_url()
+            );
+            Ok(Some(service))
+        }
+        Err(error) if settings.explicit => Err(format!("AIVTUBER_PANEL: {error}").into()),
+        Err(error) => {
+            eprintln!(
+                "panel: not started ({error}); set AIVTUBER_PANEL_PORT or AIVTUBER_PANEL=false"
+            );
+            Ok(None)
+        }
+    }
 }
 
 fn runtime_avatar_authority() -> Result<aivtuber_domain::AuthenticatedControl, Box<dyn Error>> {

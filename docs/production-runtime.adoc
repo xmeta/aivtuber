@@ -776,6 +776,39 @@ Security properties:
 * The secret is never written to logs, telemetry, audit records, or status output. Audit records use the shared redactor.
 * Transport failure (listener error, dropped connection) cannot corrupt scheduler/runtime state: requests are applied atomically on the runtime thread and connections are stateless.
 
+== Local operation panel (issue #335)
+
+A small web page for the streamer who does not want a terminal for everyday control: status, a chat box, emergency stop and mute, and a link to the avatar page. It is a thin loopback surface over the existing Rust control paths; it adds no authority of its own (docs/security-threat-model.adoc section 15).
+
+[cols="1,3"]
+|===
+|Setting |Meaning
+
+|+AIVTUBER_PANEL+
+|+true+ / +false+. Default: on in the local profile (+AIVTUBER_MODE=local+), off elsewhere. If it is only on by default and cannot start (for example its port is taken) the app logs +panel: not started+ and runs on; an explicit +AIVTUBER_PANEL=true+ makes that a startup error.
+
+|+AIVTUBER_PANEL_PORT+
+|TCP port on 127.0.0.1. Default +8766+ (the avatar page uses +8765+; +0+ picks a free port).
+
+|+AIVTUBER_PANEL_PAGE_DIR+
+|Directory holding +panel.html+ and +assets/+. Defaults to +AIVTUBER_LOCAL_AVATAR_PAGE_DIR+ because the panel is the second page of the renderer build (+renderer/local-avatar/dist/panel.html+, shipped in the release archive).
+
+|+AIVTUBER_PANEL_BIND+ / +_HOST+ / +_ADDR+
+|Not supported. Setting any of them is a startup error: there is no bind-address option.
+|===
+
+On start the app prints one line to stderr, like the avatar URL: +local operation panel URL (contains a per-launch secret, do not share or log): http://127.0.0.1:8766/#token=...+ (+aivtuber-setup start+ runs the app in the foreground, so the line appears in that terminal). The secret is 256 bits from the OS entropy source, minted per launch, separate from +AIVTUBER_CONTROL_SECRET+ and from the avatar token, and it is in the URL fragment so it is never in a request line or a server log.
+
+What the page does:
+
+* *Status.* +GET /api/state+ returns one document, published every 500 ms by the composition thread: the +aivtuberctl status+ snapshot (mute, audio/avatar/stream errors, content queue, scheduler items, generation activity), the last 16 spoken replies (text only, at most 400 characters each, newest last; recorded where the output accepts the audio, so generated replies are the text that already passed the publication-containment gate), and the avatar page URL. The page polls once per second; there is no push channel to bound.
+* *Chat.* +POST /api/chat+ with +{"text": "..."}+ (at most 500 characters, 4096 bytes of body). The composition thread builds a +chat.message+ envelope with the fixed source +local-panel+, source class +public_chat+, plane +content+, trust +untrusted+, and admits it through +ProductionApp::process_content_bytes+, the call a stdin line goes through, so the byte cap, the per-source rate limit, the ingress ceiling (+AIVTUBER_INGRESS_SOURCE_CLASSES+ must include +public_chat+, as the setup file does) and the content queue apply. The answer carries the event id (+panel-chat-N+) and the admission result; the reply appears in the state under that id. The page cannot choose any envelope field.
+* *Stop and mute.* +POST /api/stop+ and +POST /api/mute+ are the same operator actions +aivtuberctl+ sends and go through +apply_operator_action+ (the raw control secret bytes, never narrowed to text): the constant-time secret check and capability mint in +LocalControlIngress+, the hard audio stop and avatar reset of section "Operator control", and the same audit records (+operator_accepted+ / +operator_rejected+, event id +operator-panel-ctl-N+ instead of the client's id). Stop and mute have their own queue of 4 and are handled before chat in each loop turn, so a chat flood cannot delay them. Nothing else (perception, memory export, diagnose) is reachable from the panel, and there is no unmute.
+
+Bounds: 16 concurrent connections, request head 8 KiB, body 4 KiB, chat queue 8, control queue 4, state document 64 KiB, 20 authenticated requests per second (burst 40), 3 s wait for the composition thread before a 504. A refused request is only counted; the app logs the counters (+panel: refused host=.. origin=.. auth=.. request=..+) when they change, never a header or a body.
+
+Tests: +crates/adapters/src/local_avatar/panel.rs+ (HTTP negative tests: foreign Host, foreign/missing Origin, missing/wrong/query-string secret, form post, oversized body and text, malformed JSON, chunked body, preflight and CORS, full queue, page allow-list, rate limit, loopback bind), +crates/app/src/panel.rs+ (settings, no bind option, fixed chat envelope), +crates/app/src/lib.rs+ +panel_end_to_end+ (audit parity with the control path, rejected when the ingress disagrees, no other actions, chat admission), +renderer/local-avatar/test/panel-core.test.ts+, and the release smoke check (+scripts/smoke-release-archive.mjs+).
+
 == Support bundle / diagnostics (issue #68)
 
 `aivtuberctl diagnose` captures a bounded, privacy-safe support bundle over the same local operator endpoint as `status`. Authentication is the same constant-time secret verification (no control authority is minted), so generating a bundle cannot stop, mute, or otherwise disturb the runtime.

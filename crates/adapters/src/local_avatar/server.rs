@@ -24,10 +24,10 @@ use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Error as WsError, Message, WebSocket, http};
 
 const MAX_HEAD_BYTES: usize = 8192;
-const MAX_CONNECTIONS: usize = 16;
+pub(crate) const MAX_CONNECTIONS: usize = 16;
 const MAX_STATIC_BYTES: u64 = 64 * 1024 * 1024;
-const HEAD_DEADLINE: Duration = Duration::from_secs(2);
-const POLL: Duration = Duration::from_millis(10);
+pub(crate) const HEAD_DEADLINE: Duration = Duration::from_secs(2);
+pub(crate) const POLL: Duration = Duration::from_millis(10);
 
 pub struct LocalAvatarServer {
     shared: Arc<Shared>,
@@ -112,7 +112,7 @@ impl Drop for LocalAvatarServer {
     }
 }
 
-fn mint_token() -> Result<String, EngineError> {
+pub(crate) fn mint_token() -> Result<String, EngineError> {
     let mut bytes = [0_u8; 32];
     getrandom::fill(&mut bytes).map_err(|error| {
         EngineError::new(
@@ -123,7 +123,7 @@ fn mint_token() -> Result<String, EngineError> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-fn ct_eq(a: &str, b: &str) -> bool {
+pub(crate) fn ct_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     let mut diff = a.len() ^ b.len();
     for i in 0..a.len().max(b.len()) {
@@ -132,7 +132,7 @@ fn ct_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-struct ConnGuard(Arc<AtomicUsize>);
+pub(crate) struct ConnGuard(pub(crate) Arc<AtomicUsize>);
 impl Drop for ConnGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
@@ -189,7 +189,7 @@ fn handle_connection(stream: TcpStream, shared: &Arc<Shared>) {
 
 /// Peeks (without consuming) until the head terminator; returns its length
 /// and the request line.
-fn peek_head(stream: &TcpStream) -> Option<(usize, String)> {
+pub(crate) fn peek_head(stream: &TcpStream) -> Option<(usize, String)> {
     let deadline = Instant::now() + HEAD_DEADLINE;
     let mut buf = vec![0_u8; MAX_HEAD_BYTES];
     let mut last = 0;
@@ -213,7 +213,7 @@ fn peek_head(stream: &TcpStream) -> Option<(usize, String)> {
     }
 }
 
-fn header_value(head: &[u8], name: &str) -> Option<String> {
+pub(crate) fn header_value(head: &[u8], name: &str) -> Option<String> {
     let text = String::from_utf8_lossy(head);
     text.lines().skip(1).find_map(|line| {
         let (k, v) = line.split_once(':')?;
@@ -243,6 +243,12 @@ fn serve_static(stream: &mut TcpStream, shared: &Shared, method: &str, path: &st
     }
     if !host_ok {
         return respond(stream, "403 Forbidden", "text/plain", b"", head_only);
+    }
+    // The operation panel (#335) is a second page of the same build, served
+    // only by its own server: this one serves the avatar entry and nothing of
+    // the panel's.
+    if path == "/panel.html" || path.starts_with("/assets/panel-") {
+        return respond(stream, "404 Not Found", "text/plain", b"", head_only);
     }
     let Some(file) = resolve(shared.config.page_dir.as_deref(), path) else {
         return respond(stream, "404 Not Found", "text/plain", b"", head_only);
@@ -277,7 +283,7 @@ fn serve_static(stream: &mut TcpStream, shared: &Shared, method: &str, path: &st
 }
 
 /// Maps a URL path to a file strictly inside the page directory.
-fn resolve(root: Option<&Path>, path: &str) -> Option<PathBuf> {
+pub(crate) fn resolve(root: Option<&Path>, path: &str) -> Option<PathBuf> {
     let root = root?;
     let rel = path.trim_start_matches('/');
     let rel = if rel.is_empty() { "index.html" } else { rel };
@@ -296,7 +302,7 @@ fn resolve(root: Option<&Path>, path: &str) -> Option<PathBuf> {
     (full.starts_with(root) && meta.is_file() && meta.len() <= MAX_STATIC_BYTES).then_some(full)
 }
 
-fn content_type(path: &Path) -> &'static str {
+pub(crate) fn content_type(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
         "html" => "text/html; charset=utf-8",
         "js" | "mjs" => "text/javascript; charset=utf-8",

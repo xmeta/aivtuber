@@ -23,8 +23,9 @@ What is here
                           each sidecar verifies their SHA-256 at every start and
                           refuses to run if they are missing or changed.
   renderer/local-avatar/dist/
-                          the browser page for the avatar (served by the app, shown in a
-                          browser or an OBS Browser Source). No avatar model inside.
+                          the browser pages (served by the app): the avatar page (shown in
+                          a browser or an OBS Browser Source; no avatar model inside) and
+                          the operation panel page (chat, status, stop, mute).
   examples/starter-reaction-pack/
                           cached reaction descriptors (no audio; generated locally)
   THIRD-PARTY-*           licence texts of everything bundled
@@ -50,7 +51,10 @@ In short, from this directory (after the checksum check above):
   2. aivtuber-setup local             fetches and verifies the models once (about
                                       3 GB), writes local-profile.env, prints the
                                       licence duties and the start command
-  3. aivtuber-setup start             starts the language model and the performer
+  3. aivtuber-setup start             starts the language model and the performer; it
+                                      prints the operation panel URL (open it in a
+                                      browser: type to the performer, stop, mute) and
+                                      the avatar URL. Both carry a per-launch secret.
 Install FFmpeg (ffplay and ffmpeg on PATH) first; setup tells you if it is missing.
 Replace the sample avatar (renderer/local-avatar/dist/model.vrm) with a model you
 have the right to broadcast before you stream.

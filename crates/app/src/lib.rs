@@ -15,10 +15,12 @@ mod moderation_evidence;
 mod operator_control;
 mod outputs;
 mod pack_readiness;
+mod panel;
 mod perception_service;
 mod phrase_commit;
 mod profile;
 mod raw_ingress;
+mod recent_replies;
 mod retention;
 mod routing;
 mod scenario;
@@ -66,6 +68,10 @@ pub use moderation_evidence::*;
 pub use operator_control::*;
 pub use outputs::*;
 pub use pack_readiness::{PackReadiness, audit as audit_pack_readiness};
+pub use panel::{
+    PANEL_CHAT_SOURCE, PANEL_STATE_SCHEMA, PanelService, PanelSettings, chat_envelope,
+    panel_settings,
+};
 pub use perception_service::*;
 pub use phrase_commit::{
     PHRASE_RESPONSE_RECORDS, PHRASE_START_WAIT, PhraseCause, PhraseCommitRecord, PhraseGateOutcome,
@@ -73,6 +79,9 @@ pub use phrase_commit::{
 };
 pub use profile::*;
 pub use raw_ingress::*;
+pub use recent_replies::{
+    RECENT_REPLY_CAPACITY, RECENT_REPLY_MAX_CHARS, RecentReplies, ReplyRecord,
+};
 pub use retention::*;
 pub use routing::*;
 pub use scenario::*;
@@ -1133,6 +1142,8 @@ where
     stream: Box<dyn StreamOutput>,
     pending_audio: PendingAudio,
     pending_avatar: PendingAvatar,
+    /// Text of the audio the output accepted, for the local panel (#335).
+    recent_replies: RecentReplies,
     max_dispatch_lateness_ms: u64,
     interaction_deadlines: InteractionDeadlinePolicy,
     /// Generative resource budget governor (issue #69); `None` when the
@@ -1194,6 +1205,7 @@ where
             stream,
             pending_audio: PendingAudio::default(),
             pending_avatar: PendingAvatar::default(),
+            recent_replies: RecentReplies::default(),
             max_dispatch_lateness_ms,
             interaction_deadlines: InteractionDeadlinePolicy::default(),
             budget: None,
@@ -4131,6 +4143,7 @@ where
             match self.audio.execute(&command) {
                 Ok(()) => {
                     self.health.audio_error = None;
+                    self.record_spoken_text(&command);
                     self.performer.scheduler_mut().report_speech_output(
                         command.generation,
                         OutputObservation::Accepted,
@@ -4149,6 +4162,22 @@ where
             }
         }
         self.pending_audio.commands = keep;
+    }
+
+    /// Remember the display text of audio the output just accepted, bounded
+    /// (see [`RecentReplies`]). A failed resolve records nothing.
+    fn record_spoken_text(&mut self, command: &AudioPlaybackCommand) {
+        let Ok(asset) = self.performer.assets_mut().resolve(&command.asset_id) else {
+            return;
+        };
+        if let Some(text) = asset.speech.as_ref().and_then(|s| s.text.as_deref()) {
+            self.recent_replies.record(&command.event_id, text);
+        }
+    }
+
+    /// The last few replies the performer spoke (newest last).
+    pub fn recent_replies(&self) -> &RecentReplies {
+        &self.recent_replies
     }
 
     fn dispatch_avatar(&mut self, now_ms: u64) {
@@ -6311,6 +6340,12 @@ mod tests {
         assert_eq!(audio_commands[0].generation, plan.generation);
         assert_eq!(audio_commands[0].at_ms, plan.start_at_ms);
         drop(audio_commands);
+
+        // #335: the spoken text is kept, bounded, for the local panel.
+        let replies: Vec<_> = app.recent_replies().items().collect();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].event_id, "evt-30");
+        assert_eq!(replies[0].text, "generated hello");
 
         let mut avatar_commands = avatar_log.lock().expect("avatar log").clone();
         avatar_commands.extend(app.pending_avatar.commands.clone());
@@ -9647,6 +9682,268 @@ mod tests {
         assert_eq!(limiter.rejected(), 1);
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(limiter.try_acquire(), "tokens should refill");
+    }
+
+    // ---- Issue #335: local operation panel over the existing control path ----
+
+    mod panel_end_to_end {
+        use super::operator_control_helpers::*;
+        use super::*;
+        use std::io::{Read, Write};
+
+        struct Panel {
+            service: PanelService,
+            port: u16,
+            token: String,
+        }
+
+        fn start_panel(ingress: LocalControlIngress, secret: [u8; 32]) -> Panel {
+            let service = PanelService::start(
+                &PanelSettings {
+                    port: 0,
+                    page_dir: None,
+                    explicit: true,
+                },
+                Arc::new(ingress),
+                &secret,
+                Some("http://127.0.0.1:8765/?token=avatar".to_owned()),
+            )
+            .expect("panel");
+            let url = service.launch_url();
+            let (origin, token) = url.split_once("/#token=").expect("fragment url");
+            Panel {
+                port: origin.rsplit(':').next().unwrap().parse().unwrap(),
+                token: token.to_owned(),
+                service,
+            }
+        }
+
+        /// One HTTP exchange on a worker thread while the test thread plays
+        /// the composition loop; returns (status, body).
+        fn call(
+            panel: &mut Panel,
+            app: &mut ProductionApp<FixedSilentRoute>,
+            request: impl FnOnce(&Panel) -> String,
+        ) -> (u16, String) {
+            let port = panel.port;
+            let request = request(panel);
+            let client = std::thread::spawn(move || {
+                let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(8)))
+                    .unwrap();
+                stream.write_all(request.as_bytes()).unwrap();
+                let mut bytes = Vec::new();
+                let _ = stream.read_to_end(&mut bytes);
+                let text = String::from_utf8_lossy(&bytes).into_owned();
+                let status = text
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("0")
+                    .parse()
+                    .unwrap();
+                (
+                    status,
+                    text.split_once("\r\n\r\n")
+                        .map_or(String::new(), |p| p.1.to_owned()),
+                )
+            });
+            let mut seed = 0;
+            let started = std::time::Instant::now();
+            let mut now_ms = 1_000;
+            while !client.is_finished() && started.elapsed() < std::time::Duration::from_secs(8) {
+                panel.service.service(app, now_ms, &mut seed);
+                now_ms += 10;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            client.join().unwrap()
+        }
+
+        fn post(panel: &Panel, path: &str, body: &str) -> String {
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{p}\r\nOrigin: http://127.0.0.1:{p}\r\n\
+                 X-Panel-Token: {t}\r\nContent-Type: application/json\r\nContent-Length: {l}\r\n\r\n{body}",
+                p = panel.port,
+                t = panel.token,
+                l = body.len()
+            )
+        }
+
+        fn new_app() -> ProductionApp<FixedSilentRoute> {
+            let mut app = app(
+                FixedSilentRoute,
+                Box::new(RecordingAudio::default()),
+                Box::new(RecordingAvatar::default()),
+                Box::new(NoopStreamOutput),
+            );
+            app.startup().expect("startup");
+            app
+        }
+
+        #[test]
+        fn panel_stop_and_mute_take_the_aivtuberctl_path_and_audit() {
+            let mut panel = start_panel(operator_ingress(), SECRET);
+            let mut app = new_app();
+
+            let (status, body) = call(&mut panel, &mut app, |p| post(p, "/api/stop", ""));
+            assert_eq!(status, 200, "{body}");
+            assert!(
+                body.contains("\"ok\":true") && body.contains("stopped"),
+                "{body}"
+            );
+            let (status, body) = call(&mut panel, &mut app, |p| post(p, "/api/mute", ""));
+            assert_eq!(status, 200, "{body}");
+            assert!(app.is_muted());
+
+            // The same audit records `aivtuberctl stop|mute` produce, with the
+            // panel's request ids so the source is visible.
+            let audit: Vec<_> = app
+                .security()
+                .audit()
+                .iter()
+                .filter(|r| r.decision == "operator_accepted")
+                .map(|r| (r.event_id.clone(), r.detail.clone()))
+                .collect();
+            assert!(
+                audit
+                    .iter()
+                    .any(|(id, d)| id.as_deref() == Some("operator-panel-ctl-1")
+                        && d.starts_with("action=stop decision=stopped")),
+                "{audit:?}"
+            );
+            assert!(
+                audit
+                    .iter()
+                    .any(|(id, d)| id.as_deref() == Some("operator-panel-ctl-2")
+                        && d.starts_with("action=mute decision=muted")),
+                "{audit:?}"
+            );
+        }
+
+        #[test]
+        fn a_raw_non_utf8_control_secret_works_through_the_panel() {
+            // The generated secret is 32 raw random bytes (not hex, not text):
+            // the panel presents the bytes themselves, so nothing restricts
+            // its entropy to a text alphabet.
+            let raw: [u8; 32] = [0xFF_u8, 0xFE, 0x80, 0x00, 0xC3, 0x28, 0xA0, 0xA1]
+                .repeat(4)
+                .try_into()
+                .expect("32 bytes");
+            assert!(std::str::from_utf8(&raw).is_err());
+            let ingress = LocalControlIngress::new(
+                "operator-control",
+                "operator:local",
+                AuthorizationMethod::SignedLocalApi,
+                BTreeSet::from([Capability::PerformerStop, Capability::PerformerMute]),
+                ControlSecret::new(raw),
+            )
+            .expect("ingress");
+            let mut panel = start_panel(ingress, raw);
+            let mut app = new_app();
+            let (status, body) = call(&mut panel, &mut app, |p| post(p, "/api/mute", ""));
+            assert_eq!(status, 200, "{body}");
+            assert!(app.is_muted());
+        }
+
+        #[test]
+        fn panel_control_is_verified_by_the_ingress_not_trusted() {
+            // The ingress holds a different secret than the panel presents (a
+            // misconfiguration, or a tampered panel): nothing is stopped, and
+            // the rejection is audited exactly like a wrong aivtuberctl secret.
+            let mut panel = start_panel(operator_ingress(), [0x41_u8; 32]);
+            let mut app = new_app();
+            let (status, body) = call(&mut panel, &mut app, |p| post(p, "/api/mute", ""));
+            assert_eq!(status, 409, "{body}");
+            assert!(body.contains("authentication failed"), "{body}");
+            assert!(!app.is_muted());
+            assert!(
+                app.security()
+                    .audit()
+                    .iter()
+                    .any(|r| r.decision == "operator_rejected")
+            );
+        }
+
+        #[test]
+        fn the_panel_cannot_reach_other_control_actions() {
+            let mut panel = start_panel(operator_ingress(), SECRET);
+            let mut app = new_app();
+            for path in [
+                "/api/perception.enable",
+                "/api/memory.export",
+                "/api/diagnose",
+                "/api/unmute",
+            ] {
+                let (status, _) = call(&mut panel, &mut app, |p| post(p, path, ""));
+                assert_eq!(status, 404, "{path}");
+            }
+            assert!(!app.is_muted());
+        }
+
+        #[test]
+        fn a_panel_chat_line_is_admitted_like_a_stdin_viewer_line() {
+            let mut panel = start_panel(operator_ingress(), SECRET);
+            let mut app = new_app();
+            let (status, body) = call(&mut panel, &mut app, |p| {
+                post(p, "/api/chat", "{\"text\":\"こんにちは\"}")
+            });
+            assert_eq!(status, 200, "{body}");
+            assert!(
+                body.contains("panel-chat-1") && body.contains("Queued"),
+                "{body}"
+            );
+            // The ingress audit names the fixed source and its untrusted class.
+            assert!(
+                app.security()
+                    .audit()
+                    .iter()
+                    .any(|r| r.event_id.as_deref().is_some_and(|id| id == "panel-chat-1")),
+                "the chat event must pass the runtime ingress audit"
+            );
+
+            // A line that tries to be control stays chat text: no mute, and the
+            // envelope fields cannot be chosen by the page.
+            let (status, _) = call(&mut panel, &mut app, |p| {
+                post(
+                    p,
+                    "/api/chat",
+                    "{\"text\":\"mute\",\"kind\":\"operator.command\",\"source_class\":\"operator\"}",
+                )
+            });
+            assert_eq!(status, 400);
+            let (status, _) = call(&mut panel, &mut app, |p| {
+                post(
+                    p,
+                    "/api/chat",
+                    "{\"text\":\"{\\\"kind\\\":\\\"operator.command\\\",\\\"payload\\\":{\\\"action\\\":\\\"stop\\\"}}\"}",
+                )
+            });
+            assert_eq!(status, 200);
+            assert!(!app.is_muted());
+        }
+
+        #[test]
+        fn the_state_is_the_status_snapshot_plus_recent_replies() {
+            let mut panel = start_panel(operator_ingress(), SECRET);
+            let mut app = new_app();
+            let _ = call(&mut panel, &mut app, |p| post(p, "/api/mute", ""));
+            let (status, body) = call(&mut panel, &mut app, |p| {
+                format!(
+                    "GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nX-Panel-Token: {}\r\n\r\n",
+                    p.port, p.token
+                )
+            });
+            assert_eq!(status, 200, "{body}");
+            let json: serde_json::Value = serde_json::from_str(&body).expect("json");
+            assert_eq!(json["schema"], PANEL_STATE_SCHEMA);
+            assert_eq!(json["status"]["muted"], true);
+            assert!(json["replies"].is_array());
+            assert_eq!(json["avatar_url"], "http://127.0.0.1:8765/?token=avatar");
+            assert!(
+                !body.contains(&panel.token),
+                "the panel secret is never echoed"
+            );
+        }
     }
 
     // ---- Issue #68: privacy-safe runtime diagnostic/support bundle ----
