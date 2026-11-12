@@ -51,7 +51,7 @@ impl Secrets {
 }
 
 /// What `start` uses when an older env file lacks the profile keys.
-pub const LLAMA_ALIAS: &str = "qwen3-4b-instruct-2507";
+pub const LLAMA_ALIAS: &str = "gemma-4-e4b-it-qat";
 pub const LLAMA_DEFAULT_CONTEXT: u32 = 4096;
 /// A cold first start reads and hashes every pinned file from a possibly slow
 /// or busy disk (docs/local-profile-quickstart.adoc, "Slow first start"); the
@@ -340,7 +340,7 @@ mod tests {
         LlmSetup {
             profile: "default".into(),
             alias: LLAMA_ALIAS.into(),
-            model_version: "Q4_K_M".into(),
+            model_version: "UD-Q4_K_XL".into(),
             context: 4096,
             parallel: None,
             mode,

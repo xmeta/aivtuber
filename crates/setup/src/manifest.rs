@@ -288,7 +288,7 @@ mod tests {
         let d = m.profile(DEFAULT_PROFILE).unwrap();
         assert_eq!(d.llm.file, m.llm.file, "default uses the top-level pin");
         assert!(d.mmproj.is_none() && d.spec.parallel.is_none());
-        assert_eq!(d.spec.alias, "qwen3-4b-instruct-2507");
+        assert_eq!(d.spec.alias, "gemma-4-e4b-it-qat");
         assert_eq!(d.spec.context, 4096);
         let p = m.profile("perception").unwrap();
         assert_eq!(p.spec.alias, "qwen3-vl-4b-instruct");

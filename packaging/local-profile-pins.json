@@ -38,17 +38,17 @@
     }
   },
   "llm": {
-    "file": "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
-    "url": "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/a06e946bb6b655725eafa393f4a9745d460374c9/Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
-    "sha256": "3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597",
-    "size": 2497281120,
+    "file": "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf",
+    "url": "https://huggingface.co/unsloth/gemma-4-E4B-it-qat-GGUF/resolve/8c5a9e4fd5482e2be20fe0bf013b4c262a8f4265/gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf",
+    "sha256": "df0fd4ee07072c607c29a0a1cb4f98918426cca12f45a2776bdd6ee6d09a4de3",
+    "size": 4215695776,
     "licence": "Apache-2.0"
   },
   "profiles": {
     "default": {
-      "description": "Qwen3-4B-Instruct-2507 Q4_K_M, text only. About 3 GB of VRAM. Uses the top-level \"llm\" pin.",
-      "alias": "qwen3-4b-instruct-2507",
-      "model_version": "Q4_K_M",
+      "description": "Gemma 4 E4B QAT UD-Q4_K_XL, text only. About 2.6 GB of VRAM (4.2 GB download). Uses the top-level \"llm\" pin.",
+      "alias": "gemma-4-e4b-it-qat",
+      "model_version": "UD-Q4_K_XL",
       "context": 4096
     },
     "perception": {
@@ -201,8 +201,8 @@
       "duty": "Keep the licence notice if you redistribute the binaries."
     },
     {
-      "id": "qwen3-4b",
-      "component": "Qwen3-4B-Instruct-2507 Q4_K_M (unsloth GGUF)",
+      "id": "gemma-4-e4b",
+      "component": "Gemma 4 E4B QAT UD-Q4_K_XL (unsloth GGUF)",
       "licence": "Apache-2.0",
       "applies_to": ["profile:default"],
       "duty": "Keep the notice if you redistribute the weights. Model output is your responsibility."

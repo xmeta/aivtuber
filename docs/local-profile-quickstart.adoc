@@ -8,7 +8,7 @@ Issue #220 (S3). This is the operator guide for running the whole performer on o
 chat on stdin / microphone
    -> VAD + Japanese STT sidecar   (Silero VAD, sherpa-onnx ReazonSpeech k2-v2)   127.0.0.1, child processes
    -> floor policy + barge-in      (deterministic, in the app)
-   -> local ThinkingEngine         (llama.cpp llama-server, Qwen3-4B-Instruct-2507)  127.0.0.1:18080
+   -> local ThinkingEngine         (llama.cpp llama-server, Gemma 4 E4B QAT)  127.0.0.1:18080
    -> local TTS sidecar            (Supertonic 3 int8 via sherpa-onnx)               127.0.0.1:8770
    -> local audio                  (ffplay)
    -> local VRM avatar renderer    (browser page / OBS Browser Source)               127.0.0.1:8765
@@ -25,7 +25,7 @@ Using a release archive? Skip to <<download-a-release>>: it needs none of the to
 * Windows 11 x64 or Linux x64. Only these two platforms have pinned engine libraries. *This guide was run end to end on Windows only.* The Linux commands are the same files with the other pinned archive names; the differences are marked, and they were not executed.
 * To build: a Rust toolchain (the version in `rust-toolchain.toml`; `rustup` picks it), Node 20 or newer, Bun (`renderer/local-avatar/package.json` pins `bun@1.3.14`), `git`, and `ffplay` from FFmpeg on `PATH` (the default audio player).
 * A browser for the avatar page (Chrome or Edge), or OBS Studio (free, GPL) with its Browser Source.
-* About 6 GB of disk for downloads (the LLM is 2.5 GB) and about 1.5 GB of build output.
+* About 8 GB of disk for downloads (the LLM is 4.2 GB) and about 1.5 GB of build output.
 * Hardware. The measured configuration is in <<measured>>: a desktop with an 8 GB discrete GPU and 16 logical CPUs. The LLM can run on the CPU (`--llama-flavor cpu`, leave out `-ngl`), but then it competes with speech recognition and synthesis for the same cores and the measurements below do not apply. There is no guarantee below the measured hardware.
 
 Linux additionally needs ALSA development headers if you build the `mic-capture` feature (a live microphone). `--input-wav` does not need it.
@@ -94,7 +94,7 @@ sha256sum -c SHA256SUMS --ignore-missing     # must print: aivtuber-local-<versi
 Each step is skipped if its result is already on disk and matches its pin, so the command is safe to re-run after a failure or to repair a damaged file.
 
 . Checks `ffplay`, `ffmpeg` and a Vulkan loader. A missing one is a warning with the fix, never a failure; run the command again after you fix it. With Vulkan present it fetches the GPU build of llama.cpp (`-ngl 99`), otherwise the CPU build.
-. Downloads and verifies, into `local-assets/` beside the programs: llama.cpp `b12224`, the Qwen3-4B Q4_K_M model, the Silero VAD model, the ReazonSpeech k2-v2 int8 speech model, the Supertonic 3 int8 voice, and the sample VRM (placed at `renderer/local-avatar/dist/model.vrm` unless a file is already there). Every URL is HTTPS; every file has an exact pinned size and SHA-256; a redirect to plain HTTP is refused; a mismatch deletes the partial file and stops. Archives are unpacked by the program itself with path-traversal and symbolic-link checks and size limits; there is no `tar`, `unzip` or script involved.
+. Downloads and verifies, into `local-assets/` beside the programs: llama.cpp `b12224`, the Gemma 4 E4B QAT UD-Q4_K_XL model, the Silero VAD model, the ReazonSpeech k2-v2 int8 speech model, the Supertonic 3 int8 voice, and the sample VRM (placed at `renderer/local-avatar/dist/model.vrm` unless a file is already there). Every URL is HTTPS; every file has an exact pinned size and SHA-256; a redirect to plain HTTP is refused; a mismatch deletes the partial file and stops. Archives are unpacked by the program itself with path-traversal and symbolic-link checks and size limits; there is no `tar`, `unzip` or script involved.
 . Speaks the six starter reaction lines with the bundled `local-tts-sidecar` and encodes them with `ffmpeg` to `examples/starter-reaction-pack/audio/starter/`, with `PROVENANCE.json` (the same step as <<starter-audio>>).
 . Writes `local-profile.env` (the variables of step 4 of this guide, with a fresh random pseudonym key and control secret) and never overwrites an existing one unless you pass `--force`. The file holds secrets: do not share it.
 . Prints the licence and disclosure duties of what it fetched (the OpenRAIL-M voice disclosure, the ReazonSpeech provenance note, the avatar's licence) and the exact start command.
@@ -120,7 +120,7 @@ Each step is skipped if its result is already on disk and matches its pin, so th
 [cols="1,3,3",options="header"]
 |===
 |Profile |Model |llama-server
-|`default` |Qwen3-4B-Instruct-2507 Q4_K_M (2.5 GB), text only; about 3 GB of VRAM |`-c 4096`, the server's own slot count, alias `qwen3-4b-instruct-2507`
+|`default` |Gemma 4 E4B QAT UD-Q4_K_XL (4.2 GB), text only; about 2.6 GB of VRAM |`-c 4096 --reasoning off`, the server's own slot count, alias `gemma-4-e4b-it-qat`
 |`perception` (opt-in) |Qwen3-VL-4B-Instruct Q4_K_M (2.5 GB) plus the Q8_0 vision projector (0.45 GB), Apache-2.0 |`--mmproj <projector> --parallel 2 -c 8192`, alias `qwen3-vl-4b-instruct`
 |===
 
@@ -211,8 +211,8 @@ The default workspace build compiles none of the speech features and needs no mo
 
 [source,sh]
 ----
-/path/to/local-assets/llama/bin/llama-server -m /path/to/local-assets/llm/Qwen3-4B-Instruct-2507-Q4_K_M.gguf \
-  --host 127.0.0.1 --port 18080 --alias qwen3-4b-instruct-2507 -c 4096 -ngl 99
+/path/to/local-assets/llama/bin/llama-server -m /path/to/local-assets/llm/gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf \
+  --host 127.0.0.1 --port 18080 --alias gemma-4-e4b-it-qat -c 4096 --reasoning off -ngl 99
 ----
 
 `--host 127.0.0.1` is the point: llama-server defaults to loopback, and the app refuses any other endpoint in the local profile. `-ngl 99` offloads every layer to the GPU (Vulkan on Windows, or `--llama-flavor vulkan` on Linux); drop it on a CPU-only build. The port is your choice (8080 was in use on the measured host, so 18080 is used here). Wait until `curl http://127.0.0.1:18080/health` answers. The first request after start can take several seconds (model load, shader compile); later ones are sub-second to first token.
@@ -230,8 +230,8 @@ export AIVTUBER_MODE=local
 export AIVTUBER_GENERATIVE_ENABLED=true
 export AIVTUBER_OPENAI_AUTH=unauthenticated-loopback          # explicit; allowed for a loopback endpoint only; no key may be set
 export AIVTUBER_OPENAI_ENDPOINT=http://127.0.0.1:18080/v1/responses
-export AIVTUBER_OPENAI_MODEL=qwen3-4b-instruct-2507           # must equal --alias
-export AIVTUBER_OPENAI_MODEL_VERSION=Q4_K_M
+export AIVTUBER_OPENAI_MODEL=gemma-4-e4b-it-qat               # must equal --alias
+export AIVTUBER_OPENAI_MODEL_VERSION=UD-Q4_K_XL
 export AIVTUBER_OPENAI_BACKEND_NAME=llama-server
 export AIVTUBER_OPENAI_MAX_OUTPUT_TOKENS=96                   # see "Reply length" below
 
@@ -493,7 +493,7 @@ No model, voice file or avatar model is bundled or redistributed by this reposit
 |===
 |Component |Licence |What it asks of you
 |llama.cpp `b12224` |MIT |Keep the licence notice if you redistribute the binaries.
-|Qwen3-4B-Instruct-2507 Q4_K_M (unsloth GGUF) |Apache-2.0 |Keep the notice if you redistribute the weights. Model output is your responsibility.
+|Gemma 4 E4B QAT UD-Q4_K_XL (unsloth GGUF) |Apache-2.0 |Keep the notice if you redistribute the weights. Model output is your responsibility.
 |Qwen3-VL-4B-Instruct Q4_K_M and Q8_0 projector (opt-in `perception` profile; Qwen GGUF repository) |Apache-2.0 per the model card |As above, and the screen-content note of <<model-profiles>>.
 |sherpa-onnx 2.0.1 libraries |Apache-2.0 |As above.
 |Silero VAD v6 |MIT |As above.

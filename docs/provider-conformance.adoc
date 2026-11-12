@@ -57,7 +57,7 @@ Verified manually (not in CI) against the adapter's Responses wire shape:
 |llama.cpp
 |release `b12224` (`llama-server` 0.9.0-dev, commit `806b3c2be`), Windows x64 Vulkan build `llama-b12224-bin-win-vulkan-x64.zip`, SHA-256 `abb2363a8cf2fa622a40f80330828806fb9f344b483074f29478303a5b76fc27`. License: MIT.
 |Model
-|`Qwen3-4B-Instruct-2507-Q4_K_M.gguf` from `unsloth/Qwen3-4B-Instruct-2507-GGUF` (revision `a06e946bb6b655725eafa393f4a9745d460374c9`), a quantization of `Qwen/Qwen3-4B-Instruct-2507`. License: Apache-2.0 (model card of both repositories). SHA-256 `3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597`. Non-thinking instruct variant, handles Japanese.
+|`gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf` from `unsloth/gemma-4-E4B-it-qat-GGUF` (revision `8c5a9e4fd5482e2be20fe0bf013b4c262a8f4265`), a quantization of `google/gemma-4-E4B-it-qat-q4_0-unquantized` (the default since #340; it replaced `Qwen3-4B-Instruct-2507-Q4_K_M.gguf`, SHA-256 `3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597`, which this table originally recorded). License: Apache-2.0. SHA-256 `df0fd4ee07072c607c29a0a1cb4f98918426cca12f45a2776bdd6ee6d09a4de3`. Run with `--reasoning off` (reasoning on leaves every reply empty at a small token budget; A-THINK-001). Handles Japanese.
 |Endpoint
 |`POST /v1/responses` on `127.0.0.1`, no key. The server returned `output[].content[]` `output_text` items, which `OpenAiResponsesAdapter` already extracts; no adapter wire change was needed. `max_output_tokens` and `model` (matching `--alias`) are honored.
 |===

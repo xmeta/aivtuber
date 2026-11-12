@@ -224,7 +224,7 @@ try {
     const assets = join(work, "setup-assets");
     const { status, out } = run(join(root, "aivtuber-setup" + exe), ["local", "--dry-run", "--assets", assets], root);
     assert(status === 0, `exit ${status}: ${out.trim().slice(0, 400)}`);
-    for (const needle of ["dry run", "Qwen3-4B-Instruct-2507-Q4_K_M.gguf", "Supertonic 3", "OpenRAIL-M", "machine-generated", "ReazonSpeech", "start"]) {
+    for (const needle of ["dry run", "gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf", "Supertonic 3", "OpenRAIL-M", "machine-generated", "ReazonSpeech", "start"]) {
       assert(out.includes(needle), `plan lacks "${needle}": ${out.trim().slice(0, 400)}`);
     }
     assert(!existsSync(assets), "dry run created the assets directory");
