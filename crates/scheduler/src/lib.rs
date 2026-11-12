@@ -11,6 +11,8 @@ mod deferred;
 pub use deferred::*;
 mod lifecycle;
 pub use lifecycle::*;
+mod own_speech;
+pub use own_speech::*;
 mod replay;
 pub use replay::*;
 

@@ -18,7 +18,7 @@ use aivtuber_domain::{
 use aivtuber_runtime::{
     FloorHold, SpeechObservationTracker, SpeechTranscriptTracker, SurfacedFinal,
 };
-use aivtuber_scheduler::{FloorMetrics, FloorPolicy, evaluate};
+use aivtuber_scheduler::{FloorMetrics, FloorPolicy, OwnSpeechTracker, evaluate};
 use std::collections::VecDeque;
 
 /// What the raw VAD feed says about one speaker, with the feed's liveness.
@@ -82,6 +82,9 @@ pub(crate) struct SpeechFloor {
     policy: FloorPolicy,
     queue: VecDeque<Waiting>,
     metrics: SpeechFloorMetrics,
+    /// The performer's own speaking state, fed only by drained speech
+    /// lifecycle events (#222 S3): no provider event and no scheduler status.
+    own: OwnSpeechTracker,
 }
 
 impl SpeechFloor {
@@ -90,7 +93,16 @@ impl SpeechFloor {
             policy: FloorPolicy::new(config)?,
             queue: VecDeque::new(),
             metrics: SpeechFloorMetrics::default(),
+            own: OwnSpeechTracker::new(),
         })
+    }
+
+    pub(crate) fn own_tracker(&self) -> &OwnSpeechTracker {
+        &self.own
+    }
+
+    pub(crate) fn own_tracker_mut(&mut self) -> &mut OwnSpeechTracker {
+        &mut self.own
     }
 
     pub(crate) fn metrics(&self) -> SpeechFloorMetrics {
