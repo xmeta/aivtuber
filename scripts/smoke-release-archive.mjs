@@ -5,6 +5,11 @@
 // Unpacks the archive into a fresh directory and uses nothing else (no Cargo,
 // no Bun, no model, no network). It checks:
 //   * the expected files are present and no model weights or voice files are;
+//   * on Windows, no shipped .exe or .dll imports the Visual C++ runtime or the
+//     universal CRT: a clean Windows has none of them, so the Rust programs are
+//     built with the static CRT and the bundled engine DLLs are the "MT" build
+//     (a CI runner has the runtime installed, so imports are checked, not
+//     whether the program runs);
 //   * every program starts and answers its probe (usage / --help), which also
 //     shows the loader found the bundled engine libraries beside it;
 //   * the STT worker and the TTS sidecar verify the bundled engine libraries
@@ -19,6 +24,7 @@ import { spawnSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, appendFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { peImports } from "./pe-imports.mjs";
 
 const archive = process.argv[2] ? resolve(process.argv[2]) : null;
 if (!archive || !existsSync(archive)) {
@@ -92,6 +98,26 @@ try {
       assert(existsSync(join(root, name)), `missing ${name}`);
     }
   });
+
+  // A clean Windows lacks VCRUNTIME140.dll (issue #294: exit 0xC0000135). The CI
+  // runner has it, so a missing runtime cannot show up as a failed start; read
+  // the import tables instead. If a pinned engine library ever needs the runtime,
+  // this fails and the runtime DLLs must be shipped app-local beside it
+  // (docs/supply-chain.adoc section 11).
+  if (win) {
+    check("no shipped .exe or .dll imports the Visual C++ runtime or universal CRT", () => {
+      const forbidden = /^(vcruntime|msvcp|concrt|vcomp|mfc|api-ms-win-crt-)/;
+      const bad = [];
+      let scanned = 0;
+      for (const file of readdirSync(root).filter((f) => /\.(exe|dll)$/i.test(f))) {
+        scanned += 1;
+        for (const dll of peImports(join(root, file))) if (forbidden.test(dll)) bad.push(`${file} -> ${dll}`);
+      }
+      assert(scanned >= programs.length + libs.length, `scanned only ${scanned} files`);
+      assert(bad.length === 0, `needs a runtime a clean Windows lacks: ${bad.join("; ")}`);
+      return `${scanned} files scanned`;
+    });
+  }
 
   check("licence and notice files are present", () => {
     for (const name of ["README.txt", "THIRD-PARTY-LICENSES-RUST.html", "THIRD-PARTY-NOTICES.txt"]) {
