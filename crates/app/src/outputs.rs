@@ -19,11 +19,16 @@ where
         self.play(&AudioPlayRequest {
             audio_ref: command.audio_ref.clone(),
             speed_factor: command.speed_factor,
+            continuation: command.continuation,
         })
     }
 
     fn stop(&mut self, fade_ms: u32) -> Result<AudioStopOutcome, EngineError> {
         AudioPlayer::stop(self, fade_ms)
+    }
+
+    fn gapless_queue(&self) -> bool {
+        self.supports_gapless_queue()
     }
 }
 

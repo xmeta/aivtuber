@@ -114,6 +114,16 @@ jobs:
       - name: Test speech sidecar
         run: cargo test --locked -p aivtuber-adapters --features silero-vad --test speech_vad_sidecar
 
+      # Issue #83 S3d: the gapless phrase queue on rodio's offline mixer. The
+      # gapless-queue feature does not enable rodio's `playback` (cpal), so it
+      # needs no ALSA headers and no audio device; native-audio-spike (the
+      # device) is not built here.
+      - name: Clippy gapless queue
+        run: cargo clippy --locked -p aivtuber-adapters --features gapless-queue --all-targets -- -D warnings
+
+      - name: Test gapless queue (sample-exact falsifier)
+        run: cargo test --locked -p aivtuber-adapters --features gapless-queue --test gapless_queue
+
       - name: Build
         run: cargo build --locked --workspace
 

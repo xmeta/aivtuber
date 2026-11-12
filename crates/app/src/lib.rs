@@ -151,6 +151,12 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+/// How long before its logical start a continuation phrase is handed to an
+/// output that [queues gaplessly](AudioOutput::gapless_queue) (#83 S3d).
+/// A bounded constant, not a knob: about one tick plus the time a backend needs
+/// to decode and append a phrase, far below the 400 ms barge-in confirm.
+pub const AUDIO_LOOKAHEAD_MS: u64 = 250;
+
 pub trait AudioOutput: Send {
     fn execute(&mut self, command: &AudioPlaybackCommand) -> Result<(), EngineError>;
 
@@ -161,6 +167,14 @@ pub trait AudioOutput: Send {
     fn stop(&mut self, fade_ms: u32) -> Result<AudioStopOutcome, EngineError> {
         let _ = fade_ms;
         Ok(AudioStopOutcome::Unsupported)
+    }
+
+    /// Whether this output queues a continuation phrase behind the audio in
+    /// flight and starts it sample-exactly (#83 S3d). Only such an output is
+    /// handed a continuation command [`AUDIO_LOOKAHEAD_MS`] before its logical
+    /// start; the default (`false`) keeps the hand-over at the logical start.
+    fn gapless_queue(&self) -> bool {
+        false
     }
 }
 
@@ -4204,8 +4218,23 @@ where
         let mut commands = std::mem::take(&mut self.pending_audio.commands);
         commands.sort_by_key(|command| command.at_ms);
 
+        // A continuation phrase is handed to a gapless backend a bounded
+        // lookahead before its logical start so the backend can chain it onto
+        // the audio in flight (#83 S3d). Only the hand-over moves: `at_ms`, the
+        // scheduler's `Started` and the avatar stay on the logical clock, and
+        // `Accepted` below never emits `Started` (ADR-0004 D-6).
+        let lookahead_ms = if self.audio.gapless_queue() {
+            AUDIO_LOOKAHEAD_MS
+        } else {
+            0
+        };
         for command in commands {
-            if command.at_ms > now_ms {
+            let early_ms = if command.continuation {
+                lookahead_ms
+            } else {
+                0
+            };
+            if command.at_ms > now_ms.saturating_add(early_ms) {
                 keep.push(command);
                 continue;
             }
@@ -4214,6 +4243,7 @@ where
                 command.generation,
                 command.at_ms,
                 now_ms,
+                early_ms,
                 self.max_dispatch_lateness_ms,
             ) {
                 continue;
@@ -4278,6 +4308,7 @@ where
                 avatar_generation(&command),
                 at_ms,
                 now_ms,
+                0,
                 self.max_dispatch_lateness_ms,
             ) {
                 continue;
@@ -4761,9 +4792,12 @@ fn command_is_live(
     generation: u64,
     command_at_ms: u64,
     now_ms: u64,
+    lookahead_ms: u64,
     max_lateness_ms: u64,
 ) -> bool {
-    if command_at_ms > now_ms || now_ms.saturating_sub(command_at_ms) > max_lateness_ms {
+    if command_at_ms > now_ms.saturating_add(lookahead_ms)
+        || now_ms.saturating_sub(command_at_ms) > max_lateness_ms
+    {
         return false;
     }
     command_not_cancelled(scheduler, generation, command_at_ms)
@@ -9082,6 +9116,7 @@ mod tests {
                         audio_ref: "audio://speak.opus".to_owned(),
                         duration_ms: duration_ms / 2,
                         speed_factor: 1.0,
+                        continuation: false,
                     });
                 }
 
@@ -11445,6 +11480,7 @@ mod tests {
             let play = AudioPlayRequest {
                 audio_ref: "audio://clip.opus".to_owned(),
                 speed_factor: 1.0,
+                continuation: false,
             };
 
             // Control: an identical clip nobody stops runs to its end.

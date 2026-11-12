@@ -100,11 +100,21 @@ struct Rig {
 }
 
 fn rig_with(mode: PhraseMode, reply: &str, tts: PhraseTts) -> Rig {
+    let audio = RecordingAudio::default();
+    let audio_log = Arc::clone(&audio.commands);
+    rig_with_audio(mode, reply, tts, Box::new(audio), audio_log)
+}
+
+fn rig_with_audio(
+    mode: PhraseMode,
+    reply: &str,
+    tts: PhraseTts,
+    audio: Box<dyn AudioOutput>,
+    audio_log: Arc<Mutex<Vec<AudioPlaybackCommand>>>,
+) -> Rig {
     let tts_calls = Arc::clone(&tts.calls);
     let tts_texts = Arc::clone(&tts.texts);
     let release = Arc::clone(&tts.release);
-    let audio = RecordingAudio::default();
-    let audio_log = Arc::clone(&audio.commands);
     let security = SecurityRuntime::new(
         SecurityRuntimeConfig::default(),
         SchedulerConfig {
@@ -132,7 +142,7 @@ fn rig_with(mode: PhraseMode, reply: &str, tts: PhraseTts) -> Rig {
             reply_context: ReflexContext::default(),
             fallback_variant_group: None,
         },
-        Box::new(audio),
+        audio,
         Box::new(RecordingAvatar::default()),
         Box::new(NoopStreamOutput),
         250,
@@ -965,4 +975,185 @@ fn a_failed_resynthesis_leaves_the_stale_asset_playable_and_is_not_retried() {
         "unchanged and still resident"
     );
     assert_eq!(rig.tts_calls.load(Ordering::SeqCst), 1, "no retry storm");
+}
+
+// --- #83 S3d: lookahead hand-over to a gapless backend ------------------
+
+/// An output that declares gapless queueing (or not) and records every
+/// hand-over and stop, standing in for the rodio backend.
+#[derive(Clone)]
+struct QueueingAudio {
+    handed: Arc<Mutex<Vec<AudioPlaybackCommand>>>,
+    stops: Arc<Mutex<Vec<u32>>>,
+    gapless: bool,
+}
+
+impl QueueingAudio {
+    fn new(gapless: bool) -> Self {
+        Self {
+            handed: Arc::new(Mutex::new(Vec::new())),
+            stops: Arc::new(Mutex::new(Vec::new())),
+            gapless,
+        }
+    }
+}
+
+impl AudioOutput for QueueingAudio {
+    fn execute(&mut self, command: &AudioPlaybackCommand) -> Result<(), EngineError> {
+        self.handed.lock().unwrap().push(command.clone());
+        Ok(())
+    }
+
+    fn stop(&mut self, fade_ms: u32) -> Result<aivtuber_adapters::AudioStopOutcome, EngineError> {
+        self.stops.lock().unwrap().push(fade_ms);
+        Ok(aivtuber_adapters::AudioStopOutcome::Faded { fade_ms })
+    }
+
+    fn gapless_queue(&self) -> bool {
+        self.gapless
+    }
+}
+
+fn queueing_rig(gapless: bool) -> (Rig, QueueingAudio) {
+    let audio = QueueingAudio::new(gapless);
+    let log = Arc::clone(&audio.handed);
+    let rig = rig_with_audio(
+        phrased(),
+        &three_phrase_reply(),
+        PhraseTts::new(),
+        Box::new(audio.clone()),
+        log,
+    );
+    (rig, audio)
+}
+
+fn lifecycle_of(
+    events: &[aivtuber_domain::SpeechLifecycleEvent],
+    event_id: &str,
+) -> Vec<aivtuber_domain::SpeechLifecycleEvent> {
+    events
+        .iter()
+        .filter(|event| event.speech.event_id == event_id)
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn a_gapless_output_gets_the_continuation_one_lookahead_early_and_started_stays_logical() {
+    let (mut rig, _audio) = queueing_rig(true);
+    submit(&mut rig, 30, 0);
+    wait_until(&mut rig, 0, |rig| phrase_items(rig).len() == 2);
+    let a_ms = duration_of(PHRASE_A);
+    assert!(
+        a_ms > AUDIO_LOOKAHEAD_MS * 2,
+        "the premise: A outlasts the window"
+    );
+
+    // Before the window opens only phrase 1 has been handed over.
+    rig.app.tick(a_ms - AUDIO_LOOKAHEAD_MS - 1);
+    assert_eq!(audio_count(&rig), 1);
+
+    // At the edge of the window the continuation is handed over, marked as
+    // such, with its logical start untouched.
+    rig.app.tick(a_ms - AUDIO_LOOKAHEAD_MS);
+    let handed = rig.audio.lock().unwrap().clone();
+    assert_eq!(handed.len(), 2, "continuation released by the lookahead");
+    assert!(!handed[0].continuation && handed[1].continuation);
+    assert_eq!(handed[1].event_id, "evt-30#p1");
+    assert_eq!(handed[1].at_ms, a_ms, "the logical start does not move");
+
+    // Backend acceptance did not emit Started (ADR-0004 D-6): the
+    // continuation is only Committed so far.
+    let events = rig.app.drain_speech_lifecycle(usize::MAX);
+    let p1 = lifecycle_of(&events, "evt-30#p1");
+    assert!(
+        p1.iter()
+            .all(|event| !matches!(event.phase, aivtuber_domain::SpeechPhase::Started)),
+        "no Started during the lookahead: {p1:?}"
+    );
+
+    // Started arrives on the logical clock, stamped with the logical start.
+    rig.app.tick(a_ms);
+    let events = rig.app.drain_speech_lifecycle(usize::MAX);
+    let started: Vec<_> = lifecycle_of(&events, "evt-30#p1")
+        .into_iter()
+        .filter(|event| matches!(event.phase, aivtuber_domain::SpeechPhase::Started))
+        .collect();
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0].at_ms, a_ms);
+    assert_eq!(audio_count(&rig), 2, "not handed over twice");
+}
+
+#[test]
+fn an_output_without_gapless_queueing_keeps_the_hand_over_at_the_logical_start() {
+    let (mut rig, _audio) = queueing_rig(false);
+    submit(&mut rig, 30, 0);
+    wait_until(&mut rig, 0, |rig| phrase_items(rig).len() == 2);
+    let a_ms = duration_of(PHRASE_A);
+    rig.app.tick(a_ms - 1);
+    assert_eq!(audio_count(&rig), 1, "no early hand-over");
+    rig.app.tick(a_ms);
+    let handed = rig.audio.lock().unwrap().clone();
+    assert_eq!(handed.len(), 2);
+    assert!(handed[1].continuation, "the mark is set either way");
+}
+
+#[test]
+fn an_operator_stop_inside_the_lookahead_stops_the_output_and_cancels_the_queued_phrase() {
+    let (mut rig, audio) = queueing_rig(true);
+    submit(&mut rig, 30, 0);
+    wait_until(&mut rig, 0, |rig| phrase_items(rig).len() == 2);
+    let a_ms = duration_of(PHRASE_A);
+    rig.app.tick(a_ms - AUDIO_LOOKAHEAD_MS);
+    assert_eq!(
+        audio_count(&rig),
+        2,
+        "phrase 2 is queued ahead in the backend"
+    );
+    let _ = rig.app.drain_speech_lifecycle(usize::MAX);
+
+    let started = Instant::now();
+    let (_, report) = rig
+        .app
+        .handle_control_reporting(&stop_command(), a_ms - AUDIO_LOOKAHEAD_MS + 10)
+        .expect("operator stop");
+    let elapsed = started.elapsed();
+    assert!(elapsed < AUDIO_STOP_BOUND, "stop took {elapsed:?}");
+    let report = report.expect("stop report");
+    assert!(report.audio.confirmed_silent());
+    assert_eq!(
+        audio.stops.lock().unwrap().as_slice(),
+        &[0],
+        "one hard stop of the shared player"
+    );
+
+    // Both the playing phrase and the queued-ahead one end Cancelled, and the
+    // queued-ahead one never started.
+    rig.app.tick(a_ms + 100);
+    let events = rig.app.drain_speech_lifecycle(usize::MAX);
+    let p1 = lifecycle_of(&events, "evt-30#p1");
+    assert!(
+        p1.iter().any(|event| matches!(
+            event.phase,
+            aivtuber_domain::SpeechPhase::Cancelled {
+                reached: aivtuber_domain::SpeechReached::Committed,
+                ..
+            }
+        )),
+        "queued-ahead phrase is Cancelled before it started: {p1:?}"
+    );
+    assert!(
+        p1.iter()
+            .all(|event| !matches!(event.phase, aivtuber_domain::SpeechPhase::Started))
+    );
+    let p0 = lifecycle_of(&events, "evt-30");
+    assert!(
+        p0.iter()
+            .any(|event| matches!(event.phase, aivtuber_domain::SpeechPhase::Cancelled { .. }))
+    );
+    assert_eq!(
+        audio_count(&rig),
+        2,
+        "nothing is handed over after the stop"
+    );
 }
