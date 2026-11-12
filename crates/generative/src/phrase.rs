@@ -380,6 +380,10 @@ fn cap_phrase_count(ranges: &mut Vec<(usize, usize)>, max_phrases: usize) {
 pub enum PhraseFailure {
     /// The output gate refused the phrase (or its speech projection).
     GateRejected,
+    /// Streamed replies only (issue #83 S3a): the output gate refused the
+    /// already-committed phrases joined with this one, or the joined text
+    /// exceeded the reply cap. The phrase is never spoken; earlier phrases stand.
+    CumulativeGateRejected,
     /// Nothing speakable was left after the gate and the speech projection.
     NothingSpeakable,
     /// TTS failed or timed out for this phrase.
@@ -399,6 +403,7 @@ impl PhraseFailure {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::GateRejected => "gate_rejected",
+            Self::CumulativeGateRejected => "cumulative_gate_rejected",
             Self::NothingSpeakable => "nothing_speakable",
             Self::Synthesis(_) => "synthesis_failed",
             Self::Compile => "compile_failed",
@@ -643,12 +648,22 @@ pub struct StreamPolicy {
     /// spends synthesizing and waiting for lookahead slots. The first phrase
     /// is separately held to the interaction deadline.
     pub max_duration: Duration,
+    /// Hard bound, in characters, of the text the streamed-reply gate sees:
+    /// the cumulative-prefix gate input (all committed display text plus the
+    /// candidate phrase) and the final audit input never exceed it. Keep it
+    /// equal to the adapter's reply cap; a reply that would exceed it is
+    /// stopped fail-closed instead of being gated in part.
+    pub max_reply_chars: usize,
 }
+
+/// Reply cap shared with the adapter default (`StreamLimits::max_reply_chars`).
+pub const DEFAULT_STREAM_MAX_REPLY_CHARS: usize = 4096;
 
 impl Default for StreamPolicy {
     fn default() -> Self {
         Self {
             max_duration: Duration::from_secs(120),
+            max_reply_chars: DEFAULT_STREAM_MAX_REPLY_CHARS,
         }
     }
 }
@@ -675,6 +690,12 @@ impl PhraseConfig {
         {
             return Err("stream max_duration must be greater than zero".to_owned());
         }
+        if self
+            .stream
+            .is_some_and(|stream| stream.max_reply_chars == 0)
+        {
+            return Err("stream max_reply_chars must be greater than zero".to_owned());
+        }
         Ok(())
     }
 }
@@ -699,6 +720,24 @@ pub enum PhraseEnd {
     Failed { seq: u32, failure: PhraseFailure },
 }
 
+/// Result of the whole-reply gate a streamed reply gets once it completed
+/// (issue #83 S3a). It is audit and telemetry only: every phrase was already
+/// committed, so a disagreement cannot unspeak anything.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WholeReplyAudit {
+    /// Not run: a buffered reply (gated before phrase 0), a reply that did
+    /// not complete, or one with a single phrase (the per-phrase gate already
+    /// saw exactly that text).
+    #[default]
+    NotRun,
+    /// The gate published the whole committed reply unchanged.
+    Agreed,
+    /// The gate refused or altered the whole committed reply after every
+    /// phrase had been committed.
+    RejectedAfterCommit,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhraseSummary {
     pub response_id: u64,
@@ -709,6 +748,9 @@ pub struct PhraseSummary {
     pub end: PhraseEnd,
     /// Characters sent to TTS across all phrases (for budget settlement).
     pub tts_chars: u64,
+    /// Streamed replies: the final whole-reply gate at completion.
+    #[serde(default)]
+    pub whole_reply_audit: WholeReplyAudit,
 }
 
 impl PhraseSummary {
