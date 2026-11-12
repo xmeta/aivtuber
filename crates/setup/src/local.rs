@@ -693,7 +693,8 @@ pub fn run<W: Write>(
     });
     ctx.say(format!("  {}", start_command(bin, &opts.env_file)));
     ctx.say(format!(
-        "  then open http://127.0.0.1:{} (or add it to OBS as a Browser Source)",
+        "  the app then prints two URLs, each with a per-launch secret (do not share them): the operation panel (http://127.0.0.1:{}/#token=...; chat, status, stop and mute) and the avatar page (http://127.0.0.1:{}/?token=..., also usable as an OBS Browser Source)",
+        config::PANEL_PORT,
         config::AVATAR_PORT
     ));
     if !opts.dry_run && !summary.warnings.is_empty() {

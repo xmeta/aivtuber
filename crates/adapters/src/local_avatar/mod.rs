@@ -11,10 +11,12 @@
 //! * nothing here can block or fail the caller: [`LocalAvatarHandle::enqueue`]
 //!   only takes a short mutex and either queues or drops-and-counts.
 
+mod panel;
 mod presets;
 mod protocol;
 mod server;
 
+pub use panel::*;
 pub use presets::{PresetKind, PresetMapping, map_preset};
 pub use protocol::*;
 pub use server::LocalAvatarServer;

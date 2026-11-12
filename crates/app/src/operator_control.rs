@@ -490,7 +490,20 @@ pub fn apply_dispatched_request<R: RoutePlanner>(
     dispatched: &DispatchedOperatorRequest,
     now_ms: u64,
 ) -> OperatorResponse {
-    let request = &dispatched.request;
+    apply_operator_request(ingress, app, &dispatched.request, now_ms)
+}
+
+/// The same verification, capability minting and audit for a request that did
+/// not arrive over the control socket. The local operation panel (#335) calls
+/// this for stop and mute with the control secret the daemon already holds, so
+/// a panel button is exactly an `aivtuberctl` invocation and no second
+/// authority path exists.
+pub fn apply_operator_request<R: RoutePlanner>(
+    ingress: &LocalControlIngress,
+    app: &mut ProductionApp<R>,
+    request: &OperatorRequest,
+    now_ms: u64,
+) -> OperatorResponse {
     let request_id = request
         .request_id
         .clone()
