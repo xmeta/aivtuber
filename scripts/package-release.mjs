@@ -4,12 +4,10 @@
 //
 //   node scripts/package-release.mjs --version v0.1.0 --out dist-release \
 //     --sherpa-archive-dir DIR --rust-notices FILE [--target-dir target/release] \
-//     [--renderer-dist renderer/local-avatar/dist] [--msvc-runtime-dir DIR]
+//     [--renderer-dist renderer/local-avatar/dist]
 //
-// On Windows, --msvc-runtime-dir is required: the output of
-// scripts/collect-msvc-runtime.mjs (the Visual C++ runtime DLLs the pinned
-// llama.cpp zip imports, plus REDIST-VERSION.txt). They are shipped in
-// runtime/msvc and `aivtuber-setup local` copies them beside llama-server.
+// The Visual C++ runtime DLLs are not bundled (#349, docs/supply-chain.adoc
+// section 11): aivtuber-setup checks that the machine has them.
 //
 // Platform is the platform this script runs on (win32-x64 or linux-x64): the
 // engine libraries are the ones pinned for that platform in
@@ -183,19 +181,6 @@ function main() {
       cpSync(join(libDir, lib), join(stage, lib));
     }
 
-    // 2b. Windows: the app-local Visual C++ runtime for the llama.cpp build that
-    // setup fetches (docs/supply-chain.adoc section 11). Names come from the pins
-    // file; nothing else in the directory is copied.
-    if (process.platform === "win32") {
-      const rt = resolve(args["msvc-runtime-dir"] ?? fail("--msvc-runtime-dir is required on Windows (node scripts/collect-msvc-runtime.mjs)"));
-      const names = readJson(join(repo, "packaging", "local-profile-pins.json")).llama.windows_runtime_dlls;
-      mkdirSync(join(stage, "runtime", "msvc"), { recursive: true });
-      for (const f of [...names, "REDIST-VERSION.txt"]) {
-        if (!existsSync(join(rt, f))) fail(`${f} missing from --msvc-runtime-dir ${rt}`);
-        cpSync(join(rt, f), join(stage, "runtime", "msvc", f));
-      }
-    }
-
     // 3. Renderer page build (avatar page and operation panel). A VRM model is
     // operator-supplied and never shipped.
     if (!existsSync(join(rendererDist, "index.html"))) fail(`renderer build missing: ${rendererDist}/index.html (run bun run build)`);
@@ -237,9 +222,6 @@ function main() {
         fail(error.message);
       }
       engine += `\n\n${heading(notice)}\n\n${text}`;
-    }
-    if (process.platform === "win32") {
-      engine += `\n\n${readFileSync(join(repo, "packaging", "MSVC-RUNTIME-NOTICE.txt"), "utf8")}\n${readFileSync(join(stage, "runtime", "msvc", "REDIST-VERSION.txt"), "utf8")}`;
     }
     const rendererRoot = join(repo, "renderer", "local-avatar");
     let renderer;
