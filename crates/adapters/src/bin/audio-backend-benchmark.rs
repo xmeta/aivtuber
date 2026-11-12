@@ -1,10 +1,10 @@
-#[cfg(not(all(windows, feature = "native-audio-spike")))]
+#[cfg(not(feature = "native-audio-spike"))]
 fn main() {
-    eprintln!("audio-backend-benchmark requires Windows + --features native-audio-spike");
+    eprintln!("audio-backend-benchmark requires --features native-audio-spike");
     std::process::exit(2);
 }
 
-#[cfg(all(windows, feature = "native-audio-spike"))]
+#[cfg(feature = "native-audio-spike")]
 mod windows_bench {
     use aivtuber_adapters::{
         AudioPlayRequest, AudioPlayer, ProcessAudioConfig, ProcessAudioPlayer, RodioAudioPlayer,
@@ -55,10 +55,12 @@ mod windows_bench {
         let short = AudioPlayRequest {
             audio_ref: "audio://short.wav".to_owned(),
             speed_factor: 1.0,
+            continuation: false,
         };
         let long = AudioPlayRequest {
             audio_ref: "audio://long.wav".to_owned(),
             speed_factor: 1.0,
+            continuation: false,
         };
         let process_cold_start_us = one_process_start(&process, &short)?;
         let native_first_start_us = one_native_start(&native, &short)?;
@@ -273,7 +275,7 @@ mod windows_bench {
     }
 
     fn nearest_rank(sorted: &[u64], percentile: usize) -> u64 {
-        let rank = ((percentile * sorted.len()) + 99) / 100;
+        let rank = (percentile * sorted.len()).div_ceil(100);
         sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
     }
 
@@ -304,7 +306,7 @@ mod windows_bench {
     }
 }
 
-#[cfg(all(windows, feature = "native-audio-spike"))]
+#[cfg(feature = "native-audio-spike")]
 fn main() {
     if let Err(error) = windows_bench::run() {
         eprintln!("audio-backend-benchmark: {error}");

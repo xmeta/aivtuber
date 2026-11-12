@@ -170,6 +170,10 @@ pub struct AudioPlaybackCommand {
     pub audio_ref: String,
     pub duration_ms: u64,
     pub speed_factor: f64,
+    /// A later phrase (seq > 0) of a phrased reply (#83 S3d): it chains onto
+    /// the audio of the phrase before it, so a gapless backend may be handed
+    /// it a bounded lookahead before `at_ms`. `at_ms` stays the logical start.
+    pub continuation: bool,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -892,6 +896,7 @@ impl CachedPerformer {
             &plan,
             variation,
             timing.at_ms,
+            phrase.is_some_and(|link| link.seq > 0),
             audio,
             avatar,
         );
@@ -1034,6 +1039,7 @@ fn dispatch_asset<A, V>(
     plan: &PlannedPerformance,
     variation: AppliedVariation,
     event_at_ms: u64,
+    continuation: bool,
     audio: &mut A,
     avatar: &mut V,
 ) -> FastPathMetrics
@@ -1060,6 +1066,7 @@ where
             audio_ref: audio_ref.to_owned(),
             duration_ms,
             speed_factor: variation.speed_factor,
+            continuation,
         });
         first_audio_at = Some(at_ms);
 

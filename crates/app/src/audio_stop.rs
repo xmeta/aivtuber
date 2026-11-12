@@ -103,15 +103,23 @@ impl OperatorStopReport {
 /// runtime thread ever blocking on it.
 pub(crate) struct AudioChannel {
     output: Arc<Mutex<Box<dyn AudioOutput>>>,
+    /// Fixed at composition: whether the output queues gaplessly (#83 S3d).
+    /// Read without the output lock, which a stop may be holding.
+    gapless: bool,
     stop_in_flight: Arc<AtomicBool>,
 }
 
 impl AudioChannel {
     pub(crate) fn new(output: Box<dyn AudioOutput>) -> Self {
         Self {
+            gapless: output.gapless_queue(),
             output: Arc::new(Mutex::new(output)),
             stop_in_flight: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub(crate) fn gapless_queue(&self) -> bool {
+        self.gapless
     }
 
     /// Dispatch one playback command. Never blocks: while a stop holds the
