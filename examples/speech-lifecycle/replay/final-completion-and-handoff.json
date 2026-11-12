@@ -1,0 +1,186 @@
+{
+  "schema_version": "0.1.0",
+  "name": "a final phrase finishing releases the floor with no more expected; a hand-off at the same logical time reads as finished-then-started and keeps the floor held; boundaries do not change the floor",
+  "steps": [
+    {
+      "events": [
+        {
+          "schema_version": "0.1.0",
+          "seq": 1,
+          "at_ms": 0,
+          "basis": "logical_timeline",
+          "speech": {
+            "event_id": "f1",
+            "phrase": 0,
+            "final_phrase": false,
+            "asset_id": "gen-asset-1",
+            "speech_text_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+            "projection": "rules:1|lexicon:starter@1+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "phase": {
+            "kind": "prepared"
+          }
+        },
+        {
+          "schema_version": "0.1.0",
+          "seq": 2,
+          "at_ms": 0,
+          "basis": "logical_timeline",
+          "speech": {
+            "event_id": "f1",
+            "phrase": 0,
+            "final_phrase": false,
+            "asset_id": "gen-asset-1",
+            "generation": 1,
+            "speech_text_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+            "projection": "rules:1|lexicon:starter@1+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "phase": {
+            "kind": "committed"
+          }
+        },
+        {
+          "schema_version": "0.1.0",
+          "seq": 3,
+          "at_ms": 0,
+          "basis": "logical_timeline",
+          "speech": {
+            "event_id": "f1",
+            "phrase": 0,
+            "final_phrase": false,
+            "asset_id": "gen-asset-1",
+            "generation": 1,
+            "speech_text_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+            "projection": "rules:1|lexicon:starter@1+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "phase": {
+            "kind": "started"
+          }
+        },
+        {
+          "schema_version": "0.1.0",
+          "seq": 4,
+          "at_ms": 500,
+          "basis": "logical_timeline",
+          "speech": {
+            "event_id": "f1",
+            "phrase": 0,
+            "final_phrase": false,
+            "asset_id": "gen-asset-1",
+            "generation": 1,
+            "speech_text_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+            "projection": "rules:1|lexicon:starter@1+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "phase": {
+            "kind": "boundary",
+            "offset_ms": 500
+          }
+        }
+      ],
+      "expect_own": "speaking"
+    },
+    {
+      "events": [
+        {
+          "schema_version": "0.1.0",
+          "seq": 5,
+          "at_ms": 900,
+          "basis": "output_drained",
+          "speech": {
+            "event_id": "f1",
+            "phrase": 0,
+            "final_phrase": false,
+            "asset_id": "gen-asset-1",
+            "generation": 1,
+            "speech_text_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+            "projection": "rules:1|lexicon:starter@1+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "phase": {
+            "kind": "finished"
+          }
+        },
+        {
+          "schema_version": "0.1.0",
+          "seq": 6,
+          "at_ms": 900,
+          "basis": "logical_timeline",
+          "speech": {
+            "event_id": "f2",
+            "phrase": 1,
+            "final_phrase": true,
+            "asset_id": "gen-asset-1",
+            "speech_text_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+            "projection": "rules:1|lexicon:starter@1+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "phase": {
+            "kind": "prepared"
+          }
+        },
+        {
+          "schema_version": "0.1.0",
+          "seq": 7,
+          "at_ms": 900,
+          "basis": "logical_timeline",
+          "speech": {
+            "event_id": "f2",
+            "phrase": 1,
+            "final_phrase": true,
+            "asset_id": "gen-asset-1",
+            "generation": 2,
+            "speech_text_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+            "projection": "rules:1|lexicon:starter@1+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "phase": {
+            "kind": "committed"
+          }
+        },
+        {
+          "schema_version": "0.1.0",
+          "seq": 8,
+          "at_ms": 900,
+          "basis": "logical_timeline",
+          "speech": {
+            "event_id": "f2",
+            "phrase": 1,
+            "final_phrase": true,
+            "asset_id": "gen-asset-1",
+            "generation": 2,
+            "speech_text_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+            "projection": "rules:1|lexicon:starter@1+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "phase": {
+            "kind": "started"
+          }
+        }
+      ],
+      "expect_own": "speaking",
+      "expect_awaiting_next_phrase": false
+    },
+    {
+      "events": [
+        {
+          "schema_version": "0.1.0",
+          "seq": 9,
+          "at_ms": 1800,
+          "basis": "output_drained",
+          "speech": {
+            "event_id": "f2",
+            "phrase": 1,
+            "final_phrase": true,
+            "asset_id": "gen-asset-1",
+            "generation": 2,
+            "speech_text_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+            "projection": "rules:1|lexicon:starter@1+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "phase": {
+            "kind": "finished"
+          }
+        }
+      ],
+      "expect_own": "idle",
+      "expect_awaiting_next_phrase": false
+    }
+  ],
+  "expect_recorded": 9,
+  "expect_records_digest": "aa785b1c100d1fbe8565a77a8e2bccf3529dc7caf6b4dac14a523288ed6f6443"
+}

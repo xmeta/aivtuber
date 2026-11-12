@@ -132,8 +132,8 @@ use aivtuber_runtime::{
     SpeechTranscriptTracker, ViewerEraseDecision,
 };
 use aivtuber_scheduler::{
-    BlendChannel, BusyCause, DeferredOutcome, OutputFailureKind, OutputObservation,
-    ReplyAvailability, Scheduler, Status, priority_for_event,
+    BusyCause, DeferredOutcome, OutputFailureKind, OutputObservation, ReplyAvailability, Scheduler,
+    Status, priority_for_event,
 };
 use aivtuber_telemetry::{
     CacheLevel, CausalTraceCollector, CausalTraceRetentionConfig, ComparisonMode,
@@ -1131,6 +1131,8 @@ where
     speech_transcripts: Option<SpeechTranscriptTracker>,
     speech_conversation: Option<speech_conversation::SpeechConversation>,
     speech_floor: Option<speech_floor::SpeechFloor>,
+    /// Retains drained lifecycle events for replay when composed (#222 S3).
+    speech_lifecycle_recorder: Option<aivtuber_runtime::SpeechLifecycleRecorder>,
     speech_barge_in: Option<speech_barge_in::BargeIn>,
     /// Live chat-burst selection and deferred replies (#75 S1, #78 S2); `None`
     /// unless composed, so the default per-event path is unchanged.
@@ -1197,6 +1199,7 @@ where
             speech_transcripts: None,
             speech_conversation: None,
             speech_floor: None,
+            speech_lifecycle_recorder: None,
             speech_barge_in: None,
             chat_burst: None,
             speech_feed_heartbeat_ms: None,
@@ -1786,19 +1789,16 @@ where
     pub fn service_barge_in(&mut self, at_ms: u64) -> Option<BargeInRecord> {
         let fade_ms = self.speech_barge_in.as_ref()?.config().fade_ms;
         self.speech_floor.as_ref()?;
+        self.pump_speech_lifecycle();
         // A phrased reply that already spoke is still "speaking" in the gap
         // between two phrases, when nothing is audible but more would follow.
         let phrase_pending = self
             .generative
             .as_ref()
             .is_some_and(|generative| generative.phrase.has_active_spoken_run());
-        if !phrase_pending
-            && !self
-                .performer
-                .scheduler()
-                .playing_items()
-                .any(|item| item.plan.channels.contains(&BlendChannel::Audio))
-        {
+        let speaking =
+            self.speech_floor.as_ref()?.own_tracker().own() == aivtuber_domain::OwnSpeech::Speaking;
+        if !phrase_pending && !speaking {
             return None;
         }
         // Stopping speech is the costly-to-reverse decision (ADR-0005 D6): it
@@ -1940,6 +1940,7 @@ where
     /// envelope. Without a conversation route the finals are drained and
     /// discarded so the tracker's bounded queue never wedges.
     pub fn route_spoken_finals(&mut self, at_ms: u64, seed: u64) -> Vec<SpokenFinalReport> {
+        self.pump_speech_lifecycle();
         let Some(tracker) = self.speech_transcripts.as_mut() else {
             return Vec::new();
         };
@@ -1953,11 +1954,7 @@ where
             // Evidence enters only here, from the trackers and the scheduler's
             // own playing state. Missing evidence degrades to the text-only
             // path inside the policy, i.e. to the unchanged behaviour.
-            let own = if self.performer.scheduler().playing().is_some() {
-                aivtuber_domain::OwnSpeech::Speaking
-            } else {
-                aivtuber_domain::OwnSpeech::Idle
-            };
+            let own = floor.own_tracker().own();
             let observations = self.speech_observations.as_ref();
             let transcripts: &SpeechTranscriptTracker = tracker;
             // Feed liveness (#81 S2): `None` until the sidecar reports beats.
@@ -4024,6 +4021,7 @@ where
         self.dispatch_audio(now_ms);
         self.dispatch_avatar(now_ms);
         self.drive_resynthesis();
+        self.pump_speech_lifecycle();
     }
 
     /// Report, to the speech lifecycle, the pending audio commands that
@@ -4101,6 +4099,66 @@ where
         surface: &str,
     ) -> aivtuber_runtime::SurfaceInvalidation {
         self.performer.invalidate_speech_surface(surface)
+    }
+
+    /// Opt in to retaining speech lifecycle events for replay (#222 S3): the
+    /// app drains the scheduler's queue at every tick and records each event
+    /// (digest and projection identity only, never text), newest `capacity`
+    /// kept. Read them with [`Self::speech_lifecycle_records`].
+    pub fn with_speech_lifecycle_recorder(mut self, capacity: usize) -> Self {
+        self.speech_lifecycle_recorder =
+            Some(aivtuber_runtime::SpeechLifecycleRecorder::new(capacity));
+        self
+    }
+
+    /// Retained lifecycle records, oldest first; empty when not recording.
+    pub fn speech_lifecycle_records(&self) -> Vec<aivtuber_domain::SpeechLifecycleEvent> {
+        self.speech_lifecycle_recorder
+            .as_ref()
+            .map(|recorder| recorder.records().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn speech_lifecycle_recorder_metrics(
+        &self,
+    ) -> Option<aivtuber_runtime::LifecycleRecorderMetrics> {
+        self.speech_lifecycle_recorder.as_ref().map(|r| r.metrics())
+    }
+
+    /// Floor-side view of the performer's own speech, derived from lifecycle
+    /// events only; `None` when the floor is not enabled.
+    pub fn speech_floor_own(&self) -> Option<aivtuber_domain::OwnSpeech> {
+        self.speech_floor.as_ref().map(|f| f.own_tracker().own())
+    }
+
+    /// The internal lifecycle consumer (#222 S3): drains the scheduler's
+    /// queue, in `seq` order, into the floor's own-speech tracker and the
+    /// replay recorder, whichever are composed. Does nothing when neither is,
+    /// so an external consumer of [`Self::drain_speech_lifecycle`] keeps the
+    /// whole queue. A `seq` gap is repaired from the snapshot.
+    fn pump_speech_lifecycle(&mut self) {
+        if self.speech_floor.is_none() && self.speech_lifecycle_recorder.is_none() {
+            return;
+        }
+        let events = self
+            .performer
+            .scheduler_mut()
+            .drain_speech_lifecycle(usize::MAX);
+        for event in &events {
+            if let Some(floor) = self.speech_floor.as_mut() {
+                floor.own_tracker_mut().observe(event);
+            }
+            if let Some(recorder) = self.speech_lifecycle_recorder.as_mut() {
+                // A refusal is counted by the recorder; it never stops the performer.
+                let _ = recorder.record(event);
+            }
+        }
+        if let Some(floor) = self.speech_floor.as_mut()
+            && floor.own_tracker().needs_resync()
+        {
+            let snapshot = self.performer.scheduler().speech_lifecycle().snapshot();
+            floor.own_tracker_mut().resync(&snapshot);
+        }
     }
 
     /// Remove and return up to `max` queued speech lifecycle events in `seq`
@@ -9247,6 +9305,212 @@ mod tests {
                     assert_eq!(rig.audio.stops.lock().expect("stops").len(), 1);
                     assert_eq!(rig.app.speech_floor_metrics().expect("m").policy.yielded, 1);
                     assert!(observe(&rig, None)["speaking"].as_bool().expect("bool"));
+                }
+
+                // --- #222 S3: the floor reads the performer's own speech from
+                // lifecycle events, not from a provider or scheduler status ---
+
+                fn audio_playing(app: &ProductionApp<ReflexRoutePlanner<FixedEmbedding>>) -> bool {
+                    app.performer
+                        .scheduler()
+                        .playing_items()
+                        .any(|i| i.plan.channels.contains(&BlendChannel::Audio))
+                }
+
+                /// The lifecycle-derived signal and the scheduler's audio
+                /// status mean the same thing in every scenario below.
+                fn assert_floor_matches_scheduler(
+                    app: &ProductionApp<ReflexRoutePlanner<FixedEmbedding>>,
+                    at_ms: u64,
+                ) {
+                    assert_eq!(
+                        app.speech_floor_own() == Some(aivtuber_domain::OwnSpeech::Speaking),
+                        audio_playing(app),
+                        "own speech vs scheduler at {at_ms} ms"
+                    );
+                }
+
+                fn last_phase(
+                    app: &ProductionApp<ReflexRoutePlanner<FixedEmbedding>>,
+                ) -> Option<aivtuber_domain::SpeechPhase> {
+                    app.speech_lifecycle_records()
+                        .last()
+                        .map(|record| record.phase)
+                }
+
+                #[test]
+                fn the_floor_holds_a_final_while_speaking_and_yields_on_final_finished() {
+                    let mut app = floor_app(
+                        Some(FloorConfig::default()),
+                        SpeechConversationConfig::default(),
+                        false,
+                    )
+                    .with_speech_lifecycle_recorder(64);
+                    speak(&mut app, 0, &json!({"duration_ms": 2_000}));
+                    app.tick(1_000);
+                    assert_floor_matches_scheduler(&app, 1_000);
+                    assert_eq!(
+                        app.speech_floor_own(),
+                        Some(aivtuber_domain::OwnSpeech::Speaking)
+                    );
+                    ingest_final(&mut app, "mic-local", 1, "こんにちは", 900, 1_000);
+                    assert!(app.route_spoken_finals(1_000, 0).is_empty());
+                    let held = app
+                        .speech_floor_decisions()
+                        .last()
+                        .copied()
+                        .expect("decision");
+                    assert_eq!(
+                        (held.action.name(), held.reason.name()),
+                        ("hold", "performer_speaking")
+                    );
+
+                    app.tick(2_000);
+                    assert_floor_matches_scheduler(&app, 2_000);
+                    assert!(matches!(
+                        last_phase(&app),
+                        Some(aivtuber_domain::SpeechPhase::Finished)
+                    ));
+                    let released = app.route_spoken_finals(2_000, 16);
+                    assert_eq!(released.len(), 1, "the final is answered once speech ended");
+                    assert_eq!(
+                        app.speech_floor_own(),
+                        Some(aivtuber_domain::OwnSpeech::Idle)
+                    );
+                }
+
+                #[test]
+                fn a_confirmed_barge_in_cancels_the_unit_and_the_floor_follows_the_event() {
+                    let mut rig = rig(Backend::Fading, Some(BargeInConfig::default()));
+                    rig.app = rig.app.with_speech_lifecycle_recorder(64);
+                    speak(&mut rig.app, 0, &json!({"duration_ms": 8_000}));
+                    vad_edge(&mut rig.app, &start_edge(1_000), 1_000);
+                    rig.app.note_speech_feed_heartbeat(1_400);
+                    assert!(rig.app.service_barge_in(1_400).is_some());
+                    rig.app.tick(1_410);
+                    assert_floor_matches_scheduler(&rig.app, 1_410);
+                    assert_eq!(
+                        rig.app.speech_floor_own(),
+                        Some(aivtuber_domain::OwnSpeech::Idle)
+                    );
+                    assert!(matches!(
+                        last_phase(&rig.app),
+                        Some(aivtuber_domain::SpeechPhase::Cancelled {
+                            reason: aivtuber_domain::SpeechCancelReason::BargeIn,
+                            reached: aivtuber_domain::SpeechReached::Started,
+                            spoken_ms: Some(_),
+                        })
+                    ));
+                    // Acted on once: the idle floor gives the executor nothing to stop.
+                    assert!(rig.app.service_barge_in(1_420).is_none());
+                }
+
+                #[test]
+                fn operator_stop_cancels_the_unit_and_releases_the_floor() {
+                    let mut rig = rig(Backend::Fading, Some(BargeInConfig::default()));
+                    rig.app = rig.app.with_speech_lifecycle_recorder(64);
+                    speak(&mut rig.app, 0, &json!({"duration_ms": 8_000}));
+                    rig.app.tick(500);
+                    assert_floor_matches_scheduler(&rig.app, 500);
+                    assert_eq!(
+                        rig.app.speech_floor_own(),
+                        Some(aivtuber_domain::OwnSpeech::Speaking)
+                    );
+                    rig.app
+                        .handle_control(&stop_command(), 600)
+                        .expect("authenticated emergency stop");
+                    rig.app.tick(610);
+                    assert_floor_matches_scheduler(&rig.app, 610);
+                    assert_eq!(
+                        rig.app.speech_floor_own(),
+                        Some(aivtuber_domain::OwnSpeech::Idle)
+                    );
+                    assert!(matches!(
+                        last_phase(&rig.app),
+                        Some(aivtuber_domain::SpeechPhase::Cancelled {
+                            reason: aivtuber_domain::SpeechCancelReason::OperatorStop,
+                            reached: aivtuber_domain::SpeechReached::Started,
+                            ..
+                        })
+                    ));
+                }
+
+                #[test]
+                fn a_non_final_phrase_finishing_releases_audible_floor_but_is_not_the_end() {
+                    use aivtuber_scheduler::PhraseLink;
+                    let mut app = floor_app(
+                        Some(FloorConfig::default()),
+                        SpeechConversationConfig::default(),
+                        false,
+                    )
+                    .with_speech_lifecycle_recorder(64);
+                    let plan = PlannedPerformance {
+                        event_id: "evt-phrased".to_owned(),
+                        asset_id: "asset.phrased".to_owned(),
+                        priority: Priority::Conversation,
+                        interruptible: true,
+                        interrupt_points_ms: Vec::new(),
+                        start_at_ms: 0,
+                        duration_ms: 1_000,
+                        generation: 0,
+                        exclusive: false,
+                        channels: BTreeSet::from([BlendChannel::Audio, BlendChannel::Face]),
+                    };
+                    app.performer
+                        .scheduler_mut()
+                        .schedule_phrase_at(
+                            0,
+                            plan,
+                            PhraseLink {
+                                response_id: 1,
+                                seq: 0,
+                                final_phrase: false,
+                            },
+                        )
+                        .expect("phrase 0");
+                    app.tick(500);
+                    assert_eq!(
+                        app.speech_floor_own(),
+                        Some(aivtuber_domain::OwnSpeech::Speaking)
+                    );
+                    app.tick(1_100);
+                    assert_floor_matches_scheduler(&app, 1_100);
+                    let tracker = app.speech_floor.as_ref().expect("floor").own_tracker();
+                    assert!(
+                        tracker.awaiting_next_phrase(),
+                        "more of the reply is expected"
+                    );
+                    let last = app.speech_lifecycle_records().pop().expect("record");
+                    assert_eq!(last.phase, aivtuber_domain::SpeechPhase::Finished);
+                    assert!(!last.speech.final_phrase);
+                    // Pre-#222 behaviour kept: between two phrases nothing is
+                    // audible, so the floor is free; the barge-in executor
+                    // still treats the gap as speaking through the phrase
+                    // pipeline's own state (a cut-short reply has no final
+                    // phrase to wait for).
+                    ingest_final(&mut app, "mic-local", 1, "こんにちは", 1_000, 1_100);
+                    assert_eq!(app.route_spoken_finals(1_100, 0).len(), 1);
+                }
+
+                /// Two runs of the same logical-time scenario record the same
+                /// facts in the same order, with a digest and no text.
+                #[test]
+                fn recorded_lifecycle_is_deterministic_and_carries_no_text() {
+                    fn run() -> Vec<aivtuber_domain::SpeechLifecycleEvent> {
+                        let mut rig = rig(Backend::Fading, Some(BargeInConfig::default()));
+                        rig.app = rig.app.with_speech_lifecycle_recorder(64);
+                        speak(&mut rig.app, 0, &json!({"duration_ms": 2_000}));
+                        rig.app.tick(1_000);
+                        rig.app.tick(2_100);
+                        rig.app.speech_lifecycle_records()
+                    }
+                    let first = run();
+                    assert_eq!(first, run());
+                    let phases: Vec<_> = first.iter().map(|r| r.phase).collect();
+                    assert_eq!(phases.last(), Some(&aivtuber_domain::SpeechPhase::Finished));
+                    assert!(first.windows(2).all(|w| w[0].seq < w[1].seq));
+                    let json = serde_json::to_string(&first).expect("json");
+                    assert!(!json.contains("\"text\""), "{json}");
                 }
 
                 /// A feed that never reported liveness cannot stop output: the

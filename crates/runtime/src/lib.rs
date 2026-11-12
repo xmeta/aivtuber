@@ -19,6 +19,8 @@ mod scene_context;
 pub use scene_context::*;
 mod speech_observation;
 pub use speech_observation::*;
+mod speech_lifecycle_replay;
+pub use speech_lifecycle_replay::*;
 mod speech_replay;
 pub use speech_replay::*;
 mod speech_transcript;

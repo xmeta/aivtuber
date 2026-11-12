@@ -1,0 +1,272 @@
+{
+  "schema_version": "0.1.0",
+  "name": "cancelled before commit (gate refused after synthesis) and after commit but before start (operator stop) never hold the floor and carry no spoken_ms; stale and muted units end Cancelled, never Finished",
+  "steps": [
+    {
+      "events": [
+        {
+          "schema_version": "0.1.0",
+          "seq": 1,
+          "at_ms": 0,
+          "basis": "logical_timeline",
+          "speech": {
+            "event_id": "c1",
+            "phrase": 0,
+            "final_phrase": true,
+            "asset_id": "gen-asset-1",
+            "speech_text_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+            "projection": "rules:1|lexicon:starter@1+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "phase": {
+            "kind": "prepared"
+          }
+        },
+        {
+          "schema_version": "0.1.0",
+          "seq": 2,
+          "at_ms": 5,
+          "basis": "logical_timeline",
+          "speech": {
+            "event_id": "c1",
+            "phrase": 0,
+            "final_phrase": true,
+            "asset_id": "gen-asset-1",
+            "speech_text_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+            "projection": "rules:1|lexicon:starter@1+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "phase": {
+            "kind": "cancelled",
+            "reason": "gate_rejected",
+            "reached": "before_commit"
+          }
+        }
+      ],
+      "expect_own": "idle"
+    },
+    {
+      "events": [
+        {
+          "schema_version": "0.1.0",
+          "seq": 3,
+          "at_ms": 10,
+          "basis": "logical_timeline",
+          "speech": {
+            "event_id": "c2",
+            "phrase": 0,
+            "final_phrase": true,
+            "asset_id": "gen-asset-1",
+            "speech_text_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+            "projection": "rules:1|lexicon:starter@1+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "phase": {
+            "kind": "prepared"
+          }
+        },
+        {
+          "schema_version": "0.1.0",
+          "seq": 4,
+          "at_ms": 10,
+          "basis": "logical_timeline",
+          "speech": {
+            "event_id": "c2",
+            "phrase": 0,
+            "final_phrase": true,
+            "asset_id": "gen-asset-1",
+            "generation": 3,
+            "speech_text_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+            "projection": "rules:1|lexicon:starter@1+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "phase": {
+            "kind": "committed"
+          }
+        },
+        {
+          "schema_version": "0.1.0",
+          "seq": 5,
+          "at_ms": 20,
+          "basis": "logical_timeline",
+          "speech": {
+            "event_id": "c2",
+            "phrase": 0,
+            "final_phrase": true,
+            "asset_id": "gen-asset-1",
+            "generation": 3,
+            "speech_text_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+            "projection": "rules:1|lexicon:starter@1+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "phase": {
+            "kind": "cancelled",
+            "reason": "operator_stop",
+            "reached": "committed"
+          }
+        }
+      ],
+      "expect_own": "idle"
+    },
+    {
+      "events": [
+        {
+          "schema_version": "0.1.0",
+          "seq": 6,
+          "at_ms": 30,
+          "basis": "logical_timeline",
+          "speech": {
+            "event_id": "c3",
+            "phrase": 0,
+            "final_phrase": true,
+            "asset_id": "gen-asset-1",
+            "speech_text_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+            "projection": "rules:1|lexicon:starter@1+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "phase": {
+            "kind": "prepared"
+          }
+        },
+        {
+          "schema_version": "0.1.0",
+          "seq": 7,
+          "at_ms": 30,
+          "basis": "logical_timeline",
+          "speech": {
+            "event_id": "c3",
+            "phrase": 0,
+            "final_phrase": true,
+            "asset_id": "gen-asset-1",
+            "generation": 4,
+            "speech_text_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+            "projection": "rules:1|lexicon:starter@1+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "phase": {
+            "kind": "committed"
+          }
+        },
+        {
+          "schema_version": "0.1.0",
+          "seq": 8,
+          "at_ms": 30,
+          "basis": "logical_timeline",
+          "speech": {
+            "event_id": "c3",
+            "phrase": 0,
+            "final_phrase": true,
+            "asset_id": "gen-asset-1",
+            "generation": 4,
+            "speech_text_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+            "projection": "rules:1|lexicon:starter@1+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "phase": {
+            "kind": "started"
+          }
+        }
+      ],
+      "expect_own": "speaking"
+    },
+    {
+      "events": [
+        {
+          "schema_version": "0.1.0",
+          "seq": 9,
+          "at_ms": 40,
+          "basis": "output_accepted",
+          "speech": {
+            "event_id": "c3",
+            "phrase": 0,
+            "final_phrase": true,
+            "asset_id": "gen-asset-1",
+            "generation": 4,
+            "speech_text_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+            "projection": "rules:1|lexicon:starter@1+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "phase": {
+            "kind": "cancelled",
+            "reason": "stale_or_late",
+            "reached": "started",
+            "spoken_ms": 10
+          }
+        }
+      ],
+      "expect_own": "idle"
+    },
+    {
+      "events": [
+        {
+          "schema_version": "0.1.0",
+          "seq": 10,
+          "at_ms": 50,
+          "basis": "logical_timeline",
+          "speech": {
+            "event_id": "c4",
+            "phrase": 0,
+            "final_phrase": true,
+            "asset_id": "gen-asset-1",
+            "speech_text_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+            "projection": "rules:1|lexicon:starter@1+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "phase": {
+            "kind": "prepared"
+          }
+        },
+        {
+          "schema_version": "0.1.0",
+          "seq": 11,
+          "at_ms": 50,
+          "basis": "logical_timeline",
+          "speech": {
+            "event_id": "c4",
+            "phrase": 0,
+            "final_phrase": true,
+            "asset_id": "gen-asset-1",
+            "generation": 5,
+            "speech_text_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+            "projection": "rules:1|lexicon:starter@1+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "phase": {
+            "kind": "committed"
+          }
+        },
+        {
+          "schema_version": "0.1.0",
+          "seq": 12,
+          "at_ms": 50,
+          "basis": "logical_timeline",
+          "speech": {
+            "event_id": "c4",
+            "phrase": 0,
+            "final_phrase": true,
+            "asset_id": "gen-asset-1",
+            "generation": 5,
+            "speech_text_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+            "projection": "rules:1|lexicon:starter@1+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "phase": {
+            "kind": "started"
+          }
+        },
+        {
+          "schema_version": "0.1.0",
+          "seq": 13,
+          "at_ms": 60,
+          "basis": "logical_timeline",
+          "speech": {
+            "event_id": "c4",
+            "phrase": 0,
+            "final_phrase": true,
+            "asset_id": "gen-asset-1",
+            "generation": 5,
+            "speech_text_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+            "projection": "rules:1|lexicon:starter@1+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "phase": {
+            "kind": "cancelled",
+            "reason": "muted",
+            "reached": "started",
+            "spoken_ms": 10
+          }
+        }
+      ],
+      "expect_own": "idle"
+    }
+  ],
+  "expect_recorded": 13,
+  "expect_records_digest": "607b9148d613465960b5d2087711258fd5ed6129d831b1451a1be22efdb885f1"
+}
