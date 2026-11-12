@@ -25,6 +25,7 @@ history.replaceState(null, "", location.pathname);
 let state: PanelState | null = null;
 let chat: ChatEntry[] = [];
 let connection = "接続中…";
+let pollTimer: ReturnType<typeof setInterval> | undefined;
 
 const $ = <T extends HTMLElement>(id: string): T => {
   const el = document.getElementById(id);
@@ -115,6 +116,10 @@ async function poll(): Promise<void> {
   try {
     const { status, json } = await api("/api/state");
     if (status === 401) {
+      // The secret is per launch, so a 401 never heals: this page belongs to an
+      // earlier run. Stop polling instead of filling the app log with refusals.
+      clearInterval(pollTimer);
+      setBusy(true);
       connection = "トークンが無効です。aivtuber-setup start が表示したURLを開き直してください";
     } else if (status === 200) {
       const next = parseState(json);
@@ -197,5 +202,5 @@ if (token === null) {
 } else {
   render();
   void poll();
-  setInterval(() => void poll(), POLL_MS);
+  pollTimer = setInterval(() => void poll(), POLL_MS);
 }
