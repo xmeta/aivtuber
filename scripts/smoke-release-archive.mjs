@@ -6,17 +6,15 @@
 // no Bun, no model, no network). It checks:
 //   * the expected files are present and no model weights or voice files are;
 //   * THIRD-PARTY-NOTICES.txt holds every vendored engine licence text in full
-//     (packaging/third-party/, issue #349), on Windows also the Visual C++
-//     runtime notice, and never the missing-licence stub;
+//     (packaging/third-party/, issue #349) and never the missing-licence stub;
 //   * on Windows, no shipped .exe or .dll imports the Visual C++ runtime or the
 //     universal CRT: a clean Windows has none of them, so the Rust programs are
 //     built with the static CRT and the bundled engine DLLs are the "MT" build
 //     (a CI runner has the runtime installed, so imports are checked, not
 //     whether the program runs);
-//   * on Windows, runtime/msvc holds the Visual C++ DLLs that the pinned
-//     llama.cpp build imports and does not ship (the list is in
-//     packaging/local-profile-pins.json); they are excluded from the scan above
-//     because they sit outside the top directory;
+//   * no Visual C++ redistributable DLL (vcruntime140*, msvcp140*, concrt140*,
+//     vcomp140*, mfc140*) is anywhere in the archive: this project does not
+//     redistribute them (#349, docs/supply-chain.adoc section 11);
 //   * every program starts and answers its probe (usage / --help), which also
 //     shows the loader found the bundled engine libraries beside it;
 //   * the STT worker and the TTS sidecar verify the bundled engine libraries
@@ -113,7 +111,7 @@ try {
   // A clean Windows lacks VCRUNTIME140.dll (issue #294: exit 0xC0000135). The CI
   // runner has it, so a missing runtime cannot show up as a failed start; read
   // the import tables instead. If a pinned engine library ever needs the runtime,
-  // this fails and the runtime DLLs must be shipped app-local beside it
+  // this fails; fix the pin or the build, do not ship the runtime DLLs
   // (docs/supply-chain.adoc section 11).
   if (win) {
     check("no shipped .exe or .dll imports the Visual C++ runtime or universal CRT", () => {
@@ -130,27 +128,28 @@ try {
     });
   }
 
-  // The llama.cpp zip that setup fetches imports these and does not ship them
-  // (found by scanning every .exe/.dll of both pinned Windows zips with
-  // pe-imports.mjs); the archive carries them app-local in runtime/msvc and
-  // setup copies them beside llama-server. The list is the pins file's.
-  if (win) {
-    check("runtime/msvc holds the Visual C++ DLLs the pinned llama.cpp build needs", () => {
-      const pins = JSON.parse(readFileSync(join(scriptDir, "..", "packaging", "local-profile-pins.json"), "utf8"));
-      const needed = pins.llama.windows_runtime_dlls;
-      assert(Array.isArray(needed) && needed.length > 0, "pins file lists no windows_runtime_dlls");
-      const dir = join(root, "runtime", "msvc");
-      for (const name of [...needed, "REDIST-VERSION.txt"]) {
-        assert(existsSync(join(dir, name)), `runtime/msvc/${name} missing`);
+  // The pinned llama.cpp build needs the Visual C++ runtime, which setup checks
+  // for on the machine; it must not travel in the archive (#349).
+  check("no Visual C++ redistributable DLL is in the archive", () => {
+    const redist = /^(vcruntime|msvcp|concrt|vcomp|mfc)\d*(_\d+)?\.dll$/i;
+    const found = [];
+    let files = 0;
+    const walk = (dir) => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const p = join(dir, entry.name);
+        if (entry.isDirectory()) walk(p);
+        else {
+          files += 1;
+          if (redist.test(entry.name)) found.push(p.slice(root.length + 1));
+        }
       }
-      for (const name of needed) {
-        assert(statSync(join(dir, name)).size > 10_000, `runtime/msvc/${name} is implausibly small`);
-        peImports(join(dir, name)); // throws unless it is a real x64 PE file
-      }
-      assert(/redist \d+\.\d+\.\d+/.test(readFileSync(join(dir, "REDIST-VERSION.txt"), "utf8")), "REDIST-VERSION.txt records no version");
-      return needed.join(", ");
-    });
-  }
+    };
+    walk(root);
+    assert(files > programs.length, `walked only ${files} files`);
+    assert(found.length === 0, `Visual C++ redistributable DLLs in the archive: ${found.join(", ")}`);
+    assert(!existsSync(join(root, "runtime", "msvc")), "runtime/msvc exists");
+    return `${files} files checked`;
+  });
 
   check("licence and notice files are present", () => {
     for (const name of ["README.txt", "THIRD-PARTY-LICENSES-RUST.html", "THIRD-PARTY-NOTICES.txt"]) {
@@ -174,16 +173,6 @@ try {
     assert(!notices.includes(MISSING_LICENCE_STUB), `THIRD-PARTY-NOTICES.txt contains the missing-licence stub "${MISSING_LICENCE_STUB}"`);
     return `${VENDORED_NOTICES.length} texts`;
   });
-
-  if (win) {
-    check("third-party notices carry the Visual C++ runtime notice and redistributable version", () => {
-      const notices = readFileSync(join(root, "THIRD-PARTY-NOTICES.txt"), "utf8").replace(/\r\n/g, "\n");
-      const notice = readFileSync(join(scriptDir, "..", "packaging", "MSVC-RUNTIME-NOTICE.txt"), "utf8").replace(/\r\n/g, "\n").trimEnd();
-      assert(notices.includes(notice), "THIRD-PARTY-NOTICES.txt lacks packaging/MSVC-RUNTIME-NOTICE.txt");
-      const redist = readFileSync(join(root, "runtime", "msvc", "REDIST-VERSION.txt"), "utf8").replace(/\r\n/g, "\n").trimEnd();
-      assert(notices.includes(redist), "THIRD-PARTY-NOTICES.txt lacks runtime/msvc/REDIST-VERSION.txt");
-    });
-  }
 
   check("avatar page files are present", () => {
     const page = join(root, "renderer", "local-avatar", "dist");

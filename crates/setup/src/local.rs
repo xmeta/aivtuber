@@ -381,43 +381,14 @@ pub fn run<W: Write>(
         }
     }
 
-    // The Windows llama.cpp zip imports the Visual C++ runtime and does not
-    // ship it; the release archive does (runtime/msvc). Runs on every pass, so a
-    // folder set up by an earlier version is repaired by running this again.
-    if !skip("llama") && opts.platform == "win32-x64" {
-        let runtime = vcruntime::runtime_dir(bin);
-        let names = &manifest.llama.windows_runtime_dlls;
-        if opts.dry_run {
-            ctx.say(format!(
-                "  runtime   copy the Visual C++ runtime ({}) from {} beside {}",
-                names.join(", "),
-                runtime.display(),
-                exe("llama-server")
-            ));
-        } else if llama_server.is_file() {
-            let dest = llama_server.parent().unwrap_or(&llama_bin);
-            let r = vcruntime::place(&runtime, dest, names)?;
-            if r.no_runtime_dir {
-                ctx.say(format!(
-                    "  WARNING   {} not found: this is not a release archive (a source checkout?). llama-server needs the Visual C++ runtime installed on this machine",
-                    runtime.display()
-                ));
-            } else {
-                for f in &r.kept_different {
-                    ctx.say(format!(
-                        "  WARNING   {f} beside llama-server differs from the bundled one; kept as is"
-                    ));
-                }
-                if !r.placed.is_empty() {
-                    ctx.say(format!(
-                        "  ok        Visual C++ runtime placed beside llama-server ({})",
-                        r.placed.join(", ")
-                    ));
-                } else {
-                    ctx.say("  have      Visual C++ runtime beside llama-server");
-                }
-            }
-        }
+    // The Windows llama.cpp zip imports the Visual C++ runtime, which this
+    // project does not bundle (#349): `aivtuber-setup local` checks for it before
+    // any download, so a dry run only says so.
+    if !skip("llama") && opts.platform == "win32-x64" && opts.dry_run {
+        ctx.say(format!(
+            "  requires  the Microsoft Visual C++ 2015-2022 Redistributable (x64), not bundled: {}",
+            vcruntime::DOWNLOAD_PAGE
+        ));
     }
 
     // GGUF (and the vision projector of a multimodal profile)

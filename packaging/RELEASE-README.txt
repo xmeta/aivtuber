@@ -56,6 +56,9 @@ In short, from this directory (after the checksum check above):
                                       browser: type to the performer, stop, mute) and
                                       the avatar URL. Both carry a per-launch secret.
 Install FFmpeg (ffplay and ffmpeg on PATH) first; setup tells you if it is missing.
+On Windows also install the Microsoft Visual C++ 2015-2022 Redistributable (x64); it is
+not bundled, and setup stops and names it if it is missing:
+  https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist
 Replace the sample avatar (renderer/local-avatar/dist/model.vrm) with a model you
 have the right to broadcast before you stream.
 Everything listens on loopback (127.0.0.1) only.
