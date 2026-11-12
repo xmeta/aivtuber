@@ -15,6 +15,7 @@ use aivtuber_setup::local::{self, LocalOptions};
 use aivtuber_setup::manifest::Manifest;
 use aivtuber_setup::prereq;
 use aivtuber_setup::start::{self, StartOptions};
+use aivtuber_setup::vcruntime;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -125,6 +126,17 @@ fn run_local(args: LocalArgs) -> Result<(), String> {
         platform: local::host_platform()?,
         download: DownloadConfig::default(),
     };
+    // The pinned llama.cpp build imports the Visual C++ runtime, which is not
+    // bundled (#349): fail before any download, not after 2 GB.
+    if !opts.dry_run && !opts.skip.contains("llama") && opts.llm_endpoint.is_none() {
+        let manifest = Manifest::embedded();
+        vcruntime::require(
+            &opts.platform,
+            &manifest.llama.windows_runtime_dlls,
+            &vcruntime::search_dirs(None),
+            &|p| p.is_file(),
+        )?;
+    }
     let probe = prereq::check();
     local::run(&opts, &Manifest::embedded(), &probe, &mut std::io::stdout()).map(|_| ())
 }

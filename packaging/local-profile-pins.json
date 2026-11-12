@@ -5,7 +5,7 @@
     "tag": "b12224",
     "licence": "MIT",
     "windows_runtime_dlls": ["vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll"],
-    "windows_runtime_note": "Visual C++ runtime DLLs imported by every .exe/.dll of both Windows llama.cpp zips (scanned with scripts/pe-imports.mjs) and not shipped in them. They are bundled app-local in the release archive under runtime/msvc and copied beside llama-server by aivtuber-setup. libomp.dll ships in the zip itself.",
+    "windows_runtime_note": "Visual C++ runtime DLLs imported by every .exe/.dll of both Windows llama.cpp zips (scanned with scripts/pe-imports.mjs) and not shipped in them. This project does not bundle them (#349): aivtuber-setup checks that the machine has them and points to Microsoft's download page. libomp.dll ships in the zip itself.",
     "assets": {
       "win32-x64-vulkan": {
         "file": "llama-b12224-bin-win-vulkan-x64.zip",

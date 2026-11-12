@@ -203,6 +203,16 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
         println!("starting the app ({CHAT_HINT}; Ctrl+C stops it)");
         return run_app(&app, &env);
     };
+    // The pinned llama.cpp build imports the Visual C++ runtime, which is not
+    // bundled (#349): say so instead of a bare 0xC0000135 from llama-server.
+    crate::vcruntime::require(
+        if cfg!(windows) { "win32-x64" } else { "" },
+        &crate::manifest::Manifest::embedded()
+            .llama
+            .windows_runtime_dlls,
+        &crate::vcruntime::search_dirs(llama.program.parent()),
+        &|p| p.is_file(),
+    )?;
     if port_in_use(llama.port) {
         return Err(format!(
             "port {} is already in use (a /health check there could be answered by someone else's server). Stop that program, or change AIVTUBER_SETUP_LLAMA_PORT and the port in AIVTUBER_OPENAI_ENDPOINT in {}",
