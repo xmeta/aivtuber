@@ -134,7 +134,8 @@
               "memory.admin",
               "tool.grant",
               "perception.control",
-              "model.select"
+              "model.select",
+              "voice.configure"
             ]
           }
         }

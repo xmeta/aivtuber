@@ -39,6 +39,76 @@
     <p id="model-state" role="status"></p>
   </section>
 
+  <section id="voice-section" aria-labelledby="h-voice" hidden>
+    <h2 id="h-voice">声</h2>
+    <p id="voice-summary" role="status"></p>
+    <p id="voice-error" class="error" role="alert"></p>
+
+    <h3>APIキー(Aivis Cloud)</h3>
+    <p class="hint">キーはこのPCのファイルにだけ保存され、画面にもログにも表示されません。環境変数 AIVIS_API があればそちらが優先されます。</p>
+    <div class="buttons wrap">
+      <input id="voice-key" type="password" autocomplete="off" spellcheck="false" maxlength="256" placeholder="APIキーを貼り付け" aria-label="Aivis Cloud の APIキー">
+      <button id="voice-key-save" type="button">保存して確認</button>
+      <button id="voice-key-check" type="button">確認</button>
+      <button id="voice-key-remove" type="button">削除</button>
+    </div>
+    <p id="voice-key-state" role="status"></p>
+
+    <h3>モデルを探す</h3>
+    <div class="buttons wrap">
+      <input id="voice-keyword" type="search" maxlength="64" placeholder="キーワード(空欄で人気順)" aria-label="モデルの検索語">
+      <select id="voice-sort" aria-label="並び順">
+        <option value="download">ダウンロード順</option>
+        <option value="like">いいね順</option>
+        <option value="recent">新着順</option>
+      </select>
+      <button id="voice-search" type="button">検索</button>
+    </div>
+    <p id="voice-search-state" role="status"></p>
+    <ul id="voice-results" class="results"></ul>
+    <div class="buttons">
+      <button id="voice-prev" type="button" hidden>前のページ</button>
+      <button id="voice-next" type="button" hidden>次のページ</button>
+    </div>
+
+    <div id="voice-choice" hidden>
+      <h3 id="voice-choice-name"></h3>
+      <p id="voice-choice-license" class="hint"></p>
+      <p id="voice-choice-description" class="desc"></p>
+      <div class="grid">
+        <label for="voice-speaker">話者</label>
+        <select id="voice-speaker"></select>
+        <label for="voice-style">スタイル</label>
+        <select id="voice-style"></select>
+        <label for="voice-credit">クレジット表記</label>
+        <input id="voice-credit" type="text" maxlength="200" autocomplete="off">
+      </div>
+      <p class="hint">モデルのライセンスが求める表記を確認し、必要なら直してください。配信の概要欄などに表示してください。</p>
+      <label class="check"><input id="voice-egress" type="checkbox"> 返信のテキストがインターネット上の Aivis Cloud に送信されることを理解しました</label>
+      <div class="buttons wrap">
+        <button id="voice-enable" type="button">この声を使う</button>
+      </div>
+    </div>
+
+    <h3>声の調整(すぐ反映されます)</h3>
+    <div class="grid">
+      <label for="tune-speaking_rate">話す速さ</label>
+      <span class="slider"><input id="tune-speaking_rate" type="range" min="0.5" max="2" step="0.05"><output id="tune-speaking_rate-out"></output></span>
+      <label for="tune-pitch">ピッチ</label>
+      <span class="slider"><input id="tune-pitch" type="range" min="-1" max="1" step="0.05"><output id="tune-pitch-out"></output></span>
+      <label for="tune-volume">音量</label>
+      <span class="slider"><input id="tune-volume" type="range" min="0" max="2" step="0.05"><output id="tune-volume-out"></output></span>
+      <label for="tune-emotional_intensity">感情の強さ</label>
+      <span class="slider"><input id="tune-emotional_intensity" type="range" min="0" max="2" step="0.05"><output id="tune-emotional_intensity-out"></output></span>
+    </div>
+
+    <div class="buttons wrap">
+      <button id="voice-preview" type="button">試し読み</button>
+      <button id="voice-local" type="button">ローカルの声に戻す</button>
+    </div>
+    <p id="voice-result" role="status"></p>
+  </section>
+
   <section aria-labelledby="h-chat">
     <h2 id="h-chat">話しかける</h2>
     <div id="chat-log" class="log" aria-live="polite"></div>

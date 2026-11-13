@@ -40,6 +40,7 @@ mod task_plane;
 mod thinking_warmup;
 mod tool_execution;
 mod tts_sidecar;
+mod voice_control;
 mod voicevox_bridge;
 
 pub use aivis_bridge::*;
@@ -106,6 +107,11 @@ pub use thinking_warmup::{
 };
 pub use tool_execution::*;
 pub use tts_sidecar::*;
+pub use voice_control::{
+    AIVIS_KEY_FILE_VAR, PreviewSlot, PreviewThinking, VOICE_SETTINGS_VAR, VoiceController,
+    VoiceEnvironment, VoiceKeyStatus, VoicePaths, VoiceStatus, is_valid_key, read_key_file,
+    read_voice_settings,
+};
 pub use voicevox_bridge::*;
 
 use aivtuber_adaptation::{
@@ -1144,6 +1150,9 @@ where
     /// Live switching of the local Thinking model (#357); `None` (default)
     /// composes nothing and the model is whatever the environment named.
     model_switcher: Option<model_switch::ModelSwitcher>,
+    /// Live voice settings (#360); `None` (default) composes nothing and the
+    /// voice is whatever the environment named.
+    voice: Option<voice_control::VoiceController>,
     /// Scene context (#88 S1); `None` (default) composes nothing, and then no
     /// request carries a scene.
     scene: Option<scene_context::SceneContextService>,
@@ -1215,6 +1224,7 @@ where
             speech_observations: None,
             perception: None,
             model_switcher: None,
+            voice: None,
             scene: None,
             speech_transcripts: None,
             speech_conversation: None,
@@ -1712,6 +1722,100 @@ where
     pub fn service_model_switch(&mut self) {
         if let Some(switcher) = self.model_switcher.as_mut() {
             switcher.poll();
+        }
+    }
+
+    /// Opt in to changing the voice at runtime (#360). Only the authenticated
+    /// `voice.configure` capability can use it (`configure_voice`).
+    pub fn with_voice_controller(mut self, controller: voice_control::VoiceController) -> Self {
+        self.voice = Some(controller);
+        self
+    }
+
+    /// Whether voice settings are composed (the operator endpoint then holds
+    /// `voice.configure`).
+    pub fn voice_configured(&self) -> bool {
+        self.voice.is_some()
+    }
+
+    /// The Aivis Cloud origin the model search is proxied to; `None` when the
+    /// voice settings are not composed.
+    pub fn voice_search_endpoint(&self) -> Option<String> {
+        self.voice.as_ref().map(|v| v.endpoint().to_owned())
+    }
+
+    /// The voice state for the operator surfaces; `None` when not composed.
+    pub fn voice_status(&self) -> Option<voice_control::VoiceStatus> {
+        self.voice.as_ref().map(|v| v.status())
+    }
+
+    /// Apply one voice operator request. `authority` must be the authenticated
+    /// local ingress capability. `action` is one of `voice.apply` (the
+    /// argument is a settings patch), `voice.key.set` (the argument is the
+    /// key: never echoed or audited), `voice.key.remove`, `voice.key.check`
+    /// and `voice.preview`. Returns a short outcome for the operator and the
+    /// audit record, which never holds the key. Nothing here blocks: the key
+    /// check runs on its own thread and the preview line is submitted by
+    /// [`Self::service_voice`].
+    pub fn configure_voice(
+        &mut self,
+        authority: &AuthenticatedControl,
+        action: &str,
+        argument: Option<&str>,
+    ) -> Result<String, String> {
+        if !authority.has_capability(aivtuber_domain::Capability::VoiceConfigure) {
+            return Err("voice settings are not authorized".to_owned());
+        }
+        let Some(voice) = self.voice.as_mut() else {
+            return Err("voice settings are not configured".to_owned());
+        };
+        match action {
+            "voice.apply" => voice.apply(argument.unwrap_or("")),
+            "voice.key.set" => voice.set_key(argument.unwrap_or("")),
+            "voice.key.remove" => voice.remove_key(),
+            "voice.key.check" => voice.check_key(),
+            "voice.preview" => voice.request_preview(),
+            _ => Err("not a voice action".to_owned()),
+        }
+    }
+
+    /// Collect a finished key check and submit a waiting preview line (#360).
+    /// The preview is an ordinary panel chat line whose reply the Thinking
+    /// override replaces with the fixed sentence, so it takes the normal
+    /// generation, TTS, scheduling and audit path (mute and stop apply). Never
+    /// blocks.
+    pub fn service_voice(&mut self, now_ms: u64, sequence_seed: &mut u64) {
+        let Some(voice) = self.voice.as_mut() else {
+            return;
+        };
+        voice.poll();
+        let Some((event_id, sequence)) = voice.take_pending_preview() else {
+            return;
+        };
+        let raw = panel::chat_envelope(&event_id, sequence, aivtuber_domain::VOICE_PREVIEW_TEXT);
+        *sequence_seed = sequence_seed.saturating_add(1);
+        let admitted = match self.process_content_bytes(&raw, now_ms, *sequence_seed) {
+            Ok(outcome) => {
+                eprintln!(
+                    "voice: preview {event_id} admission={:?}",
+                    outcome.admission
+                );
+                outcome.admission == aivtuber_runtime::ContentAdmitDecision::Queued
+            }
+            Err(error) => {
+                eprintln!("voice: preview {event_id} rejected: {error}");
+                false
+            }
+        };
+        if !admitted && let Some(voice) = self.voice.as_mut() {
+            voice.cancel_preview();
+        }
+    }
+
+    /// Stop the Aivis bridge (and with it all egress) when the app ends.
+    pub fn shutdown_voice(&mut self) {
+        if let Some(voice) = self.voice.as_mut() {
+            voice.shutdown();
         }
     }
 
@@ -4878,6 +4982,7 @@ mod tests {
     mod speech_lifecycle_tests;
     mod streaming_thinking_tests;
     mod thinking_warmup_tests;
+    mod voice_control_tests;
     mod voicevox_tts_tests;
     use aivtuber_scheduler::SchedulerConfig;
     use aivtuber_telemetry::SecretRedactor;
@@ -10077,6 +10182,7 @@ mod tests {
                 Arc::new(ingress),
                 &secret,
                 Some("http://127.0.0.1:8765/?token=avatar".to_owned()),
+                None,
             )
             .expect("panel");
             let url = service.launch_url();

@@ -20,6 +20,7 @@ mod speech_lifecycle;
 mod speech_transcript;
 mod task;
 mod thinking_model;
+mod voice_settings;
 
 pub use avatar::Viseme;
 pub use context::{
@@ -83,6 +84,7 @@ pub use task::{
     TaskTransitionReason, TaskVerificationOutcome, VerificationResult,
 };
 pub use thinking_model::*;
+pub use voice_settings::*;
 
 /// Runtime time-scale layers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

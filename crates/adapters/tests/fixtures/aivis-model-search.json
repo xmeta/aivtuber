@@ -1,0 +1,253 @@
+{
+ "total": 77,
+ "aivm_models": [
+  {
+   "aivm_model_uuid": "a59cb814-0083-4369-8542-f51a29e72af7",
+   "name": "まお",
+   "description": "いたずらっ子な小悪魔ボイス。卯畑まお（©Oz Chat/Trippy）（CV: ねゆたろ / https://x.com/___neyu_zzz）\nクレジットして頂ける際は「AivisSpeech: まお」をご利用ください。",
+   "category": "OriginalCharacter",
+   "voice_timbre": "YouthfulFemale",
+   "total_download_count": 77589,
+   "like_count": 74,
+   "user": {
+    "handle": "ozchat",
+    "name": "オズチャット -Oz Chat-",
+    "icon_url": "https://assets.aivis-project.com/account-icons/e1911bc0-b377-4298-8efa-a0c422e03ce6.jpg"
+   },
+   "model_files": [
+    {
+     "aivm_model_uuid": "a59cb814-0083-4369-8542-f51a29e72af7",
+     "name": "まお",
+     "license_type": "ACML 1.0",
+     "model_type": "AIVM",
+     "version": "1.2.0"
+    }
+   ],
+   "speakers": [
+    {
+     "aivm_speaker_uuid": "e756b8e4-b606-4e15-99b1-3f9c6a1b2317",
+     "name": "まお",
+     "local_id": 0,
+     "supported_languages": [
+      "ja"
+     ],
+     "styles": [
+      {
+       "name": "ノーマル",
+       "local_id": 0,
+       "voice_samples": [
+        {
+         "audio_url": "https://assets.aivis-project.com/aivm-models/fd0d9420-7eee-40de-826d-7fe16b562e84/speakers/f6c7343c-a7fd-4d42-b0dc-38fe18c6ab7f/styles/7d39a003-1f4b-4154-800d-bdf8d1e0cd7d/voice-samples/0.m4a",
+         "transcript": "おはようございます！現在時刻は7時30分です。今日の東京の気温は18度で、天気は"
+        }
+       ]
+      },
+      {
+       "name": "ふつー",
+       "local_id": 1,
+       "voice_samples": [
+        {
+         "audio_url": "https://assets.aivis-project.com/aivm-models/fd0d9420-7eee-40de-826d-7fe16b562e84/speakers/f6c7343c-a7fd-4d42-b0dc-38fe18c6ab7f/styles/2c43b69d-3c14-4d2b-80ce-90e1fbbc7aab/voice-samples/0.m4a",
+         "transcript": "おはようございます！現在時刻は7時30分です。今日の東京の気温は18度で、天気は"
+        }
+       ]
+      },
+      {
+       "name": "あまあま",
+       "local_id": 2,
+       "voice_samples": [
+        {
+         "audio_url": "https://assets.aivis-project.com/aivm-models/fd0d9420-7eee-40de-826d-7fe16b562e84/speakers/f6c7343c-a7fd-4d42-b0dc-38fe18c6ab7f/styles/60f3317d-c421-423a-9cf0-cc433d649704/voice-samples/0.m4a",
+         "transcript": "おはようございます！現在時刻は7時30分です。今日の東京の気温は18度で、天気は"
+        }
+       ]
+      },
+      {
+       "name": "おちつき",
+       "local_id": 3,
+       "voice_samples": [
+        {
+         "audio_url": "https://assets.aivis-project.com/aivm-models/fd0d9420-7eee-40de-826d-7fe16b562e84/speakers/f6c7343c-a7fd-4d42-b0dc-38fe18c6ab7f/styles/0a60bcd6-36fa-4177-bcde-d52051704871/voice-samples/0.m4a",
+         "transcript": "おはようございます！現在時刻は7時30分です。今日の東京の気温は18度で、天気は"
+        }
+       ]
+      },
+      {
+       "name": "からかい",
+       "local_id": 4,
+       "voice_samples": [
+        {
+         "audio_url": "https://assets.aivis-project.com/aivm-models/fd0d9420-7eee-40de-826d-7fe16b562e84/speakers/f6c7343c-a7fd-4d42-b0dc-38fe18c6ab7f/styles/c7a48ed2-583b-469d-97b5-60566cbe97de/voice-samples/0.m4a",
+         "transcript": "おはようございます！現在時刻は7時30分です。今日の東京の気温は18度で、天気は"
+        }
+       ]
+      },
+      {
+       "name": "せつなめ",
+       "local_id": 5,
+       "voice_samples": [
+        {
+         "audio_url": "https://assets.aivis-project.com/aivm-models/fd0d9420-7eee-40de-826d-7fe16b562e84/speakers/f6c7343c-a7fd-4d42-b0dc-38fe18c6ab7f/styles/5119a2ba-3fb5-4736-8f5c-26915415334a/voice-samples/0.m4a",
+         "transcript": "おはようございます！現在時刻は7時30分です。今日の東京の気温は18度で、天気は"
+        }
+       ]
+      }
+     ]
+    }
+   ],
+   "access_key": null
+  },
+  {
+   "aivm_model_uuid": "098d4e66-2faf-4a00-889c-a1d2f05bde78",
+   "name": "Shinjou Tomoharu",
+   "description": "落ち着いた中年男性のモデルです。",
+   "category": "OriginalCharacter",
+   "voice_timbre": "MiddleAgedMale",
+   "total_download_count": 4130,
+   "like_count": 23,
+   "user": {
+    "handle": "n2PkZNR860ATafv",
+    "name": "名無しさん",
+    "icon_url": "https://assets.aivis-project.com/account-icons/default.png"
+   },
+   "model_files": [
+    {
+     "aivm_model_uuid": "098d4e66-2faf-4a00-889c-a1d2f05bde78",
+     "name": "Shinjou Tomoharu",
+     "license_type": "ACML-NC 1.0",
+     "model_type": "AIVM",
+     "version": "1.0.0"
+    }
+   ],
+   "speakers": [
+    {
+     "aivm_speaker_uuid": "85b2a5f7-ef71-4c4c-846d-71fe8d7b6fa9",
+     "name": "Shinjou Tomoharu",
+     "local_id": 0,
+     "supported_languages": [
+      "ja"
+     ],
+     "styles": [
+      {
+       "name": "ノーマル",
+       "local_id": 0,
+       "voice_samples": [
+        {
+         "audio_url": "https://assets.aivis-project.com/aivm-models/7bca001b-99d2-49be-87d1-1cd109322d4d/speakers/cc98d87b-a04a-4ae5-807d-2f44e1cdfd84/styles/8c96d410-fd0b-4cf6-bbdd-f0cc7e8f7ce7/voice-samples/0.wav",
+         "transcript": "アゼルバイジャンは、カスピ海に面した南コーカサス地方の国で、首都はバクーです。"
+        }
+       ]
+      }
+     ]
+    }
+   ],
+   "access_key": null
+  },
+  {
+   "aivm_model_uuid": "d1a7446f-230d-4077-afdf-923eddabe53c",
+   "name": "M2",
+   "description": "Style-Bert-VITS2に付属のデフォルト男性２モデル\nボイスサンプル：スタイルの強さ2.0\n\nCC BY-SA 4.0のため再配布",
+   "category": "FictionalPerson",
+   "voice_timbre": "YouthfulMale",
+   "total_download_count": 3981,
+   "like_count": 44,
+   "user": {
+    "handle": "gpt",
+    "name": "名無しさん",
+    "icon_url": "https://assets.aivis-project.com/account-icons/default.png"
+   },
+   "model_files": [
+    {
+     "aivm_model_uuid": "d1a7446f-230d-4077-afdf-923eddabe53c",
+     "name": "M2",
+     "license_type": "Custom",
+     "model_type": "AIVM",
+     "version": "1.0.0"
+    }
+   ],
+   "speakers": [
+    {
+     "aivm_speaker_uuid": "6c831a4b-a90c-4a88-9083-b473c25f69ec",
+     "name": "M2",
+     "local_id": 0,
+     "supported_languages": [
+      "ja"
+     ],
+     "styles": [
+      {
+       "name": "ノーマル",
+       "local_id": 0,
+       "voice_samples": [
+        {
+         "audio_url": "https://assets.aivis-project.com/aivm-models/d134e4b0-a0f7-4ac5-a538-021925ee23a0/speakers/2718ad2d-6060-4fc0-aab9-cd083565c9e4/styles/66a996b1-c8a4-42bc-8b00-c41c01caee1c/voice-samples/0.m4a",
+         "transcript": "おはようございます！現在時刻は7時30分です。今日の東京の気温は18度で、天気は"
+        }
+       ]
+      },
+      {
+       "name": "怒り",
+       "local_id": 1,
+       "voice_samples": [
+        {
+         "audio_url": "https://assets.aivis-project.com/aivm-models/d134e4b0-a0f7-4ac5-a538-021925ee23a0/speakers/2718ad2d-6060-4fc0-aab9-cd083565c9e4/styles/eb3df1a5-f78f-4fc6-ab39-8ee397758bc0/voice-samples/0.m4a",
+         "transcript": "おはようございます！現在時刻は7時30分です。今日の東京の気温は18度で、天気は"
+        }
+       ]
+      },
+      {
+       "name": "嫌悪",
+       "local_id": 2,
+       "voice_samples": [
+        {
+         "audio_url": "https://assets.aivis-project.com/aivm-models/d134e4b0-a0f7-4ac5-a538-021925ee23a0/speakers/2718ad2d-6060-4fc0-aab9-cd083565c9e4/styles/00c2a5b3-7cbc-4f85-9abd-5171e26a8746/voice-samples/0.m4a",
+         "transcript": "おはようございます！現在時刻は7時30分です。今日の東京の気温は18度で、天気は"
+        }
+       ]
+      },
+      {
+       "name": "恐れ",
+       "local_id": 3,
+       "voice_samples": [
+        {
+         "audio_url": "https://assets.aivis-project.com/aivm-models/d134e4b0-a0f7-4ac5-a538-021925ee23a0/speakers/2718ad2d-6060-4fc0-aab9-cd083565c9e4/styles/f6724d1f-d6f8-4d26-8cb3-029fc41e5208/voice-samples/0.m4a",
+         "transcript": "おはようございます！現在時刻は7時30分です。今日の東京の気温は18度で、天気は"
+        }
+       ]
+      },
+      {
+       "name": "幸せ",
+       "local_id": 4,
+       "voice_samples": [
+        {
+         "audio_url": "https://assets.aivis-project.com/aivm-models/d134e4b0-a0f7-4ac5-a538-021925ee23a0/speakers/2718ad2d-6060-4fc0-aab9-cd083565c9e4/styles/1c203457-8a63-49b6-a82a-bb7c416082fc/voice-samples/0.m4a",
+         "transcript": "おはようございます！現在時刻は7時30分です。今日の東京の気温は18度で、天気は"
+        }
+       ]
+      },
+      {
+       "name": "悲しみ",
+       "local_id": 5,
+       "voice_samples": [
+        {
+         "audio_url": "https://assets.aivis-project.com/aivm-models/d134e4b0-a0f7-4ac5-a538-021925ee23a0/speakers/2718ad2d-6060-4fc0-aab9-cd083565c9e4/styles/36bae268-96f0-48f9-b2ac-3bf1957903e7/voice-samples/0.m4a",
+         "transcript": "おはようございます！現在時刻は7時30分です。今日の東京の気温は18度で、天気は"
+        }
+       ]
+      },
+      {
+       "name": "驚き",
+       "local_id": 6,
+       "voice_samples": [
+        {
+         "audio_url": "https://assets.aivis-project.com/aivm-models/d134e4b0-a0f7-4ac5-a538-021925ee23a0/speakers/2718ad2d-6060-4fc0-aab9-cd083565c9e4/styles/2fcd930f-ef9d-4b6a-8333-4d5303b48ede/voice-samples/0.m4a",
+         "transcript": "おはようございます！現在時刻は7時30分です。今日の東京の気温は18度で、天気は"
+        }
+       ]
+      }
+     ]
+    }
+   ],
+   "access_key": null
+  }
+ ]
+}

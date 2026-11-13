@@ -35,6 +35,7 @@
 
 pub mod aivis_cloud;
 pub mod aivis_cloud_fake;
+pub mod aivis_models;
 pub mod envelope;
 pub mod pins;
 pub mod runner;
@@ -193,6 +194,111 @@ pub trait Synthesizer: Send + Sync + 'static {
     /// `SHA-256` bundle digest of the pinned model, part of every content
     /// address and recorded as the model version.
     fn bundle_sha256(&self) -> &str;
+
+    /// The engine that answers *this* request, when the synthesizer is a
+    /// switchable front ([`SwapSynthesizer`]). The server takes one snapshot per
+    /// request and uses it for both the content address and the synthesis, so a
+    /// swap in between can never store one voice's audio under another voice's
+    /// address. A plain engine returns `None` and is used as is.
+    fn snapshot(&self) -> Option<std::sync::Arc<dyn Synthesizer>> {
+        None
+    }
+}
+
+/// A [`Synthesizer`] whose engine can be replaced while the server runs
+/// (issue #360: the operator changes the Aivis model, style or tuning live).
+/// Clones share the slot. The previous engine finishes any synthesis already
+/// started; the next request uses the new one. It also remembers the last
+/// failure message, for the operator's panel: the messages are the engines'
+/// fixed strings (a status code or an I/O kind), never text, key or body.
+#[derive(Clone)]
+pub struct SwapSynthesizer {
+    current: std::sync::Arc<std::sync::RwLock<std::sync::Arc<dyn Synthesizer>>>,
+    last_error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl SwapSynthesizer {
+    pub fn new(initial: std::sync::Arc<dyn Synthesizer>) -> Self {
+        Self {
+            current: std::sync::Arc::new(std::sync::RwLock::new(initial)),
+            last_error: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Replace the engine for every later request and forget the last failure.
+    pub fn swap(&self, next: std::sync::Arc<dyn Synthesizer>) {
+        *self.current.write().unwrap_or_else(|e| e.into_inner()) = next;
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// The message of the most recent failed synthesis since the last success
+    /// or swap, if any.
+    pub fn last_error(&self) -> Option<String> {
+        self.last_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The current engine, wrapped so a failure is remembered.
+    fn recorded(&self) -> std::sync::Arc<dyn Synthesizer> {
+        std::sync::Arc::new(Recorded {
+            engine: self
+                .current
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            last_error: self.last_error.clone(),
+        })
+    }
+}
+
+struct Recorded {
+    engine: std::sync::Arc<dyn Synthesizer>,
+    last_error: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl Synthesizer for Recorded {
+    fn synthesize(
+        &self,
+        text: &str,
+        settings: &GenerationSettings,
+        deadline: Instant,
+    ) -> Result<Pcm, SynthError> {
+        let result = self.engine.synthesize(text, settings, deadline);
+        let mut last = self.last_error.lock().unwrap_or_else(|e| e.into_inner());
+        *last = match &result {
+            Ok(_) => None,
+            Err(SynthError::DeadlineExceeded) => Some("the synthesis timed out".to_owned()),
+            Err(SynthError::Engine(message)) => Some(message.chars().take(200).collect()),
+        };
+        result
+    }
+
+    fn bundle_sha256(&self) -> &str {
+        self.engine.bundle_sha256()
+    }
+}
+
+impl Synthesizer for SwapSynthesizer {
+    fn synthesize(
+        &self,
+        text: &str,
+        settings: &GenerationSettings,
+        deadline: Instant,
+    ) -> Result<Pcm, SynthError> {
+        self.recorded().synthesize(text, settings, deadline)
+    }
+
+    /// Not used by the server (it takes a [`Self::snapshot`]); a constant so a
+    /// direct caller can never mistake it for an engine identity.
+    fn bundle_sha256(&self) -> &str {
+        "swappable-synthesizer"
+    }
+
+    fn snapshot(&self) -> Option<std::sync::Arc<dyn Synthesizer>> {
+        Some(self.recorded())
+    }
 }
 
 /// Model-free synthesizer: a quiet tone whose length follows the text (100 ms

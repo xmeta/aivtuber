@@ -29,7 +29,7 @@
 use super::voicevox::decode_wav_pcm16_mono;
 use super::{GenerationSettings, Pcm, SynthError, Synthesizer};
 use crate::SecretString;
-use aivtuber_domain::EngineErrorKind;
+use aivtuber_domain::{EngineErrorKind, VoiceTuning};
 use serde_json::json;
 use std::io::Read;
 use std::time::Instant;
@@ -63,6 +63,9 @@ pub struct AivisCloudConfig {
     pub model_uuid: String,
     pub speaker_uuid: Option<String>,
     pub style_id: Option<u8>,
+    /// Speaking rate, pitch, volume and emotional intensity (#360); the
+    /// defaults are the API's own.
+    pub tuning: VoiceTuning,
     pub leading_silence_seconds: f32,
     pub trailing_silence_seconds: f32,
     pub max_response_bytes: usize,
@@ -122,6 +125,25 @@ pub fn is_model_reference(value: &str) -> bool {
     is_uuid(value)
 }
 
+/// The shared origin rule for every call to the service (synthesis, key
+/// check, model search): TLS for any remote host, plain http only on loopback,
+/// no embedded credentials, an origin and nothing else.
+pub fn validate_origin(endpoint: &str) -> Result<url::Url, AivisCloudConfigError> {
+    let refuse = |reason: &str| AivisCloudConfigError::Endpoint(reason.to_owned());
+    if !crate::http::is_secure_provider_endpoint(endpoint) {
+        return Err(refuse(
+            "must be https:// (http:// only for a loopback test server) without credentials",
+        ));
+    }
+    let url = url::Url::parse(endpoint).map_err(|_| refuse("not a valid URL"))?;
+    if url.query().is_some() || url.fragment().is_some() || !matches!(url.path(), "" | "/") {
+        return Err(refuse(
+            "give the origin only, e.g. https://api.aivis-project.com",
+        ));
+    }
+    Ok(url)
+}
+
 impl AivisCloudConfig {
     pub fn new(
         endpoint: impl Into<String>,
@@ -134,6 +156,7 @@ impl AivisCloudConfig {
             model_uuid: model_uuid.into(),
             speaker_uuid: None,
             style_id: None,
+            tuning: VoiceTuning::default(),
             leading_silence_seconds: 0.0,
             trailing_silence_seconds: 0.1,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
@@ -144,21 +167,7 @@ impl AivisCloudConfig {
     /// The validated origin (`scheme://host:port/`), so a later `join` cannot
     /// be redirected to another path by the operator's value.
     pub fn validated_origin(&self) -> Result<url::Url, AivisCloudConfigError> {
-        let refuse = |reason: &str| AivisCloudConfigError::Endpoint(reason.to_owned());
-        // The shared rule: TLS for any remote host, plain http only on loopback,
-        // no embedded credentials.
-        if !crate::http::is_secure_provider_endpoint(&self.endpoint) {
-            return Err(refuse(
-                "must be https:// (http:// only for a loopback test server) without credentials",
-            ));
-        }
-        let url = url::Url::parse(&self.endpoint).map_err(|_| refuse("not a valid URL"))?;
-        if url.query().is_some() || url.fragment().is_some() || !matches!(url.path(), "" | "/") {
-            return Err(refuse(
-                "give the origin only, e.g. https://api.aivis-project.com",
-            ));
-        }
-        Ok(url)
+        validate_origin(&self.endpoint)
     }
 
     pub fn validate(&self) -> Result<(), AivisCloudConfigError> {
@@ -175,6 +184,9 @@ impl AivisCloudConfig {
         }
         if self.style_id.is_some_and(|id| id > MAX_STYLE_ID) {
             return Err(AivisCloudConfigError::StyleId);
+        }
+        if self.tuning.validate().is_err() {
+            return Err(AivisCloudConfigError::Bound("tuning"));
         }
         for (name, seconds) in [
             ("leading_silence_seconds", self.leading_silence_seconds),
@@ -231,6 +243,7 @@ pub struct AivisCloudSynthesizer {
     model_uuid: String,
     speaker_uuid: Option<String>,
     style_id: Option<u8>,
+    tuning: VoiceTuning,
     leading_silence_seconds: f32,
     trailing_silence_seconds: f32,
     max_response_bytes: usize,
@@ -266,6 +279,7 @@ impl AivisCloudSynthesizer {
             model_uuid: config.model_uuid.clone(),
             speaker_uuid: config.speaker_uuid.clone(),
             style_id: config.style_id,
+            tuning: config.tuning,
             leading_silence_seconds: config.leading_silence_seconds,
             trailing_silence_seconds: config.trailing_silence_seconds,
             max_response_bytes: config.max_response_bytes,
@@ -276,6 +290,7 @@ impl AivisCloudSynthesizer {
                 &config.model_uuid,
                 config.speaker_uuid.as_deref(),
                 config.style_id,
+                &config.tuning,
             ),
         })
     }
@@ -290,6 +305,10 @@ impl AivisCloudSynthesizer {
             "output_audio_channels": "mono",
             "leading_silence_seconds": self.leading_silence_seconds,
             "trailing_silence_seconds": self.trailing_silence_seconds,
+            "speaking_rate": self.tuning.speaking_rate,
+            "pitch": self.tuning.pitch,
+            "volume": self.tuning.volume,
+            "emotional_intensity": self.tuning.emotional_intensity,
         });
         if let Some(speaker) = &self.speaker_uuid {
             body["speaker_uuid"] = json!(speaker);
@@ -301,13 +320,20 @@ impl AivisCloudSynthesizer {
     }
 }
 
-/// The cache identity: provider, model, speaker and style. Never the key and
-/// never the endpoint, so the same voice is the same cache entry.
-fn identity(model_uuid: &str, speaker_uuid: Option<&str>, style_id: Option<u8>) -> String {
+/// The cache identity: provider, model, speaker, style and tuning. Never the
+/// key and never the endpoint, so the same voice is the same cache entry and a
+/// different voice or tuning is never replayed from another's audio.
+fn identity(
+    model_uuid: &str,
+    speaker_uuid: Option<&str>,
+    style_id: Option<u8>,
+    tuning: &VoiceTuning,
+) -> String {
     format!(
-        "aivis-cloud-api;model={model_uuid};speaker={};style={}",
+        "aivis-cloud-api;model={model_uuid};speaker={};style={};{}",
         speaker_uuid.unwrap_or("-"),
         style_id.map_or_else(|| "-".to_owned(), |id| id.to_string()),
+        tuning.identity(),
     )
 }
 
@@ -627,6 +653,34 @@ mod tests {
         let body: Value = serde_json::from_slice(&api.requests()[0].body).unwrap();
         assert!(body.get("speaker_uuid").is_none());
         assert!(body.get("style_id").is_none());
+        // The tuning always goes out, at the API's own defaults when untouched.
+        assert_eq!(body["speaking_rate"], 1.0);
+        assert_eq!(body["pitch"], 0.0);
+        assert_eq!(body["volume"], 1.0);
+        assert_eq!(body["emotional_intensity"], 1.0);
+    }
+
+    #[test]
+    fn tuning_reaches_the_request_and_out_of_range_tuning_is_refused() {
+        let api = FakeAivisCloud::start(FakeAivisBehaviour::default());
+        let mut tuned = config(&api.endpoint());
+        tuned.tuning = VoiceTuning {
+            speaking_rate: 1.5,
+            pitch: -0.25,
+            volume: 0.5,
+            emotional_intensity: 2.0,
+        };
+        AivisCloudSynthesizer::new(&tuned)
+            .unwrap()
+            .synthesize("あ", &settings("x"), deadline())
+            .unwrap();
+        let body: Value = serde_json::from_slice(&api.requests()[0].body).unwrap();
+        assert_eq!(body["speaking_rate"], 1.5);
+        assert_eq!(body["pitch"], -0.25);
+        assert_eq!(body["volume"], 0.5);
+        assert_eq!(body["emotional_intensity"], 2.0);
+        tuned.tuning.pitch = 1.5;
+        assert!(AivisCloudSynthesizer::new(&tuned).is_err());
     }
 
     #[test]
@@ -638,7 +692,36 @@ mod tests {
         other_speaker.speaker_uuid = Some("11111111-2222-3333-4444-555555555555".to_owned());
         let mut other_style = config("http://127.0.0.1:9");
         other_style.style_id = Some(1);
-        for other in [other_model, other_speaker, other_style] {
+        // Every tuning value is part of the identity (#360): audio made with
+        // one voice or tuning is never replayed for another.
+        let tuned: Vec<AivisCloudConfig> = [
+            VoiceTuning {
+                speaking_rate: 1.25,
+                ..VoiceTuning::default()
+            },
+            VoiceTuning {
+                pitch: 0.5,
+                ..VoiceTuning::default()
+            },
+            VoiceTuning {
+                volume: 1.5,
+                ..VoiceTuning::default()
+            },
+            VoiceTuning {
+                emotional_intensity: 0.5,
+                ..VoiceTuning::default()
+            },
+        ]
+        .into_iter()
+        .map(|tuning| AivisCloudConfig {
+            tuning,
+            ..config("http://127.0.0.1:9")
+        })
+        .collect();
+        for other in [other_model, other_speaker, other_style]
+            .into_iter()
+            .chain(tuned)
+        {
             let other = AivisCloudSynthesizer::new(&other).unwrap();
             assert_ne!(base.bundle_sha256(), other.bundle_sha256());
         }
