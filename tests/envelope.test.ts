@@ -101,6 +101,7 @@ describe("normalizeEvent", () => {
       "perception.control",
       "model.select",
       "voice.configure",
+      "ingress.control",
     ]);
   });
 });

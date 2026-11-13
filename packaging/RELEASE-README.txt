@@ -16,8 +16,10 @@ What is here
   speech-vad-sidecar      microphone / WAV input, voice activity detection (Silero VAD)
   speech-stt-worker       Japanese speech recognition (sherpa-onnx)
   local-tts-sidecar       Japanese speech synthesis (sherpa-onnx)
-  twitch-chat-ingress     Twitch chat input
-  youtube-chat-ingress    YouTube Live chat input
+  twitch-chat-ingress     Twitch chat input (read-only; the panel's stream chat
+                          section starts it for you)
+  youtube-chat-ingress    YouTube Live chat input (read-only; needs a YouTube Data API
+                          key, entered in the panel)
   *.dll / lib*.so         the pinned sherpa-onnx and ONNX Runtime engine libraries.
                           They must stay in this directory, beside the programs:
                           each sidecar verifies their SHA-256 at every start and

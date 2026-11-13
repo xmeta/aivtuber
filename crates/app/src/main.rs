@@ -17,7 +17,8 @@ use aivtuber_adapters::{
 use aivtuber_app::{
     AIVIS_ENDPOINT_VAR, AIVIS_KEY_FILE_VAR, AIVIS_KEY_VAR, AIVIS_TIMEOUT_VAR, AIVIS_VISEMES_VAR,
     AdaptationRuntime, AdapterHealth, AivisBridge, AivisSettings, AvatarOutput, BargeInConfig,
-    BargeInMetrics, ChatBurstConfig, CompositionProfile, DEFAULT_WARMUP_TIMEOUT_MS,
+    BargeInMetrics, CHAT_SETTINGS_VAR, ChatBurstConfig, ChatIngressController,
+    ChatIngressEnvironment, CompositionProfile, DEFAULT_WARMUP_TIMEOUT_MS,
     GenerationFallbackCounts, GenerativeBudgetPolicy, GenerativeRuntime, IntentRoutePlanner,
     IntentShadowPolicy, LocalAvatarOutput, LocalRoutePlanner, MemoryFalsifierMetrics, MemorySeed,
     MemoryWriterConfig, MemoryWriterMetrics, ModelSwitcher, NoopAvatarOutput, NoopStreamOutput,
@@ -30,8 +31,9 @@ use aivtuber_app::{
     SpeechConversationConfig, SpeechConversationMetrics, SpeechFloorMetrics, SpeechSidecar,
     SpeechSidecarConfig, SpeechSidecarStats, StreamOutput, TtsSidecarSettings, VOICE_SETTINGS_VAR,
     VoiceController, VoiceEnvironment, VoicePaths, VoicevoxBridge, VoicevoxSettings,
-    VtsAvatarOutput, VtsPlaybackConfig, WarmupMode, apply_dispatched_request, audit_pack_readiness,
-    is_valid_key, panel_settings, pump_bounded_records, read_voice_settings, start_thinking_warmup,
+    VtsAvatarOutput, VtsPlaybackConfig, WarmupMode, YOUTUBE_API_BASE_VAR, YOUTUBE_KEY_FILE_VAR,
+    apply_dispatched_request, audit_pack_readiness, is_acceptable_api_base, is_valid_key,
+    panel_settings, pump_bounded_records, read_voice_settings, start_thinking_warmup,
     stt_sidecar_args, warmup_timeout,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
@@ -276,6 +278,14 @@ fn run() -> Result<(), Box<dyn Error>> {
         );
         app = app.with_voice_controller(controller);
     }
+    // #361: stream chat connected from the panel. Off unless the launcher names
+    // the settings file.
+    if let Some(controller) = build_chat_ingress(raw_ingress_config)? {
+        eprintln!(
+            "chat ingress: composed (the operation panel and aivtuberctl can connect Twitch and YouTube chat; records are admitted as untrusted public chat under the ingress ceiling)"
+        );
+        app = app.with_chat_ingress(controller);
+    }
     // #306: the production memory writer is opt-in. Default off writes nothing.
     if env_bool("AIVTUBER_MEMORY_WRITER", false)? {
         app = app
@@ -419,6 +429,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             model_select: app.thinking_model_status().is_some(),
             // #360: `voice.configure` only when the voice settings are composed.
             voice_configure: app.voice_configured(),
+            // #361: `ingress.control` only when chat connections are composed.
+            ingress_control: app.chat_ingress_configured(),
         },
     )?;
     let operator_ingress = operator_server.ingress();
@@ -806,6 +818,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 }
                 app.shutdown(now_ms);
                 app.shutdown_voice();
+                app.shutdown_chat_ingress();
                 if let Some(sidecar) = speech_sidecar.as_mut() {
                     sidecar.shutdown();
                 }
@@ -837,6 +850,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         // #360: collect a finished key check and submit a waiting voice
         // preview line. Never blocks: the check runs on its own thread.
         app.service_voice(now_ms, &mut sequence_seed);
+        // #361: admit what the panel-started chat sidecars wrote, a few
+        // records per platform per turn, through the same admission as stdin.
+        app.service_chat_ingress(now_ms, &mut sequence_seed);
         // #90 S1b: after the operator drain, so a disable is already in effect
         // before the next capture is considered. Never blocks: the slow OBS and
         // model work is on the perception worker thread.
@@ -1864,6 +1880,53 @@ fn build_voice_controller(
         Arc::clone(bypass),
         preview.clone(),
         initial,
+    )))
+}
+
+/// #361: chat connections from the panel. `AIVTUBER_CHAT_INGRESS_SETTINGS`
+/// names the file that remembers the last channel and video (set by
+/// `aivtuber-setup start`, beside the env file); `AIVTUBER_YOUTUBE_KEY_FILE`
+/// the YouTube key's own file (default: next to it). `YOUTUBE_API_KEY` wins
+/// over the stored key. The sidecars are the `twitch-chat-ingress` and
+/// `youtube-chat-ingress` programs next to this binary.
+/// `AIVTUBER_YOUTUBE_API_BASE` points the YouTube sidecar at another origin
+/// (https, or http on loopback for a fixture server); it is an operator
+/// setting, not reachable from the panel.
+fn build_chat_ingress(
+    raw: RawIngressConfig,
+) -> Result<Option<ChatIngressController>, Box<dyn Error>> {
+    let Some(settings_path) = env_path(CHAT_SETTINGS_VAR) else {
+        return Ok(None);
+    };
+    let key_file = env_path(YOUTUBE_KEY_FILE_VAR)
+        .unwrap_or_else(|| settings_path.with_file_name("local-youtube-key.txt"));
+    let env_key = match env_optional("YOUTUBE_API_KEY") {
+        Some(key) if is_valid_key(key.trim()) => Some(SecretString::new(key.trim())),
+        Some(_) => {
+            return Err(
+                "YOUTUBE_API_KEY is not a usable key (control characters, whitespace or too long); check how it was set"
+                    .to_owned()
+                    .into(),
+            );
+        }
+        None => None,
+    };
+    let api_base = match env_optional(YOUTUBE_API_BASE_VAR) {
+        Some(base) if is_acceptable_api_base(base.trim()) => Some(base.trim().to_owned()),
+        Some(_) => {
+            return Err(format!(
+                "{YOUTUBE_API_BASE_VAR} must be an https URL, or an http URL on loopback"
+            )
+            .into());
+        }
+        None => None,
+    };
+    let exe = env::current_exe()?;
+    let program_dir = exe
+        .parent()
+        .ok_or("cannot locate the directory of the app binary")?;
+    Ok(Some(ChatIngressController::new(
+        ChatIngressEnvironment::new(settings_path, key_file, env_key, program_dir, api_base, raw),
     )))
 }
 

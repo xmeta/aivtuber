@@ -9,6 +9,7 @@
 mod audio;
 #[cfg(feature = "gapless-queue")]
 mod audio_native;
+mod chat_target;
 mod hindsight;
 mod http;
 mod local_avatar;
@@ -29,6 +30,7 @@ mod youtube_chat;
 pub use audio::*;
 #[cfg(feature = "gapless-queue")]
 pub use audio_native::*;
+pub use chat_target::*;
 pub use hindsight::*;
 pub use http::*;
 pub use local_avatar::*;
@@ -57,7 +59,9 @@ impl SecretString {
         Self(value.into())
     }
 
-    pub(crate) fn expose(&self) -> &str {
+    /// The secret text. Only for handing the value to the process that needs
+    /// it (a sidecar's environment); never format it into a response or a log.
+    pub fn expose(&self) -> &str {
         &self.0
     }
 }

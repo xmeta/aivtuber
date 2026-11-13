@@ -16,6 +16,11 @@
 //! The daemon never writes a file; this client refuses to overwrite one, so an
 //! export can never replace a hand-curated seed file.
 //!
+//! `ingress` (issue #361) connects or disconnects Twitch or YouTube chat, like
+//! the operation panel. The YouTube API key is deliberately not a subcommand
+//! (it would travel in a command line and a request log): it is entered in the
+//! panel, or set as `YOUTUBE_API_KEY`.
+//!
 //! `voice` (issue #360) changes the voice at runtime, like the operation panel:
 //! the local voice or Aivis Cloud, the Aivis style and the tuning, and a
 //! preview. The API key is deliberately not a subcommand: it would travel in a
@@ -90,6 +95,47 @@ enum Command {
         #[command(subcommand)]
         action: VoiceCommand,
     },
+    /// Connect or disconnect stream chat (issue #361); needs the daemon to run
+    /// with chat connections (the local profile started by `aivtuber-setup
+    /// start`). Chat is read-only and arrives as untrusted public chat.
+    Ingress {
+        #[command(subcommand)]
+        action: IngressCommand,
+    },
+}
+
+#[derive(Subcommand, Clone, PartialEq, Eq)]
+enum IngressCommand {
+    /// Start reading a chat. The daemon validates the target.
+    Connect {
+        /// `twitch` or `youtube`.
+        #[arg(value_parser = ["twitch", "youtube"])]
+        platform: String,
+        /// A Twitch channel name, or a YouTube live video id or link.
+        target: String,
+    },
+    /// Stop reading a chat and end its sidecar.
+    Disconnect {
+        /// `twitch` or `youtube`.
+        #[arg(value_parser = ["twitch", "youtube"])]
+        platform: String,
+    },
+    /// Remove the stored YouTube API key (and disconnect YouTube if no other
+    /// key is set).
+    KeyRemove,
+}
+
+/// The `ingress.*` argument for an ingress subcommand, as JSON text.
+fn ingress_argument(action: &IngressCommand) -> Option<String> {
+    match action {
+        IngressCommand::Connect { platform, target } => {
+            Some(serde_json::json!({ "platform": platform, "target": target }).to_string())
+        }
+        IngressCommand::Disconnect { platform } => {
+            Some(serde_json::json!({ "platform": platform }).to_string())
+        }
+        IngressCommand::KeyRemove => None,
+    }
 }
 
 #[derive(Subcommand, Clone, PartialEq)]
@@ -202,6 +248,11 @@ fn action_name(command: &Command) -> &'static str {
         Command::PerceptionOff => "perception.disable",
         Command::MemoryExport { .. } => "memory.export",
         Command::Model { .. } => "model.select",
+        Command::Ingress { action } => match action {
+            IngressCommand::Connect { .. } => "ingress.connect",
+            IngressCommand::Disconnect { .. } => "ingress.disconnect",
+            IngressCommand::KeyRemove => "ingress.key.remove",
+        },
         Command::Voice { action } => match action {
             VoiceCommand::Preview => "voice.preview",
             VoiceCommand::KeyRemove => "voice.key.remove",
@@ -247,6 +298,7 @@ fn main() -> ExitCode {
     let argument = match &cli.command {
         Command::Model { alias } => Some(alias.clone()),
         Command::Voice { action } => voice_patch(action),
+        Command::Ingress { action } => ingress_argument(action),
         _ => None,
     };
     let request = OperatorRequest {
@@ -387,6 +439,39 @@ fn print_response(response: &OperatorResponse) {
                     .map_or_else(String::new, |s| format!("({s})")),
                 voice.key.check,
                 voice.last_error,
+            );
+        }
+        if let Some(chat) = &status.chat_ingress {
+            for (name, platform) in [("twitch", &chat.twitch), ("youtube", &chat.youtube)] {
+                println!(
+                    "chat_ingress {name} state={:?} target={} accepted={} dropped={} (queue_full={} refused={}) per_minute={} restarts={} sidecar={} last_error={:?}",
+                    platform.state,
+                    platform.target.as_deref().unwrap_or("-"),
+                    platform.messages_accepted,
+                    platform.messages_dropped,
+                    platform.dropped_queue_full,
+                    platform.dropped_refused,
+                    platform.messages_per_minute,
+                    platform.restarts,
+                    if platform.sidecar_found {
+                        "found"
+                    } else {
+                        "missing"
+                    },
+                    platform.last_error,
+                );
+            }
+            println!(
+                "chat_ingress youtube_key={}{}",
+                if chat.youtube_key.set {
+                    "set"
+                } else {
+                    "not-set"
+                },
+                chat.youtube_key
+                    .source
+                    .as_deref()
+                    .map_or_else(String::new, |s| format!("({s})")),
             );
         }
         if let Some(model) = &status.thinking_model {
@@ -587,6 +672,55 @@ mod tests {
         ] {
             let (name, text) = patch(args);
             assert_eq!((name, text), (action, None));
+        }
+    }
+
+    #[test]
+    fn ingress_subcommands_build_the_arguments_the_daemon_parses() {
+        let (name, argument) = {
+            let command = parse(&["ingress", "connect", "twitch", "Some_Channel"]);
+            let Command::Ingress { action } = &command else {
+                panic!("not an ingress command");
+            };
+            (action_name(&command), ingress_argument(action))
+        };
+        assert_eq!(name, "ingress.connect");
+        assert_eq!(
+            aivtuber_app::parse_connect_argument(argument.as_deref()),
+            Ok((
+                aivtuber_app::ChatPlatform::Twitch,
+                "Some_Channel".to_owned()
+            ))
+        );
+        let command = parse(&["ingress", "disconnect", "youtube"]);
+        let Command::Ingress { action } = &command else {
+            panic!("not an ingress command");
+        };
+        assert_eq!(action_name(&command), "ingress.disconnect");
+        assert_eq!(
+            aivtuber_app::parse_disconnect_argument(ingress_argument(action).as_deref()),
+            Ok(aivtuber_app::ChatPlatform::Youtube)
+        );
+        let command = parse(&["ingress", "key-remove"]);
+        let Command::Ingress { action } = &command else {
+            panic!("not an ingress command");
+        };
+        assert_eq!(action_name(&command), "ingress.key.remove");
+        assert_eq!(ingress_argument(action), None);
+        // Another platform, a missing target, or a key on the command line.
+        for args in [
+            &["ingress", "connect", "kick", "abc"][..],
+            &["ingress", "connect", "twitch"][..],
+            &["ingress", "key", "AIza-x"][..],
+            &["ingress", "key-set", "AIza-x"][..],
+        ] {
+            let mut full = vec![
+                "aivtuberctl",
+                "--secret",
+                "01234567890123456789012345678901",
+            ];
+            full.extend_from_slice(args);
+            assert!(Cli::try_parse_from(full).is_err(), "{args:?}");
         }
     }
 
