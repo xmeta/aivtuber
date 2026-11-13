@@ -905,7 +905,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         // #360: collect a finished key check and submit a waiting voice
         // preview line. Never blocks: the check runs on its own thread.
-        app.service_voice(now_ms, &mut sequence_seed);
+        if app.service_voice(now_ms, &mut sequence_seed)
+            && let Some(panel) = panel.as_mut()
+        {
+            panel.publish_next_turn();
+        }
         // #361: admit what the panel-started chat sidecars wrote, a few
         // records per platform per turn, through the same admission as stdin.
         app.service_chat_ingress(now_ms, &mut sequence_seed);
