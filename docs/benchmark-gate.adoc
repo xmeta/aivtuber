@@ -425,3 +425,15 @@ array only gained the diagnostic `base_range`/`head_range` fields).
 * end-to-end (Phase D): `resource-bench` emits `resource_soak` contract
   results; comparator PASSes identical results with the resource budgets and
   FAILs an artificially non-plateauing head with exit 1.
+
+== 10. Phrase-mode axis (issue #83 S3e)
+
+`replay-benchmark` writes three more contract results next to the replay ones, `phrase-mode-buffered-result.json`, `phrase-mode-phrased-result.json` and `phrase-mode-streamed-result.json`, from `examples/benchmarks/phrase-comparison.json` (suite `phrase-comparison`, dataset `phrase-latency-v1`).
+Metric definitions are in link:metrics.adoc[metrics] section 13.
+
+* Separation: the modes `phrase_mode_buffered`, `phrase_mode_phrased` and `phrase_mode_streamed` are added to `schemas/benchmark-result.schema.json`; they are not `ComparisonMode`s, the suite name differs, and every stub cost is part of `config_version`, so they never share a compatibility series with the replay modes, with each other, or across a changed cost.
+* Informational, not gated: no budget in `benchmarks/budgets.json` names a `phrase.*` metric, and the PR comparison uses only the `deterministic_only` result, so the "Replay base vs head" job ignores the new files (they are uploaded with the other results). `benchmark-compare` on a phrase result is not meaningful: it requires the replay hard invariants, which the phrase suite does not claim.
+* History: the "Record main benchmark history" job records the three results under `data/phrase-comparison.jsonl` on `benchmark-data`, one series per mode.
+* Baseline plan: the output is bit-for-bit reproducible, so a baseline is exact rather than statistical. After the series has a few main commits, add budgets (`phrase.first_audio.p90_ms` and `phrase.completion.p90_ms` for `phrase_mode_phrased` and `phrase_mode_streamed`, lower is better, zero tolerance for an unchanged fixture and config) and a phrased against buffered ratio check, then promote them from informational to gating in a separate change with the budget rationale. Until then a change to segmentation, lookahead or commit timing shows up as a diff in the recorded series, not as a CI failure.
+* Streamed variant: it does not go through the HTTP/SSE adapter. The loopback stub SSE server used by the app tests paces tokens in wall-clock time, so it cannot give reproducible output; the streamed mode feeds the real `IncrementalSegmenter` with 3-character deltas on the logical clock instead. The SSE parser and the wall-clock streamed against buffered measurements stay in `streaming_thinking_tests.rs` and EXP-0005.
+* Schema check: `tests/benchmark-result-schema.test.mjs` validates the checked-in valid and invalid result examples (including `examples/benchmarks/result/valid/phrase-mode-streamed.json`) against the schema, and the app unit tests check that every emitted mode is in the schema enum and round-trips through the comparator's parser.

@@ -1,0 +1,71 @@
+{
+  "schema_version": "1",
+  "benchmark_suite": "phrase-comparison",
+  "mode": "phrase_mode_streamed",
+  "dataset_id": "phrase-latency-v1",
+  "git": {
+    "commit": "1437684f00dbeef"
+  },
+  "environment": {
+    "os": "linux",
+    "architecture": "x86_64",
+    "cpu": null,
+    "rust_version": "rustc 1.98.1",
+    "bun_version": null,
+    "cargo_profile": "release"
+  },
+  "configuration": {
+    "config_version": "phrase-benchmark-v1;segmentation=phrase-seg-v1;think_first_ms=200;think_ms_per_char=8;delta_chars=3;tts_base_ms=40;tts_ms_per_char=4;audio_ms_per_char=40",
+    "runtime_profile": "local",
+    "asset_version": "phrase-model-stub-v1",
+    "thinking_model": "phrase-benchmark-thinking-v1",
+    "tts_model": "phrase-benchmark-tts-v1",
+    "seed": 83
+  },
+  "metrics": {
+    "phrase.completion.max_ms": {
+      "value": 15236,
+      "sample_count": 10
+    },
+    "phrase.completion.p50_ms": {
+      "value": 2968,
+      "sample_count": 10
+    },
+    "phrase.completion.p90_ms": {
+      "value": 10088,
+      "sample_count": 10
+    },
+    "phrase.first_audio.max_ms": {
+      "value": 848,
+      "sample_count": 10
+    },
+    "phrase.first_audio.p50_ms": {
+      "value": 568,
+      "sample_count": 10
+    },
+    "phrase.first_audio.p90_ms": {
+      "value": 636,
+      "sample_count": 10
+    },
+    "phrase.inter_phrase_gap.max_ms": {
+      "value": 0,
+      "sample_count": 36
+    },
+    "phrase.inter_phrase_gap.mean_ms": {
+      "value": 0,
+      "sample_count": 36
+    },
+    "phrase.phrases_per_response.mean_count": {
+      "value": 4.6,
+      "sample_count": 10
+    }
+  },
+  "invariants": {
+    "phrase.partition_mismatch_count": {
+      "value": 0
+    },
+    "phrase.start_before_previous_end_count": {
+      "value": 0
+    }
+  }
+}
