@@ -266,6 +266,22 @@ jobs:
                     results/main/03-semantic-jev-result.json \
                     results/main/04-full-generative-result.json
 
+      # Issue #83 S3e: informational phrase-mode series (own suite and modes, so
+      # it never shares a compatibility key with the replay series above). No
+      # budget gates it; the history is the raw material for a baseline.
+      # replay-benchmark wrote the three results beside the replay ones, and
+      # "Benchmark main" copied every *-result.json into results/main/.
+      - name: Record phrase-mode benchmark history
+        if: success()
+        run: |
+          bun scripts/benchmark-record.mjs \
+            --suite phrase-comparison \
+            --run-id "run-${{ github.run_id }}" \
+            --attempt "${{ github.run_attempt }}" \
+            --files results/main/phrase-mode-buffered-result.json \
+                    results/main/phrase-mode-phrased-result.json \
+                    results/main/phrase-mode-streamed-result.json
+
       - name: Push benchmark history
         if: success()
         run: git push origin benchmark-data

@@ -494,7 +494,7 @@ pub fn run_phrase_benchmark(
 }
 
 /// One line per mode for the console and the PR description.
-pub fn summary_line(summary: &PhraseModeSummary) -> String {
+pub fn phrase_summary_line(summary: &PhraseModeSummary) -> String {
     format!(
         "{}: responses={} first_audio_ms p50/p90/max={}/{}/{} completion_ms p50/p90/max={}/{}/{} phrases_per_response={} gap_ms mean/max={}/{}",
         summary.mode.as_str(),
@@ -602,7 +602,8 @@ mod tests {
             }
             // The result must round-trip through the comparator's own parser.
             let text = serde_json::to_string(&result).unwrap();
-            let parsed = BenchmarkResult::from_json(&text).expect("comparator accepts the result");
+            let parsed =
+                BenchmarkResult::from_json(text.as_bytes()).expect("comparator accepts the result");
             assert_eq!(parsed, result);
         }
     }
