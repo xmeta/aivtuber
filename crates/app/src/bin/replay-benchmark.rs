@@ -137,7 +137,7 @@ struct BenchmarkThinking;
 impl ThinkingEngine for BenchmarkThinking {
     fn generate<'a>(&'a self, request: &'a ThinkingRequest) -> EngineFuture<'a, GeneratedReply> {
         let text = format!("benchmark generated reply: {}", request.input.text);
-        Box::pin(async move { Ok(GeneratedReply { text }) })
+        Box::pin(async move { Ok(GeneratedReply { text, usage: None }) })
     }
 
     fn identity(&self) -> BackendIdentity {

@@ -576,7 +576,7 @@ mod tests {
         ) -> EngineFuture<'a, GeneratedReply> {
             self.generate_calls.fetch_add(1, Ordering::SeqCst);
             let text = self.full_text.clone();
-            Box::pin(async move { Ok(GeneratedReply { text }) })
+            Box::pin(async move { Ok(GeneratedReply { text, usage: None }) })
         }
 
         fn streams(&self) -> bool {
@@ -613,7 +613,7 @@ mod tests {
                     Step::CancelToken => self.token.cancel(),
                     Step::Done => {
                         *self.ended_at.lock().unwrap() = Some(Instant::now());
-                        return Some(Ok(GeneratedReply { text }));
+                        return Some(Ok(GeneratedReply { text, usage: None }));
                     }
                 }
             }

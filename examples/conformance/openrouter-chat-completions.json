@@ -1,0 +1,92 @@
+{
+  "schema_version": "1",
+  "fixture_version": "openrouter-chat-completions-fixture-v1",
+  "provider_id": "openrouter-chat-completions",
+  "cases": [
+    {
+      "id": "success-message-content-with-usage",
+      "transport": {
+        "status": 200,
+        "body": {
+          "id": "gen-fixture",
+          "model": "vendor/fixture-model",
+          "choices": [
+            {
+              "index": 0,
+              "finish_reason": "stop",
+              "message": { "role": "assistant", "content": "fixture reply" }
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 120,
+            "completion_tokens": 18,
+            "total_tokens": 138,
+            "cost": 0.000425
+          }
+        }
+      },
+      "expected": {
+        "kind": "success",
+        "output_text": "fixture reply",
+        "usage": {
+          "prompt_tokens": 120,
+          "completion_tokens": 18,
+          "cost_micro_usd": 425
+        }
+      }
+    },
+    {
+      "id": "success-without-usage",
+      "transport": {
+        "status": 200,
+        "body": {
+          "choices": [
+            { "message": { "role": "assistant", "content": "no usage reported" } }
+          ]
+        }
+      },
+      "expected": {
+        "kind": "success",
+        "output_text": "no usage reported"
+      }
+    },
+    {
+      "id": "authentication-failure",
+      "transport": { "status": 401, "body": { "error": { "code": 401 } } },
+      "expected": { "kind": "error", "error_kind": "authentication" }
+    },
+    {
+      "id": "credits-exhausted",
+      "transport": { "status": 402, "body": { "error": { "code": 402 } } },
+      "expected": { "kind": "error", "error_kind": "quota_exhausted" }
+    },
+    {
+      "id": "rate-limit-normalization",
+      "transport": { "status": 429, "body": { "error": { "code": 429 } } },
+      "expected": { "kind": "error", "error_kind": "rate_limited" }
+    },
+    {
+      "id": "upstream-unavailable",
+      "transport": { "status": 502, "body": { "error": { "code": 502 } } },
+      "expected": { "kind": "error", "error_kind": "unavailable" }
+    },
+    {
+      "id": "error-object-in-http-200",
+      "transport": {
+        "status": 200,
+        "body": { "error": { "code": 402, "message": "Insufficient credits" } }
+      },
+      "expected": { "kind": "error", "error_kind": "quota_exhausted" }
+    },
+    {
+      "id": "transport-timeout",
+      "transport": { "error": "timeout" },
+      "expected": { "kind": "error", "error_kind": "timeout" }
+    },
+    {
+      "id": "malformed-response",
+      "transport": { "status": 200, "body": { "id": "gen-bad", "choices": [] } },
+      "expected": { "kind": "error", "error_kind": "backend" }
+    }
+  ]
+}

@@ -84,6 +84,7 @@ fn reason(kind: EngineErrorKind) -> &'static str {
         EngineErrorKind::Unavailable => "unavailable",
         EngineErrorKind::RateLimited => "rate_limited",
         EngineErrorKind::Overloaded => "overloaded",
+        EngineErrorKind::QuotaExhausted => "quota_exhausted",
         EngineErrorKind::Authentication | EngineErrorKind::Unauthorized => "authentication",
         EngineErrorKind::InvalidRequest => "invalid_request",
         EngineErrorKind::Backend => "backend",

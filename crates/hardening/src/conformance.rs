@@ -1,11 +1,11 @@
 use aivtuber_adapters::{
-    HttpResponse as AdapterHttpResponse, HttpTransportError, JsonHttpTransport,
-    OpenAiResponsesAdapter, OpenAiResponsesConfig, SecretString,
+    DataCollection, ExtraHeaders, HttpResponse as AdapterHttpResponse, HttpTransportError,
+    JsonHttpTransport, OpenAiResponsesAdapter, OpenAiResponsesConfig, SecretString, ThinkingWire,
 };
 use aivtuber_domain::{
     EVENT_SCHEMA_VERSION, EngineErrorKind, EventEnvelope, EventKind, PrivacyClass, ReflexContext,
     ReflexRequest, RetrievalCandidateContext, RetrievalSnapshot, SecurityPlane, SourceClass,
-    ThinkingRequest, TrustLevel,
+    ThinkingRequest, ThinkingUsage, TrustLevel,
 };
 use aivtuber_reflex::{
     HttpResponse as JevHttpResponse, HttpTransport as JevHttpTransport, JevAdapter,
@@ -49,6 +49,9 @@ pub struct ExpectedOutcome {
     pub returned_model: Option<String>,
     pub selected_candidate_id: Option<String>,
     pub output_text: Option<String>,
+    /// Compared only when present (chat-completions fixtures).
+    #[serde(default)]
+    pub usage: Option<ThinkingUsage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +60,7 @@ pub enum ObservedOutcome {
         returned_model: Option<String>,
         selected_candidate_id: Option<String>,
         output_text: Option<String>,
+        usage: Option<ThinkingUsage>,
     },
     Error {
         error_kind: String,
@@ -105,8 +109,15 @@ fn verify_case(case: &ConformanceCase, observed: &ObservedOutcome) -> Result<(),
                 returned_model,
                 selected_candidate_id,
                 output_text,
+                usage,
             },
         ) => {
+            if case.expected.usage.is_some() && case.expected.usage != *usage {
+                return Err(format!(
+                    "usage: expected {:?}, observed {usage:?}",
+                    case.expected.usage
+                ));
+            }
             compare_optional(
                 "returned_model",
                 &case.expected.returned_model,
@@ -187,6 +198,17 @@ impl JsonHttpTransport for FixtureAdapterTransport {
     ) -> Result<AdapterHttpResponse, HttpTransportError> {
         self.response.clone()
     }
+
+    fn post_json_with_headers(
+        &self,
+        endpoint: &str,
+        bearer_token: Option<&str>,
+        _extra_headers: &ExtraHeaders,
+        body: &[u8],
+        timeout: Duration,
+    ) -> Result<AdapterHttpResponse, HttpTransportError> {
+        self.post_json(endpoint, bearer_token, body, timeout)
+    }
 }
 pub fn run_jev_case(case: &ConformanceCase) -> ObservedOutcome {
     let transport = Arc::new(FixtureJevTransport {
@@ -210,6 +232,7 @@ pub fn run_jev_case(case: &ConformanceCase) -> ObservedOutcome {
             returned_model: Some(evidence.returned_model),
             selected_candidate_id: evidence.selected_candidate_id,
             output_text: None,
+            usage: None,
         },
         Err(error) => ObservedOutcome::Error {
             error_kind: error_kind_name(error.kind).to_owned(),
@@ -218,16 +241,41 @@ pub fn run_jev_case(case: &ConformanceCase) -> ObservedOutcome {
 }
 
 pub fn run_openai_case(case: &ConformanceCase) -> ObservedOutcome {
-    let transport = Arc::new(FixtureAdapterTransport {
-        response: adapter_transport_result(&case.transport),
-    });
     let config = OpenAiResponsesConfig {
         endpoint: "https://fixture.invalid/v1/responses".to_owned(),
         model_alias: "fixture-model".to_owned(),
         model_version: Some("fixture-version".to_owned()),
         max_output_tokens: 64,
         timeout: Duration::from_millis(250),
+        ..OpenAiResponsesConfig::default()
     };
+    run_thinking_case(case, config)
+}
+
+/// The OpenRouter preset: chat-completions wire, attribution headers and
+/// `provider.data_collection = deny`, through the same adapter (#363).
+pub fn run_openrouter_chat_case(case: &ConformanceCase) -> ObservedOutcome {
+    let config = OpenAiResponsesConfig {
+        endpoint: "https://fixture.invalid/api/v1/chat/completions".to_owned(),
+        model_alias: "vendor/fixture-model".to_owned(),
+        model_version: None,
+        max_output_tokens: 64,
+        timeout: Duration::from_millis(250),
+        wire: ThinkingWire::ChatCompletions,
+        extra_headers: ExtraHeaders::new(&[
+            ("HTTP-Referer", "https://fixture.invalid"),
+            ("X-Title", "fixture"),
+        ])
+        .expect("fixture headers"),
+        data_collection: Some(DataCollection::Deny),
+    };
+    run_thinking_case(case, config)
+}
+
+fn run_thinking_case(case: &ConformanceCase, config: OpenAiResponsesConfig) -> ObservedOutcome {
+    let transport = Arc::new(FixtureAdapterTransport {
+        response: adapter_transport_result(&case.transport),
+    });
     let adapter = OpenAiResponsesAdapter::with_transport(
         config,
         SecretString::new("fixture-secret"),
@@ -240,6 +288,7 @@ pub fn run_openai_case(case: &ConformanceCase) -> ObservedOutcome {
             returned_model: None,
             selected_candidate_id: None,
             output_text: Some(reply.text),
+            usage: reply.usage,
         },
         Err(error) => ObservedOutcome::Error {
             error_kind: error_kind_name(error.kind).to_owned(),
@@ -286,6 +335,7 @@ fn error_kind_name(kind: EngineErrorKind) -> &'static str {
         EngineErrorKind::Unavailable => "unavailable",
         EngineErrorKind::RateLimited => "rate_limited",
         EngineErrorKind::Overloaded => "overloaded",
+        EngineErrorKind::QuotaExhausted => "quota_exhausted",
         EngineErrorKind::Authentication => "authentication",
         EngineErrorKind::Unauthorized => "unauthorized",
         EngineErrorKind::InvalidRequest => "invalid_request",
@@ -471,6 +521,16 @@ mod tests {
     }
 
     #[test]
+    fn openrouter_chat_fixture_matches_adapter_contract() {
+        let fixture = parse_fixture(include_bytes!(
+            "../../../examples/conformance/openrouter-chat-completions.json"
+        ))
+        .expect("OpenRouter fixture");
+        assert_eq!(fixture.provider_id, "openrouter-chat-completions");
+        verify_fixture(&fixture, run_openrouter_chat_case).expect("OpenRouter conformance");
+    }
+
+    #[test]
     fn compatibility_matrix_matches_versioned_fixtures_without_live_overclaim() {
         let jev = parse_fixture(include_bytes!(
             "../../../examples/conformance/jev-system-one.json"
@@ -480,12 +540,16 @@ mod tests {
             "../../../examples/conformance/openai-responses.json"
         ))
         .expect("OpenAI fixture");
+        let openrouter = parse_fixture(include_bytes!(
+            "../../../examples/conformance/openrouter-chat-completions.json"
+        ))
+        .expect("OpenRouter fixture");
         let matrix = verify_compatibility_matrix(
             include_bytes!("../../../examples/conformance/compatibility-matrix.json"),
-            &[&jev, &openai],
+            &[&jev, &openai, &openrouter],
         )
         .expect("compatibility matrix");
-        assert_eq!(matrix.providers.len(), 2);
+        assert_eq!(matrix.providers.len(), 3);
         assert!(matrix.providers.iter().all(|provider| {
             provider.verification_status == "fixture_verified_live_unverified"
                 && provider.last_live_verified.is_none()
