@@ -4,6 +4,7 @@ mod aivis_bridge;
 mod audio_stop;
 mod budget;
 mod chat_burst;
+mod chat_ingress;
 mod deadline;
 mod memory_compare;
 mod memory_context;
@@ -52,6 +53,13 @@ pub use chat_burst::{
     ChatBurstConfig, ChatBurstConfigError, ChatBurstMetrics, ChatBurstRecord, ChatOutcome,
     DeferredReplyReport, MAX_AUDIENCE_SIGNALS, MAX_CHAT_BURST_RECORDS, MAX_DEFERRED_REPORTS,
     MAX_REPLY_TTL_MS,
+};
+pub use chat_ingress::{
+    CHAT_RECORDS_PER_TICK, CHAT_SETTINGS_VAR, ChatIngressController, ChatIngressEnvironment,
+    ChatIngressStatus, ChatKeyStatus, ChatPlatform, ChatPlatformStatus, ChatRecord, ChatSettings,
+    ChatState, LineRefusal, MAX_INGRESS_ARGUMENT_BYTES, YOUTUBE_API_BASE_VAR, YOUTUBE_KEY_FILE_VAR,
+    gate_line, is_acceptable_api_base, parse_connect_argument, parse_disconnect_argument,
+    read_chat_settings,
 };
 pub use deadline::*;
 pub use memory_compare::*;
@@ -1157,6 +1165,9 @@ where
     /// Live voice settings (#360); `None` (default) composes nothing and the
     /// voice is whatever the environment named.
     voice: Option<voice_control::VoiceController>,
+    /// Stream-chat sidecars started from the panel (#361); `None` (default)
+    /// composes nothing and chat arrives only through stdin.
+    chat_ingress: Option<chat_ingress::ChatIngressController>,
     /// Scene context (#88 S1); `None` (default) composes nothing, and then no
     /// request carries a scene.
     scene: Option<scene_context::SceneContextService>,
@@ -1229,6 +1240,7 @@ where
             perception: None,
             model_switcher: None,
             voice: None,
+            chat_ingress: None,
             scene: None,
             speech_transcripts: None,
             speech_conversation: None,
@@ -1813,6 +1825,94 @@ where
         };
         if !admitted && let Some(voice) = self.voice.as_mut() {
             voice.cancel_preview();
+        }
+    }
+
+    /// Opt in to connecting stream chat at runtime (#361). Only the
+    /// authenticated `ingress.control` capability can use it
+    /// (`configure_ingress`).
+    pub fn with_chat_ingress(mut self, controller: chat_ingress::ChatIngressController) -> Self {
+        self.chat_ingress = Some(controller);
+        self
+    }
+
+    /// Whether chat connections are composed (the operator endpoint then holds
+    /// `ingress.control`).
+    pub fn chat_ingress_configured(&self) -> bool {
+        self.chat_ingress.is_some()
+    }
+
+    /// The chat connection state for the operator surfaces; `None` when not
+    /// composed.
+    pub fn chat_ingress_status(&self) -> Option<chat_ingress::ChatIngressStatus> {
+        self.chat_ingress.as_ref().map(|c| c.status())
+    }
+
+    /// Apply one chat connection operator request. `authority` must be the
+    /// authenticated local ingress capability. `action` is `ingress.connect`
+    /// (the argument is `{"platform","target"}`), `ingress.disconnect`
+    /// (`{"platform"}`), `ingress.key.set` (the argument is the YouTube key:
+    /// never echoed or audited) or `ingress.key.remove`. The detail returned
+    /// (and audited) names a platform and a validated target, never the key.
+    /// Nothing here blocks: the sidecar is started (or ended) at once and read
+    /// by [`Self::service_chat_ingress`].
+    pub fn configure_ingress(
+        &mut self,
+        authority: &AuthenticatedControl,
+        action: &str,
+        argument: Option<&str>,
+    ) -> Result<String, String> {
+        if !authority.has_capability(aivtuber_domain::Capability::IngressControl) {
+            return Err("chat connections are not authorized".to_owned());
+        }
+        let Some(ingress) = self.chat_ingress.as_mut() else {
+            return Err("chat connections are not configured".to_owned());
+        };
+        match action {
+            "ingress.connect" => {
+                let (platform, target) = chat_ingress::parse_connect_argument(argument)?;
+                ingress.connect(platform, &target)
+            }
+            "ingress.disconnect" => {
+                ingress.disconnect(chat_ingress::parse_disconnect_argument(argument)?)
+            }
+            "ingress.key.set" => ingress.set_key(argument.unwrap_or("")),
+            "ingress.key.remove" => ingress.remove_key(),
+            _ => Err("not an ingress action".to_owned()),
+        }
+    }
+
+    /// Admit what the chat sidecars wrote, a few records per platform per
+    /// turn, through the same path as a stdin line (#361): the app's ingress
+    /// ceiling, envelope validation and rate limits all apply. Never blocks;
+    /// a flood is dropped (and counted) in the bounded queue upstream.
+    pub fn service_chat_ingress(&mut self, now_ms: u64, sequence_seed: &mut u64) {
+        let Some(ingress) = self.chat_ingress.as_mut() else {
+            return;
+        };
+        let records = ingress.take_records(chat_ingress::CHAT_RECORDS_PER_TICK);
+        for record in records {
+            *sequence_seed = sequence_seed.saturating_add(1);
+            let accepted = match self.process_content_bytes(&record.raw, now_ms, *sequence_seed) {
+                Ok(outcome) => outcome.admission == aivtuber_runtime::ContentAdmitDecision::Queued,
+                Err(error) => {
+                    eprintln!(
+                        "chat_ingress: {} record rejected: {error}",
+                        record.platform.name()
+                    );
+                    false
+                }
+            };
+            if let Some(ingress) = self.chat_ingress.as_mut() {
+                ingress.note_outcome(record.platform, accepted);
+            }
+        }
+    }
+
+    /// End the chat sidecars (and wait for them) when the app ends.
+    pub fn shutdown_chat_ingress(&mut self) {
+        if let Some(ingress) = self.chat_ingress.as_mut() {
+            ingress.shutdown();
         }
     }
 
@@ -4978,6 +5078,7 @@ mod tests {
 
     mod aivis_cloud_tts_tests;
     mod chat_burst_tests;
+    mod chat_ingress_tests;
     mod local_thinking_fallback_tests;
     mod memory_seed_tests;
     mod memory_writer_tests;

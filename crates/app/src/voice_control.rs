@@ -100,7 +100,7 @@ impl VoiceEnvironment {
 
 /// Replaces `path` with `text` (temp file in the same directory, then rename,
 /// so a crash leaves the old or the new file, never half of one).
-fn write_atomic(path: &Path, text: &str, owner_only: bool) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, text: &str, owner_only: bool) -> std::io::Result<()> {
     let mut temp = path.as_os_str().to_owned();
     temp.push(".tmp");
     let temp = PathBuf::from(temp);
@@ -201,7 +201,7 @@ pub fn read_key_file(path: &Path) -> Option<SecretString> {
     is_valid_key(key).then(|| SecretString::new(key))
 }
 
-fn write_key_file(path: &Path, key: &str) -> std::io::Result<()> {
+pub(crate) fn write_key_file(path: &Path, key: &str) -> std::io::Result<()> {
     write_atomic(path, &format!("{key}\n"), true)
 }
 
