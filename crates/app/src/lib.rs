@@ -56,9 +56,9 @@ pub use chat_burst::{
 pub use chat_ingress::{
     CHAT_RECORDS_PER_TICK, CHAT_SETTINGS_VAR, ChatIngressController, ChatIngressEnvironment,
     ChatIngressStatus, ChatKeyStatus, ChatPlatform, ChatPlatformStatus, ChatRecord, ChatSettings,
-    ChatState, LineRefusal, MAX_INGRESS_ARGUMENT_BYTES, YOUTUBE_API_BASE_VAR, YOUTUBE_KEY_FILE_VAR,
-    gate_line, is_acceptable_api_base, parse_connect_argument, parse_disconnect_argument,
-    read_chat_settings,
+    ChatState, LineRefusal, MAX_INGRESS_ARGUMENT_BYTES, ManualChatClock, YOUTUBE_API_BASE_VAR,
+    YOUTUBE_KEY_FILE_VAR, gate_line, is_acceptable_api_base, parse_connect_argument,
+    parse_disconnect_argument, read_chat_settings,
 };
 pub use deadline::*;
 pub use memory_compare::*;
@@ -1795,14 +1795,16 @@ where
     /// The preview is an ordinary panel chat line whose reply the Thinking
     /// override replaces with the fixed sentence, so it takes the normal
     /// generation, TTS, scheduling and audit path (mute and stop apply). Never
-    /// blocks.
-    pub fn service_voice(&mut self, now_ms: u64, sequence_seed: &mut u64) {
+    /// blocks. Returns `true` when a key-check result was applied: the state
+    /// the panel published earlier this turn is then stale, and the caller
+    /// asks the panel to publish again (#373).
+    pub fn service_voice(&mut self, now_ms: u64, sequence_seed: &mut u64) -> bool {
         let Some(voice) = self.voice.as_mut() else {
-            return;
+            return false;
         };
-        voice.poll();
+        let applied = voice.poll();
         let Some((event_id, sequence)) = voice.take_pending_preview() else {
-            return;
+            return applied;
         };
         let raw = panel::chat_envelope(&event_id, sequence, aivtuber_domain::VOICE_PREVIEW_TEXT);
         *sequence_seed = sequence_seed.saturating_add(1);
@@ -1822,6 +1824,7 @@ where
         if !admitted && let Some(voice) = self.voice.as_mut() {
             voice.cancel_preview();
         }
+        applied
     }
 
     /// Opt in to connecting stream chat at runtime (#361). Only the
