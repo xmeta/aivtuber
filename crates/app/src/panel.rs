@@ -207,6 +207,13 @@ impl PanelService {
         self.server.launch_url()
     }
 
+    /// The app changed something the published state shows after this turn's
+    /// [`Self::service`] (a finished key check): publish on the next turn
+    /// instead of waiting for the periodic refresh (#373).
+    pub fn publish_next_turn(&mut self) {
+        self.next_publish_ms = 0;
+    }
+
     /// One composition-loop turn: stop and mute first (own queue), then a few
     /// chat lines, then the published state. Never blocks.
     pub fn service<R: RoutePlanner>(

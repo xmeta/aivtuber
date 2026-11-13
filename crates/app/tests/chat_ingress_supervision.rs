@@ -6,7 +6,8 @@
 
 use aivtuber_adapters::SecretString;
 use aivtuber_app::{
-    ChatIngressController, ChatIngressEnvironment, ChatPlatform, ChatState, RawIngressConfig,
+    ChatIngressController, ChatIngressEnvironment, ChatPlatform, ChatState, ManualChatClock,
+    RawIngressConfig,
 };
 use aivtuber_domain::{SourceClass, TrustLevel};
 use aivtuber_runtime::{
@@ -58,6 +59,23 @@ fn environment(root: &Path, env_key: Option<&str>) -> ChatIngressEnvironment {
 fn controller(root: &Path, env_key: Option<&str>) -> ChatIngressController {
     ChatIngressController::new(environment(root, env_key))
 }
+
+/// A controller whose backoff and connecting window run on a logical clock
+/// that only the test moves (#373): a state such as `backoff` then lasts until
+/// the test lets it end, however slow or fast the machine is.
+fn controller_on_a_logical_clock(
+    root: &Path,
+    env_key: Option<&str>,
+) -> (ChatIngressController, ManualChatClock) {
+    let clock = ManualChatClock::default();
+    let mut env = environment(root, env_key);
+    env.clock = Some(clock.clone());
+    (ChatIngressController::new(env), clock)
+}
+
+/// Only a real hang may expire this: the waits that use it end on an event (a
+/// child's exit seen, a state reached), never on elapsed time.
+const HANG_GUARD: Duration = Duration::from_secs(120);
 
 fn alive(pid: u32) -> bool {
     #[cfg(windows)]
@@ -126,7 +144,7 @@ fn a_twitch_connection_delivers_untrusted_chat_then_disconnect_leaves_no_child()
     assert!(alive(pids[0]));
     assert_eq!(chat.status().twitch.state, ChatState::Connecting);
 
-    let records = collect(&mut chat, Duration::from_secs(10), 3);
+    let records = collect(&mut chat, HANG_GUARD, 3);
     assert_eq!(records.len(), 3);
     // The same admission as a stdin line, under the documented ceiling.
     let mut runtime = runtime(IngressPolicy::new(
@@ -159,7 +177,7 @@ fn a_twitch_connection_delivers_untrusted_chat_then_disconnect_leaves_no_child()
     assert_eq!(chat.status().twitch.state, ChatState::Disconnected);
     assert!(chat.child_ids().is_empty());
     assert!(
-        wait_for(Duration::from_secs(10), || !alive(pids[0])),
+        wait_for(HANG_GUARD, || !alive(pids[0])),
         "the child must be gone"
     );
     let _ = std::fs::remove_dir_all(&root);
@@ -177,7 +195,7 @@ fn both_platforms_run_at_once_and_dropping_the_controller_ends_every_child() {
     .unwrap();
     let pids = chat.child_ids();
     assert_eq!(pids.len(), 2);
-    let records = collect(&mut chat, Duration::from_secs(10), 6);
+    let records = collect(&mut chat, HANG_GUARD, 6);
     let platforms: std::collections::BTreeSet<_> =
         records.iter().map(|r| r.platform.name()).collect();
     assert_eq!(platforms.len(), 2, "{records:?}");
@@ -185,7 +203,7 @@ fn both_platforms_run_at_once_and_dropping_the_controller_ends_every_child() {
     drop(chat);
     for pid in pids {
         assert!(
-            wait_for(Duration::from_secs(10), || !alive(pid)),
+            wait_for(HANG_GUARD, || !alive(pid)),
             "{pid} outlived the controller"
         );
     }
@@ -199,7 +217,7 @@ fn a_flood_is_dropped_in_a_bounded_queue_and_never_blocks_the_loop() {
     let mut chat = controller(&root, None);
     chat.connect(ChatPlatform::Twitch, "flood_chan").unwrap();
     // Nobody drains for a while: the child writes 30000 lines into a queue of 32.
-    assert!(wait_for(Duration::from_secs(30), || {
+    assert!(wait_for(HANG_GUARD, || {
         chat.status().twitch.dropped_queue_full > 20_000
     }));
     // The loop takes a bounded handful per turn, instantly, however much the
@@ -251,12 +269,12 @@ fn records_claiming_more_than_a_panel_source_may_are_dropped_and_counted() {
     let root = scratch("forge");
     let mut chat = controller(&root, None);
     chat.connect(ChatPlatform::Twitch, "forgery").unwrap();
-    let records = collect(&mut chat, Duration::from_secs(10), 1);
+    let records = collect(&mut chat, HANG_GUARD, 1);
     assert_eq!(records.len(), 1, "only the valid record passes the gate");
     let event: serde_json::Value = serde_json::from_slice(&records[0].raw).unwrap();
     assert_eq!(event["trust_level"], "untrusted");
     assert_eq!(event["source_class"], "public_chat");
-    assert!(wait_for(Duration::from_secs(5), || {
+    assert!(wait_for(HANG_GUARD, || {
         chat.status().twitch.dropped_refused >= 5
     }));
     let status = chat.status();
@@ -271,18 +289,34 @@ fn records_claiming_more_than_a_panel_source_may_are_dropped_and_counted() {
 #[test]
 fn a_stopping_child_is_restarted_with_backoff_then_given_up_on() {
     let root = scratch("crash");
-    let mut chat = controller(&root, None);
+    let (mut chat, clock) = controller_on_a_logical_clock(&root, None);
     chat.connect(ChatPlatform::Twitch, "crashing").unwrap();
-    let mut seen_backoff = false;
+    let mut backoffs = 0;
     let mut records = 0;
-    assert!(wait_for(Duration::from_secs(20), || {
-        records += chat.take_records(8).len();
-        let status = chat.status();
-        seen_backoff |= status.twitch.state == ChatState::Backoff;
-        status.twitch.state == ChatState::Failed
-    }));
+    // The clock is frozen, so a backoff cannot end behind the test's back: it
+    // is seen, then the test lets exactly that delay pass.
+    loop {
+        assert!(
+            wait_for(HANG_GUARD, || {
+                records += chat.take_records(8).len();
+                matches!(
+                    chat.status().twitch.state,
+                    ChatState::Backoff | ChatState::Failed
+                )
+            }),
+            "the child's exit was never handled: {:?}",
+            chat.status().twitch
+        );
+        if chat.status().twitch.state == ChatState::Failed {
+            break;
+        }
+        backoffs += 1;
+        assert!(backoffs <= 2, "more restarts than 3 failures allow");
+        assert_eq!(chat.status().twitch.restarts, backoffs - 1);
+        clock.advance(200);
+    }
     let status = chat.status();
-    assert!(seen_backoff);
+    assert_eq!(backoffs, 2, "a backoff before each of the 2 restarts");
     assert_eq!(status.twitch.restarts, 2, "3 failures allowed: 2 restarts");
     assert!(
         status
@@ -307,7 +341,7 @@ fn a_fatal_exit_is_not_retried_and_a_clean_exit_is_a_disconnect() {
     let root = scratch("exit");
     let mut chat = controller(&root, None);
     chat.connect(ChatPlatform::Twitch, "fatal_one").unwrap();
-    assert!(wait_for(Duration::from_secs(10), || {
+    assert!(wait_for(HANG_GUARD, || {
         chat.take_records(8);
         chat.status().twitch.state == ChatState::Failed
     }));
@@ -318,7 +352,7 @@ fn a_fatal_exit_is_not_retried_and_a_clean_exit_is_a_disconnect() {
         Some("double_ingress: the key was rejected")
     );
     chat.connect(ChatPlatform::Twitch, "ended_one").unwrap();
-    assert!(wait_for(Duration::from_secs(10), || {
+    assert!(wait_for(HANG_GUARD, || {
         chat.take_records(8);
         chat.status().twitch.state == ChatState::Disconnected
     }));
@@ -407,13 +441,15 @@ fn a_hostile_sidecar_cannot_put_the_key_into_the_status() {
     // `leaks______` echoes the key it was given onto stderr, writes one
     // record and exits with code 1, so its last diagnostic becomes the error.
     for (name, env_key) in [("environment", Some(KEY)), ("file", None)] {
-        let mut chat = controller(&root, env_key);
+        // Logical clock: `backoff` lasts until this test moves time, so the
+        // poll cannot step over it.
+        let (mut chat, _clock) = controller_on_a_logical_clock(&root, env_key);
         if env_key.is_none() {
             chat.set_key(KEY).unwrap();
         }
         chat.connect(ChatPlatform::Youtube, "leaks______").unwrap();
         assert!(
-            wait_for(Duration::from_secs(10), || {
+            wait_for(HANG_GUARD, || {
                 chat.take_records(8);
                 chat.status().youtube.state == ChatState::Backoff
             }),
@@ -522,7 +558,7 @@ fn reconnecting_to_the_same_target_is_idempotent_and_a_new_target_replaces_the_c
     let second = chat.child_ids();
     assert_eq!(second.len(), 1);
     assert_ne!(second, first);
-    assert!(wait_for(Duration::from_secs(10), || !alive(first[0])));
+    assert!(wait_for(HANG_GUARD, || !alive(first[0])));
     chat.disconnect(ChatPlatform::Twitch).unwrap();
     assert!(
         chat.disconnect(ChatPlatform::Twitch)

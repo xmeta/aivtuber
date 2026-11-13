@@ -36,10 +36,9 @@
 //!    ranking can neither add a candidate nor revive a suppressed one. Any
 //!    ranker failure falls back to the deterministic order.
 //!
-//! S1 deliberately ships the *seam* for Jev batch ranking, not a Jev batch
-//! prompt: [`BatchEngagementRequest`] is `Serialize`-only (no `Deserialize`,
-//! no JSON Schema) so it cannot become a second implicit wire contract before
-//! the adapter slice defines one.
+//! [`BatchEngagementRequest`] is `Serialize`-only (no `Deserialize`, no JSON
+//! Schema) so it cannot become a second implicit wire contract. The Jev ranker
+//! behind the seam (#78 S3, `jev_batch.rs`) keeps its provider shape private.
 
 use crate::audience::{
     AudienceConfig, AudienceConfigError, AudienceInput, AudienceSignal, AudienceWindow,

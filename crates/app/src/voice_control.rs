@@ -610,18 +610,20 @@ impl VoiceController {
         Ok("checking the key".to_owned())
     }
 
-    /// Collect a finished key check. Never blocks.
-    pub fn poll(&mut self) {
+    /// Collect a finished key check; `true` when a result was applied (the
+    /// published panel state is then stale). Never blocks.
+    pub fn poll(&mut self) -> bool {
         let CheckState::Checking(receiver) = &self.check else {
-            return;
+            return false;
         };
         let outcome = match receiver.try_recv() {
             Ok(outcome) => outcome,
-            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Empty) => return false,
             Err(TryRecvError::Disconnected) => KeyCheck::NetworkError,
         };
         eprintln!("voice: key check {}", check_name(Some(outcome)));
         self.check = CheckState::Done(outcome);
+        true
     }
 
     /// Arm the preview for the next panel line and return its event id and

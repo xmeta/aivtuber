@@ -47,6 +47,7 @@ use aivtuber_generative::{
 };
 use aivtuber_reflex::{
     BurstConfig, JevAdapter, JevAdapterConfig, JevApiKey, PolicyConfig, ReflexPipeline,
+    SemanticIndex,
 };
 use aivtuber_runtime::{
     CachedPerformer, CachedPlaybackConfig, IngressPolicy, LocalVisemeStore,
@@ -195,26 +196,18 @@ fn run() -> Result<(), Box<dyn Error>> {
                 .is_some_and(|generative| generative.phrase_mode().is_phrased()),
         ),
     );
+    // #78 S3: the reflex/full profiles already own a semantic index and a Jev
+    // adapter; the chat-burst lane may reuse (clones of) them. Local and cached
+    // compose neither, so those stay Jev-free.
+    let mut chat_score_index: Option<SemanticIndex> = None;
+    let mut chat_jev_adapter: Option<JevAdapter> = None;
     let active_planner: Box<dyn RoutePlanner> = match profile {
         CompositionProfile::Cached => Box::new(IntentRoutePlanner) as Box<dyn RoutePlanner>,
         // #220 S1: deterministic routing, no decision model, no Jev.
         CompositionProfile::Local => Box::new(LocalRoutePlanner) as Box<dyn RoutePlanner>,
         CompositionProfile::Reflex | CompositionProfile::Full => {
-            let semantic_pack_root = env_path("AIVTUBER_PACK_ROOT")
-                .unwrap_or_else(|| PathBuf::from("examples/starter-reaction-pack"));
-            let mut semantic_assets = AssetStore::new(
-                semantic_pack_root.join("descriptors"),
-                compatibility.clone(),
-            );
-            semantic_assets.index_local()?;
-            let semantic_index = aivtuber_app::build_semantic_index_from_asset_store(
-                &semantic_assets,
-                &aivtuber_app::AssetSemanticIndexConfig {
-                    retriever_version: "production-v1".to_owned(),
-                    embedding_model: "starter-semantic".to_owned(),
-                    embedding_model_version: "1".to_owned(),
-                },
-            )?;
+            let semantic_index = build_starter_semantic_index(&compatibility)?;
+            chat_score_index = Some(semantic_index.clone());
             let embedding_provider =
                 aivtuber_app::PayloadIntentEmbedding::new(semantic_index.dimension());
             let jev_adapter = JevAdapter::new(
@@ -228,6 +221,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 },
                 JevApiKey::new(env_optional("AIVTUBER_JEV_API_KEY").unwrap_or_default())?,
             )?;
+            chat_jev_adapter = Some(jev_adapter.clone());
             let pipeline =
                 ReflexPipeline::new(semantic_index, jev_adapter, PolicyConfig::default(), 2)?;
             Box::new(
@@ -494,6 +488,16 @@ fn run() -> Result<(), Box<dyn Error>> {
     if audience_requested && !chat_burst_mode {
         return Err("AIVTUBER_CHAT_AUDIENCE_MODE requires AIVTUBER_CHAT_BURST_MODE=true".into());
     }
+    // Issue #78 S3: both default off and only act inside the burst lane, so
+    // asking for them without it refuses startup rather than doing nothing.
+    let retrieval_score_requested = env_bool("AIVTUBER_CHAT_BURST_RETRIEVAL_SCORE", false)?;
+    let jev_ranker_requested = env_bool("AIVTUBER_CHAT_BURST_JEV_RANKER", false)?;
+    if (retrieval_score_requested || jev_ranker_requested) && !chat_burst_mode {
+        return Err(
+            "AIVTUBER_CHAT_BURST_RETRIEVAL_SCORE and AIVTUBER_CHAT_BURST_JEV_RANKER require AIVTUBER_CHAT_BURST_MODE=true"
+                .into(),
+        );
+    }
     if chat_burst_mode {
         let defaults = ChatBurstConfig::default();
         let config = ChatBurstConfig {
@@ -544,6 +548,58 @@ fn run() -> Result<(), Box<dyn Error>> {
         };
         app = app.with_chat_burst(config)?;
         chat_burst_enabled = true;
+        if retrieval_score_requested {
+            // Reuse the reflex profile's index when there is one; otherwise
+            // build the same starter index from the pack. Without a usable
+            // index the lane keeps the text heuristic (the documented
+            // fallback) rather than refusing startup.
+            let index = match chat_score_index.take() {
+                Some(index) => Ok(index),
+                None => build_starter_semantic_index(&compatibility),
+            };
+            match index {
+                Ok(index) => {
+                    let embedder = aivtuber_reflex::ReactionAxisEmbedder::new(index.dimension());
+                    let scorer = aivtuber_reflex::RetrievalScorer::new(
+                        index,
+                        Box::new(embedder),
+                        aivtuber_reflex::RetrievalScoreConfig {
+                            max_lookups_per_window: env_usize(
+                                "AIVTUBER_CHAT_BURST_RETRIEVAL_LOOKUPS",
+                                aivtuber_reflex::RetrievalScoreConfig::default()
+                                    .max_lookups_per_window,
+                            )?,
+                            window_ms: config.burst.window_ms,
+                        },
+                    )?;
+                    app = app.with_chat_burst_retrieval_score(scorer)?;
+                    eprintln!("chat_burst: retrieval-augmented local score enabled");
+                }
+                Err(error) => eprintln!(
+                    "chat_burst: retrieval score unavailable ({error}); using the text heuristic"
+                ),
+            }
+        }
+        if jev_ranker_requested {
+            let adapter = chat_jev_adapter.take().ok_or(
+                "AIVTUBER_CHAT_BURST_JEV_RANKER requires AIVTUBER_MODE=reflex or full (a composed Jev adapter)",
+            )?;
+            let ranker_config = aivtuber_reflex::JevBatchRankerConfig {
+                deadline: Duration::from_millis(env_u64(
+                    "AIVTUBER_CHAT_BURST_JEV_RANKER_DEADLINE_MS",
+                    aivtuber_reflex::JevBatchRankerConfig::default()
+                        .deadline
+                        .as_millis() as u64,
+                )?),
+                ..aivtuber_reflex::JevBatchRankerConfig::default()
+            };
+            let ranker = aivtuber_reflex::JevBatchRanker::new(adapter, ranker_config)?;
+            app = app.with_chat_burst_ranker(Box::new(ranker))?;
+            eprintln!(
+                "chat_burst: Jev batch ranker enabled deadline_ms={} (reorders only; policy re-applies)",
+                ranker_config.deadline.as_millis()
+            );
+        }
         eprintln!(
             "chat_burst: enabled window_ms={} enter_count={} top_k={} max_per_actor={} actor_cooldown_ms={} defer_capacity={} defer_per_actor={} reply_ttl_ms={}",
             config.burst.window_ms,
@@ -849,7 +905,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         // #360: collect a finished key check and submit a waiting voice
         // preview line. Never blocks: the check runs on its own thread.
-        app.service_voice(now_ms, &mut sequence_seed);
+        if app.service_voice(now_ms, &mut sequence_seed)
+            && let Some(panel) = panel.as_mut()
+        {
+            panel.publish_next_turn();
+        }
         // #361: admit what the panel-started chat sidecars wrote, a few
         // records per platform per turn, through the same admission as stdin.
         app.service_chat_ingress(now_ms, &mut sequence_seed);
@@ -2607,6 +2667,28 @@ fn parse_shadow_event_kinds() -> Result<Vec<EventKind>, Box<dyn Error>> {
         kinds.push(kind);
     }
     Ok(kinds)
+}
+
+/// Starter-semantic index over the pack's usable Performance Assets, shared by
+/// the reflex profiles' planner and the chat-burst retrieval score.
+fn build_starter_semantic_index(
+    compatibility: &RuntimeCompatibility,
+) -> Result<SemanticIndex, Box<dyn Error>> {
+    let semantic_pack_root = env_path("AIVTUBER_PACK_ROOT")
+        .unwrap_or_else(|| PathBuf::from("examples/starter-reaction-pack"));
+    let mut semantic_assets = AssetStore::new(
+        semantic_pack_root.join("descriptors"),
+        compatibility.clone(),
+    );
+    semantic_assets.index_local()?;
+    Ok(aivtuber_app::build_semantic_index_from_asset_store(
+        &semantic_assets,
+        &aivtuber_app::AssetSemanticIndexConfig {
+            retriever_version: "production-v1".to_owned(),
+            embedding_model: "starter-semantic".to_owned(),
+            embedding_model_version: "1".to_owned(),
+        },
+    )?)
 }
 
 fn env_optional(name: &str) -> Option<String> {
