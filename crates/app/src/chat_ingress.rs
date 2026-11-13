@@ -51,7 +51,9 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::time::Instant;
 
@@ -284,6 +286,20 @@ pub struct ChatIngressEnvironment {
     /// How long a running child is shown as `connecting` before `connected`
     /// (the sidecars have no handshake line; a first record also confirms it).
     pub connecting_ms: u64,
+    /// A logical clock instead of the wall clock. `None` in production; a test
+    /// moves it explicitly so the backoff and the connecting window never
+    /// depend on how fast the machine runs.
+    pub clock: Option<ManualChatClock>,
+}
+
+/// The supervisor's logical time, advanced only by the holder (tests).
+#[derive(Debug, Clone, Default)]
+pub struct ManualChatClock(Arc<AtomicU64>);
+
+impl ManualChatClock {
+    pub fn advance(&self, ms: u64) {
+        self.0.fetch_add(ms, Ordering::SeqCst);
+    }
 }
 
 impl ChatIngressEnvironment {
@@ -312,6 +328,7 @@ impl ChatIngressEnvironment {
             },
             max_failures: 6,
             connecting_ms: 3_000,
+            clock: None,
         }
     }
 }
@@ -422,6 +439,10 @@ struct Running {
     /// reader has reached end of stream (or [`STDERR_DRAIN_MS`] later), so the
     /// child's last diagnostic line is not lost to a thread race.
     exit_seen_ms: Option<u64>,
+    /// The status the child ended with. The guard reports it once (and lets
+    /// the child go), so it is kept here for the polls that wait for the
+    /// stderr reader.
+    exit_status: Option<ExitStatus>,
 }
 
 #[derive(Default)]
@@ -603,10 +624,15 @@ fn poll_slot(slot: &mut Slot, timing: Timing, key: Option<&str>, now_ms: u64) {
             }
         }
     }
+    if let Some(run) = slot.running.as_mut()
+        && run.exit_status.is_none()
+    {
+        run.exit_status = run.guard.try_wait();
+    }
     let exited = slot
         .running
-        .as_mut()
-        .and_then(|run| run.guard.try_wait().map(|status| (status, run.started_ms)));
+        .as_ref()
+        .and_then(|run| run.exit_status.map(|status| (status, run.started_ms)));
     if let Some((status, started_ms)) = exited {
         // What the child wrote before it ended may still be on its way from
         // the reader thread: wait (across polls, never blocking) until the
@@ -686,6 +712,7 @@ pub struct ChatRecord {
 pub struct ChatIngressController {
     env: ChatIngressEnvironment,
     epoch: Instant,
+    clock: Option<ManualChatClock>,
     slots: [Slot; 2],
     settings: ChatSettings,
     file_key: Option<SecretString>,
@@ -706,6 +733,7 @@ impl ChatIngressController {
         let settings = read_chat_settings(&env.settings_path);
         let file_key = read_key_file(&env.key_file);
         Self {
+            clock: env.clock.clone(),
             env,
             epoch: Instant::now(),
             slots: [
@@ -719,7 +747,10 @@ impl ChatIngressController {
     }
 
     fn now_ms(&self) -> u64 {
-        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+        match &self.clock {
+            Some(clock) => clock.0.load(Ordering::SeqCst),
+            None => u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX),
+        }
     }
 
     fn slot(&self, platform: ChatPlatform) -> &Slot {
@@ -812,6 +843,7 @@ impl ChatIngressController {
             started_ms: 0,
             saw_record: true,
             exit_seen_ms: None,
+            exit_status: None,
         });
         line_tx
     }
@@ -1029,6 +1061,7 @@ impl ChatIngressController {
             started_ms: now_ms,
             saw_record: false,
             exit_seen_ms: None,
+            exit_status: None,
         })
     }
 
@@ -1203,6 +1236,65 @@ mod tests {
             "{{\"schema_version\":\"0.2.0\",\"source\":\"{source}\",\"source_class\":\"{class}\",\"trust_level\":\"{trust}\",\"plane\":\"content\"}}"
         )
         .into_bytes()
+    }
+
+    /// #373: the guard reports a child's exit once. An exit first seen while
+    /// the stderr reader was still open used to be lost on the next poll, so
+    /// the slot stayed `connected` with a dead child forever.
+    #[test]
+    fn an_exit_seen_before_the_stderr_reader_ends_is_still_handled() {
+        use std::time::Duration;
+        // The test binary itself, with a flag it rejects: ends at once, non-zero.
+        let child = Command::new(std::env::current_exe().expect("exe"))
+            .arg("--no-such-flag")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        let (_line_tx, lines) = sync_channel(1);
+        // Held open for the whole test: the reader never reaches end of stream.
+        let (_err_tx, stderr) = sync_channel(1);
+        let mut slot = Slot::new(ChatPlatform::Twitch);
+        slot.state = ChatState::Connected;
+        slot.target = Some("alpha_one".to_owned());
+        slot.running = Some(Running {
+            guard: ChildGuard(Some(child)),
+            lines,
+            stderr,
+            pump: RawIngressMetrics::default(),
+            started_ms: 0,
+            saw_record: true,
+            exit_seen_ms: None,
+            exit_status: None,
+        });
+        let timing = Timing {
+            restart: ReconnectPolicy {
+                initial_delay_ms: 40,
+                max_delay_ms: 200,
+            },
+            max_failures: 3,
+            connecting_ms: 100,
+        };
+        // The logical clock stays at 0 while the OS ends the child; the only
+        // wall-clock bound here is a hang guard.
+        let guard = Instant::now() + Duration::from_secs(120);
+        while slot
+            .running
+            .as_ref()
+            .is_some_and(|run| run.exit_seen_ms.is_none())
+        {
+            poll_slot(&mut slot, timing, None, 0);
+            assert!(Instant::now() < guard, "the child never ended");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(slot.state, ChatState::Connected, "still waiting for stderr");
+        poll_slot(&mut slot, timing, None, STDERR_DRAIN_MS - 1);
+        assert_eq!(slot.state, ChatState::Connected, "inside the drain bound");
+        poll_slot(&mut slot, timing, None, STDERR_DRAIN_MS);
+        assert_eq!(slot.state, ChatState::Backoff);
+        assert!(slot.running.is_none());
+        assert_eq!(slot.failures, 1);
     }
 
     #[test]
