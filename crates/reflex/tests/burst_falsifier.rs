@@ -8,10 +8,14 @@ use aivtuber_domain::{
 };
 use aivtuber_reflex::{
     BatchEngagementRequest, BatchRankFailure, BatchRanker, BatchResolution, BurstConfig,
-    BurstEngine, Disposition, ImmediateReason,
+    BurstEngine, Disposition, HttpResponse, HttpTransport, ImmediateReason, JevAdapter,
+    JevAdapterConfig, JevApiKey, JevBatchRanker, JevBatchRankerConfig, TransportError,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 fn burst_100x() -> Vec<EventEnvelope> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -73,6 +77,77 @@ impl BatchRanker for CountingRanker {
     }
 }
 
+/// Stands in for the Jev endpoint. It answers every `score` question the
+/// request names, scoring in reverse request order, except that every 7th
+/// request is an HTTP 503 and every 11th a body with an invented slot, so the
+/// burst also exercises typed failure and deterministic fallback.
+#[derive(Debug, Default)]
+struct FakeJev {
+    requests: AtomicU64,
+    max_questions: AtomicU64,
+}
+
+impl HttpTransport for FakeJev {
+    fn post_json(
+        &self,
+        _endpoint: &str,
+        _bearer_token: &str,
+        body: &[u8],
+        _timeout: Duration,
+    ) -> Result<HttpResponse, TransportError> {
+        let n = self.requests.fetch_add(1, Ordering::SeqCst) + 1;
+        let request: serde_json::Value = serde_json::from_slice(body).expect("request json");
+        let slots: Vec<String> = request["questions"]
+            .as_object()
+            .expect("questions")
+            .keys()
+            .cloned()
+            .collect();
+        self.max_questions
+            .fetch_max(slots.len() as u64, Ordering::SeqCst);
+        if n.is_multiple_of(7) {
+            return Ok(HttpResponse {
+                status: 503,
+                body: Vec::new(),
+            });
+        }
+        let mut answers = serde_json::Map::new();
+        for (i, slot) in slots.iter().enumerate() {
+            let score = 1.0 - (i as f64 / slots.len() as f64);
+            answers.insert(
+                slot.clone(),
+                serde_json::json!({
+                    "type": "score", "score": score, "confidence": 0.9,
+                    "probabilities": {"low": 1.0 - score, "high": score},
+                    "legend": {"low": "l", "high": "h"},
+                }),
+            );
+        }
+        if n.is_multiple_of(11) {
+            answers.insert(
+                "evt-injected".to_owned(),
+                serde_json::json!({"type": "score", "score": 1.0, "confidence": 1.0,
+                    "probabilities": {"a": 1.0}, "legend": {}}),
+            );
+        }
+        Ok(HttpResponse {
+            status: 200,
+            body: serde_json::to_vec(&serde_json::json!({
+                "model": "fake", "answers": answers,
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }))
+            .expect("body"),
+        })
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    NoRanker,
+    Counting,
+    Jev,
+}
+
 #[derive(Default)]
 struct Run {
     records: Vec<u8>,
@@ -89,11 +164,35 @@ fn record(run: &mut Run, resolution: &BatchResolution) {
     }
 }
 
-fn drive(drain_each: bool, use_ranker: bool, poll_every_event: bool) -> (Run, BurstEngine, u64) {
+fn drive(drain_each: bool, kind: Kind, poll_every_event: bool) -> (Run, BurstEngine, u64) {
+    let (run, engine, calls, _) = drive_with(drain_each, kind, poll_every_event);
+    (run, engine, calls)
+}
+
+fn drive_with(
+    drain_each: bool,
+    kind: Kind,
+    poll_every_event: bool,
+) -> (Run, BurstEngine, u64, Arc<FakeJev>) {
     let trace = burst_100x();
     let mut engine = BurstEngine::new(BurstConfig::default()).expect("config");
     let context = ReflexContext::default();
     let mut ranker = CountingRanker { calls: 0 };
+    let fake = Arc::new(FakeJev::default());
+    let mut jev = JevBatchRanker::new(
+        JevAdapter::with_transport(
+            JevAdapterConfig::default(),
+            JevApiKey::new("test-key").expect("key"),
+            fake.clone(),
+        )
+        .expect("adapter"),
+        // A breaker would mask the per-batch call accounting under test.
+        JevBatchRankerConfig {
+            breaker_threshold: 16,
+            ..JevBatchRankerConfig::default()
+        },
+    )
+    .expect("ranker");
     let mut run = Run::default();
     let mut last_ms = 0;
 
@@ -133,9 +232,15 @@ fn drive(drain_each: bool, use_ranker: bool, poll_every_event: bool) -> (Run, Bu
         assert!(engine.pending_len() <= engine.config().max_candidates);
         assert!(engine.ready_len() <= engine.config().max_ready_batches);
         if drain_each {
-            while let Some(resolution) =
-                engine.resolve_next(&context, if use_ranker { Some(&mut ranker) } else { None })
-            {
+            loop {
+                let chosen: Option<&mut dyn BatchRanker> = match kind {
+                    Kind::NoRanker => None,
+                    Kind::Counting => Some(&mut ranker),
+                    Kind::Jev => Some(&mut jev),
+                };
+                let Some(resolution) = engine.resolve_next(&context, chosen) else {
+                    break;
+                };
                 record(&mut run, &resolution);
             }
         }
@@ -143,7 +248,11 @@ fn drive(drain_each: bool, use_ranker: bool, poll_every_event: bool) -> (Run, Bu
     for resolution in engine.shutdown(last_ms + 1, &context) {
         record(&mut run, &resolution);
     }
-    (run, engine, ranker.calls)
+    let calls = match kind {
+        Kind::Jev => fake.requests.load(Ordering::SeqCst),
+        _ => ranker.calls,
+    };
+    (run, engine, calls, fake)
 }
 
 fn assert_exactly_once(run: &Run, engine: &BurstEngine) {
@@ -164,7 +273,7 @@ fn assert_exactly_once(run: &Run, engine: &BurstEngine) {
 
 #[test]
 fn burst_100x_is_bounded_with_few_ranker_calls_and_full_accounting() {
-    let (run, engine, ranker_calls) = drive(true, true, false);
+    let (run, engine, ranker_calls) = drive(true, Kind::Counting, false);
     assert_exactly_once(&run, &engine);
     let metrics = engine.metrics();
     assert!(
@@ -190,7 +299,7 @@ fn burst_100x_is_bounded_with_few_ranker_calls_and_full_accounting() {
 
 #[test]
 fn burst_without_a_ranker_makes_zero_ranker_calls() {
-    let (run, engine, calls) = drive(true, false, false);
+    let (run, engine, calls) = drive(true, Kind::NoRanker, false);
     assert_exactly_once(&run, &engine);
     assert_eq!(calls, 0);
     assert_eq!(engine.metrics().ranker_calls, 0);
@@ -198,7 +307,7 @@ fn burst_without_a_ranker_makes_zero_ranker_calls() {
 
 #[test]
 fn undrained_burst_stays_bounded_and_sheds_with_accounting() {
-    let (run, engine, _) = drive(false, false, false);
+    let (run, engine, _) = drive(false, Kind::NoRanker, false);
     assert_exactly_once(&run, &engine);
     assert!(
         engine.metrics().batches_shed > 0,
@@ -210,9 +319,9 @@ fn undrained_burst_stays_bounded_and_sheds_with_accounting() {
 
 #[test]
 fn replay_is_byte_identical_and_independent_of_poll_cadence() {
-    let (first, _, _) = drive(true, true, false);
-    let (second, _, _) = drive(true, true, false);
-    let (polled, _, _) = drive(true, true, true);
+    let (first, _, _) = drive(true, Kind::Counting, false);
+    let (second, _, _) = drive(true, Kind::Counting, false);
+    let (polled, _, _) = drive(true, Kind::Counting, true);
     assert!(!first.records.is_empty());
     assert_eq!(first.records, second.records);
     assert_eq!(first.records, polled.records);
@@ -220,8 +329,45 @@ fn replay_is_byte_identical_and_independent_of_poll_cadence() {
 
 #[test]
 fn every_flush_reason_is_exercised_by_the_burst() {
-    let (_, engine, _) = drive(true, false, false);
+    let (_, engine, _) = drive(true, Kind::NoRanker, false);
     let metrics = engine.metrics();
     assert!(metrics.flushed_count > 0);
     assert!(metrics.flushed_window + metrics.flushed_shutdown > 0);
+}
+
+#[test]
+fn burst_100x_with_the_jev_batch_ranker_is_one_call_per_batch_and_fully_accounted() {
+    let (run, engine, calls, fake) = drive_with(true, Kind::Jev, false);
+    assert_exactly_once(&run, &engine);
+    let metrics = engine.metrics();
+    assert!(metrics.admitted > 1_500);
+    // At most one HTTP request per ranked batch, never per comment.
+    assert_eq!(calls, metrics.ranker_calls);
+    assert!(metrics.ranker_calls <= metrics.batches_flushed);
+    assert!(
+        metrics.ranker_calls_per_comment() < 0.1,
+        "ranker calls per comment {}",
+        metrics.ranker_calls_per_comment()
+    );
+    // Input stays inside the existing request ceiling.
+    assert!(fake.max_questions.load(Ordering::SeqCst) <= engine.config().request_candidates as u64);
+    // Invented slots and HTTP failures were rejected, not trusted.
+    assert!(metrics.ranker_failures > 0, "the fake injects failures");
+    assert!(metrics.ranker_failures < metrics.ranker_calls);
+    assert_eq!(metrics.ranker_unknown_ids_ignored, 0);
+    assert!(metrics.terminal[0] > 0);
+    assert!(run.control_immediate > 0);
+}
+
+#[test]
+fn jev_ranked_replay_is_byte_identical_and_records_ranker_and_fallback() {
+    let (first, _, _) = drive(true, Kind::Jev, false);
+    let (second, _, _) = drive(true, Kind::Jev, false);
+    let (polled, _, _) = drive(true, Kind::Jev, true);
+    assert!(!first.records.is_empty());
+    assert_eq!(first.records, second.records);
+    assert_eq!(first.records, polled.records);
+    let text = String::from_utf8(first.records.clone()).expect("utf8 records");
+    assert!(text.contains("\"ranking_source\":\"ranker\""));
+    assert!(text.contains("\"ranking_source\":\"ranker_fallback\""));
 }

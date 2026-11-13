@@ -111,6 +111,11 @@ impl SemanticIndex {
         &self.metadata
     }
 
+    /// Number of indexed assets (the per-query work is linear in it).
+    pub fn asset_count(&self) -> usize {
+        self.assets.len()
+    }
+
     /// Embedding dimension all queries must match.
     pub fn dimension(&self) -> usize {
         self.dimension

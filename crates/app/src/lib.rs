@@ -2797,6 +2797,41 @@ where
         Ok(self)
     }
 
+    /// #78 S3: augment the lane's local score with semantic retrieval. The
+    /// scorer only orders untrusted comments among themselves and falls back to
+    /// the text heuristic whenever retrieval is unavailable. Requires
+    /// [`Self::with_chat_burst`] first.
+    pub fn with_chat_burst_retrieval_score(
+        mut self,
+        scorer: aivtuber_reflex::RetrievalScorer,
+    ) -> Result<Self, AppError> {
+        self.chat_burst
+            .as_mut()
+            .ok_or_else(|| {
+                AppError::Routing("retrieval scoring requires the chat burst lane".to_owned())
+            })?
+            .set_scorer(scorer);
+        Ok(self)
+    }
+
+    /// #78 S3: let a batch ranker (for example the Jev one) reorder each
+    /// flushed batch. Its answer is data: it may only reorder the batch's own
+    /// candidates, the deterministic policy re-applies Top-K, the actor cap
+    /// and the cooldown, and any failure falls back to the deterministic
+    /// order. Requires [`Self::with_chat_burst`] first.
+    pub fn with_chat_burst_ranker(
+        mut self,
+        ranker: Box<dyn aivtuber_reflex::BatchRanker + Send>,
+    ) -> Result<Self, AppError> {
+        self.chat_burst
+            .as_mut()
+            .ok_or_else(|| {
+                AppError::Routing("a batch ranker requires the chat burst lane".to_owned())
+            })?
+            .set_ranker(ranker);
+        Ok(self)
+    }
+
     /// Chat-burst and deferred-reply counters; `None` when not composed.
     pub fn chat_burst_metrics(&self) -> Option<ChatBurstMetrics> {
         self.chat_burst
