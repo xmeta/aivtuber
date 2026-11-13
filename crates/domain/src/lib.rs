@@ -48,10 +48,10 @@ pub use interfaces::{
     AvatarAdapter, DecisionEngine, DeltaFlow, EngineError, EngineErrorKind, EngineFuture,
     GeneratedReply, MAX_TOOL_DESCRIPTOR_BYTES, MAX_TOOL_DISCOVERY_ITEMS,
     MAX_TOOL_OBSERVATION_BYTES, ReplyDeltaSink, SpeechArtifact, SpeechProgress, SpeechProgressSink,
-    SpeechRequest, StreamAction, StreamAdapter, ThinkingEngine, ToolAction, ToolAdapter,
-    ToolCommitFence, ToolDescriptor, ToolExecutionResult, ToolResultClass, ToolVerificationOutcome,
-    ToolVerificationRule, TtsBackendIdentity, TtsEngine, authorize_avatar_action,
-    authorize_stream_action, authorize_tool_action, verify_tool_result,
+    SpeechRequest, StreamAction, StreamAdapter, ThinkingEngine, ThinkingUsage, ToolAction,
+    ToolAdapter, ToolCommitFence, ToolDescriptor, ToolExecutionResult, ToolResultClass,
+    ToolVerificationOutcome, ToolVerificationRule, TtsBackendIdentity, TtsEngine,
+    authorize_avatar_action, authorize_stream_action, authorize_tool_action, verify_tool_result,
 };
 pub use perception::*;
 pub use reflex::{

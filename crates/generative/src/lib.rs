@@ -1181,7 +1181,11 @@ fn fallback_reason_from_error(error: &EngineError) -> FallbackReason {
         EngineErrorKind::Overloaded => FallbackReason::Overloaded,
         EngineErrorKind::Authentication => FallbackReason::Authentication,
         EngineErrorKind::InvalidRequest => FallbackReason::InvalidRequest,
-        EngineErrorKind::Unauthorized | EngineErrorKind::Backend => FallbackReason::Unavailable,
+        // Credit exhaustion is reported as `unavailable`: the wire fallback
+        // vocabulary is closed, and the typed kind stays in the engine error.
+        EngineErrorKind::Unauthorized
+        | EngineErrorKind::Backend
+        | EngineErrorKind::QuotaExhausted => FallbackReason::Unavailable,
     }
 }
 
@@ -1250,6 +1254,7 @@ mod tests {
             Self {
                 result: Ok(GeneratedReply {
                     text: text.to_owned(),
+                    usage: None,
                 }),
                 calls: Arc::new(AtomicUsize::new(0)),
                 cancel_on_call: None,

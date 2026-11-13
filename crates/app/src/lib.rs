@@ -37,6 +37,7 @@ mod speech_resynthesis;
 mod speech_sidecar;
 mod support_bundle;
 mod task_plane;
+mod thinking_provider;
 mod thinking_warmup;
 mod tool_execution;
 mod tts_sidecar;
@@ -100,6 +101,10 @@ pub use speech_floor::SpeechFloorMetrics;
 pub use speech_sidecar::*;
 pub use support_bundle::*;
 pub use task_plane::*;
+pub use thinking_provider::{
+    OPENROUTER_DEFAULT_REFERER, OPENROUTER_DEFAULT_TITLE, OPENROUTER_ENDPOINT,
+    apply_thinking_provider_env,
+};
 pub use thinking_warmup::{
     DEFAULT_WARMUP_TIMEOUT_MS, WarmupDecision, WarmupMode, decide as decide_thinking_warmup,
     run as run_thinking_warmup, start as start_thinking_warmup, warmup_timeout,
@@ -4995,6 +5000,7 @@ mod tests {
                 } else {
                     Ok(GeneratedReply {
                         text: self.reply.clone(),
+                        usage: None,
                     })
                 }
             })
@@ -5060,6 +5066,7 @@ mod tests {
                 }
                 Ok(GeneratedReply {
                     text: self.reply.clone(),
+                    usage: None,
                 })
             })
         }
@@ -5522,6 +5529,7 @@ mod tests {
             Box::pin(async {
                 Ok(aivtuber_domain::GeneratedReply {
                     text: "ok".to_owned(),
+                    usage: None,
                 })
             })
         }

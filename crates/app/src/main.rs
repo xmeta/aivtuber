@@ -28,8 +28,9 @@ use aivtuber_app::{
     ShadowPolicyIdentity, ShadowingRoutePlanner, SpeechConversationConfig,
     SpeechConversationMetrics, SpeechFloorMetrics, SpeechSidecar, SpeechSidecarConfig,
     SpeechSidecarStats, StreamOutput, TtsSidecarSettings, VoicevoxBridge, VoicevoxSettings,
-    VtsAvatarOutput, VtsPlaybackConfig, WarmupMode, apply_dispatched_request, audit_pack_readiness,
-    panel_settings, pump_bounded_records, start_thinking_warmup, stt_sidecar_args, warmup_timeout,
+    VtsAvatarOutput, VtsPlaybackConfig, WarmupMode, apply_dispatched_request,
+    apply_thinking_provider_env, audit_pack_readiness, panel_settings, pump_bounded_records,
+    start_thinking_warmup, stt_sidecar_args, warmup_timeout,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
@@ -1525,6 +1526,9 @@ fn build_generative_runtime(
     }
 
     let mut thinking_config = OpenAiResponsesConfig::default();
+    // #363: wire selector and the OpenRouter preset. The explicit endpoint and
+    // model overrides below still win over the preset.
+    apply_thinking_provider_env(&mut thinking_config, &|name| env_optional(name))?;
     if let Some(endpoint) = env_optional("AIVTUBER_OPENAI_ENDPOINT") {
         thinking_config.endpoint = endpoint;
     }
@@ -1621,8 +1625,20 @@ fn build_generative_runtime(
     }
     // Non-secret, replay-relevant identity: where Thinking runs and how it is
     // authenticated. Origin only; no path/query that could carry a token.
+    // The wire is appended only when it is not the default, so the existing
+    // line is byte-identical for the Responses wire.
+    let wire_note = match thinking.wire() {
+        aivtuber_adapters::ThinkingWire::Responses => String::new(),
+        wire => format!(
+            " wire={} data_collection={}",
+            wire.label(),
+            thinking
+                .data_collection()
+                .map_or("unset", aivtuber_adapters::DataCollection::label),
+        ),
+    };
     eprintln!(
-        "thinking: endpoint={} auth={} backend={}",
+        "thinking: endpoint={} auth={} backend={}{wire_note}",
         endpoint_origin(thinking.endpoint()),
         thinking.authentication_label(),
         aivtuber_domain::ThinkingEngine::identity(&thinking).name,

@@ -32,6 +32,110 @@ impl fmt::Display for HttpTransportError {
 
 impl Error for HttpTransportError {}
 
+/// Most extra request headers one call may carry.
+pub const MAX_EXTRA_HEADERS: usize = 4;
+const MAX_EXTRA_HEADER_NAME_BYTES: usize = 64;
+const MAX_EXTRA_HEADER_VALUE_BYTES: usize = 256;
+/// Headers the transport owns. An extra header can never replace them, so a
+/// configuration value cannot swap the credential or the content negotiation.
+const RESERVED_HEADERS: [&str; 9] = [
+    "content-type",
+    "accept",
+    "authorization",
+    "proxy-authorization",
+    "content-length",
+    "host",
+    "transfer-encoding",
+    "connection",
+    "cookie",
+];
+
+/// A bounded, validated set of operator-chosen request headers (for example
+/// the OpenRouter `HTTP-Referer` / `X-Title` attribution pair).
+///
+/// Validation happens at construction, so a value that exists is safe to put
+/// on the wire: at most [`MAX_EXTRA_HEADERS`] entries, ASCII token names,
+/// printable-ASCII values (hence no CR/LF), no duplicates, and no reserved
+/// name. `Debug` prints names only; values are never logged.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ExtraHeaders(Vec<(String, String)>);
+
+impl ExtraHeaders {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn new(pairs: &[(&str, &str)]) -> Result<Self, String> {
+        if pairs.len() > MAX_EXTRA_HEADERS {
+            return Err(format!(
+                "at most {MAX_EXTRA_HEADERS} extra headers are allowed"
+            ));
+        }
+        let mut headers: Vec<(String, String)> = Vec::with_capacity(pairs.len());
+        for (name, value) in pairs {
+            let valid_name = !name.is_empty()
+                && name.len() <= MAX_EXTRA_HEADER_NAME_BYTES
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'));
+            if !valid_name {
+                return Err(
+                    "extra header name must be 1-64 ASCII letters, digits, '-' or '_'".to_owned(),
+                );
+            }
+            if RESERVED_HEADERS
+                .iter()
+                .any(|reserved| name.eq_ignore_ascii_case(reserved))
+            {
+                return Err(format!(
+                    "extra header {name:?} is reserved by the transport"
+                ));
+            }
+            if headers
+                .iter()
+                .any(|(seen, _)| seen.eq_ignore_ascii_case(name))
+            {
+                return Err(format!("extra header {name:?} is given twice"));
+            }
+            let valid_value = !value.is_empty()
+                && value.len() <= MAX_EXTRA_HEADER_VALUE_BYTES
+                && value.bytes().all(|b| (0x20..=0x7e).contains(&b))
+                && value.trim() == *value;
+            if !valid_value {
+                return Err(format!(
+                    "extra header {name:?} value must be 1-{MAX_EXTRA_HEADER_VALUE_BYTES} printable ASCII bytes without surrounding spaces"
+                ));
+            }
+            headers.push(((*name).to_owned(), (*value).to_owned()));
+        }
+        Ok(Self(headers))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0.iter().map(|(n, v)| (n.as_str(), v.as_str()))
+    }
+}
+
+impl fmt::Debug for ExtraHeaders {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|(n, _)| n))
+            .finish()
+    }
+}
+
+fn headers_unsupported() -> HttpTransportError {
+    HttpTransportError::Unavailable("transport does not support extra request headers".to_owned())
+}
+
 pub trait JsonHttpTransport: Send + Sync {
     fn post_json(
         &self,
@@ -40,6 +144,24 @@ pub trait JsonHttpTransport: Send + Sync {
         body: &[u8],
         timeout: Duration,
     ) -> Result<HttpResponse, HttpTransportError>;
+
+    /// [`post_json`](Self::post_json) plus bounded extra headers. The default
+    /// forwards an empty set and refuses a non-empty one, so a transport that
+    /// predates headers fails closed instead of silently dropping them.
+    fn post_json_with_headers(
+        &self,
+        endpoint: &str,
+        bearer_token: Option<&str>,
+        extra_headers: &ExtraHeaders,
+        body: &[u8],
+        timeout: Duration,
+    ) -> Result<HttpResponse, HttpTransportError> {
+        if extra_headers.is_empty() {
+            self.post_json(endpoint, bearer_token, body, timeout)
+        } else {
+            Err(headers_unsupported())
+        }
+    }
 }
 
 /// A transport that can issue a JSON request with any HTTP method.
@@ -80,6 +202,24 @@ pub trait StreamingHttpTransport: Send + Sync {
         timeout: Duration,
         max_body_bytes: u64,
     ) -> Result<HttpStreamResponse, HttpTransportError>;
+
+    /// Streaming counterpart of [`JsonHttpTransport::post_json_with_headers`],
+    /// with the same fail-closed default.
+    fn post_json_stream_with_headers(
+        &self,
+        endpoint: &str,
+        bearer_token: Option<&str>,
+        extra_headers: &ExtraHeaders,
+        body: &[u8],
+        timeout: Duration,
+        max_body_bytes: u64,
+    ) -> Result<HttpStreamResponse, HttpTransportError> {
+        if extra_headers.is_empty() {
+            self.post_json_stream(endpoint, bearer_token, body, timeout, max_body_bytes)
+        } else {
+            Err(headers_unsupported())
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -111,6 +251,17 @@ impl JsonHttpTransport for UreqJsonTransport {
     ) -> Result<HttpResponse, HttpTransportError> {
         self.request_json("POST", endpoint, bearer_token, body, timeout)
     }
+
+    fn post_json_with_headers(
+        &self,
+        endpoint: &str,
+        bearer_token: Option<&str>,
+        extra_headers: &ExtraHeaders,
+        body: &[u8],
+        timeout: Duration,
+    ) -> Result<HttpResponse, HttpTransportError> {
+        self.send_json("POST", endpoint, bearer_token, extra_headers, body, timeout)
+    }
 }
 
 impl JsonHttpRequestTransport for UreqJsonTransport {
@@ -119,6 +270,27 @@ impl JsonHttpRequestTransport for UreqJsonTransport {
         method: &str,
         endpoint: &str,
         bearer_token: Option<&str>,
+        body: &[u8],
+        timeout: Duration,
+    ) -> Result<HttpResponse, HttpTransportError> {
+        self.send_json(
+            method,
+            endpoint,
+            bearer_token,
+            &ExtraHeaders::empty(),
+            body,
+            timeout,
+        )
+    }
+}
+
+impl UreqJsonTransport {
+    fn send_json(
+        &self,
+        method: &str,
+        endpoint: &str,
+        bearer_token: Option<&str>,
+        extra_headers: &ExtraHeaders,
         body: &[u8],
         timeout: Duration,
     ) -> Result<HttpResponse, HttpTransportError> {
@@ -168,6 +340,9 @@ impl JsonHttpRequestTransport for UreqJsonTransport {
         if let Some(token) = bearer_token {
             request = request.header("authorization", &format!("Bearer {token}"));
         }
+        for (name, value) in extra_headers.iter() {
+            request = request.header(name, value);
+        }
 
         let mut response = request.send(body).map_err(map_ureq_error)?;
         let status = response.status().as_u16();
@@ -211,6 +386,25 @@ impl StreamingHttpTransport for UreqJsonTransport {
         timeout: Duration,
         max_body_bytes: u64,
     ) -> Result<HttpStreamResponse, HttpTransportError> {
+        self.post_json_stream_with_headers(
+            endpoint,
+            bearer_token,
+            &ExtraHeaders::empty(),
+            body,
+            timeout,
+            max_body_bytes,
+        )
+    }
+
+    fn post_json_stream_with_headers(
+        &self,
+        endpoint: &str,
+        bearer_token: Option<&str>,
+        extra_headers: &ExtraHeaders,
+        body: &[u8],
+        timeout: Duration,
+        max_body_bytes: u64,
+    ) -> Result<HttpStreamResponse, HttpTransportError> {
         if !is_secure_provider_endpoint(endpoint) {
             return Err(HttpTransportError::Unavailable(
                 "provider endpoint must use HTTPS or loopback HTTP without embedded credentials"
@@ -233,6 +427,9 @@ impl StreamingHttpTransport for UreqJsonTransport {
             .header("accept", "text/event-stream");
         if let Some(token) = bearer_token {
             request = request.header("authorization", &format!("Bearer {token}"));
+        }
+        for (name, value) in extra_headers.iter() {
+            request = request.header(name, value);
         }
         let response = request.send(body).map_err(map_ureq_error)?;
         let status = response.status().as_u16();
@@ -284,6 +481,150 @@ fn is_loopback_host(url: &url::Url) -> bool {
         url::Host::Ipv4(ip) => ip.is_loopback(),
         url::Host::Ipv6(ip) => ip.is_loopback(),
     })
+}
+
+#[cfg(test)]
+mod extra_header_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_a_small_bounded_set_and_hides_values_in_debug() {
+        let headers = ExtraHeaders::new(&[
+            ("HTTP-Referer", "https://example.invalid/app"),
+            ("X-Title", "aivtuber"),
+        ])
+        .expect("valid");
+        assert_eq!(headers.len(), 2);
+        let debug = format!("{headers:?}");
+        assert!(debug.contains("X-Title") && !debug.contains("aivtuber"));
+        assert!(ExtraHeaders::empty().is_empty());
+        let names: Vec<String> = (0..MAX_EXTRA_HEADERS).map(|i| format!("X-H{i}")).collect();
+        let max: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "v")).collect();
+        assert!(ExtraHeaders::new(&max).is_ok());
+    }
+
+    #[test]
+    fn rejects_injection_overflow_reserved_duplicate_and_non_ascii() {
+        let five = [("A", "1"), ("B", "1"), ("C", "1"), ("D", "1"), ("E", "1")];
+        assert!(ExtraHeaders::new(&five).is_err(), "more than four");
+        for bad_value in [
+            "ok\r\nAuthorization: Bearer stolen",
+            "line\nbreak",
+            "tab\tvalue",
+            "caf\u{e9}",
+            "",
+            " padded ",
+        ] {
+            assert!(
+                ExtraHeaders::new(&[("X-Title", bad_value)]).is_err(),
+                "value accepted: {bad_value:?}"
+            );
+        }
+        let long = "v".repeat(MAX_EXTRA_HEADER_VALUE_BYTES + 1);
+        assert!(ExtraHeaders::new(&[("X-Title", long.as_str())]).is_err());
+        for bad_name in ["", "Bad Name", "X:Title", "X-Ti\r\ntle", "X-T\u{e9}"] {
+            assert!(
+                ExtraHeaders::new(&[(bad_name, "v")]).is_err(),
+                "name accepted: {bad_name:?}"
+            );
+        }
+        for reserved in ["Content-Type", "ACCEPT", "authorization", "Host", "Cookie"] {
+            assert!(
+                ExtraHeaders::new(&[(reserved, "v")]).is_err(),
+                "reserved accepted: {reserved}"
+            );
+        }
+        assert!(ExtraHeaders::new(&[("X-Title", "a"), ("x-title", "b")]).is_err());
+    }
+
+    struct PlainTransport;
+    impl JsonHttpTransport for PlainTransport {
+        fn post_json(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: &[u8],
+            _: Duration,
+        ) -> Result<HttpResponse, HttpTransportError> {
+            Ok(HttpResponse {
+                status: 200,
+                body: Vec::new(),
+                content_type: None,
+            })
+        }
+    }
+
+    #[test]
+    fn a_transport_without_header_support_fails_closed() {
+        let headers = ExtraHeaders::new(&[("X-Title", "t")]).expect("valid");
+        let timeout = Duration::from_secs(1);
+        assert!(
+            PlainTransport
+                .post_json_with_headers("https://x.invalid/", None, &headers, b"{}", timeout)
+                .is_err()
+        );
+        assert!(
+            PlainTransport
+                .post_json_with_headers(
+                    "https://x.invalid/",
+                    None,
+                    &ExtraHeaders::empty(),
+                    b"{}",
+                    timeout
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn extra_headers_reach_the_wire_and_do_not_displace_the_credential() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let endpoint = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut received = Vec::new();
+            let mut buffer = [0_u8; 2048];
+            while !received.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buffer).expect("read");
+                received.extend_from_slice(&buffer[..n]);
+            }
+            // Let the small body arrive so closing does not reset the socket.
+            std::thread::sleep(Duration::from_millis(50));
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+            String::from_utf8_lossy(&received).to_ascii_lowercase()
+        });
+        let headers = ExtraHeaders::new(&[
+            ("HTTP-Referer", "https://example.invalid"),
+            ("X-Title", "t"),
+        ])
+        .expect("valid");
+        let response = UreqJsonTransport::default()
+            .post_json_with_headers(
+                &endpoint,
+                Some("tok"),
+                &headers,
+                b"{}",
+                Duration::from_secs(5),
+            )
+            .expect("response");
+        assert_eq!(response.status, 200);
+        let head = server.join().expect("server");
+        assert!(
+            head.contains("http-referer: https://example.invalid"),
+            "{head}"
+        );
+        assert!(head.contains("x-title: t"), "{head}");
+        assert!(head.contains("authorization: bearer tok"), "{head}");
+        assert!(head.contains("content-type: application/json"), "{head}");
+    }
 }
 
 #[cfg(test)]
@@ -516,6 +857,7 @@ pub(crate) mod test_support {
     pub struct CapturedHttpRequest {
         pub endpoint: String,
         pub bearer_token: Option<String>,
+        pub headers: Vec<(String, String)>,
         pub body: Vec<u8>,
         pub timeout: Duration,
     }
@@ -547,12 +889,33 @@ pub(crate) mod test_support {
             body: &[u8],
             timeout: Duration,
         ) -> Result<HttpResponse, HttpTransportError> {
+            self.post_json_with_headers(
+                endpoint,
+                bearer_token,
+                &ExtraHeaders::empty(),
+                body,
+                timeout,
+            )
+        }
+
+        fn post_json_with_headers(
+            &self,
+            endpoint: &str,
+            bearer_token: Option<&str>,
+            extra_headers: &ExtraHeaders,
+            body: &[u8],
+            timeout: Duration,
+        ) -> Result<HttpResponse, HttpTransportError> {
             self.requests
                 .lock()
                 .expect("request lock")
                 .push(CapturedHttpRequest {
                     endpoint: endpoint.to_owned(),
                     bearer_token: bearer_token.map(str::to_owned),
+                    headers: extra_headers
+                        .iter()
+                        .map(|(n, v)| (n.to_owned(), v.to_owned()))
+                        .collect(),
                     body: body.to_vec(),
                     timeout,
                 });

@@ -182,6 +182,39 @@ AIVTUBER_TTS_TIMEOUT_MS=15000
 
 Voice model, viseme mapping, compiler version, avatar profile, and motion library are inherited from the same runtime compatibility configuration used by `AssetStore`, so a generated asset cannot be inserted when its compiler/TTS compatibility disagrees with production playback.
 
+=== Thinking wire and the OpenRouter preset (#363)
+
+`OpenAiResponsesAdapter` speaks one of two request/response shapes, chosen by `ThinkingWire`; the default stays `responses`, byte-identical to before. The chat-completions wire exists so the same adapter, with the same authentication, timeout, streaming and fallback machinery, can talk to OpenRouter and other OpenAI-compatible chat servers. There is no second client.
+
+[cols="2,3"]
+|===
+|Variable |Effect
+
+|`AIVTUBER_OPENAI_WIRE`
+|`responses` (default) or `chat-completions`. Chat sends `{model, messages:[{role:"user", content}], max_tokens[, stream]}` and reads `choices[0].message.content` (streaming reads `choices[0].delta.content`). Anything else is a startup error.
+
+|`AIVTUBER_THINKING_PROVIDER`
+|Unset or `generic`: no preset. `openrouter`: sets the endpoint to `https://openrouter.ai/api/v1/chat/completions`, the wire to `chat-completions`, the attribution headers and the data-collection default below. Any other value is a startup error. `AIVTUBER_OPENAI_MODEL` must also be set (an OpenRouter id such as `vendor/model`); the built-in default model name is not one. The bearer key is still `AIVTUBER_OPENAI_API_KEY`.
+
+|`AIVTUBER_OPENROUTER_REFERER`
+|`HTTP-Referer` value; default is the project URL. Needs `AIVTUBER_THINKING_PROVIDER=openrouter`.
+
+|`AIVTUBER_OPENROUTER_TITLE`
+|`X-Title` value; default `aivtuber`. Needs the openrouter preset.
+
+|`AIVTUBER_OPENROUTER_DATA_COLLECTION`
+|`deny` (default with the preset) or `allow`. Sent as `provider: {"data_collection": ...}` so viewer chat is not retained for training. Only the openrouter preset sends a `provider` field; the generic chat wire never does. `allow` must be spelled out.
+|===
+
+Explicit `AIVTUBER_OPENAI_ENDPOINT`, `AIVTUBER_OPENAI_MODEL` and `AIVTUBER_OPENAI_WIRE` win over the preset; a variable that would be silently ignored (an `AIVTUBER_OPENROUTER_*` value without the preset, or with the `responses` wire) is a startup error instead. Startup prints ` wire=<wire> data_collection=<policy>` after the usual `thinking:` line only when the wire is not `responses`. The preset works under the `full` profile; a dedicated profile is separate work (#364).
+
+Boundaries:
+
+* *Extra headers* are a typed, bounded `ExtraHeaders` (at most 4; ASCII token names; printable-ASCII values, so no CR/LF; no duplicates; never `content-type`, `accept`, `authorization`, `host`, `cookie` and similar transport-owned names). Validation happens at construction, `Debug` prints names only, and a transport that does not support headers refuses a non-empty set instead of dropping it. Existing callers send none.
+* *HTTP 402* (credits exhausted) maps to `EngineErrorKind::QuotaExhausted`. It degrades to the deterministic fallback like every other kind and is reported with the existing wire reason `unavailable`, because the `FallbackReason` vocabulary is a closed wire schema that this change does not widen. The typed kind stays visible in the warm-up log and conformance output as `quota_exhausted`. An `{"error":{"code":N}}` body inside HTTP 200 keeps the status it names. 401/403 are `authentication`, 429 `rate_limited`, 503/529 `overloaded`, other 5xx `unavailable`.
+* *Usage* (`usage.prompt_tokens`, `completion_tokens`, `cost`) is parsed into a bounded `ThinkingUsage` on `GeneratedReply.usage`: token counts saturate at `u32::MAX`, cost is integer micro-USD, and a missing, malformed, negative, non-finite or implausibly large value becomes absent, never an error. Streaming takes usage from the final chunk (OpenRouter sends it with an empty `choices`). It is audit data only; nothing in this change reads it for routing, telemetry or display (see #367).
+* The API key is never in a request body, header set, `Debug` output or error message.
+
 == Verification
 
 The Rust tests cover:
