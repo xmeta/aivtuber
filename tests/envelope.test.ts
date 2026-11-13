@@ -102,6 +102,7 @@ describe("normalizeEvent", () => {
       "model.select",
       "voice.configure",
       "ingress.control",
+      "avatar.configure",
     ]);
   });
 });

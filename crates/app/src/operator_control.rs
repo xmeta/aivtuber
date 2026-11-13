@@ -53,7 +53,9 @@ pub struct OperatorRequest {
     /// settings of #360; the key itself is entered in the panel only),
     /// `ingress.connect`, `ingress.disconnect`, `ingress.key.remove` (the
     /// stream-chat connections of #361; the YouTube key is entered in the
-    /// panel only).
+    /// panel only),
+    /// `avatar.confirm`, `avatar.select`, `avatar.delete`, `avatar.discard`
+    /// (the avatar choice of #362; the upload itself is panel-only).
     pub action: String,
     /// Opaque session secret presented by the operator client.
     pub secret: String,
@@ -63,7 +65,8 @@ pub struct OperatorRequest {
     /// The one argument an action may take: the model alias for
     /// `model.select`, the settings patch (JSON text) for `voice.apply`, the
     /// `{"platform","target"}` / `{"platform"}` JSON for `ingress.connect` /
-    /// `ingress.disconnect`. Ignored by every other action.
+    /// `ingress.disconnect`, a model hash (or hash prefix, or `sample`) for the
+    /// `avatar.*` actions. Ignored by every other action.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub argument: Option<String>,
 }
@@ -121,6 +124,10 @@ pub struct OperatorStatusSnapshot {
     /// unless composed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_ingress: Option<crate::ChatIngressStatus>,
+    /// The VRM avatar choice (#362): the active model, the stored ones, the
+    /// pending candidate with its licence summary. Absent unless composed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_model: Option<crate::AvatarStatus>,
 }
 
 /// Operator-visible, text-free perception status: whether it is running, why
@@ -184,6 +191,7 @@ impl OperatorStatusSnapshot {
             thinking_model: app.thinking_model_status(),
             voice: app.voice_status(),
             chat_ingress: app.chat_ingress_status(),
+            avatar_model: app.avatar_status(),
         }
     }
 }
@@ -277,6 +285,8 @@ pub struct OperatorEndpointOptions {
     pub voice_configure: bool,
     /// Stream-chat connections are composed (#361): `ingress.control`.
     pub ingress_control: bool,
+    /// The avatar store is composed (#362): `avatar.configure`.
+    pub avatar_configure: bool,
 }
 
 /// Authenticated operator control endpoint.
@@ -332,6 +342,7 @@ impl OperatorControlServer {
             model_select,
             voice_configure,
             ingress_control,
+            avatar_configure,
         } = options;
         let name = name.trim();
         if name.is_empty() {
@@ -361,6 +372,12 @@ impl OperatorControlServer {
             // mint it; what a started sidecar writes is still admitted as
             // untrusted public chat under the app's own ingress ceiling.
             capabilities.insert(aivtuber_domain::Capability::IngressControl);
+        }
+        if avatar_configure {
+            // `avatar.configure` is held only so the `avatar.*` actions can
+            // mint it; an uploaded model is untrusted data that must pass the
+            // VRM inspection and an explicit confirmation before it is shown.
+            capabilities.insert(aivtuber_domain::Capability::AvatarConfigure);
         }
         if memory_export {
             // `memory.admin` is held only so the `memory.export` action can mint
@@ -573,6 +590,7 @@ pub fn apply_operator_request<R: RoutePlanner>(
         && request.action != "model.select"
         && !is_tcp_voice_action(&request.action)
         && !is_tcp_ingress_action(&request.action)
+        && !is_tcp_avatar_action(&request.action)
     {
         let detail = format!("unknown action {}", request.action);
         app.audit_operator_action(&request_id, &request.action, &detail, false);
@@ -627,6 +645,20 @@ fn is_tcp_ingress_action(action: &str) -> bool {
     is_ingress_action(action) && action != "ingress.key.set"
 }
 
+/// The avatar choice actions (#362), all under `avatar.configure`.
+fn is_avatar_action(action: &str) -> bool {
+    matches!(
+        action,
+        "avatar.upload" | "avatar.confirm" | "avatar.select" | "avatar.delete" | "avatar.discard"
+    )
+}
+
+/// The ones the operator endpoint (`aivtuberctl`) may send: not the upload,
+/// which names a file the panel's HTTP layer staged and is panel-only.
+fn is_tcp_avatar_action(action: &str) -> bool {
+    is_avatar_action(action) && action != "avatar.upload"
+}
+
 /// Like [`apply_operator_request`] with the secret as the raw 32 bytes the
 /// ingress compares, for an in-process caller that holds them (the local
 /// panel, #335). A secret that is not valid UTF-8 (the generated one is raw
@@ -644,6 +676,7 @@ pub fn apply_operator_action<R: RoutePlanner>(
     if !matches!(action, "stop" | "mute" | "model.select")
         && !is_voice_action(action)
         && !is_ingress_action(action)
+        && !is_avatar_action(action)
     {
         let detail = format!("unknown action {action}");
         app.audit_operator_action(request_id, action, &detail, false);
@@ -721,6 +754,8 @@ fn apply_with_presented_secret<R: RoutePlanner>(
         "voice.configure".to_owned()
     } else if is_ingress_action(action) {
         "ingress.control".to_owned()
+    } else if is_avatar_action(action) {
+        "avatar.configure".to_owned()
     } else if action == "memory.export" {
         "memory.admin".to_owned()
     } else {
@@ -821,6 +856,28 @@ fn apply_with_presented_secret<R: RoutePlanner>(
         // the validated platform and target (public names, no key), and the
         // key action carries the key.
         return match app.configure_ingress(command.authority(), action, argument) {
+            Ok(detail) => {
+                app.audit_operator_action(&request_id, action, &detail, true);
+                OperatorResponse {
+                    request_id,
+                    ok: true,
+                    detail,
+                    status: None,
+                    memory_export: None,
+                }
+            }
+            Err(detail) => {
+                app.audit_operator_action(&request_id, action, &detail, false);
+                rejection(&request_id, &detail)
+            }
+        };
+    }
+
+    if is_avatar_action(action) {
+        // Audited without the argument: the detail is re-derived from the
+        // stored file (the model name, bounded untrusted text, and the content
+        // hash), never file bytes or a request value.
+        return match app.configure_avatar(command.authority(), action, argument) {
             Ok(detail) => {
                 app.audit_operator_action(&request_id, action, &detail, true);
                 OperatorResponse {

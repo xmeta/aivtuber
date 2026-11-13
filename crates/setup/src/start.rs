@@ -167,6 +167,14 @@ pub const CHAT_SETTINGS_FILE: &str = "local-chat.json";
 /// where the OS allows. The app owns it; `YOUTUBE_API_KEY` in the environment
 /// still wins.
 pub const YOUTUBE_KEY_FILE: &str = "local-youtube-key.txt";
+/// File beside the env file that remembers which VRM avatar model is active
+/// (#362): `sample` or the content hash of an uploaded model. Small, replaced
+/// atomically; a missing or invalid file means the sample.
+pub const AVATAR_SETTINGS_FILE: &str = "local-avatar.json";
+/// Directory beside the env file that holds the models uploaded in the panel
+/// (#362), named by content hash, at most a few. The app owns it; no file name
+/// or path ever comes from a client.
+pub const AVATAR_DIR: &str = "avatars";
 
 /// One model llama-server can serve.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -408,6 +416,25 @@ pub fn app_chat_env(env_file: &Path) -> Vec<(String, String)> {
     ]
 }
 
+/// Where the app keeps the avatar choice and the uploaded models (#362),
+/// layered under the env file's own values like [`app_voice_env`]. The sample
+/// stays where the renderer page directory ships it.
+pub fn app_avatar_env(env_file: &Path) -> Vec<(String, String)> {
+    vec![
+        (
+            "AIVTUBER_AVATAR_SETTINGS".to_owned(),
+            env_file
+                .with_file_name(AVATAR_SETTINGS_FILE)
+                .display()
+                .to_string(),
+        ),
+        (
+            "AIVTUBER_AVATAR_DIR".to_owned(),
+            env_file.with_file_name(AVATAR_DIR).display().to_string(),
+        ),
+    ]
+}
+
 fn port_in_use(port: u16) -> bool {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
@@ -465,6 +492,7 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
     for (name, value) in app_voice_env(&opts.env_file)
         .into_iter()
         .chain(app_chat_env(&opts.env_file))
+        .chain(app_avatar_env(&opts.env_file))
     {
         env.entry(name).or_insert(value);
     }
@@ -761,6 +789,37 @@ mod tests {
         assert_eq!(key.file_name().unwrap(), YOUTUBE_KEY_FILE);
         assert_ne!(settings, key, "the key has its own file");
         let all = [
+            CHAT_SETTINGS_FILE,
+            YOUTUBE_KEY_FILE,
+            VOICE_SETTINGS_FILE,
+            AIVIS_KEY_FILE,
+            MODEL_SETTINGS_FILE,
+        ];
+        let distinct: std::collections::BTreeSet<_> = all.iter().collect();
+        assert_eq!(distinct.len(), all.len());
+    }
+
+    #[test]
+    fn the_avatar_files_sit_beside_the_env_file() {
+        let env_file = Path::new("rel").join("local-profile.env");
+        let pairs = app_avatar_env(&env_file);
+        let get = |name: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| PathBuf::from(v))
+                .unwrap()
+        };
+        let settings = get("AIVTUBER_AVATAR_SETTINGS");
+        let dir = get("AIVTUBER_AVATAR_DIR");
+        assert_eq!(settings.parent(), env_file.parent());
+        assert_eq!(dir.parent(), env_file.parent());
+        assert_eq!(settings.file_name().unwrap(), AVATAR_SETTINGS_FILE);
+        assert_eq!(dir.file_name().unwrap(), AVATAR_DIR);
+        // Not the same name as any other file the launcher keeps there.
+        let all = [
+            AVATAR_SETTINGS_FILE,
+            AVATAR_DIR,
             CHAT_SETTINGS_FILE,
             YOUTUBE_KEY_FILE,
             VOICE_SETTINGS_FILE,

@@ -5,6 +5,13 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { AvatarState, SMOOTHING_TAU_S } from "../src/avatar-state";
 import { Controller, MAX_PENDING_ACKS, backoffMs } from "../src/controller";
+import {
+  RELOAD_POLL_MS,
+  activeIdUrl,
+  activeModelUrl,
+  modelIdFromHeader,
+  shouldReload,
+} from "../src/model-source";
 import { PROFILE_ID } from "../src/profile";
 import { decodeHostFrame, type RendererFrame } from "../src/protocol";
 
@@ -212,5 +219,39 @@ describe("decode and backoff", () => {
 
   test("backoff doubles from 250 ms and is capped at 5 s", () => {
     expect([0, 1, 2, 3, 4, 5, 6, 50].map(backoffMs)).toEqual([250, 500, 1000, 2000, 4000, 5000, 5000, 5000]);
+  });
+});
+
+describe("active model source (#362)", () => {
+  const A = "a".repeat(64);
+  const B = "b".repeat(64);
+
+  test("the urls carry the secret in the query and name no file", () => {
+    expect(activeModelUrl("t0k", false)).toBe("/avatar/model.vrm?token=t0k");
+    expect(activeModelUrl("t0k", true)).toBe("/avatar/model.vrm?token=t0k&fallback=sample");
+    expect(activeIdUrl("t0k")).toBe("/avatar/active?token=t0k");
+    // The secret is encoded, so it cannot add a parameter of its own.
+    expect(activeModelUrl("a&fallback=sample", false)).toBe("/avatar/model.vrm?token=a%26fallback%3Dsample");
+  });
+
+  test("a model id is exactly 64 lowercase hex characters, else the page does not watch", () => {
+    expect(modelIdFromHeader(A)).toBe(A);
+    for (const bad of [null, "", "abc", "A".repeat(64), "g".repeat(64), `${A}0`]) {
+      expect(modelIdFromHeader(bad)).toBeNull();
+    }
+  });
+
+  test("the page reloads only for a well-formed, different id", () => {
+    expect(shouldReload(A, { id: B })).toBe(true);
+    expect(shouldReload(A, { id: A })).toBe(false);
+    expect(shouldReload(null, { id: B })).toBe(false);
+    for (const bad of [null, undefined, "x", 7, {}, { id: 7 }, { id: "" }, { id: "nothex" }, { id: B.toUpperCase() }]) {
+      expect(shouldReload(A, bad)).toBe(false);
+    }
+  });
+
+  test("the poll is slow enough to be cheap and fast enough to feel live", () => {
+    expect(RELOAD_POLL_MS).toBeGreaterThanOrEqual(1000);
+    expect(RELOAD_POLL_MS).toBeLessThanOrEqual(5000);
   });
 });

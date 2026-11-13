@@ -61,8 +61,10 @@ Install FFmpeg (ffplay and ffmpeg on PATH) first; setup tells you if it is missi
 On Windows also install the Microsoft Visual C++ 2015-2022 Redistributable (x64); it is
 not bundled, and setup stops and names it if it is missing:
   https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist
-Replace the sample avatar (renderer/local-avatar/dist/model.vrm) with a model you
-have the right to broadcast before you stream.
+Choose your own avatar before you stream: in the operation panel's avatar section pick
+a .vrm file, read the licence it declares, and confirm (no restart; the sample in
+renderer/local-avatar/dist/model.vrm is a test model). Use a model you have the right
+to broadcast.
 Everything listens on loopback (127.0.0.1) only.
 
 Linux: the programs need the system libraries libasound2 (microphone) and

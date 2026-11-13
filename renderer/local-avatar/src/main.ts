@@ -4,7 +4,9 @@
 //
 // Page query parameters:
 //   token  per-launch secret from the runtime's launch URL (required)
-//   model  same-origin path of the VRM file (default: model.vrm)
+//   model  same-origin path of a VRM file to load instead of the host's active
+//          model (default: the active model, `/avatar/model.vrm`, which the
+//          operation panel can change; the page then reloads itself)
 //   debug  "1" exposes a read-only state snapshot at window.__avatarDebug
 //          (used by the headless smoke test; carries no secret)
 
@@ -15,6 +17,14 @@ import { AvatarState, MAX_STEP_S } from "./avatar-state";
 import { Controller, backoffMs } from "./controller";
 import { EXPRESSIONS, GAZE_ANGLES, PROFILE_ID, VISEME_EXPRESSIONS } from "./profile";
 import { MAX_FRAME_BYTES, encodeRendererFrame } from "./protocol";
+import {
+  RELOAD_POLL_MS,
+  activeIdUrl,
+  activeModelUrl,
+  modelIdFromHeader,
+  MODEL_ID_HEADER,
+  shouldReload,
+} from "./model-source";
 
 const MAX_MODEL_BYTES = 64 * 1024 * 1024; // same ceiling as the host's static server
 const params = new URLSearchParams(location.search);
@@ -161,18 +171,72 @@ function summarizeMeta(model: VRM): Record<string, unknown> {
   return Object.fromEntries(pick.filter((k) => meta[k] !== undefined).map((k) => [k, meta[k]]));
 }
 
-async function boot(): Promise<void> {
-  const modelUrl = resolveModelUrl(params.get("model"));
-  const response = await fetch(modelUrl, { credentials: "omit" });
+interface FetchedModel {
+  bytes: ArrayBuffer;
+  /** The id the host gave the active model (null for an explicit `model` path). */
+  activeId: string | null;
+  base: string;
+}
+
+async function fetchModel(fallback: boolean): Promise<FetchedModel> {
+  const explicit = params.get("model");
+  const url = explicit !== null ? resolveModelUrl(explicit).toString() : activeModelUrl(token, fallback);
+  const response = await fetch(url, { credentials: "omit", cache: "no-store" });
   if (!response.ok) throw new Error(`model fetch failed: HTTP ${response.status}`);
   const bytes = await response.arrayBuffer();
   if (bytes.byteLength > MAX_MODEL_BYTES) throw new Error("model exceeds size limit");
-  const modelHash = await sha256Hex(bytes);
+  return {
+    bytes,
+    activeId: explicit !== null ? null : modelIdFromHeader(response.headers.get(MODEL_ID_HEADER)),
+    base: explicit !== null ? new URL(url).pathname.replace(/[^/]*$/, "") : "/avatar/",
+  };
+}
+
+async function parseVrm(fetched: FetchedModel): Promise<VRM> {
   const loader = new GLTFLoader();
   loader.register((parser) => new VRMLoaderPlugin(parser));
-  const gltf = await loader.parseAsync(bytes, modelUrl.pathname.replace(/[^/]*$/, ""));
+  const gltf = await loader.parseAsync(fetched.bytes, fetched.base);
   const loaded = gltf.userData["vrm"] as VRM | undefined;
   if (loaded === undefined) throw new Error("file is not a VRM model");
+  return loaded;
+}
+
+/**
+ * Reloads the page when the host's active model changes (the operator chose
+ * another in the panel). One small authenticated request per interval; a failed
+ * or malformed answer does nothing.
+ */
+function watchActiveModel(baseline: string | null): void {
+  if (baseline === null || params.get("model") !== null) return;
+  setInterval(() => {
+    fetch(activeIdUrl(token), { credentials: "omit", cache: "no-store" })
+      .then((response) => (response.ok ? response.json() : null))
+      .then((body: unknown) => {
+        if (shouldReload(baseline, body)) location.reload();
+      })
+      .catch(() => {
+        // the host is restarting or busy; the next poll tries again
+      });
+  }, RELOAD_POLL_MS);
+}
+
+async function boot(): Promise<void> {
+  let fetched = await fetchModel(false);
+  let loaded: VRM;
+  try {
+    loaded = await parseVrm(fetched);
+  } catch (error) {
+    // The operator's model passed the host's checks but this page cannot
+    // decode it. Showing the shipped sample keeps the stream alive; the hello
+    // below reports the sample's hash, so the panel can tell the operator that
+    // the page is not showing the model they chose.
+    if (fetched.activeId === null) throw error;
+    console.error("[local-avatar] the active model could not be loaded; showing the sample:", error);
+    const activeId = fetched.activeId;
+    fetched = { ...(await fetchModel(true)), activeId };
+    loaded = await parseVrm(fetched);
+  }
+  const modelHash = await sha256Hex(fetched.bytes);
   VRMUtils.rotateVRM0(loaded);
   if (loaded.lookAt) loaded.lookAt.target = gazeTarget;
   scene.add(loaded.scene);
@@ -191,6 +255,7 @@ async function boot(): Promise<void> {
   if (debug) installDebugHook(loaded, modelHash);
   requestAnimationFrame(tick);
   connect(0);
+  watchActiveModel(fetched.activeId);
 }
 
 function installDebugHook(model: VRM, modelHash: string): void {

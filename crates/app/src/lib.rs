@@ -2,6 +2,7 @@
 
 mod aivis_bridge;
 mod audio_stop;
+mod avatar_control;
 mod budget;
 mod chat_burst;
 mod chat_ingress;
@@ -48,6 +49,10 @@ mod voicevox_bridge;
 pub use aivis_bridge::*;
 pub use aivtuber_domain::scenario::*;
 pub use audio_stop::{AUDIO_STOP_BOUND, AudioStopReport, OperatorStopReport};
+pub use avatar_control::{
+    AVATAR_DIR_VAR, AVATAR_SETTINGS_VAR, AvatarController, AvatarEnvironment, AvatarModelInfo,
+    AvatarStatus, MAX_STORED_MODELS, SAMPLE_ID,
+};
 pub use budget::*;
 pub use chat_burst::{
     ChatBurstConfig, ChatBurstConfigError, ChatBurstMetrics, ChatBurstRecord, ChatOutcome,
@@ -1166,6 +1171,7 @@ where
     /// Stream-chat sidecars started from the panel (#361); `None` (default)
     /// composes nothing and chat arrives only through stdin.
     chat_ingress: Option<chat_ingress::ChatIngressController>,
+    avatar_store: Option<avatar_control::AvatarController>,
     /// Scene context (#88 S1); `None` (default) composes nothing, and then no
     /// request carries a scene.
     scene: Option<scene_context::SceneContextService>,
@@ -1239,6 +1245,7 @@ where
             model_switcher: None,
             voice: None,
             chat_ingress: None,
+            avatar_store: None,
             scene: None,
             speech_transcripts: None,
             speech_conversation: None,
@@ -1907,6 +1914,67 @@ where
             if let Some(ingress) = self.chat_ingress.as_mut() {
                 ingress.note_outcome(record.platform, accepted);
             }
+        }
+    }
+
+    /// Opt in to choosing the VRM avatar at runtime (#362). Only the
+    /// authenticated `avatar.configure` capability can use it
+    /// (`configure_avatar`).
+    pub fn with_avatar_controller(mut self, controller: avatar_control::AvatarController) -> Self {
+        self.avatar_store = Some(controller);
+        self
+    }
+
+    /// Whether the avatar store is composed (the operator endpoint then holds
+    /// `avatar.configure`).
+    pub fn avatar_configured(&self) -> bool {
+        self.avatar_store.is_some()
+    }
+
+    /// The directory the panel stages model uploads in; `None` when the avatar
+    /// store is not composed.
+    pub fn avatar_staging_dir(&self) -> Option<std::path::PathBuf> {
+        self.avatar_store.as_ref().map(|a| a.staging_dir())
+    }
+
+    /// The avatar choice for the operator surfaces; `None` when not composed.
+    pub fn avatar_status(&self) -> Option<avatar_control::AvatarStatus> {
+        self.avatar_store.as_ref().map(|a| a.status())
+    }
+
+    /// One line naming the active model and its credit, for the startup
+    /// disclosure; `None` when not composed.
+    pub fn avatar_summary(&self) -> Option<String> {
+        self.avatar_store.as_ref().map(|a| a.active_summary())
+    }
+
+    /// Apply one avatar operator request. `authority` must be the authenticated
+    /// local ingress capability. `action` is `avatar.upload` (the argument is
+    /// the hash of a file the panel staged), `avatar.confirm` (the pending
+    /// candidate's hash), `avatar.select` (`sample` or a stored model's hash),
+    /// `avatar.delete` or `avatar.discard`. The detail returned (and audited)
+    /// holds the model name (bounded untrusted text) and the content hash,
+    /// never file bytes. Nothing here blocks beyond a rename and a header read.
+    pub fn configure_avatar(
+        &mut self,
+        authority: &AuthenticatedControl,
+        action: &str,
+        argument: Option<&str>,
+    ) -> Result<String, String> {
+        if !authority.has_capability(aivtuber_domain::Capability::AvatarConfigure) {
+            return Err("avatar settings are not authorized".to_owned());
+        }
+        let Some(avatar) = self.avatar_store.as_mut() else {
+            return Err("avatar settings are not configured".to_owned());
+        };
+        let argument = argument.unwrap_or("");
+        match action {
+            "avatar.upload" => avatar.upload(argument),
+            "avatar.confirm" => avatar.confirm(argument),
+            "avatar.select" => avatar.select(argument),
+            "avatar.delete" => avatar.delete(argument),
+            "avatar.discard" => avatar.discard(),
+            _ => Err("not an avatar action".to_owned()),
         }
     }
 
@@ -5113,6 +5181,7 @@ mod tests {
     use aivtuber_runtime::{CachedPlaybackConfig, SecurityRuntimeConfig};
 
     mod aivis_cloud_tts_tests;
+    mod avatar_control_tests;
     mod chat_burst_tests;
     mod chat_ingress_tests;
     mod local_thinking_fallback_tests;
@@ -10323,6 +10392,7 @@ mod tests {
                 Arc::new(ingress),
                 &secret,
                 Some("http://127.0.0.1:8765/?token=avatar".to_owned()),
+                None,
                 None,
             )
             .expect("panel");
