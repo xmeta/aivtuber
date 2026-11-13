@@ -26,6 +26,10 @@ use tungstenite::{Error as WsError, Message, WebSocket, http};
 const MAX_HEAD_BYTES: usize = 8192;
 pub(crate) const MAX_CONNECTIONS: usize = 16;
 const MAX_STATIC_BYTES: u64 = 64 * 1024 * 1024;
+/// The active VRM model, token required (#362).
+pub(crate) const ACTIVE_MODEL_PATH: &str = "/avatar/model.vrm";
+/// The active model's id, token required (#362).
+pub(crate) const ACTIVE_MODEL_ID_PATH: &str = "/avatar/active";
 pub(crate) const HEAD_DEADLINE: Duration = Duration::from_secs(2);
 pub(crate) const POLL: Duration = Duration::from_millis(10);
 
@@ -173,7 +177,7 @@ fn handle_connection(stream: TcpStream, shared: &Arc<Shared>) {
     };
     let mut parts = request_line.split_whitespace();
     let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
-    let path = target.split('?').next().unwrap_or("");
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
     if path == "/ws" {
         websocket(stream, shared);
     } else {
@@ -182,7 +186,7 @@ fn handle_connection(stream: TcpStream, shared: &Arc<Shared>) {
         let mut stream = stream;
         if stream.read_exact(&mut sink).is_ok() {
             let host_ok = header_value(&sink, "host").is_some_and(|h| h == shared.host);
-            serve_static(&mut stream, shared, method, path, host_ok);
+            serve_static(&mut stream, shared, method, path, query, host_ok);
         }
     }
 }
@@ -236,7 +240,14 @@ fn respond(stream: &mut TcpStream, status: &str, ctype: &str, body: &[u8], head_
     let _ = stream.flush();
 }
 
-fn serve_static(stream: &mut TcpStream, shared: &Shared, method: &str, path: &str, host_ok: bool) {
+fn serve_static(
+    stream: &mut TcpStream,
+    shared: &Shared,
+    method: &str,
+    path: &str,
+    query: &str,
+    host_ok: bool,
+) {
     let head_only = method == "HEAD";
     if method != "GET" && !head_only {
         return respond(stream, "405 Method Not Allowed", "text/plain", b"", false);
@@ -250,22 +261,16 @@ fn serve_static(stream: &mut TcpStream, shared: &Shared, method: &str, path: &st
     if path == "/panel.html" || path.starts_with("/assets/panel-") {
         return respond(stream, "404 Not Found", "text/plain", b"", head_only);
     }
+    if path == ACTIVE_MODEL_PATH || path == ACTIVE_MODEL_ID_PATH {
+        return serve_active_model(stream, shared, path, query, head_only);
+    }
     let Some(file) = resolve(shared.config.page_dir.as_deref(), path) else {
         return respond(stream, "404 Not Found", "text/plain", b"", head_only);
     };
     match fs::read(&file) {
         Ok(body) => {
             let ctype = content_type(&file);
-            // The page may talk to nothing but this origin (no CDN, no
-            // third-party egress). `blob:` in connect-src is required because
-            // three.js decodes embedded model textures by fetching a blob: URL
-            // the page itself created from the model bytes; it names no other
-            // host (observed under the CSP in the S3 smoke test).
-            let csp = format!(
-                "default-src 'self'; connect-src 'self' blob: ws://{}; img-src 'self' data: blob:; \
-                 script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'",
-                shared.host
-            );
+            let csp = page_csp(shared);
             let header = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\
                  Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n\
@@ -280,6 +285,83 @@ fn serve_static(stream: &mut TcpStream, shared: &Shared, method: &str, path: &st
         }
         Err(_) => respond(stream, "404 Not Found", "text/plain", b"", head_only),
     }
+}
+
+/// The page may talk to nothing but this origin (no CDN, no third-party
+/// egress). `blob:` in connect-src is required because three.js decodes
+/// embedded model textures by fetching a blob: URL the page itself created from
+/// the model bytes; it names no other host (observed under the CSP in the S3
+/// smoke test).
+fn page_csp(shared: &Shared) -> String {
+    format!(
+        "default-src 'self'; connect-src 'self' blob: ws://{}; img-src 'self' data: blob:; \
+         script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'",
+        shared.host
+    )
+}
+
+/// The active VRM model (#362), served only to a caller that presents the
+/// per-launch secret (the avatar page already holds it): the model bytes at
+/// [`ACTIVE_MODEL_PATH`] with their id in a header, and the bare id at
+/// [`ACTIVE_MODEL_ID_PATH`] for the page's reload poll. The file is chosen by
+/// the composition root, never by the request.
+fn serve_active_model(
+    stream: &mut TcpStream,
+    shared: &Shared,
+    path: &str,
+    query: &str,
+    head_only: bool,
+) {
+    let token_ok = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("token="))
+        .is_some_and(|t| ct_eq(t, &shared.token));
+    if !token_ok {
+        return respond(stream, "403 Forbidden", "text/plain", b"", head_only);
+    }
+    // One lock: the id and the file always belong together.
+    let (file, id) = {
+        let model = shared.model.lock().unwrap_or_else(|e| e.into_inner());
+        // `fallback=sample`: the page could not decode the active model and
+        // asks for the shipped sample, still labelled with the active id so it
+        // does not mistake the fallback for a change and reload in a loop.
+        let sample = query.split('&').any(|kv| kv == "fallback=sample");
+        let file = match &model.path {
+            Some(path) if !sample => Some(path.clone()),
+            _ => resolve(shared.config.page_dir.as_deref(), "model.vrm"),
+        };
+        (file, model.id.clone())
+    };
+    if path == ACTIVE_MODEL_ID_PATH {
+        let body = serde_json::json!({ "id": id }).to_string();
+        return respond(
+            stream,
+            "200 OK",
+            "application/json",
+            body.as_bytes(),
+            head_only,
+        );
+    }
+    let opened = file.and_then(|file| {
+        let handle = fs::File::open(file).ok()?;
+        let len = handle.metadata().ok()?.len();
+        (len <= MAX_STATIC_BYTES).then_some((handle, len))
+    });
+    let Some((handle, len)) = opened else {
+        return respond(stream, "404 Not Found", "text/plain", b"", head_only);
+    };
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: model/gltf-binary\r\nContent-Length: {len}\r\nConnection: close\r\n\
+         Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n\
+         X-Avatar-Model-Id: {id}\r\nContent-Security-Policy: {}\r\n\r\n",
+        page_csp(shared)
+    );
+    let _ = stream.write_all(header.as_bytes());
+    if !head_only {
+        // Streamed, not read whole: the file may be 64 MiB.
+        let _ = std::io::copy(&mut handle.take(len), stream);
+    }
+    let _ = stream.flush();
 }
 
 /// Maps a URL path to a file strictly inside the page directory.
@@ -415,6 +497,7 @@ fn run_session(shared: &Arc<Shared>, mut ws: WebSocket<TcpStream>) {
     let mut inner = shared.lock();
     inner.purge(DropReason::StaleEpoch);
     inner.health.state = LocalAvatarState::Disconnected;
+    inner.renderer_model = None;
     inner.session_active = false;
 }
 
@@ -430,12 +513,15 @@ fn on_frame(
         return Err(());
     };
     match frame {
-        RendererFrame::Hello { epoch, .. } => {
+        RendererFrame::Hello {
+            epoch, model_hash, ..
+        } => {
             if session.epoch.is_some() {
                 shared.lock().health.protocol_errors += 1;
                 return Err(());
             }
             session.epoch = Some(epoch);
+            shared.lock().renderer_model = Some(model_hash);
         }
         RendererFrame::Ready { epoch } => {
             if session.ready || session.epoch.as_deref() != Some(epoch.as_str()) {

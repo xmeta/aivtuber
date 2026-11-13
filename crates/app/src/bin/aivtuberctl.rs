@@ -21,6 +21,12 @@
 //! (it would travel in a command line and a request log): it is entered in the
 //! panel, or set as `YOUTUBE_API_KEY`.
 //!
+//! `avatar` (issue #362) shows and changes the VRM avatar, like the operation
+//! panel: `status`, `select`, `delete`, and `confirm` / `discard` for a model
+//! uploaded in the panel. The upload itself is deliberately not a subcommand:
+//! the file is chosen and its licence read in the panel, which is where the
+//! operator confirms it.
+//!
 //! `voice` (issue #360) changes the voice at runtime, like the operation panel:
 //! the local voice or Aivis Cloud, the Aivis style and the tuning, and a
 //! preview. The API key is deliberately not a subcommand: it would travel in a
@@ -102,6 +108,51 @@ enum Command {
         #[command(subcommand)]
         action: IngressCommand,
     },
+    /// Show or change the VRM avatar (issue #362); needs the daemon to run
+    /// with the avatar store (the local profile started by `aivtuber-setup
+    /// start`). A model is uploaded in the operation panel, where its licence
+    /// is shown.
+    Avatar {
+        #[command(subcommand)]
+        action: AvatarCommand,
+    },
+}
+
+#[derive(Subcommand, Clone, PartialEq, Eq)]
+enum AvatarCommand {
+    /// The active model, the stored ones and the pending candidate, with
+    /// their licence summaries (the `avatar` lines of `aivtuberctl status`).
+    Status,
+    /// Switch to `sample` or to a stored model (its hash, or at least 8
+    /// characters of it). The avatar page switches without a restart.
+    Select {
+        /// `sample`, or a model hash (prefix of at least 8 hex characters).
+        id: String,
+    },
+    /// Delete a stored model that is not the active one.
+    Delete {
+        /// A model hash (prefix of at least 8 hex characters).
+        id: String,
+    },
+    /// Confirm the model uploaded in the panel after reading its licence: it
+    /// is stored and becomes the active model.
+    Confirm {
+        /// The candidate's hash (prefix of at least 8 hex characters).
+        id: String,
+    },
+    /// Drop the model uploaded in the panel without using it.
+    Discard,
+}
+
+/// The `avatar.*` argument for an avatar subcommand: the model id as typed;
+/// the daemon checks its shape and resolves it against its own store.
+fn avatar_argument(action: &AvatarCommand) -> Option<String> {
+    match action {
+        AvatarCommand::Select { id }
+        | AvatarCommand::Delete { id }
+        | AvatarCommand::Confirm { id } => Some(id.clone()),
+        AvatarCommand::Status | AvatarCommand::Discard => None,
+    }
 }
 
 #[derive(Subcommand, Clone, PartialEq, Eq)]
@@ -238,6 +289,51 @@ fn voice_patch(action: &VoiceCommand) -> Option<String> {
     Some(patch.to_string())
 }
 
+/// The avatar lines of `status`. Model names and licence fields come from the
+/// file and are untrusted text: they are printed with `{:?}` so nothing in
+/// them can act as terminal control.
+fn print_avatar_status(avatar: &aivtuber_app::AvatarStatus) {
+    println!(
+        "avatar active={} page_shows={} max_models={} credit={:?} last_error={:?} save_error={:?}",
+        avatar.active,
+        avatar.renderer_model.as_deref().unwrap_or("-"),
+        avatar.max_models,
+        avatar.credit,
+        avatar.last_error,
+        avatar.save_error,
+    );
+    let mut rows: Vec<(&str, &aivtuber_app::AvatarModelInfo)> = Vec::new();
+    if let Some(sample) = &avatar.sample {
+        rows.push(("sample", sample));
+    }
+    rows.extend(avatar.models.iter().map(|m| ("stored", m)));
+    if let Some(pending) = &avatar.pending {
+        rows.push(("pending", pending));
+    }
+    for (kind, model) in rows {
+        println!(
+            "avatar {kind} id={} size={} name={:?} warnings={:?}",
+            model.id, model.size, model.name, model.warnings,
+        );
+        if let Some(meta) = &model.meta {
+            println!(
+                "avatar   {kind} licence: spec={:?} authors={:?} avatar_permission={:?} commercial_usage={:?} license_name={:?} credit_notation={:?} modification={:?} redistribution={:?} license_url={:?} contact={:?} copyright={:?}",
+                meta.spec,
+                meta.authors,
+                meta.avatar_permission,
+                meta.commercial_usage,
+                meta.license_name,
+                meta.credit_notation,
+                meta.modification,
+                meta.allow_redistribution,
+                meta.license_url,
+                meta.contact,
+                meta.copyright,
+            );
+        }
+    }
+}
+
 fn action_name(command: &Command) -> &'static str {
     match command {
         Command::Status => "status",
@@ -248,6 +344,13 @@ fn action_name(command: &Command) -> &'static str {
         Command::PerceptionOff => "perception.disable",
         Command::MemoryExport { .. } => "memory.export",
         Command::Model { .. } => "model.select",
+        Command::Avatar { action } => match action {
+            AvatarCommand::Status => "status",
+            AvatarCommand::Select { .. } => "avatar.select",
+            AvatarCommand::Delete { .. } => "avatar.delete",
+            AvatarCommand::Confirm { .. } => "avatar.confirm",
+            AvatarCommand::Discard => "avatar.discard",
+        },
         Command::Ingress { action } => match action {
             IngressCommand::Connect { .. } => "ingress.connect",
             IngressCommand::Disconnect { .. } => "ingress.disconnect",
@@ -299,6 +402,7 @@ fn main() -> ExitCode {
         Command::Model { alias } => Some(alias.clone()),
         Command::Voice { action } => voice_patch(action),
         Command::Ingress { action } => ingress_argument(action),
+        Command::Avatar { action } => avatar_argument(action),
         _ => None,
     };
     let request = OperatorRequest {
@@ -440,6 +544,9 @@ fn print_response(response: &OperatorResponse) {
                 voice.key.check,
                 voice.last_error,
             );
+        }
+        if let Some(avatar) = &status.avatar_model {
+            print_avatar_status(avatar);
         }
         if let Some(chat) = &status.chat_ingress {
             for (name, platform) in [("twitch", &chat.twitch), ("youtube", &chat.youtube)] {
@@ -713,6 +820,56 @@ mod tests {
             &["ingress", "connect", "twitch"][..],
             &["ingress", "key", "AIza-x"][..],
             &["ingress", "key-set", "AIza-x"][..],
+        ] {
+            let mut full = vec![
+                "aivtuberctl",
+                "--secret",
+                "01234567890123456789012345678901",
+            ];
+            full.extend_from_slice(args);
+            assert!(Cli::try_parse_from(full).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn avatar_subcommands_send_the_id_as_typed_and_have_no_upload() {
+        let hash = "ab".repeat(32);
+        for (args, name, argument) in [
+            (
+                vec!["avatar", "select", "sample"],
+                "avatar.select",
+                Some("sample"),
+            ),
+            (
+                vec!["avatar", "select", &hash[..12]],
+                "avatar.select",
+                Some(&hash[..12]),
+            ),
+            (
+                vec!["avatar", "delete", &hash],
+                "avatar.delete",
+                Some(hash.as_str()),
+            ),
+            (
+                vec!["avatar", "confirm", &hash],
+                "avatar.confirm",
+                Some(hash.as_str()),
+            ),
+            (vec!["avatar", "discard"], "avatar.discard", None),
+            (vec!["avatar", "status"], "status", None),
+        ] {
+            let command = parse(&args);
+            let Command::Avatar { action } = &command else {
+                panic!("not an avatar command");
+            };
+            assert_eq!(action_name(&command), name);
+            assert_eq!(avatar_argument(action).as_deref(), argument);
+        }
+        // The upload is panel-only: no subcommand takes a file or a path.
+        for args in [
+            &["avatar", "upload", "model.vrm"][..],
+            &["avatar", "select"][..],
+            &["avatar", "add", "model.vrm"][..],
         ] {
             let mut full = vec![
                 "aivtuberctl",

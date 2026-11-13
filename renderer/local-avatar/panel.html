@@ -39,6 +39,44 @@
     <p id="model-state" role="status"></p>
   </section>
 
+  <section id="avatar-section" aria-labelledby="h-avatar" hidden>
+    <h2 id="h-avatar">アバター</h2>
+    <p id="avatar-summary" role="status"></p>
+    <p id="avatar-credit" class="hint"></p>
+    <p id="avatar-error" class="error" role="alert"></p>
+    <p id="avatar-mismatch" class="error" role="alert"></p>
+    <p class="hint">配信に使うモデルは、そのライセンスで配信が許されているものにしてください。選んだファイルのライセンス表示を確認してから使います。ファイルは信頼できない入力として検査され、このPCの保存先にだけ置かれます。</p>
+
+    <div class="buttons wrap">
+      <input id="avatar-file" type="file" accept=".vrm" hidden>
+      <button id="avatar-choose" type="button">VRMファイルを選ぶ…</button>
+      <span id="avatar-upload-state" role="status"></span>
+    </div>
+
+    <div id="avatar-pending" hidden>
+      <h3>確認待ちのモデル: <span id="avatar-pending-name"></span></h3>
+      <p class="hint">まだ使われていません。ライセンスを確認して「このモデルを使う」を押すと、再起動なしでアバター画面が切り替わります。</p>
+      <ul id="avatar-pending-warnings" class="warnings"></ul>
+      <dl id="avatar-pending-rows" class="licence"></dl>
+      <p id="avatar-pending-credit" class="hint"></p>
+      <div class="buttons wrap">
+        <button id="avatar-confirm" type="button">このモデルを使う</button>
+        <button id="avatar-discard" type="button">使わない</button>
+      </div>
+    </div>
+
+    <h3>保存されているモデル</h3>
+    <ul id="avatar-models" class="models"></ul>
+    <p id="avatar-models-hint" class="hint"></p>
+    <p id="avatar-result" role="status"></p>
+
+    <details id="avatar-active-details">
+      <summary>使用中のモデルのライセンス</summary>
+      <ul id="avatar-active-warnings" class="warnings"></ul>
+      <dl id="avatar-active-rows" class="licence"></dl>
+    </details>
+  </section>
+
   <section id="voice-section" aria-labelledby="h-voice" hidden>
     <h2 id="h-voice">声</h2>
     <p id="voice-summary" role="status"></p>

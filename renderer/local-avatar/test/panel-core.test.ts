@@ -1,7 +1,9 @@
 // Unit tests for the operation panel's pure logic (issue #335).
 import { describe, expect, test } from "bun:test";
 import {
+  AVATAR_WARNING_TEXT,
   CHAT_PLATFORMS,
+  MAX_VRM_BYTES,
   MAX_CHAT_CHARS,
   MAX_CHAT_LOG,
   MAX_CHAT_TARGET_CHARS,
@@ -10,7 +12,12 @@ import {
   MAX_MODEL_CHOICES,
   SEARCH_PAGE_SIZE,
   type VoiceModel,
+  avatarView,
   checkChat,
+  checkVrmFile,
+  licenceRows,
+  parseAvatarState,
+  valueLabel,
   checkTwitchChannel,
   checkYoutubeVideo,
   chatIngressView,
@@ -610,5 +617,246 @@ describe("chat connection inputs", () => {
     });
     expect(connectBody("youtube", "nope").ok).toBe(false);
     expect(CHAT_PLATFORMS).toEqual(["twitch", "youtube"]);
+  });
+});
+
+// ---- VRM avatar choice (#362) ----
+
+const H1 = "1".repeat(64);
+const H2 = "2".repeat(64);
+const H3 = "3".repeat(64);
+
+const avMeta = (over: Record<string, unknown> = {}) => ({
+  spec: "vrm1",
+  name: "Test Girl",
+  version: "1.0",
+  authors: ["Ann"],
+  copyright: null,
+  contact: null,
+  license_url: "https://vrm.dev/licenses/1.0/",
+  other_license_url: null,
+  license_name: null,
+  avatar_permission: "everyone",
+  commercial_usage: "corporation",
+  allow_redistribution: false,
+  modification: "prohibited",
+  credit_notation: "unnecessary",
+  allow_violent_usage: false,
+  allow_sexual_usage: false,
+  allow_political_or_religious_usage: true,
+  allow_antisocial_or_hate_usage: false,
+  warnings: [],
+  credit: null,
+  ...over,
+});
+
+const avModel = (id: string, over: Record<string, unknown> = {}, metaOver: Record<string, unknown> | null = {}) => ({
+  id,
+  size: 1024 * 1024,
+  name: "Test Girl",
+  warnings: [],
+  meta: metaOver === null ? null : avMeta(metaOver),
+  ...over,
+});
+
+const avatar = (over: Record<string, unknown> = {}) => ({
+  active: "sample",
+  active_id: H1,
+  credit: null,
+  sample: avModel(H1, { name: "Sample" }, { name: "Sample" }),
+  models: [] as unknown[],
+  pending: null,
+  max_models: 5,
+  max_upload_bytes: MAX_VRM_BYTES,
+  renderer_model: H1,
+  last_error: null,
+  save_error: null,
+  ...over,
+});
+
+const avatarState = (over: Record<string, unknown> = {}) =>
+  state({ status: { ...state()!.status, avatar_model: avatar(over) } });
+
+describe("avatar state", () => {
+  test("a state without the avatar store has no avatar view", () => {
+    expect(avatarView(state())).toBeNull();
+    expect(avatarView(null)).toBeNull();
+  });
+
+  test("parseAvatarState accepts exactly the documented shape", () => {
+    expect(parseAvatarState(avatar())).not.toBeNull();
+    for (const bad of [
+      null,
+      "x",
+      avatar({ active: "../model.vrm" }),
+      avatar({ active: "ABCDEF" }),
+      avatar({ active_id: "nope" }),
+      avatar({ renderer_model: 7 }),
+      avatar({ models: "x" }),
+      avatar({ models: [avModel("short")] }),
+      avatar({ models: [avModel(H2), avModel(H2)] }),
+      avatar({ pending: avModel(H2, { warnings: ["made_up"] }) }),
+      avatar({ pending: avModel(H2, {}, { spec: "vrm2" }) }),
+      avatar({ pending: avModel(H2, {}, { authors: "Ann" }) }),
+      avatar({ pending: avModel(H2, {}, { authors: Array(9).fill("a") }) }),
+      avatar({ pending: avModel(H2, {}, { name: "あ".repeat(301) }) }),
+      avatar({ pending: avModel(H2, {}, { allow_redistribution: "yes" }) }),
+      avatar({ pending: avModel(H2, { size: -1 }) }),
+      avatar({ max_models: -1 }),
+      avatar({ last_error: 7 }),
+    ]) {
+      expect(parseAvatarState(bad)).toBeNull();
+    }
+  });
+
+  test("a malformed avatar block is dropped without rejecting the whole state", () => {
+    const s = state({ status: { ...state()!.status, avatar_model: { active: 7 } } });
+    expect(s).not.toBeNull();
+    expect(s!.status.avatar_model).toBeNull();
+    expect(avatarView(s)).toBeNull();
+  });
+});
+
+describe("avatar view", () => {
+  test("the sample is active at first, with its licence and nothing to delete", () => {
+    const view = avatarView(avatarState())!;
+    expect(view.summary).toBe("使用中: サンプル — Sample");
+    expect(view.health).toBe("ok");
+    expect(view.choices).toHaveLength(1);
+    expect(view.choices[0]).toMatchObject({ id: "sample", active: true, deletable: false });
+    expect(view.pending).toBeNull();
+    expect(view.mismatch).toBe(false);
+    expect(view.activeRows.find(([l]) => l === "作者")?.[1]).toBe("Ann");
+  });
+
+  test("a pending model shows its licence and warns when the use may not be allowed", () => {
+    const pending = avModel(
+      H2,
+      { name: "Restricted", warnings: ["author_only", "non_commercial_only", "credit_required"] },
+      {
+        name: "Restricted",
+        avatar_permission: "onlyAuthor",
+        commercial_usage: "personalNonProfit",
+        credit_notation: "required",
+        credit: "Restricted / Ann",
+        warnings: ["author_only", "non_commercial_only", "credit_required"],
+      },
+    );
+    const view = avatarView(avatarState({ pending }))!;
+    expect(view.pending).not.toBeNull();
+    const p = view.pending!;
+    expect(p.id).toBe(H2);
+    expect(p.title).toBe("Restricted");
+    expect(p.restrictive).toBe(true);
+    expect(p.warnings).toEqual([
+      AVATAR_WARNING_TEXT.author_only,
+      AVATAR_WARNING_TEXT.non_commercial_only,
+      AVATAR_WARNING_TEXT.credit_required,
+    ]);
+    expect(p.credit).toBe("Restricted / Ann");
+    expect(p.rows.find(([l]) => l === "アバターを使える人")?.[1]).toBe("作者のみ(onlyAuthor)");
+    expect(p.rows.find(([l]) => l === "営利利用")?.[1]).toBe("個人・非営利のみ(personalNonProfit)");
+    expect(p.question).toContain("最終的な判断はあなたに任されています");
+  });
+
+  test("a credit duty alone is not a restriction", () => {
+    const pending = avModel(H2, { warnings: ["credit_required"] }, { warnings: ["credit_required"], credit: "X / Y" });
+    expect(avatarView(avatarState({ pending }))!.pending!.restrictive).toBe(false);
+  });
+
+  test("stored models can be selected, the active one cannot be deleted", () => {
+    const view = avatarView(
+      avatarState({
+        active: H2,
+        active_id: H2,
+        models: [avModel(H2, { name: "Two" }), avModel(H3, { name: "Three", warnings: ["licence_not_stated"] }, null)],
+      }),
+    )!;
+    expect(view.summary).toBe("使用中: Two");
+    const two = view.choices.find((c) => c.id === H2)!;
+    const three = view.choices.find((c) => c.id === H3)!;
+    const sample = view.choices.find((c) => c.id === "sample")!;
+    expect([two.active, two.deletable]).toEqual([true, false]);
+    expect([three.active, three.deletable]).toEqual([false, true]);
+    expect(sample.active).toBe(false);
+    expect(three.warnings).toEqual([AVATAR_WARNING_TEXT.licence_not_stated]);
+    // Hash prefixes in the label let two models of one name be told apart.
+    expect(two.label).toContain(H2.slice(0, 8));
+  });
+
+  test("a restrictive active model is a warning health", () => {
+    const view = avatarView(
+      avatarState({
+        active: H2,
+        active_id: H2,
+        models: [avModel(H2, { warnings: ["licensed_persons_only"] }, { warnings: ["licensed_persons_only"] })],
+      }),
+    )!;
+    expect(view.health).toBe("warn");
+    expect(view.activeWarnings).toEqual([AVATAR_WARNING_TEXT.licensed_persons_only]);
+  });
+
+  test("a page that shows another model than the active one is reported", () => {
+    expect(avatarView(avatarState({ renderer_model: H2 }))!.mismatch).toBe(true);
+    expect(avatarView(avatarState({ renderer_model: null }))!.mismatch).toBe(false);
+    expect(avatarView(avatarState({ active_id: null, renderer_model: H2 }))!.mismatch).toBe(false);
+  });
+
+  test("errors are shown, the last request's first", () => {
+    expect(avatarView(avatarState({ last_error: "refused: not_glb" }))!.error).toBe("refused: not_glb");
+    expect(avatarView(avatarState({ save_error: "disk full" }))!.error).toContain("disk full");
+    expect(avatarView(avatarState())!.error).toBeNull();
+  });
+
+  test("model text stays plain strings and is never turned into markup or a link", () => {
+    const evil = "<img src=x onerror=alert(1)>";
+    const view = avatarView(
+      avatarState({ pending: avModel(H2, { name: evil }, { name: evil, license_url: "javascript:alert(1)", authors: [evil] }) }),
+    )!;
+    const p = view.pending!;
+    expect(p.title).toBe(evil);
+    expect(p.rows.find(([l]) => l === "ライセンスURL")?.[1]).toBe("javascript:alert(1)");
+    expect(p.rows.find(([l]) => l === "作者")?.[1]).toBe(evil);
+  });
+});
+
+describe("licence rows", () => {
+  test("VRM 0.x spellings and unknown values are shown as the file wrote them", () => {
+    const rows = licenceRows(
+      avMeta({
+        spec: "vrm0",
+        avatar_permission: "OnlyAuthor",
+        commercial_usage: "Disallow",
+        license_name: "CC_BY_NC",
+        modification: null,
+        credit_notation: null,
+        allow_redistribution: null,
+      }) as never,
+    );
+    expect(rows.find(([l]) => l === "規格")?.[1]).toBe("VRM 0.x");
+    expect(rows.find(([l]) => l === "アバターを使える人")?.[1]).toBe("作者のみ(OnlyAuthor)");
+    expect(rows.find(([l]) => l === "営利利用")?.[1]).toBe("営利利用不可(Disallow)");
+    expect(rows.find(([l]) => l === "ライセンス名")?.[1]).toBe("CC_BY_NC");
+    expect(rows.find(([l]) => l === "改変")?.[1]).toBe("(記載なし)");
+    expect(valueLabel("commercial_usage", "somethingNew")).toBe("somethingNew");
+    expect(valueLabel("commercial_usage", null)).toBe("(記載なし)");
+  });
+});
+
+describe("avatar file check", () => {
+  const glb = new Uint8Array([0x67, 0x6c, 0x54, 0x46, 2, 0, 0, 0, 0, 0, 0, 0]);
+  test("a glTF binary of a sane size passes", () => {
+    expect(checkVrmFile({ name: "a.vrm", size: 1000 }, glb)).toEqual({ ok: true });
+    expect(checkVrmFile({ name: "a.vrm", size: MAX_VRM_BYTES }, glb)).toEqual({ ok: true });
+  });
+
+  test("an empty, oversized or renamed file is refused with a reason", () => {
+    expect(checkVrmFile({ name: "a.vrm", size: 0 }, glb).ok).toBe(false);
+    const big = checkVrmFile({ name: "a.vrm", size: MAX_VRM_BYTES + 1 }, glb);
+    expect(big.ok).toBe(false);
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
+    const renamed = checkVrmFile({ name: "avatar.vrm", size: 5000 }, png);
+    expect(renamed.ok).toBe(false);
+    expect(checkVrmFile({ name: "a.vrm", size: 5000 }, new Uint8Array([0x67, 0x6c])).ok).toBe(false);
   });
 });

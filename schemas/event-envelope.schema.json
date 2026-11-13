@@ -136,7 +136,8 @@
               "perception.control",
               "model.select",
               "voice.configure",
-              "ingress.control"
+              "ingress.control",
+              "avatar.configure"
             ]
           }
         }

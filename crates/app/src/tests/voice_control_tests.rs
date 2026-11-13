@@ -571,6 +571,7 @@ fn the_key_entered_in_the_panel_reaches_the_file_and_no_other_output() {
         &SECRET,
         None,
         Some(s.api.endpoint()),
+        None,
     )
     .expect("panel");
     let url = panel.launch_url();

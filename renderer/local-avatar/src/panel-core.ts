@@ -19,6 +19,8 @@ export interface PanelState {
     voice?: VoiceState | null;
     /** The stream-chat connections (#361); absent unless the app composed them. */
     chat_ingress?: ChatIngressState | null;
+    /** The VRM avatar choice (#362); absent unless the app composed it. */
+    avatar_model?: AvatarState | null;
   };
   replies: { seq: number; event_id: string; text: string }[];
   avatar_url: string | null;
@@ -139,7 +141,11 @@ export function parseState(value: unknown): PanelState | null {
   const thinkingModel = parseModelState(v.status.thinking_model);
   const voice = parseVoiceState(v.status.voice);
   const chatIngress = parseChatIngressState(v.status.chat_ingress);
-  return { ...(v as PanelState), status: { ...v.status, thinking_model: thinkingModel, voice, chat_ingress: chatIngress } };
+  const avatarModel = parseAvatarState(v.status.avatar_model);
+  return {
+    ...(v as PanelState),
+    status: { ...v.status, thinking_model: thinkingModel, voice, chat_ingress: chatIngress, avatar_model: avatarModel },
+  };
 }
 
 /** Only an http(s) link to the loopback avatar page is offered as a link. */
@@ -747,5 +753,420 @@ export function chatIngressView(state: PanelState | null): ChatIngressView | nul
     keyText: key.set ? `設定済み(${key.source === "environment" ? "環境変数 YOUTUBE_API_KEY" : "ファイル"})` : "未設定",
     keyHealth: "ok",
     saveError: c.save_error,
+  };
+}
+
+// ---- VRM avatar choice (#362) ----
+
+/** Mirrors `MAX_VRM_BYTES` in crates/adapters/src/local_avatar/vrm.rs. */
+export const MAX_VRM_BYTES = 64 * 1024 * 1024;
+/** Mirrors `MAX_STORED_MODELS` (crates/app/src/avatar_control.rs). */
+export const MAX_AVATAR_MODELS = 5;
+const MAX_META_TEXT = 300;
+const MAX_META_AUTHORS = 8;
+const HASH64 = /^[0-9a-f]{64}$/;
+
+export type AvatarWarning =
+  | "author_only"
+  | "licensed_persons_only"
+  | "non_commercial_only"
+  | "personal_commercial_only"
+  | "credit_required"
+  | "licence_not_stated";
+const AVATAR_WARNINGS: readonly string[] = [
+  "author_only",
+  "licensed_persons_only",
+  "non_commercial_only",
+  "personal_commercial_only",
+  "credit_required",
+  "licence_not_stated",
+];
+
+/** The licence summary the app read from the model file. All text is untrusted. */
+export interface AvatarMeta {
+  spec: "vrm1" | "vrm0";
+  name: string | null;
+  version: string | null;
+  authors: string[];
+  copyright: string | null;
+  contact: string | null;
+  license_url: string | null;
+  other_license_url: string | null;
+  license_name: string | null;
+  avatar_permission: string | null;
+  commercial_usage: string | null;
+  allow_redistribution: boolean | null;
+  modification: string | null;
+  credit_notation: string | null;
+  allow_violent_usage: boolean | null;
+  allow_sexual_usage: boolean | null;
+  allow_political_or_religious_usage: boolean | null;
+  allow_antisocial_or_hate_usage: boolean | null;
+  warnings: AvatarWarning[];
+  credit: string | null;
+}
+
+export interface AvatarModel {
+  id: string;
+  size: number;
+  name: string | null;
+  warnings: AvatarWarning[];
+  meta: AvatarMeta | null;
+}
+
+export interface AvatarState {
+  active: string;
+  active_id: string | null;
+  credit: string | null;
+  sample: AvatarModel | null;
+  models: AvatarModel[];
+  pending: AvatarModel | null;
+  max_models: number;
+  max_upload_bytes: number;
+  renderer_model: string | null;
+  last_error: string | null;
+  save_error: string | null;
+}
+
+const optText = (value: unknown, max = MAX_META_TEXT): string | null | undefined =>
+  boundedText(value, max);
+
+const optBool = (value: unknown): boolean | null | undefined =>
+  value === null || typeof value === "boolean" ? value : undefined;
+
+function parseWarnings(value: unknown): AvatarWarning[] | null {
+  if (!Array.isArray(value) || value.length > AVATAR_WARNINGS.length) return null;
+  if (!value.every((w) => typeof w === "string" && AVATAR_WARNINGS.includes(w))) return null;
+  return value as AvatarWarning[];
+}
+
+function parseAvatarMeta(value: unknown): AvatarMeta | null | undefined {
+  if (value === null) return null;
+  if (typeof value !== "object") return undefined;
+  const v = value as Record<string, unknown>;
+  if (v.spec !== "vrm1" && v.spec !== "vrm0") return undefined;
+  const authors = v.authors;
+  if (!Array.isArray(authors) || authors.length > MAX_META_AUTHORS) return undefined;
+  if (!authors.every((a) => typeof a === "string" && [...a].length <= MAX_META_TEXT)) return undefined;
+  const warnings = parseWarnings(v.warnings);
+  if (warnings === null) return undefined;
+  const texts: Record<string, string | null> = {};
+  for (const key of [
+    "name",
+    "version",
+    "copyright",
+    "contact",
+    "license_url",
+    "other_license_url",
+    "license_name",
+    "avatar_permission",
+    "commercial_usage",
+    "modification",
+    "credit_notation",
+    "credit",
+  ]) {
+    const text = optText(v[key]);
+    if (text === undefined) return undefined;
+    texts[key] = text;
+  }
+  const bools: Record<string, boolean | null> = {};
+  for (const key of [
+    "allow_redistribution",
+    "allow_violent_usage",
+    "allow_sexual_usage",
+    "allow_political_or_religious_usage",
+    "allow_antisocial_or_hate_usage",
+  ]) {
+    const b = optBool(v[key]);
+    if (b === undefined) return undefined;
+    bools[key] = b;
+  }
+  return {
+    spec: v.spec,
+    authors: authors as string[],
+    warnings,
+    name: texts.name ?? null,
+    version: texts.version ?? null,
+    copyright: texts.copyright ?? null,
+    contact: texts.contact ?? null,
+    license_url: texts.license_url ?? null,
+    other_license_url: texts.other_license_url ?? null,
+    license_name: texts.license_name ?? null,
+    avatar_permission: texts.avatar_permission ?? null,
+    commercial_usage: texts.commercial_usage ?? null,
+    modification: texts.modification ?? null,
+    credit_notation: texts.credit_notation ?? null,
+    credit: texts.credit ?? null,
+    allow_redistribution: bools.allow_redistribution ?? null,
+    allow_violent_usage: bools.allow_violent_usage ?? null,
+    allow_sexual_usage: bools.allow_sexual_usage ?? null,
+    allow_political_or_religious_usage: bools.allow_political_or_religious_usage ?? null,
+    allow_antisocial_or_hate_usage: bools.allow_antisocial_or_hate_usage ?? null,
+  };
+}
+
+function parseAvatarModel(value: unknown): AvatarModel | null {
+  if (typeof value !== "object" || value === null) return null;
+  const v = value as Record<string, unknown>;
+  if (typeof v.id !== "string" || !HASH64.test(v.id)) return null;
+  if (!count(v.size) || v.size > MAX_VRM_BYTES) return null;
+  const name = optText(v.name, 200);
+  const warnings = parseWarnings(v.warnings);
+  const meta = parseAvatarMeta(v.meta);
+  if (name === undefined || warnings === null || meta === undefined) return null;
+  return { id: v.id, size: v.size, name, warnings, meta };
+}
+
+/**
+ * The avatar state, only if it has exactly the documented shape; anything else
+ * hides the card rather than offering what the app would refuse.
+ */
+export function parseAvatarState(value: unknown): AvatarState | null {
+  if (typeof value !== "object" || value === null) return null;
+  const v = value as Record<string, unknown>;
+  if (typeof v.active !== "string" || (v.active !== "sample" && !HASH64.test(v.active))) return null;
+  for (const key of ["active_id", "renderer_model"]) {
+    const id = v[key];
+    if (id !== null && (typeof id !== "string" || !HASH64.test(id))) return null;
+  }
+  const credit = optText(v.credit, 200);
+  const lastError = optText(v.last_error, 400);
+  const saveError = optText(v.save_error, 400);
+  if (credit === undefined || lastError === undefined || saveError === undefined) return null;
+  if (!count(v.max_models) || v.max_models > 64 || !count(v.max_upload_bytes)) return null;
+  let sample: AvatarModel | null = null;
+  if (v.sample !== null) {
+    sample = parseAvatarModel(v.sample);
+    if (sample === null) return null;
+  }
+  let pending: AvatarModel | null = null;
+  if (v.pending !== null) {
+    pending = parseAvatarModel(v.pending);
+    if (pending === null) return null;
+  }
+  if (!Array.isArray(v.models) || v.models.length > 64) return null;
+  const models: AvatarModel[] = [];
+  for (const entry of v.models) {
+    const model = parseAvatarModel(entry);
+    if (model === null || models.some((m) => m.id === model.id)) return null;
+    models.push(model);
+  }
+  return {
+    active: v.active,
+    active_id: (v.active_id as string | null) ?? null,
+    credit,
+    sample,
+    models,
+    pending,
+    max_models: v.max_models,
+    max_upload_bytes: v.max_upload_bytes,
+    renderer_model: (v.renderer_model as string | null) ?? null,
+    last_error: lastError,
+    save_error: saveError,
+  };
+}
+
+/** Why a file cannot be sent, or `ok`. The app checks everything again. */
+export function checkVrmFile(
+  file: { name: string; size: number },
+  head: Uint8Array,
+): { ok: true } | { ok: false; reason: string } {
+  if (file.size === 0) return { ok: false, reason: "空のファイルです" };
+  if (file.size > MAX_VRM_BYTES) {
+    return { ok: false, reason: `ファイルが大きすぎます(上限 ${MAX_VRM_BYTES / (1024 * 1024)} MiB)` };
+  }
+  // glTF binary starts with the four bytes "glTF"; a renamed image or archive
+  // does not. The app inspects the whole file; this only saves the upload.
+  const magic = [0x67, 0x6c, 0x54, 0x46];
+  if (head.length < 4 || !magic.every((b, i) => head[i] === b)) {
+    return { ok: false, reason: "VRMファイル(glTFバイナリ)ではありません。拡張子だけ .vrm に変えたファイルは使えません" };
+  }
+  return { ok: true };
+}
+
+/** Warning text, in the order the app reports them. */
+export const AVATAR_WARNING_TEXT: Record<AvatarWarning, string> = {
+  author_only: "このモデルは作者本人だけが使えます。配信に使うには作者の許可が必要です",
+  licensed_persons_only: "このモデルは作者が個別に許可した人だけが使えます。許可を受けているか確認してください",
+  non_commercial_only: "営利目的の利用が許可されていません。収益化している配信では使えない可能性があります",
+  personal_commercial_only: "営利利用は個人に限られます。法人や事務所の配信では使えない可能性があります",
+  credit_required: "クレジット表記が必要です。配信の概要欄などに表示してください",
+  licence_not_stated: "利用者や営利利用の条件が書かれていません。配布元の規約を確認してください",
+};
+
+/** Warnings that say the use may not be allowed (as opposed to a duty to credit). */
+const RESTRICTIVE: readonly AvatarWarning[] = [
+  "author_only",
+  "licensed_persons_only",
+  "non_commercial_only",
+  "personal_commercial_only",
+  "licence_not_stated",
+];
+
+export function isRestrictive(warnings: readonly AvatarWarning[]): boolean {
+  return warnings.some((w) => RESTRICTIVE.includes(w));
+}
+
+const LABELS: Record<string, Record<string, string>> = {
+  avatar_permission: {
+    onlyAuthor: "作者のみ",
+    OnlyAuthor: "作者のみ",
+    onlySeparatelyLicensedPerson: "作者が個別に許可した人のみ",
+    ExplicitlyLicensedPerson: "作者が個別に許可した人のみ",
+    everyone: "全員",
+    Everyone: "全員",
+  },
+  commercial_usage: {
+    personalNonProfit: "個人・非営利のみ",
+    personalProfit: "個人なら営利利用可",
+    corporation: "法人も営利利用可",
+    Disallow: "営利利用不可",
+    Allow: "営利利用可",
+  },
+  modification: {
+    prohibited: "改変不可",
+    allowModification: "改変可(再配布は不可)",
+    allowModificationRedistribution: "改変・再配布可",
+  },
+  credit_notation: { required: "必要", unnecessary: "不要" },
+};
+
+/** The Japanese label of a known value, else the file's own text. */
+export function valueLabel(field: keyof typeof LABELS, raw: string | null): string {
+  if (raw === null) return "(記載なし)";
+  const label = LABELS[field]?.[raw];
+  return label === undefined ? raw : `${label}(${raw})`;
+}
+
+const yesNo = (value: boolean | null): string => (value === null ? "(記載なし)" : value ? "許可" : "不許可");
+
+/** The licence rows to show, label then value. Every value is shown as text. */
+export function licenceRows(meta: AvatarMeta): [string, string][] {
+  const rows: [string, string][] = [
+    ["名前", meta.name ?? "(記載なし)"],
+    ["規格", meta.spec === "vrm1" ? "VRM 1.0" : "VRM 0.x"],
+    ["バージョン", meta.version ?? "(記載なし)"],
+    ["作者", meta.authors.length === 0 ? "(記載なし)" : meta.authors.join("、")],
+    ["アバターを使える人", valueLabel("avatar_permission", meta.avatar_permission)],
+    ["営利利用", valueLabel("commercial_usage", meta.commercial_usage)],
+    ["クレジット表記", valueLabel("credit_notation", meta.credit_notation)],
+  ];
+  if (meta.license_name !== null) rows.push(["ライセンス名", meta.license_name]);
+  rows.push(
+    ["改変", valueLabel("modification", meta.modification)],
+    ["再配布", yesNo(meta.allow_redistribution)],
+    ["過度に暴力的な表現", yesNo(meta.allow_violent_usage)],
+    ["過度に性的な表現", yesNo(meta.allow_sexual_usage)],
+    ["政治・宗教目的", yesNo(meta.allow_political_or_religious_usage)],
+    ["反社会的・ヘイト目的", yesNo(meta.allow_antisocial_or_hate_usage)],
+    ["ライセンスURL", meta.license_url ?? "(記載なし)"],
+  );
+  if (meta.other_license_url !== null) rows.push(["その他のライセンスURL", meta.other_license_url]);
+  if (meta.copyright !== null) rows.push(["著作権表示", meta.copyright]);
+  if (meta.contact !== null) rows.push(["連絡先", meta.contact]);
+  return rows;
+}
+
+export interface AvatarChoice {
+  /** `sample` or the model hash: what the select/delete request carries. */
+  id: string;
+  label: string;
+  active: boolean;
+  deletable: boolean;
+  warnings: string[];
+}
+
+export interface AvatarPendingView {
+  id: string;
+  title: string;
+  rows: [string, string][];
+  warnings: string[];
+  /** The licence says the use may not be allowed: confirm needs a second look. */
+  restrictive: boolean;
+  credit: string | null;
+  /** The text of the confirmation question when the licence is restrictive. */
+  question: string;
+}
+
+export interface AvatarView {
+  summary: string;
+  health: Health;
+  credit: string | null;
+  choices: AvatarChoice[];
+  pending: AvatarPendingView | null;
+  activeRows: [string, string][];
+  activeWarnings: string[];
+  error: string | null;
+  /** The connected avatar page shows another model than the active one. */
+  mismatch: boolean;
+  canAddMore: boolean;
+}
+
+export function formatMiB(bytes: number): string {
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+function modelLabel(model: AvatarModel, fallback: string): string {
+  return `${model.name ?? fallback}(${model.id.slice(0, 8)}, ${formatMiB(model.size)})`;
+}
+
+/** What the avatar card shows, or `null` when the app has no avatar store. */
+export function avatarView(state: PanelState | null): AvatarView | null {
+  const a = state?.status.avatar_model ?? null;
+  if (a === null) return null;
+  const choices: AvatarChoice[] = [];
+  if (a.sample !== null) {
+    choices.push({
+      id: "sample",
+      label: `サンプル — ${modelLabel(a.sample, "(名前なし)")}`,
+      active: a.active === "sample",
+      deletable: false,
+      warnings: a.sample.warnings.map((w) => AVATAR_WARNING_TEXT[w]),
+    });
+  }
+  for (const m of a.models) {
+    choices.push({
+      id: m.id,
+      label: modelLabel(m, "(名前なし)"),
+      active: a.active === m.id,
+      deletable: a.active !== m.id,
+      warnings: m.warnings.map((w) => AVATAR_WARNING_TEXT[w]),
+    });
+  }
+  const activeModel = a.active === "sample" ? a.sample : (a.models.find((m) => m.id === a.active) ?? null);
+  const pending: AvatarPendingView | null =
+    a.pending === null
+      ? null
+      : {
+          id: a.pending.id,
+          title: a.pending.name ?? "(名前なし)",
+          rows: a.pending.meta === null ? [] : licenceRows(a.pending.meta),
+          warnings: a.pending.warnings.map((w) => AVATAR_WARNING_TEXT[w]),
+          restrictive: isRestrictive(a.pending.warnings),
+          credit: a.pending.meta?.credit ?? null,
+          question:
+            "このモデルのライセンスには、配信で使えない可能性がある条件があります(上の警告を確認してください)。それでも使いますか?(最終的な判断はあなたに任されています)",
+        };
+  const failure = a.last_error ?? a.save_error;
+  const mismatch = a.renderer_model !== null && a.active_id !== null && a.renderer_model !== a.active_id;
+  return {
+    summary:
+      activeModel === null
+        ? "使用中: (モデルがありません。VRMファイルを追加してください)"
+        : `使用中: ${a.active === "sample" ? "サンプル — " : ""}${activeModel.name ?? "(名前なし)"}`,
+    health: failure === null && !isRestrictive(activeModel?.warnings ?? []) ? "ok" : "warn",
+    credit: a.credit,
+    choices,
+    pending,
+    activeRows: activeModel?.meta == null ? [] : licenceRows(activeModel.meta),
+    activeWarnings: (activeModel?.warnings ?? []).map((w) => AVATAR_WARNING_TEXT[w]),
+    error:
+      failure === null
+        ? null
+        : a.last_error !== null
+          ? a.last_error
+          : `選択を保存できませんでした: ${a.save_error}`,
+    mismatch,
+    canAddMore: true,
   };
 }

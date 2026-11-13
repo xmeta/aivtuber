@@ -10,7 +10,9 @@ import {
   type VoiceModel,
   type VoiceSearchPage,
   TUNING_RANGES,
+  avatarView,
   checkChat,
+  checkVrmFile,
   chatIngressView,
   connectBody,
   checkCredit,
@@ -100,6 +102,7 @@ function render(): void {
   renderModel();
   renderVoice();
   renderIngress();
+  renderAvatar();
   const link = $<HTMLAnchorElement>("avatar-link");
   const url = safeAvatarUrl(state?.avatar_url);
   link.hidden = url === null;
@@ -180,6 +183,183 @@ async function selectModel(): Promise<void> {
     void poll();
   }
 }
+
+// ---- VRM avatar (#362) ----
+
+const UPLOAD_TIMEOUT_MS = 120_000;
+/** The avatar page needs a few seconds to notice a switch; a longer difference is a failure. */
+const MISMATCH_GRACE_MS = 8000;
+let mismatchSince: number | null = null;
+
+function fillRows(list: HTMLElement, rows: [string, string][]): void {
+  list.replaceChildren();
+  for (const [label, value] of rows) {
+    const term = document.createElement("dt");
+    term.textContent = label;
+    const detail = document.createElement("dd");
+    detail.textContent = value;
+    list.append(term, detail);
+  }
+}
+
+function fillWarnings(list: HTMLElement, warnings: string[]): void {
+  list.replaceChildren();
+  for (const text of warnings) {
+    const item = document.createElement("li");
+    item.textContent = text;
+    list.append(item);
+  }
+}
+
+function renderAvatar(): void {
+  const view = avatarView(state);
+  $("avatar-section").hidden = view === null;
+  if (view === null) return;
+  const summary = $("avatar-summary");
+  summary.textContent = view.summary;
+  summary.className = view.health === "warn" ? "error" : "";
+  $("avatar-credit").textContent = view.credit === null ? "" : `クレジット表記(配信の概要欄などに表示してください): ${view.credit}`;
+  $("avatar-error").textContent = view.error ?? "";
+  if (view.mismatch) {
+    mismatchSince ??= Date.now();
+  } else {
+    mismatchSince = null;
+  }
+  $("avatar-mismatch").textContent =
+    mismatchSince !== null && Date.now() - mismatchSince > MISMATCH_GRACE_MS
+      ? "アバター画面が、選択中のモデルを読み込めずに別のモデルを表示しています。モデルファイルが壊れているか、対応していない可能性があります"
+      : "";
+  $<HTMLButtonElement>("avatar-choose").disabled = connectionLost;
+
+  const pending = $("avatar-pending");
+  pending.hidden = view.pending === null;
+  if (view.pending !== null) {
+    $("avatar-pending-name").textContent = view.pending.title;
+    fillWarnings($("avatar-pending-warnings"), view.pending.warnings);
+    fillRows($("avatar-pending-rows"), view.pending.rows);
+    $("avatar-pending-credit").textContent = view.pending.credit === null ? "" : `クレジット表記: ${view.pending.credit}`;
+    $<HTMLButtonElement>("avatar-confirm").disabled = connectionLost;
+    $<HTMLButtonElement>("avatar-discard").disabled = connectionLost;
+  }
+
+  const list = $("avatar-models");
+  list.replaceChildren();
+  for (const choice of view.choices) {
+    const item = document.createElement("li");
+    item.className = `model-row${choice.active ? " active" : ""}`;
+    const label = document.createElement("span");
+    label.textContent = `${choice.active ? "● " : ""}${choice.label}`;
+    for (const warning of choice.warnings) {
+      const small = document.createElement("small");
+      small.textContent = warning;
+      label.append(small);
+    }
+    const use = document.createElement("button");
+    use.type = "button";
+    use.textContent = choice.active ? "使用中" : "使う";
+    use.disabled = choice.active || connectionLost;
+    use.addEventListener("click", () => void avatarPost("/api/avatar/select", { id: choice.id }));
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "削除";
+    remove.hidden = choice.id === "sample";
+    remove.disabled = !choice.deletable || connectionLost;
+    remove.addEventListener("click", () => {
+      if (window.confirm("このモデルを保存先から削除します。よろしいですか?")) {
+        void avatarPost("/api/avatar/delete", { id: choice.id });
+      }
+    });
+    item.append(label, use, remove);
+    list.append(item);
+  }
+  const max = state?.status.avatar_model?.max_models ?? 0;
+  $("avatar-models-hint").textContent = `追加したモデルは最大 ${max} 個まで保存されます。超えると、最も長く使っていないものが自動で消えます(使用中のものは消えません)。`;
+  fillWarnings($("avatar-active-warnings"), view.activeWarnings);
+  fillRows($("avatar-active-rows"), view.activeRows);
+}
+
+async function avatarPost(path: string, body: unknown): Promise<boolean> {
+  const out = $("avatar-result");
+  try {
+    const { status, json } = await api(path, { method: "POST", body: JSON.stringify(body) });
+    const reply = (json ?? {}) as { ok?: boolean; detail?: string };
+    const ok = status === 200 && reply.ok === true;
+    out.textContent = ok ? (reply.detail ?? "") : `できませんでした: ${reply.detail ?? status}`;
+    out.className = ok ? "" : "error";
+    return ok;
+  } catch {
+    out.textContent = "できませんでした(アプリに接続できません)";
+    out.className = "error";
+    return false;
+  } finally {
+    void poll();
+  }
+}
+
+/** Sends the chosen file's raw bytes. The page never reads it into memory whole. */
+async function uploadAvatar(file: File): Promise<void> {
+  const out = $("avatar-upload-state");
+  const refuse = (text: string): void => {
+    out.textContent = text;
+    out.className = "error";
+  };
+  if (token === null) return refuse("トークンがありません");
+  const head = new Uint8Array(await file.slice(0, 12).arrayBuffer());
+  const checked = checkVrmFile(file, head);
+  if (!checked.ok) return refuse(checked.reason);
+  out.textContent = "アップロードして検査しています…";
+  out.className = "";
+  $<HTMLButtonElement>("avatar-choose").disabled = true;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), UPLOAD_TIMEOUT_MS);
+  try {
+    const response = await fetch("/api/avatar/upload", {
+      method: "POST",
+      headers: { "X-Panel-Token": token, "Content-Type": "application/octet-stream" },
+      body: file,
+      cache: "no-store",
+      credentials: "omit",
+      referrerPolicy: "no-referrer",
+      signal: controller.signal,
+    });
+    let reply: { ok?: boolean; detail?: string } = {};
+    try {
+      reply = (await response.json()) as typeof reply;
+    } catch {
+      // an empty body (401, 403) carries no JSON
+    }
+    if (response.status === 200 && reply.ok === true) {
+      out.textContent = "検査に通りました。下のライセンスを確認してください";
+      out.className = "";
+    } else {
+      refuse(`受け付けられませんでした: ${reply.detail ?? response.status}`);
+    }
+  } catch {
+    refuse("アップロードできませんでした(アプリに接続できないか、時間がかかりすぎました)");
+  } finally {
+    clearTimeout(timer);
+    $<HTMLButtonElement>("avatar-choose").disabled = connectionLost;
+    void poll();
+  }
+}
+
+function confirmAvatar(): void {
+  const pending = avatarView(state)?.pending ?? null;
+  if (pending === null) return;
+  // A licence that may not allow the use asks once more: the operator decides.
+  if (pending.restrictive && !window.confirm(`${pending.warnings.join("\n")}\n\n${pending.question}`)) return;
+  void avatarPost("/api/avatar/confirm", { id: pending.id });
+}
+
+$("avatar-choose").addEventListener("click", () => $<HTMLInputElement>("avatar-file").click());
+$("avatar-file").addEventListener("change", () => {
+  const input = $<HTMLInputElement>("avatar-file");
+  const file = input.files?.[0];
+  input.value = "";
+  if (file !== undefined) void uploadAvatar(file);
+});
+$("avatar-confirm").addEventListener("click", confirmAvatar);
+$("avatar-discard").addEventListener("click", () => void avatarPost("/api/avatar/discard", {}));
 
 // ---- stream chat connections (#361) ----
 
