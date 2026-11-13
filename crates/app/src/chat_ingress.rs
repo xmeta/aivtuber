@@ -72,6 +72,9 @@ const SIDECAR_STDERR_QUEUE: usize = 32;
 const STDERR_LINES_PER_POLL: usize = 8;
 const STDERR_LOGGED_PER_WINDOW: u32 = 20;
 const STDERR_WINDOW_MS: u64 = 60_000;
+/// After a child exits, how long its stderr reader may take to deliver the
+/// last lines (normally a few ms) before the exit is reported without them.
+const STDERR_DRAIN_MS: u64 = 500;
 const ERROR_CHARS: usize = 160;
 /// A child that has run this long counts as healthy: its failures are forgotten.
 const HEALTHY_RUN_MS: u64 = 60_000;
@@ -415,6 +418,10 @@ struct Running {
     pump: RawIngressMetrics,
     started_ms: u64,
     saw_record: bool,
+    /// When the exit was first seen; the exit is reported once the stderr
+    /// reader has reached end of stream (or [`STDERR_DRAIN_MS`] later), so the
+    /// child's last diagnostic line is not lost to a thread race.
+    exit_seen_ms: Option<u64>,
 }
 
 #[derive(Default)]
@@ -601,13 +608,25 @@ fn poll_slot(slot: &mut Slot, timing: Timing, key: Option<&str>, now_ms: u64) {
         .as_mut()
         .and_then(|run| run.guard.try_wait().map(|status| (status, run.started_ms)));
     if let Some((status, started_ms)) = exited {
-        // What the child wrote before it ended is still in the pipes.
+        // What the child wrote before it ended may still be on its way from
+        // the reader thread: wait (across polls, never blocking) until the
+        // reader reports end of stream, with a bound.
         if let Some(run) = slot.running.as_mut() {
-            while let Ok(raw) = run.stderr.try_recv() {
-                let line = sanitize(&String::from_utf8_lossy(&raw), key);
-                if !line.is_empty() && !is_stats_line(&line) {
-                    slot.last_diag = Some(line);
+            let drained = loop {
+                match run.stderr.try_recv() {
+                    Ok(raw) => {
+                        let line = sanitize(&String::from_utf8_lossy(&raw), key);
+                        if !line.is_empty() && !is_stats_line(&line) {
+                            slot.last_diag = Some(line);
+                        }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break false,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break true,
                 }
+            };
+            let seen = *run.exit_seen_ms.get_or_insert(now_ms);
+            if !drained && now_ms.saturating_sub(seen) < STDERR_DRAIN_MS {
+                return;
             }
         }
         let ran_ms = now_ms.saturating_sub(started_ms);
@@ -792,6 +811,7 @@ impl ChatIngressController {
             pump: RawIngressMetrics::default(),
             started_ms: 0,
             saw_record: true,
+            exit_seen_ms: None,
         });
         line_tx
     }
@@ -1008,6 +1028,7 @@ impl ChatIngressController {
             pump,
             started_ms: now_ms,
             saw_record: false,
+            exit_seen_ms: None,
         })
     }
 
