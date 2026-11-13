@@ -235,6 +235,8 @@ Adapter configuration references secret identifiers; it does not copy secret val
 
 Outbound provider egress: the local profile is loopback-only except the opt-in Aivis Cloud TTS backend (#327, assumption A-TTS-004), which sends only projected reply text to an HTTPS origin, holds its key (`AIVIS_API`, or the key file of #360) as a redacted `SecretString`, never follows a redirect, and never logs the key or the spoken text. Since #360 the operator can switch to it, and back, at runtime from the panel: that switch is a new egress decision point, taken only through the authenticated `voice.configure` operator action with an explicit egress confirmation (section 15.1). The model search and the key check are the only other calls to that service; neither sends reply text, and the search sends no credential.
 
+The opt-in Jev chat-batch ranker (#78 S3, `AIVTUBER_CHAT_BURST_JEV_RANKER`, reflex and full profiles only) sends the bounded text of at most 16 shortlisted comments per batch, without actor ids, through the existing Jev adapter. Its answer is data: slot-keyed scores that can only reorder the batch's own candidates, after which Top-K, the actor cap and the cooldown are re-applied; any malformed, unknown, extra or late answer falls back to the deterministic order. It holds no capability or permit, so it needs no authenticated control path.
+
 == 11. Publication containment gate
 
 Before public speech/display, generated output passes a deterministic publication-containment policy.

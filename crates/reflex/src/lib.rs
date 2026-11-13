@@ -5,7 +5,9 @@
 
 mod audience;
 mod burst;
+mod chat_score;
 mod jev;
+mod jev_batch;
 mod pipeline;
 mod retrieval;
 
@@ -25,10 +27,20 @@ pub use burst::{
     MAX_CANDIDATE_TEXT_BYTES, MAX_READY_BATCHES, MAX_TRACKED_ACTORS, RankingSource, RefusalReason,
     RequestCandidate, TerminalOutcome,
 };
+pub use chat_score::{
+    ChatTextEmbedder, MAX_SCORE_INDEX_ASSETS, MAX_SCORE_LOOKUPS_PER_WINDOW, MAX_SCORE_WINDOW_MS,
+    ReactionAxisEmbedder, RetrievalScoreConfig, RetrievalScoreConfigError, RetrievalScoreMetrics,
+    RetrievalScorer,
+};
 pub use jev::{
     HttpResponse, HttpTransport, JevAdapter, JevAdapterConfig, JevApiKey, JevCallEvidence,
     JevCallFailure, JevCancellationToken, JevUsage, NormalizedAnswer, NormalizedResponse,
     SystemOneResponse, TransportError, UreqTransport, normalize_answers, parse_jev_response_body,
+};
+pub use jev_batch::{
+    JevBatchRanker, JevBatchRankerConfig, JevBatchRankerConfigError, JevBatchRankerMetrics,
+    MAX_BATCH_RANKER_BREAKER_COOLDOWN, MAX_BATCH_RANKER_BREAKER_THRESHOLD,
+    MAX_BATCH_RANKER_DEADLINE_MS,
 };
 pub use pipeline::{
     DecisionEvidence, DecisionReplayRecord, ExecutedAction, ExecutedDecision, ModelEvidence,

@@ -22,7 +22,7 @@ const DEFAULT_ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
 const DEFAULT_MODEL: &str = "jev-latest";
 // System One responses are structured decision metadata, not media.
 // Refuse oversized provider output before JSON parsing or normalization.
-const MAX_JEV_RESPONSE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_JEV_RESPONSE_BYTES: usize = 1024 * 1024;
 
 pub struct JevApiKey(Vec<u8>);
 
@@ -348,6 +348,18 @@ impl JevAdapter {
 
     pub fn config(&self) -> &JevAdapterConfig {
         &self.config
+    }
+
+    /// One bounded POST through the adapter's transport, endpoint and key,
+    /// with no retry and no backoff. Used by the batch ranker (#78 S3), which
+    /// is allowed exactly one attempt per batch.
+    pub(crate) fn post_once(
+        &self,
+        body: &[u8],
+        timeout: Duration,
+    ) -> Result<HttpResponse, TransportError> {
+        self.transport
+            .post_json(&self.config.endpoint, self.api_key.expose(), body, timeout)
     }
 
     pub fn evaluate_evidence(
@@ -994,7 +1006,7 @@ fn parse_noul(
     Ok((probability, NormalizedAnswer::Noul { probability }))
 }
 
-fn parse_score(
+pub(crate) fn parse_score(
     answers: &BTreeMap<String, Value>,
     name: &str,
 ) -> Result<(f64, NormalizedAnswer), String> {
