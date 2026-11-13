@@ -50,7 +50,10 @@ pub struct OperatorRequest {
     /// One of `status`, `stop`, `mute`, `diagnose`, `perception.enable`,
     /// `perception.disable`, `memory.export`, `model.select`, `voice.apply`,
     /// `voice.key.remove`, `voice.key.check`, `voice.preview` (the voice
-    /// settings of #360; the key itself is entered in the panel only).
+    /// settings of #360; the key itself is entered in the panel only),
+    /// `ingress.connect`, `ingress.disconnect`, `ingress.key.remove` (the
+    /// stream-chat connections of #361; the YouTube key is entered in the
+    /// panel only).
     pub action: String,
     /// Opaque session secret presented by the operator client.
     pub secret: String,
@@ -58,8 +61,9 @@ pub struct OperatorRequest {
     #[serde(default)]
     pub request_id: Option<String>,
     /// The one argument an action may take: the model alias for
-    /// `model.select`, the settings patch (JSON text) for `voice.apply`.
-    /// Ignored by every other action.
+    /// `model.select`, the settings patch (JSON text) for `voice.apply`, the
+    /// `{"platform","target"}` / `{"platform"}` JSON for `ingress.connect` /
+    /// `ingress.disconnect`. Ignored by every other action.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub argument: Option<String>,
 }
@@ -112,6 +116,11 @@ pub struct OperatorStatusSnapshot {
     /// state (never the key). Absent unless composed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice: Option<crate::VoiceStatus>,
+    /// The stream-chat connections (#361): per platform state, counters and
+    /// last error, and whether a YouTube key is set (never the key). Absent
+    /// unless composed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_ingress: Option<crate::ChatIngressStatus>,
 }
 
 /// Operator-visible, text-free perception status: whether it is running, why
@@ -174,6 +183,7 @@ impl OperatorStatusSnapshot {
                 .map(|service| OperatorPerceptionStatus::from_report(&service.report(now_ms))),
             thinking_model: app.thinking_model_status(),
             voice: app.voice_status(),
+            chat_ingress: app.chat_ingress_status(),
         }
     }
 }
@@ -265,6 +275,8 @@ pub struct OperatorEndpointOptions {
     pub model_select: bool,
     /// Voice settings are composed (#360): `voice.configure`.
     pub voice_configure: bool,
+    /// Stream-chat connections are composed (#361): `ingress.control`.
+    pub ingress_control: bool,
 }
 
 /// Authenticated operator control endpoint.
@@ -319,6 +331,7 @@ impl OperatorControlServer {
             memory_export,
             model_select,
             voice_configure,
+            ingress_control,
         } = options;
         let name = name.trim();
         if name.is_empty() {
@@ -342,6 +355,12 @@ impl OperatorControlServer {
             // it; the voice settings are validated, bounded data and the
             // Aivis switch needs an explicit egress confirmation.
             capabilities.insert(aivtuber_domain::Capability::VoiceConfigure);
+        }
+        if ingress_control {
+            // `ingress.control` is held only so the `ingress.*` actions can
+            // mint it; what a started sidecar writes is still admitted as
+            // untrusted public chat under the app's own ingress ceiling.
+            capabilities.insert(aivtuber_domain::Capability::IngressControl);
         }
         if memory_export {
             // `memory.admin` is held only so the `memory.export` action can mint
@@ -553,6 +572,7 @@ pub fn apply_operator_request<R: RoutePlanner>(
         && request.action != "memory.export"
         && request.action != "model.select"
         && !is_tcp_voice_action(&request.action)
+        && !is_tcp_ingress_action(&request.action)
     {
         let detail = format!("unknown action {}", request.action);
         app.audit_operator_action(&request_id, &request.action, &detail, false);
@@ -593,6 +613,20 @@ fn is_tcp_voice_action(action: &str) -> bool {
     is_voice_action(action) && action != "voice.key.set"
 }
 
+/// The stream-chat connection actions (#361), all under `ingress.control`.
+fn is_ingress_action(action: &str) -> bool {
+    matches!(
+        action,
+        "ingress.connect" | "ingress.disconnect" | "ingress.key.set" | "ingress.key.remove"
+    )
+}
+
+/// The ones the operator endpoint (`aivtuberctl`) may send: not the YouTube
+/// key, for the same reason as the voice key.
+fn is_tcp_ingress_action(action: &str) -> bool {
+    is_ingress_action(action) && action != "ingress.key.set"
+}
+
 /// Like [`apply_operator_request`] with the secret as the raw 32 bytes the
 /// ingress compares, for an in-process caller that holds them (the local
 /// panel, #335). A secret that is not valid UTF-8 (the generated one is raw
@@ -607,7 +641,10 @@ pub fn apply_operator_action<R: RoutePlanner>(
     presented: &[u8; 32],
     now_ms: u64,
 ) -> OperatorResponse {
-    if !matches!(action, "stop" | "mute" | "model.select") && !is_voice_action(action) {
+    if !matches!(action, "stop" | "mute" | "model.select")
+        && !is_voice_action(action)
+        && !is_ingress_action(action)
+    {
         let detail = format!("unknown action {action}");
         app.audit_operator_action(request_id, action, &detail, false);
         return rejection(request_id, &detail);
@@ -682,6 +719,8 @@ fn apply_with_presented_secret<R: RoutePlanner>(
         "perception.control".to_owned()
     } else if is_voice_action(action) {
         "voice.configure".to_owned()
+    } else if is_ingress_action(action) {
+        "ingress.control".to_owned()
     } else if action == "memory.export" {
         "memory.admin".to_owned()
     } else {
@@ -760,6 +799,28 @@ fn apply_with_presented_secret<R: RoutePlanner>(
         // the validated settings summary (backend, model, speaker, style,
         // tuning) or a fixed phrase, never the key.
         return match app.configure_voice(command.authority(), action, argument) {
+            Ok(detail) => {
+                app.audit_operator_action(&request_id, action, &detail, true);
+                OperatorResponse {
+                    request_id,
+                    ok: true,
+                    detail,
+                    status: None,
+                    memory_export: None,
+                }
+            }
+            Err(detail) => {
+                app.audit_operator_action(&request_id, action, &detail, false);
+                rejection(&request_id, &detail)
+            }
+        };
+    }
+
+    if is_ingress_action(action) {
+        // Audited without the argument: the connect request is re-derived as
+        // the validated platform and target (public names, no key), and the
+        // key action carries the key.
+        return match app.configure_ingress(command.authority(), action, argument) {
             Ok(detail) => {
                 app.audit_operator_action(&request_id, action, &detail, true);
                 OperatorResponse {

@@ -38,7 +38,8 @@ export type Capability =
   | "tool.grant"
   | "perception.control"
   | "model.select"
-  | "voice.configure";
+  | "voice.configure"
+  | "ingress.control";
 
 export const CAPABILITIES: readonly Capability[] = [
   "performer.mute",
@@ -50,6 +51,7 @@ export const CAPABILITIES: readonly Capability[] = [
   "perception.control",
   "model.select",
   "voice.configure",
+  "ingress.control",
 ];
 
 export type AuthorizationMethod =

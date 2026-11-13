@@ -14,8 +14,11 @@
 //!   in) and the voice settings of #360 (`voice.apply`, `voice.key.set`,
 //!   `voice.key.remove`, `voice.key.check`, `voice.preview`, all
 //!   `voice.configure`; they arrive on their own queue so a slider drag cannot
-//!   delay a stop); it cannot reach perception, memory export or diagnose even
-//!   though the ingress could mint them;
+//!   delay a stop) and the stream-chat connections of #361 (`ingress.connect`,
+//!   `ingress.disconnect`, `ingress.key.set`, `ingress.key.remove`, all
+//!   `ingress.control`, on their own queue too; the request names a platform
+//!   and a validated target only); it cannot reach perception, memory export
+//!   or diagnose even though the ingress could mint them;
 //! * a chat line becomes a `chat.message` envelope whose source, source class,
 //!   plane and trust are fixed here (`local-panel`, `public_chat`, `content`,
 //!   `untrusted`) and is admitted by [`ProductionApp::process_content_bytes`],
@@ -39,6 +42,7 @@ const DEFAULT_PORT: u16 = 8766;
 /// Requests handled per tick, so a burst cannot starve the rest of the loop.
 const CONTROL_PER_TICK: usize = 4;
 const VOICE_PER_TICK: usize = 4;
+const INGRESS_PER_TICK: usize = 4;
 const CHAT_PER_TICK: usize = 4;
 const PUBLISH_INTERVAL_MS: u64 = 500;
 /// Refusal counts are logged at most this often. A stale page from an earlier
@@ -221,13 +225,18 @@ impl PanelService {
                     argument = Some(alias);
                     "model.select"
                 }
-                // Chat and voice arrive on their own queues; refuse anything else.
+                // Chat, voice and chat connections arrive on their own queues;
+                // refuse anything else.
                 PanelRequest::Chat(_)
                 | PanelRequest::VoiceApply(_)
                 | PanelRequest::VoiceKeySet(_)
                 | PanelRequest::VoiceKeyRemove
                 | PanelRequest::VoiceKeyCheck
-                | PanelRequest::VoicePreview => {
+                | PanelRequest::VoicePreview
+                | PanelRequest::IngressConnect { .. }
+                | PanelRequest::IngressDisconnect(_)
+                | PanelRequest::IngressKeySet(_)
+                | PanelRequest::IngressKeyRemove => {
                     command.respond(false, "not a control request");
                     continue;
                 }
@@ -260,6 +269,50 @@ impl PanelService {
                 PanelRequest::VoicePreview => ("voice.preview", None),
                 _ => {
                     command.respond(false, "not a voice request");
+                    continue;
+                }
+            };
+            self.control_seq += 1;
+            let response = apply_operator_action(
+                &self.ingress,
+                app,
+                &format!("panel-ctl-{}", self.control_seq),
+                action,
+                argument,
+                &self.control_secret.0,
+                now_ms,
+            );
+            eprintln!(
+                "panel: {action} ok={} detail={:?}",
+                response.ok, response.detail
+            );
+            command.respond(response.ok, response.detail);
+            changed = true;
+        }
+        for command in self.inbox.drain_ingress(INGRESS_PER_TICK) {
+            // The connect request becomes the JSON argument of the operator
+            // action; only the platform name and the already normalized target
+            // travel, and the composition thread parses them again.
+            let connect;
+            let (action, argument): (&str, Option<&str>) = match &command.request {
+                PanelRequest::IngressConnect { platform, target } => {
+                    connect = serde_json::json!({
+                        "platform": platform.name(),
+                        "target": target,
+                    })
+                    .to_string();
+                    ("ingress.connect", Some(connect.as_str()))
+                }
+                PanelRequest::IngressDisconnect(platform) => {
+                    connect = serde_json::json!({ "platform": platform.name() }).to_string();
+                    ("ingress.disconnect", Some(connect.as_str()))
+                }
+                // The key reaches the ingress path as the argument and nothing
+                // here prints it: the log line below names the action only.
+                PanelRequest::IngressKeySet(key) => ("ingress.key.set", Some(key.expose())),
+                PanelRequest::IngressKeyRemove => ("ingress.key.remove", None),
+                _ => {
+                    command.respond(false, "not a chat connection request");
                     continue;
                 }
             };

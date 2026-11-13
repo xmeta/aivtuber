@@ -234,6 +234,7 @@ fn capability_for_action(action: &str) -> Option<Capability> {
         "perception.control" => Some(Capability::PerceptionControl),
         "model.select" => Some(Capability::ModelSelect),
         "voice.configure" => Some(Capability::VoiceConfigure),
+        "ingress.control" => Some(Capability::IngressControl),
         _ => None,
     }
 }

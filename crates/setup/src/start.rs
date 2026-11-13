@@ -159,6 +159,14 @@ pub const VOICE_SETTINGS_FILE: &str = "local-voice.json";
 /// mixed into the settings or the env file. Owner-only where the OS allows. The
 /// app owns it; `AIVIS_API` in the environment still wins.
 pub const AIVIS_KEY_FILE: &str = "local-aivis-key.txt";
+/// File beside the env file that remembers the last Twitch channel and YouTube
+/// video connected from the panel (#361). Offered on the next start, never
+/// connected automatically. It never holds the API key.
+pub const CHAT_SETTINGS_FILE: &str = "local-chat.json";
+/// The YouTube Data API key entered in the panel, in its own file. Owner-only
+/// where the OS allows. The app owns it; `YOUTUBE_API_KEY` in the environment
+/// still wins.
+pub const YOUTUBE_KEY_FILE: &str = "local-youtube-key.txt";
 
 /// One model llama-server can serve.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -378,6 +386,28 @@ pub fn app_voice_env(env_file: &Path) -> Vec<(String, String)> {
     ]
 }
 
+/// Where the app keeps the chat choice and the YouTube key (#361), layered
+/// under the env file's own values like [`app_voice_env`]. The sidecars are
+/// started by the app from the directory it runs from, which is this archive's.
+pub fn app_chat_env(env_file: &Path) -> Vec<(String, String)> {
+    vec![
+        (
+            "AIVTUBER_CHAT_INGRESS_SETTINGS".to_owned(),
+            env_file
+                .with_file_name(CHAT_SETTINGS_FILE)
+                .display()
+                .to_string(),
+        ),
+        (
+            "AIVTUBER_YOUTUBE_KEY_FILE".to_owned(),
+            env_file
+                .with_file_name(YOUTUBE_KEY_FILE)
+                .display()
+                .to_string(),
+        ),
+    ]
+}
+
 fn port_in_use(port: u16) -> bool {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
@@ -432,7 +462,10 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
     let settings = opts.env_file.with_file_name(MODEL_SETTINGS_FILE);
     let preset = opts.env_file.with_file_name(PRESET_FILE);
     let mut env = env;
-    for (name, value) in app_voice_env(&opts.env_file) {
+    for (name, value) in app_voice_env(&opts.env_file)
+        .into_iter()
+        .chain(app_chat_env(&opts.env_file))
+    {
         env.entry(name).or_insert(value);
     }
     let plan = match &llm {
@@ -707,6 +740,35 @@ mod tests {
         assert_eq!(key.file_name().unwrap(), AIVIS_KEY_FILE);
         assert_ne!(settings, key, "the key has its own file");
         assert_ne!(VOICE_SETTINGS_FILE, MODEL_SETTINGS_FILE);
+    }
+
+    #[test]
+    fn the_chat_files_sit_beside_the_env_file_and_the_key_has_its_own() {
+        let env_file = Path::new("rel").join("local-profile.env");
+        let pairs = app_chat_env(&env_file);
+        let get = |name: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| PathBuf::from(v))
+                .unwrap()
+        };
+        let settings = get("AIVTUBER_CHAT_INGRESS_SETTINGS");
+        let key = get("AIVTUBER_YOUTUBE_KEY_FILE");
+        assert_eq!(settings.parent(), env_file.parent());
+        assert_eq!(key.parent(), env_file.parent());
+        assert_eq!(settings.file_name().unwrap(), CHAT_SETTINGS_FILE);
+        assert_eq!(key.file_name().unwrap(), YOUTUBE_KEY_FILE);
+        assert_ne!(settings, key, "the key has its own file");
+        let all = [
+            CHAT_SETTINGS_FILE,
+            YOUTUBE_KEY_FILE,
+            VOICE_SETTINGS_FILE,
+            AIVIS_KEY_FILE,
+            MODEL_SETTINGS_FILE,
+        ];
+        let distinct: std::collections::BTreeSet<_> = all.iter().collect();
+        assert_eq!(distinct.len(), all.len());
     }
 
     #[test]
