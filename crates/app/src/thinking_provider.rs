@@ -11,7 +11,6 @@
 use aivtuber_adapters::{DataCollection, ExtraHeaders, OpenAiResponsesConfig, ThinkingWire};
 
 pub const OPENROUTER_ENDPOINT: &str = "https://openrouter.ai/api/v1/chat/completions";
-pub const OPENROUTER_DEFAULT_REFERER: &str = "https://github.com/xmeta/aivtuber";
 pub const OPENROUTER_DEFAULT_TITLE: &str = "aivtuber";
 
 /// Apply `AIVTUBER_THINKING_PROVIDER`, `AIVTUBER_OPENAI_WIRE` and the
@@ -53,17 +52,18 @@ pub fn apply_thinking_provider_env(
         }
         config.endpoint = OPENROUTER_ENDPOINT.to_owned();
         config.wire = ThinkingWire::ChatCompletions;
-        config.extra_headers = ExtraHeaders::new(&[
-            (
-                "HTTP-Referer",
-                referer.as_deref().unwrap_or(OPENROUTER_DEFAULT_REFERER),
-            ),
-            (
-                "X-Title",
-                title.as_deref().unwrap_or(OPENROUTER_DEFAULT_TITLE),
-            ),
-        ])
-        .map_err(|error| format!("OpenRouter attribution headers: {error}"))?;
+        // No default Referer: the project is not public, so a URL is sent only
+        // when the operator sets one.
+        let mut pairs = Vec::with_capacity(2);
+        if let Some(referer) = referer.as_deref() {
+            pairs.push(("HTTP-Referer", referer));
+        }
+        pairs.push((
+            "X-Title",
+            title.as_deref().unwrap_or(OPENROUTER_DEFAULT_TITLE),
+        ));
+        config.extra_headers = ExtraHeaders::new(&pairs)
+            .map_err(|error| format!("OpenRouter attribution headers: {error}"))?;
         config.data_collection = Some(match data_collection.as_deref() {
             None => DataCollection::Deny,
             Some(value) => DataCollection::parse(value).ok_or_else(|| {
@@ -133,10 +133,8 @@ mod tests {
         );
         assert_eq!(config.endpoint, OPENROUTER_ENDPOINT);
         assert_eq!(config.wire, ThinkingWire::ChatCompletions);
-        assert_eq!(
-            header(&config, "HTTP-Referer"),
-            Some(OPENROUTER_DEFAULT_REFERER)
-        );
+        assert_eq!(header(&config, "HTTP-Referer"), None);
+        assert_eq!(config.extra_headers.len(), 1);
         assert_eq!(header(&config, "X-Title"), Some("aivtuber"));
         assert_eq!(config.data_collection, Some(DataCollection::Deny));
     }

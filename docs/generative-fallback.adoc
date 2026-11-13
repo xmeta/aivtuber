@@ -197,7 +197,7 @@ Voice model, viseme mapping, compiler version, avatar profile, and motion librar
 |Unset or `generic`: no preset. `openrouter`: sets the endpoint to `https://openrouter.ai/api/v1/chat/completions`, the wire to `chat-completions`, the attribution headers and the data-collection default below. Any other value is a startup error. `AIVTUBER_OPENAI_MODEL` must also be set (an OpenRouter id such as `vendor/model`); the built-in default model name is not one. The bearer key is still `AIVTUBER_OPENAI_API_KEY`.
 
 |`AIVTUBER_OPENROUTER_REFERER`
-|`HTTP-Referer` value; default is the project URL. Needs `AIVTUBER_THINKING_PROVIDER=openrouter`.
+|`HTTP-Referer` value; sent only when set (there is no default, so no project URL goes to OpenRouter unasked). Needs `AIVTUBER_THINKING_PROVIDER=openrouter`.
 
 |`AIVTUBER_OPENROUTER_TITLE`
 |`X-Title` value; default `aivtuber`. Needs the openrouter preset.

@@ -102,8 +102,7 @@ pub use speech_sidecar::*;
 pub use support_bundle::*;
 pub use task_plane::*;
 pub use thinking_provider::{
-    OPENROUTER_DEFAULT_REFERER, OPENROUTER_DEFAULT_TITLE, OPENROUTER_ENDPOINT,
-    apply_thinking_provider_env,
+    OPENROUTER_DEFAULT_TITLE, OPENROUTER_ENDPOINT, apply_thinking_provider_env,
 };
 pub use thinking_warmup::{
     DEFAULT_WARMUP_TIMEOUT_MS, WarmupDecision, WarmupMode, decide as decide_thinking_warmup,
