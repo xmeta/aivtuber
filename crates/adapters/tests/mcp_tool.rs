@@ -80,6 +80,7 @@ fn authenticated(capability: Capability) -> aivtuber_domain::AuthenticatedContro
         Capability::ToolGrant => "tool.grant",
         Capability::PerceptionControl => "perception.control",
         Capability::ModelSelect => "model.select",
+        Capability::VoiceConfigure => "voice.configure",
     };
     let secret = [11_u8; 32];
     let ingress = LocalControlIngress::new(

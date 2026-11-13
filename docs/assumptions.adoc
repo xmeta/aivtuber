@@ -277,7 +277,9 @@ Do not record secrets, private user data, or raw provider credentials.
 
 *Revisit when:* a second cloud provider is added (then a typed egress allowlist is warranted instead of one synthesizer), the service's terms or data handling change, replies could carry content the operator does not want sent out, or the cache key must carry a service model version.
 
-*Related:* #220, #295, #327, A-TTS-001, A-TTS-003.
+*Related:* #220, #295, #327, A-TTS-001, A-TTS-003, #360.
+
+_#360 note:_ the operator can now take this exception at runtime from the panel instead of through environment variables. The decision point is the authenticated `voice.configure` operator action with an explicit egress confirmation (the same notice as the environment route), the key is held as a `SecretString` and stored in its own owner-only file (or `AIVIS_API`, which wins), and switching back to the local voice shuts the bridge down, which ends all egress. The audio cache key now also carries the tuning (rate, pitch, volume, emotional intensity); it still has no service-side model version. The model search proxy is a second, read-only call to the same service, with no credential and no reply text. Not measured beyond the live check recorded in the pull request: the cost of a preview (one synthesis) and the behaviour of the Aivis search order for large pages.
 
 === A-AUDIO-001 -- Current process-player startup cost is acceptable until measured otherwise
 

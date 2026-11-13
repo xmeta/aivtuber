@@ -543,6 +543,7 @@ mod tests {
             Capability::ToolGrant => "tool.grant",
             Capability::PerceptionControl => "perception.control",
             Capability::ModelSelect => "model.select",
+            Capability::VoiceConfigure => "voice.configure",
         };
         let secret = [7_u8; 32];
         let ingress = LocalControlIngress::new(

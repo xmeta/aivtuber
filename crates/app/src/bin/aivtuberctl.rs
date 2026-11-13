@@ -15,6 +15,12 @@
 //! entries in seed-file format and writes them to the path the operator names.
 //! The daemon never writes a file; this client refuses to overwrite one, so an
 //! export can never replace a hand-curated seed file.
+//!
+//! `voice` (issue #360) changes the voice at runtime, like the operation panel:
+//! the local voice or Aivis Cloud, the Aivis style and the tuning, and a
+//! preview. The API key is deliberately not a subcommand: it would travel in a
+//! command line and a request log, so it is entered in the panel (or set as
+//! `AIVIS_API`).
 
 use aivtuber_app::{MemorySeed, OperatorRequest, OperatorResponse};
 use clap::{Parser, Subcommand};
@@ -45,7 +51,7 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Subcommand, Clone, PartialEq, Eq)]
+#[derive(Subcommand, Clone, PartialEq)]
 enum Command {
     /// Adapter/runtime health snapshot (no secret material).
     Status,
@@ -78,6 +84,112 @@ enum Command {
         /// A model alias from the daemon's allowlist.
         alias: String,
     },
+    /// Change the voice (issue #360); needs the daemon to run with the voice
+    /// settings (the local profile started by `aivtuber-setup start`).
+    Voice {
+        #[command(subcommand)]
+        action: VoiceCommand,
+    },
+}
+
+#[derive(Subcommand, Clone, PartialEq)]
+enum VoiceCommand {
+    /// Back to the local voice. Stops all egress.
+    Local,
+    /// Switch to Aivis Cloud with the model, credit line and API key already
+    /// set (in the panel). Reply text is sent to Aivis Cloud, so this needs
+    /// --confirm-egress.
+    Aivis {
+        /// Confirm that reply text is sent to Aivis Cloud (an internet service).
+        #[arg(long)]
+        confirm_egress: bool,
+    },
+    /// Change what Aivis Cloud speaks with. Only the given fields change.
+    Set {
+        /// AivisHub model UUID (resets speaker, style and credit line unless given).
+        #[arg(long)]
+        model: Option<String>,
+        /// Display name of the model (informational).
+        #[arg(long)]
+        model_name: Option<String>,
+        /// Speaker UUID of a multi-speaker model.
+        #[arg(long)]
+        speaker: Option<String>,
+        /// Style id 0..=31.
+        #[arg(long)]
+        style: Option<u8>,
+        /// The credit line the model requires.
+        #[arg(long)]
+        credit: Option<String>,
+        /// Speaking rate 0.5..=2.0.
+        #[arg(long)]
+        speaking_rate: Option<f32>,
+        /// Pitch -1.0..=1.0.
+        #[arg(long, allow_negative_numbers = true)]
+        pitch: Option<f32>,
+        /// Volume 0.0..=2.0.
+        #[arg(long)]
+        volume: Option<f32>,
+        /// Emotional intensity 0.0..=2.0.
+        #[arg(long)]
+        emotional_intensity: Option<f32>,
+    },
+    /// Speak the fixed preview sentence with the current voice.
+    Preview,
+    /// Remove the stored API key (and leave Aivis if no other key is set).
+    KeyRemove,
+    /// Ask Aivis Cloud whether the key works; read the result with `status`.
+    KeyCheck,
+}
+
+/// The `voice.apply` patch for a voice subcommand, as JSON text.
+fn voice_patch(action: &VoiceCommand) -> Option<String> {
+    let patch = match action {
+        VoiceCommand::Local => serde_json::json!({ "backend": "local" }),
+        VoiceCommand::Aivis { confirm_egress } => {
+            serde_json::json!({ "backend": "aivis", "confirm_egress": confirm_egress })
+        }
+        VoiceCommand::Set {
+            model,
+            model_name,
+            speaker,
+            style,
+            credit,
+            speaking_rate,
+            pitch,
+            volume,
+            emotional_intensity,
+        } => {
+            let mut patch = serde_json::Map::new();
+            for (name, value) in [
+                ("model_uuid", model.as_ref().map(|v| serde_json::json!(v))),
+                (
+                    "model_name",
+                    model_name.as_ref().map(|v| serde_json::json!(v)),
+                ),
+                (
+                    "speaker_uuid",
+                    speaker.as_ref().map(|v| serde_json::json!(v)),
+                ),
+                ("style_id", style.map(|v| serde_json::json!(v))),
+                ("credit", credit.as_ref().map(|v| serde_json::json!(v))),
+                ("speaking_rate", speaking_rate.map(|v| serde_json::json!(v))),
+                ("pitch", pitch.map(|v| serde_json::json!(v))),
+                ("volume", volume.map(|v| serde_json::json!(v))),
+                (
+                    "emotional_intensity",
+                    emotional_intensity.map(|v| serde_json::json!(v)),
+                ),
+            ] {
+                if let Some(value) = value {
+                    patch.insert(name.to_owned(), value);
+                }
+            }
+            serde_json::Value::Object(patch)
+        }
+        VoiceCommand::Preview | VoiceCommand::KeyRemove | VoiceCommand::KeyCheck => return None,
+    };
+    Some(patch.to_string())
 }
 
 fn action_name(command: &Command) -> &'static str {
@@ -90,6 +202,12 @@ fn action_name(command: &Command) -> &'static str {
         Command::PerceptionOff => "perception.disable",
         Command::MemoryExport { .. } => "memory.export",
         Command::Model { .. } => "model.select",
+        Command::Voice { action } => match action {
+            VoiceCommand::Preview => "voice.preview",
+            VoiceCommand::KeyRemove => "voice.key.remove",
+            VoiceCommand::KeyCheck => "voice.key.check",
+            _ => "voice.apply",
+        },
     }
 }
 
@@ -128,6 +246,7 @@ fn main() -> ExitCode {
 
     let argument = match &cli.command {
         Command::Model { alias } => Some(alias.clone()),
+        Command::Voice { action } => voice_patch(action),
         _ => None,
     };
     let request = OperatorRequest {
@@ -245,6 +364,29 @@ fn print_response(response: &OperatorResponse) {
                 perception.yielded_thinking,
                 perception.yielded_speech,
                 perception.observations_accepted,
+            );
+        }
+        if let Some(voice) = &status.voice {
+            println!(
+                "voice backend={} model={} speaker={} style={} rate={} pitch={} volume={} emotion={} key={}{} check={} last_error={:?}",
+                voice.backend,
+                voice.model_uuid.as_deref().unwrap_or("-"),
+                voice.speaker_uuid.as_deref().unwrap_or("-"),
+                voice
+                    .style_id
+                    .map_or_else(|| "-".to_owned(), |s| s.to_string()),
+                voice.tuning.speaking_rate,
+                voice.tuning.pitch,
+                voice.tuning.volume,
+                voice.tuning.emotional_intensity,
+                if voice.key.set { "set" } else { "not-set" },
+                voice
+                    .key
+                    .source
+                    .as_deref()
+                    .map_or_else(String::new, |s| format!("({s})")),
+                voice.key.check,
+                voice.last_error,
             );
         }
         if let Some(model) = &status.thinking_model {
@@ -372,5 +514,97 @@ mod tests {
         assert!(save_memory_export(&response("{}", "x"), &path).is_err());
         assert!(save_memory_export(&response(&seed.to_json(), "wrong"), &path).is_err());
         assert!(!path.exists());
+    }
+
+    fn parse(args: &[&str]) -> Command {
+        let mut full = vec![
+            "aivtuberctl",
+            "--secret",
+            "01234567890123456789012345678901",
+        ];
+        full.extend_from_slice(args);
+        Cli::try_parse_from(full).expect("arguments").command
+    }
+
+    #[test]
+    fn voice_subcommands_build_patches_the_daemon_accepts() {
+        let patch = |args: &[&str]| {
+            let command = parse(args);
+            let Command::Voice { action } = &command else {
+                panic!("not a voice command");
+            };
+            (action_name(&command), voice_patch(action))
+        };
+        let (action, text) = patch(&["voice", "local"]);
+        assert_eq!(action, "voice.apply");
+        assert_eq!(
+            aivtuber_domain::VoicePatch::parse(&text.unwrap())
+                .unwrap()
+                .backend,
+            Some(aivtuber_domain::VoiceBackend::Local)
+        );
+        let (_, text) = patch(&["voice", "aivis", "--confirm-egress"]);
+        let parsed = aivtuber_domain::VoicePatch::parse(&text.unwrap()).unwrap();
+        assert!(parsed.confirm_egress);
+        let (_, text) = patch(&["voice", "aivis"]);
+        assert!(
+            !aivtuber_domain::VoicePatch::parse(&text.unwrap())
+                .unwrap()
+                .confirm_egress
+        );
+        let (_, text) = patch(&[
+            "voice",
+            "set",
+            "--style",
+            "3",
+            "--speaking-rate",
+            "1.25",
+            "--pitch",
+            "-0.5",
+            "--volume",
+            "0.8",
+            "--emotional-intensity",
+            "1.5",
+            "--credit",
+            "AivisSpeech: x",
+        ]);
+        let parsed = aivtuber_domain::VoicePatch::parse(&text.unwrap()).unwrap();
+        assert_eq!(parsed.style_id, Some(Some(3)));
+        assert_eq!(parsed.pitch, Some(-0.5));
+        assert_eq!(parsed.speaking_rate, Some(1.25));
+        assert_eq!(parsed.credit, Some(Some("AivisSpeech: x".to_owned())));
+        // Only what was given is sent.
+        let (_, text) = patch(&["voice", "set", "--volume", "1.1"]);
+        let parsed = aivtuber_domain::VoicePatch::parse(&text.unwrap()).unwrap();
+        assert_eq!(
+            (parsed.volume, parsed.style_id, parsed.pitch),
+            (Some(1.1), None, None)
+        );
+        for (args, action) in [
+            (&["voice", "preview"][..], "voice.preview"),
+            (&["voice", "key-remove"][..], "voice.key.remove"),
+            (&["voice", "key-check"][..], "voice.key.check"),
+        ] {
+            let (name, text) = patch(args);
+            assert_eq!((name, text), (action, None));
+        }
+    }
+
+    #[test]
+    fn there_is_no_subcommand_that_takes_the_key() {
+        // The key would travel in a command line and a request log.
+        for args in [
+            &["voice", "key", "sk-x"][..],
+            &["voice", "set", "--api-key", "sk-x"][..],
+            &["voice", "key-set", "sk-x"][..],
+        ] {
+            let mut full = vec![
+                "aivtuberctl",
+                "--secret",
+                "01234567890123456789012345678901",
+            ];
+            full.extend_from_slice(args);
+            assert!(Cli::try_parse_from(full).is_err(), "{args:?}");
+        }
     }
 }

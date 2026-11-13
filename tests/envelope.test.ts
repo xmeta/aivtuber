@@ -100,6 +100,7 @@ describe("normalizeEvent", () => {
       "tool.grant",
       "perception.control",
       "model.select",
+      "voice.configure",
     ]);
   });
 });

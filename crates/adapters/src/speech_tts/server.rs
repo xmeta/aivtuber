@@ -660,7 +660,13 @@ fn serve_request(inner: &Arc<Inner>, stream: &mut TcpStream) -> Result<Response,
     }
 
     let settings = GenerationSettings::for_text(&text, config.voice);
-    let digest = content_digest(&text, &settings, inner.synth.bundle_sha256());
+    // One engine per request: the content address and the synthesis below must
+    // agree on it even if a switchable front is swapped in between (#360).
+    let synth: Arc<dyn Synthesizer> = inner
+        .synth
+        .snapshot()
+        .unwrap_or_else(|| Arc::clone(&inner.synth));
+    let digest = content_digest(&text, &settings, synth.bundle_sha256());
     let started = Instant::now();
     if let Some(artifact) = lookup_cache(config, &digest) {
         inner.counters.cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -695,7 +701,14 @@ fn serve_request(inner: &Arc<Inner>, stream: &mut TcpStream) -> Result<Response,
         .name("tts-synth".to_owned())
         .spawn(move || {
             let _guard = guard;
-            let result = synthesize_to_files(&worker_inner, &text, &settings, &digest, deadline);
+            let result = synthesize_to_files(
+                &worker_inner,
+                synth.as_ref(),
+                &text,
+                &settings,
+                &digest,
+                deadline,
+            );
             let _ = sender.send(result);
         });
     if spawned.is_err() {
@@ -813,13 +826,14 @@ fn lookup_cache(config: &ServerConfig, digest: &str) -> Option<Artifact> {
 
 fn synthesize_to_files(
     inner: &Inner,
+    synth: &dyn Synthesizer,
     text: &str,
     settings: &GenerationSettings,
     digest: &str,
     deadline: Instant,
 ) -> Result<Artifact, SynthError> {
     let config = &inner.config;
-    let pcm = inner.synth.synthesize(text, settings, deadline)?;
+    let pcm = synth.synthesize(text, settings, deadline)?;
     if Instant::now() > deadline {
         return Err(SynthError::DeadlineExceeded);
     }
@@ -901,7 +915,7 @@ fn prune(config: &ServerConfig, dir: &Path, keep: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::speech_tts::ToneSynthesizer;
+    use crate::speech_tts::{SwapSynthesizer, ToneSynthesizer};
     use crate::{NormalizedHttpTtsAdapter, NormalizedHttpTtsConfig};
     use aivtuber_domain::{EngineErrorKind, SpeechRequest};
     use std::sync::atomic::AtomicUsize;
@@ -1429,6 +1443,88 @@ mod tests {
             .sum();
         assert!(total <= 1024 * 1024, "{total} bytes");
         assert!(total > 0);
+        server.stop();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A named voice: counts its calls and has its own identity (the part of the
+    /// content address a model, style or tuning change must change).
+    struct Voice {
+        identity: &'static str,
+        calls: Arc<AtomicUsize>,
+        fail: bool,
+    }
+
+    impl Synthesizer for Voice {
+        fn synthesize(
+            &self,
+            text: &str,
+            settings: &GenerationSettings,
+            deadline: Instant,
+        ) -> Result<crate::speech_tts::Pcm, SynthError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(SynthError::Engine("voice: HTTP 401: scripted".to_owned()));
+            }
+            ToneSynthesizer::default().synthesize(text, settings, deadline)
+        }
+        fn bundle_sha256(&self) -> &str {
+            self.identity
+        }
+    }
+
+    fn voice(identity: &'static str, calls: &Arc<AtomicUsize>, fail: bool) -> Arc<dyn Synthesizer> {
+        Arc::new(Voice {
+            identity,
+            calls: calls.clone(),
+            fail,
+        })
+    }
+
+    #[test]
+    fn a_swapped_voice_never_replays_another_voices_audio() {
+        let root = scratch("swap");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let swap = SwapSynthesizer::new(voice("voice-a", &calls, false));
+        let server = start(config(&root), swap.clone());
+        let addr = server.local_addr();
+        let a1 = post(addr, &ok_body("やあ"));
+        let a2 = post(addr, &ok_body("やあ"));
+        assert_eq!((a1.status, a1.body == a2.body), (200, true));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "same voice: cache hit");
+        // The operator changes the voice (model, style or tuning): the same
+        // text is synthesized again and lands on another address.
+        swap.swap(voice("voice-b", &calls, false));
+        let b = post(addr, &ok_body("やあ"));
+        assert_eq!(b.status, 200);
+        assert_ne!(a1.body, b.body, "another address");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // Going back to the first voice finds its own audio again.
+        swap.swap(voice("voice-a", &calls, false));
+        let back = post(addr, &ok_body("やあ"));
+        assert_eq!(back.body, a1.body);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        server.stop();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_last_failure_is_remembered_until_a_success_or_a_swap() {
+        let root = scratch("swap-error");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let swap = SwapSynthesizer::new(voice("voice-a", &calls, true));
+        let server = start(config(&root), swap.clone());
+        let addr = server.local_addr();
+        assert!(swap.last_error().is_none());
+        assert_ne!(post(addr, &ok_body("やあ")).status, 200);
+        assert_eq!(
+            swap.last_error().as_deref(),
+            Some("voice: HTTP 401: scripted")
+        );
+        swap.swap(voice("voice-b", &calls, false));
+        assert!(swap.last_error().is_none(), "a swap forgets the failure");
+        assert_eq!(post(addr, &ok_body("やあ")).status, 200);
+        assert!(swap.last_error().is_none());
         server.stop();
         let _ = fs::remove_dir_all(&root);
     }

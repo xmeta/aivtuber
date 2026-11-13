@@ -78,6 +78,13 @@ pub enum Capability {
     /// the choice is bounded to an allowlist the operator's launcher passed in.
     #[serde(rename = "model.select")]
     ModelSelect,
+    /// Changes which voice speaks and how (#360): the local voice or the Aivis
+    /// Cloud voice, its model/speaker/style and tuning, the API key and the
+    /// preview. Held only by an authenticated local ingress and only when the
+    /// launcher composed the voice settings; the choice is validated, bounded
+    /// data and the Aivis switch needs an explicit egress confirmation.
+    #[serde(rename = "voice.configure")]
+    VoiceConfigure,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

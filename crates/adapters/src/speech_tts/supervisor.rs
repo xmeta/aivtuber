@@ -243,11 +243,29 @@ impl TtsSidecar {
 pub struct LivenessGatedTts {
     inner: Arc<dyn TtsEngine>,
     alive: Arc<AtomicBool>,
+    /// While set the gate is open whatever the sidecar is doing: the operator
+    /// pointed the voice at another backend (Aivis Cloud, #360), so the
+    /// sidecar's state is irrelevant.
+    bypass: Arc<AtomicBool>,
 }
 
 impl LivenessGatedTts {
     pub fn new(inner: Arc<dyn TtsEngine>, alive: Arc<AtomicBool>) -> Self {
-        Self { inner, alive }
+        Self {
+            inner,
+            alive,
+            bypass: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Use `bypass` as the flag that opens the gate.
+    pub fn with_bypass(mut self, bypass: Arc<AtomicBool>) -> Self {
+        self.bypass = bypass;
+        self
+    }
+
+    fn is_gone(&self) -> bool {
+        !self.bypass.load(Ordering::Acquire) && !self.alive.load(Ordering::Acquire)
     }
 
     fn gone() -> EngineError {
@@ -260,7 +278,7 @@ impl LivenessGatedTts {
 
 impl TtsEngine for LivenessGatedTts {
     fn synthesize<'a>(&'a self, request: &'a SpeechRequest) -> EngineFuture<'a, SpeechArtifact> {
-        if !self.alive.load(Ordering::Acquire) {
+        if self.is_gone() {
             return Box::pin(async { Err(Self::gone()) });
         }
         self.inner.synthesize(request)
@@ -271,7 +289,7 @@ impl TtsEngine for LivenessGatedTts {
         request: &'a SpeechRequest,
         timeout: Duration,
     ) -> EngineFuture<'a, SpeechArtifact> {
-        if !self.alive.load(Ordering::Acquire) {
+        if self.is_gone() {
             return Box::pin(async { Err(Self::gone()) });
         }
         self.inner.synthesize_with_timeout(request, timeout)

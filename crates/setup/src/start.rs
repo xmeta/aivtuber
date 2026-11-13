@@ -151,6 +151,14 @@ pub fn llama_command(env: &BTreeMap<String, String>) -> Result<LlamaCommand, Str
 pub const MODEL_SETTINGS_FILE: &str = "local-model.json";
 /// Generated router preset, rewritten at every start.
 pub const PRESET_FILE: &str = "llama-models.ini";
+/// File beside the env file that remembers the voice chosen in the panel
+/// (#360): backend, Aivis model/speaker/style, tuning and the credit line. The
+/// app reads and writes it; it never holds the API key.
+pub const VOICE_SETTINGS_FILE: &str = "local-voice.json";
+/// The Aivis Cloud API key entered in the panel, in its own file so it is never
+/// mixed into the settings or the env file. Owner-only where the OS allows. The
+/// app owns it; `AIVIS_API` in the environment still wins.
+pub const AIVIS_KEY_FILE: &str = "local-aivis-key.txt";
 
 /// One model llama-server can serve.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -348,6 +356,28 @@ pub fn app_model_env(plan: &ModelPlan, settings: &Path) -> Vec<(String, String)>
     ]
 }
 
+/// Where the app keeps the voice choice and the API key (#360), layered under
+/// the env file's own values: a setting spelled out there wins. The files are
+/// created by the app on the first change; nothing is written here.
+pub fn app_voice_env(env_file: &Path) -> Vec<(String, String)> {
+    vec![
+        (
+            "AIVTUBER_VOICE_SETTINGS".to_owned(),
+            env_file
+                .with_file_name(VOICE_SETTINGS_FILE)
+                .display()
+                .to_string(),
+        ),
+        (
+            "AIVTUBER_AIVIS_KEY_FILE".to_owned(),
+            env_file
+                .with_file_name(AIVIS_KEY_FILE)
+                .display()
+                .to_string(),
+        ),
+    ]
+}
+
 fn port_in_use(port: u16) -> bool {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
@@ -402,6 +432,9 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
     let settings = opts.env_file.with_file_name(MODEL_SETTINGS_FILE);
     let preset = opts.env_file.with_file_name(PRESET_FILE);
     let mut env = env;
+    for (name, value) in app_voice_env(&opts.env_file) {
+        env.entry(name).or_insert(value);
+    }
     let plan = match &llm {
         Llm::Managed(_) => plan_models(&env, &Manifest::embedded(), &settings, &|p| {
             std::fs::metadata(p).ok().map(|m| m.len())
@@ -653,6 +686,27 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("aivtuber-start-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn the_voice_files_sit_beside_the_env_file_and_the_key_is_not_in_the_settings_file() {
+        let env_file = Path::new("rel").join("local-profile.env");
+        let pairs = app_voice_env(&env_file);
+        let get = |name: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| PathBuf::from(v))
+                .unwrap()
+        };
+        let settings = get("AIVTUBER_VOICE_SETTINGS");
+        let key = get("AIVTUBER_AIVIS_KEY_FILE");
+        assert_eq!(settings.parent(), env_file.parent());
+        assert_eq!(key.parent(), env_file.parent());
+        assert_eq!(settings.file_name().unwrap(), VOICE_SETTINGS_FILE);
+        assert_eq!(key.file_name().unwrap(), AIVIS_KEY_FILE);
+        assert_ne!(settings, key, "the key has its own file");
+        assert_ne!(VOICE_SETTINGS_FILE, MODEL_SETTINGS_FILE);
     }
 
     #[test]

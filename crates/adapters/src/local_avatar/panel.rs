@@ -2,7 +2,7 @@
 //! renderer server (issue #335, docs/security-threat-model.adoc section 15).
 //!
 //! It reuses the renderer server's HTTP plumbing (head peeking, constant-time
-//! compare, entropy token) and adds only a static page and four JSON
+//! compare, entropy token) and adds only a static page and a few JSON
 //! endpoints. It holds **no authority**: it validates the HTTP envelope and
 //! forwards typed requests to the composition thread through bounded queues.
 //! The composition thread (`aivtuber-app`) turns a stop or mute into the same
@@ -20,12 +20,19 @@
 //!   compared in constant time. A query string is never read for it; the page
 //!   receives the secret once in the URL fragment, which no server sees;
 //! * no CORS header is ever emitted and `OPTIONS` is refused;
-//! * request heads, bodies, chat text, queues and published state are bounded.
+//! * request heads, bodies, chat text, queues and published state are bounded;
+//! * the voice settings (#360) add `/api/voice*`: the typed patch, the API key
+//!   (a body field, held in a redacted type, never echoed), key removal and
+//!   check, the preview, and a model search that this thread proxies to the
+//!   public Aivis Cloud list (so the page stays same-origin) under a deadline,
+//!   one at a time, with a bounded typed answer. The voice requests have their
+//!   own queue so a slider drag can never delay stop or mute.
 
 use super::server::{
     ConnGuard, HEAD_DEADLINE, MAX_CONNECTIONS, POLL, content_type, ct_eq, header_value, mint_token,
     peek_head, resolve,
 };
+use crate::speech_tts::aivis_models::{self, ModelSearchQuery, ModelSort};
 use aivtuber_domain::{EngineError, EngineErrorKind};
 use std::fmt;
 use std::fs;
@@ -45,7 +52,25 @@ pub const MAX_PANEL_CHAT_CHARS: usize = 500;
 /// Largest published state document; a bigger one is refused, not truncated.
 pub const MAX_PANEL_STATE_BYTES: usize = 64 * 1024;
 const CONTROL_QUEUE: usize = 4;
+const VOICE_QUEUE: usize = 4;
 const CHAT_QUEUE: usize = 8;
+/// Longest accepted API key, in characters (Aivis keys are about 40).
+pub const MAX_PANEL_KEY_CHARS: usize = 256;
+/// One model search may take this long, end to end.
+const SEARCH_DEADLINE: Duration = Duration::from_secs(6);
+/// Every state-changing endpoint (all are `POST`).
+const STATE_CHANGING: [&str; 9] = [
+    "/api/chat",
+    "/api/stop",
+    "/api/mute",
+    "/api/model",
+    "/api/voice",
+    "/api/voice/key",
+    "/api/voice/key/remove",
+    "/api/voice/key/check",
+    "/api/voice/preview",
+];
+const SEARCH_PATH: &str = "/api/voice/search";
 const REPLY_WAIT: Duration = Duration::from_secs(3);
 const TOKEN_HEADER: &str = "x-panel-token";
 /// Authenticated API calls per second (burst, then sustained).
@@ -59,6 +84,9 @@ pub struct LocalPanelConfig {
     pub port: u16,
     /// Directory holding `panel.html` and `assets/` (the renderer build).
     pub page_dir: Option<PathBuf>,
+    /// Origin of the Aivis Cloud API the model search is proxied to (#360).
+    /// `None` leaves the search route off (404).
+    pub voice_search_endpoint: Option<String>,
 }
 
 impl fmt::Debug for LocalPanelConfig {
@@ -66,7 +94,25 @@ impl fmt::Debug for LocalPanelConfig {
         f.debug_struct("LocalPanelConfig")
             .field("port", &self.port)
             .field("page_dir", &self.page_dir)
+            .field("voice_search_endpoint", &self.voice_search_endpoint)
             .finish()
+    }
+}
+
+/// A secret the page sent (the Aivis API key). Redacted in `Debug`, compared
+/// by value for tests only; the one reader is [`Self::expose`].
+#[derive(Clone, PartialEq, Eq)]
+pub struct PanelSecret(String);
+
+impl PanelSecret {
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for PanelSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PanelSecret([REDACTED])")
     }
 }
 
@@ -79,6 +125,15 @@ pub enum PanelRequest {
     /// Switch the local Thinking model (#357). Only the alias, already checked
     /// for shape; whether it is allowed is decided on the composition thread.
     SelectModel(String),
+    /// A voice settings patch (#360), the JSON text of a `VoicePatch` that the
+    /// HTTP layer already parsed once. The composition thread decides.
+    VoiceApply(String),
+    /// Store the Aivis API key (#360).
+    VoiceKeySet(PanelSecret),
+    VoiceKeyRemove,
+    VoiceKeyCheck,
+    /// Speak the fixed preview sentence (#360).
+    VoicePreview,
 }
 
 /// The composition thread's answer, relayed to the page.
@@ -147,7 +202,10 @@ struct Shared {
     state: Mutex<String>,
     bucket: Mutex<Bucket>,
     control_tx: SyncSender<PanelCommand>,
+    voice_tx: SyncSender<PanelCommand>,
     chat_tx: SyncSender<PanelCommand>,
+    voice_search_endpoint: Option<String>,
+    search_busy: std::sync::atomic::AtomicBool,
     counters: Counters,
     shutdown: std::sync::atomic::AtomicBool,
 }
@@ -176,6 +234,7 @@ impl Shared {
 pub struct PanelInbox {
     shared: Arc<Shared>,
     control_rx: Mutex<Receiver<PanelCommand>>,
+    voice_rx: Mutex<Receiver<PanelCommand>>,
     chat_rx: Mutex<Receiver<PanelCommand>>,
 }
 
@@ -183,6 +242,17 @@ impl PanelInbox {
     /// Stop and mute requests. Their own queue: chat cannot fill it.
     pub fn drain_control(&self, max: usize) -> Vec<PanelCommand> {
         self.control_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .try_iter()
+            .take(max)
+            .collect()
+    }
+
+    /// Voice settings requests (#360). Their own queue, so they can never sit
+    /// in front of a stop or a mute.
+    pub fn drain_voice(&self, max: usize) -> Vec<PanelCommand> {
+        self.voice_rx
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .try_iter()
@@ -259,6 +329,7 @@ impl LocalPanelServer {
             None => None,
         };
         let (control_tx, control_rx) = sync_channel(CONTROL_QUEUE);
+        let (voice_tx, voice_rx) = sync_channel(VOICE_QUEUE);
         let (chat_tx, chat_rx) = sync_channel(CHAT_QUEUE);
         let shared = Arc::new(Shared {
             token: mint_token()?,
@@ -271,7 +342,10 @@ impl LocalPanelServer {
                 last: Instant::now(),
             }),
             control_tx,
+            voice_tx,
             chat_tx,
+            voice_search_endpoint: config.voice_search_endpoint.clone(),
+            search_busy: std::sync::atomic::AtomicBool::new(false),
             counters: Counters::default(),
             shutdown: std::sync::atomic::AtomicBool::new(false),
         });
@@ -285,6 +359,7 @@ impl LocalPanelServer {
         let inbox = PanelInbox {
             shared: Arc::clone(&shared),
             control_rx: Mutex::new(control_rx),
+            voice_rx: Mutex::new(voice_rx),
             chat_rx: Mutex::new(chat_rx),
         };
         Ok((
@@ -447,20 +522,18 @@ fn route(
     // Content-Length and Transfer-Encoding are read once, before anything is
     // trusted, so every API response can state whether a body is pending.
     let content_length = header("content-length");
-    let state_changing = matches!(
-        (method, path),
-        (
-            "POST",
-            "/api/chat" | "/api/stop" | "/api/mute" | "/api/model"
-        )
-    );
+    // The search is a POST like the rest (a body, an Origin check) but is
+    // answered here, not by the composition thread, and only when configured.
+    let searching =
+        method == "POST" && path == SEARCH_PATH && shared.voice_search_endpoint.is_some();
+    let state_changing = searching || (method == "POST" && STATE_CHANGING.contains(&path));
     let readable = method == "GET" && path == "/api/state";
     if !state_changing && !readable {
         // Includes OPTIONS (CORS preflight): refused without CORS headers.
-        return if matches!(
-            path,
-            "/api/chat" | "/api/stop" | "/api/mute" | "/api/model" | "/api/state"
-        ) {
+        let known = path == "/api/state"
+            || STATE_CHANGING.contains(&path)
+            || (path == SEARCH_PATH && shared.voice_search_endpoint.is_some());
+        return if known {
             plain("405 Method Not Allowed")
         } else {
             plain("404 Not Found")
@@ -525,9 +598,29 @@ fn route(
         shared.count(&shared.counters.rejected_request);
         return json("400 Bad Request", false, "incomplete body");
     }
+    if searching {
+        return search(shared, &body);
+    }
     let (request, queue) = match path {
         "/api/stop" => (PanelRequest::Stop, &shared.control_tx),
         "/api/mute" => (PanelRequest::Mute, &shared.control_tx),
+        "/api/voice/preview" => (PanelRequest::VoicePreview, &shared.voice_tx),
+        "/api/voice/key/remove" => (PanelRequest::VoiceKeyRemove, &shared.voice_tx),
+        "/api/voice/key/check" => (PanelRequest::VoiceKeyCheck, &shared.voice_tx),
+        "/api/voice/key" => match key_body(&body) {
+            Ok(key) => (PanelRequest::VoiceKeySet(key), &shared.voice_tx),
+            Err((status, detail)) => {
+                shared.count(&shared.counters.rejected_request);
+                return json(status, false, detail);
+            }
+        },
+        "/api/voice" => match voice_patch(&body) {
+            Ok(patch) => (PanelRequest::VoiceApply(patch), &shared.voice_tx),
+            Err((status, detail)) => {
+                shared.count(&shared.counters.rejected_request);
+                return json(status, false, detail);
+            }
+        },
         "/api/model" => match model_alias(&body) {
             Ok(alias) => (PanelRequest::SelectModel(alias), &shared.control_tx),
             Err((status, detail)) => {
@@ -544,6 +637,115 @@ fn route(
         },
     };
     forward(shared, queue, request)
+}
+
+/// The body of `POST /api/voice`: a `VoicePatch`, parsed here once for the
+/// status code and forwarded as the text the composition thread parses again.
+fn voice_patch(body: &[u8]) -> Result<String, (&'static str, &'static str)> {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return Err(("400 Bad Request", "not a voice settings request"));
+    };
+    match aivtuber_domain::VoicePatch::parse(text) {
+        Ok(_) => Ok(text.to_owned()),
+        Err(aivtuber_domain::VoiceSettingsError::PatchTooLarge) => {
+            Err(("413 Payload Too Large", "request too large"))
+        }
+        Err(_) => Err(("400 Bad Request", "not a voice settings request")),
+    }
+}
+
+/// Parses `{"key": "..."}`. The key is trimmed and bounded and must have no
+/// whitespace inside or control characters; it never appears in a response.
+fn key_body(body: &[u8]) -> Result<PanelSecret, (&'static str, &'static str)> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Body {
+        key: String,
+    }
+    let Ok(parsed) = serde_json::from_slice::<Body>(body) else {
+        return Err(("400 Bad Request", "expected {\"key\": string}"));
+    };
+    let key = parsed.key.trim();
+    if key.is_empty() || key.chars().count() > MAX_PANEL_KEY_CHARS {
+        return Err(("400 Bad Request", "the key is empty or too long"));
+    }
+    if key.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err((
+            "400 Bad Request",
+            "the key contains whitespace or control characters",
+        ));
+    }
+    Ok(PanelSecret(key.to_owned()))
+}
+
+/// Parses `{"keyword": "...", "sort": "...", "page": n}` (all optional).
+fn search_query(body: &[u8]) -> Result<ModelSearchQuery, (&'static str, &'static str)> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Body {
+        #[serde(default)]
+        keyword: String,
+        #[serde(default = "default_sort")]
+        sort: ModelSort,
+        #[serde(default = "default_page")]
+        page: u32,
+    }
+    fn default_sort() -> ModelSort {
+        ModelSort::Download
+    }
+    fn default_page() -> u32 {
+        1
+    }
+    let Ok(parsed) = serde_json::from_slice::<Body>(body) else {
+        return Err((
+            "400 Bad Request",
+            "expected {\"keyword\", \"sort\", \"page\"}",
+        ));
+    };
+    ModelSearchQuery::new(&parsed.keyword, parsed.sort, parsed.page)
+        .map_err(|_| ("400 Bad Request", "not a valid search"))
+}
+
+/// The model search, answered on this connection's own thread: one at a time
+/// (a second one is refused, not queued), under [`SEARCH_DEADLINE`], and the
+/// answer is the typed page, never the service's body.
+fn search(shared: &Shared, body: &[u8]) -> Response {
+    let query = match search_query(body) {
+        Ok(query) => query,
+        Err((status, detail)) => {
+            shared.count(&shared.counters.rejected_request);
+            return json(status, false, detail);
+        }
+    };
+    let Some(endpoint) = shared.voice_search_endpoint.as_deref() else {
+        return plain("404 Not Found");
+    };
+    if shared
+        .search_busy
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        shared.count(&shared.counters.rate_limited);
+        return json(
+            "429 Too Many Requests",
+            false,
+            "a search is already running",
+        );
+    }
+    shared.count(&shared.counters.accepted);
+    let result = aivis_models::search_models(endpoint, &query, SEARCH_DEADLINE);
+    shared.search_busy.store(false, Ordering::Release);
+    match result {
+        Ok(page) => Response {
+            status: "200 OK",
+            ctype: "application/json",
+            body: serde_json::json!({ "ok": true, "detail": "", "id": null, "page": page })
+                .to_string()
+                .into_bytes(),
+            csp: false,
+        },
+        Err(error) => json("502 Bad Gateway", false, &error.to_string()),
+    }
 }
 
 /// Parses `{"model": "..."}`. Only the shape of the alias is checked here
@@ -650,6 +852,10 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
+        fixture_with_search(None)
+    }
+
+    fn fixture_with_search(search_endpoint: Option<String>) -> Fixture {
         let dir =
             std::env::temp_dir().join(format!("aivtuber-panel-test-{}", mint_token().unwrap()));
         fs::create_dir_all(dir.join("assets")).unwrap();
@@ -659,6 +865,7 @@ mod tests {
         let (server, inbox) = LocalPanelServer::start(LocalPanelConfig {
             port: 0,
             page_dir: Some(dir),
+            voice_search_endpoint: search_endpoint,
         })
         .unwrap();
         let port = server.local_addr().port();
@@ -762,9 +969,11 @@ mod tests {
         let LocalPanelConfig {
             port: _,
             page_dir: _,
+            voice_search_endpoint: _,
         } = LocalPanelConfig {
             port: 0,
             page_dir: None,
+            voice_search_endpoint: None,
         };
         assert!(!format!("{:?}", f.server).contains(f.server.token()));
     }
@@ -1141,5 +1350,253 @@ mod tests {
         }
         assert!(limited > 0);
         assert!(f.inbox.metrics().rate_limited > 0);
+    }
+
+    // ---- voice settings (#360) ----
+
+    const SENTINEL_KEY: &str = "sk-panel-SENTINEL-KEY-0123456789";
+
+    /// Posts and plays the composition thread: answers the one request that
+    /// reaches the voice queue with `detail`, returns what the page saw and
+    /// the request that was queued.
+    fn voice_round_trip(
+        f: &Fixture,
+        path: &str,
+        body: &str,
+        detail: &'static str,
+    ) -> (Raw, PanelRequest) {
+        let good = good(f);
+        let headers = with(&good, "none");
+        thread::scope(|s| {
+            let handle = s.spawn(|| post(f, path, &headers, body));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut commands = Vec::new();
+            while commands.is_empty() && Instant::now() < deadline {
+                commands = f.inbox.drain_voice(4);
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(commands.len(), 1, "{path}");
+            let command = commands.into_iter().next().unwrap();
+            let request = command.request.clone();
+            command.respond(true, detail);
+            (handle.join().unwrap(), request)
+        })
+    }
+
+    #[test]
+    fn voice_requests_are_authenticated_same_origin_and_use_their_own_queue() {
+        let f = fixture();
+        let good = good(&f);
+        let body = "{\"backend\":\"local\"}";
+        for path in [
+            "/api/voice",
+            "/api/voice/key",
+            "/api/voice/key/remove",
+            "/api/voice/key/check",
+            "/api/voice/preview",
+        ] {
+            let mut foreign = with(&good, "origin");
+            foreign.push(("Origin", "http://evil.example"));
+            assert_eq!(post(&f, path, &foreign, body).status, 403, "{path}");
+            assert_eq!(
+                post(&f, path, &with(&good, "x-panel-token"), body).status,
+                401,
+                "{path}"
+            );
+            let mut form = with(&good, "content-type");
+            form.push(("Content-Type", "application/x-www-form-urlencoded"));
+            assert_eq!(post(&f, path, &form, body).status, 415, "{path}");
+            assert_eq!(get(&f, path, "").status, 405, "{path}");
+        }
+        // A voice request never sits in the stop/mute queue.
+        let (answer, request) = voice_round_trip(&f, "/api/voice/preview", "{}", "speaking");
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        assert_eq!(request, PanelRequest::VoicePreview);
+        assert!(f.inbox.drain_control(8).is_empty());
+        for (path, want) in [
+            ("/api/voice/key/remove", PanelRequest::VoiceKeyRemove),
+            ("/api/voice/key/check", PanelRequest::VoiceKeyCheck),
+        ] {
+            let (answer, request) = voice_round_trip(&f, path, "{}", "ok");
+            assert_eq!(answer.status, 200, "{path}");
+            assert_eq!(request, want);
+        }
+    }
+
+    #[test]
+    fn a_voice_patch_is_shape_checked_before_it_reaches_the_queue() {
+        let f = fixture();
+        let good = good(&f);
+        let headers = with(&good, "none");
+        let long = format!("{{\"credit\":\"{}\"}}", "x".repeat(2100));
+        for body in [
+            "",
+            "[]",
+            "{\"unknown\":1}",
+            "{\"api_key\":\"sk-x\"}",
+            "{\"backend\":\"cloud\"}",
+            "{\"pitch\":\"high\"}",
+            long.as_str(),
+        ] {
+            let status = post(&f, "/api/voice", &headers, body).status;
+            assert!(status == 400 || status == 413, "{body:?} {status}");
+        }
+        assert!(f.inbox.drain_voice(8).is_empty());
+        let patch = "{\"backend\":\"aivis\",\"style_id\":3,\"confirm_egress\":true}";
+        let (answer, request) = voice_round_trip(&f, "/api/voice", patch, "applied");
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        assert_eq!(request, PanelRequest::VoiceApply(patch.to_owned()));
+    }
+
+    #[test]
+    fn the_key_is_a_body_field_held_redacted_and_never_echoed() {
+        let f = fixture();
+        let good = good(&f);
+        let headers = with(&good, "none");
+        for body in [
+            "{}".to_owned(),
+            "{\"key\":\"\"}".to_owned(),
+            "{\"key\":\"has space\"}".to_owned(),
+            "{\"key\":\"line\\nbreak\"}".to_owned(),
+            format!("{{\"key\":\"{}\"}}", "k".repeat(MAX_PANEL_KEY_CHARS + 1)),
+            format!("{{\"key\":\"{SENTINEL_KEY}\",\"also\":1}}"),
+        ] {
+            let answer = post(&f, "/api/voice/key", &headers, &body);
+            assert_eq!(answer.status, 400, "{body}");
+            assert!(!answer.body.contains(SENTINEL_KEY));
+        }
+        assert!(f.inbox.drain_voice(8).is_empty());
+        let body = format!("{{\"key\":\"  {SENTINEL_KEY}  \"}}");
+        let (answer, request) = voice_round_trip(&f, "/api/voice/key", &body, "key set");
+        assert_eq!(answer.status, 200);
+        assert!(!answer.body.contains(SENTINEL_KEY) && !answer.head.contains("sentinel"));
+        let PanelRequest::VoiceKeySet(key) = &request else {
+            panic!("{request:?}");
+        };
+        assert_eq!(key.expose(), SENTINEL_KEY, "trimmed");
+        assert!(!format!("{request:?}").contains(SENTINEL_KEY));
+        assert!(!format!("{key:?}").contains("SENTINEL"));
+    }
+
+    fn search_fixture() -> (Fixture, crate::speech_tts::aivis_cloud_fake::FakeAivisCloud) {
+        use crate::speech_tts::aivis_cloud_fake::{FakeAivisBehaviour, FakeAivisCloud};
+        let api = FakeAivisCloud::start(FakeAivisBehaviour {
+            search_body: Some(
+                include_bytes!("../../tests/fixtures/aivis-model-search.json").to_vec(),
+            ),
+            ..FakeAivisBehaviour::default()
+        });
+        (fixture_with_search(Some(api.endpoint())), api)
+    }
+
+    #[test]
+    fn the_search_is_proxied_typed_and_sends_no_credential() {
+        let (f, api) = search_fixture();
+        let good = good(&f);
+        let headers = with(&good, "none");
+        let answer = post(
+            &f,
+            "/api/voice/search",
+            &headers,
+            "{\"keyword\":\"まお\",\"sort\":\"like\",\"page\":2}",
+        );
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        let value: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["page"]["page"], 2);
+        assert_eq!(value["page"]["models"].as_array().unwrap().len(), 3);
+        assert_eq!(value["page"]["models"][0]["name"], "まお");
+        // Only the typed DTO crossed: no wire field the page does not need.
+        for absent in ["icon_url", "audio_url", "handle"] {
+            assert!(!answer.body.contains(absent), "{absent}");
+        }
+        let requests = api.requests();
+        assert_eq!(requests[0].query_param("keyword").as_deref(), Some("まお"));
+        assert_eq!(requests[0].query_param("sort").as_deref(), Some("like"));
+        assert!(requests[0].header("authorization").is_none());
+        // Defaults, and the search never touches the composition queues.
+        let answer = post(&f, "/api/voice/search", &headers, "{}");
+        assert_eq!(answer.status, 200);
+        assert!(f.inbox.drain_voice(8).is_empty() && f.inbox.drain_control(8).is_empty());
+    }
+
+    #[test]
+    fn the_search_is_validated_authenticated_bounded_and_one_at_a_time() {
+        let (f, _api) = search_fixture();
+        let good = good(&f);
+        let headers = with(&good, "none");
+        let mut foreign = with(&good, "origin");
+        foreign.push(("Origin", "http://evil.example"));
+        assert_eq!(post(&f, "/api/voice/search", &foreign, "{}").status, 403);
+        assert_eq!(
+            post(&f, "/api/voice/search", &with(&good, "x-panel-token"), "{}").status,
+            401
+        );
+        assert_eq!(get(&f, "/api/voice/search", "").status, 405);
+        let long = format!("{{\"keyword\":\"{}\"}}", "a".repeat(65));
+        for body in [
+            "{\"sort\":\"price\"}",
+            "{\"page\":0}",
+            "{\"page\":101}",
+            "{\"x\":1}",
+            "{\"keyword\":\"a\\nb\"}",
+            long.as_str(),
+        ] {
+            assert_eq!(
+                post(&f, "/api/voice/search", &headers, body).status,
+                400,
+                "{body}"
+            );
+        }
+        // Off unless configured: the route does not exist.
+        let plain_panel = fixture();
+        let good2 = self::good(&plain_panel);
+        assert_eq!(
+            post(
+                &plain_panel,
+                "/api/voice/search",
+                &with(&good2, "none"),
+                "{}"
+            )
+            .status,
+            404
+        );
+        // One at a time: a held-open search makes the second one a 429.
+        use crate::speech_tts::aivis_cloud_fake::{FakeAivisBehaviour, FakeAivisCloud};
+        let slow = FakeAivisCloud::start(FakeAivisBehaviour {
+            delay: Duration::from_millis(700),
+            ..FakeAivisBehaviour::default()
+        });
+        let g = fixture_with_search(Some(slow.endpoint()));
+        let good3 = self::good(&g);
+        let headers3 = with(&good3, "none");
+        let statuses = thread::scope(|s| {
+            let first = s.spawn(|| post(&g, "/api/voice/search", &headers3, "{}").status);
+            thread::sleep(Duration::from_millis(200));
+            let second = post(&g, "/api/voice/search", &headers3, "{}").status;
+            (first.join().unwrap(), second)
+        });
+        assert_eq!(statuses, (200, 429));
+        // The slot is free again afterwards.
+        assert_eq!(post(&g, "/api/voice/search", &headers3, "{}").status, 200);
+    }
+
+    #[test]
+    fn an_unreachable_or_failing_service_is_a_502_with_a_fixed_message() {
+        use crate::speech_tts::aivis_cloud_fake::{FakeAivisBehaviour, FakeAivisCloud};
+        let down = FakeAivisCloud::start(FakeAivisBehaviour {
+            search_status: 503,
+            ..FakeAivisBehaviour::default()
+        });
+        let f = fixture_with_search(Some(down.endpoint()));
+        let good = good(&f);
+        let answer = post(&f, "/api/voice/search", &with(&good, "none"), "{}");
+        assert_eq!(answer.status, 502);
+        assert!(answer.body.contains("HTTP 503"), "{}", answer.body);
+        let closed = fixture_with_search(Some("http://127.0.0.1:9".to_owned()));
+        let good = self::good(&closed);
+        let answer = post(&closed, "/api/voice/search", &with(&good, "none"), "{}");
+        assert_eq!(answer.status, 502);
+        assert!(answer.body.contains("unreachable"), "{}", answer.body);
     }
 }

@@ -6,7 +6,7 @@ use aivtuber_domain::{
 use serde::Deserialize;
 use serde_json::json;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 #[derive(Clone)]
@@ -34,9 +34,24 @@ impl fmt::Debug for NormalizedHttpTtsConfig {
     }
 }
 
+/// Where the adapter posts and the identity it records for that backend. The
+/// one part of the configuration an operator can change while the app runs
+/// (issue #360: local voice <-> Aivis Cloud bridge).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TtsTarget {
+    pub endpoint: String,
+    pub backend_name: String,
+    pub model_alias: Option<String>,
+    pub model_version: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct NormalizedHttpTtsAdapter {
     config: NormalizedHttpTtsConfig,
+    /// The current target. Shared by clones, so a switch made through one
+    /// handle (the operator's voice settings) reaches the pipeline's copy, the
+    /// next request and the identity recorded with it.
+    target: Arc<RwLock<TtsTarget>>,
     api_key: Option<Arc<SecretString>>,
     transport: Arc<dyn JsonHttpTransport>,
 }
@@ -64,11 +79,34 @@ impl NormalizedHttpTtsAdapter {
         transport: Arc<dyn JsonHttpTransport>,
     ) -> Result<Self, EngineError> {
         validate_config(&config)?;
+        let target = Arc::new(RwLock::new(TtsTarget {
+            endpoint: config.endpoint.clone(),
+            backend_name: config.backend_name.clone(),
+            model_alias: config.model_alias.clone(),
+            model_version: config.model_version.clone(),
+        }));
         Ok(Self {
             config,
+            target,
             api_key: api_key.map(Arc::new),
             transport,
         })
+    }
+
+    /// The target the next request uses.
+    pub fn target(&self) -> TtsTarget {
+        self.target
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Point every clone of this adapter at another target. The endpoint goes
+    /// through the same rule as the configured one (HTTPS or loopback HTTP).
+    pub fn select_target(&self, target: TtsTarget) -> Result<(), EngineError> {
+        validate_target(&target)?;
+        *self.target.write().unwrap_or_else(|e| e.into_inner()) = target;
+        Ok(())
     }
 
     pub fn synthesize_sync(&self, request: &SpeechRequest) -> Result<SpeechArtifact, EngineError> {
@@ -102,10 +140,11 @@ impl NormalizedHttpTtsAdapter {
         }))
         .map_err(|error| EngineError::new(EngineErrorKind::InvalidRequest, error.to_string()))?;
 
+        let target = self.target();
         let response = self
             .transport
             .post_json(
-                &self.config.endpoint,
+                &target.endpoint,
                 self.api_key.as_ref().map(|secret| secret.expose()),
                 &body,
                 effective_timeout,
@@ -152,11 +191,12 @@ impl TtsEngine for NormalizedHttpTtsAdapter {
     }
 
     fn identity(&self) -> TtsBackendIdentity {
+        let target = self.target();
         TtsBackendIdentity {
             backend: BackendIdentity {
-                name: self.config.backend_name.clone(),
-                model_alias: self.config.model_alias.clone(),
-                model_version: self.config.model_version.clone(),
+                name: target.backend_name,
+                model_alias: target.model_alias,
+                model_version: target.model_version,
             },
             voice_model: self.config.voice_model.clone(),
             viseme_mapping: self.config.viseme_mapping.clone(),
@@ -173,14 +213,30 @@ struct NormalizedTtsResponse {
     viseme_ref: Option<String>,
 }
 
-fn validate_config(config: &NormalizedHttpTtsConfig) -> Result<(), EngineError> {
-    if !crate::http::is_secure_provider_endpoint(&config.endpoint) {
+fn validate_target(target: &TtsTarget) -> Result<(), EngineError> {
+    if !crate::http::is_secure_provider_endpoint(&target.endpoint) {
         return Err(EngineError::new(
             EngineErrorKind::InvalidRequest,
             "TTS endpoint must use HTTPS or localhost HTTP",
         ));
     }
-    if config.backend_name.trim().is_empty() || config.timeout.is_zero() {
+    if target.backend_name.trim().is_empty() {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidRequest,
+            "TTS backend_name and timeout must be non-empty",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_config(config: &NormalizedHttpTtsConfig) -> Result<(), EngineError> {
+    validate_target(&TtsTarget {
+        endpoint: config.endpoint.clone(),
+        backend_name: config.backend_name.clone(),
+        model_alias: None,
+        model_version: None,
+    })?;
+    if config.timeout.is_zero() {
         return Err(EngineError::new(
             EngineErrorKind::InvalidRequest,
             "TTS backend_name and timeout must be non-empty",
@@ -356,5 +412,68 @@ mod tests {
             })
             .expect_err("empty text");
         assert_eq!(error.kind, EngineErrorKind::InvalidRequest);
+    }
+
+    #[test]
+    fn a_target_switch_reaches_every_clone_the_wire_and_the_identity() {
+        let transport = MockHttpTransport::new(Ok(HttpResponse {
+            status: 200,
+            body: serde_json::to_vec(&json!({
+                "audio_ref": "audio://generated/test.wav",
+                "duration_ms": 100
+            }))
+            .expect("response JSON"),
+            content_type: Some("application/json".to_owned()),
+        }));
+        let adapter =
+            NormalizedHttpTtsAdapter::with_transport(config(), None, Arc::new(transport.clone()))
+                .expect("adapter");
+        // The pipeline owns one clone; the operator's voice settings hold another.
+        let pipeline_copy = adapter.clone();
+        let local = adapter.target();
+        adapter
+            .select_target(TtsTarget {
+                endpoint: "http://127.0.0.1:41234/v1/synthesize".to_owned(),
+                backend_name: "aivis-cloud".to_owned(),
+                model_alias: Some("model/style-2".to_owned()),
+                model_version: Some("rate=1.5".to_owned()),
+            })
+            .expect("switch");
+        pipeline_copy
+            .synthesize_sync(&SpeechRequest {
+                text: "切り替え".to_owned(),
+                style: None,
+            })
+            .expect("speech");
+        assert_eq!(
+            transport.requests()[0].endpoint,
+            "http://127.0.0.1:41234/v1/synthesize"
+        );
+        let identity = pipeline_copy.identity();
+        assert_eq!(identity.backend.name, "aivis-cloud");
+        assert_eq!(
+            identity.backend.model_alias.as_deref(),
+            Some("model/style-2")
+        );
+        assert_eq!(identity.backend.model_version.as_deref(), Some("rate=1.5"));
+        // The voice model and viseme mapping are not part of the switch.
+        assert_eq!(identity.voice_model.as_deref(), Some("voice-ja-v2"));
+        // Back to the first target.
+        adapter.select_target(local.clone()).expect("back");
+        assert_eq!(pipeline_copy.target(), local);
+        // A target obeys the endpoint rule and needs a backend name.
+        for bad in [
+            TtsTarget {
+                endpoint: "http://tts.example.invalid/x".to_owned(),
+                ..local.clone()
+            },
+            TtsTarget {
+                backend_name: " ".to_owned(),
+                ..local.clone()
+            },
+        ] {
+            assert!(adapter.select_target(bad).is_err());
+        }
+        assert_eq!(adapter.target(), local, "a refused switch changes nothing");
     }
 }

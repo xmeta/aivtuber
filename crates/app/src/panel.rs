@@ -9,10 +9,13 @@
 //!   ingress compares them): the constant-time secret check in
 //!   `LocalControlIngress`, the capability mint, the output stop and the audit
 //!   record are the existing ones (the audit id is `operator-panel-ctl-N`). The
-//!   panel can ask for exactly three actions (stop, mute and the Thinking model
-//!   selection of #357, `model.select`, whose alias must be in the allowlist
-//!   the launcher passed in); it cannot reach perception, memory export or
-//!   diagnose even though the ingress could mint them;
+//!   panel can ask for stop, mute, the Thinking model selection of #357
+//!   (`model.select`, whose alias must be in the allowlist the launcher passed
+//!   in) and the voice settings of #360 (`voice.apply`, `voice.key.set`,
+//!   `voice.key.remove`, `voice.key.check`, `voice.preview`, all
+//!   `voice.configure`; they arrive on their own queue so a slider drag cannot
+//!   delay a stop); it cannot reach perception, memory export or diagnose even
+//!   though the ingress could mint them;
 //! * a chat line becomes a `chat.message` envelope whose source, source class,
 //!   plane and trust are fixed here (`local-panel`, `public_chat`, `content`,
 //!   `untrusted`) and is admitted by [`ProductionApp::process_content_bytes`],
@@ -35,6 +38,7 @@ use std::sync::Arc;
 const DEFAULT_PORT: u16 = 8766;
 /// Requests handled per tick, so a burst cannot starve the rest of the loop.
 const CONTROL_PER_TICK: usize = 4;
+const VOICE_PER_TICK: usize = 4;
 const CHAT_PER_TICK: usize = 4;
 const PUBLISH_INTERVAL_MS: u64 = 500;
 /// Refusal counts are logged at most this often. A stale page from an earlier
@@ -172,10 +176,12 @@ impl PanelService {
         ingress: Arc<LocalControlIngress>,
         control_secret: &[u8; 32],
         avatar_url: Option<String>,
+        voice_search_endpoint: Option<String>,
     ) -> Result<Self, String> {
         let (server, inbox) = LocalPanelServer::start(LocalPanelConfig {
             port: settings.port,
             page_dir: settings.page_dir.clone(),
+            voice_search_endpoint,
         })
         .map_err(|error| error.to_string())?;
         Ok(Self {
@@ -215,9 +221,45 @@ impl PanelService {
                     argument = Some(alias);
                     "model.select"
                 }
-                // Chat arrives on its own queue; refuse anything else.
-                PanelRequest::Chat(_) => {
+                // Chat and voice arrive on their own queues; refuse anything else.
+                PanelRequest::Chat(_)
+                | PanelRequest::VoiceApply(_)
+                | PanelRequest::VoiceKeySet(_)
+                | PanelRequest::VoiceKeyRemove
+                | PanelRequest::VoiceKeyCheck
+                | PanelRequest::VoicePreview => {
                     command.respond(false, "not a control request");
+                    continue;
+                }
+            };
+            self.control_seq += 1;
+            let response = apply_operator_action(
+                &self.ingress,
+                app,
+                &format!("panel-ctl-{}", self.control_seq),
+                action,
+                argument,
+                &self.control_secret.0,
+                now_ms,
+            );
+            eprintln!(
+                "panel: {action} ok={} detail={:?}",
+                response.ok, response.detail
+            );
+            command.respond(response.ok, response.detail);
+            changed = true;
+        }
+        for command in self.inbox.drain_voice(VOICE_PER_TICK) {
+            let (action, argument): (&str, Option<&str>) = match &command.request {
+                PanelRequest::VoiceApply(patch) => ("voice.apply", Some(patch)),
+                // The key reaches the ingress path as the argument and nothing
+                // here prints it: the log line below names the action only.
+                PanelRequest::VoiceKeySet(key) => ("voice.key.set", Some(key.expose())),
+                PanelRequest::VoiceKeyRemove => ("voice.key.remove", None),
+                PanelRequest::VoiceKeyCheck => ("voice.key.check", None),
+                PanelRequest::VoicePreview => ("voice.preview", None),
+                _ => {
+                    command.respond(false, "not a voice request");
                     continue;
                 }
             };
