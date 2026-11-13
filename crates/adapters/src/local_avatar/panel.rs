@@ -26,7 +26,13 @@
 //!   check, the preview, and a model search that this thread proxies to the
 //!   public Aivis Cloud list (so the page stays same-origin) under a deadline,
 //!   one at a time, with a bounded typed answer. The voice requests have their
-//!   own queue so a slider drag can never delay stop or mute.
+//!   own queue so a slider drag can never delay stop or mute;
+//! * the stream-chat connections (#361) add `/api/ingress*`: connect or
+//!   disconnect one platform (a strictly parsed Twitch login or YouTube video,
+//!   both normalized here once), and the YouTube API key (the same redacted
+//!   body field as the Aivis key). They have their own queue too, and nothing
+//!   in the request can name a program, an argument, a trust level or a source
+//!   class: the composition thread chooses all of those.
 
 use super::server::{
     ConnGuard, HEAD_DEADLINE, MAX_CONNECTIONS, POLL, content_type, ct_eq, header_value, mint_token,
@@ -53,13 +59,14 @@ pub const MAX_PANEL_CHAT_CHARS: usize = 500;
 pub const MAX_PANEL_STATE_BYTES: usize = 64 * 1024;
 const CONTROL_QUEUE: usize = 4;
 const VOICE_QUEUE: usize = 4;
+const INGRESS_QUEUE: usize = 4;
 const CHAT_QUEUE: usize = 8;
 /// Longest accepted API key, in characters (Aivis keys are about 40).
 pub const MAX_PANEL_KEY_CHARS: usize = 256;
 /// One model search may take this long, end to end.
 const SEARCH_DEADLINE: Duration = Duration::from_secs(6);
 /// Every state-changing endpoint (all are `POST`).
-const STATE_CHANGING: [&str; 9] = [
+const STATE_CHANGING: [&str; 13] = [
     "/api/chat",
     "/api/stop",
     "/api/mute",
@@ -69,6 +76,10 @@ const STATE_CHANGING: [&str; 9] = [
     "/api/voice/key/remove",
     "/api/voice/key/check",
     "/api/voice/preview",
+    "/api/ingress/connect",
+    "/api/ingress/disconnect",
+    "/api/ingress/key",
+    "/api/ingress/key/remove",
 ];
 const SEARCH_PATH: &str = "/api/voice/search";
 const REPLY_WAIT: Duration = Duration::from_secs(3);
@@ -134,6 +145,33 @@ pub enum PanelRequest {
     VoiceKeyCheck,
     /// Speak the fixed preview sentence (#360).
     VoicePreview,
+    /// Start reading one platform's chat (#361). `target` is already the
+    /// normalized Twitch login or YouTube video id; the composition thread
+    /// parses it again before it spawns anything.
+    IngressConnect {
+        platform: IngressPlatform,
+        target: String,
+    },
+    IngressDisconnect(IngressPlatform),
+    /// Store the YouTube Data API key (#361).
+    IngressKeySet(PanelSecret),
+    IngressKeyRemove,
+}
+
+/// The two chat platforms the panel can connect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngressPlatform {
+    Twitch,
+    Youtube,
+}
+
+impl IngressPlatform {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Twitch => "twitch",
+            Self::Youtube => "youtube",
+        }
+    }
 }
 
 /// The composition thread's answer, relayed to the page.
@@ -203,6 +241,7 @@ struct Shared {
     bucket: Mutex<Bucket>,
     control_tx: SyncSender<PanelCommand>,
     voice_tx: SyncSender<PanelCommand>,
+    ingress_tx: SyncSender<PanelCommand>,
     chat_tx: SyncSender<PanelCommand>,
     voice_search_endpoint: Option<String>,
     search_busy: std::sync::atomic::AtomicBool,
@@ -235,6 +274,7 @@ pub struct PanelInbox {
     shared: Arc<Shared>,
     control_rx: Mutex<Receiver<PanelCommand>>,
     voice_rx: Mutex<Receiver<PanelCommand>>,
+    ingress_rx: Mutex<Receiver<PanelCommand>>,
     chat_rx: Mutex<Receiver<PanelCommand>>,
 }
 
@@ -253,6 +293,17 @@ impl PanelInbox {
     /// in front of a stop or a mute.
     pub fn drain_voice(&self, max: usize) -> Vec<PanelCommand> {
         self.voice_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .try_iter()
+            .take(max)
+            .collect()
+    }
+
+    /// Stream-chat connection requests (#361). Their own queue, so a connect
+    /// can never sit in front of a stop or a mute.
+    pub fn drain_ingress(&self, max: usize) -> Vec<PanelCommand> {
+        self.ingress_rx
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .try_iter()
@@ -330,6 +381,7 @@ impl LocalPanelServer {
         };
         let (control_tx, control_rx) = sync_channel(CONTROL_QUEUE);
         let (voice_tx, voice_rx) = sync_channel(VOICE_QUEUE);
+        let (ingress_tx, ingress_rx) = sync_channel(INGRESS_QUEUE);
         let (chat_tx, chat_rx) = sync_channel(CHAT_QUEUE);
         let shared = Arc::new(Shared {
             token: mint_token()?,
@@ -343,6 +395,7 @@ impl LocalPanelServer {
             }),
             control_tx,
             voice_tx,
+            ingress_tx,
             chat_tx,
             voice_search_endpoint: config.voice_search_endpoint.clone(),
             search_busy: std::sync::atomic::AtomicBool::new(false),
@@ -360,6 +413,7 @@ impl LocalPanelServer {
             shared: Arc::clone(&shared),
             control_rx: Mutex::new(control_rx),
             voice_rx: Mutex::new(voice_rx),
+            ingress_rx: Mutex::new(ingress_rx),
             chat_rx: Mutex::new(chat_rx),
         };
         Ok((
@@ -607,6 +661,28 @@ fn route(
         "/api/voice/preview" => (PanelRequest::VoicePreview, &shared.voice_tx),
         "/api/voice/key/remove" => (PanelRequest::VoiceKeyRemove, &shared.voice_tx),
         "/api/voice/key/check" => (PanelRequest::VoiceKeyCheck, &shared.voice_tx),
+        "/api/ingress/key/remove" => (PanelRequest::IngressKeyRemove, &shared.ingress_tx),
+        "/api/ingress/key" => match key_body(&body) {
+            Ok(key) => (PanelRequest::IngressKeySet(key), &shared.ingress_tx),
+            Err((status, detail)) => {
+                shared.count(&shared.counters.rejected_request);
+                return json(status, false, detail);
+            }
+        },
+        "/api/ingress/connect" => match ingress_connect(&body) {
+            Ok(request) => (request, &shared.ingress_tx),
+            Err((status, detail)) => {
+                shared.count(&shared.counters.rejected_request);
+                return json(status, false, detail);
+            }
+        },
+        "/api/ingress/disconnect" => match ingress_disconnect(&body) {
+            Ok(request) => (request, &shared.ingress_tx),
+            Err((status, detail)) => {
+                shared.count(&shared.counters.rejected_request);
+                return json(status, false, detail);
+            }
+        },
         "/api/voice/key" => match key_body(&body) {
             Ok(key) => (PanelRequest::VoiceKeySet(key), &shared.voice_tx),
             Err((status, detail)) => {
@@ -652,6 +728,56 @@ fn voice_patch(body: &[u8]) -> Result<String, (&'static str, &'static str)> {
         }
         Err(_) => Err(("400 Bad Request", "not a voice settings request")),
     }
+}
+
+fn ingress_platform(name: &str) -> Option<IngressPlatform> {
+    match name {
+        "twitch" => Some(IngressPlatform::Twitch),
+        "youtube" => Some(IngressPlatform::Youtube),
+        _ => None,
+    }
+}
+
+/// Parses `{"platform": "twitch"|"youtube", "target": "..."}`. The target is
+/// parsed strictly here (a login, a video id, or a watch/live/short link) and
+/// only the normalized value goes on.
+fn ingress_connect(body: &[u8]) -> Result<PanelRequest, (&'static str, &'static str)> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Body {
+        platform: String,
+        target: String,
+    }
+    let Ok(parsed) = serde_json::from_slice::<Body>(body) else {
+        return Err((
+            "400 Bad Request",
+            "expected {\"platform\": string, \"target\": string}",
+        ));
+    };
+    let Some(platform) = ingress_platform(&parsed.platform) else {
+        return Err(("400 Bad Request", "platform must be twitch or youtube"));
+    };
+    let target = match platform {
+        IngressPlatform::Twitch => crate::parse_twitch_login(&parsed.target),
+        IngressPlatform::Youtube => crate::parse_youtube_video(&parsed.target),
+    }
+    .map_err(|detail| ("400 Bad Request", detail))?;
+    Ok(PanelRequest::IngressConnect { platform, target })
+}
+
+/// Parses `{"platform": "twitch"|"youtube"}`.
+fn ingress_disconnect(body: &[u8]) -> Result<PanelRequest, (&'static str, &'static str)> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Body {
+        platform: String,
+    }
+    let Ok(parsed) = serde_json::from_slice::<Body>(body) else {
+        return Err(("400 Bad Request", "expected {\"platform\": string}"));
+    };
+    ingress_platform(&parsed.platform)
+        .map(PanelRequest::IngressDisconnect)
+        .ok_or(("400 Bad Request", "platform must be twitch or youtube"))
 }
 
 /// Parses `{"key": "..."}`. The key is trimmed and bounded and must have no
@@ -1476,6 +1602,189 @@ mod tests {
         assert_eq!(key.expose(), SENTINEL_KEY, "trimmed");
         assert!(!format!("{request:?}").contains(SENTINEL_KEY));
         assert!(!format!("{key:?}").contains("SENTINEL"));
+    }
+
+    // ---- stream chat connections (#361) ----
+
+    /// Posts and plays the composition thread for one request on the ingress
+    /// queue, as [`voice_round_trip`] does for the voice queue.
+    fn ingress_round_trip(
+        f: &Fixture,
+        path: &str,
+        body: &str,
+        detail: &'static str,
+    ) -> (Raw, PanelRequest) {
+        let good = good(f);
+        let headers = with(&good, "none");
+        thread::scope(|s| {
+            let handle = s.spawn(|| post(f, path, &headers, body));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut commands = Vec::new();
+            while commands.is_empty() && Instant::now() < deadline {
+                commands = f.inbox.drain_ingress(4);
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(commands.len(), 1, "{path}");
+            let command = commands.into_iter().next().unwrap();
+            let request = command.request.clone();
+            command.respond(true, detail);
+            (handle.join().unwrap(), request)
+        })
+    }
+
+    #[test]
+    fn ingress_requests_are_authenticated_same_origin_and_use_their_own_queue() {
+        let f = fixture();
+        let good = good(&f);
+        let body = "{\"platform\":\"twitch\",\"target\":\"somechannel\"}";
+        for path in [
+            "/api/ingress/connect",
+            "/api/ingress/disconnect",
+            "/api/ingress/key",
+            "/api/ingress/key/remove",
+        ] {
+            let mut foreign = with(&good, "origin");
+            foreign.push(("Origin", "http://evil.example"));
+            assert_eq!(post(&f, path, &foreign, body).status, 403, "{path}");
+            assert_eq!(
+                post(&f, path, &with(&good, "x-panel-token"), body).status,
+                401,
+                "{path}"
+            );
+            let mut form = with(&good, "content-type");
+            form.push(("Content-Type", "application/x-www-form-urlencoded"));
+            assert_eq!(post(&f, path, &form, body).status, 415, "{path}");
+            assert_eq!(get(&f, path, "").status, 405, "{path}");
+        }
+        assert!(f.inbox.drain_ingress(8).is_empty(), "nothing got through");
+        // A connect never sits in the stop/mute or voice queue.
+        let (answer, request) = ingress_round_trip(&f, "/api/ingress/connect", body, "connecting");
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        assert_eq!(
+            request,
+            PanelRequest::IngressConnect {
+                platform: IngressPlatform::Twitch,
+                target: "somechannel".to_owned()
+            }
+        );
+        assert!(f.inbox.drain_control(8).is_empty());
+        assert!(f.inbox.drain_voice(8).is_empty());
+        let (answer, request) = ingress_round_trip(
+            &f,
+            "/api/ingress/disconnect",
+            "{\"platform\":\"youtube\"}",
+            "ok",
+        );
+        assert_eq!(answer.status, 200);
+        assert_eq!(
+            request,
+            PanelRequest::IngressDisconnect(IngressPlatform::Youtube)
+        );
+        let (answer, request) = ingress_round_trip(&f, "/api/ingress/key/remove", "{}", "ok");
+        assert_eq!(answer.status, 200);
+        assert_eq!(request, PanelRequest::IngressKeyRemove);
+    }
+
+    #[test]
+    fn a_connect_target_is_normalized_and_bad_input_never_reaches_the_queue() {
+        let f = fixture();
+        let good = good(&f);
+        let headers = with(&good, "none");
+        for body in [
+            "",
+            "[]",
+            "{}",
+            "{\"platform\":\"twitch\"}",
+            "{\"platform\":\"kick\",\"target\":\"abcdef\"}",
+            "{\"platform\":\"twitch\",\"target\":\"ab\"}",
+            "{\"platform\":\"twitch\",\"target\":\"#channel\"}",
+            "{\"platform\":\"twitch\",\"target\":\"a b\"}",
+            "{\"platform\":\"twitch\",\"target\":\"abc\",\"program\":\"cmd.exe\"}",
+            "{\"platform\":\"youtube\",\"target\":\"short\"}",
+            "{\"platform\":\"youtube\",\"target\":\"https://evil.example/watch?v=dQw4w9WgXcQ\"}",
+            "{\"platform\":\"youtube\",\"target\":\"dQw4w9WgXcQ; calc\"}",
+            "{\"platform\":\"disconnect-me\"}",
+        ] {
+            let status = post(&f, "/api/ingress/connect", &headers, body).status;
+            assert_eq!(status, 400, "{body:?}");
+        }
+        assert_eq!(
+            post(
+                &f,
+                "/api/ingress/disconnect",
+                &headers,
+                "{\"platform\":\"kick\"}"
+            )
+            .status,
+            400
+        );
+        assert_eq!(
+            post(
+                &f,
+                "/api/ingress/disconnect",
+                &headers,
+                "{\"platform\":\"twitch\",\"x\":1}"
+            )
+            .status,
+            400
+        );
+        assert!(f.inbox.drain_ingress(8).is_empty());
+        // Normalized before it is queued: a link becomes the video id, a
+        // channel is lowercased.
+        let (_, request) = ingress_round_trip(
+            &f,
+            "/api/ingress/connect",
+            "{\"platform\":\"youtube\",\"target\":\" https://youtu.be/dQw4w9WgXcQ?si=x \"}",
+            "ok",
+        );
+        assert_eq!(
+            request,
+            PanelRequest::IngressConnect {
+                platform: IngressPlatform::Youtube,
+                target: "dQw4w9WgXcQ".to_owned()
+            }
+        );
+        let (_, request) = ingress_round_trip(
+            &f,
+            "/api/ingress/connect",
+            "{\"platform\":\"twitch\",\"target\":\" Some_Channel \"}",
+            "ok",
+        );
+        assert_eq!(
+            request,
+            PanelRequest::IngressConnect {
+                platform: IngressPlatform::Twitch,
+                target: "some_channel".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn the_youtube_key_is_a_redacted_body_field_never_echoed() {
+        let f = fixture();
+        let good = good(&f);
+        let headers = with(&good, "none");
+        for body in [
+            "{}".to_owned(),
+            "{\"key\":\"\"}".to_owned(),
+            "{\"key\":\"has space\"}".to_owned(),
+            format!("{{\"key\":\"{}\"}}", "k".repeat(MAX_PANEL_KEY_CHARS + 1)),
+            format!("{{\"key\":\"{SENTINEL_KEY}\",\"also\":1}}"),
+        ] {
+            let answer = post(&f, "/api/ingress/key", &headers, &body);
+            assert_eq!(answer.status, 400, "{body}");
+            assert!(!answer.body.contains(SENTINEL_KEY));
+        }
+        assert!(f.inbox.drain_ingress(8).is_empty());
+        let body = format!("{{\"key\":\"  {SENTINEL_KEY}  \"}}");
+        let (answer, request) = ingress_round_trip(&f, "/api/ingress/key", &body, "key set");
+        assert_eq!(answer.status, 200);
+        assert!(!answer.body.contains(SENTINEL_KEY));
+        let PanelRequest::IngressKeySet(key) = &request else {
+            panic!("{request:?}");
+        };
+        assert_eq!(key.expose(), SENTINEL_KEY, "trimmed");
+        assert!(!format!("{request:?}").contains(SENTINEL_KEY));
     }
 
     fn search_fixture() -> (Fixture, crate::speech_tts::aivis_cloud_fake::FakeAivisCloud) {

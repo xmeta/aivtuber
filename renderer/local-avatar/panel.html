@@ -109,6 +109,37 @@
     <p id="voice-result" role="status"></p>
   </section>
 
+  <section id="ingress-section" aria-labelledby="h-ingress" hidden>
+    <h2 id="h-ingress">配信チャット</h2>
+    <p class="hint">配信のコメントを読み取って返事をします。読み取り専用で、コメントの投稿や配信側の操作はしません。コメントは外部からの入力として扱われ、操作権限は持ちません。</p>
+    <p id="ingress-error" class="error" role="alert"></p>
+
+    <h3>Twitch</h3>
+    <p id="ingress-twitch-state" role="status"></p>
+    <div class="buttons wrap">
+      <input id="ingress-twitch-target" type="text" maxlength="64" autocomplete="off" spellcheck="false" placeholder="チャンネル名(例: somechannel)" aria-label="Twitchのチャンネル名">
+      <button id="ingress-twitch-connect" type="button">接続</button>
+      <button id="ingress-twitch-disconnect" type="button">切断</button>
+    </div>
+    <p id="ingress-twitch-result" role="status"></p>
+
+    <h3>YouTube ライブ</h3>
+    <p class="hint">YouTube Data API のキーが必要です。キーはこのPCのファイルにだけ保存され、画面にもログにも表示されません。環境変数 YOUTUBE_API_KEY があればそちらが優先されます。</p>
+    <div class="buttons wrap">
+      <input id="ingress-key" type="password" autocomplete="off" spellcheck="false" maxlength="256" placeholder="APIキーを貼り付け" aria-label="YouTube Data API の APIキー">
+      <button id="ingress-key-save" type="button">保存</button>
+      <button id="ingress-key-remove" type="button">削除</button>
+    </div>
+    <p id="ingress-key-state" role="status"></p>
+    <p id="ingress-youtube-state" role="status"></p>
+    <div class="buttons wrap">
+      <input id="ingress-youtube-target" type="text" maxlength="256" autocomplete="off" spellcheck="false" placeholder="ライブ配信のURLか動画ID" aria-label="YouTube ライブ配信のURLか動画ID">
+      <button id="ingress-youtube-connect" type="button">接続</button>
+      <button id="ingress-youtube-disconnect" type="button">切断</button>
+    </div>
+    <p id="ingress-youtube-result" role="status"></p>
+  </section>
+
   <section aria-labelledby="h-chat">
     <h2 id="h-chat">話しかける</h2>
     <div id="chat-log" class="log" aria-live="polite"></div>

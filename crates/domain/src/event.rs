@@ -85,6 +85,13 @@ pub enum Capability {
     /// data and the Aivis switch needs an explicit egress confirmation.
     #[serde(rename = "voice.configure")]
     VoiceConfigure,
+    /// Connects or disconnects a read-only stream-chat sidecar (#361): the
+    /// Twitch or YouTube chat reader the app supervises as a child process.
+    /// Held only by an authenticated local ingress and only when the launcher
+    /// composed chat ingress. It cannot raise trust: what the sidecar reads is
+    /// admitted through the raw-ingress gate as untrusted public chat.
+    #[serde(rename = "ingress.control")]
+    IngressControl,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

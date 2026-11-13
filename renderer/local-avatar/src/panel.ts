@@ -3,12 +3,16 @@
 // in the URL fragment), and renders every server string with textContent.
 import {
   type ChatEntry,
+  type ChatPlatform,
+  type ChatPlatformView,
   type PanelState,
   type TuningKey,
   type VoiceModel,
   type VoiceSearchPage,
   TUNING_RANGES,
   checkChat,
+  chatIngressView,
+  connectBody,
   checkCredit,
   checkKey,
   checkKeyword,
@@ -95,6 +99,7 @@ function render(): void {
   }
   renderModel();
   renderVoice();
+  renderIngress();
   const link = $<HTMLAnchorElement>("avatar-link");
   const url = safeAvatarUrl(state?.avatar_url);
   link.hidden = url === null;
@@ -175,6 +180,93 @@ async function selectModel(): Promise<void> {
     void poll();
   }
 }
+
+// ---- stream chat connections (#361) ----
+
+const PLATFORMS: ChatPlatform[] = ["twitch", "youtube"];
+
+function renderIngressPlatform(platform: ChatPlatform, view: ChatPlatformView): void {
+  const line = $(`ingress-${platform}-state`);
+  line.textContent = `${view.label}: ${view.stateText}${view.detail === "" ? "" : ` — ${view.detail}`}${view.error === null ? "" : `(${view.error})`}${view.blocked === null ? "" : ` / ${view.blocked}`}`;
+  line.className = view.health === "warn" || view.error !== null ? "error" : "";
+  const input = $<HTMLInputElement>(`ingress-${platform}-target`);
+  // The last choice is offered, never connected by itself; a field the
+  // streamer has typed in (or is typing in) is left alone.
+  if (input.value === "" && document.activeElement !== input && view.prefill !== "") input.value = view.prefill;
+  $<HTMLButtonElement>(`ingress-${platform}-connect`).disabled = !view.canConnect || connectionLost;
+  $<HTMLButtonElement>(`ingress-${platform}-disconnect`).disabled = !view.canDisconnect || connectionLost;
+  $<HTMLButtonElement>(`ingress-${platform}-connect`).title = view.blocked ?? "";
+}
+
+function renderIngress(): void {
+  const view = chatIngressView(state);
+  $("ingress-section").hidden = view === null;
+  if (view === null) return;
+  $("ingress-error").textContent = view.saveError === null ? "" : `選択を保存できませんでした: ${view.saveError}`;
+  renderIngressPlatform("twitch", view.twitch);
+  renderIngressPlatform("youtube", view.youtube);
+  $("ingress-key-state").textContent = `キー: ${view.keyText}`;
+  $<HTMLButtonElement>("ingress-key-save").disabled = connectionLost;
+  $<HTMLButtonElement>("ingress-key-remove").disabled = !(state?.status.chat_ingress?.youtube_key.set ?? false) || connectionLost;
+}
+
+async function ingressPost(platform: ChatPlatform | "key", path: string, body: unknown): Promise<boolean> {
+  const out = $(`ingress-${platform === "key" ? "youtube" : platform}-result`);
+  try {
+    const { status, json } = await api(path, { method: "POST", body: JSON.stringify(body) });
+    const reply = (json ?? {}) as { ok?: boolean; detail?: string };
+    const ok = status === 200 && reply.ok === true;
+    out.textContent = ok ? (reply.detail ?? "") : `できませんでした: ${reply.detail ?? status}`;
+    out.className = ok ? "" : "error";
+    return ok;
+  } catch {
+    out.textContent = "できませんでした(アプリに接続できません)";
+    out.className = "error";
+    return false;
+  } finally {
+    void poll();
+  }
+}
+
+function connectPlatform(platform: ChatPlatform): void {
+  const checked = connectBody(platform, $<HTMLInputElement>(`ingress-${platform}-target`).value);
+  if (!checked.ok) {
+    const out = $(`ingress-${platform}-result`);
+    out.textContent = checked.reason;
+    out.className = "error";
+    return;
+  }
+  void ingressPost(platform, "/api/ingress/connect", checked.body);
+}
+
+async function saveIngressKey(): Promise<void> {
+  const input = $<HTMLInputElement>("ingress-key");
+  const checked = checkKey(input.value);
+  if (!checked.ok) {
+    const out = $("ingress-youtube-result");
+    out.textContent = checked.reason;
+    out.className = "error";
+    return;
+  }
+  // The field is emptied before the request is answered and whatever the
+  // answer: the page keeps no copy of the key.
+  input.value = "";
+  await ingressPost("key", "/api/ingress/key", { key: checked.key });
+}
+
+for (const platform of PLATFORMS) {
+  $(`ingress-${platform}-connect`).addEventListener("click", () => connectPlatform(platform));
+  $(`ingress-${platform}-target`).addEventListener("keydown", (event) => {
+    if ((event as KeyboardEvent).key === "Enter") connectPlatform(platform);
+  });
+  $(`ingress-${platform}-disconnect`).addEventListener("click", () => void ingressPost(platform, "/api/ingress/disconnect", { platform }));
+}
+$("ingress-key-save").addEventListener("click", () => void saveIngressKey());
+$("ingress-key-remove").addEventListener("click", () => {
+  if (window.confirm("保存したYouTube APIキーを削除します。YouTubeに接続中の場合は切断されます。よろしいですか?")) {
+    void ingressPost("key", "/api/ingress/key/remove", {});
+  }
+});
 
 // ---- voice settings (#360) ----
 

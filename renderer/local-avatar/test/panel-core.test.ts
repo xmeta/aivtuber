@@ -1,14 +1,20 @@
 // Unit tests for the operation panel's pure logic (issue #335).
 import { describe, expect, test } from "bun:test";
 import {
+  CHAT_PLATFORMS,
   MAX_CHAT_CHARS,
   MAX_CHAT_LOG,
+  MAX_CHAT_TARGET_CHARS,
   MAX_CREDIT_CHARS,
   MAX_KEY_CHARS,
   MAX_MODEL_CHOICES,
   SEARCH_PAGE_SIZE,
   type VoiceModel,
   checkChat,
+  checkTwitchChannel,
+  checkYoutubeVideo,
+  chatIngressView,
+  connectBody,
   checkCredit,
   checkKey,
   checkKeyword,
@@ -19,6 +25,7 @@ import {
   keyCheckLabel,
   modelView,
   otherReplies,
+  parseChatIngressState,
   parseModelState,
   parseSearchPage,
   parseState,
@@ -436,5 +443,172 @@ describe("voice inputs", () => {
     });
     // There is no key field in a patch.
     expect(Object.keys(patch).some((k) => /key/i.test(k))).toBe(false);
+  });
+});
+
+// ---- Stream chat connections (#361) ----
+
+const platformState = (over: Record<string, unknown> = {}) => ({
+  state: "disconnected",
+  target: null,
+  saved_target: null,
+  sidecar_found: true,
+  messages_accepted: 0,
+  messages_dropped: 0,
+  dropped_queue_full: 0,
+  dropped_refused: 0,
+  messages_per_minute: 0,
+  restarts: 0,
+  last_error: null,
+  ...over,
+});
+
+const ingress = (over: Record<string, unknown> = {}) => ({
+  twitch: platformState(),
+  youtube: platformState(),
+  youtube_key: { set: false, source: null },
+  save_error: null,
+  ...over,
+});
+
+const withIngress = (value: unknown) =>
+  parseState({
+    schema: "local-panel/1",
+    uptime_ms: 5,
+    status: {
+      muted: false,
+      audio_error: null,
+      avatar_error: null,
+      stream_error: null,
+      content_queue: 0,
+      scheduler_items: 0,
+      generation_active: false,
+      chat_ingress: value,
+    },
+    replies: [],
+    avatar_url: null,
+  });
+
+describe("chat connection state", () => {
+  test("absent or malformed state hides the card instead of failing the page", () => {
+    expect(chatIngressView(state())).toBeNull();
+    expect(chatIngressView(null)).toBeNull();
+    for (const bad of [
+      null,
+      "x",
+      {},
+      ingress({ twitch: platformState({ state: "exploded" }) }),
+      ingress({ youtube: platformState({ messages_accepted: -1 }) }),
+      ingress({ youtube: platformState({ messages_dropped: 1.5 }) }),
+      ingress({ twitch: platformState({ target: 5 }) }),
+      ingress({ youtube_key: { set: "yes", source: null } }),
+      ingress({ youtube_key: { set: true, source: "registry" } }),
+      ingress({ save_error: 7 }),
+    ]) {
+      expect(chatIngressView(withIngress(bad))).toBeNull();
+    }
+    expect(parseChatIngressState(ingress())).not.toBeNull();
+  });
+
+  test("a connected channel shows its counters and the last choice is only offered", () => {
+    const s = withIngress(
+      ingress({
+        twitch: platformState({ state: "connected", target: "somechannel", saved_target: "somechannel", messages_accepted: 12, messages_dropped: 3, messages_per_minute: 40 }),
+        youtube: platformState({ saved_target: "dQw4w9WgXcQ" }),
+      }),
+    );
+    const view = chatIngressView(s)!;
+    expect(view.twitch.stateText).toBe("接続済み");
+    expect(view.twitch.detail).toBe("#somechannel — 受理 12 件 / 破棄 3 件 / 直近1分 40 件");
+    expect(view.twitch.canDisconnect).toBe(true);
+    expect(view.twitch.health).toBe("ok");
+    // Not connected, but the saved video is offered to prefill (never auto-connected).
+    expect(view.youtube.stateText).toBe("未接続");
+    expect(view.youtube.prefill).toBe("dQw4w9WgXcQ");
+    expect(view.youtube.canDisconnect).toBe(false);
+  });
+
+  test("YouTube needs a key and a missing sidecar blocks connecting", () => {
+    const noKey = chatIngressView(withIngress(ingress()))!;
+    expect(noKey.twitch.canConnect).toBe(true);
+    expect(noKey.youtube.canConnect).toBe(false);
+    expect(noKey.youtube.blocked).toContain("APIキー");
+    expect(noKey.keyText).toBe("未設定");
+    const keyed = chatIngressView(withIngress(ingress({ youtube_key: { set: true, source: "file" } })))!;
+    expect(keyed.youtube.canConnect).toBe(true);
+    expect(keyed.keyText).toContain("ファイル");
+    const env = chatIngressView(withIngress(ingress({ youtube_key: { set: true, source: "environment" } })))!;
+    expect(env.keyText).toContain("YOUTUBE_API_KEY");
+    const missing = chatIngressView(withIngress(ingress({ twitch: platformState({ sidecar_found: false }) })))!;
+    expect(missing.twitch.canConnect).toBe(false);
+    expect(missing.twitch.blocked).toContain("twitch-chat-ingress");
+  });
+
+  test("backoff and failure are warnings that can be disconnected", () => {
+    const view = chatIngressView(
+      withIngress(
+        ingress({
+          twitch: platformState({ state: "backoff", target: "abc", restarts: 2, last_error: "the sidecar stopped (exit code 1)" }),
+          youtube: platformState({ state: "failed", target: "dQw4w9WgXcQ", last_error: "the key was rejected" }),
+        }),
+      ),
+    )!;
+    expect(view.twitch.health).toBe("warn");
+    expect(view.twitch.stateText).toContain("再起動 2 回");
+    expect(view.twitch.canDisconnect).toBe(true);
+    expect(view.youtube.health).toBe("warn");
+    expect(view.youtube.error).toBe("the key was rejected");
+    expect(view.youtube.canDisconnect).toBe(true);
+  });
+});
+
+describe("chat connection inputs", () => {
+  test("a Twitch channel is lowercased and strict, like the app", () => {
+    expect(checkTwitchChannel("  Some_Channel1 ")).toEqual({ ok: true, target: "some_channel1" });
+    for (const bad of ["", "ab", "#abc", "a b", "ab-c", "https://twitch.tv/abc", "a".repeat(26), "日本語です"]) {
+      expect(checkTwitchChannel(bad).ok).toBe(false);
+    }
+  });
+
+  test("a YouTube video id or one of the three link shapes is accepted", () => {
+    for (const ok of [
+      "dQw4w9WgXcQ",
+      " dQw4w9WgXcQ ",
+      "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+      "https://youtube.com/watch?v=dQw4w9WgXcQ&t=10s",
+      "http://m.youtube.com/watch?feature=share&v=dQw4w9WgXcQ",
+      "https://www.youtube.com/live/dQw4w9WgXcQ",
+      "https://www.youtube.com/live/dQw4w9WgXcQ?feature=share",
+      "https://youtu.be/dQw4w9WgXcQ",
+    ]) {
+      expect(checkYoutubeVideo(ok)).toEqual({ ok: true, target: "dQw4w9WgXcQ" });
+    }
+    for (const bad of [
+      "",
+      "short",
+      "dQw4w9WgXcQ1",
+      "https://example.com/watch?v=dQw4w9WgXcQ",
+      "https://youtube.com.evil.example/watch?v=dQw4w9WgXcQ",
+      "https://user:pw@www.youtube.com/watch?v=dQw4w9WgXcQ",
+      "https://www.youtube.com:8443/watch?v=dQw4w9WgXcQ",
+      "javascript:alert(1)",
+      "https://www.youtube.com/channel/UC1234567890123456789012",
+      "https://www.youtube.com/watch",
+      "https://www.youtube.com/watch/extra?v=dQw4w9WgXcQ",
+      "https://youtu.be/",
+      "x".repeat(MAX_CHAT_TARGET_CHARS + 1),
+    ]) {
+      expect(checkYoutubeVideo(bad).ok).toBe(false);
+    }
+  });
+
+  test("the connect body carries a platform and the normalized target only", () => {
+    expect(connectBody("twitch", " Abc ")).toEqual({ ok: true, body: { platform: "twitch", target: "abc" } });
+    expect(connectBody("youtube", "https://youtu.be/dQw4w9WgXcQ")).toEqual({
+      ok: true,
+      body: { platform: "youtube", target: "dQw4w9WgXcQ" },
+    });
+    expect(connectBody("youtube", "nope").ok).toBe(false);
+    expect(CHAT_PLATFORMS).toEqual(["twitch", "youtube"]);
   });
 });

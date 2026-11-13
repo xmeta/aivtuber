@@ -135,7 +135,8 @@
               "tool.grant",
               "perception.control",
               "model.select",
-              "voice.configure"
+              "voice.configure",
+              "ingress.control"
             ]
           }
         }

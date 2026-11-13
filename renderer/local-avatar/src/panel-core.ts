@@ -17,6 +17,8 @@ export interface PanelState {
     thinking_model?: ThinkingModelState | null;
     /** The voice settings (#360); absent unless the app composed them. */
     voice?: VoiceState | null;
+    /** The stream-chat connections (#361); absent unless the app composed them. */
+    chat_ingress?: ChatIngressState | null;
   };
   replies: { seq: number; event_id: string; text: string }[];
   avatar_url: string | null;
@@ -136,7 +138,8 @@ export function parseState(value: unknown): PanelState | null {
   // An absent or malformed selector is dropped, not fatal: the rest still works.
   const thinkingModel = parseModelState(v.status.thinking_model);
   const voice = parseVoiceState(v.status.voice);
-  return { ...(v as PanelState), status: { ...v.status, thinking_model: thinkingModel, voice } };
+  const chatIngress = parseChatIngressState(v.status.chat_ingress);
+  return { ...(v as PanelState), status: { ...v.status, thinking_model: thinkingModel, voice, chat_ingress: chatIngress } };
 }
 
 /** Only an http(s) link to the loopback avatar page is offered as a link. */
@@ -532,5 +535,217 @@ export function voiceView(state: PanelState | null): VoiceView | null {
         : v.last_error !== null
           ? `最後の合成に失敗しました: ${v.last_error}(返答は定型の返しになります)`
           : `設定を保存できませんでした: ${v.save_error}`,
+  };
+}
+
+// ---- Stream chat connections (#361) ----
+
+export type ChatPlatform = "twitch" | "youtube";
+export const CHAT_PLATFORMS: readonly ChatPlatform[] = ["twitch", "youtube"];
+export type ChatConnectionState = "disconnected" | "connecting" | "connected" | "backoff" | "failed";
+const CHAT_STATES: readonly string[] = ["disconnected", "connecting", "connected", "backoff", "failed"];
+/** Longest text the page sends as a target (the app refuses more). */
+export const MAX_CHAT_TARGET_CHARS = 256;
+
+export interface ChatPlatformState {
+  state: ChatConnectionState;
+  target: string | null;
+  saved_target: string | null;
+  sidecar_found: boolean;
+  messages_accepted: number;
+  messages_dropped: number;
+  dropped_queue_full: number;
+  dropped_refused: number;
+  messages_per_minute: number;
+  restarts: number;
+  last_error: string | null;
+}
+
+export interface ChatIngressState {
+  twitch: ChatPlatformState;
+  youtube: ChatPlatformState;
+  youtube_key: { set: boolean; source: "environment" | "file" | null };
+  save_error: string | null;
+}
+
+const count = (value: unknown): value is number =>
+  typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER;
+
+const boundedText = (value: unknown, max: number): string | null | undefined => {
+  if (value === null) return null;
+  return typeof value === "string" && [...value].length <= max ? value : undefined;
+};
+
+function parseChatPlatform(value: unknown): ChatPlatformState | null {
+  if (typeof value !== "object" || value === null) return null;
+  const v = value as Record<string, unknown>;
+  if (typeof v.state !== "string" || !CHAT_STATES.includes(v.state)) return null;
+  const target = boundedText(v.target, MAX_CHAT_TARGET_CHARS);
+  const savedTarget = boundedText(v.saved_target, MAX_CHAT_TARGET_CHARS);
+  const lastError = boundedText(v.last_error, 400);
+  if (target === undefined || savedTarget === undefined || lastError === undefined) return null;
+  if (typeof v.sidecar_found !== "boolean") return null;
+  for (const key of [
+    "messages_accepted",
+    "messages_dropped",
+    "dropped_queue_full",
+    "dropped_refused",
+    "messages_per_minute",
+    "restarts",
+  ]) {
+    if (!count(v[key])) return null;
+  }
+  return {
+    state: v.state as ChatConnectionState,
+    target,
+    saved_target: savedTarget,
+    sidecar_found: v.sidecar_found,
+    messages_accepted: v.messages_accepted as number,
+    messages_dropped: v.messages_dropped as number,
+    dropped_queue_full: v.dropped_queue_full as number,
+    dropped_refused: v.dropped_refused as number,
+    messages_per_minute: v.messages_per_minute as number,
+    restarts: v.restarts as number,
+    last_error: lastError,
+  };
+}
+
+/**
+ * The chat connection state, only if it has exactly the documented shape;
+ * anything else hides the card rather than offering what the app would refuse.
+ */
+export function parseChatIngressState(value: unknown): ChatIngressState | null {
+  if (typeof value !== "object" || value === null) return null;
+  const v = value as Record<string, unknown>;
+  const twitch = parseChatPlatform(v.twitch);
+  const youtube = parseChatPlatform(v.youtube);
+  if (twitch === null || youtube === null) return null;
+  const key = v.youtube_key as Record<string, unknown> | null;
+  if (typeof key !== "object" || key === null || typeof key.set !== "boolean") return null;
+  if (key.source !== null && key.source !== "environment" && key.source !== "file") return null;
+  const saveError = boundedText(v.save_error, 400);
+  if (saveError === undefined) return null;
+  return { twitch, youtube, youtube_key: { set: key.set, source: key.source }, save_error: saveError };
+}
+
+/** Mirrors `parse_twitch_login` (crates/adapters/src/chat_target.rs). */
+export function checkTwitchChannel(raw: string): { ok: true; target: string } | { ok: false; reason: string } {
+  const target = raw.trim().toLowerCase();
+  if (!/^[a-z0-9_]{3,25}$/.test(target)) {
+    return { ok: false, reason: "Twitchのチャンネル名は、英小文字・数字・アンダースコアの3〜25文字です(# や URL は不要です)" };
+  }
+  return { ok: true, target };
+}
+
+const VIDEO_ID = /^[A-Za-z0-9_-]{11}$/;
+
+/** Mirrors `parse_youtube_video`: an 11-character id or a watch/live/youtu.be link. */
+export function checkYoutubeVideo(raw: string): { ok: true; target: string } | { ok: false; reason: string } {
+  const refused = { ok: false as const, reason: "動画IDか、youtube.com の視聴・ライブ配信URL、youtu.be の短縮URLを入力してください" };
+  const text = raw.trim();
+  if ([...text].length > MAX_CHAT_TARGET_CHARS) return { ok: false, reason: "長すぎます" };
+  if (VIDEO_ID.test(text)) return { ok: true, target: text };
+  let url: URL;
+  try {
+    url = new URL(text);
+  } catch {
+    return refused;
+  }
+  if ((url.protocol !== "https:" && url.protocol !== "http:") || url.username !== "" || url.password !== "" || url.port !== "") {
+    return refused;
+  }
+  const segments = url.pathname.split("/").slice(1);
+  let id: string | null = null;
+  if (["youtube.com", "www.youtube.com", "m.youtube.com"].includes(url.hostname)) {
+    if (segments[0] === "watch" && (segments.length === 1 || (segments.length === 2 && segments[1] === ""))) {
+      id = url.searchParams.get("v");
+    } else if (segments[0] === "live" && segments.length >= 2) {
+      id = segments[1] ?? null;
+    }
+  } else if (url.hostname === "youtu.be") {
+    id = segments[0] ?? null;
+  }
+  return id !== null && VIDEO_ID.test(id) ? { ok: true, target: id } : refused;
+}
+
+/** The body of `POST /api/ingress/connect`, or why the input cannot be sent. */
+export function connectBody(
+  platform: ChatPlatform,
+  raw: string,
+): { ok: true; body: { platform: ChatPlatform; target: string } } | { ok: false; reason: string } {
+  const checked = platform === "twitch" ? checkTwitchChannel(raw) : checkYoutubeVideo(raw);
+  return checked.ok ? { ok: true, body: { platform, target: checked.target } } : checked;
+}
+
+export interface ChatPlatformView {
+  label: string;
+  stateText: string;
+  health: Health;
+  /** Target and counters on one line, or empty when there is nothing to show. */
+  detail: string;
+  error: string | null;
+  /** Value to put in an empty input (the last choice; never connected by itself). */
+  prefill: string;
+  canConnect: boolean;
+  canDisconnect: boolean;
+  /** Reason the connect button is off, when it is not the connection state. */
+  blocked: string | null;
+}
+
+export interface ChatIngressView {
+  twitch: ChatPlatformView;
+  youtube: ChatPlatformView;
+  keyText: string;
+  keyHealth: Health;
+  saveError: string | null;
+}
+
+const STATE_TEXT: Record<ChatConnectionState, string> = {
+  disconnected: "未接続",
+  connecting: "接続中…",
+  connected: "接続済み",
+  backoff: "再接続待ち",
+  failed: "失敗",
+};
+
+function platformView(platform: ChatPlatform, s: ChatPlatformState, keySet: boolean): ChatPlatformView {
+  const label = platform === "twitch" ? "Twitch" : "YouTube";
+  const active = s.state === "connecting" || s.state === "connected" || s.state === "backoff";
+  const shown = s.target === null ? "" : platform === "twitch" ? `#${s.target}` : s.target;
+  const counters =
+    s.state === "disconnected" && s.messages_accepted === 0 && s.messages_dropped === 0
+      ? ""
+      : `受理 ${s.messages_accepted} 件 / 破棄 ${s.messages_dropped} 件 / 直近1分 ${s.messages_per_minute} 件`;
+  const detail = [shown, counters].filter((t) => t !== "").join(" — ");
+  let blocked: string | null = null;
+  if (!s.sidecar_found) {
+    blocked = `${platform === "twitch" ? "twitch" : "youtube"}-chat-ingress がアプリと同じフォルダにありません`;
+  } else if (platform === "youtube" && !keySet) {
+    blocked = "先にYouTube Data APIキーを保存してください";
+  }
+  return {
+    label,
+    stateText: STATE_TEXT[s.state] + (s.restarts > 0 ? `(再起動 ${s.restarts} 回)` : ""),
+    health: s.state === "failed" || s.state === "backoff" ? "warn" : "ok",
+    detail,
+    error: s.last_error,
+    prefill: s.saved_target ?? "",
+    canConnect: blocked === null,
+    canDisconnect: active || s.state === "failed",
+    blocked,
+  };
+}
+
+/** What the chat connection card shows, or `null` when the app has none. */
+export function chatIngressView(state: PanelState | null): ChatIngressView | null {
+  const c = state?.status.chat_ingress ?? null;
+  if (c === null) return null;
+  const key = c.youtube_key;
+  return {
+    twitch: platformView("twitch", c.twitch, key.set),
+    youtube: platformView("youtube", c.youtube, key.set),
+    keyText: key.set ? `設定済み(${key.source === "environment" ? "環境変数 YOUTUBE_API_KEY" : "ファイル"})` : "未設定",
+    keyHealth: "ok",
+    saveError: c.save_error,
   };
 }
