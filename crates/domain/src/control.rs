@@ -233,6 +233,7 @@ fn capability_for_action(action: &str) -> Option<Capability> {
         "tool.grant" => Some(Capability::ToolGrant),
         "perception.control" => Some(Capability::PerceptionControl),
         "model.select" => Some(Capability::ModelSelect),
+        "voice.configure" => Some(Capability::VoiceConfigure),
         _ => None,
     }
 }

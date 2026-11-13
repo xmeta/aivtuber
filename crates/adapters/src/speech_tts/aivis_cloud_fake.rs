@@ -2,7 +2,8 @@
 //!
 //! It answers `POST /v1/tts/synthesize` with a quiet-tone WAV (40 ms per
 //! character of the request's `text`, 44.1 kHz mono) or a scripted status/body,
-//! and records every request (headers and body) so a test can assert what the
+//! `GET /v1/users/me` (the key check) and `GET /v1/aivm-models/search` (a
+//! scripted JSON body), and records every request (headers and body) so a test can assert what the
 //! service was actually sent. A test double like [`super::voicevox_fake`]: it
 //! speaks nothing and must never be used as a voice. Binds `127.0.0.1` only.
 
@@ -23,6 +24,15 @@ pub struct FakeAivisBehaviour {
     pub body: Option<Vec<u8>>,
     /// Slept before answering every request.
     pub delay: Duration,
+    /// When set, a request whose `Authorization: Bearer` differs answers 401
+    /// (synthesis and the key check).
+    pub accept_key: Option<String>,
+    /// Status of `GET /v1/users/me` for an accepted key; `0` means 200.
+    pub me_status: u16,
+    /// Status of `GET /v1/aivm-models/search`; `0` means 200.
+    pub search_status: u16,
+    /// Body of the search answer; default is an empty page.
+    pub search_body: Option<Vec<u8>>,
 }
 
 pub struct FakeAivisCloud {
@@ -116,8 +126,50 @@ fn handle(
     if !behaviour.delay.is_zero() {
         thread::sleep(behaviour.delay);
     }
-    if request.method != "POST" || request.route() != "/v1/tts/synthesize" {
-        reply(&mut stream, 404, "application/json", b"{}");
+    let key_accepted = behaviour.accept_key.as_ref().is_none_or(|expected| {
+        request.header("authorization").as_deref() == Some(format!("Bearer {expected}").as_str())
+    });
+    match (request.method.as_str(), request.route()) {
+        ("GET", "/v1/users/me") => {
+            let status = match (key_accepted, behaviour.me_status) {
+                (false, _) => 401,
+                (true, 0) => 200,
+                (true, status) => status,
+            };
+            reply(
+                &mut stream,
+                status,
+                "application/json",
+                b"{\"handle\":\"fake\"}",
+            );
+            return;
+        }
+        ("GET", "/v1/aivm-models/search") => {
+            let status = if behaviour.search_status == 0 {
+                200
+            } else {
+                behaviour.search_status
+            };
+            let body = behaviour
+                .search_body
+                .clone()
+                .unwrap_or_else(|| b"{\"total\":0,\"aivm_models\":[]}".to_vec());
+            reply(&mut stream, status, "application/json", &body);
+            return;
+        }
+        ("POST", "/v1/tts/synthesize") => {}
+        _ => {
+            reply(&mut stream, 404, "application/json", b"{}");
+            return;
+        }
+    }
+    if !key_accepted {
+        reply(
+            &mut stream,
+            401,
+            "application/json",
+            b"{\"detail\":\"bad key\"}",
+        );
         return;
     }
     let status = if behaviour.status == 0 {

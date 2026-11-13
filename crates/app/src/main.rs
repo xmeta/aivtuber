@@ -15,6 +15,7 @@ use aivtuber_adapters::{
     endpoint_origin, verify_loopback_endpoint,
 };
 use aivtuber_app::{
+    AIVIS_ENDPOINT_VAR, AIVIS_KEY_FILE_VAR, AIVIS_KEY_VAR, AIVIS_TIMEOUT_VAR, AIVIS_VISEMES_VAR,
     AdaptationRuntime, AdapterHealth, AivisBridge, AivisSettings, AvatarOutput, BargeInConfig,
     BargeInMetrics, ChatBurstConfig, CompositionProfile, DEFAULT_WARMUP_TIMEOUT_MS,
     GenerationFallbackCounts, GenerativeBudgetPolicy, GenerativeRuntime, IntentRoutePlanner,
@@ -22,14 +23,16 @@ use aivtuber_app::{
     MemoryWriterConfig, MemoryWriterMetrics, ModelSwitcher, NoopAvatarOutput, NoopStreamOutput,
     ObsProgramSceneSource, ObsStreamOutput, OperatorControlServer, OperatorEndpointOptions,
     OperatorRateLimiter, PanelService, PerceptionService, PerceptionServiceConfig, PhraseMetrics,
-    PhraseMode, ProducerWorker, ProductionApp, ProfileSummary, RawIngressConfig, RawIngressMetrics,
-    RawIngressMetricsSnapshot, RoutePlanner, RuntimeRetentionPolicy,
-    SHADOW_ORCHESTRATOR_SCHEMA_VERSION, SceneContextService, ShadowOrchestratorConfig,
-    ShadowPolicyIdentity, ShadowingRoutePlanner, SpeechConversationConfig,
-    SpeechConversationMetrics, SpeechFloorMetrics, SpeechSidecar, SpeechSidecarConfig,
-    SpeechSidecarStats, StreamOutput, TtsSidecarSettings, VoicevoxBridge, VoicevoxSettings,
+    PhraseMode, PreviewSlot, PreviewThinking, ProducerWorker, ProductionApp, ProfileSummary,
+    RawIngressConfig, RawIngressMetrics, RawIngressMetricsSnapshot, RoutePlanner,
+    RuntimeRetentionPolicy, SHADOW_ORCHESTRATOR_SCHEMA_VERSION, SceneContextService,
+    ShadowOrchestratorConfig, ShadowPolicyIdentity, ShadowingRoutePlanner,
+    SpeechConversationConfig, SpeechConversationMetrics, SpeechFloorMetrics, SpeechSidecar,
+    SpeechSidecarConfig, SpeechSidecarStats, StreamOutput, TtsSidecarSettings, VOICE_SETTINGS_VAR,
+    VoiceController, VoiceEnvironment, VoicePaths, VoicevoxBridge, VoicevoxSettings,
     VtsAvatarOutput, VtsPlaybackConfig, WarmupMode, apply_dispatched_request, audit_pack_readiness,
-    panel_settings, pump_bounded_records, start_thinking_warmup, stt_sidecar_args, warmup_timeout,
+    is_valid_key, panel_settings, pump_bounded_records, read_voice_settings, start_thinking_warmup,
+    stt_sidecar_args, warmup_timeout,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
@@ -105,13 +108,21 @@ fn run() -> Result<(), Box<dyn Error>> {
     let aivis_bridge = start_aivis_bridge(profile, &audio_root, &pack_root)?;
     // #220 S2b: optional supervised local TTS sidecar (local profile only).
     let mut tts_sidecar = start_tts_sidecar(profile, &audio_root, &pack_root)?;
-    let (generative_configured, model_switcher) = build_generative_runtime(
+    let GenerativeParts {
+        runtime: generative_configured,
+        model_switcher,
+        voice: voice_controller,
+    } = build_generative_runtime(
         &compatibility,
         retention,
         profile,
         tts_sidecar.as_ref().map(|handle| handle.alive.clone()),
-        voicevox_bridge.as_ref(),
-        aivis_bridge.as_ref(),
+        TtsBackends {
+            voicevox: voicevox_bridge.as_ref(),
+            aivis: aivis_bridge.as_ref(),
+            audio_root: &audio_root,
+            pack_root: &pack_root,
+        },
     )?;
     let jev_api_key_present =
         env_optional("AIVTUBER_JEV_API_KEY").is_some_and(|key| !key.trim().is_empty());
@@ -126,6 +137,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
     // #357: the model selector only exists next to a composed generative path.
     let model_switcher = model_switcher.filter(|_| generative.is_some());
+    // #360: the voice settings only exist next to a composed generative path.
+    let voice_controller = voice_controller.filter(|_| generative.is_some());
     let adaptation = build_adaptation_runtime(retention)?;
     let scheduler_config = retention.scheduler_config(SchedulerConfig::default());
     let security_config = retention.security_config(SecurityRuntimeConfig::default());
@@ -255,6 +268,13 @@ fn run() -> Result<(), Box<dyn Error>> {
             switcher.catalog().render_choices()
         );
         app = app.with_model_switcher(switcher);
+    }
+    if let Some(controller) = voice_controller {
+        eprintln!(
+            "voice settings: composed (backend={}; the operation panel and aivtuberctl can change it)",
+            controller.status().backend
+        );
+        app = app.with_voice_controller(controller);
     }
     // #306: the production memory writer is opt-in. Default off writes nothing.
     if env_bool("AIVTUBER_MEMORY_WRITER", false)? {
@@ -397,6 +417,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             memory_export: app.memory_writer_metrics().is_some(),
             // #357: `model.select` only when a model allowlist is composed.
             model_select: app.thinking_model_status().is_some(),
+            // #360: `voice.configure` only when the voice settings are composed.
+            voice_configure: app.voice_configured(),
         },
     )?;
     let operator_ingress = operator_server.ingress();
@@ -408,6 +430,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         &operator_ingress,
         &operator_secret,
         avatar_launch_url,
+        app.voice_search_endpoint(),
     )?;
     let operator_rate = Arc::new(Mutex::new(OperatorRateLimiter::new(16, 8)));
     {
@@ -782,6 +805,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     service.shutdown();
                 }
                 app.shutdown(now_ms);
+                app.shutdown_voice();
                 if let Some(sidecar) = speech_sidecar.as_mut() {
                     sidecar.shutdown();
                 }
@@ -810,6 +834,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         if let Some(panel) = panel.as_mut() {
             panel.service(&mut app, now_ms, &mut sequence_seed);
         }
+        // #360: collect a finished key check and submit a waiting voice
+        // preview line. Never blocks: the check runs on its own thread.
+        app.service_voice(now_ms, &mut sequence_seed);
         // #90 S1b: after the operator drain, so a disable is already in effect
         // before the next capture is considered. Never blocks: the slow OBS and
         // model work is on the perception worker thread.
@@ -1512,16 +1539,42 @@ fn start_aivis_bridge(
     Ok(Some(bridge))
 }
 
+/// What the composition root built for the generative path.
+struct GenerativeParts {
+    runtime: Option<GenerativeRuntime>,
+    model_switcher: Option<ModelSwitcher>,
+    /// #360: live voice settings.
+    voice: Option<VoiceController>,
+}
+
+/// The environment-selected TTS bridges and the directories the voice
+/// settings (#360) start their own bridge under.
+struct TtsBackends<'a> {
+    voicevox: Option<&'a VoicevoxBridge>,
+    aivis: Option<&'a AivisBridge>,
+    audio_root: &'a std::path::Path,
+    pack_root: &'a std::path::Path,
+}
+
 fn build_generative_runtime(
     compatibility: &RuntimeCompatibility,
     retention: RuntimeRetentionPolicy,
     profile: CompositionProfile,
     supervised_tts: Option<Arc<AtomicBool>>,
-    voicevox: Option<&VoicevoxBridge>,
-    aivis: Option<&AivisBridge>,
-) -> Result<(Option<GenerativeRuntime>, Option<ModelSwitcher>), Box<dyn Error>> {
+    backends: TtsBackends<'_>,
+) -> Result<GenerativeParts, Box<dyn Error>> {
+    let TtsBackends {
+        voicevox,
+        aivis,
+        audio_root,
+        pack_root,
+    } = backends;
     if !env_bool("AIVTUBER_GENERATIVE_ENABLED", false)? {
-        return Ok((None, None));
+        return Ok(GenerativeParts {
+            runtime: None,
+            model_switcher: None,
+            voice: None,
+        });
     }
 
     let mut thinking_config = OpenAiResponsesConfig::default();
@@ -1677,8 +1730,23 @@ fn build_generative_runtime(
         expression_intensity: 0.4,
     })?;
 
+    // #360: the voice settings share the adapter's target slot (clones follow a
+    // switch) and open the sidecar liveness gate while Aivis is speaking.
+    let voice_bypass = Arc::new(AtomicBool::new(false));
+    let preview_slot = PreviewSlot::default();
+    let voice_controller = build_voice_controller(
+        profile,
+        voicevox.is_some() || aivis.is_some(),
+        &tts,
+        &voice_bypass,
+        &preview_slot,
+        audio_root,
+        pack_root,
+    )?;
     let tts: Arc<dyn aivtuber_domain::TtsEngine> = match supervised_tts {
-        Some(alive) => Arc::new(LivenessGatedTts::new(Arc::new(tts), alive)),
+        Some(alive) => {
+            Arc::new(LivenessGatedTts::new(Arc::new(tts), alive).with_bypass(voice_bypass))
+        }
         None => Arc::new(tts),
     };
     let speech_lexicon = build_speech_lexicon()?;
@@ -1691,7 +1759,14 @@ fn build_generative_runtime(
     // #357: a clone shares the adapter's model slot, so a switch made through
     // the selector is seen by the pipeline's copy.
     let model_switcher = build_model_switcher(&warmup_adapter, warmup_timeout)?;
-    let pipeline = GenerativePipeline::new(Arc::new(thinking), tts, compiler)
+    // The preview override (#360) answers one armed panel line with the fixed
+    // sentence; with no voice settings composed the model is used as is.
+    let thinking: Arc<dyn aivtuber_domain::ThinkingEngine> = if voice_controller.is_some() {
+        Arc::new(PreviewThinking::new(Arc::new(thinking), preview_slot))
+    } else {
+        Arc::new(thinking)
+    };
+    let pipeline = GenerativePipeline::new(thinking, tts, compiler)
         .with_speech_lexicon(Arc::new(speech_lexicon));
     eprintln!(
         "generated replies: {}",
@@ -1709,7 +1784,87 @@ fn build_generative_runtime(
     // running. Background only; readiness and ingress never wait for it.
     let backend = aivtuber_domain::ThinkingEngine::identity(&warmup_adapter).name;
     let _ = start_thinking_warmup(warmup_mode, &warmup_adapter, &backend, warmup_timeout);
-    Ok((Some(runtime), model_switcher))
+    Ok(GenerativeParts {
+        runtime: Some(runtime),
+        model_switcher,
+        voice: voice_controller,
+    })
+}
+
+/// #360: the live voice settings. `AIVTUBER_VOICE_SETTINGS` names the file
+/// that remembers the choice (set by `aivtuber-setup start`, beside the env
+/// file); `AIVTUBER_AIVIS_KEY_FILE` the key's own file (default: next to it).
+/// `AIVIS_API` still wins over the stored key, and `AIVTUBER_AIVIS_ENDPOINT` /
+/// `AIVTUBER_AIVIS_TIMEOUT_MS` / `AIVTUBER_AIVIS_AMPLITUDE_VISEMES` mean what
+/// they mean for the environment-selected backend. When the environment already
+/// selects a TTS backend (`AIVTUBER_TTS_BACKEND`) the settings stay off: one
+/// source of truth for the voice.
+fn build_voice_controller(
+    profile: CompositionProfile,
+    env_selects_backend: bool,
+    tts: &NormalizedHttpTtsAdapter,
+    bypass: &Arc<AtomicBool>,
+    preview: &PreviewSlot,
+    audio_root: &std::path::Path,
+    pack_root: &std::path::Path,
+) -> Result<Option<VoiceController>, Box<dyn Error>> {
+    let Some(settings_path) = env_path(VOICE_SETTINGS_VAR) else {
+        return Ok(None);
+    };
+    if profile != CompositionProfile::Local {
+        return Err(
+            format!("{VOICE_SETTINGS_VAR} is supported with AIVTUBER_MODE=local only").into(),
+        );
+    }
+    if env_selects_backend {
+        eprintln!(
+            "voice settings: off ({VOICE_SETTINGS_VAR} is set but AIVTUBER_TTS_BACKEND selects the voice)"
+        );
+        return Ok(None);
+    }
+    let key_file = env_path(AIVIS_KEY_FILE_VAR)
+        .unwrap_or_else(|| settings_path.with_file_name("local-aivis-key.txt"));
+    let env_key = match env_optional(AIVIS_KEY_VAR) {
+        Some(key) if is_valid_key(key.trim()) => Some(SecretString::new(key.trim())),
+        Some(_) => {
+            return Err(format!(
+                "{AIVIS_KEY_VAR} is not a usable key (control characters, whitespace or too long); check how it was set"
+            )
+            .into());
+        }
+        None => None,
+    };
+    let endpoint = env_optional(AIVIS_ENDPOINT_VAR)
+        .map_or_else(VoiceEnvironment::default_endpoint, |v| v.trim().to_owned());
+    aivtuber_adapters::speech_tts::aivis_cloud::validate_origin(&endpoint)
+        .map_err(|error| format!("{AIVIS_ENDPOINT_VAR}: {error}"))?;
+    let synth_timeout_ms = env_u64(AIVIS_TIMEOUT_VAR, 12_000)?;
+    if !(1..=120_000).contains(&synth_timeout_ms) {
+        return Err(format!("{AIVIS_TIMEOUT_VAR} must be an integer from 1 to 120000").into());
+    }
+    let amplitude_visemes = env_bool(
+        AIVIS_VISEMES_VAR,
+        env_bool("AIVTUBER_TTS_SIDECAR_AMPLITUDE_VISEMES", false)?,
+    )?;
+    let initial = read_voice_settings(&settings_path).unwrap_or_default();
+    Ok(Some(VoiceController::new(
+        VoiceEnvironment {
+            paths: VoicePaths {
+                settings: settings_path,
+                key_file,
+            },
+            env_key,
+            endpoint,
+            synth_timeout: Duration::from_millis(synth_timeout_ms),
+            amplitude_visemes,
+            audio_root: audio_root.to_path_buf(),
+            pack_root: pack_root.to_path_buf(),
+        },
+        tts.clone(),
+        Arc::clone(bypass),
+        preview.clone(),
+        initial,
+    )))
 }
 
 /// #357: the Thinking model allowlist (`AIVTUBER_OPENAI_MODEL_CHOICES`, set by
@@ -2139,6 +2294,7 @@ fn start_panel(
     ingress: &Arc<LocalControlIngress>,
     control_secret: &[u8; 32],
     avatar_launch_url: Option<String>,
+    voice_search_endpoint: Option<String>,
 ) -> Result<Option<PanelService>, Box<dyn Error>> {
     let Some(settings) = panel_settings(profile == CompositionProfile::Local, &|name| {
         env_optional(name)
@@ -2151,6 +2307,7 @@ fn start_panel(
         Arc::clone(ingress),
         control_secret,
         avatar_launch_url,
+        voice_search_endpoint,
     ) {
         Ok(service) => {
             // Deliberate operator console output, like the avatar URL: it

@@ -4,15 +4,30 @@
 import {
   type ChatEntry,
   type PanelState,
+  type TuningKey,
+  type VoiceModel,
+  type VoiceSearchPage,
+  TUNING_RANGES,
   checkChat,
+  checkCredit,
+  checkKey,
+  checkKeyword,
+  clampTuning,
+  creditFor,
+  defaultSelection,
+  enablePatch,
   modelView,
   otherReplies,
+  parseSearchPage,
   parseState,
   pushChat,
   repliesFor,
   safeAvatarUrl,
+  searchPageCount,
   statusRows,
   tokenFromHash,
+  tuningPatch,
+  voiceView,
 } from "./panel-core";
 
 const POLL_MS = 1000;
@@ -79,6 +94,7 @@ function render(): void {
     }
   }
   renderModel();
+  renderVoice();
   const link = $<HTMLAnchorElement>("avatar-link");
   const url = safeAvatarUrl(state?.avatar_url);
   link.hidden = url === null;
@@ -158,6 +174,236 @@ async function selectModel(): Promise<void> {
   } finally {
     void poll();
   }
+}
+
+// ---- voice settings (#360) ----
+
+const TUNING_KEYS: TuningKey[] = ["speaking_rate", "pitch", "volume", "emotional_intensity"];
+let results: VoiceSearchPage | null = null;
+let selected: VoiceModel | null = null;
+let lastSearch = { keyword: "", sort: "download", page: 1 };
+let searching = false;
+
+/** The voice section. The sliders and selects are not touched while the
+ * streamer is using them, so a poll never fights a drag or an open dropdown. */
+function renderVoice(): void {
+  const view = voiceView(state);
+  $("voice-section").hidden = view === null;
+  const voice = state?.status.voice ?? null;
+  if (view === null || voice === null) return;
+  const summary = $("voice-summary");
+  summary.textContent = view.summary;
+  summary.className = view.health === "warn" ? "error" : "";
+  $("voice-error").textContent = view.error ?? "";
+  const keyState = $("voice-key-state");
+  keyState.textContent = `キー: ${view.keyText}`;
+  keyState.className = view.keyHealth === "warn" ? "error" : "";
+  $<HTMLButtonElement>("voice-key-check").disabled = !voice.key.set || connectionLost;
+  $<HTMLButtonElement>("voice-key-remove").disabled = !voice.key.set || connectionLost;
+  $<HTMLButtonElement>("voice-key-save").disabled = connectionLost;
+  $<HTMLButtonElement>("voice-enable").disabled = selected === null || !view.canEnable || connectionLost;
+  $<HTMLButtonElement>("voice-local").disabled = voice.backend === "local" || connectionLost;
+  $<HTMLButtonElement>("voice-preview").disabled = connectionLost;
+  for (const key of TUNING_KEYS) {
+    const input = $<HTMLInputElement>(`tune-${key}`);
+    if (document.activeElement !== input) input.value = String(voice.tuning[key]);
+    $(`tune-${key}-out`).textContent = Number(input.value).toFixed(2);
+  }
+  // A model already chosen (from a previous run) is shown even before a search.
+  if (selected === null && voice.model_uuid !== null && voice.model_name !== null) {
+    showChoicePlaceholder(voice.model_name);
+  }
+}
+
+function showChoicePlaceholder(name: string): void {
+  if (!$("voice-choice").hidden) return;
+  $("voice-choice-name").textContent = `選択中のモデル: ${name}(別のモデルは検索して選べます)`;
+  $("voice-choice").hidden = false;
+  for (const id of ["voice-speaker", "voice-style", "voice-enable"]) $<HTMLButtonElement>(id).disabled = true;
+  const credit = state?.status.voice?.credit;
+  if (credit) $<HTMLInputElement>("voice-credit").value = credit;
+}
+
+function renderResults(): void {
+  const list = $("voice-results");
+  list.replaceChildren();
+  const hasPrev = results !== null && results.page > 1;
+  const hasNext = results !== null && results.page < searchPageCount(results.total);
+  $<HTMLButtonElement>("voice-prev").hidden = !hasPrev;
+  $<HTMLButtonElement>("voice-next").hidden = !hasNext;
+  if (results === null) return;
+  for (const model of results.models) {
+    const item = document.createElement("li");
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = model.name;
+    const small = document.createElement("small");
+    small.textContent = ` ${model.licenses.join(" / ")}${model.voice_timbre ? ` · ${model.voice_timbre}` : ""}`;
+    button.append(small);
+    button.addEventListener("click", () => chooseModel(model));
+    item.append(button);
+    list.append(item);
+  }
+  $("voice-search-state").textContent =
+    results.models.length === 0 ? "見つかりませんでした" : `${results.total}件中 ${results.page}/${searchPageCount(results.total)}ページ`;
+}
+
+function fillSelect(select: HTMLSelectElement, options: { value: string; label: string }[], chosen: string | null): void {
+  select.replaceChildren(
+    ...options.map((o) => {
+      const option = document.createElement("option");
+      option.value = o.value;
+      option.textContent = o.label;
+      return option;
+    }),
+  );
+  if (chosen !== null && options.some((o) => o.value === chosen)) select.value = chosen;
+  select.disabled = options.length === 0;
+}
+
+function speakerOf(model: VoiceModel): string | null {
+  const value = $<HTMLSelectElement>("voice-speaker").value;
+  return model.speakers.some((sp) => sp.uuid === value) ? value : (model.speakers[0]?.uuid ?? null);
+}
+
+function fillStyles(model: VoiceModel, speakerUuid: string | null, styleId: number | null): void {
+  const speaker = model.speakers.find((sp) => sp.uuid === speakerUuid);
+  fillSelect(
+    $<HTMLSelectElement>("voice-style"),
+    (speaker?.styles ?? []).map((st) => ({ value: String(st.style_id), label: `${st.name} (${st.style_id})` })),
+    styleId === null ? null : String(styleId),
+  );
+}
+
+/** A model picked from the search results. Everything shown comes from the
+ * typed DTO and goes in through textContent. */
+function chooseModel(model: VoiceModel): void {
+  selected = model;
+  const voice = state?.status.voice ?? null;
+  const same = voice !== null && voice.model_uuid === model.uuid;
+  const first = defaultSelection(model);
+  const speakerUuid = same && voice.speaker_uuid !== null ? voice.speaker_uuid : first.speakerUuid;
+  $("voice-choice-name").textContent = model.name;
+  $("voice-choice-license").textContent = `ライセンス: ${model.licenses.join(" / ") || "不明"}${model.category ? `  分類: ${model.category}` : ""}`;
+  $("voice-choice-description").textContent = model.description;
+  fillSelect(
+    $<HTMLSelectElement>("voice-speaker"),
+    model.speakers.map((sp) => ({ value: sp.uuid, label: sp.name })),
+    speakerUuid,
+  );
+  fillStyles(model, speakerUuid, same ? voice.style_id : first.styleId);
+  $<HTMLInputElement>("voice-credit").value = same && voice.credit ? voice.credit : creditFor(model.name);
+  $("voice-choice").hidden = false;
+  render();
+}
+
+async function voicePost(path: string, body: unknown, done: (detail: string) => string): Promise<boolean> {
+  const out = $("voice-result");
+  try {
+    const { status, json } = await api(path, { method: "POST", body: JSON.stringify(body) });
+    const reply = (json ?? {}) as { ok?: boolean; detail?: string };
+    const ok = status === 200 && reply.ok === true;
+    out.textContent = ok ? done(reply.detail ?? "") : `できませんでした: ${reply.detail ?? status}`;
+    out.className = ok ? "" : "error";
+    return ok;
+  } catch {
+    out.textContent = "できませんでした(アプリに接続できません)";
+    out.className = "error";
+    return false;
+  } finally {
+    void poll();
+  }
+}
+
+async function searchModels(page: number): Promise<void> {
+  if (searching) return;
+  const checked = checkKeyword($<HTMLInputElement>("voice-keyword").value);
+  const status = $("voice-search-state");
+  if (!checked.ok) {
+    status.textContent = checked.reason;
+    return;
+  }
+  searching = true;
+  $<HTMLButtonElement>("voice-search").disabled = true;
+  status.textContent = "検索中…";
+  lastSearch = { keyword: checked.keyword, sort: $<HTMLSelectElement>("voice-sort").value, page };
+  try {
+    const { status: code, json } = await api("/api/voice/search", { method: "POST", body: JSON.stringify(lastSearch) });
+    const parsed = code === 200 ? parseSearchPage(json) : null;
+    if (parsed === null) {
+      const reply = (json ?? {}) as { detail?: string };
+      status.textContent = `検索できませんでした: ${reply.detail ?? code}`;
+    } else {
+      results = parsed;
+      renderResults();
+    }
+  } catch {
+    status.textContent = "検索できませんでした(アプリに接続できません)";
+  } finally {
+    searching = false;
+    $<HTMLButtonElement>("voice-search").disabled = false;
+  }
+}
+
+async function enableAivis(): Promise<void> {
+  const voice = state?.status.voice ?? null;
+  if (selected === null || voice === null) return;
+  const credit = checkCredit($<HTMLInputElement>("voice-credit").value);
+  if (!credit.ok) {
+    $("voice-result").textContent = credit.reason;
+    return;
+  }
+  const confirm = $<HTMLInputElement>("voice-egress").checked;
+  if (voice.backend !== "aivis" && !confirm) {
+    $("voice-result").textContent = "返信テキストが外部に送信されることの確認にチェックを入れてください";
+    return;
+  }
+  const styleValue = $<HTMLSelectElement>("voice-style").value;
+  const patch = enablePatch({
+    model: selected,
+    speakerUuid: speakerOf(selected),
+    styleId: styleValue === "" ? null : Number(styleValue),
+    credit: credit.text,
+    confirmEgress: confirm || voice.backend === "aivis",
+  });
+  await voicePost("/api/voice", patch, () => "Aivis Cloud の声に切り替えました。次の発話から反映されます");
+}
+
+/** A speaker or style change on the voice that is already speaking applies at
+ * once; on another model it waits for "この声を使う". */
+async function liveStyleChange(): Promise<void> {
+  const voice = state?.status.voice ?? null;
+  if (selected === null || voice === null) return;
+  const speakerUuid = speakerOf(selected);
+  fillStyles(selected, speakerUuid, null);
+  const styleValue = $<HTMLSelectElement>("voice-style").value;
+  if (voice.backend !== "aivis" || voice.model_uuid !== selected.uuid) return;
+  await voicePost(
+    "/api/voice",
+    { speaker_uuid: speakerUuid, style_id: styleValue === "" ? null : Number(styleValue) },
+    () => "スタイルを変えました。次の発話から反映されます",
+  );
+}
+
+async function liveStyleOnly(): Promise<void> {
+  const voice = state?.status.voice ?? null;
+  if (selected === null || voice === null) return;
+  if (voice.backend !== "aivis" || voice.model_uuid !== selected.uuid) return;
+  const styleValue = $<HTMLSelectElement>("voice-style").value;
+  await voicePost("/api/voice", { style_id: styleValue === "" ? null : Number(styleValue) }, () => "スタイルを変えました。次の発話から反映されます");
+}
+
+async function saveKey(): Promise<void> {
+  const input = $<HTMLInputElement>("voice-key");
+  const checked = checkKey(input.value);
+  if (!checked.ok) {
+    $("voice-result").textContent = checked.reason;
+    return;
+  }
+  // The field is emptied before the request is answered and whatever the
+  // answer: the page keeps no copy of the key.
+  input.value = "";
+  await voicePost("/api/voice/key", { key: checked.key }, (detail) => `キーを保存しました(${detail})`);
 }
 
 async function poll(): Promise<void> {
@@ -242,6 +488,35 @@ $("chat-input").addEventListener("keydown", (event) => {
   }
 });
 $("model-apply").addEventListener("click", () => void selectModel());
+$("voice-search").addEventListener("click", () => void searchModels(1));
+$("voice-keyword").addEventListener("keydown", (event) => {
+  if ((event as KeyboardEvent).key === "Enter") void searchModels(1);
+});
+$("voice-prev").addEventListener("click", () => void searchModels(Math.max(1, lastSearch.page - 1)));
+$("voice-next").addEventListener("click", () => void searchModels(lastSearch.page + 1));
+$("voice-speaker").addEventListener("change", () => void liveStyleChange());
+$("voice-style").addEventListener("change", () => void liveStyleOnly());
+$("voice-enable").addEventListener("click", () => void enableAivis());
+$("voice-local").addEventListener("click", () => void voicePost("/api/voice", { backend: "local" }, () => "ローカルの声に戻しました。外部への送信は止まっています"));
+$("voice-preview").addEventListener("click", () => void voicePost("/api/voice/preview", {}, () => "試し読みを再生します"));
+$("voice-key-save").addEventListener("click", () => void saveKey());
+$("voice-key-check").addEventListener("click", () => void voicePost("/api/voice/key/check", {}, () => "キーを確認しています"));
+$("voice-key-remove").addEventListener("click", () => {
+  if (window.confirm("保存したAPIキーを削除します。Aivis Cloud の声を使っている場合はローカルの声に戻ります。よろしいですか?")) {
+    void voicePost("/api/voice/key/remove", {}, (detail) => detail);
+  }
+});
+for (const key of TUNING_KEYS) {
+  const input = $<HTMLInputElement>(`tune-${key}`);
+  input.addEventListener("input", () => {
+    $(`tune-${key}-out`).textContent = clampTuning(key, Number(input.value)).toFixed(2);
+  });
+  input.addEventListener("change", () => {
+    const [low, high] = TUNING_RANGES[key];
+    if (!(Number(input.value) >= low && Number(input.value) <= high)) return;
+    void voicePost("/api/voice", tuningPatch(key, Number(input.value)), () => "調整しました。次の発話から反映されます");
+  });
+}
 $("stop").addEventListener("click", () => void control("stop"));
 $("mute").addEventListener("click", () => void control("mute"));
 

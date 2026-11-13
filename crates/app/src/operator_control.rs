@@ -48,7 +48,9 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OperatorRequest {
     /// One of `status`, `stop`, `mute`, `diagnose`, `perception.enable`,
-    /// `perception.disable`, `memory.export`, `model.select`.
+    /// `perception.disable`, `memory.export`, `model.select`, `voice.apply`,
+    /// `voice.key.remove`, `voice.key.check`, `voice.preview` (the voice
+    /// settings of #360; the key itself is entered in the panel only).
     pub action: String,
     /// Opaque session secret presented by the operator client.
     pub secret: String,
@@ -56,7 +58,8 @@ pub struct OperatorRequest {
     #[serde(default)]
     pub request_id: Option<String>,
     /// The one argument an action may take: the model alias for
-    /// `model.select`. Ignored by every other action.
+    /// `model.select`, the settings patch (JSON text) for `voice.apply`.
+    /// Ignored by every other action.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub argument: Option<String>,
 }
@@ -105,6 +108,10 @@ pub struct OperatorStatusSnapshot {
     /// The local Thinking model selector (#357). Absent unless composed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_model: Option<crate::ThinkingModelStatus>,
+    /// The voice settings (#360): which voice speaks, the choice, the key's
+    /// state (never the key). Absent unless composed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice: Option<crate::VoiceStatus>,
 }
 
 /// Operator-visible, text-free perception status: whether it is running, why
@@ -166,6 +173,7 @@ impl OperatorStatusSnapshot {
                 .perception()
                 .map(|service| OperatorPerceptionStatus::from_report(&service.report(now_ms))),
             thinking_model: app.thinking_model_status(),
+            voice: app.voice_status(),
         }
     }
 }
@@ -255,6 +263,8 @@ pub struct OperatorEndpointOptions {
     pub memory_export: bool,
     /// A Thinking model allowlist is composed (#357): `model.select`.
     pub model_select: bool,
+    /// Voice settings are composed (#360): `voice.configure`.
+    pub voice_configure: bool,
 }
 
 /// Authenticated operator control endpoint.
@@ -308,6 +318,7 @@ impl OperatorControlServer {
             perception,
             memory_export,
             model_select,
+            voice_configure,
         } = options;
         let name = name.trim();
         if name.is_empty() {
@@ -325,6 +336,12 @@ impl OperatorControlServer {
             // `model.select` is held only so the `model.select` action can mint
             // it; the app still checks the alias against its allowlist.
             capabilities.insert(aivtuber_domain::Capability::ModelSelect);
+        }
+        if voice_configure {
+            // `voice.configure` is held only so the `voice.*` actions can mint
+            // it; the voice settings are validated, bounded data and the
+            // Aivis switch needs an explicit egress confirmation.
+            capabilities.insert(aivtuber_domain::Capability::VoiceConfigure);
         }
         if memory_export {
             // `memory.admin` is held only so the `memory.export` action can mint
@@ -416,7 +433,9 @@ impl OperatorControlServer {
     }
 }
 
-const MAX_RECORD_BYTES: usize = 1_024;
+/// One request line. A `voice.apply` patch (at most 2048 bytes, JSON inside a
+/// JSON string) is the largest legitimate request.
+const MAX_RECORD_BYTES: usize = 8 * 1_024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn handle_connection(
@@ -533,6 +552,7 @@ pub fn apply_operator_request<R: RoutePlanner>(
         && request.action != "perception.disable"
         && request.action != "memory.export"
         && request.action != "model.select"
+        && !is_tcp_voice_action(&request.action)
     {
         let detail = format!("unknown action {}", request.action);
         app.audit_operator_action(&request_id, &request.action, &detail, false);
@@ -558,6 +578,21 @@ pub fn apply_operator_request<R: RoutePlanner>(
     )
 }
 
+/// The voice settings actions (#360), all under `voice.configure`.
+fn is_voice_action(action: &str) -> bool {
+    matches!(
+        action,
+        "voice.apply" | "voice.key.set" | "voice.key.remove" | "voice.key.check" | "voice.preview"
+    )
+}
+
+/// The ones the operator endpoint (`aivtuberctl`) may send: not the key, which
+/// would travel in a command line and a request log. The key is entered in
+/// the panel only.
+fn is_tcp_voice_action(action: &str) -> bool {
+    is_voice_action(action) && action != "voice.key.set"
+}
+
 /// Like [`apply_operator_request`] with the secret as the raw 32 bytes the
 /// ingress compares, for an in-process caller that holds them (the local
 /// panel, #335). A secret that is not valid UTF-8 (the generated one is raw
@@ -572,7 +607,7 @@ pub fn apply_operator_action<R: RoutePlanner>(
     presented: &[u8; 32],
     now_ms: u64,
 ) -> OperatorResponse {
-    if !matches!(action, "stop" | "mute" | "model.select") {
+    if !matches!(action, "stop" | "mute" | "model.select") && !is_voice_action(action) {
         let detail = format!("unknown action {action}");
         app.audit_operator_action(request_id, action, &detail, false);
         return rejection(request_id, &detail);
@@ -645,6 +680,8 @@ fn apply_with_presented_secret<R: RoutePlanner>(
     // the memory export is the `memory.admin` capability.
     let capability_action = if action.starts_with("perception.") {
         "perception.control".to_owned()
+    } else if is_voice_action(action) {
+        "voice.configure".to_owned()
     } else if action == "memory.export" {
         "memory.admin".to_owned()
     } else {
@@ -711,6 +748,29 @@ fn apply_with_presented_secret<R: RoutePlanner>(
             }
             Err(detail) => {
                 let detail = format!("{shown}: {detail}");
+                app.audit_operator_action(&request_id, action, &detail, false);
+                rejection(&request_id, &detail)
+            }
+        };
+    }
+
+    if is_voice_action(action) {
+        // Audited without the argument: a settings patch carries the credit
+        // line (free text) and the key action carries the key. The detail is
+        // the validated settings summary (backend, model, speaker, style,
+        // tuning) or a fixed phrase, never the key.
+        return match app.configure_voice(command.authority(), action, argument) {
+            Ok(detail) => {
+                app.audit_operator_action(&request_id, action, &detail, true);
+                OperatorResponse {
+                    request_id,
+                    ok: true,
+                    detail,
+                    status: None,
+                    memory_export: None,
+                }
+            }
+            Err(detail) => {
                 app.audit_operator_action(&request_id, action, &detail, false);
                 rejection(&request_id, &detail)
             }
