@@ -34,6 +34,7 @@ pub use phrase::{
     segment_reply,
 };
 pub use phrase_pipeline::wait_for_started;
+pub use phrase_stream::IncrementalSegmenter;
 pub use speech_lexicon::{
     LexiconEntry, LexiconLayer, MAX_LEXICON_BYTES, MAX_LEXICON_ENTRIES, MAX_LEXICON_INPUT_CHARS,
     MAX_LEXICON_LAYERS, MAX_READING_CHARS, MAX_SURFACE_CHARS, ProjectionIdentity,

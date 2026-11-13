@@ -506,6 +506,9 @@ fn the_operator_endpoint_never_takes_the_key_and_a_missing_capability_changes_no
     assert_eq!(s.rig.app.voice_status().unwrap().tuning.pitch, 0.25);
 }
 
+/// Not a deadline the tests depend on: only a real hang may reach it.
+const HANG_GUARD: Duration = Duration::from_secs(120);
+
 /// One HTTP exchange to the panel on a worker thread while this thread plays
 /// the composition loop.
 fn call(
@@ -516,9 +519,7 @@ fn call(
 ) -> (u16, String) {
     let client = std::thread::spawn(move || {
         let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(8)))
-            .unwrap();
+        stream.set_read_timeout(Some(HANG_GUARD)).unwrap();
         stream.write_all(request.as_bytes()).unwrap();
         let mut bytes = Vec::new();
         let _ = stream.read_to_end(&mut bytes);
@@ -535,12 +536,15 @@ fn call(
                 .map_or(String::new(), |p| p.1.to_owned()),
         )
     });
+    // The loop ends when the exchange does; only a hang can reach the guard.
     let started = Instant::now();
     let mut now_ms = 1_000;
     let mut seed = 0;
-    while !client.is_finished() && started.elapsed() < Duration::from_secs(8) {
+    while !client.is_finished() && started.elapsed() < HANG_GUARD {
         service.service(app, now_ms, &mut seed);
-        app.service_voice(now_ms, &mut seed);
+        if app.service_voice(now_ms, &mut seed) {
+            service.publish_next_turn();
+        }
         now_ms += 10;
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -607,18 +611,34 @@ fn the_key_entered_in_the_panel_reaches_the_file_and_no_other_output() {
     );
     assert_eq!(status, 200, "{body}");
     outputs.push(body);
-    // Let the key check finish, then read what the page would read.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let state = loop {
-        let (status, body) = call(&mut panel, &mut s.rig.app, port, get_state());
-        assert_eq!(status, 200);
-        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
-        if value["status"]["voice"]["key"]["check"] == "valid" {
-            break (body, value);
+    // Let the key check finish: pump the loop's own step (the one that applies
+    // the check thread's result) until the app reports it. The wait ends on
+    // that event; the wall clock is only a hang guard (#373: a time limit on
+    // HTTP reads expired once with the result already logged, because a read
+    // is served before the same turn's `service_voice` applies the result).
+    let hang_guard = Instant::now() + Duration::from_secs(120);
+    let mut seed = 0;
+    while s.rig.app.voice_status().expect("voice").key.check != "valid" {
+        if s.rig.app.service_voice(2_000, &mut seed) {
+            panel.publish_next_turn();
         }
-        assert!(Instant::now() < deadline, "{body}");
-        std::thread::sleep(Duration::from_millis(60));
-    };
+        assert!(
+            Instant::now() < hang_guard,
+            "the key check never finished: {:?}",
+            s.rig.app.voice_status()
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // The next loop turn publishes it (the result was applied after this
+    // turn's publish; without the request it waited for the periodic
+    // refresh, and this test's per-call clock restarts below it).
+    panel.service(&mut s.rig.app, 2_000, &mut seed);
+    // Now what the page would read: the applied result stays published.
+    let (status, body) = call(&mut panel, &mut s.rig.app, port, get_state());
+    assert_eq!(status, 200);
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["status"]["voice"]["key"]["check"], "valid", "{body}");
+    let state = (body, value);
     outputs.push(state.0);
     let voice = &state.1["status"]["voice"];
     assert_eq!(voice["backend"], "aivis");

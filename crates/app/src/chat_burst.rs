@@ -31,8 +31,8 @@
 
 use aivtuber_domain::{EventEnvelope, ReflexContext};
 use aivtuber_reflex::{
-    AudienceConfig, AudienceConfigError, AudienceSignal, BurstConfig, BurstConfigError,
-    BurstEngine, Disposition, TerminalOutcome,
+    AudienceConfig, AudienceConfigError, AudienceSignal, BatchRanker, BurstConfig,
+    BurstConfigError, BurstEngine, Disposition, RetrievalScorer, TerminalOutcome,
 };
 use aivtuber_scheduler::{
     BusyCause, DeferredConfig, DeferredConfigError, DeferredInbox, DeferredItem, DeferredMetrics,
@@ -293,6 +293,12 @@ enum Held {
 
 pub(crate) struct ChatBurstLane {
     engine: BurstEngine,
+    /// #78 S3: optional retrieval-augmented local score. `None` keeps the
+    /// text heuristic alone.
+    scorer: Option<RetrievalScorer>,
+    /// #78 S3: optional batch ranker (Jev). At most one call per
+    /// [`ChatBurstLane::resolve_ready`] step, and none at shutdown.
+    ranker: Option<Box<dyn BatchRanker + Send>>,
     held: BTreeMap<String, Held>,
     inbox: DeferredInbox<EventEnvelope>,
     reply_ttl_ms: u64,
@@ -346,6 +352,8 @@ impl ChatBurstLane {
         engine.set_audience(config.audience)?;
         Ok(Self {
             engine,
+            scorer: None,
+            ranker: None,
             held: BTreeMap::new(),
             inbox: DeferredInbox::new(config.deferred)?,
             reply_ttl_ms: config.reply_ttl_ms,
@@ -355,6 +363,14 @@ impl ChatBurstLane {
             signals: VecDeque::new(),
             last_ms: 0,
         })
+    }
+
+    pub(crate) fn set_scorer(&mut self, scorer: RetrievalScorer) {
+        self.scorer = Some(scorer);
+    }
+
+    pub(crate) fn set_ranker(&mut self, ranker: Box<dyn BatchRanker + Send>) {
+        self.ranker = Some(ranker);
     }
 
     pub(crate) fn metrics(&self) -> ChatBurstMetrics {
@@ -443,11 +459,14 @@ impl ChatBurstLane {
             self.metrics.refused += 1;
             return Offer::Refused;
         }
-        let score = event
+        let text = event
             .payload
             .get("text")
-            .and_then(serde_json::Value::as_str)
-            .map_or(0, local_score_milli);
+            .and_then(serde_json::Value::as_str);
+        let mut score = text.map_or(0, local_score_milli);
+        if let (Some(scorer), Some(text)) = (self.scorer.as_mut(), text) {
+            score = scorer.score(text, score, now_ms);
+        }
         let (disposition, shed) = self.engine.offer(&event, now_ms, score);
         self.apply_resolutions(shed.into_iter().map(|shed| shed.record), now_ms, None);
         match disposition {
@@ -496,7 +515,25 @@ impl ChatBurstLane {
             now_ms: Some(now_ms),
             ..ReflexContext::default()
         };
-        while let Some(resolution) = self.engine.resolve_next(&context, None) {
+        // A ranker call blocks this step for at most its deadline, so only the
+        // first ready batch of a step may use it; later batches resolve with
+        // the deterministic order. The ranker only reorders; policy re-applies.
+        let mut ranker_available = true;
+        loop {
+            let ranker = if ranker_available {
+                self.ranker
+                    .as_mut()
+                    .map(|ranker| &mut **ranker as &mut dyn BatchRanker)
+            } else {
+                None
+            };
+            let used = ranker.is_some();
+            let Some(resolution) = self.engine.resolve_next(&context, ranker) else {
+                break;
+            };
+            if used {
+                ranker_available = false;
+            }
             self.apply_resolutions(
                 std::iter::once(resolution.record),
                 now_ms,
@@ -800,6 +837,149 @@ mod tests {
         b.source = "a".to_owned();
         b.actor_id = Some("bc".to_owned());
         assert_ne!(actor_key(&a), actor_key(&b));
+    }
+
+    use aivtuber_reflex::{BatchEngagementRequest, BatchRankFailure};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Reverse(Arc<AtomicU64>);
+
+    impl BatchRanker for Reverse {
+        fn rank(
+            &mut self,
+            request: &BatchEngagementRequest,
+        ) -> Result<Vec<String>, BatchRankFailure> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(request
+                .candidates
+                .iter()
+                .rev()
+                .map(|candidate| candidate.event_id.clone())
+                .collect())
+        }
+    }
+
+    struct Hostile;
+
+    impl BatchRanker for Hostile {
+        fn rank(&mut self, _: &BatchEngagementRequest) -> Result<Vec<String>, BatchRankFailure> {
+            // Unknown ids and repeats: nothing here may add or revive anyone.
+            Ok(vec!["not-in-batch".to_owned(), "also-not".to_owned()])
+        }
+    }
+
+    fn small_lane() -> ChatBurstLane {
+        ChatBurstLane::new(ChatBurstConfig {
+            burst: BurstConfig {
+                window_ms: 1_000,
+                burst_enter_count: 2,
+                max_candidates: 3,
+                top_k: 1,
+                max_per_actor: 1,
+                actor_cooldown_ms: 0,
+                ..BurstConfig::default()
+            },
+            ..ChatBurstConfig::default()
+        })
+        .expect("lane")
+    }
+
+    fn feed(lane: &mut ChatBurstLane, count: u64) {
+        for i in 1..=count {
+            let mut event = sample(&format!("e{i}"));
+            event.sequence = i;
+            event.actor_id = Some(format!("viewer{i}"));
+            let _ = lane.offer(event, i);
+        }
+    }
+
+    fn selected_ids(lane: &mut ChatBurstLane) -> Vec<String> {
+        lane.resolve_ready(10)
+            .into_iter()
+            .map(|candidate| candidate.event.event_id)
+            .collect()
+    }
+
+    #[test]
+    fn ranker_is_used_once_per_step_and_only_reorders() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let mut lane = small_lane();
+        lane.set_ranker(Box::new(Reverse(calls.clone())));
+        feed(&mut lane, 7);
+        // e1 was quiet; e2..e4 and e5..e7 are two ready batches.
+        let selected = selected_ids(&mut lane);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one ranker call per step");
+        // The ranked batch promoted its last comment; the other batch used the
+        // deterministic order. Top-K 1 per batch still holds.
+        assert_eq!(selected, vec!["e4".to_owned(), "e5".to_owned()]);
+        assert_eq!(lane.metrics().invariant_violations, 0);
+    }
+
+    #[test]
+    fn hostile_ranker_cannot_add_or_change_the_deterministic_selection() {
+        let mut ranked = small_lane();
+        ranked.set_ranker(Box::new(Hostile));
+        feed(&mut ranked, 4);
+        let mut plain = small_lane();
+        feed(&mut plain, 4);
+        assert_eq!(selected_ids(&mut ranked), selected_ids(&mut plain));
+        assert_eq!(ranked.metrics().invariant_violations, 0);
+    }
+
+    #[test]
+    fn retrieval_score_is_deterministic_and_never_revives_spam() {
+        use aivtuber_reflex::{
+            IndexedAsset, ReactionAxisEmbedder, RetrievalMetadata, RetrievalScoreConfig,
+            SemanticIndex, SimilarityMetric,
+        };
+        let build = || {
+            let index = SemanticIndex::new(
+                RetrievalMetadata {
+                    retriever_version: "t".to_owned(),
+                    embedding_model: "starter-semantic".to_owned(),
+                    index_version: "1".to_owned(),
+                    asset_compiler_version: "1".to_owned(),
+                    similarity_metric: SimilarityMetric::Cosine,
+                    tie_break_rule: "similarity_desc_then_asset_id_asc".to_owned(),
+                },
+                vec![IndexedAsset {
+                    asset_id: "agree".to_owned(),
+                    asset_identity: None,
+                    embedding: vec![1.0, 0.0, 0.0],
+                }],
+            )
+            .expect("index");
+            RetrievalScorer::new(
+                index,
+                Box::new(ReactionAxisEmbedder::new(3)),
+                RetrievalScoreConfig::default(),
+            )
+            .expect("scorer")
+        };
+        let run = || {
+            let mut lane = small_lane();
+            lane.set_scorer(build());
+            for (i, text) in ["hi", "wow!", "aaaaaaaa", "what is that?", "nice one", "ok"]
+                .iter()
+                .enumerate()
+            {
+                let mut event = sample(&format!("e{i}"));
+                event.sequence = i as u64;
+                event.actor_id = Some(format!("viewer{i}"));
+                event
+                    .payload
+                    .insert("text".to_owned(), serde_json::json!(text));
+                let _ = lane.offer(event, i as u64);
+            }
+            selected_ids(&mut lane)
+        };
+        assert_eq!(run(), run());
+        let mut scorer = build();
+        assert_eq!(
+            scorer.score("aaaaaaaa", local_score_milli("aaaaaaaa"), 0),
+            0
+        );
     }
 
     fn sample(id: &str) -> EventEnvelope {

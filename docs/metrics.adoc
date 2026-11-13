@@ -131,7 +131,12 @@ The runner writes:
 04-full-generative.json
 04-full-generative-calibration.csv
 comparison-suite.json
+phrase-mode-buffered-result.json
+phrase-mode-phrased-result.json
+phrase-mode-streamed-result.json
 ----
+
+The three `phrase-mode-*-result.json` files are the phrase-mode axis (section 13), a separate suite that is not one of the four comparison modes.
 
 The required Rust CI job runs this fixture as a benchmark smoke test.
 
@@ -189,3 +194,37 @@ Do not accept statements such as "Jev reduces LLM usage" or "semantic reuse impr
 
 The observations in this document are the raw material; they are not objectives.
 link:operational-slo.adoc[Operational SLOs and Error Budgets] (#71) turns them into session and represented-stream-hour service indicators, distinguishes an external provider failure from a runtime degradation failure, and keeps the result separate from the #58 per-PR regression budget: a report that improved relative to base can still miss its operational objective, and both statements are true at once.
+== 13. Phrase-mode latency (issue #83 S3e)
+
+`replay-benchmark` also compares buffered replies against phrase-level commit, so #58 can compare first-audio and completion latency across the two (and against streamed Thinking) in the real harness.
+The comparison is a deterministic logical-time model, not a wall-clock measurement: stub Thinking and stub TTS are described by declared costs in `examples/benchmarks/phrase-comparison.json`, the phrase partition comes from the production `phrase-seg-v1` segmenter (`segment_reply` and `IncrementalSegmenter`), and the commit timeline applies the production lookahead rule (phrase `k` is synthesized once phrase `k - 1` has started, and starts when its audio is ready and phrase `k - 1` has ended).
+An app test runs the real phrased pipeline on the same reply and requires the same phrases and the same start, end and gap, so the model cannot drift from the runtime unnoticed.
+The numbers say how the three modes relate under the declared stub costs; they are not a claim about a real model, voice or host (see EXP-0005 for a real llama-server measurement).
+
+Modes (the result `mode`, and so part of the comparator's compatibility key; none is a `ComparisonMode`):
+
+* `phrase_mode_buffered`: the whole reply is generated, then one TTS call covers all of it;
+* `phrase_mode_phrased`: buffered Thinking, phrase-level commit;
+* `phrase_mode_streamed`: streamed Thinking feeding the incremental segmenter, phrase-level commit.
+
+Metrics per mode, over the replies of the fixture, all in logical time from the request start; percentiles are nearest-rank:
+
+[cols="2,4",options="header"]
+|===
+|Metric |Definition
+
+|`phrase.first_audio.{p50,p90,max}_ms`
+|Request start to the first audible sample: the start of phrase 0 (the whole reply in buffered mode).
+
+|`phrase.completion.{p50,p90,max}_ms`
+|Whole-response completion: request start to the end of the last committed phrase's audio.
+
+|`phrase.phrases_per_response.mean_count`
+|Mean number of committed phrases per reply (1 in buffered mode).
+
+|`phrase.inter_phrase_gap.{mean,max}_ms`
+|Silence between the end of a phrase and the start of the next, over every adjacent phrase pair (`0` means gapless). `sample_count` is the number of pairs; a mode with no pairs reports `0` with `sample_count` `0`.
+|===
+
+Invariants (informational, no budget): `phrase.partition_mismatch_count` (a reply whose streamed or phrased cut differs from the buffered `phrase-seg-v1` cut; must be 0) and `phrase.start_before_previous_end_count` (must be 0).
+The stub TTS synthesizes faster than real time, so the gap is 0 under the checked-in costs; raise `tts_ms_per_char` to see a synthesis-bound reply produce gaps.
