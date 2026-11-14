@@ -10,6 +10,8 @@ import {
   MAX_MODEL_CHOICES,
   SEARCH_PAGE_SIZE,
   type VoiceModel,
+  parseUsageState,
+  usageView,
   checkChat,
   checkTwitchChannel,
   checkYoutubeVideo,
@@ -610,5 +612,75 @@ describe("chat connection inputs", () => {
     });
     expect(connectBody("youtube", "nope").ok).toBe(false);
     expect(CHAT_PLATFORMS).toEqual(["twitch", "youtube"]);
+  });
+});
+
+const usage = (over: Record<string, unknown> = {}) => ({
+  prompt_tokens: 1000,
+  completion_tokens: 234,
+  cost_micro_usd: 12_340,
+  turns_with_usage: 3,
+  turns_unknown_usage: 0,
+  turns_cost_reported: 3,
+  cap_micro_usd: null,
+  cap_tripped: false,
+  suspended_calls: 0,
+  ...over,
+});
+
+const withUsage = (u: unknown) =>
+  state({
+    status: {
+      muted: false,
+      audio_error: null,
+      avatar_error: null,
+      stream_error: null,
+      content_queue: 0,
+      scheduler_items: 0,
+      generation_active: false,
+      thinking_usage: u,
+    },
+  });
+
+describe("thinking usage (#367)", () => {
+  test("no meter means no usage card", () => {
+    expect(usageView(state())).toBeNull();
+    expect(usageView(null)).toBeNull();
+    expect(usageView(withUsage({ prompt_tokens: "many" }))).toBeNull();
+    expect(parseUsageState(usage({ cost_micro_usd: -1 }))).toBeNull();
+    expect(parseUsageState(usage({ cap_tripped: "yes" }))).toBeNull();
+  });
+
+  test("shows the session tokens and cost", () => {
+    const view = usageView(withUsage(usage()))!;
+    expect(view.summary).toBe("今回の配信: 1,234 トークン · $0.0123");
+    expect(view.cap).toBe("");
+    expect(view.health).toBe("ok");
+  });
+
+  test("an unreported cost is unknown, never $0", () => {
+    const tokensOnly = usageView(withUsage(usage({ cost_micro_usd: null, turns_cost_reported: 0 })))!;
+    expect(tokensOnly.summary).toBe("今回の配信: 1,234 トークン · 金額は不明");
+    expect(tokensOnly.summary).not.toContain("$0");
+    const none = usageView(withUsage(usage({ prompt_tokens: 0, completion_tokens: 0, cost_micro_usd: null, turns_with_usage: 0, turns_unknown_usage: 2, turns_cost_reported: 0 })))!;
+    expect(none.summary).toContain("不明");
+    expect(none.summary).not.toContain("$");
+    const idle = usageView(withUsage(usage({ prompt_tokens: 0, completion_tokens: 0, cost_micro_usd: null, turns_with_usage: 0, turns_cost_reported: 0 })))!;
+    expect(idle.summary).toContain("まだ応答がありません");
+  });
+
+  test("a partly reported cost is a lower bound", () => {
+    const view = usageView(withUsage(usage({ turns_with_usage: 3, turns_unknown_usage: 1, turns_cost_reported: 2 })))!;
+    expect(view.summary).toBe("今回の配信: 1,234 トークン · $0.0123 以上(2回分は金額不明)");
+  });
+
+  test("shows the cap, and that it tripped", () => {
+    const armed = usageView(withUsage(usage({ cap_micro_usd: 5_000_000 })))!;
+    expect(armed.cap).toContain("上限 $5.0000");
+    expect(armed.health).toBe("ok");
+    const tripped = usageView(withUsage(usage({ cap_micro_usd: 12_000, cap_tripped: true, suspended_calls: 2 })))!;
+    expect(tripped.cap).toContain("上限 $0.0120 に達したため");
+    expect(tripped.cap).toContain("定型の返し");
+    expect(tripped.health).toBe("warn");
   });
 });
