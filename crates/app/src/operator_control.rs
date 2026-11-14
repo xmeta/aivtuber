@@ -112,6 +112,10 @@ pub struct OperatorStatusSnapshot {
     /// The local Thinking model selector (#357). Absent unless composed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_model: Option<crate::ThinkingModelStatus>,
+    /// Session Thinking tokens/cost and the optional spend cap (#367). Absent
+    /// unless composed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_usage: Option<crate::ThinkingUsageStatus>,
     /// The voice settings (#360): which voice speaks, the choice, the key's
     /// state (never the key). Absent unless composed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -182,6 +186,7 @@ impl OperatorStatusSnapshot {
                 .perception()
                 .map(|service| OperatorPerceptionStatus::from_report(&service.report(now_ms))),
             thinking_model: app.thinking_model_status(),
+            thinking_usage: app.thinking_usage_status(),
             voice: app.voice_status(),
             chat_ingress: app.chat_ingress_status(),
         }

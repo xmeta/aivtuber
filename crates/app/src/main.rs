@@ -115,6 +115,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         runtime: generative_configured,
         model_switcher,
         voice: voice_controller,
+        thinking_meter,
     } = build_generative_runtime(
         &compatibility,
         retention,
@@ -142,6 +143,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let model_switcher = model_switcher.filter(|_| generative.is_some());
     // #360: the voice settings only exist next to a composed generative path.
     let voice_controller = voice_controller.filter(|_| generative.is_some());
+    // #367: the usage totals only exist next to a composed generative path.
+    let thinking_meter = thinking_meter.filter(|_| generative.is_some());
     let adaptation = build_adaptation_runtime(retention)?;
     let scheduler_config = retention.scheduler_config(SchedulerConfig::default());
     let security_config = retention.security_config(SecurityRuntimeConfig::default());
@@ -264,6 +267,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             switcher.catalog().render_choices()
         );
         app = app.with_model_switcher(switcher);
+    }
+    if let Some(meter) = thinking_meter {
+        app = app.with_thinking_meter(meter);
     }
     if let Some(controller) = voice_controller {
         eprintln!(
@@ -1621,6 +1627,8 @@ struct GenerativeParts {
     model_switcher: Option<ModelSwitcher>,
     /// #360: live voice settings.
     voice: Option<VoiceController>,
+    /// #367: Thinking usage totals and the optional spend cap.
+    thinking_meter: Option<aivtuber_app::ThinkingMeter>,
 }
 
 /// The environment-selected TTS bridges and the directories the voice
@@ -1650,9 +1658,20 @@ fn build_generative_runtime(
             runtime: None,
             model_switcher: None,
             voice: None,
+            thinking_meter: None,
         });
     }
 
+    // #367: optional session spend cap; invalid is a startup error.
+    let cost_cap = env_optional(aivtuber_app::THINKING_COST_CAP_VAR)
+        .map(|raw| aivtuber_app::parse_cost_cap_usd(&raw))
+        .transpose()?;
+    let thinking_meter = aivtuber_app::ThinkingMeter::new(cost_cap);
+    if let Some(cap) = cost_cap {
+        eprintln!(
+            "thinking cost cap: {cap} micro-USD (Thinking is suspended for the session once the provider-reported cost reaches it)"
+        );
+    }
     let mut thinking_config = OpenAiResponsesConfig::default();
     // #363: wire selector and the OpenRouter preset. The explicit endpoint and
     // model overrides below still win over the preset.
@@ -1852,10 +1871,15 @@ fn build_generative_runtime(
     let model_switcher = build_model_switcher(&warmup_adapter, warmup_timeout)?;
     // The preview override (#360) answers one armed panel line with the fixed
     // sentence; with no voice settings composed the model is used as is.
+    // #367: the meter wraps the real engine (the preview line costs nothing and
+    // is not counted); it also enforces the optional spend cap.
+    let metered: Arc<dyn aivtuber_domain::ThinkingEngine> = Arc::new(
+        aivtuber_app::MeteredThinking::new(Arc::new(thinking), thinking_meter.clone()),
+    );
     let thinking: Arc<dyn aivtuber_domain::ThinkingEngine> = if voice_controller.is_some() {
-        Arc::new(PreviewThinking::new(Arc::new(thinking), preview_slot))
+        Arc::new(PreviewThinking::new(metered, preview_slot))
     } else {
-        Arc::new(thinking)
+        metered
     };
     let pipeline = GenerativePipeline::new(thinking, tts, compiler)
         .with_speech_lexicon(Arc::new(speech_lexicon));
@@ -1879,6 +1903,7 @@ fn build_generative_runtime(
         runtime: Some(runtime),
         model_switcher,
         voice: voice_controller,
+        thinking_meter: Some(thinking_meter),
     })
 }
 

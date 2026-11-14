@@ -39,6 +39,7 @@ mod speech_resynthesis;
 mod speech_sidecar;
 mod support_bundle;
 mod task_plane;
+mod thinking_meter;
 mod thinking_provider;
 mod thinking_warmup;
 mod tool_execution;
@@ -112,6 +113,10 @@ pub use speech_floor::SpeechFloorMetrics;
 pub use speech_sidecar::*;
 pub use support_bundle::*;
 pub use task_plane::*;
+pub use thinking_meter::{
+    MAX_THINKING_COST_CAP_USD, MeteredThinking, THINKING_COST_CAP_VAR, ThinkingMeter,
+    ThinkingUsageStatus, parse_cost_cap_usd,
+};
 pub use thinking_provider::{
     OPENROUTER_DEFAULT_TITLE, OPENROUTER_ENDPOINT, apply_thinking_provider_env,
 };
@@ -1164,6 +1169,7 @@ where
     /// Live switching of the local Thinking model (#357); `None` (default)
     /// composes nothing and the model is whatever the environment named.
     model_switcher: Option<model_switch::ModelSwitcher>,
+    thinking_meter: Option<thinking_meter::ThinkingMeter>,
     /// Live voice settings (#360); `None` (default) composes nothing and the
     /// voice is whatever the environment named.
     voice: Option<voice_control::VoiceController>,
@@ -1241,6 +1247,7 @@ where
             speech_observations: None,
             perception: None,
             model_switcher: None,
+            thinking_meter: None,
             voice: None,
             chat_ingress: None,
             scene: None,
@@ -1701,6 +1708,18 @@ where
                 Err("perception source capacity reached")
             }
         }
+    }
+
+    /// Share the Thinking usage totals with the operator surfaces (#367). The
+    /// same meter must wrap the Thinking engine (`MeteredThinking`).
+    pub fn with_thinking_meter(mut self, meter: thinking_meter::ThinkingMeter) -> Self {
+        self.thinking_meter = Some(meter);
+        self
+    }
+
+    /// Session Thinking usage and cap state; `None` when no meter is composed.
+    pub fn thinking_usage_status(&self) -> Option<thinking_meter::ThinkingUsageStatus> {
+        self.thinking_meter.as_ref().map(|m| m.status())
     }
 
     /// Opt in to switching the local Thinking model at runtime (#357). Only the
@@ -4145,6 +4164,14 @@ where
                 observation.fallback_reason = Some(reason.to_owned());
             }
             observation.budget_denial_reason = trace.budget_denial_reason.clone();
+            // #367: audit data only; absent usage stays `None`, never zero.
+            for usage in trace.llm_calls.iter().filter_map(|call| call.usage) {
+                observation.add_thinking_usage(
+                    u64::from(usage.prompt_tokens),
+                    u64::from(usage.completion_tokens),
+                    usage.cost_micro_usd,
+                );
+            }
             if matches!(
                 handled.route,
                 RouteClass::CachedFallback | RouteClass::NonVerbalFallback
@@ -5126,6 +5153,7 @@ mod tests {
     mod scene_context_tests;
     mod speech_lifecycle_tests;
     mod streaming_thinking_tests;
+    mod thinking_cost_cap_tests;
     mod thinking_warmup_tests;
     mod voice_control_tests;
     mod voicevox_tts_tests;

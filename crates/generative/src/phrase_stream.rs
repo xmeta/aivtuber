@@ -330,7 +330,7 @@ impl GenerativePipeline {
             trace.thinking_timeout_ms = Some(duration_ms_ceil(remaining));
         }
 
-        let (outcome, stop, delivered, tts_chars, deadline_hit, whole_reply_audit) = {
+        let (outcome, stop, delivered, tts_chars, deadline_hit, whole_reply_audit, usage) = {
             let mut sink = StreamSink {
                 pipeline: self,
                 request,
@@ -353,6 +353,10 @@ impl GenerativePipeline {
             let outcome =
                 self.thinking
                     .generate_streaming(&request.thinking, stream.max_duration, &mut sink);
+            let usage = outcome
+                .as_ref()
+                .and_then(|result| result.as_ref().ok())
+                .and_then(|reply| reply.usage);
             let mut outcome = outcome.map(|result| result.map(|_| ()));
             if matches!(outcome, Some(Ok(()))) && sink.stop.is_none() {
                 let tail = sink.segmenter.finish();
@@ -376,8 +380,10 @@ impl GenerativePipeline {
                 sink.tts_chars,
                 sink.deadline_hit.get(),
                 audit,
+                usage,
             )
         };
+        trace.record_thinking_usage(usage);
 
         let summary = |planned: u32, end: PhraseEnd| PhraseSummary {
             response_id: options.response_id,

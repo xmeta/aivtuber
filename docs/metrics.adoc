@@ -68,6 +68,8 @@ Generated output is identified separately from cache hits even though a complete
 
 Cost fields are populated only when cost inputs are supplied. Zero configured cost is not interpreted as a measured zero-cost model.
 
+Provider-reported Thinking usage (#367) is a separate, audit-only per-event record: `thinking_prompt_tokens`, `thinking_completion_tokens` and `thinking_cost_micro_usd` on +EventObservation+, summed over the event's Thinking calls, serialized only when present (an absent value means the provider reported nothing; it is never zero). They are not part of `estimated_cost_microunits`, any benchmark metric, budget, route decision or replay identity. In streamed phrase mode the values are attached when the stream's final completion arrives, after the first phrase has already recorded the observation.
+
 == 5. Reproducibility metadata
 
 Every benchmark report records:

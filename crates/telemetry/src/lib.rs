@@ -158,6 +158,17 @@ pub struct EventObservation {
     pub llm_calls: u32,
     pub tts_calls: u32,
     pub estimated_cost_microunits: Option<u64>,
+    /// Provider-reported Thinking accounting for this turn (#367), summed over
+    /// its calls. `None` means the provider reported nothing (unknown, never
+    /// zero). Audit data only: no routing, replay identity or benchmark gate
+    /// reads these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_prompt_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_completion_tokens: Option<u64>,
+    /// Provider-reported Thinking cost in millionths of a USD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_cost_micro_usd: Option<u64>,
 }
 
 impl EventObservation {
@@ -198,6 +209,36 @@ impl EventObservation {
             llm_calls: 0,
             tts_calls: 0,
             estimated_cost_microunits: None,
+            thinking_prompt_tokens: None,
+            thinking_completion_tokens: None,
+            thinking_cost_micro_usd: None,
+        }
+    }
+
+    /// Add one Thinking call's provider-reported accounting (#367). Saturating;
+    /// an absent cost leaves the cost field as it was (unknown, not zero).
+    pub fn add_thinking_usage(
+        &mut self,
+        prompt: u64,
+        completion: u64,
+        cost_micro_usd: Option<u64>,
+    ) {
+        self.thinking_prompt_tokens = Some(
+            self.thinking_prompt_tokens
+                .unwrap_or(0)
+                .saturating_add(prompt),
+        );
+        self.thinking_completion_tokens = Some(
+            self.thinking_completion_tokens
+                .unwrap_or(0)
+                .saturating_add(completion),
+        );
+        if let Some(cost) = cost_micro_usd {
+            self.thinking_cost_micro_usd = Some(
+                self.thinking_cost_micro_usd
+                    .unwrap_or(0)
+                    .saturating_add(cost),
+            );
         }
     }
 }
