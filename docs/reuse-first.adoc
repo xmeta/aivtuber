@@ -396,6 +396,42 @@ A library may implement a lower-level primitive used by these systems, but it mu
 Study sentence segmentation, early first response, speech interruption, segmented TTS, and live voice interaction.
 Use it to identify tested patterns and failure cases, not as a reason to weaken aivtuber's atomic Performance Asset and output-gate requirements.
 
+==== Segmentation comparison: Open-LLM-VTuber `sentence_divider` against `phrase-seg-v1` (#83 S3e)
+
+Read at upstream commit `992309c0aa19845960228f880013d4685fde93b5` (2026-11-13), files `src/open_llm_vtuber/utils/sentence_divider.py` and `src/open_llm_vtuber/conversations/tts_manager.py`.
+Ours: `crates/generative/src/phrase.rs` (`segment_reply`, `SegmentationConfig`) and `crates/generative/src/phrase_stream.rs` (`IncrementalSegmenter`).
+
+[cols="1,3,3",options="header"]
+|===
+|Aspect |Open-LLM-VTuber |`phrase-seg-v1`
+
+|Cut rules
+|A sentence ends at one of a small list of terminators (`. ! ? 。 ！ ？ ... 。。。`, `END_PUNCTUATIONS`).
+`pysbd` is used for the languages it supports and a regex otherwise (`segment_text_by_pysbd`, `segment_text_by_regex`); a trailing fragment without a terminator stays in the buffer.
+There is no length bound: a long run-on sentence is one unit, a very short one is also a unit.
+|Terminators and clause breaks are cut by a pure function with a minimum weight (a short tail merges back), a clause weight (a comma cuts only past it), a preferred and a hard maximum weight (a long run is cut at the best earlier boundary) and a phrase cap (the tail merges into the last phrase instead of being dropped).
+Weight counts a wide character as 2, so Japanese and English phrases get a comparable spoken length without a language detector or a third-party segmenter.
+The streamed and the buffered cuts are the same function (`segment_ranges`), so streaming never changes the partition (tested for every chunk size, and checked again by the phrase benchmark).
+
+|First-response trick
+|`faster_first_response` (default on): for the first sentence only, split at the first comma (`comma_splitter`) without waiting for a terminator, whatever the length of the resulting piece.
+|No special case for phrase 0.
+A clause break cuts at or above `clause_weight` for every phrase, and the minimum weight prevents a tiny first utterance.
+The first-audio gain comes from phrase-level commit in general, and from streamed Thinking where enabled, rather than from one rule for the first sentence.
+
+|Gate and commit
+|Each completed sentence is queued for TTS (`TTSTaskManager.speak`); TTS runs as parallel tasks and only the delivery to the client is ordered by a sequence counter.
+In the files read there is no per-sentence output gate or compile step between the segmenter and synthesis, no one-phrase lookahead (every sentence is synthesized as soon as it exists) and no typed state for a phrase that fails in the middle of a reply.
+|A phrase is cut only when complete (a closing mark can still follow a terminator), then passes the output gate on its own text, a cumulative-prefix gate in streamed mode, speech projection, TTS and compile, and only then crosses the commit horizon into the shared scheduler as one atomic item.
+Synthesis of phrase `k` waits until phrase `k - 1` has started (bounded lookahead), failure and cancellation are typed, and committed phrases are never rewritten.
+|===
+
+Decision: *custom*, with the idea adopted.
+Earlier reuse modes do not fit because the cut rules are the smallest part of the problem: what must be project-owned is the gate-then-commit order, the replayable `PhraseLink` records and the bounded lookahead, and none of those exist upstream.
+A `pysbd` dependency (Python) would add a sidecar for a rule set we need to be deterministic and weight-bounded.
+The comma-first trick was considered and not adopted as a special case: it removes the minimum length guarantee that keeps the first utterance natural, and the phrase benchmark (`docs/metrics.adoc` section 13) shows phrase-level commit already moves first audio from whole-reply time to first-phrase time.
+Revisit if a real-voice measurement shows first-phrase synthesis, not phrase length, dominating first audio.
+
 === 4.2 AIRI
 
 Study Live2D/VRM behavior, auto blink, auto look-at, idle eye movement, motion mapping, attention UX, plugin capability negotiation, and control/data-plane separation.

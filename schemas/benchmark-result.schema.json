@@ -32,9 +32,12 @@
         "deterministic_semantic",
         "deterministic_semantic_jev",
         "full_generative",
-        "resource_soak"
+        "resource_soak",
+        "phrase_mode_buffered",
+        "phrase_mode_phrased",
+        "phrase_mode_streamed"
       ],
-      "description": "Comparison mode the observation ran under. `resource_soak` results come from the high-volume logical-time resource benchmark (issue #58 Phase D) and carry retained-state/high-water metrics instead of latency percentiles."
+      "description": "Comparison mode the observation ran under. `resource_soak` results come from the high-volume logical-time resource benchmark (issue #58 Phase D) and carry retained-state/high-water metrics instead of latency percentiles. `phrase_mode_buffered`, `phrase_mode_phrased` and `phrase_mode_streamed` (suite `phrase-comparison`, issue #83 S3e) come from the deterministic logical-time phrase-mode latency model; they are informational (no budget gates them) and never share a compatibility key with the replay modes."
     },
     "dataset_id": {
       "type": "string",

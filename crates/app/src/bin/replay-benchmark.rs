@@ -2,9 +2,10 @@
 
 use aivtuber_app::{
     AppError, AssetSemanticIndexConfig, AudioOutput, CachedReplayPlayability, GenerativeRuntime,
-    IntentRoutePlanner, NoopAvatarOutput, NoopStreamOutput, PlaybackRoute, ProductionApp,
-    QueryEmbeddingProvider, ReflexRoutePlanner, RoutePlanner, StreamScenario,
-    build_semantic_index_from_asset_store, scenario_to_benchmark_fixture,
+    IntentRoutePlanner, NoopAvatarOutput, NoopStreamOutput, PhraseBenchProvenance, PhraseFixture,
+    PlaybackRoute, ProductionApp, QueryEmbeddingProvider, ReflexRoutePlanner, RoutePlanner,
+    StreamScenario, build_semantic_index_from_asset_store, phrase_summary_line,
+    run_phrase_benchmark, scenario_to_benchmark_fixture,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
@@ -290,6 +291,38 @@ fn run() -> Result<(), Box<dyn Error>> {
     // per mode plus an aggregate, all sharing the same metadata.
     write_gate_results(&output_dir, &suite)?;
     print_summary(&suite);
+    write_phrase_benchmark(&output_dir)?;
+    Ok(())
+}
+
+/// Issue #83 S3e: the phrase-mode against buffered-mode latency axis. It runs on
+/// its own checked-in fixture (deterministic stub Thinking/TTS model) and writes
+/// `phrase-mode-*-result.json` beside the replay results. The modes are not
+/// `ComparisonMode`s and no budget names their metrics, so the comparator and
+/// the existing CI jobs ignore them; they are informational until a baseline
+/// exists (docs/benchmark-gate.adoc).
+fn write_phrase_benchmark(output_dir: &Path) -> Result<(), Box<dyn Error>> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/benchmarks/phrase-comparison.json");
+    let fixture = PhraseFixture::from_json(&fs::read(path)?).map_err(invalid_data)?;
+    let provenance = PhraseBenchProvenance {
+        git_commit: git_revision(),
+        rust_version: command_output("rustc", &["--version"])
+            .unwrap_or_else(|| "unknown".to_owned()),
+        bun_version: command_output("bun", &["--version"]),
+        cargo_profile: if cfg!(debug_assertions) {
+            "debug".to_owned()
+        } else {
+            "release".to_owned()
+        },
+    };
+    for (summary, result) in run_phrase_benchmark(&fixture, &provenance) {
+        fs::write(
+            output_dir.join(format!("{}-result.json", summary.mode.file_stem())),
+            serde_json::to_vec_pretty(&result)?,
+        )?;
+        println!("{}", phrase_summary_line(&summary));
+    }
     Ok(())
 }
 

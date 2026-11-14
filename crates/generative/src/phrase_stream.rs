@@ -57,14 +57,16 @@ use std::cell::Cell;
 use std::time::Instant;
 
 /// Cuts a growing reply into phrases without ever cutting on incomplete text.
-pub(crate) struct IncrementalSegmenter {
+/// Public so the phrase-mode benchmark (#83 S3e) drives the same cut rules the
+/// streamed pipeline uses instead of a copy of them.
+pub struct IncrementalSegmenter {
     config: SegmentationConfig,
     pending: Vec<char>,
     emitted: usize,
 }
 
 impl IncrementalSegmenter {
-    pub(crate) fn new(config: SegmentationConfig) -> Self {
+    pub fn new(config: SegmentationConfig) -> Self {
         Self {
             config,
             pending: Vec::new(),
@@ -73,7 +75,7 @@ impl IncrementalSegmenter {
     }
 
     /// Append a delta; returns the phrases that are now complete.
-    pub(crate) fn push(&mut self, delta: &str) -> Vec<String> {
+    pub fn push(&mut self, delta: &str) -> Vec<String> {
         self.pending.extend(delta.chars());
         let mut out = Vec::new();
         // The last allowed phrase takes the whole tail (the same cap
@@ -96,7 +98,7 @@ impl IncrementalSegmenter {
     }
 
     /// The stream ended: everything left is cut as in a buffered reply.
-    pub(crate) fn finish(&mut self) -> Vec<String> {
+    pub fn finish(&mut self) -> Vec<String> {
         let mut config = self.config;
         config.max_phrases = self.config.max_phrases.saturating_sub(self.emitted).max(1);
         let ranges = segment_ranges(&self.pending, &config);

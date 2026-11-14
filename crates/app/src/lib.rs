@@ -19,6 +19,7 @@ mod outputs;
 mod pack_readiness;
 mod panel;
 mod perception_service;
+mod phrase_benchmark;
 mod phrase_commit;
 mod profile;
 mod raw_ingress;
@@ -85,6 +86,7 @@ pub use panel::{
     panel_settings,
 };
 pub use perception_service::*;
+pub use phrase_benchmark::*;
 pub use phrase_commit::{
     PHRASE_RESPONSE_RECORDS, PHRASE_START_WAIT, PhraseCause, PhraseCommitRecord, PhraseGateOutcome,
     PhraseMetrics, PhraseMode, PhraseResponseEnd, PhraseResponseRecord,

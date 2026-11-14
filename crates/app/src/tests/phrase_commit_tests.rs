@@ -1157,3 +1157,55 @@ fn an_operator_stop_inside_the_lookahead_stops_the_output_and_cancels_the_queued
         "nothing is handed over after the stop"
     );
 }
+
+/// The phrase-mode benchmark (#83 S3e) is a logical-time model; this ties it to
+/// the real pipeline: with zero modelled latency it must produce the commits the
+/// phrased `ProductionApp` actually makes (same phrases, same start/end/gap).
+#[test]
+fn the_benchmark_model_matches_the_real_phrased_pipeline() {
+    use crate::{PhraseBenchMode, PhraseBenchReply, PhraseModelParams, simulate_reply};
+    let reply = three_phrase_reply();
+    let mut rig = rig_with(phrased(), &reply, PhraseTts::new());
+    submit(&mut rig, 30, 0);
+    wait_until(&mut rig, 0, |rig| phrase_items(rig).len() == 2);
+    let a_ms = duration_of(PHRASE_A);
+    let b_ms = duration_of(PHRASE_B);
+    rig.app.tick(a_ms);
+    wait_until(&mut rig, a_ms, |rig| {
+        rig.tts_calls.load(Ordering::SeqCst) == 3 && phrase_items(rig).len() == 2
+    });
+    rig.app.tick(a_ms + b_ms);
+    wait_until(&mut rig, a_ms + b_ms, |rig| {
+        !rig.app.recent_phrase_responses().is_empty()
+    });
+    let record = the_record(&rig);
+
+    let params = PhraseModelParams {
+        thinking_first_token_ms: 0,
+        thinking_ms_per_char: 0,
+        thinking_delta_chars: 3,
+        tts_base_ms: 0,
+        tts_ms_per_char: 0,
+        audio_ms_per_char: 40,
+    };
+    let model = simulate_reply(
+        PhraseBenchMode::Phrased,
+        &PhraseBenchReply {
+            id: "r".to_owned(),
+            text: reply,
+        },
+        &params,
+        &aivtuber_generative::SegmentationConfig::default(),
+    );
+    let real: Vec<(usize, u64, u64, u64)> = record
+        .commits
+        .iter()
+        .map(|c| (c.text_chars, c.start_at_ms, c.end_at_ms, c.gap_before_ms))
+        .collect();
+    let modelled: Vec<(usize, u64, u64, u64)> = model
+        .phrases
+        .iter()
+        .map(|p| (p.chars, p.start_ms, p.end_ms, p.gap_before_ms))
+        .collect();
+    assert_eq!(real, modelled);
+}
