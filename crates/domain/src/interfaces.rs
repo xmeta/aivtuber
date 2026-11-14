@@ -13,6 +13,10 @@ pub enum EngineErrorKind {
     Unavailable,
     RateLimited,
     Overloaded,
+    /// The provider account has no credit left (HTTP 402). Degrades to the
+    /// deterministic fallback like every other kind; retrying cannot help
+    /// until the operator tops up, so it is kept apart from `RateLimited`.
+    QuotaExhausted,
     Authentication,
     Unauthorized,
     InvalidRequest,
@@ -45,6 +49,21 @@ impl Error for EngineError {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GeneratedReply {
     pub text: String,
+    /// Provider-reported token/cost accounting, when the provider sent it.
+    /// Audit data only: it never influences routing here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ThinkingUsage>,
+}
+
+/// Bounded, provider-neutral accounting for one Thinking call. Plain integers
+/// so no provider DTO crosses the adapter boundary; cost is micro-USD.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThinkingUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    /// Provider-reported cost in millionths of a USD; `None` when absent or
+    /// not a sane non-negative amount.
+    pub cost_micro_usd: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

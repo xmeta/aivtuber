@@ -52,6 +52,34 @@
       "assumption_ids": [
         "A-LLM-001"
       ]
+    },
+    {
+      "provider_id": "openrouter-chat-completions",
+      "system": "OpenRouter OpenAI-compatible chat-completions ThinkingEngine",
+      "api_protocol_version": "chat-completions HTTP JSON (provider/model version unverified)",
+      "adapter": "aivtuber_adapters::OpenAiResponsesAdapter",
+      "fixture_version": "openrouter-chat-completions-fixture-v1",
+      "verification_status": "fixture_verified_live_unverified",
+      "required_capabilities": [
+        "bearer authentication",
+        "choices[0].message.content extraction",
+        "usage and cost normalization",
+        "credit-exhaustion (402) normalization",
+        "timeout normalization",
+        "rate-limit normalization",
+        "malformed response rejection"
+      ],
+      "optional_capabilities": [
+        "streaming",
+        "provider.data_collection"
+      ],
+      "last_live_verified": null,
+      "known_deviations": [
+        "Only the chat-completions subset used by aivtuber is fixture-verified; live OpenRouter behavior and per-model support are not claimed."
+      ],
+      "assumption_ids": [
+        "A-LLM-001"
+      ]
     }
   ]
 }

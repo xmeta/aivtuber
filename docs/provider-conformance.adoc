@@ -20,7 +20,8 @@ The provider-neutral harness in +crates/hardening/src/conformance.rs+ loads the 
 Current Stage 1 coverage includes:
 
 * Jev / TypeSafe System One through +JevAdapter+;
-* OpenAI-compatible Responses through +OpenAiResponsesAdapter+.
+* OpenAI-compatible Responses through +OpenAiResponsesAdapter+;
+* OpenRouter chat-completions through the same +OpenAiResponsesAdapter+ on the +ChatCompletions+ wire (#363): +examples/conformance/openrouter-chat-completions.json+ covers +choices[0].message.content+, usage/cost normalization (+expected.usage+), 401, 402 (+quota_exhausted+), 429, 502, an error object inside HTTP 200, timeout and a malformed body.
 
 Run the offline layer with:
 
@@ -81,6 +82,13 @@ OpenAI-compatible Responses::
 
 * secret +AIVTUBER_OPENAI_API_KEY+
 * optional variables +AIVTUBER_OPENAI_ENDPOINT+, +AIVTUBER_OPENAI_MODEL+, +AIVTUBER_OPENAI_MODEL_VERSION+
+
+OpenRouter chat-completions (+live_openrouter_chat_conformance+, workflow input +openrouter-chat+)::
+
+* secret +AIVTUBER_OPENAI_API_KEY+ (an OpenRouter key)
+* variable +AIVTUBER_OPENAI_MODEL+ (required; an OpenRouter model id such as +vendor/model+)
+* optional variable +AIVTUBER_OPENAI_ENDPOINT+ (defaults to +https://openrouter.ai/api/v1/chat/completions+)
+* the probe sends +provider.data_collection = deny+, a 32-token output limit and an +X-Title+ header, and prints only whether usage was reported
 
 A live probe may be billable. Use least-privilege/test credentials, a bounded model/output configuration, and an environment where a probe response cannot become public output.
 

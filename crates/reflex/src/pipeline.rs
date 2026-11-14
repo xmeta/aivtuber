@@ -316,7 +316,9 @@ pub fn execute_policy(policy: &PolicyDecision) -> ExecutedDecision {
 fn fallback_reason(kind: EngineErrorKind) -> FallbackReason {
     match kind {
         EngineErrorKind::Timeout => FallbackReason::Timeout,
-        EngineErrorKind::Unavailable | EngineErrorKind::Backend => FallbackReason::Unavailable,
+        EngineErrorKind::Unavailable
+        | EngineErrorKind::Backend
+        | EngineErrorKind::QuotaExhausted => FallbackReason::Unavailable,
         EngineErrorKind::RateLimited => FallbackReason::RateLimited,
         EngineErrorKind::Overloaded => FallbackReason::Overloaded,
         EngineErrorKind::Authentication | EngineErrorKind::Unauthorized => {

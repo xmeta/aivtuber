@@ -545,7 +545,7 @@ mod tests {
             _request: &'a ThinkingRequest,
         ) -> EngineFuture<'a, GeneratedReply> {
             let text = self.0.clone();
-            Box::pin(async move { Ok(GeneratedReply { text }) })
+            Box::pin(async move { Ok(GeneratedReply { text, usage: None }) })
         }
 
         fn identity(&self) -> BackendIdentity {

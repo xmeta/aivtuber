@@ -1,9 +1,10 @@
 use crate::{
-    HttpTransportError, JsonHttpTransport, SecretString, StreamingHttpTransport, UreqJsonTransport,
+    ExtraHeaders, HttpTransportError, JsonHttpTransport, SecretString, StreamingHttpTransport,
+    UreqJsonTransport,
 };
 use aivtuber_domain::{
     BackendIdentity, EngineError, EngineErrorKind, EngineFuture, GeneratedReply, ReplyDeltaSink,
-    ThinkingContextSource, ThinkingEngine, ThinkingRequest,
+    ThinkingContextSource, ThinkingEngine, ThinkingRequest, ThinkingUsage,
 };
 use serde_json::{Value, json};
 use std::fmt;
@@ -11,6 +12,8 @@ use std::net::{IpAddr, ToSocketAddrs};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+#[cfg(test)]
+mod chat_tests;
 mod stream;
 #[cfg(test)]
 mod stream_tests;
@@ -167,6 +170,60 @@ pub fn verify_loopback_endpoint(
     }
 }
 
+/// Which request/response shape the Thinking endpoint speaks (issue #363).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ThinkingWire {
+    /// `POST {model, input, max_output_tokens}`; reply in `output[].content[]`.
+    #[default]
+    Responses,
+    /// `POST {model, messages, max_tokens}`; reply in `choices[0].message`.
+    /// The shape OpenRouter and most OpenAI-compatible servers accept.
+    ChatCompletions,
+}
+
+impl ThinkingWire {
+    /// Parse the `AIVTUBER_OPENAI_WIRE` value.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "responses" => Some(Self::Responses),
+            "chat-completions" | "chat_completions" => Some(Self::ChatCompletions),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Responses => "responses",
+            Self::ChatCompletions => "chat-completions",
+        }
+    }
+}
+
+/// OpenRouter `provider.data_collection`: whether an upstream provider may
+/// retain the prompt (viewer chat) for training. Chat-completions only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataCollection {
+    Deny,
+    Allow,
+}
+
+impl DataCollection {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "deny" => Some(Self::Deny),
+            "allow" => Some(Self::Allow),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
+            Self::Allow => "allow",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct OpenAiResponsesConfig {
     pub endpoint: String,
@@ -174,6 +231,14 @@ pub struct OpenAiResponsesConfig {
     pub model_version: Option<String>,
     pub max_output_tokens: u64,
     pub timeout: Duration,
+    /// Request/response shape; `Responses` keeps the pre-#363 behavior.
+    pub wire: ThinkingWire,
+    /// Operator-chosen attribution headers (OpenRouter `HTTP-Referer`,
+    /// `X-Title`). Bounded and validated by [`ExtraHeaders`].
+    pub extra_headers: ExtraHeaders,
+    /// When set, the chat body carries `provider.data_collection`. `None`
+    /// sends no `provider` field, which is what a generic server expects.
+    pub data_collection: Option<DataCollection>,
 }
 
 impl Default for OpenAiResponsesConfig {
@@ -184,6 +249,9 @@ impl Default for OpenAiResponsesConfig {
             model_version: None,
             max_output_tokens: 256,
             timeout: Duration::from_secs(15),
+            wire: ThinkingWire::Responses,
+            extra_headers: ExtraHeaders::empty(),
+            data_collection: None,
         }
     }
 }
@@ -196,6 +264,9 @@ impl fmt::Debug for OpenAiResponsesConfig {
             .field("model_version", &self.model_version)
             .field("max_output_tokens", &self.max_output_tokens)
             .field("timeout", &self.timeout)
+            .field("wire", &self.wire)
+            .field("extra_headers", &self.extra_headers)
+            .field("data_collection", &self.data_collection)
             .finish()
     }
 }
@@ -342,6 +413,15 @@ impl OpenAiResponsesAdapter {
         &self.config.endpoint
     }
 
+    pub fn wire(&self) -> ThinkingWire {
+        self.config.wire
+    }
+
+    /// The `provider.data_collection` policy the chat body carries, if any.
+    pub fn data_collection(&self) -> Option<DataCollection> {
+        self.config.data_collection
+    }
+
     /// The model the next request will name.
     pub fn active_model(&self) -> ActiveModel {
         self.model.read().unwrap_or_else(|e| e.into_inner()).clone()
@@ -392,18 +472,14 @@ impl OpenAiResponsesAdapter {
         // the caller's interaction budget still caps the total.
         let effective_timeout = (self.config.timeout + self.warmup.grace()).min(timeout);
         let input = compact_generation_input(request)?;
-        let body = serde_json::to_vec(&json!({
-            "model": self.active_model().alias,
-            "input": input,
-            "max_output_tokens": self.config.max_output_tokens,
-        }))
-        .map_err(|error| EngineError::new(EngineErrorKind::InvalidRequest, error.to_string()))?;
+        let body = self.request_body(&input, self.config.max_output_tokens, false)?;
 
         let response = self
             .transport
-            .post_json(
+            .post_json_with_headers(
                 &self.config.endpoint,
                 self.api_key.as_ref().map(|key| key.expose()),
+                &self.config.extra_headers,
                 &body,
                 effective_timeout,
             )
@@ -419,20 +495,66 @@ impl OpenAiResponsesAdapter {
                 format!("invalid OpenAI-compatible response JSON: {error}"),
             )
         })?;
-        let text = extract_output_text(&payload).ok_or_else(|| {
-            EngineError::new(
+        let extracted = match self.config.wire {
+            ThinkingWire::Responses => extract_output_text(&payload),
+            ThinkingWire::ChatCompletions => extract_chat_content(&payload),
+        };
+        let Some(text) = extracted else {
+            // Some gateways answer HTTP 200 with an error object; type it as
+            // the status it names rather than as a generic empty reply.
+            if let Some(status) = embedded_error_status(&payload) {
+                return Err(map_status(status));
+            }
+            return Err(EngineError::new(
                 EngineErrorKind::Backend,
-                "OpenAI-compatible response contained no output_text",
-            )
-        })?;
+                "OpenAI-compatible response contained no output text",
+            ));
+        };
         if text.trim().is_empty() {
             return Err(EngineError::new(
                 EngineErrorKind::Backend,
-                "OpenAI-compatible response output_text was empty",
+                "OpenAI-compatible response output text was empty",
             ));
         }
 
-        Ok(GeneratedReply { text })
+        Ok(GeneratedReply {
+            text,
+            usage: parse_usage(&payload),
+        })
+    }
+
+    /// The JSON request body for this adapter's wire. One builder serves the
+    /// buffered call, the streaming call and the warm-up, so they cannot
+    /// drift apart.
+    pub(super) fn request_body(
+        &self,
+        input: &str,
+        max_tokens: u64,
+        stream: bool,
+    ) -> Result<Vec<u8>, EngineError> {
+        let model = self.active_model().alias;
+        let mut body = match self.config.wire {
+            ThinkingWire::Responses => json!({
+                "model": model,
+                "input": input,
+                "max_output_tokens": max_tokens,
+            }),
+            ThinkingWire::ChatCompletions => json!({
+                "model": model,
+                "messages": [{"role": "user", "content": input}],
+                "max_tokens": max_tokens,
+            }),
+        };
+        if stream {
+            body["stream"] = json!(true);
+        }
+        if self.config.wire == ThinkingWire::ChatCompletions
+            && let Some(policy) = self.config.data_collection
+        {
+            body["provider"] = json!({"data_collection": policy.label()});
+        }
+        serde_json::to_vec(&body)
+            .map_err(|error| EngineError::new(EngineErrorKind::InvalidRequest, error.to_string()))
     }
 }
 
@@ -486,6 +608,12 @@ fn validate_config(config: &OpenAiResponsesConfig) -> Result<(), EngineError> {
         return Err(EngineError::new(
             EngineErrorKind::InvalidRequest,
             "model_alias, max_output_tokens, and timeout must be non-empty",
+        ));
+    }
+    if config.data_collection.is_some() && config.wire != ThinkingWire::ChatCompletions {
+        return Err(EngineError::new(
+            EngineErrorKind::InvalidRequest,
+            "provider data_collection needs the chat-completions wire",
         ));
     }
     Ok(())
@@ -546,6 +674,62 @@ fn extract_output_text(payload: &Value) -> Option<String> {
     }
 }
 
+/// `choices[0].message.content` of a chat-completions reply. The loopback
+/// screen describer (`perception.rs`) reads the same pointer but has its own
+/// request shape and error vocabulary, so it is deliberately left alone.
+fn extract_chat_content(payload: &Value) -> Option<String> {
+    payload
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// The HTTP-like status of an `{"error":{"code":N}}` body, when N is a valid
+/// error status. Anything else is left to the generic backend error.
+fn embedded_error_status(payload: &Value) -> Option<u16> {
+    payload
+        .pointer("/error/code")
+        .and_then(Value::as_u64)
+        .and_then(|code| u16::try_from(code).ok())
+        .filter(|code| (400..=599).contains(code))
+}
+
+/// Largest cost accepted from a provider, in USD. A larger (or negative, or
+/// non-finite) figure is a provider bug, not a price, and is dropped.
+const MAX_COST_USD: f64 = 100_000.0;
+
+/// Provider-neutral usage from an OpenAI-compatible `usage` object (chat
+/// `prompt_tokens`/`completion_tokens`, Responses `input_tokens`/
+/// `output_tokens`, OpenRouter `cost` in USD). Missing or malformed fields
+/// become 0 / `None` rather than failing the reply: usage is audit data and
+/// must never turn a good answer into a fallback.
+pub(crate) fn parse_usage(payload: &Value) -> Option<ThinkingUsage> {
+    let usage = payload
+        .get("usage")
+        .or_else(|| payload.pointer("/response/usage"))?
+        .as_object()?;
+    let tokens = |keys: [&str; 2]| {
+        keys.iter()
+            .find_map(|key| usage.get(*key).and_then(Value::as_u64))
+    };
+    let prompt = tokens(["prompt_tokens", "input_tokens"]);
+    let completion = tokens(["completion_tokens", "output_tokens"]);
+    let cost_micro_usd = usage
+        .get("cost")
+        .and_then(Value::as_f64)
+        .filter(|cost| cost.is_finite() && (0.0..=MAX_COST_USD).contains(cost))
+        .map(|cost| (cost * 1_000_000.0).round() as u64);
+    if prompt.is_none() && completion.is_none() && cost_micro_usd.is_none() {
+        return None;
+    }
+    let saturate = |value: Option<u64>| u32::try_from(value.unwrap_or(0)).unwrap_or(u32::MAX);
+    Some(ThinkingUsage {
+        prompt_tokens: saturate(prompt),
+        completion_tokens: saturate(completion),
+        cost_micro_usd,
+    })
+}
+
 fn map_transport_error(error: HttpTransportError) -> EngineError {
     match error {
         HttpTransportError::Timeout => {
@@ -561,6 +745,7 @@ fn map_status(status: u16) -> EngineError {
     let kind = match status {
         400 | 404 | 422 => EngineErrorKind::InvalidRequest,
         401 | 403 => EngineErrorKind::Authentication,
+        402 => EngineErrorKind::QuotaExhausted,
         429 => EngineErrorKind::RateLimited,
         503 | 529 => EngineErrorKind::Overloaded,
         _ if status >= 500 => EngineErrorKind::Unavailable,
