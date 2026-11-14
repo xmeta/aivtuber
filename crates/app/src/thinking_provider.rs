@@ -21,7 +21,7 @@ pub fn openrouter_preset_active(get: &dyn Fn(&str) -> Option<String>) -> bool {
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("openrouter"))
 }
 
-/// Apply `AIVTUBER_THINKING_PROVIDER`,`AIVTUBER_OPENAI_WIRE` and the
+/// Apply `AIVTUBER_THINKING_PROVIDER`, `AIVTUBER_OPENAI_WIRE` and the
 /// OpenRouter knobs to `config`. Call it right after `default()` and before
 /// the explicit endpoint/model overrides, so those keep precedence.
 pub fn apply_thinking_provider_env(
