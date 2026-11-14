@@ -1,0 +1,109 @@
+= ADR-0009: Hybrid profile and typed Thinking egress allowlist
+:status: Accepted
+:date: 2026-11-14
+:accepted: 2026-11-14
+:toc:
+
+== Context
+
+Remote Thinking is only reachable today under `full`, which also requires Jev credentials, a semantic index and the template route. "The local stack plus a better cloud LLM" is therefore impossible: `local` refuses every non-loopback provider endpoint (`CompositionProfile::validate_provider_endpoints`, #220), and `full` is the wrong route graph. Tracking issue #368 makes OpenRouter a first-class Thinking provider; #363 added the chat-completions wire and the `AIVTUBER_THINKING_PROVIDER=openrouter` preset. This ADR records the profile and egress decision of slice #364, which also resolves the A-TTS-004 revisit condition "a second cloud provider is added".
+
+A durable record is appropriate because it adds the first path by which viewer chat text can leave the machine without the operator opting into a voice service, and because it changes the meaning of "loopback-only" in the profile contract.
+
+== Hard constraints
+
+* Security invariants (`docs/security-threat-model.adoc`): model output is data; secrets are `SecretString` and never logged; no redirect may forward a credential; the operator emergency path and the deterministic performer do not depend on the provider.
+* `local` must stay loopback-only and behave exactly as before.
+* The unauthenticated Thinking policy remains loopback-only; a remote endpoint needs a credential.
+* Fail closed with role-named errors that never echo an endpoint URL.
+* No new dependency; no change to the wire schemas.
+
+== Assumptions
+
+* A-LLM-004 (new): a typed per-role allowlist plus Bearer auth is a sufficient boundary for sending Thinking text to OpenRouter.
+* A-LLM-002, A-TTS-004 (unchanged, cross-referenced; the A-TTS-004 revisit condition is marked resolved).
+
+== Alternatives considered
+
+. *Status quo.* Operators who want a cloud LLM use `full` and a Jev key. Rejected: forces a paid decision model and a different route graph for a Thinking-only need.
+. *Relax `local` to allow remote Thinking.* Rejected: it would remove the one profile whose name is a promise that nothing leaves the machine, and the quickstart, setup and tests rely on it.
+. *Generic per-role allowlist data in the environment.* A list of arbitrary role/host pairs. Rejected: every other role has a reason to stay loopback, a list invites silently widening them, and the only needed exception is one role.
+. *New `hybrid` profile with a typed Thinking-only exception.* Selected.
+
+== Decision
+
+Add `CompositionProfile::Hybrid` (`AIVTUBER_MODE=hybrid`):
+
+* Route graph identical to `local`: `jev`, `semantic_retrieval` and `template_route` false, `generative_route` true, `LocalRoutePlanner`, phrased replies by default, the local panel, sidecar, VOICEVOX and Aivis Cloud opt-ins (a single `local_stack()` predicate replaces the `== Local` checks for those).
+* `thinking_stream_by_default` is *false*: the streaming default for `local` rests on a measurement against a loopback llama-server (EXP-0005). A remote provider has none, and a stream has no whole-reply gate before phrase 0. `AIVTUBER_THINKING_STREAM=on` still opts in. Measure first, then reconsider.
+* Per-role egress policy. `validate_provider_endpoints` now covers the non-Thinking roles for the whole local stack (loopback-only under `local` and `hybrid`), and `validate_thinking_endpoint` is the Thinking policy: `local` loopback-only (same error as before); `hybrid` loopback, or HTTPS to an exact allowlisted DNS host with Bearer auth; other profiles unchanged.
+* The allowlist is `ThinkingEgressAllowlist`: `openrouter.ai:443` when the OpenRouter preset is active, plus at most one host (optionally `host:port`) from `AIVTUBER_THINKING_EGRESS_HOST`. Comparison is on the parsed URL host, case-insensitive, exact: no wildcards, no suffix match, no IP literals, no userinfo, port 443 unless written in the configured value, HTTPS only. `AIVTUBER_THINKING_EGRESS_HOST` under any other profile is a startup error so it cannot widen `local`.
+* Startup reports the profile and the egress host (host only) and states that chat and reply text are sent to it, as the Aivis Cloud bridge does.
+
+The existing Aivis Cloud and chat-ingress treatment is unchanged. Aivis is a loopback bridge as far as the profile check sees and stays bounded by its one synthesizer. The Twitch/YouTube chat sidecars (#361) are not profile-gated today: they are bounded by their own origin rules (YouTube API base must be `https://` or loopback `http://`), and `hybrid` treats them exactly as `local` does.
+
+== Reuse / Adapt / Build comparison
+
+[cols="2,1,1"]
+|===
+|Dimension |Hybrid profile (selected) |Relax `local` / generic allowlist
+
+|Implementation effort
+|Small: one enum variant, one predicate, one policy function
+|Small, but touches every `local` assumption
+
+|Security
+|One role, one provider, exact host, Bearer, no redirect; `local` untouched
+|Wider blast radius; easy to widen other roles by config
+
+|Determinism / replay
+|Fingerprint differs by profile name; route graph is `local`'s
+|Same fingerprint for different egress postures
+
+|Operational complexity
+|One new profile name, one optional env
+|Operators must audit a host list per role
+|===
+
+== Evidence
+
+* Repository executable evidence: profile tests (allowlisted vs other hosts, plaintext, userinfo, port, suffix and IP tricks, Bearer requirement, other roles still loopback-only, `local` unchanged, hybrid capability matrix and stream default, summary and errors without URL or secret); the #363 adapter tests for the chat-completions wire, headers, `data_collection` and 402 typing; the adapter test that a redirect is not followed.
+* Mock-only: no live OpenRouter run is recorded in this slice.
+
+== Consequences
+
+=== Positive
+
+* The local stack with a stronger cloud LLM is one profile and one key; no Jev needed.
+* `local`'s promise is intact and testable.
+* The egress is visible at startup.
+
+=== Costs / trade-offs
+
+* Viewer chat text reaches OpenRouter and the upstream provider it routes to. `data_collection=deny` is a request, not a guarantee.
+* Host pinning is by name, not certificate.
+* With both Thinking egress and the Aivis Cloud TTS opt-in active, reply and viewer-derived text leaves by two independent paths (the Thinking prompt to the Thinking host; projected speech text to Aivis Cloud), each separately opted in and announced at startup.
+* The Aivis Cloud exception is still a separate mechanism, so there are two egress concepts until a later slice unifies them.
+
+=== Known limitations
+
+* Buffered (not streamed) Thinking by default under `hybrid`, until measured.
+* The panel model switcher for remote aliases is slice #365, not this one.
+
+== Staging and rollback
+
+Additive: nothing changes unless `AIVTUBER_MODE=hybrid`. Rollback is `AIVTUBER_MODE=local` with a loopback Thinking endpoint; no data migration. The point after which rollback becomes expensive is the first stream run that sends real viewer text to the remote host, which cannot be recalled.
+
+== Revisit conditions
+
+* A second remote Thinking provider is requested (needs its own preset and review, not a wider pattern).
+* Streaming Thinking is measured against a remote provider.
+* A role other than Thinking needs to leave the machine under `hybrid`.
+* OpenRouter changes `data_collection`, routing or authentication semantics.
+* A certificate or key pin becomes warranted.
+
+== Related
+
+* Issues: #364, #363, #368; #220 (local profile); #327, #360 (Aivis Cloud); #361 (chat ingress).
+* Assumptions: A-LLM-002, A-LLM-004, A-TTS-004.
+* Other ADRs: ADR-0007 (perception stays loopback).

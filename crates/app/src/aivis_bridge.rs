@@ -80,7 +80,7 @@ impl std::fmt::Display for AivisSettingsError {
         match self {
             Self::NotLocalProfile => write!(
                 f,
-                "{TTS_BACKEND_VAR}=aivis-cloud is supported with AIVTUBER_MODE=local only; start a bridge yourself and set AIVTUBER_TTS_ENDPOINT for other profiles"
+                "{TTS_BACKEND_VAR}=aivis-cloud is supported with AIVTUBER_MODE=local or hybrid only; start a bridge yourself and set AIVTUBER_TTS_ENDPOINT for other profiles"
             ),
             Self::GenerativeDisabled => write!(
                 f,
@@ -159,7 +159,7 @@ impl AivisSettings {
             // first at startup and owns the selector's vocabulary.
             return Ok(None);
         }
-        if profile != CompositionProfile::Local {
+        if !profile.local_stack() {
             return Err(AivisSettingsError::NotLocalProfile);
         }
         if !generative_enabled {
@@ -448,6 +448,12 @@ mod tests {
         assert_eq!(
             AivisSettings::resolve(&lookup(&BASE), CompositionProfile::Cached, true),
             Err(AivisSettingsError::NotLocalProfile)
+        );
+        // #364: hybrid composes the same local stack, so the opt-in is unchanged.
+        assert!(
+            AivisSettings::resolve(&lookup(&BASE), CompositionProfile::Hybrid, true)
+                .expect("hybrid accepts the same opt-in")
+                .is_some()
         );
         assert_eq!(
             AivisSettings::resolve(&lookup(&BASE), CompositionProfile::Local, false),

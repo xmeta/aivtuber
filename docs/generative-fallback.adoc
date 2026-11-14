@@ -206,7 +206,7 @@ Voice model, viseme mapping, compiler version, avatar profile, and motion librar
 |`deny` (default with the preset) or `allow`. Sent as `provider: {"data_collection": ...}` so viewer chat is not retained for training. Only the openrouter preset sends a `provider` field; the generic chat wire never does. `allow` must be spelled out.
 |===
 
-Explicit `AIVTUBER_OPENAI_ENDPOINT`, `AIVTUBER_OPENAI_MODEL` and `AIVTUBER_OPENAI_WIRE` win over the preset; a variable that would be silently ignored (an `AIVTUBER_OPENROUTER_*` value without the preset, or with the `responses` wire) is a startup error instead. Startup prints ` wire=<wire> data_collection=<policy>` after the usual `thinking:` line only when the wire is not `responses`. The preset works under the `full` profile; a dedicated profile is separate work (#364).
+Explicit `AIVTUBER_OPENAI_ENDPOINT`, `AIVTUBER_OPENAI_MODEL` and `AIVTUBER_OPENAI_WIRE` win over the preset; a variable that would be silently ignored (an `AIVTUBER_OPENROUTER_*` value without the preset, or with the `responses` wire) is a startup error instead. Startup prints ` wire=<wire> data_collection=<policy>` after the usual `thinking:` line only when the wire is not `responses`. The preset works under the `full` and `hybrid` profiles. `hybrid` (#364, ADR-0009) is the only profile that combines it with the local stack: it accepts the OpenRouter host (or one host named in `AIVTUBER_THINKING_EGRESS_HOST`) over HTTPS with Bearer authentication and nothing else; `local` refuses the preset because its Thinking endpoint must be loopback.
 
 Boundaries:
 

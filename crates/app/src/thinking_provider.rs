@@ -13,7 +13,15 @@ use aivtuber_adapters::{DataCollection, ExtraHeaders, OpenAiResponsesConfig, Thi
 pub const OPENROUTER_ENDPOINT: &str = "https://openrouter.ai/api/v1/chat/completions";
 pub const OPENROUTER_DEFAULT_TITLE: &str = "aivtuber";
 
-/// Apply `AIVTUBER_THINKING_PROVIDER`, `AIVTUBER_OPENAI_WIRE` and the
+/// Whether `AIVTUBER_THINKING_PROVIDER` selects the OpenRouter preset (the
+/// `hybrid` egress allowlist, issue #364, keys off this). Value validation is
+/// [`apply_thinking_provider_env`]'s job; anything else reads as not active.
+pub fn openrouter_preset_active(get: &dyn Fn(&str) -> Option<String>) -> bool {
+    get("AIVTUBER_THINKING_PROVIDER")
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("openrouter"))
+}
+
+/// Apply `AIVTUBER_THINKING_PROVIDER`,`AIVTUBER_OPENAI_WIRE` and the
 /// OpenRouter knobs to `config`. Call it right after `default()` and before
 /// the explicit endpoint/model overrides, so those keep precedence.
 pub fn apply_thinking_provider_env(
@@ -107,6 +115,20 @@ mod tests {
             .iter()
             .find(|(n, _)| *n == name)
             .map(|(_, v)| v)
+    }
+
+    #[test]
+    fn the_preset_flag_reads_the_provider_variable_only() {
+        let active = |value: Option<&str>| {
+            openrouter_preset_active(&|name| {
+                (name == "AIVTUBER_THINKING_PROVIDER")
+                    .then(|| value.map(str::to_owned))
+                    .flatten()
+            })
+        };
+        assert!(active(Some(" OpenRouter ")));
+        assert!(!active(Some("generic")));
+        assert!(!active(None));
     }
 
     #[test]

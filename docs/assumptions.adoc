@@ -215,7 +215,23 @@ Do not record secrets, private user data, or raw provider credentials.
 
 *Related:* #333, #294, A-LLM-001.
 
-=== A-TTS-001 -- TTS streaming/prosody controls are provider-specific
+=== A-LLM-004 -- A typed per-role egress allowlist plus Bearer auth is a sufficient boundary for sending Thinking text to OpenRouter
+
+*Subsystem:* Thinking provider adapters / `hybrid` composition profile (issue #364, ADR-0009)
+
+*Status:* Needs validation (policy enforced by tests against fakes; no recorded live OpenRouter run in this slice)
+
+*Statement:* Under `AIVTUBER_MODE=hybrid` the Thinking role may be a remote provider. The profile accepts it only when the endpoint is HTTPS to an exact allowlisted DNS host (`openrouter.ai` for the preset, or the one host in `AIVTUBER_THINKING_EGRESS_HOST`) with Bearer authentication, and every other role stays loopback-only. The key is a `SecretString`, no redirect is followed, `provider.data_collection` is `deny` by default, and the reply is data that passes the same gates as a local reply. Viewer chat text in the prompt is disclosed to that host, and through OpenRouter to the upstream model provider that serves the request, whose retention the operator cannot inspect.
+
+*Evidence:* `crates/app/src/profile.rs` tests (allowlisted vs other hosts, plaintext, userinfo/port/suffix/IP tricks, Bearer requirement, other roles still loopback-only, `local` unchanged, no URL or secret in errors or the summary), `crates/adapters/src/openai/chat_tests.rs` (#363 wire, headers, `data_collection`), `crates/adapters/src/http.rs` (no redirect).
+
+*Consequence if false:* Viewer text reaches a third party the operator did not intend, or an upstream provider retains it despite `deny`; a leaked key spends the operator's credits. A DNS or CA compromise of the allowlisted host defeats host pinning (the check is on the name, not a certificate pin).
+
+*Revisit when:* a second remote Thinking provider is added (each needs its own preset and ADR note, not a wider pattern), OpenRouter changes how `data_collection` or routing is honoured, the profile needs per-model or per-provider egress restrictions, streaming Thinking is measured against a remote provider (then `thinking_stream_by_default` for `hybrid` can be reconsidered), or a certificate pin becomes warranted.
+
+*Related:* #363, #364, #368, A-LLM-001, A-LLM-002, A-TTS-004, ADR-0009.
+
+=== A-TTS-001 --TTS streaming/prosody controls are provider-specific
 
 *Subsystem:* TTS adapters / performance compilation
 
@@ -275,7 +291,9 @@ Do not record secrets, private user data, or raw provider credentials.
 
 *Consequence if false:* Reply text, which can quote a viewer, reaches a third party the operator did not intend; a leaked key spends the operator's credits. Credits exhausted or the service down degrade the voice to the visible non-verbal fallback, never the performer. The audio cache key does not contain a service-side model version, so a silent model update can leave stale cached audio.
 
-*Revisit when:* a second cloud provider is added (then a typed egress allowlist is warranted instead of one synthesizer), the service's terms or data handling change, replies could carry content the operator does not want sent out, or the cache key must carry a service model version.
+*Revisit when:* a second cloud provider is added (then a typed egress allowlist is warranted instead of one synthesizer; *resolved by #364, see the note below*), the service's terms or data handling change, replies could carry content the operator does not want sent out, or the cache key must carry a service model version.
+
+_#364 note (resolves the "second cloud provider" condition):_ OpenRouter Thinking is the second cloud provider. It is not handled by widening this exception: the `hybrid` profile adds a typed per-role egress policy (`CompositionProfile::validate_thinking_endpoint` and `ThinkingEgressAllowlist` in `crates/app/src/profile.rs`; ADR-0009, A-LLM-004) in which only the Thinking role may be non-loopback, to an exact allowlisted HTTPS host with Bearer auth. This exception is unchanged and is taken the same way under `hybrid` as under `local`; the Aivis bridge is still bounded by its one synthesizer rather than by that allowlist, because its endpoint is a loopback bridge as far as the profile check can see.
 
 *Related:* #220, #295, #327, A-TTS-001, A-TTS-003, #360.
 
