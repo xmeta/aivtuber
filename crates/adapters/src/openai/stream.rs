@@ -10,12 +10,15 @@
 //! interrupted); an abandoned reader ends at the transport deadline at the
 //! latest.
 
-use super::{OpenAiResponsesAdapter, compact_generation_input, map_status, map_transport_error};
-use crate::StreamingHttpTransport;
+use super::{
+    OpenAiResponsesAdapter, compact_generation_input, map_status, map_transport_error, parse_usage,
+};
+use crate::{ExtraHeaders, StreamingHttpTransport};
 use aivtuber_domain::{
     DeltaFlow, EngineError, EngineErrorKind, GeneratedReply, ReplyDeltaSink, ThinkingRequest,
+    ThinkingUsage,
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::io::Read;
 use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -231,10 +234,22 @@ fn read_error(error: &std::io::Error) -> EngineError {
     }
 }
 
+/// Usage carried by a stream event, if any. OpenRouter (and OpenAI with
+/// `include_usage`) send it on a final chunk whose `choices` may be empty,
+/// which `parse_stream_event` deliberately treats as nothing to say. The
+/// substring check keeps the common delta path from parsing twice.
+pub(crate) fn parse_event_usage(data: &str) -> Option<ThinkingUsage> {
+    if !data.contains("\"usage\"") {
+        return None;
+    }
+    parse_usage(&serde_json::from_str::<Value>(data.trim()).ok()?)
+}
+
 fn spawn_reader(
     transport: Arc<dyn StreamingHttpTransport>,
     endpoint: String,
     bearer: Option<String>,
+    extra_headers: ExtraHeaders,
     body: Vec<u8>,
     timeout: Duration,
     max_stream_bytes: u64,
@@ -243,9 +258,10 @@ fn spawn_reader(
     std::thread::Builder::new()
         .name("thinking-sse-reader".to_owned())
         .spawn(move || {
-            let response = match transport.post_json_stream(
+            let response = match transport.post_json_stream_with_headers(
                 &endpoint,
                 bearer.as_deref(),
+                &extra_headers,
                 &body,
                 timeout,
                 max_stream_bytes,
@@ -319,17 +335,12 @@ impl OpenAiResponsesAdapter {
         }
         let started = Instant::now();
         let input = compact_generation_input(request)?;
-        let body = serde_json::to_vec(&json!({
-            "model": self.active_model().alias,
-            "input": input,
-            "max_output_tokens": self.config.max_output_tokens,
-            "stream": true,
-        }))
-        .map_err(|error| EngineError::new(EngineErrorKind::InvalidRequest, error.to_string()))?;
+        let body = self.request_body(&input, self.config.max_output_tokens, true)?;
         let receiver = spawn_reader(
             Arc::clone(transport),
             self.config.endpoint.clone(),
             self.api_key.as_ref().map(|key| key.expose().to_owned()),
+            self.config.extra_headers.clone(),
             body,
             timeout,
             limits.max_stream_bytes,
@@ -337,6 +348,7 @@ impl OpenAiResponsesAdapter {
 
         let mut parser = SseParser::new(limits.max_event_bytes);
         let mut reply = String::new();
+        let mut usage: Option<ThinkingUsage> = None;
         let mut chars = 0_usize;
         let mut last_activity = Instant::now();
         let mut events = Vec::new();
@@ -390,6 +402,9 @@ impl OpenAiResponsesAdapter {
                         )
                     })?;
                     for data in events.drain(..) {
+                        if let Some(seen) = parse_event_usage(&data) {
+                            usage = Some(seen);
+                        }
                         match parse_stream_event(&data)? {
                             StreamItem::Ignore => {}
                             StreamItem::Done => {
@@ -399,7 +414,7 @@ impl OpenAiResponsesAdapter {
                                         "OpenAI-compatible stream produced no text",
                                     ));
                                 }
-                                return Ok(GeneratedReply { text: reply });
+                                return Ok(GeneratedReply { text: reply, usage });
                             }
                             StreamItem::Delta(text) => {
                                 chars += text.chars().count();

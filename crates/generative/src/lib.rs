@@ -14,7 +14,7 @@ use aivtuber_asset_store::{
 use aivtuber_domain::{
     BackendIdentity, EngineError, EngineErrorKind, EventEnvelope, FallbackReason, SpeechArtifact,
     SpeechProgress, SpeechProgressSink, SpeechRequest, ThinkingEngine, ThinkingRequest,
-    TtsBackendIdentity, TtsEngine,
+    ThinkingUsage, TtsBackendIdentity, TtsEngine,
 };
 use aivtuber_scheduler::{Priority, priority_for_event};
 use futures::executor::block_on;
@@ -74,6 +74,10 @@ pub struct LlmCallRecord {
     pub event_id: String,
     pub routing_reason: GenerationRoutingReason,
     pub backend: BackendIdentity,
+    /// Provider-reported accounting for this call, once it returned a reply.
+    /// Audit data only (#367): nothing in routing or replay reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ThinkingUsage>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -129,6 +133,13 @@ pub struct SpeechProjectionTrace {
 }
 
 impl GenerationTrace {
+    /// Attach the provider's accounting to the most recent Thinking call.
+    pub(crate) fn record_thinking_usage(&mut self, usage: Option<ThinkingUsage>) {
+        if let Some(call) = self.llm_calls.last_mut() {
+            call.usage = usage;
+        }
+    }
+
     pub(crate) fn record_speech_projection(&mut self, projection: &SpeechTextProjection) {
         let entry = self
             .speech_projection
@@ -993,6 +1004,7 @@ impl GenerativePipeline {
             event_id: request.source_event.event_id.clone(),
             routing_reason: request.routing_reason.clone(),
             backend: thinking_identity.clone(),
+            usage: None,
         });
 
         let thinking = match thinking_timeout {
@@ -1008,6 +1020,7 @@ impl GenerativePipeline {
                 return Ok(fallback_result(trace, fallback.clone()));
             }
         };
+        trace.record_thinking_usage(reply.usage);
 
         if cancellation.is_cancelled() {
             return Ok(cancelled_result(trace, CancellationStage::AfterThinking));
@@ -1182,7 +1195,11 @@ fn fallback_reason_from_error(error: &EngineError) -> FallbackReason {
         EngineErrorKind::Overloaded => FallbackReason::Overloaded,
         EngineErrorKind::Authentication => FallbackReason::Authentication,
         EngineErrorKind::InvalidRequest => FallbackReason::InvalidRequest,
-        EngineErrorKind::Unauthorized | EngineErrorKind::Backend => FallbackReason::Unavailable,
+        // Credit exhaustion is reported as `unavailable`: the wire fallback
+        // vocabulary is closed, and the typed kind stays in the engine error.
+        EngineErrorKind::Unauthorized
+        | EngineErrorKind::Backend
+        | EngineErrorKind::QuotaExhausted => FallbackReason::Unavailable,
     }
 }
 
@@ -1251,6 +1268,7 @@ mod tests {
             Self {
                 result: Ok(GeneratedReply {
                     text: text.to_owned(),
+                    usage: None,
                 }),
                 calls: Arc::new(AtomicUsize::new(0)),
                 cancel_on_call: None,

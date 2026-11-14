@@ -1,4 +1,7 @@
-use aivtuber_adapters::{OpenAiResponsesAdapter, OpenAiResponsesConfig, SecretString};
+use aivtuber_adapters::{
+    DataCollection, ExtraHeaders, OpenAiResponsesAdapter, OpenAiResponsesConfig, SecretString,
+    ThinkingWire,
+};
 use aivtuber_domain::{
     EVENT_SCHEMA_VERSION, EventEnvelope, EventKind, PrivacyClass, ReflexContext, ReflexRequest,
     RetrievalCandidateContext, RetrievalSnapshot, SecurityPlane, SourceClass, ThinkingRequest,
@@ -126,5 +129,43 @@ fn live_openai_responses_conformance() {
             .model_alias
             .as_deref()
             .is_some_and(|model| !model.is_empty())
+    );
+}
+
+#[test]
+#[ignore = "may be billable and requires an explicit OpenRouter key"]
+fn live_openrouter_chat_conformance() {
+    // Reads the same variables the app does; nothing is hard-coded and the
+    // key never reaches the output. A small `max_tokens` bounds the cost.
+    let mut config = OpenAiResponsesConfig {
+        endpoint: "https://openrouter.ai/api/v1/chat/completions".to_owned(),
+        model_alias: required_env("AIVTUBER_OPENAI_MODEL"),
+        timeout: Duration::from_secs(20),
+        max_output_tokens: 32,
+        wire: ThinkingWire::ChatCompletions,
+        extra_headers: ExtraHeaders::new(&[("X-Title", "aivtuber-conformance")])
+            .expect("probe headers"),
+        data_collection: Some(DataCollection::Deny),
+        ..OpenAiResponsesConfig::default()
+    };
+    if let Ok(endpoint) = env::var("AIVTUBER_OPENAI_ENDPOINT")
+        && !endpoint.trim().is_empty()
+    {
+        config.endpoint = endpoint;
+    }
+    let adapter = OpenAiResponsesAdapter::new(
+        config,
+        SecretString::new(required_env("AIVTUBER_OPENAI_API_KEY")),
+    )
+    .expect("valid OpenRouter live probe config");
+
+    let reply = adapter
+        .generate_sync(&thinking_request())
+        .expect("OpenRouter live conformance response");
+    assert!(!reply.text.trim().is_empty());
+    // Usage is audit data: report its presence, never the reply text.
+    println!(
+        "openrouter live probe: usage_reported={}",
+        reply.usage.is_some()
     );
 }

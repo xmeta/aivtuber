@@ -249,6 +249,7 @@ impl PreviewThinking {
     fn reply() -> GeneratedReply {
         GeneratedReply {
             text: VOICE_PREVIEW_TEXT.to_owned(),
+            usage: None,
         }
     }
 }

@@ -21,6 +21,8 @@ export interface PanelState {
     chat_ingress?: ChatIngressState | null;
     /** The VRM avatar choice (#362); absent unless the app composed it. */
     avatar_model?: AvatarState | null;
+    /** Session Thinking tokens/cost and the optional spend cap (#367); absent unless composed. */
+    thinking_usage?: ThinkingUsageState | null;
   };
   replies: { seq: number; event_id: string; text: string }[];
   avatar_url: string | null;
@@ -38,6 +40,20 @@ export interface ThinkingModelState {
   /** The model being loaded, or the one that failed to load. */
   target: string | null;
   available: ModelOption[];
+}
+
+/** Mirrors `ThinkingUsageStatus` in crates/app/src/thinking_meter.rs. */
+export interface ThinkingUsageState {
+  prompt_tokens: number;
+  completion_tokens: number;
+  /** Summed micro-USD, or null when no reply has reported a cost (unknown, not 0). */
+  cost_micro_usd: number | null;
+  turns_with_usage: number;
+  turns_unknown_usage: number;
+  turns_cost_reported: number;
+  cap_micro_usd: number | null;
+  cap_tripped: boolean;
+  suspended_calls: number;
 }
 
 export const STATE_SCHEMA = "local-panel/1";
@@ -130,6 +146,85 @@ export function modelView(state: PanelState | null): ModelView | null {
   };
 }
 
+const isCount = (value: unknown): value is number => typeof value === "number" && Number.isInteger(value) && value >= 0;
+
+/** The usage state, only if it has exactly the documented shape; otherwise the section is hidden. */
+export function parseUsageState(value: unknown): ThinkingUsageState | null {
+  if (typeof value !== "object" || value === null) return null;
+  const v = value as Record<string, unknown>;
+  const optionalCount = (x: unknown): number | null | undefined => (x === null ? null : isCount(x) ? x : undefined);
+  const cost = optionalCount(v.cost_micro_usd);
+  const cap = optionalCount(v.cap_micro_usd);
+  if (cost === undefined || cap === undefined) return null;
+  if (
+    !isCount(v.prompt_tokens) ||
+    !isCount(v.completion_tokens) ||
+    !isCount(v.turns_with_usage) ||
+    !isCount(v.turns_unknown_usage) ||
+    !isCount(v.turns_cost_reported) ||
+    !isCount(v.suspended_calls) ||
+    typeof v.cap_tripped !== "boolean"
+  ) {
+    return null;
+  }
+  return {
+    prompt_tokens: v.prompt_tokens,
+    completion_tokens: v.completion_tokens,
+    cost_micro_usd: cost,
+    turns_with_usage: v.turns_with_usage,
+    turns_unknown_usage: v.turns_unknown_usage,
+    turns_cost_reported: v.turns_cost_reported,
+    cap_micro_usd: cap,
+    cap_tripped: v.cap_tripped,
+    suspended_calls: v.suspended_calls,
+  };
+}
+
+/** Micro-USD as `$X.XXXX`. */
+export function formatUsd(micro: number): string {
+  return `$${(micro / 1_000_000).toFixed(4)}`;
+}
+
+export interface UsageView {
+  /** "今回の配信: N トークン · $X.XXXX", with "不明" where the provider reported nothing. */
+  summary: string;
+  /** The spend cap and whether it stopped Thinking; empty when there is no cap. */
+  cap: string;
+  health: Health;
+}
+
+/** What the usage card shows, or `null` when the app has no meter. */
+export function usageView(state: PanelState | null): UsageView | null {
+  const u = state?.status.thinking_usage ?? null;
+  if (u === null) return null;
+  const replies = u.turns_with_usage + u.turns_unknown_usage;
+  let summary: string;
+  if (u.turns_with_usage === 0) {
+    summary = replies === 0 ? "今回の配信: まだ応答がありません" : "今回の配信: 不明(プロバイダーが使用量を返していません)";
+  } else {
+    const tokens = `${(u.prompt_tokens + u.completion_tokens).toLocaleString("en-US")} トークン`;
+    if (u.cost_micro_usd === null) {
+      summary = `今回の配信: ${tokens} · 金額は不明`;
+    } else {
+      const unknown = replies - u.turns_cost_reported;
+      summary =
+        unknown > 0
+          ? `今回の配信: ${tokens} · ${formatUsd(u.cost_micro_usd)} 以上(${unknown}回分は金額不明)`
+          : `今回の配信: ${tokens} · ${formatUsd(u.cost_micro_usd)}`;
+    }
+  }
+  if (u.cap_micro_usd === null) return { summary, cap: "", health: "ok" };
+  const limit = formatUsd(u.cap_micro_usd);
+  if (u.cap_tripped) {
+    return {
+      summary,
+      cap: `上限 ${limit} に達したため、応答の生成を停止しています。以降は定型の返しになります(再起動で解除)`,
+      health: "warn",
+    };
+  }
+  return { summary, cap: `上限 ${limit}(金額が報告された分だけ数えます。超えると応答の生成を停止します)`, health: "ok" };
+}
+
 /** A state document is only trusted if it has the shape this page was built for. */
 export function parseState(value: unknown): PanelState | null {
   if (typeof value !== "object" || value === null) return null;
@@ -142,9 +237,17 @@ export function parseState(value: unknown): PanelState | null {
   const voice = parseVoiceState(v.status.voice);
   const chatIngress = parseChatIngressState(v.status.chat_ingress);
   const avatarModel = parseAvatarState(v.status.avatar_model);
+  const thinkingUsage = parseUsageState(v.status.thinking_usage);
   return {
     ...(v as PanelState),
-    status: { ...v.status, thinking_model: thinkingModel, voice, chat_ingress: chatIngress, avatar_model: avatarModel },
+    status: {
+      ...v.status,
+      thinking_model: thinkingModel,
+      voice,
+      chat_ingress: chatIngress,
+      avatar_model: avatarModel,
+      thinking_usage: thinkingUsage,
+    },
   };
 }
 

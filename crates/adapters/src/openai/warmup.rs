@@ -19,7 +19,7 @@ use aivtuber_domain::{
     EngineError, EngineErrorKind, EventKind, PrivacyClass, ReflexContext, RetrievalSnapshot,
     SourceClass, ThinkingContent, ThinkingContextSource, ThinkingRequest, TrustLevel,
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -108,19 +108,15 @@ impl OpenAiResponsesAdapter {
         }
         let started = Instant::now();
         let input = compact_generation_input(&warmup_request())?;
-        let body = serde_json::to_vec(&json!({
-            "model": self.active_model().alias,
-            "input": input,
-            "max_output_tokens": WARMUP_MAX_OUTPUT_TOKENS,
-        }))
-        .map_err(|error| EngineError::new(EngineErrorKind::InvalidRequest, error.to_string()))?;
+        let body = self.request_body(&input, WARMUP_MAX_OUTPUT_TOKENS, false)?;
 
         let _in_flight = self.warmup.begin(timeout);
         let response = self
             .transport
-            .post_json(
+            .post_json_with_headers(
                 &self.config.endpoint,
                 self.api_key.as_ref().map(|key| key.expose()),
+                &self.config.extra_headers,
                 &body,
                 timeout,
             )

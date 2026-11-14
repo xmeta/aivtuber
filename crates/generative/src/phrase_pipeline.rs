@@ -151,6 +151,7 @@ impl GenerativePipeline {
             event_id: request.source_event.event_id.clone(),
             routing_reason: request.routing_reason.clone(),
             backend: thinking_identity.clone(),
+            usage: None,
         });
         // Token streaming (issue #83 S2): same per-phrase stages, fed as the
         // provider produces text instead of after the whole reply exists.
@@ -183,6 +184,7 @@ impl GenerativePipeline {
                 return Ok(fallback_result(trace, fallback));
             }
         };
+        trace.record_thinking_usage(reply.usage);
         if cancellation.is_cancelled() {
             return Ok(cancelled_result(trace, CancellationStage::AfterThinking));
         }
@@ -545,7 +547,7 @@ mod tests {
             _request: &'a ThinkingRequest,
         ) -> EngineFuture<'a, GeneratedReply> {
             let text = self.0.clone();
-            Box::pin(async move { Ok(GeneratedReply { text }) })
+            Box::pin(async move { Ok(GeneratedReply { text, usage: None }) })
         }
 
         fn identity(&self) -> BackendIdentity {
