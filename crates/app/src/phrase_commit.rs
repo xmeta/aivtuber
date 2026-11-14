@@ -919,6 +919,11 @@ where
             },
             Err(_) => None,
         };
+        // A streamed reply's accounting arrives with the stream's end, after
+        // phrase 0 recorded the observation: attach it now (audit data only).
+        if let Ok(result) = &completion.result {
+            self.backfill_thinking_usage(&event_id, &result.trace);
+        }
         let spoke = run.has_committed();
         let chars = if spoke {
             self.finish_phrase_run(run, summary.as_ref())
@@ -945,6 +950,31 @@ where
                 generative.note_cancelled_or_stale();
             }
             generative.finish(completion.generation_id, &event_id);
+        }
+    }
+
+    /// Fill the thinking usage of an already recorded observation whose
+    /// reply finished after it was recorded. Never overwrites usage that is
+    /// already there.
+    fn backfill_thinking_usage(&mut self, event_id: &str, trace: &GenerationTrace) {
+        let Some(observation) = self
+            .telemetry
+            .events_mut()
+            .iter_mut()
+            .rev()
+            .find(|event| event.event_id == event_id)
+        else {
+            return;
+        };
+        if observation.thinking_prompt_tokens.is_some() {
+            return;
+        }
+        for usage in trace.llm_calls.iter().filter_map(|call| call.usage) {
+            observation.add_thinking_usage(
+                u64::from(usage.prompt_tokens),
+                u64::from(usage.completion_tokens),
+                usage.cost_micro_usd,
+            );
         }
     }
 

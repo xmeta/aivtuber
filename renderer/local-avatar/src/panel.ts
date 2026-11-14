@@ -21,6 +21,7 @@ import {
   defaultSelection,
   enablePatch,
   modelView,
+  usageView,
   otherReplies,
   parseSearchPage,
   parseState,
@@ -98,6 +99,7 @@ function render(): void {
     }
   }
   renderModel();
+  renderUsage();
   renderVoice();
   renderIngress();
   const link = $<HTMLAnchorElement>("avatar-link");
@@ -134,6 +136,18 @@ function render(): void {
     others.append(li);
   }
   $("other-wrap").hidden = others.childElementCount === 0;
+}
+
+/** Session Thinking tokens/cost and the spend cap (#367). */
+function renderUsage(): void {
+  const view = usageView(state);
+  $("usage-section").hidden = view === null;
+  if (view === null) return;
+  $("usage-summary").textContent = view.summary;
+  const cap = $("usage-cap");
+  cap.textContent = view.cap;
+  cap.hidden = view.cap === "";
+  cap.className = view.health === "warn" ? "error" : "hint";
 }
 
 let modelKey = "";

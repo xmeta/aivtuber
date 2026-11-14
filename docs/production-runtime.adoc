@@ -743,6 +743,7 @@ Startup prints `thinking: endpoint=<origin> auth=<policy> backend=<name>` (origi
 
 * `AIVTUBER_THINKING_WARMUP`: `auto` (default; on only for `AIVTUBER_OPENAI_AUTH=unauthenticated-loopback` with `AIVTUBER_OPENAI_BACKEND_NAME=llama-server`, off for remote or paid endpoints), `on`, `off`.
 * `AIVTUBER_THINKING_WARMUP_TIMEOUT_MS`: default 120000, accepted 1000 to 600000.
+* `AIVTUBER_THINKING_COST_CAP_USD` (#367): optional session spend cap, a decimal number of USD greater than 0 and at most 10000 (up to six decimal places). Once the provider-reported Thinking cost for the session reaches it, Thinking is suspended until restart and replies use the deterministic fallback; costs a provider does not report do not count. Invalid values are a startup error. Session tokens/cost and the cap are shown in the operator panel; see `docs/generative-fallback.adoc` ("Session usage and the optional spend cap").
 * Log lines: `thinking_warmup: started timeout_ms=N`, `thinking_warmup: ok ms=N prompt_tokens=N` (tokens only when the server reports usage), `thinking_warmup: failed reason=<timeout|unavailable|...>`, `thinking_warmup: skipped reason=<disabled|not_local_llama_server|thread_unavailable>`.
 
 All profiles still require `AIVTUBER_MEMORY_PSEUDONYM_KEY_HEX`; VTube Studio/OBS and the remaining tuning variables apply unchanged to every profile.
