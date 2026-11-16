@@ -29,7 +29,7 @@ use aivtuber_app::{
     RawIngressConfig, RawIngressMetrics, RawIngressMetricsSnapshot, RoutePlanner,
     RuntimeRetentionPolicy, SHADOW_ORCHESTRATOR_SCHEMA_VERSION, SceneContextService,
     ShadowOrchestratorConfig, ShadowPolicyIdentity, ShadowingRoutePlanner,
-    SpeechConversationConfig, SpeechConversationMetrics, SpeechFloorMetrics, SpeechSidecar,
+    SpeechConversationConfig, SpeechConversationMetrics, SpeechFloorMetrics, SpeechInputController,
     SpeechSidecarConfig, SpeechSidecarStats, StreamOutput, SwitchWarmup, ThinkingEgressAllowlist,
     TtsSidecarSettings, VOICE_SETTINGS_VAR, VoiceController, VoiceEnvironment, VoicePaths,
     VoicevoxBridge, VoicevoxSettings, VtsAvatarOutput, VtsPlaybackConfig, WarmupMode,
@@ -455,6 +455,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     // #90 S1b: live screen perception is opt-in. Only then does the operator
     // endpoint's ingress also hold `perception.control`.
     let perception_opt_in = env_bool("AIVTUBER_PERCEPTION", false)?;
+    // #397/#400: the speech sidecar program and the voice-input state file.
+    // With both, voice input is composed and the operator endpoint holds
+    // `speech_input.control`; without the file (the app run directly) the
+    // sidecar starts as before and cannot be switched.
+    let speech_program = env_optional("AIVTUBER_SPEECH_SIDECAR");
+    let speech_settings = env_path(aivtuber_app::speech_input::SPEECH_INPUT_SETTINGS_VAR);
     // #321: the memory export needs the writer's live entries, so the endpoint
     // holds `memory.admin` only when the writer is composed.
     let (operator_server, mut operator_receiver) = OperatorControlServer::with_options(
@@ -471,6 +477,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             ingress_control: app.chat_ingress_configured(),
             // #362: `avatar.configure` only when the avatar store is composed.
             avatar_configure: app.avatar_configured(),
+            // #400: `speech_input.control` only when voice input is composed.
+            speech_input_control: speech_program.is_some() && speech_settings.is_some(),
         },
     )?;
     let operator_ingress = operator_server.ingress();
@@ -527,7 +535,6 @@ fn run() -> Result<(), Box<dyn Error>> {
     // tracker only (untrusted content-plane data, no scheduler or output
     // path); a sidecar that cannot start or later fails degrades to no speech
     // observations and never blocks this loop.
-    let mut speech_sidecar: Option<SpeechSidecar> = None;
     let mut speech_conversation_enabled = false;
     let mut chat_burst_enabled = false;
     // Issues #75 S1 / #78 S2: live chat-burst selection and deferred
@@ -691,11 +698,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut last_phrase_response_logged: Option<u64> = None;
     let mut last_conversation_metrics = SpeechConversationMetrics::default();
     // #397: under `aivtuber-setup start` the microphone is opened only when the
-    // state file says voice input is on. When it is off the whole block is
-    // skipped, exactly as when AIVTUBER_SPEECH_SIDECAR is absent: no sidecar,
-    // no transcript tracker, no conversation route, no floor, no barge-in.
-    let speech_program = env_optional("AIVTUBER_SPEECH_SIDECAR");
-    let speech_settings = env_path(aivtuber_app::speech_input::SPEECH_INPUT_SETTINGS_VAR);
+    // state file says voice input is on. #400: the trackers, conversation
+    // route, floor and barge-in are built either way (voice input can be
+    // switched on later from the panel); only the sidecar is started or not.
+    // The speech program and state-file variable were read above.
     let speech_input = aivtuber_app::speech_input::SpeechInput::decide(
         speech_program.is_some(),
         speech_settings.is_some(),
@@ -713,7 +719,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             )
         );
     }
-    if let Some(program) = speech_program.filter(|_| speech_input.starts_sidecar()) {
+    if let Some(program) = speech_program {
         let mut tracker = SpeechObservationTracker::new(
             SpeechObservationConfig::default(),
             IngressPolicy::parse(
@@ -869,19 +875,28 @@ fn run() -> Result<(), Box<dyn Error>> {
         let mut config = SpeechSidecarConfig::new(program, sidecar_args);
         config.resync_interval =
             Duration::from_millis(env_u64("AIVTUBER_SPEECH_SIDECAR_RESYNC_MS", 5_000)?);
-        match SpeechSidecar::spawn(config, started) {
-            Ok(sidecar) => {
-                if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
-                    eprintln!("speech_sidecar: started");
+        let mut input = SpeechInputController::new(
+            config,
+            started,
+            speech_settings.clone(),
+            thinking_leaves_machine,
+        );
+        if speech_input.starts_sidecar() {
+            match input.start_initial() {
+                Ok(()) => {
+                    if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+                        eprintln!("speech_sidecar: started");
+                    }
                 }
-                speech_sidecar = Some(sidecar);
-            }
-            Err(error) => {
-                eprintln!("speech_sidecar: could not start: {error}; no speech observations");
-                tracker.record_provider_unavailable();
+                Err(error) => {
+                    eprintln!("speech_sidecar: could not start: {error}; no speech observations");
+                    tracker.record_provider_unavailable();
+                }
             }
         }
-        app = app.with_speech_observations(tracker);
+        app = app
+            .with_speech_input(input)
+            .with_speech_observations(tracker);
     }
     // #90 S1b: opt-in live screen perception ("perception" local profile).
     // Composed disabled; the only way to turn it on is the authenticated
@@ -968,9 +983,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 app.shutdown(now_ms);
                 app.shutdown_voice();
                 app.shutdown_chat_ingress();
-                if let Some(sidecar) = speech_sidecar.as_mut() {
-                    sidecar.shutdown();
-                }
+                app.shutdown_speech_input();
                 break;
             }
         }
@@ -1049,20 +1062,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                 last_perception_status = Some(key);
             }
         }
-        if let Some(sidecar) = speech_sidecar.as_mut()
-            && let (Some(tracker), transcripts) = app.speech_trackers_mut()
-        {
-            sidecar.poll_with_transcripts(tracker, transcripts, now_ms, |_, _| {}, |_, _| {});
-        }
-        // Issue #81 S2: feed liveness first, then the confirmed barge-in, so a
-        // stalled feed is already stale when the barge-in is judged. Only
-        // lengths and counts are logged.
-        if let Some(beat_ms) = speech_sidecar
-            .as_ref()
-            .and_then(SpeechSidecar::feed_heartbeat_ms)
-        {
-            app.note_speech_feed_heartbeat(beat_ms);
-        }
+        // #400: the sidecar is owned by the app (it can be switched from the
+        // panel). Feed liveness is noted here too, first, then the confirmed
+        // barge-in, so a stalled feed is already stale when the barge-in is
+        // judged. Only lengths and counts are logged (issue #81 S2).
+        app.service_speech_input(now_ms);
         if speech_barge_in_enabled && let Some(record) = app.service_barge_in(now_ms) {
             eprintln!(
                 "speech_barge_in: decision_seq={} at_ms={} effect={:?} cancelled_playing={} cancelled_queued={} fade_ms={} audio={:?} audio_error={} avatar_reset={:?} decision_to_stop_micros={}",
@@ -1148,21 +1152,19 @@ fn run() -> Result<(), Box<dyn Error>> {
             if let Some(tracker) = app.speech_transcripts_mut() {
                 tracker.sweep(now_ms);
             }
-            if let Some(sidecar) = speech_sidecar.as_ref() {
-                let stats = sidecar.stats();
-                if stats.lines_dropped_queue_full != last_speech_stats.lines_dropped_queue_full
+            if let Some(stats) = app.speech_sidecar_stats()
+                && (stats.lines_dropped_queue_full != last_speech_stats.lines_dropped_queue_full
                     || stats.lines_dropped_oversize != last_speech_stats.lines_dropped_oversize
-                    || stats.lines_rejected != last_speech_stats.lines_rejected
-                {
-                    eprintln!(
-                        "speech_sidecar_metrics: ingested={} rejected={} dropped_queue_full={} dropped_oversize={}",
-                        stats.batches_ingested,
-                        stats.lines_rejected,
-                        stats.lines_dropped_queue_full,
-                        stats.lines_dropped_oversize
-                    );
-                    last_speech_stats = stats;
-                }
+                    || stats.lines_rejected != last_speech_stats.lines_rejected)
+            {
+                eprintln!(
+                    "speech_sidecar_metrics: ingested={} rejected={} dropped_queue_full={} dropped_oversize={}",
+                    stats.batches_ingested,
+                    stats.lines_rejected,
+                    stats.lines_dropped_queue_full,
+                    stats.lines_dropped_oversize
+                );
+                last_speech_stats = stats;
             }
             if let Some(metrics) = app.speech_conversation_metrics()
                 && metrics != last_conversation_metrics
@@ -1192,14 +1194,19 @@ fn run() -> Result<(), Box<dyn Error>> {
                 && (metrics.policy != last_floor_metrics.policy
                     || metrics.deferred != last_floor_metrics.deferred
                     || metrics.dropped_expired != last_floor_metrics.dropped_expired
-                    || metrics.dropped_overflow != last_floor_metrics.dropped_overflow)
+                    || metrics.dropped_overflow != last_floor_metrics.dropped_overflow
+                    || metrics.dropped_by_operator != last_floor_metrics.dropped_by_operator)
             {
                 if aivtuber_app::ready_guide::metrics_line_visible(
                     aivtuber_adapters::log_verbosity::diagnostics_enabled(),
-                    &[metrics.dropped_expired, metrics.dropped_overflow],
+                    &[
+                        metrics.dropped_expired,
+                        metrics.dropped_overflow,
+                        metrics.dropped_by_operator,
+                    ],
                 ) {
                     eprintln!(
-                        "speech_floor_metrics: decisions={} take_turn={} wait={} hold={} yield_recorded={} fallback_take_turn={} deferred={} released={} dropped_expired={} dropped_overflow={} queued={}",
+                        "speech_floor_metrics: decisions={} take_turn={} wait={} hold={} yield_recorded={} fallback_take_turn={} deferred={} released={} dropped_expired={} dropped_overflow={} dropped_by_operator={} queued={}",
                         metrics.policy.decisions,
                         metrics.policy.take_turn,
                         metrics.policy.wait,
@@ -1210,6 +1217,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         metrics.released_after_deferral,
                         metrics.dropped_expired,
                         metrics.dropped_overflow,
+                        metrics.dropped_by_operator,
                         metrics.queued
                     );
                 }

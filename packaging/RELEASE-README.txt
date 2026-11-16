@@ -66,7 +66,11 @@ In short, from this directory (after the checksum check above):
                                       garble the Japanese; the English stays readable.)
                                       The microphone is OFF until you run
                                       "aivtuber-setup start --voice-input on" once
-                                      (remembered; --voice-input off turns it off).
+                                      (remembered; --voice-input off turns it off),
+                                      or turn it on in the operation panel's
+                                      voice input card (also remembered; the same
+                                      card, or "aivtuberctl voice-input off", turns
+                                      it off at once).
                                       In the hybrid profile, voice input on sends the
                                       transcribed speech to the cloud model.
 Install FFmpeg (ffplay and ffmpeg on PATH) first; setup tells you if it is missing.

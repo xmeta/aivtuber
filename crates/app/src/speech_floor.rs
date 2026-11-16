@@ -62,6 +62,9 @@ pub struct SpeechFloorMetrics {
     pub dropped_expired: u64,
     /// Dropped because the deferred queue was full (oldest first).
     pub dropped_overflow: u64,
+    /// Dropped because the operator turned voice input off (#400): speech
+    /// heard before the switch is neither answered nor sent anywhere.
+    pub dropped_by_operator: u64,
     /// Highest queue depth seen.
     pub queue_high_water: usize,
     /// Current queue depth.
@@ -115,6 +118,18 @@ impl SpeechFloor {
 
     pub(crate) fn recent(&self) -> Vec<FloorDecision> {
         self.policy.recent().copied().collect()
+    }
+
+    /// Voice input was turned off (#400): discard every final still waiting
+    /// for the floor, counted in `dropped_by_operator`. The policy keeps no
+    /// holder or speaker state (its sequence, decision ring and counters are
+    /// history and stay), and nothing here reads a clock, so this is
+    /// deterministic. Returns how many were dropped.
+    pub(crate) fn clear(&mut self) -> usize {
+        let dropped = self.queue.len();
+        self.metrics.dropped_by_operator += dropped as u64;
+        self.queue.clear();
+        dropped
     }
 
     /// A confirmed barge-in, if `input` is one (ADR-0005 S-3). Evaluates
@@ -185,5 +200,96 @@ impl SpeechFloor {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aivtuber_domain::{FallbackTurnSignal, OwnSpeech, TrustedInterruptibility};
+    use aivtuber_runtime::{IngressPolicy, SpeechTranscriptConfig};
+
+    fn finals(texts: &[&str]) -> Vec<SurfacedFinal> {
+        let mut tracker = SpeechTranscriptTracker::new(
+            SpeechTranscriptConfig::default(),
+            IngressPolicy::default(),
+        )
+        .unwrap();
+        for (n, text) in texts.iter().enumerate() {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "schema_version": "0.1.0", "provider_id": "stt", "provider_version": "1",
+                "language": "ja",
+                "engine": {"model_id": "m:1", "sha256": "0".repeat(64)},
+                "transcripts": [{
+                    "speaker_id": format!("s{n}"), "segment_id": 1, "revision": 0,
+                    "kind": "final", "text": text, "covered_audio_ms": 500,
+                    "observed_at_ms": 900, "complete": true
+                }]
+            }))
+            .unwrap();
+            tracker.ingest_bytes(&bytes, 1_000).unwrap();
+        }
+        tracker.take_finals(16)
+    }
+
+    fn speaking(now_ms: u64) -> FloorInput {
+        FloorInput {
+            now_ms,
+            user: Some(UserSpeechEvidence {
+                signal: FallbackTurnSignal::SpeakerActive,
+                last_edge_ms: Some(900),
+                feed_age_ms: None,
+            }),
+            hold: TranscriptHold::None,
+            own: OwnSpeech::Idle,
+            reply_waiting: true,
+            scene: TrustedInterruptibility::unknown(),
+            reply_inbox: false,
+        }
+    }
+
+    fn silent(now_ms: u64) -> FloorInput {
+        FloorInput {
+            user: None,
+            ..speaking(now_ms)
+        }
+    }
+
+    #[test]
+    fn clear_discards_held_finals_counts_them_and_leaves_a_fresh_floor() {
+        let mut floor = SpeechFloor::new(FloorConfig::default()).unwrap();
+        // Held behind a speaking user.
+        let out = floor.admit(1_000, finals(&["あ", "い"]), 8, |_| speaking(1_000));
+        assert!(out.is_empty());
+        assert_eq!(floor.metrics().queued, 2);
+
+        assert_eq!(floor.clear(), 2);
+        let m = floor.metrics();
+        assert_eq!((m.queued, m.dropped_by_operator), (0, 2));
+        // Dropped, not released and not expired.
+        assert_eq!((m.released_after_deferral, m.dropped_expired), (0, 0));
+        // Nothing comes out later, whatever the evidence says.
+        assert!(
+            floor
+                .admit(1_010, Vec::new(), 8, |_| silent(1_010))
+                .is_empty()
+        );
+        assert!(
+            floor
+                .admit(30_000, Vec::new(), 8, |_| silent(30_000))
+                .is_empty()
+        );
+        // An empty clear counts nothing.
+        assert_eq!(floor.clear(), 0);
+        assert_eq!(floor.metrics().dropped_by_operator, 2);
+
+        // Afterwards decisions are those of a fresh floor.
+        let mut fresh = SpeechFloor::new(FloorConfig::default()).unwrap();
+        let a = floor.admit(31_000, finals(&["う"]), 8, |_| silent(31_000));
+        let b = fresh.admit(31_000, finals(&["う"]), 8, |_| silent(31_000));
+        assert_eq!(a.len(), 1);
+        assert_eq!(a, b);
+        let last = |f: &SpeechFloor| f.recent().last().map(|d| (d.action, d.reason));
+        assert_eq!(last(&floor), last(&fresh));
     }
 }

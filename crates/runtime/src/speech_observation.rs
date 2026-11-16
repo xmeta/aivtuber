@@ -211,6 +211,9 @@ pub struct SpeechObservationMetrics {
     pub speakers: usize,
     pub speakers_high_water: usize,
     pub speakers_evicted: u64,
+    /// Speakers dropped by [`SpeechObservationTracker::clear`] (voice input
+    /// turned off, #400).
+    pub cleared_by_operator: u64,
     /// Silence episodes that became turn-end eligible while the deterministic
     /// fallback applied. Counted once per episode, not per poll.
     pub fallback_signals: u64,
@@ -458,6 +461,18 @@ impl SpeechObservationTracker {
         self.speakers
             .retain(|_, entry| now_ms.saturating_sub(entry.last_seen_ms) < ttl);
         self.metrics.speakers_evicted += (before - self.speakers.len()) as u64;
+    }
+
+    /// Drops every tracked speaker (voice input was turned off, #400): the
+    /// microphone that produced those edges is gone, so no one holds the floor
+    /// or counts as active, and a fresh sidecar starts from empty state. Counted
+    /// in `cleared_by_operator`; the other counters keep their history.
+    pub fn clear(&mut self) {
+        self.metrics.cleared_by_operator = self
+            .metrics
+            .cleared_by_operator
+            .saturating_add(self.speakers.len() as u64);
+        self.speakers.clear();
     }
 
     /// Whether any tracked speaker currently has an active speech edge
@@ -1011,5 +1026,52 @@ mod tests {
         ] {
             assert!(SpeechObservationTracker::new(config, IngressPolicy::default()).is_err());
         }
+    }
+
+    #[test]
+    fn clear_drops_every_speaker_and_a_fresh_feed_is_accepted() {
+        let mut tracker = tracker(SpeechObservationConfig::default());
+        tracker
+            .ingest_batch(
+                &batch(
+                    "ja",
+                    vec![
+                        edge("mic", SpeechEdge::Start, 1_000),
+                        edge("b", SpeechEdge::Start, 1_000),
+                    ],
+                ),
+                1_000,
+            )
+            .unwrap();
+        assert!(tracker.any_speaker_active());
+        tracker.clear();
+        assert!(!tracker.any_speaker_active());
+        assert_eq!(tracker.speaker_ids().count(), 0);
+        assert!(tracker.view("mic", 1_010).is_none());
+        let metrics = tracker.metrics();
+        assert_eq!((metrics.speakers, metrics.cleared_by_operator), (0, 2));
+        // Other counters keep their history.
+        assert_eq!(metrics.observations_accepted, 2);
+        // A second clear of an empty tracker counts nothing.
+        tracker.clear();
+        assert_eq!(tracker.metrics().cleared_by_operator, 2);
+
+        // A fresh sidecar on the same runtime clock is accepted, also with an
+        // edge no newer than the cleared one (nothing remembers the old order).
+        let report = tracker
+            .ingest_batch(
+                &batch("ja", vec![edge("mic", SpeechEdge::End, 1_000)]),
+                1_050,
+            )
+            .unwrap();
+        assert_eq!(outcome_names(&report), ["accepted"]);
+        let report = tracker
+            .ingest_batch(
+                &batch("ja", vec![edge("mic", SpeechEdge::Start, 5_000)]),
+                5_010,
+            )
+            .unwrap();
+        assert_eq!(outcome_names(&report), ["accepted"]);
+        assert!(tracker.any_speaker_active());
     }
 }

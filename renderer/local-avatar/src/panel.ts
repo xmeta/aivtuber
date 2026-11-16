@@ -28,6 +28,9 @@ import {
   enablePatch,
   modelView,
   usageView,
+  voiceInputBody,
+  voiceInputResultText,
+  voiceInputView,
   otherReplies,
   parseSearchPage,
   parseState,
@@ -131,6 +134,7 @@ function render(): void {
   }
   renderModel();
   renderUsage();
+  renderVoiceInput();
   renderVoice();
   renderIngress();
   renderAvatar();
@@ -179,6 +183,46 @@ function render(): void {
     others.append(li);
   }
   $("other-wrap").hidden = others.childElementCount === 0;
+}
+
+/** Voice input (#400): hidden unless the app composed live switching. Every
+ * string, the host's failure reason included, goes in with textContent. */
+function renderVoiceInput(): void {
+  const view = voiceInputView(state);
+  $("voice-input-section").hidden = view === null;
+  if (view === null) return;
+  const stateLine = $("voice-input-state");
+  stateLine.textContent = view.stateText;
+  stateLine.className = view.health === "warn" ? "error" : "";
+  $("voice-input-explanation").textContent = view.explanation;
+  const cloud = $("voice-input-cloud");
+  cloud.textContent = view.cloudNote ?? "";
+  cloud.hidden = view.cloudNote === null;
+  const enable = $<HTMLButtonElement>("voice-input-on");
+  enable.textContent = view.enableLabel;
+  enable.hidden = !view.canEnable;
+  enable.disabled = connectionLost || voiceInputBusy;
+  const disable = $<HTMLButtonElement>("voice-input-off");
+  disable.hidden = !view.canDisable;
+  disable.disabled = connectionLost || voiceInputBusy;
+}
+
+let voiceInputBusy = false;
+
+async function setVoiceInput(enabled: boolean): Promise<void> {
+  voiceInputBusy = true;
+  renderVoiceInput();
+  const out = $("voice-input-result");
+  try {
+    const { status, json } = await api("/api/speech-input", { method: "POST", body: JSON.stringify(voiceInputBody(enabled)) });
+    const body = (json ?? {}) as { ok?: boolean; detail?: string };
+    out.textContent = voiceInputResultText(enabled, status === 200 && body.ok === true, body.detail, status);
+  } catch {
+    out.textContent = "失敗しました(アプリに接続できません)";
+  } finally {
+    voiceInputBusy = false;
+    void poll();
+  }
 }
 
 /** Session Thinking tokens/cost and the spend cap (#367). */
@@ -853,6 +897,8 @@ for (const key of TUNING_KEYS) {
     void voicePost("/api/voice", tuningPatch(key, Number(input.value)), () => "調整しました。次の発話から反映されます");
   });
 }
+$("voice-input-on").addEventListener("click", () => void setVoiceInput(true));
+$("voice-input-off").addEventListener("click", () => void setVoiceInput(false));
 $("stop").addEventListener("click", () => void control("stop"));
 $("mute").addEventListener("click", () => void control("mute"));
 

@@ -150,7 +150,9 @@ struct StartArgs {
     /// Turn voice input (the microphone, voice-activity detection and speech
     /// recognition) on or off and remember it beside the env file. Without this
     /// flag the remembered choice is used; the default is off. Under the hybrid
-    /// profile, turning it on sends transcribed speech to the cloud model.
+    /// profile, turning it on sends transcribed speech to the cloud model. While
+    /// the app runs, the operation panel and `aivtuberctl voice-input on|off`
+    /// switch it too, with the same remembered choice.
     #[arg(long, value_enum, value_name = "on|off")]
     voice_input: Option<VoiceInput>,
 }

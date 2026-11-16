@@ -38,6 +38,7 @@ import {
   parseModelState,
   parseSearchPage,
   parseState,
+  parseVoiceInputState,
   parseVoiceState,
   pushChat,
   repliesFor,
@@ -52,6 +53,12 @@ import {
   reasonText,
   tokenFromHash,
   tuningPatch,
+  voiceInputBody,
+  voiceInputResultText,
+  voiceInputView,
+  VOICE_INPUT_CLOUD_NOTE,
+  VOICE_INPUT_EXPLANATION,
+  MAX_VOICE_INPUT_REASON_CHARS,
   voiceView,
 } from "../src/panel-core";
 
@@ -1032,5 +1039,146 @@ describe("shouldReloadForHash", () => {
     expect(shouldReloadForHash("#token=")).toBe(false);
     expect(shouldReloadForHash("#token=short")).toBe(false);
     expect(shouldReloadForHash("#x=1&token=" + "cd".repeat(32))).toBe(false);
+  });
+});
+
+// ---- voice input (#400) ----
+
+const voiceInput = (over: Record<string, unknown> = {}) => ({
+  composed: true,
+  state: "off",
+  thinking_remote: false,
+  ...over,
+});
+
+const withVoiceInput = (value: unknown) =>
+  parseState({
+    schema: "local-panel/1",
+    uptime_ms: 5,
+    status: {
+      muted: false,
+      audio_error: null,
+      avatar_error: null,
+      stream_error: null,
+      content_queue: 0,
+      scheduler_items: 0,
+      generation_active: false,
+      ...(value === undefined ? {} : { voice_input: value }),
+    },
+    replies: [],
+    avatar_url: null,
+  });
+
+describe("voice input state", () => {
+  test("a host that does not send the field hides the toggle", () => {
+    // An older app: no `voice_input` key at all.
+    const older = withVoiceInput(undefined);
+    expect(older).not.toBeNull();
+    expect(older!.status.voice_input ?? null).toBeNull();
+    expect(voiceInputView(older)).toBeNull();
+    expect(voiceInputView(null)).toBeNull();
+    expect(voiceInputView(state())).toBeNull();
+  });
+
+  test("anything but the documented shape is dropped, not fatal", () => {
+    for (const bad of [
+      null,
+      "on",
+      7,
+      [],
+      {},
+      voiceInput({ composed: "yes" }),
+      voiceInput({ composed: undefined }),
+      voiceInput({ state: "listening" }),
+      voiceInput({ state: 1 }),
+      voiceInput({ thinking_remote: "no" }),
+      voiceInput({ thinking_remote: undefined }),
+      voiceInput({ state: "failed", reason: 3 }),
+      voiceInput({ state: "failed", reason: "x".repeat(MAX_VOICE_INPUT_REASON_CHARS + 1) }),
+    ]) {
+      expect(parseVoiceInputState(bad)).toBeNull();
+      const parsed = withVoiceInput(bad);
+      expect(parsed).not.toBeNull();
+      expect(voiceInputView(parsed)).toBeNull();
+    }
+    expect(parseVoiceInputState(voiceInput())).toEqual({
+      composed: true,
+      state: "off",
+      reason: null,
+      thinking_remote: false,
+    });
+    // The host omits `reason` unless failed; null and the longest reason are fine.
+    expect(parseVoiceInputState(voiceInput({ state: "failed", reason: null }))!.reason).toBeNull();
+    const longest = "あ".repeat(MAX_VOICE_INPUT_REASON_CHARS);
+    expect(parseVoiceInputState(voiceInput({ state: "failed", reason: longest }))!.reason).toBe(longest);
+  });
+
+  test("a state that is not composed stays hidden", () => {
+    expect(voiceInputView(withVoiceInput(voiceInput({ composed: false })))).toBeNull();
+    expect(voiceInputView(withVoiceInput(voiceInput({ composed: false, state: "on" })))).toBeNull();
+  });
+
+  test("the three states in Japanese, with the buttons each one allows", () => {
+    const off = voiceInputView(withVoiceInput(voiceInput()))!;
+    expect(off.stateText).toBe("オフ");
+    expect(off.health).toBe("ok");
+    expect(off.explanation).toBe(VOICE_INPUT_EXPLANATION);
+    expect(off.explanation).toBe("オンにすると、マイクで聞き取った音声に返事をします");
+    expect([off.canEnable, off.canDisable, off.enableLabel]).toEqual([true, false, "オンにする"]);
+
+    const on = voiceInputView(withVoiceInput(voiceInput({ state: "on" })))!;
+    expect(on.stateText).toBe("聞き取り中");
+    expect(on.health).toBe("ok");
+    expect([on.canEnable, on.canDisable]).toEqual([false, true]);
+
+    const failed = voiceInputView(
+      withVoiceInput(voiceInput({ state: "failed", reason: "sidecar exited (exit code: 3)" })),
+    )!;
+    expect(failed.stateText).toBe("失敗: sidecar exited (exit code: 3)");
+    expect(failed.health).toBe("warn");
+    expect([failed.canEnable, failed.canDisable, failed.enableLabel]).toEqual([true, true, "もう一度オンにする"]);
+    const noReason = voiceInputView(withVoiceInput(voiceInput({ state: "failed" })))!;
+    expect(noReason.stateText).toBe("失敗");
+  });
+
+  test("the cloud sentence shows in every state exactly when Thinking is remote", () => {
+    for (const s of ["off", "on", "failed"]) {
+      const local = voiceInputView(withVoiceInput(voiceInput({ state: s, thinking_remote: false })))!;
+      expect(local.cloudNote).toBeNull();
+      const remote = voiceInputView(withVoiceInput(voiceInput({ state: s, thinking_remote: true })))!;
+      expect(remote.cloudNote).toBe(VOICE_INPUT_CLOUD_NOTE);
+    }
+    // Before the first turn-on, while off.
+    const before = voiceInputView(withVoiceInput(voiceInput({ thinking_remote: true })))!;
+    expect(before.canEnable && before.cloudNote !== null).toBe(true);
+    expect(VOICE_INPUT_CLOUD_NOTE).toContain("クラウド");
+  });
+
+  test("the host's failure text is data: carried as is for textContent, never interpreted", () => {
+    const hostile = "<img src=x onerror=alert(1)> &amp; `x`";
+    const view = voiceInputView(withVoiceInput(voiceInput({ state: "failed", reason: hostile })))!;
+    expect(view.stateText).toBe(`失敗: ${hostile}`);
+  });
+});
+
+describe("voice input request", () => {
+  test("the body is a boolean and nothing else", () => {
+    expect(voiceInputBody(true)).toEqual({ enabled: true });
+    expect(voiceInputBody(false)).toEqual({ enabled: false });
+    expect(Object.keys(voiceInputBody(true))).toEqual(["enabled"]);
+    expect(JSON.stringify(voiceInputBody(false))).toBe('{"enabled":false}');
+  });
+
+  test("the result line", () => {
+    expect(voiceInputResultText(true, true, "voice input is on", 200)).toBe("音声入力をオンにしました");
+    expect(voiceInputResultText(false, true, "voice input is off", 200)).toBe("音声入力をオフにしました");
+    expect(voiceInputResultText(true, false, "voice input could not start: entity not found", 200)).toBe(
+      "オンにすることができませんでした: voice input could not start: entity not found",
+    );
+    expect(voiceInputResultText(false, false, undefined, 503)).toBe("オフにすることができませんでした (503)");
+    // A 200 whose body says not ok is a failure; so is an ok body with a bad status.
+    expect(voiceInputResultText(true, true, "x", 500)).toContain("できませんでした");
+    // Host text stays bounded.
+    expect(voiceInputResultText(true, false, "x".repeat(5000), 200).length).toBeLessThan(MAX_HOST_TEXT_CHARS + 60);
   });
 });

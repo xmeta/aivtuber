@@ -103,6 +103,7 @@ describe("normalizeEvent", () => {
       "voice.configure",
       "ingress.control",
       "avatar.configure",
+      "speech_input.control",
     ]);
   });
 });
