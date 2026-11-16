@@ -9,12 +9,16 @@
 //          operation panel can change; the page then reloads itself)
 //   debug  "1" exposes a read-only state snapshot at window.__avatarDebug
 //          (used by the headless smoke test; carries no secret)
+//   idle   "0" switches the renderer-local idle motion off (breathing, sway,
+//          blink, saccades); `prefers-reduced-motion: reduce` does the same.
+//          The natural rest pose stays. See src/idle.ts.
 
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { VRMLoaderPlugin, VRMUtils, type VRM } from "@pixiv/three-vrm";
 import { AvatarState, MAX_STEP_S } from "./avatar-state";
 import { Controller, backoffMs } from "./controller";
+import { blinkScaleForHost, idlePose, IDLE_BONES } from "./idle";
 import { EXPRESSIONS, GAZE_ANGLES, PROFILE_ID, VISEME_EXPRESSIONS } from "./profile";
 import { MAX_FRAME_BYTES, encodeRendererFrame } from "./protocol";
 import {
@@ -30,6 +34,8 @@ const MAX_MODEL_BYTES = 64 * 1024 * 1024; // same ceiling as the host's static s
 const params = new URLSearchParams(location.search);
 const token = params.get("token") ?? "";
 const debug = params.get("debug") === "1";
+const idleEnabled =
+  params.get("idle") !== "0" && !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 /// Same-origin, host-allowlisted path characters only (mirrors the Rust
 /// static server), so a crafted `model` value cannot reach another origin.
@@ -63,7 +69,6 @@ scene.add(light);
 const gazeTarget = new THREE.Object3D();
 scene.add(gazeTarget);
 
-const REST_ARM_RAD = 1.2;
 const GAZE_DISTANCE_M = 2;
 const FOCUS_Y_M = 1.3;
 
@@ -93,6 +98,9 @@ let animClockS = 0; // animation clock advanced by frame deltas, not wall time
 let lastTickMs: number | null = null;
 
 function applyToModel(model: VRM, dt: number): void {
+  // Renderer-private idle layer (src/idle.ts): additive under host state.
+  const speaking = Math.max(0, ...Object.values(state.current.visemes));
+  const idle = idlePose(animClockS, { enabled: idleEnabled, speaking });
   const em = model.expressionManager;
   if (em) {
     for (const [preset, vrmName] of Object.entries(EXPRESSIONS)) {
@@ -101,25 +109,27 @@ function applyToModel(model: VRM, dt: number): void {
     for (const [viseme, vrmName] of Object.entries(VISEME_EXPRESSIONS)) {
       em.setValue(vrmName, state.current.visemes[viseme as keyof typeof VISEME_EXPRESSIONS]);
     }
-    // Renderer-local idle blink: fixed period on the animation clock.
-    em.setValue("blink", animClockS % 4 > 3.88 ? 1 : 0);
+    // Idle blink, scaled down by host expressions that already narrow the eyes
+    // so the two never double-close. Never overrides a host value.
+    const ex = state.current.expressions;
+    em.setValue("blink", idle.blink * blinkScaleForHost([ex.joy, ex.calm, ex.sadness]));
   }
+  // Idle saccades are added to the host-commanded gaze direction.
   gazeTarget.position.set(
-    Math.tan(THREE.MathUtils.degToRad(state.current.yaw)) * GAZE_DISTANCE_M,
-    FOCUS_Y_M + Math.tan(THREE.MathUtils.degToRad(state.current.pitch)) * GAZE_DISTANCE_M,
+    Math.tan(THREE.MathUtils.degToRad(state.current.yaw + idle.gazeYawDeg)) * GAZE_DISTANCE_M,
+    FOCUS_Y_M + Math.tan(THREE.MathUtils.degToRad(state.current.pitch + idle.gazePitchDeg)) * GAZE_DISTANCE_M,
     GAZE_DISTANCE_M,
   );
-  const head = model.humanoid.getNormalizedBoneNode("head");
-  const chest = model.humanoid.getNormalizedBoneNode("chest");
-  const pose = state.headPose();
-  if (head !== null) head.rotation.set(pose.x, pose.y, 0);
-  // Static relaxed rest pose: VRM models are authored in a T-pose. VRMA clips
-  // for real body motion are out of scope (ADR-0003 known limitations).
-  const leftArm = model.humanoid.getNormalizedBoneNode("leftUpperArm");
-  const rightArm = model.humanoid.getNormalizedBoneNode("rightUpperArm");
-  if (leftArm !== null) leftArm.rotation.z = -REST_ARM_RAD;
-  if (rightArm !== null) rightArm.rotation.z = REST_ARM_RAD;
-  if (chest !== null) chest.rotation.x = 0.01 * Math.sin((animClockS * Math.PI * 2) / 7.5);
+  // Rest pose and idle motion. Optional VRM bones may be absent: skip them.
+  // The host-commanded gesture head pose is always added on top.
+  const hostHead = state.headPose();
+  for (const name of IDLE_BONES) {
+    const bone = model.humanoid.getNormalizedBoneNode(name);
+    if (bone === null) continue;
+    const r = idle[name];
+    if (name === "head") bone.rotation.set(r.x + hostHead.x, r.y + hostHead.y, r.z);
+    else bone.rotation.set(r.x, r.y, r.z);
+  }
   model.update(dt);
 }
 
@@ -278,6 +288,7 @@ function installDebugHook(model: VRM, modelHash: string): void {
         visemes: Object.fromEntries(
           Object.entries(VISEME_EXPRESSIONS).map(([viseme, vrmName]) => [viseme, value(vrmName)]),
         ),
+        idle: idleEnabled,
         gaze: { yaw: state.current.yaw, pitch: state.current.pitch },
         gazeTarget: { yaw: state.target.yaw, pitch: state.target.pitch },
         gazeAngles: GAZE_ANGLES,
