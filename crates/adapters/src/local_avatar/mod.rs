@@ -15,11 +15,13 @@ mod panel;
 mod presets;
 mod protocol;
 mod server;
+pub mod vrm;
 
 pub use panel::*;
 pub use presets::{PresetKind, PresetMapping, map_preset};
 pub use protocol::*;
 pub use server::LocalAvatarServer;
+pub use vrm::{VrmError, VrmMeta, VrmSpec, VrmWarning};
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -155,6 +157,19 @@ pub(crate) struct Inner {
     pub health: LocalAvatarHealth,
     pub session_active: bool,
     pub sessions_seen: u64,
+    /// SHA-256 of the model bytes the connected page reported in its `hello`
+    /// (#362); `None` while no page is connected.
+    pub renderer_model: Option<String>,
+}
+
+/// Which model file the page is served (#362). `path: None` means the sample
+/// that ships in the page directory (`model.vrm`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ActiveModel {
+    pub path: Option<PathBuf>,
+    /// The model's SHA-256 (lowercase hex), or empty when nobody has set one.
+    /// The page compares it with the one it loaded to know when to reload.
+    pub id: String,
 }
 
 impl Inner {
@@ -174,6 +189,7 @@ impl Inner {
 
 pub(crate) struct Shared {
     pub inner: Mutex<Inner>,
+    pub model: Mutex<ActiveModel>,
     /// Per-launch secret. Never logged; see the `Debug` impls.
     pub token: String,
     /// `http://127.0.0.1:<port>`: the only acceptable `Origin`.
@@ -196,7 +212,9 @@ impl Shared {
                 health: LocalAvatarHealth::new(),
                 session_active: false,
                 sessions_seen: 0,
+                renderer_model: None,
             }),
+            model: Mutex::new(ActiveModel::default()),
             token,
             origin: format!("http://127.0.0.1:{port}"),
             host: format!("127.0.0.1:{port}"),
@@ -262,6 +280,25 @@ impl LocalAvatarHandle {
     /// Counts a command that could not be mapped to a wire command.
     pub fn record_drop(&self, reason: DropReason) {
         self.shared.lock().drop_one(reason);
+    }
+
+    /// Chooses the model file the avatar page is served and loads (#362). The
+    /// page notices the changed `id` on its next poll and reloads; no restart.
+    /// `path: None` serves the sample in the page directory. `id` is the
+    /// model's SHA-256 in lowercase hex. The path is chosen by the composition
+    /// root from its own model store, never from a request.
+    pub fn set_active_model(&self, path: Option<PathBuf>, id: &str) {
+        let mut model = self.shared.model.lock().unwrap_or_else(|e| e.into_inner());
+        *model = ActiveModel {
+            path,
+            id: id.to_owned(),
+        };
+    }
+
+    /// The SHA-256 of the model the connected page says it loaded, or `None`
+    /// when no page is connected.
+    pub fn renderer_model(&self) -> Option<String> {
+        self.shared.lock().renderer_model.clone()
     }
 
     pub fn health(&self) -> LocalAvatarHealth {

@@ -33,3 +33,12 @@ input[type="text"], input[type="password"], input[type="search"], select { font:
 .results button { width: 100%; text-align: left; padding: .35rem .6rem; }
 .results small { opacity: .7; }
 label.check { display: block; margin: .5rem 0; }
+.warnings { margin: .25rem 0; padding-left: 1.2rem; color: #a60; }
+.warnings:empty { display: none; }
+.licence { display: grid; grid-template-columns: max-content 1fr; gap: .15rem .75rem; margin: .5rem 0; font-size: .85rem; }
+.licence dt { font-weight: 600; }
+.licence dd { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.model-row { display: grid; grid-template-columns: 1fr auto auto; gap: .5rem; align-items: center; }
+.model-row.active { font-weight: 600; }
+.model-row small { display: block; font-weight: 400; color: #a60; }
+.models { list-style: none; padding: 0; margin: .25rem 0; display: grid; gap: .35rem; }

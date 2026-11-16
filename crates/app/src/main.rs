@@ -6,17 +6,18 @@ use aivtuber_adapters::speech_tts::pins::{
 };
 use aivtuber_adapters::speech_tts::supervisor::{LivenessGatedTts, TtsSidecar};
 use aivtuber_adapters::{
-    AdapterClock, CaptionLanguage, LocalAvatarConfig, LocalAvatarServer, NormalizedHttpTtsAdapter,
-    NormalizedHttpTtsConfig, ObsScreenSource, ObsScreenshotRequest, ObsWebSocketAdapter,
-    ObsWebSocketConfig, OpenAiResponsesAdapter, OpenAiResponsesConfig, ProcessAudioConfig,
-    ProcessAudioPlayer, ScreenDescriber, ScreenDescriberConfig, ScreenImageFormat,
-    ScreenObservationProducer, ScreenProducerConfig, SecretString, StreamLimits,
+    AdapterClock, CaptionLanguage, LocalAvatarConfig, LocalAvatarHandle, LocalAvatarServer,
+    NormalizedHttpTtsAdapter, NormalizedHttpTtsConfig, ObsScreenSource, ObsScreenshotRequest,
+    ObsWebSocketAdapter, ObsWebSocketConfig, OpenAiResponsesAdapter, OpenAiResponsesConfig,
+    ProcessAudioConfig, ProcessAudioPlayer, ScreenDescriber, ScreenDescriberConfig,
+    ScreenImageFormat, ScreenObservationProducer, ScreenProducerConfig, SecretString, StreamLimits,
     SystemHostResolver, ThinkingAuthentication, VTubeStudioAdapter, VTubeStudioConfig,
     endpoint_origin, verify_loopback_endpoint,
 };
 use aivtuber_app::{
     AIVIS_ENDPOINT_VAR, AIVIS_KEY_FILE_VAR, AIVIS_KEY_VAR, AIVIS_TIMEOUT_VAR, AIVIS_VISEMES_VAR,
-    AdaptationRuntime, AdapterHealth, AivisBridge, AivisSettings, AvatarOutput, BargeInConfig,
+    AVATAR_DIR_VAR, AVATAR_SETTINGS_VAR, AdaptationRuntime, AdapterHealth, AivisBridge,
+    AivisSettings, AvatarController, AvatarEnvironment, AvatarOutput, BargeInConfig,
     BargeInMetrics, CHAT_SETTINGS_VAR, ChatBurstConfig, ChatIngressController,
     ChatIngressEnvironment, CompositionProfile, DEFAULT_WARMUP_TIMEOUT_MS,
     GenerationFallbackCounts, GenerativeBudgetPolicy, GenerativeRuntime, IntentRoutePlanner,
@@ -29,13 +30,13 @@ use aivtuber_app::{
     RuntimeRetentionPolicy, SHADOW_ORCHESTRATOR_SCHEMA_VERSION, SceneContextService,
     ShadowOrchestratorConfig, ShadowPolicyIdentity, ShadowingRoutePlanner,
     SpeechConversationConfig, SpeechConversationMetrics, SpeechFloorMetrics, SpeechSidecar,
-    SpeechSidecarConfig, SpeechSidecarStats, StreamOutput, ThinkingEgressAllowlist,
+    SpeechSidecarConfig, SpeechSidecarStats, StreamOutput, SwitchWarmup, ThinkingEgressAllowlist,
     TtsSidecarSettings, VOICE_SETTINGS_VAR, VoiceController, VoiceEnvironment, VoicePaths,
     VoicevoxBridge, VoicevoxSettings, VtsAvatarOutput, VtsPlaybackConfig, WarmupMode,
     YOUTUBE_API_BASE_VAR, YOUTUBE_KEY_FILE_VAR, apply_dispatched_request,
     apply_thinking_provider_env, audit_pack_readiness, is_acceptable_api_base, is_valid_key,
     openrouter_preset_active, panel_settings, pump_bounded_records, read_voice_settings,
-    start_thinking_warmup, stt_sidecar_args, warmup_timeout,
+    remembered_model, start_thinking_warmup, stt_sidecar_args, switch_warmup_for, warmup_timeout,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
@@ -182,7 +183,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let audio = ProcessAudioPlayer::new(audio_config)?;
 
     let mut avatar_launch_url: Option<String> = None;
-    let avatar = build_avatar_output(&mut avatar_launch_url)?;
+    let mut avatar_server: Option<(LocalAvatarHandle, Option<PathBuf>)> = None;
+    let avatar = build_avatar_output(&mut avatar_launch_url, &mut avatar_server)?;
     let stream = build_stream_output()?;
     let max_lateness_ms = env_u64("AIVTUBER_MAX_DISPATCH_LATENESS_MS", 250)?;
 
@@ -291,6 +293,17 @@ fn run() -> Result<(), Box<dyn Error>> {
             "chat ingress: composed (the operation panel and aivtuberctl can connect Twitch and YouTube chat; records are admitted as untrusted public chat under the ingress ceiling)"
         );
         app = app.with_chat_ingress(controller);
+    }
+    // #362: the VRM avatar choice. Off unless the launcher names the settings
+    // file and the store directory, and the local avatar renderer is composed.
+    if let Some((handle, page_dir)) = avatar_server.take()
+        && let Some(controller) = build_avatar_controller(handle, page_dir.as_deref())?
+    {
+        eprintln!(
+            "avatar model: {} (the operation panel and aivtuberctl can change it; show any credit where viewers see it)",
+            controller.active_summary()
+        );
+        app = app.with_avatar_controller(controller);
     }
     // #306: the production memory writer is opt-in. Default off writes nothing.
     if env_bool("AIVTUBER_MEMORY_WRITER", false)? {
@@ -440,6 +453,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             voice_configure: app.voice_configured(),
             // #361: `ingress.control` only when chat connections are composed.
             ingress_control: app.chat_ingress_configured(),
+            // #362: `avatar.configure` only when the avatar store is composed.
+            avatar_configure: app.avatar_configured(),
         },
     )?;
     let operator_ingress = operator_server.ingress();
@@ -452,6 +467,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         &operator_secret,
         avatar_launch_url,
         app.voice_search_endpoint(),
+        app.avatar_staging_dir(),
     )?;
     let operator_rate = Arc::new(Mutex::new(OperatorRateLimiter::new(16, 8)));
     {
@@ -2058,12 +2074,39 @@ fn build_chat_ingress(
     )))
 }
 
-/// #357: the Thinking model allowlist (`AIVTUBER_OPENAI_MODEL_CHOICES`, set by
-/// `aivtuber-setup start` from the models it serves) and the file that
-/// remembers the choice (`AIVTUBER_OPENAI_MODEL_SETTINGS`). Only a loopback
-/// unauthenticated endpoint (a local llama-server) can be switched: a bearer
-/// credential names one provider model, and the router is a local-server
-/// feature.
+/// #362: the avatar store, when `AIVTUBER_AVATAR_SETTINGS` and
+/// `AIVTUBER_AVATAR_DIR` are set (`aivtuber-setup start` sets both beside the
+/// env file). The sample is the page directory's `model.vrm`. A store that
+/// cannot be opened is a startup error: the operator asked for it.
+fn build_avatar_controller(
+    handle: LocalAvatarHandle,
+    page_dir: Option<&std::path::Path>,
+) -> Result<Option<AvatarController>, Box<dyn Error>> {
+    let (Some(settings), Some(dir)) = (env_path(AVATAR_SETTINGS_VAR), env_path(AVATAR_DIR_VAR))
+    else {
+        return Ok(None);
+    };
+    let sample = page_dir
+        .map(|d| d.join("model.vrm"))
+        .filter(|path| path.is_file());
+    AvatarController::new(
+        AvatarEnvironment {
+            settings,
+            dir,
+            sample,
+        },
+        handle,
+    )
+    .map(Some)
+    .map_err(|error| format!("{AVATAR_DIR_VAR}: {error}").into())
+}
+
+/// #357/#365: the Thinking model allowlist (`AIVTUBER_OPENAI_MODEL_CHOICES`)
+/// and the file that remembers the choice (`AIVTUBER_OPENAI_MODEL_SETTINGS`).
+/// A loopback unauthenticated endpoint (a local llama-server router) is
+/// switched and warmed up; a Bearer endpoint can be switched only under the
+/// OpenRouter preset, where a switch merely changes the request `model` from
+/// the fixed allowlist and makes no call of its own.
 fn build_model_switcher(
     adapter: &OpenAiResponsesAdapter,
     timeout: Duration,
@@ -2071,17 +2114,29 @@ fn build_model_switcher(
     let Some(choices) = env_optional("AIVTUBER_OPENAI_MODEL_CHOICES") else {
         return Ok(None);
     };
-    if adapter.authentication_label() != "unauthenticated-loopback" {
-        return Err("AIVTUBER_OPENAI_MODEL_CHOICES needs AIVTUBER_OPENAI_AUTH=unauthenticated-loopback (a local llama-server)".into());
-    }
+    let warmup = switch_warmup_for(
+        adapter.authentication_label(),
+        openrouter_preset_active(&|name| env_optional(name)),
+    )?;
     let catalog = ThinkingModelCatalog::parse_choices(&choices)
         .map_err(|error| format!("AIVTUBER_OPENAI_MODEL_CHOICES: {error}"))?;
     let settings = env_optional("AIVTUBER_OPENAI_MODEL_SETTINGS").map(PathBuf::from);
+    // The local launcher applies the remembered choice before the app starts;
+    // with a remote provider there is no launcher, so apply it here. A name
+    // outside the allowlist is ignored.
+    if warmup == SwitchWarmup::Skip
+        && let Some(model) = settings
+            .as_deref()
+            .and_then(|path| remembered_model(path, &catalog))
+    {
+        adapter.select_model(&model.alias, Some(&model.version))?;
+    }
     Ok(Some(ModelSwitcher::new(
         catalog,
         adapter.clone(),
         settings,
         timeout,
+        warmup,
     )?))
 }
 
@@ -2174,12 +2229,13 @@ fn build_adaptation_runtime(
 /// behavior (`AIVTUBER_VTS_ENABLED` selects VTube Studio, otherwise none).
 fn build_avatar_output(
     launch_url: &mut Option<String>,
+    server_handle: &mut Option<(LocalAvatarHandle, Option<PathBuf>)>,
 ) -> Result<Box<dyn AvatarOutput>, Box<dyn Error>> {
     match env_optional("AIVTUBER_AVATAR_OUTPUT").as_deref() {
         None => build_vts_avatar_output(env_bool("AIVTUBER_VTS_ENABLED", false)?),
         Some("vts") => build_vts_avatar_output(true),
         Some("none") => Ok(Box::new(NoopAvatarOutput)),
-        Some("local") => build_local_avatar_output(launch_url),
+        Some("local") => build_local_avatar_output(launch_url, server_handle),
         Some(other) => {
             Err(format!("AIVTUBER_AVATAR_OUTPUT must be local, vts or none (got {other:?})").into())
         }
@@ -2188,6 +2244,7 @@ fn build_avatar_output(
 
 fn build_local_avatar_output(
     launch_url: &mut Option<String>,
+    server_handle: &mut Option<(LocalAvatarHandle, Option<PathBuf>)>,
 ) -> Result<Box<dyn AvatarOutput>, Box<dyn Error>> {
     let port = env_u64("AIVTUBER_LOCAL_AVATAR_PORT", 8765)?;
     let defaults = LocalAvatarConfig::default();
@@ -2200,7 +2257,11 @@ fn build_local_avatar_output(
             250,
         )?),
     };
+    let page_dir = config.page_dir.clone();
     let server = LocalAvatarServer::start(config)?;
+    // Kept for the avatar choice (#362): it tells the server which model to
+    // serve; the handle is not authority for anything else.
+    *server_handle = Some((server.handle(), page_dir));
     let output = LocalAvatarOutput::new(server, runtime_avatar_authority()?);
     // Deliberate operator console output: the launch URL carries the
     // per-launch secret and is the only way to hand it to OBS. Do not capture
@@ -2486,6 +2547,7 @@ fn start_panel(
     control_secret: &[u8; 32],
     avatar_launch_url: Option<String>,
     voice_search_endpoint: Option<String>,
+    avatar_staging_dir: Option<PathBuf>,
 ) -> Result<Option<PanelService>, Box<dyn Error>> {
     let Some(settings) = panel_settings(profile.local_stack(), &|name| env_optional(name))? else {
         return Ok(None);
@@ -2496,6 +2558,7 @@ fn start_panel(
         control_secret,
         avatar_launch_url,
         voice_search_endpoint,
+        avatar_staging_dir,
     ) {
         Ok(service) => {
             // Deliberate operator console output, like the avatar URL: it

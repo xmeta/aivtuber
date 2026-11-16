@@ -92,6 +92,14 @@ pub enum Capability {
     /// admitted through the raw-ingress gate as untrusted public chat.
     #[serde(rename = "ingress.control")]
     IngressControl,
+    /// Chooses which VRM model the local avatar page shows (#362): confirm an
+    /// uploaded candidate, select a stored model, delete one. Held only by an
+    /// authenticated local ingress and only when the launcher composed the
+    /// avatar store. Deliberately not `avatar.control` (the runtime motor
+    /// authority that drives the avatar's expressions): choosing which file is
+    /// parsed by the renderer is an operator decision, not a performance one.
+    #[serde(rename = "avatar.configure")]
+    AvatarConfigure,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
