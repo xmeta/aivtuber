@@ -57,10 +57,13 @@ In short, from this directory (after the checksum check above):
                                       prints the operation panel URL (open it in a
                                       browser: type to the performer, stop, mute) and
                                       the avatar URL. Both carry a per-launch secret.
-                                      The terminal stays quiet (periodic measurement
-                                      lines are hidden; errors, refusals and operator
-                                      lines are always shown). Add --verbose to see
-                                      everything.
+                                      The terminal stays quiet (measurement lines and
+                                      start-up settings are hidden; errors, refusals,
+                                      licence notices and operator lines are always
+                                      shown) and ends with a short Japanese/English
+                                      guide. Add --verbose to see everything. (With
+                                      Windows PowerShell 5.1, redirected output can
+                                      garble the Japanese; the English stays readable.)
 Install FFmpeg (ffplay and ffmpeg on PATH) first; setup tells you if it is missing.
 On Windows also install the Microsoft Visual C++ 2015-2022 Redistributable (x64); it is
 not bundled, and setup stops and names it if it is missing:

@@ -80,6 +80,25 @@ pub fn log_choice(
     }
 }
 
+/// Quiet start-up text (#393), Japanese first with English beside it. Fixed
+/// strings, no locale detection. With the app's three lines
+/// (`aivtuber_app::ready_guide`) the quiet start-up adds at most six lines.
+/// The Japanese text can be garbled when Windows PowerShell 5.1 output is
+/// redirected or piped; the English half stays readable.
+const QUIET_NOTE: &str = "表示を簡略にしています。すべて表示するには `aivtuber-setup start --verbose` / Terminal output is quiet; run `aivtuber-setup start --verbose` to see everything.";
+const READY_STARTING: &str =
+    "llama-server の準備ができました。アプリを起動します。 / llama-server ready; starting the app.";
+const STARTING_APP: &str = "アプリを起動します。 / Starting the app.";
+const TYPE_HERE: &str = "この画面に文字を入力して Enter でも話しかけられます。終了は Ctrl+C。 / Type here and press Enter to talk; Ctrl+C stops everything.";
+#[cfg(test)]
+const QUIET_LINES: [&str; 4] = [QUIET_NOTE, READY_STARTING, STARTING_APP, TYPE_HERE];
+
+/// Whether `start` prints the llama-server command line, the model list and
+/// the app path. A dry run exists to show them, so it always does.
+pub fn show_launch_details(quiet: bool, dry_run: bool) -> bool {
+    !quiet || dry_run
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct LlamaCommand {
     pub program: PathBuf,
@@ -595,12 +614,14 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
             *llama = router_command(&env, &preset)?;
         }
     }
+    let details = show_launch_details(log.quiet, opts.dry_run);
     match &llm {
-        Llm::Managed(llama) => println!(
+        Llm::Managed(llama) if details => println!(
             "llama-server: {} {}",
             llama.program.display(),
             llama.args.join(" ")
         ),
+        Llm::Managed(_) => {}
         Llm::Remote => println!(
             "language model: OpenRouter, model {} (remote: chat and reply text are sent to openrouter.ai; no local model server is started)",
             env.get("AIVTUBER_OPENAI_MODEL").map_or("?", String::as_str)
@@ -611,7 +632,7 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
                 .map_or("?", String::as_str)
         ),
     }
-    if let Some(plan) = &plan {
+    if let Some(plan) = plan.as_ref().filter(|_| details) {
         println!(
             "models:       {} (starting on {}){}",
             plan.catalog.render_choices(),
@@ -623,15 +644,15 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
             }
         );
     }
-    println!(
-        "app:          {} (environment from {})",
-        app.display(),
-        opts.env_file.display()
-    );
-    if log.quiet {
+    if details {
         println!(
-            "terminal output is quiet (measurement lines hidden); run `aivtuber-setup start --verbose` to see everything"
+            "app:          {} (environment from {})",
+            app.display(),
+            opts.env_file.display()
         );
+    }
+    if log.quiet {
+        println!("{QUIET_NOTE}");
     }
     if opts.dry_run {
         println!("dry run: nothing was started");
@@ -650,7 +671,12 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
         }
     }
     let Llm::Managed(llama) = llm else {
-        println!("starting the app ({CHAT_HINT}; Ctrl+C stops it)");
+        announce_app(
+            log.quiet,
+            STARTING_APP,
+            "starting the app",
+            "Ctrl+C stops it",
+        );
         return run_app(&app, &env);
     };
     // The pinned llama.cpp build imports the Visual C++ runtime, which is not
@@ -679,14 +705,14 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
             .map_err(|e| format!("cannot write {}: {e}", preset.display()))?;
     }
     let log_path = opts.env_file.with_file_name("llama-server.log");
-    let log = std::fs::File::create(&log_path)
+    let log_file = std::fs::File::create(&log_path)
         .map_err(|e| format!("cannot create {}: {e}", log_path.display()))?;
     let mut guard = KillOnDrop(
         Command::new(&llama.program)
             .args(&llama.args)
             .stdin(Stdio::null())
-            .stdout(log.try_clone().map_err(|e| e.to_string())?)
-            .stderr(log)
+            .stdout(log_file.try_clone().map_err(|e| e.to_string())?)
+            .stderr(log_file)
             .spawn()
             .map_err(|e| format!("cannot start llama-server: {e}"))?,
     );
@@ -714,8 +740,23 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    println!("llama-server ready; starting the app ({CHAT_HINT}; Ctrl+C stops everything)");
+    announce_app(
+        log.quiet,
+        READY_STARTING,
+        "llama-server ready; starting the app",
+        "Ctrl+C stops everything",
+    );
     run_app(&app, &env)
+}
+
+/// Quiet: the short Japanese-first lines. Otherwise the line printed before #393.
+fn announce_app(quiet: bool, quiet_first: &str, verbose_first: &str, stop: &str) {
+    if quiet {
+        println!("{quiet_first}");
+        println!("{TYPE_HERE}");
+    } else {
+        println!("{verbose_first} ({CHAT_HINT}; {stop})");
+    }
 }
 
 const CHAT_HINT: &str = "type chat as plain text, or paste Event Envelope JSON lines";
@@ -751,6 +792,26 @@ fn run_app(app: &Path, env: &BTreeMap<String, String>) -> Result<i32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_quiet_text_is_short_and_carries_no_secret() {
+        // The app prints three more (aivtuber_app::ready_guide); six in all.
+        // STARTING_APP and READY_STARTING are alternatives, never both.
+        assert!(QUIET_LINES.len() - 1 <= 3);
+        for line in QUIET_LINES {
+            assert!(!line.trim().is_empty() && !line.contains('\n'));
+            assert!(!line.contains("token="), "{line}");
+        }
+        assert!(QUIET_NOTE.contains("aivtuber-setup start --verbose"));
+    }
+
+    #[test]
+    fn launch_details_are_hidden_only_in_a_quiet_real_run() {
+        assert!(!show_launch_details(true, false));
+        assert!(show_launch_details(true, true));
+        assert!(show_launch_details(false, false));
+        assert!(show_launch_details(false, true));
+    }
 
     #[test]
     fn log_env_name_matches_the_adapters_helper() {

@@ -102,10 +102,12 @@ fn main() -> ExitCode {
 
     let verify_ms = verify_started.elapsed().as_millis();
     eprintln!("local-tts-sidecar: {VOICE_LICENCE_NOTICE}");
-    eprintln!(
-        "local-tts-sidecar: loading model={} language=ja speaker_id={} steps={} threads={threads} style=ignored",
-        pin.model_id, config.voice.speaker_id, config.voice.num_steps
-    );
+    if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+        eprintln!(
+            "local-tts-sidecar: loading model={} language=ja speaker_id={} steps={} threads={threads} style=ignored",
+            pin.model_id, config.voice.speaker_id, config.voice.num_steps
+        );
+    }
     let started = std::time::Instant::now();
     let synth = match SherpaSynthesizer::load(&pin, &model_dir, threads) {
         Ok(synth) => synth,
@@ -125,17 +127,19 @@ fn main() -> ExitCode {
         Ok(server) => server,
         Err(error) => return fail(2, error),
     };
-    eprintln!(
-        "local-tts-sidecar: ready listen={} verify_ms={verify_ms} load_ms={} audio_root={} visemes={}",
-        server.local_addr(),
-        started.elapsed().as_millis(),
-        config.audio_root.display(),
-        if config.viseme_root.is_some() {
-            "amplitude"
-        } else {
-            "off"
-        }
-    );
+    if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+        eprintln!(
+            "local-tts-sidecar: ready listen={} verify_ms={verify_ms} load_ms={} audio_root={} visemes={}",
+            server.local_addr(),
+            started.elapsed().as_millis(),
+            config.audio_root.display(),
+            if config.viseme_root.is_some() {
+                "amplitude"
+            } else {
+                "off"
+            }
+        );
+    }
     run(server, pin.model_id, &bundle_sha256(&pin));
     ExitCode::SUCCESS
 }

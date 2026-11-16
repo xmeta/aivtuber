@@ -423,7 +423,9 @@ impl SpeechSidecar {
             Some(SttStatus::Ready) => {
                 if self.transcript_path == SpeechTranscriptPath::NotReported {
                     self.transcript_path = SpeechTranscriptPath::Ready;
-                    eprintln!("speech_sidecar: transcript worker ready");
+                    if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+                        eprintln!("speech_sidecar: transcript worker ready");
+                    }
                 }
             }
             Some(SttStatus::Unavailable { reason }) => {

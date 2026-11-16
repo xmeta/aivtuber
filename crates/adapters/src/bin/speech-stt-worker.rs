@@ -152,10 +152,12 @@ fn main() -> ExitCode {
         eprintln!("speech-stt-worker: {error}");
         return ExitCode::from(2);
     }
-    eprintln!(
-        "speech-stt-worker: loading model={} language={} threads={}",
-        pin.model_id, args.language, args.threads
-    );
+    if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+        eprintln!(
+            "speech-stt-worker: loading model={} language={} threads={}",
+            pin.model_id, args.language, args.threads
+        );
+    }
     let (model_dir, threads) = (args.model_dir.clone(), args.threads);
     let started = std::time::Instant::now();
     let (exit, stats) = run_worker(
@@ -163,10 +165,12 @@ fn main() -> ExitCode {
         std::io::stdout(),
         move || {
             let decoder = SherpaDecoder::load(&pin, &model_dir, threads)?;
-            eprintln!(
-                "speech-stt-worker: ready load_ms={}",
-                started.elapsed().as_millis()
-            );
+            if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+                eprintln!(
+                    "speech-stt-worker: ready load_ms={}",
+                    started.elapsed().as_millis()
+                );
+            }
             Ok(decoder)
         },
         &config,

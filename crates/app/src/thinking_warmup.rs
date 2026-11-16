@@ -139,7 +139,13 @@ pub fn start(
             let spawned = std::thread::Builder::new()
                 .name("thinking-warmup".to_owned())
                 .spawn(move || {
-                    run(&adapter, timeout, &|line| eprintln!("{line}"));
+                    // Quiet hides the measurement lines but keeps one wait note.
+                    run(&adapter, timeout, &|line| {
+                        let on = aivtuber_adapters::log_verbosity::diagnostics_enabled();
+                        if let Some(line) = crate::ready_guide::warmup_line(line, on) {
+                            eprintln!("{line}");
+                        }
+                    });
                 });
             match spawned {
                 Ok(handle) => Some(handle),
