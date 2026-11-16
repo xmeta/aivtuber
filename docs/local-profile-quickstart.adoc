@@ -85,9 +85,9 @@ sha256sum -c SHA256SUMS --ignore-missing     # must print: aivtuber-local-<versi
 ----
 ./aivtuber-setup start                  # Windows: .\aivtuber-setup.exe start
 ----
-7. Open the operation panel. The app prints one line, `local operation panel URL (contains a per-launch secret, do not share or log): http://127.0.0.1:8766/#token=...`; paste that URL into Chrome or Edge. The panel shows the runtime status, has a box to type to the performer (the reply appears as text under your line, and is spoken), and has the *emergency stop* and *mute* buttons, when another model is installed (<<model-switch>>) a selector for the Thinking model, a *声* section to choose the voice (<<voice-panel>>), and a *配信チャット* section to connect your Twitch or YouTube chat (<<chat-panel>>). The secret is in the part after `#`, which the browser never sends to any server; the page keeps it in memory and removes it from the address bar, so do not bookmark the page (the secret changes on every start). Mute is latched: it lasts until you restart the app. The panel listens on `127.0.0.1` only and can be turned off with `AIVTUBER_PANEL=false`.
+7. Open the operation panel. The app prints one line, `local operation panel URL (contains a per-launch secret, do not share or log): http://127.0.0.1:8766/#token=...`; paste that URL into Chrome or Edge. The panel shows the runtime status, has a box to type to the performer (the reply appears as text under your line, and is spoken), and has the *emergency stop* and *mute* buttons, when another model is installed (<<model-switch>>) a selector for the Thinking model, a *声* section to choose the voice (<<voice-panel>>), and a *配信チャット* section to connect your Twitch or YouTube chat (<<chat-panel>>), and an *アバター* section to choose your VRM model with its licence shown (<<avatar-panel>>). The secret is in the part after `#`, which the browser never sends to any server; the page keeps it in memory and removes it from the address bar, so do not bookmark the page (the secret changes on every start). Mute is latched: it lasts until you restart the app. The panel listens on `127.0.0.1` only and can be turned off with `AIVTUBER_PANEL=false`.
 8. Open the avatar: the panel has an "アバター画面を開く" link, or open the `local avatar renderer URL` that `start` printed (`http://127.0.0.1:8765/?token=...`; the token changes on every start and is required for the avatar to connect) in the browser, or add it to OBS as a Browser Source. Do not share that URL. The first answer after start can take several seconds while the model loads.
-9. Before you stream: replace the sample avatar (`renderer/local-avatar/dist/model.vrm`) with a model you have the right to broadcast, and put the disclosures that setup printed (section 8) where viewers see them.
+9. Before you stream: in the panel's *アバター* section choose the VRM model you have the right to broadcast (<<avatar-panel>>: pick the `.vrm` file, read the licence the file declares, confirm; the avatar page switches without a restart), and put the disclosures that setup printed (section 8), and the model's credit line if its licence asks for one, where viewers see them. The sample avatar is a pixiv test model only.
 
 === What `aivtuber-setup local` does
 
@@ -181,6 +181,21 @@ The panel's *配信チャット* section reads your stream's chat and lets the p
 
 A chat connection is of course a remote connection (Twitch's chat servers, `www.googleapis.com` for YouTube), so it is outside the "no network" check below; the check applies with both disconnected. If a sidecar is missing from the folder (a source checkout that did not build every binary) the panel says so and the button stays off; `cargo build --release -p aivtuber-adapters --bin twitch-chat-ingress --bin youtube-chat-ingress` builds them. For a fixture or proxy instead of the real YouTube API, `AIVTUBER_YOUTUBE_API_BASE` (https, or http on loopback) points the YouTube sidecar elsewhere; it is an operator setting and cannot be changed from the panel.
 
+[#avatar-panel]
+=== Choosing the avatar from the panel (issue #362)
+
+The panel's *アバター* section replaces copying a file to `renderer/local-avatar/dist/model.vrm` by hand, and shows the licence the model declares before you use it.
+
+. *Choose a file.* Press "VRMファイルを選ぶ…" and pick a `.vrm` (VRM 1.0 or 0.x, at most 64 MiB). The page sends the raw bytes to the app on `127.0.0.1`; nothing leaves the PC. A file that is not a glTF binary (an image renamed to `.vrm`, an archive), is truncated, has a header that lies about its length, or has no VRM licence block is refused with the reason, and nothing is stored.
+. *Read the licence.* An accepted file becomes a *candidate*: it is not shown yet. The panel lists what the file says (name, authors, who may use the avatar, commercial use, credit notation, modification, redistribution, the licence URLs), exactly as the file wrote it. These are the model author's words, shown as plain text and never as links; the file is untrusted. A clear warning appears when the licence limits the use: only the author, or only people the author licensed separately, may use it; commercial use is not allowed (personal, non-profit only); commercial use is limited to an individual; a credit is required; or the file does not say who may use it. A warning does not stop you: you decide, and for a restrictive licence the confirm button asks once more.
+. *Confirm.* "このモデルを使う" stores the model and makes it active. The avatar page (the browser tab or the OBS Browser Source) notices within a couple of seconds and reloads the model by itself; there is no restart and the URL stays the same. "使わない" drops the candidate. If the page cannot decode a model that passed the app's checks it shows the sample instead and the panel says so.
+. *Credit.* If the licence asks for a credit (VRM 1.0 `creditNotation: required`, or a Creative Commons "BY" licence name in VRM 0.x), the panel shows the credit line made from the model name and authors, the app prints it at start, and the audit record of the switch carries it. Put it where viewers see it, like the voice credit.
+. *Keeping models.* Models are stored in the `avatars` folder beside `local-profile.env`, named by their SHA-256, at most 5; adding another removes the one you used longest ago (never the active one). "使う" switches to a stored model or to the sample, and "削除" removes a stored model that is not active. The choice is remembered in `local-avatar.json` beside the env file; a missing or damaged file means the sample.
+
+`aivtuberctl` does the rest: `aivtuberctl status` prints the `avatar` lines (active model, candidate, licence fields), `aivtuberctl avatar select <sample|hash>`, `avatar delete <hash>`, `avatar confirm <hash>` and `avatar discard`. A hash may be shortened to its first 8 characters. There is deliberately no command that uploads a file: you pick it, and read its licence, in the panel.
+
+The `renderer/local-avatar/dist/model.vrm` file still works as the *sample* when you run the app yourself without the launcher; set `AIVTUBER_AVATAR_SETTINGS` and `AIVTUBER_AVATAR_DIR` to turn the panel's avatar section on in that case. You remain responsible for having the right to stream the model (`docs/vts-obs-adapters.adoc`, "Model and rights").
+
 [#from-source-checkout]
 === Run from a source checkout
 
@@ -233,7 +248,7 @@ If you prefer the individual steps, they are `node scripts/fetch-sherpa-onnx.mjs
 
 === Replace the sample avatar
 
-The sample VRM is a pixiv test model for checking the pipeline. Before you stream, use a model you have the right to broadcast (see `docs/vts-obs-adapters.adoc`, "Model and rights"). Copy it to `renderer/local-avatar/dist/model.vrm` in step 2.
+The sample VRM is a pixiv test model for checking the pipeline. Before you stream, use a model you have the right to broadcast (see `docs/vts-obs-adapters.adoc`, "Model and rights"). Choose it in the panel's *アバター* section (<<avatar-panel>>), or, without the launcher, copy it to `renderer/local-avatar/dist/model.vrm` in step 2.
 
 == 2. Build
 
@@ -556,7 +571,7 @@ No model, voice file or avatar model is bundled or redistributed by this reposit
 |VOICEVOX ENGINE and voices (optional, not shipped; `AIVTUBER_TTS_BACKEND=voicevox`) |Engine LGPL-3.0 (or separate licence), run as a separate process; voices under the VOICEVOX terms plus per-character terms |No default character ships; you choose the speaker. *Show the credit line* (`VOICEVOX:<character name>`) and follow your character's own terms; see <<voicevox-terms>>. The startup log prints the credit line you configured.
 |Aivis Cloud API and AivisHub models (optional, not shipped; `AIVTUBER_TTS_BACKEND=aivis-cloud`) |Aivis Cloud API terms; each model under its own AivisHub licence |*Reply text is sent to the service.* No default voice ships; you choose the model, own its licence and credit line (`AIVTUBER_AIVIS_CREDIT`, printed at start) and pay for the credits used. See the Aivis Cloud section above.
 |three.js, `@pixiv/three-vrm`, Vite (renderer) |MIT, exact-pinned, allowlist-checked in CI |See `docs/supply-chain.adoc` section 8.
-|Sample VRM (`VRM1_Constraint_Twist_Sample.vrm`) |Embedded VRM 1.0 metadata: pixiv Inc., avatar permission everyone, credit notation unnecessary, no hateful use |Test model only. Check the embedded licence of whatever model you stream; the page logs its metadata at load.
+|Sample VRM (`VRM1_Constraint_Twist_Sample.vrm`) |Embedded VRM 1.0 metadata: pixiv Inc., avatar permission everyone, credit notation unnecessary, no hateful use |Test model only. Check the embedded licence of whatever model you stream; the panel shows it for every model you choose (<<avatar-panel>>) and the page logs it at load.
 |FFmpeg `ffplay` |LGPL/GPL depending on your build |Installed by you; not bundled.
 |===
 
