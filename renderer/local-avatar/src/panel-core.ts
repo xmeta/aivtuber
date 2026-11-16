@@ -57,7 +57,11 @@ export interface ThinkingUsageState {
 export const STATE_SCHEMA = "local-panel/1";
 /** Mirrors `MAX_THINKING_MODEL_CHOICES` and the alias shape in crates/domain. */
 export const MAX_MODEL_CHOICES = 8;
-const MODEL_ALIAS = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+const MODEL_ALIAS_CHARS = 96;
+// `alias`, `vendor/model` or either with `:variant` (issue #365); see
+// `is_valid_model_alias` in crates/domain.
+const MODEL_ALIAS_RE = /^[a-z0-9][a-z0-9._-]*(\/[a-z0-9][a-z0-9._-]*)?(:[a-z0-9][a-z0-9._-]*)?$/;
+const MODEL_ALIAS = { test: (alias: string) => alias.length <= MODEL_ALIAS_CHARS && MODEL_ALIAS_RE.test(alias) };
 const MODEL_VERSION = /^[A-Za-z0-9._-]{1,32}$/;
 export const MAX_CHAT_CHARS = 500;
 /** Chat lines kept in the page. Bounded like everything on the Rust side. */

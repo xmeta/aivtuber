@@ -29,13 +29,13 @@ use aivtuber_app::{
     RuntimeRetentionPolicy, SHADOW_ORCHESTRATOR_SCHEMA_VERSION, SceneContextService,
     ShadowOrchestratorConfig, ShadowPolicyIdentity, ShadowingRoutePlanner,
     SpeechConversationConfig, SpeechConversationMetrics, SpeechFloorMetrics, SpeechSidecar,
-    SpeechSidecarConfig, SpeechSidecarStats, StreamOutput, ThinkingEgressAllowlist,
+    SpeechSidecarConfig, SpeechSidecarStats, StreamOutput, SwitchWarmup, ThinkingEgressAllowlist,
     TtsSidecarSettings, VOICE_SETTINGS_VAR, VoiceController, VoiceEnvironment, VoicePaths,
     VoicevoxBridge, VoicevoxSettings, VtsAvatarOutput, VtsPlaybackConfig, WarmupMode,
     YOUTUBE_API_BASE_VAR, YOUTUBE_KEY_FILE_VAR, apply_dispatched_request,
     apply_thinking_provider_env, audit_pack_readiness, is_acceptable_api_base, is_valid_key,
     openrouter_preset_active, panel_settings, pump_bounded_records, read_voice_settings,
-    start_thinking_warmup, stt_sidecar_args, warmup_timeout,
+    remembered_model, start_thinking_warmup, stt_sidecar_args, switch_warmup_for, warmup_timeout,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
@@ -2058,12 +2058,12 @@ fn build_chat_ingress(
     )))
 }
 
-/// #357: the Thinking model allowlist (`AIVTUBER_OPENAI_MODEL_CHOICES`, set by
-/// `aivtuber-setup start` from the models it serves) and the file that
-/// remembers the choice (`AIVTUBER_OPENAI_MODEL_SETTINGS`). Only a loopback
-/// unauthenticated endpoint (a local llama-server) can be switched: a bearer
-/// credential names one provider model, and the router is a local-server
-/// feature.
+/// #357/#365: the Thinking model allowlist (`AIVTUBER_OPENAI_MODEL_CHOICES`)
+/// and the file that remembers the choice (`AIVTUBER_OPENAI_MODEL_SETTINGS`).
+/// A loopback unauthenticated endpoint (a local llama-server router) is
+/// switched and warmed up; a Bearer endpoint can be switched only under the
+/// OpenRouter preset, where a switch merely changes the request `model` from
+/// the fixed allowlist and makes no call of its own.
 fn build_model_switcher(
     adapter: &OpenAiResponsesAdapter,
     timeout: Duration,
@@ -2071,17 +2071,29 @@ fn build_model_switcher(
     let Some(choices) = env_optional("AIVTUBER_OPENAI_MODEL_CHOICES") else {
         return Ok(None);
     };
-    if adapter.authentication_label() != "unauthenticated-loopback" {
-        return Err("AIVTUBER_OPENAI_MODEL_CHOICES needs AIVTUBER_OPENAI_AUTH=unauthenticated-loopback (a local llama-server)".into());
-    }
+    let warmup = switch_warmup_for(
+        adapter.authentication_label(),
+        openrouter_preset_active(&|name| env_optional(name)),
+    )?;
     let catalog = ThinkingModelCatalog::parse_choices(&choices)
         .map_err(|error| format!("AIVTUBER_OPENAI_MODEL_CHOICES: {error}"))?;
     let settings = env_optional("AIVTUBER_OPENAI_MODEL_SETTINGS").map(PathBuf::from);
+    // The local launcher applies the remembered choice before the app starts;
+    // with a remote provider there is no launcher, so apply it here. A name
+    // outside the allowlist is ignored.
+    if warmup == SwitchWarmup::Skip
+        && let Some(model) = settings
+            .as_deref()
+            .and_then(|path| remembered_model(path, &catalog))
+    {
+        adapter.select_model(&model.alias, Some(&model.version))?;
+    }
     Ok(Some(ModelSwitcher::new(
         catalog,
         adapter.clone(),
         settings,
         timeout,
+        warmup,
     )?))
 }
 

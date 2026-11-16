@@ -77,7 +77,10 @@ pub use memory_writer::{
     MEMORY_WRITER_EVENT_PREFIX, MEMORY_WRITER_MAX_LIVE_ENTRIES_CEILING, MemoryWriterConfig,
     MemoryWriterMetrics,
 };
-pub use model_switch::{ModelSwitchError, ModelSwitcher, ThinkingModelStatus, WarmFn};
+pub use model_switch::{
+    ModelSwitchError, ModelSwitcher, SwitchWarmup, ThinkingModelStatus, WarmFn, remembered_model,
+    switch_warmup_for,
+};
 pub use moderation_evidence::*;
 pub use operator_control::*;
 pub use outputs::*;
