@@ -377,7 +377,7 @@ The verdict is `rejected`, and the reasons are the cases:
 
 The service got the authority boundary right: no out-of-scope claim was returned and no retired claim came back, so `refused_items` is empty and every zero-tolerance scope and removal check passed. What it fails is retrieval quality and text fidelity, which is the comparison's actual question; keeping the runtime's own store is the supported verdict, not a formality.
 
-This closes the Hindsight half of the issue's comparison. Graphiti is still unmeasured: it needs its own adapter over the same port plus a running deployment, and the rule that will judge it is already executable.
+This closes the Hindsight half of the issue's comparison. The Graphiti half was measured later on an unmerged branch and rejected; see <<graphiti-rejected,12.3>>.
 
 Run it four ways:
 
@@ -389,6 +389,35 @@ Run it four ways:
 The verdict rule is exactly the sentence this section states: `Improvement` when the candidate beats `temporal_order_errors` or `current_fact_correctness` and regresses nothing, `Rejected` when it leaks a superseded, refused, or shortened claim, answers with an item the project has to refuse, or breaks a request bound, `NoImprovement` otherwise — and a win never rescues a leak, because the zero-tolerance checks are decided per case, not on the average. A refusal is not a delivered-memory leak (the item never reached generation), but it still rejects the candidate: a project that has to filter its memory service's answers forever is not better off for adopting it. `causal_pairs_delivered` — the fixture's declared cause/effect pairs whose two members both came back — is reported per case and in the totals for both sides. It is re-derived by the comparison from the case document and each side's delivered set, never read from a report's own causal count, because a sidecar keeps no project edge and such a number would describe a store the comparison was not handed. It is a metric the comparison shows rather than one it scores: a candidate cannot be adopted on causal coverage alone, because the rule that decides adoption is unchanged.
 
 A candidate report is never trusted on its declared totals. Each case row carries the claims it required (`must_deliver`) and the claims it refused (`refused_claims`), so correctness, `stale_memory_use`, and `absent_violations` are re-derived from the delivered list and the aggregates are re-derived from the case rows. `retained_causal_spans` is summed the same way, and each case row is bounded by the fixture: a count above the declared pairs that case's delivered set supports is refused, because an answer can return both members of at most the pairs the case declares and a store can retain at most the pairs its claims declared — an invented count beside a delivery that supports none is refused rather than shown. A report whose numbers disagree with its own records — or which covers a different set of cases, is not about the fixture's cases in the fixture's order, does not carry that document's digest, carries other expectations than the fixture declares, names another fixture document, or carries another schema — is refused as *incomparable*: "not verifiable" must not be reported as a measurement.
+
+[[graphiti-rejected]]
+=== 12.3 Graphiti sidecar (measured, rejected, not merged)
+
+Graphiti was measured behind the same `MemorySidecar` port and judged by the same `memory-eval-compare` rule as Hindsight. The adapter and its reference deployment are *not on `main`*: they live only on the unmerged branch `feat/105-graphiti-sidecar` at commit `9498d31b` (PR #256, closed unmerged), and nothing in this repository selects, builds, or depends on them. The measured record is link:experiments/EXP-0105-graphiti-sidecar-eval.adoc[EXP-0105].
+
+Measured 2026-11-04 on the full 14-case fixture (`graphiti-core==0.31.2` on FalkorDB `v4.22.3`; Ollama's cloud-routed `gpt-oss:120b` as extractor with `nomic-embed-text` embeddings; pass-through reranker). One run of one model configuration, not a distribution.
+
+[cols="2,1,1",options="header"]
+|===
+|Metric |Runtime |Graphiti
+
+|`current_fact_correctness` |1.0 |0.661
+|`stale_memory_use` |0 |0
+|`absent_violations` |0 |1
+|`truncated_claims` |0 |0
+|`temporal_order_errors` |2 |8
+|max context items / request bytes |12 / 7,038 |12 / 1,000
+|entries / links high-water |14 / 69 |13 / 0
+|`refused_items` |0 |0
+|===
+
+The verdict is `rejected` on one case: `topic_shifted_correction_under_limit` has an item bound of 12 and refuses two claims; the service returned `evt-c1`, which the case refuses, and missed `evt-c9`. That case also produced 6 of the 8 temporal-order errors (`retention_plateau` the other 2), and several cases came back with facts that did not map to a retained claim, so no causal pair was delivered. This is the same failure class as Hindsight: under a tight item bound the service's semantic ranking decides membership, and nothing enforces the project's retention or supersession order at ranking time. Graphiti did keep every request inside its item and byte bounds and returned no stale or shortened text.
+
+The first full run reported 7 `refused_items` because the reference stack's cleanup route was not scoped to the group's graph and silently reported success for a live episode; that run was discarded and the measurement above is the rerun after the deployment fix. Retirement through a sidecar is therefore a correctness surface of the deployment, not something an HTTP success status proves.
+
+*Known unresolved limits.* Two P1 review findings on PR #256 were never fixed: on a retain timeout Graphiti's asynchronous worker can still write an episode after `DELETE /group` returns, and `graphiti-core` 0.31.2 `remove_episode` can restore stale shared entity summaries after a model failure and does not reverse all invalidations while the reference cleanup route always returns `success: true` (getzep/graphiti#2034). Both must be fixed, with live tests covering multi-episode scopes, delayed ingest, shared entity summaries, and injected model failure, before that adapter is trusted on any revisit.
+
+The §12.2 verdict stands: the runtime's own store is the supported default, and Graphiti must not be described as adopted. A revisit must follow EXP-0105's revisit condition and report under the same fixture digest.
 
 == 13.0 Production memory writer (issue #306, ADR-0008 Q1)
 

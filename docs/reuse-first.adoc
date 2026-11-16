@@ -161,7 +161,7 @@ Record the result as one of:
 |Agent long-term memory service
 |Hindsight; Graphiti
 |Optional sidecar / MCP; benchmark first
-|Hindsight exposes retain/recall/reflect through a built-in MCP endpoint and is a strong first benchmark candidate; Graphiti remains useful when explicit temporal graph relationships are the requirement. Only memories that passed aivtuber write authority may enter either service. Retention/deletion, epistemic class, bounds, provenance authority, replay, and privacy remain project-owned. Avoid mandatory external memory in the minimal profile.
+|Hindsight exposes retain/recall/reflect through a built-in MCP endpoint and is a strong first benchmark candidate; Graphiti remains useful when explicit temporal graph relationships are the requirement. Only memories that passed aivtuber write authority may enter either service. Retention/deletion, epistemic class, bounds, provenance authority, replay, and privacy remain project-owned. Avoid mandatory external memory in the minimal profile. Measured disposition (#105): Hindsight `reject` (memory-adaptation §12.2) and Graphiti `reject` (link:experiments/EXP-0105-graphiti-sidecar-eval.adoc[EXP-0105]; adapter unmerged) for the default memory path; the runtime store remains the default.
 |#105, #193
 
 |Stateful-agent memory/runtime reference
