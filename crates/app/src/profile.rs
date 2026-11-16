@@ -28,10 +28,22 @@ pub enum CompositionProfile {
     /// retrieval) + a Thinking engine that must be a local/loopback endpoint.
     /// Free text chat/speech reaches Thinking instead of ending `Silent`.
     Local,
+    /// The `local` route graph with a **remote Thinking provider** (issue
+    /// #364): no Jev, no semantic retrieval, local TTS/avatar. Only the
+    /// Thinking role may leave the machine, and only over HTTPS to an
+    /// allowlisted host ([`ThinkingEgressAllowlist`]) with a Bearer
+    /// credential; every other role stays loopback-only, exactly as `local`.
+    Hybrid,
 }
 
 impl CompositionProfile {
-    pub const ALL: [Self; 4] = [Self::Cached, Self::Reflex, Self::Full, Self::Local];
+    pub const ALL: [Self; 5] = [
+        Self::Cached,
+        Self::Reflex,
+        Self::Full,
+        Self::Local,
+        Self::Hybrid,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -39,6 +51,7 @@ impl CompositionProfile {
             Self::Reflex => "reflex",
             Self::Full => "full",
             Self::Local => "local",
+            Self::Hybrid => "hybrid",
         }
     }
 
@@ -48,8 +61,9 @@ impl CompositionProfile {
             "reflex" => Ok(Self::Reflex),
             "full" => Ok(Self::Full),
             "local" => Ok(Self::Local),
+            "hybrid" => Ok(Self::Hybrid),
             other => Err(ProfileError::new(format!(
-                "unknown composition profile {other:?}; expected one of cached, reflex, full, local"
+                "unknown composition profile {other:?}; expected one of cached, reflex, full, local, hybrid"
             ))),
         }
     }
@@ -67,7 +81,14 @@ impl CompositionProfile {
     }
 
     pub fn generative_route(self) -> bool {
-        matches!(self, Self::Full | Self::Local)
+        matches!(self, Self::Full | Self::Local | Self::Hybrid)
+    }
+
+    /// Whether the profile composes the local stack (deterministic routing,
+    /// loopback TTS/avatar/sidecars, operation panel by default): `local`, and
+    /// `hybrid`, which differs only in the Thinking endpoint policy.
+    pub fn local_stack(self) -> bool {
+        matches!(self, Self::Local | Self::Hybrid)
     }
 
     /// Whether generated replies are committed phrase by phrase unless
@@ -80,8 +101,11 @@ impl CompositionProfile {
     /// whole-reply commit, which is the more conservative publication
     /// boundary for remote providers, until it has the same evidence;
     /// `AIVTUBER_PHRASE_MODE=phrase` opts any profile in.
+    ///
+    /// `hybrid` follows `local`: it composes the same local TTS stack, where
+    /// whole-reply synthesis is the dominant first-audio latency.
     pub fn phrased_replies_by_default(self) -> bool {
-        self == Self::Local
+        self.local_stack()
     }
 
     /// Whether a phrased reply streams the provider's tokens into phrase
@@ -93,14 +117,18 @@ impl CompositionProfile {
     /// was not slower at p50, p90 or max on either workload and reached the
     /// first phrase much sooner for multi-phrase replies. Every other profile
     /// stays buffered: its Thinking provider is remote or unmeasured, and a
-    /// stream has no whole-reply gate before phrase 0. It still needs phrase
+    /// stream has no whole-reply gate before phrase 0. That includes `hybrid`
+    /// (issue #364): its remote provider (OpenRouter) has no streaming
+    /// time-to-first-audio measurement yet, so it stays buffered until one
+    /// exists (`AIVTUBER_THINKING_STREAM=on` opts in). It still needs phrase
     /// mode, so the default applies only when the reply is phrased.
     pub fn thinking_stream_by_default(self) -> bool {
         self == Self::Local
     }
 
-    /// Whether every provider endpoint must be loopback (nothing leaves the
-    /// machine). Enforced by [`Self::validate_provider_endpoints`].
+    /// Whether every provider endpoint, Thinking included, must be loopback
+    /// (nothing leaves the machine). Only `local`; see
+    /// [`Self::validate_thinking_endpoint`] for `hybrid`.
     pub fn loopback_only(self) -> bool {
         self == Self::Local
     }
@@ -137,15 +165,18 @@ impl CompositionProfile {
         Ok(())
     }
 
-    /// Fail closed when a loopback-only profile is pointed at a provider
+    /// Fail closed when the local stack is pointed at a non-Thinking provider
     /// endpoint that is not provably this machine. `endpoints` pairs a
     /// human-readable role with its already-verified loopback status, so the
-    /// error names the offender without echoing the URL.
+    /// error names the offender without echoing the URL. This covers every
+    /// role except Thinking, which `hybrid` may send off-machine under
+    /// [`Self::validate_thinking_endpoint`]; it is loopback-only for `local`
+    /// and `hybrid` alike. Pass Thinking here only for `local`.
     pub fn validate_provider_endpoints(
         self,
         endpoints: &[(&str, bool)],
     ) -> Result<(), ProfileError> {
-        if !self.loopback_only() {
+        if !self.local_stack() {
             return Ok(());
         }
         for (role, loopback) in endpoints {
@@ -157,6 +188,120 @@ impl CompositionProfile {
             }
         }
         Ok(())
+    }
+
+    /// Per-role egress policy for the Thinking endpoint (issue #364).
+    ///
+    /// * `local`: loopback only, exactly as [`Self::validate_provider_endpoints`].
+    /// * `hybrid`: loopback, or a remote host that is HTTPS, exactly matches
+    ///   `allowlist` and is reached with a Bearer credential. Anything else
+    ///   fails closed.
+    /// * other profiles: no restriction (unchanged).
+    ///
+    /// Returns the remote host the chat/reply text will be sent to, for the
+    /// startup notice; `None` when nothing leaves the machine. Errors name the
+    /// role and never echo the URL.
+    pub fn validate_thinking_endpoint(
+        self,
+        endpoint: &str,
+        loopback: bool,
+        bearer_auth: bool,
+        allowlist: &ThinkingEgressAllowlist,
+    ) -> Result<Option<String>, ProfileError> {
+        match self {
+            Self::Local => {
+                self.validate_provider_endpoints(&[("thinking", loopback)])?;
+                Ok(None)
+            }
+            Self::Hybrid if !loopback => {
+                let refuse = |reason: &str| {
+                    ProfileError::new(format!(
+                        "profile \"hybrid\" refuses the thinking endpoint: {reason}"
+                    ))
+                };
+                let (host, port) =
+                    aivtuber_adapters::https_endpoint_target(endpoint).map_err(|reason| {
+                        refuse(&format!(
+                            "a remote endpoint must be HTTPS to a DNS name without credentials ({reason})"
+                        ))
+                    })?;
+                if !allowlist.permits(&host, port) {
+                    return Err(refuse(
+                        "its host is not on the egress allowlist; use AIVTUBER_THINKING_PROVIDER=openrouter or set AIVTUBER_THINKING_EGRESS_HOST to the exact host",
+                    ));
+                }
+                if !bearer_auth {
+                    return Err(refuse(
+                        "a remote endpoint requires Bearer authentication (AIVTUBER_OPENAI_API_KEY)",
+                    ));
+                }
+                Ok(Some(host))
+            }
+            Self::Hybrid | Self::Cached | Self::Reflex | Self::Full => Ok(None),
+        }
+    }
+}
+
+/// Host of the OpenRouter preset (`AIVTUBER_THINKING_PROVIDER=openrouter`).
+pub const OPENROUTER_EGRESS_HOST: &str = "openrouter.ai";
+
+/// Exact `(host, port)` pairs the `hybrid` profile may send Thinking traffic
+/// to (issue #364). No wildcards, no suffix matching, no IP literals; the
+/// default port is 443.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ThinkingEgressAllowlist {
+    entries: Vec<(String, u16)>,
+}
+
+impl ThinkingEgressAllowlist {
+    /// `openrouter_preset` allows [`OPENROUTER_EGRESS_HOST`]; `configured` is
+    /// the `AIVTUBER_THINKING_EGRESS_HOST` value (`host` or `host:port`).
+    pub fn new(openrouter_preset: bool, configured: Option<&str>) -> Result<Self, ProfileError> {
+        let mut entries = Vec::new();
+        if openrouter_preset {
+            entries.push((OPENROUTER_EGRESS_HOST.to_owned(), 443));
+        }
+        if let Some(value) = configured {
+            let invalid = || {
+                ProfileError::new(
+                    "AIVTUBER_THINKING_EGRESS_HOST must be one bare DNS name with an optional :port (no scheme, path, userinfo, IP address or wildcard)",
+                )
+            };
+            let value = value.trim();
+            if value.is_empty()
+                || !value
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':'))
+            {
+                return Err(invalid());
+            }
+            let (host, port) = match value.split_once(':') {
+                None => (value, 443),
+                Some((host, port)) => {
+                    let port: u16 = port.parse().map_err(|_| invalid())?;
+                    if port == 0 {
+                        return Err(invalid());
+                    }
+                    (host, port)
+                }
+            };
+            // Round-trip through the endpoint parser so the allowlist and the
+            // endpoint check share one notion of "host".
+            let (parsed, parsed_port) =
+                aivtuber_adapters::https_endpoint_target(&format!("https://{host}:{port}/"))
+                    .map_err(|_| invalid())?;
+            if parsed != host.to_ascii_lowercase() || parsed_port != port {
+                return Err(invalid());
+            }
+            entries.push((parsed, port));
+        }
+        Ok(Self { entries })
+    }
+
+    pub fn permits(&self, host: &str, port: u16) -> bool {
+        self.entries
+            .iter()
+            .any(|(allowed, allowed_port)| allowed == host && *allowed_port == port)
     }
 }
 
@@ -198,6 +343,10 @@ pub struct ProfileSummary {
     /// Fingerprint of the active configuration for replay/telemetry
     /// correlation (#55 acceptance: replay records the active profile).
     pub config_fingerprint: String,
+    /// Remote host that Thinking traffic (chat and reply text) is sent to;
+    /// `None` when nothing leaves the machine (issue #364). Host only: no
+    /// scheme, path, key or text.
+    pub thinking_egress_host: Option<String>,
 }
 
 impl ProfileSummary {
@@ -222,17 +371,35 @@ impl ProfileSummary {
                 }
                 // No decision model: deterministic intent playback, else
                 // Thinking, else the typed non-verbal reaction (#220 S1).
-                CompositionProfile::Local => "deterministic_local".to_owned(),
+                CompositionProfile::Local | CompositionProfile::Hybrid => {
+                    "deterministic_local".to_owned()
+                }
             },
             config_fingerprint,
+            thinking_egress_host: None,
         }
+    }
+
+    pub fn with_thinking_egress_host(mut self, host: Option<String>) -> Self {
+        self.thinking_egress_host = host;
+        self
+    }
+
+    /// Operator-facing egress notice, mirroring the Aivis Cloud one: what
+    /// leaves the machine, and to whom. Host only.
+    pub fn egress_notice(&self) -> Option<String> {
+        self.thinking_egress_host.as_ref().map(|host| {
+            format!(
+                "thinking egress: NOTICE viewer chat and reply text are sent to {host} (internet service) for every generated reply; the credential goes only to that host and no redirect is followed"
+            )
+        })
     }
 
     /// Render the startup log line. Never includes credentials or endpoints
     /// with embedded keys.
     pub fn log_line(&self) -> String {
         format!(
-            "composition profile: profile={} semantic={} jev={} template={} generative={} generative_available={} fallback={} fingerprint={}",
+            "composition profile: profile={} semantic={} jev={} template={} generative={} generative_available={} fallback={} fingerprint={}{}",
             self.profile,
             self.semantic_retrieval,
             self.jev,
@@ -241,6 +408,10 @@ impl ProfileSummary {
             self.generative_available,
             self.fallback_route,
             self.config_fingerprint,
+            self.thinking_egress_host
+                .as_ref()
+                .map(|host| format!(" thinking_egress={host}"))
+                .unwrap_or_default(),
         )
     }
 }
@@ -421,11 +592,14 @@ mod tests {
     }
 
     #[test]
-    fn only_the_local_profile_is_phrased_by_default() {
+    fn only_the_local_stack_is_phrased_by_default() {
         for profile in CompositionProfile::ALL {
             assert_eq!(
                 profile.phrased_replies_by_default(),
-                profile == CompositionProfile::Local
+                matches!(
+                    profile,
+                    CompositionProfile::Local | CompositionProfile::Hybrid
+                )
             );
         }
     }
@@ -443,6 +617,235 @@ mod tests {
                 assert!(profile.phrased_replies_by_default());
             }
         }
+    }
+
+    #[test]
+    fn hybrid_is_the_local_route_graph_with_buffered_streaming_default() {
+        let hybrid = CompositionProfile::Hybrid;
+        assert_eq!(
+            CompositionProfile::parse(" Hybrid ").expect("parse"),
+            hybrid
+        );
+        assert_eq!(hybrid.as_str(), "hybrid");
+        assert!(!hybrid.semantic_retrieval());
+        assert!(!hybrid.jev());
+        assert!(!hybrid.template_route());
+        assert!(hybrid.generative_route());
+        assert!(hybrid.local_stack());
+        assert!(hybrid.phrased_replies_by_default());
+        assert!(
+            !hybrid.thinking_stream_by_default(),
+            "remote Thinking has no streaming measurement yet"
+        );
+        assert!(
+            !hybrid.loopback_only(),
+            "only the Thinking role may leave the machine"
+        );
+        assert!(!CompositionProfile::Full.local_stack());
+        // No Jev credential needed; generative configuration still is.
+        hybrid
+            .validate(true, false)
+            .expect("hybrid runs without Jev");
+        assert!(hybrid.validate(false, false).is_err());
+        assert_eq!(
+            ProfileSummary::for_profile(hybrid, true, String::new()).fallback_route,
+            "deterministic_local"
+        );
+    }
+
+    const OPENROUTER: &str = "https://openrouter.ai/api/v1/chat/completions";
+
+    fn openrouter_allowlist() -> ThinkingEgressAllowlist {
+        ThinkingEgressAllowlist::new(true, None).expect("preset")
+    }
+
+    #[test]
+    fn hybrid_allows_only_the_allowlisted_https_thinking_host_with_bearer_auth() {
+        let allow = openrouter_allowlist();
+        let host = CompositionProfile::Hybrid
+            .validate_thinking_endpoint(OPENROUTER, false, true, &allow)
+            .expect("openrouter is allowlisted");
+        assert_eq!(host.as_deref(), Some("openrouter.ai"));
+        // Host comparison is case-insensitive on the parsed URL host.
+        CompositionProfile::Hybrid
+            .validate_thinking_endpoint("https://OpenRouter.AI/api/v1/x", false, true, &allow)
+            .expect("case-insensitive host");
+        // Loopback Thinking is fine and reports no egress.
+        assert_eq!(
+            CompositionProfile::Hybrid
+                .validate_thinking_endpoint("http://127.0.0.1:8080/v1/x", true, false, &allow)
+                .expect("loopback"),
+            None
+        );
+    }
+
+    #[test]
+    fn hybrid_refuses_other_hosts_plaintext_and_endpoint_tricks() {
+        let allow = openrouter_allowlist();
+        for endpoint in [
+            "https://api.openai.com/v1/chat/completions",
+            "https://openrouter.ai.evil.example/v1/x",
+            "https://evilopenrouter.ai/v1/x",
+            "https://sub.openrouter.ai/v1/x",
+            "https://openrouter.ai./v1/x",
+            "https://evil.example/openrouter.ai",
+            "https://evil.example/?h=openrouter.ai",
+            "http://openrouter.ai/api/v1/x",
+            "https://openrouter.ai@evil.example/v1/x",
+            "https://user:pass@openrouter.ai/v1/x",
+            "https://openrouter.ai:8443/v1/x",
+            "https://openrouter.ai:80/v1/x",
+            "https://104.18.0.1/v1/x",
+            "https://[2606:4700::1]/v1/x",
+            "ftp://openrouter.ai/x",
+            "not a url",
+        ] {
+            let error = CompositionProfile::Hybrid
+                .validate_thinking_endpoint(endpoint, false, true, &allow)
+                .expect_err(endpoint);
+            let message = error.to_string();
+            assert!(message.contains("thinking"), "{message}");
+            assert!(
+                !message.contains("evil") && !message.contains("pass"),
+                "the error must not echo the URL: {message}"
+            );
+        }
+        // No preset and no configured host: nothing remote is allowed.
+        assert!(
+            CompositionProfile::Hybrid
+                .validate_thinking_endpoint(
+                    OPENROUTER,
+                    false,
+                    true,
+                    &ThinkingEgressAllowlist::default()
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn hybrid_requires_bearer_auth_for_a_remote_thinking_endpoint() {
+        let error = CompositionProfile::Hybrid
+            .validate_thinking_endpoint(OPENROUTER, false, false, &openrouter_allowlist())
+            .expect_err("unauthenticated remote Thinking");
+        assert!(error.to_string().contains("Bearer"));
+    }
+
+    #[test]
+    fn a_configured_egress_host_is_exact_and_strict() {
+        let allow = ThinkingEgressAllowlist::new(false, Some(" LLM.Example.org ")).expect("host");
+        assert!(allow.permits("llm.example.org", 443));
+        assert!(
+            !allow.permits("openrouter.ai", 443),
+            "no preset, no openrouter"
+        );
+        assert!(!allow.permits("llm.example.org", 8443));
+        assert!(!allow.permits("x.llm.example.org", 443));
+        CompositionProfile::Hybrid
+            .validate_thinking_endpoint("https://llm.example.org/v1/chat", false, true, &allow)
+            .expect("configured host");
+        assert!(
+            CompositionProfile::Hybrid
+                .validate_thinking_endpoint("https://llm.example.org:8443/v1", false, true, &allow)
+                .is_err(),
+            "a port that is not part of the configured value"
+        );
+        let with_port =
+            ThinkingEgressAllowlist::new(false, Some("llm.example.org:8443")).expect("port");
+        CompositionProfile::Hybrid
+            .validate_thinking_endpoint("https://llm.example.org:8443/v1", false, true, &with_port)
+            .expect("explicit port");
+        assert!(
+            CompositionProfile::Hybrid
+                .validate_thinking_endpoint("https://llm.example.org/v1", false, true, &with_port)
+                .is_err()
+        );
+        // The preset and a configured host are a union.
+        let both = ThinkingEgressAllowlist::new(true, Some("llm.example.org")).expect("both");
+        assert!(both.permits("openrouter.ai", 443) && both.permits("llm.example.org", 443));
+        for bad in [
+            "",
+            "*.example.org",
+            "*",
+            "https://llm.example.org",
+            "llm.example.org/path",
+            "user@llm.example.org",
+            "127.0.0.1",
+            "127.1",
+            "0x7f.1",
+            "[::1]",
+            "llm.example.org:0",
+            "llm.example.org:99999",
+            "llm.example.org:443:1",
+            "llm example.org",
+        ] {
+            let error = ThinkingEgressAllowlist::new(false, Some(bad)).expect_err(bad);
+            assert!(!error.to_string().contains("example.org"));
+        }
+    }
+
+    #[test]
+    fn hybrid_keeps_every_other_role_loopback_only() {
+        CompositionProfile::Hybrid
+            .validate_provider_endpoints(&[("tts", true), ("perception model", true)])
+            .expect("loopback roles");
+        for role in ["tts", "perception model", "scene context OBS"] {
+            let error = CompositionProfile::Hybrid
+                .validate_provider_endpoints(&[(role, false)])
+                .expect_err("non-loopback non-Thinking role");
+            assert!(error.to_string().contains(role));
+        }
+    }
+
+    #[test]
+    fn local_still_refuses_every_remote_thinking_endpoint() {
+        let allow = openrouter_allowlist();
+        let error = CompositionProfile::Local
+            .validate_thinking_endpoint(OPENROUTER, false, true, &allow)
+            .expect_err("local never sends Thinking off the machine");
+        assert!(error.to_string().contains("thinking"));
+        assert!(error.to_string().contains("\"local\""));
+        assert_eq!(
+            CompositionProfile::Local
+                .validate_thinking_endpoint("http://127.0.0.1:1/v1", true, false, &allow)
+                .expect("loopback"),
+            None
+        );
+        // Unchanged: the other profiles carry no Thinking restriction.
+        CompositionProfile::Full
+            .validate_thinking_endpoint(
+                OPENROUTER,
+                false,
+                true,
+                &ThinkingEgressAllowlist::default(),
+            )
+            .expect("full is unrestricted");
+    }
+
+    #[test]
+    fn hybrid_summary_names_the_egress_host_and_no_secret() {
+        let summary = ProfileSummary::for_profile(
+            CompositionProfile::Hybrid,
+            true,
+            config_fingerprint(CompositionProfile::Hybrid, true),
+        )
+        .with_thinking_egress_host(Some("openrouter.ai".to_owned()));
+        let line = summary.log_line();
+        assert!(line.contains("profile=hybrid"));
+        assert!(line.contains("jev=false"));
+        assert!(line.contains("thinking_egress=openrouter.ai"));
+        let notice = summary.egress_notice().expect("notice");
+        assert!(notice.contains("openrouter.ai"));
+        assert!(notice.contains("chat and reply text"));
+        for text in [&line, &notice] {
+            assert!(!text.contains("sk-") && !text.contains("Bearer"));
+            assert!(!text.contains("https://"));
+        }
+        assert_eq!(
+            ProfileSummary::for_profile(CompositionProfile::Local, true, String::new())
+                .egress_notice(),
+            None
+        );
     }
 
     #[test]

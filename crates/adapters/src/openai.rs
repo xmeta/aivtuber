@@ -170,6 +170,27 @@ pub fn verify_loopback_endpoint(
     }
 }
 
+/// The remote authority of an HTTPS endpoint as `(lowercase domain, port)`
+/// (issue #364), for an exact-match egress allowlist.
+///
+/// Strict on purpose: HTTPS only, no userinfo, a DNS name (never an IP
+/// literal, which also rules out `0x7f.1`-style spellings the URL parser
+/// normalizes to an address), and the default port 443 unless a port is
+/// spelled out. The error is a fixed reason that never echoes the input.
+pub fn https_endpoint_target(endpoint: &str) -> Result<(String, u16), &'static str> {
+    let url = url::Url::parse(endpoint).map_err(|_| "not a valid URL")?;
+    if url.scheme() != "https" {
+        return Err("scheme must be https");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("must not embed credentials");
+    }
+    match (url.host(), url.port_or_known_default()) {
+        (Some(url::Host::Domain(host)), Some(port)) => Ok((host.to_ascii_lowercase(), port)),
+        _ => Err("host must be a DNS name"),
+    }
+}
+
 /// Which request/response shape the Thinking endpoint speaks (issue #363).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ThinkingWire {
