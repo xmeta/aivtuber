@@ -30,9 +30,34 @@ pub fn diagnostics_enabled() -> bool {
     *VERBOSITY.get_or_init(|| parse(std::env::var(LOG_ENV).ok().as_deref())) == Verbosity::Verbose
 }
 
+/// The value a child should get: `Some("quiet")` for a quiet process, `None`
+/// (leave the variable removed) otherwise. Always a literal, never the raw value.
+pub fn child_value(verbosity: Verbosity) -> Option<&'static str> {
+    match verbosity {
+        Verbosity::Quiet => Some("quiet"),
+        Verbosity::Verbose => None,
+    }
+}
+
+/// Call after a sidecar spawn site has stripped every `AIVTUBER_*` variable.
+/// This is the single, non-secret exception to that stripping: a normalized
+/// `AIVTUBER_LOG=quiet` literal derived from this process's parsed verbosity,
+/// so the sidecar's own measurement lines honour the operator's choice.
+pub fn forward_to_child(command: &mut std::process::Command) {
+    if !diagnostics_enabled() {
+        command.env(LOG_ENV, "quiet");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_quiet_is_forwarded_and_always_as_a_literal() {
+        assert_eq!(child_value(Verbosity::Quiet), Some("quiet"));
+        assert_eq!(child_value(Verbosity::Verbose), None);
+    }
 
     #[test]
     fn unset_empty_and_unknown_are_verbose() {

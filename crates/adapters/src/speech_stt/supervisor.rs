@@ -206,6 +206,8 @@ impl SttWorker {
                 command.env_remove(key);
             }
         }
+        // The one non-secret exception: the normalized quiet switch (#391).
+        crate::log_verbosity::forward_to_child(&mut command);
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {

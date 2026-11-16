@@ -223,7 +223,8 @@ impl SpeechSidecar {
     /// sync immediately. `started` is the instant the runtime's `now_ms`
     /// counts from, so the sidecar's stamps land on the runtime timeline.
     /// `AIVTUBER_*` variables are removed from the child's environment: it has
-    /// no use for the app's credentials or configuration.
+    /// no use for the app's credentials or configuration. The single exception
+    /// is a normalized `AIVTUBER_LOG=quiet` when this process is quiet (#391).
     pub fn spawn(config: SpeechSidecarConfig, started: Instant) -> io::Result<Self> {
         config
             .validate()
@@ -239,6 +240,8 @@ impl SpeechSidecar {
                 command.env_remove(key);
             }
         }
+        // The one non-secret exception: the normalized quiet switch (#391).
+        aivtuber_adapters::log_verbosity::forward_to_child(&mut command);
         let mut child = command.spawn()?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
