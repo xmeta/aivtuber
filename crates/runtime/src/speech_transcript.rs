@@ -307,6 +307,9 @@ pub struct SpeechTranscriptMetrics {
     pub speakers: usize,
     pub speakers_high_water: usize,
     pub speakers_evicted: u64,
+    /// Speakers and pending finals dropped by
+    /// [`SpeechTranscriptTracker::clear`] (voice input turned off, #400).
+    pub cleared_by_operator: u64,
     /// Reported by adapters through `record_provider_unavailable`.
     pub provider_unavailable: u64,
 }
@@ -628,6 +631,22 @@ impl SpeechTranscriptTracker {
         self.speakers
             .retain(|_, entry| now_ms.saturating_sub(entry.last_seen_ms) < ttl);
         self.metrics.speakers_evicted += (before - self.speakers.len()) as u64;
+    }
+
+    /// Drops every speaker (open segment, segment ordering) and every pending
+    /// final (voice input was turned off, #400): what was heard before the
+    /// switch must not be answered after it, nobody holds the floor through a
+    /// stale partial, and a fresh recognizer whose segment ids start over is
+    /// not judged against the old instance's ordering. Counted in
+    /// `cleared_by_operator`; the other counters keep their history.
+    pub fn clear(&mut self) {
+        let dropped = self.speakers.len() + self.finals.len();
+        self.metrics.cleared_by_operator = self
+            .metrics
+            .cleared_by_operator
+            .saturating_add(dropped as u64);
+        self.speakers.clear();
+        self.finals.clear();
     }
 
     /// What the partials say about one speaker's floor right now. Read-only.
@@ -969,5 +988,67 @@ mod tests {
         ] {
             assert!(bad.validate().is_err());
         }
+    }
+
+    #[test]
+    fn clear_drops_speakers_and_pending_finals_and_a_restarted_recognizer_is_accepted() {
+        let mut k = tracker();
+        one(&mut k, t(1, 0, TranscriptKind::Final, "古い", 1_000), 1_100);
+        one(&mut k, t(2, 0, TranscriptKind::Partial, "あ", 2_000), 2_100);
+        assert_eq!(k.pending_finals(), 1);
+        assert!(matches!(
+            k.floor_hold("s1", 2_200),
+            FloorHold::Holding { .. }
+        ));
+
+        k.clear();
+        assert_eq!(k.pending_finals(), 0);
+        assert!(k.take_finals(10).is_empty());
+        assert_eq!(k.floor_hold("s1", 2_200), FloorHold::None);
+        let m = k.metrics();
+        // One speaker and one pending final.
+        assert_eq!((m.speakers, m.cleared_by_operator), (0, 2));
+        // History counters survive.
+        assert_eq!((m.finals_accepted, m.finals_surfaced), (1, 1));
+
+        // The restarted recognizer numbers its segments from 1 again, with
+        // an earlier audio clock than the old instance's newest segment.
+        assert_eq!(
+            one(
+                &mut k,
+                t(1, 0, TranscriptKind::Partial, "こんにちは", 2_300),
+                2_400
+            )
+            .name(),
+            "accepted_partial"
+        );
+        assert_eq!(
+            one(
+                &mut k,
+                t(1, 1, TranscriptKind::Final, "こんにちは", 2_500),
+                2_600
+            )
+            .name(),
+            "accepted_final"
+        );
+        let finals = k.take_finals(10);
+        assert_eq!(finals.len(), 1);
+        assert_eq!(finals[0].text, "こんにちは");
+        // Without the clear the same segment id would have been out of order.
+        let mut stale = tracker();
+        one(
+            &mut stale,
+            t(2, 0, TranscriptKind::Partial, "あ", 2_000),
+            2_100,
+        );
+        assert_eq!(
+            one(
+                &mut stale,
+                t(1, 0, TranscriptKind::Partial, "い", 2_300),
+                2_400
+            )
+            .name(),
+            "out_of_order"
+        );
     }
 }

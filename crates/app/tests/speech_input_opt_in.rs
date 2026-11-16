@@ -124,12 +124,13 @@ fn without_the_variable_a_configured_sidecar_starts_as_before() {
 
 /// The environment `aivtuber-setup` writes for the speech stack: conversation,
 /// floor and barge-in on, with a transcript worker and its model directory.
-/// With voice input off none of it is read, so the app starts and shuts down
-/// cleanly with no floor, no conversation route and no sidecar (typed chat
-/// is unaffected, as when the sidecar variable is absent). The worker and
-/// model paths do not exist: reaching them would be an error.
+/// With voice input off (#400) the trackers, conversation route, floor and
+/// barge-in are composed at start so it can be switched on later, but nothing
+/// is spawned: no sidecar and no worker, and the app starts and shuts down
+/// cleanly (typed chat is unaffected). The worker and model paths do not
+/// exist: spawning them would be an error.
 #[test]
-fn the_setup_speech_environment_is_inert_while_voice_input_is_off() {
+fn the_setup_speech_environment_spawns_nothing_while_voice_input_is_off() {
     let dir = scratch("setup-env");
     let missing = dir.join("local-speech-input.json");
     let _ = std::fs::remove_file(&missing);
@@ -142,14 +143,12 @@ fn the_setup_speech_environment_is_inert_while_voice_input_is_off() {
     ];
     let text = run_app(Some(&missing), "verbose", &setup_env);
     assert!(text.contains("voice input: off"), "{text}");
-    for forbidden in [
-        "speech_sidecar",
-        "speech_floor",
-        "speech_barge_in",
-        "speech_conversation",
-        "speech-stt-worker",
-    ] {
+    for forbidden in ["speech_sidecar", "speech-stt-worker"] {
         assert!(!text.contains(forbidden), "{forbidden}: {text}");
+    }
+    // Composed for a later switch-on, though nothing runs.
+    for composed in ["speech_floor: enabled", "speech_conversation: enabled"] {
+        assert!(text.contains(composed), "{composed}: {text}");
     }
     assert!(
         text.contains("raw_ingress: stdin closed; shutting down"),

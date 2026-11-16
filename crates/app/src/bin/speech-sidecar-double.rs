@@ -20,6 +20,13 @@
 //! unavailable status, then transcript lines that must be ignored while the
 //! edges continue) and `transcript-garbage` (valid edges plus two invalid
 //! transcript lines per sync).
+//!
+//! Worker-lifetime modes (#400): `with-worker` spawns a child of itself as a
+//! stand-in for the STT worker (piped stdin and stdout, like the real one) and
+//! then idles; `worker` (that child) exits when its stdin reaches end of
+//! input. With a lock file named as the second argument the worker holds
+//! `<file>.worker`, so a test can tell whether the "worker" outlives a parent
+//! that was killed without any chance to clean up.
 
 use aivtuber_adapters::speech_vad::pump_clock_syncs;
 use std::io::{self, BufRead, BufReader, Write};
@@ -44,7 +51,27 @@ fn emit(out: &mut impl Write, line: &str) {
     let _ = out.write_all(line.as_bytes()).and_then(|()| out.flush());
 }
 
+/// Test hook (#400): with a file named as the second argument (or by
+/// `SPEECH_SIDECAR_DOUBLE_LOCK`), hold an exclusive lock on it for the life of
+/// the process, so a test can tell that the double is running (the lock is
+/// busy) or gone (the lock is free). The lock is released by the OS however
+/// the process ends.
+fn hold_liveness_lock() -> Option<std::fs::File> {
+    let path = std::env::args_os()
+        .nth(2)
+        .or_else(|| std::env::var_os("SPEECH_SIDECAR_DOUBLE_LOCK"))?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .ok()?;
+    file.lock().ok()?;
+    Some(file)
+}
+
 fn main() -> ExitCode {
+    let _liveness = hold_liveness_lock();
     let mode = std::env::args().nth(1).unwrap_or_default();
     let mut out = io::stdout().lock();
     match mode.as_str() {
@@ -151,9 +178,31 @@ fn main() -> ExitCode {
         "hang" => loop {
             std::thread::sleep(std::time::Duration::from_secs(3600));
         },
+        "with-worker" => {
+            let mut command = std::process::Command::new(std::env::current_exe().expect("exe"));
+            command.arg("worker");
+            if let Some(lock) = std::env::args_os().nth(2) {
+                let mut worker_lock = lock;
+                worker_lock.push(".worker");
+                command.arg(worker_lock);
+            }
+            let _worker = command
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn();
+            // Idle with the worker's pipes open, as the real sidecar does.
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+            }
+        }
+        "worker" => {
+            let mut sink = Vec::new();
+            let _ = io::Read::read_to_end(&mut io::stdin().lock(), &mut sink);
+            ExitCode::SUCCESS
+        }
         _ => {
             eprintln!(
-                "usage: speech-sidecar-double clock|crash|garbage|flood|oversize|hang|transcripts|stt-fail|transcript-garbage|beat|beat-stall|beat-garbage"
+                "usage: speech-sidecar-double clock|crash|garbage|flood|oversize|hang|with-worker|transcripts|stt-fail|transcript-garbage|beat|beat-stall|beat-garbage"
             );
             ExitCode::FAILURE
         }

@@ -100,6 +100,14 @@ pub enum Capability {
     /// parsed by the renderer is an operator decision, not a performance one.
     #[serde(rename = "avatar.configure")]
     AvatarConfigure,
+    /// Turns the supervised microphone / voice-activity / speech-recognition
+    /// sidecar on or off while the app runs (#400). Held only by an
+    /// authenticated local ingress and only when the launcher composed voice
+    /// input (a sidecar is configured and the settings file is named). It
+    /// cannot raise trust: what the sidecar hears is admitted as untrusted
+    /// speech, exactly as when it was started with the app.
+    #[serde(rename = "speech_input.control")]
+    SpeechInputControl,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -591,6 +599,22 @@ mod tests {
         let event: EventEnvelope =
             serde_json::from_str(json).expect("deserialize negative fixture");
         let error = event.validate().expect_err("forged operator must fail");
+        assert_eq!(error.field(), "source_class");
+    }
+
+    #[test]
+    fn repository_forged_speech_input_control_fixture_is_rejected() {
+        let json =
+            include_str!("../../../examples/events/invalid/forged-speech-input-control.json");
+        let event: EventEnvelope =
+            serde_json::from_str(json).expect("the capability name is a closed, known one");
+        assert!(
+            event
+                .authorization
+                .as_ref()
+                .is_some_and(|auth| auth.capabilities.contains(&Capability::SpeechInputControl))
+        );
+        let error = event.validate().expect_err("a chat source cannot carry it");
         assert_eq!(error.field(), "source_class");
     }
 

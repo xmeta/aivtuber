@@ -276,7 +276,9 @@ pub const AVATAR_SETTINGS_FILE: &str = "local-avatar.json";
 /// File beside the env file that remembers whether voice input (the microphone,
 /// VAD and speech recognition) is on (#397). `start --voice-input on|off`
 /// writes it; the app reads it and opens no capture device unless it says
-/// enabled. A missing or invalid file means off.
+/// enabled. A missing or invalid file means off. Since #400 the app rewrites it
+/// too, when the operator switches voice input in the panel or with
+/// `aivtuberctl voice-input` (the same atomic write, the same document).
 pub const SPEECH_INPUT_SETTINGS_FILE: &str = "local-speech-input.json";
 /// Same name as `aivtuber_app::speech_input::SPEECH_INPUT_SETTINGS_VAR`; a test
 /// pins the two together (the app crate is not linked here).

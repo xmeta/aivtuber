@@ -138,6 +138,12 @@ impl BargeIn {
         })
     }
 
+    /// Forget the handled run (voice input was turned off, #400): a fresh
+    /// feed starts with no run acted on.
+    pub(crate) fn reset_handled(&mut self) {
+        self.handled = None;
+    }
+
     pub(crate) fn mark_handled(&mut self, speaker: &str, run_start_ms: Option<u64>) {
         if let Some(edge) = run_start_ms {
             self.handled = Some((speaker.to_owned(), edge));

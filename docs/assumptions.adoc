@@ -406,7 +406,7 @@ _#357 note:_ the premise now holds per model. +reasoning = off+ is written into 
 
 *Subsystem:* local and hybrid profile launcher (+crates/setup+), speech sidecar start-up (+crates/app+)
 
-*Status:* Decided (#396 investigation, 2026-11-17; implemented by #397)
+*Status:* Decided (#396 investigation, 2026-11-17; implemented by #397; live switching by #400)
 
 *Statement:* The default under `aivtuber-setup start` changed from on to off: the microphone is opened only after the operator runs `aivtuber-setup start --voice-input on` (remembered in +local-speech-input.json+ beside the env file). The app run directly without +AIVTUBER_SPEECH_INPUT_SETTINGS+ keeps the old behaviour.
 
@@ -414,9 +414,9 @@ _#357 note:_ the premise now holds per model. +reasoning = off+ is written into 
 
 *Consequence if false:* Streamers who want voice input pay one extra step (the flag, once). If viewers or the operator never leave ambient audio near the device, the default costs only that step; if it is wrong the other way (off hides a feature people expect) the first-run guide line says how to turn it on.
 
-*Revisit when:* the panel toggle (slice B of #396, through an authenticated control capability) lands, or self-echo handling is implemented and measured with speakers and an acoustic microphone; then the default and the start-up line can be reconsidered.
+*Revisit when:* self-echo handling is implemented and measured with speakers and an acoustic microphone, or the device-choice slice lands; then the default and the start-up line can be reconsidered. The panel and `aivtuberctl` toggle (slice B of #396, #400, through the closed `speech_input.control` capability) landed, so a streamer no longer restarts the app to change it: if that makes "on" the common state, revisit whether the default should stay off or whether the first-run guide should offer the switch more prominently. Also revisit the disable path if the real STT worker is ever seen to outlive a disabled sidecar (it is expected to exit when its input pipe closes; this was read in code, not measured with the real worker).
 
-*Related:* #396, #397, #393.
+*Related:* #396, #397, #400, #393.
 
 == Adding or updating an assumption
 

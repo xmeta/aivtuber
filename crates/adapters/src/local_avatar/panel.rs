@@ -40,7 +40,11 @@
 //!   it arrives and inspected as a VRM before the composition thread is even
 //!   asked; one upload at a time) and the confirm / select / delete / discard
 //!   requests, each naming a model by its content hash only. They have their
-//!   own queue. The client never supplies a path or a file name.
+//!   own queue. The client never supplies a path or a file name;
+//! * voice input (#400) adds `POST /api/speech-input` with `{"enabled": bool}`
+//!   and nothing else (a strict body: no device, program or argument), on its
+//!   own queue. It asks the composition thread to start or stop the microphone
+//!   sidecar; whether voice input is composed at all is decided there.
 
 use super::server::{
     ConnGuard, HEAD_DEADLINE, MAX_CONNECTIONS, POLL, content_type, ct_eq, header_value, mint_token,
@@ -71,13 +75,14 @@ const CONTROL_QUEUE: usize = 4;
 const VOICE_QUEUE: usize = 4;
 const INGRESS_QUEUE: usize = 4;
 const AVATAR_QUEUE: usize = 4;
+const SPEECH_INPUT_QUEUE: usize = 4;
 const CHAT_QUEUE: usize = 8;
 /// Longest accepted API key, in characters (Aivis keys are about 40).
 pub const MAX_PANEL_KEY_CHARS: usize = 256;
 /// One model search may take this long, end to end.
 const SEARCH_DEADLINE: Duration = Duration::from_secs(6);
 /// Every state-changing endpoint (all are `POST`).
-const STATE_CHANGING: [&str; 17] = [
+const STATE_CHANGING: [&str; 18] = [
     "/api/chat",
     "/api/stop",
     "/api/mute",
@@ -95,6 +100,7 @@ const STATE_CHANGING: [&str; 17] = [
     "/api/avatar/select",
     "/api/avatar/delete",
     "/api/avatar/discard",
+    "/api/speech-input",
 ];
 const SEARCH_PATH: &str = "/api/voice/search";
 /// The model upload (#362): a raw body, so it is not in [`STATE_CHANGING`]'s
@@ -202,6 +208,12 @@ pub enum PanelRequest {
     AvatarDelete(String),
     /// Drop the pending candidate.
     AvatarDiscard,
+    /// Turn voice input (the microphone sidecar) on or off (#400). Only the
+    /// wish: the composition thread decides whether it is composed and
+    /// whether the sidecar can start.
+    SpeechInput {
+        enabled: bool,
+    },
 }
 
 /// The two chat platforms the panel can connect.
@@ -289,6 +301,7 @@ struct Shared {
     voice_tx: SyncSender<PanelCommand>,
     ingress_tx: SyncSender<PanelCommand>,
     avatar_tx: SyncSender<PanelCommand>,
+    speech_input_tx: SyncSender<PanelCommand>,
     chat_tx: SyncSender<PanelCommand>,
     voice_search_endpoint: Option<String>,
     search_busy: std::sync::atomic::AtomicBool,
@@ -325,6 +338,7 @@ pub struct PanelInbox {
     voice_rx: Mutex<Receiver<PanelCommand>>,
     ingress_rx: Mutex<Receiver<PanelCommand>>,
     avatar_rx: Mutex<Receiver<PanelCommand>>,
+    speech_input_rx: Mutex<Receiver<PanelCommand>>,
     chat_rx: Mutex<Receiver<PanelCommand>>,
 }
 
@@ -365,6 +379,17 @@ impl PanelInbox {
     /// switch can never sit in front of a stop or a mute.
     pub fn drain_avatar(&self, max: usize) -> Vec<PanelCommand> {
         self.avatar_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .try_iter()
+            .take(max)
+            .collect()
+    }
+
+    /// Voice input on/off requests (#400). Their own queue, so switching the
+    /// microphone can never sit in front of a stop or a mute.
+    pub fn drain_speech_input(&self, max: usize) -> Vec<PanelCommand> {
+        self.speech_input_rx
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .try_iter()
@@ -444,6 +469,7 @@ impl LocalPanelServer {
         let (voice_tx, voice_rx) = sync_channel(VOICE_QUEUE);
         let (ingress_tx, ingress_rx) = sync_channel(INGRESS_QUEUE);
         let (avatar_tx, avatar_rx) = sync_channel(AVATAR_QUEUE);
+        let (speech_input_tx, speech_input_rx) = sync_channel(SPEECH_INPUT_QUEUE);
         let (chat_tx, chat_rx) = sync_channel(CHAT_QUEUE);
         let shared = Arc::new(Shared {
             token: mint_token()?,
@@ -459,6 +485,7 @@ impl LocalPanelServer {
             voice_tx,
             ingress_tx,
             avatar_tx,
+            speech_input_tx,
             chat_tx,
             voice_search_endpoint: config.voice_search_endpoint.clone(),
             search_busy: std::sync::atomic::AtomicBool::new(false),
@@ -480,6 +507,7 @@ impl LocalPanelServer {
             voice_rx: Mutex::new(voice_rx),
             ingress_rx: Mutex::new(ingress_rx),
             avatar_rx: Mutex::new(avatar_rx),
+            speech_input_rx: Mutex::new(speech_input_rx),
             chat_rx: Mutex::new(chat_rx),
         };
         Ok((
@@ -786,6 +814,16 @@ fn route(
                 return json(status, false, detail);
             }
         },
+        "/api/speech-input" => match speech_input_body(&body) {
+            Ok(enabled) => (
+                PanelRequest::SpeechInput { enabled },
+                &shared.speech_input_tx,
+            ),
+            Err((status, detail)) => {
+                shared.count(&shared.counters.rejected_request);
+                return json(status, false, detail);
+            }
+        },
         "/api/ingress/connect" => match ingress_connect(&body) {
             Ok(request) => (request, &shared.ingress_tx),
             Err((status, detail)) => {
@@ -830,6 +868,19 @@ fn route(
         },
     };
     forward(shared, queue, request)
+}
+
+/// Parses `{"enabled": true|false}`: a strict boolean and nothing else, so a
+/// request cannot name a device, a program, an argument or a trust level.
+fn speech_input_body(body: &[u8]) -> Result<bool, (&'static str, &'static str)> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Body {
+        enabled: bool,
+    }
+    serde_json::from_slice::<Body>(body)
+        .map(|parsed| parsed.enabled)
+        .map_err(|_| ("400 Bad Request", "expected {\"enabled\": boolean}"))
 }
 
 /// Parses `{}`: the discard request names nothing.
@@ -2056,6 +2107,75 @@ mod tests {
         let (answer, request) = ingress_round_trip(&f, "/api/ingress/key/remove", "{}", "ok");
         assert_eq!(answer.status, 200);
         assert_eq!(request, PanelRequest::IngressKeyRemove);
+    }
+
+    // ---- voice input (#400) ----
+
+    fn speech_input_round_trip(f: &Fixture, body: &str) -> (Raw, PanelRequest) {
+        let good = good(f);
+        let headers = with(&good, "none");
+        thread::scope(|s| {
+            let handle = s.spawn(|| post(f, "/api/speech-input", &headers, body));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut commands = Vec::new();
+            while commands.is_empty() && Instant::now() < deadline {
+                commands = f.inbox.drain_speech_input(4);
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(commands.len(), 1);
+            let command = commands.into_iter().next().unwrap();
+            let request = command.request.clone();
+            command.respond(true, "ok");
+            (handle.join().unwrap(), request)
+        })
+    }
+
+    #[test]
+    fn speech_input_requests_are_authenticated_same_origin_strict_and_on_their_own_queue() {
+        let f = fixture();
+        let good = good(&f);
+        let path = "/api/speech-input";
+        let body = "{\"enabled\":true}";
+        let mut foreign = with(&good, "origin");
+        foreign.push(("Origin", "http://evil.example"));
+        assert_eq!(post(&f, path, &foreign, body).status, 403);
+        assert_eq!(
+            post(&f, path, &with(&good, "x-panel-token"), body).status,
+            401
+        );
+        let mut form = with(&good, "content-type");
+        form.push(("Content-Type", "application/x-www-form-urlencoded"));
+        assert_eq!(post(&f, path, &form, body).status, 415);
+        assert_eq!(get(&f, path, "").status, 405);
+        // Only a boolean `enabled`: nothing else can ride along.
+        let headers = with(&good, "none");
+        for bad in [
+            "",
+            "[]",
+            "{}",
+            "{\"enabled\":\"true\"}",
+            "{\"enabled\":1}",
+            "{\"enabled\":null}",
+            "{\"enabled\":true,\"device\":\"mic\"}",
+            "{\"enabled\":true,\"program\":\"cmd.exe\"}",
+            "{\"enabled\":true}{\"enabled\":false}",
+        ] {
+            assert_eq!(post(&f, path, &headers, bad).status, 400, "{bad:?}");
+        }
+        assert!(
+            f.inbox.drain_speech_input(8).is_empty(),
+            "nothing got through"
+        );
+        let (answer, request) = speech_input_round_trip(&f, body);
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        assert_eq!(request, PanelRequest::SpeechInput { enabled: true });
+        let (_, request) = speech_input_round_trip(&f, "{\"enabled\":false}");
+        assert_eq!(request, PanelRequest::SpeechInput { enabled: false });
+        // Never in the stop/mute, voice, chat-connection or chat queues.
+        assert!(f.inbox.drain_control(8).is_empty());
+        assert!(f.inbox.drain_voice(8).is_empty());
+        assert!(f.inbox.drain_ingress(8).is_empty());
+        assert!(f.inbox.drain_chat(8).is_empty());
     }
 
     #[test]

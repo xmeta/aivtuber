@@ -236,6 +236,9 @@ fn capability_for_action(action: &str) -> Option<Capability> {
         "voice.configure" => Some(Capability::VoiceConfigure),
         "ingress.control" => Some(Capability::IngressControl),
         "avatar.configure" => Some(Capability::AvatarConfigure),
+        "speech_input.control" | "speech_input.enable" | "speech_input.disable" => {
+            Some(Capability::SpeechInputControl)
+        }
         _ => None,
     }
 }

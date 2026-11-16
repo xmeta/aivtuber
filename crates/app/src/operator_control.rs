@@ -55,7 +55,8 @@ pub struct OperatorRequest {
     /// stream-chat connections of #361; the YouTube key is entered in the
     /// panel only),
     /// `avatar.confirm`, `avatar.select`, `avatar.delete`, `avatar.discard`
-    /// (the avatar choice of #362; the upload itself is panel-only).
+    /// (the avatar choice of #362; the upload itself is panel-only),
+    /// `speech_input.enable`, `speech_input.disable` (voice input, #400).
     pub action: String,
     /// Opaque session secret presented by the operator client.
     pub secret: String,
@@ -132,6 +133,10 @@ pub struct OperatorStatusSnapshot {
     /// pending candidate with its licence summary. Absent unless composed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar_model: Option<crate::AvatarStatus>,
+    /// Voice input (#400): whether it can be switched, its state, and whether
+    /// Thinking is remote. Absent when no speech sidecar is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_input: Option<crate::SpeechInputStatus>,
 }
 
 /// Operator-visible, text-free perception status: whether it is running, why
@@ -197,6 +202,7 @@ impl OperatorStatusSnapshot {
             voice: app.voice_status(),
             chat_ingress: app.chat_ingress_status(),
             avatar_model: app.avatar_status(),
+            voice_input: app.speech_input_status(),
         }
     }
 }
@@ -292,6 +298,8 @@ pub struct OperatorEndpointOptions {
     pub ingress_control: bool,
     /// The avatar store is composed (#362): `avatar.configure`.
     pub avatar_configure: bool,
+    /// Voice input is composed (#400): `speech_input.control`.
+    pub speech_input_control: bool,
 }
 
 /// Authenticated operator control endpoint.
@@ -348,6 +356,7 @@ impl OperatorControlServer {
             voice_configure,
             ingress_control,
             avatar_configure,
+            speech_input_control,
         } = options;
         let name = name.trim();
         if name.is_empty() {
@@ -383,6 +392,12 @@ impl OperatorControlServer {
             // mint it; an uploaded model is untrusted data that must pass the
             // VRM inspection and an explicit confirmation before it is shown.
             capabilities.insert(aivtuber_domain::Capability::AvatarConfigure);
+        }
+        if speech_input_control {
+            // `speech_input.control` is held only so the `speech_input.*`
+            // actions can mint it; what the microphone sidecar hears is still
+            // admitted as untrusted speech under the app's ingress ceiling.
+            capabilities.insert(aivtuber_domain::Capability::SpeechInputControl);
         }
         if memory_export {
             // `memory.admin` is held only so the `memory.export` action can mint
@@ -596,6 +611,7 @@ pub fn apply_operator_request<R: RoutePlanner>(
         && !is_tcp_voice_action(&request.action)
         && !is_tcp_ingress_action(&request.action)
         && !is_tcp_avatar_action(&request.action)
+        && !is_speech_input_action(&request.action)
     {
         let detail = format!("unknown action {}", request.action);
         app.audit_operator_action(&request_id, &request.action, &detail, false);
@@ -650,6 +666,12 @@ fn is_tcp_ingress_action(action: &str) -> bool {
     is_ingress_action(action) && action != "ingress.key.set"
 }
 
+/// The voice-input actions (#400), both under `speech_input.control`. The
+/// operator endpoint (`aivtuberctl`) may send both.
+fn is_speech_input_action(action: &str) -> bool {
+    matches!(action, "speech_input.enable" | "speech_input.disable")
+}
+
 /// The avatar choice actions (#362), all under `avatar.configure`.
 fn is_avatar_action(action: &str) -> bool {
     matches!(
@@ -682,6 +704,7 @@ pub fn apply_operator_action<R: RoutePlanner>(
         && !is_voice_action(action)
         && !is_ingress_action(action)
         && !is_avatar_action(action)
+        && !is_speech_input_action(action)
     {
         let detail = format!("unknown action {action}");
         app.audit_operator_action(request_id, action, &detail, false);
@@ -761,6 +784,8 @@ fn apply_with_presented_secret<R: RoutePlanner>(
         "ingress.control".to_owned()
     } else if is_avatar_action(action) {
         "avatar.configure".to_owned()
+    } else if is_speech_input_action(action) {
+        "speech_input.control".to_owned()
     } else if action == "memory.export" {
         "memory.admin".to_owned()
     } else {
@@ -861,6 +886,27 @@ fn apply_with_presented_secret<R: RoutePlanner>(
         // the validated platform and target (public names, no key), and the
         // key action carries the key.
         return match app.configure_ingress(command.authority(), action, argument) {
+            Ok(detail) => {
+                app.audit_operator_action(&request_id, action, &detail, true);
+                OperatorResponse {
+                    request_id,
+                    ok: true,
+                    detail,
+                    status: None,
+                    memory_export: None,
+                }
+            }
+            Err(detail) => {
+                app.audit_operator_action(&request_id, action, &detail, false);
+                rejection(&request_id, &detail)
+            }
+        };
+    }
+
+    if is_speech_input_action(action) {
+        // No argument at all; the detail is a fixed phrase (never a path or a
+        // device), so the audit record carries the action and its outcome.
+        return match app.configure_speech_input(command.authority(), action) {
             Ok(detail) => {
                 app.audit_operator_action(&request_id, action, &detail, true);
                 OperatorResponse {

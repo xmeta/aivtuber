@@ -21,6 +21,8 @@ export interface PanelState {
     chat_ingress?: ChatIngressState | null;
     /** The VRM avatar choice (#362); absent unless the app composed it. */
     avatar_model?: AvatarState | null;
+    /** Voice input (#400); absent from an older host, or when no speech sidecar is configured. */
+    voice_input?: VoiceInputState | null;
     /** Session Thinking tokens/cost and the optional spend cap (#367); absent unless composed. */
     thinking_usage?: ThinkingUsageState | null;
   };
@@ -250,6 +252,7 @@ export function parseState(value: unknown): PanelState | null {
   const voice = parseVoiceState(v.status.voice);
   const chatIngress = parseChatIngressState(v.status.chat_ingress);
   const avatarModel = parseAvatarState(v.status.avatar_model);
+  const voiceInput = parseVoiceInputState(v.status.voice_input);
   const thinkingUsage = parseUsageState(v.status.thinking_usage);
   return {
     ...(v as PanelState),
@@ -259,6 +262,7 @@ export function parseState(value: unknown): PanelState | null {
       voice,
       chat_ingress: chatIngress,
       avatar_model: avatarModel,
+      voice_input: voiceInput,
       thinking_usage: thinkingUsage,
     },
   };
@@ -873,6 +877,94 @@ export function chatIngressView(state: PanelState | null): ChatIngressView | nul
     keyHealth: "ok",
     saveError: c.save_error,
   };
+}
+
+// ---- voice input (#400) ----
+
+/** Mirrors `MAX_SPEECH_INPUT_REASON_CHARS` (crates/app/src/speech_input.rs). */
+export const MAX_VOICE_INPUT_REASON_CHARS = 200;
+export type VoiceInputStateName = "off" | "on" | "failed";
+const VOICE_INPUT_STATES: readonly string[] = ["off", "on", "failed"];
+
+/** Mirrors `SpeechInputStatus` (crates/app/src/speech_input.rs). */
+export interface VoiceInputState {
+  /** Whether the launcher composed live switching; false hides the toggle. */
+  composed: boolean;
+  state: VoiceInputStateName;
+  /** Why it failed (host text, shown with textContent only). */
+  reason: string | null;
+  /** The Thinking endpoint leaves this machine: transcribed speech goes to a cloud model. */
+  thinking_remote: boolean;
+}
+
+/**
+ * The voice-input state, only if it has exactly the documented shape. An older
+ * host never sends it, and anything malformed is dropped: either way the
+ * toggle is hidden rather than offering what the app would refuse.
+ */
+export function parseVoiceInputState(value: unknown): VoiceInputState | null {
+  if (typeof value !== "object" || value === null) return null;
+  const v = value as Record<string, unknown>;
+  if (typeof v.composed !== "boolean" || typeof v.thinking_remote !== "boolean") return null;
+  if (typeof v.state !== "string" || !VOICE_INPUT_STATES.includes(v.state)) return null;
+  // The host omits `reason` unless failed; null and absent both mean none.
+  const reason = v.reason === undefined ? null : boundedText(v.reason, MAX_VOICE_INPUT_REASON_CHARS);
+  if (reason === undefined) return null;
+  return { composed: v.composed, state: v.state as VoiceInputStateName, reason, thinking_remote: v.thinking_remote };
+}
+
+export interface VoiceInputView {
+  /** オフ / 聞き取り中 / 失敗: …. */
+  stateText: string;
+  health: Health;
+  /** What turning it on does, always shown. */
+  explanation: string;
+  /** Shown whenever Thinking is remote, so it is read before the first turn-on. */
+  cloudNote: string | null;
+  canEnable: boolean;
+  canDisable: boolean;
+  enableLabel: string;
+}
+
+export const VOICE_INPUT_EXPLANATION = "オンにすると、マイクで聞き取った音声に返事をします";
+export const VOICE_INPUT_CLOUD_NOTE = "聞き取った音声の文字起こしは、クラウドの応答モデルに送信されます";
+
+/** What the voice-input card shows, or `null` when it must stay hidden (absent or not composed). */
+export function voiceInputView(state: PanelState | null): VoiceInputView | null {
+  const v = state?.status.voice_input ?? null;
+  if (v === null || !v.composed) return null;
+  const base = {
+    explanation: VOICE_INPUT_EXPLANATION,
+    cloudNote: v.thinking_remote ? VOICE_INPUT_CLOUD_NOTE : null,
+  };
+  switch (v.state) {
+    case "on":
+      return { ...base, stateText: "聞き取り中", health: "ok", canEnable: false, canDisable: true, enableLabel: "オンにする" };
+    case "failed":
+      return {
+        ...base,
+        stateText: `失敗${v.reason === null || v.reason === "" ? "" : `: ${v.reason}`}`,
+        health: "warn",
+        canEnable: true,
+        canDisable: true,
+        enableLabel: "もう一度オンにする",
+      };
+    default:
+      return { ...base, stateText: "オフ", health: "ok", canEnable: true, canDisable: false, enableLabel: "オンにする" };
+  }
+}
+
+/** The body of `POST /api/speech-input`: a boolean and nothing else (the app refuses anything more). */
+export function voiceInputBody(enabled: boolean): { enabled: boolean } {
+  return { enabled };
+}
+
+/** The line shown after an on/off request; the host's own text is only a short tail. */
+export function voiceInputResultText(enabled: boolean, ok: boolean, detail: unknown, status: number): string {
+  const raw = typeof detail === "string" ? bounded(detail) : "";
+  const name = enabled ? "オンにする" : "オフにする";
+  if (ok && status === 200) return enabled ? "音声入力をオンにしました" : "音声入力をオフにしました";
+  return `${name}ことができませんでした${raw === "" ? ` (${status})` : `: ${raw}`}`;
 }
 
 // ---- VRM avatar choice (#362) ----

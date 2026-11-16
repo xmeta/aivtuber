@@ -120,6 +120,9 @@ pub use speech_barge_in::{
 };
 pub use speech_conversation::{SpeechConversationConfig, SpeechConversationMetrics};
 pub use speech_floor::SpeechFloorMetrics;
+pub use speech_input::{
+    SpeechInputController, SpeechInputError, SpeechInputStateName, SpeechInputStatus,
+};
 pub use speech_sidecar::*;
 pub use support_bundle::*;
 pub use task_plane::*;
@@ -1197,6 +1200,10 @@ where
     /// Retains drained lifecycle events for replay when composed (#222 S3).
     speech_lifecycle_recorder: Option<aivtuber_runtime::SpeechLifecycleRecorder>,
     speech_barge_in: Option<speech_barge_in::BargeIn>,
+    /// The speech sidecar and its on/off state (#400); `None` unless a speech
+    /// sidecar is configured. Switchable only when composed with a settings
+    /// file (`speech_input.control`).
+    speech_input: Option<speech_input::SpeechInputController>,
     /// Live chat-burst selection and deferred replies (#75 S1, #78 S2); `None`
     /// unless composed, so the default per-event path is unchanged.
     chat_burst: Option<chat_burst::ChatBurstLane>,
@@ -1269,6 +1276,7 @@ where
             speech_floor: None,
             speech_lifecycle_recorder: None,
             speech_barge_in: None,
+            speech_input: None,
             chat_burst: None,
             speech_feed_heartbeat_ms: None,
             audio: audio_stop::AudioChannel::new(audio),
@@ -2103,6 +2111,128 @@ where
         self.speech_barge_in =
             Some(speech_barge_in::BargeIn::new(config).map_err(AppError::Routing)?);
         Ok(self)
+    }
+
+    /// Own the speech sidecar and its on/off state (#400). The sidecar is
+    /// polled by [`Self::service_speech_input`]; the operator endpoint holds
+    /// `speech_input.control` only when the controller is composed (its
+    /// settings file is named).
+    pub fn with_speech_input(mut self, controller: speech_input::SpeechInputController) -> Self {
+        self.speech_input = Some(controller);
+        self
+    }
+
+    /// Whether voice input can be switched while running (the operator
+    /// endpoint then holds `speech_input.control`).
+    pub fn speech_input_composed(&self) -> bool {
+        self.speech_input
+            .as_ref()
+            .is_some_and(speech_input::SpeechInputController::composed)
+    }
+
+    /// The voice-input state for the operator surfaces; `None` when no speech
+    /// sidecar is configured.
+    pub fn speech_input_status(&self) -> Option<speech_input::SpeechInputStatus> {
+        self.speech_input.as_ref().map(|input| input.status())
+    }
+
+    /// Counters of the running speech sidecar, if there is one.
+    pub fn speech_sidecar_stats(&self) -> Option<SpeechSidecarStats> {
+        self.speech_input.as_ref().and_then(|input| input.stats())
+    }
+
+    /// Drain what the speech sidecar wrote into the trackers and note the
+    /// feed heartbeat. Never blocks; does nothing without a running sidecar.
+    pub fn service_speech_input(&mut self, now_ms: u64) {
+        let Some(input) = self.speech_input.as_mut() else {
+            return;
+        };
+        if let Some(observations) = self.speech_observations.as_mut() {
+            input.poll(observations, self.speech_transcripts.as_mut(), now_ms);
+        }
+        if let Some(beat_ms) = input.feed_heartbeat_ms() {
+            self.note_speech_feed_heartbeat(beat_ms);
+        }
+    }
+
+    /// End the speech sidecar (and its STT worker) when the app ends. Changes
+    /// neither the state file nor the reported state.
+    pub fn shutdown_speech_input(&mut self) {
+        if let Some(input) = self.speech_input.as_mut() {
+            input.shutdown();
+        }
+    }
+
+    /// Forget everything the old speech feed said (#400): both trackers'
+    /// speakers, partial transcripts and pending finals, the feed heartbeat
+    /// and the barge-in run that was already handled. After this nobody holds
+    /// the floor or counts as speaking, no barge-in can be confirmed from
+    /// stale edges (it needs a fresh heartbeat), and a final the floor was
+    /// still deferring is released at the next [`Self::route_spoken_finals`]
+    /// (no evidence means the text-only path, which takes the turn at once).
+    /// It fabricates no end-of-speech event.
+    pub fn clear_speech_state(&mut self) {
+        if let Some(tracker) = self.speech_observations.as_mut() {
+            tracker.clear();
+        }
+        if let Some(tracker) = self.speech_transcripts.as_mut() {
+            tracker.clear();
+        }
+        self.speech_feed_heartbeat_ms = None;
+        if let Some(barge_in) = self.speech_barge_in.as_mut() {
+            barge_in.reset_handled();
+        }
+    }
+
+    /// Apply one voice-input operator request. `authority` must be the
+    /// authenticated local ingress capability. `action` is
+    /// `speech_input.enable` or `speech_input.disable`. Disable always
+    /// succeeds and is immediate; enable starts a fresh sidecar and a spawn
+    /// failure is an `Err` with the state unchanged. The detail (and the audit
+    /// record) is a fixed phrase, never a path or a device name.
+    pub fn configure_speech_input(
+        &mut self,
+        authority: &AuthenticatedControl,
+        action: &str,
+    ) -> Result<String, String> {
+        if !authority.has_capability(aivtuber_domain::Capability::SpeechInputControl) {
+            return Err("voice input is not authorized".to_owned());
+        }
+        if !self.speech_input_composed() {
+            return Err("voice input is not configured".to_owned());
+        }
+        let announce = |on: bool, remote: bool| {
+            eprintln!(
+                "{}",
+                ready_guide::voice_input_line(
+                    on,
+                    remote,
+                    aivtuber_adapters::log_verbosity::diagnostics_enabled(),
+                )
+            );
+        };
+        match action {
+            "speech_input.enable" => {
+                if self.speech_input.as_ref().is_some_and(|i| i.is_on()) {
+                    return Ok("voice input is already on".to_owned());
+                }
+                // The new instance starts from empty state (a failed one left
+                // stale edges and segment numbers behind).
+                self.clear_speech_state();
+                let input = self.speech_input.as_mut().expect("composed");
+                input.enable(announce).map_err(|error| error.to_string())
+            }
+            "speech_input.disable" => {
+                let detail = self
+                    .speech_input
+                    .as_mut()
+                    .expect("composed")
+                    .disable(announce);
+                self.clear_speech_state();
+                Ok(detail)
+            }
+            _ => Err("not a voice input action".to_owned()),
+        }
     }
 
     pub fn speech_barge_in_metrics(&self) -> Option<BargeInMetrics> {
@@ -10016,6 +10146,411 @@ mod tests {
                             .is_err()
                     );
                 }
+
+                /// #400: turning voice input off while the trackers hold an
+                /// active speaker. No microphone, model or child process: the
+                /// controller points at a program that does not exist, so what
+                /// is under test is the app side (clear, floor, barge-in, the
+                /// capability, the state file).
+                mod voice_input_off {
+                    use super::*;
+                    use crate::{
+                        SpeechInputController, SpeechInputStateName, apply_operator_action,
+                    };
+
+                    const SECRET: [u8; 32] = [0x6C; 32];
+                    const OFF: &str =
+                        "{\"schema\":\"local-speech-input-settings/1\",\"enabled\":false}\n";
+
+                    fn ingress(capabilities: &[Capability]) -> LocalControlIngress {
+                        LocalControlIngress::new(
+                            "operator-control",
+                            "operator:local",
+                            AuthorizationMethod::SignedLocalApi,
+                            capabilities.iter().copied().collect(),
+                            ControlSecret::new(SECRET),
+                        )
+                        .expect("ingress")
+                    }
+
+                    fn operator() -> LocalControlIngress {
+                        ingress(&[
+                            Capability::PerformerStop,
+                            Capability::PerformerMute,
+                            Capability::SpeechInputControl,
+                        ])
+                    }
+
+                    fn scratch_file(name: &str) -> PathBuf {
+                        let dir = std::env::temp_dir().join(format!(
+                            "aivtuber-400-{name}-{}-{}",
+                            std::process::id(),
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .expect("clock")
+                                .as_nanos()
+                        ));
+                        fs::create_dir_all(&dir).expect("scratch dir");
+                        dir.join("local-speech-input.json")
+                    }
+
+                    fn controller(path: Option<PathBuf>) -> SpeechInputController {
+                        SpeechInputController::new(
+                            crate::SpeechSidecarConfig::new(
+                                "definitely-not-a-real-speech-sidecar",
+                                Vec::new(),
+                            ),
+                            Instant::now(),
+                            path,
+                            false,
+                        )
+                    }
+
+                    fn act(
+                        app: &mut ProductionApp<ReflexRoutePlanner<FixedEmbedding>>,
+                        ingress: &LocalControlIngress,
+                        action: &str,
+                        now_ms: u64,
+                    ) -> OperatorResponse {
+                        apply_operator_action(
+                            ingress,
+                            app,
+                            &format!("voice-input-{now_ms}"),
+                            action,
+                            None,
+                            &SECRET,
+                            now_ms,
+                        )
+                    }
+
+                    #[test]
+                    fn the_old_speaker_cannot_confirm_a_barge_in_after_it_is_switched_off() {
+                        // Control: the same evidence does confirm one.
+                        let mut control = rig(Backend::Fading, Some(BargeInConfig::default()));
+                        speak(&mut control.app, 0, &json!({"duration_ms": 8_000}));
+                        vad_edge(&mut control.app, &start_edge(1_000), 1_000);
+                        control.app.note_speech_feed_heartbeat(1_400);
+                        assert!(control.app.service_barge_in(1_400).is_some());
+
+                        let path = scratch_file("barge");
+                        let mut r = rig(Backend::Fading, Some(BargeInConfig::default()));
+                        r.app = r.app.with_speech_input(controller(Some(path.clone())));
+                        speak(&mut r.app, 0, &json!({"duration_ms": 8_000}));
+                        vad_edge(&mut r.app, &start_edge(1_000), 1_000);
+                        r.app.note_speech_feed_heartbeat(1_400);
+                        assert!(
+                            r.app
+                                .speech_observations_mut()
+                                .expect("vad")
+                                .any_speaker_active()
+                        );
+                        let response = act(&mut r.app, &operator(), "speech_input.disable", 1_405);
+                        assert!(response.ok, "{response:?}");
+                        let vad = r.app.speech_observations_mut().expect("vad");
+                        assert!(!vad.any_speaker_active());
+                        assert_eq!(vad.speaker_ids().count(), 0);
+                        assert_eq!(vad.metrics().cleared_by_operator, 1);
+                        // Neither the old cadence of heartbeats nor later ticks
+                        // can confirm anything: there is no stale edge left and
+                        // the heartbeat was forgotten.
+                        assert!(r.app.service_barge_in(1_406).is_none());
+                        r.app.note_speech_feed_heartbeat(1_450);
+                        assert!(r.app.service_barge_in(1_450).is_none());
+                        assert!(r.app.service_barge_in(3_000).is_none());
+                        assert_eq!(r.app.speech_barge_in_metrics().expect("m").confirmed, 0);
+                        assert!(r.audio.stops.lock().expect("stops").is_empty());
+                        // The performer itself was not touched by the switch.
+                        assert!(observe(&r, None)["speaking"].as_bool().expect("bool"));
+                    }
+
+                    /// A final the floor was deferring because the user still
+                    /// held the floor is released at the next route, not at the
+                    /// defer limit; what the tracker had not yet handed over is
+                    /// discarded.
+                    #[test]
+                    fn a_final_the_floor_was_holding_is_released_at_once_and_nothing_older_is_kept()
+                    {
+                        fn setup(switch_off: bool) -> usize {
+                            let mut app = floor_app(
+                                Some(FloorConfig::default()),
+                                SpeechConversationConfig::default(),
+                                true,
+                            )
+                            .with_speech_input(controller(Some(scratch_file("floor"))));
+                            vad_edge(&mut app, &start_edge(1_000), 1_000);
+                            app.note_speech_feed_heartbeat(1_000);
+                            ingest_final(&mut app, "mic-local", 1, "こんにちは", 900, 1_000);
+                            assert!(app.route_spoken_finals(1_010, 0).is_empty());
+                            assert_eq!(app.speech_floor_metrics().expect("m").queued, 1);
+                            // Not yet handed to the floor when the switch comes.
+                            ingest_final(&mut app, "mic-local", 2, "あとで", 1_020, 1_030);
+                            assert_eq!(
+                                app.speech_transcripts_mut().expect("t").pending_finals(),
+                                1
+                            );
+                            if switch_off {
+                                let response =
+                                    act(&mut app, &operator(), "speech_input.disable", 1_040);
+                                assert!(response.ok, "{response:?}");
+                                assert_eq!(
+                                    app.speech_transcripts_mut().expect("t").pending_finals(),
+                                    0
+                                );
+                            }
+                            let reports = app.route_spoken_finals(1_050, 16);
+                            let texts: Vec<_> = reports
+                                .iter()
+                                .map(|r| r.event.payload["text"].as_str().unwrap_or("").to_owned())
+                                .collect();
+                            if switch_off {
+                                // Only the deferred one (spoken before the
+                                // switch and already past the tracker), now
+                                // promptly; the unclaimed one is gone.
+                                assert_eq!(texts, ["こんにちは"]);
+                                let m = app.speech_floor_metrics().expect("m");
+                                assert_eq!((m.released_after_deferral, m.queued), (1, 0));
+                                assert_eq!(m.dropped_expired, 0);
+                                let t = app.speech_transcripts_mut().expect("t").metrics();
+                                assert_eq!(t.cleared_by_operator, 2, "one speaker, one final");
+                                // Nothing is held after that, however long.
+                                assert!(app.route_spoken_finals(20_000, 32).is_empty());
+                            } else {
+                                // Control: still held for the speaker.
+                                assert!(texts.is_empty(), "{texts:?}");
+                            }
+                            reports.len()
+                        }
+                        assert_eq!(setup(false), 0);
+                        assert_eq!(setup(true), 1);
+                    }
+
+                    #[test]
+                    fn the_capability_the_composition_and_the_state_file_decide_every_request() {
+                        let path = scratch_file("actions");
+                        let mut app = floor_app(
+                            Some(FloorConfig::default()),
+                            SpeechConversationConfig::default(),
+                            true,
+                        );
+                        // Not composed: the action is refused, there is no status.
+                        assert!(!app.speech_input_composed());
+                        assert!(app.speech_input_status().is_none());
+                        let response = act(&mut app, &operator(), "speech_input.enable", 10);
+                        assert!(
+                            !response.ok && response.detail.contains("not configured"),
+                            "{response:?}"
+                        );
+                        // Legacy (no settings file): present, but not switchable.
+                        app = app.with_speech_input(controller(None));
+                        assert!(!app.speech_input_composed());
+                        let status = app.speech_input_status().expect("status");
+                        assert!(!status.composed);
+                        let response = act(&mut app, &operator(), "speech_input.disable", 20);
+                        assert!(
+                            !response.ok && response.detail.contains("not configured"),
+                            "{response:?}"
+                        );
+
+                        let mut app = floor_app(
+                            Some(FloorConfig::default()),
+                            SpeechConversationConfig::default(),
+                            true,
+                        )
+                        .with_speech_input(controller(Some(path.clone())));
+                        assert!(app.speech_input_composed());
+                        let status = OperatorStatusSnapshot::from_app(&app, 0)
+                            .voice_input
+                            .expect("voice input status");
+                        assert_eq!(
+                            (status.composed, status.state, status.reason),
+                            (true, SpeechInputStateName::Off, None)
+                        );
+                        // Without the capability the ingress cannot mint it.
+                        let weak = ingress(&[Capability::PerformerStop, Capability::PerformerMute]);
+                        for action in ["speech_input.enable", "speech_input.disable"] {
+                            let response = act(&mut app, &weak, action, 30);
+                            assert!(
+                                !response.ok && response.detail.contains("authentication failed"),
+                                "{response:?}"
+                            );
+                        }
+                        assert!(!path.exists(), "a refused request wrote nothing");
+                        // A wrong secret changes nothing either.
+                        let response = apply_operator_action(
+                            &operator(),
+                            &mut app,
+                            "wrong-secret",
+                            "speech_input.disable",
+                            None,
+                            &[0_u8; 32],
+                            40,
+                        );
+                        assert!(!response.ok);
+                        assert!(!path.exists());
+                        // An unknown action is refused.
+                        let response = act(&mut app, &operator(), "speech_input.reconfigure", 50);
+                        assert!(!response.ok);
+
+                        // A sidecar that cannot start: a typed refusal, the
+                        // state stays off and nothing is written as enabled.
+                        let response = act(&mut app, &operator(), "speech_input.enable", 60);
+                        assert!(
+                            !response.ok && response.detail.contains("voice input could not start"),
+                            "{response:?}"
+                        );
+                        assert!(
+                            !response.detail.contains("definitely-not"),
+                            "the program path is not echoed: {response:?}"
+                        );
+                        assert!(!path.exists(), "enabled is written only after a spawn");
+                        let status = app.speech_input_status().expect("status");
+                        assert_eq!(status.state, SpeechInputStateName::Off);
+
+                        // Disable always succeeds, writes the choice, and again.
+                        for now_ms in [70, 80] {
+                            let response =
+                                act(&mut app, &operator(), "speech_input.disable", now_ms);
+                            assert!(response.ok, "{response:?}");
+                            assert_eq!(fs::read_to_string(&path).expect("file"), OFF);
+                        }
+                        // Audited like the other operator actions.
+                        let audit: Vec<String> = app
+                            .security()
+                            .audit()
+                            .iter()
+                            .map(|r| format!("{} {}", r.decision, r.detail))
+                            .collect();
+                        assert!(
+                            audit
+                                .iter()
+                                .any(|line| line.contains("speech_input.disable")),
+                            "{audit:?}"
+                        );
+                        assert!(
+                            audit.iter().all(|line| !line.contains("definitely-not")),
+                            "{audit:?}"
+                        );
+                    }
+
+                    /// Acceptance of #400: switching off while the tracker holds an
+                    /// active speaker does not delay the next typed chat line.
+                    #[test]
+                    fn a_typed_line_is_answered_at_once_after_switching_off_with_an_active_speaker()
+                    {
+                        fn first_scheduled_ms(switch_off: bool) -> Option<u64> {
+                            let mut app = floor_app(
+                                Some(FloorConfig::default()),
+                                SpeechConversationConfig::default(),
+                                true,
+                            )
+                            .with_barge_in(BargeInConfig::default())
+                            .expect("barge-in")
+                            .with_speech_input(controller(Some(scratch_file("typed-after"))));
+                            vad_edge(&mut app, &start_edge(1_000), 1_000);
+                            app.note_speech_feed_heartbeat(1_000);
+                            if switch_off {
+                                let response =
+                                    act(&mut app, &operator(), "speech_input.disable", 1_010);
+                                assert!(response.ok, "{response:?}");
+                            }
+                            let raw = serde_json::to_vec(&chat_event(9)).expect("chat");
+                            let outcome = app.process_content_bytes(&raw, 1_020, 9).expect("chat");
+                            assert_eq!(outcome.admission, ContentAdmitDecision::Queued);
+                            for now_ms in (1_020..1_320).step_by(10) {
+                                app.service_speech_input(now_ms);
+                                let _ = app.service_barge_in(now_ms);
+                                let _ = app.route_spoken_finals(now_ms, now_ms);
+                                app.tick(now_ms);
+                                if !app.performer.scheduler().items().is_empty() {
+                                    return Some(now_ms);
+                                }
+                            }
+                            None
+                        }
+                        let at = first_scheduled_ms(true).expect("the line was answered");
+                        // Typed chat never waits on the floor: the same tick as with
+                        // no speaker at all, far below the floor's defer limit.
+                        assert_eq!(Some(at), first_scheduled_ms(false));
+                        assert!(at - 1_020 < FloorConfig::default().max_defer_ms);
+                    }
+
+                    /// With voice input composed but off, the idle floor,
+                    /// trackers and barge-in add nothing to a typed chat line:
+                    /// the same admission and the same playback at the same
+                    /// ticks as an app with no speech stack at all.
+                    #[test]
+                    fn a_composed_but_off_speech_stack_does_not_delay_typed_chat() {
+                        fn run(with_stack: bool) -> Vec<(u64, String, Option<String>, usize)> {
+                            let mut app = if with_stack {
+                                floor_app(
+                                    Some(FloorConfig::default()),
+                                    SpeechConversationConfig::default(),
+                                    true,
+                                )
+                                .with_barge_in(BargeInConfig::default())
+                                .expect("barge-in")
+                                .with_speech_input(controller(Some(scratch_file("typed"))))
+                            } else {
+                                conversation_app(
+                                    None,
+                                    SecurityRuntimeConfig::default(),
+                                    IngressPolicy::default(),
+                                )
+                            };
+                            let mut seen = Vec::new();
+                            let mut seed = 0_u64;
+                            for now_ms in (1_000..1_400).step_by(10) {
+                                if now_ms == 1_000 {
+                                    let raw = serde_json::to_vec(&chat_event(5)).expect("chat");
+                                    let outcome =
+                                        app.process_content_bytes(&raw, now_ms, 5).expect("chat");
+                                    seen.push((
+                                        now_ms,
+                                        format!("{:?}", outcome.admission),
+                                        outcome.playback.map(|p| p.asset_id),
+                                        0,
+                                    ));
+                                }
+                                // Everything the main loop does for speech each
+                                // tick, in the same order; all of it idle.
+                                app.service_speech_input(now_ms);
+                                let _ = app.service_barge_in(now_ms);
+                                seed += 16;
+                                assert!(app.route_spoken_finals(now_ms, seed).is_empty());
+                                app.tick(now_ms);
+                                seen.push((
+                                    now_ms,
+                                    String::new(),
+                                    None,
+                                    app.performer.scheduler().items().len(),
+                                ));
+                            }
+                            seen
+                        }
+                        let baseline = run(false);
+                        assert!(
+                            baseline
+                                .iter()
+                                .any(|(_, admission, _, _)| admission == "Queued"),
+                            "the chat line was admitted: {baseline:?}"
+                        );
+                        assert!(
+                            baseline.iter().any(|(_, _, _, items)| *items > 0)
+                                || baseline
+                                    .iter()
+                                    .any(|(_, _, playback, _)| playback.is_some()),
+                            "the line was answered: {baseline:?}"
+                        );
+                        assert_eq!(run(true), baseline);
+                        // The idle stack is not "speaking" for the perception gate either.
+                        let app = floor_app(
+                            Some(FloorConfig::default()),
+                            SpeechConversationConfig::default(),
+                            true,
+                        );
+                        assert!(!app.perception_gates().speech_active);
+                    }
+                }
             }
 
             /// The policy reads the same pseudonymous id the VAD uses; another
@@ -10620,6 +11155,122 @@ mod tests {
                         .to_owned()
                 )]
             );
+        }
+
+        fn speech_input_ingress(with_capability: bool) -> LocalControlIngress {
+            let mut capabilities =
+                BTreeSet::from([Capability::PerformerStop, Capability::PerformerMute]);
+            if with_capability {
+                capabilities.insert(Capability::SpeechInputControl);
+            }
+            LocalControlIngress::new(
+                "operator-control",
+                "operator:local",
+                AuthorizationMethod::SignedLocalApi,
+                capabilities,
+                ControlSecret::new(SECRET),
+            )
+            .expect("ingress")
+        }
+
+        fn voice_input_audit(app: &ProductionApp<FixedSilentRoute>) -> Vec<(String, String)> {
+            app.security()
+                .audit()
+                .iter()
+                .filter(|r| r.detail.contains("speech_input."))
+                .map(|r| (r.decision.clone(), r.detail.clone()))
+                .collect()
+        }
+
+        /// #400: the panel's voice-input request is the operator action,
+        /// through the same ingress, secret check and audit; composed only
+        /// with the capability and a controller.
+        #[test]
+        fn the_panel_switches_voice_input_through_the_operator_path() {
+            let dir = std::env::temp_dir().join(format!(
+                "aivtuber-400-panel-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&dir).expect("dir");
+            let file = dir.join("local-speech-input.json");
+            let mut panel = start_panel(speech_input_ingress(true), SECRET);
+            let mut app = new_app().with_speech_input(SpeechInputController::new(
+                SpeechSidecarConfig::new("definitely-not-a-real-speech-sidecar", Vec::new()),
+                Instant::now(),
+                Some(file.clone()),
+                true,
+            ));
+
+            // The published state carries the voice-input object.
+            let (status, body) = call(&mut panel, &mut app, |p| {
+                format!(
+                    "GET /api/state HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nX-Panel-Token: {}\r\n\r\n",
+                    p.port, p.token
+                )
+            });
+            assert_eq!(status, 200, "{body}");
+            let state: serde_json::Value = serde_json::from_str(&body).expect("state json");
+            assert_eq!(
+                state["status"]["voice_input"],
+                json!({"composed": true, "state": "off", "thinking_remote": true}),
+                "{body}"
+            );
+
+            // Off: written, audited, answered.
+            let (status, body) = call(&mut panel, &mut app, |p| {
+                post(p, "/api/speech-input", "{\"enabled\":false}")
+            });
+            assert_eq!(status, 200, "{body}");
+            assert!(body.contains("\"ok\":true"), "{body}");
+            assert_eq!(
+                fs::read_to_string(&file).expect("file"),
+                "{\"schema\":\"local-speech-input-settings/1\",\"enabled\":false}\n"
+            );
+            // On with a sidecar that cannot start: refused, nothing enabled.
+            let (status, body) = call(&mut panel, &mut app, |p| {
+                post(p, "/api/speech-input", "{\"enabled\":true}")
+            });
+            assert_eq!(status, 409, "{body}");
+            assert!(body.contains("voice input could not start"), "{body}");
+            assert!(
+                fs::read_to_string(&file)
+                    .expect("file")
+                    .contains("\"enabled\":false")
+            );
+            let audit = voice_input_audit(&app);
+            assert_eq!(
+                audit.iter().map(|(d, _)| d.as_str()).collect::<Vec<_>>(),
+                ["operator_accepted", "operator_rejected"],
+                "{audit:?}"
+            );
+            assert!(
+                audit
+                    .iter()
+                    .all(|(_, detail)| !detail.contains("definitely-not")),
+                "{audit:?}"
+            );
+            // A malformed request never reaches the app.
+            for bad in [
+                "{\"enabled\":\"yes\"}",
+                "{\"enabled\":true,\"device\":\"x\"}",
+            ] {
+                let (status, _) = call(&mut panel, &mut app, |p| post(p, "/api/speech-input", bad));
+                assert_eq!(status, 400, "{bad}");
+            }
+            assert_eq!(voice_input_audit(&app).len(), 2);
+
+            // The ingress without the capability cannot mint it.
+            let mut weak_panel = start_panel(speech_input_ingress(false), SECRET);
+            let (status, body) = call(&mut weak_panel, &mut app, |p| {
+                post(p, "/api/speech-input", "{\"enabled\":true}")
+            });
+            assert_eq!(status, 409, "{body}");
+            assert!(body.contains("authentication failed"), "{body}");
+            let _ = fs::remove_dir_all(&dir);
         }
 
         #[test]

@@ -137,7 +137,8 @@
               "model.select",
               "voice.configure",
               "ingress.control",
-              "avatar.configure"
+              "avatar.configure",
+              "speech_input.control"
             ]
           }
         }

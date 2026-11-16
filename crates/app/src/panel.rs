@@ -21,7 +21,9 @@
 //!   (`avatar.upload` for a file the HTTP layer staged and hashed,
 //!   `avatar.confirm`, `avatar.select`, `avatar.delete`, `avatar.discard`, all
 //!   `avatar.configure`, again on their own queue; a model is named by content
-//!   hash only); it cannot reach perception, memory export
+//!   hash only) and voice input of #400 (`speech_input.enable`,
+//!   `speech_input.disable`, both `speech_input.control`, on their own queue;
+//!   the request is a boolean and nothing else); it cannot reach perception, memory export
 //!   or diagnose even though the ingress could mint them;
 //! * a chat line becomes a `chat.message` envelope whose source, source class,
 //!   plane and trust are fixed here (`local-panel`, `public_chat`, `content`,
@@ -48,6 +50,7 @@ const CONTROL_PER_TICK: usize = 4;
 const VOICE_PER_TICK: usize = 4;
 const INGRESS_PER_TICK: usize = 4;
 const AVATAR_PER_TICK: usize = 4;
+const SPEECH_INPUT_PER_TICK: usize = 4;
 const CHAT_PER_TICK: usize = 4;
 const PUBLISH_INTERVAL_MS: u64 = 500;
 /// Refusal counts are logged at most this often. A stale page from an earlier
@@ -255,7 +258,8 @@ impl PanelService {
                 | PanelRequest::AvatarConfirm(_)
                 | PanelRequest::AvatarSelect(_)
                 | PanelRequest::AvatarDelete(_)
-                | PanelRequest::AvatarDiscard => {
+                | PanelRequest::AvatarDiscard
+                | PanelRequest::SpeechInput { .. } => {
                     command.respond(false, "not a control request");
                     continue;
                 }
@@ -373,6 +377,32 @@ impl PanelService {
                 &format!("panel-ctl-{}", self.control_seq),
                 action,
                 argument,
+                &self.control_secret.0,
+                now_ms,
+            );
+            eprintln!(
+                "panel: {action} ok={} detail={:?}",
+                response.ok, response.detail
+            );
+            command.respond(response.ok, response.detail);
+            changed = true;
+        }
+        for command in self.inbox.drain_speech_input(SPEECH_INPUT_PER_TICK) {
+            let action = match &command.request {
+                PanelRequest::SpeechInput { enabled: true } => "speech_input.enable",
+                PanelRequest::SpeechInput { enabled: false } => "speech_input.disable",
+                _ => {
+                    command.respond(false, "not a voice input request");
+                    continue;
+                }
+            };
+            self.control_seq += 1;
+            let response = apply_operator_action(
+                &self.ingress,
+                app,
+                &format!("panel-ctl-{}", self.control_seq),
+                action,
+                None,
                 &self.control_secret.0,
                 now_ms,
             );

@@ -21,16 +21,18 @@ pub const WARMUP_NOTE: &str = "モデルを準備しています… / warming up
 
 /// Voice input (#397), quiet form: Japanese first, English beside it. One line
 /// each; none carries a secret, a path or a URL. The `cloud` forms say that
-/// speech text leaves the machine because the Thinking model is remote.
-pub const VOICE_OFF: &str = "マイクはオフです。音声入力を使うには aivtuber-setup start --voice-input on で起動してください。 / Voice input is off; start with `aivtuber-setup start --voice-input on` to use the microphone.";
-pub const VOICE_OFF_CLOUD: &str = "マイクはオフです。オンにすると、聞き取った音声の文字起こしはクラウドの応答モデルに送信されます(aivtuber-setup start --voice-input on)。 / Voice input is off; once on (`aivtuber-setup start --voice-input on`), transcribed speech is sent to the cloud model.";
-pub const VOICE_ON: &str = "マイクで聞き取り中です(既定の録音デバイス)。止めるには aivtuber-setup start --voice-input off で起動してください。 / Voice input is on (listening on the default capture device); start with `aivtuber-setup start --voice-input off` to stop.";
+/// speech text leaves the machine because the Thinking model is remote. The
+/// same lines are printed when the operator switches voice input in the panel
+/// or with `aivtuberctl` (#400), which is why they name both ways.
+pub const VOICE_OFF: &str = "マイクはオフです。使うには、操作パネルの「音声入力」か aivtuber-setup start --voice-input on をお使いください。 / Voice input is off; turn it on in the operation panel's voice input card or with `aivtuber-setup start --voice-input on`.";
+pub const VOICE_OFF_CLOUD: &str = "マイクはオフです。オンにすると、聞き取った音声の文字起こしはクラウドの応答モデルに送信されます(操作パネルの「音声入力」か aivtuber-setup start --voice-input on)。 / Voice input is off; once on (in the operation panel or with `aivtuber-setup start --voice-input on`), transcribed speech is sent to the cloud model.";
+pub const VOICE_ON: &str = "マイクで聞き取り中です(既定の録音デバイス)。止めるには、操作パネルの「音声入力」か aivtuber-setup start --voice-input off をお使いください。 / Voice input is on (listening on the default capture device); turn it off in the operation panel or with `aivtuber-setup start --voice-input off`.";
 pub const VOICE_ON_CLOUD: &str = "マイクで聞き取り中です(既定の録音デバイス)。聞き取った音声の文字起こしはクラウドの応答モデルに送信されます。 / Voice input is on (listening on the default capture device); transcribed speech is sent to the cloud model.";
 
 /// Verbose (diagnostics) form of the same line, in English like the other
 /// diagnostic lines.
-pub const VOICE_OFF_VERBOSE: &str = "voice input: off (microphone not opened); turn it on with `aivtuber-setup start --voice-input on`";
-pub const VOICE_OFF_CLOUD_VERBOSE: &str = "voice input: off (microphone not opened); turn it on with `aivtuber-setup start --voice-input on`; once on, transcribed speech is sent to the cloud model";
+pub const VOICE_OFF_VERBOSE: &str = "voice input: off (microphone not opened); turn it on in the operation panel or with `aivtuber-setup start --voice-input on`";
+pub const VOICE_OFF_CLOUD_VERBOSE: &str = "voice input: off (microphone not opened); turn it on in the operation panel or with `aivtuber-setup start --voice-input on`; once on, transcribed speech is sent to the cloud model";
 pub const VOICE_ON_VERBOSE: &str = "voice input: on (listening on the default capture device)";
 pub const VOICE_ON_CLOUD_VERBOSE: &str = "voice input: on (listening on the default capture device); transcribed speech is sent to the cloud model";
 

@@ -24,6 +24,7 @@ textarea { width: 100%; box-sizing: border-box; font: inherit; margin: .5rem 0; 
 .buttons.wrap { flex-wrap: wrap; align-items: center; }
 input[type="text"], input[type="password"], input[type="search"], select { font: inherit; padding: .4rem; border-radius: .4rem; border: 1px solid #8886; max-width: 100%; box-sizing: border-box; }
 .hint { font-size: .8rem; opacity: .75; margin: .25rem 0; }
+.hint.cloud { opacity: 1; font-weight: 600; color: #a60; }
 .desc { white-space: pre-wrap; overflow-wrap: anywhere; font-size: .85rem; max-height: 8rem; overflow-y: auto; margin: .25rem 0; }
 .grid { display: grid; grid-template-columns: max-content 1fr; gap: .4rem .75rem; align-items: center; margin: .5rem 0; }
 .slider { display: flex; gap: .5rem; align-items: center; }

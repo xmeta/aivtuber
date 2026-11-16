@@ -27,6 +27,11 @@
 //! the file is chosen and its licence read in the panel, which is where the
 //! operator confirms it.
 //!
+//! `voice-input` (issue #400) turns the microphone (voice input) on or off
+//! while the daemon runs, like the operation panel; needs the daemon to run
+//! with voice input composed (`aivtuber-setup start`). Transcribed speech is
+//! admitted as untrusted speech either way.
+//!
 //! `voice` (issue #360) changes the voice at runtime, like the operation panel:
 //! the local voice or Aivis Cloud, the Aivis style and the tuning, and a
 //! preview. The API key is deliberately not a subcommand: it would travel in a
@@ -107,6 +112,15 @@ enum Command {
     Ingress {
         #[command(subcommand)]
         action: IngressCommand,
+    },
+    /// Turn voice input (the microphone) on or off (issue #400); needs the
+    /// daemon to run with voice input composed (the local profile started by
+    /// `aivtuber-setup start`). Off stops the microphone and the speech
+    /// recognizer at once; the choice is remembered for the next start.
+    VoiceInput {
+        /// `on` or `off`.
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
     },
     /// Show or change the VRM avatar (issue #362); needs the daemon to run
     /// with the avatar store (the local profile started by `aivtuber-setup
@@ -344,6 +358,13 @@ fn action_name(command: &Command) -> &'static str {
         Command::PerceptionOff => "perception.disable",
         Command::MemoryExport { .. } => "memory.export",
         Command::Model { .. } => "model.select",
+        Command::VoiceInput { state } => {
+            if state == "on" {
+                "speech_input.enable"
+            } else {
+                "speech_input.disable"
+            }
+        }
         Command::Avatar { action } => match action {
             AvatarCommand::Status => "status",
             AvatarCommand::Select { .. } => "avatar.select",
@@ -547,6 +568,15 @@ fn print_response(response: &OperatorResponse) {
         }
         if let Some(avatar) = &status.avatar_model {
             print_avatar_status(avatar);
+        }
+        if let Some(voice_input) = &status.voice_input {
+            println!(
+                "voice_input composed={} state={:?} thinking_remote={} reason={:?}",
+                voice_input.composed,
+                voice_input.state,
+                voice_input.thinking_remote,
+                voice_input.reason,
+            );
         }
         if let Some(chat) = &status.chat_ingress {
             for (name, platform) in [("twitch", &chat.twitch), ("youtube", &chat.youtube)] {
@@ -779,6 +809,30 @@ mod tests {
         ] {
             let (name, text) = patch(args);
             assert_eq!((name, text), (action, None));
+        }
+    }
+
+    #[test]
+    fn voice_input_subcommand_maps_to_the_two_actions_and_takes_no_argument() {
+        for (state, action) in [
+            ("on", "speech_input.enable"),
+            ("off", "speech_input.disable"),
+        ] {
+            let command = parse(&["voice-input", state]);
+            assert_eq!(action_name(&command), action);
+        }
+        for args in [
+            &["voice-input"][..],
+            &["voice-input", "maybe"][..],
+            &["voice-input", "on", "off"][..],
+        ] {
+            let mut full = vec![
+                "aivtuberctl",
+                "--secret",
+                "01234567890123456789012345678901",
+            ];
+            full.extend_from_slice(args);
+            assert!(Cli::try_parse_from(full).is_err(), "{args:?}");
         }
     }
 
