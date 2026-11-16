@@ -155,6 +155,12 @@ The model must sit inside the served directory; the page loads the host's *activ
 
 The page connects to the host with the token in its own URL, mints a fresh epoch for every connection, loads the model, renders one neutral frame and only then reports `ready`. It never connects without a rendered model, so a missing or broken model shows as `disconnected` health, with the reason in the page's browser console. On a socket drop it snaps to neutral and reconnects with a new epoch and a bounded backoff (250 ms doubling to 5 s).
 
+=== Idle layer (renderer-local)
+
+So the avatar does not stand frozen between commands, the page adds a procedural idle layer (`renderer/local-avatar/src/idle.ts`, issue #383): a natural rest pose (arms close to the body, slightly bent forearms) instead of the stiff A-pose, breathing, slow weight-shift sway, small head drift, seeded irregular blinks (some double, each a smooth 120-180 ms close/open) and micro eye saccades of at most 2 degrees, plus a small extra head/chest motion while visemes are active. It is renderer-private presentation: not host state, not sent on the wire, not replay-relevant, and a pure function of the page's animation clock and a fixed seed (no wall clock, no `Math.random`). It is additive and bounded under the host-commanded state: expressions, visemes, gaze and gestures always apply, and the idle blink is scaled down while a host expression such as `joy`, `calm` or `sadness` already narrows the eyes. VRMA clip playback is still out of scope (ADR-0003).
+
+To switch the motion off (the rest pose stays), add `&idle=0` to the launch URL; the page also does this when the system asks for reduced motion (`prefers-reduced-motion: reduce`). With `debug=1` the state snapshot reports the flag as `idle`.
+
 === OBS Browser Source capture (no paid software)
 
 . Start the runtime as above and copy the `local avatar renderer URL` printed on stderr (`http://127.0.0.1:<port>/?token=...`). The token changes on every launch, so update the source URL after each restart.
