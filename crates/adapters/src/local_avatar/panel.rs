@@ -32,14 +32,24 @@
 //!   both normalized here once), and the YouTube API key (the same redacted
 //!   body field as the Aivis key). They have their own queue too, and nothing
 //!   in the request can name a program, an argument, a trust level or a source
-//!   class: the composition thread chooses all of those.
+//!   class: the composition thread chooses all of those;
+//! * the avatar choice (#362) adds `/api/avatar/*`: the model file upload (the
+//!   one body that is not small JSON: raw bytes, `application/octet-stream`,
+//!   declared length at most 64 MiB and checked before anything is written,
+//!   streamed to a staging file under a name this thread generates, hashed as
+//!   it arrives and inspected as a VRM before the composition thread is even
+//!   asked; one upload at a time) and the confirm / select / delete / discard
+//!   requests, each naming a model by its content hash only. They have their
+//!   own queue. The client never supplies a path or a file name.
 
 use super::server::{
     ConnGuard, HEAD_DEADLINE, MAX_CONNECTIONS, POLL, content_type, ct_eq, header_value, mint_token,
     peek_head, resolve,
 };
+use super::vrm::{self, VrmError};
 use crate::speech_tts::aivis_models::{self, ModelSearchQuery, ModelSort};
 use aivtuber_domain::{EngineError, EngineErrorKind};
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
@@ -60,13 +70,14 @@ pub const MAX_PANEL_STATE_BYTES: usize = 64 * 1024;
 const CONTROL_QUEUE: usize = 4;
 const VOICE_QUEUE: usize = 4;
 const INGRESS_QUEUE: usize = 4;
+const AVATAR_QUEUE: usize = 4;
 const CHAT_QUEUE: usize = 8;
 /// Longest accepted API key, in characters (Aivis keys are about 40).
 pub const MAX_PANEL_KEY_CHARS: usize = 256;
 /// One model search may take this long, end to end.
 const SEARCH_DEADLINE: Duration = Duration::from_secs(6);
 /// Every state-changing endpoint (all are `POST`).
-const STATE_CHANGING: [&str; 13] = [
+const STATE_CHANGING: [&str; 17] = [
     "/api/chat",
     "/api/stop",
     "/api/mute",
@@ -80,8 +91,26 @@ const STATE_CHANGING: [&str; 13] = [
     "/api/ingress/disconnect",
     "/api/ingress/key",
     "/api/ingress/key/remove",
+    "/api/avatar/confirm",
+    "/api/avatar/select",
+    "/api/avatar/delete",
+    "/api/avatar/discard",
 ];
 const SEARCH_PATH: &str = "/api/voice/search";
+/// The model upload (#362): a raw body, so it is not in [`STATE_CHANGING`]'s
+/// small-JSON handling; it exists only when a staging directory is configured.
+const UPLOAD_PATH: &str = "/api/avatar/upload";
+/// An upload that sends nothing for this long is dropped.
+const UPLOAD_IDLE: Duration = Duration::from_secs(10);
+/// An upload that is still running after this long is dropped.
+const UPLOAD_DEADLINE: Duration = Duration::from_secs(120);
+const UPLOAD_CHUNK: usize = 64 * 1024;
+/// How long an unread upload body is drained after a refusal, at most, and how
+/// long a silent client is waited for.
+const DRAIN_DEADLINE: Duration = Duration::from_secs(3);
+const DRAIN_IDLE: Duration = Duration::from_millis(100);
+/// Most files cleared from the staging directory before an upload.
+const STAGING_SWEEP_LIMIT: usize = 64;
 const REPLY_WAIT: Duration = Duration::from_secs(3);
 const TOKEN_HEADER: &str = "x-panel-token";
 /// Authenticated API calls per second (burst, then sustained).
@@ -98,6 +127,10 @@ pub struct LocalPanelConfig {
     /// Origin of the Aivis Cloud API the model search is proxied to (#360).
     /// `None` leaves the search route off (404).
     pub voice_search_endpoint: Option<String>,
+    /// Directory the avatar upload is staged in (#362), owned by the app's
+    /// avatar store. `None` leaves the upload route off (404). Everything in it
+    /// is deleted before each upload.
+    pub avatar_staging_dir: Option<PathBuf>,
 }
 
 impl fmt::Debug for LocalPanelConfig {
@@ -106,6 +139,7 @@ impl fmt::Debug for LocalPanelConfig {
             .field("port", &self.port)
             .field("page_dir", &self.page_dir)
             .field("voice_search_endpoint", &self.voice_search_endpoint)
+            .field("avatar_staging_dir", &self.avatar_staging_dir)
             .finish()
     }
 }
@@ -156,6 +190,18 @@ pub enum PanelRequest {
     /// Store the YouTube Data API key (#361).
     IngressKeySet(PanelSecret),
     IngressKeyRemove,
+    /// A model file was uploaded and staged (#362). Only the SHA-256 (64
+    /// lowercase hex) of the staged file, which is named after it in the
+    /// staging directory; the HTTP layer already checked it is a VRM.
+    AvatarUpload(String),
+    /// Make the pending candidate with this hash the active model (#362).
+    AvatarConfirm(String),
+    /// Switch to a stored model by hash, or to the sample (`sample`).
+    AvatarSelect(String),
+    /// Delete a stored model by hash.
+    AvatarDelete(String),
+    /// Drop the pending candidate.
+    AvatarDiscard,
 }
 
 /// The two chat platforms the panel can connect.
@@ -242,9 +288,12 @@ struct Shared {
     control_tx: SyncSender<PanelCommand>,
     voice_tx: SyncSender<PanelCommand>,
     ingress_tx: SyncSender<PanelCommand>,
+    avatar_tx: SyncSender<PanelCommand>,
     chat_tx: SyncSender<PanelCommand>,
     voice_search_endpoint: Option<String>,
     search_busy: std::sync::atomic::AtomicBool,
+    avatar_staging_dir: Option<PathBuf>,
+    upload_busy: std::sync::atomic::AtomicBool,
     counters: Counters,
     shutdown: std::sync::atomic::AtomicBool,
 }
@@ -275,6 +324,7 @@ pub struct PanelInbox {
     control_rx: Mutex<Receiver<PanelCommand>>,
     voice_rx: Mutex<Receiver<PanelCommand>>,
     ingress_rx: Mutex<Receiver<PanelCommand>>,
+    avatar_rx: Mutex<Receiver<PanelCommand>>,
     chat_rx: Mutex<Receiver<PanelCommand>>,
 }
 
@@ -304,6 +354,17 @@ impl PanelInbox {
     /// can never sit in front of a stop or a mute.
     pub fn drain_ingress(&self, max: usize) -> Vec<PanelCommand> {
         self.ingress_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .try_iter()
+            .take(max)
+            .collect()
+    }
+
+    /// Avatar choice requests (#362). Their own queue, so a model upload or
+    /// switch can never sit in front of a stop or a mute.
+    pub fn drain_avatar(&self, max: usize) -> Vec<PanelCommand> {
+        self.avatar_rx
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .try_iter()
@@ -382,6 +443,7 @@ impl LocalPanelServer {
         let (control_tx, control_rx) = sync_channel(CONTROL_QUEUE);
         let (voice_tx, voice_rx) = sync_channel(VOICE_QUEUE);
         let (ingress_tx, ingress_rx) = sync_channel(INGRESS_QUEUE);
+        let (avatar_tx, avatar_rx) = sync_channel(AVATAR_QUEUE);
         let (chat_tx, chat_rx) = sync_channel(CHAT_QUEUE);
         let shared = Arc::new(Shared {
             token: mint_token()?,
@@ -396,9 +458,12 @@ impl LocalPanelServer {
             control_tx,
             voice_tx,
             ingress_tx,
+            avatar_tx,
             chat_tx,
             voice_search_endpoint: config.voice_search_endpoint.clone(),
             search_busy: std::sync::atomic::AtomicBool::new(false),
+            avatar_staging_dir: config.avatar_staging_dir.clone(),
+            upload_busy: std::sync::atomic::AtomicBool::new(false),
             counters: Counters::default(),
             shutdown: std::sync::atomic::AtomicBool::new(false),
         });
@@ -414,6 +479,7 @@ impl LocalPanelServer {
             control_rx: Mutex::new(control_rx),
             voice_rx: Mutex::new(voice_rx),
             ingress_rx: Mutex::new(ingress_rx),
+            avatar_rx: Mutex::new(avatar_rx),
             chat_rx: Mutex::new(chat_rx),
         };
         Ok((
@@ -550,6 +616,28 @@ fn handle_connection(mut stream: TcpStream, shared: &Arc<Shared>) {
     let head_only = method == "HEAD";
     let response = route(&mut stream, shared, &head, method, path);
     write_response(&mut stream, &response, head_only);
+    if method == "POST" && path == UPLOAD_PATH {
+        discard_unread(&mut stream);
+    }
+}
+
+/// After the answer to an upload that was refused early, reads (and drops) what
+/// the client is still sending, bounded in bytes and time, so closing the socket
+/// does not reset the connection under the answer the client has not read yet.
+/// The write side is closed first: the client sees the whole answer and the end
+/// of it, then its own body drains into nothing.
+fn discard_unread(stream: &mut TcpStream) {
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(DRAIN_IDLE));
+    let started = Instant::now();
+    let mut total = 0_u64;
+    let mut sink = vec![0_u8; UPLOAD_CHUNK];
+    while total <= vrm::MAX_VRM_BYTES && started.elapsed() < DRAIN_DEADLINE {
+        match stream.read(&mut sink) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => total += n as u64,
+        }
+    }
 }
 
 fn route(
@@ -580,12 +668,15 @@ fn route(
     // answered here, not by the composition thread, and only when configured.
     let searching =
         method == "POST" && path == SEARCH_PATH && shared.voice_search_endpoint.is_some();
-    let state_changing = searching || (method == "POST" && STATE_CHANGING.contains(&path));
+    let uploading = method == "POST" && path == UPLOAD_PATH && shared.avatar_staging_dir.is_some();
+    let state_changing =
+        searching || uploading || (method == "POST" && STATE_CHANGING.contains(&path));
     let readable = method == "GET" && path == "/api/state";
     if !state_changing && !readable {
         // Includes OPTIONS (CORS preflight): refused without CORS headers.
         let known = path == "/api/state"
             || STATE_CHANGING.contains(&path)
+            || (path == UPLOAD_PATH && shared.avatar_staging_dir.is_some())
             || (path == SEARCH_PATH && shared.voice_search_endpoint.is_some());
         return if known {
             plain("405 Method Not Allowed")
@@ -619,6 +710,9 @@ fn route(
             body: state.into_bytes(),
             csp: false,
         };
+    }
+    if uploading {
+        return upload(stream, shared, &header);
     }
     // State-changing from here. Stop and mute take no body but must still be a
     // JSON POST so a plain form post cannot reach them.
@@ -662,6 +756,29 @@ fn route(
         "/api/voice/key/remove" => (PanelRequest::VoiceKeyRemove, &shared.voice_tx),
         "/api/voice/key/check" => (PanelRequest::VoiceKeyCheck, &shared.voice_tx),
         "/api/ingress/key/remove" => (PanelRequest::IngressKeyRemove, &shared.ingress_tx),
+        "/api/avatar/discard" => match empty_object(&body) {
+            Ok(()) => (PanelRequest::AvatarDiscard, &shared.avatar_tx),
+            Err((status, detail)) => {
+                shared.count(&shared.counters.rejected_request);
+                return json(status, false, detail);
+            }
+        },
+        "/api/avatar/confirm" | "/api/avatar/select" | "/api/avatar/delete" => {
+            match avatar_id(&body) {
+                Ok(id) => (
+                    match path {
+                        "/api/avatar/confirm" => PanelRequest::AvatarConfirm(id),
+                        "/api/avatar/select" => PanelRequest::AvatarSelect(id),
+                        _ => PanelRequest::AvatarDelete(id),
+                    },
+                    &shared.avatar_tx,
+                ),
+                Err((status, detail)) => {
+                    shared.count(&shared.counters.rejected_request);
+                    return json(status, false, detail);
+                }
+            }
+        }
         "/api/ingress/key" => match key_body(&body) {
             Ok(key) => (PanelRequest::IngressKeySet(key), &shared.ingress_tx),
             Err((status, detail)) => {
@@ -713,6 +830,231 @@ fn route(
         },
     };
     forward(shared, queue, request)
+}
+
+/// Parses `{}`: the discard request names nothing.
+fn empty_object(body: &[u8]) -> Result<(), (&'static str, &'static str)> {
+    match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(serde_json::Value::Object(map)) if map.is_empty() => Ok(()),
+        _ => Err(("400 Bad Request", "expected {}")),
+    }
+}
+
+/// Parses `{"id": "sample" | <hash or hash prefix>}`. An avatar model is named
+/// by content hash only (8 to 64 lowercase hex characters) or `sample`: no
+/// path, no file name, nothing the file system could resolve differently.
+fn avatar_id(body: &[u8]) -> Result<String, (&'static str, &'static str)> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Body {
+        id: String,
+    }
+    let Ok(parsed) = serde_json::from_slice::<Body>(body) else {
+        return Err(("400 Bad Request", "expected {\"id\": string}"));
+    };
+    if parsed.id == "sample" || is_hash_prefix(&parsed.id) {
+        Ok(parsed.id)
+    } else {
+        Err(("400 Bad Request", "not a model id"))
+    }
+}
+
+/// 8 to 64 lowercase hex characters: a content hash or a prefix of one.
+pub fn is_hash_prefix(text: &str) -> bool {
+    (8..=64).contains(&text.len())
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Clears the upload-in-progress flag however the upload ends.
+struct UploadGuard<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for UploadGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+fn upload_error(error: VrmError) -> (&'static str, String) {
+    let status = match error {
+        VrmError::TooLarge => "413 Payload Too Large",
+        VrmError::NotGlb
+        | VrmError::UnsupportedVersion
+        | VrmError::NotVrm
+        | VrmError::MissingMeta => "415 Unsupported Media Type",
+        _ => "400 Bad Request",
+    };
+    (status, format!("{}: {error}", error.code()))
+}
+
+/// `POST /api/avatar/upload` (#362): the raw bytes of one model.
+///
+/// Order matters: the declared length is checked before anything is read or
+/// written, the first twelve bytes are checked against it before the file is
+/// created, the body is read in bounded chunks into a staging file whose name
+/// this function made up (a random name, then the content hash) and hashed as it
+/// arrives (never held whole), and the finished file is inspected as a VRM
+/// before the composition thread is asked to take it. Any failure removes the
+/// staging file.
+fn upload(
+    stream: &mut TcpStream,
+    shared: &Shared,
+    head_header: &dyn Fn(&str) -> Option<String>,
+) -> Response {
+    let reject = |status: &'static str, detail: &str| {
+        shared.count(&shared.counters.rejected_request);
+        json(status, false, detail)
+    };
+    let octet_stream = head_header("content-type").is_some_and(|ct| {
+        ct.split(';')
+            .next()
+            .is_some_and(|t| t.trim().eq_ignore_ascii_case("application/octet-stream"))
+    });
+    if !octet_stream {
+        return reject(
+            "415 Unsupported Media Type",
+            "content type must be application/octet-stream",
+        );
+    }
+    if head_header("transfer-encoding").is_some() {
+        return reject("400 Bad Request", "chunked bodies are not accepted");
+    }
+    let Some(length) = head_header("content-length").and_then(|v| v.parse::<u64>().ok()) else {
+        return reject("411 Length Required", "content-length required");
+    };
+    let Some(dir) = shared.avatar_staging_dir.as_deref() else {
+        return plain("404 Not Found");
+    };
+    // Before a single byte of the body is read.
+    if length > vrm::MAX_VRM_BYTES {
+        let (status, detail) = upload_error(VrmError::TooLarge);
+        return reject(status, &detail);
+    }
+    if shared
+        .upload_busy
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        shared.count(&shared.counters.rate_limited);
+        return json(
+            "429 Too Many Requests",
+            false,
+            "an upload is already running",
+        );
+    }
+    let _busy = UploadGuard(&shared.upload_busy);
+    let mut prefix = [0_u8; 12];
+    if length < 20 {
+        let (status, detail) = upload_error(VrmError::Truncated);
+        return reject(status, &detail);
+    }
+    let _ = stream.set_read_timeout(Some(UPLOAD_IDLE));
+    if stream.read_exact(&mut prefix).is_err() {
+        return reject("400 Bad Request", "incomplete body");
+    }
+    if let Err(error) = vrm::check_prefix(&prefix, length) {
+        let (status, detail) = upload_error(error);
+        return reject(status, &detail);
+    }
+    shared.count(&shared.counters.accepted);
+    match stage_upload(stream, dir, &prefix, length) {
+        Ok(hash) => {
+            let response = forward(
+                shared,
+                &shared.avatar_tx,
+                PanelRequest::AvatarUpload(hash.clone()),
+            );
+            if !response.status.starts_with("200") {
+                // Refused or never picked up: do not leave the file behind.
+                let _ = fs::remove_file(dir.join(format!("{hash}.vrm")));
+            }
+            response
+        }
+        Err((status, detail)) => reject(status, &detail),
+    }
+}
+
+/// Streams the rest of the body (after `prefix`) into the staging directory,
+/// returning the SHA-256 of the staged, inspected file, which is renamed to
+/// `<hash>.vrm`.
+fn stage_upload(
+    stream: &mut TcpStream,
+    dir: &std::path::Path,
+    prefix: &[u8; 12],
+    length: u64,
+) -> Result<String, (&'static str, String)> {
+    let io_error = |_: std::io::Error| {
+        (
+            "500 Internal Server Error",
+            "could not stage the file".to_owned(),
+        )
+    };
+    // One upload at a time, so the directory only ever holds this one.
+    sweep(dir);
+    fs::create_dir_all(dir).map_err(io_error)?;
+    let temp = dir.join(format!(
+        "up-{}.part",
+        mint_token()
+            .map_err(|_| ("500 Internal Server Error", "no entropy".to_owned()))?
+            .get(..16)
+            .unwrap_or("0")
+    ));
+    let result = (|| {
+        let mut file = fs::File::create(&temp).map_err(io_error)?;
+        let mut hasher = Sha256::new();
+        file.write_all(prefix).map_err(io_error)?;
+        hasher.update(prefix);
+        let started = Instant::now();
+        let mut remaining = length - prefix.len() as u64;
+        let mut chunk = vec![0_u8; UPLOAD_CHUNK];
+        while remaining > 0 {
+            if started.elapsed() > UPLOAD_DEADLINE {
+                return Err(("408 Request Timeout", "the upload took too long".to_owned()));
+            }
+            let want = chunk
+                .len()
+                .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+            match stream.read(&mut chunk[..want]) {
+                Ok(0) | Err(_) => {
+                    return Err(("400 Bad Request", "incomplete body".to_owned()));
+                }
+                Ok(n) => {
+                    file.write_all(&chunk[..n]).map_err(io_error)?;
+                    hasher.update(&chunk[..n]);
+                    remaining -= n as u64;
+                }
+            }
+        }
+        file.flush().map_err(io_error)?;
+        drop(file);
+        vrm::inspect_file(&temp).map_err(upload_error)?;
+        let hash: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let staged = dir.join(format!("{hash}.vrm"));
+        let _ = fs::remove_file(&staged);
+        fs::rename(&temp, &staged).map_err(io_error)?;
+        Ok(hash)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+/// Deletes what an earlier upload left in the staging directory (bounded).
+fn sweep(dir: &std::path::Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten().take(STAGING_SWEEP_LIMIT) {
+        if entry.file_type().is_ok_and(|t| t.is_file()) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// The body of `POST /api/voice`: a `VoicePatch`, parsed here once for the
@@ -975,6 +1317,7 @@ mod tests {
         inbox: PanelInbox,
         host: String,
         origin: String,
+        staging: PathBuf,
     }
 
     fn fixture() -> Fixture {
@@ -988,10 +1331,12 @@ mod tests {
         fs::write(dir.join("panel.html"), "<html>panel</html>").unwrap();
         fs::write(dir.join("index.html"), "<html>avatar</html>").unwrap();
         fs::write(dir.join("assets").join("a.js"), "1").unwrap();
+        let staging = dir.join("staging");
         let (server, inbox) = LocalPanelServer::start(LocalPanelConfig {
             port: 0,
             page_dir: Some(dir),
             voice_search_endpoint: search_endpoint,
+            avatar_staging_dir: Some(staging.clone()),
         })
         .unwrap();
         let port = server.local_addr().port();
@@ -1000,6 +1345,7 @@ mod tests {
             inbox,
             host: format!("127.0.0.1:{port}"),
             origin: format!("http://127.0.0.1:{port}"),
+            staging,
         }
     }
 
@@ -1010,11 +1356,19 @@ mod tests {
     }
 
     fn send(f: &Fixture, request: &str) -> Raw {
+        send_bytes(f, request.as_bytes())
+    }
+
+    fn send_bytes(f: &Fixture, request: &[u8]) -> Raw {
         let mut stream = TcpStream::connect(f.server.local_addr()).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
-        stream.write_all(request.as_bytes()).unwrap();
+        // The server may answer (and close) before the whole body is sent.
+        let _ = stream.write_all(request);
+        // Nothing more is coming: a body shorter than its declared length ends
+        // the read at once instead of waiting for the idle timeout.
+        let _ = stream.shutdown(std::net::Shutdown::Write);
         let mut bytes = Vec::new();
         let _ = stream.read_to_end(&mut bytes);
         let text = String::from_utf8_lossy(&bytes).into_owned();
@@ -1096,10 +1450,12 @@ mod tests {
             port: _,
             page_dir: _,
             voice_search_endpoint: _,
+            avatar_staging_dir: _,
         } = LocalPanelConfig {
             port: 0,
             page_dir: None,
             voice_search_endpoint: None,
+            avatar_staging_dir: None,
         };
         assert!(!format!("{:?}", f.server).contains(f.server.token()));
     }
@@ -1467,15 +1823,30 @@ mod tests {
     fn authenticated_calls_are_rate_limited() {
         let f = fixture();
         let token = f.server.token().to_owned();
-        let mut limited = 0;
-        for _ in 0..(API_BURST as usize + 30) {
-            let r = get(&f, "/api/state", &format!("X-Panel-Token: {token}\r\n"));
-            if r.status == 429 {
-                limited += 1;
-            }
-        }
-        assert!(limited > 0);
+        // Not timing based: the bucket is emptied far below zero, so no refill
+        // can make a request pass however slowly the machine runs.
+        f.server
+            .shared
+            .bucket
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .tokens = -1.0e9;
+        let r = get(&f, "/api/state", &format!("X-Panel-Token: {token}\r\n"));
+        assert_eq!(r.status, 429);
         assert!(f.inbox.metrics().rate_limited > 0);
+        // And a full bucket lets the burst through.
+        {
+            let mut bucket = f
+                .server
+                .shared
+                .bucket
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            bucket.tokens = API_BURST;
+            bucket.last = Instant::now();
+        }
+        let r = get(&f, "/api/state", &format!("X-Panel-Token: {token}\r\n"));
+        assert_eq!(r.status, 200);
     }
 
     // ---- voice settings (#360) ----
@@ -1907,5 +2278,388 @@ mod tests {
         let answer = post(&closed, "/api/voice/search", &with(&good, "none"), "{}");
         assert_eq!(answer.status, 502);
         assert!(answer.body.contains("unreachable"), "{}", answer.body);
+    }
+
+    // ---- avatar choice (#362) ----
+
+    const VRM_JSON: &str = r#"{"extensions":{"VRMC_vrm":{"meta":{"name":"Test","authors":["A"],
+        "avatarPermission":"everyone","commercialUsage":"corporation"}}}}"#;
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    fn post_bytes(
+        f: &Fixture,
+        headers: &[(&str, &str)],
+        declared: Option<u64>,
+        body: &[u8],
+    ) -> Raw {
+        let mut request =
+            format!("POST {UPLOAD_PATH} HTTP/1.1\r\nHost: {}\r\n", f.host).into_bytes();
+        for (k, v) in headers {
+            request.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
+        }
+        let declared = declared.unwrap_or(body.len() as u64);
+        request.extend_from_slice(format!("Content-Length: {declared}\r\n\r\n").as_bytes());
+        request.extend_from_slice(body);
+        send_bytes(f, &request)
+    }
+
+    fn upload_headers(f: &Fixture) -> Vec<(&'static str, String)> {
+        vec![
+            ("Origin", f.origin.clone()),
+            ("X-Panel-Token", f.server.token().to_owned()),
+            ("Content-Type", "application/octet-stream".to_owned()),
+        ]
+    }
+
+    fn as_pairs<'a>(headers: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
+        headers.iter().map(|(k, v)| (*k, v.as_str())).collect()
+    }
+
+    fn staging_is_empty(f: &Fixture) -> bool {
+        fs::read_dir(&f.staging).map_or(true, |mut entries| entries.next().is_none())
+    }
+
+    /// Waits for the one queued avatar request (the composition thread's side).
+    fn take_avatar(f: &Fixture) -> PanelCommand {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(command) = f.inbox.drain_avatar(1).into_iter().next() {
+                return command;
+            }
+            assert!(Instant::now() < deadline, "no avatar request arrived");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn an_upload_is_staged_hashed_and_only_its_hash_is_forwarded() {
+        let f = fixture();
+        let model = crate::local_avatar::vrm::test_model(VRM_JSON);
+        let hash = sha256_hex(&model);
+        let headers = upload_headers(&f);
+        let response = thread::scope(|s| {
+            let handle = s.spawn(|| post_bytes(&f, &as_pairs(&headers), None, &model));
+            let command = take_avatar(&f);
+            assert_eq!(command.request, PanelRequest::AvatarUpload(hash.clone()));
+            // The staged file is named after its hash and holds the bytes.
+            assert_eq!(
+                fs::read(f.staging.join(format!("{hash}.vrm"))).unwrap(),
+                model
+            );
+            command.respond(true, "candidate ready");
+            handle.join().unwrap()
+        });
+        assert_eq!(response.status, 200, "{}", response.body);
+        assert!(response.body.contains("candidate ready"));
+        // No temporary file is left next to it.
+        let names: Vec<_> = fs::read_dir(&f.staging)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, [format!("{hash}.vrm")]);
+    }
+
+    #[test]
+    fn a_refused_upload_leaves_nothing_staged() {
+        let f = fixture();
+        let model = crate::local_avatar::vrm::test_model(VRM_JSON);
+        let headers = upload_headers(&f);
+        let pairs = as_pairs(&headers);
+        // The composition thread cannot take it: the file is removed again.
+        let response = thread::scope(|s| {
+            let handle = s.spawn(|| post_bytes(&f, &pairs, None, &model));
+            take_avatar(&f).respond(false, "avatar store is full");
+            handle.join().unwrap()
+        });
+        assert_eq!(response.status, 409);
+        assert!(staging_is_empty(&f));
+    }
+
+    #[test]
+    fn bad_uploads_get_typed_refusals_and_never_reach_the_queue() {
+        let f = fixture();
+        let headers = upload_headers(&f);
+        let pairs = as_pairs(&headers);
+        let valid = crate::local_avatar::vrm::test_model(VRM_JSON);
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.resize(4096, 0);
+        let mut cut = valid.clone();
+        cut.truncate(cut.len() - 100);
+        let mut lying = valid.clone();
+        lying[12..16].copy_from_slice(&(1_u32 << 30).to_le_bytes());
+        let plain_glb = crate::local_avatar::vrm::test_model(r#"{"asset":{"version":"2.0"}}"#);
+        let mut not_utf8 = crate::local_avatar::vrm::test_model(VRM_JSON);
+        not_utf8[20] = 0xFF;
+        let mut huge_json = valid.clone();
+        huge_json[12..16].copy_from_slice(&(vrm::MAX_JSON_BYTES as u32 + 4).to_le_bytes());
+        let cases: [(&str, &[u8], u16, &str); 7] = [
+            ("renamed png", &png[..], 415, "not_glb"),
+            ("truncated glb", &cut[..], 400, "length_mismatch"),
+            ("lying json chunk", &lying[..], 400, "chunk_out_of_bounds"),
+            ("glb without VRM", &plain_glb[..], 415, "not_vrm"),
+            (
+                "json that is not utf-8",
+                &not_utf8[..],
+                400,
+                "json_not_utf8",
+            ),
+            (
+                "json chunk length over the cap",
+                &huge_json[..],
+                400,
+                "chunk_out_of_bounds",
+            ),
+            ("too short", &b"glTF"[..], 400, "truncated"),
+        ];
+        for (name, body, status, code) in cases {
+            let r = post_bytes(&f, &pairs, None, body);
+            assert_eq!(r.status, status, "{name}: {}", r.body);
+            assert!(r.body.contains(code), "{name}: {}", r.body);
+        }
+        // A body longer than the glTF header says: the header is the lie.
+        let r = post_bytes(&f, &pairs, Some(valid.len() as u64 + 10), &valid);
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("length_mismatch"), "{}", r.body);
+        // A consistent header and declared length, but the client stops
+        // sending early: refused once it does, not after the idle timeout, and
+        // the partial file is removed.
+        let r = post_bytes(
+            &f,
+            &pairs,
+            Some(valid.len() as u64),
+            &valid[..valid.len() - 10],
+        );
+        assert_eq!(r.status, 400, "{}", r.body);
+        assert!(r.body.contains("incomplete body"), "{}", r.body);
+        assert!(f.inbox.drain_avatar(8).is_empty());
+        assert!(staging_is_empty(&f), "no partial file may remain");
+    }
+
+    #[test]
+    fn an_oversized_upload_is_refused_before_any_of_it_is_read() {
+        let f = fixture();
+        let headers = upload_headers(&f);
+        let pairs = as_pairs(&headers);
+        // Only a header is sent; the declared length is one byte over the cap.
+        let r = post_bytes(&f, &pairs, Some(vrm::MAX_VRM_BYTES + 1), b"");
+        assert_eq!(r.status, 413, "{}", r.body);
+        assert!(r.body.contains("too_large"));
+        let r = post_bytes(&f, &pairs, Some(u64::MAX), b"");
+        assert_eq!(r.status, 413);
+        assert!(f.inbox.drain_avatar(8).is_empty());
+        assert!(staging_is_empty(&f));
+    }
+
+    #[test]
+    fn an_upload_needs_origin_secret_and_the_right_content_type() {
+        let f = fixture();
+        let model = crate::local_avatar::vrm::test_model(VRM_JSON);
+        let headers = upload_headers(&f);
+        let without = |name: &str| -> Vec<(&'static str, &str)> {
+            headers
+                .iter()
+                .filter(|(k, _)| !k.eq_ignore_ascii_case(name))
+                .map(|(k, v)| (*k, v.as_str()))
+                .collect()
+        };
+        assert_eq!(post_bytes(&f, &without("origin"), None, &model).status, 403);
+        let mut foreign = without("origin");
+        foreign.push(("Origin", "http://evil.example"));
+        assert_eq!(post_bytes(&f, &foreign, None, &model).status, 403);
+        assert_eq!(
+            post_bytes(&f, &without("x-panel-token"), None, &model).status,
+            401
+        );
+        let mut wrong = without("x-panel-token");
+        wrong.push(("X-Panel-Token", "nope"));
+        assert_eq!(post_bytes(&f, &wrong, None, &model).status, 401);
+        // A form post or a JSON post is not an upload.
+        for ctype in [
+            "application/json",
+            "multipart/form-data; boundary=x",
+            "text/plain",
+        ] {
+            let mut other = without("content-type");
+            other.push(("Content-Type", ctype));
+            assert_eq!(post_bytes(&f, &other, None, &model).status, 415, "{ctype}");
+        }
+        assert_eq!(
+            post_bytes(&f, &without("content-type"), None, &model).status,
+            415
+        );
+        // Chunked bodies are not parsed.
+        let mut chunked = without("none");
+        chunked.push(("Transfer-Encoding", "chunked"));
+        assert_eq!(post_bytes(&f, &chunked, None, &model).status, 400);
+        assert!(f.inbox.drain_avatar(8).is_empty());
+        assert!(staging_is_empty(&f));
+    }
+
+    #[test]
+    fn one_upload_runs_at_a_time() {
+        let f = fixture();
+        let model = crate::local_avatar::vrm::test_model(VRM_JSON);
+        let headers = upload_headers(&f);
+        f.server.shared.upload_busy.store(true, Ordering::SeqCst);
+        let r = post_bytes(&f, &as_pairs(&headers), None, &model);
+        assert_eq!(r.status, 429, "{}", r.body);
+        assert!(f.inbox.drain_avatar(8).is_empty());
+        f.server.shared.upload_busy.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn the_upload_flag_is_released_after_a_refusal() {
+        let f = fixture();
+        let headers = upload_headers(&f);
+        let pairs = as_pairs(&headers);
+        assert_eq!(
+            post_bytes(&f, &pairs, None, b"not a model at all, but long enough").status,
+            415
+        );
+        assert!(!f.server.shared.upload_busy.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn the_upload_route_does_not_exist_without_a_staging_directory() {
+        let (server, inbox) = LocalPanelServer::start(LocalPanelConfig {
+            port: 0,
+            page_dir: None,
+            voice_search_endpoint: None,
+            avatar_staging_dir: None,
+        })
+        .unwrap();
+        let port = server.local_addr().port();
+        let f = Fixture {
+            server,
+            inbox,
+            host: format!("127.0.0.1:{port}"),
+            origin: format!("http://127.0.0.1:{port}"),
+            staging: PathBuf::new(),
+        };
+        let headers = upload_headers(&f);
+        let r = post_bytes(&f, &as_pairs(&headers), None, b"anything");
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn avatar_requests_name_a_model_by_hash_only() {
+        let f = fixture();
+        let good = good(&f);
+        let headers = with(&good, "none");
+        let hash = "ab".repeat(32);
+        let cases = [
+            (
+                "/api/avatar/confirm",
+                format!("{{\"id\":\"{hash}\"}}"),
+                PanelRequest::AvatarConfirm(hash.clone()),
+            ),
+            (
+                "/api/avatar/select",
+                "{\"id\":\"sample\"}".to_owned(),
+                PanelRequest::AvatarSelect("sample".to_owned()),
+            ),
+            (
+                "/api/avatar/select",
+                "{\"id\":\"abcdef01\"}".to_owned(),
+                PanelRequest::AvatarSelect("abcdef01".to_owned()),
+            ),
+            (
+                "/api/avatar/delete",
+                format!("{{\"id\":\"{hash}\"}}"),
+                PanelRequest::AvatarDelete(hash.clone()),
+            ),
+            (
+                "/api/avatar/discard",
+                "{}".to_owned(),
+                PanelRequest::AvatarDiscard,
+            ),
+        ];
+        for (path, body, expected) in cases {
+            let response = thread::scope(|s| {
+                let handle = s.spawn(|| post(&f, path, &headers, &body));
+                let command = take_avatar(&f);
+                assert_eq!(command.request, expected, "{path}");
+                command.respond(true, "done");
+                handle.join().unwrap()
+            });
+            assert_eq!(response.status, 200, "{path}: {}", response.body);
+        }
+        // Nothing else is accepted as an id: paths, names, upper case, short
+        // prefixes, extra fields, other types.
+        for body in [
+            "{\"id\":\"../../etc/passwd\"}".to_owned(),
+            "{\"id\":\"model.vrm\"}".to_owned(),
+            "{\"id\":\"C:\\\\x\"}".to_owned(),
+            format!("{{\"id\":\"{}\"}}", hash.to_uppercase()),
+            "{\"id\":\"abcdef0\"}".to_owned(),
+            format!("{{\"id\":\"{}0\"}}", hash),
+            "{\"id\":\"\"}".to_owned(),
+            "{\"id\":7}".to_owned(),
+            "{\"id\":\"sample\",\"path\":\"/x\"}".to_owned(),
+            "{}".to_owned(),
+            "not json".to_owned(),
+        ] {
+            for path in [
+                "/api/avatar/confirm",
+                "/api/avatar/select",
+                "/api/avatar/delete",
+            ] {
+                let r = post(&f, path, &headers, &body);
+                assert_eq!(r.status, 400, "{path} {body}: {}", r.body);
+            }
+        }
+        for body in ["{\"id\":\"sample\"}", "not json", "[]"] {
+            assert_eq!(
+                post(&f, "/api/avatar/discard", &headers, body).status,
+                400,
+                "{body}"
+            );
+        }
+        assert!(f.inbox.drain_avatar(8).is_empty());
+        assert!(
+            f.inbox.drain_control(8).is_empty(),
+            "never on the stop queue"
+        );
+        assert!(f.inbox.drain_chat(8).is_empty());
+    }
+
+    #[test]
+    fn avatar_requests_need_origin_and_secret_like_every_state_change() {
+        let f = fixture();
+        let good = good(&f);
+        for path in [
+            "/api/avatar/confirm",
+            "/api/avatar/select",
+            "/api/avatar/delete",
+            "/api/avatar/discard",
+        ] {
+            let mut foreign = with(&good, "origin");
+            foreign.push(("Origin", "http://evil.example"));
+            assert_eq!(post(&f, path, &foreign, "{}").status, 403, "{path}");
+            assert_eq!(
+                post(&f, path, &with(&good, "x-panel-token"), "{}").status,
+                401,
+                "{path}"
+            );
+            assert_eq!(get(&f, path, "").status, 405, "{path}");
+        }
+        assert!(f.inbox.drain_avatar(8).is_empty());
+    }
+
+    #[test]
+    fn the_hash_shape_check_is_strict() {
+        assert!(is_hash_prefix("abcdef01"));
+        assert!(is_hash_prefix(&"0".repeat(64)));
+        assert!(!is_hash_prefix("abcdef0"));
+        assert!(!is_hash_prefix(&"0".repeat(65)));
+        assert!(!is_hash_prefix("ABCDEF01"));
+        assert!(!is_hash_prefix("abcdefg1"));
+        assert!(!is_hash_prefix("abcd ef01"));
     }
 }

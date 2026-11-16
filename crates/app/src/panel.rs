@@ -17,7 +17,11 @@
 //!   delay a stop) and the stream-chat connections of #361 (`ingress.connect`,
 //!   `ingress.disconnect`, `ingress.key.set`, `ingress.key.remove`, all
 //!   `ingress.control`, on their own queue too; the request names a platform
-//!   and a validated target only); it cannot reach perception, memory export
+//!   and a validated target only) and the avatar choice of #362
+//!   (`avatar.upload` for a file the HTTP layer staged and hashed,
+//!   `avatar.confirm`, `avatar.select`, `avatar.delete`, `avatar.discard`, all
+//!   `avatar.configure`, again on their own queue; a model is named by content
+//!   hash only); it cannot reach perception, memory export
 //!   or diagnose even though the ingress could mint them;
 //! * a chat line becomes a `chat.message` envelope whose source, source class,
 //!   plane and trust are fixed here (`local-panel`, `public_chat`, `content`,
@@ -43,6 +47,7 @@ const DEFAULT_PORT: u16 = 8766;
 const CONTROL_PER_TICK: usize = 4;
 const VOICE_PER_TICK: usize = 4;
 const INGRESS_PER_TICK: usize = 4;
+const AVATAR_PER_TICK: usize = 4;
 const CHAT_PER_TICK: usize = 4;
 const PUBLISH_INTERVAL_MS: u64 = 500;
 /// Refusal counts are logged at most this often. A stale page from an earlier
@@ -181,11 +186,13 @@ impl PanelService {
         control_secret: &[u8; 32],
         avatar_url: Option<String>,
         voice_search_endpoint: Option<String>,
+        avatar_staging_dir: Option<PathBuf>,
     ) -> Result<Self, String> {
         let (server, inbox) = LocalPanelServer::start(LocalPanelConfig {
             port: settings.port,
             page_dir: settings.page_dir.clone(),
             voice_search_endpoint,
+            avatar_staging_dir,
         })
         .map_err(|error| error.to_string())?;
         Ok(Self {
@@ -243,7 +250,12 @@ impl PanelService {
                 | PanelRequest::IngressConnect { .. }
                 | PanelRequest::IngressDisconnect(_)
                 | PanelRequest::IngressKeySet(_)
-                | PanelRequest::IngressKeyRemove => {
+                | PanelRequest::IngressKeyRemove
+                | PanelRequest::AvatarUpload(_)
+                | PanelRequest::AvatarConfirm(_)
+                | PanelRequest::AvatarSelect(_)
+                | PanelRequest::AvatarDelete(_)
+                | PanelRequest::AvatarDiscard => {
                     command.respond(false, "not a control request");
                     continue;
                 }
@@ -320,6 +332,37 @@ impl PanelService {
                 PanelRequest::IngressKeyRemove => ("ingress.key.remove", None),
                 _ => {
                     command.respond(false, "not a chat connection request");
+                    continue;
+                }
+            };
+            self.control_seq += 1;
+            let response = apply_operator_action(
+                &self.ingress,
+                app,
+                &format!("panel-ctl-{}", self.control_seq),
+                action,
+                argument,
+                &self.control_secret.0,
+                now_ms,
+            );
+            eprintln!(
+                "panel: {action} ok={} detail={:?}",
+                response.ok, response.detail
+            );
+            command.respond(response.ok, response.detail);
+            changed = true;
+        }
+        for command in self.inbox.drain_avatar(AVATAR_PER_TICK) {
+            // Only the hash (or `sample`) the HTTP layer already shape-checked
+            // travels; the app resolves it against its own store.
+            let (action, argument): (&str, Option<&str>) = match &command.request {
+                PanelRequest::AvatarUpload(hash) => ("avatar.upload", Some(hash)),
+                PanelRequest::AvatarConfirm(id) => ("avatar.confirm", Some(id)),
+                PanelRequest::AvatarSelect(id) => ("avatar.select", Some(id)),
+                PanelRequest::AvatarDelete(id) => ("avatar.delete", Some(id)),
+                PanelRequest::AvatarDiscard => ("avatar.discard", None),
+                _ => {
+                    command.respond(false, "not an avatar request");
                     continue;
                 }
             };
