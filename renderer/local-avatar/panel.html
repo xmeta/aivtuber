@@ -12,16 +12,23 @@
 <main>
   <header>
     <h1>aivtuber 操作パネル</h1>
-    <p id="connection" role="status">接続中…</p>
+    <p id="connection" role="status" class="conn">接続しています…</p>
   </header>
 
+  <p id="avatar-cta-wrap" class="cta-wrap" hidden>
+    <a id="avatar-cta" class="cta" href="about:blank" target="_blank" rel="noopener noreferrer">アバター画面を開く</a>
+    <span class="hint">最初にアバター画面を開いてください。開くと、応答に合わせてアバターが動きます。</span>
+  </p>
+
+<div class="layout">
+<div class="side">
   <section aria-labelledby="h-status">
     <h2 id="h-status">状態</h2>
     <div id="status" class="rows"></div>
     <p><a id="avatar-link" href="about:blank" target="_blank" rel="noopener noreferrer" hidden>アバター画面を開く</a></p>
   </section>
 
-  <section aria-labelledby="h-control">
+  <section aria-labelledby="h-control" class="emergency">
     <h2 id="h-control">緊急操作</h2>
     <div class="buttons">
       <button id="stop" type="button" class="danger">緊急停止</button>
@@ -29,18 +36,33 @@
     </div>
     <p id="control-result" role="status"></p>
   </section>
+</div>
 
-  <section id="model-section" aria-labelledby="h-model" hidden>
-    <h2 id="h-model">応答モデル</h2>
+  <section aria-labelledby="h-chat" class="chat">
+    <h2 id="h-chat">話しかける</h2>
+    <div id="chat-log" class="log" aria-live="polite"></div>
+    <textarea id="chat-input" rows="3" maxlength="500" placeholder="ここに入力(Ctrl+Enterで送信)" aria-label="話しかける内容"></textarea>
+    <div class="buttons"><button id="send" type="button">送信</button></div>
+    <p id="chat-error" class="error" role="alert"></p>
+    <div id="other-wrap" hidden>
+      <h3>最近の発話(ほかの入力への返答)</h3>
+      <ul id="other-replies"></ul>
+    </div>
+  </section>
+
+<div class="settings">
+
+  <details id="model-section" class="card" hidden>
+    <summary><h2 id="h-model">応答モデル</h2></summary>
     <div class="buttons">
       <select id="model-select" aria-label="応答に使うモデル"></select>
       <button id="model-apply" type="button">切り替える</button>
     </div>
     <p id="model-state" role="status"></p>
-  </section>
+  </details>
 
-  <section id="avatar-section" aria-labelledby="h-avatar" hidden>
-    <h2 id="h-avatar">アバター</h2>
+  <details id="avatar-section" class="card" hidden>
+    <summary><h2 id="h-avatar">アバター</h2></summary>
     <p id="avatar-summary" role="status"></p>
     <p id="avatar-credit" class="hint"></p>
     <p id="avatar-error" class="error" role="alert"></p>
@@ -75,16 +97,16 @@
       <ul id="avatar-active-warnings" class="warnings"></ul>
       <dl id="avatar-active-rows" class="licence"></dl>
     </details>
-  </section>
+  </details>
 
-  <section id="usage-section" aria-labelledby="h-usage" hidden>
-    <h2 id="h-usage">応答の使用量</h2>
+  <details id="usage-section" class="card" hidden>
+    <summary><h2 id="h-usage">応答の使用量</h2></summary>
     <p id="usage-summary" role="status"></p>
     <p id="usage-cap" role="status" hidden></p>
-  </section>
+  </details>
 
-  <section id="voice-section" aria-labelledby="h-voice" hidden>
-    <h2 id="h-voice">声</h2>
+  <details id="voice-section" class="card" hidden>
+    <summary><h2 id="h-voice">声</h2></summary>
     <p id="voice-summary" role="status"></p>
     <p id="voice-error" class="error" role="alert"></p>
 
@@ -151,10 +173,10 @@
       <button id="voice-local" type="button">ローカルの声に戻す</button>
     </div>
     <p id="voice-result" role="status"></p>
-  </section>
+  </details>
 
-  <section id="ingress-section" aria-labelledby="h-ingress" hidden>
-    <h2 id="h-ingress">配信チャット</h2>
+  <details id="ingress-section" class="card" hidden>
+    <summary><h2 id="h-ingress">配信チャット</h2></summary>
     <p class="hint">配信のコメントを読み取って返事をします。読み取り専用で、コメントの投稿や配信側の操作はしません。コメントは外部からの入力として扱われ、操作権限は持ちません。</p>
     <p id="ingress-error" class="error" role="alert"></p>
 
@@ -182,19 +204,10 @@
       <button id="ingress-youtube-disconnect" type="button">切断</button>
     </div>
     <p id="ingress-youtube-result" role="status"></p>
-  </section>
+  </details>
 
-  <section aria-labelledby="h-chat">
-    <h2 id="h-chat">話しかける</h2>
-    <div id="chat-log" class="log" aria-live="polite"></div>
-    <textarea id="chat-input" rows="3" maxlength="500" placeholder="ここに入力(Ctrl+Enterで送信)"></textarea>
-    <div class="buttons"><button id="send" type="button">送信</button></div>
-    <p id="chat-error" class="error" role="alert"></p>
-    <div id="other-wrap" hidden>
-      <h3>最近の発話(ほかの入力への返答)</h3>
-      <ul id="other-replies"></ul>
-    </div>
-  </section>
+</div>
+</div>
 </main>
 <script type="module" src="/src/panel.ts"></script>
 </body>

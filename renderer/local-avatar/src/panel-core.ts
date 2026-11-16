@@ -80,6 +80,15 @@ export function tokenFromHash(hash: string): string | null {
 }
 
 /**
+ * Whether a fragment change should reload the page: only a well-formed token
+ * fragment. The page scrubs its own fragment with replaceState (no hashchange),
+ * and an empty or malformed fragment never reloads, so there is no loop.
+ */
+export function shouldReloadForHash(hash: string): boolean {
+  return tokenFromHash(hash) !== null;
+}
+
+/**
  * The selector state, only if it has exactly the documented shape. Anything
  * else (a newer or older app, a malformed document) yields `null`, which hides
  * the selector rather than offering a model the app would refuse.
@@ -273,17 +282,20 @@ export interface StatusRow {
   label: string;
   value: string;
   health: Health;
+  /** Raw host text behind a translated value, for support (tooltip). */
+  raw?: string;
 }
 
 /** The rows the status card shows, in order, with Japanese labels. */
 export function statusRows(state: PanelState): StatusRow[] {
   const s = state.status;
-  const err = (e: string | null): StatusRow["value"] => (e === null ? "正常" : e);
+  const err = (e: string | null): StatusRow["value"] => (e === null ? "正常" : reasonText(e));
+  const raw = (e: string | null): { raw?: string } => (e === null ? {} : { raw: e.slice(0, MAX_HOST_TEXT_CHARS) });
   return [
     { label: "ミュート", value: s.muted ? "ミュート中(再起動まで解除不可)" : "いいえ", health: s.muted ? "warn" : "ok" },
-    { label: "音声出力", value: err(s.audio_error), health: s.audio_error === null ? "ok" : "warn" },
-    { label: "アバター", value: err(s.avatar_error), health: s.avatar_error === null ? "ok" : "warn" },
-    { label: "配信連携", value: err(s.stream_error), health: s.stream_error === null ? "ok" : "warn" },
+    { label: "音声出力", value: err(s.audio_error), health: s.audio_error === null ? "ok" : "warn", ...raw(s.audio_error) },
+    { label: "アバター", value: err(s.avatar_error), health: s.avatar_error === null ? "ok" : "warn", ...raw(s.avatar_error) },
+    { label: "配信連携", value: err(s.stream_error), health: s.stream_error === null ? "ok" : "warn", ...raw(s.stream_error) },
     { label: "応答生成", value: s.generation_active ? "生成中" : "待機中", health: "ok" },
     { label: "入力待ち", value: String(s.content_queue), health: "ok" },
     { label: "再生予定", value: String(s.scheduler_items), health: "ok" },
@@ -1276,4 +1288,126 @@ export function avatarView(state: PanelState | null): AvatarView | null {
     mismatch,
     canAddMore: true,
   };
+}
+
+// ---- First-run wording (#384) ----
+// The host sends English diagnostics (EngineError Display = "<Kind>: <message>",
+// operator stop/mute detail tokens). The page shows short Japanese text for the
+// stable, common ones and keeps the raw string for support. Everything here is
+// total: no input can make it throw, and unknown text passes through unchanged
+// (bounded, so a hostile or runaway string cannot flood the page).
+
+/** Longest host string the page will show or match against. */
+export const MAX_HOST_TEXT_CHARS = 300;
+
+function bounded(raw: string): string {
+  return raw.length > MAX_HOST_TEXT_CHARS ? `${raw.slice(0, MAX_HOST_TEXT_CHARS)}…` : raw;
+}
+
+export type AvatarLink = "none" | "disconnected" | "handshaking" | "degraded";
+
+/**
+ * Mirrors LocalAvatarOutput::connect (crates/app/src/outputs.rs):
+ * `local avatar renderer is {Disconnected|Handshaking|Degraded}`.
+ */
+export function avatarLinkState(raw: string | null | undefined): AvatarLink {
+  if (typeof raw !== "string") return "none";
+  const m = /local avatar renderer is (Disconnected|Handshaking|Degraded)/.exec(raw.slice(0, MAX_HOST_TEXT_CHARS));
+  if (m === null) return "none";
+  return m[1] === "Disconnected" ? "disconnected" : m[1] === "Handshaking" ? "handshaking" : "degraded";
+}
+
+/** A status-row error (audio/avatar/stream) in Japanese; unknown text is kept. */
+export function reasonText(raw: string | null | undefined): string {
+  if (typeof raw !== "string" || raw === "") return "";
+  switch (avatarLinkState(raw)) {
+    case "disconnected":
+      return "アバター画面が開かれていません";
+    case "handshaking":
+      return "アバター画面と接続しています";
+    case "degraded":
+      return "アバター画面の応答が遅れています";
+    case "none":
+      break;
+  }
+  const text = raw.slice(0, MAX_HOST_TEXT_CHARS);
+  // crates/app/src/audio_stop.rs (AudioChannel::execute)
+  if (text === "Unavailable: audio output busy ending playback") return "音声を止めている最中のため再生できませんでした";
+  // crates/app/src/lib.rs (stop_started_audio)
+  if (text === "audio stop did not complete within its bound") return "音声の停止を確認できませんでした(音が残っている可能性があります)";
+  return bounded(raw);
+}
+
+const STOP_TOKENS: Record<string, string> = {
+  nothing_playing: "再生中の音声はありませんでした",
+  hard_stopped: "音声を止めました",
+  unsupported: "この音声出力は停止に対応していません(音が残る可能性があります)",
+  failed: "音声を止められませんでした",
+  unconfirmed: "音声が止まったか確認できませんでした",
+};
+
+function audioStopText(token: string): string | null {
+  const known = Object.hasOwn(STOP_TOKENS, token) ? STOP_TOKENS[token] : undefined;
+  if (known !== undefined) return known;
+  return /^faded_\d{1,6}ms$/.test(token) ? "音声をフェードアウトして止めました" : null;
+}
+
+export interface ControlResultText {
+  /** Shown line. */
+  text: string;
+  /** Raw host detail for the tooltip; empty when there was none. */
+  raw: string;
+}
+
+/**
+ * Result line of an emergency stop / mute. Detail formats come from
+ * crates/app/src/operator_control.rs (`stopped N items` | `muted` |
+ * `authenticated`, then `; audio_stop=<token> avatar_reset=ok|failed` from
+ * crates/app/src/audio_stop.rs) and `rejected: ...` for a refusal.
+ */
+export function controlResultText(action: "stop" | "mute", ok: boolean, detail: unknown, status: number): ControlResultText {
+  const raw = typeof detail === "string" ? bounded(detail) : "";
+  const name = action === "stop" ? "停止" : "ミュート";
+  if (!ok || status !== 200) {
+    return { text: `失敗しました${raw === "" ? ` (${status})` : `: ${raw}`}`, raw };
+  }
+  const m = /^(?:stopped (\d{1,9}) items?|muted|authenticated)(?:; (.*))?$/.exec(raw);
+  if (m === null) return { text: raw === "" ? `${name}しました` : `${name}しました: ${raw}`, raw };
+  const parts: string[] = [];
+  if (m[1] !== undefined) parts.push(Number(m[1]) === 0 ? "止める発話はありませんでした" : `${m[1]}件の発話を止めました`);
+  const tail = m[2] ?? "";
+  const audio = /(?:^| )audio_stop=(\S+)/.exec(tail);
+  const reset = /(?:^| )avatar_reset=(ok|failed)(?: |$)/.exec(tail);
+  if (audio !== null) parts.push(audioStopText(audio[1] ?? "") ?? `音声: ${audio[1]}`);
+  if (reset !== null) parts.push(reset[1] === "ok" ? "アバターを戻しました" : "アバターを戻せませんでした");
+  return { text: parts.length === 0 ? `${name}しました` : `${name}しました(${parts.join("、")})`, raw };
+}
+
+export type ConnectionKind =
+  | { kind: "connecting" }
+  | { kind: "connected" }
+  | { kind: "reconnecting" }
+  | { kind: "lost" }
+  | { kind: "no-token" }
+  | { kind: "mismatch" }
+  | { kind: "http-error"; status: number };
+
+/** The connection line: connecting, connected and reconnecting stay distinct. */
+export function connectionText(c: ConnectionKind): string {
+  switch (c.kind) {
+    case "connecting":
+      return "接続しています…";
+    case "connected":
+      return "接続済み";
+    case "reconnecting":
+      return "再接続中…(アプリが終了した可能性があります)";
+    case "lost":
+      return "切断されました(アプリを再起動して、aivtuber-setup start が表示した新しいURLを開いてください)";
+    case "no-token":
+      return "切断されました(トークンがありません。aivtuber-setup start が表示したURLをそのまま開いてください)";
+    case "mismatch":
+      return "この画面とバージョンが合いません(ページを再読み込みしてください)";
+    case "http-error":
+      return `再接続中…(応答エラー ${Number.isFinite(c.status) ? Math.trunc(c.status) : 0})`;
+  }
 }

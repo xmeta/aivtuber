@@ -44,6 +44,12 @@ import {
   safeAvatarUrl,
   searchPageCount,
   statusRows,
+  shouldReloadForHash,
+  MAX_HOST_TEXT_CHARS,
+  avatarLinkState,
+  connectionText,
+  controlResultText,
+  reasonText,
   tokenFromHash,
   tuningPatch,
   voiceView,
@@ -940,5 +946,91 @@ describe("thinking usage (#367)", () => {
     expect(tripped.cap).toContain("上限 $0.0120 に達したため");
     expect(tripped.cap).toContain("定型の返し");
     expect(tripped.health).toBe("warn");
+  });
+});
+
+// ---- First-run wording (#384) ----
+describe("reasonText", () => {
+  test("maps the avatar renderer states the host reports", () => {
+    expect(reasonText("Unavailable: local avatar renderer is Disconnected")).toBe("アバター画面が開かれていません");
+    expect(reasonText("Unavailable: local avatar renderer is Handshaking")).toContain("接続しています");
+    expect(reasonText("Unavailable: local avatar renderer is Degraded")).toContain("遅れ");
+    expect(avatarLinkState("Unavailable: local avatar renderer is Disconnected")).toBe("disconnected");
+    expect(avatarLinkState("Unavailable: local avatar renderer is Ready")).toBe("none");
+    expect(avatarLinkState(null)).toBe("none");
+  });
+  test("maps the stable audio messages", () => {
+    expect(reasonText("Unavailable: audio output busy ending playback")).toContain("音声を止めている");
+    expect(reasonText("audio stop did not complete within its bound")).toContain("確認できません");
+  });
+  test("unknown text passes through, empty stays empty, long text is bounded", () => {
+    expect(reasonText("ffplay missing")).toBe("ffplay missing");
+    expect(reasonText("")).toBe("");
+    expect(reasonText(null)).toBe("");
+    const long = reasonText("x".repeat(50_000));
+    expect(long.length).toBeLessThanOrEqual(MAX_HOST_TEXT_CHARS + 1);
+    expect(avatarLinkState("y".repeat(50_000) + "local avatar renderer is Disconnected")).toBe("none");
+  });
+  test("statusRows translates the avatar row and keeps the raw text", () => {
+    const row = statusRows(
+      state({ status: { ...state()!.status, avatar_error: "Unavailable: local avatar renderer is Disconnected" } })!,
+    ).find((r) => r.label === "アバター");
+    expect(row?.value).toBe("アバター画面が開かれていません");
+    expect(row?.raw).toBe("Unavailable: local avatar renderer is Disconnected");
+    expect(row?.health).toBe("warn");
+  });
+});
+
+describe("controlResultText", () => {
+  test("stop with audio and avatar detail", () => {
+    const r = controlResultText("stop", true, "stopped 2 items; audio_stop=hard_stopped avatar_reset=ok", 200);
+    expect(r.text).toBe("停止しました(2件の発話を止めました、音声を止めました、アバターを戻しました)");
+    expect(r.raw).toBe("stopped 2 items; audio_stop=hard_stopped avatar_reset=ok");
+  });
+  test("each audio token and a failed reset", () => {
+    expect(controlResultText("stop", true, "stopped 0 items; audio_stop=nothing_playing avatar_reset=failed", 200).text).toBe(
+      "停止しました(止める発話はありませんでした、再生中の音声はありませんでした、アバターを戻せませんでした)",
+    );
+    expect(controlResultText("stop", true, "stopped 1 items; audio_stop=faded_40ms avatar_reset=ok", 200).text).toContain("フェード");
+    expect(controlResultText("stop", true, "stopped 1 items; audio_stop=unsupported avatar_reset=ok", 200).text).toContain("対応していません");
+    expect(controlResultText("stop", true, "stopped 1 items; audio_stop=unconfirmed avatar_reset=ok", 200).text).toContain("確認できません");
+  });
+  test("mute, unknown token and unknown detail", () => {
+    expect(controlResultText("mute", true, "muted; audio_stop=hard_stopped avatar_reset=ok", 200).text).toBe(
+      "ミュートしました(音声を止めました、アバターを戻しました)",
+    );
+    expect(controlResultText("mute", true, "muted", 200).text).toBe("ミュートしました");
+    expect(controlResultText("stop", true, "stopped 1 items; audio_stop=weird avatar_reset=ok", 200).text).toContain("音声: weird");
+    expect(controlResultText("stop", true, "something new", 200).text).toBe("停止しました: something new");
+    expect(controlResultText("stop", true, "stopped 1 items; audio_stop=__proto__ avatar_reset=ok", 200).text).toContain("音声: __proto__");
+  });
+  test("failure, missing and oversized detail never throw", () => {
+    expect(controlResultText("stop", false, "rejected: nope", 200).text).toBe("失敗しました: rejected: nope");
+    expect(controlResultText("stop", false, undefined, 500).text).toBe("失敗しました (500)");
+    expect(controlResultText("stop", true, 42, 200).text).toBe("停止しました");
+    expect(controlResultText("stop", true, "z".repeat(100_000), 200).text.length).toBeLessThan(MAX_HOST_TEXT_CHARS + 20);
+  });
+});
+
+describe("connectionText", () => {
+  test("connected, connecting and lost are distinct", () => {
+    const texts = (["connecting", "connected", "reconnecting", "lost", "no-token", "mismatch"] as const).map((kind) => connectionText({ kind }));
+    expect(new Set(texts).size).toBe(texts.length);
+    expect(connectionText({ kind: "connected" })).toBe("接続済み");
+    expect(connectionText({ kind: "reconnecting" })).toContain("再接続中");
+    expect(connectionText({ kind: "lost" })).toContain("切断されました");
+    expect(connectionText({ kind: "http-error", status: 502 })).toContain("502");
+    expect(connectionText({ kind: "http-error", status: Number.NaN })).toContain("0");
+  });
+});
+
+describe("shouldReloadForHash", () => {
+  test("reloads only for a well-formed token fragment", () => {
+    expect(shouldReloadForHash("#token=" + "cd".repeat(32))).toBe(true);
+    expect(shouldReloadForHash("")).toBe(false);
+    expect(shouldReloadForHash("#")).toBe(false);
+    expect(shouldReloadForHash("#token=")).toBe(false);
+    expect(shouldReloadForHash("#token=short")).toBe(false);
+    expect(shouldReloadForHash("#x=1&token=" + "cd".repeat(32))).toBe(false);
   });
 });

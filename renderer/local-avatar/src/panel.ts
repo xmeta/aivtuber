@@ -13,6 +13,10 @@ import {
   avatarView,
   checkChat,
   checkVrmFile,
+  type ConnectionKind,
+  avatarLinkState,
+  connectionText,
+  controlResultText,
   chatIngressView,
   connectBody,
   checkCredit,
@@ -31,6 +35,7 @@ import {
   repliesFor,
   safeAvatarUrl,
   searchPageCount,
+  shouldReloadForHash,
   statusRows,
   tokenFromHash,
   tuningPatch,
@@ -47,7 +52,8 @@ history.replaceState(null, "", location.pathname);
 
 let state: PanelState | null = null;
 let chat: ChatEntry[] = [];
-let connection = "接続中…";
+let connection: ConnectionKind = { kind: "connecting" };
+let focusedChat = false;
 let connectionLost = false;
 let pollTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -83,8 +89,29 @@ async function api(path: string, init?: { method: "POST"; body?: string }): Prom
   }
 }
 
+// A settings section that reports a problem or waits for a decision opens once;
+// after that the operator's own open/close choice is respected.
+const autoOpened = new Set<string>();
+function openForAttention(): void {
+  const needs: [string, string[]][] = [
+    ["avatar-section", ["avatar-error", "avatar-mismatch"]],
+    ["voice-section", ["voice-error"]],
+    ["ingress-section", ["ingress-error"]],
+  ];
+  for (const [id, errors] of needs) {
+    const section = $<HTMLDetailsElement>(id);
+    const attention = errors.some((e) => $(e).textContent !== "") || (id === "avatar-section" && !$("avatar-pending").hidden);
+    if (attention && !section.hidden && !autoOpened.has(id)) {
+      autoOpened.add(id);
+      section.open = true;
+    }
+  }
+}
+
 function render(): void {
-  $("connection").textContent = connection;
+  const conn = $("connection");
+  conn.textContent = connectionText(connection);
+  conn.className = `conn ${connection.kind === "connected" ? "ok" : connection.kind === "connecting" || connection.kind === "reconnecting" || connection.kind === "http-error" ? "warn" : "bad"}`;
   const rows = $("status");
   rows.replaceChildren();
   if (state !== null) {
@@ -95,7 +122,9 @@ function render(): void {
       label.className = "label";
       label.textContent = row.label;
       const value = document.createElement("span");
+      value.className = "value";
       value.textContent = row.value;
+      if (row.raw !== undefined) value.title = row.raw;
       item.append(label, value);
       rows.append(item);
     }
@@ -107,8 +136,19 @@ function render(): void {
   renderAvatar();
   const link = $<HTMLAnchorElement>("avatar-link");
   const url = safeAvatarUrl(state?.avatar_url);
-  link.hidden = url === null;
+  // Renderer not connected yet: the first step gets a prominent button near the top.
+  const needsAvatar = url !== null && avatarLinkState(state?.status.avatar_error) === "disconnected";
+  link.hidden = url === null || needsAvatar;
   if (url !== null) link.href = url;
+  const cta = $<HTMLAnchorElement>("avatar-cta");
+  $("avatar-cta-wrap").hidden = !needsAvatar;
+  if (url !== null) cta.href = url;
+  openForAttention();
+  if (!focusedChat && connection.kind === "connected") {
+    // First connected render: the chat box is the first thing a new user needs.
+    focusedChat = true;
+    $("chat-input").focus();
+  }
 
   const log = $("chat-log");
   log.replaceChildren();
@@ -701,20 +741,20 @@ async function poll(): Promise<void> {
       clearInterval(pollTimer);
       connectionLost = true;
       setBusy(true);
-      connection = "トークンが無効です。aivtuber-setup start が表示したURLを開き直してください";
+      connection = { kind: "lost" };
     } else if (status === 200) {
       const next = parseState(json);
       if (next === null) {
-        connection = "この画面とバージョンが合いません(ページを再読み込みしてください)";
+        connection = { kind: "mismatch" };
       } else {
         state = next;
-        connection = "接続中";
+        connection = { kind: "connected" };
       }
     } else {
-      connection = `応答エラー (${status})`;
+      connection = { kind: "http-error", status };
     }
   } catch {
-    connection = "アプリに接続できません(終了した可能性があります)";
+    connection = { kind: "reconnecting" };
   }
   render();
 }
@@ -755,15 +795,25 @@ async function control(action: "stop" | "mute"): Promise<void> {
   try {
     const { status, json } = await api(`/api/${action}`, { method: "POST", body: "{}" });
     const body = (json ?? {}) as { ok?: boolean; detail?: string };
-    $("control-result").textContent =
-      status === 200 && body.ok ? `${action === "stop" ? "停止" : "ミュート"}しました: ${body.detail}` : `失敗しました: ${body.detail ?? status}`;
+    const shown = controlResultText(action, status === 200 && body.ok === true, body.detail, status);
+    const out = $("control-result");
+    out.textContent = shown.text;
+    out.title = shown.raw;
   } catch {
     $("control-result").textContent = "失敗しました(アプリに接続できません)";
+    $("control-result").title = "";
   } finally {
     setBusy(false);
     void poll();
   }
 }
+
+// Pasting a new launch URL into this same tab only changes the fragment, so the
+// browser would not reload and the old in-memory secret would stay. Reload so the
+// one load path above reads the new token and scrubs the address bar again.
+window.addEventListener("hashchange", () => {
+  if (shouldReloadForHash(location.hash)) location.reload();
+});
 
 $("send").addEventListener("click", () => void send());
 $("chat-input").addEventListener("keydown", (event) => {
@@ -807,7 +857,7 @@ $("stop").addEventListener("click", () => void control("stop"));
 $("mute").addEventListener("click", () => void control("mute"));
 
 if (token === null) {
-  connection = "トークンがありません。aivtuber-setup start が表示したURLをそのまま開いてください";
+  connection = { kind: "no-token" };
   connectionLost = true;
   setBusy(true);
   render();
