@@ -13,6 +13,7 @@ mod chat_target;
 mod hindsight;
 mod http;
 mod local_avatar;
+pub mod log_verbosity;
 mod mcp;
 mod obs;
 mod openai;

@@ -890,6 +890,7 @@ fn start_with_a_hybrid_env_file_plans_no_llama_server() {
     let code = aivtuber_setup::start::start(&aivtuber_setup::start::StartOptions {
         env_file: o.env_file.clone(),
         dry_run: true,
+        verbose: false,
         health_timeout: Duration::from_secs(1),
     })
     .unwrap();

@@ -10,7 +10,7 @@
 //! start-up.
 //!
 //! Policy, as for STT: the first failure is final and there is no automatic
-//! restart (a restart is an operator decision); the child gets no `AIVTUBER_*`
+//! restart (a restart is an operator decision); the child gets no `AIVTUBER_*` (except a normalized `AIVTUBER_LOG=quiet`, #391)
 //! environment; the engine libraries beside the program are checked against
 //! their SHA-256 pins *before* the program is spawned; and the child exits by
 //! itself when the app goes away (its stdin, held open here, reaches EOF).
@@ -150,6 +150,8 @@ impl TtsSidecar {
                 command.env_remove(key);
             }
         }
+        // The one non-secret exception: the normalized quiet switch (#391).
+        crate::log_verbosity::forward_to_child(&mut command);
         let mut child = command
             .spawn()
             .map_err(|error| format!("tts sidecar {}: {error}", config.program.display()))?;

@@ -10,7 +10,7 @@
 //!                         [--skip steps] [--root DIR] [--assets DIR] [--env-file FILE]
 //!                         [--from-target CARGO_TARGET_DIR]
 //!                         (the OpenRouter key is read from OPENROUTER_API_KEY or a hidden prompt)
-//!   aivtuber-setup start [--env-file FILE] [--dry-run]
+//!   aivtuber-setup start [--env-file FILE] [--dry-run] [--verbose]
 //!
 //! Exit codes: 0 success, 1 a step failed (the message says which and how to
 //! fix it), 2 bad arguments.
@@ -143,6 +143,10 @@ struct StartArgs {
     /// Print what would run and stop.
     #[arg(long)]
     dry_run: bool,
+    /// Print every diagnostic line the app writes (by default `start` hides periodic
+    /// measurement lines; sets AIVTUBER_LOG=verbose for the app).
+    #[arg(long)]
+    verbose: bool,
 }
 
 fn program_dir() -> Result<PathBuf, String> {
@@ -259,6 +263,7 @@ fn run_start(args: StartArgs) -> Result<i32, String> {
     start::start(&StartOptions {
         env_file,
         dry_run: args.dry_run,
+        verbose: args.verbose,
         health_timeout: Duration::from_secs(180),
     })
 }

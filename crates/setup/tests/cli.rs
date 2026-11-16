@@ -231,6 +231,14 @@ fn offline_with_nothing_fetched_fails_closed() {
 }
 
 #[test]
+fn start_help_lists_verbose() {
+    let o = run(&["start", "--help"]);
+    assert!(o.status.success());
+    let t = text(&o);
+    assert!(t.contains("--verbose") && t.contains("AIVTUBER_LOG"), "{t}");
+}
+
+#[test]
 fn start_without_an_env_file_says_to_run_setup_first() {
     let root = fake_release("cli-start");
     let o = run(&[
