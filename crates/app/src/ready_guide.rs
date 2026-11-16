@@ -28,6 +28,13 @@ pub fn ready_lines(panel_running: bool) -> Vec<&'static str> {
     lines
 }
 
+/// Whether the `thinking: endpoint=... wire=... data_collection=...` line is
+/// printed. Quiet hides it only for a loopback endpoint; when Thinking leaves
+/// the machine the line is privacy-relevant and always printed.
+pub fn thinking_line_visible(diagnostics: bool, endpoint_is_loopback: bool) -> bool {
+    diagnostics || !endpoint_is_loopback
+}
+
 /// The warm-up line under the current verbosity: the original line when
 /// verbose; in quiet the bilingual note for `started` and nothing for `ok`
 /// (a failure or skip is always printed unchanged).
@@ -71,6 +78,14 @@ mod tests {
         let lines = ready_lines(false);
         assert_eq!(lines, vec![DISCLOSURE_REMINDER]);
         assert!(ready_lines(true).contains(&PANEL_HINT));
+    }
+
+    #[test]
+    fn the_thinking_line_is_hidden_only_for_loopback_under_quiet() {
+        assert!(!thinking_line_visible(false, true));
+        assert!(thinking_line_visible(false, false));
+        assert!(thinking_line_visible(true, true));
+        assert!(thinking_line_visible(true, false));
     }
 
     #[test]

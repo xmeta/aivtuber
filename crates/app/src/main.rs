@@ -1795,9 +1795,11 @@ fn build_generative_runtime(
         openrouter_preset_active(&|name| env_optional(name)),
         egress_host_env.as_deref(),
     )?;
+    let thinking_endpoint_is_loopback =
+        verify_loopback_endpoint(&thinking_config.endpoint, &resolver).is_ok();
     let thinking_egress_host = profile.validate_thinking_endpoint(
         &thinking_config.endpoint,
-        verify_loopback_endpoint(&thinking_config.endpoint, &resolver).is_ok(),
+        thinking_endpoint_is_loopback,
         matches!(thinking_auth, ThinkingAuthentication::Bearer(_)),
         &egress_allowlist,
     )?;
@@ -1871,7 +1873,10 @@ fn build_generative_runtime(
                 .map_or("unset", aivtuber_adapters::DataCollection::label),
         ),
     };
-    if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+    if aivtuber_app::ready_guide::thinking_line_visible(
+        aivtuber_adapters::log_verbosity::diagnostics_enabled(),
+        thinking_endpoint_is_loopback,
+    ) {
         eprintln!(
             "thinking: endpoint={} auth={} backend={}{wire_note}",
             endpoint_origin(thinking.endpoint()),
