@@ -503,7 +503,7 @@ Free text (no `intent`) goes to the local Thinking engine; `"intent":"reaction.a
 
 For a real stream, put chat in front of it with `twitch-chat-ingress` (`docs/production-runtime.adoc`, "Twitch chat sidecar"); it is anonymous and read-only, and a Twitch connection is of course a remote connection, so it is outside the "no network" check below.
 
-*Speech.* Speak into the microphone, or use `--input-wav`. Expect, in the log, `speech_conversation: final chars=N final_age_ms=...` when the app has a transcript and the floor lets the turn through, then `local-tts-sidecar: ok chars=N audio_ms=...` (run `aivtuber-setup start --verbose` to see it), and the avatar's mouth moving while `ffplay` plays the reply.
+*Speech.* Speak into the microphone, or use `--input-wav`. Expect, in the log with `aivtuber-setup start --verbose` (the quiet default hides both lines; a final that was dropped or rejected is always printed), `speech_conversation: final chars=N final_age_ms=...` when the app has a transcript and the floor lets the turn through, then `local-tts-sidecar: ok chars=N audio_ms=...`, and the avatar's mouth moving while `ffplay` plays the reply.
 
 *Emergency stop.* `aivtuberctl` stops or mutes through the authenticated operator endpoint independent of every model path (`docs/production-runtime.adoc`, "Operator control").
 

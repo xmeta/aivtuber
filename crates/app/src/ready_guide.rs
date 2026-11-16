@@ -35,6 +35,20 @@ pub fn thinking_line_visible(diagnostics: bool, endpoint_is_loopback: bool) -> b
     diagnostics || !endpoint_is_loopback
 }
 
+/// Periodic or on-change `*_metrics:` lines (speech floor, conversation,
+/// barge-in, memory writer, ...): hidden under quiet unless one of the line's
+/// drop / error / overflow / expired counters is non-zero, like `panel: refused`.
+/// A line with no such counters passes an empty slice and is hidden.
+pub fn metrics_line_visible(diagnostics: bool, trouble_counters: &[u64]) -> bool {
+    diagnostics || trouble_counters.iter().any(|&count| count != 0)
+}
+
+/// `speech_conversation: final ...`: quiet hides only the normal accepted
+/// outcome (admission Queued); a drop or a route error stays printed.
+pub fn final_line_visible(diagnostics: bool, accepted_normally: bool) -> bool {
+    diagnostics || !accepted_normally
+}
+
 /// The warm-up line under the current verbosity: the original line when
 /// verbose; in quiet the bilingual note for `started` and nothing for `ok`
 /// (a failure or skip is always printed unchanged).
@@ -86,6 +100,28 @@ mod tests {
         assert!(thinking_line_visible(false, false));
         assert!(thinking_line_visible(true, true));
         assert!(thinking_line_visible(true, false));
+    }
+
+    #[test]
+    fn floor_and_conversation_metrics_print_under_quiet_only_with_trouble() {
+        // speech_floor_metrics: [dropped_expired, dropped_overflow]
+        assert!(!metrics_line_visible(false, &[0, 0]));
+        assert!(metrics_line_visible(false, &[0, 2]));
+        // speech_conversation_metrics: [oversize, blank, runtime, route_errors]
+        assert!(!metrics_line_visible(false, &[0, 0, 0, 0]));
+        assert!(metrics_line_visible(false, &[0, 0, 1, 0]));
+        // No trouble counters at all (memory_falsifier_metrics): hidden.
+        assert!(!metrics_line_visible(false, &[]));
+        // Verbose always prints.
+        assert!(metrics_line_visible(true, &[0, 0]));
+        assert!(metrics_line_visible(true, &[]));
+    }
+
+    #[test]
+    fn a_normal_accepted_final_is_hidden_under_quiet_only() {
+        assert!(!final_line_visible(false, true));
+        assert!(final_line_visible(false, false));
+        assert!(final_line_visible(true, true));
     }
 
     #[test]

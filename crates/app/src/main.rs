@@ -1066,6 +1066,15 @@ fn run() -> Result<(), Box<dyn Error>> {
                     .and_then(serde_json::Value::as_str)
                     .map_or(0, |text| text.chars().count());
                 match &report.result {
+                    // Quiet hides the normal accepted outcome only.
+                    Ok(outcome)
+                        if !aivtuber_app::ready_guide::final_line_visible(
+                            aivtuber_adapters::log_verbosity::diagnostics_enabled(),
+                            matches!(
+                                outcome.admission,
+                                aivtuber_runtime::ContentAdmitDecision::Queued
+                            ),
+                        ) => {}
                     Ok(outcome) => eprintln!(
                         "speech_conversation: final chars={chars} final_age_ms={} route_micros={} admission={:?} playback={}",
                         report.final_age_ms,
@@ -1131,15 +1140,25 @@ fn run() -> Result<(), Box<dyn Error>> {
             if let Some(metrics) = app.speech_conversation_metrics()
                 && metrics != last_conversation_metrics
             {
-                eprintln!(
-                    "speech_conversation_metrics: finals={} admitted={} dropped_oversize={} dropped_blank={} dropped_by_runtime={} route_errors={}",
-                    metrics.finals_seen,
-                    metrics.admitted,
-                    metrics.dropped_oversize,
-                    metrics.dropped_blank,
-                    metrics.dropped_by_runtime,
-                    metrics.route_errors
-                );
+                if aivtuber_app::ready_guide::metrics_line_visible(
+                    aivtuber_adapters::log_verbosity::diagnostics_enabled(),
+                    &[
+                        metrics.dropped_oversize,
+                        metrics.dropped_blank,
+                        metrics.dropped_by_runtime,
+                        metrics.route_errors,
+                    ],
+                ) {
+                    eprintln!(
+                        "speech_conversation_metrics: finals={} admitted={} dropped_oversize={} dropped_blank={} dropped_by_runtime={} route_errors={}",
+                        metrics.finals_seen,
+                        metrics.admitted,
+                        metrics.dropped_oversize,
+                        metrics.dropped_blank,
+                        metrics.dropped_by_runtime,
+                        metrics.route_errors
+                    );
+                }
                 last_conversation_metrics = metrics;
             }
             if let Some(metrics) = app.speech_floor_metrics()
@@ -1148,38 +1167,52 @@ fn run() -> Result<(), Box<dyn Error>> {
                     || metrics.dropped_expired != last_floor_metrics.dropped_expired
                     || metrics.dropped_overflow != last_floor_metrics.dropped_overflow)
             {
-                eprintln!(
-                    "speech_floor_metrics: decisions={} take_turn={} wait={} hold={} yield_recorded={} fallback_take_turn={} deferred={} released={} dropped_expired={} dropped_overflow={} queued={}",
-                    metrics.policy.decisions,
-                    metrics.policy.take_turn,
-                    metrics.policy.wait,
-                    metrics.policy.hold,
-                    metrics.policy.yielded,
-                    metrics.policy.fallback_take_turn,
-                    metrics.deferred,
-                    metrics.released_after_deferral,
-                    metrics.dropped_expired,
-                    metrics.dropped_overflow,
-                    metrics.queued
-                );
+                if aivtuber_app::ready_guide::metrics_line_visible(
+                    aivtuber_adapters::log_verbosity::diagnostics_enabled(),
+                    &[metrics.dropped_expired, metrics.dropped_overflow],
+                ) {
+                    eprintln!(
+                        "speech_floor_metrics: decisions={} take_turn={} wait={} hold={} yield_recorded={} fallback_take_turn={} deferred={} released={} dropped_expired={} dropped_overflow={} queued={}",
+                        metrics.policy.decisions,
+                        metrics.policy.take_turn,
+                        metrics.policy.wait,
+                        metrics.policy.hold,
+                        metrics.policy.yielded,
+                        metrics.policy.fallback_take_turn,
+                        metrics.deferred,
+                        metrics.released_after_deferral,
+                        metrics.dropped_expired,
+                        metrics.dropped_overflow,
+                        metrics.queued
+                    );
+                }
                 last_floor_metrics = metrics;
             }
             if let Some(metrics) = app.speech_barge_in_metrics()
                 && metrics != last_barge_in_metrics
             {
-                eprintln!(
-                    "speech_barge_in_metrics: confirmed={} stopped={} nothing_to_stop={} audio_faded={} audio_hard_stopped={} audio_stop_unsupported={} audio_stop_errors={} avatar_resets={} avatar_reset_errors={} max_decision_to_stop_micros={}",
-                    metrics.confirmed,
-                    metrics.stopped,
-                    metrics.nothing_to_stop,
-                    metrics.audio_faded,
-                    metrics.audio_hard_stopped,
-                    metrics.audio_stop_unsupported,
-                    metrics.audio_stop_errors,
-                    metrics.avatar_resets,
-                    metrics.avatar_reset_errors,
-                    metrics.max_decision_to_stop_micros
-                );
+                if aivtuber_app::ready_guide::metrics_line_visible(
+                    aivtuber_adapters::log_verbosity::diagnostics_enabled(),
+                    &[
+                        metrics.audio_stop_unsupported,
+                        metrics.audio_stop_errors,
+                        metrics.avatar_reset_errors,
+                    ],
+                ) {
+                    eprintln!(
+                        "speech_barge_in_metrics: confirmed={} stopped={} nothing_to_stop={} audio_faded={} audio_hard_stopped={} audio_stop_unsupported={} audio_stop_errors={} avatar_resets={} avatar_reset_errors={} max_decision_to_stop_micros={}",
+                        metrics.confirmed,
+                        metrics.stopped,
+                        metrics.nothing_to_stop,
+                        metrics.audio_faded,
+                        metrics.audio_hard_stopped,
+                        metrics.audio_stop_unsupported,
+                        metrics.audio_stop_errors,
+                        metrics.avatar_resets,
+                        metrics.avatar_reset_errors,
+                        metrics.max_decision_to_stop_micros
+                    );
+                }
                 last_barge_in_metrics = metrics;
             }
             let projection_metrics = app.speech_projection_metrics();
@@ -1197,35 +1230,50 @@ fn run() -> Result<(), Box<dyn Error>> {
             if let Some(metrics) = app.memory_writer_metrics()
                 && metrics != last_memory_writer_metrics
             {
-                eprintln!(
-                    "memory_writer_metrics: considered={} written={} retrieved_used={} expired={} removed_early={} live={} rejected_viewer_attributed={} rejected_oversize={} rejected_quota={} rejected_duplicate={} rejected_gate={} rejected_store={}",
-                    metrics.texts_considered,
-                    metrics.written,
-                    metrics.retrieved_used,
-                    metrics.expired,
-                    metrics.removed_early,
-                    metrics.live,
-                    metrics.rejected_viewer_attributed,
-                    metrics.rejected_oversize,
-                    metrics.rejected_quota,
-                    metrics.rejected_duplicate,
-                    metrics.rejected_gate,
-                    metrics.rejected_store
-                );
+                if aivtuber_app::ready_guide::metrics_line_visible(
+                    aivtuber_adapters::log_verbosity::diagnostics_enabled(),
+                    &[
+                        metrics.expired,
+                        metrics.rejected_viewer_attributed,
+                        metrics.rejected_oversize,
+                        metrics.rejected_quota,
+                        metrics.rejected_duplicate,
+                        metrics.rejected_gate,
+                        metrics.rejected_store,
+                    ],
+                ) {
+                    eprintln!(
+                        "memory_writer_metrics: considered={} written={} retrieved_used={} expired={} removed_early={} live={} rejected_viewer_attributed={} rejected_oversize={} rejected_quota={} rejected_duplicate={} rejected_gate={} rejected_store={}",
+                        metrics.texts_considered,
+                        metrics.written,
+                        metrics.retrieved_used,
+                        metrics.expired,
+                        metrics.removed_early,
+                        metrics.live,
+                        metrics.rejected_viewer_attributed,
+                        metrics.rejected_oversize,
+                        metrics.rejected_quota,
+                        metrics.rejected_duplicate,
+                        metrics.rejected_gate,
+                        metrics.rejected_store
+                    );
+                }
                 last_memory_writer_metrics = metrics;
             }
             let falsifier = app.memory_falsifier_metrics();
             if falsifier != last_memory_falsifier_metrics {
-                eprintln!(
-                    "memory_falsifier_metrics: seed_entries_loaded={} requests_with_memory={} seed_used={} writer_used_reproducible_from_seed={} writer_only_used={} requests_with_writer_only={} exports={}",
-                    falsifier.seed_entries_loaded,
-                    falsifier.requests_with_memory,
-                    falsifier.seed_used,
-                    falsifier.writer_used_reproducible_from_seed,
-                    falsifier.writer_only_used,
-                    falsifier.requests_with_writer_only,
-                    falsifier.exports
-                );
+                if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+                    eprintln!(
+                        "memory_falsifier_metrics: seed_entries_loaded={} requests_with_memory={} seed_used={} writer_used_reproducible_from_seed={} writer_only_used={} requests_with_writer_only={} exports={}",
+                        falsifier.seed_entries_loaded,
+                        falsifier.requests_with_memory,
+                        falsifier.seed_used,
+                        falsifier.writer_used_reproducible_from_seed,
+                        falsifier.writer_only_used,
+                        falsifier.requests_with_writer_only,
+                        falsifier.exports
+                    );
+                }
                 last_memory_falsifier_metrics = falsifier;
             }
             let phrase_metrics = app.phrase_metrics();
