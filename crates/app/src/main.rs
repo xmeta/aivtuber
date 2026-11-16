@@ -1194,14 +1194,19 @@ fn run() -> Result<(), Box<dyn Error>> {
                 && (metrics.policy != last_floor_metrics.policy
                     || metrics.deferred != last_floor_metrics.deferred
                     || metrics.dropped_expired != last_floor_metrics.dropped_expired
-                    || metrics.dropped_overflow != last_floor_metrics.dropped_overflow)
+                    || metrics.dropped_overflow != last_floor_metrics.dropped_overflow
+                    || metrics.dropped_by_operator != last_floor_metrics.dropped_by_operator)
             {
                 if aivtuber_app::ready_guide::metrics_line_visible(
                     aivtuber_adapters::log_verbosity::diagnostics_enabled(),
-                    &[metrics.dropped_expired, metrics.dropped_overflow],
+                    &[
+                        metrics.dropped_expired,
+                        metrics.dropped_overflow,
+                        metrics.dropped_by_operator,
+                    ],
                 ) {
                     eprintln!(
-                        "speech_floor_metrics: decisions={} take_turn={} wait={} hold={} yield_recorded={} fallback_take_turn={} deferred={} released={} dropped_expired={} dropped_overflow={} queued={}",
+                        "speech_floor_metrics: decisions={} take_turn={} wait={} hold={} yield_recorded={} fallback_take_turn={} deferred={} released={} dropped_expired={} dropped_overflow={} dropped_by_operator={} queued={}",
                         metrics.policy.decisions,
                         metrics.policy.take_turn,
                         metrics.policy.wait,
@@ -1212,6 +1217,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         metrics.released_after_deferral,
                         metrics.dropped_expired,
                         metrics.dropped_overflow,
+                        metrics.dropped_by_operator,
                         metrics.queued
                     );
                 }

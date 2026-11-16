@@ -2168,8 +2168,8 @@ where
     /// and the barge-in run that was already handled. After this nobody holds
     /// the floor or counts as speaking, no barge-in can be confirmed from
     /// stale edges (it needs a fresh heartbeat), and a final the floor was
-    /// still deferring is released at the next [`Self::route_spoken_finals`]
-    /// (no evidence means the text-only path, which takes the turn at once).
+    /// still deferring is discarded (counted `dropped_by_operator`): nothing
+    /// heard before the switch is answered or sent to a model afterwards.
     /// It fabricates no end-of-speech event.
     pub fn clear_speech_state(&mut self) {
         if let Some(tracker) = self.speech_observations.as_mut() {
@@ -2177,6 +2177,9 @@ where
         }
         if let Some(tracker) = self.speech_transcripts.as_mut() {
             tracker.clear();
+        }
+        if let Some(floor) = self.speech_floor.as_mut() {
+            floor.clear();
         }
         self.speech_feed_heartbeat_ms = None;
         if let Some(barge_in) = self.speech_barge_in.as_mut() {
@@ -10263,65 +10266,67 @@ mod tests {
                         assert!(observe(&r, None)["speaking"].as_bool().expect("bool"));
                     }
 
-                    /// A final the floor was deferring because the user still
-                    /// held the floor is released at the next route, not at the
-                    /// defer limit; what the tracker had not yet handed over is
-                    /// discarded.
+                    /// Speech the floor was holding (and speech the tracker had
+                    /// not yet handed over) is discarded on off: nothing heard
+                    /// before the switch is answered or sent to a model.
                     #[test]
-                    fn a_final_the_floor_was_holding_is_released_at_once_and_nothing_older_is_kept()
-                    {
-                        fn setup(switch_off: bool) -> usize {
-                            let mut app = floor_app(
-                                Some(FloorConfig::default()),
-                                SpeechConversationConfig::default(),
-                                true,
-                            )
-                            .with_speech_input(controller(Some(scratch_file("floor"))));
-                            vad_edge(&mut app, &start_edge(1_000), 1_000);
-                            app.note_speech_feed_heartbeat(1_000);
-                            ingest_final(&mut app, "mic-local", 1, "こんにちは", 900, 1_000);
-                            assert!(app.route_spoken_finals(1_010, 0).is_empty());
-                            assert_eq!(app.speech_floor_metrics().expect("m").queued, 1);
-                            // Not yet handed to the floor when the switch comes.
-                            ingest_final(&mut app, "mic-local", 2, "あとで", 1_020, 1_030);
-                            assert_eq!(
-                                app.speech_transcripts_mut().expect("t").pending_finals(),
-                                1
-                            );
-                            if switch_off {
-                                let response =
-                                    act(&mut app, &operator(), "speech_input.disable", 1_040);
-                                assert!(response.ok, "{response:?}");
-                                assert_eq!(
-                                    app.speech_transcripts_mut().expect("t").pending_finals(),
-                                    0
-                                );
-                            }
-                            let reports = app.route_spoken_finals(1_050, 16);
-                            let texts: Vec<_> = reports
-                                .iter()
-                                .map(|r| r.event.payload["text"].as_str().unwrap_or("").to_owned())
-                                .collect();
-                            if switch_off {
-                                // Only the deferred one (spoken before the
-                                // switch and already past the tracker), now
-                                // promptly; the unclaimed one is gone.
-                                assert_eq!(texts, ["こんにちは"]);
-                                let m = app.speech_floor_metrics().expect("m");
-                                assert_eq!((m.released_after_deferral, m.queued), (1, 0));
-                                assert_eq!(m.dropped_expired, 0);
-                                let t = app.speech_transcripts_mut().expect("t").metrics();
-                                assert_eq!(t.cleared_by_operator, 2, "one speaker, one final");
-                                // Nothing is held after that, however long.
-                                assert!(app.route_spoken_finals(20_000, 32).is_empty());
-                            } else {
-                                // Control: still held for the speaker.
-                                assert!(texts.is_empty(), "{texts:?}");
-                            }
-                            reports.len()
+                    fn speech_held_by_the_floor_is_discarded_when_voice_input_is_switched_off() {
+                        let mut app = floor_app(
+                            Some(FloorConfig::default()),
+                            SpeechConversationConfig::default(),
+                            true,
+                        )
+                        .with_speech_input(controller(Some(scratch_file("floor"))));
+                        vad_edge(&mut app, &start_edge(1_000), 1_000);
+                        app.note_speech_feed_heartbeat(1_000);
+                        ingest_final(&mut app, "mic-local", 1, "こんにちは", 900, 1_000);
+                        assert!(app.route_spoken_finals(1_010, 0).is_empty());
+                        assert_eq!(app.speech_floor_metrics().expect("m").queued, 1);
+                        // Not yet handed to the floor when the switch comes.
+                        ingest_final(&mut app, "mic-local", 2, "あとで", 1_020, 1_030);
+                        assert_eq!(app.speech_transcripts_mut().expect("t").pending_finals(), 1);
+                        let content_before = app.security().content_len();
+                        let admitted_before =
+                            app.speech_conversation_metrics().expect("c").admitted;
+
+                        let response = act(&mut app, &operator(), "speech_input.disable", 1_040);
+                        assert!(response.ok, "{response:?}");
+                        let m = app.speech_floor_metrics().expect("m");
+                        assert_eq!((m.queued, m.dropped_by_operator), (0, 1));
+                        assert_eq!((m.released_after_deferral, m.dropped_expired), (0, 0));
+                        let t = app.speech_transcripts_mut().expect("t");
+                        assert_eq!(t.pending_finals(), 0);
+                        assert_eq!(t.metrics().cleared_by_operator, 2, "one speaker, one final");
+
+                        // Not on the next tick, nor after the defer limit.
+                        for now_ms in [1_050, 1_100, 5_000, 20_000] {
+                            assert!(app.route_spoken_finals(now_ms, now_ms).is_empty());
+                            app.tick(now_ms);
                         }
-                        assert_eq!(setup(false), 0);
-                        assert_eq!(setup(true), 1);
+                        // Nothing was admitted to the content path, so no
+                        // Thinking request could have been made for it.
+                        assert_eq!(app.security().content_len(), content_before);
+                        let c = app.speech_conversation_metrics().expect("c");
+                        assert_eq!(c.admitted, admitted_before);
+                        assert_eq!(
+                            app.speech_floor_metrics()
+                                .expect("m")
+                                .released_after_deferral,
+                            0
+                        );
+
+                        // (c) afterwards the stack behaves as with a fresh floor:
+                        // a new utterance (segment numbers start over) is
+                        // routed as before.
+                        ingest_final(&mut app, "mic-local", 1, "もう一度", 20_100, 20_110);
+                        let reports = app.route_spoken_finals(20_120, 99);
+                        let texts: Vec<_> = reports
+                            .iter()
+                            .map(|r| r.event.payload["text"].as_str().unwrap_or("").to_owned())
+                            .collect();
+                        assert_eq!(texts, ["もう一度"]);
+                        let m = app.speech_floor_metrics().expect("m");
+                        assert_eq!((m.queued, m.dropped_by_operator), (0, 1));
                     }
 
                     #[test]
