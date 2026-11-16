@@ -52,6 +52,48 @@ pub(crate) fn write_model_settings(path: &Path, alias: &str) -> std::io::Result<
     })
 }
 
+/// What follows a switch once the adapter names the new model (issue #365).
+/// Typed so that "no warm-up" is a decision made where the switcher is built,
+/// not a side effect of some other setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwitchWarmup {
+    /// A local server loads weights on demand: run the Thinking warm-up for
+    /// the new model and only then call the switch done.
+    Probe,
+    /// A remote provider (OpenRouter) has nothing to load, and a warm-up is a
+    /// paid call: the switch is complete as soon as the request model changes.
+    /// A bad model id surfaces as an ordinary typed Thinking failure on the
+    /// next reply, never as a spend triggered by the switch itself.
+    Skip,
+}
+
+/// Which warm-up policy a Thinking endpoint gets, or why it cannot be
+/// switched. A local llama-server router is the only endpoint with weights to
+/// load; a Bearer credential names one provider account, so it may be switched
+/// only when the OpenRouter preset says the endpoint is a multi-model router.
+pub fn switch_warmup_for(auth_label: &str, openrouter: bool) -> Result<SwitchWarmup, String> {
+    match (auth_label, openrouter) {
+        ("unauthenticated-loopback", _) => Ok(SwitchWarmup::Probe),
+        ("bearer", true) => Ok(SwitchWarmup::Skip),
+        _ => Err("AIVTUBER_OPENAI_MODEL_CHOICES needs AIVTUBER_OPENAI_AUTH=unauthenticated-loopback (a local llama-server) or AIVTUBER_THINKING_PROVIDER=openrouter".to_owned()),
+    }
+}
+
+/// The remembered alias in `path`, only if the (bounded, well formed) file
+/// names a model that is in `catalog`; anything else is `None` and the
+/// configured model stays.
+pub fn remembered_model(path: &Path, catalog: &ThinkingModelCatalog) -> Option<ThinkingModel> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(aivtuber_domain::MAX_MODEL_SETTINGS_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let alias = aivtuber_domain::parse_model_settings(&bytes)?;
+    catalog.get(&alias).cloned()
+}
+
 /// How the warm-up that follows a switch is run: `true` when the model
 /// answered. Injected so tests need no model server; production runs the
 /// app's own [`crate::thinking_warmup`] against a clone of the adapter.
@@ -130,11 +172,15 @@ impl ModelSwitcher {
         adapter: OpenAiResponsesAdapter,
         settings: Option<PathBuf>,
         warmup_timeout: Duration,
+        warmup: SwitchWarmup,
     ) -> Result<Self, String> {
         let warm_adapter = adapter.clone();
-        let warm: WarmFn = Arc::new(move |timeout| {
-            crate::thinking_warmup::run(&warm_adapter, timeout, &|line| eprintln!("{line}"))
-        });
+        let warm: WarmFn = match warmup {
+            SwitchWarmup::Probe => Arc::new(move |timeout| {
+                crate::thinking_warmup::run(&warm_adapter, timeout, &|line| eprintln!("{line}"))
+            }),
+            SwitchWarmup::Skip => Arc::new(|_| true),
+        };
         Self::with_warmup(catalog, adapter, settings, warmup_timeout, warm)
     }
 
@@ -438,6 +484,164 @@ mod tests {
         assert!(!path.exists());
         // After a failure the operator may try again (here, the same model).
         assert!(s.select("beta").unwrap().starts_with("switching to beta"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Counts every request the adapter would send; replies like a provider.
+    #[derive(Default)]
+    struct CountingTransport(
+        std::sync::atomic::AtomicUsize,
+        std::sync::Mutex<Vec<String>>,
+    );
+
+    impl aivtuber_adapters::JsonHttpTransport for CountingTransport {
+        fn post_json(
+            &self,
+            _endpoint: &str,
+            _bearer_token: Option<&str>,
+            body: &[u8],
+            _timeout: Duration,
+        ) -> Result<aivtuber_adapters::HttpResponse, aivtuber_adapters::HttpTransportError>
+        {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            self.1
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(body).into_owned());
+            Err(aivtuber_adapters::HttpTransportError::Unavailable(
+                "mock".to_owned(),
+            ))
+        }
+    }
+
+    fn remote_adapter(transport: Arc<CountingTransport>) -> OpenAiResponsesAdapter {
+        OpenAiResponsesAdapter::with_transport(
+            OpenAiResponsesConfig {
+                endpoint: "https://openrouter.ai/api/v1/chat/completions".to_owned(),
+                model_alias: "openai/gpt-5-mini".to_owned(),
+                wire: aivtuber_adapters::ThinkingWire::ChatCompletions,
+                ..OpenAiResponsesConfig::default()
+            },
+            aivtuber_adapters::SecretString::new("sk-test".to_owned()),
+            transport,
+        )
+        .unwrap()
+    }
+
+    fn remote_catalog() -> ThinkingModelCatalog {
+        ThinkingModelCatalog::parse_choices(
+            "openai/gpt-5-mini:or,meta-llama/llama-3.3-70b-instruct:free:or-free",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn bearer_endpoints_are_switchable_only_under_the_openrouter_preset() {
+        assert_eq!(
+            switch_warmup_for("unauthenticated-loopback", false),
+            Ok(SwitchWarmup::Probe)
+        );
+        // The llama-server router path is the same with or without the preset flag.
+        assert_eq!(
+            switch_warmup_for("unauthenticated-loopback", true),
+            Ok(SwitchWarmup::Probe)
+        );
+        assert_eq!(switch_warmup_for("bearer", true), Ok(SwitchWarmup::Skip));
+        assert!(switch_warmup_for("bearer", false).is_err());
+    }
+
+    #[test]
+    fn a_remote_switch_changes_only_the_request_model_and_makes_no_call() {
+        let transport = Arc::new(CountingTransport::default());
+        let shared = remote_adapter(Arc::clone(&transport));
+        let mut s = ModelSwitcher::new(
+            remote_catalog(),
+            shared.clone(),
+            None,
+            Duration::from_secs(1),
+            SwitchWarmup::Skip,
+        )
+        .unwrap();
+        assert_eq!(shared.authentication_label(), "bearer");
+        assert!(
+            s.select("meta-llama/llama-3.3-70b-instruct:free")
+                .unwrap()
+                .starts_with("switching to")
+        );
+        wait_for(&mut s, "ready");
+        assert_eq!(
+            shared.active_model().alias,
+            "meta-llama/llama-3.3-70b-instruct:free"
+        );
+        assert_eq!(shared.active_model().version.as_deref(), Some("or-free"));
+        assert_eq!(
+            transport.0.load(Ordering::SeqCst),
+            0,
+            "no paid warm-up call"
+        );
+        // Not in the allowlist (even though well formed): refused, unchanged.
+        for bad in ["openai/gpt-5", "meta-llama/llama-3.3-70b-instruct", "A/b"] {
+            assert!(
+                matches!(s.select(bad), Err(ModelSwitchError::Refused(_))),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            shared.active_model().alias,
+            "meta-llama/llama-3.3-70b-instruct:free"
+        );
+        assert_eq!(transport.0.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_probe_switch_still_calls_the_server_for_the_warm_up() {
+        let transport = Arc::new(CountingTransport::default());
+        let shared = remote_adapter(Arc::clone(&transport));
+        let mut s = ModelSwitcher::new(
+            remote_catalog(),
+            shared.clone(),
+            None,
+            Duration::from_secs(1),
+            SwitchWarmup::Probe,
+        )
+        .unwrap();
+        s.select("meta-llama/llama-3.3-70b-instruct:free").unwrap();
+        // The mock server is down, so the warm-up fails and reverts.
+        wait_for(&mut s, "failed");
+        assert!(transport.0.load(Ordering::SeqCst) >= 1);
+        assert_eq!(shared.active_model().alias, "openai/gpt-5-mini");
+    }
+
+    #[test]
+    fn a_remote_initial_model_must_be_in_the_allowlist() {
+        let transport = Arc::new(CountingTransport::default());
+        let err = ModelSwitcher::new(
+            ThinkingModelCatalog::parse_choices("other/model:v").unwrap(),
+            remote_adapter(transport),
+            None,
+            Duration::from_secs(1),
+            SwitchWarmup::Skip,
+        )
+        .unwrap_err();
+        assert!(err.contains("openai/gpt-5-mini"), "{err}");
+    }
+
+    #[test]
+    fn a_remembered_alias_is_used_only_when_it_is_allowlisted() {
+        let dir = std::env::temp_dir().join(format!("aivtuber-remember-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.json");
+        let catalog = remote_catalog();
+        assert_eq!(remembered_model(&path, &catalog), None);
+        write_model_settings(&path, "meta-llama/llama-3.3-70b-instruct:free").unwrap();
+        assert_eq!(
+            remembered_model(&path, &catalog).map(|m| m.version),
+            Some("or-free".to_owned())
+        );
+        write_model_settings(&path, "some/other-model").unwrap();
+        assert_eq!(remembered_model(&path, &catalog), None);
+        std::fs::write(&path, "x".repeat(600)).unwrap();
+        assert_eq!(remembered_model(&path, &catalog), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

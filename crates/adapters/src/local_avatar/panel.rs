@@ -1217,7 +1217,7 @@ fn search(shared: &Shared, body: &[u8]) -> Response {
 }
 
 /// Parses `{"model": "..."}`. Only the shape of the alias is checked here
-/// (bounded, a-z 0-9 . _ -); the allowlist lives with the composition thread.
+/// (bounded, a-z 0-9 . _ -, optionally vendor/model[:variant]); the allowlist lives with the composition thread.
 fn model_alias(body: &[u8]) -> Result<String, (&'static str, &'static str)> {
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -1691,12 +1691,14 @@ mod tests {
             401
         );
         // A path, markup, an oversized alias, extra fields or a missing field.
-        let long = format!("{{\"model\":\"{}\"}}", "a".repeat(65));
+        let long = format!("{{\"model\":\"{}\"}}", "a".repeat(97));
         for body in [
             "",
             "{}",
             "{\"model\":\"C:\\x.gguf\"}",
             "{\"model\":\"../x\"}",
+            "{\"model\":\"a//b\"}",
+            "{\"model\":\"a:b/c\"}",
             "{\"model\":\"A\"}",
             "{\"model\":\"a\",\"path\":\"/x\"}",
             long.as_str(),

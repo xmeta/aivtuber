@@ -192,6 +192,16 @@ describe("model selector state", () => {
     }
   });
 
+  test("OpenRouter-style ids (vendor/model:variant) are accepted, malformed ones are not", () => {
+    const ok = "meta-llama/llama-3.3-70b-instruct:free";
+    const parsed = parseModelState(model({ active: ok, available: [{ alias: ok, version: "or-free" }] }));
+    expect(parsed?.active).toBe(ok);
+    expect(parseModelState(model({ active: "a".repeat(96), available: [{ alias: "a".repeat(96), version: "v" }] }))).not.toBeNull();
+    for (const bad of ["a//b", "/a", "a/", "a:b:c", "a:b/c", "a/b/c", "A/b", "a".repeat(97)]) {
+      expect(parseModelState(model({ active: bad, available: [{ alias: bad, version: "v" }] }))).toBeNull();
+    }
+  });
+
   test("a malformed selector is dropped without rejecting the whole state", () => {
     const s = withModel({ active: "<script>", available: [] });
     expect(s).not.toBeNull();

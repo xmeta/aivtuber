@@ -13,25 +13,40 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-pub const MAX_THINKING_MODEL_ALIAS_CHARS: usize = 64;
+pub const MAX_THINKING_MODEL_ALIAS_CHARS: usize = 96;
 pub const MAX_THINKING_MODEL_VERSION_CHARS: usize = 32;
 pub const MAX_THINKING_MODEL_CHOICES: usize = 8;
 /// A settings file larger than this is ignored, not read.
 pub const MAX_MODEL_SETTINGS_BYTES: u64 = 512;
 pub const MODEL_SETTINGS_SCHEMA: &str = "local-model-settings/1";
 
-/// Lowercase ASCII letters, digits, `.`, `_` and `-`; starts with a letter or
-/// digit. Narrow on purpose: the alias is sent to the model server and shown
-/// in audit records, so it can never carry markup, paths or control text.
+/// A local alias (`gemma-4-e4b-it-qat`) or an OpenRouter-style id
+/// (`vendor/model[:variant]`, issue #365). Characters are lowercase ASCII
+/// letters, digits, `.`, `_` and `-`, starting with a letter or digit; at most
+/// one `/` (never first or last, no empty segment) and at most one `:` (never
+/// first or last, and after the `/` part when there is one). Narrow on
+/// purpose: the alias is sent to the model server and shown in audit records,
+/// so it can never carry markup, paths or control text.
 pub fn is_valid_model_alias(alias: &str) -> bool {
-    let mut chars = alias.chars();
-    alias.chars().count() <= MAX_THINKING_MODEL_ALIAS_CHARS
-        && chars
-            .next()
-            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-        && alias
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+    if alias.chars().count() > MAX_THINKING_MODEL_ALIAS_CHARS {
+        return false;
+    }
+    let (name, variant) = match alias.split_once(':') {
+        Some((name, variant)) => (name, Some(variant)),
+        None => (alias, None),
+    };
+    let segment_ok = |text: &str| {
+        text.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+            && text.chars().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-')
+            })
+    };
+    let name_ok = match name.split_once('/') {
+        Some((vendor, model)) => segment_ok(vendor) && segment_ok(model),
+        None => segment_ok(name),
+    };
+    // The variant (`free`, `nitro`) cannot contain `/` or `:`.
+    name_ok && variant.is_none_or(segment_ok)
 }
 
 /// Letters, digits, `.`, `_` and `-` (quantization names such as `UD-Q4_K_XL`).
@@ -60,7 +75,7 @@ impl fmt::Display for ThinkingModelError {
         match self {
             Self::InvalidAlias => write!(
                 f,
-                "a model alias is 1..={MAX_THINKING_MODEL_ALIAS_CHARS} characters of a-z, 0-9, '.', '_' or '-'"
+                "a model alias is 1..={MAX_THINKING_MODEL_ALIAS_CHARS} characters of a-z, 0-9, '.', '_' or '-', optionally vendor/model[:variant]"
             ),
             Self::InvalidVersion => write!(
                 f,
@@ -123,14 +138,18 @@ impl ThinkingModelCatalog {
     }
 
     /// `alias:version[,alias:version...]`, the form carried in
-    /// `AIVTUBER_OPENAI_MODEL_CHOICES`.
+    /// `AIVTUBER_OPENAI_MODEL_CHOICES`. The split is on the last `:`.
     pub fn parse_choices(text: &str) -> Result<Self, ThinkingModelError> {
         let models = text
             .split(',')
             .map(|part| {
+                // A version never contains ':' but an alias may (`vendor/m:free`),
+                // so the LAST ':' is always the separator. The version is
+                // therefore required: `vendor/m:free` alone reads as alias
+                // `vendor/m` with version `free`; write `vendor/m:free:v1`.
                 let (alias, version) = part
                     .trim()
-                    .split_once(':')
+                    .rsplit_once(':')
                     .ok_or(ThinkingModelError::MalformedChoice)?;
                 ThinkingModel::new(alias, version)
             })
@@ -208,7 +227,16 @@ mod tests {
 
     #[test]
     fn aliases_are_narrow() {
-        for ok in ["gemma-4-e4b-it-qat", "a", "qwen3.5_4b", &"a".repeat(64)] {
+        for ok in [
+            "gemma-4-e4b-it-qat",
+            "a",
+            "qwen3.5_4b",
+            &"a".repeat(96),
+            "vendor/model:free",
+            "meta-llama/llama-3.3-70b-instruct:free",
+            "a/b:c",
+            "a/b",
+        ] {
             assert!(is_valid_model_alias(ok), "{ok}");
         }
         for bad in [
@@ -216,16 +244,69 @@ mod tests {
             "-x",
             "Gemma",
             "a b",
-            "a/b",
             "..\\x",
             "x\n",
             "モデル",
-            &"a".repeat(65),
+            &"a".repeat(97),
+            "a//b",
+            "/a",
+            "a/",
+            "a/b/c",
+            "a:b:c",
+            "a:b/c",
+            "a:",
+            ":a",
+            "a/:b",
+            "Vendor/model",
+            "a/Model",
+            "a/b:Free",
+            "a/-b",
+            "a/b:-c",
         ] {
             assert!(!is_valid_model_alias(bad), "{bad:?}");
         }
         assert!(is_valid_model_version("UD-Q4_K_XL"));
         assert!(!is_valid_model_version("") && !is_valid_model_version("Q4 K"));
+    }
+
+    #[test]
+    fn choices_accept_openrouter_ids_and_split_on_the_last_colon() {
+        let c = ThinkingModelCatalog::parse_choices(
+            "openai/gpt-5-mini:or,meta-llama/llama-3.3-70b-instruct:free:or-free",
+        )
+        .unwrap();
+        assert_eq!(
+            c.models()[1].alias,
+            "meta-llama/llama-3.3-70b-instruct:free"
+        );
+        assert_eq!(c.models()[1].version, "or-free");
+        assert_eq!(
+            ThinkingModelCatalog::parse_choices(&c.render_choices()).unwrap(),
+            c
+        );
+        // Without a version the variant is read as the version: documented.
+        let m = ThinkingModelCatalog::parse_choices("a/b:free").unwrap();
+        assert_eq!(m.models()[0].alias, "a/b");
+        assert_eq!(
+            ThinkingModelCatalog::parse_choices("a/b:c:d:e"),
+            Err(ThinkingModelError::InvalidAlias)
+        );
+        assert_eq!(
+            ThinkingModelCatalog::parse_choices("A/b:v"),
+            Err(ThinkingModelError::InvalidAlias)
+        );
+        assert_eq!(c.select("openai/gpt-5-mini").unwrap().version, "or");
+        assert_eq!(
+            c.select("openai/other"),
+            Err(ThinkingModelError::NotInstalled)
+        );
+        let long = format!("{}/{}", "a".repeat(40), "b".repeat(40));
+        assert!(is_valid_model_alias(&long));
+        let doc = render_model_settings(&long).unwrap();
+        assert_eq!(parse_model_settings(doc.as_bytes()), Some(long));
+        assert!(render_model_settings(&"a".repeat(97)).is_err());
+        let max = render_model_settings(&"a".repeat(96)).unwrap();
+        assert!((max.len() as u64) < MAX_MODEL_SETTINGS_BYTES);
     }
 
     #[test]
