@@ -29,12 +29,13 @@ use aivtuber_app::{
     RuntimeRetentionPolicy, SHADOW_ORCHESTRATOR_SCHEMA_VERSION, SceneContextService,
     ShadowOrchestratorConfig, ShadowPolicyIdentity, ShadowingRoutePlanner,
     SpeechConversationConfig, SpeechConversationMetrics, SpeechFloorMetrics, SpeechSidecar,
-    SpeechSidecarConfig, SpeechSidecarStats, StreamOutput, TtsSidecarSettings, VOICE_SETTINGS_VAR,
-    VoiceController, VoiceEnvironment, VoicePaths, VoicevoxBridge, VoicevoxSettings,
-    VtsAvatarOutput, VtsPlaybackConfig, WarmupMode, YOUTUBE_API_BASE_VAR, YOUTUBE_KEY_FILE_VAR,
-    apply_dispatched_request, apply_thinking_provider_env, audit_pack_readiness,
-    is_acceptable_api_base, is_valid_key, panel_settings, pump_bounded_records,
-    read_voice_settings, start_thinking_warmup, stt_sidecar_args, warmup_timeout,
+    SpeechSidecarConfig, SpeechSidecarStats, StreamOutput, ThinkingEgressAllowlist,
+    TtsSidecarSettings, VOICE_SETTINGS_VAR, VoiceController, VoiceEnvironment, VoicePaths,
+    VoicevoxBridge, VoicevoxSettings, VtsAvatarOutput, VtsPlaybackConfig, WarmupMode,
+    YOUTUBE_API_BASE_VAR, YOUTUBE_KEY_FILE_VAR, apply_dispatched_request,
+    apply_thinking_provider_env, audit_pack_readiness, is_acceptable_api_base, is_valid_key,
+    openrouter_preset_active, panel_settings, pump_bounded_records, read_voice_settings,
+    start_thinking_warmup, stt_sidecar_args, warmup_timeout,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
@@ -109,12 +110,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     let voicevox_bridge = start_voicevox_bridge(profile, &audio_root, &pack_root)?;
     // #327: optional Aivis Cloud backend (internet egress, explicit opt-in).
     let aivis_bridge = start_aivis_bridge(profile, &audio_root, &pack_root)?;
-    // #220 S2b: optional supervised local TTS sidecar (local profile only).
+    // #220 S2b: optional supervised local TTS sidecar (local and hybrid profiles only).
     let mut tts_sidecar = start_tts_sidecar(profile, &audio_root, &pack_root)?;
     let GenerativeParts {
         runtime: generative_configured,
         model_switcher,
         voice: voice_controller,
+        thinking_egress_host,
         thinking_meter,
     } = build_generative_runtime(
         &compatibility,
@@ -198,7 +200,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                 .as_ref()
                 .is_some_and(|generative| generative.phrase_mode().is_phrased()),
         ),
-    );
+    )
+    .with_thinking_egress_host(thinking_egress_host);
     // #78 S3: the reflex/full profiles already own a semantic index and a Jev
     // adapter; the chat-burst lane may reuse (clones of) them. Local and cached
     // compose neither, so those stay Jev-free.
@@ -206,8 +209,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut chat_jev_adapter: Option<JevAdapter> = None;
     let active_planner: Box<dyn RoutePlanner> = match profile {
         CompositionProfile::Cached => Box::new(IntentRoutePlanner) as Box<dyn RoutePlanner>,
-        // #220 S1: deterministic routing, no decision model, no Jev.
-        CompositionProfile::Local => Box::new(LocalRoutePlanner) as Box<dyn RoutePlanner>,
+        // #220 S1: deterministic routing, no decision model, no Jev. #364: hybrid
+        // composes the same graph; only its Thinking egress policy differs.
+        CompositionProfile::Local | CompositionProfile::Hybrid => {
+            Box::new(LocalRoutePlanner) as Box<dyn RoutePlanner>
+        }
         CompositionProfile::Reflex | CompositionProfile::Full => {
             let semantic_index = build_starter_semantic_index(&compatibility)?;
             chat_score_index = Some(semantic_index.clone());
@@ -368,6 +374,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     // Issue #55 acceptance: startup states the active routing capabilities
     // without leaking secrets.
     eprintln!("{}", startup_summary.log_line());
+    if let Some(notice) = startup_summary.egress_notice() {
+        eprintln!("{notice}");
+    }
     if let Some(line) = shadow_summary {
         eprintln!("{line}");
     }
@@ -1507,9 +1516,9 @@ fn start_tts_sidecar(
     let Some(program) = env_optional("AIVTUBER_TTS_SIDECAR") else {
         return Ok(None);
     };
-    if profile != CompositionProfile::Local {
+    if !profile.local_stack() {
         return Err(
-            "AIVTUBER_TTS_SIDECAR is supported with AIVTUBER_MODE=local only; start the sidecar yourself and point AIVTUBER_TTS_ENDPOINT at it"
+            "AIVTUBER_TTS_SIDECAR is supported with AIVTUBER_MODE=local or hybrid only; start the sidecar yourself and point AIVTUBER_TTS_ENDPOINT at it"
                 .into(),
         );
     }
@@ -1627,6 +1636,9 @@ struct GenerativeParts {
     model_switcher: Option<ModelSwitcher>,
     /// #360: live voice settings.
     voice: Option<VoiceController>,
+    /// #364: the allowlisted remote host Thinking traffic goes to under the
+    /// hybrid profile; `None` when nothing leaves the machine.
+    thinking_egress_host: Option<String>,
     /// #367: Thinking usage totals and the optional spend cap.
     thinking_meter: Option<aivtuber_app::ThinkingMeter>,
 }
@@ -1658,6 +1670,7 @@ fn build_generative_runtime(
             runtime: None,
             model_switcher: None,
             voice: None,
+            thinking_egress_host: None,
             thinking_meter: None,
         });
     }
@@ -1708,18 +1721,31 @@ fn build_generative_runtime(
         (None, Some(bridge)) => bridge.tts_endpoint().to_owned(),
         (None, None) => required_env("AIVTUBER_TTS_ENDPOINT")?,
     };
-    // The loopback-only profile must not be pointed at a remote provider.
+    // Per-role egress policy (#364). The local stack's non-Thinking roles are
+    // loopback-only; Thinking is loopback-only under `local` and may go to an
+    // allowlisted HTTPS host with Bearer auth under `hybrid`.
     let resolver = SystemHostResolver;
-    profile.validate_provider_endpoints(&[
-        (
-            "thinking",
-            verify_loopback_endpoint(&thinking_config.endpoint, &resolver).is_ok(),
-        ),
-        (
-            "tts",
-            verify_loopback_endpoint(&tts_endpoint, &resolver).is_ok(),
-        ),
-    ])?;
+    let egress_host_env = env_optional("AIVTUBER_THINKING_EGRESS_HOST");
+    if egress_host_env.is_some() && profile != CompositionProfile::Hybrid {
+        return Err(
+            "AIVTUBER_THINKING_EGRESS_HOST needs AIVTUBER_MODE=hybrid (only that profile may send Thinking off the machine)"
+                .into(),
+        );
+    }
+    let egress_allowlist = ThinkingEgressAllowlist::new(
+        openrouter_preset_active(&|name| env_optional(name)),
+        egress_host_env.as_deref(),
+    )?;
+    let thinking_egress_host = profile.validate_thinking_endpoint(
+        &thinking_config.endpoint,
+        verify_loopback_endpoint(&thinking_config.endpoint, &resolver).is_ok(),
+        matches!(thinking_auth, ThinkingAuthentication::Bearer(_)),
+        &egress_allowlist,
+    )?;
+    profile.validate_provider_endpoints(&[(
+        "tts",
+        verify_loopback_endpoint(&tts_endpoint, &resolver).is_ok(),
+    )])?;
     let mut thinking = OpenAiResponsesAdapter::with_authentication(thinking_config, thinking_auth)?;
     if let Some(name) = env_optional("AIVTUBER_OPENAI_BACKEND_NAME") {
         thinking = thinking.with_backend_name(name);
@@ -1903,6 +1929,7 @@ fn build_generative_runtime(
         runtime: Some(runtime),
         model_switcher,
         voice: voice_controller,
+        thinking_egress_host,
         thinking_meter: Some(thinking_meter),
     })
 }
@@ -1927,10 +1954,11 @@ fn build_voice_controller(
     let Some(settings_path) = env_path(VOICE_SETTINGS_VAR) else {
         return Ok(None);
     };
-    if profile != CompositionProfile::Local {
-        return Err(
-            format!("{VOICE_SETTINGS_VAR} is supported with AIVTUBER_MODE=local only").into(),
-        );
+    if !profile.local_stack() {
+        return Err(format!(
+            "{VOICE_SETTINGS_VAR} is supported with AIVTUBER_MODE=local or hybrid only"
+        )
+        .into());
     }
     if env_selects_backend {
         eprintln!(
@@ -2309,10 +2337,10 @@ fn build_perception_service(
     profile: CompositionProfile,
     started: Instant,
 ) -> Result<PerceptionService, Box<dyn Error>> {
-    if profile != CompositionProfile::Local {
+    if !profile.local_stack() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "AIVTUBER_PERCEPTION requires AIVTUBER_MODE=local (the loopback-only profile)",
+            "AIVTUBER_PERCEPTION requires AIVTUBER_MODE=local or hybrid (loopback-only model and OBS endpoints)",
         )
         .into());
     }
@@ -2459,10 +2487,7 @@ fn start_panel(
     avatar_launch_url: Option<String>,
     voice_search_endpoint: Option<String>,
 ) -> Result<Option<PanelService>, Box<dyn Error>> {
-    let Some(settings) = panel_settings(profile == CompositionProfile::Local, &|name| {
-        env_optional(name)
-    })?
-    else {
+    let Some(settings) = panel_settings(profile.local_stack(), &|name| env_optional(name))? else {
         return Ok(None);
     };
     match PanelService::start(

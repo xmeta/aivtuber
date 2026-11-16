@@ -67,7 +67,7 @@ impl std::fmt::Display for VoicevoxSettingsError {
             ),
             Self::NotLocalProfile => write!(
                 f,
-                "{TTS_BACKEND_VAR}=voicevox is supported with AIVTUBER_MODE=local only; start the bridge yourself and set AIVTUBER_TTS_ENDPOINT for other profiles"
+                "{TTS_BACKEND_VAR}=voicevox is supported with AIVTUBER_MODE=local or hybrid only; start the bridge yourself and set AIVTUBER_TTS_ENDPOINT for other profiles"
             ),
             Self::GenerativeDisabled => write!(
                 f,
@@ -139,7 +139,7 @@ impl VoicevoxSettings {
             Some("voicevox") => {}
             Some(other) => return Err(VoicevoxSettingsError::UnknownBackend(other.to_owned())),
         }
-        if profile != CompositionProfile::Local {
+        if !profile.local_stack() {
             return Err(VoicevoxSettingsError::NotLocalProfile);
         }
         if !generative_enabled {
@@ -399,6 +399,12 @@ mod tests {
         assert_eq!(
             VoicevoxSettings::resolve(&lookup(&BASE), CompositionProfile::Cached, true),
             Err(VoicevoxSettingsError::NotLocalProfile)
+        );
+        // #364: hybrid composes the same local stack, so the opt-in is unchanged.
+        assert!(
+            VoicevoxSettings::resolve(&lookup(&BASE), CompositionProfile::Hybrid, true)
+                .expect("hybrid accepts the same opt-in")
+                .is_some()
         );
         assert_eq!(
             VoicevoxSettings::resolve(&lookup(&BASE), CompositionProfile::Local, false),
