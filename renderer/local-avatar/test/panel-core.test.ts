@@ -44,6 +44,7 @@ import {
   safeAvatarUrl,
   searchPageCount,
   statusRows,
+  shouldReloadForHash,
   MAX_HOST_TEXT_CHARS,
   avatarLinkState,
   connectionText,
@@ -1020,5 +1021,16 @@ describe("connectionText", () => {
     expect(connectionText({ kind: "lost" })).toContain("切断されました");
     expect(connectionText({ kind: "http-error", status: 502 })).toContain("502");
     expect(connectionText({ kind: "http-error", status: Number.NaN })).toContain("0");
+  });
+});
+
+describe("shouldReloadForHash", () => {
+  test("reloads only for a well-formed token fragment", () => {
+    expect(shouldReloadForHash("#token=" + "cd".repeat(32))).toBe(true);
+    expect(shouldReloadForHash("")).toBe(false);
+    expect(shouldReloadForHash("#")).toBe(false);
+    expect(shouldReloadForHash("#token=")).toBe(false);
+    expect(shouldReloadForHash("#token=short")).toBe(false);
+    expect(shouldReloadForHash("#x=1&token=" + "cd".repeat(32))).toBe(false);
   });
 });

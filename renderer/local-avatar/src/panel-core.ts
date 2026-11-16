@@ -80,6 +80,15 @@ export function tokenFromHash(hash: string): string | null {
 }
 
 /**
+ * Whether a fragment change should reload the page: only a well-formed token
+ * fragment. The page scrubs its own fragment with replaceState (no hashchange),
+ * and an empty or malformed fragment never reloads, so there is no loop.
+ */
+export function shouldReloadForHash(hash: string): boolean {
+  return tokenFromHash(hash) !== null;
+}
+
+/**
  * The selector state, only if it has exactly the documented shape. Anything
  * else (a newer or older app, a malformed document) yields `null`, which hides
  * the selector rather than offering a model the app would refuse.

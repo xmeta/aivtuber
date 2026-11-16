@@ -35,6 +35,7 @@ import {
   repliesFor,
   safeAvatarUrl,
   searchPageCount,
+  shouldReloadForHash,
   statusRows,
   tokenFromHash,
   tuningPatch,
@@ -806,6 +807,13 @@ async function control(action: "stop" | "mute"): Promise<void> {
     void poll();
   }
 }
+
+// Pasting a new launch URL into this same tab only changes the fragment, so the
+// browser would not reload and the old in-memory secret would stay. Reload so the
+// one load path above reads the new token and scrubs the address bar again.
+window.addEventListener("hashchange", () => {
+  if (shouldReloadForHash(location.hash)) location.reload();
+});
 
 $("send").addEventListener("click", () => void send());
 $("chat-input").addEventListener("keydown", (event) => {
