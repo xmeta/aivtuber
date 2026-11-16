@@ -19,6 +19,7 @@ use crate::config::{LLAMA_ALIAS, LLAMA_DEFAULT_CONTEXT, parse_env};
 use crate::manifest::{DEFAULT_PROFILE, Manifest};
 use aivtuber_domain::{
     MAX_MODEL_SETTINGS_BYTES, ThinkingModel, ThinkingModelCatalog, parse_model_settings,
+    render_speech_input_settings,
 };
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -32,6 +33,9 @@ pub struct StartOptions {
     pub dry_run: bool,
     /// `--verbose`: give the app `AIVTUBER_LOG=verbose` (every line printed).
     pub verbose: bool,
+    /// `--voice-input on|off` (#397): remember the choice in the state file
+    /// before starting. `None` leaves the remembered value (default off).
+    pub voice_input: Option<bool>,
     pub health_timeout: Duration,
 }
 
@@ -81,8 +85,8 @@ pub fn log_choice(
 }
 
 /// Quiet start-up text (#393), Japanese first with English beside it. Fixed
-/// strings, no locale detection. With the app's three lines
-/// (`aivtuber_app::ready_guide`) the quiet start-up adds at most six lines.
+/// strings, no locale detection. With the app's four lines
+/// (`aivtuber_app::ready_guide`) the quiet start-up adds at most seven lines.
 /// The Japanese text can be garbled when Windows PowerShell 5.1 output is
 /// redirected or piped; the English half stays readable.
 const QUIET_NOTE: &str = "表示を簡略にしています。すべて表示するには `aivtuber-setup start --verbose` / Terminal output is quiet; run `aivtuber-setup start --verbose` to see everything.";
@@ -269,6 +273,15 @@ pub const YOUTUBE_KEY_FILE: &str = "local-youtube-key.txt";
 /// (#362): `sample` or the content hash of an uploaded model. Small, replaced
 /// atomically; a missing or invalid file means the sample.
 pub const AVATAR_SETTINGS_FILE: &str = "local-avatar.json";
+/// File beside the env file that remembers whether voice input (the microphone,
+/// VAD and speech recognition) is on (#397). `start --voice-input on|off`
+/// writes it; the app reads it and opens no capture device unless it says
+/// enabled. A missing or invalid file means off.
+pub const SPEECH_INPUT_SETTINGS_FILE: &str = "local-speech-input.json";
+/// Same name as `aivtuber_app::speech_input::SPEECH_INPUT_SETTINGS_VAR`; a test
+/// pins the two together (the app crate is not linked here).
+const SPEECH_INPUT_SETTINGS_VAR: &str = "AIVTUBER_SPEECH_INPUT_SETTINGS";
+const SPEECH_SIDECAR_VAR: &str = "AIVTUBER_SPEECH_SIDECAR";
 /// Directory beside the env file that holds the models uploaded in the panel
 /// (#362), named by content hash, at most a few. The app owns it; no file name
 /// or path ever comes from a client.
@@ -533,6 +546,59 @@ pub fn app_avatar_env(env_file: &Path) -> Vec<(String, String)> {
     ]
 }
 
+/// Where the app finds the voice-input state file (#397), whenever the profile
+/// has a speech sidecar at all: without this variable the app starts a
+/// configured sidecar unconditionally, which is how v0.1.6 opened the
+/// microphone by default. An explicit value in the env file or the process
+/// environment wins; a profile without a sidecar gets nothing.
+pub fn app_speech_input_env(
+    env_file: &Path,
+    file_env: &BTreeMap<String, String>,
+    process_env: &dyn Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    let set = |name: &str| {
+        file_env.get(name).is_some_and(|v| !v.trim().is_empty())
+            || process_env(name).is_some_and(|v| !v.trim().is_empty())
+    };
+    if !set(SPEECH_SIDECAR_VAR) || set(SPEECH_INPUT_SETTINGS_VAR) {
+        return Vec::new();
+    }
+    vec![(
+        SPEECH_INPUT_SETTINGS_VAR.to_owned(),
+        env_file
+            .with_file_name(SPEECH_INPUT_SETTINGS_FILE)
+            .display()
+            .to_string(),
+    )]
+}
+
+/// Replaces the state file with the on/off document (temp file in the same
+/// directory, then rename, so a crash leaves the old or the new file, never
+/// half of one). Same pattern as the app's own settings writers.
+pub fn write_speech_input_settings(path: &Path, enabled: bool) -> std::io::Result<()> {
+    let mut temp = path.as_os_str().to_owned();
+    temp.push(".tmp");
+    let temp = PathBuf::from(temp);
+    std::fs::write(&temp, render_speech_input_settings(enabled))?;
+    std::fs::rename(&temp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temp);
+    })
+}
+
+/// The state file `--voice-input` writes: the explicit value the user gave (env
+/// file, then process environment), else the one `start` derived. `None` when
+/// the profile has no speech sidecar.
+fn speech_input_file(
+    env: &BTreeMap<String, String>,
+    process_env: &dyn Fn(&str) -> Option<String>,
+) -> Option<PathBuf> {
+    env.get(SPEECH_INPUT_SETTINGS_VAR)
+        .cloned()
+        .or_else(|| process_env(SPEECH_INPUT_SETTINGS_VAR))
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+}
+
 fn port_in_use(port: u16) -> bool {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
@@ -601,6 +667,9 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
     {
         env.entry(name).or_insert(value);
     }
+    let speech_input_vars =
+        app_speech_input_env(&opts.env_file, &env, &|name| std::env::var(name).ok());
+    env.extend(speech_input_vars);
     let plan = match &llm {
         Llm::Managed(_) => plan_models(&env, &Manifest::embedded(), &settings, &|p| {
             std::fs::metadata(p).ok().map(|m| m.len())
@@ -654,6 +723,22 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
     if log.quiet {
         println!("{QUIET_NOTE}");
     }
+    // #397: the state file the app was told about (ours, or the user's own
+    // value); absent when the profile has no speech sidecar.
+    let speech_input_file = speech_input_file(&env, &|name| std::env::var(name).ok());
+    if let Some(enabled) = opts.voice_input {
+        let word = if enabled { "on" } else { "off" };
+        match &speech_input_file {
+            Some(path) if opts.dry_run => {
+                println!("voice input: would be turned {word} in {}", path.display());
+            }
+            Some(_) => {}
+            None => println!(
+                "voice input: --voice-input {word} has no effect; {} configures no speech input (AIVTUBER_SPEECH_SIDECAR)",
+                opts.env_file.display()
+            ),
+        }
+    }
     if opts.dry_run {
         println!("dry run: nothing was started");
         return Ok(0);
@@ -669,6 +754,10 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
                 path.display()
             ));
         }
+    }
+    if let (Some(enabled), Some(path)) = (opts.voice_input, &speech_input_file) {
+        write_speech_input_settings(path, enabled)
+            .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     }
     let Llm::Managed(llama) = llm else {
         announce_app(
@@ -795,7 +884,8 @@ mod tests {
 
     #[test]
     fn the_quiet_text_is_short_and_carries_no_secret() {
-        // The app prints three more (aivtuber_app::ready_guide); six in all.
+        // The app prints four more (aivtuber_app::ready_guide, the fourth being
+        // the voice-input line of #397); seven in all.
         // STARTING_APP and READY_STARTING are alternatives, never both.
         assert!(QUIET_LINES.len() - 1 <= 3);
         for line in QUIET_LINES {
@@ -803,6 +893,113 @@ mod tests {
             assert!(!line.contains("token="), "{line}");
         }
         assert!(QUIET_NOTE.contains("aivtuber-setup start --verbose"));
+    }
+
+    // The literal documents the app's own tests pin
+    // (crates/app/src/speech_input.rs, crates/domain/src/speech_input.rs).
+    const SPEECH_ON: &str = "{\"schema\":\"local-speech-input-settings/1\",\"enabled\":true}
+";
+    const SPEECH_OFF: &str = "{\"schema\":\"local-speech-input-settings/1\",\"enabled\":false}
+";
+
+    fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn the_app_is_told_where_the_voice_input_state_file_is_when_a_sidecar_is_configured() {
+        let env_file = Path::new("/x/local-profile.env");
+        let none = |_: &str| None;
+        let configured = map(&[("AIVTUBER_SPEECH_SIDECAR", "/x/speech-vad-sidecar")]);
+        let got = app_speech_input_env(env_file, &configured, &none);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "AIVTUBER_SPEECH_INPUT_SETTINGS");
+        assert!(got[0].1.ends_with(SPEECH_INPUT_SETTINGS_FILE), "{got:?}");
+        // The file sits beside the env file, like the other settings.
+        assert_eq!(Path::new(&got[0].1).parent(), env_file.parent(), "{got:?}");
+        // An env file written by v0.1.6 or earlier has no such variable; the
+        // same decision covers it, so the missing state file means off.
+        // A profile without a sidecar gets nothing.
+        assert!(app_speech_input_env(env_file, &map(&[]), &none).is_empty());
+        assert!(
+            app_speech_input_env(env_file, &map(&[("AIVTUBER_SPEECH_SIDECAR", " ")]), &none)
+                .is_empty()
+        );
+        // A sidecar named only in the process environment counts too.
+        let process = |n: &str| (n == "AIVTUBER_SPEECH_SIDECAR").then(|| "/y/side".to_owned());
+        assert_eq!(app_speech_input_env(env_file, &map(&[]), &process).len(), 1);
+        // An explicit value (env file or process) wins.
+        let explicit = map(&[
+            ("AIVTUBER_SPEECH_SIDECAR", "/x/s"),
+            ("AIVTUBER_SPEECH_INPUT_SETTINGS", "/mine.json"),
+        ]);
+        assert!(app_speech_input_env(env_file, &explicit, &none).is_empty());
+        let process_explicit =
+            |n: &str| (n == "AIVTUBER_SPEECH_INPUT_SETTINGS").then(|| "/p".to_owned());
+        assert!(app_speech_input_env(env_file, &configured, &process_explicit).is_empty());
+    }
+
+    #[test]
+    fn the_state_file_to_write_follows_an_explicit_value_wherever_it_was_given() {
+        let none = |_: &str| None;
+        let process = |n: &str| (n == "AIVTUBER_SPEECH_INPUT_SETTINGS").then(|| "/p/s.json".into());
+        let derived = map(&[(
+            "AIVTUBER_SPEECH_INPUT_SETTINGS",
+            "/x/local-speech-input.json",
+        )]);
+        assert_eq!(
+            speech_input_file(&derived, &none),
+            Some(PathBuf::from("/x/local-speech-input.json"))
+        );
+        // Only the process environment names it: `start` derived nothing, the
+        // flag still writes where the app will read.
+        assert_eq!(
+            speech_input_file(&map(&[]), &process),
+            Some(PathBuf::from("/p/s.json"))
+        );
+        assert_eq!(speech_input_file(&map(&[]), &none), None);
+        assert_eq!(
+            speech_input_file(&map(&[("AIVTUBER_SPEECH_INPUT_SETTINGS", " ")]), &none),
+            None
+        );
+    }
+
+    #[test]
+    fn the_variable_name_is_the_one_the_app_reads() {
+        // The app crate is not linked here; its own test pins the same literal.
+        assert_eq!(SPEECH_INPUT_SETTINGS_VAR, "AIVTUBER_SPEECH_INPUT_SETTINGS");
+    }
+
+    #[test]
+    fn the_state_file_writer_replaces_atomically_and_matches_the_pinned_documents() {
+        let dir = temp_dir("speech-input");
+        let path = dir.join(SPEECH_INPUT_SETTINGS_FILE);
+        let _ = std::fs::remove_file(&path);
+        write_speech_input_settings(&path, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SPEECH_ON);
+        write_speech_input_settings(&path, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SPEECH_OFF);
+        write_speech_input_settings(&path, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SPEECH_ON);
+        // No temporary file is left behind.
+        assert!(
+            !dir.join(format!("{SPEECH_INPUT_SETTINGS_FILE}.tmp"))
+                .exists()
+        );
+        assert!((SPEECH_ON.len() as u64) < aivtuber_domain::MAX_SPEECH_INPUT_SETTINGS_BYTES);
+        assert!(aivtuber_domain::parse_speech_input_settings(
+            SPEECH_ON.as_bytes()
+        ));
+        assert!(!aivtuber_domain::parse_speech_input_settings(
+            SPEECH_OFF.as_bytes()
+        ));
+        // An unwritable location is an error, not a silent success.
+        assert!(
+            write_speech_input_settings(&dir.join("no-such-dir").join("x.json"), true).is_err()
+        );
     }
 
     #[test]

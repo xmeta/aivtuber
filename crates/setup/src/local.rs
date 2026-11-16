@@ -340,7 +340,7 @@ pub fn run<W: Write>(
     }
     if let Some(h) = hybrid {
         ctx.say(format!(
-            "  thinking OpenRouter ({} model(s), starting on {}); chat and reply text are sent to openrouter.ai, everything else stays on this machine",
+            "  thinking OpenRouter ({} model(s), starting on {}); chat and reply text are sent to openrouter.ai (transcribed speech too, only once you turn voice input on), everything else stays on this machine",
             h.models.len(),
             h.models.first().map_or("?", String::as_str)
         ));
@@ -765,6 +765,12 @@ pub fn run<W: Write>(
         "\nStart"
     });
     ctx.say(format!("  {}", start_command(bin, &opts.env_file)));
+    // #397: the microphone is not opened until the operator asks for it.
+    ctx.say(if hybrid.is_some() {
+        "  voice input (the microphone) is off until you run `start --voice-input on`; once on, the transcribed speech is sent to openrouter.ai as chat text; `start --voice-input off` turns it off again"
+    } else {
+        "  voice input (the microphone) is off until you run `start --voice-input on`; the choice is remembered, and `start --voice-input off` turns it off again"
+    });
     ctx.say(format!(
         "  the app then prints two URLs, each with a per-launch secret (do not share them): the operation panel (http://127.0.0.1:{}/#token=...; chat, status, stop and mute) and the avatar page (http://127.0.0.1:{}/?token=..., also usable as an OBS Browser Source)",
         config::PANEL_PORT,

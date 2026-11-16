@@ -10,7 +10,7 @@
 //!                         [--skip steps] [--root DIR] [--assets DIR] [--env-file FILE]
 //!                         [--from-target CARGO_TARGET_DIR]
 //!                         (the OpenRouter key is read from OPENROUTER_API_KEY or a hidden prompt)
-//!   aivtuber-setup start [--env-file FILE] [--dry-run] [--verbose]
+//!   aivtuber-setup start [--env-file FILE] [--dry-run] [--verbose] [--voice-input on|off]
 //!
 //! Exit codes: 0 success, 1 a step failed (the message says which and how to
 //! fix it), 2 bad arguments.
@@ -147,6 +147,18 @@ struct StartArgs {
     /// measurement lines; sets AIVTUBER_LOG=verbose for the app).
     #[arg(long)]
     verbose: bool,
+    /// Turn voice input (the microphone, voice-activity detection and speech
+    /// recognition) on or off and remember it beside the env file. Without this
+    /// flag the remembered choice is used; the default is off. Under the hybrid
+    /// profile, turning it on sends transcribed speech to the cloud model.
+    #[arg(long, value_enum, value_name = "on|off")]
+    voice_input: Option<VoiceInput>,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum VoiceInput {
+    On,
+    Off,
 }
 
 fn program_dir() -> Result<PathBuf, String> {
@@ -264,6 +276,7 @@ fn run_start(args: StartArgs) -> Result<i32, String> {
         env_file,
         dry_run: args.dry_run,
         verbose: args.verbose,
+        voice_input: args.voice_input.map(|v| matches!(v, VoiceInput::On)),
         health_timeout: Duration::from_secs(180),
     })
 }

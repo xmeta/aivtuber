@@ -37,6 +37,7 @@ mod shadow_orchestrator;
 mod speech_barge_in;
 mod speech_conversation;
 mod speech_floor;
+pub mod speech_input;
 mod speech_resynthesis;
 mod speech_sidecar;
 mod support_bundle;

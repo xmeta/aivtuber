@@ -16,6 +16,7 @@ pub mod scenario;
 mod scene;
 mod sidecar;
 mod speech;
+mod speech_input;
 mod speech_lifecycle;
 mod speech_transcript;
 mod task;
@@ -73,6 +74,7 @@ pub use speech::{
     SpeakerActivityState, SpeechActivityObservation, SpeechEdge, SpeechObservation,
     SpeechObservationBatch, TurnEndFallbackReason, TurnEndScoreObservation, fallback_turn_signal,
 };
+pub use speech_input::*;
 pub use speech_lifecycle::*;
 pub use speech_transcript::*;
 pub use task::{

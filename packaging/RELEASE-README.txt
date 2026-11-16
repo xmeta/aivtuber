@@ -64,6 +64,11 @@ In short, from this directory (after the checksum check above):
                                       guide. Add --verbose to see everything. (With
                                       Windows PowerShell 5.1, redirected output can
                                       garble the Japanese; the English stays readable.)
+                                      The microphone is OFF until you run
+                                      "aivtuber-setup start --voice-input on" once
+                                      (remembered; --voice-input off turns it off).
+                                      In the hybrid profile, voice input on sends the
+                                      transcribed speech to the cloud model.
 Install FFmpeg (ffplay and ffmpeg on PATH) first; setup tells you if it is missing.
 On Windows also install the Microsoft Visual C++ 2015-2022 Redistributable (x64); it is
 not bundled, and setup stops and names it if it is missing:

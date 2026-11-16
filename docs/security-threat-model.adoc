@@ -257,6 +257,14 @@ With both the hybrid Thinking egress and the Aivis Cloud TTS opt-in active, repl
 
 *Failure.* A refused, slow, rate-limited, unauthorized or out-of-credit provider degrades like any Thinking failure: the typed non-verbal reaction, never a frozen performer. Operator emergency control does not depend on the provider.
 
+=== 10.2 Voice input is opt-in (#396, #397)
+
+*Threat.* Up to v0.1.6 `aivtuber-setup start` opened the OS default capture device at every start in both the local and the hybrid profile. That is an unannounced ambient-speech path: whatever the device carries (a microphone, or on a streaming mixer whatever is routed to its input) is transcribed, answered as untrusted conversation input and able to barge-in over the performer, and under the hybrid profile each routed final is sent to the cloud Thinking host as the triggering event text (section 10.1). The operator had not turned voice input on, and the hybrid disclosure did not say the microphone was listening.
+
+*Mitigation.* Voice input is off unless turned on. `aivtuber-setup start` passes `AIVTUBER_SPEECH_INPUT_SETTINGS`, and the app starts the speech sidecar only if that file is a well-formed `enabled: true`; with it off no capture device, VAD or STT process exists. The file is local operator-owned data treated as untrusted input: read bounded (512 bytes, like the model settings file), strictly parsed, and every failure (missing, unreadable, oversized, malformed, wrong type, unknown field) reads as off, so a damaged file can never turn the microphone on. Start-up always prints whether voice input is on or off (not hidden by quiet mode), and says that transcribed speech goes to the cloud model when Thinking is remote. The file confers no authority: speech finals stay untrusted `speech` content on the same normalizer path as before.
+
+*Residual.* The state file is writable by any local process or user that can write the install directory (the same trust as the env file, which names the programs to run). The choice is made at start; a live toggle through an authenticated control capability, device choice and self-echo handling are later slices of #396. The app run directly without the variable keeps the previous behaviour.
+
 == 11. Publication containment gate
 
 Before public speech/display, generated output passes a deterministic publication-containment policy.

@@ -891,10 +891,19 @@ fn start_with_a_hybrid_env_file_plans_no_llama_server() {
         env_file: o.env_file.clone(),
         dry_run: true,
         verbose: false,
+        voice_input: Some(true),
         health_timeout: Duration::from_secs(1),
     })
     .unwrap();
     assert_eq!(code, 0);
+    // #397: the hybrid env file configures the speech sidecar, so `start` hands
+    // the app a state file; a dry run asks for voice input but writes nothing.
+    assert!(env.contains_key("AIVTUBER_SPEECH_SIDECAR"));
+    assert!(
+        !o.env_file
+            .with_file_name(aivtuber_setup::start::SPEECH_INPUT_SETTINGS_FILE)
+            .exists()
+    );
     assert!(!o.env_file.with_file_name("llama-models.ini").exists());
     assert!(!o.env_file.with_file_name("llama-server.log").exists());
 

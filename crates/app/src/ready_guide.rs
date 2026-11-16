@@ -1,8 +1,10 @@
 //! Short Japanese-first ready guide printed on stderr under `AIVTUBER_LOG=quiet` (#393).
 //!
 //! Fixed text, no locale detection, no catalogue. The whole quiet start-up adds
-//! at most six lines across the app and `aivtuber-setup start`: three here and
-//! three in `crates/setup/src/start.rs`. The duty text itself (AI-generated
+//! at most seven lines across the app and `aivtuber-setup start`: four here and
+//! three in `crates/setup/src/start.rs`. The fourth app line is the voice-input
+//! state (#397), printed only when `aivtuber-setup start` governs voice input;
+//! a privacy-relevant fact (is the microphone open) must not be hidden by quiet. The duty text itself (AI-generated
 //! voice disclosure, licences) is never translated; the English notices printed
 //! earlier stay authoritative.
 
@@ -16,6 +18,36 @@ pub const DISCLOSURE_REMINDER: &str = "配信ではAI音声・AI出演者であ�
 /// Quiet-mode replacement for `thinking_warmup: started`, so the model warm-up
 /// is not a silent wait.
 pub const WARMUP_NOTE: &str = "モデルを準備しています… / warming up the model…";
+
+/// Voice input (#397), quiet form: Japanese first, English beside it. One line
+/// each; none carries a secret, a path or a URL. The `cloud` forms say that
+/// speech text leaves the machine because the Thinking model is remote.
+pub const VOICE_OFF: &str = "マイクはオフです。音声入力を使うには aivtuber-setup start --voice-input on で起動してください。 / Voice input is off; start with `aivtuber-setup start --voice-input on` to use the microphone.";
+pub const VOICE_OFF_CLOUD: &str = "マイクはオフです。オンにすると、聞き取った音声の文字起こしはクラウドの応答モデルに送信されます(aivtuber-setup start --voice-input on)。 / Voice input is off; once on (`aivtuber-setup start --voice-input on`), transcribed speech is sent to the cloud model.";
+pub const VOICE_ON: &str = "マイクで聞き取り中です(既定の録音デバイス)。止めるには aivtuber-setup start --voice-input off で起動してください。 / Voice input is on (listening on the default capture device); start with `aivtuber-setup start --voice-input off` to stop.";
+pub const VOICE_ON_CLOUD: &str = "マイクで聞き取り中です(既定の録音デバイス)。聞き取った音声の文字起こしはクラウドの応答モデルに送信されます。 / Voice input is on (listening on the default capture device); transcribed speech is sent to the cloud model.";
+
+/// Verbose (diagnostics) form of the same line, in English like the other
+/// diagnostic lines.
+pub const VOICE_OFF_VERBOSE: &str = "voice input: off (microphone not opened); turn it on with `aivtuber-setup start --voice-input on`";
+pub const VOICE_OFF_CLOUD_VERBOSE: &str = "voice input: off (microphone not opened); turn it on with `aivtuber-setup start --voice-input on`; once on, transcribed speech is sent to the cloud model";
+pub const VOICE_ON_VERBOSE: &str = "voice input: on (listening on the default capture device)";
+pub const VOICE_ON_CLOUD_VERBOSE: &str = "voice input: on (listening on the default capture device); transcribed speech is sent to the cloud model";
+
+/// The voice-input line for the current state and verbosity. `cloud` is true
+/// when Thinking leaves the machine (a non-loopback endpoint).
+pub fn voice_input_line(on: bool, cloud: bool, diagnostics: bool) -> &'static str {
+    match (on, cloud, diagnostics) {
+        (true, false, true) => VOICE_ON_VERBOSE,
+        (true, true, true) => VOICE_ON_CLOUD_VERBOSE,
+        (false, false, true) => VOICE_OFF_VERBOSE,
+        (false, true, true) => VOICE_OFF_CLOUD_VERBOSE,
+        (true, false, false) => VOICE_ON,
+        (true, true, false) => VOICE_ON_CLOUD,
+        (false, false, false) => VOICE_OFF,
+        (false, true, false) => VOICE_OFF_CLOUD,
+    }
+}
 
 /// The lines printed once start-up reaches the panel URL / operator-control
 /// point. Empty guidance for the panel is omitted when the panel is disabled.
@@ -69,12 +101,56 @@ mod tests {
     use super::*;
 
     const ALL: [&str; 3] = [PANEL_HINT, DISCLOSURE_REMINDER, WARMUP_NOTE];
+    const VOICE: [&str; 8] = [
+        VOICE_OFF,
+        VOICE_OFF_CLOUD,
+        VOICE_ON,
+        VOICE_ON_CLOUD,
+        VOICE_OFF_VERBOSE,
+        VOICE_OFF_CLOUD_VERBOSE,
+        VOICE_ON_VERBOSE,
+        VOICE_ON_CLOUD_VERBOSE,
+    ];
 
     #[test]
-    fn the_app_side_guide_fits_its_share_of_the_six_line_budget() {
-        // Setup owns the other three (see its own test).
-        assert!(ALL.len() <= 3);
+    fn the_app_side_guide_fits_its_share_of_the_seven_line_budget() {
+        // Setup owns three more (see its own test). The voice-input line is
+        // the fourth app line: at most one of the eight forms is printed.
+        assert!(ALL.len() < 4);
         assert!(ready_lines(true).len() <= 2);
+    }
+
+    #[test]
+    fn voice_lines_are_single_line_secret_free_and_say_what_they_must() {
+        for line in VOICE {
+            assert!(!line.trim().is_empty() && !line.contains('\n'), "{line}");
+            assert!(!line.contains("token") && !line.contains("http"), "{line}");
+        }
+        for (on, cloud, diagnostics) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+            (true, true, false),
+            (false, false, true),
+            (false, true, true),
+            (true, false, true),
+            (true, true, true),
+        ] {
+            let line = voice_input_line(on, cloud, diagnostics);
+            assert!(VOICE.contains(&line));
+            // Cloud wording appears exactly when Thinking is remote.
+            let says_cloud = line.contains("cloud model");
+            assert_eq!(says_cloud, cloud, "{line}");
+            // Only the on-forms claim to listen; the off-forms name the way on.
+            assert_eq!(line.contains("listening"), on, "{line}");
+            if !on {
+                assert!(line.contains("--voice-input on"), "{line}");
+            }
+            // Quiet forms are Japanese first with the English half beside it.
+            assert_eq!(line.contains(" / "), !diagnostics, "{line}");
+        }
+        assert!(VOICE_OFF_CLOUD.starts_with("マイクはオフです。"));
+        assert!(VOICE_ON_CLOUD.contains("クラウドの応答モデルに送信されます"));
     }
 
     #[test]

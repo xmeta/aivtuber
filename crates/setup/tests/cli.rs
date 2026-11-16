@@ -239,6 +239,92 @@ fn start_help_lists_verbose() {
 }
 
 #[test]
+fn start_help_lists_voice_input_and_what_it_does() {
+    let t = text(&run(&["start", "--help"]));
+    assert!(t.contains("--voice-input") && t.contains("on|off"), "{t}");
+    assert!(t.contains("microphone") && t.contains("cloud"), "{t}");
+}
+
+/// A minimal env file `start` accepts without running anything: your own model
+/// server, so there is no llama-server to find.
+fn external_env_file(tag: &str, with_sidecar: bool) -> PathBuf {
+    let dir = common::scratch(tag);
+    fs::create_dir_all(&dir).unwrap();
+    let mut text = format!(
+        "AIVTUBER_SETUP_LLAMA_MODE=external
+AIVTUBER_SETUP_APP={}
+",
+        dir.join("aivtuber-app").display()
+    );
+    if with_sidecar {
+        text.push_str(
+            "AIVTUBER_SPEECH_SIDECAR=speech-vad-sidecar
+",
+        );
+    }
+    let path = dir.join("local-profile.env");
+    fs::write(&path, text).unwrap();
+    path
+}
+
+#[test]
+fn a_dry_run_with_voice_input_on_says_so_and_writes_no_state_file() {
+    let env_file = external_env_file("cli-voice-on", true);
+    let state = env_file.with_file_name("local-speech-input.json");
+    let o = run(&[
+        "start",
+        "--dry-run",
+        "--voice-input",
+        "on",
+        "--env-file",
+        env_file.to_str().unwrap(),
+    ]);
+    assert!(o.status.success(), "{}", text(&o));
+    let t = text(&o);
+    assert!(t.contains("voice input: would be turned on in"), "{t}");
+    assert!(t.contains("local-speech-input.json"), "{t}");
+    assert!(!state.exists(), "a dry run must not write the state file");
+}
+
+#[test]
+fn voice_input_is_refused_cleanly_for_a_bad_value_and_noted_without_a_sidecar() {
+    let env_file = external_env_file("cli-voice-bad", true);
+    let o = run(&[
+        "start",
+        "--dry-run",
+        "--voice-input",
+        "maybe",
+        "--env-file",
+        env_file.to_str().unwrap(),
+    ]);
+    assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+
+    let bare = external_env_file("cli-voice-nosidecar", false);
+    let o = run(&[
+        "start",
+        "--dry-run",
+        "--voice-input",
+        "on",
+        "--env-file",
+        bare.to_str().unwrap(),
+    ]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("has no effect"), "{}", text(&o));
+    assert!(!bare.with_file_name("local-speech-input.json").exists());
+
+    // Without the flag nothing about voice input is said or written.
+    let o = run(&[
+        "start",
+        "--dry-run",
+        "--env-file",
+        env_file.to_str().unwrap(),
+    ]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(!text(&o).contains("voice input"), "{}", text(&o));
+    assert!(!env_file.with_file_name("local-speech-input.json").exists());
+}
+
+#[test]
 fn start_without_an_env_file_says_to_run_setup_first() {
     let root = fake_release("cli-start");
     let o = run(&[
