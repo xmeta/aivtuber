@@ -296,11 +296,26 @@ struct RunningApp {
 impl RunningApp {
     fn start(program: &str, file: &Path, lock: &Path, log: &str) -> Self {
         static RUNS: AtomicU32 = AtomicU32::new(0);
-        let endpoint = format!(
+        let name = format!(
             "voice-live-test-{}-{}",
             std::process::id(),
             RUNS.fetch_add(1, Ordering::Relaxed)
         );
+        // Windows: a named pipe in the namespace, the bare name. Unix: the
+        // endpoint is a filesystem path, so a bare name would be resolved
+        // against each process's own working directory (the app runs from the
+        // repository root, `aivtuberctl` from elsewhere) and never meet. Use
+        // one absolute path, short enough for a socket address.
+        let endpoint = if cfg!(unix) {
+            let path = file
+                .parent()
+                .expect("state file directory")
+                .join(format!("{name}.sock"));
+            let _ = std::fs::remove_file(&path);
+            path.to_string_lossy().into_owned()
+        } else {
+            name
+        };
         let mut command = Command::new(APP);
         command
             // The default pack root is relative to the repository root.
@@ -340,16 +355,34 @@ impl RunningApp {
                     .push_str(&String::from_utf8_lossy(&buffer[..n]));
             }
         });
-        let app = Self {
+        let mut app = Self {
             child,
             stdin,
             stderr,
             reader: Some(reader),
             endpoint,
         };
-        wait_for("the control endpoint", Duration::from_secs(30), || {
-            app.ctl(&["status"]).0
-        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !app.ctl_once(&["status"]).0 {
+            let exited = app.child_exited();
+            if Instant::now() >= deadline || exited {
+                let log = app.log();
+                let tail: String = log
+                    .chars()
+                    .rev()
+                    .take(4000)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                panic!(
+                    "the control endpoint {} did not become reachable (app exited: {exited}); app stderr (last 4000 chars):
+{tail}",
+                    app.endpoint
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
         app
     }
 
@@ -383,6 +416,10 @@ impl RunningApp {
         let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
         text.push_str(&String::from_utf8_lossy(&output.stderr));
         (output.status.success(), text)
+    }
+
+    fn child_exited(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)))
     }
 
     fn voice_input_line(&self) -> String {
