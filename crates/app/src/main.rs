@@ -118,6 +118,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         model_switcher,
         voice: voice_controller,
         thinking_egress_host,
+        thinking_endpoint_is_loopback,
         thinking_meter,
     } = build_generative_runtime(
         &compatibility,
@@ -131,6 +132,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             pack_root: &pack_root,
         },
     )?;
+    // #397: whether Thinking leaves this machine, for the voice-input line:
+    // the same loopback decision the `thinking:` line uses (#393).
+    let thinking_leaves_machine = !thinking_endpoint_is_loopback;
     let jev_api_key_present =
         env_optional("AIVTUBER_JEV_API_KEY").is_some_and(|key| !key.trim().is_empty());
     profile.validate(generative_configured.is_some(), jev_api_key_present)?;
@@ -686,7 +690,30 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut last_projection_metrics = aivtuber_app::SpeechProjectionMetrics::default();
     let mut last_phrase_response_logged: Option<u64> = None;
     let mut last_conversation_metrics = SpeechConversationMetrics::default();
-    if let Some(program) = env_optional("AIVTUBER_SPEECH_SIDECAR") {
+    // #397: under `aivtuber-setup start` the microphone is opened only when the
+    // state file says voice input is on. When it is off the whole block is
+    // skipped, exactly as when AIVTUBER_SPEECH_SIDECAR is absent: no sidecar,
+    // no transcript tracker, no conversation route, no floor, no barge-in.
+    let speech_program = env_optional("AIVTUBER_SPEECH_SIDECAR");
+    let speech_settings = env_path(aivtuber_app::speech_input::SPEECH_INPUT_SETTINGS_VAR);
+    let speech_input = aivtuber_app::speech_input::SpeechInput::decide(
+        speech_program.is_some(),
+        speech_settings.is_some(),
+        speech_settings
+            .as_deref()
+            .is_some_and(aivtuber_app::speech_input::read_enabled),
+    );
+    if speech_input.announces() {
+        eprintln!(
+            "{}",
+            aivtuber_app::ready_guide::voice_input_line(
+                speech_input == aivtuber_app::speech_input::SpeechInput::On,
+                thinking_leaves_machine,
+                aivtuber_adapters::log_verbosity::diagnostics_enabled(),
+            )
+        );
+    }
+    if let Some(program) = speech_program.filter(|_| speech_input.starts_sidecar()) {
         let mut tracker = SpeechObservationTracker::new(
             SpeechObservationConfig::default(),
             IngressPolicy::parse(
@@ -1746,6 +1773,9 @@ struct GenerativeParts {
     /// #364: the allowlisted remote host Thinking traffic goes to under the
     /// hybrid profile; `None` when nothing leaves the machine.
     thinking_egress_host: Option<String>,
+    /// #397: the loopback decision for the Thinking endpoint; `true` when no
+    /// generative runtime is composed (nothing is sent anywhere).
+    thinking_endpoint_is_loopback: bool,
     /// #367: Thinking usage totals and the optional spend cap.
     thinking_meter: Option<aivtuber_app::ThinkingMeter>,
 }
@@ -1778,6 +1808,7 @@ fn build_generative_runtime(
             model_switcher: None,
             voice: None,
             thinking_egress_host: None,
+            thinking_endpoint_is_loopback: true,
             thinking_meter: None,
         });
     }
@@ -2048,6 +2079,7 @@ fn build_generative_runtime(
         model_switcher,
         voice: voice_controller,
         thinking_egress_host,
+        thinking_endpoint_is_loopback,
         thinking_meter: Some(thinking_meter),
     })
 }
