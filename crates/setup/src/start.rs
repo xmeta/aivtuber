@@ -30,7 +30,54 @@ use std::time::{Duration, Instant};
 pub struct StartOptions {
     pub env_file: PathBuf,
     pub dry_run: bool,
+    /// `--verbose`: give the app `AIVTUBER_LOG=verbose` (every line printed).
+    pub verbose: bool,
     pub health_timeout: Duration,
+}
+
+/// Same name as `aivtuber_adapters::log_verbosity::LOG_ENV`. The setup binary
+/// deliberately does not link the adapters crate (it is a dev-dependency only,
+/// to keep the release setup tool small); a test pins the two together.
+const LOG_ENV: &str = "AIVTUBER_LOG";
+
+/// What `start` does about the app's `AIVTUBER_LOG` (#391).
+#[derive(Debug, PartialEq, Eq)]
+pub struct LogChoice {
+    /// A value to put in the child's environment; `None` leaves the user's own
+    /// value (process environment or env file) untouched.
+    pub set: Option<&'static str>,
+    /// Whether the app will end up quiet, so `start` says so.
+    pub quiet: bool,
+}
+
+/// `--verbose` wins; otherwise an explicit non-empty user value (env file, then
+/// process environment) wins; otherwise quiet is the default under `start`.
+pub fn log_choice(
+    verbose_flag: bool,
+    file_env: &BTreeMap<String, String>,
+    process_value: Option<&str>,
+) -> LogChoice {
+    if verbose_flag {
+        return LogChoice {
+            set: Some("verbose"),
+            quiet: false,
+        };
+    }
+    let explicit = file_env
+        .get(LOG_ENV)
+        .map(String::as_str)
+        .or(process_value)
+        .filter(|v| !v.trim().is_empty());
+    match explicit {
+        Some(value) => LogChoice {
+            set: None,
+            quiet: value.trim().eq_ignore_ascii_case("quiet"),
+        },
+        None => LogChoice {
+            set: Some("quiet"),
+            quiet: true,
+        },
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -521,6 +568,13 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
     let settings = opts.env_file.with_file_name(MODEL_SETTINGS_FILE);
     let preset = opts.env_file.with_file_name(PRESET_FILE);
     let mut env = env;
+    // The child inherits the process environment, so an explicit user value is
+    // simply left alone; only the default and `--verbose` are written here.
+    let process_log = std::env::var(LOG_ENV).ok();
+    let log = log_choice(opts.verbose, &env, process_log.as_deref());
+    if let Some(value) = log.set {
+        env.insert(LOG_ENV.to_owned(), value.to_owned());
+    }
     for (name, value) in app_voice_env(&opts.env_file)
         .into_iter()
         .chain(app_chat_env(&opts.env_file))
@@ -574,6 +628,11 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
         app.display(),
         opts.env_file.display()
     );
+    if log.quiet {
+        println!(
+            "terminal output is quiet (measurement lines hidden); run `aivtuber-setup start --verbose` to see everything"
+        );
+    }
     if opts.dry_run {
         println!("dry run: nothing was started");
         return Ok(0);
@@ -692,6 +751,53 @@ fn run_app(app: &Path, env: &BTreeMap<String, String>) -> Result<i32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_env_name_matches_the_adapters_helper() {
+        assert_eq!(LOG_ENV, aivtuber_adapters::log_verbosity::LOG_ENV);
+    }
+
+    #[test]
+    fn log_choice_defaults_to_quiet_and_respects_explicit_values() {
+        let none = BTreeMap::new();
+        let quiet = LogChoice {
+            set: Some("quiet"),
+            quiet: true,
+        };
+        assert_eq!(log_choice(false, &none, None), quiet);
+        assert_eq!(log_choice(false, &none, Some("  ")), quiet);
+        // An explicit user value wins and is left for the child to inherit.
+        assert_eq!(
+            log_choice(false, &none, Some("verbose")),
+            LogChoice {
+                set: None,
+                quiet: false
+            }
+        );
+        assert_eq!(
+            log_choice(false, &none, Some("QUIET")),
+            LogChoice {
+                set: None,
+                quiet: true
+            }
+        );
+        let file: BTreeMap<_, _> = [("AIVTUBER_LOG".to_owned(), "verbose".to_owned())].into();
+        assert_eq!(
+            log_choice(false, &file, Some("quiet")),
+            LogChoice {
+                set: None,
+                quiet: false
+            }
+        );
+        // --verbose beats everything.
+        assert_eq!(
+            log_choice(true, &file, Some("quiet")),
+            LogChoice {
+                set: Some("verbose"),
+                quiet: false
+            }
+        );
+    }
 
     fn env(layers: &str) -> BTreeMap<String, String> {
         parse_env(&format!(

@@ -730,13 +730,15 @@ fn run_mic(
         if Instant::now() >= next_stats {
             next_stats = Instant::now() + args.stats_every;
             let sink = emitter.sink.stats();
-            eprintln!(
-                "speech-vad-sidecar: stats pipeline={:?} dropped_audio_chunks={dropped} lines_written={} dropped_queue_full={} preroll_len={}",
-                pipeline.stats(),
-                sink.lines_written,
-                sink.dropped_queue_full,
-                pipeline.preroll().len()
-            );
+            if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+                eprintln!(
+                    "speech-vad-sidecar: stats pipeline={:?} dropped_audio_chunks={dropped} lines_written={} dropped_queue_full={} preroll_len={}",
+                    pipeline.stats(),
+                    sink.lines_written,
+                    sink.dropped_queue_full,
+                    pipeline.preroll().len()
+                );
+            }
         }
     }
     edges.clear();

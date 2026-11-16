@@ -394,9 +394,12 @@ impl PanelService {
             *sequence_seed = sequence_seed.saturating_add(1);
             match app.process_content_bytes(&raw, now_ms, *sequence_seed) {
                 Ok(outcome) => {
-                    eprintln!("panel: chat {event_id} admission={:?}", outcome.admission);
                     let queued =
                         outcome.admission == aivtuber_runtime::ContentAdmitDecision::Queued;
+                    // A refused or dropped admission is never hidden by quiet mode.
+                    if !queued || aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+                        eprintln!("panel: chat {event_id} admission={:?}", outcome.admission);
+                    }
                     command.respond_with_id(queued, format!("{:?}", outcome.admission), event_id);
                 }
                 Err(error) => {
@@ -412,16 +415,25 @@ impl PanelService {
         }
         let metrics = self.inbox.metrics();
         if self.refusal_log.due(metrics, now_ms) {
-            // Counts only: never a header, a body or a secret.
-            eprintln!(
-                "panel: refused host={} origin={} auth={} request={} rate_limited={} queue_full={}",
-                metrics.rejected_host,
-                metrics.rejected_origin,
-                metrics.rejected_auth,
-                metrics.rejected_request,
-                metrics.rate_limited,
-                metrics.queue_full
-            );
+            // Counts only: never a header, a body or a secret. Quiet mode hides
+            // the line only when every counter is zero (nothing was refused).
+            let all_zero = metrics.rejected_host == 0
+                && metrics.rejected_origin == 0
+                && metrics.rejected_auth == 0
+                && metrics.rejected_request == 0
+                && metrics.rate_limited == 0
+                && metrics.queue_full == 0;
+            if !all_zero || aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+                eprintln!(
+                    "panel: refused host={} origin={} auth={} request={} rate_limited={} queue_full={}",
+                    metrics.rejected_host,
+                    metrics.rejected_origin,
+                    metrics.rejected_auth,
+                    metrics.rejected_request,
+                    metrics.rate_limited,
+                    metrics.queue_full
+                );
+            }
         }
     }
 

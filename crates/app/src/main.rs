@@ -1149,12 +1149,14 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
             let projection_metrics = app.speech_projection_metrics();
             if projection_metrics != last_projection_metrics {
-                eprintln!(
-                    "speech_projection: replies={} lexicon_hits={} projection_passthrough_latin={}",
-                    projection_metrics.replies,
-                    projection_metrics.lexicon_hits,
-                    projection_metrics.passthrough_latin
-                );
+                if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+                    eprintln!(
+                        "speech_projection: replies={} lexicon_hits={} projection_passthrough_latin={}",
+                        projection_metrics.replies,
+                        projection_metrics.lexicon_hits,
+                        projection_metrics.passthrough_latin
+                    );
+                }
                 last_projection_metrics = projection_metrics;
             }
             if let Some(metrics) = app.memory_writer_metrics()
@@ -1193,52 +1195,56 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
             let phrase_metrics = app.phrase_metrics();
             if phrase_metrics != last_phrase_metrics {
-                eprintln!(
-                    "phrase_metrics: responses={} completed={} partial={} phrases_committed={} gate_rejected_before_first={} gate_rejected_after_commit={} stream_cumulative_gate_rejected={} stream_whole_reply_gate_audits={} stream_whole_reply_gate_rejected_after_commit={} scheduler_rejected={} synthesis_failed_after_commit={} cancelled_after_commit={} underruns={} max_gap_ms={} max_synthesis_ms={} late_dropped={}",
-                    phrase_metrics.responses,
-                    phrase_metrics.completed,
-                    phrase_metrics.partial,
-                    phrase_metrics.phrases_committed,
-                    phrase_metrics.gate_rejected_before_first_commit,
-                    phrase_metrics.gate_rejected_after_commit,
-                    phrase_metrics.stream_cumulative_gate_rejected,
-                    phrase_metrics.stream_whole_reply_gate_audits,
-                    phrase_metrics.stream_whole_reply_gate_rejected_after_commit,
-                    phrase_metrics.scheduler_rejected,
-                    phrase_metrics.synthesis_failed_after_commit,
-                    phrase_metrics.cancelled_after_commit,
-                    phrase_metrics.underruns,
-                    phrase_metrics.max_gap_ms,
-                    phrase_metrics.max_synthesis_ms,
-                    phrase_metrics.late_phrases_dropped
-                );
+                if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+                    eprintln!(
+                        "phrase_metrics: responses={} completed={} partial={} phrases_committed={} gate_rejected_before_first={} gate_rejected_after_commit={} stream_cumulative_gate_rejected={} stream_whole_reply_gate_audits={} stream_whole_reply_gate_rejected_after_commit={} scheduler_rejected={} synthesis_failed_after_commit={} cancelled_after_commit={} underruns={} max_gap_ms={} max_synthesis_ms={} late_dropped={}",
+                        phrase_metrics.responses,
+                        phrase_metrics.completed,
+                        phrase_metrics.partial,
+                        phrase_metrics.phrases_committed,
+                        phrase_metrics.gate_rejected_before_first_commit,
+                        phrase_metrics.gate_rejected_after_commit,
+                        phrase_metrics.stream_cumulative_gate_rejected,
+                        phrase_metrics.stream_whole_reply_gate_audits,
+                        phrase_metrics.stream_whole_reply_gate_rejected_after_commit,
+                        phrase_metrics.scheduler_rejected,
+                        phrase_metrics.synthesis_failed_after_commit,
+                        phrase_metrics.cancelled_after_commit,
+                        phrase_metrics.underruns,
+                        phrase_metrics.max_gap_ms,
+                        phrase_metrics.max_synthesis_ms,
+                        phrase_metrics.late_phrases_dropped
+                    );
+                }
                 last_phrase_metrics = phrase_metrics;
             }
             for record in app.recent_phrase_responses() {
                 if last_phrase_response_logged.is_some_and(|logged| record.response_id <= logged) {
                     continue;
                 }
-                eprintln!(
-                    "phrase_response: response={} event={} planned={} committed={} end={:?} commits=[{}]",
-                    record.response_id,
-                    record.event_id,
-                    record.planned_phrases,
-                    record.commit_horizon(),
-                    record.end,
-                    record
-                        .commits
-                        .iter()
-                        .map(|commit| format!(
-                            "{}@{}..{}(gap {}, synth {}ms)",
-                            commit.seq,
-                            commit.start_at_ms,
-                            commit.end_at_ms,
-                            commit.gap_before_ms,
-                            commit.synthesis_ms
-                        ))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                );
+                if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+                    eprintln!(
+                        "phrase_response: response={} event={} planned={} committed={} end={:?} commits=[{}]",
+                        record.response_id,
+                        record.event_id,
+                        record.planned_phrases,
+                        record.commit_horizon(),
+                        record.end,
+                        record
+                            .commits
+                            .iter()
+                            .map(|commit| format!(
+                                "{}@{}..{}(gap {}, synth {}ms)",
+                                commit.seq,
+                                commit.start_at_ms,
+                                commit.end_at_ms,
+                                commit.gap_before_ms,
+                                commit.synthesis_ms
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
+                }
                 last_phrase_response_logged = Some(record.response_id);
             }
             report_raw_ingress_metrics(&raw_ingress_metrics, &mut last_raw_ingress_metrics, false);

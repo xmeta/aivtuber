@@ -671,12 +671,14 @@ fn serve_request(inner: &Arc<Inner>, stream: &mut TcpStream) -> Result<Response,
     if let Some(artifact) = lookup_cache(config, &digest) {
         inner.counters.cache_hits.fetch_add(1, Ordering::Relaxed);
         inner.counters.ok.fetch_add(1, Ordering::Relaxed);
-        eprintln!(
-            "local-tts-sidecar: ok chars={} audio_ms={} cache=hit total_ms={} style_applied=false",
-            text.chars().count(),
-            artifact.duration_ms,
-            started.elapsed().as_millis()
-        );
+        if crate::log_verbosity::diagnostics_enabled() {
+            eprintln!(
+                "local-tts-sidecar: ok chars={} audio_ms={} cache=hit total_ms={} style_applied=false",
+                text.chars().count(),
+                artifact.duration_ms,
+                started.elapsed().as_millis()
+            );
+        }
         return Ok(success(&artifact));
     }
 
@@ -721,11 +723,13 @@ fn serve_request(inner: &Arc<Inner>, stream: &mut TcpStream) -> Result<Response,
     match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
         Ok(Ok(artifact)) => {
             inner.counters.ok.fetch_add(1, Ordering::Relaxed);
-            eprintln!(
-                "local-tts-sidecar: ok chars={char_count} audio_ms={} cache=miss total_ms={} style_applied=false",
-                artifact.duration_ms,
-                started.elapsed().as_millis()
-            );
+            if crate::log_verbosity::diagnostics_enabled() {
+                eprintln!(
+                    "local-tts-sidecar: ok chars={char_count} audio_ms={} cache=miss total_ms={} style_applied=false",
+                    artifact.duration_ms,
+                    started.elapsed().as_millis()
+                );
+            }
             Ok(success(&artifact))
         }
         Ok(Err(SynthError::DeadlineExceeded)) | Err(mpsc::RecvTimeoutError::Timeout) => {
