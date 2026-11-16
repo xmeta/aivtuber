@@ -1335,12 +1335,14 @@ mod tests {
             401
         );
         // A path, markup, an oversized alias, extra fields or a missing field.
-        let long = format!("{{\"model\":\"{}\"}}", "a".repeat(65));
+        let long = format!("{{\"model\":\"{}\"}}", "a".repeat(97));
         for body in [
             "",
             "{}",
             "{\"model\":\"C:\\x.gguf\"}",
             "{\"model\":\"../x\"}",
+            "{\"model\":\"a//b\"}",
+            "{\"model\":\"a:b/c\"}",
             "{\"model\":\"A\"}",
             "{\"model\":\"a\",\"path\":\"/x\"}",
             long.as_str(),
