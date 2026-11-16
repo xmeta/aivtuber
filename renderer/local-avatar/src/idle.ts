@@ -27,7 +27,7 @@ export interface Vec3 {
 }
 
 export interface IdleInput {
-  /// Master switch for motion (`?idle=0` or prefers-reduced-motion turn it off).
+  /// Master switch for motion (`?idle=0` turns it off).
   enabled: boolean;
   /// Speaking level 0..1 (e.g. the largest current viseme weight). Clamped.
   speaking: number;
