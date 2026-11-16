@@ -6,6 +6,7 @@
 //! extracts them without path traversal, synthesizes the starter reaction audio
 //! with the bundled sidecar, writes the env file and prints the licence duties
 //! and the start command. `aivtuber-setup start` then runs the profile.
+//! `aivtuber-setup hybrid` (#366) is the same flow with Thinking on OpenRouter.
 //!
 //! Every pin comes from `packaging/local-profile-pins.json`, the one manifest
 //! shared with the Node fetch scripts.
@@ -15,6 +16,7 @@ pub mod chat;
 pub mod config;
 pub mod download;
 pub mod extract;
+pub mod hybrid;
 pub mod local;
 pub mod manifest;
 pub mod prereq;

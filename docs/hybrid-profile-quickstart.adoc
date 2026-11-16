@@ -1,0 +1,137 @@
+= Hybrid profile quickstart (local stack, Thinking on OpenRouter)
+:toc:
+
+Issue #366 (OpenRouter slice S4 of #368). This is the operator guide for running the performer with *one* role off the machine: the language model (Thinking) is a cloud model on https://openrouter.ai[OpenRouter]; speech recognition, the voice, the avatar page and the operation panel stay on this machine exactly as in the link:local-profile-quickstart.adoc[local profile quickstart]. Choose it when the local Gemma model is not good enough or your GPU cannot run it. It is *not* free: OpenRouter bills the model you pick, and your viewers' chat text is sent to it.
+
+[source,text]
+----
+chat on stdin / microphone
+   -> VAD + Japanese STT sidecar   127.0.0.1, child processes           (unchanged)
+   -> floor policy + barge-in      deterministic, in the app            (unchanged)
+   -> Thinking                     HTTPS to openrouter.ai, Bearer key   <- the only thing that leaves
+   -> local TTS sidecar            Supertonic 3 int8                    127.0.0.1:8770
+   -> local audio                  ffplay
+   -> local VRM avatar renderer    browser page / OBS Browser Source    127.0.0.1:8765
+----
+
+Everything else on this page is procedure; the design is in link:adr/0009-hybrid-profile-thinking-egress.adoc[ADR-0009] and link:security-threat-model.adoc[the threat model, section 10.1].
+
+== What leaves the machine
+
+Read this before you run it. Under `hybrid`, every generated reply sends a bounded request to `openrouter.ai` containing the fixed instruction, the text of the event that triggered it (which can be a *viewer's chat message or transcribed speech*) and the bounded context the runtime projects (curated context items, which can include approved memory or scene text). Nothing is sent for a reply played from the cached reaction pack, and nothing is sent for any other role: voice, speech recognition and the avatar never leave loopback.
+
+* The destination is a typed allowlist, not a setting you can widen by accident: HTTPS, the exact host `openrouter.ai`, with a Bearer key. A different host, a plain-HTTP URL or a missing key stops the app at start. `AIVTUBER_THINKING_EGRESS_HOST` (one extra exact host) is a separate, hybrid-only opt-in that this setup never writes.
+* The app logs the host (never the key or any text) at start and says that chat and reply text are sent to it.
+* The key is held redacted in memory, sent only in the `Authorization` header to that host, and never logged. The HTTP client follows no redirects, so a redirect cannot carry it elsewhere.
+* The setup asks OpenRouter not to retain or train on the prompts (`provider.data_collection` is `deny`). That is a request to the routed providers, not a guarantee; it can be loosened only by setting `AIVTUBER_OPENROUTER_DATA_COLLECTION=allow` yourself.
+* *You* are responsible for your platform's rules and for telling viewers that their chat goes to a third-party model. A remote model's output is untrusted data exactly like a local model's: it can say unwanted things (the publication gate is not content moderation), but it cannot gain control of the runtime.
+* If OpenRouter is slow, rate limited, out of credit or unreachable, the performer degrades to a fixed non-verbal reaction; it never freezes, and the emergency stop and mute do not depend on it.
+
+== What you need
+
+* The same machine as the link:local-profile-quickstart.adoc[local quickstart's release archive path]: Windows 11 x64 or Linux x64, an unpacked release archive, `ffplay` and `ffmpeg` on `PATH`, a browser or OBS. *No GPU, no Vulkan and no Visual C++ runtime are needed*: there is no llama.cpp. The download is about 0.3 GB (voice, speech models, sample avatar) instead of 2.8 GB.
+* An OpenRouter account with credit and an API key.
+
+== 1. Get an OpenRouter key
+
+. Create an account at https://openrouter.ai and add a small amount of credit (a few dollars is plenty to try; replies are short).
+. Create a key at https://openrouter.ai/settings/keys. Give it a credit limit in OpenRouter's own settings if you want a hard ceiling that does not depend on this software (see <<cost>>).
+. Keep the key private. Do not paste it into a chat, an issue or a screenshot. If it leaks, revoke it on the same page.
+
+== 2. Set up
+
+From the unpacked archive folder (a path without spaces, as for `local`):
+
+[source,sh]
+----
+# Linux: put the key in the environment, not on the command line
+export OPENROUTER_API_KEY=...            # or leave it unset to be asked, with the input hidden
+./aivtuber-setup hybrid --check-key
+----
+
+[source,powershell]
+----
+# Windows PowerShell
+$env:OPENROUTER_API_KEY = "..."          # or leave it unset to be asked, with the input hidden
+.\aivtuber-setup.exe hybrid --check-key
+----
+
+*The key is never accepted as a command-line argument* (arguments show up in process lists and shell history), and the setup never prints it. It is read from `OPENROUTER_API_KEY`, or, when that is unset and you are at a terminal, from a prompt with the input hidden. With neither, the command stops and says so; nothing is written. The hidden prompt uses the system's own tool (`stty` on Linux, PowerShell on Windows), so it adds no dependency. If it does not work in your terminal, use the environment variable.
+
+`--check-key` is optional: it asks OpenRouter (`GET https://openrouter.ai/api/v1/key`) whether the key works *before* anything is downloaded or written. If the key is refused, the account has no credit or the network is down, the command prints the reason (never the key or OpenRouter's reply) and leaves the machine untouched. Without it a bad key shows up only when the first reply fails.
+
+`aivtuber-setup hybrid` then does the same as `local`, minus the language model:
+
+. Downloads and verifies the voice, the Silero VAD model, the ReazonSpeech speech model and the sample avatar (each against its pinned SHA-256, see the local quickstart). *No llama.cpp and no model are downloaded.*
+. Speaks the starter reaction lines with the bundled voice sidecar and encodes them with `ffmpeg`.
+. Writes `hybrid-profile.env` beside the programs, with fresh random secrets, your OpenRouter key and the first model. The file is created owner-only on Linux; on Windows it inherits the folder's permissions, so keep the folder in your own profile. It is never overwritten without `--force` (checked *before* the key is asked for), it is never printed, and you must not share or commit it.
+. Prints the licence duties of what it fetched and the start command.
+
+[cols="2,5",options="header"]
+|===
+|Option |Meaning
+|`--model ID` |An OpenRouter model id such as `google/gemini-2.5-flash-lite` (`vendor/model`, optionally `:variant`). Repeatable, at most 8; the *first* is the model the app starts on. Without `--model` the three defaults below are used. Invalid ids and more than 8 are refused before anything else happens.
+|`--check-key` |Check the key with OpenRouter first (needs the network; not with `--offline`).
+|`--dry-run` |Print the plan. No network, no key asked for, nothing written.
+|`--offline`, `--force`, `--skip`, `--assets`, `--root`, `--env-file`, `--from-target` |As for `local` (`--skip` takes `vad,stt,tts,avatar,audio`). `--env-file` defaults to `hybrid-profile.env`.
+|===
+
+=== The default models
+
+Chosen for price and for answering a short in-character reply without a hidden "reasoning" phase that would eat the small reply budget. Prices are USD per million tokens, prompt / completion, as listed by `GET https://openrouter.ai/api/v1/models` on *2026-11-16*; they change, so check https://openrouter.ai/models before you rely on them.
+
+[cols="3,2,3",options="header"]
+|===
+|Model id |Price (in / out) |Why
+|`google/gemini-2.5-flash-lite` |0.10 / 0.40 |Cheap, fast, strong Japanese. The default first model.
+|`qwen/qwen3-30b-a3b-instruct-2507` |0.10 / 0.30 |Non-reasoning instruct model, good Japanese.
+|`mistralai/mistral-small-3.2-24b-instruct` |0.10 / 0.30 |Small, predictable, a different vendor to fall back on.
+|===
+
+No `:free` model is a default: free tiers are rate limited and their providers may use prompts for training, which is the wrong default for viewer chat. You can still pass one with `--model` if you accept that.
+
+== 3. Start
+
+[source,sh]
+----
+./aivtuber-setup start --env-file hybrid-profile.env      # Windows: .\aivtuber-setup.exe start --env-file hybrid-profile.env
+----
+
+`start` sees that the env file is a hybrid one and runs *only the app*: no llama-server, no wait for a model, no GPU. (When `hybrid-profile.env` is the only profile env file beside the program, `--env-file` can be left out; if `local-profile.env` is there too, `start` refuses to guess.) Type chat lines in that terminal or use the microphone; Ctrl+C stops it. The operation panel and the avatar page work as in the local quickstart (steps 7 and 8): the app prints their URLs with per-launch secrets.
+
+== Switching models
+
+The first `--model` is the one the app starts on. When you name more than one (the three defaults count), the setup writes them all to `AIVTUBER_OPENAI_MODEL_CHOICES` as `<id>:openrouter` entries, and the operation panel offers a selector to switch between them while the show is running (#365; the choice is remembered across restarts like the local model switch). *Only the models listed at setup can be switched to*: the panel never takes a free-text model id. To add or remove one, run `aivtuber-setup hybrid --force --model ...` again, or edit that line in `hybrid-profile.env` (`vendor/model[:variant]:openrouter`, comma separated, at most 8, lowercase) and restart. With a single `--model` there is no selector.
+
+[#cost]
+== Cost, the usage panel and the spend cap
+
+The operation panel shows the session's Thinking usage: prompt and completion tokens and the cost OpenRouter reports, as "今回の配信: N トークン · $X.XXXX" (or 不明 when the provider reported none: missing is unknown, never zero). The same totals are in `aivtuberctl status` as `thinking_usage`. They cover the current process only.
+
+To stop spending automatically, add a session cap to `hybrid-profile.env` (the file has the line commented out):
+
+[source,text]
+----
+AIVTUBER_THINKING_COST_CAP_USD=1.00
+----
+
+It is a decimal number of USD, greater than 0 and at most 10000, up to six decimals. When the *provider-reported* cost reaches it, Thinking is suspended until you restart the app: replies become the fixed fallback, and the panel says so. Notes (details in link:generative-fallback.adoc[the generative-fallback doc]):
+
+* Only costs OpenRouter reported count; a reply with no reported cost does not trip the cap.
+* A reply already in flight when the cap is reached still completes, so you can overshoot by one reply.
+* The cap resets when you restart the app. For a ceiling that survives restarts, set a credit limit on the key at openrouter.ai.
+
+== If something goes wrong
+
+[cols="2,4",options="header"]
+|===
+|Message |Meaning and fix
+|`no OpenRouter API key: set OPENROUTER_API_KEY ...` |There is no terminal to ask on and the variable is unset. Set it and run again.
+|`OpenRouter rejected the key (HTTP 401)` |Wrong, revoked or truncated key. Copy it again from openrouter.ai/settings/keys.
+|`OpenRouter reports no credit on this account (HTTP 402)` |Add credit, then run again.
+|`... already exists and is never overwritten without --force` |A `hybrid-profile.env` is already there. `--force` replaces it with new secrets and the key you give now.
+|`profile "hybrid" refuses the thinking endpoint ...` (from the app) |Something in the env file points Thinking somewhere that is not on the allowlist. Run `aivtuber-setup hybrid --force` for a clean file.
+|Replies are the fixed fallback |OpenRouter is unreachable, rate limiting, out of credit, or the spend cap tripped (the panel says which). The performer keeps running; fix it and restart.
+|===
+
+Related: link:local-profile-quickstart.adoc[the local profile quickstart] (voice, chat connections, licences, verification that nothing else leaves the machine) and link:production-runtime.adoc[the production runtime guide] for every variable.

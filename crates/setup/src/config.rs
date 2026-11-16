@@ -4,8 +4,9 @@
 //! works with `docker run --env-file` style tools and is trivial to parse.
 //!
 //! The file holds two generated secrets (the memory pseudonym key and the
-//! control secret). It is never overwritten without `--force`, is created
-//! owner-only on Unix, and is never printed.
+//! control secret); the `hybrid` profile's file also holds the OpenRouter API
+//! key. It is never overwritten without `--force`, is created owner-only on
+//! Unix, and is never printed.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -122,6 +123,163 @@ pub fn normalize_llm_endpoint(raw: &str) -> Result<String, String> {
     Ok(url.to_string())
 }
 
+/// An OpenRouter API key. It is checked to be one line of printable ASCII
+/// (it is written as an env-file value, so a newline would inject a variable),
+/// is never printed, and its `Debug` is redacted.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ApiKey(String);
+
+impl std::fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ApiKey(<redacted>)")
+    }
+}
+
+impl ApiKey {
+    pub const MIN_LEN: usize = 8;
+    pub const MAX_LEN: usize = 256;
+
+    /// Surrounding whitespace (a pasted newline) is dropped; anything else
+    /// outside `!`..`~` is refused. The error never contains the value.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let key = raw.trim();
+        if key.is_empty() {
+            return Err("the API key is empty".to_owned());
+        }
+        if !(Self::MIN_LEN..=Self::MAX_LEN).contains(&key.len()) {
+            return Err(format!(
+                "the API key must be {} to {} characters (it was {})",
+                Self::MIN_LEN,
+                Self::MAX_LEN,
+                key.len()
+            ));
+        }
+        if !key.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(
+                "the API key may contain only printable ASCII characters without spaces or line breaks; was it pasted whole?"
+                    .to_owned(),
+            );
+        }
+        Ok(Self(key.to_owned()))
+    }
+
+    /// The only way to read the value: for the env file and the key check.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The hybrid profile's Thinking setup (`aivtuber-setup hybrid`).
+#[derive(Debug, Clone)]
+pub struct HybridSetup {
+    /// `None` only for a dry run, which writes nothing.
+    pub api_key: Option<ApiKey>,
+    /// Validated OpenRouter model ids; the first is the one the app starts on.
+    pub models: Vec<String>,
+}
+
+/// The sections every profile shares: pack and audio, the local voice and
+/// speech children, the local avatar, the operation panel and the ingress
+/// ceiling. Only the Thinking role differs between profiles.
+fn push_common(t: &mut String, paths: &Paths) {
+    let p = |path: &Path| path.display().to_string();
+    t.push_str("\n# pack, audio\n");
+    push(t, "AIVTUBER_PACK_ROOT", &p(&paths.pack_root));
+    push(t, "AIVTUBER_AUDIO_ROOT", &p(&paths.audio_root));
+    t.push_str("\n# local TTS (supervised child)\n");
+    push(
+        t,
+        "AIVTUBER_TTS_ENDPOINT",
+        &format!("http://127.0.0.1:{TTS_PORT}/v1/synthesize"),
+    );
+    push(t, "AIVTUBER_TTS_SIDECAR", &p(&paths.tts_sidecar));
+    push(
+        t,
+        "AIVTUBER_TTS_SIDECAR_MODEL_DIR",
+        &p(&paths.tts_model_dir),
+    );
+    push(t, "AIVTUBER_TTS_SIDECAR_AMPLITUDE_VISEMES", "true");
+    push(
+        t,
+        "AIVTUBER_TTS_SIDECAR_READY_TIMEOUT_MS",
+        &TTS_READY_TIMEOUT_MS.to_string(),
+    );
+    t.push_str("\n# speech input (supervised children); the app splits ARGS on whitespace\n");
+    push(t, "AIVTUBER_SPEECH_SIDECAR", &p(&paths.speech_sidecar));
+    push(
+        t,
+        "AIVTUBER_SPEECH_SIDECAR_ARGS",
+        &format!("--model {} --language ja", p(&paths.vad_model)),
+    );
+    push(t, "AIVTUBER_SPEECH_STT_WORKER", &p(&paths.stt_worker));
+    push(t, "AIVTUBER_SPEECH_STT_MODEL_DIR", &p(&paths.stt_model_dir));
+    push(t, "AIVTUBER_SPEECH_CONVERSATION", "true");
+    push(t, "AIVTUBER_SPEECH_FLOOR", "true");
+    push(t, "AIVTUBER_SPEECH_BARGE_IN", "true");
+    t.push_str("\n# local avatar\n");
+    push(t, "AIVTUBER_AVATAR_OUTPUT", "local");
+    push(t, "AIVTUBER_LOCAL_AVATAR_PORT", &AVATAR_PORT.to_string());
+    push(
+        t,
+        "AIVTUBER_LOCAL_AVATAR_PAGE_DIR",
+        &p(&paths.avatar_page_dir),
+    );
+    t.push_str("\n# local operation panel (loopback only; the app prints its URL, the secret is in the fragment)\n");
+    push(t, "AIVTUBER_PANEL", "true");
+    push(t, "AIVTUBER_PANEL_PORT", &PANEL_PORT.to_string());
+    push(t, "AIVTUBER_PANEL_PAGE_DIR", &p(&paths.avatar_page_dir));
+    t.push_str("\n# untrusted-input ceiling\n");
+    push(t, "AIVTUBER_INGRESS_MAX_TRUST", "untrusted");
+    push(t, "AIVTUBER_INGRESS_SOURCE_CLASSES", "public_chat,speech");
+}
+
+/// The `hybrid` profile's env file (issue #366): the local stack with the
+/// Thinking role on OpenRouter. There is no llama-server, so `start` runs only
+/// the app. Holds the API key: owner-only, never printed.
+pub fn render_hybrid(paths: &Paths, secrets: &Secrets, key: &ApiKey, models: &[String]) -> String {
+    let p = |path: &Path| path.display().to_string();
+    let mut t = String::new();
+    t.push_str("# Generated by `aivtuber-setup hybrid` (docs/hybrid-profile-quickstart.adoc).\n");
+    t.push_str("# Holds three secrets, including your OpenRouter API key: do not share or commit this file.\n");
+    t.push_str("# KEY=VALUE, no quoting. Start the whole profile with `aivtuber-setup start --env-file <this file>`.\n\n");
+    t.push_str(
+        "# profile and Thinking: the one role that leaves this machine (HTTPS to openrouter.ai)\n",
+    );
+    push(&mut t, "AIVTUBER_MODE", "hybrid");
+    push(&mut t, "AIVTUBER_GENERATIVE_ENABLED", "true");
+    push(&mut t, "AIVTUBER_THINKING_PROVIDER", "openrouter");
+    push(&mut t, "AIVTUBER_OPENAI_AUTH", "bearer");
+    push(&mut t, "AIVTUBER_OPENAI_API_KEY", key.expose());
+    push(
+        &mut t,
+        "AIVTUBER_OPENAI_MODEL",
+        models.first().map_or("", String::as_str),
+    );
+    push(&mut t, "AIVTUBER_OPENAI_BACKEND_NAME", "openrouter");
+    if models.len() > 1 {
+        // The panel's model switch (#365): `alias:version` entries, split on
+        // the last `:`, so the version `openrouter` keeps `vendor/model:variant`
+        // aliases intact. Only models named at setup can be switched to.
+        let choices: Vec<String> = models.iter().map(|m| format!("{m}:openrouter")).collect();
+        push(&mut t, "AIVTUBER_OPENAI_MODEL_CHOICES", &choices.join(","));
+    }
+    t.push_str("# Optional session spend cap in USD; Thinking stops when OpenRouter-reported cost reaches it.\n");
+    t.push_str("# AIVTUBER_THINKING_COST_CAP_USD=1.00\n");
+    push(
+        &mut t,
+        "AIVTUBER_MEMORY_PSEUDONYM_KEY_HEX",
+        &secrets.pseudonym_key_hex,
+    );
+    push(&mut t, "AIVTUBER_CONTROL_SECRET", &secrets.control_secret);
+    push_common(&mut t, paths);
+    t.push_str("\n# read by `aivtuber-setup start` only; the app ignores these\n");
+    t.push_str("# The language model is remote: `start` runs only the app, no llama-server.\n");
+    push(&mut t, "AIVTUBER_SETUP_APP", &p(&paths.app));
+    push(&mut t, "AIVTUBER_SETUP_LLAMA_MODE", "remote");
+    t
+}
+
+/// The local profile's env file: llama-server on loopback.
 pub fn render(
     paths: &Paths,
     secrets: &Secrets,
@@ -162,70 +320,7 @@ pub fn render(
         &secrets.pseudonym_key_hex,
     );
     push(&mut t, "AIVTUBER_CONTROL_SECRET", &secrets.control_secret);
-    t.push_str("\n# pack, audio\n");
-    push(&mut t, "AIVTUBER_PACK_ROOT", &p(&paths.pack_root));
-    push(&mut t, "AIVTUBER_AUDIO_ROOT", &p(&paths.audio_root));
-    t.push_str("\n# local TTS (supervised child)\n");
-    push(
-        &mut t,
-        "AIVTUBER_TTS_ENDPOINT",
-        &format!("http://127.0.0.1:{TTS_PORT}/v1/synthesize"),
-    );
-    push(&mut t, "AIVTUBER_TTS_SIDECAR", &p(&paths.tts_sidecar));
-    push(
-        &mut t,
-        "AIVTUBER_TTS_SIDECAR_MODEL_DIR",
-        &p(&paths.tts_model_dir),
-    );
-    push(&mut t, "AIVTUBER_TTS_SIDECAR_AMPLITUDE_VISEMES", "true");
-    push(
-        &mut t,
-        "AIVTUBER_TTS_SIDECAR_READY_TIMEOUT_MS",
-        &TTS_READY_TIMEOUT_MS.to_string(),
-    );
-    t.push_str("\n# speech input (supervised children); the app splits ARGS on whitespace\n");
-    push(&mut t, "AIVTUBER_SPEECH_SIDECAR", &p(&paths.speech_sidecar));
-    push(
-        &mut t,
-        "AIVTUBER_SPEECH_SIDECAR_ARGS",
-        &format!("--model {} --language ja", p(&paths.vad_model)),
-    );
-    push(&mut t, "AIVTUBER_SPEECH_STT_WORKER", &p(&paths.stt_worker));
-    push(
-        &mut t,
-        "AIVTUBER_SPEECH_STT_MODEL_DIR",
-        &p(&paths.stt_model_dir),
-    );
-    push(&mut t, "AIVTUBER_SPEECH_CONVERSATION", "true");
-    push(&mut t, "AIVTUBER_SPEECH_FLOOR", "true");
-    push(&mut t, "AIVTUBER_SPEECH_BARGE_IN", "true");
-    t.push_str("\n# local avatar\n");
-    push(&mut t, "AIVTUBER_AVATAR_OUTPUT", "local");
-    push(
-        &mut t,
-        "AIVTUBER_LOCAL_AVATAR_PORT",
-        &AVATAR_PORT.to_string(),
-    );
-    push(
-        &mut t,
-        "AIVTUBER_LOCAL_AVATAR_PAGE_DIR",
-        &p(&paths.avatar_page_dir),
-    );
-    t.push_str("\n# local operation panel (loopback only; the app prints its URL, the secret is in the fragment)\n");
-    push(&mut t, "AIVTUBER_PANEL", "true");
-    push(&mut t, "AIVTUBER_PANEL_PORT", &PANEL_PORT.to_string());
-    push(
-        &mut t,
-        "AIVTUBER_PANEL_PAGE_DIR",
-        &p(&paths.avatar_page_dir),
-    );
-    t.push_str("\n# untrusted-input ceiling\n");
-    push(&mut t, "AIVTUBER_INGRESS_MAX_TRUST", "untrusted");
-    push(
-        &mut t,
-        "AIVTUBER_INGRESS_SOURCE_CLASSES",
-        "public_chat,speech",
-    );
+    push_common(&mut t, paths);
     t.push_str("\n# read by `aivtuber-setup start` only; the app ignores these\n");
     push(&mut t, "AIVTUBER_SETUP_APP", &p(&paths.app));
     push(&mut t, "AIVTUBER_SETUP_PROFILE", &llm.profile);
@@ -292,6 +387,14 @@ pub fn write_env(path: &Path, content: &str, force: bool) -> Result<WriteOutcome
     }
     match options.open(path) {
         Ok(mut file) => {
+            // `mode` applies only when the file is created: a file that
+            // `--force` replaces keeps its old permissions unless set here.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| format!("cannot restrict {}: {e}", path.display()))?;
+            }
             file.write_all(content.as_bytes())
                 .map_err(|e| e.to_string())?;
             Ok(WriteOutcome::Written)

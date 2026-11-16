@@ -257,3 +257,185 @@ fn an_unknown_skip_step_is_refused() {
     assert_eq!(o.status.code(), Some(1));
     assert!(text(&o).contains("unknown step"));
 }
+
+// ---- aivtuber-setup hybrid (#366) ----
+
+/// A recognisable stand-in; never a real key.
+const FAKE_KEY: &str = "sk-or-v1-0000test0000fake0000key0000";
+
+fn run_with_key(args: &[&str], key: Option<&str>) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aivtuber-setup"));
+    cmd.env_remove("HTTPS_PROXY")
+        .env_remove("HTTP_PROXY")
+        .env_remove("OPENROUTER_API_KEY")
+        // No terminal: the prompt must never be reached.
+        .stdin(std::process::Stdio::null());
+    if let Some(key) = key {
+        cmd.env("OPENROUTER_API_KEY", key);
+    }
+    cmd.args(args).output().unwrap()
+}
+
+#[test]
+fn hybrid_help_lists_its_flags_and_no_key_flag() {
+    let t = text(&run(&["hybrid", "--help"]));
+    for flag in [
+        "--model",
+        "--check-key",
+        "--dry-run",
+        "--force",
+        "--env-file",
+    ] {
+        assert!(t.contains(flag), "{flag} missing from: {t}");
+    }
+    assert!(t.contains("OPENROUTER_API_KEY"), "{t}");
+    for forbidden in ["--api-key", "--key", "--token"] {
+        assert!(!t.contains(forbidden), "{forbidden} must not exist: {t}");
+    }
+}
+
+#[test]
+fn the_key_is_not_accepted_on_the_command_line() {
+    let root = fake_release("cli-hybrid-argv");
+    let o = run_with_key(
+        &[
+            "hybrid",
+            "--root",
+            root.to_str().unwrap(),
+            "--api-key",
+            FAKE_KEY,
+        ],
+        None,
+    );
+    assert_eq!(o.status.code(), Some(2), "{}", text(&o));
+    assert!(!text(&o).contains(FAKE_KEY), "{}", text(&o));
+    assert!(!root.join("hybrid-profile.env").exists());
+}
+
+#[test]
+fn without_a_terminal_and_without_the_variable_it_fails_with_guidance_and_writes_nothing() {
+    let root = fake_release("cli-hybrid-nokey");
+    let before = listing(&root);
+    let o = run_with_key(&["hybrid", "--root", root.to_str().unwrap()], None);
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+    let t = text(&o);
+    assert!(t.contains("OPENROUTER_API_KEY"), "{t}");
+    assert_eq!(listing(&root), before);
+}
+
+#[test]
+fn the_model_list_is_bounded_and_validated_before_anything_else() {
+    let root = fake_release("cli-hybrid-models");
+    let nine: Vec<String> = (0..9).map(|i| format!("v/m{i}")).collect();
+    let mut args = vec!["hybrid", "--dry-run", "--root", root.to_str().unwrap()];
+    for m in &nine {
+        args.push("--model");
+        args.push(m);
+    }
+    let o = run_with_key(&args, Some(FAKE_KEY));
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+    assert!(text(&o).contains("at most 8"), "{}", text(&o));
+
+    let o = run_with_key(
+        &[
+            "hybrid",
+            "--dry-run",
+            "--root",
+            root.to_str().unwrap(),
+            "--model",
+            "not-an-id",
+        ],
+        Some(FAKE_KEY),
+    );
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+    assert!(text(&o).contains("vendor/model"), "{}", text(&o));
+}
+
+#[test]
+fn a_hybrid_dry_run_needs_no_key_downloads_no_llama_and_writes_nothing() {
+    let root = fake_release("cli-hybrid-dry");
+    let before = listing(&root);
+    let assets = root.parent().unwrap().join("assets");
+    let o = run_with_key(
+        &[
+            "hybrid",
+            "--dry-run",
+            "--root",
+            root.to_str().unwrap(),
+            "--assets",
+            assets.to_str().unwrap(),
+        ],
+        None,
+    );
+    let t = text(&o);
+    assert!(o.status.success(), "{t}");
+    for needle in [
+        "aivtuber-setup hybrid",
+        "OpenRouter",
+        "openrouter.ai",
+        "--env-file",
+    ] {
+        assert!(t.contains(needle), "plan lacks {needle:?}: {t}");
+    }
+    for absent in ["llama.cpp", "gguf", "Vulkan"] {
+        assert!(!t.contains(absent), "hybrid plan mentions {absent:?}: {t}");
+    }
+    assert!(!assets.exists());
+    assert_eq!(listing(&root), before);
+}
+
+#[test]
+fn the_key_in_the_environment_never_reaches_the_output() {
+    let root = fake_release("cli-hybrid-env");
+    let assets = root.parent().unwrap().join("assets");
+    // A real (non dry) offline run cannot finish, but it must still not leak.
+    let o = run_with_key(
+        &[
+            "hybrid",
+            "--offline",
+            "--root",
+            root.to_str().unwrap(),
+            "--assets",
+            assets.to_str().unwrap(),
+        ],
+        Some(FAKE_KEY),
+    );
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+    assert!(!text(&o).contains(FAKE_KEY), "{}", text(&o));
+    assert!(!root.join("hybrid-profile.env").exists());
+}
+
+#[test]
+fn an_existing_hybrid_env_file_is_refused_before_the_key_is_asked_for() {
+    let root = fake_release("cli-hybrid-exists");
+    fs::write(root.join("hybrid-profile.env"), "A=1\n").unwrap();
+    let o = run_with_key(&["hybrid", "--root", root.to_str().unwrap()], None);
+    assert_eq!(o.status.code(), Some(1));
+    let t = text(&o);
+    assert!(
+        t.contains("--force") && !t.contains("OPENROUTER_API_KEY"),
+        "{t}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("hybrid-profile.env")).unwrap(),
+        "A=1\n"
+    );
+}
+
+#[test]
+fn check_key_cannot_be_combined_with_offline() {
+    let root = fake_release("cli-hybrid-offline-check");
+    let o = run_with_key(
+        &[
+            "hybrid",
+            "--offline",
+            "--check-key",
+            "--root",
+            root.to_str().unwrap(),
+        ],
+        Some(FAKE_KEY),
+    );
+    assert_eq!(o.status.code(), Some(1));
+    assert!(text(&o).contains("--offline"), "{}", text(&o));
+    assert!(!text(&o).contains(FAKE_KEY));
+}
