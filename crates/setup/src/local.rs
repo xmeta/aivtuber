@@ -16,7 +16,7 @@
 //!   writes the env file; fails and lists what is missing.
 
 use crate::audio;
-use crate::config::{self, LlmMode, LlmSetup, Paths, Secrets, WriteOutcome};
+use crate::config::{self, HybridSetup, LlmMode, LlmSetup, Paths, Secrets, WriteOutcome};
 use crate::download::{self, DownloadConfig, Outcome, matches_pin};
 use crate::extract::{self, Limits};
 use crate::manifest::{Asset, Manifest};
@@ -58,6 +58,9 @@ pub struct LocalOptions {
     /// Where the executables are when they are not in `root` (a cargo target
     /// directory, for a developer running from a source checkout).
     pub bin_dir: Option<PathBuf>,
+    /// `aivtuber-setup hybrid` (#366): the Thinking role is OpenRouter, so no
+    /// llama.cpp and no model are fetched and the env file is the hybrid one.
+    pub hybrid: Option<HybridSetup>,
     /// `win32-x64` or `linux-x64`.
     pub platform: String,
     pub download: DownloadConfig,
@@ -215,8 +218,19 @@ pub fn run<W: Write>(
         .as_deref()
         .map(config::normalize_llm_endpoint)
         .transpose()?;
-    let skip =
-        |id: &str| opts.skip.contains(id) || (endpoint.is_some() && matches!(id, "llama" | "llm"));
+    let hybrid = opts.hybrid.as_ref();
+    if hybrid.is_some() && (endpoint.is_some() || !opts.with_models.is_empty()) {
+        return Err(
+            "the hybrid profile has no local model: --llm-endpoint and --with-model do not apply"
+                .to_owned(),
+        );
+    }
+    // A hybrid profile sends Thinking to OpenRouter: nothing is fetched for a
+    // local model server.
+    let skip = |id: &str| {
+        opts.skip.contains(id)
+            || ((endpoint.is_some() || hybrid.is_some()) && matches!(id, "llama" | "llm"))
+    };
     let profile = manifest.profile(&opts.profile)?;
     let mut extra_models = Vec::new();
     for id in &opts.with_models {
@@ -314,22 +328,33 @@ pub fn run<W: Write>(
     } else {
         "fetching"
     };
-    ctx.say(format!("aivtuber-setup local ({mode})"));
+    ctx.say(format!(
+        "aivtuber-setup {} ({mode})",
+        if hybrid.is_some() { "hybrid" } else { "local" }
+    ));
     ctx.say(format!("  install  {}", root.display()));
     ctx.say(format!("  assets   {}", opts.assets.display()));
     ctx.say(format!("  env file {}", opts.env_file.display()));
     if let Some(dir) = &opts.bin_dir {
         ctx.say(format!("  programs {} (--from-target)", dir.display()));
     }
-    ctx.say(format!(
-        "  llama.cpp {} build {flavor} on {}",
-        manifest.llama.tag, opts.platform
-    ));
-    ctx.say(format!(
-        "  profile  {} ({})",
-        profile.name, profile.spec.description
-    ));
-    if let Some(gb) = profile.spec.min_vram_gb {
+    if let Some(h) = hybrid {
+        ctx.say(format!(
+            "  thinking OpenRouter ({} model(s), starting on {}); chat and reply text are sent to openrouter.ai, everything else stays on this machine",
+            h.models.len(),
+            h.models.first().map_or("?", String::as_str)
+        ));
+    } else {
+        ctx.say(format!(
+            "  llama.cpp {} build {flavor} on {}",
+            manifest.llama.tag, opts.platform
+        ));
+        ctx.say(format!(
+            "  profile  {} ({})",
+            profile.name, profile.spec.description
+        ));
+    }
+    if let Some(gb) = profile.spec.min_vram_gb.filter(|_| hybrid.is_none()) {
         ctx.say(format!(
             "  REQUIRES  at least about {gb} GB of VRAM for the {} profile; on a smaller GPU the model spills to system memory and replies slow down badly (EXP-0004c). Use the default profile there.",
             profile.name
@@ -359,11 +384,18 @@ pub fn run<W: Write>(
             None => ctx.say(format!("  WARNING   {name}: not found on PATH")),
         }
     }
-    match &probe.vulkan {
-        Vulkan::Found(p) => ctx.say(format!("  ok        Vulkan loader: {p}")),
-        Vulkan::NotFound => ctx.say("  WARNING   Vulkan loader: not found"),
+    // Only a local model server uses the GPU.
+    if hybrid.is_none() {
+        match &probe.vulkan {
+            Vulkan::Found(p) => ctx.say(format!("  ok        Vulkan loader: {p}")),
+            Vulkan::NotFound => ctx.say("  WARNING   Vulkan loader: not found"),
+        }
     }
-    summary.warnings = probe.warnings();
+    summary.warnings = probe
+        .warnings()
+        .into_iter()
+        .filter(|w| hybrid.is_none() || !w.starts_with("no Vulkan loader"))
+        .collect();
     for w in &summary.warnings {
         ctx.say(format!("  -> {w}"));
     }
@@ -660,6 +692,8 @@ pub fn run<W: Write>(
     if opts.dry_run {
         let state = if opts.env_file.exists() {
             "exists and would be kept (--force replaces it)"
+        } else if hybrid.is_some() {
+            "would be created with two generated secrets and your OpenRouter API key"
         } else {
             "would be created with two generated secrets"
         };
@@ -667,17 +701,25 @@ pub fn run<W: Write>(
         summary.env = None;
     } else {
         let secrets = Secrets::generate()?;
-        let gpu_layers = if flavor == "vulkan" { 99 } else { 0 };
-        let llm_setup = LlmSetup {
-            profile: profile.name.to_owned(),
-            alias: profile.spec.alias.clone(),
-            model_version: profile.spec.model_version.clone(),
-            context: profile.spec.context,
-            parallel: profile.spec.parallel,
-            mode: mode.clone(),
+        let text = if let Some(h) = hybrid {
+            let key = h
+                .api_key
+                .as_ref()
+                .ok_or("no OpenRouter API key was given")?;
+            config::render_hybrid(&paths, &secrets, key, &h.models)
+        } else {
+            let gpu_layers = if flavor == "vulkan" { 99 } else { 0 };
+            let llm_setup = LlmSetup {
+                profile: profile.name.to_owned(),
+                alias: profile.spec.alias.clone(),
+                model_version: profile.spec.model_version.clone(),
+                context: profile.spec.context,
+                parallel: profile.spec.parallel,
+                mode: mode.clone(),
+            };
+            config::render(&paths, &secrets, opts.llama_port, gpu_layers, &llm_setup)
         };
-        let text = config::render(&paths, &secrets, opts.llama_port, gpu_layers, &llm_setup);
-        if mode == LlmMode::Missing {
+        if mode == LlmMode::Missing && hybrid.is_none() {
             ctx.say("  NOTE      no language model is provisioned (skipped, or not on disk): `start` will refuse until you run this command again without --skip, or pass --llm-endpoint <loopback url>");
         }
         let outcome = config::write_env(&opts.env_file, &text, opts.force)?;

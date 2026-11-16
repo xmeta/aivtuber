@@ -1,5 +1,7 @@
 //! `aivtuber-setup start`: runs the local profile from the env file written by
-//! `aivtuber-setup local` (quickstart steps 3 and 4 in one command).
+//! `aivtuber-setup local` (quickstart steps 3 and 4 in one command), or the
+//! hybrid profile from the one `aivtuber-setup hybrid` wrote (#366), where
+//! Thinking is remote and only the app is started.
 //!
 //! It starts llama-server on loopback, waits for `/health`, then runs
 //! `aivtuber-app` with the env file's variables in the foreground (chat is read
@@ -48,11 +50,28 @@ fn need<'a>(env: &'a BTreeMap<String, String>, key: &str) -> Result<&'a str, Str
 pub fn load_env(path: &Path) -> Result<BTreeMap<String, String>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| {
         format!(
-            "cannot read {}: {e}; run `aivtuber-setup local` first",
+            "cannot read {}: {e}; run `aivtuber-setup local` (or `aivtuber-setup hybrid`) first",
             path.display()
         )
     })?;
     Ok(parse_env(&text).into_iter().collect())
+}
+
+/// The env file `start` uses when `--env-file` is not given: the one `local`
+/// or `hybrid` wrote beside this program. Both present is ambiguous and is
+/// refused rather than guessed, because they start different profiles.
+pub fn default_env_file(dir: &Path, exists: &dyn Fn(&Path) -> bool) -> Result<PathBuf, String> {
+    let local = dir.join("local-profile.env");
+    let hybrid = dir.join("hybrid-profile.env");
+    match (exists(&local), exists(&hybrid)) {
+        (true, true) => Err(format!(
+            "both {} and {} exist; say which profile to start with --env-file",
+            local.display(),
+            hybrid.display()
+        )),
+        (false, true) => Ok(hybrid),
+        _ => Ok(local),
+    }
 }
 
 /// What `aivtuber-setup local` recorded about the language model.
@@ -62,6 +81,9 @@ pub enum Llm {
     Managed(LlamaCommand),
     /// The operator runs the model server at the endpoint in the env file.
     External,
+    /// `aivtuber-setup hybrid` (#366): Thinking is OpenRouter; no model server
+    /// is started here.
+    Remote,
 }
 
 /// Decides how the model is served, or refuses with the way out. An env file
@@ -70,6 +92,16 @@ pub fn llm(env: &BTreeMap<String, String>) -> Result<Llm, String> {
     match env.get("AIVTUBER_SETUP_LLAMA_MODE").map(String::as_str) {
         None | Some("managed") => llama_command(env).map(Llm::Managed),
         Some("external") => Ok(Llm::External),
+        Some("remote") => {
+            for key in ["AIVTUBER_OPENAI_API_KEY", "AIVTUBER_OPENAI_MODEL"] {
+                if env.get(key).is_none_or(|v| v.trim().is_empty()) {
+                    return Err(format!(
+                        "{key} is missing from the env file; run `aivtuber-setup hybrid --force` to write it again"
+                    ));
+                }
+            }
+            Ok(Llm::Remote)
+        }
         Some("missing") => Err(
             "this env file has no language model: `aivtuber-setup local` was run with --skip llm (or llama), or the files are not on disk. Run it again without --skip (add --force to rewrite the env file), or run it with --llm-endpoint <loopback url> to use a model server you run yourself".to_owned(),
         ),
@@ -472,7 +504,7 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
         Llm::Managed(_) => plan_models(&env, &Manifest::embedded(), &settings, &|p| {
             std::fs::metadata(p).ok().map(|m| m.len())
         })?,
-        Llm::External => None,
+        Llm::External | Llm::Remote => None,
     };
     let mut llm = llm;
     if let (Some(plan), Llm::Managed(llama)) = (&plan, &mut llm) {
@@ -486,6 +518,10 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
             "llama-server: {} {}",
             llama.program.display(),
             llama.args.join(" ")
+        ),
+        Llm::Remote => println!(
+            "language model: OpenRouter, model {} (remote: chat and reply text are sent to openrouter.ai; no local model server is started)",
+            env.get("AIVTUBER_OPENAI_MODEL").map_or("?", String::as_str)
         ),
         Llm::External => println!(
             "language model: your own server at {} (not started here)",

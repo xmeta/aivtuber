@@ -3,15 +3,19 @@
 
 mod common;
 
+use aivtuber_setup::config::{ApiKey, HybridSetup};
 use aivtuber_setup::download::DownloadConfig;
+use aivtuber_setup::hybrid;
 use aivtuber_setup::local::{self, LocalOptions, exe};
 use aivtuber_setup::manifest::Manifest;
 use aivtuber_setup::prereq::{Report, Vulkan};
 use common::*;
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// The two pinned platforms; independent of the machine the test runs on.
@@ -223,6 +227,7 @@ fn options(f: &Fixture) -> LocalOptions {
         with_models: Vec::new(),
         llm_endpoint: None,
         bin_dir: None,
+        hybrid: None,
         platform: platform(),
         download: DownloadConfig {
             allow_loopback_http: true,
@@ -758,4 +763,322 @@ fn the_dry_run_names_the_unbundled_runtime_and_writes_nothing() {
         "{out}"
     );
     assert!(!o.assets.exists());
+}
+
+// ---- aivtuber-setup hybrid (#366) ----
+
+/// A recognisable stand-in; never a real key.
+const FAKE_KEY: &str = "sk-or-v1-0000test0000fake0000key0000";
+
+fn hybrid_options(f: &Fixture) -> LocalOptions {
+    let mut o = options(f);
+    o.env_file = f.root.join("hybrid-profile.env");
+    o.hybrid = Some(HybridSetup {
+        api_key: Some(ApiKey::parse(FAKE_KEY).unwrap()),
+        models: vec!["google/gemini-2.5-flash-lite".into(), "a/b:nitro".into()],
+    });
+    o
+}
+
+/// Answers every request with `status` and records the Authorization header.
+fn key_server(status: u16) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/api/v1/key", listener.local_addr().unwrap());
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let head = String::from_utf8_lossy(&buf[..n]).to_string();
+            let auth = head
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix("authorization: ")
+                        .or_else(|| l.strip_prefix("Authorization: "))
+                })
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+            log.lock().unwrap().push(auth);
+            let body = br#"{"error":{"message":"details that must never be printed"}}"#;
+            let reply = format!(
+                "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(reply.as_bytes());
+            let _ = stream.write_all(body);
+        }
+    });
+    (url, seen)
+}
+
+#[test]
+fn the_hybrid_env_names_openrouter_holds_the_key_and_has_no_local_model() {
+    let f = fixture("hybrid-env", false);
+    let o = hybrid_options(&f);
+    let (r, out) = go(&f, &o);
+    r.unwrap_or_else(|e| panic!("{e}\n{out}"));
+    // No llama.cpp and no model are fetched.
+    assert!(!o.assets.join("llm").exists() && !o.assets.join("llama").exists());
+    assert!(o.assets.join("vad").exists() && o.assets.join("supertonic").exists());
+    let env = env_map(&o.env_file);
+    for (k, v) in [
+        ("AIVTUBER_MODE", "hybrid"),
+        ("AIVTUBER_GENERATIVE_ENABLED", "true"),
+        ("AIVTUBER_THINKING_PROVIDER", "openrouter"),
+        ("AIVTUBER_OPENAI_AUTH", "bearer"),
+        ("AIVTUBER_OPENAI_API_KEY", FAKE_KEY),
+        ("AIVTUBER_OPENAI_MODEL", "google/gemini-2.5-flash-lite"),
+        ("AIVTUBER_OPENAI_BACKEND_NAME", "openrouter"),
+        ("AIVTUBER_SETUP_LLAMA_MODE", "remote"),
+    ] {
+        assert_eq!(env[k], v, "{k}");
+    }
+    // Only Thinking may leave the machine: no remote endpoint is spelled out
+    // (the preset owns it), the TTS stays loopback, nothing local-llm remains.
+    assert!(!env.contains_key("AIVTUBER_OPENAI_ENDPOINT"));
+    assert!(!env.contains_key("AIVTUBER_THINKING_EGRESS_HOST"));
+    assert!(!env.contains_key("AIVTUBER_OPENAI_MODEL_CHOICES"));
+    assert!(
+        !env.keys()
+            .any(|k| k.starts_with("AIVTUBER_SETUP_LLAMA_") && k != "AIVTUBER_SETUP_LLAMA_MODE")
+    );
+    assert!(env["AIVTUBER_TTS_ENDPOINT"].starts_with("http://127.0.0.1:"));
+    assert_eq!(env["AIVTUBER_CONTROL_SECRET"].len(), 32);
+    assert_eq!(env["AIVTUBER_MEMORY_PSEUDONYM_KEY_HEX"].len(), 64);
+    // The key is in the file and nowhere else: not in the output, not in Debug.
+    assert!(!out.contains(FAKE_KEY), "{out}");
+    assert!(!format!("{o:?}").contains(FAKE_KEY));
+    assert!(out.contains("openrouter.ai"));
+    assert!(!out.contains("llama.cpp"), "{out}");
+    // `start` takes it as a remote model: no llama-server command.
+    assert_eq!(
+        aivtuber_setup::start::llm(&env).unwrap(),
+        aivtuber_setup::start::Llm::Remote
+    );
+}
+
+#[test]
+fn the_local_env_file_still_holds_no_remote_credential() {
+    let f = fixture("hybrid-local-unchanged", false);
+    let o = options(&f);
+    go(&f, &o).0.unwrap();
+    let env = env_map(&o.env_file);
+    assert_eq!(env["AIVTUBER_MODE"], "local");
+    assert!(!env.keys().any(|k| k.contains("API_KEY")));
+    assert!(!env.contains_key("AIVTUBER_THINKING_PROVIDER"));
+}
+
+#[test]
+fn start_with_a_hybrid_env_file_plans_no_llama_server() {
+    let f = fixture("hybrid-start", false);
+    let o = hybrid_options(&f);
+    go(&f, &o).0.unwrap();
+    let env = env_map(&o.env_file);
+    // The mode key makes `start` run only the app; plan_models is only asked
+    // for a managed server.
+    assert!(matches!(
+        aivtuber_setup::start::llm(&env).unwrap(),
+        aivtuber_setup::start::Llm::Remote
+    ));
+    let code = aivtuber_setup::start::start(&aivtuber_setup::start::StartOptions {
+        env_file: o.env_file.clone(),
+        dry_run: true,
+        health_timeout: Duration::from_secs(1),
+    })
+    .unwrap();
+    assert_eq!(code, 0);
+    assert!(!o.env_file.with_file_name("llama-models.ini").exists());
+    assert!(!o.env_file.with_file_name("llama-server.log").exists());
+
+    // An env file without the key or the model is refused, with the way out.
+    let mut broken = env.clone();
+    broken.remove("AIVTUBER_OPENAI_API_KEY");
+    let err = aivtuber_setup::start::llm(&broken).unwrap_err();
+    assert!(
+        err.contains("AIVTUBER_OPENAI_API_KEY") && err.contains("hybrid --force"),
+        "{err}"
+    );
+    assert!(!err.contains(FAKE_KEY));
+}
+
+#[test]
+fn start_picks_the_only_profile_env_file_and_refuses_when_both_exist() {
+    let dir = scratch("hybrid-default-env");
+    let exists = |p: &Path| p.exists();
+    // Neither: the local name, whose read error names `local` and `hybrid`.
+    assert_eq!(
+        aivtuber_setup::start::default_env_file(&dir, &exists).unwrap(),
+        dir.join("local-profile.env")
+    );
+    fs::write(dir.join("hybrid-profile.env"), "A=1\n").unwrap();
+    assert_eq!(
+        aivtuber_setup::start::default_env_file(&dir, &exists).unwrap(),
+        dir.join("hybrid-profile.env")
+    );
+    fs::write(dir.join("local-profile.env"), "A=1\n").unwrap();
+    let err = aivtuber_setup::start::default_env_file(&dir, &exists).unwrap_err();
+    assert!(err.contains("--env-file"), "{err}");
+}
+
+#[test]
+fn an_existing_hybrid_env_file_is_kept_unless_forced() {
+    let f = fixture("hybrid-force", false);
+    let o = hybrid_options(&f);
+    go(&f, &o).0.unwrap();
+    let first = fs::read_to_string(&o.env_file).unwrap();
+
+    // A second run with another key keeps the file untouched.
+    let mut again = hybrid_options(&f);
+    again.hybrid.as_mut().unwrap().api_key =
+        Some(ApiKey::parse("sk-or-v1-another-key-entirely").unwrap());
+    let (r, out) = go(&f, &again);
+    assert_eq!(
+        r.unwrap().env,
+        Some(aivtuber_setup::config::WriteOutcome::KeptExisting)
+    );
+    assert_eq!(fs::read_to_string(&o.env_file).unwrap(), first);
+    assert!(out.contains("--force"), "{out}");
+
+    again.force = true;
+    go(&f, &again).0.unwrap();
+    let replaced = fs::read_to_string(&o.env_file).unwrap();
+    assert!(replaced.contains("sk-or-v1-another-key-entirely"));
+    assert!(!replaced.contains(FAKE_KEY));
+}
+
+#[cfg(unix)]
+#[test]
+fn the_hybrid_env_file_is_owner_only_even_when_replaced_by_force() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture("hybrid-perms", false);
+    let mut o = hybrid_options(&f);
+    go(&f, &o).0.unwrap();
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&o.env_file), 0o600);
+    // A looser pre-existing file is tightened when --force replaces it.
+    fs::set_permissions(&o.env_file, fs::Permissions::from_mode(0o644)).unwrap();
+    o.force = true;
+    go(&f, &o).0.unwrap();
+    assert_eq!(mode(&o.env_file), 0o600);
+}
+
+#[test]
+fn an_unusable_key_never_reaches_the_env_file() {
+    // A newline would inject a variable into the file.
+    assert!(ApiKey::parse("sk-or-v1-abc\nAIVTUBER_MODE=local").is_err());
+    assert!(ApiKey::parse("short").is_err());
+    assert!(ApiKey::parse("has space inside key").is_err());
+    assert_eq!(
+        format!("{:?}", ApiKey::parse(FAKE_KEY).unwrap()),
+        "ApiKey(<redacted>)"
+    );
+}
+
+#[test]
+fn a_dry_run_needs_no_key_and_writes_nothing() {
+    let f = fixture("hybrid-dry", false);
+    let mut o = hybrid_options(&f);
+    o.dry_run = true;
+    o.hybrid.as_mut().unwrap().api_key = None;
+    let before = tree(&f.base);
+    let (r, out) = go(&f, &o);
+    r.unwrap_or_else(|e| panic!("{e}\n{out}"));
+    assert_eq!(tree(&f.base), before);
+    assert!(!o.env_file.exists());
+    assert!(out.contains("your OpenRouter API key"), "{out}");
+}
+
+#[test]
+fn hybrid_refuses_the_local_model_options() {
+    let f = fixture("hybrid-conflict", false);
+    let mut o = hybrid_options(&f);
+    o.llm_endpoint = Some("http://127.0.0.1:9100".into());
+    assert!(go(&f, &o).0.unwrap_err().contains("do not apply"));
+}
+
+fn preflight(url: &str, o: &LocalOptions, f: &Fixture) -> (Result<local::Summary, String>, String) {
+    let mut out = Vec::new();
+    let r = hybrid::run(o, Some(url), &f.manifest, &probe(), &mut out);
+    (r, String::from_utf8(out).unwrap())
+}
+
+#[test]
+fn a_failed_key_check_writes_and_downloads_nothing_and_prints_only_the_reason() {
+    for (status, reason) in [(401u16, "rejected the key"), (402, "no credit")] {
+        let f = fixture(&format!("hybrid-check-{status}"), false);
+        let o = hybrid_options(&f);
+        let before = tree(&f.base);
+        let (url, seen) = key_server(status);
+        let (r, out) = preflight(&url, &o, &f);
+        let err = r.unwrap_err();
+        assert!(err.contains(reason), "{status}: {err}");
+        for text in [&err, &out] {
+            assert!(!text.contains(FAKE_KEY), "{text}");
+            assert!(!text.contains("details that must never"), "{text}");
+        }
+        // The key went to the endpoint as a Bearer header, once.
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [format!("Bearer {FAKE_KEY}")]
+        );
+        // Nothing written: no env file, no assets, nothing else in the tree.
+        assert!(!o.env_file.exists() && !o.assets.exists());
+        assert_eq!(tree(&f.base), before);
+        assert_eq!(f.server.count(), 0, "no download may start");
+    }
+}
+
+#[test]
+fn an_unreachable_key_check_endpoint_fails_closed_without_the_key_in_the_message() {
+    let f = fixture("hybrid-check-down", false);
+    let o = hybrid_options(&f);
+    // Nothing listens on this port.
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let (r, _) = preflight(&format!("http://127.0.0.1:{port}/api/v1/key"), &o, &f);
+    let err = r.unwrap_err();
+    assert!(err.contains("could not reach"), "{err}");
+    assert!(!err.contains(FAKE_KEY));
+    assert!(!o.env_file.exists());
+}
+
+#[test]
+fn an_accepted_key_check_lets_the_setup_finish() {
+    let f = fixture("hybrid-check-ok", false);
+    let o = hybrid_options(&f);
+    let (url, seen) = key_server(200);
+    let (r, out) = preflight(&url, &o, &f);
+    r.unwrap_or_else(|e| panic!("{e}\n{out}"));
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    assert!(o.env_file.is_file());
+    assert!(!out.contains(FAKE_KEY));
+}
+
+#[test]
+fn a_redirecting_key_check_does_not_forward_the_key() {
+    let f = fixture("hybrid-check-redirect", false);
+    let o = hybrid_options(&f);
+    let (target, target_seen) = key_server(200);
+    // 302 to the second server: the key must not follow.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/api/v1/key", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf);
+            let reply = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(reply.as_bytes());
+        }
+    });
+    let (r, _) = preflight(&url, &o, &f);
+    assert!(r.is_err());
+    assert!(target_seen.lock().unwrap().is_empty());
+    assert!(!o.env_file.exists());
 }
