@@ -10,8 +10,10 @@
 //   debug  "1" exposes a read-only state snapshot at window.__avatarDebug
 //          (used by the headless smoke test; carries no secret)
 //   idle   "0" switches the renderer-local idle motion off (breathing, sway,
-//          blink, saccades); `prefers-reduced-motion: reduce` does the same.
-//          The natural rest pose stays. See src/idle.ts.
+//          blink, saccades). This is the operator's explicit switch only: the
+//          avatar's motion is broadcast content, so the OS reduced-motion
+//          setting does not turn it off. The natural rest pose stays. See
+//          src/idle.ts.
 
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
@@ -34,8 +36,7 @@ const MAX_MODEL_BYTES = 64 * 1024 * 1024; // same ceiling as the host's static s
 const params = new URLSearchParams(location.search);
 const token = params.get("token") ?? "";
 const debug = params.get("debug") === "1";
-const idleEnabled =
-  params.get("idle") !== "0" && !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+const idleEnabled = params.get("idle") !== "0";
 
 /// Same-origin, host-allowlisted path characters only (mirrors the Rust
 /// static server), so a crafted `model` value cannot reach another origin.

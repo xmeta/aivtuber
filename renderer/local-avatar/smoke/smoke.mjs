@@ -139,7 +139,7 @@ try {
     "--disable-gpu", "--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist",
   ];
   browser = await chromium.launch({ channel, headless: true, args: gpuArgs });
-  const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+  const page = await browser.newPage({ viewport: { width: 1280, height: 720 }, reducedMotion: "reduce" }); // idle must not follow it (#387)
   const problems = [];
   page.on("pageerror", (e) => problems.push(`pageerror: ${e.message}`));
   page.on("console", (m) => {
@@ -155,6 +155,7 @@ try {
   await until(async () => (await snap())?.ready, "renderer ready");
   const first = await snap();
   check("ready arrives", first.ready === true && typeof first.epoch === "string");
+  check("idle motion is on by default even with reduced motion emulated", first.idle === true, String(first.idle));
   check("epoch is a UUID", /^[0-9a-f-]{36}$/.test(first.epoch), first.epoch);
   check("model hash is the pinned SHA-256", first.modelHash === MODEL.sha256, first.modelHash);
   const h0 = await until(async () => {
