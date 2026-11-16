@@ -269,29 +269,35 @@ fn run() -> Result<(), Box<dyn Error>> {
         app = app.with_generation(generative);
     }
     if let Some(switcher) = model_switcher {
-        eprintln!(
-            "thinking model: {} (switchable: {})",
-            switcher.status().active,
-            switcher.catalog().render_choices()
-        );
+        if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+            eprintln!(
+                "thinking model: {} (switchable: {})",
+                switcher.status().active,
+                switcher.catalog().render_choices()
+            );
+        }
         app = app.with_model_switcher(switcher);
     }
     if let Some(meter) = thinking_meter {
         app = app.with_thinking_meter(meter);
     }
     if let Some(controller) = voice_controller {
-        eprintln!(
-            "voice settings: composed (backend={}; the operation panel and aivtuberctl can change it)",
-            controller.status().backend
-        );
+        if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+            eprintln!(
+                "voice settings: composed (backend={}; the operation panel and aivtuberctl can change it)",
+                controller.status().backend
+            );
+        }
         app = app.with_voice_controller(controller);
     }
     // #361: stream chat connected from the panel. Off unless the launcher names
     // the settings file.
     if let Some(controller) = build_chat_ingress(raw_ingress_config)? {
-        eprintln!(
-            "chat ingress: composed (the operation panel and aivtuberctl can connect Twitch and YouTube chat; records are admitted as untrusted public chat under the ingress ceiling)"
-        );
+        if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+            eprintln!(
+                "chat ingress: composed (the operation panel and aivtuberctl can connect Twitch and YouTube chat; records are admitted as untrusted public chat under the ingress ceiling)"
+            );
+        }
         app = app.with_chat_ingress(controller);
     }
     // #362: the VRM avatar choice. Off unless the launcher names the settings
@@ -386,7 +392,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     // Issue #55 acceptance: startup states the active routing capabilities
     // without leaking secrets.
-    eprintln!("{}", startup_summary.log_line());
+    if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+        eprintln!("{}", startup_summary.log_line());
+    }
     if let Some(notice) = startup_summary.egress_notice() {
         eprintln!("{notice}");
     }
@@ -394,10 +402,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         eprintln!("{line}");
     }
     let preload = app.startup()?;
-    eprintln!(
-        "aivtuber-app ready: indexed={} usable={} preloaded={}",
-        preload.indexed.indexed, preload.indexed.usable, preload.preloaded
-    );
+    if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+        eprintln!(
+            "aivtuber-app ready: indexed={} usable={} preloaded={}",
+            preload.indexed.indexed, preload.indexed.usable, preload.preloaded
+        );
+    }
     // #289: one counted warning when cached reactions would be silent or skipped.
     for line in audit_pack_readiness(app.performer().assets(), &audio_root)
         .warning_lines(compatibility.voice_model.as_deref(), &audio_root)
@@ -418,10 +428,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         );
     }
     report_degraded(app.avatar_output_name(), app.health());
-    eprintln!(
-        "raw_ingress: max_record_bytes={} queue_capacity={}",
-        raw_ingress_config.max_record_bytes, raw_ingress_config.queue_capacity
-    );
+    if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+        eprintln!(
+            "raw_ingress: max_record_bytes={} queue_capacity={}",
+            raw_ingress_config.max_record_bytes, raw_ingress_config.queue_capacity
+        );
+    }
 
     // Issue #56: authenticated local operator control endpoint. The endpoint
     // is opt-in (AIVTUBER_CONTROL_ENDPOINT), local-machine scope only, and
@@ -485,6 +497,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         });
     }
     eprintln!("operator_control: endpoint={operator_endpoint} unmute=restart-only");
+    // #393: quiet start-up ends with a short guide; it does not wait for the
+    // microphone or speech recognition.
+    if !aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+        for line in aivtuber_app::ready_guide::ready_lines(panel.is_some()) {
+            eprintln!("{line}");
+        }
+    }
 
     let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(raw_ingress_config.queue_capacity);
     let raw_ingress_metrics = RawIngressMetrics::default();
@@ -604,7 +623,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                         },
                     )?;
                     app = app.with_chat_burst_retrieval_score(scorer)?;
-                    eprintln!("chat_burst: retrieval-augmented local score enabled");
+                    if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+                        eprintln!("chat_burst: retrieval-augmented local score enabled");
+                    }
                 }
                 Err(error) => eprintln!(
                     "chat_burst: retrieval score unavailable ({error}); using the text heuristic"
@@ -626,23 +647,29 @@ fn run() -> Result<(), Box<dyn Error>> {
             };
             let ranker = aivtuber_reflex::JevBatchRanker::new(adapter, ranker_config)?;
             app = app.with_chat_burst_ranker(Box::new(ranker))?;
+            if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+                eprintln!(
+                    "chat_burst: Jev batch ranker enabled deadline_ms={} (reorders only; policy re-applies)",
+                    ranker_config.deadline.as_millis()
+                );
+            }
+        }
+        if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
             eprintln!(
-                "chat_burst: Jev batch ranker enabled deadline_ms={} (reorders only; policy re-applies)",
-                ranker_config.deadline.as_millis()
+                "chat_burst: enabled window_ms={} enter_count={} top_k={} max_per_actor={} actor_cooldown_ms={} defer_capacity={} defer_per_actor={} reply_ttl_ms={}",
+                config.burst.window_ms,
+                config.burst.burst_enter_count,
+                config.burst.top_k,
+                config.burst.max_per_actor,
+                config.burst.actor_cooldown_ms,
+                config.deferred.capacity,
+                config.deferred.per_actor_cap,
+                config.reply_ttl_ms
             );
         }
-        eprintln!(
-            "chat_burst: enabled window_ms={} enter_count={} top_k={} max_per_actor={} actor_cooldown_ms={} defer_capacity={} defer_per_actor={} reply_ttl_ms={}",
-            config.burst.window_ms,
-            config.burst.burst_enter_count,
-            config.burst.top_k,
-            config.burst.max_per_actor,
-            config.burst.actor_cooldown_ms,
-            config.deferred.capacity,
-            config.deferred.per_actor_cap,
-            config.reply_ttl_ms
-        );
-        if let Some(audience) = config.audience {
+        if let Some(audience) = config.audience
+            && aivtuber_adapters::log_verbosity::diagnostics_enabled()
+        {
             eprintln!(
                 "chat_burst: audience aggregation enabled min_cluster={} min_actors={}",
                 audience.min_cluster_size, audience.min_unique_actors
@@ -755,10 +782,12 @@ fn run() -> Result<(), Box<dyn Error>> {
                     };
                     app = app.with_speech_floor(floor)?;
                     speech_floor_enabled = true;
-                    eprintln!(
-                        "speech_floor: enabled take_turn_silence_ms={} max_defer_ms={} max_deferred={}",
-                        floor.take_turn_silence_ms, floor.max_defer_ms, floor.max_deferred
-                    );
+                    if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+                        eprintln!(
+                            "speech_floor: enabled take_turn_silence_ms={} max_defer_ms={} max_deferred={}",
+                            floor.take_turn_silence_ms, floor.max_defer_ms, floor.max_deferred
+                        );
+                    }
                     // Issue #81 S2: a confirmed barge-in stops the performer's
                     // speech with a bounded fade. Off unless
                     // AIVTUBER_SPEECH_BARGE_IN is true; layered on the floor.
@@ -770,13 +799,17 @@ fn run() -> Result<(), Box<dyn Error>> {
                         .unwrap_or(u32::MAX);
                         app = app.with_barge_in(BargeInConfig { fade_ms })?;
                         speech_barge_in_enabled = true;
-                        eprintln!("speech_barge_in: enabled fade_ms={fade_ms}");
+                        if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+                            eprintln!("speech_barge_in: enabled fade_ms={fade_ms}");
+                        }
                     }
                 }
-                eprintln!(
-                    "speech_conversation: enabled max_finals_per_tick={} max_text_chars={}",
-                    conversation.max_finals_per_tick, conversation.max_text_chars
-                );
+                if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+                    eprintln!(
+                        "speech_conversation: enabled max_finals_per_tick={} max_text_chars={}",
+                        conversation.max_finals_per_tick, conversation.max_text_chars
+                    );
+                }
             }
         } else if env_bool("AIVTUBER_SPEECH_CONVERSATION", false)? {
             return Err(io::Error::new(
@@ -811,7 +844,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             Duration::from_millis(env_u64("AIVTUBER_SPEECH_SIDECAR_RESYNC_MS", 5_000)?);
         match SpeechSidecar::spawn(config, started) {
             Ok(sidecar) => {
-                eprintln!("speech_sidecar: started");
+                if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+                    eprintln!("speech_sidecar: started");
+                }
                 speech_sidecar = Some(sidecar);
             }
             Err(error) => {
@@ -1577,17 +1612,19 @@ fn start_tts_sidecar(
     match TtsSidecar::spawn(&config) {
         Ok(child) => {
             alive.store(true, Ordering::Release);
-            eprintln!(
-                "tts_sidecar: ready listen={} model={} load_ms={} visemes={}",
-                child.ready().listen,
-                child.ready().model_id,
-                started.elapsed().as_millis(),
-                if settings.viseme_root.is_some() {
-                    "amplitude"
-                } else {
-                    "off"
-                }
-            );
+            if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+                eprintln!(
+                    "tts_sidecar: ready listen={} model={} load_ms={} visemes={}",
+                    child.ready().listen,
+                    child.ready().model_id,
+                    started.elapsed().as_millis(),
+                    if settings.viseme_root.is_some() {
+                        "amplitude"
+                    } else {
+                        "off"
+                    }
+                );
+            }
             Ok(Some(TtsSidecarHandle {
                 child: Some(child),
                 alive,
@@ -1811,12 +1848,14 @@ fn build_generative_runtime(
         };
         config.stream = Some(policy);
         config.validate()?;
-        eprintln!(
-            "thinking stream: on (idle {} ms, max {} ms, max reply {} chars)",
-            limits.idle_timeout.as_millis(),
-            policy.max_duration.as_millis(),
-            limits.max_reply_chars,
-        );
+        if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+            eprintln!(
+                "thinking stream: on (idle {} ms, max {} ms, max reply {} chars)",
+                limits.idle_timeout.as_millis(),
+                policy.max_duration.as_millis(),
+                limits.max_reply_chars,
+            );
+        }
     }
     // Non-secret, replay-relevant identity: where Thinking runs and how it is
     // authenticated. Origin only; no path/query that could carry a token.
@@ -1832,12 +1871,14 @@ fn build_generative_runtime(
                 .map_or("unset", aivtuber_adapters::DataCollection::label),
         ),
     };
-    eprintln!(
-        "thinking: endpoint={} auth={} backend={}{wire_note}",
-        endpoint_origin(thinking.endpoint()),
-        thinking.authentication_label(),
-        aivtuber_domain::ThinkingEngine::identity(&thinking).name,
-    );
+    if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+        eprintln!(
+            "thinking: endpoint={} auth={} backend={}{wire_note}",
+            endpoint_origin(thinking.endpoint()),
+            thinking.authentication_label(),
+            aivtuber_domain::ThinkingEngine::identity(&thinking).name,
+        );
+    }
 
     // A supervised sidecar has a known identity; record it in provenance
     // unless the operator overrode it.
@@ -1931,13 +1972,15 @@ fn build_generative_runtime(
     };
     let pipeline = GenerativePipeline::new(thinking, tts, compiler)
         .with_speech_lexicon(Arc::new(speech_lexicon));
-    eprintln!(
-        "generated replies: {}",
-        match phrase_mode {
-            PhraseMode::Buffered => "buffered (one commit per reply)",
-            PhraseMode::Phrased(_) => "phrase mode (one atomic commit per phrase)",
-        }
-    );
+    if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+        eprintln!(
+            "generated replies: {}",
+            match phrase_mode {
+                PhraseMode::Buffered => "buffered (one commit per reply)",
+                PhraseMode::Phrased(_) => "phrase mode (one atomic commit per phrase)",
+            }
+        );
+    }
     let runtime =
         GenerativeRuntime::with_execution_config(pipeline, retention.generation_execution_config())
             .map_err(io::Error::other)?
@@ -2158,11 +2201,13 @@ fn build_speech_lexicon() -> Result<SpeechLexicon, Box<dyn Error>> {
     let lexicon = SpeechLexicon::load(include_builtin, operator_file.as_deref())
         .map_err(|error| format!("AIVTUBER_SPEECH_LEXICON: {error}"))?;
     // The identity is not secret and is replay-relevant; entries are not logged.
-    eprintln!(
-        "speech lexicon: {} entries, projection {}",
-        lexicon.len(),
-        lexicon.identity().key()
-    );
+    if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+        eprintln!(
+            "speech lexicon: {} entries, projection {}",
+            lexicon.len(),
+            lexicon.identity().key()
+        );
+    }
     Ok(lexicon)
 }
 
@@ -2347,10 +2392,12 @@ fn load_obs_scene_map(path: &std::path::Path) -> Result<ObsSceneMap, Box<dyn Err
         .map_err(|error| format!("AIVTUBER_OBS_SCENE_MAP: cannot read the file: {error}"))?;
     let map = ObsSceneMap::from_json_bytes(&bytes)
         .map_err(|error| format!("AIVTUBER_OBS_SCENE_MAP: {error}"))?;
-    eprintln!(
-        "scene_context: obs scene table loaded scenes={}",
-        map.scenes.len()
-    );
+    if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+        eprintln!(
+            "scene_context: obs scene table loaded scenes={}",
+            map.scenes.len()
+        );
+    }
     Ok(map)
 }
 
@@ -2389,7 +2436,9 @@ fn build_scene_context_service(
         )?)),
         Duration::from_millis(poll_ms),
     )?;
-    eprintln!("scene_context: composed obs_poll_ms={poll_ms}");
+    if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+        eprintln!("scene_context: composed obs_poll_ms={poll_ms}");
+    }
     Ok(service)
 }
 

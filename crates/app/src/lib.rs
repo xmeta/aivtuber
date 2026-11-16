@@ -24,6 +24,7 @@ mod phrase_benchmark;
 mod phrase_commit;
 mod profile;
 mod raw_ingress;
+pub mod ready_guide;
 mod recent_replies;
 mod retention;
 mod routing;

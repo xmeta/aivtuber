@@ -447,12 +447,14 @@ fn run() -> Result<(), String> {
     let model = args.model.as_deref().ok_or("--model is required")?;
     let scorer = SileroVad::from_file(std::path::Path::new(model))?;
     let timeline = start_clock(&args)?;
-    eprintln!(
-        "speech-vad-sidecar: ready provider_version={SILERO_PROVIDER_VERSION} language={} frame_ms={FRAME_MS} preroll_ms={} stt={}",
-        args.language,
-        args.ring_ms(),
-        emitter.stt.is_some()
-    );
+    if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+        eprintln!(
+            "speech-vad-sidecar: ready provider_version={SILERO_PROVIDER_VERSION} language={} frame_ms={FRAME_MS} preroll_ms={} stt={}",
+            args.language,
+            args.ring_ms(),
+            emitter.stt.is_some()
+        );
+    }
     let stats = match &args.input_wav {
         Some(path) => run_wav(&args, path, scorer, &timeline, &mut emitter)?,
         None => run_mic(&args, scorer, &timeline, &mut emitter)?,
@@ -492,7 +494,9 @@ fn start_stt(args: &Args, emitter: &Emitter) -> Option<SegmentFeeder<SttWorker>>
     match SttWorker::spawn(config, handle) {
         Ok(worker) => match SegmentFeeder::new(stt.feeder, worker) {
             Ok(feeder) => {
-                eprintln!("speech-vad-sidecar: stt worker started; waiting for it to load");
+                if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
+                    eprintln!("speech-vad-sidecar: stt worker started; waiting for it to load");
+                }
                 Some(feeder)
             }
             Err(error) => {
