@@ -257,10 +257,11 @@ pub fn render_hybrid(paths: &Paths, secrets: &Secrets, key: &ApiKey, models: &[S
     );
     push(&mut t, "AIVTUBER_OPENAI_BACKEND_NAME", "openrouter");
     if models.len() > 1 {
-        t.push_str(
-            "# Other models you named at setup (to switch to later by editing the line above):\n",
-        );
-        t.push_str(&format!("# {}\n", models[1..].join(", ")));
+        // The panel's model switch (#365): `alias:version` entries, split on
+        // the last `:`, so the version `openrouter` keeps `vendor/model:variant`
+        // aliases intact. Only models named at setup can be switched to.
+        let choices: Vec<String> = models.iter().map(|m| format!("{m}:openrouter")).collect();
+        push(&mut t, "AIVTUBER_OPENAI_MODEL_CHOICES", &choices.join(","));
     }
     t.push_str("# Optional session spend cap in USD; Thinking stops when OpenRouter-reported cost reaches it.\n");
     t.push_str("# AIVTUBER_THINKING_COST_CAP_USD=1.00\n");

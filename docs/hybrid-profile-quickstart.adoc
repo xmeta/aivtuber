@@ -101,7 +101,7 @@ No `:free` model is a default: free tiers are rate limited and their providers m
 
 == Switching models
 
-The first `--model` is the one the app starts on. To change it, edit the `AIVTUBER_OPENAI_MODEL` line in `hybrid-profile.env` and restart. Choosing among several models from the operation panel while the show is running is a separate slice (#365); until it lands, the other models you named are only listed in a comment in the env file.
+The first `--model` is the one the app starts on. When you name more than one (the three defaults count), the setup writes them all to `AIVTUBER_OPENAI_MODEL_CHOICES` as `<id>:openrouter` entries, and the operation panel offers a selector to switch between them while the show is running (#365; the choice is remembered across restarts like the local model switch). *Only the models listed at setup can be switched to*: the panel never takes a free-text model id. To add or remove one, run `aivtuber-setup hybrid --force --model ...` again, or edit that line in `hybrid-profile.env` (`vendor/model[:variant]:openrouter`, comma separated, at most 8, lowercase) and restart. With a single `--model` there is no selector.
 
 [#cost]
 == Cost, the usage panel and the spend cap

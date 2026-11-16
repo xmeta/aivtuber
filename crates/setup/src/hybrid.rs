@@ -48,7 +48,7 @@ const MAX_MODEL_ID_LEN: usize = 96;
 
 /// One OpenRouter model id: `vendor/model`, optionally with a `:variant`
 /// suffix. Strict on purpose, because the value goes into the env file and a
-/// request body: letters, digits and `.-_` around exactly one `/`.
+/// request body: lowercase letters, digits and `.-_` around exactly one `/`.
 pub fn validate_model_id(id: &str) -> Result<(), String> {
     let bad = |why: &str| format!("--model {id:?}: {why}");
     if id.is_empty() || id.len() > MAX_MODEL_ID_LEN {
@@ -61,9 +61,12 @@ pub fn validate_model_id(id: &str) -> Result<(), String> {
         None => (id, None),
     };
     let part_ok = |s: &str| {
-        !s.is_empty()
-            && s.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+        // The app's model catalog (alias rule of #365) takes lowercase only,
+        // each segment starting with a letter or digit.
+        s.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+            && s.bytes().all(|b| {
+                b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'_')
+            })
     };
     let mut parts = body.split('/');
     let well_formed = matches!(
@@ -304,6 +307,8 @@ mod tests {
             "vendor/model:",
             "vendor/model:a:b",
             "vendor/mo del",
+            "Vendor/model",
+            "vendor/-model",
             "vendor/model\nAIVTUBER_X=1",
             "vendor/model\r",
             "ven dor/model",

@@ -839,7 +839,12 @@ fn the_hybrid_env_names_openrouter_holds_the_key_and_has_no_local_model() {
     // (the preset owns it), the TTS stays loopback, nothing local-llm remains.
     assert!(!env.contains_key("AIVTUBER_OPENAI_ENDPOINT"));
     assert!(!env.contains_key("AIVTUBER_THINKING_EGRESS_HOST"));
-    assert!(!env.contains_key("AIVTUBER_OPENAI_MODEL_CHOICES"));
+    // Two models: the panel can switch between them, `alias:version` with the
+    // version `openrouter`, covering every model including the first.
+    assert_eq!(
+        env["AIVTUBER_OPENAI_MODEL_CHOICES"],
+        "google/gemini-2.5-flash-lite:openrouter,a/b:nitro:openrouter"
+    );
     assert!(
         !env.keys()
             .any(|k| k.starts_with("AIVTUBER_SETUP_LLAMA_") && k != "AIVTUBER_SETUP_LLAMA_MODE")
@@ -1081,4 +1086,15 @@ fn a_redirecting_key_check_does_not_forward_the_key() {
     assert!(r.is_err());
     assert!(target_seen.lock().unwrap().is_empty());
     assert!(!o.env_file.exists());
+}
+
+#[test]
+fn a_single_model_writes_no_choices_line() {
+    let f = fixture("hybrid-single", false);
+    let mut o = hybrid_options(&f);
+    o.hybrid.as_mut().unwrap().models = vec!["google/gemini-2.5-flash-lite".into()];
+    go(&f, &o).0.unwrap();
+    let env = env_map(&o.env_file);
+    assert_eq!(env["AIVTUBER_OPENAI_MODEL"], "google/gemini-2.5-flash-lite");
+    assert!(!env.contains_key("AIVTUBER_OPENAI_MODEL_CHOICES"));
 }
