@@ -366,8 +366,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             })
             .map_err(|error| format!("AIVTUBER_MEMORY_WRITER: {error}"))?;
     }
-    // #321: the operator memory seed file is opt-in and read-only. It loads
-    // once, through the permit-gated path; an invalid or refused file stops
+    // #321: the operator memory seed file is opt-in. It loads at start (and is
+    // replaced only by the authenticated `memory.seed.set`, #402), through the permit-gated path; an invalid or refused file stops
     // startup rather than running with silently different memory.
     let memory_seed_path = env_path(aivtuber_app::MEMORY_SEED_FILE_VAR);
     if let Some(path) = memory_seed_path.as_deref() {
@@ -383,9 +383,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         );
     }
     // #402: the seed can be viewed and replaced while running whenever the
-    // adaptation runtime is composed; a save goes to the file when one is named.
-    if app.adaptation().is_some() {
-        app = app.with_memory_seed_editor(aivtuber_app::MemorySeedEditor::new(
+    // adaptation runtime and the generative path are composed; a save goes to the file when one is named.
+    if app.adaptation().is_some() && app.generation_execution_snapshot().is_some() {
+        app.set_memory_seed_editor(aivtuber_app::MemorySeedEditor::new(
             memory_seed_path,
             thinking_leaves_machine,
         ));

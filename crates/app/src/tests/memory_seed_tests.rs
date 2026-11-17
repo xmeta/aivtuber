@@ -961,6 +961,27 @@ mod live_edit {
         let got = act(&mut app, &ingress, "memory.seed.get", None);
         assert!(got.ok);
 
+        // Parse and version errors must not echo the document either.
+        let leaky = [
+            format!(
+                r#"{{"schema_version":"0.1.0","seed_id":"x","revision":"1","entries":[{{"kind":"{marker}","claim":"c"}}]}}"#
+            ),
+            format!(
+                r#"{{"schema_version":"0.1.0","seed_id":"x","revision":"1","entries":["{marker}"]}}"#
+            ),
+            format!(r#"{{"{marker}":1}}"#),
+            format!(r#"{{"schema_version":"{marker}","seed_id":"x","revision":"1","entries":[]}}"#),
+        ];
+        let mut leaked_details = Vec::new();
+        for document in &leaky {
+            let response = act(&mut app, &ingress, "memory.seed.set", Some(document));
+            assert!(!response.ok);
+            leaked_details.push(response.detail);
+        }
+        assert!(
+            leaked_details.iter().all(|d| !d.contains(marker)),
+            "{leaked_details:?}"
+        );
         for detail in [&set.detail, &rejected.detail, &got.detail] {
             assert!(!detail.contains(marker), "{detail}");
         }

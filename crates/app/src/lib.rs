@@ -1405,7 +1405,7 @@ where
     /// output gate unchanged), so every permit is minted before anything is
     /// stored and one refused entry loads nothing. The entries are ordinary
     /// durable memory: the #305 operator erase removes them for the session
-    /// (`erase_memory_seed_operator`), and the file itself is never touched.
+    /// (`erase_memory_seed_operator`), and an erase never touches the file.
     pub fn with_memory_seed(
         mut self,
         seed: &MemorySeed,
@@ -1513,6 +1513,12 @@ where
         self
     }
 
+    /// In-place form of [`Self::with_memory_seed_editor`] for the composition
+    /// root, whose stack frame cannot afford another by-value move of the app.
+    pub fn set_memory_seed_editor(&mut self, editor: MemorySeedEditor) {
+        self.memory_seed_editor = Some(editor);
+    }
+
     /// Whether the seed can be edited while running (the operator endpoint
     /// then holds `memory.admin` for the `memory.seed.*` actions).
     pub fn memory_seed_editor_composed(&self) -> bool {
@@ -1583,7 +1589,24 @@ where
                 };
                 let not_changed =
                     |error: MemorySeedError| format!("memory seed not changed: {error}");
-                let seed = MemorySeed::parse(text).map_err(not_changed)?;
+                // The parser's messages can quote the document (serde) or echo
+                // a supplied value, so those two are fixed phrases here.
+                let seed = MemorySeed::parse(text).map_err(|error| match error {
+                    MemorySeedError::Parse(_) => {
+                        "memory seed not changed: the document is not valid seed JSON".to_owned()
+                    }
+                    MemorySeedError::Invalid { ref path, .. } if path == "schema_version" => {
+                        "memory seed not changed: schema_version is not supported".to_owned()
+                    }
+                    other => not_changed(other),
+                })?;
+                if seed.to_json().len() > MAX_SEED_FILE_BYTES {
+                    // The file is written pretty-printed; the next start would
+                    // refuse one over the bound.
+                    return Err(not_changed(MemorySeedError::TooLarge {
+                        bytes: seed.to_json().len(),
+                    }));
+                }
                 if !self
                     .adaptation
                     .as_ref()

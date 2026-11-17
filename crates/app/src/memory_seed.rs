@@ -2,7 +2,8 @@
 //!
 //! The seed file is the cheapest benefit test for cross-session continuity: a
 //! short list of performer-level facts the operator curates by hand, loaded
-//! into working memory at startup, with no runtime disk write anywhere. This
+//! into working memory at startup. Since #402 the authenticated operator can
+//! also replace it live (the only runtime write of the file, atomic). This
 //! module owns the file contract (`schemas/memory-seed.schema.json`), its
 //! bounds and typed errors, the deterministic content hash recorded as a replay
 //! input, and the counters for the ADR-0008 Q4 falsifier.
@@ -16,7 +17,8 @@
 //!   [`aivtuber_runtime::SecurityRuntime::authorize_operator_seed_memory_write`]
 //!   and the permit-gated durable path; the file path is process configuration
 //!   the operator owns, never an input chat or a model can reach.
-//! * The runtime never writes a seed file. The export is returned to an
+//! * The runtime writes the seed file only for the authenticated operator's
+//!   `memory.seed.set` (#402). The export is returned to an
 //!   authenticated operator command and the *client* decides where it lands.
 //! * Bounds are fixed: entry count, claim bytes and file bytes. Anything over a
 //!   bound is refused, never truncated.
@@ -339,7 +341,7 @@ impl MemorySeed {
     }
 
     /// Read a seed file, refusing more than [`MAX_SEED_FILE_BYTES`] bytes
-    /// before parsing. This is the only read path; there is no write path.
+    /// before parsing. This is the only read path; the one write is `memory.seed.set` (#402).
     pub fn load(path: &Path) -> Result<Self, MemorySeedError> {
         let io = |e: std::io::Error| MemorySeedError::Io(format!("{}: {e}", path.display()));
         let file = File::open(path).map_err(io)?;
