@@ -34,8 +34,10 @@ pub fn list_input_devices() -> Result<Vec<String>, String> {
         .collect())
 }
 
-/// Start capturing from the default input device, or the first device whose
-/// name contains `name_contains` (case-insensitive).
+/// Start capturing from the default input device, or the device named
+/// `name_contains`: an exact (case-insensitive) match wins, else the first
+/// device whose name contains it. The exact match makes a name copied from
+/// [`list_input_devices`] open that device even when another name contains it.
 pub fn start_capture(
     name_contains: Option<&str>,
     sender: SyncSender<AudioChunk>,
@@ -47,14 +49,19 @@ pub fn start_capture(
             .ok_or("no default input device")?,
         Some(needle) => {
             let needle = needle.to_lowercase();
-            host.input_devices()
-                .map_err(|e| e.to_string())?
-                .find(|d| {
-                    d.description()
-                        .map(|d| d.name().to_lowercase().contains(&needle))
-                        .unwrap_or(false)
-                })
-                .ok_or_else(|| format!("no input device matching {needle:?}"))?
+            let named = |d: &cpal::Device| {
+                d.description()
+                    .map(|d| d.name().to_lowercase())
+                    .unwrap_or_default()
+            };
+            let mut devices: Vec<cpal::Device> =
+                host.input_devices().map_err(|e| e.to_string())?.collect();
+            let index = devices
+                .iter()
+                .position(|d| named(d) == needle)
+                .or_else(|| devices.iter().position(|d| named(d).contains(&needle)))
+                .ok_or_else(|| format!("no input device matching {needle:?}"))?;
+            devices.swap_remove(index)
         }
     };
     let device_name = device

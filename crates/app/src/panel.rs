@@ -268,6 +268,8 @@ impl PanelService {
                 | PanelRequest::AvatarDelete(_)
                 | PanelRequest::AvatarDiscard
                 | PanelRequest::SpeechInput { .. }
+                | PanelRequest::SpeechInputDevice(_)
+                | PanelRequest::SpeechInputDuplex { .. }
                 | PanelRequest::PersonaSet(_)
                 | PanelRequest::PersonaGet
                 | PanelRequest::MemorySeedSet(_)
@@ -400,9 +402,18 @@ impl PanelService {
             changed = true;
         }
         for command in self.inbox.drain_speech_input(SPEECH_INPUT_PER_TICK) {
-            let action = match &command.request {
-                PanelRequest::SpeechInput { enabled: true } => "speech_input.enable",
-                PanelRequest::SpeechInput { enabled: false } => "speech_input.disable",
+            let (action, argument): (&str, Option<&str>) = match &command.request {
+                PanelRequest::SpeechInput { enabled: true } => ("speech_input.enable", None),
+                PanelRequest::SpeechInput { enabled: false } => ("speech_input.disable", None),
+                // The device name is the operator's own local data; the audit
+                // and the log line below carry the action and its outcome only.
+                PanelRequest::SpeechInputDevice(device) => {
+                    ("speech_input.device", Some(device.as_deref().unwrap_or("")))
+                }
+                PanelRequest::SpeechInputDuplex { full } => (
+                    "speech_input.duplex",
+                    Some(if *full { "full" } else { "half" }),
+                ),
                 _ => {
                     command.respond(false, "not a voice input request");
                     continue;
@@ -414,7 +425,7 @@ impl PanelService {
                 app,
                 &format!("panel-ctl-{}", self.control_seq),
                 action,
-                None,
+                argument,
                 &self.control_secret.0,
                 now_ms,
             );

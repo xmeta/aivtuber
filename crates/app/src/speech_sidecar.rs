@@ -26,7 +26,9 @@
 
 use crate::raw_ingress::{RawIngressConfig, RawIngressMetrics, pump_bounded_records};
 use aivtuber_adapters::speech_stt::{SttStatus, SttUnavailableReason, parse_stt_status_line};
-use aivtuber_adapters::speech_vad::{encode_clock_sync_line, parse_feed_heartbeat_line};
+use aivtuber_adapters::speech_vad::{
+    DeviceReport, encode_clock_sync_line, parse_device_report_line, parse_feed_heartbeat_line,
+};
 use aivtuber_domain::{MAX_SPEECH_OBSERVATION_BATCH_BYTES, MAX_SPEECH_TRANSCRIPT_BATCH_BYTES};
 use aivtuber_runtime::{
     SpeechBatchReport, SpeechObservationTracker, SpeechTranscriptTracker, TranscriptBatchReport,
@@ -57,8 +59,9 @@ struct LineProbe {
 }
 
 enum LineKind {
-    /// `{"vad":{"heartbeat":{...}}}`: feed liveness (#81 S2).
-    FeedHeartbeat,
+    /// `{"vad":{"heartbeat":{...}}}`: feed liveness (#81 S2), or
+    /// `{"vad":{"devices":{...}}}`: the capture-device report (#396).
+    Vad,
     Status,
     Transcript,
     Observation,
@@ -71,7 +74,7 @@ fn classify(line: &[u8]) -> LineKind {
             transcripts: Some(_),
             ..
         }) => LineKind::Transcript,
-        Ok(LineProbe { vad: Some(_), .. }) => LineKind::FeedHeartbeat,
+        Ok(LineProbe { vad: Some(_), .. }) => LineKind::Vad,
         // Anything else, including garbage, is judged by the observation
         // tracker exactly as before S3b.
         _ => LineKind::Observation,
@@ -214,6 +217,9 @@ pub struct SpeechSidecar {
     /// receipt time, not the child's stamp, so a clock-mapping error cannot
     /// hide a stalled feed. `None`: the child never reported one.
     feed_heartbeat_ms: Option<u64>,
+    /// The capture devices and the opened one, as the child reported them
+    /// once at start (#396). `None` until it does (a WAV input never does).
+    device_report: Option<DeviceReport>,
     stats: SpeechSidecarStats,
     config: SpeechSidecarConfig,
 }
@@ -276,6 +282,7 @@ impl SpeechSidecar {
             consecutive_invalid_transcripts: 0,
             transcript_path: SpeechTranscriptPath::NotReported,
             feed_heartbeat_ms: None,
+            device_report: None,
             stats: SpeechSidecarStats::default(),
             config,
         })
@@ -299,6 +306,11 @@ impl SpeechSidecar {
     /// as "stale".
     pub fn feed_heartbeat_ms(&self) -> Option<u64> {
         self.feed_heartbeat_ms
+    }
+
+    /// What the child reported about its capture devices, if it has.
+    pub fn device_report(&self) -> Option<&DeviceReport> {
+        self.device_report.as_ref()
     }
 
     pub fn stats(&self) -> SpeechSidecarStats {
@@ -345,10 +357,13 @@ impl SpeechSidecar {
                         continue;
                     }
                     match classify(&line) {
-                        LineKind::FeedHeartbeat => {
-                            // A malformed beat says nothing and changes
-                            // nothing; it never counts toward degrading.
-                            if parse_feed_heartbeat_line(&line).is_some() {
+                        LineKind::Vad => {
+                            // A malformed beat or report says nothing and
+                            // changes nothing; it never counts toward
+                            // degrading.
+                            if let Some(report) = parse_device_report_line(&line) {
+                                self.device_report = Some(report);
+                            } else if parse_feed_heartbeat_line(&line).is_some() {
                                 self.feed_heartbeat_ms =
                                     Some(self.feed_heartbeat_ms.map_or(now_ms, |p| p.max(now_ms)));
                                 self.stats.feed_heartbeats += 1;

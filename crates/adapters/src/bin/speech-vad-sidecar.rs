@@ -457,7 +457,14 @@ fn run() -> Result<(), String> {
     }
     let stats = match &args.input_wav {
         Some(path) => run_wav(&args, path, scorer, &timeline, &mut emitter)?,
-        None => run_mic(&args, scorer, &timeline, &mut emitter)?,
+        None => match run_mic(&args, scorer, &timeline, &mut emitter) {
+            Ok(stats) => stats,
+            Err(error) => {
+                // Flush what was queued (the device report) before exiting.
+                let _ = finish(emitter, None, drain);
+                return Err(error);
+            }
+        },
     };
     finish(emitter, Some(stats), drain)
 }
@@ -671,7 +678,32 @@ fn run_mic(
     // About 2 s of 10 ms callbacks. A slower consumer drops chunks (a counted
     // gap) instead of growing memory.
     let (sender, receiver) = sync_channel(256);
-    let capture = start_capture(args.input_device.as_deref(), sender)?;
+    // #396: tell the app which capture devices exist and which one opened,
+    // once, before anything else. A failed open still reports the list (with
+    // no opened device) so the app can name the alternatives.
+    let available = aivtuber_adapters::speech_vad::mic::list_input_devices().unwrap_or_default();
+    let capture = match start_capture(args.input_device.as_deref(), sender) {
+        Ok(capture) => capture,
+        Err(error) => {
+            emitter
+                .sink
+                .send(aivtuber_adapters::speech_vad::encode_device_report_line(
+                    None, &available,
+                ));
+            if let Some(wanted) = &args.input_device {
+                eprintln!(
+                    "speech-vad-sidecar: 入力デバイス {wanted:?} を開けません / cannot open input device {wanted:?}: {error}; available: {available:?}"
+                );
+            }
+            return Err(error);
+        }
+    };
+    emitter
+        .sink
+        .send(aivtuber_adapters::speech_vad::encode_device_report_line(
+            Some(&capture.device_name),
+            &available,
+        ));
     eprintln!(
         "speech-vad-sidecar: capturing device={:?} input_rate_hz={}",
         capture.device_name, capture.sample_rate_hz

@@ -58,6 +58,20 @@ pub fn voice_input_line(on: bool, cloud: bool, diagnostics: bool) -> &'static st
     }
 }
 
+/// [`voice_input_line`], with the "default capture device" wording replaced
+/// when the operator chose a device (#396), so the line never says "default"
+/// about a chosen one. The device name itself is not printed here (the panel
+/// shows it).
+pub fn voice_input_text(on: bool, cloud: bool, diagnostics: bool, device_chosen: bool) -> String {
+    let line = voice_input_line(on, cloud, diagnostics);
+    if on && device_chosen {
+        line.replace("既定の録音デバイス", "選択した録音デバイス")
+            .replace("default capture device", "chosen capture device")
+    } else {
+        line.to_owned()
+    }
+}
+
 /// The character sheet line (#404): always printed once, whichever way the
 /// file read went, so the operator knows whether the character is in effect and
 /// whether it leaves the machine. Quiet form is Japanese first with the English

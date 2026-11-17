@@ -137,14 +137,19 @@ enum Command {
         #[command(subcommand)]
         action: IngressCommand,
     },
-    /// Turn voice input (the microphone) on or off (issue #400); needs the
-    /// daemon to run with voice input composed (the local profile started by
-    /// `aivtuber-setup start`). Off stops the microphone and the speech
-    /// recognizer at once; the choice is remembered for the next start.
+    /// Voice input (the microphone), issue #400 and #396; needs the daemon to
+    /// run with voice input composed (the local profile started by
+    /// `aivtuber-setup start`). `on` / `off` start or stop the microphone and
+    /// the speech recognizer at once; `devices` lists the capture devices the
+    /// microphone reported and the one it opened; `device NAME` (or
+    /// `device --default`) chooses one and restarts the microphone on it;
+    /// `duplex half|full` chooses whether the performer listens while it
+    /// speaks (`half`, the default, ignores speech that starts during its
+    /// playback and turns voice barge-in off; `full` is for a headset). All
+    /// choices are remembered for the next start.
     VoiceInput {
-        /// `on` or `off`.
-        #[arg(value_parser = ["on", "off"])]
-        state: String,
+        #[command(subcommand)]
+        action: VoiceInputCommand,
     },
     /// Show, replace or clear the character sheet (issue #401); needs the
     /// daemon to run with the generative path (the local and hybrid profiles
@@ -204,6 +209,32 @@ fn memory_seed_argument(action: &MemorySeedCommand) -> Result<Option<String>, St
             Ok(Some(compact))
         }
     }
+}
+
+#[derive(Subcommand, Clone, PartialEq, Eq)]
+enum VoiceInputCommand {
+    /// Turn the microphone on.
+    On,
+    /// Turn the microphone off.
+    Off,
+    /// List the capture devices and the opened one (the `voice_input` lines of
+    /// `status`). The list exists once the microphone has been on.
+    Devices,
+    /// Choose the capture device by its name as listed by `devices`.
+    Device {
+        /// The device name, exactly as listed.
+        #[arg(required_unless_present = "default", conflicts_with = "default")]
+        name: Option<String>,
+        /// Use the system default capture device.
+        #[arg(long)]
+        default: bool,
+    },
+    /// Half (default) or full duplex.
+    Duplex {
+        /// `half` or `full`.
+        #[arg(value_parser = ["half", "full"])]
+        mode: String,
+    },
 }
 
 #[derive(Subcommand, Clone, PartialEq, Eq)]
@@ -464,6 +495,16 @@ fn print_avatar_status(avatar: &aivtuber_app::AvatarStatus) {
     }
 }
 
+/// The argument of a voice-input subcommand: the device name (empty is the
+/// system default) or `half` / `full`.
+fn voice_input_argument(action: &VoiceInputCommand) -> Option<String> {
+    match action {
+        VoiceInputCommand::Device { name, .. } => Some(name.clone().unwrap_or_default()),
+        VoiceInputCommand::Duplex { mode } => Some(mode.clone()),
+        VoiceInputCommand::On | VoiceInputCommand::Off | VoiceInputCommand::Devices => None,
+    }
+}
+
 fn action_name(command: &Command) -> &'static str {
     match command {
         Command::Status => "status",
@@ -482,13 +523,13 @@ fn action_name(command: &Command) -> &'static str {
             PersonaCommand::Show => "persona.get",
             PersonaCommand::Set { .. } | PersonaCommand::Clear => "persona.set",
         },
-        Command::VoiceInput { state } => {
-            if state == "on" {
-                "speech_input.enable"
-            } else {
-                "speech_input.disable"
-            }
-        }
+        Command::VoiceInput { action } => match action {
+            VoiceInputCommand::On => "speech_input.enable",
+            VoiceInputCommand::Off => "speech_input.disable",
+            VoiceInputCommand::Devices => "status",
+            VoiceInputCommand::Device { .. } => "speech_input.device",
+            VoiceInputCommand::Duplex { .. } => "speech_input.duplex",
+        },
         Command::Avatar { action } => match action {
             AvatarCommand::Status => "status",
             AvatarCommand::Select { .. } => "avatar.select",
@@ -559,6 +600,7 @@ fn main() -> ExitCode {
             }
         },
         Command::Model { alias } => Some(alias.clone()),
+        Command::VoiceInput { action } => voice_input_argument(action),
         Command::Voice { action } => voice_patch(action),
         Command::Ingress { action } => ingress_argument(action),
         Command::Avatar { action } => avatar_argument(action),
@@ -735,12 +777,19 @@ fn print_response(response: &OperatorResponse) {
         }
         if let Some(voice_input) = &status.voice_input {
             println!(
-                "voice_input composed={} state={:?} thinking_remote={} reason={:?}",
+                "voice_input composed={} state={:?} thinking_remote={} reason={:?} duplex={:?} dropped_during_playback={} device={:?} selected_device={:?}",
                 voice_input.composed,
                 voice_input.state,
                 voice_input.thinking_remote,
                 voice_input.reason,
+                voice_input.duplex,
+                voice_input.dropped_during_playback,
+                voice_input.device,
+                voice_input.selected_device,
             );
+            for name in &voice_input.devices {
+                println!("voice_input_device {name:?}");
+            }
         }
         if let Some(persona) = &status.persona {
             // Identity only (#404): never the character sheet's text.
@@ -1130,18 +1179,49 @@ mod tests {
     }
 
     #[test]
-    fn voice_input_subcommand_maps_to_the_two_actions_and_takes_no_argument() {
+    fn voice_input_subcommand_maps_to_the_actions_and_their_arguments() {
         for (state, action) in [
             ("on", "speech_input.enable"),
             ("off", "speech_input.disable"),
+            ("devices", "status"),
         ] {
             let command = parse(&["voice-input", state]);
             assert_eq!(action_name(&command), action);
+            let Command::VoiceInput { action } = &command else {
+                panic!("not voice-input")
+            };
+            assert_eq!(voice_input_argument(action), None, "{state}");
+        }
+        let command = parse(&["voice-input", "device", "Line (YAMAHA AG06/AG03)"]);
+        assert_eq!(action_name(&command), "speech_input.device");
+        let Command::VoiceInput { action } = &command else {
+            panic!("not voice-input")
+        };
+        assert_eq!(
+            voice_input_argument(action).as_deref(),
+            Some("Line (YAMAHA AG06/AG03)")
+        );
+        let command = parse(&["voice-input", "device", "--default"]);
+        let Command::VoiceInput { action } = &command else {
+            panic!("not voice-input")
+        };
+        assert_eq!(voice_input_argument(action).as_deref(), Some(""));
+        for mode in ["half", "full"] {
+            let command = parse(&["voice-input", "duplex", mode]);
+            assert_eq!(action_name(&command), "speech_input.duplex");
+            let Command::VoiceInput { action } = &command else {
+                panic!("not voice-input")
+            };
+            assert_eq!(voice_input_argument(action).as_deref(), Some(mode));
         }
         for args in [
             &["voice-input"][..],
             &["voice-input", "maybe"][..],
             &["voice-input", "on", "off"][..],
+            &["voice-input", "device"][..],
+            &["voice-input", "device", "--default", "Mic"][..],
+            &["voice-input", "duplex", "both"][..],
+            &["voice-input", "duplex"][..],
         ] {
             let mut full = vec![
                 "aivtuberctl",

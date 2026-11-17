@@ -44,7 +44,12 @@
 //! * voice input (#400) adds `POST /api/speech-input` with `{"enabled": bool}`
 //!   and nothing else (a strict body: no device, program or argument), on its
 //!   own queue. It asks the composition thread to start or stop the microphone
-//!   sidecar; whether voice input is composed at all is decided there;
+//!   sidecar; whether voice input is composed at all is decided there. Two
+//!   more strict bodies share that queue (#396): `POST /api/speech-input/device`
+//!   with `{"device": "<name>"|null}` (a capture device name, or null for the
+//!   system default; the composition thread accepts only a device the sidecar
+//!   listed) and `POST /api/speech-input/duplex` with `{"duplex":
+//!   "half"|"full"}`. No path, program or argument can ride along;
 //! * the character sheet (#401) adds `POST /api/persona/set` with
 //!   `{"text": string}` and `POST /api/persona/get` with `{}`, on their own
 //!   queue. The set body has its own larger bound, checked before the body is
@@ -104,7 +109,7 @@ pub const MAX_PANEL_KEY_CHARS: usize = 256;
 /// One model search may take this long, end to end.
 const SEARCH_DEADLINE: Duration = Duration::from_secs(6);
 /// Every state-changing endpoint (all are `POST`).
-const STATE_CHANGING: [&str; 22] = [
+const STATE_CHANGING: [&str; 24] = [
     "/api/chat",
     "/api/stop",
     "/api/mute",
@@ -127,6 +132,8 @@ const STATE_CHANGING: [&str; 22] = [
     "/api/persona/get",
     "/api/memory-seed/set",
     "/api/memory-seed/get",
+    "/api/speech-input/device",
+    "/api/speech-input/duplex",
 ];
 const SEARCH_PATH: &str = "/api/voice/search";
 /// The model upload (#362): a raw body, so it is not in [`STATE_CHANGING`]'s
@@ -239,6 +246,15 @@ pub enum PanelRequest {
     /// whether the sidecar can start.
     SpeechInput {
         enabled: bool,
+    },
+    /// Choose the capture device (#396); `None` is the system default. Only
+    /// the wish: the composition thread accepts a name only when it is
+    /// acceptable and, once the sidecar listed its devices, one of them.
+    SpeechInputDevice(Option<String>),
+    /// Half or full duplex (#396): whether the performer listens while it
+    /// speaks.
+    SpeechInputDuplex {
+        full: bool,
     },
     /// Replace the character sheet (#401) with this text (empty clears it).
     /// Redacted in `Debug`; the composition thread validates it.
@@ -955,6 +971,26 @@ fn route(
                 return json(status, false, detail);
             }
         },
+        "/api/speech-input/device" => match speech_input_device_body(&body) {
+            Ok(device) => (
+                PanelRequest::SpeechInputDevice(device),
+                &shared.speech_input_tx,
+            ),
+            Err((status, detail)) => {
+                shared.count(&shared.counters.rejected_request);
+                return json(status, false, detail);
+            }
+        },
+        "/api/speech-input/duplex" => match speech_input_duplex_body(&body) {
+            Ok(full) => (
+                PanelRequest::SpeechInputDuplex { full },
+                &shared.speech_input_tx,
+            ),
+            Err((status, detail)) => {
+                shared.count(&shared.counters.rejected_request);
+                return json(status, false, detail);
+            }
+        },
         "/api/ingress/connect" => match ingress_connect(&body) {
             Ok(request) => (request, &shared.ingress_tx),
             Err((status, detail)) => {
@@ -1038,6 +1074,41 @@ fn persona_set_body(body: &[u8]) -> Result<PanelSecret, (&'static str, &'static 
     serde_json::from_slice::<Body>(body)
         .map(|parsed| PanelSecret(parsed.text))
         .map_err(|_| ("400 Bad Request", "expected {\"text\": string}"))
+}
+
+/// Parses `{"device": "<name>"|null}`: a bounded name without control
+/// characters, or null for the system default, and nothing else.
+fn speech_input_device_body(body: &[u8]) -> Result<Option<String>, (&'static str, &'static str)> {
+    const BAD: (&str, &str) = (
+        "400 Bad Request",
+        "expected {\"device\": string or null}, at most 128 bytes",
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(body).map_err(|_| BAD)?;
+    let object = parsed.as_object().filter(|o| o.len() == 1).ok_or(BAD)?;
+    match object.get("device").ok_or(BAD)? {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(name) if aivtuber_domain::is_valid_speech_device_name(name) => {
+            Ok(Some(name.clone()))
+        }
+        _ => Err(BAD),
+    }
+}
+
+/// Parses `{"duplex": "half"|"full"}` and nothing else.
+fn speech_input_duplex_body(body: &[u8]) -> Result<bool, (&'static str, &'static str)> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Body {
+        duplex: String,
+    }
+    serde_json::from_slice::<Body>(body)
+        .ok()
+        .and_then(|parsed| aivtuber_domain::SpeechDuplex::parse(&parsed.duplex))
+        .map(|duplex| duplex == aivtuber_domain::SpeechDuplex::Full)
+        .ok_or((
+            "400 Bad Request",
+            "expected {\"duplex\": \"half\" or \"full\"}",
+        ))
 }
 
 /// Parses `{}`: the discard request names nothing.
@@ -2270,10 +2341,14 @@ mod tests {
     // ---- voice input (#400) ----
 
     fn speech_input_round_trip(f: &Fixture, body: &str) -> (Raw, PanelRequest) {
+        speech_input_round_trip_at(f, "/api/speech-input", body)
+    }
+
+    fn speech_input_round_trip_at(f: &Fixture, path: &str, body: &str) -> (Raw, PanelRequest) {
         let good = good(f);
         let headers = with(&good, "none");
         thread::scope(|s| {
-            let handle = s.spawn(|| post(f, "/api/speech-input", &headers, body));
+            let handle = s.spawn(|| post(f, path, &headers, body));
             let deadline = Instant::now() + Duration::from_secs(3);
             let mut commands = Vec::new();
             while commands.is_empty() && Instant::now() < deadline {
@@ -2640,6 +2715,91 @@ mod tests {
         raw.extend_from_slice(b"{\"a\":\"\xFF\xFE\"}");
         assert_eq!(send_bytes(&f, &raw).status, 400);
         assert!(f.inbox.drain_memory_seed(8).is_empty());
+    }
+
+    #[test]
+    fn speech_input_device_and_duplex_are_strict_authenticated_and_on_the_same_queue() {
+        let f = fixture();
+        let good = good(&f);
+        let headers = with(&good, "none");
+        for path in ["/api/speech-input/device", "/api/speech-input/duplex"] {
+            let body = if path.ends_with("device") {
+                "{\"device\":null}"
+            } else {
+                "{\"duplex\":\"full\"}"
+            };
+            let mut foreign = with(&good, "origin");
+            foreign.push(("Origin", "http://evil.example"));
+            assert_eq!(post(&f, path, &foreign, body).status, 403, "{path}");
+            assert_eq!(
+                post(&f, path, &with(&good, "x-panel-token"), body).status,
+                401,
+                "{path}"
+            );
+            assert_eq!(get(&f, path, "").status, 405, "{path}");
+        }
+        let long = "x".repeat(129);
+        let too_long = format!("{{\"device\":\"{long}\"}}");
+        for bad in [
+            "",
+            "{}",
+            "{\"device\":1}",
+            "{\"device\":\"\"}",
+            "{\"device\":\"a\nb\"}",
+            "{\"device\":\"mic\",\"enabled\":true}",
+            "{\"device\":\"mic\",\"program\":\"cmd.exe\"}",
+            too_long.as_str(),
+        ] {
+            assert_eq!(
+                post(&f, "/api/speech-input/device", &headers, bad).status,
+                400,
+                "{bad:?}"
+            );
+        }
+        for bad in [
+            "",
+            "{}",
+            "{\"duplex\":\"both\"}",
+            "{\"duplex\":true}",
+            "{\"duplex\":\"half\",\"device\":\"mic\"}",
+        ] {
+            assert_eq!(
+                post(&f, "/api/speech-input/duplex", &headers, bad).status,
+                400,
+                "{bad:?}"
+            );
+        }
+        // Nothing but the enabled body reaches the old endpoint either.
+        assert_eq!(
+            post(&f, "/api/speech-input", &headers, "{\"duplex\":\"half\"}").status,
+            400
+        );
+        assert!(
+            f.inbox.drain_speech_input(8).is_empty(),
+            "nothing got through"
+        );
+        let (answer, request) = speech_input_round_trip_at(
+            &f,
+            "/api/speech-input/device",
+            "{\"device\":\"USB Mic (Yamaha)\"}",
+        );
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        assert_eq!(
+            request,
+            PanelRequest::SpeechInputDevice(Some("USB Mic (Yamaha)".to_owned()))
+        );
+        let (_, request) =
+            speech_input_round_trip_at(&f, "/api/speech-input/device", "{\"device\":null}");
+        assert_eq!(request, PanelRequest::SpeechInputDevice(None));
+        let (_, request) =
+            speech_input_round_trip_at(&f, "/api/speech-input/duplex", "{\"duplex\":\"full\"}");
+        assert_eq!(request, PanelRequest::SpeechInputDuplex { full: true });
+        let (_, request) =
+            speech_input_round_trip_at(&f, "/api/speech-input/duplex", "{\"duplex\":\"half\"}");
+        assert_eq!(request, PanelRequest::SpeechInputDuplex { full: false });
+        assert!(f.inbox.drain_control(8).is_empty());
+        assert!(f.inbox.drain_voice(8).is_empty());
+        assert!(f.inbox.drain_chat(8).is_empty());
     }
 
     #[test]

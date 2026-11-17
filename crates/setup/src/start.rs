@@ -18,8 +18,8 @@
 use crate::config::{LLAMA_ALIAS, LLAMA_DEFAULT_CONTEXT, parse_env};
 use crate::manifest::{DEFAULT_PROFILE, Manifest};
 use aivtuber_domain::{
-    MAX_MODEL_SETTINGS_BYTES, ThinkingModel, ThinkingModelCatalog, parse_model_settings,
-    render_speech_input_settings,
+    MAX_MODEL_SETTINGS_BYTES, MAX_SPEECH_INPUT_SETTINGS_BYTES, ThinkingModel, ThinkingModelCatalog,
+    parse_model_settings, parse_speech_input_document, render_speech_input_document,
 };
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -666,12 +666,25 @@ pub fn ensure_memory_seed_file(path: &Path) -> std::io::Result<()> {
 
 /// Replaces the state file with the on/off document (temp file in the same
 /// directory, then rename, so a crash leaves the old or the new file, never
-/// half of one). Same pattern as the app's own settings writers.
+/// half of one). Same pattern as the app's own settings writers. The device
+/// and duplex choices of #396 already in the file are kept: only `enabled`
+/// changes (a missing or damaged file reads as the defaults).
 pub fn write_speech_input_settings(path: &Path, enabled: bool) -> std::io::Result<()> {
+    let mut settings = std::fs::File::open(path)
+        .ok()
+        .and_then(|file| {
+            let mut bytes = Vec::new();
+            file.take(MAX_SPEECH_INPUT_SETTINGS_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .ok()
+                .map(|_| parse_speech_input_document(&bytes))
+        })
+        .unwrap_or_default();
+    settings.enabled = enabled;
     let mut temp = path.as_os_str().to_owned();
     temp.push(".tmp");
     let temp = PathBuf::from(temp);
-    std::fs::write(&temp, render_speech_input_settings(enabled))?;
+    std::fs::write(&temp, render_speech_input_document(&settings))?;
     std::fs::rename(&temp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&temp);
     })
@@ -1198,6 +1211,36 @@ mod tests {
         assert!(
             write_speech_input_settings(&dir.join("no-such-dir").join("x.json"), true).is_err()
         );
+    }
+
+    #[test]
+    fn the_writer_keeps_the_device_and_duplex_choices_of_the_file() {
+        let dir = temp_dir("speech-input-keep");
+        let path = dir.join(SPEECH_INPUT_SETTINGS_FILE);
+        std::fs::write(
+            &path,
+            "{\"schema\":\"local-speech-input-settings/1\",\"enabled\":false,\"device\":\"USB Mic\",\"duplex\":\"full\"}
+",
+        )
+        .unwrap();
+        write_speech_input_settings(&path, true).unwrap();
+        let settings = aivtuber_domain::parse_speech_input_document(
+            std::fs::read_to_string(&path).unwrap().as_bytes(),
+        );
+        assert!(settings.enabled);
+        assert_eq!(settings.device.as_deref(), Some("USB Mic"));
+        assert_eq!(settings.duplex, aivtuber_domain::SpeechDuplex::Full);
+        write_speech_input_settings(&path, false).unwrap();
+        let settings = aivtuber_domain::parse_speech_input_document(
+            std::fs::read_to_string(&path).unwrap().as_bytes(),
+        );
+        assert!(!settings.enabled);
+        assert_eq!(settings.device.as_deref(), Some("USB Mic"));
+        assert_eq!(settings.duplex, aivtuber_domain::SpeechDuplex::Full);
+        // A damaged file reads as the defaults rather than blocking the choice.
+        std::fs::write(&path, b"garbage").unwrap();
+        write_speech_input_settings(&path, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SPEECH_ON);
     }
 
     #[test]

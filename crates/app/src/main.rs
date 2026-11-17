@@ -70,8 +70,22 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// `run` composes the whole app in one frame; a debug build of it already
+/// takes most of a Windows main thread's 1 MiB stack, so a request path that
+/// is deep (a failed process spawn) overflowed it as soon as the app struct
+/// grew a field. It runs on a thread with a stack that cannot be the limit.
+const RUN_STACK_BYTES: usize = 32 * 1024 * 1024;
+
 fn main() {
-    if let Err(error) = run() {
+    let worker = thread::Builder::new()
+        .name("aivtuber-app".to_owned())
+        .stack_size(RUN_STACK_BYTES)
+        .spawn(|| run().map_err(|error| error.to_string()));
+    let result = match worker {
+        Ok(handle) => handle.join().unwrap_or_else(|_| Err("panicked".to_owned())),
+        Err(error) => Err(format!("could not start the main thread: {error}")),
+    };
+    if let Err(error) = result {
         eprintln!("aivtuber-app: {error}");
         std::process::exit(1);
     }
@@ -755,20 +769,24 @@ fn run() -> Result<(), Box<dyn Error>> {
     // route, floor and barge-in are built either way (voice input can be
     // switched on later from the panel); only the sidecar is started or not.
     // The speech program and state-file variable were read above.
+    // #396: the file also remembers the capture device and the duplex choice.
+    let speech_remembered = speech_settings
+        .as_deref()
+        .map(aivtuber_app::speech_input::read_settings)
+        .unwrap_or_default();
     let speech_input = aivtuber_app::speech_input::SpeechInput::decide(
         speech_program.is_some(),
         speech_settings.is_some(),
-        speech_settings
-            .as_deref()
-            .is_some_and(aivtuber_app::speech_input::read_enabled),
+        speech_remembered.enabled,
     );
     if speech_input.announces() {
         eprintln!(
             "{}",
-            aivtuber_app::ready_guide::voice_input_line(
+            aivtuber_app::ready_guide::voice_input_text(
                 speech_input == aivtuber_app::speech_input::SpeechInput::On,
                 thinking_leaves_machine,
                 aivtuber_adapters::log_verbosity::diagnostics_enabled(),
+                speech_remembered.device.is_some(),
             )
         );
     }
@@ -933,7 +951,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             started,
             speech_settings.clone(),
             thinking_leaves_machine,
-        );
+        )
+        .with_settings(speech_remembered.clone());
         if speech_input.starts_sidecar() {
             match input.start_initial() {
                 Ok(()) => {

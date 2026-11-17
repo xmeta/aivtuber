@@ -890,7 +890,11 @@ export function chatIngressView(state: PanelState | null): ChatIngressView | nul
 // ---- voice input (#400) ----
 
 /** Mirrors `MAX_SPEECH_INPUT_REASON_CHARS` (crates/app/src/speech_input.rs). */
-export const MAX_VOICE_INPUT_REASON_CHARS = 200;
+export const MAX_VOICE_INPUT_REASON_CHARS = 400;
+/** Mirrors `MAX_SPEECH_DEVICES` and `MAX_SPEECH_DEVICE_NAME_BYTES` (crates/domain/src/speech_input.rs). */
+export const MAX_VOICE_INPUT_DEVICES = 32;
+export const MAX_VOICE_INPUT_DEVICE_NAME_BYTES = 128;
+export type VoiceInputDuplex = "half" | "full";
 export type VoiceInputStateName = "off" | "on" | "failed";
 const VOICE_INPUT_STATES: readonly string[] = ["off", "on", "failed"];
 
@@ -903,7 +907,22 @@ export interface VoiceInputState {
   reason: string | null;
   /** The Thinking endpoint leaves this machine: transcribed speech goes to a cloud model. */
   thinking_remote: boolean;
+  /** The capture device the running microphone opened (#396), if known. Host text. */
+  device: string | null;
+  /** The remembered choice; null is the system default. */
+  selected_device: string | null;
+  /** Capture devices the microphone reported at its last start. */
+  devices: string[];
+  /** half: speech during the performer's playback is ignored; full: headset. */
+  duplex: VoiceInputDuplex;
+  /** Segments dropped for starting during playback (half duplex). */
+  dropped_during_playback: number;
 }
+
+const deviceName = (value: unknown): value is string =>
+  typeof value === "string" &&
+  value.length > 0 &&
+  new TextEncoder().encode(value).length <= MAX_VOICE_INPUT_DEVICE_NAME_BYTES;
 
 /**
  * The voice-input state, only if it has exactly the documented shape. An older
@@ -918,7 +937,28 @@ export function parseVoiceInputState(value: unknown): VoiceInputState | null {
   // The host omits `reason` unless failed; null and absent both mean none.
   const reason = v.reason === undefined ? null : boundedText(v.reason, MAX_VOICE_INPUT_REASON_CHARS);
   if (reason === undefined) return null;
-  return { composed: v.composed, state: v.state as VoiceInputStateName, reason, thinking_remote: v.thinking_remote };
+  // The device fields are optional (an older host sends none): absent means
+  // unknown / system default / full duplex, as the host's own defaults do.
+  const device = v.device === undefined ? null : v.device;
+  const selected = v.selected_device === undefined ? null : v.selected_device;
+  if ((device !== null && !deviceName(device)) || (selected !== null && !deviceName(selected))) return null;
+  const devices = v.devices === undefined ? [] : v.devices;
+  if (!Array.isArray(devices) || devices.length > MAX_VOICE_INPUT_DEVICES || !devices.every(deviceName)) return null;
+  const duplex = v.duplex === undefined ? "full" : v.duplex;
+  if (duplex !== "half" && duplex !== "full") return null;
+  const dropped = v.dropped_during_playback === undefined ? 0 : v.dropped_during_playback;
+  if (!count(dropped)) return null;
+  return {
+    composed: v.composed,
+    state: v.state as VoiceInputStateName,
+    reason,
+    thinking_remote: v.thinking_remote,
+    device,
+    selected_device: selected,
+    devices: [...devices],
+    duplex,
+    dropped_during_playback: dropped,
+  };
 }
 
 export interface VoiceInputView {
@@ -932,7 +972,24 @@ export interface VoiceInputView {
   canEnable: boolean;
   canDisable: boolean;
   enableLabel: string;
+  /** Which microphone is open, or the default; host text, textContent only. */
+  deviceText: string;
+  /** The dropdown: the system default first, then the reported names (and the remembered one if unlisted). */
+  deviceOptions: { value: string; label: string }[];
+  /** The option value to select ("" is the system default). */
+  deviceSelected: string;
+  /** The headset switch (full duplex). */
+  headset: boolean;
+  headsetLabel: string;
+  headsetHint: string;
+  /** How many segments half duplex dropped, or null when none. */
+  droppedText: string | null;
 }
+
+export const VOICE_INPUT_HEADSET_LABEL = "ヘッドセット使用(話し中に割り込み可)";
+export const VOICE_INPUT_HEADSET_HINT_HALF = "オフの間は、アバターが話している間に始まった音声は聞き取らず、声での割り込みもしません(スピーカー使用時の自己反響を防ぎます)";
+export const VOICE_INPUT_HEADSET_HINT_FULL = "オンの間は、アバターが話している間でも聞き取り、声で割り込めます。スピーカーでは自分の声を聞き取ることがあります";
+export const VOICE_INPUT_DEFAULT_DEVICE = "システムの既定のデバイス";
 
 export const VOICE_INPUT_EXPLANATION = "オンにすると、マイクで聞き取った音声に返事をします";
 export const VOICE_INPUT_CLOUD_NOTE = "聞き取った音声の文字起こしは、クラウドの応答モデルに送信されます";
@@ -941,9 +998,23 @@ export const VOICE_INPUT_CLOUD_NOTE = "聞き取った音声の文字起こし�
 export function voiceInputView(state: PanelState | null): VoiceInputView | null {
   const v = state?.status.voice_input ?? null;
   if (v === null || !v.composed) return null;
+  const names = [...v.devices];
+  if (v.selected_device !== null && !names.includes(v.selected_device)) names.push(v.selected_device);
   const base = {
     explanation: VOICE_INPUT_EXPLANATION,
     cloudNote: v.thinking_remote ? VOICE_INPUT_CLOUD_NOTE : null,
+    deviceText:
+      v.state === "on" && v.device !== null
+        ? `使用中のマイク: ${v.device}`
+        : v.selected_device === null
+          ? `マイク: ${VOICE_INPUT_DEFAULT_DEVICE}`
+          : `マイク: ${v.selected_device}`,
+    deviceOptions: [{ value: "", label: VOICE_INPUT_DEFAULT_DEVICE }, ...names.map((n) => ({ value: n, label: n }))],
+    deviceSelected: v.selected_device ?? "",
+    headset: v.duplex === "full",
+    headsetLabel: VOICE_INPUT_HEADSET_LABEL,
+    headsetHint: v.duplex === "full" ? VOICE_INPUT_HEADSET_HINT_FULL : VOICE_INPUT_HEADSET_HINT_HALF,
+    droppedText: v.dropped_during_playback > 0 ? `話し中に始まったため無視した音声: ${v.dropped_during_playback} 件` : null,
   };
   switch (v.state) {
     case "on":
@@ -965,6 +1036,23 @@ export function voiceInputView(state: PanelState | null): VoiceInputView | null 
 /** The body of `POST /api/speech-input`: a boolean and nothing else (the app refuses anything more). */
 export function voiceInputBody(enabled: boolean): { enabled: boolean } {
   return { enabled };
+}
+
+/** The body of `POST /api/speech-input/device`: a name, or null for the system default. */
+export function voiceInputDeviceBody(device: string): { device: string | null } {
+  return { device: device === "" ? null : device };
+}
+
+/** The body of `POST /api/speech-input/duplex`. */
+export function voiceInputDuplexBody(headset: boolean): { duplex: VoiceInputDuplex } {
+  return { duplex: headset ? "full" : "half" };
+}
+
+/** The line shown after a device or duplex request (the host's text is only a short tail). */
+export function voiceInputChoiceResultText(what: "マイク" | "ヘッドセット設定", ok: boolean, detail: unknown, status: number): string {
+  const raw = typeof detail === "string" ? bounded(detail) : "";
+  if (ok && status === 200) return `${what}を変更しました`;
+  return `${what}を変更できませんでした${raw === "" ? ` (${status})` : `: ${raw}`}`;
 }
 
 /** The line shown after an on/off request; the host's own text is only a short tail. */

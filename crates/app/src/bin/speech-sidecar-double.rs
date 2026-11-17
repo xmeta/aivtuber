@@ -21,6 +21,12 @@
 //! edges continue) and `transcript-garbage` (valid edges plus two invalid
 //! transcript lines per sync).
 //!
+//! Capture-device mode (#396): `devices <lock> [--input-device NAME]` reports
+//! three capture devices like the real sidecar does (the opened one is NAME if
+//! it is one of them, else `Mic A`; an unknown NAME is reported as opened
+//! nothing and the process exits with status 2), appends `pid device` to
+//! `<lock>.log`, then idles until stdin closes.
+//!
 //! Worker-lifetime modes (#400): `with-worker` spawns a child of itself as a
 //! stand-in for the STT worker (piped stdin and stdout, like the real one) and
 //! then idles; `worker` (that child) exits when its stdin reaches end of
@@ -178,6 +184,41 @@ fn main() -> ExitCode {
         "hang" => loop {
             std::thread::sleep(std::time::Duration::from_secs(3600));
         },
+        "devices" => {
+            const AVAILABLE: [&str; 3] = ["Mic A", "Mic B", "Line (AG06)"];
+            let args: Vec<String> = std::env::args().collect();
+            let wanted = args
+                .iter()
+                .position(|arg| arg == "--input-device")
+                .and_then(|index| args.get(index + 1));
+            let opened = match wanted {
+                None => Some(AVAILABLE[0]),
+                Some(name) => AVAILABLE.iter().copied().find(|device| device == name),
+            };
+            if let Some(lock) = std::env::args_os().nth(2) {
+                let mut log = lock;
+                log.push(".log");
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(log)
+                {
+                    let _ = writeln!(file, "{} {}", std::process::id(), opened.unwrap_or("-"));
+                }
+            }
+            let names: Vec<String> = AVAILABLE.iter().map(|name| (*name).to_owned()).collect();
+            emit(
+                &mut out,
+                &aivtuber_adapters::speech_vad::encode_device_report_line(opened, &names),
+            );
+            if opened.is_none() {
+                eprintln!("speech-sidecar-double: no such input device");
+                return ExitCode::from(2);
+            }
+            let mut sink = Vec::new();
+            let _ = io::Read::read_to_end(&mut io::stdin().lock(), &mut sink);
+            ExitCode::SUCCESS
+        }
         "with-worker" => {
             let mut command = std::process::Command::new(std::env::current_exe().expect("exe"));
             command.arg("worker");
@@ -202,7 +243,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: speech-sidecar-double clock|crash|garbage|flood|oversize|hang|with-worker|transcripts|stt-fail|transcript-garbage|beat|beat-stall|beat-garbage"
+                "usage: speech-sidecar-double clock|crash|garbage|flood|oversize|hang|with-worker|transcripts|stt-fail|transcript-garbage|beat|beat-stall|beat-garbage|devices"
             );
             ExitCode::FAILURE
         }

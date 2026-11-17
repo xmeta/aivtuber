@@ -57,6 +57,8 @@ pub struct OperatorRequest {
     /// `avatar.confirm`, `avatar.select`, `avatar.delete`, `avatar.discard`
     /// (the avatar choice of #362; the upload itself is panel-only),
     /// `speech_input.enable`, `speech_input.disable` (voice input, #400),
+    /// `speech_input.device`, `speech_input.duplex` (the capture device and the
+    /// half/full duplex choice, #396),
     /// `persona.set`, `persona.get` (the character sheet, #401),
     /// `memory.seed.get`, `memory.seed.set` (the operator memory seed, #402).
     pub action: String,
@@ -70,7 +72,9 @@ pub struct OperatorRequest {
     /// `{"platform","target"}` / `{"platform"}` JSON for `ingress.connect` /
     /// `ingress.disconnect`, a model hash (or hash prefix, or `sample`) for the
     /// `avatar.*` actions, the whole new character sheet for `persona.set`
-    /// (empty clears it), the whole seed document for `memory.seed.set`.
+    /// (empty clears it), the whole seed document for `memory.seed.set`, the
+    /// capture device name (empty is the system default) for
+    /// `speech_input.device` and `half` or `full` for `speech_input.duplex`.
     /// Ignored by every other action.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub argument: Option<String>,
@@ -709,10 +713,16 @@ fn is_tcp_ingress_action(action: &str) -> bool {
     is_ingress_action(action) && action != "ingress.key.set"
 }
 
-/// The voice-input actions (#400), both under `speech_input.control`. The
-/// operator endpoint (`aivtuberctl`) may send both.
+/// The voice-input actions (#400, #396), all under `speech_input.control`.
+/// The operator endpoint (`aivtuberctl`) and the panel may send all of them.
 fn is_speech_input_action(action: &str) -> bool {
-    matches!(action, "speech_input.enable" | "speech_input.disable")
+    matches!(
+        action,
+        "speech_input.enable"
+            | "speech_input.disable"
+            | "speech_input.device"
+            | "speech_input.duplex"
+    )
 }
 
 /// The character sheet actions (#401), both under `persona.configure`. The
@@ -992,9 +1002,9 @@ fn apply_with_presented_secret<R: RoutePlanner>(
     }
 
     if is_speech_input_action(action) {
-        // No argument at all; the detail is a fixed phrase (never a path or a
-        // device), so the audit record carries the action and its outcome.
-        return match app.configure_speech_input(command.authority(), action) {
+        // The detail is a fixed phrase (never a path or a device name), so the
+        // audit record carries the action and its outcome, not the argument.
+        return match app.configure_speech_input(command.authority(), action, argument) {
             Ok(detail) => {
                 app.audit_operator_action(&request_id, action, &detail, true);
                 OperatorResponse {

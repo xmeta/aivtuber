@@ -237,9 +237,11 @@ fn capability_for_action(action: &str) -> Option<Capability> {
         "voice.configure" => Some(Capability::VoiceConfigure),
         "ingress.control" => Some(Capability::IngressControl),
         "avatar.configure" => Some(Capability::AvatarConfigure),
-        "speech_input.control" | "speech_input.enable" | "speech_input.disable" => {
-            Some(Capability::SpeechInputControl)
-        }
+        "speech_input.control"
+        | "speech_input.enable"
+        | "speech_input.disable"
+        | "speech_input.device"
+        | "speech_input.duplex" => Some(Capability::SpeechInputControl),
         "persona.configure" | "persona.set" | "persona.get" => Some(Capability::PersonaConfigure),
         _ => None,
     }

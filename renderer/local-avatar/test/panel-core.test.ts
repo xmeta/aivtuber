@@ -80,6 +80,9 @@ import {
   tokenFromHash,
   tuningPatch,
   voiceInputBody,
+  voiceInputChoiceResultText,
+  voiceInputDeviceBody,
+  voiceInputDuplexBody,
   voiceInputResultText,
   voiceInputView,
   VOICE_INPUT_CLOUD_NOTE,
@@ -1095,6 +1098,61 @@ const withVoiceInput = (value: unknown) =>
     avatar_url: null,
   });
 
+describe("voice input device and duplex (#396)", () => {
+  test("the card shows the open device, the reported names and the remembered choice", () => {
+    const view = voiceInputView(
+      withVoiceInput(
+        voiceInput({
+          state: "on",
+          device: "Line (YAMAHA AG06/AG03)",
+          selected_device: "Line (YAMAHA AG06/AG03)",
+          devices: ["Mic A", "Line (YAMAHA AG06/AG03)"],
+          duplex: "half",
+          dropped_during_playback: 3,
+        }),
+      ),
+    )!;
+    expect(view.deviceText).toBe("使用中のマイク: Line (YAMAHA AG06/AG03)");
+    expect(view.deviceOptions.map((o) => o.value)).toEqual(["", "Mic A", "Line (YAMAHA AG06/AG03)"]);
+    expect(view.deviceSelected).toBe("Line (YAMAHA AG06/AG03)");
+    expect(view.headset).toBe(false);
+    expect(view.droppedText).toContain("3");
+    // A remembered name the microphone did not list is still offered, so the
+    // select never silently shows another device.
+    const unlisted = voiceInputView(withVoiceInput(voiceInput({ selected_device: "Gone", devices: ["Mic A"] })))!;
+    expect(unlisted.deviceOptions.map((o) => o.value)).toEqual(["", "Mic A", "Gone"]);
+    expect(unlisted.deviceText).toBe("マイク: Gone");
+    const plain = voiceInputView(withVoiceInput(voiceInput()))!;
+    expect(plain.deviceSelected).toBe("");
+    expect(plain.droppedText).toBeNull();
+    expect(voiceInputView(withVoiceInput(voiceInput({ duplex: "full" })))!.headset).toBe(true);
+  });
+
+  test("malformed device fields drop the state", () => {
+    for (const bad of [
+      voiceInput({ device: 3 }),
+      voiceInput({ selected_device: "" }),
+      voiceInput({ devices: "Mic" }),
+      voiceInput({ devices: [1] }),
+      voiceInput({ devices: Array.from({ length: 33 }, (_, i) => `d${i}`) }),
+      voiceInput({ devices: ["x".repeat(129)] }),
+      voiceInput({ duplex: "both" }),
+      voiceInput({ dropped_during_playback: -1 }),
+    ]) {
+      expect(voiceInputView(withVoiceInput(bad))).toBeNull();
+    }
+  });
+
+  test("the request bodies carry only the choice", () => {
+    expect(voiceInputDeviceBody("")).toEqual({ device: null });
+    expect(voiceInputDeviceBody("Mic A")).toEqual({ device: "Mic A" });
+    expect(voiceInputDuplexBody(true)).toEqual({ duplex: "full" });
+    expect(voiceInputDuplexBody(false)).toEqual({ duplex: "half" });
+    expect(voiceInputChoiceResultText("マイク", true, "x", 200)).toBe("マイクを変更しました");
+    expect(voiceInputChoiceResultText("マイク", false, "refused", 409)).toContain("refused");
+  });
+});
+
 describe("voice input state", () => {
   test("a host that does not send the field hides the toggle", () => {
     // An older app: no `voice_input` key at all.
@@ -1132,6 +1190,11 @@ describe("voice input state", () => {
       state: "off",
       reason: null,
       thinking_remote: false,
+      device: null,
+      selected_device: null,
+      devices: [],
+      duplex: "full",
+      dropped_during_playback: 0,
     });
     // The host omits `reason` unless failed; null and the longest reason are fine.
     expect(parseVoiceInputState(voiceInput({ state: "failed", reason: null }))!.reason).toBeNull();

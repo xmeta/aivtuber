@@ -17,6 +17,7 @@
 //!   The only state is the start/end hysteresis of the VAD probability.
 
 mod clock;
+mod devices;
 mod edges;
 mod emit;
 mod heartbeat;
@@ -31,6 +32,10 @@ mod silero;
 pub use clock::{
     CLOCK_SYNC_MAX_LINE_BYTES, ClockError, ClockPumpStats, RuntimeClockMap, StreamClock,
     encode_clock_sync_line, parse_clock_sync_line, pump_clock_syncs,
+};
+pub use devices::{
+    DEVICE_REPORT_MAX_LINE_BYTES, DeviceReport, clean_device_name, encode_device_report_line,
+    parse_device_report_line,
 };
 pub use edges::{EdgeDetector, HysteresisConfig};
 pub use emit::{LineHandle, LineSink, ObservationStamper, SinkStats, StamperConfig};
