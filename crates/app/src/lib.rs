@@ -1186,8 +1186,11 @@ where
     model_switcher: Option<model_switch::ModelSwitcher>,
     /// The operator's character sheet read at start (#404); `None` unless
     /// `AIVTUBER_PERSONA_FILE` was set, then the load outcome (the sheet, or
-    /// why there is none). Never changed while running.
+    /// why there is none). Changed while running only by
+    /// `configure_persona` (#401), read when each Thinking request is built.
     persona: Option<persona::PersonaLoad>,
+    /// Live editing of the sheet (#401); `None` (default) composes nothing.
+    persona_editor: Option<persona::PersonaEditor>,
     thinking_meter: Option<thinking_meter::ThinkingMeter>,
     /// Live voice settings (#360); `None` (default) composes nothing and the
     /// voice is whatever the environment named.
@@ -1272,6 +1275,7 @@ where
             perception: None,
             model_switcher: None,
             persona: None,
+            persona_editor: None,
             thinking_meter: None,
             voice: None,
             chat_ingress: None,
@@ -1763,6 +1767,110 @@ where
     /// unless `AIVTUBER_PERSONA_FILE` was set.
     pub fn persona_status(&self) -> Option<persona::PersonaStatus> {
         self.persona.as_ref().map(persona::PersonaLoad::status)
+    }
+
+    /// Opt in to editing the character sheet while running (#401). Only the
+    /// authenticated `persona.configure` capability can use it
+    /// (`configure_persona`); `editor` names the file a save is written to
+    /// (none = in memory only). Without a sheet loaded the live slot starts
+    /// empty.
+    pub fn with_persona_editor(mut self, editor: persona::PersonaEditor) -> Self {
+        self.persona_editor = Some(editor);
+        self.persona.get_or_insert(persona::PersonaLoad::Absent);
+        self
+    }
+
+    /// Whether the sheet can be edited while running (the operator endpoint
+    /// then holds `persona.configure`).
+    pub fn persona_editor_composed(&self) -> bool {
+        self.persona_editor.is_some()
+    }
+
+    /// Live-edit state for the operator surfaces; `None` unless composed.
+    pub fn persona_editor_status(&self) -> Option<persona::PersonaEditorStatus> {
+        self.persona_editor
+            .as_ref()
+            .map(persona::PersonaEditor::status)
+    }
+
+    /// Apply one character-sheet operator request (#401). `authority` must be
+    /// the authenticated local ingress capability. `action` is `persona.set`
+    /// (`argument` is the whole new text; empty clears) or `persona.get`.
+    ///
+    /// A set is validated by the same parser as the start-up file, then
+    /// written atomically when a file is configured, and only then becomes
+    /// the live sheet: any refusal, or a failed write, leaves the live sheet
+    /// unchanged. A reply already being generated keeps the old text; the next
+    /// Thinking request carries the new one. Details are fixed phrases plus the
+    /// sheet's length and hash prefix, never the text; only `persona.get`
+    /// returns it, to the authenticated caller.
+    pub fn configure_persona(
+        &mut self,
+        authority: &AuthenticatedControl,
+        action: &str,
+        argument: Option<&str>,
+    ) -> Result<persona::PersonaOutcome, String> {
+        if !authority.has_capability(aivtuber_domain::Capability::PersonaConfigure) {
+            return Err("character sheet editing is not authorized".to_owned());
+        }
+        let Some(editor) = self.persona_editor.as_ref() else {
+            return Err("character sheet editing is not configured".to_owned());
+        };
+        match action {
+            "persona.get" => {
+                let current = self.persona.as_ref().and_then(persona::PersonaLoad::sheet);
+                Ok(persona::PersonaOutcome {
+                    detail: self
+                        .persona_status()
+                        .map_or_else(|| "none".to_owned(), |status| status.identity()),
+                    text: Some(current.map_or_else(String::new, |s| s.text().to_owned())),
+                })
+            }
+            "persona.set" => {
+                let Some(text) = argument else {
+                    return Err("persona not changed: no text given".to_owned());
+                };
+                let sheet = match aivtuber_domain::parse_persona(text.as_bytes()) {
+                    Ok(persona) => persona.map(persona::PersonaSheet::new),
+                    Err(error) => {
+                        return Err(format!("persona not changed: {}", error.reason()));
+                    }
+                };
+                let persisted = if let Some(path) = editor.path() {
+                    let normalised = sheet.as_ref().map_or("", persona::PersonaSheet::text);
+                    if persona::write_persona_file_atomic(path, normalised).is_err() {
+                        return Err(
+                            "persona not changed: the persona file could not be written".to_owned()
+                        );
+                    }
+                    true
+                } else {
+                    false
+                };
+                let thinking_remote = editor.status().thinking_remote;
+                let load = sheet.map_or(persona::PersonaLoad::Absent, persona::PersonaLoad::Loaded);
+                let identity = load.status().identity();
+                eprintln!(
+                    "{}",
+                    ready_guide::persona_line(
+                        &load,
+                        thinking_remote,
+                        aivtuber_adapters::log_verbosity::diagnostics_enabled(),
+                    )
+                );
+                self.persona = Some(load);
+                let kept = if persisted {
+                    "saved to the persona file"
+                } else {
+                    "applied in memory only (no persona file is configured)"
+                };
+                Ok(persona::PersonaOutcome {
+                    detail: format!("persona updated, {kept}: {identity}"),
+                    text: None,
+                })
+            }
+            _ => Err("not a character sheet action".to_owned()),
+        }
     }
 
     /// Opt in to switching the local Thinking model at runtime (#357). Only the

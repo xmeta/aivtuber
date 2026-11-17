@@ -116,8 +116,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     // #404: the operator's character sheet, read once and bounded. Unset = no
     // persona and nothing changes; the outcome is announced below once the
     // generative path and the Thinking endpoint are known.
-    let persona_load = env_path(aivtuber_app::persona::PERSONA_FILE_VAR)
-        .map(|path| aivtuber_app::persona::load_persona_file(&path));
+    let persona_path = env_path(aivtuber_app::persona::PERSONA_FILE_VAR);
+    let persona_load = persona_path
+        .as_deref()
+        .map(aivtuber_app::persona::load_persona_file);
     let GenerativeParts {
         runtime: generative_configured,
         model_switcher,
@@ -293,6 +295,14 @@ fn run() -> Result<(), Box<dyn Error>> {
         );
     if let Some(load) = persona_load {
         app = app.with_persona(load);
+    }
+    // #401: the sheet can be replaced while running whenever the generative
+    // path is composed; a save goes to the file when one is named.
+    if generative.is_some() {
+        app = app.with_persona_editor(aivtuber_app::persona::PersonaEditor::new(
+            persona_path,
+            thinking_leaves_machine,
+        ));
     }
     if let Some(generative) = generative {
         app = app.with_generation(generative);
@@ -504,6 +514,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             avatar_configure: app.avatar_configured(),
             // #400: `speech_input.control` only when voice input is composed.
             speech_input_control: speech_program.is_some() && speech_settings.is_some(),
+            // #401: `persona.configure` only when live editing is composed.
+            persona_configure: app.persona_editor_composed(),
         },
     )?;
     let operator_ingress = operator_server.ingress();

@@ -38,7 +38,18 @@ import {
   parseModelState,
   parseSearchPage,
   parseState,
+  parsePersonaEditorState,
   parseVoiceInputState,
+  personaBytes,
+  personaGetBody,
+  personaResultText,
+  personaSetBody,
+  personaTextFrom,
+  personaView,
+  MAX_PERSONA_BYTES,
+  PERSONA_CLOUD_NOTE,
+  PERSONA_EXPLANATION,
+  PERSONA_MEMORY_ONLY_NOTE,
   parseVoiceState,
   pushChat,
   repliesFor,
@@ -1180,5 +1191,133 @@ describe("voice input request", () => {
     expect(voiceInputResultText(true, true, "x", 500)).toContain("できませんでした");
     // Host text stays bounded.
     expect(voiceInputResultText(true, false, "x".repeat(5000), 200).length).toBeLessThan(MAX_HOST_TEXT_CHARS + 60);
+  });
+});
+
+// ---- character sheet (#401) ----
+
+const personaEditor = (over: Record<string, unknown> = {}) => ({
+  persisted: true,
+  thinking_remote: false,
+  ...over,
+});
+
+const withPersonaEditor = (value: unknown) =>
+  parseState({
+    schema: "local-panel/1",
+    uptime_ms: 5,
+    status: {
+      muted: false,
+      audio_error: null,
+      avatar_error: null,
+      stream_error: null,
+      content_queue: 0,
+      scheduler_items: 0,
+      generation_active: false,
+      ...(value === undefined ? {} : { persona_editor: value }),
+    },
+    replies: [],
+    avatar_url: null,
+  });
+
+describe("character sheet editor state", () => {
+  test("a host that does not send the field hides the editor", () => {
+    const older = withPersonaEditor(undefined);
+    expect(older).not.toBeNull();
+    expect(older!.status.persona_editor ?? null).toBeNull();
+    expect(personaView(older, "")).toBeNull();
+    expect(personaView(null, "")).toBeNull();
+    expect(personaView(state(), "")).toBeNull();
+  });
+
+  test("anything but the documented shape is dropped, not fatal", () => {
+    for (const bad of [
+      null,
+      "on",
+      7,
+      [],
+      {},
+      personaEditor({ persisted: "yes" }),
+      personaEditor({ persisted: undefined }),
+      personaEditor({ thinking_remote: 1 }),
+      personaEditor({ thinking_remote: undefined }),
+    ]) {
+      expect(parsePersonaEditorState(bad)).toBeNull();
+      const parsed = withPersonaEditor(bad);
+      expect(parsed).not.toBeNull();
+      expect(personaView(parsed, "")).toBeNull();
+    }
+    expect(parsePersonaEditorState(personaEditor())).toEqual({ persisted: true, thinking_remote: false });
+  });
+});
+
+describe("character sheet view", () => {
+  test("the counter measures UTF-8 bytes the way the host normalises", () => {
+    expect(personaBytes("")).toBe(0);
+    expect(personaBytes("abc")).toBe(3);
+    expect(personaBytes("ミコト")).toBe(9);
+    // CRLF and lone CR count as one byte, trailing whitespace is not counted.
+    expect(personaBytes("a\r\nb\rc\n\n  ")).toBe(5);
+    expect(personaBytes("あ".repeat(1000))).toBe(MAX_PERSONA_BYTES);
+    const view = personaView(withPersonaEditor(personaEditor()), "ミコト")!;
+    expect(view.counterText).toBe("9 / 3,000 バイト");
+    expect(view.health).toBe("ok");
+    expect(view.canSave).toBe(true);
+  });
+
+  test("over the limit warns and cannot be saved; exactly at the limit can", () => {
+    const state = withPersonaEditor(personaEditor());
+    const at = personaView(state, "あ".repeat(1000))!;
+    expect([at.health, at.canSave]).toEqual(["ok", true]);
+    const over = personaView(state, "あ".repeat(1000) + "a")!;
+    expect([over.health, over.canSave]).toEqual(["warn", false]);
+    expect(over.counterText).toBe("3,001 / 3,000 バイト");
+    // Empty is allowed: it clears the sheet.
+    expect(personaView(state, "")!.canSave).toBe(true);
+  });
+
+  test("the cloud sentence shows exactly when Thinking is remote", () => {
+    const local = personaView(withPersonaEditor(personaEditor({ thinking_remote: false })), "x")!;
+    expect(local.cloudNote).toBeNull();
+    const remote = personaView(withPersonaEditor(personaEditor({ thinking_remote: true })), "x")!;
+    expect(remote.cloudNote).toBe(PERSONA_CLOUD_NOTE);
+    expect(PERSONA_CLOUD_NOTE).toContain("クラウドのモデルへ送信されます");
+    expect(PERSONA_CLOUD_NOTE).toContain("sent to the cloud model with every reply");
+  });
+
+  test("a save that is not written to a file says it will be lost on restart", () => {
+    const kept = personaView(withPersonaEditor(personaEditor({ persisted: true })), "x")!;
+    expect(kept.memoryOnlyNote).toBeNull();
+    const memory = personaView(withPersonaEditor(personaEditor({ persisted: false })), "x")!;
+    expect(memory.memoryOnlyNote).toBe(PERSONA_MEMORY_ONLY_NOTE);
+    expect(kept.explanation).toBe(PERSONA_EXPLANATION);
+  });
+});
+
+describe("character sheet requests", () => {
+  test("the set body is the text and nothing else; get is an empty object", () => {
+    expect(personaSetBody("名前: ミコト\n")).toEqual({ text: "名前: ミコト\n" });
+    expect(Object.keys(personaSetBody("x"))).toEqual(["text"]);
+    expect(JSON.stringify(personaSetBody("a\"b\\c\n"))).toBe('{"text":"a\\"b\\\\c\\n"}');
+    expect(JSON.stringify(personaGetBody())).toBe("{}");
+  });
+
+  test("the text of a get answer is taken only when it is a string within the bound", () => {
+    expect(personaTextFrom({ ok: true, text: "名前: ミコト" })).toBe("名前: ミコト");
+    expect(personaTextFrom({ ok: true, text: "" })).toBe("");
+    for (const bad of [null, "x", 7, {}, { text: 3 }, { text: null }, { text: "あ".repeat(1001) }]) {
+      expect(personaTextFrom(bad)).toBeNull();
+    }
+  });
+
+  test("the result lines", () => {
+    expect(personaResultText("save", true, "x", 200)).toBe("保存しました。次の返答から反映されます");
+    expect(personaResultText("reload", true, "x", 200)).toBe("読み込みました");
+    expect(personaResultText("save", false, "persona not changed: larger than 3000 bytes", 409)).toBe(
+      "保存できませんでした: persona not changed: larger than 3000 bytes",
+    );
+    expect(personaResultText("reload", false, undefined, 503)).toBe("読み込みできませんでした (503)");
+    expect(personaResultText("save", true, "x", 500)).toContain("できませんでした");
+    expect(personaResultText("save", false, "x".repeat(5000), 409).length).toBeLessThan(MAX_HOST_TEXT_CHARS + 60);
   });
 });

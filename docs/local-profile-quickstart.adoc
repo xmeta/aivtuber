@@ -216,13 +216,20 @@ The `renderer/local-avatar/dist/model.vrm` file still works as the *sample* when
 
 [#from-source-checkout]
 [#character-sheet]
-=== Character sheet: give the performer a name and a way of speaking (issue #404)
+=== Character sheet: give the performer a name and a way of speaking (issues #404, #401)
 
 Optional. A *character sheet* is a short text file that tells the language model who it is: name, how it refers to itself, tone, personality, likes, dislikes and what not to talk about.
 
 . Copy `examples/persona/starter.ja.md` from the archive (Japanese; the fields are 名前 / 一人称 / 話し方 / 性格 / 好きなもの / 苦手なもの / 話題にしないこと) to `local-persona.md` beside `local-profile.env`, and replace the sample values with yours.
-. Start again (`aivtuber-setup start`). The sheet is read once at start; there is no panel editor in this version, so a change needs a restart. The app prints one line saying whether it was loaded and how many bytes it has (never the text); an invalid file prints a warning with the reason and the performer speaks in its default voice.
+. Start again (`aivtuber-setup start`). The sheet is read at start. The app prints one line saying whether it was loaded and how many bytes it has (never the text); an invalid file prints a warning with the reason and the performer speaks in its default voice.
 . The bound is 3,000 bytes (about 1,000 Japanese characters) of plain text, saved as UTF-8. Control characters (other than a newline or tab) and the tags `<character` / `</character` are refused.
+
+*Edit it while the app runs (#401).* You do not have to restart to change the sheet:
+
+* *In the operation panel*, the *キャラクター設定* card shows the current text in a box with a byte counter (`1,234 / 3,000 バイト`). *保存* applies it: the next reply is written under the new text (a reply already being generated keeps the old one); *読み込み直す* reloads what the app holds. Saving an empty box removes the sheet. Under the hybrid profile the card says, before you save, that the text is sent to the cloud model with every reply (この内容は返答ごとにクラウドのモデルへ送信されます / sent to the cloud model with every reply).
+* *From a terminal*: `aivtuberctl persona show` prints the text, `aivtuberctl persona set --file local-persona.md` replaces it with that UTF-8 file, `aivtuberctl persona clear` removes it. `aivtuberctl status` prints `persona` (present, bytes, hash prefix) and `persona_editor` (whether a save is written to the file, and whether Thinking is remote), never the text.
+* A save is checked with the same rules as the file (UTF-8, at most 3,000 bytes, no control characters, no `<character` tag); an invalid text is refused and the current sheet and file are unchanged. A valid one is written to `local-persona.md` by writing a temporary file next to it and renaming it over it, so a crash cannot leave half a file, and the next start reads it. If the app was started without a persona file (run directly, without `aivtuber-setup start`), a save applies in memory only: the answer and the panel say so, and the text is lost at exit.
+* Only you can do this: the panel (with its per-launch token) and `aivtuberctl` (with the control secret) are the only ways in. A chat line, the model and tool output cannot.
 
 What it does: every reply the *language model* writes is written as that character. It does not change what the model is allowed to do: the text is only data that describes identity and style, it cannot grant permissions or issue commands, and the usual output checks still apply to every reply.
 

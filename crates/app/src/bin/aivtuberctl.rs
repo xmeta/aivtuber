@@ -32,6 +32,13 @@
 //! with voice input composed (`aivtuber-setup start`). Transcribed speech is
 //! admitted as untrusted speech either way.
 //!
+//! `persona` (issue #401) shows, replaces or clears the operator's character
+//! sheet while the daemon runs, like the operation panel: `persona show` prints
+//! the text, `persona set --file <path>` sends it (the whole text, checked as
+//! UTF-8 and bounded here before anything is sent), `persona clear` removes it.
+//! The daemon validates it again and writes `AIVTUBER_PERSONA_FILE` atomically
+//! when one is configured; the text is never logged or audited.
+//!
 //! `voice` (issue #360) changes the voice at runtime, like the operation panel:
 //! the local voice or Aivis Cloud, the Aivis style and the tuning, and a
 //! preview. The API key is deliberately not a subcommand: it would travel in a
@@ -122,6 +129,14 @@ enum Command {
         #[arg(value_parser = ["on", "off"])]
         state: String,
     },
+    /// Show, replace or clear the character sheet (issue #401); needs the
+    /// daemon to run with the generative path (the local and hybrid profiles
+    /// started by `aivtuber-setup start`). The text goes to the model with
+    /// every reply; with a cloud model it leaves this machine.
+    Persona {
+        #[command(subcommand)]
+        action: PersonaCommand,
+    },
     /// Show or change the VRM avatar (issue #362); needs the daemon to run
     /// with the avatar store (the local profile started by `aivtuber-setup
     /// start`). A model is uploaded in the operation panel, where its licence
@@ -130,6 +145,48 @@ enum Command {
         #[command(subcommand)]
         action: AvatarCommand,
     },
+}
+
+#[derive(Subcommand, Clone, PartialEq, Eq)]
+enum PersonaCommand {
+    /// Print the character sheet the daemon holds (nothing if there is none).
+    Show,
+    /// Replace the character sheet with the text of a UTF-8 file (at most
+    /// 3000 bytes after line endings are normalised).
+    Set {
+        /// The file to read, for example local-persona.md.
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Remove the character sheet; replies use the default voice.
+    Clear,
+}
+
+/// The `persona.set` argument for a persona subcommand: the whole text. The
+/// file is read bounded and must be UTF-8 before anything is sent; the daemon
+/// validates it again. `Clear` sends the empty text, `Show` no argument.
+fn persona_argument(action: &PersonaCommand) -> Result<Option<String>, String> {
+    use std::io::Read as _;
+    match action {
+        PersonaCommand::Show => Ok(None),
+        PersonaCommand::Clear => Ok(Some(String::new())),
+        PersonaCommand::Set { file } => {
+            let limit = aivtuber_domain::MAX_PERSONA_FILE_BYTES;
+            let mut bytes = Vec::new();
+            std::fs::File::open(file)
+                .and_then(|f| f.take(limit + 1).read_to_end(&mut bytes))
+                .map_err(|error| format!("cannot read {}: {error}", file.display()))?;
+            if bytes.len() as u64 > limit {
+                return Err(format!(
+                    "{} is larger than {limit} bytes; the character sheet is at most 3000 bytes",
+                    file.display()
+                ));
+            }
+            String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|_| format!("{} is not valid UTF-8", file.display()))
+        }
+    }
 }
 
 #[derive(Subcommand, Clone, PartialEq, Eq)]
@@ -358,6 +415,10 @@ fn action_name(command: &Command) -> &'static str {
         Command::PerceptionOff => "perception.disable",
         Command::MemoryExport { .. } => "memory.export",
         Command::Model { .. } => "model.select",
+        Command::Persona { action } => match action {
+            PersonaCommand::Show => "persona.get",
+            PersonaCommand::Set { .. } | PersonaCommand::Clear => "persona.set",
+        },
         Command::VoiceInput { state } => {
             if state == "on" {
                 "speech_input.enable"
@@ -420,6 +481,13 @@ fn main() -> ExitCode {
     };
 
     let argument = match &cli.command {
+        Command::Persona { action } => match persona_argument(action) {
+            Ok(argument) => argument,
+            Err(error) => {
+                eprintln!("aivtuberctl: {error}");
+                return ExitCode::from(2);
+            }
+        },
         Command::Model { alias } => Some(alias.clone()),
         Command::Voice { action } => voice_patch(action),
         Command::Ingress { action } => ingress_argument(action),
@@ -448,6 +516,16 @@ fn main() -> ExitCode {
                         ExitCode::from(1)
                     }
                 };
+            }
+            if let Command::Persona {
+                action: PersonaCommand::Show,
+            } = &cli.command
+                && response.ok
+            {
+                // The identity goes to stderr so stdout is exactly the sheet.
+                eprintln!("{}", response.detail);
+                print!("{}", response.persona.as_deref().unwrap_or(""));
+                return ExitCode::SUCCESS;
             }
             if cli.command == Command::Diagnose && response.ok {
                 print_diagnose(&response);
@@ -587,6 +665,12 @@ fn print_response(response: &OperatorResponse) {
                 persona.sha256.as_deref().unwrap_or("-"),
             );
         }
+        if let Some(editor) = &status.persona_editor {
+            println!(
+                "persona_editor persisted={} thinking_remote={}",
+                editor.persisted, editor.thinking_remote
+            );
+        }
         if let Some(chat) = &status.chat_ingress {
             for (name, platform) in [("twitch", &chat.twitch), ("youtube", &chat.youtube)] {
                 println!(
@@ -713,6 +797,7 @@ mod tests {
                 skipped: 0,
                 content_hash: hash.to_owned(),
             }),
+            persona: None,
         }
     }
 
@@ -818,6 +903,65 @@ mod tests {
         ] {
             let (name, text) = patch(args);
             assert_eq!((name, text), (action, None));
+        }
+    }
+
+    #[test]
+    fn persona_subcommands_map_to_the_two_actions_and_bound_the_file_before_sending() {
+        let dir = std::env::temp_dir().join(format!("aivtuberctl-persona-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, bytes: &[u8]| {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        let command = parse(&["persona", "show"]);
+        assert_eq!(action_name(&command), "persona.get");
+        let Command::Persona { action } = &command else {
+            panic!("not a persona command");
+        };
+        assert_eq!(persona_argument(action), Ok(None));
+
+        let command = parse(&["persona", "clear"]);
+        assert_eq!(action_name(&command), "persona.set");
+        let Command::Persona { action } = &command else {
+            panic!("not a persona command");
+        };
+        assert_eq!(persona_argument(action), Ok(Some(String::new())));
+
+        let good = write("good.md", "名前: ミコト\n".as_bytes());
+        let command = parse(&["persona", "set", "--file", &good]);
+        assert_eq!(action_name(&command), "persona.set");
+        let Command::Persona { action } = &command else {
+            panic!("not a persona command");
+        };
+        assert_eq!(
+            persona_argument(action),
+            Ok(Some("名前: ミコト\n".to_owned()))
+        );
+
+        let bad = write("bad.md", b"\xFF\xFE");
+        let big = write("big.md", &vec![b'a'; 100_000]);
+        let missing = dir.join("missing.md").to_string_lossy().into_owned();
+        for file in [&bad, &big, &missing] {
+            let command = parse(&["persona", "set", "--file", file]);
+            let Command::Persona { action } = &command else {
+                panic!("not a persona command");
+            };
+            assert!(persona_argument(action).is_err(), "{file}");
+        }
+        for args in [
+            &["persona"][..],
+            &["persona", "set"][..],
+            &["persona", "set", "--text", "x"][..],
+        ] {
+            let mut full = vec![
+                "aivtuberctl",
+                "--secret",
+                "01234567890123456789012345678901",
+            ];
+            full.extend_from_slice(args);
+            assert!(Cli::try_parse_from(full).is_err(), "{args:?}");
         }
     }
 

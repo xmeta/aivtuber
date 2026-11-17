@@ -48,6 +48,20 @@
     </div>
     <p id="voice-input-result" role="status"></p>
   </section>
+
+  <section id="persona-section" aria-labelledby="h-persona" hidden>
+    <h2 id="h-persona">キャラクター設定</h2>
+    <p id="persona-explanation" class="hint"></p>
+    <p id="persona-cloud" class="hint cloud" hidden></p>
+    <p id="persona-memory-only" class="hint" hidden></p>
+    <textarea id="persona-text" rows="10" spellcheck="false" aria-label="キャラクター設定(名前・一人称・口調など)" aria-describedby="persona-counter"></textarea>
+    <p id="persona-counter" class="hint" role="status"></p>
+    <div class="buttons wrap">
+      <button id="persona-save" type="button">保存</button>
+      <button id="persona-reload" type="button">読み込み直す</button>
+    </div>
+    <p id="persona-result" role="status"></p>
+  </section>
 </div>
 
   <section aria-labelledby="h-chat" class="chat">
