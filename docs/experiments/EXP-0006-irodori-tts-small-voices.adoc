@@ -156,7 +156,7 @@ All numbers were measured here unless marked as read from a source.
 * *LUNA fp32 has a heavy tail*: p50 1.19 s but p95 6.86 s (one reply took 25.5 s), RTF 0.585. The p50 is close to bf16; the tail is not. Both LUNA rows use 4 NFE, so the tail is not a sampler effect, but its cause was not isolated (section 8).
 * *Step count is nearly free; the codec is the bottleneck.* 4 NFE against 24 steps on GPU fp32 changed the mean by 11% (2.76 s against 3.10 s), while switching the codec (and DiT) to bf16 on LUNA cut it by 58% (1.16 s against 2.76 s). A faster sampler alone cannot make SUN live-capable.
 * *CPU is out on this host.* SUN with the card's recipe took *about 150 s* for one 19-character reply (3.36 s of audio, RTF ~45) when run through the checkpoint's own synthesize.py; a 3-reply harness run did not finish its second pass within 25 minutes. LUNA, which needs only 4 NFE, produced *no reply at all within about 15 minutes* of the same harness. This CPU (Zen 2) has no hardware bf16, and the cards' "RTF 1.110 on 8 CPU cores" (SUN) and "0.602" (LUNA) were not reproduced; those numbers were obtained on an unidentified VM and are not evidence for this project's hosts.
-* *Load and footprint.* Load (checkpoint + codec + tokenizer, cold process) 57.5 s (SUN fp32), 59.9 s (LUNA fp32), 67.0 s (SUN bf16), 93.5 s (LUNA bf16); first call 16.8 / 7.1 / 4.2 / 1.4 s; peak VRAM 3.9 / 3.8 / 2.9 / 3.1 GB; peak process RSS 6.4-6.9 GB. The model fits the 8 GB card on its own; a Thinking model of the sizes in the local profile cannot share that card at the same time (Q3).
+* *Load and footprint.* Load (checkpoint + codec + tokenizer, cold process) 57.5 s (SUN fp32), 59.9 s (LUNA fp32), 67.0 s (SUN bf16), 93.5 s (LUNA bf16); first call 16.8 / 7.1 / 4.2 / 1.4 s; peak VRAM 3.9 / 3.8 / 2.9 / 3.1 GB; peak process RSS 6.4-6.9 GB. The recommended LUNA bf16 row (3.1 GB) plus the default Thinking model's about 2.6 GB is roughly 5.7 GB of an 8 GB card; SUN fp32 is about 6.5 GB. Those are sums of separately measured figures, not a co-residency measurement (Q3).
 * *Sample rate is 48 kHz* (the DACVAE codec), against 44.1 kHz for the shipped Supertonic path.
 * *Intelligibility is the negative result.* The same round-trip instrument that gave the shipped engine 4.0% reading CER gives every Irodori configuration about 12.4-13.5% (text CER 15.8-18.1% against 8.2%), with 11-15 of 50 replies above 30% text CER. The scored handling set is nearly clean (3-5 of 32), and the reply errors are *lost first words* rather than misread kanji (section 6.2): the audio starts within 18-32 ms of the first sample, and `こんにちは、…` came back as `…今日も来てくれてありがとう`, `わあ` as `うわ`, `あはは` as `ハハ`. The instrument cannot say whether the model clips the onset or the STT is weak on this voice, but neither explanation supports calling this voice better than the shipped one.
 * *Licences are MIT end to end* (code, both checkpoints, base model, MF model, Yomi vector, codec weights, text encoder) with Apache-2.0 for the DACVAE code and MIT for SilentCipher; the base model card carries *ethical restrictions* (no impersonation, no deepfakes, no misinformation, a "may resemble a real person by chance" disclaimer) that the project must state (section 3.2).
@@ -255,6 +255,8 @@ They were written for one VTuber persona and one annotator's expected readings; 
 * *Call time:* wall time of one `InferenceRuntime.synthesize()` call (Python `perf_counter`), including text
   normalization, tokenization, duration prediction, sampling, codec decode and WAV write. No engine streams, so
   the time to first audio equals the call time: about 1.1 s (LUNA bf16) to 3.5 s (SUN bf16) after the text is final.
+  *Per-phrase latency is this call time:* every corpus item is one phrase, which is one request in the project's
+  phrase mode, so a reply of several phrases costs one call each.
 * *RTF* is the sum of call times over the sum of audio durations (below 1 means faster than real time).
 * *Load time:* `InferenceRuntime.from_key` plus `speed_patch.apply` (checkpoint load, codec download/load,
   tokenizer fetch, weight folding/fusing). *First call* is the first synthesis after load; three more warm-ups
@@ -324,10 +326,14 @@ longest (9.5 s) come from the same 50-item set, so the RTF is not an artefact of
 
 Cold load is 57-94 s, dominated by reading a 3 GB safetensors checkpoint and building/folding the modules;
 the codec (410 MB) is downloaded on first use and cached afterwards. VRAM peaks at 2.9-3.9 GB with 48 kHz
-output, and the process adds 6.4-6.9 GB of resident memory. On the reference machine (8 GB card) the model fits,
-but a Thinking model cannot share the card with it at the sizes in `docs/local-profile-quickstart.adoc` unless
-the TTS runs on CPU (which this record rejects) or the Thinking model is small. The operator-facing consequence
-is Q3.
+output, and the process adds 6.4-6.9 GB of resident memory.
+
+*Next to the default Thinking model:* `docs/local-profile-quickstart.adoc` gives the default Thinking model
+(Gemma 4 E4B QAT) about 2.6 GB of VRAM, so the recommended LUNA bf16 configuration (3.1 GB) sums to about
+5.7 GB of an 8 GB card and SUN fp32 (3.9 GB) to about 6.5 GB. That is an addition of two separately measured
+allocator figures, not a measurement of both loaded together; the optional `qwen3-4b` (2.5 GB file) is closer.
+What does not fit on an 8 GB card is the perception profile, which the same document puts at about 12 GB VRAM.
+The operator-facing consequence is Q3.
 
 === 5.4 Determinism
 
@@ -471,9 +477,12 @@ deployment note is required. Nothing downloads at *build* time, and the project'
    question #409 leaves open).
 . *Q2 (default remains Supertonic).* Is a GPU-only, 1.1 s-per-reply optional backend worth a second install
    path next to VOICEVOX, or should Irodori wait until the voice-quality comparison (Q4) shows it is better?
-. *Q3 (VRAM budget).* The backend needs 2.9-3.9 GB of VRAM and 6.4-6.9 GB of RSS. On an 8 GB card it does not
-   coexist with a 4-6 GB Thinking model. Which configuration does the product support: TTS on the GPU and a
-   smaller Thinking model, or TTS on a second GPU?
+   Listing it in the panel's voice section (#409's second open decision) follows only after the backend works
+   from configuration, as VOICEVOX does; this record does not propose a panel change.
+. *Q3 (VRAM budget).* The backend needs 2.9-3.9 GB of VRAM and 6.4-6.9 GB of RSS. Against the default Thinking
+   model's ~2.6 GB that sums to ~5.7 GB (LUNA bf16) of an 8 GB card, which looks feasible but was not measured
+   with both loaded; the ~12 GB perception profile does not fit. Does the product support Irodori on an 8 GB
+   card next to `default`, only on a larger card, or not at all?
 . *Q4 (listening test).* Nobody has listened to SUN or LUNA, and the round-trip reading CER is about 13%
    against the shipped engine's 4.0% (section 6.1). A small blinded comparison against Supertonic and VOICEVOX,
    plus a check of whether the first word is actually audible, is the gate for this backend; without it the
