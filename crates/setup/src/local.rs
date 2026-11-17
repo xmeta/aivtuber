@@ -823,6 +823,7 @@ pub const NEXT_STEPS: &[&str] = &[
     "起動方法: `{cmd}` / How to start: `{cmd}`",
     "操作パネル: 起動時に表示された URL をブラウザで開いてください / Open the operation panel URL printed at start in a browser",
     "音声入力: パネルでオンにするか `start --voice-input on` を実行するまでオフです / Voice input is off until turned on in the panel or with `start --voice-input on`",
+    "キャラクターシート: `examples/persona/starter.ja.md` を env ファイルの隣に `local-persona.md` としてコピーして編集し、再起動してください / Character sheet: copy `examples/persona/starter.ja.md` to `local-persona.md` beside the env file, edit it, then restart",
     "開示: AI 生成音声と AI パフォーマーであることを配信で開示してください（上の英語の義務文が正式です）/ Disclose the AI-generated voice and AI performer on stream (the English duties above are the authoritative text)",
 ];
 
@@ -851,5 +852,18 @@ mod tests {
             );
             assert!(line.chars().any(|c| c.is_ascii_alphabetic()), "{line}");
         }
+        let sheet = NEXT_STEPS
+            .iter()
+            .position(|line| line.contains("starter.ja.md") && line.contains("local-persona.md"))
+            .expect("character-sheet line");
+        assert!(sheet > 0 && sheet + 1 < NEXT_STEPS.len());
+        assert!(
+            NEXT_STEPS[sheet - 1].contains("音声入力"),
+            "must follow the voice-input line"
+        );
+        assert!(
+            NEXT_STEPS[sheet + 1].contains("開示"),
+            "must precede the disclosure line"
+        );
     }
 }
