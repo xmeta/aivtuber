@@ -36,6 +36,9 @@ pub struct StartOptions {
     /// `--voice-input on|off` (#397): remember the choice in the state file
     /// before starting. `None` leaves the remembered value (default off).
     pub voice_input: Option<bool>,
+    /// `--open` (#388): once the app answers, open the operation panel in the
+    /// default browser.
+    pub open: bool,
     pub health_timeout: Duration,
 }
 
@@ -879,7 +882,7 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
             "starting the app",
             "Ctrl+C stops it",
         );
-        return run_app(&app, &env);
+        return run_app(&app, &env, opts.open);
     };
     // The pinned llama.cpp build imports the Visual C++ runtime, which is not
     // bundled (#349): say so instead of a bare 0xC0000135 from llama-server.
@@ -948,7 +951,7 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
         "llama-server ready; starting the app",
         "Ctrl+C stops everything",
     );
-    run_app(&app, &env)
+    run_app(&app, &env, opts.open)
 }
 
 /// Quiet: the short Japanese-first lines. Otherwise the line printed before #393.
@@ -966,7 +969,7 @@ const CHAT_HINT: &str = "type chat as plain text, or paste Event Envelope JSON l
 /// Runs the app in the foreground with its stdin fed from this terminal through
 /// the plain-text wrapper (see `chat`). EOF here closes the app's stdin, which
 /// is its clean-shutdown signal, exactly as before.
-fn run_app(app: &Path, env: &BTreeMap<String, String>) -> Result<i32, String> {
+fn run_app(app: &Path, env: &BTreeMap<String, String>, open: bool) -> Result<i32, String> {
     let mut child = Command::new(app)
         .envs(env.iter())
         .stdin(Stdio::piped())
@@ -985,10 +988,90 @@ fn run_app(app: &Path, env: &BTreeMap<String, String>) -> Result<i32, String> {
             );
         });
     }
+    if open {
+        let (app, env) = (app.to_path_buf(), env.clone());
+        // Detached: it polls the app's own operator endpoint and never blocks
+        // the app, its stdin or its output.
+        std::thread::spawn(move || open_panel_when_ready(&app, &env));
+    }
     let status = child
         .wait()
         .map_err(|e| format!("waiting for {}: {e}", app.display()))?;
     Ok(status.code().unwrap_or(1))
+}
+
+/// Printed when `--open` could not open the browser; not an error (#388).
+const OPEN_FAILED: &str = "ブラウザを開けませんでした。`aivtuberctl panel-url` でパネルの URL を表示できます。 / Could not open the browser; run `aivtuberctl panel-url` to show the panel URL.";
+
+/// How long `--open` waits for the app's operator endpoint and panel.
+const OPEN_WAIT: Duration = Duration::from_secs(180);
+
+/// The program and arguments that open `url` in the default browser, with no
+/// shell: `cmd /c start` would mangle `&` and echo through a shell (#388). The
+/// URL is the last argument and the only place the panel secret appears, which
+/// the threat model accepts for a same-user local process.
+pub fn browser_command(os: &str, url: &str, system_root: &Path) -> (PathBuf, Vec<String>) {
+    match os {
+        "windows" => (
+            system_root.join("System32").join("rundll32.exe"),
+            vec!["url.dll,FileProtocolHandler".to_owned(), url.to_owned()],
+        ),
+        "macos" => (PathBuf::from("open"), vec![url.to_owned()]),
+        _ => (PathBuf::from("xdg-open"), vec![url.to_owned()]),
+    }
+}
+
+/// The `aivtuberctl` beside the app (the release archive ships them together).
+fn ctl_beside(app: &Path) -> PathBuf {
+    app.with_file_name(if cfg!(windows) {
+        "aivtuberctl.exe"
+    } else {
+        "aivtuberctl"
+    })
+}
+
+/// A line is the panel URL only if it is the loopback panel origin; anything
+/// else the control client printed is never handed to the browser.
+pub fn panel_url_from_output(output: &str) -> Option<&str> {
+    let line = output.trim();
+    (line.starts_with("http://127.0.0.1:") && !line.contains(char::is_whitespace)).then_some(line)
+}
+
+fn open_panel_when_ready(app: &Path, env: &BTreeMap<String, String>) {
+    let ctl = ctl_beside(app);
+    let deadline = Instant::now() + OPEN_WAIT;
+    while Instant::now() < deadline {
+        // The secret travels in the child's environment, as for any
+        // `aivtuberctl` run; stderr is dropped, stdout is the URL.
+        let output = Command::new(&ctl)
+            .arg("panel-url")
+            .envs(env.iter())
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output();
+        if let Ok(output) = output
+            && output.status.success()
+            && let Some(url) = panel_url_from_output(&String::from_utf8_lossy(&output.stdout))
+        {
+            let root = std::env::var_os("SystemRoot")
+                .filter(|v| !v.is_empty())
+                .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+            let (program, args) = browser_command(std::env::consts::OS, url, &root);
+            let opened = Command::new(program)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if !opened {
+                eprintln!("{OPEN_FAILED}");
+            }
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    eprintln!("{OPEN_FAILED}");
 }
 
 #[cfg(test)]
@@ -996,10 +1079,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_browser_is_opened_without_a_shell_with_the_url_as_one_argument() {
+        let url = "http://127.0.0.1:8787/#token=abc&x=1";
+        let (program, args) = browser_command("windows", url, Path::new(r"C:\Windows"));
+        assert_eq!(
+            program,
+            Path::new(r"C:\Windows")
+                .join("System32")
+                .join("rundll32.exe")
+        );
+        assert_eq!(args, ["url.dll,FileProtocolHandler", url]);
+        assert!(!program.to_string_lossy().contains("cmd"));
+        let (program, args) = browser_command("linux", url, Path::new("/"));
+        assert_eq!(
+            (program, args),
+            (PathBuf::from("xdg-open"), vec![url.to_owned()])
+        );
+        let (program, _) = browser_command("macos", url, Path::new("/"));
+        assert_eq!(program, PathBuf::from("open"));
+    }
+
+    #[test]
+    fn only_the_loopback_panel_url_is_handed_to_the_browser() {
+        assert_eq!(
+            panel_url_from_output("http://127.0.0.1:8787/#token=ab\n"),
+            Some("http://127.0.0.1:8787/#token=ab")
+        );
+        for bad in [
+            "",
+            "https://evil.example/",
+            "http://127.0.0.1:8787/ calc.exe",
+            "aivtuberctl: failed",
+            "http://127.0.0.1:1/\nhttp://x",
+        ] {
+            assert_eq!(panel_url_from_output(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
     fn the_quiet_text_is_short_and_carries_no_secret() {
         // The app prints five more (aivtuber_app::ready_guide, the fourth being
         // the voice-input line of #397 and the fifth the character sheet line of
-        // #404); eight in all.
+        // #404); eight in all (nine with the panel URL reprint line of #388,
+        // which the app prints, not this program).
         // STARTING_APP and READY_STARTING are alternatives, never both.
         assert!(QUIET_LINES.len() - 1 <= 3);
         for line in QUIET_LINES {
