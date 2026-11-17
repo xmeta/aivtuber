@@ -56,7 +56,8 @@ pub struct OperatorRequest {
     /// panel only),
     /// `avatar.confirm`, `avatar.select`, `avatar.delete`, `avatar.discard`
     /// (the avatar choice of #362; the upload itself is panel-only),
-    /// `speech_input.enable`, `speech_input.disable` (voice input, #400).
+    /// `speech_input.enable`, `speech_input.disable` (voice input, #400),
+    /// `persona.set`, `persona.get` (the character sheet, #401).
     pub action: String,
     /// Opaque session secret presented by the operator client.
     pub secret: String,
@@ -67,7 +68,8 @@ pub struct OperatorRequest {
     /// `model.select`, the settings patch (JSON text) for `voice.apply`, the
     /// `{"platform","target"}` / `{"platform"}` JSON for `ingress.connect` /
     /// `ingress.disconnect`, a model hash (or hash prefix, or `sample`) for the
-    /// `avatar.*` actions. Ignored by every other action.
+    /// `avatar.*` actions, the whole new character sheet for `persona.set`
+    /// (empty clears it). Ignored by every other action.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub argument: Option<String>,
 }
@@ -87,6 +89,10 @@ pub struct OperatorResponse {
     /// chooses the destination.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_export: Option<OperatorMemoryExport>,
+    /// The character sheet text (#401); present only for a successful
+    /// `persona.get`, to the authenticated caller. Never logged or audited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
 }
 
 /// A memory seed export in seed-file format (`schemas/memory-seed.schema.json`).
@@ -142,6 +148,10 @@ pub struct OperatorStatusSnapshot {
     /// `AIVTUBER_PERSONA_FILE` is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persona: Option<crate::persona::PersonaStatus>,
+    /// Live editing of the character sheet (#401): whether a save reaches the
+    /// file and whether the sheet goes to a cloud model. Absent unless composed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona_editor: Option<crate::persona::PersonaEditorStatus>,
 }
 
 /// Operator-visible, text-free perception status: whether it is running, why
@@ -209,6 +219,7 @@ impl OperatorStatusSnapshot {
             avatar_model: app.avatar_status(),
             voice_input: app.speech_input_status(),
             persona: app.persona_status(),
+            persona_editor: app.persona_editor_status(),
         }
     }
 }
@@ -306,6 +317,8 @@ pub struct OperatorEndpointOptions {
     pub avatar_configure: bool,
     /// Voice input is composed (#400): `speech_input.control`.
     pub speech_input_control: bool,
+    /// Live character-sheet editing is composed (#401): `persona.configure`.
+    pub persona_configure: bool,
 }
 
 /// Authenticated operator control endpoint.
@@ -363,6 +376,7 @@ impl OperatorControlServer {
             ingress_control,
             avatar_configure,
             speech_input_control,
+            persona_configure,
         } = options;
         let name = name.trim();
         if name.is_empty() {
@@ -404,6 +418,12 @@ impl OperatorControlServer {
             // actions can mint it; what the microphone sidecar hears is still
             // admitted as untrusted speech under the app's ingress ceiling.
             capabilities.insert(aivtuber_domain::Capability::SpeechInputControl);
+        }
+        if persona_configure {
+            // `persona.configure` is held only so the `persona.*` actions can
+            // mint it. The text it sets is data in the Thinking request and
+            // grants nothing.
+            capabilities.insert(aivtuber_domain::Capability::PersonaConfigure);
         }
         if memory_export {
             // `memory.admin` is held only so the `memory.export` action can mint
@@ -618,6 +638,7 @@ pub fn apply_operator_request<R: RoutePlanner>(
         && !is_tcp_ingress_action(&request.action)
         && !is_tcp_avatar_action(&request.action)
         && !is_speech_input_action(&request.action)
+        && !is_persona_action(&request.action)
     {
         let detail = format!("unknown action {}", request.action);
         app.audit_operator_action(&request_id, &request.action, &detail, false);
@@ -678,6 +699,12 @@ fn is_speech_input_action(action: &str) -> bool {
     matches!(action, "speech_input.enable" | "speech_input.disable")
 }
 
+/// The character sheet actions (#401), both under `persona.configure`. The
+/// operator endpoint (`aivtuberctl`) and the panel may send both.
+fn is_persona_action(action: &str) -> bool {
+    matches!(action, "persona.set" | "persona.get")
+}
+
 /// The avatar choice actions (#362), all under `avatar.configure`.
 fn is_avatar_action(action: &str) -> bool {
     matches!(
@@ -711,6 +738,7 @@ pub fn apply_operator_action<R: RoutePlanner>(
         && !is_ingress_action(action)
         && !is_avatar_action(action)
         && !is_speech_input_action(action)
+        && !is_persona_action(action)
     {
         let detail = format!("unknown action {action}");
         app.audit_operator_action(request_id, action, &detail, false);
@@ -754,6 +782,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
                 detail: "status".to_owned(),
                 status: Some(snapshot),
                 memory_export: None,
+                persona: None,
             };
         }
         // Issue #68: capture the bounded support bundle. Generation is
@@ -777,6 +806,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
             detail,
             status: None,
             memory_export: None,
+            persona: None,
         };
     }
 
@@ -792,6 +822,8 @@ fn apply_with_presented_secret<R: RoutePlanner>(
         "avatar.configure".to_owned()
     } else if is_speech_input_action(action) {
         "speech_input.control".to_owned()
+    } else if is_persona_action(action) {
+        "persona.configure".to_owned()
     } else if action == "memory.export" {
         "memory.admin".to_owned()
     } else {
@@ -826,6 +858,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
                     detail: detail.to_owned(),
                     status: None,
                     memory_export: None,
+                    persona: None,
                 }
             }
             Err(detail) => {
@@ -854,6 +887,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
                     detail,
                     status: None,
                     memory_export: None,
+                    persona: None,
                 }
             }
             Err(detail) => {
@@ -878,6 +912,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
                     detail,
                     status: None,
                     memory_export: None,
+                    persona: None,
                 }
             }
             Err(detail) => {
@@ -900,6 +935,29 @@ fn apply_with_presented_secret<R: RoutePlanner>(
                     detail,
                     status: None,
                     memory_export: None,
+                    persona: None,
+                }
+            }
+            Err(detail) => {
+                app.audit_operator_action(&request_id, action, &detail, false);
+                rejection(&request_id, &detail)
+            }
+        };
+    }
+
+    if is_persona_action(action) {
+        // Audited without the argument: the text is the character sheet. The
+        // detail is a fixed phrase with the sheet's length and hash prefix.
+        return match app.configure_persona(command.authority(), action, argument) {
+            Ok(outcome) => {
+                app.audit_operator_action(&request_id, action, &outcome.detail, true);
+                OperatorResponse {
+                    request_id,
+                    ok: true,
+                    detail: outcome.detail,
+                    status: None,
+                    memory_export: None,
+                    persona: outcome.text,
                 }
             }
             Err(detail) => {
@@ -921,6 +979,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
                     detail,
                     status: None,
                     memory_export: None,
+                    persona: None,
                 }
             }
             Err(detail) => {
@@ -943,6 +1002,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
                     detail,
                     status: None,
                     memory_export: None,
+                    persona: None,
                 }
             }
             Err(detail) => {
@@ -973,6 +1033,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
                         skipped: export.skipped,
                         content_hash: export.seed.content_hash(),
                     }),
+                    persona: None,
                 }
             }
             Err(error) => {
@@ -1002,6 +1063,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
                 detail,
                 status: None,
                 memory_export: None,
+                persona: None,
             }
         }
         Err(error) => {
@@ -1019,6 +1081,7 @@ fn rejection(request_id: &str, detail: &str) -> OperatorResponse {
         detail: detail.to_owned(),
         status: None,
         memory_export: None,
+        persona: None,
     }
 }
 
@@ -1106,6 +1169,7 @@ mod tests {
                     detail: "test".into(),
                     status: None,
                     memory_export: None,
+                    persona: None,
                 });
                 break;
             }

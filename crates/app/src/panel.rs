@@ -23,7 +23,10 @@
 //!   `avatar.configure`, again on their own queue; a model is named by content
 //!   hash only) and voice input of #400 (`speech_input.enable`,
 //!   `speech_input.disable`, both `speech_input.control`, on their own queue;
-//!   the request is a boolean and nothing else); it cannot reach perception, memory export
+//!   the request is a boolean and nothing else) and the character sheet of
+//!   #401 (`persona.set`, `persona.get`, both `persona.configure`, on their
+//!   own queue; the text is never logged and only `persona.get` returns it);
+//!   it cannot reach perception, memory export
 //!   or diagnose even though the ingress could mint them;
 //! * a chat line becomes a `chat.message` envelope whose source, source class,
 //!   plane and trust are fixed here (`local-panel`, `public_chat`, `content`,
@@ -51,6 +54,7 @@ const VOICE_PER_TICK: usize = 4;
 const INGRESS_PER_TICK: usize = 4;
 const AVATAR_PER_TICK: usize = 4;
 const SPEECH_INPUT_PER_TICK: usize = 4;
+const PERSONA_PER_TICK: usize = 4;
 const CHAT_PER_TICK: usize = 4;
 const PUBLISH_INTERVAL_MS: u64 = 500;
 /// Refusal counts are logged at most this often. A stale page from an earlier
@@ -259,7 +263,9 @@ impl PanelService {
                 | PanelRequest::AvatarSelect(_)
                 | PanelRequest::AvatarDelete(_)
                 | PanelRequest::AvatarDiscard
-                | PanelRequest::SpeechInput { .. } => {
+                | PanelRequest::SpeechInput { .. }
+                | PanelRequest::PersonaSet(_)
+                | PanelRequest::PersonaGet => {
                     command.respond(false, "not a control request");
                     continue;
                 }
@@ -411,6 +417,35 @@ impl PanelService {
                 response.ok, response.detail
             );
             command.respond(response.ok, response.detail);
+            changed = true;
+        }
+        for command in self.inbox.drain_persona(PERSONA_PER_TICK) {
+            let (action, argument) = match &command.request {
+                PanelRequest::PersonaSet(text) => ("persona.set", Some(text.expose())),
+                PanelRequest::PersonaGet => ("persona.get", None),
+                _ => {
+                    command.respond(false, "not a character sheet request");
+                    continue;
+                }
+            };
+            self.control_seq += 1;
+            let response = apply_operator_action(
+                &self.ingress,
+                app,
+                &format!("panel-ctl-{}", self.control_seq),
+                action,
+                argument,
+                &self.control_secret.0,
+                now_ms,
+            );
+            // The line names the action and the fixed detail only: the text
+            // (in the request, and in the `persona.get` answer) is never
+            // printed.
+            eprintln!(
+                "panel: {action} ok={} detail={:?}",
+                response.ok, response.detail
+            );
+            command.respond_with_text(response.ok, response.detail, response.persona);
             changed = true;
         }
         for command in self.inbox.drain_chat(CHAT_PER_TICK) {

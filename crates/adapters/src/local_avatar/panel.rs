@@ -44,7 +44,12 @@
 //! * voice input (#400) adds `POST /api/speech-input` with `{"enabled": bool}`
 //!   and nothing else (a strict body: no device, program or argument), on its
 //!   own queue. It asks the composition thread to start or stop the microphone
-//!   sidecar; whether voice input is composed at all is decided there.
+//!   sidecar; whether voice input is composed at all is decided there;
+//! * the character sheet (#401) adds `POST /api/persona/set` with
+//!   `{"text": string}` and `POST /api/persona/get` with `{}`, on their own
+//!   queue. The set body has its own larger bound, checked before the body is
+//!   read; the text is held as a [`PanelSecret`] so it never reaches a `Debug`
+//!   line, and only the get answer carries it back (`text`).
 
 use super::server::{
     ConnGuard, HEAD_DEADLINE, MAX_CONNECTIONS, POLL, content_type, ct_eq, header_value, mint_token,
@@ -76,13 +81,18 @@ const VOICE_QUEUE: usize = 4;
 const INGRESS_QUEUE: usize = 4;
 const AVATAR_QUEUE: usize = 4;
 const SPEECH_INPUT_QUEUE: usize = 4;
+const PERSONA_QUEUE: usize = 4;
+/// Largest `persona.set` body: a 3,000-byte sheet whose every byte is a
+/// newline, tab, quote or backslash escapes to 6,000 bytes, plus the envelope.
+/// A sheet over 3,000 bytes is refused by the app's validator, not here.
+pub const MAX_PANEL_PERSONA_BODY_BYTES: usize = 8 * 1024;
 const CHAT_QUEUE: usize = 8;
 /// Longest accepted API key, in characters (Aivis keys are about 40).
 pub const MAX_PANEL_KEY_CHARS: usize = 256;
 /// One model search may take this long, end to end.
 const SEARCH_DEADLINE: Duration = Duration::from_secs(6);
 /// Every state-changing endpoint (all are `POST`).
-const STATE_CHANGING: [&str; 18] = [
+const STATE_CHANGING: [&str; 20] = [
     "/api/chat",
     "/api/stop",
     "/api/mute",
@@ -101,6 +111,8 @@ const STATE_CHANGING: [&str; 18] = [
     "/api/avatar/delete",
     "/api/avatar/discard",
     "/api/speech-input",
+    "/api/persona/set",
+    "/api/persona/get",
 ];
 const SEARCH_PATH: &str = "/api/voice/search";
 /// The model upload (#362): a raw body, so it is not in [`STATE_CHANGING`]'s
@@ -214,6 +226,11 @@ pub enum PanelRequest {
     SpeechInput {
         enabled: bool,
     },
+    /// Replace the character sheet (#401) with this text (empty clears it).
+    /// Redacted in `Debug`; the composition thread validates it.
+    PersonaSet(PanelSecret),
+    /// Read the character sheet back into the editor (#401).
+    PersonaGet,
 }
 
 /// The two chat platforms the panel can connect.
@@ -239,6 +256,9 @@ pub struct PanelReply {
     pub detail: String,
     /// The event id a chat line was given, so the page can pair the reply.
     pub id: Option<String>,
+    /// The character sheet text answering `PersonaGet` (#401); nothing else
+    /// sets it.
+    pub text: Option<String>,
 }
 
 /// One queued request with the slot its answer goes to.
@@ -249,16 +269,26 @@ pub struct PanelCommand {
 
 impl PanelCommand {
     pub fn respond(self, ok: bool, detail: impl Into<String>) {
-        self.send(ok, detail.into(), None);
+        self.send(ok, detail.into(), None, None);
     }
 
     pub fn respond_with_id(self, ok: bool, detail: impl Into<String>, id: impl Into<String>) {
-        self.send(ok, detail.into(), Some(id.into()));
+        self.send(ok, detail.into(), Some(id.into()), None);
     }
 
-    fn send(self, ok: bool, detail: String, id: Option<String>) {
+    /// Answer `PersonaGet` with the sheet text (#401).
+    pub fn respond_with_text(self, ok: bool, detail: impl Into<String>, text: Option<String>) {
+        self.send(ok, detail.into(), None, text);
+    }
+
+    fn send(self, ok: bool, detail: String, id: Option<String>, text: Option<String>) {
         // The page may have given up; there is nobody to tell.
-        let _ = self.reply.try_send(PanelReply { ok, detail, id });
+        let _ = self.reply.try_send(PanelReply {
+            ok,
+            detail,
+            id,
+            text,
+        });
     }
 }
 
@@ -302,6 +332,7 @@ struct Shared {
     ingress_tx: SyncSender<PanelCommand>,
     avatar_tx: SyncSender<PanelCommand>,
     speech_input_tx: SyncSender<PanelCommand>,
+    persona_tx: SyncSender<PanelCommand>,
     chat_tx: SyncSender<PanelCommand>,
     voice_search_endpoint: Option<String>,
     search_busy: std::sync::atomic::AtomicBool,
@@ -339,6 +370,7 @@ pub struct PanelInbox {
     ingress_rx: Mutex<Receiver<PanelCommand>>,
     avatar_rx: Mutex<Receiver<PanelCommand>>,
     speech_input_rx: Mutex<Receiver<PanelCommand>>,
+    persona_rx: Mutex<Receiver<PanelCommand>>,
     chat_rx: Mutex<Receiver<PanelCommand>>,
 }
 
@@ -390,6 +422,16 @@ impl PanelInbox {
     /// microphone can never sit in front of a stop or a mute.
     pub fn drain_speech_input(&self, max: usize) -> Vec<PanelCommand> {
         self.speech_input_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .try_iter()
+            .take(max)
+            .collect()
+    }
+
+    /// Character sheet requests (#401). Their own queue, like the others.
+    pub fn drain_persona(&self, max: usize) -> Vec<PanelCommand> {
+        self.persona_rx
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .try_iter()
@@ -470,6 +512,7 @@ impl LocalPanelServer {
         let (ingress_tx, ingress_rx) = sync_channel(INGRESS_QUEUE);
         let (avatar_tx, avatar_rx) = sync_channel(AVATAR_QUEUE);
         let (speech_input_tx, speech_input_rx) = sync_channel(SPEECH_INPUT_QUEUE);
+        let (persona_tx, persona_rx) = sync_channel(PERSONA_QUEUE);
         let (chat_tx, chat_rx) = sync_channel(CHAT_QUEUE);
         let shared = Arc::new(Shared {
             token: mint_token()?,
@@ -486,6 +529,7 @@ impl LocalPanelServer {
             ingress_tx,
             avatar_tx,
             speech_input_tx,
+            persona_tx,
             chat_tx,
             voice_search_endpoint: config.voice_search_endpoint.clone(),
             search_busy: std::sync::atomic::AtomicBool::new(false),
@@ -508,6 +552,7 @@ impl LocalPanelServer {
             ingress_rx: Mutex::new(ingress_rx),
             avatar_rx: Mutex::new(avatar_rx),
             speech_input_rx: Mutex::new(speech_input_rx),
+            persona_rx: Mutex::new(persona_rx),
             chat_rx: Mutex::new(chat_rx),
         };
         Ok((
@@ -591,7 +636,21 @@ fn json(status: &'static str, ok: bool, detail: &str) -> Response {
 }
 
 fn json_with_id(status: &'static str, ok: bool, detail: &str, id: Option<&str>) -> Response {
-    let body = serde_json::json!({ "ok": ok, "detail": detail, "id": id }).to_string();
+    json_full(status, ok, detail, id, None)
+}
+
+fn json_full(
+    status: &'static str,
+    ok: bool,
+    detail: &str,
+    id: Option<&str>,
+    text: Option<&str>,
+) -> Response {
+    let mut value = serde_json::json!({ "ok": ok, "detail": detail, "id": id });
+    if let (Some(text), Some(object)) = (text, value.as_object_mut()) {
+        object.insert("text".to_owned(), serde_json::Value::from(text));
+    }
+    let body = value.to_string();
     Response {
         status,
         ctype: "application/json",
@@ -765,7 +824,12 @@ fn route(
         shared.count(&shared.counters.rejected_request);
         return json("411 Length Required", false, "content-length required");
     };
-    if length > MAX_PANEL_BODY_BYTES {
+    let body_limit = if path == "/api/persona/set" {
+        MAX_PANEL_PERSONA_BODY_BYTES
+    } else {
+        MAX_PANEL_BODY_BYTES
+    };
+    if length > body_limit {
         shared.count(&shared.counters.rejected_request);
         return json("413 Payload Too Large", false, "body too large");
     }
@@ -819,6 +883,20 @@ fn route(
                 PanelRequest::SpeechInput { enabled },
                 &shared.speech_input_tx,
             ),
+            Err((status, detail)) => {
+                shared.count(&shared.counters.rejected_request);
+                return json(status, false, detail);
+            }
+        },
+        "/api/persona/set" => match persona_set_body(&body) {
+            Ok(text) => (PanelRequest::PersonaSet(text), &shared.persona_tx),
+            Err((status, detail)) => {
+                shared.count(&shared.counters.rejected_request);
+                return json(status, false, detail);
+            }
+        },
+        "/api/persona/get" => match empty_object(&body) {
+            Ok(()) => (PanelRequest::PersonaGet, &shared.persona_tx),
             Err((status, detail)) => {
                 shared.count(&shared.counters.rejected_request);
                 return json(status, false, detail);
@@ -881,6 +959,20 @@ fn speech_input_body(body: &[u8]) -> Result<bool, (&'static str, &'static str)> 
     serde_json::from_slice::<Body>(body)
         .map(|parsed| parsed.enabled)
         .map_err(|_| ("400 Bad Request", "expected {\"enabled\": boolean}"))
+}
+
+/// Parses `{"text": string}` and nothing else (#401). The body is already
+/// bounded; the text is only checked for being a string here (the invalid UTF-8
+/// of a raw body fails the JSON parse), the composition thread validates it.
+fn persona_set_body(body: &[u8]) -> Result<PanelSecret, (&'static str, &'static str)> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Body {
+        text: String,
+    }
+    serde_json::from_slice::<Body>(body)
+        .map(|parsed| PanelSecret(parsed.text))
+        .map_err(|_| ("400 Bad Request", "expected {\"text\": string}"))
 }
 
 /// Parses `{}`: the discard request names nothing.
@@ -1324,11 +1416,12 @@ fn forward(shared: &Shared, queue: &SyncSender<PanelCommand>, request: PanelRequ
     }
     shared.count(&shared.counters.accepted);
     match answer.recv_timeout(REPLY_WAIT) {
-        Ok(reply) => json_with_id(
+        Ok(reply) => json_full(
             if reply.ok { "200 OK" } else { "409 Conflict" },
             reply.ok,
             &reply.detail,
             reply.id.as_deref(),
+            reply.text.as_deref(),
         ),
         Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
             json("504 Gateway Timeout", false, "no answer from the runtime")
@@ -2176,6 +2269,169 @@ mod tests {
         assert!(f.inbox.drain_voice(8).is_empty());
         assert!(f.inbox.drain_ingress(8).is_empty());
         assert!(f.inbox.drain_chat(8).is_empty());
+    }
+
+    // ---- character sheet (#401) ----
+
+    /// Posts `body` to a persona path and answers the one queued command with
+    /// `reply`; returns the HTTP answer and the request the queue saw.
+    fn persona_round_trip(
+        f: &Fixture,
+        path: &str,
+        body: &str,
+        text: Option<&str>,
+    ) -> (Raw, PanelRequest) {
+        let good = good(f);
+        let headers = with(&good, "none");
+        thread::scope(|s| {
+            let handle = s.spawn(|| post(f, path, &headers, body));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut commands = Vec::new();
+            while commands.is_empty() && Instant::now() < deadline {
+                commands = f.inbox.drain_persona(4);
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(commands.len(), 1);
+            let command = commands.into_iter().next().unwrap();
+            let request = command.request.clone();
+            command.respond_with_text(true, "ok", text.map(str::to_owned));
+            (handle.join().unwrap(), request)
+        })
+    }
+
+    #[test]
+    fn persona_requests_are_authenticated_same_origin_strict_and_on_their_own_queue() {
+        let f = fixture();
+        let good = good(&f);
+        for path in ["/api/persona/set", "/api/persona/get"] {
+            let body = if path.ends_with("set") {
+                "{\"text\":\"x\"}"
+            } else {
+                "{}"
+            };
+            let mut foreign = with(&good, "origin");
+            foreign.push(("Origin", "http://evil.example"));
+            assert_eq!(post(&f, path, &foreign, body).status, 403, "{path}");
+            assert_eq!(
+                post(&f, path, &with(&good, "x-panel-token"), body).status,
+                401,
+                "{path}"
+            );
+            let mut form = with(&good, "content-type");
+            form.push(("Content-Type", "application/x-www-form-urlencoded"));
+            assert_eq!(post(&f, path, &form, body).status, 415, "{path}");
+            assert_eq!(get(&f, path, "").status, 405, "{path}");
+        }
+        // Only a string `text`: nothing else can ride along, and a bad body
+        // never reaches the queue.
+        let headers = with(&good, "none");
+        for bad in [
+            "",
+            "[]",
+            "{}",
+            "{\"text\":1}",
+            "{\"text\":null}",
+            "{\"text\":\"x\",\"capability\":\"persona.configure\"}",
+            "{\"text\":\"x\"}{\"text\":\"y\"}",
+        ] {
+            assert_eq!(
+                post(&f, "/api/persona/set", &headers, bad).status,
+                400,
+                "{bad:?}"
+            );
+        }
+        for bad in ["", "[]", "{\"text\":\"x\"}"] {
+            assert_eq!(
+                post(&f, "/api/persona/get", &headers, bad).status,
+                400,
+                "{bad:?}"
+            );
+        }
+        assert!(f.inbox.drain_persona(8).is_empty(), "nothing got through");
+
+        let (answer, request) = persona_round_trip(
+            &f,
+            "/api/persona/set",
+            "{\"text\":\"名前: ミコト\\n\"}",
+            None,
+        );
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        let PanelRequest::PersonaSet(text) = &request else {
+            panic!("{request:?}");
+        };
+        assert_eq!(text.expose(), "名前: ミコト\n");
+        // The text is redacted in Debug, and the set answer carries none.
+        assert!(!format!("{request:?}").contains("ミコト"));
+        assert!(!answer.body.contains("ミコト") && !answer.body.contains("\"text\""));
+        let (_, request) = persona_round_trip(&f, "/api/persona/set", "{\"text\":\"\"}", None);
+        let PanelRequest::PersonaSet(text) = &request else {
+            panic!("{request:?}");
+        };
+        assert_eq!(text.expose(), "");
+
+        // Never in the stop/mute, voice, chat-connection, speech or chat queues.
+        assert!(f.inbox.drain_control(8).is_empty());
+        assert!(f.inbox.drain_voice(8).is_empty());
+        assert!(f.inbox.drain_ingress(8).is_empty());
+        assert!(f.inbox.drain_speech_input(8).is_empty());
+        assert!(f.inbox.drain_chat(8).is_empty());
+    }
+
+    #[test]
+    fn a_persona_get_answer_carries_the_text_and_only_that_answer_does() {
+        let f = fixture();
+        let (answer, request) = persona_round_trip(
+            &f,
+            "/api/persona/get",
+            "{}",
+            Some("名前: ミコト\n\"一人称\""),
+        );
+        assert_eq!(request, PanelRequest::PersonaGet);
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        let value: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["text"], "名前: ミコト\n\"一人称\"");
+        // The state document the page polls never holds it.
+        let token = f.server.token().to_owned();
+        let state = get(&f, "/api/state", &format!("X-Panel-Token: {token}\r\n"));
+        assert!(!state.body.contains("ミコト"));
+    }
+
+    #[test]
+    fn the_persona_body_is_bounded_before_it_is_read_and_must_be_valid_utf8() {
+        let f = fixture();
+        let good = good(&f);
+        let headers = with(&good, "none");
+        // A body larger than the persona bound is refused unread.
+        let declared = (MAX_PANEL_PERSONA_BODY_BYTES + 1).to_string();
+        let mut long = headers.clone();
+        long.push(("Content-Length", &declared));
+        assert_eq!(post(&f, "/api/persona/set", &long, "{").status, 413);
+        // Every other body keeps the small bound.
+        let declared = (MAX_PANEL_BODY_BYTES + 1).to_string();
+        let mut other = headers.clone();
+        other.push(("Content-Length", &declared));
+        assert_eq!(post(&f, "/api/chat", &other, "{").status, 413);
+        // A body above the old bound but within the persona one is read.
+        let big = format!(
+            "{{\"text\":\"{}\"}}",
+            "a".repeat(MAX_PANEL_BODY_BYTES + 100)
+        );
+        let (answer, request) = persona_round_trip(&f, "/api/persona/set", &big, None);
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        assert!(matches!(request, PanelRequest::PersonaSet(_)));
+        // Bytes that are not UTF-8 never reach the queue.
+        let mut raw = format!(
+            "POST /api/persona/set HTTP/1.1\r\nHost: {}\r\nOrigin: {}\r\nX-Panel-Token: {}\r\n\
+             Content-Type: application/json\r\nContent-Length: 13\r\n\r\n",
+            f.host,
+            f.origin,
+            f.server.token()
+        )
+        .into_bytes();
+        raw.extend_from_slice(b"{\"text\":\"\xFF\xFE\"}");
+        assert_eq!(send_bytes(&f, &raw).status, 400);
+        assert!(f.inbox.drain_persona(8).is_empty());
     }
 
     #[test]

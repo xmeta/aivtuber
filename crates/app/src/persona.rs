@@ -9,16 +9,19 @@
 //!
 //! The sheet is data in the Thinking request, placed first in
 //! `curated_context` (see `ProductionApp::attach_persona`) and rendered by the
-//! adapter as delimited text. Nothing here can mint a capability or a permit,
-//! and the file is changed only by the operator editing it and restarting.
+//! adapter as delimited text. Nothing here can mint a capability or a permit.
+//! The operator changes it by editing the file and restarting, or live (#401
+//! slice B) through the `persona.configure` capability
+//! (`ProductionApp::configure_persona`), which validates with the same parser
+//! and writes the file atomically.
 
 use aivtuber_domain::{
     MAX_PERSONA_FILE_BYTES, Persona, PersonaError, ThinkingContent, parse_persona,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::io::Read;
-use std::path::Path;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 pub const PERSONA_FILE_VAR: &str = "AIVTUBER_PERSONA_FILE";
 
@@ -57,6 +60,12 @@ impl PersonaSheet {
 
     pub fn sha256_prefix(&self) -> &str {
         &self.sha256_prefix
+    }
+
+    /// The normalised text. Only `persona.get` (operator-authenticated) and
+    /// the Thinking request read it; no log, status or bundle does.
+    pub fn text(&self) -> &str {
+        self.persona.text()
     }
 
     /// The one Thinking item the sheet becomes (`operator_curated`, trusted).
@@ -99,6 +108,76 @@ impl PersonaStatus {
             _ => "none".to_owned(),
         }
     }
+}
+
+/// Live editing (#401 slice B): where a saved sheet is written and whether
+/// Thinking is remote. Composed only with the generative path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersonaEditor {
+    path: Option<PathBuf>,
+    thinking_remote: bool,
+}
+
+impl PersonaEditor {
+    /// `path` is `AIVTUBER_PERSONA_FILE`; `None` applies in memory only.
+    pub fn new(path: Option<PathBuf>, thinking_remote: bool) -> Self {
+        Self {
+            path,
+            thinking_remote,
+        }
+    }
+
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    pub fn status(&self) -> PersonaEditorStatus {
+        PersonaEditorStatus {
+            persisted: self.path.is_some(),
+            thinking_remote: self.thinking_remote,
+        }
+    }
+}
+
+/// The `persona_editor` object of the operator status: present only when live
+/// editing is composed. Tells the panel whether a save reaches the file and
+/// whether the sheet leaves the machine with each reply. No text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonaEditorStatus {
+    /// A save is written to `AIVTUBER_PERSONA_FILE` (and so survives a
+    /// restart); false = in memory only.
+    pub persisted: bool,
+    /// The Thinking endpoint leaves this machine.
+    pub thinking_remote: bool,
+}
+
+/// What a `persona.*` operator action produced. `text` is set only by
+/// `persona.get` and goes to the authenticated caller, never to a log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersonaOutcome {
+    pub detail: String,
+    pub text: Option<String>,
+}
+
+/// Replace `path` with `text`: write a sibling temporary file, flush it to
+/// disk, then rename it over the target, so a reader (or a crash) sees the old
+/// file or the new one, never half of either. The temporary file is removed on
+/// failure.
+pub fn write_persona_file_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(".tmp");
+    let temporary = PathBuf::from(temporary);
+    let result = (|| {
+        let mut file = std::fs::File::create(&temporary)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 /// Why a file that exists could not become a sheet.

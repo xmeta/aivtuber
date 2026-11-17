@@ -80,7 +80,9 @@ In short, from this directory (after the checksum check above):
                                       examples/persona/starter.ja.md to
                                       local-persona.md beside local-profile.env, edit
                                       it (at most 3000 bytes, plain text) and start
-                                      again. The model then speaks as that character;
+                                      again, or edit it while running in the panel's
+                                      character settings card or with
+                                      aivtuberctl persona show|set --file|clear. The model then speaks as that character;
                                       cached reactions, the starter audio and fallback
                                       lines do not follow it. The app prints one line
                                       saying whether it was loaded (never its text).

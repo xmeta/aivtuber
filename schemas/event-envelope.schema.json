@@ -138,7 +138,8 @@
               "voice.configure",
               "ingress.control",
               "avatar.configure",
-              "speech_input.control"
+              "speech_input.control",
+              "persona.configure"
             ]
           }
         }
