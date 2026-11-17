@@ -206,6 +206,12 @@ Record the result as one of:
 |Keep display text, resolved speech text, phrase identity, audible playback lifecycle, cancellation, and replay semantics provider-neutral. Use local lexicon/rules as the baseline; cloud pronunciation services are optional. Synthesis completion is not audible completion.
 |#222
 
+|Text-to-affect for generated replies
+|No maintained candidate is listed in this matrix; generic sentiment libraries and classifier models were judged by their runtime cost and non-determinism, not benchmarked
+|Custom (rules/lexicon, compiled in)
+|A bounded lexicon of about 250 entries needs no dependency and costs tens of microseconds, stays deterministic for replay, and keeps the classifier advisory (the compiler owns pack availability, intensity cap and anti-repetition). Revisit with a measured model only if the fixture accuracy proves insufficient on real chat.
+|#84 S1
+
 |Dynamic context-valid actions
 |Neuro SDK ActionWindow/action registration patterns
 |Reference only

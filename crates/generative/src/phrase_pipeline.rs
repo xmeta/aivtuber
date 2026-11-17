@@ -213,6 +213,7 @@ impl GenerativePipeline {
         let planned = plan.len() as u32;
         let mut delivered = 0_u32;
         let mut tts_chars = 0_u64;
+        let mut affect = crate::AffectState::default();
 
         let summary = |delivered: u32, tts_chars: u64, end: PhraseEnd| PhraseSummary {
             response_id: options.response_id,
@@ -275,6 +276,7 @@ impl GenerativePipeline {
                 (&thinking_identity, &tts_identity),
                 cancellation,
                 &mut trace,
+                &mut affect,
                 None,
             );
             let (unit, chars) = match prepared {
@@ -334,6 +336,7 @@ impl GenerativePipeline {
         ),
         cancellation: &GenerationCancellationToken,
         trace: &mut GenerationTrace,
+        affect: &mut crate::AffectState,
         cumulative: Option<CumulativeGate<'_>>,
     ) -> Result<(PhraseUnit, usize), PhraseStop>
     where
@@ -463,6 +466,7 @@ impl GenerativePipeline {
                 &speech,
                 thinking_identity,
                 tts_identity,
+                affect,
             )
             .map(|asset| {
                 asset.with_speech_projection(speech_request.text.clone(), projection.identity.key())
