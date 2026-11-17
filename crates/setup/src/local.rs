@@ -794,6 +794,9 @@ pub fn run<W: Write>(
             summary.warnings.len()
         ));
     }
+    for line in next_steps(&start_command(bin, &opts.env_file)) {
+        ctx.say(line);
+    }
     Ok(summary)
 }
 
@@ -813,5 +816,40 @@ pub fn start_command(root: &Path, env_file: &Path) -> String {
         format!("{} start", q(&setup))
     } else {
         format!("{} start --env-file {}", q(&setup), q(env_file))
+    }
+}
+
+pub const NEXT_STEPS: &[&str] = &[
+    "起動方法: `{cmd}` / How to start: `{cmd}`",
+    "操作パネル: 起動時に表示された URL をブラウザで開いてください / Open the operation panel URL printed at start in a browser",
+    "音声入力: パネルでオンにするか `start --voice-input on` を実行するまでオフです / Voice input is off until turned on in the panel or with `start --voice-input on`",
+    "開示: AI 生成音声と AI パフォーマーであることを配信で開示してください（上の英語の義務文が正式です）/ Disclose the AI-generated voice and AI performer on stream (the English duties above are the authoritative text)",
+];
+
+pub fn next_steps(start_cmd: &str) -> Vec<String> {
+    NEXT_STEPS
+        .iter()
+        .map(|line| line.replace("{cmd}", start_cmd))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_steps_block_is_short_single_line_bilingual_and_secret_free() {
+        assert!(!NEXT_STEPS.is_empty() && NEXT_STEPS.len() <= 5);
+        for line in NEXT_STEPS {
+            assert!(!line.contains('\n') && !line.contains('\r'), "{line}");
+            assert!(!line.contains("token="), "{line}");
+            assert!(!line.contains("sk-or-v1"), "{line}");
+            assert!(
+                line.chars().any(|c| ('\u{3040}'..='\u{30ff}').contains(&c)
+                    || ('\u{4e00}'..='\u{9fff}').contains(&c)),
+                "{line}"
+            );
+            assert!(line.chars().any(|c| c.is_ascii_alphabetic()), "{line}");
+        }
     }
 }
