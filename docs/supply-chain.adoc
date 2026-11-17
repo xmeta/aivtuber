@@ -115,7 +115,9 @@ Issue: #219 (S3) · Decision: ADR-0003 decision 8 · CI job: `renderer` in `.git
 
 === Current validation (2026-11)
 
-39 installed packages, 15 in the runtime closure (`three` 0.187.0, `@pixiv/three-vrm` 3.5.5 and its 6 `three-vrm-*` and 7 `types-*` packages), all `MIT`. `bun audit` reports no vulnerabilities.
+39 installed packages, 15 in the runtime closure (`three` 0.187.0, `@pixiv/three-vrm` 3.5.5 and its 6 `three-vrm-*` and 7 `types-*` packages), all `MIT`. `bun audit` reports one advisory, excepted below.
+
+*Active exception* (2026-11-18): `GHSA-fc5q-39xc-vjpf` (high, ReDoS in `picomatch` <=4.0.7 through repeated extglobs). Reason: build tooling only (`vite` › `tinyglobby` › `fdir` › `picomatch`), never in the shipped bundle, and it only matches glob patterns written in this repository; no patched release exists (4.0.7 is the latest). Owner: maintainers. Revisit: when a fixed `picomatch` is published (then update `bun.lock` and drop `--ignore`), or if any glob pattern becomes user-supplied.
 
 Active license exception (build/test only):
 

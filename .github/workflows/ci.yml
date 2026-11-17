@@ -538,9 +538,9 @@ jobs:
         run: bun run check:licenses
 
       # Advisory audit of the locked tree. Exceptions: docs/supply-chain.adoc
-      # section 8 (none active).
+      # section 8 (GHSA-fc5q-39xc-vjpf, picomatch, build tooling only).
       - name: Advisory audit
-        run: bun audit
+        run: bun audit --ignore=GHSA-fc5q-39xc-vjpf
 
       - name: Cache Playwright browsers
         uses: actions/cache@v4
