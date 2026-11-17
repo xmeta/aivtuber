@@ -21,22 +21,23 @@ use aivtuber_app::{
     BargeInMetrics, CHAT_SETTINGS_VAR, ChatBurstConfig, ChatIngressController,
     ChatIngressEnvironment, CompositionProfile, DEFAULT_WARMUP_TIMEOUT_MS,
     GenerationFallbackCounts, GenerativeBudgetPolicy, GenerativeRuntime, IntentRoutePlanner,
-    IntentShadowPolicy, LocalAvatarOutput, LocalRoutePlanner, MemoryFalsifierMetrics, MemorySeed,
-    MemoryWriterConfig, MemoryWriterMetrics, ModelSwitcher, NoopAvatarOutput, NoopStreamOutput,
-    ObsProgramSceneSource, ObsStreamOutput, OperatorControlServer, OperatorEndpointOptions,
-    OperatorRateLimiter, PanelService, PerceptionService, PerceptionServiceConfig, PhraseMetrics,
-    PhraseMode, PreviewSlot, PreviewThinking, ProducerWorker, ProductionApp, ProfileSummary,
-    RawIngressConfig, RawIngressMetrics, RawIngressMetricsSnapshot, RoutePlanner,
-    RuntimeRetentionPolicy, SHADOW_ORCHESTRATOR_SCHEMA_VERSION, SceneContextService,
-    ShadowOrchestratorConfig, ShadowPolicyIdentity, ShadowingRoutePlanner,
-    SpeechConversationConfig, SpeechConversationMetrics, SpeechFloorMetrics, SpeechInputController,
-    SpeechSidecarConfig, SpeechSidecarStats, StreamOutput, SwitchWarmup, ThinkingEgressAllowlist,
-    TtsSidecarSettings, VOICE_SETTINGS_VAR, VoiceController, VoiceEnvironment, VoicePaths,
-    VoicevoxBridge, VoicevoxSettings, VtsAvatarOutput, VtsPlaybackConfig, WarmupMode,
-    YOUTUBE_API_BASE_VAR, YOUTUBE_KEY_FILE_VAR, apply_dispatched_request,
-    apply_thinking_provider_env, audit_pack_readiness, is_acceptable_api_base, is_valid_key,
-    openrouter_preset_active, panel_settings, pump_bounded_records, read_voice_settings,
-    remembered_model, start_thinking_warmup, stt_sidecar_args, switch_warmup_for, warmup_timeout,
+    IntentShadowPolicy, IrodoriBridge, IrodoriSettings, LocalAvatarOutput, LocalRoutePlanner,
+    MemoryFalsifierMetrics, MemorySeed, MemoryWriterConfig, MemoryWriterMetrics, ModelSwitcher,
+    NoopAvatarOutput, NoopStreamOutput, ObsProgramSceneSource, ObsStreamOutput,
+    OperatorControlServer, OperatorEndpointOptions, OperatorRateLimiter, PanelService,
+    PerceptionService, PerceptionServiceConfig, PhraseMetrics, PhraseMode, PreviewSlot,
+    PreviewThinking, ProducerWorker, ProductionApp, ProfileSummary, RawIngressConfig,
+    RawIngressMetrics, RawIngressMetricsSnapshot, RoutePlanner, RuntimeRetentionPolicy,
+    SHADOW_ORCHESTRATOR_SCHEMA_VERSION, SceneContextService, ShadowOrchestratorConfig,
+    ShadowPolicyIdentity, ShadowingRoutePlanner, SpeechConversationConfig,
+    SpeechConversationMetrics, SpeechFloorMetrics, SpeechInputController, SpeechSidecarConfig,
+    SpeechSidecarStats, StreamOutput, SwitchWarmup, ThinkingEgressAllowlist, TtsSidecarSettings,
+    VOICE_SETTINGS_VAR, VoiceController, VoiceEnvironment, VoicePaths, VoicevoxBridge,
+    VoicevoxSettings, VtsAvatarOutput, VtsPlaybackConfig, WarmupMode, YOUTUBE_API_BASE_VAR,
+    YOUTUBE_KEY_FILE_VAR, apply_dispatched_request, apply_thinking_provider_env,
+    audit_pack_readiness, is_acceptable_api_base, is_valid_key, openrouter_preset_active,
+    panel_settings, pump_bounded_records, read_voice_settings, remembered_model,
+    start_thinking_warmup, stt_sidecar_args, switch_warmup_for, warmup_timeout,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
@@ -111,6 +112,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let voicevox_bridge = start_voicevox_bridge(profile, &audio_root, &pack_root)?;
     // #327: optional Aivis Cloud backend (internet egress, explicit opt-in).
     let aivis_bridge = start_aivis_bridge(profile, &audio_root, &pack_root)?;
+    // #411: optional experimental Irodori-TTS backend (operator-run server, loopback).
+    let irodori_bridge = start_irodori_bridge(profile, &audio_root, &pack_root)?;
     // #220 S2b: optional supervised local TTS sidecar (local and hybrid profiles only).
     let mut tts_sidecar = start_tts_sidecar(profile, &audio_root, &pack_root)?;
     // #404: the operator's character sheet, read once and bounded. Unset = no
@@ -136,6 +139,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         TtsBackends {
             voicevox: voicevox_bridge.as_ref(),
             aivis: aivis_bridge.as_ref(),
+            irodori: irodori_bridge.as_ref(),
             audio_root: &audio_root,
             pack_root: &pack_root,
         },
@@ -1797,6 +1801,27 @@ fn start_aivis_bridge(
     Ok(Some(bridge))
 }
 
+/// `AIVTUBER_TTS_BACKEND=irodori` (off by default, experimental): validate the
+/// settings and start the in-process bridge to an operator-run
+/// Irodori-TTS-Server. Misconfiguration (no endpoint, non-loopback server, bad
+/// seed, ...) is a startup error; a server that is not running is not.
+fn start_irodori_bridge(
+    profile: CompositionProfile,
+    audio_root: &std::path::Path,
+    pack_root: &std::path::Path,
+) -> Result<Option<IrodoriBridge>, Box<dyn Error>> {
+    let generative = env_bool("AIVTUBER_GENERATIVE_ENABLED", false)?;
+    let Some(settings) = IrodoriSettings::resolve(&|name| env_optional(name), profile, generative)?
+    else {
+        return Ok(None);
+    };
+    let bridge = IrodoriBridge::start(settings, audio_root, pack_root)?;
+    for line in bridge.startup_lines() {
+        eprintln!("{line}");
+    }
+    Ok(Some(bridge))
+}
+
 /// What the composition root built for the generative path.
 struct GenerativeParts {
     runtime: Option<GenerativeRuntime>,
@@ -1818,6 +1843,7 @@ struct GenerativeParts {
 struct TtsBackends<'a> {
     voicevox: Option<&'a VoicevoxBridge>,
     aivis: Option<&'a AivisBridge>,
+    irodori: Option<&'a IrodoriBridge>,
     audio_root: &'a std::path::Path,
     pack_root: &'a std::path::Path,
 }
@@ -1833,6 +1859,7 @@ fn build_generative_runtime(
     let TtsBackends {
         voicevox,
         aivis,
+        irodori,
         audio_root,
         pack_root,
     } = backends;
@@ -1888,10 +1915,11 @@ fn build_generative_runtime(
     )?;
     // The bridge endpoint is loopback either way; the Aivis Cloud egress is
     // inside the bridge, not a provider endpoint the profile check sees.
-    let tts_endpoint = match (voicevox, aivis) {
-        (Some(bridge), _) => bridge.tts_endpoint().to_owned(),
-        (None, Some(bridge)) => bridge.tts_endpoint().to_owned(),
-        (None, None) => required_env("AIVTUBER_TTS_ENDPOINT")?,
+    let tts_endpoint = match (voicevox, aivis, irodori) {
+        (Some(bridge), _, _) => bridge.tts_endpoint().to_owned(),
+        (None, Some(bridge), _) => bridge.tts_endpoint().to_owned(),
+        (None, None, Some(bridge)) => bridge.tts_endpoint().to_owned(),
+        (None, None, None) => required_env("AIVTUBER_TTS_ENDPOINT")?,
     };
     // Per-role egress policy (#364). The local stack's non-Thinking roles are
     // loopback-only; Thinking is loopback-only under `local` and may go to an
@@ -2026,6 +2054,12 @@ fn build_generative_runtime(
             Some(bridge.settings().model_alias()),
             None,
         )
+    } else if let Some(bridge) = irodori {
+        (
+            aivtuber_adapters::speech_tts::irodori::BACKEND_NAME,
+            Some(bridge.settings().model_alias()),
+            None,
+        )
     } else {
         ("normalized-http-tts", None, None)
     };
@@ -2059,7 +2093,7 @@ fn build_generative_runtime(
     let preview_slot = PreviewSlot::default();
     let voice_controller = build_voice_controller(
         profile,
-        voicevox.is_some() || aivis.is_some(),
+        voicevox.is_some() || aivis.is_some() || irodori.is_some(),
         &tts,
         &voice_bypass,
         &preview_slot,

@@ -7,6 +7,7 @@ mod budget;
 mod chat_burst;
 mod chat_ingress;
 mod deadline;
+mod irodori_bridge;
 mod memory_compare;
 mod memory_context;
 mod memory_eval;
@@ -72,6 +73,7 @@ pub use chat_ingress::{
     parse_disconnect_argument, read_chat_settings,
 };
 pub use deadline::*;
+pub use irodori_bridge::*;
 pub use memory_compare::*;
 pub use memory_context::*;
 pub use memory_eval::*;
@@ -5417,6 +5419,7 @@ mod tests {
     mod avatar_control_tests;
     mod chat_burst_tests;
     mod chat_ingress_tests;
+    mod irodori_tts_tests;
     mod local_thinking_fallback_tests;
     mod memory_seed_tests;
     mod memory_writer_tests;

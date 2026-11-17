@@ -472,6 +472,56 @@ Do not set `AIVTUBER_TTS_ENDPOINT` or `AIVTUBER_TTS_SIDECAR` with it. At start t
 * Each uncached synthesis spends credits. Identical sentences are served from the audio cache without a call; phrase mode makes one call per phrase.
 * Not guaranteed byte-identical: the service gives no determinism promise, and a model update on the service side is invisible to the app. The audio cache key includes the model, speaker and style (so switching voice never replays old audio) but not a service version, so delete `AIVTUBER_AUDIO_ROOT/generated/` after you change the model or the provider updates it.
 
+=== Optional: Irodori-TTS voice (GPU, experimental, issue #411)
+
+*Experimental, opt-in, and not the default.* In the project's round-trip test (EXP-0006) Irodori-TTS read Japanese less accurately than the default Supertonic voice (about 13% character error against 4.0%, with first words sometimes lost; the instrument cannot say whether the model or the speech recogniser is at fault). The default voice does not change, the panel does not list it, and `aivtuber-setup` does not write it. Use it if you want its voice and will listen to the output before streaming. At start the app prints one line saying so, in English and Japanese.
+
+The app does not install, bundle or download anything for it. You run the official `Irodori-TTS-Server` (MIT, an OpenAI-style `POST /v1/audio/speech`) yourself, on loopback, with the *LUNA* checkpoint on an NVIDIA GPU, and the built-in bridge translates the app's TTS contract to that request. EXP-0006 measured LUNA with bf16 DiT and codec at a median 1.13 s per reply and 3.1 GB of VRAM. The SUN checkpoint and any CPU run are *not suitable for live replies* (SUN is about 2.5 times slower on a GPU, and CPU runs took 19 s or more per reply). Next to the default Thinking model (about 2.6 GB) this is roughly 5.7 GB of an 8 GB card; that is a sum of separately measured figures, not a co-residency measurement.
+
+Pins (what the live smoke below ran, 2026-11-17):
+
+* Server: https://github.com/Aratako/Irodori-TTS-Server at commit `ce06bebd0ed243cc0fb6999ef7827b6e45d0d9d2`, installed with its own lock file (`uv sync --frozen --extra cu128`; it pins Irodori-TTS code commit `89f9d8fbd4d51ea019867ee1197725ede1df13c5`, torch 2.10 and the DACVAE codec code).
+* Checkpoint: `summerAIO/Irodori-TTS-v4.1-Small-LUNA` at `08e80a3c13db2bbfd8464f670fb7cd127e6f0d8c`, file `model.safetensors`, SHA-256 `ebfd3414e32df83dec23e7499a4f8c6effd2f977369d474dd473d8be8a7ca115` (3.09 GB). Check the digest before use.
+* Codec `Aratako/Semantic-DACVAE-Japanese-32dim` at `47376ee24834d7a05a48ebabfe3cde29b3c5e214` (`weights.pth`, 410 MB, SHA-256 `db120339c5ee7eca1912cdf29bc612b947a0808e69c3cebfb4936b45a762c1d5`; a plain `state_dict` file that the codec library reads with `torch.load`, weights-only by default in the server's torch 2.10) and the tokenizer files of `sbintuitions/modernbert-ja-310m` (8 MB): the server fetches them from the Hugging Face Hub on first load.
+* Patch step: *not applied.* The checkpoint ships `code_patches/cpu_bf16_ode_fp32.patch` (it lets bf16 run on a CPU and keeps the sampler state in fp32). EXP-0006 measured a tree with that patch applied (Irodori-TTS code `382205679ebc32295b7d1bfb329327d04c8f4eed`); it does not apply cleanly to the code the server pins (`89f9d8f`: two of its `rf.py` hunks fail), and the CUDA configuration here runs without it, with the sampler state in bf16. So the live smoke below measured the unpatched stack, and EXP-0006's latency and reading-error figures belong to the patched one: treat both as indicative, listen before streaming, and do not try to patch the server's installed package for CPU use (CPU is not a supported way to use this backend). The checkpoint's `speed_patch.py` is not applied by the server and was not used.
+
+Steps:
+
+. Install the server as above, with a Python 3.10+ environment and `uv`. Run it once with network access so the codec and tokenizer reach the Hugging Face cache, or pre-seed that cache and run with `HF_HUB_OFFLINE=1` on an offline machine (both repositories are needed; nothing else is downloaded).
+. Start it on loopback with the checkpoint, bf16 and preloading, and wait for `"loaded": true` from `http://127.0.0.1:8088/health` before starting the app (the first load took minutes on a cold disk, and the first request after it took 14 s while the GPU kernels warmed up, so send one throwaway request before going live):
++
+[source,sh]
+----
+export IRODORI_HOST=127.0.0.1                 # loopback; never 0.0.0.0
+export IRODORI_PORT=8088
+export IRODORI_CHECKPOINT=/path/to/model.safetensors   # the LUNA file above
+export IRODORI_MODEL_DEVICE=cuda IRODORI_CODEC_DEVICE=cuda
+export IRODORI_MODEL_PRECISION=bf16 IRODORI_CODEC_PRECISION=bf16
+export IRODORI_PRELOAD=true
+# leave IRODORI_API_KEY unset: the bridge sends no credential
+uv run --no-sync python -m irodori_openai_tts --host 127.0.0.1 --port 8088
+----
+. Replace the `# local TTS (supervised child)` block of step 4 with:
++
+[source,sh]
+----
+export AIVTUBER_TTS_BACKEND=irodori                         # or: irodori-tts
+export AIVTUBER_IRODORI_ENDPOINT=http://127.0.0.1:8088      # loopback http:// origin only
+# optional
+export AIVTUBER_IRODORI_SEED=1234                           # fixed seed sent with every request (default 1234)
+export AIVTUBER_IRODORI_VOICE=<name>                        # a voice you installed on the server, by name (default: none)
+export AIVTUBER_IRODORI_MODEL=irodori-tts                   # the server's IRODORI_MODEL_NAME (default irodori-tts)
+export AIVTUBER_IRODORI_MODEL_LABEL=LUNA-bf16               # free label mixed into the audio cache key
+export AIVTUBER_IRODORI_TIMEOUT_MS=12000                    # total budget for one synthesis (default 12000)
+export AIVTUBER_IRODORI_AMPLITUDE_VISEMES=true              # mouth movement from the audio envelope (default off)
+----
+
+Do not set `AIVTUBER_TTS_ENDPOINT` or `AIVTUBER_TTS_SIDECAR` with it. A non-loopback or non-`http://` endpoint, a bad seed or an unusable name stops the app at start, naming the variable; a server that is not running does not (see below).
+
+*Known limit: the seed does not keep one speaker across different phrases.* LUNA has no named voices: without a reference it samples a speaker from the noise the seed draws, and that noise depends on the length of the text. The bridge sends the same seed and `no_ref` with every request, which makes *identical text* give identical audio (byte-identical in the smoke below, so the audio cache and replays are stable), but on the reference host twelve different phrases at one seed did not sound like one speaker by the available instruments (production-runtime, "Optional Irodori-TTS backend"). Treat the voice as changing from phrase to phrase until you have listened: this is why the backend is experimental and why phrase mode is the more audible case. If you set `AIVTUBER_IRODORI_VOICE`, the bridge sends that name instead of `no_ref`; the voice is whatever you installed on the server under that name (not exercised in the smoke). *The app never uploads or passes reference audio*, and nothing in a reply or a chat message can add a field to the request. Cloning a real person's voice is out of scope here; the base model's card forbids impersonation without consent (see section 8).
+
+If the server is stopped, slow, answers an error or returns audio that is not 16-bit mono PCM WAV, the synthesis fails like any TTS failure: the viewer sees the non-verbal reaction (#291), the performer carries on, and the next reply tries again. The audio cache key contains the seed, the voice name and `AIVTUBER_IRODORI_MODEL_LABEL` but not the server or checkpoint revision, so set a new label when you change the checkpoint. Output is 48 kHz. Not guaranteed reproducible across hosts, drivers or code revisions: the live smoke produced byte-identical audio for the same phrase and seed twice on one host.
+
 === Optional: let her see the game (screen perception, issue #90)
 
 Off by default, and not for every machine. The "perception profile" runs one `llama-server` with a multimodal model (Qwen3-VL-4B-Instruct Q4_K_M and its projector) that serves both the Thinking replies and one short screen caption every 10 seconds. **It needs about 12 GB of VRAM** for the whole local stack (model, renderer, speech sidecars, desktop). On an 8 GB card the measurements (EXP-0004c) showed a run that fit and an identical run that spilled into system memory, with captions taking 12 s and speech getting slower; that card class stays on structured telemetry only. If you try it anyway, the app measures this for you: a latency probe at start and every minute suspends perception, and `aivtuberctl status` says why, instead of letting the stream stutter.
@@ -604,6 +654,7 @@ No model, voice file or avatar model is bundled or redistributed by this reposit
 |Supertonic 3 weights (TTS voice) |OpenRAIL-M (the sample code in the archive is MIT) |*Disclose that the voice is machine-generated.* One of the use restrictions is to publish AI-generated content without clearly disclosing it. Keep an "AI-generated voice" line where viewers see it (channel or stream description, or an overlay text); the runtime cannot show it for you and only prints a start-up notice. The other restrictions (no unlawful use, no harm to minors, no disinformation, no harassment or discrimination, no impersonation or deepfakes without consent, no fully automated legal/medical/law-enforcement decisions) pass on to you. The licensor claims no rights in the audio; you are accountable for it. Licence text (BigScience OpenRAIL-M) at the pinned revision `3cadd1ee6394adea1bd021217a0e650ede09a323`: https://huggingface.co/Supertone/supertonic-3/blob/3cadd1ee6394adea1bd021217a0e650ede09a323/LICENSE.
 |VOICEVOX ENGINE and voices (optional, not shipped; `AIVTUBER_TTS_BACKEND=voicevox`) |Engine LGPL-3.0 (or separate licence), run as a separate process; voices under the VOICEVOX terms plus per-character terms |No default character ships; you choose the speaker. *Show the credit line* (`VOICEVOX:<character name>`) and follow your character's own terms; see <<voicevox-terms>>. The startup log prints the credit line you configured.
 |Aivis Cloud API and AivisHub models (optional, not shipped; `AIVTUBER_TTS_BACKEND=aivis-cloud`) |Aivis Cloud API terms; each model under its own AivisHub licence |*Reply text is sent to the service.* No default voice ships; you choose the model, own its licence and credit line (`AIVTUBER_AIVIS_CREDIT`, printed at start) and pay for the credits used. See the Aivis Cloud section above.
+|Irodori-TTS-Server, the LUNA checkpoint, the codec and the text encoder (optional, operator-installed, not shipped; `AIVTUBER_TTS_BACKEND=irodori`) |Server, Irodori-TTS code, checkpoint, codec weights and text encoder MIT; DACVAE code Apache-2.0 |*Disclose that the voice is machine-generated.* The base model's card adds ethical restrictions (no impersonation without consent, no deepfakes or misleading synthetic speech, a generated voice may coincidentally resemble a real person). No credit line is required and no reference voice is used. Experimental: reading accuracy is lower than the default voice (EXP-0006).
 |three.js, `@pixiv/three-vrm`, Vite (renderer) |MIT, exact-pinned, allowlist-checked in CI |See `docs/supply-chain.adoc` section 8.
 |Sample VRM (`VRM1_Constraint_Twist_Sample.vrm`) |Embedded VRM 1.0 metadata: pixiv Inc., avatar permission everyone, credit notation unnecessary, no hateful use |Test model only. Check the embedded licence of whatever model you stream; the panel shows it for every model you choose (<<avatar-panel>>) and the page logs it at load.
 |FFmpeg `ffplay` |LGPL/GPL depending on your build |Installed by you; not bundled.

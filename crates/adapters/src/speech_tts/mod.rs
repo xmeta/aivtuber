@@ -30,6 +30,10 @@
 //! * `aivis_cloud` is an optional third [`Synthesizer`] (issue #327) and the
 //!   only one that talks to the internet: the Aivis Cloud API over HTTPS, as an
 //!   explicit operator opt-in, behind the same server and wire contract.
+//! * `irodori` is an optional fourth [`Synthesizer`] (issue #411): it drives an
+//!   operator-run official Irodori-TTS-Server on loopback (experimental, GPU),
+//!   behind this same server and wire contract, with a pinned seed and no
+//!   reference audio.
 //! * Nothing is downloaded at build or run time; the model files and the engine
 //!   libraries must match SHA-256 pins ([`pins`], `speech_stt::pins`).
 
@@ -37,6 +41,8 @@ pub mod aivis_cloud;
 pub mod aivis_cloud_fake;
 pub mod aivis_models;
 pub mod envelope;
+pub mod irodori;
+pub mod irodori_fake;
 pub mod pins;
 pub mod runner;
 pub mod server;

@@ -63,7 +63,7 @@ impl std::fmt::Display for VoicevoxSettingsError {
         match self {
             Self::UnknownBackend(value) => write!(
                 f,
-                "{TTS_BACKEND_VAR} must be voicevox, aivis-cloud or http (got {value:?})"
+                "{TTS_BACKEND_VAR} must be voicevox, aivis-cloud, irodori or http (got {value:?})"
             ),
             Self::NotLocalProfile => write!(
                 f,
@@ -136,6 +136,8 @@ impl VoicevoxSettings {
             None | Some("http") | Some("normalized-http") => return Ok(None),
             // Another in-process backend (issue #327) owns this selection.
             Some(name) if crate::aivis_bridge::is_aivis_backend_name(name) => return Ok(None),
+            // Another in-process backend (issue #411) owns this selection.
+            Some(name) if crate::irodori_bridge::is_irodori_backend_name(name) => return Ok(None),
             Some("voicevox") => {}
             Some(other) => return Err(VoicevoxSettingsError::UnknownBackend(other.to_owned())),
         }
