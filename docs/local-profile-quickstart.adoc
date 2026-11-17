@@ -101,7 +101,7 @@ Each step is skipped if its result is already on disk and matches its pin, so th
 . Downloads and verifies, into `local-assets/` beside the programs: llama.cpp `b12224`, the Gemma 4 E4B QAT UD-Q4_K_XL model, the Silero VAD model, the ReazonSpeech k2-v2 int8 speech model, the Supertonic 3 int8 voice, and the sample VRM (placed at `renderer/local-avatar/dist/model.vrm` unless a file is already there). Every URL is HTTPS; every file has an exact pinned size and SHA-256; a redirect to plain HTTP is refused; a mismatch deletes the partial file and stops. Archives are unpacked by the program itself with path-traversal and symbolic-link checks and size limits; there is no `tar`, `unzip` or script involved.
 . Speaks the six starter reaction lines with the bundled `local-tts-sidecar` and encodes them with `ffmpeg` to `examples/starter-reaction-pack/audio/starter/`, with `PROVENANCE.json` (the same step as <<starter-audio>>).
 . Writes `local-profile.env` (the variables of step 4 of this guide, with a fresh random pseudonym key and control secret) and never overwrites an existing one unless you pass `--force`. The file holds secrets: do not share it.
-. Prints the licence and disclosure duties of what it fetched (the OpenRAIL-M voice disclosure, the ReazonSpeech provenance note, the avatar's licence) and the exact start command.
+. Prints the licence and disclosure duties of what it fetched (the OpenRAIL-M voice disclosure, the ReazonSpeech provenance note, the avatar's licence) and the exact start command. It ends with a short Japanese-first next-steps block (start command, operation panel URL, voice input, character sheet and disclosure reminder), each line with the English beside it.
 
 [cols="2,5",options="header"]
 |===
