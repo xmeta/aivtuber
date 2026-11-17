@@ -124,6 +124,34 @@ fn dry_run_prints_the_plan_and_the_duties_without_writing_anything() {
 }
 
 #[test]
+fn local_dry_run_output_ends_with_the_japanese_first_next_steps_block() {
+    let root = fake_release("cli-next-steps-ja");
+    let assets = root.parent().unwrap().join("assets");
+    let o = run(&[
+        "local",
+        "--dry-run",
+        "--root",
+        root.to_str().unwrap(),
+        "--assets",
+        assets.to_str().unwrap(),
+    ]);
+    assert!(o.status.success(), "{}", text(&o));
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    let cmd = aivtuber_setup::local::start_command(&root, &root.join("local-profile.env"));
+    let expected = aivtuber_setup::local::next_steps(&cmd);
+    let got: Vec<&str> = stdout
+        .lines()
+        .rev()
+        .take(expected.len())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    assert_eq!(got, expected.iter().map(String::as_str).collect::<Vec<_>>());
+    assert!(stdout.contains("\nStart (after a real run of this command)\n"));
+}
+
+#[test]
 fn the_perception_dry_run_names_the_vision_files_the_vram_and_the_extra_duty() {
     let root = fake_release("cli-dry-perception");
     let before = listing(&root);
