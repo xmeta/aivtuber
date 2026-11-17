@@ -208,6 +208,11 @@ function main() {
       filter: (src) => !/[\\/]generated([\\/]|$)/.test(src),
     });
 
+    // 4b. The character sheet template (#404): the streamer copies it to
+    // local-persona.md beside the env file. Text only; the app reads the copy.
+    mkdirSync(join(stage, "examples", "persona"), { recursive: true });
+    cpSync(join(repo, "examples", "persona", "starter.ja.md"), join(stage, "examples", "persona", "starter.ja.md"));
+
     // 5. Licences and notices.
     if (existsSync(join(repo, "LICENSE"))) cpSync(join(repo, "LICENSE"), join(stage, "LICENSE"));
     cpSync(rustNotices, join(stage, "THIRD-PARTY-LICENSES-RUST.html"));

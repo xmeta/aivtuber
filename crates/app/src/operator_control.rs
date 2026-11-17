@@ -137,6 +137,11 @@ pub struct OperatorStatusSnapshot {
     /// Thinking is remote. Absent when no speech sidecar is configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice_input: Option<crate::SpeechInputStatus>,
+    /// The operator's character sheet (#404): whether one is loaded, its length
+    /// and a SHA-256 prefix, never the text. Absent unless
+    /// `AIVTUBER_PERSONA_FILE` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<crate::persona::PersonaStatus>,
 }
 
 /// Operator-visible, text-free perception status: whether it is running, why
@@ -203,6 +208,7 @@ impl OperatorStatusSnapshot {
             chat_ingress: app.chat_ingress_status(),
             avatar_model: app.avatar_status(),
             voice_input: app.speech_input_status(),
+            persona: app.persona_status(),
         }
     }
 }
@@ -756,11 +762,11 @@ fn apply_with_presented_secret<R: RoutePlanner>(
         // Identity reports the daemon's live composition (#167), not
         // placeholders, so an attached bundle is comparable across incidents.
         let (profile, fingerprint) = app.composition_identity();
-        let builder = SupportBundleBuilder::new(
-            profile,
-            fingerprint,
-            SupportBundleProvenance::from_build_env(),
-        );
+        let mut provenance = SupportBundleProvenance::from_build_env();
+        // #404: the character sheet's identity (length and hash prefix), never
+        // its text.
+        provenance.persona = app.persona_status().map(|status| status.identity());
+        let builder = SupportBundleBuilder::new(profile, fingerprint, provenance);
         let bundle: SupportBundle = builder.generate(app, wall_unix_millis());
         let detail = serde_json::to_string(&bundle)
             .unwrap_or_else(|_| "{\"error\":\"bundle serialization failed\"}".to_owned());

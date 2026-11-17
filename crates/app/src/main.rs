@@ -113,6 +113,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     let aivis_bridge = start_aivis_bridge(profile, &audio_root, &pack_root)?;
     // #220 S2b: optional supervised local TTS sidecar (local and hybrid profiles only).
     let mut tts_sidecar = start_tts_sidecar(profile, &audio_root, &pack_root)?;
+    // #404: the operator's character sheet, read once and bounded. Unset = no
+    // persona and nothing changes; the outcome is announced below once the
+    // generative path and the Thinking endpoint are known.
+    let persona_load = env_path(aivtuber_app::persona::PERSONA_FILE_VAR)
+        .map(|path| aivtuber_app::persona::load_persona_file(&path));
     let GenerativeParts {
         runtime: generative_configured,
         model_switcher,
@@ -125,6 +130,9 @@ fn run() -> Result<(), Box<dyn Error>> {
         retention,
         profile,
         tts_sidecar.as_ref().map(|handle| handle.alive.clone()),
+        persona_load
+            .as_ref()
+            .and_then(aivtuber_app::persona::PersonaLoad::sheet),
         TtsBackends {
             voicevox: voicevox_bridge.as_ref(),
             aivis: aivis_bridge.as_ref(),
@@ -146,6 +154,20 @@ fn run() -> Result<(), Box<dyn Error>> {
     } else {
         None
     };
+    // #404: a character sheet needs the generative path. One always-printed
+    // line says whether it is in effect and, under a remote Thinking endpoint,
+    // that it is sent to the cloud model with each reply (never the text).
+    let persona_load = persona_load.filter(|_| generative.is_some());
+    if let Some(load) = &persona_load {
+        eprintln!(
+            "{}",
+            aivtuber_app::ready_guide::persona_line(
+                load,
+                thinking_leaves_machine,
+                aivtuber_adapters::log_verbosity::diagnostics_enabled(),
+            )
+        );
+    }
     // #357: the model selector only exists next to a composed generative path.
     let model_switcher = model_switcher.filter(|_| generative.is_some());
     // #360: the voice settings only exist next to a composed generative path.
@@ -269,6 +291,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             &startup_summary.profile,
             &startup_summary.config_fingerprint,
         );
+    if let Some(load) = persona_load {
+        app = app.with_persona(load);
+    }
     if let Some(generative) = generative {
         app = app.with_generation(generative);
     }
@@ -1802,6 +1827,7 @@ fn build_generative_runtime(
     retention: RuntimeRetentionPolicy,
     profile: CompositionProfile,
     supervised_tts: Option<Arc<AtomicBool>>,
+    persona: Option<&aivtuber_app::persona::PersonaSheet>,
     backends: TtsBackends<'_>,
 ) -> Result<GenerativeParts, Box<dyn Error>> {
     let TtsBackends {
@@ -1895,6 +1921,12 @@ fn build_generative_runtime(
         verify_loopback_endpoint(&tts_endpoint, &resolver).is_ok(),
     )])?;
     let mut thinking = OpenAiResponsesAdapter::with_authentication(thinking_config, thinking_auth)?;
+    // #404: the warm-up carries the character sheet so the first reply does not
+    // pay to evaluate it. Set before any clone (the model switcher's warm-up
+    // and the pipeline's copy) is made.
+    if let Some(sheet) = persona {
+        thinking = thinking.with_warmup_context(vec![sheet.thinking_content()]);
+    }
     if let Some(name) = env_optional("AIVTUBER_OPENAI_BACKEND_NAME") {
         thinking = thinking.with_backend_name(name);
     }

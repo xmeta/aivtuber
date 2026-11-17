@@ -11,6 +11,7 @@ mod event;
 mod floor;
 mod interfaces;
 mod perception;
+mod persona;
 mod reflex;
 pub mod scenario;
 mod scene;
@@ -56,6 +57,10 @@ pub use interfaces::{
     authorize_avatar_action, authorize_stream_action, authorize_tool_action, verify_tool_result,
 };
 pub use perception::*;
+pub use persona::{
+    MAX_PERSONA_BYTES, MAX_PERSONA_FILE_BYTES, Persona, PersonaError, contains_character_tag,
+    parse_persona,
+};
 pub use reflex::{
     AttentionTarget, BackendIdentity, FallbackReason, REFLEX_SCHEMA_VERSION, ReflexDecision,
     ResponseRoute, RouteDecision,

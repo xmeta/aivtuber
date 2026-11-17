@@ -771,6 +771,18 @@ pub fn run<W: Write>(
     } else {
         "  voice input (the microphone) is off until you turn it on, with `start --voice-input on` or the switch in the operation panel; the choice is remembered, and `start --voice-input off` or the panel turns it off again"
     });
+    // #404: the optional character sheet; nothing changes until the file exists.
+    ctx.say(if hybrid.is_some() {
+        format!(
+            "  character sheet (optional): copy examples/persona/starter.ja.md to {} beside the env file, edit it and restart; the model then speaks as that character, and the sheet is sent to openrouter.ai with each reply",
+            crate::start::PERSONA_FILE
+        )
+    } else {
+        format!(
+            "  character sheet (optional): copy examples/persona/starter.ja.md to {} beside the env file, edit it and restart; the model then speaks as that character (cached reactions and fallback lines do not follow it)",
+            crate::start::PERSONA_FILE
+        )
+    });
     ctx.say(format!(
         "  the app then prints two URLs, each with a per-launch secret (do not share them): the operation panel (http://127.0.0.1:{}/#token=...; chat, status, stop and mute) and the avatar page (http://127.0.0.1:{}/?token=..., also usable as an OBS Browser Source)",
         config::PANEL_PORT,

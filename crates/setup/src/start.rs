@@ -85,8 +85,8 @@ pub fn log_choice(
 }
 
 /// Quiet start-up text (#393), Japanese first with English beside it. Fixed
-/// strings, no locale detection. With the app's four lines
-/// (`aivtuber_app::ready_guide`) the quiet start-up adds at most seven lines.
+/// strings, no locale detection. With the app's five lines
+/// (`aivtuber_app::ready_guide`) the quiet start-up adds at most eight lines.
 /// The Japanese text can be garbled when Windows PowerShell 5.1 output is
 /// redirected or piped; the English half stays readable.
 const QUIET_NOTE: &str = "表示を簡略にしています。すべて表示するには `aivtuber-setup start --verbose` / Terminal output is quiet; run `aivtuber-setup start --verbose` to see everything.";
@@ -284,6 +284,13 @@ pub const SPEECH_INPUT_SETTINGS_FILE: &str = "local-speech-input.json";
 /// pins the two together (the app crate is not linked here).
 const SPEECH_INPUT_SETTINGS_VAR: &str = "AIVTUBER_SPEECH_INPUT_SETTINGS";
 const SPEECH_SIDECAR_VAR: &str = "AIVTUBER_SPEECH_SIDECAR";
+/// The character sheet beside the env file (#404): Markdown the streamer edits
+/// (`examples/persona/starter.ja.md` in the release archive is the template).
+/// The app reads it once at start; missing or empty means no character sheet.
+pub const PERSONA_FILE: &str = "local-persona.md";
+/// Same name as `aivtuber_app::persona::PERSONA_FILE_VAR`; a test pins the two
+/// together by value (the app crate is not linked here).
+const PERSONA_FILE_VAR: &str = "AIVTUBER_PERSONA_FILE";
 /// Directory beside the env file that holds the models uploaded in the panel
 /// (#362), named by content hash, at most a few. The app owns it; no file name
 /// or path ever comes from a client.
@@ -574,6 +581,33 @@ pub fn app_speech_input_env(
     )]
 }
 
+/// Where the app finds the character sheet (#404): `local-persona.md` beside the
+/// env file, for the local and hybrid profiles (the only ones with a Thinking
+/// model that can use it). An explicit value in the env file or the process
+/// environment wins. The file need not exist: the app treats a missing file as
+/// no character sheet, so this changes nothing until the streamer creates it.
+pub fn app_persona_env(
+    env_file: &Path,
+    file_env: &BTreeMap<String, String>,
+    process_env: &dyn Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    let value = |name: &str| {
+        file_env
+            .get(name)
+            .cloned()
+            .or_else(|| process_env(name))
+            .filter(|v| !v.trim().is_empty())
+    };
+    let generative = matches!(value("AIVTUBER_MODE").as_deref(), Some("local" | "hybrid"));
+    if !generative || value(PERSONA_FILE_VAR).is_some() {
+        return Vec::new();
+    }
+    vec![(
+        PERSONA_FILE_VAR.to_owned(),
+        env_file.with_file_name(PERSONA_FILE).display().to_string(),
+    )]
+}
+
 /// Replaces the state file with the on/off document (temp file in the same
 /// directory, then rename, so a crash leaves the old or the new file, never
 /// half of one). Same pattern as the app's own settings writers.
@@ -672,6 +706,8 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
     let speech_input_vars =
         app_speech_input_env(&opts.env_file, &env, &|name| std::env::var(name).ok());
     env.extend(speech_input_vars);
+    let persona_vars = app_persona_env(&opts.env_file, &env, &|name| std::env::var(name).ok());
+    env.extend(persona_vars);
     let plan = match &llm {
         Llm::Managed(_) => plan_models(&env, &Manifest::embedded(), &settings, &|p| {
             std::fs::metadata(p).ok().map(|m| m.len())
@@ -886,8 +922,9 @@ mod tests {
 
     #[test]
     fn the_quiet_text_is_short_and_carries_no_secret() {
-        // The app prints four more (aivtuber_app::ready_guide, the fourth being
-        // the voice-input line of #397); seven in all.
+        // The app prints five more (aivtuber_app::ready_guide, the fourth being
+        // the voice-input line of #397 and the fifth the character sheet line of
+        // #404); eight in all.
         // STARTING_APP and READY_STARTING are alternatives, never both.
         assert!(QUIET_LINES.len() - 1 <= 3);
         for line in QUIET_LINES {
@@ -942,6 +979,44 @@ mod tests {
         let process_explicit =
             |n: &str| (n == "AIVTUBER_SPEECH_INPUT_SETTINGS").then(|| "/p".to_owned());
         assert!(app_speech_input_env(env_file, &configured, &process_explicit).is_empty());
+    }
+
+    #[test]
+    fn the_app_is_told_where_the_character_sheet_is_for_local_and_hybrid_only() {
+        let env_file = Path::new("/x/local-profile.env");
+        let none = |_: &str| None;
+        for mode in ["local", "hybrid"] {
+            let got = app_persona_env(env_file, &map(&[("AIVTUBER_MODE", mode)]), &none);
+            assert_eq!(got.len(), 1, "{mode}");
+            assert_eq!(got[0].0, "AIVTUBER_PERSONA_FILE");
+            assert!(got[0].1.ends_with(PERSONA_FILE), "{got:?}");
+            // Beside the env file, like the other settings.
+            assert_eq!(Path::new(&got[0].1).parent(), env_file.parent(), "{got:?}");
+        }
+        // The names are the app's: a test in the app pins the same literals.
+        assert_eq!(PERSONA_FILE, "local-persona.md");
+        assert_eq!(PERSONA_FILE_VAR, "AIVTUBER_PERSONA_FILE");
+        // Other profiles, and an env file with no mode, get nothing.
+        assert!(app_persona_env(env_file, &map(&[("AIVTUBER_MODE", "cached")]), &none).is_empty());
+        assert!(app_persona_env(env_file, &map(&[]), &none).is_empty());
+        // The mode can come from the process environment.
+        let process_mode = |n: &str| (n == "AIVTUBER_MODE").then(|| "local".to_owned());
+        assert_eq!(app_persona_env(env_file, &map(&[]), &process_mode).len(), 1);
+        // An explicit value (env file or process environment) wins.
+        let explicit = map(&[
+            ("AIVTUBER_MODE", "local"),
+            ("AIVTUBER_PERSONA_FILE", "/mine.md"),
+        ]);
+        assert!(app_persona_env(env_file, &explicit, &none).is_empty());
+        let process_explicit = |n: &str| (n == "AIVTUBER_PERSONA_FILE").then(|| "/p.md".to_owned());
+        assert!(
+            app_persona_env(
+                env_file,
+                &map(&[("AIVTUBER_MODE", "local")]),
+                &process_explicit
+            )
+            .is_empty()
+        );
     }
 
     #[test]

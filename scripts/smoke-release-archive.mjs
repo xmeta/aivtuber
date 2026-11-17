@@ -209,6 +209,11 @@ try {
     assert(readdirSync(join(root, "examples", "starter-reaction-pack", "descriptors")).length > 0, "no descriptors");
   });
 
+  check("the character sheet template ships and is text", () => {
+    const template = readFileSync(join(root, "examples", "persona", "starter.ja.md"), "utf8");
+    assert(template.includes("名前") && template.length < 3000, "starter.ja.md is not the template");
+  });
+
   check("no model weights, voice files or avatar models are bundled", () => {
     const hits = [];
     const walk = (dir) => {

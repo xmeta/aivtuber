@@ -578,6 +578,15 @@ fn print_response(response: &OperatorResponse) {
                 voice_input.reason,
             );
         }
+        if let Some(persona) = &status.persona {
+            // Identity only (#404): never the character sheet's text.
+            println!(
+                "persona present={} bytes={} sha256={}",
+                persona.present,
+                persona.bytes,
+                persona.sha256.as_deref().unwrap_or("-"),
+            );
+        }
         if let Some(chat) = &status.chat_ingress {
             for (name, platform) in [("twitch", &chat.twitch), ("youtube", &chat.youtube)] {
                 println!(

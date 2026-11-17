@@ -20,6 +20,7 @@ mod outputs;
 mod pack_readiness;
 mod panel;
 mod perception_service;
+pub mod persona;
 mod phrase_benchmark;
 mod phrase_commit;
 mod profile;
@@ -1183,6 +1184,10 @@ where
     /// Live switching of the local Thinking model (#357); `None` (default)
     /// composes nothing and the model is whatever the environment named.
     model_switcher: Option<model_switch::ModelSwitcher>,
+    /// The operator's character sheet read at start (#404); `None` unless
+    /// `AIVTUBER_PERSONA_FILE` was set, then the load outcome (the sheet, or
+    /// why there is none). Never changed while running.
+    persona: Option<persona::PersonaLoad>,
     thinking_meter: Option<thinking_meter::ThinkingMeter>,
     /// Live voice settings (#360); `None` (default) composes nothing and the
     /// voice is whatever the environment named.
@@ -1266,6 +1271,7 @@ where
             speech_observations: None,
             perception: None,
             model_switcher: None,
+            persona: None,
             thinking_meter: None,
             voice: None,
             chat_ingress: None,
@@ -1741,6 +1747,22 @@ where
     /// Session Thinking usage and cap state; `None` when no meter is composed.
     pub fn thinking_usage_status(&self) -> Option<thinking_meter::ThinkingUsageStatus> {
         self.thinking_meter.as_ref().map(|m| m.status())
+    }
+
+    /// Compose the operator's character sheet read at start (#404): `load` is
+    /// the outcome of reading `AIVTUBER_PERSONA_FILE`. A loaded sheet is put
+    /// first in every generated reply's curated context; any other outcome
+    /// changes no request but is reported in the status.
+    pub fn with_persona(mut self, load: persona::PersonaLoad) -> Self {
+        self.persona = Some(load);
+        self
+    }
+
+    /// The character sheet's identity (loaded or not, length, SHA-256 prefix;
+    /// never the text) for the operator status and the support bundle; `None`
+    /// unless `AIVTUBER_PERSONA_FILE` was set.
+    pub fn persona_status(&self) -> Option<persona::PersonaStatus> {
+        self.persona.as_ref().map(persona::PersonaLoad::status)
     }
 
     /// Opt in to switching the local Thinking model at runtime (#357). Only the
@@ -3378,13 +3400,24 @@ where
             .payload
             .get("topic")
             .and_then(serde_json::Value::as_str);
-        let context = retained_memory_context(
+        // #404: the character sheet is placed first by `attach_persona` and is
+        // never dropped, so memory fills only what it leaves of the item and
+        // byte budgets.
+        let reserve = self
+            .persona
+            .as_ref()
+            .and_then(persona::PersonaLoad::sheet)
+            .map_or(ContextReserve::NONE, |sheet| {
+                ContextReserve::one_item(sheet.len())
+            });
+        let context = retained_memory_context_reserving(
             &adaptation.memory,
             &event.source,
             event.actor_id.as_deref(),
             topic,
             at_ms,
             generation.thinking.input.text.len(),
+            reserve,
         );
         if context.is_empty() {
             return;
@@ -3408,6 +3441,34 @@ where
             // Fail closed to "no memory context" rather than failing the event:
             // retrieval enriches a reply and is never a precondition for one.
             generation.thinking.curated_context = Vec::new();
+        }
+    }
+
+    /// Put the operator's character sheet first in a generation route's
+    /// curated context (#404).
+    ///
+    /// The sheet is one `operator_curated` item (see
+    /// [`persona::PersonaSheet::thinking_content`]), placed at index 0 after
+    /// memory was selected with its room reserved, so it is never dropped and
+    /// memory plus the scene caption fill the rest. It is data in the Thinking
+    /// request: this reads the sheet loaded at start and mints nothing, and
+    /// the request carries no capability or permit to mint one from. With no
+    /// sheet loaded this is a no-op and the request is byte-identical to one
+    /// built before the character sheet existed.
+    fn attach_persona(&self, route: &mut PlaybackRoute) {
+        let Some(sheet) = self.persona.as_ref().and_then(persona::PersonaLoad::sheet) else {
+            return;
+        };
+        let PlaybackRoute::Generate(generation) = route else {
+            return;
+        };
+        let thinking = &mut generation.thinking;
+        thinking.curated_context.insert(0, sheet.thinking_content());
+        if thinking.validate().is_err() {
+            // The reserved room should make this unreachable (the input is at
+            // most one item and the sheet at most 3,000 bytes). If it ever
+            // happens, drop memory, never the sheet.
+            thinking.curated_context.truncate(1);
         }
     }
 
@@ -3512,6 +3573,8 @@ where
         // it owns both the memory store and the routed request; the planner
         // keeps producing a memory-free request.
         self.attach_memory_context(&event, &mut route, at_ms);
+        // #404: the operator's character sheet, first and never dropped.
+        self.attach_persona(&mut route);
         // #88 / #90 S2: closed-vocabulary scene for the Reflex and Thinking
         // context, and at most one untrusted screen caption for Thinking.
         self.attach_scene_context(&mut route, scene, at_ms);
@@ -5357,6 +5420,7 @@ mod tests {
     mod local_thinking_fallback_tests;
     mod memory_seed_tests;
     mod memory_writer_tests;
+    mod persona_tests;
     mod phrase_commit_tests;
     mod scene_context_tests;
     mod speech_lifecycle_tests;
