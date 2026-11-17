@@ -1,0 +1,13 @@
+use aivtuber_generative::classify_affect;
+use std::io::BufRead;
+fn main() {
+    let mut times = Vec::new();
+    for line in std::io::stdin().lock().lines() {
+        let line = line.unwrap();
+        let t = std::time::Instant::now();
+        let mut r = classify_affect(&line);
+        for _ in 0..200 { r = classify_affect(&line); }
+        times.push(t.elapsed().as_nanos() as f64 / 201.0);
+        println!("{}\t{}", r.class.as_str(), times.last().unwrap());
+    }
+}

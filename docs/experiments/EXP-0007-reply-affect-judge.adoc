@@ -1,0 +1,208 @@
+= EXP-0007: rules vs System One vs Thinking-tag affect judgement for reply expressions (#423)
+
+:toc:
+:toclevels: 2
+
+This is a durable experiment record in the link:README.adoc[Durable Experiment Records] format.
+It is the measurement #423 asked for after #84 S1 (PR #422) merged the rules classifier.
+No production code changed; the harness is a throwaway under +examples/benchmarks/affect-judge/+.
+
+== 1. Record
+
+[source,text]
+----
+Decision question:
+  Does a model-based affect judgement on each reply phrase beat the S1 rules classifier enough to justify its
+  cost, without delaying first audio or slowing reply generation?
+
+Context / baseline:
+  A = crates/generative/src/affect.rs as merged (d47a1ee6): deterministic lexicon, microseconds, no model.
+  B = System One (Jev). C = the reply model emits an affect tag with the text.
+
+Hypothesis / expected outcome:
+  A model judge is more accurate than the lexicon on negation, sarcasm and mention traps, but a per-phrase call
+  costs too much latency or GPU time.
+
+Guardrails:
+  Model output is data, never authority; no Jev/LLM call in the frame loop; synthetic data only; thresholds
+  not changed after measuring.
+
+Decision-changing evidence:
+  Macro-F1 gain over A on the blind set; added p95 time-to-first-audio; reply-generation slowdown.
+
+Cheapest informative test:
+  One blind labelled set, the real classifier, the real default local Thinking model on the real GPU.
+
+Dataset/workload:
+  examples/benchmarks/affect-judge/blind.json (scratch original I:\temp\expaffect-data\blind.json), 144
+  synthetic lines (120 ja, 24 en), written and labelled by a separate labeller who had not read affect.rs or
+  examples/affect/. Labels: neutral 49, joy 28, surprise 17, sadness 17, anger 17, calm 16. Traps: negation 13,
+  quote 10, mention 7, mixed 6, sarcasm 4, none 104. A fixed 20-line dev slice (random.Random(20261118) over
+  indices, dev_ids.json) was the only data used to adjust the B/C prompts (two iterations, then frozen). All
+  B/C/A numbers below are on the remaining 124 lines (neutral 42, joy 22, surprise 15, calm 13, sadness 16,
+  anger 16) unless stated.
+
+Commit/base/head:
+  Branch exp/reply-affect-judge from origin/main d47a1ee6.
+
+Profile/config fingerprint:
+  llama-server (Vulkan build shipped in aivtuber-local-v0.1.2) loaded gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf, the
+  local profile default, with the arguments +aivtuber-setup start+ uses (-c 4096, --reasoning off, -ngl 99) plus
+  --parallel 2 and port 18090 so a second request has its own slot. Temperature 0 for classification,
+  0.7 for reply generation.
+
+Seed:
+  20261118 (dev split, bootstrap); reply seeds rep*100 + prompt index.
+
+Provider/model versions:
+  Gemma 4 E4B it QAT UD-Q4_K_XL (4,215,695,776 bytes). No System One model or key (section 3).
+
+Other relevant environment:
+  Windows 11, RTX 2070 SUPER 8 GB shared with the desktop (about 3.0 GB already in use before the run).
+
+Confirmatory success/guardrail criteria (fixed in #423 before measuring):
+  Adopt B or C only if macro-F1 gain >= 0.10 over A on the blind set AND added p95 time-to-first-audio <= 20 ms
+  AND reply generation slows <= 5 %. Otherwise keep A.
+
+Decision:
+  Keep A. See section 5.
+----
+
+== 2. How the candidates were run
+
+* *A.* +examples/benchmarks/affect-judge/affect_dump.rs.txt+ (a throwaway cargo example, kept as text so it is
+  not built) calls +aivtuber_generative::classify_affect+ per line, release build.
+* *B (System One).* *Not measured.* See section 3.
+* *B' (local stand-in for B, not Jev).* The default local Thinking model asked, in a separate chat request per
+  line, for one closed-vocabulary word (system prompt with six class definitions and "most lines are neutral").
+  It shows what a separate per-phrase model call costs on this machine; it is not evidence about Jev's accuracy.
+* *C (Thinking tag).* The same model in the same request that carries the text: the prompt asks for
+  +[affect:X] + followed by the line unchanged. For accuracy the labelled lines were given as "the line you are
+  about to say" (they were not generated); reply quality used real replies (section 4.4).
+* A response that is not exactly one of the six names counts as a parse failure and as wrong.
+
+== 3. What System One (B) is here, and why it was not measured
+
+System One/Jev is not a local model in this repository. The adapter posts to +https://api.typesafe.ai/v1/systemone+
+over HTTPS with a bearer key (+docs/jev-routing.adoc+, +AIVTUBER_JEV_API_KEY+); the local profile runs without Jev,
+and the +reflex+ and +full+ profiles refuse to start without a key.
+No key is available on this machine and no local System One weights exist under +local-assets+ (only the Gemma
+LLM, Supertonic, K2v2 STT, VAD and an avatar). So B's accuracy, network latency and contention are *not measured*.
+Because B is remote it adds no local GPU load by construction; its added latency is a network round trip this
+experiment could not observe, and each phrase would also leave the machine (a privacy and availability cost the
+local profile avoids). B' below is the closest local measurement.
+
+== 4. Results
+
+=== 4.1 Accuracy on the blind set (n = 124)
+
+[cols="2,1,1,2,1,2"]
+|===
+|Candidate |Accuracy |Macro-F1 |False non-neutral (42 neutral lines) |Parse failures |Macro-F1 gain over A (95% bootstrap)
+
+|A rules |0.694 |0.703 |0.143 (6/42) |0 |-
+|B' separate Gemma call |0.935 |0.940 |0.167 (7/42) |0 |+0.237 (+0.154 to +0.337)
+|C Gemma tag |0.823 |0.853 |0.333 (14/42) |7 |+0.150 (+0.054 to +0.261)
+|===
+
+A on all 144 lines: accuracy 0.701, macro-F1 0.707, false non-neutral 0.163.
+Accuracy by trap (eval lines; A / B' / C): none 0.79 / 0.98 / 0.84 (n 90); negation 0.50 / 0.92 / 0.75 (12);
+quote 0.50 / 0.62 / 0.75 (8); mention 0.40 / 0.80 / 0.80 (5); mixed 0.50 / 1.0 / 1.0 (6); sarcasm 0.0 / 0.67 / 0.33 (3).
+By language: ja 0.69 / 0.93 / 0.83 (101), en 0.70 / 0.96 / 0.78 (23).
+All seven C parse failures are the model writing +[affect:sad]+ on sadness lines (the prompt names +sadness+);
+a lenient alias would remove them, the closed-vocabulary rule used here does not. B' over-calls neutral lines as
+calm (4 of 42). Trap strata are small (3 to 12 lines): trap-level figures are indicative only.
+
+=== 4.2 Added latency per phrase
+
+[cols="3,1,1,3"]
+|===
+|Path |p50 ms |p95 ms |Note
+
+|A rules |0.010 |0.013 |per call, 201-call average per line, release build
+|B' separate call, GPU otherwise idle |248 |428 |124 sequential calls, about 25 prompt tokens, at most 8 output tokens
+|B' separate call while a reply streams (paced, 1 per 1.5 s) |212 |313 |22 calls
+|B' separate call while a reply streams (back to back) |217 |293 |285 calls
+|C tag |about 100 (estimate) |- |5 to 6 extra tokens at about 57 tokens/s before the first text; not isolated
+|===
+
+First-audio fit: Supertonic synthesises a 12-43 character reply in about 0.9 s p50 on CPU (EXP-0003, per reply, not
+per phrase) and Irodori LUNA bf16 takes 1.13 s p50 / 1.36 s p95 (EXP-0006, per reply). A 428 ms p95 call is shorter
+than either, so it could be *hidden* if started in parallel with phrase synthesis. That was not built or measured,
+and no per-phrase TTS time distribution was taken. Run in series (classify, then synthesise) the added
+time-to-first-audio is the whole 248 ms p50 / 428 ms p95, about 21 times the 20 ms limit at p95. With LUNA the TTS
+shares the GPU with the judge (EXP-0006: 3.1 GB VRAM next to Gemma); that was not run.
+
+=== 4.3 Contention: reply generation with a judge on the same GPU
+
+24 viewer comments (20 ja, 4 en), streamed replies, max 96 tokens, two rounds per condition, conditions interleaved
+by round (n = 48 replies per condition). Judge calls are B' and use the second server slot.
+
+[cols="3,1,2,1,1"]
+|===
+|Condition |Tokens/s mean |Paired slowdown vs alone (median / mean) |First token p50 ms |First token p90 ms
+
+|Alone |57.1 |- |131 |232
+|With paced judge (1 per 1.5 s) |52.8 |2.0 % / 7.5 % |127 |148
+|With saturating judge (back to back) |23.6 |59.4 % / 58.6 % |219 |258
+|===
+
+The alone condition had one 9.6 s first-token outlier and the saturating condition one 7.2 s outlier (server-side
+stalls, cause not isolated; they move means, not p50/p90). The paced result is mixed: the median reply is 2 %
+slower, the mean 7.5 % slower, and the slowest tenth runs at 0.74 of its solo speed. With 48 replies this is near
+the 5 % limit and above it on the mean. A judge on every phrase of a busy reply would sit between the paced and
+saturating rows.
+
+=== 4.4 C: reply quality signals (24 prompts x 2 seeds, plain vs tagged)
+
+|===
+|Signal |Plain |Tagged
+
+|Reply body length, chars (mean / p95) |48.3 / 64 |36.0 / 47.7
+|Japanese reply to Japanese prompt |100 % |100 %
+|Tag parse failures |- |0 of 48
+|Tag distribution |- |joy 36, calm 5, neutral 3, surprise 2, sadness 2, anger 0
+|First-token p50 / end p50 ms |99 / 586 |138 / 593
+|===
+
+The tag shortened the reply body by about a quarter, and 75 % of self-assigned tags were joy: the self-label of a
+cheerful persona is biased and is not an accuracy measurement. The 0.853 macro-F1 in 4.1 is for given text.
+
+== 5. Verdict against the fixed decision rule
+
+[cols="2,2,2,2"]
+|===
+|Gate |B (System One) |B' (local stand-in) |C
+
+|Macro-F1 gain >= 0.10 |not measured |pass (+0.237) |pass (+0.150)
+|Added p95 TTFA <= 20 ms |not measured |fail as a serial call (428 ms); unmeasured if hidden behind TTS |fail as a serial estimate (about 100 ms)
+|Generation slowdown <= 5 % |not measured (remote, no local GPU load) |fail on the mean (7.5 % paced), pass on the median (2 %), fail saturating (59 %) |not isolated; the reply is shorter, end-to-end time equal
+|===
+
+*Decision: Keep A.* No candidate meets all three gates as measured, and B could not be run. Accuracy is not what
+keeps a model judge out: it reads negation, mention and mixed lines much better than the lexicon (macro-F1 0.94
+against 0.70); the latency and contention gates do.
+
+== 6. Not measured
+
+* System One/Jev accuracy, latency and network cost (no key, no local weights).
+* Added TTFA when the judge runs in parallel with synthesis; any per-phrase Supertonic/LUNA time distribution.
+* The judge and Irodori LUNA on the GPU together.
+* A smaller dedicated classifier, a CPU classifier, or caching by phrase.
+* C's effect on reply quality beyond length and language match (no human or model rating).
+* Dataset is 124 lines with trap strata of 3 to 12; one labeller, one run, one GPU shared with the desktop.
+
+== 7. Follow-up and revisit
+
+* Revisit if a local System One-class model or a small CPU classifier exists, or if the judge can be moved off the
+  critical path (for example classify a phrase while the previous one plays).
+* Cheap next test if reopened: B' in parallel with TTS with measured per-phrase TTS times, and a sub-1B
+  classifier on CPU.
+
+== 8. Evidence artifacts
+
+* Raw (not committed): +I:\temp\expaffect-data\raw_classification.json+, +raw_contention.json+,
+  +raw_reply_quality.json+, +llama.err.log+.
+* Committed: scripts, blind set, dev ids and summary numbers in +examples/benchmarks/affect-judge/+.
+* Related: link:EXP-0003-japanese-tts-bench.adoc[EXP-0003], link:EXP-0006-irodori-tts-small-voices.adoc[EXP-0006],
+  +docs/jev-routing.adoc+, #84, #423.
