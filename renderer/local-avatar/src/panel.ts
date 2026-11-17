@@ -44,6 +44,9 @@ import {
   type SeedEntry,
   type SeedKind,
   voiceInputBody,
+  voiceInputChoiceResultText,
+  voiceInputDeviceBody,
+  voiceInputDuplexBody,
   voiceInputResultText,
   voiceInputView,
   otherReplies,
@@ -215,6 +218,32 @@ function renderVoiceInput(): void {
   const cloud = $("voice-input-cloud");
   cloud.textContent = view.cloudNote ?? "";
   cloud.hidden = view.cloudNote === null;
+  // #396: the open device, the dropdown and the headset switch. Names are
+  // host text (operator-local): textContent / option text only, never HTML.
+  $("voice-input-device-line").textContent = view.deviceText;
+  const select = $<HTMLSelectElement>("voice-input-device");
+  const wanted = JSON.stringify([view.deviceOptions, view.deviceSelected]);
+  if (select.dataset.shown !== wanted) {
+    select.dataset.shown = wanted;
+    select.replaceChildren(
+      ...view.deviceOptions.map((option) => {
+        const el = document.createElement("option");
+        el.value = option.value;
+        el.textContent = option.label;
+        return el;
+      }),
+    );
+    select.value = view.deviceSelected;
+  }
+  select.disabled = connectionLost || voiceInputBusy;
+  const headset = $<HTMLInputElement>("voice-input-headset");
+  headset.checked = view.headset;
+  headset.disabled = connectionLost || voiceInputBusy;
+  $("voice-input-headset-label").textContent = view.headsetLabel;
+  $("voice-input-headset-hint").textContent = view.headsetHint;
+  const dropped = $("voice-input-dropped");
+  dropped.textContent = view.droppedText ?? "";
+  dropped.hidden = view.droppedText === null;
   const enable = $<HTMLButtonElement>("voice-input-on");
   enable.textContent = view.enableLabel;
   enable.hidden = !view.canEnable;
@@ -234,6 +263,22 @@ async function setVoiceInput(enabled: boolean): Promise<void> {
     const { status, json } = await api("/api/speech-input", { method: "POST", body: JSON.stringify(voiceInputBody(enabled)) });
     const body = (json ?? {}) as { ok?: boolean; detail?: string };
     out.textContent = voiceInputResultText(enabled, status === 200 && body.ok === true, body.detail, status);
+  } catch {
+    out.textContent = "失敗しました(アプリに接続できません)";
+  } finally {
+    voiceInputBusy = false;
+    void poll();
+  }
+}
+
+async function setVoiceInputChoice(path: string, body: unknown, what: "マイク" | "ヘッドセット設定"): Promise<void> {
+  voiceInputBusy = true;
+  renderVoiceInput();
+  const out = $("voice-input-result");
+  try {
+    const { status, json } = await api(path, { method: "POST", body: JSON.stringify(body) });
+    const reply = (json ?? {}) as { ok?: boolean; detail?: string };
+    out.textContent = voiceInputChoiceResultText(what, status === 200 && reply.ok === true, reply.detail, status);
   } catch {
     out.textContent = "失敗しました(アプリに接続できません)";
   } finally {
@@ -1148,6 +1193,16 @@ $("memory-save").addEventListener("click", () => void saveMemory());
 $("memory-reload").addEventListener("click", () => void loadMemory());
 $("voice-input-on").addEventListener("click", () => void setVoiceInput(true));
 $("voice-input-off").addEventListener("click", () => void setVoiceInput(false));
+$<HTMLSelectElement>("voice-input-device").addEventListener(
+  "change",
+  (event) =>
+    void setVoiceInputChoice("/api/speech-input/device", voiceInputDeviceBody((event.target as HTMLSelectElement).value), "マイク"),
+);
+$<HTMLInputElement>("voice-input-headset").addEventListener(
+  "change",
+  (event) =>
+    void setVoiceInputChoice("/api/speech-input/duplex", voiceInputDuplexBody((event.target as HTMLInputElement).checked), "ヘッドセット設定"),
+);
 $("stop").addEventListener("click", () => void control("stop"));
 $("mute").addEventListener("click", () => void control("mute"));
 
