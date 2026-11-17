@@ -28,6 +28,11 @@ import {
   enablePatch,
   modelView,
   usageView,
+  personaGetBody,
+  personaResultText,
+  personaSetBody,
+  personaTextFrom,
+  personaView,
   voiceInputBody,
   voiceInputResultText,
   voiceInputView,
@@ -135,6 +140,7 @@ function render(): void {
   renderModel();
   renderUsage();
   renderVoiceInput();
+  renderPersona();
   renderVoice();
   renderIngress();
   renderAvatar();
@@ -222,6 +228,81 @@ async function setVoiceInput(enabled: boolean): Promise<void> {
   } finally {
     voiceInputBusy = false;
     void poll();
+  }
+}
+
+/** Character sheet (#401): hidden unless the app composed live editing. The text
+ * is loaded from the host once when the card first shows and again on "reload";
+ * a poll never overwrites what is being typed. Every string goes in with
+ * textContent or `.value`, never as HTML. */
+let personaLoaded = false;
+let personaTried = false;
+let personaBusy = false;
+
+function renderPersona(): void {
+  const field = $<HTMLTextAreaElement>("persona-text");
+  const view = personaView(state, field.value);
+  $("persona-section").hidden = view === null;
+  if (view === null) {
+    personaLoaded = false;
+    personaTried = false;
+    return;
+  }
+  if (!personaLoaded && !personaBusy && !personaTried) {
+    personaTried = true;
+    void loadPersona();
+  }
+  $("persona-explanation").textContent = view.explanation;
+  const cloud = $("persona-cloud");
+  cloud.textContent = view.cloudNote ?? "";
+  cloud.hidden = view.cloudNote === null;
+  const memoryOnly = $("persona-memory-only");
+  memoryOnly.textContent = view.memoryOnlyNote ?? "";
+  memoryOnly.hidden = view.memoryOnlyNote === null;
+  const counter = $("persona-counter");
+  counter.textContent = view.counterText;
+  counter.className = view.health === "warn" ? "error" : "hint";
+  $<HTMLButtonElement>("persona-save").disabled = connectionLost || personaBusy || !view.canSave || !personaLoaded;
+  $<HTMLButtonElement>("persona-reload").disabled = connectionLost || personaBusy;
+}
+
+async function loadPersona(): Promise<void> {
+  personaBusy = true;
+  const out = $("persona-result");
+  try {
+    const { status, json } = await api("/api/persona/get", { method: "POST", body: JSON.stringify(personaGetBody()) });
+    const body = (json ?? {}) as { ok?: boolean; detail?: string };
+    const text = personaTextFrom(json);
+    if (status === 200 && body.ok === true && text !== null) {
+      $<HTMLTextAreaElement>("persona-text").value = text;
+      personaLoaded = true;
+      out.textContent = "";
+    } else {
+      out.textContent = personaResultText("reload", false, body.detail, status);
+    }
+  } catch {
+    out.textContent = "読み込めませんでした(アプリに接続できません)";
+  } finally {
+    personaBusy = false;
+    renderPersona();
+  }
+}
+
+async function savePersona(): Promise<void> {
+  personaBusy = true;
+  renderPersona();
+  const out = $("persona-result");
+  try {
+    const text = $<HTMLTextAreaElement>("persona-text").value;
+    const { status, json } = await api("/api/persona/set", { method: "POST", body: JSON.stringify(personaSetBody(text)) });
+    const body = (json ?? {}) as { ok?: boolean; detail?: string };
+    out.textContent = personaResultText("save", status === 200 && body.ok === true, body.detail, status);
+  } catch {
+    out.textContent = "保存できませんでした(アプリに接続できません)";
+  } finally {
+    personaBusy = false;
+    void poll();
+    renderPersona();
   }
 }
 
@@ -897,6 +978,9 @@ for (const key of TUNING_KEYS) {
     void voicePost("/api/voice", tuningPatch(key, Number(input.value)), () => "調整しました。次の発話から反映されます");
   });
 }
+$("persona-text").addEventListener("input", () => renderPersona());
+$("persona-save").addEventListener("click", () => void savePersona());
+$("persona-reload").addEventListener("click", () => void loadPersona());
 $("voice-input-on").addEventListener("click", () => void setVoiceInput(true));
 $("voice-input-off").addEventListener("click", () => void setVoiceInput(false));
 $("stop").addEventListener("click", () => void control("stop"));

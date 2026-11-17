@@ -239,6 +239,7 @@ fn capability_for_action(action: &str) -> Option<Capability> {
         "speech_input.control" | "speech_input.enable" | "speech_input.disable" => {
             Some(Capability::SpeechInputControl)
         }
+        "persona.configure" | "persona.set" | "persona.get" => Some(Capability::PersonaConfigure),
         _ => None,
     }
 }

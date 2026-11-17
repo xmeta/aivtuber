@@ -23,6 +23,8 @@ export interface PanelState {
     avatar_model?: AvatarState | null;
     /** Voice input (#400); absent from an older host, or when no speech sidecar is configured. */
     voice_input?: VoiceInputState | null;
+    /** Live character-sheet editing (#401); absent from an older host, or when the app did not compose it. */
+    persona_editor?: PersonaEditorState | null;
     /** Session Thinking tokens/cost and the optional spend cap (#367); absent unless composed. */
     thinking_usage?: ThinkingUsageState | null;
   };
@@ -253,6 +255,7 @@ export function parseState(value: unknown): PanelState | null {
   const chatIngress = parseChatIngressState(v.status.chat_ingress);
   const avatarModel = parseAvatarState(v.status.avatar_model);
   const voiceInput = parseVoiceInputState(v.status.voice_input);
+  const personaEditor = parsePersonaEditorState(v.status.persona_editor);
   const thinkingUsage = parseUsageState(v.status.thinking_usage);
   return {
     ...(v as PanelState),
@@ -263,6 +266,7 @@ export function parseState(value: unknown): PanelState | null {
       chat_ingress: chatIngress,
       avatar_model: avatarModel,
       voice_input: voiceInput,
+      persona_editor: personaEditor,
       thinking_usage: thinkingUsage,
     },
   };
@@ -965,6 +969,97 @@ export function voiceInputResultText(enabled: boolean, ok: boolean, detail: unkn
   const name = enabled ? "オンにする" : "オフにする";
   if (ok && status === 200) return enabled ? "音声入力をオンにしました" : "音声入力をオフにしました";
   return `${name}ことができませんでした${raw === "" ? ` (${status})` : `: ${raw}`}`;
+}
+
+// ---- character sheet (#401) ----
+
+/** Mirrors `MAX_PERSONA_BYTES` (crates/domain/src/persona.rs). */
+export const MAX_PERSONA_BYTES = 3000;
+
+/** Mirrors `PersonaEditorStatus` (crates/app/src/persona.rs). */
+export interface PersonaEditorState {
+  /** A save is written to the persona file and survives a restart. */
+  persisted: boolean;
+  /** The Thinking endpoint leaves this machine: the sheet goes to a cloud model. */
+  thinking_remote: boolean;
+}
+
+/** The editor state only if it has exactly the documented shape; anything else hides the editor. */
+export function parsePersonaEditorState(value: unknown): PersonaEditorState | null {
+  if (typeof value !== "object" || value === null) return null;
+  const v = value as Record<string, unknown>;
+  if (typeof v.persisted !== "boolean" || typeof v.thinking_remote !== "boolean") return null;
+  return { persisted: v.persisted, thinking_remote: v.thinking_remote };
+}
+
+/**
+ * The size the host will measure: UTF-8 bytes after line endings become LF and
+ * trailing whitespace is trimmed (the host's normalisation, `parse_persona`).
+ */
+export function personaBytes(text: string): number {
+  const normalised = text.replace(/\r\n?/g, "\n").trimEnd();
+  return new TextEncoder().encode(normalised).length;
+}
+
+export const PERSONA_CLOUD_NOTE =
+  "この内容は返答ごとにクラウドのモデルへ送信されます / sent to the cloud model with every reply";
+export const PERSONA_MEMORY_ONLY_NOTE =
+  "保存先のファイルが設定されていないため、この内容はアプリを再起動すると元に戻ります";
+export const PERSONA_EXPLANATION =
+  "キャラクターの名前・一人称・口調などを書きます。保存すると次の返答から反映されます(すでに生成中の返答は元の内容のままです)。空にして保存すると解除されます";
+
+export interface PersonaView {
+  /** `1,234 / 3,000 バイト`. */
+  counterText: string;
+  /** warn once the text is over the limit. */
+  health: Health;
+  explanation: string;
+  /** Shown whenever Thinking is remote, so it is read before the first save. */
+  cloudNote: string | null;
+  /** Shown when a save is not written to a file. */
+  memoryOnlyNote: string | null;
+  canSave: boolean;
+}
+
+/** What the character-sheet card shows for the text in the editor, or `null` when it stays hidden. */
+export function personaView(state: PanelState | null, text: string): PersonaView | null {
+  const editor = state?.status.persona_editor ?? null;
+  if (editor === null) return null;
+  const bytes = personaBytes(text);
+  return {
+    counterText: `${bytes.toLocaleString("en-US")} / ${MAX_PERSONA_BYTES.toLocaleString("en-US")} バイト`,
+    health: bytes > MAX_PERSONA_BYTES ? "warn" : "ok",
+    explanation: PERSONA_EXPLANATION,
+    cloudNote: editor.thinking_remote ? PERSONA_CLOUD_NOTE : null,
+    memoryOnlyNote: editor.persisted ? null : PERSONA_MEMORY_ONLY_NOTE,
+    canSave: bytes <= MAX_PERSONA_BYTES,
+  };
+}
+
+/** The body of `POST /api/persona/set`: the whole text and nothing else. */
+export function personaSetBody(text: string): { text: string } {
+  return { text };
+}
+
+/** The body of `POST /api/persona/get`: an empty object. */
+export function personaGetBody(): Record<string, never> {
+  return {};
+}
+
+/** The text a `persona/get` answer carries, only if it is a string within the file bound. */
+export function personaTextFrom(json: unknown): string | null {
+  if (typeof json !== "object" || json === null) return null;
+  const text = (json as Record<string, unknown>).text;
+  if (typeof text !== "string" || personaBytes(text) > MAX_PERSONA_BYTES) return null;
+  return text;
+}
+
+/** The line shown after a save or a reload; the host's own text is only a short tail. */
+export function personaResultText(kind: "save" | "reload", ok: boolean, detail: unknown, status: number): string {
+  const raw = typeof detail === "string" ? bounded(detail) : "";
+  if (ok && status === 200) return kind === "save" ? "保存しました。次の返答から反映されます" : "読み込みました";
+  const name = kind === "save" ? "保存" : "読み込み";
+  return `${name}できませんでした${raw === "" ? ` (${status})` : `: ${raw}`}`;
 }
 
 // ---- VRM avatar choice (#362) ----
