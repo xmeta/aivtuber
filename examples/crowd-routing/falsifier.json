@@ -1,0 +1,62 @@
+{
+  "fixture_id": "crowd-routing-falsifier-v1",
+  "issue": "#79 S2",
+  "description": "Replay fixture for crowd-level reaction routing. Phase 'celebration' is 85 celebration comments in mixed tokens (three reaction families, one reaction group) from 40 viewers plus a threat, a scam link and a genuine question: it must yield exactly one crowd reaction, not a reply per comment, and the three outliers must stay individual. Phases 'question' and 'question-again' are repeated-question bursts: each must yield exactly one representative reply carrying a typed crowd summary, and the second must read the first across batches (rising trend, raised intensity, two batches). Time is the fixture's own logical milliseconds; nothing here is wall-clock.",
+  "lane": {
+    "burst": {
+      "window_ms": 1500,
+      "burst_enter_count": 2,
+      "top_k": 8,
+      "max_per_actor": 4,
+      "max_candidates": 64,
+      "max_bytes": 32768
+    },
+    "reply_ttl_ms": 20000,
+    "crowd": { "window_ms": 60000, "cooldown_ms": 20000 }
+  },
+  "phases": [
+    {
+      "name": "celebration",
+      "start_ms": 0,
+      "step_ms": 5,
+      "items": [
+        { "actor": "viewer:w1", "text": "hello everyone" },
+        { "actor": "viewer:w2", "text": "how is the stream going" },
+        { "repeat": 30, "actor_prefix": "fan", "actors": 40, "texts": ["おめでとう", "GG", "congrats", "nice", "おめでとう！"] },
+        { "actor": "viewer:out-threat", "text": "i will find you and kill you" },
+        { "repeat": 30, "actor_prefix": "fan", "actors": 40, "texts": ["おめでとう", "GG", "congrats", "nice", "おめでとう！"] },
+        { "actor": "viewer:out-scam", "text": "free bitcoin giveaway http://scam.example/claim" },
+        { "repeat": 25, "actor_prefix": "fan", "actors": 40, "texts": ["おめでとう", "GG", "congrats", "nice", "おめでとう！"] },
+        { "actor": "viewer:out-question", "text": "what is your favorite boss?" }
+      ]
+    },
+    {
+      "name": "question",
+      "start_ms": 60000,
+      "step_ms": 5,
+      "items": [
+        { "actor": "viewer:w3", "text": "good evening" },
+        { "actor": "viewer:w4", "text": "ready for tonight" },
+        { "repeat": 12, "actor_prefix": "q", "actors": 12, "texts": ["What game is this?", "what game is this ?", "WHAT GAME IS THIS?", "what game is this?"] },
+        { "actor": "viewer:out-scam-2", "text": "free robux http://scam.example/robux" },
+        { "actor": "viewer:out-question-2", "text": "can you play the piano?" }
+      ]
+    },
+    {
+      "name": "question-again",
+      "start_ms": 70000,
+      "step_ms": 5,
+      "items": [
+        { "actor": "viewer:w5", "text": "back again" },
+        { "actor": "viewer:w6", "text": "still here" },
+        { "repeat": 20, "actor_prefix": "r", "actors": 20, "texts": ["What game is this?", "what game is this ?", "WHAT GAME IS THIS?", "what game is this?"] }
+      ]
+    }
+  ],
+  "expected": {
+    "celebration_comments": 85,
+    "crowd_non_verbal_reactions": 1,
+    "crowd_representative_replies": 2,
+    "outliers_kept_individual": ["evt-33", "evt-64", "evt-90"]
+  }
+}
