@@ -25,6 +25,8 @@ export interface PanelState {
     voice_input?: VoiceInputState | null;
     /** Live character-sheet editing (#401); absent from an older host, or when the app did not compose it. */
     persona_editor?: PersonaEditorState | null;
+    /** Live memory-seed editing (#402); absent from an older host, or when the app did not compose it. */
+    memory_seed_editor?: MemorySeedEditorState | null;
     /** Session Thinking tokens/cost and the optional spend cap (#367); absent unless composed. */
     thinking_usage?: ThinkingUsageState | null;
   };
@@ -256,6 +258,7 @@ export function parseState(value: unknown): PanelState | null {
   const avatarModel = parseAvatarState(v.status.avatar_model);
   const voiceInput = parseVoiceInputState(v.status.voice_input);
   const personaEditor = parsePersonaEditorState(v.status.persona_editor);
+  const memorySeedEditor = parseMemorySeedEditorState(v.status.memory_seed_editor);
   const thinkingUsage = parseUsageState(v.status.thinking_usage);
   return {
     ...(v as PanelState),
@@ -267,6 +270,7 @@ export function parseState(value: unknown): PanelState | null {
       avatar_model: avatarModel,
       voice_input: voiceInput,
       persona_editor: personaEditor,
+      memory_seed_editor: memorySeedEditor,
       thinking_usage: thinkingUsage,
     },
   };
@@ -1597,4 +1601,205 @@ export function connectionText(c: ConnectionKind): string {
     case "http-error":
       return `再接続中…(応答エラー ${Number.isFinite(c.status) ? Math.trunc(c.status) : 0})`;
   }
+}
+
+// ---- memory seed (#402) ----
+
+/** Mirror `MAX_SEED_ENTRIES` / `MAX_SEED_CLAIM_BYTES` / `MAX_SEED_FILE_BYTES` (crates/app/src/memory_seed.rs). */
+export const MAX_SEED_ENTRIES = 128;
+export const MAX_SEED_CLAIM_BYTES = 240;
+export const MAX_SEED_FILE_BYTES = 64 * 1024;
+/** The only `schema_version` the host's seed parser accepts. */
+export const SEED_SCHEMA_VERSION = "0.1.0";
+
+export type SeedKind = "persona-fact" | "running-joke" | "commitment" | "segment-summary";
+
+/** The four kinds of `schemas/memory-seed.schema.json`, with the label the card shows. */
+export const SEED_KINDS: readonly { kind: SeedKind; label: string }[] = [
+  { kind: "persona-fact", label: "人物設定" },
+  { kind: "running-joke", label: "お決まりのネタ" },
+  { kind: "commitment", label: "約束" },
+  { kind: "segment-summary", label: "配信のまとめ" },
+];
+
+export interface SeedEntry {
+  kind: SeedKind;
+  claim: string;
+}
+
+/** The whole seed document (`schemas/memory-seed.schema.json`): Save sends all of it. */
+export interface SeedDocument {
+  schema_version: string;
+  seed_id: string;
+  revision: string;
+  entries: SeedEntry[];
+}
+
+/** Mirrors `MemorySeedEditorStatus` (crates/app/src/memory_seed.rs). Counts and a hash, never a claim. */
+export interface MemorySeedEditorState {
+  /** A save is written to the seed file and survives a restart. */
+  persisted: boolean;
+  /** The Thinking endpoint leaves this machine: relevant entries go to a cloud model. */
+  thinking_remote: boolean;
+  entries: number;
+  content_hash: string;
+}
+
+/** The editor state only if it has exactly the documented shape; anything else hides the card. */
+export function parseMemorySeedEditorState(value: unknown): MemorySeedEditorState | null {
+  if (typeof value !== "object" || value === null) return null;
+  const v = value as Record<string, unknown>;
+  if (typeof v.persisted !== "boolean" || typeof v.thinking_remote !== "boolean") return null;
+  if (typeof v.entries !== "number" || !Number.isInteger(v.entries) || v.entries < 0) return null;
+  if (typeof v.content_hash !== "string") return null;
+  return {
+    persisted: v.persisted,
+    thinking_remote: v.thinking_remote,
+    entries: v.entries,
+    content_hash: v.content_hash,
+  };
+}
+
+const SEED_KIND_SET: ReadonlySet<string> = new Set(SEED_KINDS.map((k) => k.kind));
+
+/**
+ * The document a `memory-seed/get` answer carries (its `text`), only if it is
+ * JSON of exactly the seed shape within the bounds. Anything else is `null`, so
+ * the card never edits a document it cannot send back.
+ */
+export function parseSeedDocument(text: unknown): SeedDocument | null {
+  if (typeof text !== "string" || new TextEncoder().encode(text).length > MAX_SEED_FILE_BYTES) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const v = value as Record<string, unknown>;
+  if (v.schema_version !== SEED_SCHEMA_VERSION) return null;
+  if (typeof v.seed_id !== "string" || typeof v.revision !== "string") return null;
+  if (!Array.isArray(v.entries) || v.entries.length > MAX_SEED_ENTRIES) return null;
+  const entries: SeedEntry[] = [];
+  for (const raw of v.entries) {
+    if (typeof raw !== "object" || raw === null) return null;
+    const e = raw as Record<string, unknown>;
+    if (typeof e.kind !== "string" || !SEED_KIND_SET.has(e.kind) || typeof e.claim !== "string") return null;
+    entries.push({ kind: e.kind as SeedKind, claim: e.claim });
+  }
+  return { schema_version: v.schema_version, seed_id: v.seed_id, revision: v.revision, entries };
+}
+
+/** The size the host measures for one claim: UTF-8 bytes of the claim with its edges trimmed. */
+export function seedClaimBytes(claim: string): number {
+  return new TextEncoder().encode(claim.trim()).length;
+}
+
+/** The host's duplicate rule (`fold`): ignoring case and the amount of white space. */
+function seedFold(claim: string): string {
+  return claim.split(/\s+/).filter((part) => part !== "").join(" ").toLowerCase();
+}
+
+// eslint-disable-next-line no-control-regex
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/;
+
+/** Why a claim cannot be saved, in Japanese, or `null`. The host checks again. */
+export function seedClaimProblem(claim: string, earlier: readonly string[]): string | null {
+  const trimmed = claim.trim();
+  if (trimmed === "") return "内容が空です。入力するか、この項目を削除してください";
+  if (CONTROL_CHARS.test(trimmed)) return "改行や制御文字は使えません";
+  if (seedClaimBytes(claim) > MAX_SEED_CLAIM_BYTES) return `${MAX_SEED_CLAIM_BYTES} バイトを超えています`;
+  const folded = seedFold(trimmed);
+  if (earlier.some((other) => seedFold(other) === folded)) return "同じ内容の項目が前にあります";
+  return null;
+}
+
+export const SEED_CLOUD_NOTE =
+  "関連する項目は返答のたびにクラウドのモデルへ送信されます / relevant entries are sent to the cloud model";
+export const SEED_MEMORY_ONLY_NOTE =
+  "保存先のファイルが設定されていないため、この内容はアプリを再起動すると元に戻ります";
+export const SEED_EXPLANATION =
+  "配信者として覚えておくことを1行ずつ書きます。保存すると次の返答から反映されます。返答ごとに、話題に関係のある項目だけがモデルに渡されます";
+
+export interface SeedRowView {
+  kindLabel: string;
+  /** `12 / 240 バイト`. */
+  bytesText: string;
+  health: Health;
+  /** Why this row blocks saving, or `null`. */
+  problem: string | null;
+}
+
+export interface SeedView {
+  /** `3 / 128 件`. */
+  countText: string;
+  health: Health;
+  explanation: string;
+  /** Shown whenever Thinking is remote, so it is read before the first save. */
+  cloudNote: string | null;
+  /** Shown when a save is not written to a file. */
+  memoryOnlyNote: string | null;
+  rows: SeedRowView[];
+  canSave: boolean;
+  canAdd: boolean;
+}
+
+/** What the memory card shows for the entries in the editor, or `null` when it stays hidden. */
+export function seedView(state: PanelState | null, entries: readonly SeedEntry[]): SeedView | null {
+  const editor = state?.status.memory_seed_editor ?? null;
+  if (editor === null) return null;
+  const rows = entries.map((entry, index): SeedRowView => {
+    const bytes = seedClaimBytes(entry.claim);
+    const problem = seedClaimProblem(
+      entry.claim,
+      entries.slice(0, index).map((e) => e.claim),
+    );
+    return {
+      kindLabel: SEED_KINDS.find((k) => k.kind === entry.kind)?.label ?? entry.kind,
+      bytesText: `${bytes} / ${MAX_SEED_CLAIM_BYTES} バイト`,
+      health: problem === null ? "ok" : "warn",
+      problem,
+    };
+  });
+  const tooMany = entries.length > MAX_SEED_ENTRIES;
+  return {
+    countText: `${entries.length} / ${MAX_SEED_ENTRIES} 件`,
+    health: tooMany ? "warn" : "ok",
+    explanation: SEED_EXPLANATION,
+    cloudNote: editor.thinking_remote ? SEED_CLOUD_NOTE : null,
+    memoryOnlyNote: editor.persisted ? null : SEED_MEMORY_ONLY_NOTE,
+    rows,
+    canSave: !tooMany && rows.every((row) => row.problem === null),
+    canAdd: entries.length < MAX_SEED_ENTRIES,
+  };
+}
+
+/** The body of `POST /api/memory-seed/set`: the whole document, claims trimmed, nothing else. */
+export function seedSetBody(seed: Pick<SeedDocument, "seed_id" | "revision">, entries: readonly SeedEntry[]): SeedDocument {
+  return {
+    schema_version: SEED_SCHEMA_VERSION,
+    seed_id: seed.seed_id,
+    revision: seed.revision,
+    entries: entries.map((entry) => ({ kind: entry.kind, claim: entry.claim.trim() })),
+  };
+}
+
+/** The body of `POST /api/memory-seed/get`: an empty object. */
+export function seedGetBody(): Record<string, never> {
+  return {};
+}
+
+/** The text a `memory-seed/get` answer carries, if it is a string; `parseSeedDocument` checks the rest. */
+export function seedTextFrom(json: unknown): string | null {
+  if (typeof json !== "object" || json === null) return null;
+  const text = (json as Record<string, unknown>).text;
+  return typeof text === "string" ? text : null;
+}
+
+/** The line shown after a save or a reload; the host's own text is only a short tail. */
+export function seedResultText(kind: "save" | "reload", ok: boolean, detail: unknown, status: number): string {
+  const raw = typeof detail === "string" ? bounded(detail) : "";
+  if (ok && status === 200) return kind === "save" ? "保存しました。次の返答から反映されます" : "読み込みました";
+  const name = kind === "save" ? "保存" : "読み込み";
+  return `${name}できませんでした${raw === "" ? ` (${status})` : `: ${raw}`}`;
 }

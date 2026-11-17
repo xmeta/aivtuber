@@ -75,3 +75,7 @@ details[open] > summary { margin-bottom: .5rem; }
   .rows { grid-template-columns: minmax(0, 1fr); }
   .chat .log { max-height: 55vh; }
 }
+.seed-list { list-style: none; margin: .5rem 0; padding: 0; display: flex; flex-direction: column; gap: .4rem; }
+.seed-row { display: grid; grid-template-columns: auto 1fr auto auto; gap: .4rem; align-items: center; }
+.seed-row .seed-claim { min-width: 0; width: 100%; }
+.seed-row .seed-problem { grid-column: 1 / -1; margin: 0; }

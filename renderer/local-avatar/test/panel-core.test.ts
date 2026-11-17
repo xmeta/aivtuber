@@ -40,6 +40,21 @@ import {
   parseState,
   parsePersonaEditorState,
   parseVoiceInputState,
+  MAX_SEED_ENTRIES,
+  MAX_SEED_FILE_BYTES,
+  SEED_CLOUD_NOTE,
+  SEED_EXPLANATION,
+  SEED_KINDS,
+  SEED_MEMORY_ONLY_NOTE,
+  parseMemorySeedEditorState,
+  parseSeedDocument,
+  seedClaimBytes,
+  seedGetBody,
+  seedResultText,
+  seedSetBody,
+  seedTextFrom,
+  seedView,
+  type SeedKind,
   personaBytes,
   personaGetBody,
   personaResultText,
@@ -1319,5 +1334,193 @@ describe("character sheet requests", () => {
     expect(personaResultText("reload", false, undefined, 503)).toBe("読み込みできませんでした (503)");
     expect(personaResultText("save", true, "x", 500)).toContain("できませんでした");
     expect(personaResultText("save", false, "x".repeat(5000), 409).length).toBeLessThan(MAX_HOST_TEXT_CHARS + 60);
+  });
+});
+
+// ---- memory seed (#402) ----
+
+const seedEditor = (over: Record<string, unknown> = {}) => ({
+  persisted: true,
+  thinking_remote: false,
+  entries: 2,
+  content_hash: "ab".repeat(32),
+  ...over,
+});
+
+const withSeedEditor = (value: unknown) =>
+  parseState({
+    schema: "local-panel/1",
+    uptime_ms: 5,
+    status: {
+      muted: false,
+      audio_error: null,
+      avatar_error: null,
+      stream_error: null,
+      content_queue: 0,
+      scheduler_items: 0,
+      generation_active: false,
+      ...(value === undefined ? {} : { memory_seed_editor: value }),
+    },
+    replies: [],
+    avatar_url: null,
+  });
+
+const seedEntry = (claim: string, kind: SeedKind = "persona-fact") => ({ kind, claim });
+
+describe("memory seed editor state", () => {
+  test("a host that does not send the field hides the card", () => {
+    const older = withSeedEditor(undefined);
+    expect(older).not.toBeNull();
+    expect(older!.status.memory_seed_editor ?? null).toBeNull();
+    expect(seedView(older, [])).toBeNull();
+    expect(seedView(null, [])).toBeNull();
+  });
+
+  test("anything but the documented shape is dropped, not fatal", () => {
+    for (const bad of [
+      null,
+      "on",
+      7,
+      [],
+      {},
+      seedEditor({ persisted: "yes" }),
+      seedEditor({ thinking_remote: undefined }),
+      seedEditor({ entries: -1 }),
+      seedEditor({ entries: 1.5 }),
+      seedEditor({ entries: "2" }),
+      seedEditor({ content_hash: 3 }),
+    ]) {
+      expect(parseMemorySeedEditorState(bad)).toBeNull();
+      const parsed = withSeedEditor(bad);
+      expect(parsed).not.toBeNull();
+      expect(seedView(parsed, [])).toBeNull();
+    }
+    expect(parseMemorySeedEditorState(seedEditor())).toEqual(seedEditor());
+  });
+});
+
+describe("memory seed document", () => {
+  const doc = (over: Record<string, unknown> = {}) =>
+    JSON.stringify({
+      schema_version: "0.1.0",
+      seed_id: "s",
+      revision: "1",
+      entries: [seedEntry("ミコトは猫が好き"), seedEntry("冷蔵庫はいつも空", "running-joke")],
+      ...over,
+    });
+
+  test("a get answer is taken only when it is exactly the seed shape within the bounds", () => {
+    const parsed = parseSeedDocument(doc());
+    expect(parsed?.entries.length).toBe(2);
+    expect(parsed?.seed_id).toBe("s");
+    for (const bad of [
+      null,
+      7,
+      "",
+      "not json",
+      "[]",
+      "null",
+      doc({ schema_version: "9.9.9" }),
+      doc({ seed_id: 3 }),
+      doc({ entries: "x" }),
+      doc({ entries: [seedEntry("a", "viewer-fact" as SeedKind)] }),
+      doc({ entries: [{ kind: "persona-fact" }] }),
+      doc({ entries: Array.from({ length: MAX_SEED_ENTRIES + 1 }, (_, i) => seedEntry(`c${i}`)) }),
+      doc({ entries: [seedEntry("a".repeat(MAX_SEED_FILE_BYTES))] }),
+    ]) {
+      expect(parseSeedDocument(bad)).toBeNull();
+    }
+    expect(seedTextFrom({ ok: true, text: "x" })).toBe("x");
+    for (const bad of [null, "x", 7, {}, { text: 3 }, { text: null }]) expect(seedTextFrom(bad)).toBeNull();
+  });
+
+  test("the set body is the whole document with trimmed claims and nothing else", () => {
+    const body = seedSetBody({ seed_id: "s", revision: "1" }, [seedEntry("  ミコト  "), seedEntry("b", "commitment")]);
+    expect(Object.keys(body)).toEqual(["schema_version", "seed_id", "revision", "entries"]);
+    expect(body).toEqual({
+      schema_version: "0.1.0",
+      seed_id: "s",
+      revision: "1",
+      entries: [seedEntry("ミコト"), seedEntry("b", "commitment")],
+    });
+    expect(Object.keys(body.entries[0]!)).toEqual(["kind", "claim"]);
+    expect(JSON.stringify(seedGetBody())).toBe("{}");
+    // What the card sends is what the card accepts back.
+    expect(parseSeedDocument(JSON.stringify(body))).toEqual(body);
+  });
+});
+
+describe("memory seed view", () => {
+  const state = (over: Record<string, unknown> = {}) => withSeedEditor(seedEditor(over));
+
+  test("the claim counter measures UTF-8 bytes of the trimmed claim", () => {
+    expect(seedClaimBytes("")).toBe(0);
+    expect(seedClaimBytes("abc")).toBe(3);
+    expect(seedClaimBytes("ミコト")).toBe(9);
+    expect(seedClaimBytes("  ミコト \t")).toBe(9);
+    const view = seedView(state(), [seedEntry("ミコト")])!;
+    expect(view.rows[0]!.bytesText).toBe("9 / 240 バイト");
+    expect(view.rows[0]!.kindLabel).toBe("人物設定");
+    expect(view.countText).toBe("1 / 128 件");
+    expect(view.canSave && view.canAdd).toBe(true);
+  });
+
+  test("a claim at exactly 240 bytes saves; one byte more does not", () => {
+    const at = seedView(state(), [seedEntry("あ".repeat(80))])!;
+    expect([at.rows[0]!.health, at.canSave]).toEqual(["ok", true]);
+    const over = seedView(state(), [seedEntry("あ".repeat(80) + "a")])!;
+    expect([over.rows[0]!.health, over.canSave]).toEqual(["warn", false]);
+    expect(over.rows[0]!.problem).toContain("240");
+    expect(over.rows[0]!.bytesText).toBe("241 / 240 バイト");
+  });
+
+  test("empty, multi-line and repeated claims block saving, with the reason on the row", () => {
+    expect(seedView(state(), [seedEntry("  ")])!.rows[0]!.problem).toContain("空");
+    expect(seedView(state(), [seedEntry("a\nb")])!.rows[0]!.problem).toContain("改行");
+    expect(seedView(state(), [seedEntry("a\u0000b")])!.canSave).toBe(false);
+    const repeated = seedView(state(), [seedEntry("Same  claim"), seedEntry("same CLAIM", "commitment")])!;
+    expect(repeated.rows[0]!.problem).toBeNull();
+    expect(repeated.rows[1]!.problem).toContain("同じ内容");
+    expect(repeated.canSave).toBe(false);
+    // The empty seed is a valid document (it clears the memory).
+    expect(seedView(state(), [])!.canSave).toBe(true);
+  });
+
+  test("the entry limit stops adding and saving", () => {
+    const full = Array.from({ length: MAX_SEED_ENTRIES }, (_, i) => seedEntry(`claim ${i}`));
+    const atLimit = seedView(state(), full)!;
+    expect([atLimit.canAdd, atLimit.canSave, atLimit.health]).toEqual([false, true, "ok"]);
+    const over = seedView(state(), [...full, seedEntry("one more")])!;
+    expect([over.canSave, over.health]).toEqual([false, "warn"]);
+    expect(over.countText).toBe("129 / 128 件");
+  });
+
+  test("the cloud sentence shows exactly when Thinking is remote", () => {
+    expect(seedView(state({ thinking_remote: false }), [])!.cloudNote).toBeNull();
+    const remote = seedView(state({ thinking_remote: true }), [])!;
+    expect(remote.cloudNote).toBe(SEED_CLOUD_NOTE);
+    expect(SEED_CLOUD_NOTE).toContain("関連する項目は返答のたびにクラウドのモデルへ送信されます");
+    expect(SEED_CLOUD_NOTE).toContain("relevant entries are sent to the cloud model");
+  });
+
+  test("a save that is not written to a file says it will be lost on restart", () => {
+    expect(seedView(state({ persisted: true }), [])!.memoryOnlyNote).toBeNull();
+    expect(seedView(state({ persisted: false }), [])!.memoryOnlyNote).toBe(SEED_MEMORY_ONLY_NOTE);
+    expect(seedView(state(), [])!.explanation).toBe(SEED_EXPLANATION);
+  });
+
+  test("the kind labels cover exactly the four schema kinds", () => {
+    expect(SEED_KINDS.map((k) => k.kind)).toEqual(["persona-fact", "running-joke", "commitment", "segment-summary"]);
+  });
+
+  test("the result lines", () => {
+    expect(seedResultText("save", true, "x", 200)).toBe("保存しました。次の返答から反映されます");
+    expect(seedResultText("reload", true, "x", 200)).toBe("読み込みました");
+    expect(seedResultText("save", false, "memory seed not changed: shorten it", 409)).toBe(
+      "保存できませんでした: memory seed not changed: shorten it",
+    );
+    expect(seedResultText("reload", false, undefined, 503)).toBe("読み込みできませんでした (503)");
+    expect(seedResultText("save", true, "x", 500)).toContain("できませんでした");
+    expect(seedResultText("save", false, "x".repeat(5000), 409).length).toBeLessThan(MAX_HOST_TEXT_CHARS + 60);
   });
 });

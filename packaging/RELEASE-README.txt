@@ -88,6 +88,13 @@ In short, from this directory (after the checksum check above):
                                       saying whether it was loaded (never its text).
                                       In the hybrid profile the sheet is sent to the
                                       cloud model with each reply.
+                                      Optional memory: setup creates
+                                      local-memory-seed.json beside local-profile.env;
+                                      view and edit the facts she remembers in the
+                                      panel's memory card or with
+                                      aivtuberctl memory-seed show|set --file. In the
+                                      hybrid profile relevant entries are sent to the
+                                      cloud model with each reply.
 Install FFmpeg (ffplay and ffmpeg on PATH) first; setup tells you if it is missing.
 On Windows also install the Microsoft Visual C++ 2015-2022 Redistributable (x64); it is
 not bundled, and setup stops and names it if it is missing:

@@ -33,6 +33,16 @@ import {
   personaSetBody,
   personaTextFrom,
   personaView,
+  seedGetBody,
+  seedResultText,
+  seedSetBody,
+  seedTextFrom,
+  seedView,
+  parseSeedDocument,
+  SEED_KINDS,
+  type SeedDocument,
+  type SeedEntry,
+  type SeedKind,
   voiceInputBody,
   voiceInputResultText,
   voiceInputView,
@@ -141,6 +151,7 @@ function render(): void {
   renderUsage();
   renderVoiceInput();
   renderPersona();
+  renderMemory();
   renderVoice();
   renderIngress();
   renderAvatar();
@@ -303,6 +314,153 @@ async function savePersona(): Promise<void> {
     personaBusy = false;
     void poll();
     renderPersona();
+  }
+}
+
+/** Memory seed (#402): hidden unless the app composed live editing. The document is
+ * loaded from the host once when the card first shows and again on "reload"; a
+ * poll never rebuilds the rows being typed in. Save sends the whole document.
+ * Every string goes in with textContent or `.value`, never as HTML. */
+let memoryLoaded = false;
+let memoryTried = false;
+let memoryBusy = false;
+/** The document's identity fields are kept as the host sent them. */
+let memoryDocument: Pick<SeedDocument, "seed_id" | "revision"> = { seed_id: "local-memory-seed", revision: "1" };
+let memoryEntries: SeedEntry[] = [];
+
+function renderMemory(): void {
+  const view = seedView(state, memoryEntries);
+  $("memory-section").hidden = view === null;
+  if (view === null) {
+    memoryLoaded = false;
+    memoryTried = false;
+    return;
+  }
+  if (!memoryLoaded && !memoryBusy && !memoryTried) {
+    memoryTried = true;
+    void loadMemory();
+  }
+  $("memory-explanation").textContent = view.explanation;
+  const cloud = $("memory-cloud");
+  cloud.textContent = view.cloudNote ?? "";
+  cloud.hidden = view.cloudNote === null;
+  const memoryOnly = $("memory-memory-only");
+  memoryOnly.textContent = view.memoryOnlyNote ?? "";
+  memoryOnly.hidden = view.memoryOnlyNote === null;
+  const count = $("memory-count");
+  count.textContent = view.countText;
+  count.className = view.health === "warn" ? "error" : "hint";
+  // Counters and problems follow the rows without rebuilding them.
+  const items = $("memory-list").children;
+  view.rows.forEach((row, index) => {
+    const item = items[index];
+    if (!item) return;
+    const bytes = item.querySelector(".seed-bytes");
+    if (bytes) {
+      bytes.textContent = row.bytesText;
+      bytes.className = row.health === "warn" ? "seed-bytes error" : "seed-bytes hint";
+    }
+    const problem = item.querySelector<HTMLElement>(".seed-problem");
+    if (problem) {
+      problem.textContent = row.problem ?? "";
+      problem.hidden = row.problem === null;
+    }
+  });
+  $<HTMLButtonElement>("memory-add").disabled = connectionLost || memoryBusy || !memoryLoaded || !view.canAdd;
+  $<HTMLButtonElement>("memory-save").disabled = connectionLost || memoryBusy || !memoryLoaded || !view.canSave;
+  $<HTMLButtonElement>("memory-reload").disabled = connectionLost || memoryBusy;
+}
+
+/** Rebuild the rows from `memoryEntries` (after a load, an add or a delete). */
+function buildMemoryRows(): void {
+  const list = $("memory-list");
+  list.replaceChildren();
+  memoryEntries.forEach((entry, index) => {
+    const li = document.createElement("li");
+    li.className = "seed-row";
+    const kind = document.createElement("select");
+    kind.setAttribute("aria-label", `項目 ${index + 1} の種類`);
+    for (const { kind: value, label } of SEED_KINDS) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = label;
+      kind.append(option);
+    }
+    kind.value = entry.kind;
+    kind.addEventListener("change", () => {
+      entry.kind = kind.value as SeedKind;
+      renderMemory();
+    });
+    const claim = document.createElement("input");
+    claim.type = "text";
+    claim.className = "seed-claim";
+    claim.spellcheck = false;
+    claim.setAttribute("aria-label", `項目 ${index + 1} の内容`);
+    claim.value = entry.claim;
+    claim.addEventListener("input", () => {
+      entry.claim = claim.value;
+      renderMemory();
+    });
+    const bytes = document.createElement("span");
+    bytes.className = "seed-bytes hint";
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "削除";
+    remove.setAttribute("aria-label", `項目 ${index + 1} を削除`);
+    remove.addEventListener("click", () => {
+      memoryEntries.splice(index, 1);
+      buildMemoryRows();
+      renderMemory();
+    });
+    const problem = document.createElement("p");
+    problem.className = "seed-problem error";
+    problem.hidden = true;
+    li.append(kind, claim, bytes, remove, problem);
+    list.append(li);
+  });
+}
+
+async function loadMemory(): Promise<void> {
+  memoryBusy = true;
+  const out = $("memory-result");
+  try {
+    const { status, json } = await api("/api/memory-seed/get", { method: "POST", body: JSON.stringify(seedGetBody()) });
+    const body = (json ?? {}) as { ok?: boolean; detail?: string };
+    const loaded = parseSeedDocument(seedTextFrom(json));
+    if (status === 200 && body.ok === true && loaded !== null) {
+      memoryDocument = { seed_id: loaded.seed_id, revision: loaded.revision };
+      memoryEntries = loaded.entries;
+      memoryLoaded = true;
+      buildMemoryRows();
+      out.textContent = "";
+    } else {
+      out.textContent = seedResultText("reload", false, body.detail, status);
+    }
+  } catch {
+    out.textContent = "読み込めませんでした(アプリに接続できません)";
+  } finally {
+    memoryBusy = false;
+    renderMemory();
+  }
+}
+
+async function saveMemory(): Promise<void> {
+  memoryBusy = true;
+  renderMemory();
+  const out = $("memory-result");
+  try {
+    const { status, json } = await api("/api/memory-seed/set", {
+      method: "POST",
+      body: JSON.stringify(seedSetBody(memoryDocument, memoryEntries)),
+    });
+    const body = (json ?? {}) as { ok?: boolean; detail?: string };
+    out.textContent = seedResultText("save", status === 200 && body.ok === true, body.detail, status);
+  } catch {
+    out.textContent = "保存できませんでした(アプリに接続できません)";
+  } finally {
+    memoryBusy = false;
+    void poll();
+    renderMemory();
   }
 }
 
@@ -981,6 +1139,13 @@ for (const key of TUNING_KEYS) {
 $("persona-text").addEventListener("input", () => renderPersona());
 $("persona-save").addEventListener("click", () => void savePersona());
 $("persona-reload").addEventListener("click", () => void loadPersona());
+$("memory-add").addEventListener("click", () => {
+  memoryEntries.push({ kind: "persona-fact", claim: "" });
+  buildMemoryRows();
+  renderMemory();
+});
+$("memory-save").addEventListener("click", () => void saveMemory());
+$("memory-reload").addEventListener("click", () => void loadMemory());
 $("voice-input-on").addEventListener("click", () => void setVoiceInput(true));
 $("voice-input-off").addEventListener("click", () => void setVoiceInput(false));
 $("stop").addEventListener("click", () => void control("stop"));
