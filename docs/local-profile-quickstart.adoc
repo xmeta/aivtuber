@@ -561,7 +561,7 @@ What you should know before enabling it:
 * Not covered by this quickstart: webcam capture (out of scope), per-window capture (one OBS source only).
 
 [#memory-seed]
-=== Optional: remember facts between streams (memory seed, issue #321)
+=== Optional: remember facts between streams (memory seed, issues #321, #402)
 
 Off by default. The runtime keeps its memory in RAM only, so a restart forgets what she said last time. A *seed file* is a short list of facts you write by hand that she knows at every start: who she is, running jokes, things she promised.
 
@@ -569,6 +569,13 @@ Off by default. The runtime keeps its memory in RAM only, so a restart forgets w
 . Start with `AIVTUBER_MEMORY_SEED=<path to your file>`. A mistake in the file stops startup with a message naming the field, instead of starting with the wrong memory. The start log prints a `memory_seed:` line with the file's content hash.
 . To grow the file from a real stream, also set `AIVTUBER_MEMORY_WRITER=true` and, while she is running, `aivtuberctl memory-export --out <new file>`. It writes the facts she said that look like commitments, running jokes or recaps (never anything that names a viewer). It refuses to overwrite an existing file. Read it, keep what you like, copy those entries into your seed file by hand, and restart. She never edits your seed file herself.
 . Seeded entries are ordinary session memory: the operator erase removes them for the running session, and the file is untouched. They lapse after the memory's durable lifetime (24 hours by default) inside one run.
+
+*View and edit it while the app runs (#402).* With `aivtuber-setup start` (local and hybrid profiles) you do not need to set anything: `start` names `local-memory-seed.json` beside `local-profile.env` (creating it empty when it is absent) and the app loads it. An explicit `AIVTUBER_MEMORY_SEED` in the env file or the environment wins and is never created for you.
+
+* *In the operation panel*, the *記憶* card lists the entries in readable form (the kind as 人物設定 / お決まりのネタ / 約束 / 配信のまとめ, and the claim), with a counter against the 240-byte limit on every row. *項目を追加* and *削除* change the list; *保存* sends the whole list and applies it from the next reply (a reply already being generated keeps the old memory); *読み込み直す* reloads what the app holds. An empty list clears the memory. A row that is empty, has a line break, repeats an earlier claim or is too long is marked and blocks saving. Under the hybrid profile the card says, before you save, that relevant entries are sent to the cloud model with every reply (関連する項目は返答のたびにクラウドのモデルへ送信されます / relevant entries are sent to the cloud model). Which entries go with a reply is unchanged: only the ones relevant to the line being answered.
+* *From a terminal*: `aivtuberctl memory-seed show` prints the seed document (seed-file format), `aivtuberctl memory-seed set --file local-memory-seed.json` replaces it. The file is checked here with the same rules the app uses before anything is sent, and a seed too large for one control record (about 7 KB once encoded, roughly 20 to 30 entries) is refused with a pointer to the panel, which has no such limit. `aivtuberctl status` prints a `memory_seed_editor` line (whether a save is written to the file, whether Thinking is remote, the entry count and the content hash), never a claim.
+* A save is checked with the same rules as the file (at most 128 entries of at most 240 bytes, one line, no repeats, nothing the output gate would withhold). A refused save leaves the file and the running memory unchanged. A valid one is written to the seed file by writing a temporary file next to it and renaming it over it, so a crash cannot leave half a file, and the next start loads exactly it. If the app was started without a seed file (run directly, without `aivtuber-setup start`), a save applies in memory only: the panel says so, and the entries are lost at exit.
+* Only you can do this: the panel (with its per-launch token) and `aivtuberctl` (with the control secret) are the only ways in, under the same `memory.admin` authority as `memory-export`. A chat line, the model and tool output cannot. What she learns from the stream (memory writer proposals) is a separate step and is not part of this card.
 
 The procedure for measuring whether any of this is worth more than the seed file is in `docs/memory-adaptation.adoc` section 13.2.
 

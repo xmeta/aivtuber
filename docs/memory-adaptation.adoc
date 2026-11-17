@@ -432,7 +432,7 @@ The app owns one post-turn consolidation step, enabled by +AIVTUBER_MEMORY_WRITE
 
 == 13.2 Operator memory seed file and the Q4 falsifier procedure (issue #321, ADR-0008 S2)
 
-A seed file gives the performer continuity across restarts with no runtime disk write: persona facts, running jokes and commitments the operator curates by hand. It is also the cheapest benefit test before any snapshot store (S3).
+A seed file gives the performer continuity across restarts with no runtime disk write for learned content (the operator's own live save, #402, is the only write of the file): persona facts, running jokes and commitments the operator curates by hand. It is also the cheapest benefit test before any snapshot store (S3).
 
 *Setting.* +AIVTUBER_MEMORY_SEED=<path>+ (default unset: no seed, today's behaviour). It needs the adaptation runtime, which the production composition always has. The file is read once at startup. An invalid, over-bound or refused file stops startup with a typed error instead of running with different memory than the operator wrote.
 

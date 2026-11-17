@@ -366,12 +366,13 @@ fn run() -> Result<(), Box<dyn Error>> {
             })
             .map_err(|error| format!("AIVTUBER_MEMORY_WRITER: {error}"))?;
     }
-    // #321: the operator memory seed file is opt-in and read-only. It loads
-    // once, through the permit-gated path; an invalid or refused file stops
+    // #321: the operator memory seed file is opt-in. It loads at start (and is
+    // replaced only by the authenticated `memory.seed.set`, #402), through the permit-gated path; an invalid or refused file stops
     // startup rather than running with silently different memory.
-    if let Some(path) = env_path("AIVTUBER_MEMORY_SEED") {
+    let memory_seed_path = env_path(aivtuber_app::MEMORY_SEED_FILE_VAR);
+    if let Some(path) = memory_seed_path.as_deref() {
         let seed =
-            MemorySeed::load(&path).map_err(|error| format!("AIVTUBER_MEMORY_SEED: {error}"))?;
+            MemorySeed::load(path).map_err(|error| format!("AIVTUBER_MEMORY_SEED: {error}"))?;
         app = app
             .with_memory_seed(&seed, 0)
             .map_err(|error| format!("AIVTUBER_MEMORY_SEED: {error}"))?;
@@ -380,6 +381,14 @@ fn run() -> Result<(), Box<dyn Error>> {
             "memory_seed: loaded id={} revision={} entries={} content_hash={}",
             identity.seed_id, identity.revision, identity.entries, identity.content_hash
         );
+    }
+    // #402: the seed can be viewed and replaced while running whenever the
+    // adaptation runtime and the generative path are composed; a save goes to the file when one is named.
+    if app.adaptation().is_some() && app.generation_execution_snapshot().is_some() {
+        app.set_memory_seed_editor(aivtuber_app::MemorySeedEditor::new(
+            memory_seed_path,
+            thinking_leaves_machine,
+        ));
     }
     // Issue #69: generative resource budgets are opt-in (disabled by default
     // so existing deployments keep identical behavior). All limits are
@@ -520,6 +529,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             speech_input_control: speech_program.is_some() && speech_settings.is_some(),
             // #401: `persona.configure` only when live editing is composed.
             persona_configure: app.persona_editor_composed(),
+            // #402: `memory.admin` also for the `memory.seed.*` actions when
+            // live seed editing is composed.
+            memory_seed_edit: app.memory_seed_editor_composed(),
         },
     )?;
     let operator_ingress = operator_server.ingress();

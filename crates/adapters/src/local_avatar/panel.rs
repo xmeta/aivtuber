@@ -49,7 +49,14 @@
 //!   `{"text": string}` and `POST /api/persona/get` with `{}`, on their own
 //!   queue. The set body has its own larger bound, checked before the body is
 //!   read; the text is held as a [`PanelSecret`] so it never reaches a `Debug`
-//!   line, and only the get answer carries it back (`text`).
+//!   line, and only the get answer carries it back (`text`);
+//! * the operator memory seed (#402) adds `POST /api/memory-seed/set`, whose
+//!   body is the seed document itself (`schemas/memory-seed.schema.json`, parsed
+//!   and bounded by the composition thread), and `POST /api/memory-seed/get`
+//!   with `{}`, on their own queue. The set body has its own larger bound,
+//!   checked before the body is read; the document is held as a
+//!   [`PanelSecret`] so no claim reaches a `Debug` line, and only the get
+//!   answer carries it back (`text`).
 
 use super::server::{
     ConnGuard, HEAD_DEADLINE, MAX_CONNECTIONS, POLL, content_type, ct_eq, header_value, mint_token,
@@ -82,6 +89,11 @@ const INGRESS_QUEUE: usize = 4;
 const AVATAR_QUEUE: usize = 4;
 const SPEECH_INPUT_QUEUE: usize = 4;
 const PERSONA_QUEUE: usize = 4;
+const MEMORY_SEED_QUEUE: usize = 4;
+/// Largest `memory-seed.set` body: the seed file bound (64 KiB) plus room for a
+/// whitespace-heavy hand-edited document. The app refuses a document over the
+/// file bound; this only keeps the read itself bounded.
+pub const MAX_PANEL_MEMORY_SEED_BODY_BYTES: usize = 96 * 1024;
 /// Largest `persona.set` body: a 3,000-byte sheet whose every byte is a
 /// newline, tab, quote or backslash escapes to 6,000 bytes, plus the envelope.
 /// A sheet over 3,000 bytes is refused by the app's validator, not here.
@@ -92,7 +104,7 @@ pub const MAX_PANEL_KEY_CHARS: usize = 256;
 /// One model search may take this long, end to end.
 const SEARCH_DEADLINE: Duration = Duration::from_secs(6);
 /// Every state-changing endpoint (all are `POST`).
-const STATE_CHANGING: [&str; 20] = [
+const STATE_CHANGING: [&str; 22] = [
     "/api/chat",
     "/api/stop",
     "/api/mute",
@@ -113,6 +125,8 @@ const STATE_CHANGING: [&str; 20] = [
     "/api/speech-input",
     "/api/persona/set",
     "/api/persona/get",
+    "/api/memory-seed/set",
+    "/api/memory-seed/get",
 ];
 const SEARCH_PATH: &str = "/api/voice/search";
 /// The model upload (#362): a raw body, so it is not in [`STATE_CHANGING`]'s
@@ -231,6 +245,11 @@ pub enum PanelRequest {
     PersonaSet(PanelSecret),
     /// Read the character sheet back into the editor (#401).
     PersonaGet,
+    /// Replace the operator memory seed (#402) with this document. Redacted in
+    /// `Debug`; the composition thread parses and validates it.
+    MemorySeedSet(PanelSecret),
+    /// Read the operator memory seed back into the editor (#402).
+    MemorySeedGet,
 }
 
 /// The two chat platforms the panel can connect.
@@ -333,6 +352,7 @@ struct Shared {
     avatar_tx: SyncSender<PanelCommand>,
     speech_input_tx: SyncSender<PanelCommand>,
     persona_tx: SyncSender<PanelCommand>,
+    memory_seed_tx: SyncSender<PanelCommand>,
     chat_tx: SyncSender<PanelCommand>,
     voice_search_endpoint: Option<String>,
     search_busy: std::sync::atomic::AtomicBool,
@@ -371,6 +391,7 @@ pub struct PanelInbox {
     avatar_rx: Mutex<Receiver<PanelCommand>>,
     speech_input_rx: Mutex<Receiver<PanelCommand>>,
     persona_rx: Mutex<Receiver<PanelCommand>>,
+    memory_seed_rx: Mutex<Receiver<PanelCommand>>,
     chat_rx: Mutex<Receiver<PanelCommand>>,
 }
 
@@ -432,6 +453,16 @@ impl PanelInbox {
     /// Character sheet requests (#401). Their own queue, like the others.
     pub fn drain_persona(&self, max: usize) -> Vec<PanelCommand> {
         self.persona_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .try_iter()
+            .take(max)
+            .collect()
+    }
+
+    /// Memory seed requests (#402). Their own queue, like the others.
+    pub fn drain_memory_seed(&self, max: usize) -> Vec<PanelCommand> {
+        self.memory_seed_rx
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .try_iter()
@@ -513,6 +544,7 @@ impl LocalPanelServer {
         let (avatar_tx, avatar_rx) = sync_channel(AVATAR_QUEUE);
         let (speech_input_tx, speech_input_rx) = sync_channel(SPEECH_INPUT_QUEUE);
         let (persona_tx, persona_rx) = sync_channel(PERSONA_QUEUE);
+        let (memory_seed_tx, memory_seed_rx) = sync_channel(MEMORY_SEED_QUEUE);
         let (chat_tx, chat_rx) = sync_channel(CHAT_QUEUE);
         let shared = Arc::new(Shared {
             token: mint_token()?,
@@ -530,6 +562,7 @@ impl LocalPanelServer {
             avatar_tx,
             speech_input_tx,
             persona_tx,
+            memory_seed_tx,
             chat_tx,
             voice_search_endpoint: config.voice_search_endpoint.clone(),
             search_busy: std::sync::atomic::AtomicBool::new(false),
@@ -553,6 +586,7 @@ impl LocalPanelServer {
             avatar_rx: Mutex::new(avatar_rx),
             speech_input_rx: Mutex::new(speech_input_rx),
             persona_rx: Mutex::new(persona_rx),
+            memory_seed_rx: Mutex::new(memory_seed_rx),
             chat_rx: Mutex::new(chat_rx),
         };
         Ok((
@@ -826,6 +860,8 @@ fn route(
     };
     let body_limit = if path == "/api/persona/set" {
         MAX_PANEL_PERSONA_BODY_BYTES
+    } else if path == "/api/memory-seed/set" {
+        MAX_PANEL_MEMORY_SEED_BODY_BYTES
     } else {
         MAX_PANEL_BODY_BYTES
     };
@@ -895,6 +931,23 @@ fn route(
                 return json(status, false, detail);
             }
         },
+        "/api/memory-seed/set" => match memory_seed_set_body(&body) {
+            Ok(document) => (
+                PanelRequest::MemorySeedSet(document),
+                &shared.memory_seed_tx,
+            ),
+            Err((status, detail)) => {
+                shared.count(&shared.counters.rejected_request);
+                return json(status, false, detail);
+            }
+        },
+        "/api/memory-seed/get" => match empty_object(&body) {
+            Ok(()) => (PanelRequest::MemorySeedGet, &shared.memory_seed_tx),
+            Err((status, detail)) => {
+                shared.count(&shared.counters.rejected_request);
+                return json(status, false, detail);
+            }
+        },
         "/api/persona/get" => match empty_object(&body) {
             Ok(()) => (PanelRequest::PersonaGet, &shared.persona_tx),
             Err((status, detail)) => {
@@ -959,6 +1012,18 @@ fn speech_input_body(body: &[u8]) -> Result<bool, (&'static str, &'static str)> 
     serde_json::from_slice::<Body>(body)
         .map(|parsed| parsed.enabled)
         .map_err(|_| ("400 Bad Request", "expected {\"enabled\": boolean}"))
+}
+
+/// The seed document of `memory-seed.set` (#402): the body as UTF-8 text that
+/// is a JSON object. The body is already bounded; the composition thread parses
+/// it against the seed contract (unknown fields, bounds) before anything moves.
+fn memory_seed_set_body(body: &[u8]) -> Result<PanelSecret, (&'static str, &'static str)> {
+    const BAD: (&str, &str) = ("400 Bad Request", "expected a memory seed document");
+    let text = std::str::from_utf8(body).map_err(|_| BAD)?;
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(serde_json::Value::Object(_)) => Ok(PanelSecret(text.to_owned())),
+        _ => Err(BAD),
+    }
 }
 
 /// Parses `{"text": string}` and nothing else (#401). The body is already
@@ -2432,6 +2497,149 @@ mod tests {
         raw.extend_from_slice(b"{\"text\":\"\xFF\xFE\"}");
         assert_eq!(send_bytes(&f, &raw).status, 400);
         assert!(f.inbox.drain_persona(8).is_empty());
+    }
+
+    // ---- memory seed (#402) ----
+
+    /// Posts `body` to a memory-seed path and answers the one queued command
+    /// with `text`; returns the HTTP answer and the request the queue saw.
+    fn memory_seed_round_trip(
+        f: &Fixture,
+        path: &str,
+        body: &str,
+        text: Option<&str>,
+    ) -> (Raw, PanelRequest) {
+        let good = good(f);
+        let headers = with(&good, "none");
+        thread::scope(|s| {
+            let handle = s.spawn(|| post(f, path, &headers, body));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut commands = Vec::new();
+            while commands.is_empty() && Instant::now() < deadline {
+                commands = f.inbox.drain_memory_seed(4);
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(commands.len(), 1);
+            let command = commands.into_iter().next().unwrap();
+            let request = command.request.clone();
+            command.respond_with_text(true, "ok", text.map(str::to_owned));
+            (handle.join().unwrap(), request)
+        })
+    }
+
+    const SEED_DOC: &str = "{\"schema_version\":\"0.1.0\",\"seed_id\":\"s\",\"revision\":\"1\",\"entries\":[{\"kind\":\"persona-fact\",\"claim\":\"ミコトは猫が好き\"}]}";
+
+    #[test]
+    fn memory_seed_requests_are_authenticated_same_origin_strict_and_on_their_own_queue() {
+        let f = fixture();
+        let good = good(&f);
+        for path in ["/api/memory-seed/set", "/api/memory-seed/get"] {
+            let body = if path.ends_with("set") {
+                SEED_DOC
+            } else {
+                "{}"
+            };
+            let mut foreign = with(&good, "origin");
+            foreign.push(("Origin", "http://evil.example"));
+            assert_eq!(post(&f, path, &foreign, body).status, 403, "{path}");
+            assert_eq!(
+                post(&f, path, &with(&good, "x-panel-token"), body).status,
+                401,
+                "{path}"
+            );
+            let mut form = with(&good, "content-type");
+            form.push(("Content-Type", "application/x-www-form-urlencoded"));
+            assert_eq!(post(&f, path, &form, body).status, 415, "{path}");
+            assert_eq!(get(&f, path, "").status, 405, "{path}");
+        }
+        let headers = with(&good, "none");
+        for bad in ["", "[]", "\"x\"", "7", "null", "{\"a\":", "{}{}"] {
+            assert_eq!(
+                post(&f, "/api/memory-seed/set", &headers, bad).status,
+                400,
+                "{bad:?}"
+            );
+        }
+        for bad in ["", "[]", SEED_DOC] {
+            assert_eq!(
+                post(&f, "/api/memory-seed/get", &headers, bad).status,
+                400,
+                "{bad:?}"
+            );
+        }
+        assert!(
+            f.inbox.drain_memory_seed(8).is_empty(),
+            "nothing got through"
+        );
+
+        let (answer, request) = memory_seed_round_trip(&f, "/api/memory-seed/set", SEED_DOC, None);
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        let PanelRequest::MemorySeedSet(document) = &request else {
+            panic!("{request:?}");
+        };
+        assert_eq!(document.expose(), SEED_DOC);
+        // The claim is redacted in Debug, and the set answer carries none.
+        assert!(!format!("{request:?}").contains("ミコト"));
+        assert!(!answer.body.contains("ミコト") && !answer.body.contains("\"text\""));
+
+        // Never in the other queues.
+        assert!(f.inbox.drain_control(8).is_empty());
+        assert!(f.inbox.drain_voice(8).is_empty());
+        assert!(f.inbox.drain_ingress(8).is_empty());
+        assert!(f.inbox.drain_speech_input(8).is_empty());
+        assert!(f.inbox.drain_persona(8).is_empty());
+        assert!(f.inbox.drain_chat(8).is_empty());
+    }
+
+    #[test]
+    fn a_memory_seed_get_answer_carries_the_document_and_only_that_answer_does() {
+        let f = fixture();
+        let (answer, request) =
+            memory_seed_round_trip(&f, "/api/memory-seed/get", "{}", Some(SEED_DOC));
+        assert_eq!(request, PanelRequest::MemorySeedGet);
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        let value: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["text"], SEED_DOC);
+        let token = f.server.token().to_owned();
+        let state = get(&f, "/api/state", &format!("X-Panel-Token: {token}\r\n"));
+        assert!(!state.body.contains("ミコト"));
+    }
+
+    #[test]
+    fn the_memory_seed_body_is_bounded_before_it_is_read_and_must_be_valid_utf8() {
+        let f = fixture();
+        let good = good(&f);
+        let headers = with(&good, "none");
+        let declared = (MAX_PANEL_MEMORY_SEED_BODY_BYTES + 1).to_string();
+        let mut long = headers.clone();
+        long.push(("Content-Length", &declared));
+        assert_eq!(post(&f, "/api/memory-seed/set", &long, "{").status, 413);
+        // The persona bound is untouched by it.
+        let declared = (MAX_PANEL_PERSONA_BODY_BYTES + 1).to_string();
+        let mut other = headers.clone();
+        other.push(("Content-Length", &declared));
+        assert_eq!(post(&f, "/api/persona/set", &other, "{").status, 413);
+        // A document above the persona bound but within the seed one is read.
+        let big = format!(
+            "{{\"pad\":\"{}\"}}",
+            "a".repeat(MAX_PANEL_PERSONA_BODY_BYTES + 100)
+        );
+        let (answer, request) = memory_seed_round_trip(&f, "/api/memory-seed/set", &big, None);
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        assert!(matches!(request, PanelRequest::MemorySeedSet(_)));
+        // Bytes that are not UTF-8 never reach the queue.
+        let mut raw = format!(
+            "POST /api/memory-seed/set HTTP/1.1\r\nHost: {}\r\nOrigin: {}\r\nX-Panel-Token: {}\r\n\
+             Content-Type: application/json\r\nContent-Length: 10\r\n\r\n",
+            f.host,
+            f.origin,
+            f.server.token()
+        )
+        .into_bytes();
+        raw.extend_from_slice(b"{\"a\":\"\xFF\xFE\"}");
+        assert_eq!(send_bytes(&f, &raw).status, 400);
+        assert!(f.inbox.drain_memory_seed(8).is_empty());
     }
 
     #[test]

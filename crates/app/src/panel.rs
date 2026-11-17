@@ -25,8 +25,11 @@
 //!   `speech_input.disable`, both `speech_input.control`, on their own queue;
 //!   the request is a boolean and nothing else) and the character sheet of
 //!   #401 (`persona.set`, `persona.get`, both `persona.configure`, on their
-//!   own queue; the text is never logged and only `persona.get` returns it);
-//!   it cannot reach perception, memory export
+//!   own queue; the text is never logged and only `persona.get` returns it)
+//!   and the operator memory seed of #402 (`memory.seed.set`,
+//!   `memory.seed.get`, both under the existing `memory.admin`, on their own
+//!   queue; no claim is ever logged and only `memory.seed.get` returns the
+//!   document); it cannot reach perception, memory export, memory erase
 //!   or diagnose even though the ingress could mint them;
 //! * a chat line becomes a `chat.message` envelope whose source, source class,
 //!   plane and trust are fixed here (`local-panel`, `public_chat`, `content`,
@@ -55,6 +58,7 @@ const INGRESS_PER_TICK: usize = 4;
 const AVATAR_PER_TICK: usize = 4;
 const SPEECH_INPUT_PER_TICK: usize = 4;
 const PERSONA_PER_TICK: usize = 4;
+const MEMORY_SEED_PER_TICK: usize = 4;
 const CHAT_PER_TICK: usize = 4;
 const PUBLISH_INTERVAL_MS: u64 = 500;
 /// Refusal counts are logged at most this often. A stale page from an earlier
@@ -265,7 +269,9 @@ impl PanelService {
                 | PanelRequest::AvatarDiscard
                 | PanelRequest::SpeechInput { .. }
                 | PanelRequest::PersonaSet(_)
-                | PanelRequest::PersonaGet => {
+                | PanelRequest::PersonaGet
+                | PanelRequest::MemorySeedSet(_)
+                | PanelRequest::MemorySeedGet => {
                     command.respond(false, "not a control request");
                     continue;
                 }
@@ -446,6 +452,38 @@ impl PanelService {
                 response.ok, response.detail
             );
             command.respond_with_text(response.ok, response.detail, response.persona);
+            changed = true;
+        }
+        for command in self.inbox.drain_memory_seed(MEMORY_SEED_PER_TICK) {
+            let (action, argument) = match &command.request {
+                PanelRequest::MemorySeedSet(document) => {
+                    ("memory.seed.set", Some(document.expose()))
+                }
+                PanelRequest::MemorySeedGet => ("memory.seed.get", None),
+                _ => {
+                    command.respond(false, "not a memory seed request");
+                    continue;
+                }
+            };
+            self.control_seq += 1;
+            let response = apply_operator_action(
+                &self.ingress,
+                app,
+                &format!("panel-ctl-{}", self.control_seq),
+                action,
+                argument,
+                &self.control_secret.0,
+                now_ms,
+            );
+            // The line names the action and the fixed detail only (entry count
+            // and hash): no claim, in the request or in the `get` answer, is
+            // ever printed.
+            eprintln!(
+                "panel: {action} ok={} detail={:?}",
+                response.ok, response.detail
+            );
+            let document = response.memory_export.map(|export| export.seed_json);
+            command.respond_with_text(response.ok, response.detail, document);
             changed = true;
         }
         for command in self.inbox.drain_chat(CHAT_PER_TICK) {

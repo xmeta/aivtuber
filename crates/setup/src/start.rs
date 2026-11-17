@@ -291,6 +291,18 @@ pub const PERSONA_FILE: &str = "local-persona.md";
 /// Same name as `aivtuber_app::persona::PERSONA_FILE_VAR`; a test pins the two
 /// together by value (the app crate is not linked here).
 const PERSONA_FILE_VAR: &str = "AIVTUBER_PERSONA_FILE";
+/// The operator memory seed beside the env file (#402): the JSON the streamer
+/// edits in the panel or with `aivtuberctl memory-seed`
+/// (`schemas/memory-seed.schema.json`). `start` creates it empty when absent so
+/// the app can load it and the panel has a file to save to.
+pub const MEMORY_SEED_FILE: &str = "local-memory-seed.json";
+/// Same name as `aivtuber_app::MEMORY_SEED_FILE_VAR`; a test pins the two
+/// together by value (the app crate is not linked here).
+const MEMORY_SEED_FILE_VAR: &str = "AIVTUBER_MEMORY_SEED";
+/// The empty seed written when the file is absent. It is a fixture the app's
+/// own loader test validates, so it cannot drift from the seed contract.
+const EMPTY_MEMORY_SEED: &str =
+    include_str!("../../../examples/memory-seeds/valid/local-empty.json");
 /// Directory beside the env file that holds the models uploaded in the panel
 /// (#362), named by content hash, at most a few. The app owns it; no file name
 /// or path ever comes from a client.
@@ -608,6 +620,50 @@ pub fn app_persona_env(
     )]
 }
 
+/// Where the app finds the operator memory seed (#402): `local-memory-seed.json`
+/// beside the env file, for the local and hybrid profiles (the only ones with a
+/// Thinking model that can use it). An explicit value in the env file or the
+/// process environment wins and is never created or touched here.
+pub fn app_memory_seed_env(
+    env_file: &Path,
+    file_env: &BTreeMap<String, String>,
+    process_env: &dyn Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    let value = |name: &str| {
+        file_env
+            .get(name)
+            .cloned()
+            .or_else(|| process_env(name))
+            .filter(|v| !v.trim().is_empty())
+    };
+    let generative = matches!(value("AIVTUBER_MODE").as_deref(), Some("local" | "hybrid"));
+    if !generative || value(MEMORY_SEED_FILE_VAR).is_some() {
+        return Vec::new();
+    }
+    vec![(
+        MEMORY_SEED_FILE_VAR.to_owned(),
+        env_file
+            .with_file_name(MEMORY_SEED_FILE)
+            .display()
+            .to_string(),
+    )]
+}
+
+/// Creates the empty seed at `path` unless something is already there (an
+/// existing file, valid or not, is the streamer's and is never overwritten).
+pub fn ensure_memory_seed_file(path: &Path) -> std::io::Result<()> {
+    use std::io::Write as _;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => file.write_all(EMPTY_MEMORY_SEED.as_bytes()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Replaces the state file with the on/off document (temp file in the same
 /// directory, then rename, so a crash leaves the old or the new file, never
 /// half of one). Same pattern as the app's own settings writers.
@@ -708,6 +764,12 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
     env.extend(speech_input_vars);
     let persona_vars = app_persona_env(&opts.env_file, &env, &|name| std::env::var(name).ok());
     env.extend(persona_vars);
+    let seed_vars = app_memory_seed_env(&opts.env_file, &env, &|name| std::env::var(name).ok());
+    for (_, path) in &seed_vars {
+        ensure_memory_seed_file(Path::new(path))
+            .map_err(|e| format!("cannot create {path}: {e}"))?;
+    }
+    env.extend(seed_vars);
     let plan = match &llm {
         Llm::Managed(_) => plan_models(&env, &Manifest::embedded(), &settings, &|p| {
             std::fs::metadata(p).ok().map(|m| m.len())
@@ -1017,6 +1079,65 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn the_app_is_told_where_the_memory_seed_is_for_local_and_hybrid_only() {
+        let env_file = Path::new("/x/local-profile.env");
+        let none = |_: &str| None;
+        for mode in ["local", "hybrid"] {
+            let got = app_memory_seed_env(env_file, &map(&[("AIVTUBER_MODE", mode)]), &none);
+            assert_eq!(got.len(), 1, "{mode}");
+            assert_eq!(got[0].0, "AIVTUBER_MEMORY_SEED");
+            assert!(got[0].1.ends_with(MEMORY_SEED_FILE), "{got:?}");
+            assert_eq!(Path::new(&got[0].1).parent(), env_file.parent(), "{got:?}");
+        }
+        assert_eq!(MEMORY_SEED_FILE, "local-memory-seed.json");
+        assert_eq!(MEMORY_SEED_FILE_VAR, "AIVTUBER_MEMORY_SEED");
+        assert!(
+            app_memory_seed_env(env_file, &map(&[("AIVTUBER_MODE", "cached")]), &none).is_empty()
+        );
+        assert!(app_memory_seed_env(env_file, &map(&[]), &none).is_empty());
+        let process_mode = |n: &str| (n == "AIVTUBER_MODE").then(|| "local".to_owned());
+        assert_eq!(
+            app_memory_seed_env(env_file, &map(&[]), &process_mode).len(),
+            1
+        );
+        // An explicit value (env file or process environment) wins.
+        let explicit = map(&[
+            ("AIVTUBER_MODE", "local"),
+            ("AIVTUBER_MEMORY_SEED", "/mine.json"),
+        ]);
+        assert!(app_memory_seed_env(env_file, &explicit, &none).is_empty());
+        let process_explicit =
+            |n: &str| (n == "AIVTUBER_MEMORY_SEED").then(|| "/p.json".to_owned());
+        assert!(
+            app_memory_seed_env(
+                env_file,
+                &map(&[("AIVTUBER_MODE", "local")]),
+                &process_explicit
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_empty_seed_is_created_only_when_absent_and_never_overwrites() {
+        let dir = std::env::temp_dir().join(format!("aivtuber-seed-setup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(MEMORY_SEED_FILE);
+        let _ = std::fs::remove_file(&path);
+        ensure_memory_seed_file(&path).unwrap();
+        let created = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&created).unwrap();
+        assert_eq!(value["schema_version"], "0.1.0");
+        assert_eq!(value["entries"], serde_json::json!([]));
+        // The streamer's own file, even an invalid one, is left alone.
+        std::fs::write(&path, "my own notes").unwrap();
+        ensure_memory_seed_file(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "my own notes");
+        // A directory that is not there is an error, not a silent skip.
+        assert!(ensure_memory_seed_file(&dir.join("missing").join("s.json")).is_err());
     }
 
     #[test]

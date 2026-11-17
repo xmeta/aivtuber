@@ -2,7 +2,8 @@
 //!
 //! The seed file is the cheapest benefit test for cross-session continuity: a
 //! short list of performer-level facts the operator curates by hand, loaded
-//! into working memory at startup, with no runtime disk write anywhere. This
+//! into working memory at startup. Since #402 the authenticated operator can
+//! also replace it live (the only runtime write of the file, atomic). This
 //! module owns the file contract (`schemas/memory-seed.schema.json`), its
 //! bounds and typed errors, the deterministic content hash recorded as a replay
 //! input, and the counters for the ADR-0008 Q4 falsifier.
@@ -16,7 +17,8 @@
 //!   [`aivtuber_runtime::SecurityRuntime::authorize_operator_seed_memory_write`]
 //!   and the permit-gated durable path; the file path is process configuration
 //!   the operator owns, never an input chat or a model can reach.
-//! * The runtime never writes a seed file. The export is returned to an
+//! * The runtime writes the seed file only for the authenticated operator's
+//!   `memory.seed.set` (#402). The export is returned to an
 //!   authenticated operator command and the *client* decides where it lands.
 //! * Bounds are fixed: entry count, claim bytes and file bytes. Anything over a
 //!   bound is refused, never truncated.
@@ -29,7 +31,7 @@ use std::error::Error;
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use aivtuber_domain::ThinkingContent;
 use serde::{Deserialize, Serialize};
@@ -53,6 +55,10 @@ const SEED_ID_MAX: usize = 63;
 const REVISION_MAX: usize = 32;
 /// `seed_id` of an export. The operator renames it when promoting.
 pub const EXPORT_SEED_ID: &str = "memory-export";
+/// `seed_id` of the empty seed the live editor starts from (#402).
+pub const EDITOR_SEED_ID: &str = "local-memory-seed";
+/// The variable naming the seed file; `aivtuber-setup start` sets it (#402).
+pub const MEMORY_SEED_FILE_VAR: &str = "AIVTUBER_MEMORY_SEED";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MemorySeedError {
@@ -335,7 +341,7 @@ impl MemorySeed {
     }
 
     /// Read a seed file, refusing more than [`MAX_SEED_FILE_BYTES`] bytes
-    /// before parsing. This is the only read path; there is no write path.
+    /// before parsing. This is the only read path; the one write is `memory.seed.set` (#402).
     pub fn load(path: &Path) -> Result<Self, MemorySeedError> {
         let io = |e: std::io::Error| MemorySeedError::Io(format!("{}: {e}", path.display()));
         let file = File::open(path).map_err(io)?;
@@ -437,6 +443,27 @@ impl MemorySeed {
         text
     }
 
+    /// The same document as [`Self::to_json`] without indentation, for a
+    /// transport with a small record bound (the operator control socket).
+    pub fn to_compact_json(&self) -> String {
+        let file = SeedFile {
+            schema_version: MEMORY_SEED_SCHEMA_VERSION.to_owned(),
+            seed_id: self.seed_id.clone(),
+            revision: self.revision.clone(),
+            entries: self.entries.clone(),
+        };
+        serde_json::to_string(&file).expect("a seed file always serializes")
+    }
+
+    /// The empty seed the editor shows (and saves over) when none was loaded.
+    pub fn empty() -> Self {
+        Self {
+            seed_id: EDITOR_SEED_ID.to_owned(),
+            revision: "1".to_owned(),
+            entries: Vec::new(),
+        }
+    }
+
     /// Seed for an export: fixed id, and a revision derived from the entries so
     /// the same live entries always export the same file.
     pub(crate) fn for_export(entries: Vec<SeedEntry>) -> Result<Self, MemorySeedError> {
@@ -480,8 +507,58 @@ pub struct MemoryFalsifierMetrics {
     pub exports: u64,
 }
 
+/// Live editing of the memory seed (#402): where a saved seed is written and
+/// whether the relevant entries go to a cloud model. Composed only with the
+/// adaptation runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemorySeedEditor {
+    path: Option<PathBuf>,
+    thinking_remote: bool,
+}
+
+impl MemorySeedEditor {
+    /// `path` is `AIVTUBER_MEMORY_SEED`; `None` applies in memory only.
+    pub fn new(path: Option<PathBuf>, thinking_remote: bool) -> Self {
+        Self {
+            path,
+            thinking_remote,
+        }
+    }
+
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    pub fn thinking_remote(&self) -> bool {
+        self.thinking_remote
+    }
+}
+
+/// The `memory_seed_editor` object of the operator status: present only when
+/// live editing is composed. Counts and the identity hash only, never a claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemorySeedEditorStatus {
+    /// A save is written to `AIVTUBER_MEMORY_SEED`; false = in memory only.
+    pub persisted: bool,
+    /// The Thinking endpoint leaves this machine, so relevant entries do too.
+    pub thinking_remote: bool,
+    pub entries: usize,
+    pub content_hash: String,
+}
+
+/// What a `memory.seed.*` operator action produced. `seed` is set only by
+/// `memory.seed.get` and goes to the authenticated caller, never to a log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemorySeedOutcome {
+    pub detail: String,
+    pub seed: Option<MemorySeed>,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct MemoryFalsifier {
+    /// The seed as the operator last wrote it (loaded or saved); what the
+    /// editor shows. Bounded by the seed bounds.
+    seed: Option<MemorySeed>,
     identity: Option<MemorySeedIdentity>,
     seed_folds: HashSet<String>,
     metrics: MemoryFalsifierMetrics,
@@ -490,12 +567,17 @@ pub(crate) struct MemoryFalsifier {
 impl MemoryFalsifier {
     pub(crate) fn note_seed(&mut self, seed: &MemorySeed) {
         self.identity = Some(seed.identity());
+        self.seed = Some(seed.clone());
         self.seed_folds = seed.entries.iter().map(|e| fold(&e.claim)).collect();
         self.metrics.seed_entries_loaded = seed.entries.len();
     }
 
     pub(crate) fn identity(&self) -> Option<&MemorySeedIdentity> {
         self.identity.as_ref()
+    }
+
+    pub(crate) fn seed(&self) -> Option<&MemorySeed> {
+        self.seed.as_ref()
     }
 
     pub(crate) fn metrics(&self) -> MemoryFalsifierMetrics {

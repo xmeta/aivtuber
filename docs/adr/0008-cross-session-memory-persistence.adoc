@@ -537,3 +537,7 @@ S1, the RAM-only erase primitive plus the erasure report, becomes its own implem
 * Issue: #282; parent #105; related #51, #220, #280, #281, #283, #284
 * Assumptions: A-MEM-001 (existing), A-MEM-002 and A-MEM-003 (added to the register)
 * Other ADRs: none; ADR-0007 (perception) is independent
+
+== Amendment (2026-11-17, #402 slice A)
+
+The seed file is no longer read-only to the runtime: the operator may replace it from the panel or `aivtuberctl memory-seed set`, under the existing closed `memory.admin` capability (operator ingress only). The file stays operator-written (epistemic class unchanged), keeps the `memory-seed` schema and bounds, is written atomically, and is reloaded through the same permit path. Nothing from chat, model or Jev can reach these actions; viewer-attributed persistence remains deferred as above.
