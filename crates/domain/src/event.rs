@@ -108,6 +108,13 @@ pub enum Capability {
     /// speech, exactly as when it was started with the app.
     #[serde(rename = "speech_input.control")]
     SpeechInputControl,
+    /// Replaces the operator's character sheet while the app runs (#401). Held
+    /// only by an authenticated local ingress (the panel and the control
+    /// socket) and only when the generative path is composed. The text is data
+    /// in the Thinking request and grants nothing: a sheet that claims a
+    /// capability, a permit or a trust level gains none.
+    #[serde(rename = "persona.configure")]
+    PersonaConfigure,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -613,6 +620,21 @@ mod tests {
                 .authorization
                 .as_ref()
                 .is_some_and(|auth| auth.capabilities.contains(&Capability::SpeechInputControl))
+        );
+        let error = event.validate().expect_err("a chat source cannot carry it");
+        assert_eq!(error.field(), "source_class");
+    }
+
+    #[test]
+    fn repository_forged_persona_configure_fixture_is_rejected() {
+        let json = include_str!("../../../examples/events/invalid/forged-persona-configure.json");
+        let event: EventEnvelope =
+            serde_json::from_str(json).expect("the capability name is a closed, known one");
+        assert!(
+            event
+                .authorization
+                .as_ref()
+                .is_some_and(|auth| auth.capabilities.contains(&Capability::PersonaConfigure))
         );
         let error = event.validate().expect_err("a chat source cannot carry it");
         assert_eq!(error.field(), "source_class");

@@ -169,6 +169,7 @@ mod tests {
             Capability::IngressControl => "ingress.control",
             Capability::AvatarConfigure => "avatar.configure",
             Capability::SpeechInputControl => "speech_input.control",
+            Capability::PersonaConfigure => "persona.configure",
         };
         let secret = [13_u8; 32];
         let ingress = LocalControlIngress::new(
