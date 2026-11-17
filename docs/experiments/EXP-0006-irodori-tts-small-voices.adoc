@@ -116,7 +116,9 @@ Noise / uncertainty / missing evidence:
 Expected-vs-actual difference:
   LUNA on a GPU is fast enough for live replies (p50 1.13 s, RTF 0.245 with its own bf16 recipe) and SUN is
   not (p50 2.85 s, RTF 0.66); that matches (a). CPU is worse than the cards suggest: SUN needed about 150 s
-  for a 3.4 s utterance and LUNA produced no reply in 15 minutes, so (b) holds on this host. The sampler step
+  for a 3.4 s utterance, LUNA with its bf16 recipe produced no reply in 15 minutes, and LUNA in fp32 took
+  18.8 s for a 3.9 s reply (RTF 4.84), so (b) holds on this host, with bf16 emulation rather than the sampler
+  as the dominant cause. The sampler step
   count is nearly free next to the codec (4 NFE against 24 steps on GPU fp32: 2.76 s against 3.10 s), which
   is (c). Load is 57-94 s and 2.9-3.9 GB of VRAM, (d). An official MIT OpenAI-compatible server exists
   (Irodori-TTS-Server), so (e) holds, but it speaks OpenAI's /v1/audio/speech, not this project's contract.
@@ -126,8 +128,9 @@ Expected-vs-actual difference:
 Likely explanation:
   The codec's DACVAE decoder runs once per reply and is the wall-clock floor; MeanFlow's 4 NFE only shortens
   the DiT part. bf16 helps only when *both* DiT and codec are cast (LUNA): casting the DiT alone (SUN) adds
-  fp32/bf16 conversions and was measured slower than fp32. The CPU rows are dominated by emulated bf16 on a
-  Zen 2 part (SUN additionally runs 24 sequential DiT steps; LUNA's much shorter sampler did not rescue it).
+  fp32/bf16 conversions and was measured slower than fp32. On CPU, emulated bf16 on a Zen 2 part dominates:
+  the same LUNA checkpoint that stalled in bf16 answered in 18.8 s in fp32, and SUN's 24 sequential DiT steps
+  add to that cost in its own bf16 recipe (SUN fp32 was not measured).
 
 Decision:
   Defer (recommendation for the supervisor, not a decision).
@@ -155,7 +158,7 @@ All numbers were measured here unless marked as read from a source.
 * *SUN is not a live-reply candidate*: p50 2.85 s, p95 3.33 s (RTF 0.66) in fp32, and *slower* in its own bf16 recipe (p50 3.46 s, RTF 0.75), because the codec stays fp32 and the casts cost more than the smaller DiT saves. Also deterministic (50/50).
 * *LUNA fp32 has a heavy tail*: p50 1.19 s but p95 6.86 s (one reply took 25.5 s), RTF 0.585. The p50 is close to bf16; the tail is not. Both LUNA rows use 4 NFE, so the tail is not a sampler effect, but its cause was not isolated (section 8).
 * *Step count is nearly free; the codec is the bottleneck.* 4 NFE against 24 steps on GPU fp32 changed the mean by 11% (2.76 s against 3.10 s), while switching the codec (and DiT) to bf16 on LUNA cut it by 58% (1.16 s against 2.76 s). A faster sampler alone cannot make SUN live-capable.
-* *CPU is out on this host.* SUN with the card's recipe took *about 150 s* for one 19-character reply (3.36 s of audio, RTF ~45) when run through the checkpoint's own synthesize.py; a 3-reply harness run did not finish its second pass within 25 minutes. LUNA, which needs only 4 NFE, produced *no reply at all within about 15 minutes* of the same harness. This CPU (Zen 2) has no hardware bf16, and the cards' "RTF 1.110 on 8 CPU cores" (SUN) and "0.602" (LUNA) were not reproduced; those numbers were obtained on an unidentified VM and are not evidence for this project's hosts.
+* *CPU is out on this host, but bf16 is what breaks it.* SUN with the card's bf16 recipe took *about 150 s* for one 19-character reply (3.36 s of audio, RTF ~45) through the checkpoint's own synthesize.py, and LUNA with its bf16 recipe produced *no reply at all within about 15 minutes*. In *fp32*, the same LUNA checkpoint completed a reply in *18.8 s* for 3.88 s of audio (RTF 4.84; 38 handling items in 16-18 s each, no errors). So LUNA fp32 runs at about a fifth of real time and is still unusable for live replies, while the cards' bf16 CPU recipes are pathological on a CPU without hardware bf16 (Zen 2). The cards' "RTF 1.110 on 8 CPU cores" (SUN) and "0.602" (LUNA) were not reproduced; they were produced on an unidentified VM and are not evidence for this project's hosts.
 * *Load and footprint.* Load (checkpoint + codec + tokenizer, cold process) 57.5 s (SUN fp32), 59.9 s (LUNA fp32), 67.0 s (SUN bf16), 93.5 s (LUNA bf16); first call 16.8 / 7.1 / 4.2 / 1.4 s; peak VRAM 3.9 / 3.8 / 2.9 / 3.1 GB; peak process RSS 6.4-6.9 GB. The recommended LUNA bf16 row (3.1 GB) plus the default Thinking model's about 2.6 GB is roughly 5.7 GB of an 8 GB card; SUN fp32 is about 6.5 GB. Those are sums of separately measured figures, not a co-residency measurement (Q3).
 * *Sample rate is 48 kHz* (the DACVAE codec), against 44.1 kHz for the shipped Supertonic path.
 * *Intelligibility is the negative result.* The same round-trip instrument that gave the shipped engine 4.0% reading CER gives every Irodori configuration about 12.4-13.5% (text CER 15.8-18.1% against 8.2%), with 11-15 of 50 replies above 30% text CER. The scored handling set is nearly clean (3-5 of 32), and the reply errors are *lost first words* rather than misread kanji (section 6.2): the audio starts within 18-32 ms of the first sample, and `こんにちは、…` came back as `…今日も来てくれてありがとう`, `わあ` as `うわ`, `あはは` as `ハハ`. The instrument cannot say whether the model clips the onset or the STT is weak on this voice, but neither explanation supports calling this voice better than the shipped one.
@@ -231,13 +234,13 @@ Read on 2026-11-17 from the source named in the last column, not legal advice.
 |1.110 total / 0.550 model
 |1.7%
 |0.658 / 0.745
-|~45 (one utterance; section 9)
+|~45 (bf16 recipe, one utterance; section 9)
 
 |LUNA (4-NFE MeanFlow)
 |0.602 total / 0.105 model
 |2.0%
 |0.585 / 0.245
-|not measured: no reply in 15 min
+|4.84 (fp32, one reply); bf16 recipe: no reply in 15 min
 |===
 
 The cards' CPU figures were produced on an 8-core VM of unknown type, with 4 threads, 40 plain + 10 clone utterances, watermarking off, CER against kotoba-whisper. On *this* CPU the same recipes are 40-70 times slower than real time, so the card numbers should not be used to size a deployment.
@@ -295,8 +298,14 @@ reading CER against the hand-written expected reading; above 0.25 counts as a mi
 |SUN bf16 DiT + fp32 codec, GPU (the card's recipe)
 |3.461 |4.001 |0.745 |67.0 |4.17 |2929 |6887 |50/50 |10/10
 
-|SUN bf16, CPU 4 threads (1 utterance, synthesize.py, section 9)
+|LUNA fp32, CPU 4 threads (1 reply + 38 handling items, section 9)
+|18.8 |n/a |4.84 |38.5 |67.1 |n/a |6889 |not run |not run
+
+|SUN bf16 DiT + fp32 codec, CPU 4 threads (1 utterance, synthesize.py, section 9)
 |~150 |n/a |~45 |~100 |n/a |n/a |not measured |not run |not run
+
+|LUNA bf16 DiT + bf16 codec, CPU 4 threads
+|no reply in ~15 min |n/a |n/a |~144 |n/a |n/a |not measured |not run |not run
 |===
 
 Mean audio per reply: 4.71 s (SUN) and 4.72 s (LUNA) at 48 kHz. Every GPU configuration produced 50 of 50
@@ -321,6 +330,10 @@ longest (9.5 s) come from the same 50-item set, so the RTF is not an artefact of
 * *The sampler is cheap; the codec is not.* LUNA's 4 NFE against SUN's 24 steps changes the GPU fp32 mean by
   11%, while the bf16 codec cut LUNA's mean by 58%. Any future speed work should target the DACVAE decoder or
   a streaming/chunked decode, not the flow steps.
+* *On CPU, fp32 beats the cards' bf16 recipe by an order of magnitude.* LUNA fp32 answered in 18.8 s; LUNA with
+  its own bf16 recipe produced nothing in 15 minutes on the same 4 threads. This CPU (Zen 2) has no hardware
+  bf16, so the checkpoint authors' "intended use: fastest CPU inference" recipe applies to AMX-class chips.
+  A CPU-only host was not made live-capable by this record.
 
 === 5.3 Load, footprint and devices
 
@@ -449,7 +462,7 @@ deployment note is required. Nothing downloads at *build* time, and the project'
 . *The voice is not fixed in this record.* Every row ran `no_ref` with one seed, so each configuration is one sampled speaker, and a different seed is a different voice. A persona decision cannot be made from this record.
 . *STT errors count against the TTS,* and the ReazonSpeech instrument has its own error floor on synthetic speech (EXP-0002), so absolute CER is pessimistic and the ordering among the four configurations is within noise.
 . *The 13%-against-4.0% reading gap is not attributable.* The transcripts show lost first words, and the audio has no leading silence (onset 18-32 ms), which is consistent with both a model artefact and an STT weakness on this voice. It is too large to ignore and too ambiguous to blame on the model; only a listener can settle it.
-. *CPU rows are incomplete and confounded.* SUN was measured with one utterance through the checkpoint's own script; the 3-reply harness run did not reach its second pass in 25 minutes, and LUNA produced no reply in about 15 minutes, both at 4 threads. bf16 on a Zen 2 CPU is emulated, which is the likely dominant cause, and *fp32 CPU was not measured* (one attempt was abandoned for time). "CPU is out" therefore means "on a CPU without hardware bf16, with the cards' bf16 recipes".
+. *CPU rows are thin.* LUNA fp32 is a single reply plus the 38 handling items at 4 threads; SUN was measured with one utterance through the checkpoint's own script, its harness run did not reach the second pass in 25 minutes, and LUNA bf16 produced nothing in about 15 minutes. *SUN fp32 on CPU was not measured at all*, so the difference between the two checkpoints on a CPU is not established. What the rows do show is that the bf16 recipes fail on a CPU without hardware bf16 and that fp32 is roughly an order of magnitude faster there.
 . *One GPU, one run per configuration* (run2 repeats only the first 10 replies), on a machine that also ran monitoring commands. The LUNA fp32 tail (25.5 s, 14.5 s) was not reproduced or explained.
 . *The cards' benchmark method is not reproduced.* Their CER uses kotoba-whisper and a different sentence set, their RTF a different CPU; the comparison in section 3.3 is informative, not a replication.
 . *Watermarking was off* (silentcipher not installed), so the record says nothing about the watermark's latency or its effect on the round trip. The code paths exist.
@@ -459,10 +472,12 @@ deployment note is required. Nothing downloads at *build* time, and the project'
 == 9. Protocol deviations
 
 * *SUN CPU is a single utterance* through the checkpoint's own `synthesize.py` with `--threads 4`, timed end to
-  end (~250 s including ~100 s of load, 3.36 s of audio); the harness rows for CPU could not be completed.
-* *LUNA CPU produced no output* in about 15 minutes and was stopped; no number is reported for it rather than a
-  zero.
-* *Handling set on CPU:* not run (the reply rows alone did not finish).
+  end (~250 s including ~100 s of load, 3.36 s of audio); its 3-reply harness run did not reach the second pass
+  in 25 minutes and was stopped.
+* *LUNA CPU bf16 produced no output* in about 15 minutes and was stopped; no number is reported for it rather
+  than a zero. It was replaced by a *LUNA CPU fp32* run of one reply and the full handling set, which completed.
+* *SUN CPU fp32* was attempted with one reply and abandoned for time after the load took several minutes with
+  the machine otherwise idle; it is reported as not measured.
 * *The second in-process pass* was run for every GPU row but not for the CPU rows.
 * *run2* repeats the first 10 replies and, because the runner passes `--handling-limit 0`, also the 38 handling
   items; only the replies are compared.
