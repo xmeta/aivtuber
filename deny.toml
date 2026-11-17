@@ -12,6 +12,7 @@
 version = 2
 ignore = [
     # { id = "RUSTSEC-0000-0000", reason = "example: unmaintained transitive dep, no actionable fix; revisit when X" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained (no vulnerability); transitive only via rmcp and twitch-irc, no actionable fix; owner: maintainers; revisit when rmcp or twitch-irc drop chrono, or a chrono vulnerability is filed" },
 ]
 
 # This section is considered when running `cargo deny check licenses`.
