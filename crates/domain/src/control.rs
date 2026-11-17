@@ -229,7 +229,8 @@ fn capability_for_action(action: &str) -> Option<Capability> {
         "mute" | "performer.mute" => Some(Capability::PerformerMute),
         "obs.control" => Some(Capability::ObsControl),
         "avatar.control" => Some(Capability::AvatarControl),
-        "memory.admin" => Some(Capability::MemoryAdmin),
+        // The memory seed view/edit actions (#402) reuse the closed `memory.admin`.
+        "memory.admin" | "memory.seed.get" | "memory.seed.set" => Some(Capability::MemoryAdmin),
         "tool.grant" => Some(Capability::ToolGrant),
         "perception.control" => Some(Capability::PerceptionControl),
         "model.select" => Some(Capability::ModelSelect),

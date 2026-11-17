@@ -57,7 +57,8 @@ pub struct OperatorRequest {
     /// `avatar.confirm`, `avatar.select`, `avatar.delete`, `avatar.discard`
     /// (the avatar choice of #362; the upload itself is panel-only),
     /// `speech_input.enable`, `speech_input.disable` (voice input, #400),
-    /// `persona.set`, `persona.get` (the character sheet, #401).
+    /// `persona.set`, `persona.get` (the character sheet, #401),
+    /// `memory.seed.get`, `memory.seed.set` (the operator memory seed, #402).
     pub action: String,
     /// Opaque session secret presented by the operator client.
     pub secret: String,
@@ -69,7 +70,8 @@ pub struct OperatorRequest {
     /// `{"platform","target"}` / `{"platform"}` JSON for `ingress.connect` /
     /// `ingress.disconnect`, a model hash (or hash prefix, or `sample`) for the
     /// `avatar.*` actions, the whole new character sheet for `persona.set`
-    /// (empty clears it). Ignored by every other action.
+    /// (empty clears it), the whole seed document for `memory.seed.set`.
+    /// Ignored by every other action.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub argument: Option<String>,
 }
@@ -85,8 +87,9 @@ pub struct OperatorResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<OperatorStatusSnapshot>,
     /// The memory seed export (#321); present only for a successful
-    /// `memory.export`. The daemon returns it and writes nothing: the client
-    /// chooses the destination.
+    /// `memory.export`, and for a successful `memory.seed.get` (#402, the
+    /// operator's own seed, `skipped` 0). The daemon returns it and writes
+    /// nothing for an export: the client chooses the destination.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_export: Option<OperatorMemoryExport>,
     /// The character sheet text (#401); present only for a successful
@@ -152,6 +155,11 @@ pub struct OperatorStatusSnapshot {
     /// file and whether the sheet goes to a cloud model. Absent unless composed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persona_editor: Option<crate::persona::PersonaEditorStatus>,
+    /// Live editing of the operator memory seed (#402): entry count, identity
+    /// hash, whether a save reaches the file and whether relevant entries go to
+    /// a cloud model. Never a claim. Absent unless composed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_seed_editor: Option<crate::MemorySeedEditorStatus>,
 }
 
 /// Operator-visible, text-free perception status: whether it is running, why
@@ -220,6 +228,7 @@ impl OperatorStatusSnapshot {
             voice_input: app.speech_input_status(),
             persona: app.persona_status(),
             persona_editor: app.persona_editor_status(),
+            memory_seed_editor: app.memory_seed_editor_status(),
         }
     }
 }
@@ -319,6 +328,9 @@ pub struct OperatorEndpointOptions {
     pub speech_input_control: bool,
     /// Live character-sheet editing is composed (#401): `persona.configure`.
     pub persona_configure: bool,
+    /// Live memory-seed editing is composed (#402): the closed `memory.admin`
+    /// is held for the `memory.seed.*` actions as well as `memory.export`.
+    pub memory_seed_edit: bool,
 }
 
 /// Authenticated operator control endpoint.
@@ -377,6 +389,7 @@ impl OperatorControlServer {
             avatar_configure,
             speech_input_control,
             persona_configure,
+            memory_seed_edit,
         } = options;
         let name = name.trim();
         if name.is_empty() {
@@ -425,9 +438,11 @@ impl OperatorControlServer {
             // grants nothing.
             capabilities.insert(aivtuber_domain::Capability::PersonaConfigure);
         }
-        if memory_export {
-            // `memory.admin` is held only so the `memory.export` action can mint
-            // it; no other action maps to it and nothing here writes memory.
+        if memory_export || memory_seed_edit {
+            // `memory.admin` is held only so `memory.export` and the
+            // `memory.seed.*` actions (#402) can mint it; no other action maps
+            // to it. Only `memory.seed.set` changes memory, and only the
+            // operator-seed entries through the seed permit.
             capabilities.insert(aivtuber_domain::Capability::MemoryAdmin);
         }
         let ingress = Arc::new(
@@ -633,6 +648,7 @@ pub fn apply_operator_request<R: RoutePlanner>(
         && request.action != "perception.enable"
         && request.action != "perception.disable"
         && request.action != "memory.export"
+        && !is_memory_seed_action(&request.action)
         && request.action != "model.select"
         && !is_tcp_voice_action(&request.action)
         && !is_tcp_ingress_action(&request.action)
@@ -705,6 +721,13 @@ fn is_persona_action(action: &str) -> bool {
     matches!(action, "persona.set" | "persona.get")
 }
 
+/// The memory seed actions (#402), both under the existing `memory.admin`. The
+/// operator endpoint (`aivtuberctl`) and the panel may send both; nothing else
+/// that holds `memory.admin` (export, erase) is reachable from the panel.
+fn is_memory_seed_action(action: &str) -> bool {
+    matches!(action, "memory.seed.get" | "memory.seed.set")
+}
+
 /// The avatar choice actions (#362), all under `avatar.configure`.
 fn is_avatar_action(action: &str) -> bool {
     matches!(
@@ -739,6 +762,7 @@ pub fn apply_operator_action<R: RoutePlanner>(
         && !is_avatar_action(action)
         && !is_speech_input_action(action)
         && !is_persona_action(action)
+        && !is_memory_seed_action(action)
     {
         let detail = format!("unknown action {action}");
         app.audit_operator_action(request_id, action, &detail, false);
@@ -824,7 +848,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
         "speech_input.control".to_owned()
     } else if is_persona_action(action) {
         "persona.configure".to_owned()
-    } else if action == "memory.export" {
+    } else if action == "memory.export" || is_memory_seed_action(action) {
         "memory.admin".to_owned()
     } else {
         action.to_owned()
@@ -1002,6 +1026,33 @@ fn apply_with_presented_secret<R: RoutePlanner>(
                     detail,
                     status: None,
                     memory_export: None,
+                    persona: None,
+                }
+            }
+            Err(detail) => {
+                app.audit_operator_action(&request_id, action, &detail, false);
+                rejection(&request_id, &detail)
+            }
+        };
+    }
+
+    if is_memory_seed_action(action) {
+        // Audited without the argument: the document is the operator's claims.
+        // The detail is a fixed phrase with the entry count and the hash.
+        return match app.configure_memory_seed(command.authority(), action, argument, now_ms) {
+            Ok(outcome) => {
+                app.audit_operator_action(&request_id, action, &outcome.detail, true);
+                OperatorResponse {
+                    request_id,
+                    ok: true,
+                    detail: outcome.detail,
+                    status: None,
+                    memory_export: outcome.seed.map(|seed| OperatorMemoryExport {
+                        seed_json: seed.to_json(),
+                        entries: seed.len(),
+                        skipped: 0,
+                        content_hash: seed.content_hash(),
+                    }),
                     persona: None,
                 }
             }

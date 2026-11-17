@@ -16,6 +16,15 @@
 //! The daemon never writes a file; this client refuses to overwrite one, so an
 //! export can never replace a hand-curated seed file.
 //!
+//! `memory-seed` (issue #402) shows or replaces the operator memory seed while
+//! the daemon runs, like the operation panel: `memory-seed show` prints the seed
+//! document, `memory-seed set --file <path>` validates a seed file here against
+//! the seed contract, then sends it compact. The control socket carries at most
+//! 8 KiB per record, so a larger seed is refused here with a pointer to the
+//! panel (which has no such limit). The daemon validates again and writes
+//! `AIVTUBER_MEMORY_SEED` atomically when one is configured; no claim is ever
+//! logged or audited.
+//!
 //! `ingress` (issue #361) connects or disconnects Twitch or YouTube chat, like
 //! the operation panel. The YouTube API key is deliberately not a subcommand
 //! (it would travel in a command line and a request log): it is entered in the
@@ -99,6 +108,14 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Show or replace the operator memory seed (issue #402); needs the daemon
+    /// to run with live seed editing (the local and hybrid profiles started by
+    /// `aivtuber-setup start`). The entries relevant to a reply go to the model
+    /// with it; with a cloud model they leave this machine.
+    MemorySeed {
+        #[command(subcommand)]
+        action: MemorySeedCommand,
+    },
     /// Switch the local Thinking model (issue #357), for example
     /// `aivtuberctl model qwen3-4b-instruct-2507`. The alias must be one the
     /// launcher listed (`aivtuberctl status` prints them); the operation panel
@@ -145,6 +162,48 @@ enum Command {
         #[command(subcommand)]
         action: AvatarCommand,
     },
+}
+
+#[derive(Subcommand, Clone, PartialEq, Eq)]
+enum MemorySeedCommand {
+    /// Print the seed document the daemon holds (seed-file format).
+    Show,
+    /// Replace the seed with a seed file (`schemas/memory-seed.schema.json`;
+    /// at most 128 entries of 240 bytes, and small enough for one control
+    /// record: use the operation panel for a larger one).
+    Set {
+        /// The seed file to read.
+        #[arg(long)]
+        file: PathBuf,
+    },
+}
+
+/// The request line the control socket accepts (`MAX_RECORD_BYTES` of the
+/// daemon), less room for the secret and the other fields.
+const SEED_ARGUMENT_BUDGET: usize = 7_000;
+
+/// The `memory.seed.set` argument for a memory-seed subcommand: the validated
+/// seed as compact JSON. The file is read bounded and parsed with the daemon's
+/// own parser before anything is sent; `Show` sends no argument.
+fn memory_seed_argument(action: &MemorySeedCommand) -> Result<Option<String>, String> {
+    match action {
+        MemorySeedCommand::Show => Ok(None),
+        MemorySeedCommand::Set { file } => {
+            let seed = MemorySeed::load(file)
+                .map_err(|error| format!("cannot use {}: {error}", file.display()))?;
+            let compact = seed.to_compact_json();
+            // JSON inside a JSON string: quotes and backslashes are escaped
+            // again, so measure the escaped form.
+            let escaped = serde_json::to_string(&compact).map_or(usize::MAX, |s| s.len());
+            if escaped > SEED_ARGUMENT_BUDGET {
+                return Err(format!(
+                    "{} is too large for the control socket ({escaped} of {SEED_ARGUMENT_BUDGET} bytes after encoding); edit it in the operation panel instead",
+                    file.display()
+                ));
+            }
+            Ok(Some(compact))
+        }
+    }
 }
 
 #[derive(Subcommand, Clone, PartialEq, Eq)]
@@ -415,6 +474,10 @@ fn action_name(command: &Command) -> &'static str {
         Command::PerceptionOff => "perception.disable",
         Command::MemoryExport { .. } => "memory.export",
         Command::Model { .. } => "model.select",
+        Command::MemorySeed { action } => match action {
+            MemorySeedCommand::Show => "memory.seed.get",
+            MemorySeedCommand::Set { .. } => "memory.seed.set",
+        },
         Command::Persona { action } => match action {
             PersonaCommand::Show => "persona.get",
             PersonaCommand::Set { .. } | PersonaCommand::Clear => "persona.set",
@@ -481,6 +544,13 @@ fn main() -> ExitCode {
     };
 
     let argument = match &cli.command {
+        Command::MemorySeed { action } => match memory_seed_argument(action) {
+            Ok(argument) => argument,
+            Err(error) => {
+                eprintln!("aivtuberctl: {error}");
+                return ExitCode::from(2);
+            }
+        },
         Command::Persona { action } => match persona_argument(action) {
             Ok(argument) => argument,
             Err(error) => {
@@ -516,6 +586,22 @@ fn main() -> ExitCode {
                         ExitCode::from(1)
                     }
                 };
+            }
+            if let Command::MemorySeed {
+                action: MemorySeedCommand::Show,
+            } = &cli.command
+                && response.ok
+            {
+                // The identity goes to stderr so stdout is exactly the seed.
+                eprintln!("{}", response.detail);
+                print!(
+                    "{}",
+                    response
+                        .memory_export
+                        .as_ref()
+                        .map_or("", |export| export.seed_json.as_str())
+                );
+                return ExitCode::SUCCESS;
             }
             if let Command::Persona {
                 action: PersonaCommand::Show,
@@ -669,6 +755,12 @@ fn print_response(response: &OperatorResponse) {
             println!(
                 "persona_editor persisted={} thinking_remote={}",
                 editor.persisted, editor.thinking_remote
+            );
+        }
+        if let Some(editor) = &status.memory_seed_editor {
+            println!(
+                "memory_seed_editor persisted={} thinking_remote={} entries={} content_hash={}",
+                editor.persisted, editor.thinking_remote, editor.entries, editor.content_hash
             );
         }
         if let Some(chat) = &status.chat_ingress {
@@ -903,6 +995,78 @@ mod tests {
         ] {
             let (name, text) = patch(args);
             assert_eq!((name, text), (action, None));
+        }
+    }
+
+    #[test]
+    fn memory_seed_subcommands_map_to_the_two_actions_and_validate_the_file_before_sending() {
+        let dir = std::env::temp_dir().join(format!("aivtuberctl-seed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, text: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, text).unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        let command = parse(&["memory-seed", "show"]);
+        assert_eq!(action_name(&command), "memory.seed.get");
+        let Command::MemorySeed { action } = &command else {
+            panic!("not a memory-seed command");
+        };
+        assert_eq!(memory_seed_argument(action), Ok(None));
+
+        let seed = MemorySeed::from_entries(
+            "s",
+            "1",
+            vec![aivtuber_app::SeedEntry {
+                kind: aivtuber_app::SeedKind::PersonaFact,
+                claim: "ミコトは猫が好き".to_owned(),
+            }],
+        )
+        .unwrap();
+        let good = write("good.json", &seed.to_json());
+        let command = parse(&["memory-seed", "set", "--file", &good]);
+        assert_eq!(action_name(&command), "memory.seed.set");
+        let Command::MemorySeed { action } = &command else {
+            panic!("not a memory-seed command");
+        };
+        let argument = memory_seed_argument(action).unwrap().unwrap();
+        assert_eq!(MemorySeed::parse(&argument).unwrap(), seed);
+        assert!(!argument.contains('\n'), "compact: one line");
+
+        // Invalid, unknown-field, missing and over-the-record files send nothing.
+        let invalid = write("invalid.json", "{\"schema_version\":\"0.1.0\"}");
+        let missing = dir.join("missing.json").to_string_lossy().into_owned();
+        let many = MemorySeed::from_entries(
+            "s",
+            "1",
+            (0..40)
+                .map(|i| aivtuber_app::SeedEntry {
+                    kind: aivtuber_app::SeedKind::RunningJoke,
+                    claim: format!("{i:03} {}", "x".repeat(200)),
+                })
+                .collect(),
+        )
+        .unwrap();
+        let big = write("big.json", &many.to_json());
+        for file in [&invalid, &missing, &big] {
+            let command = parse(&["memory-seed", "set", "--file", file]);
+            let Command::MemorySeed { action } = &command else {
+                panic!("not a memory-seed command");
+            };
+            assert!(memory_seed_argument(action).is_err(), "{file}");
+        }
+        for args in [
+            &["memory-seed"][..],
+            &["memory-seed", "set"][..],
+            &["memory-seed", "set", "--text", "x"][..],
+        ] {
+            let mut full = vec![
+                "aivtuberctl",
+                "--secret",
+                "01234567890123456789012345678901",
+            ];
+            full.extend_from_slice(args);
+            assert!(Cli::try_parse_from(full).is_err(), "{args:?}");
         }
     }
 

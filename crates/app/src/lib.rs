@@ -79,8 +79,9 @@ pub use memory_context::*;
 pub use memory_eval::*;
 pub use memory_seed::{
     EXPORT_SEED_ID, MAX_SEED_CLAIM_BYTES, MAX_SEED_ENTRIES, MAX_SEED_FILE_BYTES,
-    MEMORY_SEED_EVENT_PREFIX, MEMORY_SEED_SCHEMA_VERSION, MemoryFalsifierMetrics, MemorySeed,
-    MemorySeedError, MemorySeedExport, MemorySeedIdentity, SeedEntry, SeedKind,
+    MEMORY_SEED_EVENT_PREFIX, MEMORY_SEED_FILE_VAR, MEMORY_SEED_SCHEMA_VERSION,
+    MemoryFalsifierMetrics, MemorySeed, MemorySeedEditor, MemorySeedEditorStatus, MemorySeedError,
+    MemorySeedExport, MemorySeedIdentity, MemorySeedOutcome, SeedEntry, SeedKind,
 };
 pub use memory_sidecar_eval::*;
 pub use memory_writer::{
@@ -1180,6 +1181,11 @@ where
     memory_writer: Option<memory_writer::MemoryWriter>,
     /// Q4 falsifier counters and the loaded seed's identity (#321).
     memory_falsifier: memory_seed::MemoryFalsifier,
+    /// Live editing of the operator memory seed (#402); `None` (default)
+    /// composes nothing.
+    memory_seed_editor: Option<memory_seed::MemorySeedEditor>,
+    /// Saves applied so far; names the erase transaction of each one.
+    memory_seed_edits: u64,
     speech_observations: Option<SpeechObservationTracker>,
     /// Opt-in live screen perception (#90 S1b); `None` (default) composes nothing.
     perception: Option<perception_service::PerceptionService>,
@@ -1273,6 +1279,8 @@ where
             adaptation: None,
             memory_writer: None,
             memory_falsifier: memory_seed::MemoryFalsifier::default(),
+            memory_seed_editor: None,
+            memory_seed_edits: 0,
             speech_observations: None,
             perception: None,
             model_switcher: None,
@@ -1414,13 +1422,38 @@ where
         seed: &MemorySeed,
         now_ms: u64,
     ) -> Result<(), MemorySeedError> {
+        let permits = self.admit_memory_seed(seed, false)?;
+        self.store_memory_seed(seed, &permits, now_ms)
+    }
+
+    /// Every check a seed must pass before anything is stored, and its permits.
+    /// `replacing` discounts the entries a live save is about to remove, so the
+    /// capacity check sees the store as it will be. Changes no memory.
+    fn admit_memory_seed(
+        &mut self,
+        seed: &MemorySeed,
+        replacing: bool,
+    ) -> Result<Vec<aivtuber_runtime::MemoryWritePermit>, MemorySeedError> {
         let Some(adaptation) = self.adaptation.as_ref() else {
             return Err(MemorySeedError::AdaptationUnavailable);
         };
         let config = adaptation.memory.config();
+        let replaced = if replacing {
+            adaptation
+                .memory
+                .entries()
+                .iter()
+                .filter(|entry| entry.source.source == aivtuber_runtime::OPERATOR_SEED_SOURCE)
+                .count()
+        } else {
+            0
+        };
         // Leave at least half of the store to the runtime's own memory.
-        let limit = (config.max_entries / 2)
-            .min(config.max_entries.saturating_sub(adaptation.memory.len()));
+        let limit = (config.max_entries / 2).min(
+            config
+                .max_entries
+                .saturating_sub(adaptation.memory.len().saturating_sub(replaced)),
+        );
         if seed.len() > limit {
             return Err(MemorySeedError::StoreCapacity {
                 entries: seed.len(),
@@ -1448,11 +1481,20 @@ where
                 .ok_or(MemorySeedError::Refused { index })?;
             permits.push(permit);
         }
+        Ok(permits)
+    }
+
+    fn store_memory_seed(
+        &mut self,
+        seed: &MemorySeed,
+        permits: &[aivtuber_runtime::MemoryWritePermit],
+        now_ms: u64,
+    ) -> Result<(), MemorySeedError> {
         let adaptation = self
             .adaptation
             .as_mut()
             .ok_or(MemorySeedError::AdaptationUnavailable)?;
-        for (entry, permit) in seed.entries().iter().zip(&permits) {
+        for (entry, permit) in seed.entries().iter().zip(permits) {
             adaptation
                 .memory
                 .remember_durable(permit, &entry.claim, Some(entry.kind.topic()), now_ms)
@@ -1460,6 +1502,135 @@ where
         }
         self.memory_falsifier.note_seed(seed);
         Ok(())
+    }
+
+    /// Opt in to viewing and editing the memory seed while running (#402).
+    /// Only the authenticated `memory.admin` capability can use it
+    /// (`configure_memory_seed`); `editor` names the file a save is written to
+    /// (none = in memory only). Needs the adaptation runtime.
+    pub fn with_memory_seed_editor(mut self, editor: MemorySeedEditor) -> Self {
+        self.memory_seed_editor = Some(editor);
+        self
+    }
+
+    /// Whether the seed can be edited while running (the operator endpoint
+    /// then holds `memory.admin` for the `memory.seed.*` actions).
+    pub fn memory_seed_editor_composed(&self) -> bool {
+        self.memory_seed_editor.is_some() && self.adaptation.is_some()
+    }
+
+    /// The seed as the operator last wrote it (loaded or saved).
+    fn current_memory_seed(&self) -> MemorySeed {
+        self.memory_falsifier
+            .seed()
+            .cloned()
+            .unwrap_or_else(MemorySeed::empty)
+    }
+
+    /// Live-edit state for the operator surfaces; counts and the identity hash
+    /// only. `None` unless composed.
+    pub fn memory_seed_editor_status(&self) -> Option<MemorySeedEditorStatus> {
+        let editor = self.memory_seed_editor.as_ref()?;
+        self.adaptation.as_ref()?;
+        let seed = self.current_memory_seed();
+        Some(MemorySeedEditorStatus {
+            persisted: editor.path().is_some(),
+            thinking_remote: editor.thinking_remote(),
+            entries: seed.len(),
+            content_hash: seed.content_hash(),
+        })
+    }
+
+    /// Apply one memory-seed operator request (#402). `authority` must hold
+    /// the authenticated `memory.admin` capability. `action` is
+    /// `memory.seed.get` or `memory.seed.set` (`argument` is the whole seed
+    /// document, `schemas/memory-seed.schema.json`).
+    ///
+    /// A set is validated by the seed parser and admitted by the same gates as
+    /// the start-up load before anything changes; then the file is written
+    /// atomically when one is configured; only then are the live seed entries
+    /// replaced. A refusal or a failed write leaves the file and the live
+    /// entries unchanged. Details are fixed phrases plus counts and the hash,
+    /// never a claim; only `get` returns the document, to the caller.
+    pub fn configure_memory_seed(
+        &mut self,
+        authority: &AuthenticatedControl,
+        action: &str,
+        argument: Option<&str>,
+        now_ms: u64,
+    ) -> Result<MemorySeedOutcome, String> {
+        if !authority.has_capability(aivtuber_domain::Capability::MemoryAdmin) {
+            return Err("memory seed editing is not authorized".to_owned());
+        }
+        if !self.memory_seed_editor_composed() {
+            return Err("memory seed editing is not configured".to_owned());
+        }
+        match action {
+            "memory.seed.get" => {
+                let seed = self.current_memory_seed();
+                Ok(MemorySeedOutcome {
+                    detail: format!(
+                        "memory seed: entries={} content_hash={}",
+                        seed.len(),
+                        seed.content_hash()
+                    ),
+                    seed: Some(seed),
+                })
+            }
+            "memory.seed.set" => {
+                let Some(text) = argument else {
+                    return Err("memory seed not changed: no document given".to_owned());
+                };
+                let not_changed =
+                    |error: MemorySeedError| format!("memory seed not changed: {error}");
+                let seed = MemorySeed::parse(text).map_err(not_changed)?;
+                if !self
+                    .adaptation
+                    .as_ref()
+                    .is_some_and(|a| a.memory.pending_erasure_ids().is_empty())
+                {
+                    return Err(not_changed(MemorySeedError::ErasePending));
+                }
+                let permits = self.admit_memory_seed(&seed, true).map_err(not_changed)?;
+                let persisted = match self
+                    .memory_seed_editor
+                    .as_ref()
+                    .and_then(|editor| editor.path())
+                {
+                    Some(path) => {
+                        // The canonical form, the bytes `memory-export` also
+                        // writes, so a restart loads exactly this seed.
+                        if persona::write_persona_file_atomic(path, &seed.to_json()).is_err() {
+                            return Err(
+                                "memory seed not changed: the seed file could not be written"
+                                    .to_owned(),
+                            );
+                        }
+                        true
+                    }
+                    None => false,
+                };
+                self.memory_seed_edits += 1;
+                let request_id = format!("memory-seed-set-{}", self.memory_seed_edits);
+                self.erase_memory_seed_operator(&request_id, authority, now_ms)
+                    .map_err(|error| format!("memory seed partly applied: {error}"))?;
+                self.store_memory_seed(&seed, &permits, now_ms)
+                    .map_err(|error| format!("memory seed partly applied: {error}"))?;
+                let kept = if persisted {
+                    "saved to the seed file"
+                } else {
+                    "applied in memory only (no seed file is configured)"
+                };
+                let detail = format!(
+                    "memory seed updated, {kept}: entries={} content_hash={}",
+                    seed.len(),
+                    seed.content_hash()
+                );
+                eprintln!("memory_seed: {detail}");
+                Ok(MemorySeedOutcome { detail, seed: None })
+            }
+            _ => Err("not a memory seed action".to_owned()),
+        }
     }
 
     /// Identity (id, revision, content hash, entry count) of the loaded seed:
