@@ -192,6 +192,186 @@ fn the_controller_starts_stops_and_restarts_a_fresh_sidecar() {
     assert_eq!(std::fs::read_to_string(&file).unwrap(), ON);
 }
 
+fn device_controller(lock: &Path, file: &Path, started: Instant) -> SpeechInputController {
+    controller(DOUBLE, "devices", lock, file, started)
+}
+
+fn log_lines(lock: &Path) -> Vec<String> {
+    let mut log = lock.as_os_str().to_owned();
+    log.push(".log");
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// #396: the sidecar reports its devices and the opened one; choosing another
+/// stops the old sidecar and starts a new one on it (the double holds an
+/// exclusive lock, so a second instance could not even report while the first
+/// lived), and the choice is saved with the rest of the file.
+#[test]
+fn the_capture_device_is_reported_and_a_switch_restarts_the_sidecar_without_a_leftover() {
+    let dir = scratch("device-switch");
+    let (lock, file) = (dir.join("alive.lock"), dir.join("local-speech-input.json"));
+    let started = Instant::now();
+    let mut input = device_controller(&lock, &file, started);
+    let (mut observations, mut transcripts) = trackers();
+    let announce = |_: bool, _: bool| {};
+    input.enable(announce).expect("enable");
+    poll_until(
+        &mut input,
+        &mut observations,
+        &mut transcripts,
+        started,
+        "the device report",
+        |_, input| input.status().device.is_some(),
+    );
+    let status = input.status();
+    assert_eq!(status.device.as_deref(), Some("Mic A"));
+    assert_eq!(status.devices, ["Mic A", "Mic B", "Line (AG06)"]);
+    assert_eq!(status.selected_device, None);
+    assert_eq!(log_lines(&lock).len(), 1);
+
+    // A device nobody listed is refused; nothing restarts.
+    assert!(matches!(
+        input.set_device(Some("Nope".to_owned()), announce),
+        Err(SpeechInputError::Device(_))
+    ));
+    assert_eq!(log_lines(&lock).len(), 1);
+    assert_eq!(input.status().selected_device, None);
+
+    let detail = input
+        .set_device(Some("Line (AG06)".to_owned()), announce)
+        .expect("switch");
+    assert_eq!(detail, "capture device changed");
+    assert!(
+        !detail.contains("AG06"),
+        "the answer never carries the name"
+    );
+    poll_until(
+        &mut input,
+        &mut observations,
+        &mut transcripts,
+        started,
+        "the new device report",
+        |_, input| input.status().device.as_deref() == Some("Line (AG06)"),
+    );
+    let log = log_lines(&lock);
+    assert_eq!(log.len(), 2, "{log:?}");
+    let pids: Vec<&str> = log.iter().filter_map(|l| l.split(' ').next()).collect();
+    assert_ne!(pids[0], pids[1], "a fresh process");
+    assert!(log[1].ends_with("Line (AG06)"), "{log:?}");
+    assert!(double_alive(&lock), "exactly the new one runs");
+    let saved = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        saved.contains("\"enabled\":true") && saved.contains("Line (AG06)"),
+        "{saved}"
+    );
+
+    // Back to the system default restarts again and drops the name.
+    input.set_device(None, announce).expect("default");
+    poll_until(
+        &mut input,
+        &mut observations,
+        &mut transcripts,
+        started,
+        "the default device report",
+        |_, input| input.status().device.as_deref() == Some("Mic A"),
+    );
+    assert_eq!(log_lines(&lock).len(), 3);
+    assert!(!std::fs::read_to_string(&file).unwrap().contains("device"));
+
+    // Off: the process is gone, and the choice is remembered.
+    input
+        .set_device(Some("Mic B".to_owned()), announce)
+        .expect("mic b");
+    input.disable(announce);
+    let spawned = log_lines(&lock).len();
+    assert!(!double_alive(&lock), "the sidecar outlived the disable");
+    let saved = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        saved.contains("\"enabled\":false") && saved.contains("Mic B"),
+        "{saved}"
+    );
+    // The list is still offered while it is off; the opened device is not.
+    let status = input.status();
+    assert_eq!(status.devices.len(), 3);
+    assert_eq!(status.device, None);
+    // Choosing while off only remembers: nothing starts.
+    input
+        .set_device(Some("Mic A".to_owned()), announce)
+        .expect("off");
+    assert!(!double_alive(&lock));
+    assert_eq!(log_lines(&lock).len(), spawned, "nothing started while off");
+}
+
+/// #396: a remembered device that does not exist keeps voice input off with a
+/// reason that names the devices that do; choosing a listed one recovers.
+#[test]
+fn an_unknown_remembered_device_fails_clearly_and_a_listed_one_recovers() {
+    let dir = scratch("device-unknown");
+    let (lock, file) = (dir.join("alive.lock"), dir.join("local-speech-input.json"));
+    let started = Instant::now();
+    let mut input = device_controller(&lock, &file, started).with_settings(
+        aivtuber_domain::SpeechInputSettings {
+            enabled: true,
+            device: Some("Missing Mic".to_owned()),
+            ..aivtuber_domain::SpeechInputSettings::default()
+        },
+    );
+    let (mut observations, mut transcripts) = trackers();
+    let announce = |_: bool, _: bool| {};
+    input.start_initial().expect("the process starts");
+    poll_until(
+        &mut input,
+        &mut observations,
+        &mut transcripts,
+        started,
+        "the failure",
+        |_, input| input.status().state == SpeechInputStateName::Failed,
+    );
+    let status = input.status();
+    let reason = status.reason.expect("a reason");
+    assert!(reason.contains("Missing Mic"), "{reason}");
+    assert!(
+        reason.contains("Mic A") && reason.contains("Line (AG06)"),
+        "{reason}"
+    );
+    assert!(
+        reason.contains("見つかりません") && reason.contains("not found"),
+        "{reason}"
+    );
+    assert_eq!(status.device, None);
+    assert_eq!(status.devices.len(), 3, "the list survives the exit");
+    assert!(!double_alive(&lock), "no process is left");
+    // Still failed after more polling (no restart), and the file is untouched.
+    input.poll(&mut observations, Some(&mut transcripts), 5);
+    assert_eq!(input.status().state, SpeechInputStateName::Failed);
+    assert!(!file.exists());
+
+    // Choosing a listed device starts a working one and saves the choice.
+    input
+        .set_device(Some("Mic B".to_owned()), announce)
+        .expect("recover");
+    poll_until(
+        &mut input,
+        &mut observations,
+        &mut transcripts,
+        started,
+        "the recovered device",
+        |_, input| input.status().device.as_deref() == Some("Mic B"),
+    );
+    assert_eq!(input.status().state, SpeechInputStateName::On);
+    assert!(
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("\"enabled\":true")
+    );
+    input.shutdown();
+    assert!(!double_alive(&lock));
+}
+
 #[test]
 fn a_sidecar_that_cannot_start_is_a_typed_failure_and_the_state_stays_off() {
     let dir = scratch("nospawn");
@@ -475,7 +655,7 @@ fn the_panel_and_aivtuberctl_switch_the_real_app_five_times_without_leftovers() 
     assert!(!double_alive(&lock), "off at start opens nothing");
     assert_eq!(
         app.voice_input_line(),
-        "voice_input composed=true state=Off thinking_remote=false reason=None"
+        "voice_input composed=true state=Off thinking_remote=false reason=None duplex=Half dropped_during_playback=0 device=None selected_device=None"
     );
 
     for round in 1..=5 {
@@ -526,6 +706,42 @@ fn the_panel_and_aivtuberctl_switch_the_real_app_five_times_without_leftovers() 
     assert!(!double_alive(&lock));
     app.finish();
     assert_eq!(std::fs::read_to_string(&file).unwrap(), OFF);
+}
+
+/// #396 over the real control endpoint: the duplex and device choices are
+/// accepted, saved whole beside `enabled`, and shown in `status`.
+#[test]
+fn aivtuberctl_chooses_the_device_and_duplex_and_the_choices_are_saved() {
+    let dir = scratch("app-choices");
+    let (lock, file) = (dir.join("alive.lock"), dir.join("local-speech-input.json"));
+    let app = RunningApp::start(DOUBLE, &file, &lock, "verbose");
+    let (ok, text) = app.ctl(&["voice-input", "duplex", "full"]);
+    assert!(ok, "{text}");
+    let (ok, text) = app.ctl(&["voice-input", "device", "Mic B"]);
+    assert!(ok, "{text}");
+    assert!(
+        !text.contains("Mic B"),
+        "the answer never carries the name: {text}"
+    );
+    let line = app.voice_input_line();
+    assert!(
+        line.contains("duplex=Full") && line.contains("selected_device=Some(\"Mic B\")"),
+        "{line}"
+    );
+    let saved = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        saved.contains("\"device\":\"Mic B\"") && saved.contains("\"duplex\":\"full\""),
+        "{saved}"
+    );
+    // The audit line of the endpoint does not carry the name either.
+    assert!(!app.log().contains("Mic B"), "{}", app.log());
+    let (ok, text) = app.ctl(&["voice-input", "device", "--default"]);
+    assert!(ok, "{text}");
+    assert!(!std::fs::read_to_string(&file).unwrap().contains("device"));
+    assert!(app.voice_input_line().contains("selected_device=None"));
+    let (ok, _) = app.ctl(&["voice-input", "duplex", "both"]);
+    assert!(!ok, "clap refuses it before anything is sent");
+    app.finish();
 }
 
 #[test]

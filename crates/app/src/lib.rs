@@ -38,6 +38,7 @@ mod shadow_evidence;
 mod shadow_orchestrator;
 mod speech_barge_in;
 mod speech_conversation;
+mod speech_duplex;
 mod speech_floor;
 pub mod speech_input;
 mod speech_resynthesis;
@@ -1225,6 +1226,8 @@ where
     chat_burst: Option<chat_burst::ChatBurstLane>,
     /// Runtime time the VAD sidecar's newest feed-liveness beat arrived.
     speech_feed_heartbeat_ms: Option<u64>,
+    /// Performer playback intervals, for the half-duplex gate (#396).
+    speech_playback: speech_duplex::PlaybackGate,
     audio: audio_stop::AudioChannel,
     avatar: Box<dyn AvatarOutput>,
     stream: Box<dyn StreamOutput>,
@@ -1299,6 +1302,7 @@ where
             speech_input: None,
             chat_burst: None,
             speech_feed_heartbeat_ms: None,
+            speech_playback: speech_duplex::PlaybackGate::default(),
             audio: audio_stop::AudioChannel::new(audio),
             avatar,
             stream,
@@ -2459,7 +2463,27 @@ where
     /// The voice-input state for the operator surfaces; `None` when no speech
     /// sidecar is configured.
     pub fn speech_input_status(&self) -> Option<speech_input::SpeechInputStatus> {
-        self.speech_input.as_ref().map(|input| input.status())
+        self.speech_input.as_ref().map(|input| {
+            let mut status = input.status();
+            status.dropped_during_playback = self.speech_playback.dropped_during_playback();
+            status
+        })
+    }
+
+    /// Whether the performer listens while it speaks (#396). Without a
+    /// composed voice input (the app run directly) it always does, as before.
+    fn speech_full_duplex(&self) -> bool {
+        self.speech_input
+            .as_ref()
+            .is_none_or(|input| input.duplex() == aivtuber_domain::SpeechDuplex::Full)
+    }
+
+    /// Whether the playback history is kept: only a composed voice input has a
+    /// duplex choice.
+    fn speech_playback_tracked(&self) -> bool {
+        self.speech_input
+            .as_ref()
+            .is_some_and(speech_input::SpeechInputController::composed)
     }
 
     /// Counters of the running speech sidecar, if there is one.
@@ -2523,6 +2547,7 @@ where
         &mut self,
         authority: &AuthenticatedControl,
         action: &str,
+        argument: Option<&str>,
     ) -> Result<String, String> {
         if !authority.has_capability(aivtuber_domain::Capability::SpeechInputControl) {
             return Err("voice input is not authorized".to_owned());
@@ -2530,13 +2555,21 @@ where
         if !self.speech_input_composed() {
             return Err("voice input is not configured".to_owned());
         }
+        let device_chosen = match action {
+            "speech_input.device" => argument.is_some_and(|name| !name.is_empty()),
+            _ => self
+                .speech_input
+                .as_ref()
+                .is_some_and(|input| input.selected_device().is_some()),
+        };
         let announce = |on: bool, remote: bool| {
             eprintln!(
                 "{}",
-                ready_guide::voice_input_line(
+                ready_guide::voice_input_text(
                     on,
                     remote,
                     aivtuber_adapters::log_verbosity::diagnostics_enabled(),
+                    device_chosen,
                 )
             );
         };
@@ -2560,8 +2593,52 @@ where
                 self.clear_speech_state();
                 Ok(detail)
             }
+            "speech_input.device" => self.set_speech_input_device(argument, announce),
+            "speech_input.duplex" => self.set_speech_input_duplex(argument),
             _ => Err("not a voice input action".to_owned()),
         }
+    }
+
+    /// `speech_input.device`: the argument is a capture device name, empty for
+    /// the system default. The controller accepts only a name the sidecar
+    /// listed (or any acceptable name before it listed any); the answer and
+    /// the audit record never carry the name. A separate function so the
+    /// request path through [`Self::configure_speech_input`] keeps a small
+    /// frame (the app's main thread is a Windows 1 MiB stack).
+    fn set_speech_input_device(
+        &mut self,
+        argument: Option<&str>,
+        announce: impl FnOnce(bool, bool),
+    ) -> Result<String, String> {
+        let device = match argument {
+            None | Some("") => None,
+            Some(name) => Some(name.to_owned()),
+        };
+        // The new instance starts from empty state, like enable.
+        self.clear_speech_state();
+        let input = self.speech_input.as_mut().expect("composed");
+        input
+            .set_device(device, announce)
+            .map_err(|error| error.to_string())
+    }
+
+    /// `speech_input.duplex`: `half` or `full`, applied at once and saved.
+    fn set_speech_input_duplex(&mut self, argument: Option<&str>) -> Result<String, String> {
+        let duplex = argument
+            .and_then(aivtuber_domain::SpeechDuplex::parse)
+            .ok_or_else(|| "expected half or full".to_owned())?;
+        let detail = self
+            .speech_input
+            .as_mut()
+            .expect("composed")
+            .set_duplex(duplex);
+        if duplex == aivtuber_domain::SpeechDuplex::Half {
+            // Nothing heard before the switch can still confirm a barge-in.
+            if let Some(barge_in) = self.speech_barge_in.as_mut() {
+                barge_in.reset_handled();
+            }
+        }
+        Ok(detail)
     }
 
     pub fn speech_barge_in_metrics(&self) -> Option<BargeInMetrics> {
@@ -2614,6 +2691,11 @@ where
     pub fn service_barge_in(&mut self, at_ms: u64) -> Option<BargeInRecord> {
         let fade_ms = self.speech_barge_in.as_ref()?.config().fade_ms;
         self.speech_floor.as_ref()?;
+        // Half duplex (#396): the performer's own audio can come back through
+        // the microphone, so the user's voice does not stop it.
+        if !self.speech_full_duplex() {
+            return None;
+        }
         self.pump_speech_lifecycle();
         // A phrased reply that already spoke is still "speaking" in the gap
         // between two phrases, when nothing is audible but more would follow.
@@ -2771,6 +2853,7 @@ where
     /// discarded so the tracker's bounded queue never wedges.
     pub fn route_spoken_finals(&mut self, at_ms: u64, seed: u64) -> Vec<SpokenFinalReport> {
         self.pump_speech_lifecycle();
+        let half_duplex = self.speech_playback_tracked() && !self.speech_full_duplex();
         let Some(tracker) = self.speech_transcripts.as_mut() else {
             return Vec::new();
         };
@@ -2780,6 +2863,23 @@ where
         };
         let max_finals = conversation.config().max_finals_per_tick;
         let mut finals = tracker.take_finals(max_finals);
+        // Half duplex (#396): a segment that started while the performer's
+        // audio played, or in the tail after it, is its own echo. It is
+        // dropped here, before the floor, so it is never held, routed or sent
+        // to a model. The start is the segment's end less the audio it covers
+        // (pre-roll included, so slightly early, which errs toward dropping).
+        if half_duplex {
+            let before = finals.len();
+            let playback = &self.speech_playback;
+            finals.retain(|spoken| {
+                !playback.covers(
+                    spoken
+                        .observed_at_ms
+                        .saturating_sub(spoken.covered_audio_ms),
+                )
+            });
+            self.speech_playback.count_dropped(before - finals.len());
+        }
         if let Some(floor) = self.speech_floor.as_mut() {
             // Evidence enters only here, from the trackers and the scheduler's
             // own playing state. Missing evidence degrades to the text-only
@@ -5070,7 +5170,11 @@ where
     /// so an external consumer of [`Self::drain_speech_lifecycle`] keeps the
     /// whole queue. A `seq` gap is repaired from the snapshot.
     fn pump_speech_lifecycle(&mut self) {
-        if self.speech_floor.is_none() && self.speech_lifecycle_recorder.is_none() {
+        let track_playback = self.speech_playback_tracked();
+        if self.speech_floor.is_none()
+            && self.speech_lifecycle_recorder.is_none()
+            && !track_playback
+        {
             return;
         }
         let events = self
@@ -5078,6 +5182,9 @@ where
             .scheduler_mut()
             .drain_speech_lifecycle(usize::MAX);
         for event in &events {
+            if track_playback {
+                self.speech_playback.observe(event);
+            }
             if let Some(floor) = self.speech_floor.as_mut() {
                 floor.own_tracker_mut().observe(event);
             }
@@ -10531,8 +10638,9 @@ mod tests {
                     };
 
                     const SECRET: [u8; 32] = [0x6C; 32];
-                    const OFF: &str =
-                        "{\"schema\":\"local-speech-input-settings/1\",\"enabled\":false}\n";
+                    // The controller of these tests is full duplex, which the file records.
+                    const OFF: &str = "{\"schema\":\"local-speech-input-settings/1\",\"enabled\":false,\"duplex\":\"full\"}
+";
 
                     fn ingress(capabilities: &[Capability]) -> LocalControlIngress {
                         LocalControlIngress::new(
@@ -10566,7 +10674,16 @@ mod tests {
                         dir.join("local-speech-input.json")
                     }
 
+                    /// Full duplex: the #400 tests below are about barge-in and
+                    /// the floor, which half duplex (the file default) turns off.
                     fn controller(path: Option<PathBuf>) -> SpeechInputController {
+                        duplex_controller(path, aivtuber_domain::SpeechDuplex::Full)
+                    }
+
+                    fn duplex_controller(
+                        path: Option<PathBuf>,
+                        duplex: aivtuber_domain::SpeechDuplex,
+                    ) -> SpeechInputController {
                         SpeechInputController::new(
                             crate::SpeechSidecarConfig::new(
                                 "definitely-not-a-real-speech-sidecar",
@@ -10576,6 +10693,12 @@ mod tests {
                             path,
                             false,
                         )
+                        .with_settings(
+                            aivtuber_domain::SpeechInputSettings {
+                                duplex,
+                                ..aivtuber_domain::SpeechInputSettings::default()
+                            },
+                        )
                     }
 
                     fn act(
@@ -10584,12 +10707,22 @@ mod tests {
                         action: &str,
                         now_ms: u64,
                     ) -> OperatorResponse {
+                        act_arg(app, ingress, action, None, now_ms)
+                    }
+
+                    fn act_arg(
+                        app: &mut ProductionApp<ReflexRoutePlanner<FixedEmbedding>>,
+                        ingress: &LocalControlIngress,
+                        action: &str,
+                        argument: Option<&str>,
+                        now_ms: u64,
+                    ) -> OperatorResponse {
                         apply_operator_action(
                             ingress,
                             app,
                             &format!("voice-input-{now_ms}"),
                             action,
-                            None,
+                            argument,
                             &SECRET,
                             now_ms,
                         )
@@ -10741,11 +10874,16 @@ mod tests {
                         );
                         // Without the capability the ingress cannot mint it.
                         let weak = ingress(&[Capability::PerformerStop, Capability::PerformerMute]);
-                        for action in ["speech_input.enable", "speech_input.disable"] {
-                            let response = act(&mut app, &weak, action, 30);
+                        for (action, argument) in [
+                            ("speech_input.enable", None),
+                            ("speech_input.disable", None),
+                            ("speech_input.device", Some("USB Mic")),
+                            ("speech_input.duplex", Some("full")),
+                        ] {
+                            let response = act_arg(&mut app, &weak, action, argument, 30);
                             assert!(
                                 !response.ok && response.detail.contains("authentication failed"),
-                                "{response:?}"
+                                "{action}: {response:?}"
                             );
                         }
                         assert!(!path.exists(), "a refused request wrote nothing");
@@ -10804,6 +10942,221 @@ mod tests {
                             audit.iter().all(|line| !line.contains("definitely-not")),
                             "{audit:?}"
                         );
+                    }
+
+                    fn half_rig(duplex: aivtuber_domain::SpeechDuplex, name: &str) -> Rig {
+                        let mut r = rig(Backend::Fading, Some(BargeInConfig::default()));
+                        r.app = r
+                            .app
+                            .with_speech_conversation(SpeechConversationConfig::default())
+                            .expect("conversation")
+                            .with_speech_input(duplex_controller(Some(scratch_file(name)), duplex));
+                        r
+                    }
+
+                    fn routed_texts(
+                        app: &mut ProductionApp<ReflexRoutePlanner<FixedEmbedding>>,
+                        now_ms: u64,
+                    ) -> Vec<String> {
+                        let mut texts = Vec::new();
+                        // A few ticks, so a per-tick cap cannot hide a final.
+                        for round in 0..4 {
+                            texts.extend(
+                                app.route_spoken_finals(now_ms + round, round)
+                                    .iter()
+                                    .map(|r| {
+                                        r.event.payload["text"].as_str().unwrap_or("").to_owned()
+                                    }),
+                            );
+                        }
+                        texts
+                    }
+
+                    /// #396: the performer plays 1 000 to 3 000 ms (logical). A
+                    /// segment that starts inside it, or within 400 ms after,
+                    /// is its own echo: dropped, counted and never held or
+                    /// routed. One that starts later is kept.
+                    #[test]
+                    fn half_duplex_drops_segments_that_start_during_playback_or_in_its_tail() {
+                        use aivtuber_domain::SpeechDuplex;
+                        // (observed_at_ms, text): `ingest_final` covers 500 ms,
+                        // so the segment starts 500 ms earlier.
+                        let finals = [
+                            (2_000, "during playback"),
+                            (3_700, "in the tail"),
+                            (4_300, "after the tail"),
+                        ];
+                        let run = |duplex: SpeechDuplex, name: &str| {
+                            let mut r = half_rig(duplex, name);
+                            speak(&mut r.app, 1_000, &json!({"duration_ms": 2_000}));
+                            r.app.tick(1_000);
+                            r.app.tick(3_100);
+                            for (segment, (observed, text)) in finals.iter().enumerate() {
+                                ingest_final(
+                                    &mut r.app,
+                                    "mic-local",
+                                    segment as u64 + 1,
+                                    text,
+                                    *observed,
+                                    *observed,
+                                );
+                            }
+                            let texts = routed_texts(&mut r.app, 6_000);
+                            (texts, r)
+                        };
+                        let (texts, r) = run(SpeechDuplex::Half, "half-drop");
+                        assert_eq!(texts, ["after the tail"]);
+                        let status = r.app.speech_input_status().expect("status");
+                        assert_eq!(status.duplex, SpeechDuplex::Half);
+                        assert_eq!(status.dropped_during_playback, 2);
+                        let floor = r.app.speech_floor_metrics().expect("floor");
+                        assert_eq!(
+                            (floor.deferred, floor.queued, floor.dropped_expired),
+                            (0, 0, 0),
+                            "the dropped ones never reached the floor"
+                        );
+                        // Control: the same evidence in full duplex is all heard.
+                        let (texts, r) = run(SpeechDuplex::Full, "full-keep");
+                        assert_eq!(texts, ["during playback", "in the tail", "after the tail"]);
+                        assert_eq!(
+                            r.app
+                                .speech_input_status()
+                                .expect("status")
+                                .dropped_during_playback,
+                            0
+                        );
+                    }
+
+                    /// A reply that is still playing when its echo is recognized
+                    /// (the usual order: the final arrives after recognition,
+                    /// while the next phrase plays) is covered by the open unit.
+                    #[test]
+                    fn half_duplex_covers_a_unit_that_is_still_playing() {
+                        let mut r = half_rig(aivtuber_domain::SpeechDuplex::Half, "half-open");
+                        speak(&mut r.app, 1_000, &json!({"duration_ms": 8_000}));
+                        r.app.tick(1_000);
+                        r.app.tick(2_000);
+                        ingest_final(&mut r.app, "mic-local", 1, "echo", 2_500, 2_500);
+                        assert!(routed_texts(&mut r.app, 2_600).is_empty());
+                        assert_eq!(
+                            r.app
+                                .speech_input_status()
+                                .expect("status")
+                                .dropped_during_playback,
+                            1
+                        );
+                    }
+
+                    /// Half duplex turns voice barge-in off; full keeps it; the
+                    /// panel / `aivtuberctl` action switches it live and the
+                    /// choice is remembered whole.
+                    #[test]
+                    fn half_duplex_has_no_barge_in_and_the_switch_is_live_and_saved() {
+                        use aivtuber_domain::SpeechDuplex;
+                        let mut r = half_rig(SpeechDuplex::Half, "half-barge");
+                        let path = r.app.speech_input.as_ref().map(|_| ()).and(None::<PathBuf>);
+                        assert!(path.is_none());
+                        speak(&mut r.app, 0, &json!({"duration_ms": 8_000}));
+                        vad_edge(&mut r.app, &start_edge(1_000), 1_000);
+                        r.app.note_speech_feed_heartbeat(1_400);
+                        assert!(r.app.service_barge_in(1_400).is_none(), "half: no barge-in");
+                        assert!(r.audio.stops.lock().expect("stops").is_empty());
+                        // Bad choices change nothing.
+                        for bad in [None, Some(""), Some("both"), Some("HALF")] {
+                            let response =
+                                act_arg(&mut r.app, &operator(), "speech_input.duplex", bad, 1_410);
+                            assert!(!response.ok, "{bad:?}: {response:?}");
+                        }
+                        assert_eq!(
+                            r.app.speech_input_status().expect("s").duplex,
+                            SpeechDuplex::Half
+                        );
+                        // Live: the same evidence now confirms one.
+                        let response = act_arg(
+                            &mut r.app,
+                            &operator(),
+                            "speech_input.duplex",
+                            Some("full"),
+                            1_420,
+                        );
+                        assert!(response.ok, "{response:?}");
+                        assert!(!response.detail.contains("mic"), "{response:?}");
+                        assert_eq!(
+                            r.app.speech_input_status().expect("s").duplex,
+                            SpeechDuplex::Full
+                        );
+                        r.app.note_speech_feed_heartbeat(1_430);
+                        assert!(r.app.service_barge_in(1_430).is_some(), "full: barge-in");
+                    }
+
+                    /// The device action refuses what it must, never echoes the
+                    /// name, and a duplex choice is saved with the rest.
+                    #[test]
+                    fn the_device_action_validates_the_name_and_audits_no_name() {
+                        let path = scratch_file("device-action");
+                        let mut app = floor_app(
+                            Some(FloorConfig::default()),
+                            SpeechConversationConfig::default(),
+                            true,
+                        )
+                        .with_speech_input(duplex_controller(
+                            Some(path.clone()),
+                            aivtuber_domain::SpeechDuplex::Half,
+                        ));
+                        let secret_name = "Private Mic 7f3a";
+                        let response = act_arg(
+                            &mut app,
+                            &operator(),
+                            "speech_input.device",
+                            Some(secret_name),
+                            10,
+                        );
+                        assert!(response.ok, "{response:?}");
+                        assert!(!response.detail.contains(secret_name), "{response:?}");
+                        let saved = fs::read_to_string(&path).expect("saved");
+                        assert!(saved.contains(secret_name), "{saved}");
+                        let status = app.speech_input_status().expect("status");
+                        assert_eq!(status.selected_device.as_deref(), Some(secret_name));
+                        assert_eq!(status.device, None, "nothing is open while off");
+                        // A bad name is refused and not echoed.
+                        for bad in ["a\nb", &"x".repeat(129)] {
+                            let response = act_arg(
+                                &mut app,
+                                &operator(),
+                                "speech_input.device",
+                                Some(bad),
+                                20,
+                            );
+                            assert!(!response.ok, "{response:?}");
+                            assert!(!response.detail.contains(bad), "{response:?}");
+                        }
+                        // The system default.
+                        let response =
+                            act_arg(&mut app, &operator(), "speech_input.device", Some(""), 30);
+                        assert!(response.ok, "{response:?}");
+                        assert_eq!(app.speech_input_status().expect("s").selected_device, None);
+                        // The audit trail has the action, never the name.
+                        let audit: Vec<String> = app
+                            .security()
+                            .audit()
+                            .iter()
+                            .map(|r| format!("{} {}", r.decision, r.detail))
+                            .collect();
+                        assert!(
+                            audit
+                                .iter()
+                                .any(|line| line.contains("speech_input.device")),
+                            "{audit:?}"
+                        );
+                        assert!(
+                            audit.iter().all(|line| !line.contains(secret_name)),
+                            "{audit:?}"
+                        );
+                        // The status snapshot reaches the operator wire.
+                        let snapshot = OperatorStatusSnapshot::from_app(&app, 0)
+                            .voice_input
+                            .expect("voice input");
+                        assert_eq!(snapshot.duplex, aivtuber_domain::SpeechDuplex::Half);
                     }
 
                     /// Acceptance of #400: switching off while the tracker holds an
@@ -11590,7 +11943,13 @@ mod tests {
             let state: serde_json::Value = serde_json::from_str(&body).expect("state json");
             assert_eq!(
                 state["status"]["voice_input"],
-                json!({"composed": true, "state": "off", "thinking_remote": true}),
+                json!({
+                    "composed": true,
+                    "state": "off",
+                    "thinking_remote": true,
+                    "duplex": "half",
+                    "dropped_during_playback": 0
+                }),
                 "{body}"
             );
 
@@ -11644,6 +12003,31 @@ mod tests {
             });
             assert_eq!(status, 409, "{body}");
             assert!(body.contains("authentication failed"), "{body}");
+            let (status, body) = call(&mut weak_panel, &mut app, |p| {
+                post(p, "/api/speech-input/device", "{\"device\":\"USB Mic\"}")
+            });
+            assert_eq!(status, 409, "{body}");
+            assert!(body.contains("authentication failed"), "{body}");
+
+            // #396: the duplex and device choices take the same path and are
+            // saved whole; the answer never carries the device name.
+            let (status, body) = call(&mut panel, &mut app, |p| {
+                post(p, "/api/speech-input/duplex", "{\"duplex\":\"full\"}")
+            });
+            assert_eq!(status, 200, "{body}");
+            let (status, body) = call(&mut panel, &mut app, |p| {
+                post(p, "/api/speech-input/device", "{\"device\":\"USB Mic\"}")
+            });
+            assert_eq!(status, 200, "{body}");
+            assert!(!body.contains("USB Mic"), "{body}");
+            assert_eq!(
+                fs::read_to_string(&file).expect("file"),
+                "{\"schema\":\"local-speech-input-settings/1\",\"enabled\":false,\"device\":\"USB Mic\",\"duplex\":\"full\"}
+"
+            );
+            let status = app.speech_input_status().expect("status");
+            assert_eq!(status.selected_device.as_deref(), Some("USB Mic"));
+            assert_eq!(status.duplex, aivtuber_domain::SpeechDuplex::Full);
             let _ = fs::remove_dir_all(&dir);
         }
 
