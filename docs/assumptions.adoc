@@ -313,19 +313,19 @@ _#364 note (resolves the "second cloud provider" condition):_ OpenRouter Thinkin
 
 *Related:* #220, #295, #327, A-TTS-001, A-TTS-003, #360.
 
-=== A-TTS-005 -- A loopback Irodori-TTS-Server run by the operator, with a pinned seed, is a sufficient boundary for the optional experimental voice
+=== A-TTS-005 -- A loopback Irodori-TTS-Server run by the operator, with a self-made anchor voice, is a sufficient boundary for the optional experimental voice
 
 *Subsystem:* Irodori-TTS bridge / `local` composition profile (issue #411)
 
 *Status:* Needs validation (one host, one GPU, one checkpoint; the bridge is otherwise tested against a fake server)
 
-*Statement:* (Known gap: a constant seed does not keep one speaker across different texts, see production-runtime, "Optional Irodori-TTS backend".) The bridge accepts a loopback `http://` server origin only, sends a fixed field set with a constant seed (and `no_ref` or a named server-side voice) and never reference audio, never follows a redirect or uses a proxy, and parses the answer as strict 16-bit mono WAV. The server is not authenticated: another local process on that port could feed bounded audio into the voice path (data only). Loading is the operator's: the checkpoint is `safetensors`; the codec `weights.pth` is read by the codec library's `torch.load`, which is weights-only by default in the server's pinned torch (2.10).
+*Statement:* The bridge accepts a loopback `http://` server origin only, sends a fixed field set with a constant seed and, as the only reference, an anchor clip it synthesized itself from a fixed sentence (never operator-supplied audio, so no path to clone a real person), never follows a redirect or uses a proxy, and parses the answer as strict 16-bit mono WAV. The server is not authenticated: another local process on that port could feed bounded audio into the voice path (data only). Loading is the operator's: the checkpoint is `safetensors`; the codec `weights.pth` is read by the codec library's `torch.load`, which is weights-only by default in the server's pinned torch (2.10).
 
 *Evidence:* `crates/adapters/src/speech_tts/irodori.rs` tests, `crates/app/src/tests/irodori_tts_tests.rs`, EXP-0006 (latency, VRAM, determinism, licences, reading accuracy), the live smoke recorded in `docs/production-runtime.adoc`.
 
-*Consequence if false:* A different seed, checkpoint, code revision or GPU stack changes the voice (the cache key holds the seed, voice name and operator label, not the server revision), so a stale audio cache could replay another voice for the same text; a swapped checkpoint is a different speaker with a different reading error. Reading accuracy is a known open gap (about 13% against 4.0% character error); it is why the backend is opt-in and labelled experimental.
+*Consequence if false:* A different seed, checkpoint, code revision or GPU stack changes the voice (the cache key and the anchor name hold the model name, label and seed, not the server revision), so a stale audio cache could replay another voice for the same text; a swapped checkpoint is a different speaker with a different reading error. Reading accuracy is a known open gap (about 13% against 4.0% character error); it is why the backend is opt-in and labelled experimental.
 
-*Revisit when:* a listening check or a better instrument settles the reading error, the server stops pinning the voice by seed, the server's torch pin moves below 2.6, a quantized or CPU-capable variant is benchmarked, or reference voices are wanted (out of scope here).
+*Revisit when:* a listening check or a better instrument settles the reading error, the anchor stops fixing the speaker, the server's torch pin moves below 2.6, a quantized or CPU-capable variant is benchmarked, or operator-supplied reference voices are ever wanted (refused by design here).
 
 *Related:* #409, #411, A-TTS-001, A-TTS-003.
 

@@ -54,7 +54,7 @@ fn tts_adapter(bridge: &IrodoriBridge) -> NormalizedHttpTtsAdapter {
             model_version: None,
             voice_model: Some("example-voice-v1".to_owned()),
             viseme_mapping: Some("ja-5vowel-v1".to_owned()),
-            timeout: Duration::from_secs(10),
+            timeout: Duration::from_secs(30),
         },
         None,
     )
@@ -109,13 +109,31 @@ fn spoken_replies_reach_the_server_projected_and_pinned_in_both_modes() {
             assert!(!text.contains('😊') && !text.contains('🎉'), "{text}");
         }
         assert!(spoken.join("").contains("ありがとう"), "{spoken:?}");
-        // The voice is pinned on every request of the session.
+        // The speaker is the self-made anchor: one anchor synthesis (no
+        // reference), one upload, and every reply request names the anchor
+        // with the same seed.
+        let anchor_id = server.voices().pop().expect("the anchor was uploaded");
+        let mut anchors = 0;
         for request in server.requests() {
+            if request.route() != "/v1/audio/speech" {
+                continue;
+            }
             let body: serde_json::Value =
                 serde_json::from_slice(&request.body).expect("request JSON");
             assert_eq!(body["irodori"]["seed"], json!(4242));
-            assert_eq!(body["irodori"]["no_ref"], json!(true));
+            if body["irodori"]["no_ref"] == json!(true) {
+                anchors += 1;
+            } else {
+                assert_eq!(body["voice"], json!(anchor_id));
+            }
         }
+        assert_eq!(anchors, 1, "one anchor");
+        assert!(
+            root.join("audio")
+                .join("irodori-anchor")
+                .join(format!("{anchor_id}.wav"))
+                .is_file()
+        );
 
         let audio = rig.audio.lock().expect("audio log");
         assert!(!audio.is_empty(), "the reply plays");
@@ -162,7 +180,13 @@ fn a_server_failure_plays_the_visible_fallback_in_both_modes() {
         delay: Duration::from_millis(1_500),
         ..FakeBehaviour::default()
     });
-    let cases: [(&str, String, &str); 4] = [
+    // The anchor itself cannot be made, or cannot be uploaded.
+    let anchor_down = FakeIrodoriServer::start(FakeBehaviour {
+        upload_status: 500,
+        ..FakeBehaviour::default()
+    });
+    let cases: [(&str, String, &str); 5] = [
+        ("anchor upload fails", anchor_down.endpoint(), "5000"),
         ("unreachable", dead, "5000"),
         ("non-2xx", server_error.endpoint(), "5000"),
         ("malformed audio", malformed.endpoint(), "5000"),
@@ -202,7 +226,21 @@ const LIVE_PHRASES: [&str; 12] = [
 
 fn live_bridge(root: &Path) -> IrodoriBridge {
     let endpoint = std::env::var("AIVTUBER_IRODORI_ENDPOINT").expect("AIVTUBER_IRODORI_ENDPOINT");
-    bridge_for(&endpoint, "60000", root)
+    let seed = std::env::var("AIVTUBER_IRODORI_LIVE_SEED").unwrap_or_else(|_| "1234".to_owned());
+    let env: HashMap<&str, &str> = HashMap::from([
+        ("AIVTUBER_TTS_BACKEND", "irodori"),
+        ("AIVTUBER_IRODORI_ENDPOINT", endpoint.as_str()),
+        ("AIVTUBER_IRODORI_SEED", seed.as_str()),
+        ("AIVTUBER_IRODORI_TIMEOUT_MS", "60000"),
+    ]);
+    let settings = IrodoriSettings::resolve(
+        &|name| env.get(name).map(|value| (*value).to_owned()),
+        CompositionProfile::Local,
+        true,
+    )
+    .expect("settings")
+    .expect("irodori selected");
+    IrodoriBridge::start(settings, &root.join("audio"), root).expect("bridge")
 }
 
 fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
@@ -246,6 +284,10 @@ fn irodori_live_synth_twelve_phrases_and_a_repeat() {
             "phrase latency_ms={elapsed} audio_ms={} {}",
             artifact.duration_ms, artifact.audio_ref
         );
+        if let Ok(out) = std::env::var("AIVTUBER_IRODORI_LIVE_OUT") {
+            let _ = std::fs::create_dir_all(&out);
+            let _ = std::fs::copy(&file, format!("{out}/p{:02}.wav", files.len()));
+        }
         files.push(file);
     }
     // The same phrase through a second bridge with a fresh audio root, so the
@@ -272,6 +314,10 @@ fn irodori_live_synth_twelve_phrases_and_a_repeat() {
         u32::from_le_bytes([first[24], first[25], first[26], first[27]])
     );
     assert_eq!(first, second, "the same phrase must give the same voice");
+    println!(
+        "first phrase (anchor made and uploaded first) latency_ms={}",
+        millis[0]
+    );
     millis.sort_unstable();
     println!(
         "live smoke: n={} median_ms={} p90_ms={} max_ms={}",

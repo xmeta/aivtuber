@@ -9,17 +9,17 @@
 //! line says so (EXP-0006 measured a higher reading error than the default
 //! voice).
 //!
-//! The seed is fixed for the session (and optionally a server-side voice the
-//! operator installed is addressed by name). There is no way to pass reference
-//! audio from this project. A fixed seed makes identical text reproducible; it
-//! does not keep one speaker across different texts (measured, issue #411).
+//! The speaker is fixed by a self-synthesized anchor clip (see the adapter's
+//! module docs): the bridge makes it once from a fixed sentence and the
+//! configured seed, caches it under `AIVTUBER_AUDIO_ROOT/irodori-anchor/`, and
+//! sends it as the reference. There is no setting for operator-supplied
+//! reference audio of any kind.
 //!
 //! | variable | meaning |
 //! | --- | --- |
 //! | `AIVTUBER_TTS_BACKEND` | `irodori` (or `irodori-tts`) selects this backend |
 //! | `AIVTUBER_IRODORI_ENDPOINT` | server origin, loopback `http://` only (required) |
 //! | `AIVTUBER_IRODORI_SEED` | fixed seed sent with every request, default 1234 |
-//! | `AIVTUBER_IRODORI_VOICE` | optional server-side voice name (otherwise the unconditioned voice) |
 //! | `AIVTUBER_IRODORI_MODEL` | the server's model name, default `irodori-tts` |
 //! | `AIVTUBER_IRODORI_MODEL_LABEL` | optional label of the checkpoint, e.g. `LUNA-bf16`, in the cache identity |
 //! | `AIVTUBER_IRODORI_TIMEOUT_MS` | total budget for one synthesis, default 12000 |
@@ -36,7 +36,6 @@ use std::time::Duration;
 
 pub const IRODORI_ENDPOINT_VAR: &str = "AIVTUBER_IRODORI_ENDPOINT";
 pub const IRODORI_SEED_VAR: &str = "AIVTUBER_IRODORI_SEED";
-pub const IRODORI_VOICE_VAR: &str = "AIVTUBER_IRODORI_VOICE";
 pub const IRODORI_MODEL_VAR: &str = "AIVTUBER_IRODORI_MODEL";
 pub const IRODORI_LABEL_VAR: &str = "AIVTUBER_IRODORI_MODEL_LABEL";
 pub const IRODORI_TIMEOUT_VAR: &str = "AIVTUBER_IRODORI_TIMEOUT_MS";
@@ -45,6 +44,9 @@ pub const IRODORI_VISEMES_VAR: &str = "AIVTUBER_IRODORI_AMPLITUDE_VISEMES";
 /// A cold server loads the model on its first request unless the operator set
 /// `IRODORI_PRELOAD=true`; LUNA on a GPU answers a reply in about a second.
 const DEFAULT_TIMEOUT_MS: u64 = 12_000;
+
+/// Under `AIVTUBER_AUDIO_ROOT`, beside `generated/`.
+const ANCHOR_DIR: &str = "irodori-anchor";
 
 /// Whether `AIVTUBER_TTS_BACKEND` (already trimmed and lower-cased) names this
 /// backend. The VOICEVOX settings use it to stay out of the way.
@@ -147,7 +149,6 @@ impl IrodoriSettings {
                 .parse::<u32>()
                 .map_err(|_| IrodoriSettingsError::InvalidSeed(seed))?;
         }
-        config.voice = get(IRODORI_VOICE_VAR).map(|v| v.trim().to_owned());
         if let Some(model) = get(IRODORI_MODEL_VAR) {
             config.model_name = model.trim().to_owned();
         }
@@ -174,7 +175,6 @@ impl IrodoriSettings {
                 IrodoriConfigError::Endpoint(_) | IrodoriConfigError::Bound(_) => {
                     IRODORI_ENDPOINT_VAR
                 }
-                IrodoriConfigError::Name("voice name") => IRODORI_VOICE_VAR,
                 IrodoriConfigError::Name("model label") => IRODORI_LABEL_VAR,
                 IrodoriConfigError::Name(_) => IRODORI_MODEL_VAR,
             };
@@ -213,6 +213,10 @@ impl IrodoriBridge {
         audio_root: &Path,
         pack_root: &Path,
     ) -> Result<Self, String> {
+        // The anchor clips live in the bridge's own directory beside the
+        // generated audio (outside its byte cap), never in an operator path.
+        let mut settings = settings;
+        settings.config.anchor_dir = audio_root.join(ANCHOR_DIR);
         let synth = IrodoriSynthesizer::new(&settings.config).map_err(|e| e.to_string())?;
         let (handle, tts_endpoint) = start_loopback_bridge(
             synth,
@@ -241,19 +245,15 @@ impl IrodoriBridge {
         self.handle.stats()
     }
 
-    /// Non-secret startup lines: where the server is, the pinned voice, and the
+    /// Non-secret startup lines: where the server is, the anchor directory, and the
     /// experimental notice. The spoken text never appears.
     pub fn startup_lines(&self) -> Vec<String> {
         vec![
             format!(
-                "irodori: server={} seed={} voice={} bridge={} visemes={} (the server is a separate process; synthesis fails like any TTS failure while it is down)",
+                "irodori: server={} seed={} anchor={} bridge={} visemes={} (the server is a separate process; synthesis fails like any TTS failure while it is down)",
                 aivtuber_adapters::endpoint_origin(&self.settings.config.endpoint),
                 self.settings.config.seed,
-                self.settings
-                    .config
-                    .voice
-                    .as_deref()
-                    .unwrap_or("none (unconditioned)"),
+                self.settings.config.anchor_dir.display(),
                 aivtuber_adapters::endpoint_origin(&self.tts_endpoint),
                 if self.settings.amplitude_visemes {
                     "amplitude"
@@ -314,10 +314,9 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_the_measured_seed_and_the_unconditioned_voice() {
+    fn defaults_are_the_measured_seed_and_the_default_model() {
         let settings = resolve(&BASE).unwrap().unwrap();
         assert_eq!(settings.config.seed, irodori::DEFAULT_SEED);
-        assert_eq!(settings.config.voice, None);
         assert_eq!(settings.config.model_name, "irodori-tts");
         assert_eq!(settings.synth_timeout, Duration::from_millis(12_000));
         assert!(!settings.amplitude_visemes);
@@ -333,7 +332,6 @@ mod tests {
     fn every_variable_is_applied() {
         let settings = resolve(&with(&[
             (IRODORI_SEED_VAR, "42"),
-            (IRODORI_VOICE_VAR, "my-voice"),
             (IRODORI_MODEL_VAR, "irodori-tts-luna"),
             (IRODORI_LABEL_VAR, "LUNA-bf16"),
             (IRODORI_TIMEOUT_VAR, "9000"),
@@ -342,7 +340,6 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(settings.config.seed, 42);
-        assert_eq!(settings.config.voice.as_deref(), Some("my-voice"));
         assert_eq!(settings.config.model_name, "irodori-tts-luna");
         assert_eq!(settings.synth_timeout, Duration::from_millis(9_000));
         assert!(settings.amplitude_visemes);
@@ -390,9 +387,23 @@ mod tests {
             Err(IrodoriSettingsError::InvalidFlag(IRODORI_VISEMES_VAR))
         );
         assert!(matches!(
-            resolve(&with(&[(IRODORI_VOICE_VAR, "a/b")])),
-            Err(IrodoriSettingsError::Config(IRODORI_VOICE_VAR, _))
+            resolve(&with(&[(IRODORI_LABEL_VAR, "a/b")])),
+            Err(IrodoriSettingsError::Config(IRODORI_LABEL_VAR, _))
         ));
+    }
+
+    #[test]
+    fn there_is_no_setting_for_reference_audio() {
+        // Whatever the operator exports, the settings carry no reference: the
+        // only reference is the anchor the bridge synthesizes itself.
+        let settings = resolve(&with(&[
+            ("AIVTUBER_IRODORI_VOICE", "someone"),
+            ("AIVTUBER_IRODORI_REF_WAV", "/x/y.wav"),
+            ("AIVTUBER_IRODORI_REFERENCE", "http://example.com/a.wav"),
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(settings, resolve(&BASE).unwrap().unwrap());
     }
 
     #[test]
