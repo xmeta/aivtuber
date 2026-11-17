@@ -559,6 +559,7 @@ impl PerformanceCompiler {
     /// the face the first one set instead of restarting it at every boundary;
     /// with affect enabled, a later phrase starts a new expression only when
     /// its affect class changes (`affect` is the per-reply carry, #84 S1).
+    #[allow(clippy::too_many_arguments)]
     pub fn compile_phrase(
         &self,
         request: &GenerationRequest,
@@ -580,6 +581,7 @@ impl PerformanceCompiler {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn compile_inner(
         &self,
         request: &GenerationRequest,
