@@ -289,6 +289,21 @@ With both the hybrid Thinking egress and the Aivis Cloud TTS opt-in active, repl
 
 *Residual.* The text is operator-written but the model is not bound to follow it: a character sheet changes style, not safety, and a hostile viewer can still try to talk the model out of the character (the output gate, not the sheet, limits what can be published). Anyone who can write the install directory can change the file, the same trust as the other settings files. Cached reactions, the starter audio and typed fallback lines do not follow the sheet and so can break character.
 
+=== 10.4 Opt-in System One affect judgement sends reply phrases to the System One provider (#426)
+
+*Threat.* With +AIVTUBER_AFFECT_JUDGE=system-one+ the display text of each generated reply phrase (after the publication containment gate, at most 400 characters) is sent to the System One provider while the phrase is synthesized. Reply text can contain viewer-derived content, so this is a new path for it to leave the machine, and the provider's answer is untrusted input to the performer.
+
+*Mitigation.*
+
+* *Opt-in and announced.* Off by default. When on, the always-printed bilingual start-up line says the text of each reply phrase goes to the System One provider (+AIVTUBER_JEV_ENDPOINT+). Nothing is sent for cached or template replies, and nothing is sent when the judge is off.
+* *Profile policy unchanged.* It is refused at start under +local+ and +hybrid+, whose non-Thinking roles are loopback-only (section 10.1), and without +AIVTUBER_JEV_API_KEY+ or with +AIVTUBER_AFFECT_EXPRESSION=false+. It is allowed only under +full+, where Jev is already a composed provider; no profile rule, capability or gate was changed or widened. Extending it to +hybrid+ would be a new egress role and needs its own decision.
+* *Same client rules as Jev.* The existing endpoint, key, HTTPS-only validation, no redirects and response size cap apply; the key is the redacted Jev key and appears in no log, line or error.
+* *Output is data in a closed set.* Whatever the text says to the model, the answer is parsed against exactly six class names; anything else is malformed and the rules label is used. The worst a hostile line can do is pick one of six facial expressions, mapped through the pack's presets and the 0.6 intensity cap. The answer cannot mint a capability or a permit, address an event, or reach control, memory or the scheduler.
+* *Availability.* Audio never waits for the call (fixed when the audio is ready, hard cap 1,200 ms); a slow, failing, rate-limited or malicious provider yields the local rules label. At most two calls are in flight; each worker is bounded by the hard cap. Operator emergency control does not use this path.
+* *No text kept.* Text appears in no log, status, trace or support bundle; counters and per-phrase class and source only.
+
+*Residual.* The provider sees reply phrases and may log them; the operator accepts that by opting in. The provider can bias expressions, never behaviour.
+
 == 11. Publication containment gate
 
 Before public speech/display, generated output passes a deterministic publication-containment policy.

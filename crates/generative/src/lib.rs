@@ -2407,4 +2407,63 @@ mod tests {
             compile_phrases(&affected, &texts)
         );
     }
+
+    /// #426: replay feeds the recorded judge classes back with no judge
+    /// runner and gets the same assets, and a phrase that fell back to the
+    /// rules label compiles exactly as without the judge.
+    #[test]
+    fn recorded_judge_classes_replay_to_identical_assets_without_a_runner() {
+        let affected = compiler().with_affect(AffectConfig::starter_pack());
+        let texts = [
+            "今日の予定を話します",
+            "次はゲームの話です",
+            "最後にお知らせです",
+        ];
+        let offers = [Some(AffectClass::Joy), None, Some(AffectClass::Surprise)];
+        let request = generation_request(7);
+        let speech = SpeechArtifact {
+            audio_ref: "audio://generated/mock.opus".to_owned(),
+            duration_ms: 1_200,
+            viseme_ref: None,
+        };
+        let thinking = MockThinking::success("x").identity();
+        let tts = MockTts::success().identity();
+        let replay = || {
+            let mut affect = AffectState::default();
+            texts
+                .iter()
+                .zip(offers)
+                .enumerate()
+                .map(|(seq, (text, offer))| {
+                    if let Some(class) = offer {
+                        affect.offer_judged_class(class);
+                    }
+                    affected
+                        .compile_phrase(
+                            &request,
+                            seq as u32,
+                            text,
+                            &speech,
+                            &thinking,
+                            &tts,
+                            &mut affect,
+                        )
+                        .expect("compile")
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = replay();
+        assert_eq!(first, replay());
+        assert!(expression_of(&first[0]).unwrap().0.starts_with("smile"));
+        assert!(expression_of(&first[2]).unwrap().0.starts_with("surprise"));
+        // The fallback phrase equals the rules-only compilation of that phrase
+        // at the same position in the same reply state.
+        let rules_only = compile_phrases(&affected, &texts);
+        assert_eq!(expression_of(&rules_only[1]), None);
+        assert_eq!(
+            expression_of(&first[1]),
+            None,
+            "neutral text holds the joy face"
+        );
+    }
 }

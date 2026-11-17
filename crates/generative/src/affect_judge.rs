@@ -411,7 +411,7 @@ mod tests {
     fn an_answer_in_time_is_used() {
         let runner = runner(5, Ok(AffectClass::Joy));
         let ticket = runner.start("hello");
-        std::thread::sleep(Duration::from_millis(60));
+        wait_idle(&runner);
         assert_eq!(ticket.resolve(), Ok(AffectClass::Joy));
         assert_eq!(runner.stats().snapshot().judged, 1);
         assert!(runner.stats().snapshot().latency_p50_ms.is_some());
@@ -451,9 +451,8 @@ mod tests {
         ] {
             let runner = runner(0, Err(failure));
             let ticket = runner.start("hello");
-            std::thread::sleep(Duration::from_millis(40));
-            assert_eq!(ticket.resolve(), Err(reason));
             wait_idle(&runner);
+            assert_eq!(ticket.resolve(), Err(reason));
         }
     }
 
@@ -493,7 +492,7 @@ mod tests {
             AffectJudgeRunner::new(Arc::new(Len(Arc::clone(&seen))), Duration::from_millis(400))
                 .expect("runner");
         let ticket = runner.start(&"あ".repeat(5_000));
-        std::thread::sleep(Duration::from_millis(40));
+        wait_idle(&runner);
         let _ = ticket.resolve();
         assert_eq!(*seen.lock().unwrap(), AFFECT_MAX_INPUT_CHARS);
     }
@@ -507,5 +506,61 @@ mod tests {
         assert!(AffectJudgeRunner::new(Arc::clone(&judge), Duration::ZERO).is_err());
         assert!(AffectJudgeRunner::new(Arc::clone(&judge), Duration::from_millis(1_201)).is_err());
         assert!(AffectJudgeRunner::new(judge, DEFAULT_JUDGE_HARD_CAP).is_ok());
+    }
+
+    /// What the opt-in adds to the audio path itself is `start` (spawn one
+    /// bounded worker) plus a non-blocking `resolve`; the call is hidden under
+    /// synthesis. Loose bound so a loaded CI host does not flake; the real
+    /// figure is printed.
+    #[test]
+    fn start_plus_resolve_costs_next_to_nothing_on_the_audio_path() {
+        let runner = runner(0, Ok(AffectClass::Joy));
+        let mut costs: Vec<Duration> = (0..200)
+            .map(|_| {
+                let t = Instant::now();
+                let ticket = runner.start("hello");
+                let _ = ticket.resolve();
+                let cost = t.elapsed();
+                wait_idle(&runner);
+                cost
+            })
+            .collect();
+        costs.sort();
+        eprintln!(
+            "judge start+resolve: p50={:?} p95={:?} max={:?}",
+            costs[100], costs[189], costs[199]
+        );
+        assert!(costs[100] < Duration::from_millis(5), "{:?}", costs[100]);
+    }
+
+    #[test]
+    fn decisions_round_trip_through_json_for_every_source() {
+        for source in [
+            AffectSource::Judge,
+            AffectSource::RulesFallback(AffectFallbackReason::Late),
+            AffectSource::RulesFallback(AffectFallbackReason::RateLimited),
+        ] {
+            let decision = AffectDecision {
+                seq: 3,
+                source,
+                class: AffectClass::Sadness,
+            };
+            let json = serde_json::to_string(&decision).expect("serialize");
+            assert!(!json.contains("text"), "{json}");
+            assert_eq!(
+                serde_json::from_str::<AffectDecision>(&json).unwrap(),
+                decision
+            );
+        }
+        let json = serde_json::to_value(AffectDecision {
+            seq: 0,
+            source: AffectSource::RulesFallback(AffectFallbackReason::Busy),
+            class: AffectClass::Joy,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"seq":0,"source":"rules_fallback","reason":"busy","class":"joy"})
+        );
     }
 }

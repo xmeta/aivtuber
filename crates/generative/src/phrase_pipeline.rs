@@ -1326,7 +1326,7 @@ mod tests {
     fn a_judge_answer_that_is_in_before_audio_picks_the_expression() {
         // Rules read PHRASE_B as neutral; the judge says joy.
         let (pipeline, runner, _) =
-            judged_pipeline(PHRASE_B, slow_tts(120), Some((5, Ok(AffectClass::Joy))));
+            judged_pipeline(PHRASE_B, slow_tts(300), Some((0, Ok(AffectClass::Joy))));
         let mut delivery = RecordingDelivery::default();
         let result = run(
             &pipeline,
@@ -1392,7 +1392,7 @@ mod tests {
             ),
         ] {
             let (pipeline, runner, _) =
-                judged_pipeline(PHRASE_B, slow_tts(60), Some((0, Err(failure))));
+                judged_pipeline(PHRASE_B, slow_tts(200), Some((0, Err(failure))));
             let mut delivery = RecordingDelivery::default();
             let result = run(
                 &pipeline,
@@ -1432,7 +1432,7 @@ mod tests {
         let run_once = || {
             let (pipeline, runner, _) = judged_pipeline(
                 &three_phrase_reply(),
-                slow_tts(80),
+                slow_tts(250),
                 Some((2, Ok(AffectClass::Surprise))),
             );
             let mut delivery = RecordingDelivery::default();

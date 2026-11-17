@@ -52,7 +52,10 @@ fn status_carries_the_judge_counters_and_omits_them_by_default() {
     .expect("runner");
     rig.app = rig.app.with_affect_judge_stats(runner.stats());
     let ticket = runner.start("synthetic phrase");
-    std::thread::sleep(Duration::from_millis(50));
+    let until = std::time::Instant::now() + Duration::from_secs(3);
+    while runner.in_flight() > 0 && std::time::Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(2));
+    }
     assert!(ticket.resolve().is_err());
 
     let json = serde_json::to_value(OperatorStatusSnapshot::from_app(&rig.app, 0)).expect("json");
@@ -62,4 +65,31 @@ fn status_carries_the_judge_counters_and_omits_them_by_default() {
         !json.to_string().contains("synthetic phrase"),
         "status never carries text"
     );
+}
+
+#[test]
+fn the_commit_record_takes_the_phrase_s_own_affect_decision() {
+    use aivtuber_generative::{AffectDecision, AffectFallbackReason, AffectSource};
+    let mut trace = GenerationTrace::default();
+    assert_eq!(crate::phrase_commit::affect_decision_for(&trace, 0), None);
+    let first = AffectDecision {
+        seq: 0,
+        source: AffectSource::Judge,
+        class: AffectClass::Joy,
+    };
+    let second = AffectDecision {
+        seq: 1,
+        source: AffectSource::RulesFallback(AffectFallbackReason::Late),
+        class: AffectClass::Neutral,
+    };
+    trace.affect_decisions = vec![first, second];
+    assert_eq!(
+        crate::phrase_commit::affect_decision_for(&trace, 1),
+        Some(second)
+    );
+    assert_eq!(
+        crate::phrase_commit::affect_decision_for(&trace, 0),
+        Some(first)
+    );
+    assert_eq!(crate::phrase_commit::affect_decision_for(&trace, 2), None);
 }

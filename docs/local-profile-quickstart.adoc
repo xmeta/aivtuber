@@ -845,3 +845,7 @@ Limits of this evidence: one host, a debug app build, ten replies written by han
 * *The WAV ended:* `speech_sidecar: degraded: sidecar exited`, then typed chat continued.
 * *Shutdown:* closing stdin ended the app with exit code 0, and no runtime process survived it (checked in all four runs).
 * *Not exercised live:* killing the VAD sidecar or the STT worker in the middle of a turn, a live microphone, OBS Browser Source, a Linux host, a CPU-only llama.cpp, and a machine with fewer than 16 threads. The supervisor tests cover the first.
+
+== Optional: System One affect judgement (not offered here)
+
++AIVTUBER_AFFECT_JUDGE=system-one+ (#426) sends the text of each reply phrase to the System One provider to pick the expression, in parallel with speech and never delaying it. It is an opt-in for +AIVTUBER_MODE=full+ only, with +AIVTUBER_JEV_API_KEY+ set. This profile refuses it at start: nothing but may leave the machine here. Leave it unset (+rules+, the default) and expressions come from the local rules classifier. Details: link:production-runtime.adoc[production runtime], link:security-threat-model.adoc[threat model section 10.4].

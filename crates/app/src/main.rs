@@ -2183,6 +2183,7 @@ fn build_generative_runtime(
         profile.jev(),
         affect_expression,
         env_optional("AIVTUBER_JEV_API_KEY").is_some_and(|key| !key.trim().is_empty()),
+        phrase_mode.is_phrased(),
     )?;
     let (compiler, affect_judge_stats) = match affect_judge_mode {
         aivtuber_app::AffectJudgeMode::Rules => (compiler, None),

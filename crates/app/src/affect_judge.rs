@@ -49,6 +49,7 @@ impl AffectJudgeMode {
         profile_allows_jev_egress: bool,
         affect_expression_enabled: bool,
         jev_api_key_present: bool,
+        phrased_replies: bool,
     ) -> Result<(), String> {
         if self == Self::Rules {
             return Ok(());
@@ -61,6 +62,11 @@ impl AffectJudgeMode {
         if !affect_expression_enabled {
             return Err(format!(
                 "{AFFECT_JUDGE_VAR}=system-one needs AIVTUBER_AFFECT_EXPRESSION=true (the judge only picks among the expressions the affect mapping offers)"
+            ));
+        }
+        if !phrased_replies {
+            return Err(format!(
+                "{AFFECT_JUDGE_VAR}=system-one runs per phrase and needs phrased replies (set AIVTUBER_PHRASE_MODE=phrase; the full profile defaults to buffered replies)"
             ));
         }
         if !jev_api_key_present {
@@ -123,7 +129,7 @@ mod tests {
         // `rules` never refuses, whatever else is configured.
         assert!(
             AffectJudgeMode::Rules
-                .validate("local", false, false, false)
+                .validate("local", false, false, false, false)
                 .is_ok()
         );
     }
@@ -131,13 +137,15 @@ mod tests {
     #[test]
     fn system_one_is_refused_where_text_may_not_leave_or_nothing_could_use_it() {
         let sys = AffectJudgeMode::SystemOne;
-        assert!(sys.validate("full", true, true, true).is_ok());
+        assert!(sys.validate("full", true, true, true, true).is_ok());
         for profile in ["local", "hybrid"] {
-            let error = sys.validate(profile, false, true, true).unwrap_err();
+            let error = sys.validate(profile, false, true, true, true).unwrap_err();
             assert!(error.contains("loopback-only"), "{error}");
         }
-        assert!(sys.validate("full", true, false, true).is_err());
-        assert!(sys.validate("full", true, true, false).is_err());
+        assert!(sys.validate("full", true, false, true, true).is_err());
+        assert!(sys.validate("full", true, true, false, true).is_err());
+        let buffered = sys.validate("full", true, true, true, false).unwrap_err();
+        assert!(buffered.contains("phrased replies"), "{buffered}");
     }
 
     #[test]

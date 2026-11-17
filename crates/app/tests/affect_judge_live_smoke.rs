@@ -33,17 +33,16 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const LINES: [&str; 12] = [
+const LINES: [&str; 11] = [
     "今日は配信に来てくれて本当にありがとう！とても嬉しいよ。",
     "えっ、それ本当に？まさかそんなことがあるなんてびっくりした！",
     "大丈夫だよ、ゆっくり深呼吸してね。ここでのんびりしていこう。",
     "昨日はずっと一人で、ちょっと寂しかったんだ。",
     "もう、何度言ったらわかるの！いい加減にしてよ！",
     "このあとはゲームを遊びながらお話しします。",
-    "Thanks for joining the stream today, I really appreciate it!",
-    "Wow, I did not expect that at all, that is amazing!",
-    "Take your time, there is no rush, everything is fine.",
-    "I miss the old days, it feels a little lonely tonight.",
+    "わあ、すごい！こんなにたくさんの人が来てくれるなんて夢みたい！",
+    "ねえ、聞いて。今日はなんだかとても静かで、気持ちが落ち着くね。",
+    "ううん、やっぱり会えなくなるのはさみしいな。また来てね。",
     "次の曲は、みんながリクエストしてくれたものです。",
     "ありがとう、でもちょっと疲れちゃったかな。",
 ];
@@ -123,6 +122,20 @@ fn request() -> GenerationRequest {
     }
 }
 
+/// A distinct fixed-length (3 hiragana) token per spoken text, so the
+/// sidecar's audio cache can never turn a repeated line into a free one while
+/// both arms of a pair still speak the same number of characters.
+fn token(n: usize) -> String {
+    const KANA: &str =
+        "あいうえおかきくけこさしすせそたちつてとなにぬねのはひふへほまみむめもやゆよらりるれろわ";
+    let kana: Vec<char> = KANA.chars().collect();
+    let base = kana.len();
+    [n / (base * base) % base, n / base % base, n % base]
+        .iter()
+        .map(|i| kana[*i])
+        .collect()
+}
+
 fn percentile(sorted: &[f64], q: f64) -> f64 {
     let rank = ((sorted.len() as f64) * q).ceil() as usize;
     sorted[rank.clamp(1, sorted.len()) - 1]
@@ -133,6 +146,8 @@ fn percentile(sorted: &[f64], q: f64) -> f64 {
 fn judge_in_parallel_with_local_tts() {
     let scratch = PathBuf::from(env("AIVTUBER_SMOKE_SCRATCH"));
     let audio_root = scratch.join("audio");
+    // The sidecar's audio cache is content addressed on disk; start empty.
+    let _ = std::fs::remove_dir_all(&audio_root);
     std::fs::create_dir_all(&audio_root).expect("audio root");
     let port = 18_770_u16;
     let listen = format!("127.0.0.1:{port}");
@@ -151,15 +166,25 @@ fn judge_in_parallel_with_local_tts() {
             "--threads",
             "2",
         ])
+        // The sidecar exits when its stdin closes (parent liveness); a piped
+        // handle kept inside `Child` stays open for the whole test.
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(
+            std::fs::File::create(scratch.join("sidecar.err")).expect("sidecar log"),
+        ))
         .spawn()
         .expect("spawn sidecar");
     eprintln!("sidecar pid={}", child.id());
-    let _sidecar = Sidecar(child);
+    let mut sidecar = Sidecar(child);
     let address: SocketAddr = listen.parse().unwrap();
     let ready_by = Instant::now() + Duration::from_secs(120);
     while TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_err() {
+        let status = sidecar.0.try_wait().expect("sidecar status");
+        assert!(
+            status.is_none(),
+            "sidecar exited early: {status:?} (see sidecar.err in the scratch directory)"
+        );
         assert!(Instant::now() < ready_by, "sidecar did not become ready");
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -180,6 +205,18 @@ fn judge_in_parallel_with_local_tts() {
         .expect("tts adapter"),
     );
 
+    {
+        let t = Instant::now();
+        let probe = tts.synthesize_sync(&aivtuber_domain::SpeechRequest {
+            text: "接続の確認です。".to_owned(),
+            style: None,
+        });
+        eprintln!(
+            "tts probe {:?} ms={}",
+            probe.as_ref().err().map(|e| e.to_string()),
+            t.elapsed().as_millis()
+        );
+    }
     let endpoint = std::env::var("AIVTUBER_SMOKE_JEV_ENDPOINT")
         .unwrap_or_else(|_| "https://openrouter.ai/api/alpha/decisions".to_owned());
     let model = std::env::var("AIVTUBER_SMOKE_JEV_MODEL")
@@ -217,12 +254,23 @@ fn judge_in_parallel_with_local_tts() {
             base
         }
     };
+    let counter = std::cell::Cell::new(0_usize);
     let trial = |line: &str, judge: bool| {
-        let pipeline = GenerativePipeline::new(
-            Arc::new(FixedThinking(line.to_owned())),
-            tts.clone(),
-            compiler(judge),
-        );
+        // A fresh token in front of every sentence: every phrase of every arm
+        // is a distinct text, so no phrase is served from the audio cache.
+        let mut unique = String::new();
+        let mut at_start = true;
+        for c in line.chars() {
+            if at_start {
+                counter.set(counter.get() + 1);
+                unique.push_str(&token(counter.get()));
+            }
+            unique.push(c);
+            at_start = matches!(c, '。' | '！' | '？' | '!' | '?' | '.');
+        }
+        let line = unique;
+        let pipeline =
+            GenerativePipeline::new(Arc::new(FixedThinking(line)), tts.clone(), compiler(judge));
         let mut delivery = Delivered::default();
         let started = Instant::now();
         let result = pipeline
@@ -246,6 +294,7 @@ fn judge_in_parallel_with_local_tts() {
             GenerationDisposition::Phrased { .. }
         ));
         let first = delivery.first_at.expect("a phrase was delivered") - started;
+        eprintln!("trial judge={judge} first_audio_ms={}", first.as_millis());
         (first.as_secs_f64() * 1_000.0, result.trace)
     };
 
@@ -258,21 +307,34 @@ fn judge_in_parallel_with_local_tts() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(36);
     let (mut rules_ms, mut judge_ms, mut diffs) = (Vec::new(), Vec::new(), Vec::new());
+    let mut control_diffs: Vec<f64> = Vec::new();
     let (mut judged, mut fallbacks) = (0_usize, std::collections::BTreeMap::new());
+    // (judged, total) for the first phrase of a reply and for later phrases.
+    let (mut first_phrase, mut later_phrases) = ((0_usize, 0_usize), (0_usize, 0_usize));
     for i in 0..trials {
         let line = LINES[i % LINES.len()];
-        // Alternate the order so drift and caching do not favour one arm.
-        let ((r, _), (j, trace)) = if i % 2 == 0 {
-            let r = trial(line, false);
-            (r, trial(line, true))
-        } else {
-            let j = trial(line, true);
-            (trial(line, false), j)
-        };
+        // Three arms on the same line: rules, judge, and a second rules arm as
+        // the control that measures the run-to-run noise of the TTS sidecar.
+        // The order rotates so drift and caching do not favour one arm.
+        let mut arms = [(0_usize, None), (1, None), (2, None)];
+        for slot in 0..3 {
+            let arm = (slot + i) % 3;
+            arms[arm].1 = Some(trial(line, arm == 1));
+        }
+        let [(_, a), (_, j), (_, b)] = arms;
+        let ((r, _), (j, trace), (control, _)) = (a.unwrap(), j.unwrap(), b.unwrap());
         rules_ms.push(r);
         judge_ms.push(j);
         diffs.push(j - r);
+        control_diffs.push(control - r);
         for decision in &trace.affect_decisions {
+            let bucket = if decision.seq == 0 {
+                &mut first_phrase
+            } else {
+                &mut later_phrases
+            };
+            bucket.1 += 1;
+            bucket.0 += usize::from(decision.source == AffectSource::Judge);
             match decision.source {
                 AffectSource::Judge => judged += 1,
                 AffectSource::RulesFallback(reason) => {
@@ -282,11 +344,18 @@ fn judge_in_parallel_with_local_tts() {
         }
         std::thread::sleep(Duration::from_millis(700));
     }
-    for series in [&mut rules_ms, &mut judge_ms, &mut diffs] {
+    for series in [&mut rules_ms, &mut judge_ms, &mut diffs, &mut control_diffs] {
         series.sort_by(f64::total_cmp);
     }
     let status = runner.stats().snapshot();
-    eprintln!("phrases={trials} judged={judged} fallbacks={fallbacks:?}");
+    eprintln!(
+        "replies={trials} phrases={} judged={judged} fallbacks={fallbacks:?}",
+        first_phrase.1 + later_phrases.1
+    );
+    eprintln!(
+        "judged/total: first phrase {}/{}, later phrases {}/{}",
+        first_phrase.0, first_phrase.1, later_phrases.0, later_phrases.1
+    );
     eprintln!(
         "first_audio_ms rules p50={:.0} p95={:.0} | judge p50={:.0} p95={:.0}",
         percentile(&rules_ms, 0.5),
@@ -299,6 +368,12 @@ fn judge_in_parallel_with_local_tts() {
         percentile(&diffs, 0.5),
         percentile(&diffs, 0.95),
         diffs.last().copied().unwrap_or(0.0)
+    );
+    eprintln!(
+        "control (rules2-rules1, the noise floor) p50={:.1} p95={:.1} max={:.1}",
+        percentile(&control_diffs, 0.5),
+        percentile(&control_diffs, 0.95),
+        control_diffs.last().copied().unwrap_or(0.0)
     );
     eprintln!(
         "judge call latency ms p50={:?} p95={:?} samples={}",
