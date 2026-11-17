@@ -41,11 +41,16 @@
 //! behind the seam (#78 S3, `jev_batch.rs`) keeps its provider shape private.
 
 use crate::audience::{
-    AudienceConfig, AudienceConfigError, AudienceInput, AudienceSignal, AudienceWindow,
-    GuardReason, plan_audience,
+    AudienceConfig, AudienceConfigError, AudienceInput, AudienceSignal, AudienceSignalClass,
+    AudienceWindow, GuardReason, plan_audience,
+};
+use crate::crowd::{
+    CrowdAction, CrowdConfig, CrowdConfigError, CrowdKey, CrowdReactionGroup, CrowdRouting,
+    CrowdWindow, crowd_class, domain_trend, reaction_group, summary_for,
 };
 use aivtuber_domain::{
-    EventEnvelope, EventKind, MAX_SNAPSHOT_STRING_BYTES, ReflexContext, SecurityPlane, SourceClass,
+    CrowdClass, EventEnvelope, EventKind, MAX_SNAPSHOT_STRING_BYTES, ReflexContext, SecurityPlane,
+    SourceClass,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -247,6 +252,11 @@ pub enum TerminalOutcome {
     /// into [`BatchReplayRecord::audience_signals`]). The cluster's carrier
     /// stands for the crowd in selection and has its own outcome.
     RepresentedByAggregate { signal: usize },
+    /// #79 S2: the carrier of crowd `signal` (an index into
+    /// [`BatchReplayRecord::audience_signals`]) was held back because its
+    /// reaction group reacted within the crowd cooldown. It takes no Top-K
+    /// slot and stamps nothing.
+    SuppressedCrowdCooldown { signal: usize },
 }
 
 impl TerminalOutcome {
@@ -259,6 +269,7 @@ impl TerminalOutcome {
             Self::SuppressedActorBatchCap => 4,
             Self::ShedPendingOverflow => 5,
             Self::RepresentedByAggregate { .. } => 6,
+            Self::SuppressedCrowdCooldown { .. } => 7,
         }
     }
 }
@@ -444,6 +455,11 @@ pub struct BatchReplayRecord {
     /// those produced before aggregation existed.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub audience_signals: Vec<AudienceSignal>,
+    /// #79 S2: crowd routing decisions of this batch, one per routed cluster.
+    /// Omitted when empty, so a batch without crowd routing encodes exactly as
+    /// before.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub crowd: Vec<CrowdRouting>,
 }
 
 impl BatchReplayRecord {
@@ -466,7 +482,7 @@ pub struct BurstMetrics {
     pub admitted: u64,
     /// Terminal outcomes by category: selected, quiet, capacity, cooldown,
     /// per-batch cap, shed, represented by aggregate.
-    pub terminal: [u64; 7],
+    pub terminal: [u64; 8],
     pub immediate: u64,
     pub refused: u64,
     pub priority_claims_ignored: u64,
@@ -495,6 +511,10 @@ pub struct BurstMetrics {
     pub audience_members_represented: u64,
     pub audience_carriers: u64,
     pub audience_below_threshold: u64,
+    /// #79 S2: clusters routed as crowd reactions or representative replies.
+    pub crowd_routed: u64,
+    /// Rolling-window entries dropped because the ring was full.
+    pub crowd_window_evicted: u64,
     pub audience_guarded: BTreeMap<GuardReason, u64>,
     pub pending_candidates_high_water: usize,
     pub pending_bytes_high_water: usize,
@@ -586,6 +606,7 @@ pub struct BurstEngine {
     arrivals: VecDeque<u64>,
     cooldowns: BTreeMap<String, u64>,
     audience: Option<AudienceConfig>,
+    crowd: Option<CrowdWindow>,
     next_batch_id: u64,
     last_ms: u64,
     shut_down: bool,
@@ -602,6 +623,7 @@ impl BurstEngine {
             arrivals: VecDeque::new(),
             cooldowns: BTreeMap::new(),
             audience: None,
+            crowd: None,
             next_batch_id: 1,
             last_ms: 0,
             shut_down: false,
@@ -620,6 +642,18 @@ impl BurstEngine {
             config.validate()?;
         }
         self.audience = config;
+        Ok(())
+    }
+
+    /// Enable (or disable) #79 S2 crowd routing for batches resolved from now
+    /// on. Requires audience aggregation to produce clusters; without it
+    /// nothing is routed. Off by default. Replacing the configuration clears
+    /// the rolling window and the cooldowns.
+    pub fn set_crowd(&mut self, config: Option<CrowdConfig>) -> Result<(), CrowdConfigError> {
+        if let Some(config) = &config {
+            config.validate()?;
+        }
+        self.crowd = config.map(CrowdWindow::new);
         Ok(())
     }
 
@@ -898,6 +932,7 @@ impl BurstEngine {
                 selected: Vec::new(),
                 outcomes,
                 audience_signals: Vec::new(),
+                crowd: Vec::new(),
             },
         }
     }
@@ -944,6 +979,11 @@ impl BurstEngine {
         // are represented by it and never ranked. Anything the guard flagged
         // is not in any cluster and is ranked individually as before.
         let mut audience_signals: Vec<AudienceSignal> = Vec::new();
+        let mut crowd_routing: Vec<CrowdRouting> = Vec::new();
+        // #79 S2: carrier index -> (signal, reaction group) for carriers that
+        // take the non-verbal path and so are subject to the crowd cooldown.
+        let mut crowd_group: Vec<Option<(usize, CrowdReactionGroup)>> =
+            vec![None; candidates.len()];
         if let Some(config) = self.audience {
             let inputs: Vec<AudienceInput<'_>> = candidates
                 .iter()
@@ -977,6 +1017,51 @@ impl BurstEngine {
                 self.metrics.audience_signals += 1;
                 self.metrics.audience_carriers += 1;
                 self.metrics.audience_members_represented += cluster.members.len() as u64 - 1;
+                // #79 S2: route the cluster. It only reads what the guard and
+                // threshold already admitted; it groups nothing.
+                if let Some(window) = self.crowd.as_mut() {
+                    let routed = match cluster.signal.class {
+                        AudienceSignalClass::Reaction { family } => {
+                            let group = reaction_group(family);
+                            Some((
+                                CrowdKey::Group(group),
+                                crowd_class(family),
+                                CrowdAction::NonVerbal { group },
+                            ))
+                        }
+                        AudienceSignalClass::RepeatedText if cluster.question => Some((
+                            CrowdKey::Question(cluster.topic_key),
+                            CrowdClass::RepeatedQuestion,
+                            CrowdAction::RepresentativeReply,
+                        )),
+                        AudienceSignalClass::RepeatedText => None,
+                    };
+                    if let Some((key, class, action)) = routed {
+                        let persistence = window.observe(
+                            key,
+                            batch_id,
+                            flushed_ms,
+                            cluster.signal.count,
+                            domain_trend(cluster.signal.trend),
+                            cluster.signal.intensity_milli,
+                        );
+                        if let CrowdAction::NonVerbal { group } = action {
+                            crowd_group[cluster.carrier] = Some((signal, group));
+                        }
+                        crowd_routing.push(CrowdRouting {
+                            signal,
+                            action,
+                            summary: summary_for(
+                                class,
+                                cluster.signal.count,
+                                cluster.signal.unique_actors_estimate,
+                                persistence,
+                            ),
+                        });
+                        self.metrics.crowd_routed += 1;
+                        self.metrics.crowd_window_evicted = window.evicted();
+                    }
+                }
                 audience_signals.push(cluster.signal);
             }
         }
@@ -1069,8 +1154,22 @@ impl BurstEngine {
         // and per-actor cooldown are applied to whatever order we ended up with.
         let mut selected: Vec<usize> = Vec::new();
         let mut per_actor: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut reacted_groups: BTreeSet<CrowdReactionGroup> = BTreeSet::new();
         for &index in &shortlist {
             let candidate = &candidates[index];
+            // #79 S2: a crowd reaction of a group that reacted within the
+            // cooldown (earlier batch or earlier in this one) is suppressed
+            // before it can take a Top-K slot.
+            if let Some((signal, group)) = crowd_group[index]
+                && (reacted_groups.contains(&group)
+                    || self
+                        .crowd
+                        .as_ref()
+                        .is_some_and(|window| window.cooling(group, flushed_ms)))
+            {
+                outcomes[index] = Some(TerminalOutcome::SuppressedCrowdCooldown { signal });
+                continue;
+            }
             // A crowd candidate has no single actor, so fairness (cap and
             // cooldown) does not apply to it and it stamps no cooldown.
             let actor = if crowd[index].is_some() {
@@ -1104,7 +1203,17 @@ impl BurstEngine {
                     rank: selected.len() - 1,
                 }
             };
+            if matches!(outcome, TerminalOutcome::Selected { .. })
+                && let Some((_, group)) = crowd_group[index]
+            {
+                reacted_groups.insert(group);
+            }
             outcomes[index] = Some(outcome);
+        }
+        if let Some(window) = self.crowd.as_mut() {
+            for group in &reacted_groups {
+                window.stamp(*group, flushed_ms);
+            }
         }
         for &index in &selected {
             if crowd[index].is_some() {
@@ -1139,6 +1248,7 @@ impl BurstEngine {
                     .collect(),
                 outcomes: records,
                 audience_signals,
+                crowd: crowd_routing,
             },
         }
     }

@@ -232,6 +232,13 @@ pub struct AudienceCluster {
     /// Local score of the crowd candidate, `0..=1000`.
     pub crowd_score_milli: u16,
     pub signal: AudienceSignal,
+    /// Every member carries a question mark (#79 S2). Read by crowd routing
+    /// only; it never changes grouping.
+    pub question: bool,
+    /// Fixed-size FNV-1a hash of the folded duplicate key, `0` for a reaction
+    /// family. It lets a rolling window recognise the same remark across
+    /// batches without retaining any text.
+    pub topic_key: u64,
 }
 
 /// Result of planning one batch.
@@ -914,6 +921,11 @@ pub fn plan_audience(
         };
         let carrier = members[0];
         let count = members.len();
+        let question = members.iter().all(|&m| has_question_mark(inputs[m].text));
+        let topic_key = match &key {
+            GroupKey::Family(_) => 0,
+            GroupKey::Text(text) => fnv1a64(text.as_bytes()),
+        };
         let best = members
             .iter()
             .map(|&m| inputs[m].local_score_milli)
@@ -949,9 +961,26 @@ pub fn plan_audience(
                 },
             },
             members,
+            question,
+            topic_key,
         });
     }
     plan
+}
+
+/// A reviewed question marker (ASCII or full-width).
+fn has_question_mark(text: &str) -> bool {
+    text.contains('?') || text.contains('？')
+}
+
+/// Stable, dependency-free 64-bit hash (not a security primitive).
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn unique_actors(inputs: &[AudienceInput<'_>], members: &[usize]) -> usize {

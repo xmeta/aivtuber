@@ -5,6 +5,7 @@
 mod avatar;
 mod context;
 mod control;
+mod crowd;
 mod deadline;
 mod error;
 mod event;
@@ -37,6 +38,7 @@ pub use control::{
     AuthenticatedControl, AuthenticatedControlCommand, CONTROL_SECRET_LEN, ControlIngressError,
     ControlSecret, LocalControlIngress, OperatorCommandInput,
 };
+pub use crowd::*;
 pub use deadline::{
     DeadlineExhaustionReason, DeadlineStage, InteractionDeadline, InteractionDeadlineClass,
 };

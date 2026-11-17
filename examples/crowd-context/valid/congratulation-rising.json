@@ -1,0 +1,9 @@
+{
+  "schema_version": "0.1.0",
+  "class": "congratulation",
+  "member_count": 64,
+  "unique_actors_estimate": 41,
+  "intensity_milli": 900,
+  "trend": "rising",
+  "window_batches": 2
+}

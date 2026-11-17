@@ -24,6 +24,7 @@ const speechTranscriptSchema = ajv.compile(loadJson("schemas/speech-transcript.s
 const speechLifecycleSchema = ajv.compile(loadJson("schemas/speech-lifecycle.schema.json"));
 const perceptionObservationSchema = ajv.compile(loadJson("schemas/perception-observation.schema.json"));
 const sceneContextSchema = ajv.compile(loadJson("schemas/scene-context.schema.json"));
+const crowdContextSchema = ajv.compile(loadJson("schemas/crowd-context.schema.json"));
 const obsSceneMapSchema = ajv.compile(loadJson("schemas/obs-scene-map.schema.json"));
 
 const output = execFileSync(
@@ -72,6 +73,12 @@ const sceneOutput = execFileSync(
   { cwd: root, encoding: "utf8" },
 );
 const sceneEmitted = JSON.parse(sceneOutput);
+const crowdOutput = execFileSync(
+  "cargo",
+  ["run", "--locked", "--quiet", "-p", "aivtuber-domain", "--example", "crowd_context_parity"],
+  { cwd: root, encoding: "utf8" },
+);
+const crowdEmitted = JSON.parse(crowdOutput);
 
 let failures = 0;
 function check(label, validator, value) {
@@ -145,6 +152,21 @@ if (sceneEmitted.snapshots.length < 5 || sceneEmitted.obs_scene_maps.length < 2)
   console.error("FAIL      expected at least 5 Rust SceneContextSnapshot and 2 ObsSceneMap samples");
 }
 
+for (const [index, summary] of crowdEmitted.summaries.entries()) {
+  check(`Rust CrowdSummary[${index}] -> JSON Schema`, crowdContextSchema, summary);
+}
+// The Reflex context carries the summary as an optional member; with no crowd
+// the member is absent, so the wire form is unchanged.
+if (crowdEmitted.reflex_context_without_crowd.crowd !== undefined) {
+  failures += 1;
+  console.error("FAIL      Rust ReflexContext without a crowd must omit the crowd member");
+}
+check("Rust ReflexContext.crowd -> JSON Schema", crowdContextSchema, crowdEmitted.reflex_context_with_crowd.crowd);
+if (crowdEmitted.summaries.length < 10) {
+  failures += 1;
+  console.error("FAIL      expected one Rust CrowdSummary sample per crowd class");
+}
+
 if (!avatarEmitted.commands.some((command) => command.kind === "reset")) {
   failures += 1;
   console.error("FAIL      expected a Rust AvatarPlaybackCommand::Reset sample");
@@ -159,6 +181,6 @@ if (emitted.reflex_decisions.length < 1) {
   console.error("FAIL      expected at least one Rust ReflexDecision sample");
 }
 
-const total = emitted.events.length + emitted.reflex_decisions.length + avatarEmitted.commands.length + speechEmitted.batches.length + transcriptEmitted.batches.length + lifecycleEmitted.events.length + perceptionEmitted.batches.length + sceneEmitted.snapshots.length + sceneEmitted.obs_scene_maps.length + 1;
+const total = emitted.events.length + emitted.reflex_decisions.length + avatarEmitted.commands.length + speechEmitted.batches.length + transcriptEmitted.batches.length + lifecycleEmitted.events.length + perceptionEmitted.batches.length + sceneEmitted.snapshots.length + sceneEmitted.obs_scene_maps.length + crowdEmitted.summaries.length + 1;
 console.log(`\n${total - failures} passed, ${failures} failed`);
 process.exit(failures > 0 ? 1 : 0);

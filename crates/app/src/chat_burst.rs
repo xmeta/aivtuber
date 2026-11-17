@@ -29,10 +29,11 @@
 //!   outcome* ([`ChatOutcome`]); `admitted` must equal terminal outcomes plus
 //!   what is still held, and a violation is counted, never repaired silently.
 
-use aivtuber_domain::{EventEnvelope, ReflexContext};
+use aivtuber_domain::{CrowdSummary, EventEnvelope, ReflexContext};
 use aivtuber_reflex::{
     AudienceConfig, AudienceConfigError, AudienceSignal, BatchRanker, BurstConfig,
-    BurstConfigError, BurstEngine, Disposition, RetrievalScorer, TerminalOutcome,
+    BurstConfigError, BurstEngine, CrowdAction, CrowdConfig, CrowdConfigError, Disposition,
+    RetrievalScorer, TerminalOutcome,
 };
 use aivtuber_scheduler::{
     BusyCause, DeferredConfig, DeferredConfigError, DeferredInbox, DeferredItem, DeferredMetrics,
@@ -61,6 +62,10 @@ pub struct ChatBurstConfig {
     /// #79: audience-signal aggregation of batched chat. `None` (the default)
     /// leaves batch resolution exactly as it was.
     pub audience: Option<AudienceConfig>,
+    /// #79 S2: crowd-level reaction routing of aggregated clusters. `None`
+    /// (the default) leaves a crowd carrier dispatched like any comment.
+    /// Needs `audience`, since routing reads the clusters it produces.
+    pub crowd: Option<CrowdConfig>,
 }
 
 impl Default for ChatBurstConfig {
@@ -70,6 +75,7 @@ impl Default for ChatBurstConfig {
             deferred: DeferredConfig::default(),
             reply_ttl_ms: 20_000,
             audience: None,
+            crowd: None,
         }
     }
 }
@@ -98,6 +104,12 @@ impl From<AudienceConfigError> for ChatBurstConfigError {
     }
 }
 
+impl From<CrowdConfigError> for ChatBurstConfigError {
+    fn from(error: CrowdConfigError) -> Self {
+        Self(error.to_string())
+    }
+}
+
 impl From<DeferredConfigError> for ChatBurstConfigError {
     fn from(error: DeferredConfigError) -> Self {
         Self(error.to_string())
@@ -110,6 +122,15 @@ impl ChatBurstConfig {
         self.deferred.validate()?;
         if let Some(audience) = &self.audience {
             audience.validate()?;
+        }
+        if let Some(crowd) = &self.crowd {
+            crowd.validate()?;
+            if self.audience.is_none() {
+                return Err(ChatBurstConfigError(
+                    "invalid chat burst configuration: crowd routing requires audience aggregation"
+                        .to_owned(),
+                ));
+            }
         }
         if self.reply_ttl_ms == 0 || self.reply_ttl_ms > self.deferred.max_ttl_ms {
             return Err(ChatBurstConfigError(
@@ -149,12 +170,15 @@ pub enum ChatOutcome {
     /// #79: absorbed into an audience signal; the cluster's carrier comment
     /// stands for the crowd and has its own outcome.
     RepresentedByAggregate,
+    /// #79 S2: the carrier of a crowd reaction whose group reacted within the
+    /// crowd cooldown: one reaction per crowd moment, not one per batch.
+    SuppressedCrowdCooldown,
     /// It was deferred and reached the inbox's terminal outcome.
     Deferred(DeferredOutcome),
 }
 
 impl ChatOutcome {
-    const IMMEDIATE_COUNT: usize = 11;
+    const IMMEDIATE_COUNT: usize = 12;
 
     /// Category among the outcomes the lane itself accounts. `Deferred(_)`
     /// outcomes are accounted by the inbox.
@@ -171,6 +195,7 @@ impl ChatOutcome {
             Self::ShutdownBeforeSelection => 8,
             Self::ExpiredBeforeDispatch => 9,
             Self::RepresentedByAggregate => 10,
+            Self::SuppressedCrowdCooldown => 11,
             Self::Deferred(_) => return None,
         })
     }
@@ -202,7 +227,7 @@ pub struct ChatBurstMetrics {
     /// Terminal outcomes the lane accounts itself, indexed like
     /// [`ChatOutcome`] (dispatched now, failed, capacity, cooldown, batch cap,
     /// shed, erased, cancelled, shutdown, expired before dispatch,
-    /// represented by aggregate).
+    /// represented by aggregate, suppressed by the crowd cooldown).
     pub terminal: [u64; ChatOutcome::IMMEDIATE_COUNT],
     /// Not batchable (donation, game event, ...): the unchanged per-event path.
     pub bypassed: u64,
@@ -241,6 +266,14 @@ pub struct ChatBurstMetrics {
     pub audience_guarded: u64,
     /// Signals dropped because their bounded ring was full.
     pub audience_signals_dropped: u64,
+    /// #79 S2 crowd routing: clusters routed, carriers answered with a
+    /// non-verbal crowd reaction, carriers answered with a representative
+    /// reply, and non-verbal carriers that found no fitting asset and took the
+    /// ordinary reply path. Cooldown suppressions are `terminal[11]`.
+    pub crowd_routed: u64,
+    pub crowd_non_verbal: u64,
+    pub crowd_replies: u64,
+    pub crowd_fallback_replies: u64,
 }
 
 impl ChatBurstMetrics {
@@ -266,6 +299,42 @@ impl ChatBurstMetrics {
 pub(crate) struct Candidate {
     pub event: EventEnvelope,
     pub arrived_ms: u64,
+    /// #79 S2: set when this comment stands for a crowd. The route and the
+    /// summary come from the engine's own record, never from the event.
+    pub crowd: Option<CrowdDispatch>,
+}
+
+/// Asset variant groups a crowd reaction prefers, most specific first. A pack
+/// may ship `crowd.<group>` assets for a sharper reaction; the generic
+/// `reaction.*` groups are the fallback. Code-owned and closed: neither a
+/// viewer nor a model can name a group.
+pub(crate) fn crowd_asset_groups(
+    group: aivtuber_reflex::CrowdReactionGroup,
+) -> &'static [&'static str] {
+    use aivtuber_reflex::CrowdReactionGroup as G;
+    match group {
+        G::Celebration => &["crowd.celebration", "reaction.agree"],
+        G::Laughter => &["crowd.laughter", "reaction.agree"],
+        G::Surprise => &["crowd.surprise", "reaction.surprise"],
+        G::Sympathy => &["crowd.sympathy", "reaction.neutral"],
+        G::Greeting => &["crowd.greeting", "reaction.agree"],
+    }
+}
+
+/// How a crowd carrier is to be answered, with its typed summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CrowdDispatch {
+    pub action: CrowdAction,
+    pub summary: CrowdSummary,
+}
+
+/// What waits in the deferred inbox: the event plus its crowd tag, so a crowd
+/// carrier that had to wait is still answered as a crowd, not as a reply to
+/// its own text.
+#[derive(Debug, Clone)]
+pub(crate) struct DeferredReply {
+    pub event: EventEnvelope,
+    pub crowd: Option<CrowdDispatch>,
 }
 
 /// What the lane decided for an offered event.
@@ -300,7 +369,7 @@ pub(crate) struct ChatBurstLane {
     /// [`ChatBurstLane::resolve_ready`] step, and none at shutdown.
     ranker: Option<Box<dyn BatchRanker + Send>>,
     held: BTreeMap<String, Held>,
-    inbox: DeferredInbox<EventEnvelope>,
+    inbox: DeferredInbox<DeferredReply>,
     reply_ttl_ms: u64,
     metrics: ChatBurstMetrics,
     records: VecDeque<ChatBurstRecord>,
@@ -350,6 +419,7 @@ impl ChatBurstLane {
         config.validate()?;
         let mut engine = BurstEngine::new(config.burst)?;
         engine.set_audience(config.audience)?;
+        engine.set_crowd(config.crowd)?;
         Ok(Self {
             engine,
             scorer: None,
@@ -384,6 +454,7 @@ impl ChatBurstLane {
             audience_signals: burst.audience_signals,
             audience_members_represented: burst.audience_members_represented,
             audience_guarded: burst.audience_guarded.values().sum(),
+            crowd_routed: burst.crowd_routed,
             ..self.metrics
         }
     }
@@ -403,6 +474,21 @@ impl ChatBurstLane {
     pub(crate) fn take_audience_signals(&mut self, max: usize) -> Vec<AudienceSignal> {
         let take = max.min(self.signals.len());
         self.signals.drain(..take).collect()
+    }
+
+    /// A crowd carrier was answered with a non-verbal crowd reaction.
+    pub(crate) fn note_crowd_non_verbal(&mut self) {
+        self.metrics.crowd_non_verbal += 1;
+    }
+
+    /// A crowd carrier was answered on the reply path: `fallback` when it was
+    /// a non-verbal carrier with no fitting asset.
+    pub(crate) fn note_crowd_reply(&mut self, fallback: bool) {
+        if fallback {
+            self.metrics.crowd_fallback_replies += 1;
+        } else {
+            self.metrics.crowd_replies += 1;
+        }
     }
 
     pub(crate) fn push_report(&mut self, report: DeferredReplyReport) {
@@ -485,6 +571,7 @@ impl ChatBurstLane {
                 Offer::Quiet(Candidate {
                     event,
                     arrived_ms: now_ms,
+                    crowd: None,
                 })
             }
             Disposition::Batched => {
@@ -558,6 +645,25 @@ impl ChatBurstLane {
                 }
                 self.signals.push_back(signal.clone());
             }
+            // #79 S2: the engine's routing, keyed by the carrier's event id.
+            let crowd_of: BTreeMap<&str, CrowdDispatch> = record
+                .crowd
+                .iter()
+                .filter_map(|route| {
+                    let carrier = record
+                        .audience_signals
+                        .get(route.signal)?
+                        .representative_event_ids
+                        .first()?;
+                    Some((
+                        carrier.as_str(),
+                        CrowdDispatch {
+                            action: route.action,
+                            summary: route.summary.clone(),
+                        },
+                    ))
+                })
+                .collect();
             let order: BTreeMap<&str, usize> = record
                 .selected
                 .iter()
@@ -580,6 +686,7 @@ impl ChatBurstLane {
                                 Candidate {
                                     event: *event,
                                     arrived_ms,
+                                    crowd: crowd_of.get(outcome.event_id.as_str()).cloned(),
                                 },
                             ));
                         }
@@ -599,6 +706,9 @@ impl ChatBurstLane {
                     }
                     (_, TerminalOutcome::RepresentedByAggregate { .. }) => {
                         Some(ChatOutcome::RepresentedByAggregate)
+                    }
+                    (_, TerminalOutcome::SuppressedCrowdCooldown { .. }) => {
+                        Some(ChatOutcome::SuppressedCrowdCooldown)
                     }
                     // A quiet passthrough is never held, and a selected
                     // comment without its envelope cannot happen: the lane
@@ -669,7 +779,11 @@ impl ChatBurstLane {
     /// expiry is `arrival + reply_ttl`; the cause is a trusted runtime input.
     /// The caller has already checked [`Self::still_fresh`].
     pub(crate) fn defer(&mut self, candidate: Candidate, now_ms: u64, cause: BusyCause) {
-        let Candidate { event, arrived_ms } = candidate;
+        let Candidate {
+            event,
+            arrived_ms,
+            crowd,
+        } = candidate;
         let now_ms = self.advance(now_ms);
         self.metrics.in_flight = self.metrics.in_flight.saturating_sub(1);
         match cause {
@@ -693,7 +807,7 @@ impl ChatBurstLane {
                 Some(event.event_id.clone()),
                 reason,
             ),
-            payload: event,
+            payload: DeferredReply { event, crowd },
         };
         let (_result, terminals) = self.inbox.defer(item, now_ms);
         self.record_deferred(terminals, now_ms);
@@ -706,7 +820,7 @@ impl ChatBurstLane {
         &mut self,
         now_ms: u64,
         availability: ReplyAvailability,
-    ) -> Option<ReadyDeferred<EventEnvelope>> {
+    ) -> Option<ReadyDeferred<DeferredReply>> {
         let now_ms = self.advance(now_ms);
         let (terminals, ready) = self.inbox.poll(now_ms, availability);
         self.record_deferred(terminals, now_ms);
@@ -716,7 +830,7 @@ impl ChatBurstLane {
 
     pub(crate) fn complete_deferred(
         &mut self,
-        ready: ReadyDeferred<EventEnvelope>,
+        ready: ReadyDeferred<DeferredReply>,
         outcome: DeferredOutcome,
         now_ms: u64,
     ) {

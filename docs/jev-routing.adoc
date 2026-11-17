@@ -355,7 +355,7 @@ The deterministic order is local score (a caller-supplied `0..=1000` value such 
 
 === 12.4 Terminal outcomes
 
-Each admitted comment ends in exactly one of: `selected{rank}`, `quiet_passthrough`, `not_selected_capacity`, `suppressed_actor_cooldown`, `suppressed_actor_batch_cap`, `shed_pending_overflow`, and, with audience aggregation on (12.7), `represented_by_aggregate{signal}`. `BurstMetrics::invariant_violations` counts any observation of `admitted != terminal + pending + ready` and must be zero.
+Each admitted comment ends in exactly one of: `selected{rank}`, `quiet_passthrough`, `not_selected_capacity`, `suppressed_actor_cooldown`, `suppressed_actor_batch_cap`, `shed_pending_overflow`, and, with audience aggregation on (12.7), `represented_by_aggregate{signal}`, and, with crowd routing on (12.9), `suppressed_crowd_cooldown{signal}`. `BurstMetrics::invariant_violations` counts any observation of `admitted != terminal + pending + ready` and must be zero.
 
 === 12.5 Configuration (`BurstConfig`) and metrics
 
@@ -422,7 +422,30 @@ A burst is mostly the same few reactions or the same remark repeated. With `AIVT
 
 Falsifiers (`crates/reflex/tests/audience_falsifier.rs`, `crates/app/src/tests/chat_burst_tests.rs`): a burst with six laughter reactions, four `gg`, one threat, one scam link and one real question yields two signals; the threat, scam and question stay individual candidates and are selected; each member has exactly one terminal outcome (8 represented, invariant 0); replay bytes are identical across runs and independent of polling cadence; a ranker sees one actor-less crowd candidate per cluster and cannot revive an absorbed member; the 100x burst stays fully accounted with aggregation on.
 
-Deferred: semantic/topic grouping and conflicting explicit threads (#80), cross-batch windows, trends and decay, coordinated-spam moderation actions (#76/#77), feeding a signal into the router or a Jev prompt, and an operator-visible crowd view.
+Deferred: semantic/topic grouping and conflicting explicit threads (#80), decay, coordinated-spam moderation actions (#76/#77), and an operator-visible crowd view. Routing a signal and the cross-batch window are section 12.9 (#79 S2).
+
+=== 12.9 Crowd-level reaction routing (issue #79, S2)
+
+S1 turns a cluster into one carrier but dispatches it like any comment, so a crowd was still answered as one viewer's text. With `AIVTUBER_CHAT_CROWD_MODE=true` (default off; requires `AIVTUBER_CHAT_AUDIENCE_MODE=true`, otherwise startup is refused) the engine routes each cluster by its signal class with deterministic policy in code (`crates/reflex/src/crowd.rs`, `crates/app/src/lib.rs`). Without it, or with no cluster, behaviour and replay bytes are exactly as before: `BatchReplayRecord::crowd` is omitted from the encoding when empty. `AIVTUBER_CHAT_BURST_MODE` and every other default are unchanged.
+
+*No new absorption path.* Routing reads clusters the S1 guard and thresholds already produced and groups nothing itself; the guard still sees every candidate first, so a threat, scam, link, mention or injection-looking text is never absorbed and never routed as a crowd. The only classification S2 adds is "every member carries a question mark" (`?` or full-width), and it never changes grouping.
+
+*Routes.*
+* A *reaction family* maps through a reviewed, code-owned table to a reaction group (`celebration` = good game, praise, congratulation, cheer and thanks; `laughter`; `surprise`; `sympathy`; `greeting`). The carrier is answered by a cached or non-verbal reaction of that group (`crowd.<group>` first, then a generic pack group: `reaction.agree` for celebration, laughter and greeting, `reaction.surprise` for surprise, `reaction.neutral` for sympathy) played through the same performer, scheduler, mute and stop path as any intent. It bypasses the router: nothing is retrieved, generated or shadow-evaluated from the carrier's text, and no router decision is recorded. When no fitting asset exists the carrier takes the ordinary reply path (today's behaviour) and is counted in `crowd_fallback_replies`.
+* A *repeated question* gets one representative reply on the normal reply path. Its Thinking request carries a `crowd` member in the context (a `CrowdSummary`, section 4.4 of `docs/domain-contract.adoc`): class, member count, unique-actor estimate, intensity, trend and window batches. It has no member text and no actor id; the carrier's own text is `input`, as before.
+* Any other repeated remark is unchanged.
+
+*Cross-batch window and cooldown.* A bounded `CrowdWindow` (at most `max_entries` <= 64 entries, default 32; window `AIVTUBER_CHAT_CROWD_WINDOW_MS` default 60000, 1 to 3600000) remembers recent crowd classes by logical flush instant: a reaction group, or a question by a fixed-size FNV-1a hash of its folded text (no text is retained). A class that persists across batches raises its intensity by 100 per extra recent batch (cap 1000), reads its trend from the previous batch's count, and states `window_batches`. A per-group cooldown (`AIVTUBER_CHAT_CROWD_COOLDOWN_MS` default 20000, 0 to 3600000; 0 disables) is stamped when a crowd reaction is *selected* and checked at selection, so a carrier of a group that reacted within the cooldown (earlier batch or earlier in the same batch, for example "GG" and "congrats" clusters of one celebration) ends as `suppressed_crowd_cooldown` without taking a Top-K slot. A question is never cooled down: a repeated question after the window is a new question. Time is the batch's own logical instant; a regressing clock cannot reopen a cooldown.
+
+*Deferral keeps the tag.* A crowd carrier that must wait for the performer sits in the deferred inbox together with its route and summary, so it is still answered as a crowd (never as a reply to its own text) when it drains. The content gate is re-run before it dispatches (`revalidate_deferred_content`), exactly as for any deferred reply.
+
+*Authority.* The summary is data built by the runtime from its own record; it grants nothing and has no path to the operator or control plane, a capability, a permit, the memory writer or the content guard order. The route comes from the engine, never from a payload field or a model, and a viewer cannot name an asset group.
+
+*Metrics.* `BurstMetrics::crowd_routed`, `crowd_window_evicted`; `ChatBurstMetrics::crowd_routed`, `crowd_non_verbal`, `crowd_replies`, `crowd_fallback_replies` and `terminal[11]` (cooldown suppressions).
+
+Falsifier (`examples/crowd-routing/falsifier.json`, `crates/app/src/tests/crowd_routing_tests.rs`, `crates/reflex/tests/crowd_routing.rs`): 85 celebration comments in mixed tokens from 40 viewers plus a threat, a scam link and a question yield exactly one crowd reaction (one cached asset, no router call or provider request for the crowd's text), five carriers held by the cooldown and 79 members represented, with the three outliers answered individually; two repeated-question bursts yield one representative reply each, the second reading the first across batches (`window_batches` 2, rising); every one of the 128 comments ends exactly once, and the replay is byte-identical across runs.
+
+Deferred: semantic/topic grouping (#80), a cooldown for repeated questions, decay, coordinated-spam moderation (#76/#77).
 
 === 12.8 Retrieval score and Jev batch ranker (issue #78, S3)
 

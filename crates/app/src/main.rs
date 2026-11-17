@@ -616,6 +616,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     if audience_requested && !chat_burst_mode {
         return Err("AIVTUBER_CHAT_AUDIENCE_MODE requires AIVTUBER_CHAT_BURST_MODE=true".into());
     }
+    // Issue #79 S2: crowd-level reaction routing of the clusters S1 produces.
+    // Its own default-off flag; it needs audience aggregation, so asking for it
+    // without AIVTUBER_CHAT_AUDIENCE_MODE refuses startup.
+    let crowd_requested = env_bool("AIVTUBER_CHAT_CROWD_MODE", false)?;
+    if crowd_requested && !audience_requested {
+        return Err("AIVTUBER_CHAT_CROWD_MODE requires AIVTUBER_CHAT_AUDIENCE_MODE=true".into());
+    }
     // Issue #78 S3: both default off and only act inside the burst lane, so
     // asking for them without it refuses startup rather than doing nothing.
     let retrieval_score_requested = env_bool("AIVTUBER_CHAT_BURST_RETRIEVAL_SCORE", false)?;
@@ -669,6 +676,19 @@ fn run() -> Result<(), Box<dyn Error>> {
                         "AIVTUBER_CHAT_AUDIENCE_MIN_ACTORS",
                         audience_defaults.min_unique_actors,
                     )?,
+                })
+            } else {
+                None
+            },
+            crowd: if crowd_requested {
+                let crowd_defaults = aivtuber_reflex::CrowdConfig::default();
+                Some(aivtuber_reflex::CrowdConfig {
+                    window_ms: env_u64("AIVTUBER_CHAT_CROWD_WINDOW_MS", crowd_defaults.window_ms)?,
+                    cooldown_ms: env_u64(
+                        "AIVTUBER_CHAT_CROWD_COOLDOWN_MS",
+                        crowd_defaults.cooldown_ms,
+                    )?,
+                    max_entries: crowd_defaults.max_entries,
                 })
             } else {
                 None

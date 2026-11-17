@@ -1224,6 +1224,10 @@ where
     /// Live chat-burst selection and deferred replies (#75 S1, #78 S2); `None`
     /// unless composed, so the default per-event path is unchanged.
     chat_burst: Option<chat_burst::ChatBurstLane>,
+    /// #79 S2: the crowd summary for the one reply being dispatched right now.
+    /// Set by the crowd path immediately before `dispatch_admitted_event` and
+    /// taken by `handle_event`, so it can never reach another event.
+    crowd_context: Option<aivtuber_domain::CrowdSummary>,
     /// Runtime time the VAD sidecar's newest feed-liveness beat arrived.
     speech_feed_heartbeat_ms: Option<u64>,
     /// Performer playback intervals, for the half-duplex gate (#396).
@@ -1301,6 +1305,7 @@ where
             speech_barge_in: None,
             speech_input: None,
             chat_burst: None,
+            crowd_context: None,
             speech_feed_heartbeat_ms: None,
             speech_playback: speech_duplex::PlaybackGate::default(),
             audio: audio_stop::AudioChannel::new(audio),
@@ -3662,15 +3667,113 @@ where
                 None
             }
             ReplyAvailability::Available => {
-                let event = candidate.event;
+                let chat_burst::Candidate { event, crowd, .. } = candidate;
                 let id = event.event_id.clone();
-                let result = self.dispatch_admitted_event(event, at_ms, seed, interaction_started);
+                let result =
+                    self.dispatch_maybe_crowd(event, crowd, at_ms, seed, interaction_started);
                 if let Some(lane) = self.chat_burst.as_mut() {
                     lane.dispatched_now(&id, at_ms, result.is_ok());
                 }
                 Some(result)
             }
         }
+    }
+
+    /// Dispatch a selected comment. An ordinary comment takes the unchanged
+    /// per-event path. A crowd carrier (#79 S2) is answered by the engine's
+    /// deterministic routing: a reaction family plays a cached or non-verbal
+    /// reaction of its group and never generates a reply to the carrier's text
+    /// (when no fitting asset exists it falls back to the ordinary reply path,
+    /// today's behaviour); a repeated question gets one representative reply
+    /// with the typed summary in its context. The content gate already ran at
+    /// admission (and again for a deferred reply); nothing here reorders it.
+    fn dispatch_maybe_crowd(
+        &mut self,
+        event: EventEnvelope,
+        crowd: Option<chat_burst::CrowdDispatch>,
+        at_ms: u64,
+        seed: u64,
+        interaction_started: Instant,
+    ) -> Result<Option<CachedPlaybackOutcome>, AppError> {
+        let Some(crowd) = crowd else {
+            return self.dispatch_admitted_event(event, at_ms, seed, interaction_started);
+        };
+        let fallback = matches!(crowd.action, aivtuber_reflex::CrowdAction::NonVerbal { .. });
+        if let aivtuber_reflex::CrowdAction::NonVerbal { group } = crowd.action
+            && let Some(result) = self.play_crowd_reaction(&event, group, at_ms, seed)
+        {
+            if let Some(lane) = self.chat_burst.as_mut() {
+                lane.note_crowd_non_verbal();
+            }
+            return result;
+        }
+        if let Some(lane) = self.chat_burst.as_mut() {
+            lane.note_crowd_reply(fallback);
+        }
+        self.crowd_context = Some(crowd.summary);
+        let result = self.dispatch_admitted_event(event, at_ms, seed, interaction_started);
+        // `handle_event` takes it; a dispatch that failed earlier must not
+        // leave it for the next event.
+        self.crowd_context = None;
+        result
+    }
+
+    /// Play a cached or non-verbal reaction for a crowd moment, or `None` when
+    /// the pack has no fitting asset (the caller then falls back). Bypasses the
+    /// router on purpose: nothing is generated or retrieved from the carrier's
+    /// text, so no router decision, shadow job or generation is created.
+    fn play_crowd_reaction(
+        &mut self,
+        event: &EventEnvelope,
+        group: aivtuber_reflex::CrowdReactionGroup,
+        at_ms: u64,
+        seed: u64,
+    ) -> Option<Result<Option<CachedPlaybackOutcome>, AppError>> {
+        let variant_seed = seed.wrapping_add(event.sequence);
+        let intent = chat_burst::crowd_asset_groups(group)
+            .iter()
+            .find(|candidate| {
+                self.performer
+                    .assets()
+                    .select_variant_id(candidate, variant_seed, &[])
+                    .is_some()
+            })?;
+        let event_id = event.event_id.clone();
+        let mut reaction = event.clone();
+        reaction.payload.insert(
+            "intent".to_owned(),
+            serde_json::Value::String((*intent).to_owned()),
+        );
+        let played = self.performer.handle_event(
+            &reaction,
+            at_ms,
+            seed,
+            &self.visemes,
+            &mut self.pending_audio,
+            &mut self.pending_avatar,
+        );
+        let outcome = match played {
+            Ok(outcome) => outcome,
+            Err(error) => return Some(Err(error.into())),
+        };
+        self.tick(at_ms);
+        let cache_level = cache_level(Some(outcome.cache_tier));
+        let handled = HandledEvent {
+            playback: Some(outcome),
+            route: RouteClass::Deterministic,
+            routing_latency_us: 0,
+            generation_latency_us: None,
+            generation_trace: None,
+            decision: None,
+            template_fallback: None,
+            cache_level,
+            deadline: None,
+            deferred_generation: false,
+            admitted_bytes: None,
+            correlation_id: Some(event.correlation_id.clone()),
+        };
+        self.record_handled_event(&event_id, &handled, at_ms);
+        Some(Ok(handled.playback))
     }
 
     fn report_selected_dispatch(
@@ -3710,7 +3813,7 @@ where
             else {
                 break;
             };
-            let event = ready.item.payload.clone();
+            let chat_burst::DeferredReply { event, crowd } = ready.item.payload.clone();
             if self.security.revalidate_deferred_content(&event) != DeferredRevalidation::Permitted
             {
                 if let Some(lane) = self.chat_burst.as_mut() {
@@ -3718,8 +3821,9 @@ where
                 }
                 continue;
             }
-            let result = self.dispatch_admitted_event(
+            let result = self.dispatch_maybe_crowd(
                 event,
+                crowd,
                 at_ms,
                 seed.wrapping_add(step as u64),
                 Instant::now(),
@@ -3876,6 +3980,24 @@ where
         }
     }
 
+    /// Add the crowd summary to a generation route (#79 S2). The summary is
+    /// closed vocabulary and counts (no member text, no actor id), built by the
+    /// lane from the engine's own record; it is taken here whether or not the
+    /// route generates, so it cannot outlive the event it was set for. A
+    /// request that does not validate with it is kept exactly as routed.
+    fn attach_crowd_context(&mut self, route: &mut PlaybackRoute) {
+        let Some(summary) = self.crowd_context.take() else {
+            return;
+        };
+        let PlaybackRoute::Generate(generation) = route else {
+            return;
+        };
+        generation.thinking.context.crowd = Some(summary);
+        if generation.thinking.validate().is_err() {
+            generation.thinking.context.crowd = None;
+        }
+    }
+
     /// Add the scene context to a generation route (#88 S1, #90 S2).
     ///
     /// * `context.scene` is the closed-vocabulary snapshot only: a scene class,
@@ -3982,6 +4104,8 @@ where
         // #88 / #90 S2: closed-vocabulary scene for the Reflex and Thinking
         // context, and at most one untrusted screen caption for Thinking.
         self.attach_scene_context(&mut route, scene, at_ms);
+        // #79 S2: the typed crowd summary, when this reply stands for a crowd.
+        self.attach_crowd_context(&mut route);
         let routing_latency_us = elapsed_us(route_started);
         let decision = self.router.decision_record().cloned();
         let template_fallback = self
@@ -5828,6 +5952,7 @@ mod tests {
     mod avatar_control_tests;
     mod chat_burst_tests;
     mod chat_ingress_tests;
+    mod crowd_routing_tests;
     mod irodori_tts_tests;
     mod local_thinking_fallback_tests;
     mod memory_seed_tests;

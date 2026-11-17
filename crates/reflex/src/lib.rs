@@ -6,6 +6,7 @@
 mod audience;
 mod burst;
 mod chat_score;
+mod crowd;
 mod jev;
 mod jev_batch;
 mod pipeline;
@@ -31,6 +32,10 @@ pub use chat_score::{
     ChatTextEmbedder, MAX_SCORE_INDEX_ASSETS, MAX_SCORE_LOOKUPS_PER_WINDOW, MAX_SCORE_WINDOW_MS,
     ReactionAxisEmbedder, RetrievalScoreConfig, RetrievalScoreConfigError, RetrievalScoreMetrics,
     RetrievalScorer,
+};
+pub use crowd::{
+    CrowdAction, CrowdConfig, CrowdConfigError, CrowdReactionGroup, CrowdRouting,
+    MAX_CROWD_SPAN_MS, MAX_CROWD_WINDOW_ENTRIES, crowd_class, reaction_group,
 };
 pub use jev::{
     HttpResponse, HttpTransport, JevAdapter, JevAdapterConfig, JevApiKey, JevCallEvidence,

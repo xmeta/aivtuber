@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xmeta/aivtuber/schemas/crowd-context.schema.json",
+  "title": "AI VTuber Crowd Summary",
+  "description": "Bounded, versioned crowd summary for a reply context (issue #79 S2). Serialized form of aivtuber_domain::CrowdSummary: a closed crowd class, how many viewers the representative comment stands for, the distinct-viewer estimate, an intensity, a trend and the number of recent batches (within the runtime's rolling window) in which the class appeared. There is no free text, no viewer text and no actor identifier in this contract. It is carried as the optional `crowd` member of the Reflex context and of the Thinking request context; the member is omitted when absent, so a request without a crowd is byte-identical to one built before this contract existed. Authority rule: the summary is derived data built by the runtime from its own aggregation, never from a payload field, and it grants no capability, permit or gate decision; it cannot reach the operator or control plane. unique_actors_estimate <= member_count is re-checked by the Rust validator (JSON Schema cannot compare two fields).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "class", "member_count", "unique_actors_estimate",
+    "intensity_milli", "trend", "window_batches"
+  ],
+  "properties": {
+    "schema_version": {"const": "0.1.0"},
+    "class": {
+      "enum": [
+        "laughter", "good_game", "praise", "congratulation", "greeting",
+        "cheer", "surprise", "sympathy", "thanks", "repeated_question"
+      ],
+      "description": "Closed crowd vocabulary: the reviewed reaction families plus a repeated question."
+    },
+    "member_count": {
+      "type": "integer",
+      "minimum": 2,
+      "maximum": 100000,
+      "description": "Comments the representative stands for, including itself."
+    },
+    "unique_actors_estimate": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100000,
+      "description": "Distinct viewers among them, as the aggregator counted them; never more than member_count."
+    },
+    "intensity_milli": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1000,
+      "description": "Share of the batch, raised while the class persists across batches."
+    },
+    "trend": {"enum": ["rising", "steady", "falling", "unknown"]},
+    "window_batches": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 64,
+      "description": "Recent batches, within the runtime's rolling window, in which the class appeared, this one included."
+    }
+  }
+}
