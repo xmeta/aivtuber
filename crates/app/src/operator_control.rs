@@ -139,6 +139,10 @@ pub struct OperatorStatusSnapshot {
     /// unless composed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_usage: Option<crate::ThinkingUsageStatus>,
+    /// The opt-in System One affect judge (#426): phrases judged, fallbacks by
+    /// reason, answer latency. Counters only, never text. Absent unless composed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affect_judge: Option<aivtuber_generative::AffectJudgeStatus>,
     /// The voice settings (#360): which voice speaks, the choice, the key's
     /// state (never the key). Absent unless composed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -232,6 +236,7 @@ impl OperatorStatusSnapshot {
                 .map(|service| OperatorPerceptionStatus::from_report(&service.report(now_ms))),
             thinking_model: app.thinking_model_status(),
             thinking_usage: app.thinking_usage_status(),
+            affect_judge: app.affect_judge_status(),
             voice: app.voice_status(),
             chat_ingress: app.chat_ingress_status(),
             avatar_model: app.avatar_status(),

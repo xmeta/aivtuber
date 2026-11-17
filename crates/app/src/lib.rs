@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod affect_judge;
 mod aivis_bridge;
 mod audio_stop;
 mod avatar_control;
@@ -53,6 +54,10 @@ mod tts_sidecar;
 mod voice_control;
 mod voicevox_bridge;
 
+pub use affect_judge::{
+    AFFECT_JUDGE_DEADLINE_VAR, AFFECT_JUDGE_VAR, AffectJudgeMode, SystemOneAffectJudge,
+    startup_notice as affect_judge_startup_notice,
+};
 pub use aivis_bridge::*;
 pub use aivtuber_domain::scenario::*;
 pub use audio_stop::{AUDIO_STOP_BOUND, AudioStopReport, OperatorStopReport};
@@ -1205,6 +1210,9 @@ where
     /// status or the support bundle.
     panel_url: Option<aivtuber_adapters::SecretString>,
     thinking_meter: Option<thinking_meter::ThinkingMeter>,
+    /// Counters of the opt-in System One affect judge (#426); `None` (default)
+    /// when the judge is not composed.
+    affect_judge_stats: Option<aivtuber_generative::AffectJudgeStats>,
     /// Live voice settings (#360); `None` (default) composes nothing and the
     /// voice is whatever the environment named.
     voice: Option<voice_control::VoiceController>,
@@ -1299,6 +1307,7 @@ where
             persona_editor: None,
             panel_url: None,
             thinking_meter: None,
+            affect_judge_stats: None,
             voice: None,
             chat_ingress: None,
             avatar_store: None,
@@ -1956,6 +1965,19 @@ where
     pub fn with_thinking_meter(mut self, meter: thinking_meter::ThinkingMeter) -> Self {
         self.thinking_meter = Some(meter);
         self
+    }
+
+    /// Share the affect judge's counters with the operator surfaces (#426).
+    /// The same runner must be on the compiler.
+    pub fn with_affect_judge_stats(mut self, stats: aivtuber_generative::AffectJudgeStats) -> Self {
+        self.affect_judge_stats = Some(stats);
+        self
+    }
+
+    /// Judge counters (judged, fallback by reason, latency p50/p95); `None`
+    /// when the judge is not composed.
+    pub fn affect_judge_status(&self) -> Option<aivtuber_generative::AffectJudgeStatus> {
+        self.affect_judge_stats.as_ref().map(|s| s.snapshot())
     }
 
     /// Session Thinking usage and cap state; `None` when no meter is composed.
@@ -5973,6 +5995,7 @@ mod tests {
     };
     use aivtuber_runtime::{CachedPlaybackConfig, SecurityRuntimeConfig};
 
+    mod affect_judge_status_tests;
     mod aivis_cloud_tts_tests;
     mod avatar_control_tests;
     mod chat_burst_tests;

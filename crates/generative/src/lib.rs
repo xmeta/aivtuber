@@ -23,6 +23,7 @@ use serde_json::json;
 use std::error::Error;
 use std::fmt;
 mod affect;
+mod affect_judge;
 mod phrase;
 mod phrase_pipeline;
 mod phrase_stream;
@@ -31,6 +32,11 @@ mod speech_text;
 pub use affect::{
     AFFECT_INTENSITY_CAP, AFFECT_MAX_INPUT_CHARS, AffectClass, AffectConfig, AffectReading,
     AffectState, AffectStrength, classify_affect,
+};
+pub use affect_judge::{
+    AffectDecision, AffectFallbackReason, AffectJudge, AffectJudgeFailure, AffectJudgeRunner,
+    AffectJudgeStats, AffectJudgeStatus, AffectJudgeTicket, AffectSource, DEFAULT_JUDGE_HARD_CAP,
+    MAX_AFFECT_DECISIONS, MAX_JUDGE_IN_FLIGHT,
 };
 pub use phrase::{
     Delivery, MAX_PHRASES_CEILING, PHRASE_SEGMENTATION_VERSION, PhraseConfig, PhraseDelivery,
@@ -124,6 +130,12 @@ pub struct GenerationTrace {
     /// the replay identity and the `projection_passthrough_latin` metric.
     #[serde(default)]
     pub speech_projection: Option<SpeechProjectionTrace>,
+    /// Per-phrase affect decisions of the opt-in System One judge (#426):
+    /// the class and where it came from (`judge` or `rules_fallback` with a
+    /// reason), never text. Empty, and absent on the wire, unless the judge is
+    /// enabled; bounded by [`MAX_AFFECT_DECISIONS`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub affect_decisions: Vec<AffectDecision>,
 }
 
 /// Counts and identity of the speech projections made for one reply. Never
@@ -142,6 +154,12 @@ impl GenerationTrace {
     pub(crate) fn record_thinking_usage(&mut self, usage: Option<ThinkingUsage>) {
         if let Some(call) = self.llm_calls.last_mut() {
             call.usage = usage;
+        }
+    }
+
+    pub(crate) fn record_affect_decision(&mut self, decision: AffectDecision) {
+        if self.affect_decisions.len() < MAX_AFFECT_DECISIONS {
+            self.affect_decisions.push(decision);
         }
     }
 
@@ -176,6 +194,7 @@ impl Default for GenerationTrace {
             cancelled_stage: None,
             budget_denial_reason: None,
             speech_projection: None,
+            affect_decisions: Vec::new(),
         }
     }
 }
@@ -381,6 +400,7 @@ impl GenerationCancellationRegistry {
 pub struct PerformanceCompiler {
     config: PerformanceCompilerConfig,
     affect: Option<AffectConfig>,
+    affect_judge: Option<AffectJudgeRunner>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -521,6 +541,7 @@ impl PerformanceCompiler {
         Ok(Self {
             config,
             affect: None,
+            affect_judge: None,
         })
     }
 
@@ -532,6 +553,20 @@ impl PerformanceCompiler {
     pub fn with_affect(mut self, affect: AffectConfig) -> Self {
         self.affect = Some(affect);
         self
+    }
+
+    /// Opt in to the System One affect judge (#426): each phrase's judge call
+    /// runs in parallel with its synthesis and its answer is used only if it
+    /// is in when the audio is ready; otherwise the S1 rules label stands.
+    /// Only meaningful together with [`Self::with_affect`].
+    #[must_use]
+    pub fn with_affect_judge(mut self, judge: AffectJudgeRunner) -> Self {
+        self.affect_judge = Some(judge);
+        self
+    }
+
+    pub(crate) fn affect_judge(&self) -> Option<&AffectJudgeRunner> {
+        self.affect.as_ref().and(self.affect_judge.as_ref())
     }
 
     pub fn compile(
