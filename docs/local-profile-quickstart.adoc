@@ -215,6 +215,21 @@ The panel's *アバター* section replaces copying a file to `renderer/local-av
 The `renderer/local-avatar/dist/model.vrm` file still works as the *sample* when you run the app yourself without the launcher; set `AIVTUBER_AVATAR_SETTINGS` and `AIVTUBER_AVATAR_DIR` to turn the panel's avatar section on in that case. You remain responsible for having the right to stream the model (`docs/vts-obs-adapters.adoc`, "Model and rights").
 
 [#from-source-checkout]
+[#character-sheet]
+=== Character sheet: give the performer a name and a way of speaking (issue #404)
+
+Optional. A *character sheet* is a short text file that tells the language model who it is: name, how it refers to itself, tone, personality, likes, dislikes and what not to talk about.
+
+. Copy `examples/persona/starter.ja.md` from the archive (Japanese; the fields are 名前 / 一人称 / 話し方 / 性格 / 好きなもの / 苦手なもの / 話題にしないこと) to `local-persona.md` beside `local-profile.env`, and replace the sample values with yours.
+. Start again (`aivtuber-setup start`). The sheet is read once at start; there is no panel editor in this version, so a change needs a restart. The app prints one line saying whether it was loaded and how many bytes it has (never the text); an invalid file prints a warning with the reason and the performer speaks in its default voice.
+. The bound is 3,000 bytes (about 1,000 Japanese characters) of plain text, saved as UTF-8. Control characters (other than a newline or tab) and the tags `<character` / `</character` are refused.
+
+What it does: every reply the *language model* writes is written as that character. It does not change what the model is allowed to do: the text is only data that describes identity and style, it cannot grant permissions or issue commands, and the usual output checks still apply to every reply.
+
+What it does not do: *cached reactions, the starter audio and the typed fallback lines (the short reactions used when the model is slow or unavailable) do not follow the sheet*; they are fixed recordings. It is also not the same as a `persona-fact` entry of the <<memory-seed,memory seed>>: a seed fact is one short remembered claim (at most 240 bytes) that competes with other memories for room in the request and can be dropped when the request is full, while the character sheet is always in the request, first, and describes how to speak rather than what happened. Use the sheet for the character and the seed for facts and running jokes.
+
+It costs a little time and size: the sheet is part of every prompt (about 80 ms more to the first token on the measured GPU; the warm-up includes it so the first reply does not pay for it). Under the hybrid profile it is sent to the cloud model with each reply (see the hybrid quickstart).
+
 === Run from a source checkout
 
 Developers do not need a release archive or `scripts/package-release.mjs` (which also wants the sherpa archive and a notices file). Build as in section 2, plus `cargo build --release --locked -p aivtuber-setup --bin aivtuber-setup`, then from the repository root:
@@ -489,6 +504,7 @@ What you should know before enabling it:
 * A native Japanese read of the captions and a run on a 12 GB card are still manual checks; treat it as experimental.
 * Not covered by this quickstart: webcam capture (out of scope), per-window capture (one OBS source only).
 
+[#memory-seed]
 === Optional: remember facts between streams (memory seed, issue #321)
 
 Off by default. The runtime keeps its memory in RAM only, so a restart forgets what she said last time. A *seed file* is a short list of facts you write by hand that she knows at every start: who she is, running jokes, things she promised.

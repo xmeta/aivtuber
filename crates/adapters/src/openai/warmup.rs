@@ -67,7 +67,7 @@ pub struct WarmupReport {
     pub prompt_tokens: Option<u64>,
 }
 
-pub(super) fn warmup_request() -> ThinkingRequest {
+pub(super) fn warmup_request(curated_context: Vec<ThinkingContent>) -> ThinkingRequest {
     ThinkingRequest {
         schema_version: aivtuber_domain::THINKING_REQUEST_SCHEMA_VERSION.to_owned(),
         input: ThinkingContent {
@@ -84,7 +84,7 @@ pub(super) fn warmup_request() -> ThinkingRequest {
         retrieval: RetrievalSnapshot {
             candidates: Vec::new(),
         },
-        curated_context: Vec::new(),
+        curated_context,
     }
 }
 
@@ -107,7 +107,7 @@ impl OpenAiResponsesAdapter {
             ));
         }
         let started = Instant::now();
-        let input = compact_generation_input(&warmup_request())?;
+        let input = compact_generation_input(&warmup_request(self.warmup_context.to_vec()))?;
         let body = self.request_body(&input, WARMUP_MAX_OUTPUT_TOKENS, false)?;
 
         let _in_flight = self.warmup.begin(timeout);

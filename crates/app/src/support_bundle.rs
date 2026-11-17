@@ -80,6 +80,9 @@ pub struct SupportIdentity {
     /// Provider/model **identifiers** (names only, never keys or endpoints).
     pub thinking_provider: Option<String>,
     pub thinking_model: Option<String>,
+    /// The operator's character sheet identity (#404): `bytes=N sha256=<12 hex>`
+    /// or `none`; never the text.
+    pub persona: Option<String>,
     pub tts_provider: Option<String>,
     pub tts_model: Option<String>,
 }
@@ -204,6 +207,9 @@ pub struct SupportBundleProvenance {
     /// endpoints — endpoints can embed private infrastructure names).
     pub thinking_provider: Option<String>,
     pub thinking_model: Option<String>,
+    /// The operator's character sheet identity (#404): `bytes=N sha256=<12 hex>`
+    /// or `none`; never the text.
+    pub persona: Option<String>,
     pub tts_provider: Option<String>,
     pub tts_model: Option<String>,
 }
@@ -228,6 +234,7 @@ impl SupportBundleProvenance {
             embedding_model: None,
             thinking_provider: None,
             thinking_model: None,
+            persona: None,
             tts_provider: None,
             tts_model: None,
         }
@@ -268,6 +275,7 @@ impl SupportBundleBuilder {
                 embedding_model: provenance.embedding_model,
                 thinking_provider: provenance.thinking_provider,
                 thinking_model: provenance.thinking_model,
+                persona: provenance.persona,
                 tts_provider: provenance.tts_provider,
                 tts_model: provenance.tts_model,
             },

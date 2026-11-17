@@ -138,6 +138,8 @@ A `memory` context item additionally carries `epistemic_class` — the class its
 
 Raw transcript or stream-history fields are not part of either request type. If historical content is needed for generation, an upstream component must deliberately reduce/select it into bounded `curated_context` items with explicit provenance, trust, and privacy metadata.
 
+An `operator_curated` item (#404) is the operator's character sheet: one item, `trusted`, with no event identity, source class or epistemic class, placed first in `curated_context` and never dropped by the context budget (retained memory fills the rest). The OpenAI-compatible adapter renders it in the fixed part of the prompt, between `<character>` tags before the JSON, and omits it from the JSON. It describes identity and style only and is not authorization. There is no wire or schema change: the source value already existed.
+
 The initial internal request schema versions are `ReflexRequest 0.1.0`, `ReflexContext 0.1.0`, and `ThinkingRequest 0.1.0`. Reflex replay records carry both the request and context schema versions.
 
 === 4.2 Perception observations

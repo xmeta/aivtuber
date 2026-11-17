@@ -231,6 +231,22 @@ Do not record secrets, private user data, or raw provider credentials.
 
 *Related:* #363, #364, #368, A-LLM-001, A-LLM-002, A-TTS-004, ADR-0009.
 
+=== A-LLM-005 -- The default local model follows a character sheet passed as data
+
+*Subsystem:* Thinking prompt / operator character sheet (issue #404, slice A of #401)
+
+*Status:* Needs validation (one spike on one model; policy and layout enforced by tests)
+
+*Statement:* The default local model (Gemma 4 E4B QAT on llama.cpp, no reasoning) speaks as a character when the operator's character sheet is given as one delimited block in the fixed part of the prompt, before the JSON, with one sentence that says it is the operator's sheet and describes identity and style only. In the #401 spike (ten Japanese chat lines per condition, a sheet of about 250 characters) a first-person pronoun marker appeared in 9 of 10 replies and a sentence-ending marker in 10 of 10, against 0 of 10 for both without the sheet, for about 80 ms more to the first token on a GPU. The same result held with the item after the input; the position before the JSON was chosen so a server-side prompt cache can keep it. The sheet is data: the structural bounds (3,000 bytes, validated characters, no `<character` tag, delimiters, no capability path, output gate) are what hold, not the sentence.
+
+*Evidence:* The #401 spike (2026-11-17 comment; throwaway script, nothing committed); `crates/adapters/src/openai.rs` tests (prompt byte-identical without a sheet, layout with a sheet, warm-up shares the prefix), `crates/domain/src/persona.rs` and `crates/app/src/tests/persona_tests.rs`.
+
+*Consequence if false:* Replies ignore or only partly follow the sheet (the character is weak, not unsafe); a larger or different model may follow it better. Prompt-cache reuse and CPU-only latency were not measured.
+
+*Revisit when:* The default Thinking model changes, the instruction sentence or the layout changes, a CPU-only host is measured, or slice B (live editing) lands.
+
+*Related:* #401, #404, A-LLM-003.
+
 === A-TTS-001 --TTS streaming/prosody controls are provider-specific
 
 *Subsystem:* TTS adapters / performance compilation

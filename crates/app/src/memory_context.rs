@@ -41,15 +41,56 @@ pub fn retained_memory_context(
     now_ms: u64,
     charged_bytes: usize,
 ) -> Vec<ThinkingContent> {
+    retained_memory_context_reserving(
+        memory,
+        source_namespace,
+        actor_id,
+        topic,
+        now_ms,
+        charged_bytes,
+        ContextReserve::NONE,
+    )
+}
+
+/// Room in the request budget that retained memory must leave free (#404): the
+/// operator's character sheet is placed first and never dropped, so memory
+/// fills what remains of the item and byte budgets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextReserve {
+    pub items: usize,
+    pub bytes: usize,
+}
+
+impl ContextReserve {
+    pub const NONE: Self = Self { items: 0, bytes: 0 };
+
+    /// One item of `bytes` bytes.
+    pub fn one_item(bytes: usize) -> Self {
+        Self { items: 1, bytes }
+    }
+}
+
+/// [`retained_memory_context`] that leaves `reserve` free in the budget.
+pub fn retained_memory_context_reserving(
+    memory: &WorkingMemory,
+    source_namespace: &str,
+    actor_id: Option<&str>,
+    topic: Option<&str>,
+    now_ms: u64,
+    charged_bytes: usize,
+    reserve: ContextReserve,
+) -> Vec<ThinkingContent> {
     let entries = memory.context_for(
         source_namespace,
         actor_id,
         topic,
-        MAX_THINKING_CONTEXT_ITEMS,
+        MAX_THINKING_CONTEXT_ITEMS.saturating_sub(reserve.items),
         now_ms,
     );
     let content = entries.into_iter().map(memory_content).collect();
-    bounded_context(content, charged_bytes)
+    bounded_prefix_reserving(content, charged_bytes, reserve, |item: &ThinkingContent| {
+        item.text.as_str()
+    })
 }
 
 /// The request budget, applied to whatever retained content a request carries.
@@ -76,10 +117,24 @@ pub fn bounded_prefix<T>(
     charged_bytes: usize,
     text: impl Fn(&T) -> &str,
 ) -> Vec<T> {
-    let mut used_bytes = charged_bytes;
-    let mut bounded = Vec::with_capacity(content.len().min(MAX_THINKING_CONTEXT_ITEMS));
+    bounded_prefix_reserving(content, charged_bytes, ContextReserve::NONE, text)
+}
+
+/// [`bounded_prefix`] that leaves `reserve` items and bytes free (#404). The
+/// reserved bytes are charged up front and the reserved items are taken off the
+/// item bound, so what the caller later adds in that room (the character sheet)
+/// always fits both budgets.
+pub fn bounded_prefix_reserving<T>(
+    content: Vec<T>,
+    charged_bytes: usize,
+    reserve: ContextReserve,
+    text: impl Fn(&T) -> &str,
+) -> Vec<T> {
+    let item_bound = MAX_THINKING_CONTEXT_ITEMS.saturating_sub(reserve.items);
+    let mut used_bytes = charged_bytes.saturating_add(reserve.bytes);
+    let mut bounded = Vec::with_capacity(content.len().min(item_bound));
     for item in content {
-        if bounded.len() >= MAX_THINKING_CONTEXT_ITEMS {
+        if bounded.len() >= item_bound {
             break;
         }
         let len = text(&item).len();

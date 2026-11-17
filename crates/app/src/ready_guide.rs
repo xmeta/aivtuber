@@ -1,12 +1,19 @@
 //! Short Japanese-first ready guide printed on stderr under `AIVTUBER_LOG=quiet` (#393).
 //!
 //! Fixed text, no locale detection, no catalogue. The whole quiet start-up adds
-//! at most seven lines across the app and `aivtuber-setup start`: four here and
+//! at most eight lines across the app and `aivtuber-setup start`: five here and
 //! three in `crates/setup/src/start.rs`. The fourth app line is the voice-input
 //! state (#397), printed only when `aivtuber-setup start` governs voice input;
-//! a privacy-relevant fact (is the microphone open) must not be hidden by quiet. The duty text itself (AI-generated
+//! a privacy-relevant fact (is the microphone open) must not be hidden by quiet.
+//! The fifth is the character sheet line (#404), printed only when
+//! `AIVTUBER_PERSONA_FILE` is set: whether the sheet is in effect, and that it
+//! is sent to the cloud model when Thinking is remote, must not be hidden either.
+//! The duty text itself (AI-generated
 //! voice disclosure, licences) is never translated; the English notices printed
 //! earlier stay authoritative.
+
+use crate::persona::{PersonaLoad, PersonaRefusal};
+use aivtuber_domain::PersonaError;
 
 /// Printed after the panel URL line, only when the panel is running. Does not
 /// repeat the URL or its secret.
@@ -48,6 +55,66 @@ pub fn voice_input_line(on: bool, cloud: bool, diagnostics: bool) -> &'static st
         (true, true, false) => VOICE_ON_CLOUD,
         (false, false, false) => VOICE_OFF,
         (false, true, false) => VOICE_OFF_CLOUD,
+    }
+}
+
+/// The character sheet line (#404): always printed once, whichever way the
+/// file read went, so the operator knows whether the character is in effect and
+/// whether it leaves the machine. Quiet form is Japanese first with the English
+/// half beside it; verbose is English like the other diagnostic lines. None
+/// carries the text, a path or a URL: only the length, a SHA-256 prefix and a
+/// fixed reason phrase.
+pub fn persona_line(load: &PersonaLoad, cloud: bool, diagnostics: bool) -> String {
+    match load {
+        PersonaLoad::Loaded(sheet) => {
+            let (bytes, hash) = (sheet.len(), sheet.sha256_prefix());
+            match (cloud, diagnostics) {
+                (false, true) => format!("persona: loaded bytes={bytes} sha256={hash}"),
+                (true, true) => format!(
+                    "persona: loaded bytes={bytes} sha256={hash}; the character sheet is sent to the cloud model with each reply"
+                ),
+                (false, false) => format!(
+                    "キャラクター設定を読み込みました({bytes} バイト)。 / Character sheet loaded ({bytes} bytes, sha256 {hash})."
+                ),
+                (true, false) => format!(
+                    "キャラクター設定を読み込みました({bytes} バイト)。この設定は返信のたびにクラウドの応答モデルへ送信されます。 / Character sheet loaded ({bytes} bytes, sha256 {hash}); it is sent to the cloud model with each reply."
+                ),
+            }
+        }
+        PersonaLoad::Absent => {
+            if diagnostics {
+                "persona: none (the file is missing or empty); replies use the default voice"
+                    .to_owned()
+            } else {
+                "キャラクター設定はありません(ファイルが無いか空です)。 / No character sheet (the file is missing or empty).".to_owned()
+            }
+        }
+        PersonaLoad::Refused(refusal) => {
+            let (en, ja) = match refusal {
+                PersonaRefusal::Unreadable => ("could not be read", "読み込めません"),
+                PersonaRefusal::Invalid(PersonaError::NotUtf8) => {
+                    ("not valid UTF-8", "UTF-8 ではありません")
+                }
+                PersonaRefusal::Invalid(PersonaError::ControlCharacter) => (
+                    "contains a control character (only newline and tab are allowed)",
+                    "制御文字が含まれています(改行とタブのみ可)",
+                ),
+                PersonaRefusal::Invalid(PersonaError::TooLarge) => {
+                    ("larger than 3000 bytes", "3000 バイトを超えています")
+                }
+                PersonaRefusal::Invalid(PersonaError::ReservedTag) => (
+                    "contains a <character tag, which the prompt reserves",
+                    "<character タグが含まれています(予約済みです)",
+                ),
+            };
+            if diagnostics {
+                format!("persona: not loaded ({en}); replies use the default voice")
+            } else {
+                format!(
+                    "キャラクター設定を読み込めませんでした({ja})。既定の話し方になります。 / Character sheet not loaded ({en}); replies use the default voice."
+                )
+            }
+        }
     }
 }
 
@@ -115,11 +182,84 @@ mod tests {
     ];
 
     #[test]
-    fn the_app_side_guide_fits_its_share_of_the_seven_line_budget() {
+    fn the_app_side_guide_fits_its_share_of_the_eight_line_budget() {
         // Setup owns three more (see its own test). The voice-input line is
-        // the fourth app line: at most one of the eight forms is printed.
+        // the fourth app line: at most one of the eight forms is printed. The
+        // character sheet line (#404) is the fifth, so the total quiet
+        // start-up is eight lines, one more than before the character sheet.
         assert!(ALL.len() < 4);
         assert!(ready_lines(true).len() <= 2);
+    }
+
+    #[test]
+    fn persona_lines_are_single_line_text_free_and_say_what_they_must() {
+        use crate::persona::PersonaSheet;
+        use aivtuber_domain::parse_persona;
+        let sheet = PersonaSheet::new(
+            parse_persona("名前: SECRET-NAME".as_bytes())
+                .unwrap()
+                .unwrap(),
+        );
+        let loaded = PersonaLoad::Loaded(sheet.clone());
+        let mut lines = Vec::new();
+        for cloud in [false, true] {
+            for diagnostics in [false, true] {
+                lines.push((
+                    cloud,
+                    diagnostics,
+                    persona_line(&loaded, cloud, diagnostics),
+                ));
+            }
+        }
+        for (cloud, diagnostics, line) in &lines {
+            assert!(
+                !line.contains('\n') && !line.contains("SECRET-NAME"),
+                "{line}"
+            );
+            assert!(line.contains(&sheet.len().to_string()), "{line}");
+            assert!(line.contains(sheet.sha256_prefix()), "{line}");
+            assert_eq!(line.contains("cloud model"), *cloud, "{line}");
+            assert_eq!(line.contains(" / "), !diagnostics, "{line}");
+        }
+        assert_eq!(
+            persona_line(&loaded, false, true),
+            format!(
+                "persona: loaded bytes={} sha256={}",
+                sheet.len(),
+                sheet.sha256_prefix()
+            )
+        );
+        assert!(
+            persona_line(&loaded, true, false).starts_with("キャラクター設定を読み込みました(")
+        );
+        assert!(persona_line(&loaded, true, false).contains("クラウドの応答モデルへ送信されます"));
+        // The other outcomes name a fixed reason, never content.
+        let mut others = vec![PersonaLoad::Absent];
+        for refusal in [
+            PersonaRefusal::Unreadable,
+            PersonaRefusal::Invalid(PersonaError::NotUtf8),
+            PersonaRefusal::Invalid(PersonaError::ControlCharacter),
+            PersonaRefusal::Invalid(PersonaError::TooLarge),
+            PersonaRefusal::Invalid(PersonaError::ReservedTag),
+        ] {
+            others.push(PersonaLoad::Refused(refusal));
+        }
+        for load in others {
+            for diagnostics in [false, true] {
+                let line = persona_line(&load, true, diagnostics);
+                assert!(!line.contains('\n') && !line.is_empty(), "{line}");
+                assert!(!line.contains("http") && !line.contains("token="), "{line}");
+                assert_eq!(line.contains(" / "), !diagnostics, "{line}");
+            }
+        }
+        assert!(
+            persona_line(
+                &PersonaLoad::Refused(PersonaRefusal::Invalid(PersonaError::TooLarge)),
+                false,
+                true
+            )
+            .contains("larger than 3000 bytes")
+        );
     }
 
     #[test]

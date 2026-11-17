@@ -49,7 +49,7 @@ fn warm_up_uses_the_real_prompt_builder_with_a_one_token_limit() {
     // instruction prefix matches a real request's.
     assert_eq!(
         input,
-        compact_generation_input(&warmup_request()).expect("input")
+        compact_generation_input(&warmup_request(Vec::new())).expect("input")
     );
     assert!(input.starts_with("Generate one concise AI VTuber reply"));
 }
@@ -94,7 +94,7 @@ fn in_flight_warm_up_extends_only_a_real_request_timeout() {
         "output": [{"content": [{"type": "output_text", "text": "hi"}]}]
     }))));
     let adapter = adapter(&transport);
-    let request = warmup_request();
+    let request = warmup_request(Vec::new());
 
     adapter
         .generate_sync_with_timeout(&request, Duration::from_secs(30))
@@ -117,4 +117,39 @@ fn in_flight_warm_up_extends_only_a_real_request_timeout() {
         .generate_sync_with_timeout(&request, Duration::from_secs(30))
         .expect("reply");
     assert_eq!(transport.requests()[3].timeout, Duration::from_secs(15));
+}
+
+#[test]
+fn warm_up_carries_the_operator_context_through_the_real_prompt_builder() {
+    use aivtuber_domain::{PrivacyClass, ThinkingContent, ThinkingContextSource, TrustLevel};
+    let item = ThinkingContent {
+        source: ThinkingContextSource::OperatorCurated,
+        event_id: None,
+        event_kind: None,
+        source_class: None,
+        trust_level: TrustLevel::Trusted,
+        privacy: PrivacyClass::Public,
+        epistemic_class: None,
+        text: "name: Mikoto".to_owned(),
+    };
+    let transport = MockHttpTransport::new(Ok(ok(json!({
+        "output": [{"content": [{"type": "output_text", "text": "x"}]}]
+    }))));
+    let adapter = adapter(&transport).with_warmup_context(vec![item.clone()]);
+    // A clone shares the context, like the model slot.
+    adapter
+        .clone()
+        .warm_up(Duration::from_secs(120))
+        .expect("warm-up");
+    let body: Value = serde_json::from_slice(&transport.requests()[0].body).expect("body");
+    assert_eq!(
+        body["input"].as_str().expect("input"),
+        compact_generation_input(&warmup_request(vec![item])).expect("input")
+    );
+    assert!(
+        body["input"]
+            .as_str()
+            .unwrap()
+            .contains("\n<character>\nname: Mikoto\n</character>\n{")
+    );
 }

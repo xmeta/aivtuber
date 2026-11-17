@@ -28,6 +28,9 @@ What is here
                           the browser pages (served by the app): the avatar page (shown in
                           a browser or an OBS Browser Source; no avatar model inside) and
                           the operation panel page (chat, status, stop, mute).
+  examples/persona/starter.ja.md
+                          character sheet template (Japanese): copy it to local-persona.md
+                          beside local-profile.env, edit it and restart; see below
   examples/starter-reaction-pack/
                           cached reaction descriptors (no audio; generated locally)
   THIRD-PARTY-*           licence texts of everything bundled
@@ -73,6 +76,16 @@ In short, from this directory (after the checksum check above):
                                       it off at once).
                                       In the hybrid profile, voice input on sends the
                                       transcribed speech to the cloud model.
+                                      Optional character sheet: copy
+                                      examples/persona/starter.ja.md to
+                                      local-persona.md beside local-profile.env, edit
+                                      it (at most 3000 bytes, plain text) and start
+                                      again. The model then speaks as that character;
+                                      cached reactions, the starter audio and fallback
+                                      lines do not follow it. The app prints one line
+                                      saying whether it was loaded (never its text).
+                                      In the hybrid profile the sheet is sent to the
+                                      cloud model with each reply.
 Install FFmpeg (ffplay and ffmpeg on PATH) first; setup tells you if it is missing.
 On Windows also install the Microsoft Visual C++ 2015-2022 Redistributable (x64); it is
 not bundled, and setup stops and names it if it is missing:
