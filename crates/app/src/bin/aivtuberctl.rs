@@ -94,6 +94,11 @@ enum Command {
     /// Capture a bounded, redacted diagnostic/support bundle (issue #68).
     /// Uses the status path (secret verification only, no control authority).
     Diagnose,
+    /// Print the operation panel URL again (issue #388), for example after
+    /// closing the browser tab. The URL carries the per-launch panel secret
+    /// (do not share it). Needs the operator endpoint's own authentication, the
+    /// same secret as `stop`; it is printed to this terminal only.
+    PanelUrl,
     /// Enable opt-in live screen perception (issue #90). Needs the daemon to
     /// run with AIVTUBER_PERCEPTION=true; starts with a latency probe.
     PerceptionOn,
@@ -511,6 +516,7 @@ fn action_name(command: &Command) -> &'static str {
         Command::Stop => "stop",
         Command::Mute => "mute",
         Command::Diagnose => "diagnose",
+        Command::PanelUrl => "panel.url",
         Command::PerceptionOn => "perception.enable",
         Command::PerceptionOff => "perception.disable",
         Command::MemoryExport { .. } => "memory.export",
@@ -653,6 +659,11 @@ fn main() -> ExitCode {
                 // The identity goes to stderr so stdout is exactly the sheet.
                 eprintln!("{}", response.detail);
                 print!("{}", response.persona.as_deref().unwrap_or(""));
+                return ExitCode::SUCCESS;
+            }
+            if cli.command == Command::PanelUrl && response.ok {
+                // Only stdout, only the URL: nothing is logged or written.
+                println!("{}", response.panel_url.as_deref().unwrap_or(""));
                 return ExitCode::SUCCESS;
             }
             if cli.command == Command::Diagnose && response.ok {
@@ -939,6 +950,7 @@ mod tests {
                 content_hash: hash.to_owned(),
             }),
             persona: None,
+            panel_url: None,
         }
     }
 
@@ -1117,6 +1129,13 @@ mod tests {
             full.extend_from_slice(args);
             assert!(Cli::try_parse_from(full).is_err(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn panel_url_maps_to_its_action_and_takes_no_argument() {
+        let command = parse(&["panel-url"]);
+        assert_eq!(action_name(&command), "panel.url");
+        assert!(Cli::try_parse_from(["aivtuberctl", "panel-url", "extra"]).is_err());
     }
 
     #[test]

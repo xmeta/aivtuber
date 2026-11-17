@@ -1,7 +1,7 @@
 //! Short Japanese-first ready guide printed on stderr under `AIVTUBER_LOG=quiet` (#393).
 //!
 //! Fixed text, no locale detection, no catalogue. The whole quiet start-up adds
-//! at most eight lines across the app and `aivtuber-setup start`: five here and
+//! at most nine lines across the app and `aivtuber-setup start`: six here and
 //! three in `crates/setup/src/start.rs`. The fourth app line is the voice-input
 //! state (#397), printed only when `aivtuber-setup start` governs voice input;
 //! a privacy-relevant fact (is the microphone open) must not be hidden by quiet.
@@ -18,6 +18,10 @@ use aivtuber_domain::PersonaError;
 /// Printed after the panel URL line, only when the panel is running. Does not
 /// repeat the URL or its secret.
 pub const PANEL_HINT: &str = "準備ができました。上の「local operation panel URL」の行のURLをブラウザで開いてください(秘密を含むので共有しないでください)。 / Ready: open the URL on the \"local operation panel URL\" line above in a browser (it contains a secret; do not share it).";
+
+/// Printed after [`PANEL_HINT`] (#388): how to see the URL again. Names a
+/// command, never the URL.
+pub const PANEL_URL_REPRINT: &str = "パネルの URL をもう一度表示: aivtuberctl panel-url / reprint the panel URL: aivtuberctl panel-url";
 
 /// One-line reminder; the English notice above is the authoritative text.
 pub const DISCLOSURE_REMINDER: &str = "配信ではAI音声・AI出演者であることを表示してください(正文は上の英語の通知です)。 / Disclose the AI-generated voice and AI performer on stream (the English notice above is authoritative).";
@@ -138,6 +142,7 @@ pub fn ready_lines(panel_running: bool) -> Vec<&'static str> {
     let mut lines = Vec::with_capacity(2);
     if panel_running {
         lines.push(PANEL_HINT);
+        lines.push(PANEL_URL_REPRINT);
     }
     lines.push(DISCLOSURE_REMINDER);
     lines
@@ -183,7 +188,12 @@ pub fn warmup_line(line: &str, diagnostics: bool) -> Option<&str> {
 mod tests {
     use super::*;
 
-    const ALL: [&str; 3] = [PANEL_HINT, DISCLOSURE_REMINDER, WARMUP_NOTE];
+    const ALL: [&str; 4] = [
+        PANEL_HINT,
+        PANEL_URL_REPRINT,
+        DISCLOSURE_REMINDER,
+        WARMUP_NOTE,
+    ];
     const VOICE: [&str; 8] = [
         VOICE_OFF,
         VOICE_OFF_CLOUD,
@@ -201,8 +211,9 @@ mod tests {
         // the fourth app line: at most one of the eight forms is printed. The
         // character sheet line (#404) is the fifth, so the total quiet
         // start-up is eight lines, one more than before the character sheet.
-        assert!(ALL.len() < 4);
-        assert!(ready_lines(true).len() <= 2);
+        assert!(ALL.len() < 5);
+        // The panel hint, the panel URL reprint (#388) and the disclosure.
+        assert!(ready_lines(true).len() <= 3);
     }
 
     #[test]
@@ -324,6 +335,8 @@ mod tests {
         let lines = ready_lines(false);
         assert_eq!(lines, vec![DISCLOSURE_REMINDER]);
         assert!(ready_lines(true).contains(&PANEL_HINT));
+        assert!(ready_lines(true).contains(&PANEL_URL_REPRINT));
+        assert!(PANEL_URL_REPRINT.contains("aivtuberctl panel-url"));
     }
 
     #[test]

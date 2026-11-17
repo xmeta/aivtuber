@@ -1200,6 +1200,10 @@ where
     persona: Option<persona::PersonaLoad>,
     /// Live editing of the sheet (#401); `None` (default) composes nothing.
     persona_editor: Option<persona::PersonaEditor>,
+    /// The operation panel's launch URL, held only to answer an authenticated
+    /// `panel.url` (#388); redacted `Debug`, never logged, audited or put in
+    /// status or the support bundle.
+    panel_url: Option<aivtuber_adapters::SecretString>,
     thinking_meter: Option<thinking_meter::ThinkingMeter>,
     /// Live voice settings (#360); `None` (default) composes nothing and the
     /// voice is whatever the environment named.
@@ -1293,6 +1297,7 @@ where
             model_switcher: None,
             persona: None,
             persona_editor: None,
+            panel_url: None,
             thinking_meter: None,
             voice: None,
             chat_ingress: None,
@@ -1983,6 +1988,26 @@ where
         self.persona_editor = Some(editor);
         self.persona.get_or_insert(persona::PersonaLoad::Absent);
         self
+    }
+
+    /// Remember the operation panel's launch URL so an authenticated
+    /// `panel.url` can show it again (#388). Called once, after the panel
+    /// started.
+    pub fn set_panel_url(&mut self, url: String) {
+        self.panel_url = Some(aivtuber_adapters::SecretString::new(url));
+    }
+
+    /// The panel's launch URL for `panel.url` (#388). `authority` must be the
+    /// authenticated local operator capability; the URL (it carries the panel
+    /// secret) goes only to the caller, never to a log or an audit record.
+    pub fn reveal_panel_url(&self, authority: &AuthenticatedControl) -> Result<String, String> {
+        if !authority.has_capability(aivtuber_domain::Capability::PerformerStop) {
+            return Err("panel url is not authorized".to_owned());
+        }
+        self.panel_url
+            .as_ref()
+            .map(|url| url.expose().to_owned())
+            .ok_or_else(|| "the operation panel is not running".to_owned())
     }
 
     /// Whether the sheet can be edited while running (the operator endpoint
@@ -5957,6 +5982,7 @@ mod tests {
     mod local_thinking_fallback_tests;
     mod memory_seed_tests;
     mod memory_writer_tests;
+    mod panel_url_tests;
     mod persona_tests;
     mod phrase_commit_tests;
     mod scene_context_tests;

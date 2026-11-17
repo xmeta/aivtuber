@@ -10,7 +10,7 @@
 //!                         [--skip steps] [--root DIR] [--assets DIR] [--env-file FILE]
 //!                         [--from-target CARGO_TARGET_DIR]
 //!                         (the OpenRouter key is read from OPENROUTER_API_KEY or a hidden prompt)
-//!   aivtuber-setup start [--env-file FILE] [--dry-run] [--verbose] [--voice-input on|off]
+//!   aivtuber-setup start [--env-file FILE] [--dry-run] [--verbose] [--voice-input on|off] [--open]
 //!
 //! Exit codes: 0 success, 1 a step failed (the message says which and how to
 //! fix it), 2 bad arguments.
@@ -155,6 +155,11 @@ struct StartArgs {
     /// switch it too, with the same remembered choice.
     #[arg(long, value_enum, value_name = "on|off")]
     voice_input: Option<VoiceInput>,
+    /// Open the operation panel in the default browser once the app is up
+    /// (the URL carries a per-launch secret, so it is handed to the browser as
+    /// a process argument). `aivtuberctl panel-url` shows it again.
+    #[arg(long)]
+    open: bool,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -279,6 +284,7 @@ fn run_start(args: StartArgs) -> Result<i32, String> {
         dry_run: args.dry_run,
         verbose: args.verbose,
         voice_input: args.voice_input.map(|v| matches!(v, VoiceInput::On)),
+        open: args.open,
         health_timeout: Duration::from_secs(180),
     })
 }

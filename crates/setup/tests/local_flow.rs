@@ -892,6 +892,7 @@ fn start_with_a_hybrid_env_file_plans_no_llama_server() {
         dry_run: true,
         verbose: false,
         voice_input: Some(true),
+        open: false,
         health_timeout: Duration::from_secs(1),
     })
     .unwrap();

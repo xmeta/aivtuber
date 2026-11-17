@@ -560,6 +560,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         app.voice_search_endpoint(),
         app.avatar_staging_dir(),
     )?;
+    // #388: kept (redacted, in memory only) so `aivtuberctl panel-url` can show
+    // it again to the authenticated operator endpoint.
+    if let Some(panel) = &panel {
+        app.set_panel_url(panel.launch_url());
+    }
     let operator_rate = Arc::new(Mutex::new(OperatorRateLimiter::new(16, 8)));
     {
         let rate = operator_rate.clone();
