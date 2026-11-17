@@ -22,11 +22,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::error::Error;
 use std::fmt;
+mod affect;
 mod phrase;
 mod phrase_pipeline;
 mod phrase_stream;
 mod speech_lexicon;
 mod speech_text;
+pub use affect::{
+    AFFECT_INTENSITY_CAP, AFFECT_MAX_INPUT_CHARS, AffectClass, AffectConfig, AffectReading,
+    AffectState, AffectStrength, classify_affect,
+};
 pub use phrase::{
     Delivery, MAX_PHRASES_CEILING, PHRASE_SEGMENTATION_VERSION, PhraseConfig, PhraseDelivery,
     PhraseEnd, PhraseFailure, PhraseOptions, PhraseState, PhraseStep, PhraseSummary,
@@ -375,6 +380,7 @@ impl GenerationCancellationRegistry {
 #[derive(Debug, Clone)]
 pub struct PerformanceCompiler {
     config: PerformanceCompilerConfig,
+    affect: Option<AffectConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -512,7 +518,20 @@ impl PerformanceCompiler {
                 "expression_intensity must be a finite value in 0..=1",
             ));
         }
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            affect: None,
+        })
+    }
+
+    /// Let the text-to-affect classifier (#84 S1) choose the expression of
+    /// generated replies from the expressions the pack ships. Advisory: the
+    /// compiler still owns the preset, the intensity cap and the fallback to
+    /// the configured baseline. Off by default.
+    #[must_use]
+    pub fn with_affect(mut self, affect: AffectConfig) -> Self {
+        self.affect = Some(affect);
+        self
     }
 
     pub fn compile(
@@ -523,14 +542,24 @@ impl PerformanceCompiler {
         thinking: &BackendIdentity,
         tts: &TtsBackendIdentity,
     ) -> Result<PerformanceAsset, GenerationError> {
-        self.compile_inner(request, reply_text, speech, thinking, tts, None)
+        self.compile_inner(
+            request,
+            reply_text,
+            speech,
+            thinking,
+            tts,
+            None,
+            &mut AffectState::default(),
+        )
     }
 
     /// Compile one phrase of a phrased reply (issue #83). The asset id mixes in
     /// the phrase position so two phrases with the same text stay distinct
     /// assets. Only phrase 0 carries the expression start: later phrases keep
-    /// the face the first one set instead of restarting it at every boundary
-    /// (cross-phrase continuity proper is #84).
+    /// the face the first one set instead of restarting it at every boundary;
+    /// with affect enabled, a later phrase starts a new expression only when
+    /// its affect class changes (`affect` is the per-reply carry, #84 S1).
+    #[allow(clippy::too_many_arguments)]
     pub fn compile_phrase(
         &self,
         request: &GenerationRequest,
@@ -539,6 +568,7 @@ impl PerformanceCompiler {
         speech: &SpeechArtifact,
         thinking: &BackendIdentity,
         tts: &TtsBackendIdentity,
+        affect: &mut AffectState,
     ) -> Result<PerformanceAsset, GenerationError> {
         self.compile_inner(
             request,
@@ -547,9 +577,11 @@ impl PerformanceCompiler {
             thinking,
             tts,
             Some(phrase_seq),
+            affect,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn compile_inner(
         &self,
         request: &GenerationRequest,
@@ -558,6 +590,7 @@ impl PerformanceCompiler {
         thinking: &BackendIdentity,
         tts: &TtsBackendIdentity,
         phrase_seq: Option<u32>,
+        affect: &mut AffectState,
     ) -> Result<PerformanceAsset, GenerationError> {
         if request.intent.trim().is_empty() {
             return Err(GenerationError::new("generation intent must not be empty"));
@@ -573,15 +606,20 @@ impl PerformanceCompiler {
 
         let asset_id =
             generated_asset_id(&request.source_event, reply_text, thinking, tts, phrase_seq);
-        let expression = self
+        let baseline = self
             .config
             .expression_preset
             .as_ref()
-            .filter(|_| phrase_seq.is_none_or(|seq| seq == 0))
             .map(|preset| ExpressionTrack {
                 preset: preset.clone(),
                 intensity: self.config.expression_intensity,
             });
+        let expression = match (&self.affect, baseline) {
+            (Some(config), Some(baseline)) => {
+                affect.plan(config, phrase_seq.unwrap_or(0), reply_text, &baseline)
+            }
+            (_, baseline) => baseline.filter(|_| phrase_seq.is_none_or(|seq| seq == 0)),
+        };
 
         let mut timeline = Vec::new();
         if let Some(expression) = &expression {
@@ -2246,5 +2284,92 @@ mod tests {
         session.cancel();
 
         assert!(session.finalize(&compiler()).is_err());
+    }
+    fn expression_of(asset: &PerformanceAsset) -> Option<(String, f64)> {
+        asset
+            .expression
+            .as_ref()
+            .map(|e| (e.preset.clone(), e.intensity))
+    }
+
+    fn compile_phrases(compiler: &PerformanceCompiler, texts: &[&str]) -> Vec<PerformanceAsset> {
+        let request = generation_request(7);
+        let speech = SpeechArtifact {
+            audio_ref: "audio://generated/mock.opus".to_owned(),
+            duration_ms: 1_200,
+            viseme_ref: None,
+        };
+        let thinking = MockThinking::success("x").identity();
+        let tts = MockTts::success().identity();
+        let mut affect = AffectState::default();
+        texts
+            .iter()
+            .enumerate()
+            .map(|(seq, text)| {
+                compiler
+                    .compile_phrase(
+                        &request,
+                        seq as u32,
+                        text,
+                        &speech,
+                        &thinking,
+                        &tts,
+                        &mut affect,
+                    )
+                    .expect("compile")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn affect_picks_the_expression_per_phrase_and_holds_it_between() {
+        let affected = compiler().with_affect(AffectConfig::starter_pack());
+        let assets = compile_phrases(
+            &affected,
+            &[
+                "今日はとても嬉しい！最高！",
+                "嬉しいな、最高！",
+                "次の話題です。",
+            ],
+        );
+        let (first, intensity) = expression_of(&assets[0]).expect("phrase 0");
+        assert!(first.starts_with("smile"), "{first}");
+        assert!(intensity <= AFFECT_INTENSITY_CAP);
+        assert_eq!(expression_of(&assets[1]), None, "same class holds the face");
+        assert_eq!(
+            expression_of(&assets[2]),
+            Some(("speaking.neutral".to_owned(), 0.4)),
+            "the second hold relaxes to the baseline"
+        );
+    }
+
+    #[test]
+    fn without_affect_only_phrase_zero_carries_the_baseline() {
+        let assets = compile_phrases(&compiler(), &["嬉しい！最高！", "怒り！むかつく！"]);
+        assert_eq!(
+            expression_of(&assets[0]),
+            Some(("speaking.neutral".to_owned(), 0.4))
+        );
+        assert_eq!(expression_of(&assets[1]), None);
+    }
+
+    #[test]
+    fn a_pack_without_the_class_falls_back_to_the_baseline_expression() {
+        let affected = compiler().with_affect(AffectConfig::new(Vec::new()));
+        let assets = compile_phrases(&affected, &["嬉しい！最高！"]);
+        assert_eq!(
+            expression_of(&assets[0]),
+            Some(("speaking.neutral".to_owned(), 0.4))
+        );
+    }
+
+    #[test]
+    fn affect_compilation_is_deterministic() {
+        let affected = compiler().with_affect(AffectConfig::starter_pack());
+        let texts = ["えっ！？まさか！", "ゆっくり落ち着いて", "嬉しい！最高！"];
+        assert_eq!(
+            compile_phrases(&affected, &texts),
+            compile_phrases(&affected, &texts)
+        );
     }
 }

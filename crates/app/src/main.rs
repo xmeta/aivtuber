@@ -45,7 +45,7 @@ use aivtuber_domain::{
     MAX_OBS_SCENE_MAP_BYTES, ObsSceneMap, OperatorCommandInput, ThinkingModelCatalog,
 };
 use aivtuber_generative::{
-    GenerativePipeline, PerformanceCompiler, PerformanceCompilerConfig, PhraseConfig,
+    AffectConfig, GenerativePipeline, PerformanceCompiler, PerformanceCompilerConfig, PhraseConfig,
     SpeechLexicon, StreamPolicy,
 };
 use aivtuber_reflex::{
@@ -2154,6 +2154,16 @@ fn build_generative_runtime(
         )),
         expression_intensity: 0.4,
     })?;
+    // #84 S1: the text-to-affect classifier picks the expression of generated
+    // replies from what the loaded pack ships. `AIVTUBER_AFFECT_EXPRESSION=false`
+    // restores the fixed baseline expression.
+    let compiler = if env_bool("AIVTUBER_AFFECT_EXPRESSION", true)? {
+        compiler.with_affect(AffectConfig::new(pack_expression_presets(
+            &pack_root.join("descriptors"),
+        )))
+    } else {
+        compiler
+    };
 
     // #360: the voice settings share the adapter's target slot (clones follow a
     // switch) and open the sidecar liveness gate while Aivis is speaking.
@@ -3096,6 +3106,27 @@ fn env_string(name: &str, default: &str) -> String {
 
 fn env_path(name: &str) -> Option<PathBuf> {
     env_optional(name).map(PathBuf::from)
+}
+
+/// Expression presets the pack's descriptors use: the vocabulary the affect
+/// classifier may pick from. Unreadable descriptors contribute nothing, so a
+/// broken pack degrades to the neutral baseline.
+fn pack_expression_presets(descriptors: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(descriptors) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<_> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    paths.sort();
+    paths
+        .iter()
+        .take(4096)
+        .filter_map(|path| aivtuber_asset_store::load_asset_file(path).ok())
+        .filter_map(|asset| asset.expression.map(|expression| expression.preset))
+        .collect()
 }
 
 fn env_bool(name: &str, default: bool) -> Result<bool, Box<dyn Error>> {

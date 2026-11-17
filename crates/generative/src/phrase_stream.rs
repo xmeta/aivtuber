@@ -139,6 +139,7 @@ struct StreamSink<'a, F, D> {
     segmenter: IncrementalSegmenter,
     carry: String,
     next_seq: u32,
+    affect: crate::AffectState,
     tts_chars: u64,
     /// Display text of every delivered phrase, joined (bounded by
     /// `max_reply_chars`: the cumulative gate refuses to grow it past that).
@@ -235,6 +236,7 @@ where
             self.identities,
             self.cancellation,
             self.trace,
+            &mut self.affect,
             Some(CumulativeGate {
                 prefix: &self.committed,
                 max_chars: self.max_reply_chars,
@@ -344,6 +346,7 @@ impl GenerativePipeline {
                 segmenter: IncrementalSegmenter::new(options.config.segmentation),
                 carry: String::new(),
                 next_seq: 0,
+                affect: crate::AffectState::default(),
                 tts_chars: 0,
                 committed: String::new(),
                 max_reply_chars: stream.max_reply_chars,

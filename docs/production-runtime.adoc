@@ -953,6 +953,10 @@ One interaction budget spans routing and provider work. Retrieval time is subtra
 
 The immediate interaction deadline is distinct from any future deferred-response expiry (#75): missing the immediate useful-time budget vetoes immediate work, but does not by itself define whether a separately retained deferred item is still contextually valid.
 
+== Generated-reply expression (issue #84 S1)
+
+Generated replies pick their face from the text instead of always playing +speaking.neutral+. A bounded rules/lexicon classifier (Japanese and English, no model) reads each phrase's gated display text and recommends one of neutral, joy, surprise, calm, sadness, or anger; the compiler maps it to an expression the loaded pack ships, caps intensity at 0.6, and keeps the baseline (+AIVTUBER_GENERATED_EXPRESSION_PRESET+, default +speaking.neutral+) when the pack lacks the preset. The vocabulary is read from the pack's descriptors at start; the starter pack ships joy, surprise, and calm expressions only, so sadness and anger readings play the baseline there. A phrase starts a new expression only when its class changes; an unchanged class or a neutral reading holds the face, and a held mood relaxes to the baseline after two consecutive holds. Set +AIVTUBER_AFFECT_EXPRESSION=false+ for the previous fixed behavior. The classifier is advisory and deterministic (same text, same reading); it does not touch control or security paths. Not covered: gaze, gesture, prosody, and cross-phrase motion continuity (ADR-0006, later slices). Accuracy and cost: +cargo test -p aivtuber-generative --test affect_fixture -- --nocapture+ on +examples/affect/affect-lines.json+.
+
 == Generative resource budgets (issue #69)
 
 The generative resource budget is a provider-neutral admission policy that sits **before** generation submit: a denial never allocates provider work that must then be cancelled. It is disabled by default — existing deployments keep identical behavior until it is enabled explicitly.

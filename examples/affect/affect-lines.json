@@ -1,0 +1,617 @@
+{
+ "schema": "affect-fixture/1",
+ "note": "Synthetic lines. 'dev' was used while building the lexicon; 'test' was written after the dev lexicon was fixed and is the reported accuracy. Neutral-labelled traps (negation, sarcasm, filler, mention) are expected to stay neutral.",
+ "lines": [
+  {
+   "id": "dev-01",
+   "split": "dev",
+   "lang": "ja",
+   "label": "joy",
+   "text": "今日はみんなに会えて本当に嬉しいです！"
+  },
+  {
+   "id": "dev-02",
+   "split": "dev",
+   "lang": "ja",
+   "label": "joy",
+   "text": "やった、ゲームクリアできたよ！最高！"
+  },
+  {
+   "id": "dev-03",
+   "split": "dev",
+   "lang": "ja",
+   "label": "sadness",
+   "text": "昨日のイベントが中止になって、とても残念です。"
+  },
+  {
+   "id": "dev-04",
+   "split": "dev",
+   "lang": "ja",
+   "label": "sadness",
+   "text": "一人でいると寂しいな。"
+  },
+  {
+   "id": "dev-05",
+   "split": "dev",
+   "lang": "ja",
+   "label": "anger",
+   "text": "いい加減にしてほしい、本当にむかつく！"
+  },
+  {
+   "id": "dev-06",
+   "split": "dev",
+   "lang": "ja",
+   "label": "anger",
+   "text": "そういう言い方は許せない。"
+  },
+  {
+   "id": "dev-07",
+   "split": "dev",
+   "lang": "ja",
+   "label": "surprise",
+   "text": "えっ！？まさか、そんなことがあるの？"
+  },
+  {
+   "id": "dev-08",
+   "split": "dev",
+   "lang": "ja",
+   "label": "surprise",
+   "text": "突然ライトが消えてびっくりしました。"
+  },
+  {
+   "id": "dev-09",
+   "split": "dev",
+   "lang": "ja",
+   "label": "calm",
+   "text": "今日はのんびりゆっくり過ごしましょう。"
+  },
+  {
+   "id": "dev-10",
+   "split": "dev",
+   "lang": "ja",
+   "label": "calm",
+   "text": "深呼吸して、落ち着いていきましょうね。"
+  },
+  {
+   "id": "dev-11",
+   "split": "dev",
+   "lang": "ja",
+   "label": "neutral",
+   "text": "次の配信は夜八時から始めます。"
+  },
+  {
+   "id": "dev-12",
+   "split": "dev",
+   "lang": "ja",
+   "label": "neutral",
+   "text": "えっと、そのコメントについて考えますね。",
+   "trap": "filler"
+  },
+  {
+   "id": "dev-13",
+   "split": "dev",
+   "lang": "ja",
+   "label": "neutral",
+   "text": "設定画面から音量を調整できます。"
+  },
+  {
+   "id": "dev-14",
+   "split": "dev",
+   "lang": "ja",
+   "label": "neutral",
+   "text": "この間の続きから話します。"
+  },
+  {
+   "id": "dev-15",
+   "split": "dev",
+   "lang": "ja",
+   "label": "neutral",
+   "text": "今日は雨が降っているみたいです。"
+  },
+  {
+   "id": "dev-16",
+   "split": "dev",
+   "lang": "ja",
+   "label": "neutral",
+   "text": "全然楽しくなかったです。",
+   "trap": "negation"
+  },
+  {
+   "id": "dev-17",
+   "split": "dev",
+   "lang": "ja",
+   "label": "neutral",
+   "text": "さすがですね、また遅刻ですか。",
+   "trap": "sarcasm"
+  },
+  {
+   "id": "dev-18",
+   "split": "dev",
+   "lang": "en",
+   "label": "joy",
+   "text": "I'm so happy to see you all tonight!"
+  },
+  {
+   "id": "dev-19",
+   "split": "dev",
+   "lang": "en",
+   "label": "joy",
+   "text": "That was awesome, thank you so much!"
+  },
+  {
+   "id": "dev-20",
+   "split": "dev",
+   "lang": "en",
+   "label": "sadness",
+   "text": "I'm really sad that the stream is ending."
+  },
+  {
+   "id": "dev-21",
+   "split": "dev",
+   "lang": "en",
+   "label": "anger",
+   "text": "This is so annoying, I hate it!"
+  },
+  {
+   "id": "dev-22",
+   "split": "dev",
+   "lang": "en",
+   "label": "surprise",
+   "text": "Wow, I did not expect that at all!"
+  },
+  {
+   "id": "dev-23",
+   "split": "dev",
+   "lang": "en",
+   "label": "calm",
+   "text": "Let's take it easy and relax for a bit."
+  },
+  {
+   "id": "dev-24",
+   "split": "dev",
+   "lang": "en",
+   "label": "neutral",
+   "text": "The next game starts in ten minutes."
+  },
+  {
+   "id": "dev-25",
+   "split": "dev",
+   "lang": "en",
+   "label": "neutral",
+   "text": "Let me check the chat for questions."
+  },
+  {
+   "id": "dev-26",
+   "split": "dev",
+   "lang": "en",
+   "label": "neutral",
+   "text": "I'm not happy with the audio quality.",
+   "trap": "negation"
+  },
+  {
+   "id": "dev-27",
+   "split": "dev",
+   "lang": "en",
+   "label": "neutral",
+   "text": "Oh great, another crash.",
+   "trap": "sarcasm"
+  },
+  {
+   "id": "dev-28",
+   "split": "dev",
+   "lang": "en",
+   "label": "neutral",
+   "text": "Today we are playing a puzzle game."
+  },
+  {
+   "id": "dev-29",
+   "split": "dev",
+   "lang": "en",
+   "label": "neutral",
+   "text": "It's not sad at all, just a normal day.",
+   "trap": "negation"
+  },
+  {
+   "id": "dev-30",
+   "split": "dev",
+   "lang": "en",
+   "label": "joy",
+   "text": "Thanks for the gift, I love it!"
+  },
+  {
+   "id": "test-01",
+   "split": "test",
+   "lang": "ja",
+   "label": "joy",
+   "text": "ありがとう！みんなのおかげでとても幸せです！"
+  },
+  {
+   "id": "test-02",
+   "split": "test",
+   "lang": "ja",
+   "label": "joy",
+   "text": "わーい、新しい衣装だ！すてき！"
+  },
+  {
+   "id": "test-03",
+   "split": "test",
+   "lang": "ja",
+   "label": "joy",
+   "text": "おめでとうございます！ずっと応援していたので感激です！"
+  },
+  {
+   "id": "test-04",
+   "split": "test",
+   "lang": "ja",
+   "label": "joy",
+   "text": "一緒に遊べて楽しかったな、また来てね。"
+  },
+  {
+   "id": "test-05",
+   "split": "test",
+   "lang": "ja",
+   "label": "joy",
+   "text": "ハッピーな気分で一日が始まりました。"
+  },
+  {
+   "id": "test-06",
+   "split": "test",
+   "lang": "ja",
+   "label": "surprise",
+   "text": "うそでしょ、本当にその値段なの？"
+  },
+  {
+   "id": "test-07",
+   "split": "test",
+   "lang": "ja",
+   "label": "surprise",
+   "text": "これは驚きました。想像もしていなかったです。"
+  },
+  {
+   "id": "test-08",
+   "split": "test",
+   "lang": "ja",
+   "label": "surprise",
+   "text": "なんと、初見でノーミスクリアですか！"
+  },
+  {
+   "id": "test-09",
+   "split": "test",
+   "lang": "ja",
+   "label": "surprise",
+   "text": "えええ、信じられない！"
+  },
+  {
+   "id": "test-10",
+   "split": "test",
+   "lang": "ja",
+   "label": "sadness",
+   "text": "今日で最後だなんて、悲しくて泣きそうです。"
+  },
+  {
+   "id": "test-11",
+   "split": "test",
+   "lang": "ja",
+   "label": "sadness",
+   "text": "ごめんなさい、うまくできなくてがっかりです。"
+  },
+  {
+   "id": "test-12",
+   "split": "test",
+   "lang": "ja",
+   "label": "sadness",
+   "text": "友達が引っ越してしまって、少し寂しい。"
+  },
+  {
+   "id": "test-13",
+   "split": "test",
+   "lang": "ja",
+   "label": "sadness",
+   "text": "試合に負けてしまって、本当に落ち込んでいます。"
+  },
+  {
+   "id": "test-14",
+   "split": "test",
+   "lang": "ja",
+   "label": "anger",
+   "text": "何度も同じことを言わせないで、イライラする！"
+  },
+  {
+   "id": "test-15",
+   "split": "test",
+   "lang": "ja",
+   "label": "anger",
+   "text": "ひどい、ふざけるな！"
+  },
+  {
+   "id": "test-16",
+   "split": "test",
+   "lang": "ja",
+   "label": "anger",
+   "text": "うるさい、もう黙って。"
+  },
+  {
+   "id": "test-17",
+   "split": "test",
+   "lang": "ja",
+   "label": "calm",
+   "text": "窓の外を眺めて、静かにお茶を飲んでいます。"
+  },
+  {
+   "id": "test-18",
+   "split": "test",
+   "lang": "ja",
+   "label": "calm",
+   "text": "大丈夫、まったりいこう。"
+  },
+  {
+   "id": "test-19",
+   "split": "test",
+   "lang": "ja",
+   "label": "calm",
+   "text": "ほっとしました。もう安心です。"
+  },
+  {
+   "id": "test-20",
+   "split": "test",
+   "lang": "ja",
+   "label": "neutral",
+   "text": "開始まであと五分です。"
+  },
+  {
+   "id": "test-21",
+   "split": "test",
+   "lang": "ja",
+   "label": "neutral",
+   "text": "質問は概要欄のフォームからお願いします。"
+  },
+  {
+   "id": "test-22",
+   "split": "test",
+   "lang": "ja",
+   "label": "neutral",
+   "text": "今のはチュートリアルの最初の部分でした。"
+  },
+  {
+   "id": "test-23",
+   "split": "test",
+   "lang": "ja",
+   "label": "neutral",
+   "text": "このキャラクターは攻撃力が高いです。"
+  },
+  {
+   "id": "test-24",
+   "split": "test",
+   "lang": "ja",
+   "label": "neutral",
+   "text": "ええと、少し時間をください。",
+   "trap": "filler"
+  },
+  {
+   "id": "test-25",
+   "split": "test",
+   "lang": "ja",
+   "label": "neutral",
+   "text": "ありがとうございます、では次の質問に進みます。"
+  },
+  {
+   "id": "test-26",
+   "split": "test",
+   "lang": "ja",
+   "label": "neutral",
+   "text": "今日の天気は晴れ、気温は二十度です。"
+  },
+  {
+   "id": "test-27",
+   "split": "test",
+   "lang": "ja",
+   "label": "neutral",
+   "text": "怒りの日という曲を聴いています。",
+   "trap": "mention"
+  },
+  {
+   "id": "test-28",
+   "split": "test",
+   "lang": "ja",
+   "label": "neutral",
+   "text": "悲しくなんかないよ、大丈夫。",
+   "trap": "negation"
+  },
+  {
+   "id": "test-29",
+   "split": "test",
+   "lang": "ja",
+   "label": "neutral",
+   "text": "あまり嬉しくはないです。",
+   "trap": "negation"
+  },
+  {
+   "id": "test-30",
+   "split": "test",
+   "lang": "ja",
+   "label": "neutral",
+   "text": "はいはい、さすがですね、素晴らしいですね。",
+   "trap": "sarcasm"
+  },
+  {
+   "id": "test-31",
+   "split": "test",
+   "lang": "ja",
+   "label": "neutral",
+   "text": "どうせ私なんか最高ですよ。",
+   "trap": "sarcasm"
+  },
+  {
+   "id": "test-32",
+   "split": "test",
+   "lang": "en",
+   "label": "joy",
+   "text": "I love this song so much, it's fantastic!"
+  },
+  {
+   "id": "test-33",
+   "split": "test",
+   "lang": "en",
+   "label": "joy",
+   "text": "Congratulations on the new job, that's wonderful!"
+  },
+  {
+   "id": "test-34",
+   "split": "test",
+   "lang": "en",
+   "label": "joy",
+   "text": "Yay, we finally made it!"
+  },
+  {
+   "id": "test-35",
+   "split": "test",
+   "lang": "en",
+   "label": "joy",
+   "text": "We had so much fun today, thanks for coming."
+  },
+  {
+   "id": "test-36",
+   "split": "test",
+   "lang": "en",
+   "label": "surprise",
+   "text": "Whoa, that came out of nowhere!"
+  },
+  {
+   "id": "test-37",
+   "split": "test",
+   "lang": "en",
+   "label": "surprise",
+   "text": "No way, you actually did it?"
+  },
+  {
+   "id": "test-38",
+   "split": "test",
+   "lang": "en",
+   "label": "surprise",
+   "text": "I'm shocked, that is incredible."
+  },
+  {
+   "id": "test-39",
+   "split": "test",
+   "lang": "en",
+   "label": "sadness",
+   "text": "I'm so sorry, I feel really lonely tonight."
+  },
+  {
+   "id": "test-40",
+   "split": "test",
+   "lang": "en",
+   "label": "sadness",
+   "text": "Sadly the server is down, and I'm disappointed."
+  },
+  {
+   "id": "test-41",
+   "split": "test",
+   "lang": "en",
+   "label": "sadness",
+   "text": "I miss you all already, goodbye for now."
+  },
+  {
+   "id": "test-42",
+   "split": "test",
+   "lang": "en",
+   "label": "anger",
+   "text": "I'm furious about the rules, this is unacceptable!"
+  },
+  {
+   "id": "test-43",
+   "split": "test",
+   "lang": "en",
+   "label": "anger",
+   "text": "Stop it, that's so annoying."
+  },
+  {
+   "id": "test-44",
+   "split": "test",
+   "lang": "en",
+   "label": "anger",
+   "text": "I am fed up with these delays, it's outrageous."
+  },
+  {
+   "id": "test-45",
+   "split": "test",
+   "lang": "en",
+   "label": "calm",
+   "text": "Just breathe, nice and slowly, and stay calm."
+  },
+  {
+   "id": "test-46",
+   "split": "test",
+   "lang": "en",
+   "label": "calm",
+   "text": "It's a peaceful evening, so let's relax."
+  },
+  {
+   "id": "test-47",
+   "split": "test",
+   "lang": "en",
+   "label": "neutral",
+   "text": "Please remember to follow the channel."
+  },
+  {
+   "id": "test-48",
+   "split": "test",
+   "lang": "en",
+   "label": "neutral",
+   "text": "The patch notes are on the website."
+  },
+  {
+   "id": "test-49",
+   "split": "test",
+   "lang": "en",
+   "label": "neutral",
+   "text": "I'll read the next comment now."
+  },
+  {
+   "id": "test-50",
+   "split": "test",
+   "lang": "en",
+   "label": "neutral",
+   "text": "Thanks for the question, here is the answer."
+  },
+  {
+   "id": "test-51",
+   "split": "test",
+   "lang": "en",
+   "label": "neutral",
+   "text": "That wasn't fun at all.",
+   "trap": "negation"
+  },
+  {
+   "id": "test-52",
+   "split": "test",
+   "lang": "en",
+   "label": "neutral",
+   "text": "Yeah right, like that will ever work.",
+   "trap": "sarcasm"
+  },
+  {
+   "id": "test-53",
+   "split": "test",
+   "lang": "en",
+   "label": "neutral",
+   "text": "Thanks a lot, you broke the build again.",
+   "trap": "sarcasm"
+  },
+  {
+   "id": "test-54",
+   "split": "test",
+   "lang": "en",
+   "label": "neutral",
+   "text": "She was mad about the ending of the novel."
+  },
+  {
+   "id": "test-55",
+   "split": "test",
+   "lang": "en",
+   "label": "neutral",
+   "text": "The sad ending of the film is on page ten.",
+   "trap": "mention"
+  }
+ ]
+}
