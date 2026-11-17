@@ -1,0 +1,79 @@
+= EXP-0007 addendum: B measured with pplx-decider-flash-v1.3 (2026-11-18) (#423)
+
+This extends EXP-0007 (branch +exp/reply-affect-judge+, not yet on main), whose section 3 left candidate B
+(System One) unmeasured for lack of a key. It uses the same blind set, the same 124-line eval split (the 20 ids in
++dev_ids.json+ excluded) and the same per-line A and B' predictions, and the decision rule fixed in #423, unchanged.
+
+== 1. Setup
+
+* Model: +perplexity/pplx-decider-flash-v1.3:free+ (returned +...-20261112+) at
+  +https://openrouter.ai/api/alpha/decisions+, the same endpoint the +jev_batch_live_smoke+ test uses.
+* Prompt shape: the System One wire shape of +crates/reflex/src/jev.rs+ (+{state, model, questions}+, one
+  +choice+ question with six criteria; classes, definitions and "judge the speaker's own feeling, most lines are
+  neutral" as in EXP-0007 B'). State is only +{"line": text}+. One prompt, written before running; no tuning, so
+  the dev slice was not used to adjust anything (its 20 lines are reported only for reference).
+* Run 2026-11-18, 144 sequential calls from one Windows machine over the public internet, no retry, 30 s
+  timeout. A failed call (HTTP error, unparseable, unknown class) counts as wrong. Synthetic data only; key from
+  the environment, never logged or committed; raw responses stay in +I:\temp\expaffect-data\raw_jev.json+.
+* Scripts: +examples/benchmarks/affect-judge-jev/+ (+jev_affect.py+, +analyze.py+). Bootstrap: 2000 resamples of
+  lines, seed 20261118. This is test-only use of a free test model; it is not a default or a supported config.
+
+== 2. Results (n = 124)
+
+[cols="2,1,1,2,1,2"]
+|===
+|Candidate |Accuracy |Macro-F1 |False non-neutral (42 neutral) |Failed calls |Macro-F1 gain over A (95% bootstrap)
+
+|A rules |0.694 |0.703 |0.143 (6/42) |0 |-
+|B' local Gemma call |0.935 |0.940 |0.167 (7/42) |0 |+0.237 (+0.154 to +0.337)
+|*B System One (flash-v1.3)* |0.944 |0.952 |0.071 (3/42) |3 (HTTP 429) |*+0.249 (+0.165 to +0.349)*
+|===
+
+* The 3 failures are all HTTP 429 (free-tier rate limit) at roughly 0.3 s call spacing: 2.1 % of calls, 0 parse
+  failures, 0 other errors. On the 121 answered lines accuracy is 0.967 and macro-F1 0.967; treating the failures
+  as correct would give 0.968, so the failures cost about 0.015 macro-F1.
+* Remaining errors: 3 neutral lines called calm, 1 anger called joy (plus the 3 failures: anger, joy, surprise).
+* Accuracy by trap (n): none 0.96 (90), negation 0.83 (12), quote 1.00 (8), mixed 1.00 (6), mention 1.00 (5),
+  sarcasm 0.67 (3). Trap strata are small; indicative only. Reference dev 20 lines: accuracy 0.95, macro-F1 0.822
+  (several classes have one or two lines there).
+* Latency per phrase over the network: p50 293 ms, p95 390 ms on the 121 answered calls (identical over all 144),
+  max 1004 ms. This is one machine, one afternoon, sequential calls; not a distribution over time or networks.
+* Reply-generation slowdown: none locally (the call is remote and uses no local GPU/CPU), so the 5 % gate is met
+  by construction. The call does leave the machine with each phrase (privacy/availability cost).
+
+== 3. Fixed decision rule (unchanged)
+
+[cols="2,3"]
+|===
+|Gate |B (System One)
+
+|Macro-F1 gain >= 0.10 over A |pass: +0.249, CI lower bound +0.165
+|Added p95 time-to-first-audio <= 20 ms |*fail as a serial call*: 390 ms p95 (293 p50), about 20 times the limit
+|Reply generation slows <= 5 % |pass (remote, no local load)
+|===
+
+*Decision under the rule: Keep A* (the rule requires all three gates, and the serial design fails the TTFA gate).
+Accuracy is no longer the open question: B is the most accurate candidate measured, with the fewest false
+non-neutral calls.
+
+== 4. What a parallel-with-TTS design would need
+
+* Fit: 390 ms p95 (max 1004 ms) is shorter than a phrase's synthesis time at the p50s EXP-0003/EXP-0006 report
+  (Supertonic about 0.9 s, LUNA 1.13 s p50 / 1.36 s p95; per reply, no per-phrase distribution exists). If the call
+  starts when the phrase text is final and runs concurrently with synthesis, the label would usually arrive before
+  audio and added TTFA would be about 0 ms. The one slow call seen (1004 ms) would exceed Supertonic's 0.9 s.
+  Not built or measured end to end; the rule's TTFA gate would need re-measuring on the real pipeline.
+* A hard deadline (below the phrase's TTS time) after which the runtime uses A's label, so a slow, failed or
+  rate-limited call (2.1 % here) never delays audio. The judge result is data that picks among six expressions,
+  never authority.
+* A paid or contracted key with a rate limit that covers one call per phrase; the free tier rate-limited three of
+  144 sequential calls, and the free model is allowed only for tests (until 2026-11-19, never a default).
+* An owner decision on sending each phrase of public-reply text to a third party, and a Jev-enabled profile
+  (the local profile runs without Jev; EXP-0007 section 3); the local-only default would keep A.
+* Per-phrase TTS time distributions and a repeat over several times of day to confirm p95.
+
+== 5. Not measured
+
+* Time-to-first-audio with the call actually in parallel with Supertonic/LUNA; latency from other networks.
+* Production-tier model or key behaviour; the Jev +api.typesafe.ai+ endpoint itself.
+* Prompt variants (none tried); one run, one labeller, 124 lines.
