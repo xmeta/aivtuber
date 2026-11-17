@@ -1,0 +1,28 @@
+{
+ "plain": {
+  "n": 48,
+  "len_mean": 48.333333333333336,
+  "len_p95": 64.0,
+  "ja_match": 1,
+  "first_p50": 98.94029999850318,
+  "end_p50": 586.3154499966186
+ },
+ "tagged": {
+  "n": 48,
+  "len_mean": 35.958333333333336,
+  "len_p95": 47.65,
+  "ja_match": 1,
+  "first_p50": 137.5764499825891,
+  "end_p50": 592.999399988912
+ },
+ "parse_ok": 1,
+ "parse_fail": 0,
+ "tag_dist": {
+  "neutral": 3,
+  "joy": 36,
+  "surprise": 2,
+  "calm": 5,
+  "sadness": 2,
+  "anger": 0
+ }
+}
