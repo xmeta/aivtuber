@@ -242,6 +242,7 @@ current Japanese-capable VAD/ASR/TTS ecosystems
 First measurement (synthetic-pause VAD and turn-end bench, #92): link:experiments/EXP-0001-japanese-turn-observation-bench.adoc[EXP-0001].
 Second measurement (local Japanese STT engine bench: sherpa-onnx ReazonSpeech/parakeet/SenseVoice, Whisper-family via whisper.cpp, Vosk; accuracy, latency, cost, determinism, licenses and Rust integration cost, #92 S3a): link:experiments/EXP-0002-japanese-stt-bench.adoc[EXP-0002].
 Third measurement (local Japanese TTS engine bench: sherpa-onnx Supertonic 3 and Kokoro, Kokoro through kokoro-onnx, VOICEVOX engine as a loopback sidecar; latency, RTF, determinism, text handling, an STT round-trip proxy, code/weights/voice license table and Rust integration cost, #220 S2a): link:experiments/EXP-0003-japanese-tts-bench.adoc[EXP-0003].
+Fourth measurement (Irodori-TTS v4.1-Small SUN and LUNA, the official PyTorch code with the checkpoints' own speed patch, GPU and CPU; per-reply latency and RTF, VRAM/RSS, load, determinism, the same round-trip proxy, the licence table and the wrap-the-official-server integration cost, #409 step 1): link:experiments/EXP-0006-irodori-tts-small-voices.adoc[EXP-0006].
 
 |Modern TTS
 |GPT-SoVITS;

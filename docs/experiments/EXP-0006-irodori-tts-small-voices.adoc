@@ -1,0 +1,494 @@
+= EXP-0006: Irodori-TTS v4.1-Small SUN and LUNA as an optional local TTS backend (#409)
+
+:toc:
+:toclevels: 2
+
+This is a durable experiment record in the link:README.adoc[Durable Experiment Records] format.
+It is *step 1* of #409, which at the time of writing carries `status:design-ready`: an evaluation, with throwaway
+scripts only.
+No production code, no new dependency in the repository, and no model, binary or audio is committed.
+The default voice stays Supertonic 3 int8 on sherpa-onnx (link:EXP-0003-japanese-tts-bench.adoc[EXP-0003]); this
+record asks whether the two Irodori-TTS checkpoints are a viable *optional* second backend, in the shape #295 gave
+VOICEVOX (a separate loopback process the operator installs, nothing bundled).
+
+== 1. Record
+
+[source,text]
+----
+Decision question:
+  Should aivtuber offer Irodori-TTS v4.1-Small as an opt-in local Japanese TTS backend, and if so which of the
+  two published checkpoints (SUN, quality-safe 24-step rectified flow; LUNA, 4-NFE MeanFlow turbo), on which
+  device (GPU or CPU), through which bridge, and with what licence and disclosure duties?
+
+Context / baseline:
+  The local profile's shipped voice is Supertonic 3 int8 on sherpa-onnx: CPU, RTF 0.24, 364 MB, 44.1 kHz,
+  bit-identical when seeded, one voice (EXP-0003). VOICEVOX 0.26.1 is an optional second backend (#295) run as a
+  separate loopback process with per-character terms and a credit line. No TTS SLO exists; EXP-0003 compares
+  engines against real time. #409 asks for the Irodori-TTS family, which EXP-0003 named but did not run.
+  The contract is the provider-neutral normalized HTTP TTS contract (request {text, style, voice_model,
+  viseme_mapping}; response {audio_ref, duration_ms, viseme_ref?}); audio travels by reference under
+  AIVTUBER_AUDIO_ROOT.
+
+Hypothesis / expected outcome (exploratory, no numeric threshold pre-registered):
+  (a) LUNA is fast enough for live replies on a GPU and SUN is not; (b) neither is usable on a CPU without
+  bf16 hardware, whatever the model cards claim; (c) the DACVAE codec decode, not the sampler step count,
+  dominates GPU wall time; (d) load takes about a minute and 3-4 GB of VRAM; (e) the existing bridge shape
+  (a separate loopback process) fits, because an official OpenAI-compatible server already exists.
+
+Guardrails:
+  Code, weights, codec and text encoder licences read separately; nothing bundled in the release archive;
+  no build-time network download in any integration path; the model stays in a separate process (PyTorch is
+  too large to link); default voice unchanged; synth never in the scheduler/frame loop; generated audio is
+  data, never authority; voice cloning and reference clips are out of the first slice (consent, disclosure);
+  operator-visible licence and machine-generated-voice disclosure.
+
+Decision-changing evidence:
+  Per-reply latency (p50, p95) and RTF over the 50 replies of the EXP-0003 corpus, load time, sample rate,
+  peak VRAM and resident set, determinism (same process and a fresh process), the STT round-trip and reading
+  CER on the same corpus and handling set, a licence table, and the integration cost (official server,
+  codec/tokenizer downloads, offline seeding).
+
+Cheapest informative test:
+  The two checkpoints' own published recipes (speed_patch.py + cpu_bf16_ode_fp32.patch) on the official code,
+  one fresh process per configuration, the unchanged EXP-0003 corpus and evaluators, on one GPU and one CPU.
+
+Dataset/workload:
+  examples/benchmarks/tts/corpus.py unchanged: 50 VTuber-style replies (12-43 characters) and the 38-item
+  handling set, of which 32 items have an expected reading. Not a naturalness test.
+
+Commit/base/head:
+  Branch docs/409-irodori-tts-exp from origin/main 3a144023. Scripts: examples/benchmarks/irodori/.
+  Official inference code: github.com/Aratako/Irodori-TTS at 382205679ebc32295b7d1bfb329327d04c8f4eed,
+  patched with the checkpoints' code_patches/cpu_bf16_ode_fp32.patch (3 files, applies cleanly).
+
+Profile/config fingerprint:
+  SUN: model bf16 or fp32, codec fp32, 24 RF steps (the card's recipe). LUNA: model bf16 or fp32, codec
+  bf16 or fp32, num_steps unset = MeanFlow 4 NFE. speed_patch.apply(snake=SUN, fold_codec, rope, fuse) in
+  every row; cfg_scale_text 3.0 (official default); no reference audio (no_ref), no caption; no_ref,
+  seed 1234, torch.set_num_threads(4). CUDA rows use the same 4 threads; no torch.compile.
+
+Seed:
+  1234 for every request. The reply text is fixed, not sampled. The bootstrap seed for CER intervals is
+  20261110 (EXP-0003's).
+
+Asset/index/compiler version:
+  Not applicable (no repository assets, replay index or compiler involved).
+
+Provider/model versions:
+  summerAIO/Irodori-TTS-v4.1-Small-SUN at a68be741b6631186ce2b4e60ce6432dd8d920558 (model.safetensors
+  3,064,295,596 bytes, 766.1 M parameters, fp32); summerAIO/Irodori-TTS-v4.1-Small-LUNA at
+  08e80a3c13db2bbfd8464f670fb7cd127e6f0d8c (3,093,131,788 bytes, 773.3 M parameters, fp32; checkpoint
+  metadata flow_parameterization=meanflow). Codec Aratako/Semantic-DACVAE-Japanese-32dim at
+  47376ee24834d7a05a48ebabfe3cde29b3c5e214 (weights.pth, 410 MB, downloaded from the Hub at load time);
+  text tokenizer sbintuitions/modernbert-ja-310m at 77675fc96a7e445e982e2ba90246b816efc74ec6 (the 310 M text
+  encoder weights are inside the checkpoint; only the tokenizer files are downloaded, 8.2 MB).
+  STT for the round trip: reazon-research/reazonspeech-k2-v2 at 291488c8, int8, SHA-256 verified (EXP-0002/0003).
+
+Toolchain:
+  Python 3.13.12 (Windows), torch 2.11.0+cu128, transformers 5.23.0, safetensors, soundfile, dacvae from
+  github.com/facebookresearch/dacvae at 414c20785fc3a28373073ea8ef7a1316eeeaca6e (Apache-2.0) with argbind,
+  descript-audiotools and einops, sherpa-onnx 2.0.1 (Python wheel), pyopenjtalk-plus, rapidfuzz, numpy, scipy,
+  psutil, huggingface_hub. Isolated virtual environment outside the repository. silentcipher (the optional
+  watermarker) was *not* installed, so no watermark was applied, as in the model cards' own benchmark.
+  Deviation: the official pyproject pins torch <2.11 in its backend extras; 2.11.0 was what this host had.
+
+Other relevant environment:
+  Windows 11 Pro, AMD Ryzen 7 3700X (Zen 2, 8 cores / 16 threads; no AVX-512, therefore no hardware bf16),
+  NVIDIA GeForce RTX 2070 SUPER (8 GB), driver/CUDA 12.8. Run date 2026-11-17, one machine.
+
+Exploratory unknowns:
+  Everything in sections 4-6. No confirmatory criterion was fixed before the results were read.
+
+Confirmatory success/guardrail criteria:
+  None (selection and viability question).
+
+Actual:
+  Sections 4-6.
+
+Evidence artifacts:
+  Scripts are committed (examples/benchmarks/irodori/). Per-run outputs (wavs, result.json, stt.json,
+  eval.json) are local only; the tables in this record are the retained evidence.
+
+Noise / uncertainty / missing evidence:
+  Section 8. In short: no listening test, STT errors count against the TTS, one GPU, one run per configuration,
+  the CPU rows are incomplete (section 9), and the LUNA fp32 tail is unstable.
+
+Expected-vs-actual difference:
+  LUNA on a GPU is fast enough for live replies (p50 1.13 s, RTF 0.245 with its own bf16 recipe) and SUN is
+  not (p50 2.85 s, RTF 0.66); that matches (a). CPU is worse than the cards suggest: SUN needed about 150 s
+  for a 3.4 s utterance and LUNA produced no reply in 15 minutes, so (b) holds on this host. The sampler step
+  count is nearly free next to the codec (4 NFE against 24 steps on GPU fp32: 2.76 s against 3.10 s), which
+  is (c). Load is 57-94 s and 2.9-3.9 GB of VRAM, (d). An official MIT OpenAI-compatible server exists
+  (Irodori-TTS-Server), so (e) holds, but it speaks OpenAI's /v1/audio/speech, not this project's contract.
+  The one result that was *not* anticipated: on the EXP-0003 round-trip instrument the checkpoints read worse
+  than the shipped engine (reading CER about 13% against 4.0%, section 6.1), mostly through lost onsets.
+
+Likely explanation:
+  The codec's DACVAE decoder runs once per reply and is the wall-clock floor; MeanFlow's 4 NFE only shortens
+  the DiT part. bf16 helps only when *both* DiT and codec are cast (LUNA): casting the DiT alone (SUN) adds
+  fp32/bf16 conversions and was measured slower than fp32. The CPU rows are dominated by emulated bf16 on a
+  Zen 2 part (SUN additionally runs 24 sequential DiT steps; LUNA's much shorter sampler did not rescue it).
+
+Decision:
+  Defer (recommendation for the supervisor, not a decision).
+  Do not implement a backend in #409's current form. A later slice, if the voice is wanted, should be *LUNA
+  only*, on a *GPU*, with bf16 DiT and codec, wrapped around the official Irodori-TTS-Server behind a
+  bridge; not CPU, and not SUN for live replies. The prerequisite is a human listening comparison: the
+  measured round-trip reading CER of about 13% against the shipped engine's 4.0% means the evidence does not
+  currently support "a better voice costs 0.2 s more per reply".
+
+Follow-up / owning issue:
+  #409 (this evaluation is its step 1; an implementation slice needs status:agent-ready and the listening
+  comparison of Q4). Open questions: section 10.
+
+Revisit condition:
+  A listening test that prefers SUN's or LUNA's voice and explains the round-trip gap, a bf16-capable CPU
+  (AMX/AVX-512) or a faster codec or quantized variant that brings CPU under real time, a streaming or chunked
+  synthesis path, or a project decision to accept ~3 s per reply for pre-rendered lines.
+----
+
+== 2. Result summary
+
+All numbers were measured here unless marked as read from a source.
+
+* *The usable configuration is LUNA with both the DiT and the codec in bf16 on the GPU*: p50 1.13 s, p95 1.36 s per reply (mean audio 4.72 s), RTF 0.245, peak 3.1 GB of VRAM, load 94 s. Deterministic: 50 of 50 replies identical in a second pass in the same process and 10 of 10 in a fresh process; no error in 50 replies or 38 handling items; 48 kHz.
+* *SUN is not a live-reply candidate*: p50 2.85 s, p95 3.33 s (RTF 0.66) in fp32, and *slower* in its own bf16 recipe (p50 3.46 s, RTF 0.75), because the codec stays fp32 and the casts cost more than the smaller DiT saves. Also deterministic (50/50).
+* *LUNA fp32 has a heavy tail*: p50 1.19 s but p95 6.86 s (one reply took 25.5 s), RTF 0.585. The p50 is close to bf16; the tail is not. Both LUNA rows use 4 NFE, so the tail is not a sampler effect, but its cause was not isolated (section 8).
+* *Step count is nearly free; the codec is the bottleneck.* 4 NFE against 24 steps on GPU fp32 changed the mean by 11% (2.76 s against 3.10 s), while switching the codec (and DiT) to bf16 on LUNA cut it by 58% (1.16 s against 2.76 s). A faster sampler alone cannot make SUN live-capable.
+* *CPU is out on this host.* SUN with the card's recipe took *about 150 s* for one 19-character reply (3.36 s of audio, RTF ~45) when run through the checkpoint's own synthesize.py; a 3-reply harness run did not finish its second pass within 25 minutes. LUNA, which needs only 4 NFE, produced *no reply at all within about 15 minutes* of the same harness. This CPU (Zen 2) has no hardware bf16, and the cards' "RTF 1.110 on 8 CPU cores" (SUN) and "0.602" (LUNA) were not reproduced; those numbers were obtained on an unidentified VM and are not evidence for this project's hosts.
+* *Load and footprint.* Load (checkpoint + codec + tokenizer, cold process) 57.5 s (SUN fp32), 59.9 s (LUNA fp32), 67.0 s (SUN bf16), 93.5 s (LUNA bf16); first call 16.8 / 7.1 / 4.2 / 1.4 s; peak VRAM 3.9 / 3.8 / 2.9 / 3.1 GB; peak process RSS 6.4-6.9 GB. The model fits the 8 GB card on its own; a Thinking model of the sizes in the local profile cannot share that card at the same time (Q3).
+* *Sample rate is 48 kHz* (the DACVAE codec), against 44.1 kHz for the shipped Supertonic path.
+* *Intelligibility is the negative result.* The same round-trip instrument that gave the shipped engine 4.0% reading CER gives every Irodori configuration about 12.4-13.5% (text CER 15.8-18.1% against 8.2%), with 11-15 of 50 replies above 30% text CER. The scored handling set is nearly clean (3-5 of 32), and the reply errors are *lost first words* rather than misread kanji (section 6.2): the audio starts within 18-32 ms of the first sample, and `こんにちは、…` came back as `…今日も来てくれてありがとう`, `わあ` as `うわ`, `あはは` as `ハハ`. The instrument cannot say whether the model clips the onset or the STT is weak on this voice, but neither explanation supports calling this voice better than the shipped one.
+* *Licences are MIT end to end* (code, both checkpoints, base model, MF model, Yomi vector, codec weights, text encoder) with Apache-2.0 for the DACVAE code and MIT for SilentCipher; the base model card carries *ethical restrictions* (no impersonation, no deepfakes, no misinformation, a "may resemble a real person by chance" disclaimer) that the project must state (section 3.2).
+
+== 3. Setup, pinned versions and licence table
+
+=== 3.1 What was run
+
+[cols="2,4,3",options="header"]
+|===
+|Item |Pinned identity |Used for
+
+|Irodori-TTS inference code (official)
+|github.com/Aratako/Irodori-TTS at commit 382205679ebc32295b7d1bfb329327d04c8f4eed, MIT, 1625 stars, no tagged releases, *not on PyPI* (`pypi.org/pypi/irodori-tts` 404). Cloned, then `code_patches/cpu_bf16_ode_fp32.patch` applied (3 files: inference_runtime.py allows CPU bf16; rf.py and meanflow.py keep the ODE state and the CFG combination in fp32).
+|Both rows
+
+|SUN checkpoint
+|HF summerAIO/Irodori-TTS-v4.1-Small-SUN at a68be741..., model.safetensors SHA-256 af9bbab351046c5320b71add301b425d367d9a2c6d6828f426ee3156cf785215, 3.06 GB, 766.1 M parameters, fp32, 24-step rectified flow. Ships `speed_patch.py` (fold DACVAE weight-norm, fuse QKV/gate and SwiGLU, real-arithmetic RoPE, optional bf16) and `codec_folded_fp32.safetensors` (429 MB, unused here).
+|SUN rows
+
+|LUNA checkpoint
+|HF summerAIO/Irodori-TTS-v4.1-Small-LUNA at 08e80a3c..., model.safetensors SHA-256 ebfd3414e32df83dec23e7499a4f8c6effd2f977369d474dd473d8be8a7ca115, 3.09 GB, 773.3 M parameters, fp32, checkpoint metadata `flow_parameterization=meanflow`, 4 NFE by default; same speed_patch.py plus an all-bf16 codec option.
+|LUNA rows
+
+|Audio codec
+|Aratako/Semantic-DACVAE-Japanese-32dim at 47376ee2..., weights.pth 410 MB, MIT. *Downloaded from the Hub at load time* by the official code; the tokenizer files come from sbintuitions/modernbert-ja-310m (8.2 MB).
+|Every row
+
+|ReazonSpeech k2-v2 int8 (STT for the round trip)
+|reazon-research/reazonspeech-k2-v2 at 291488c8..., four files SHA-256 verified against the EXP-0003 pins (Apache-2.0 model card; the ReazonSpeech corpus caveat of EXP-0002 applies to this measuring instrument, not to anything shipped).
+|Round-trip proxy
+|===
+
+The two checkpoints are *weight-space modifications*, not retrainings: SUN is v4.1 + 1.0 x (Yomi - v4.1) with a 24-step RF sampler; LUNA applies the same vector on the official MeanFlow model (v4.1-Small-MF) and casts DiT and codec to bf16. Both are derived from MIT checkpoints and the card says why the Yomi vector was kept (UTMOS 3.543 against 3.328 on the card's own screen).
+
+=== 3.2 Licence table (code / weights / voice terms)
+
+Read on 2026-11-17 from the source named in the last column, not legal advice.
+
+[cols="2,2,3,3",options="header"]
+|===
+|Item |Code |Weights |Terms and obligations
+
+|Irodori-TTS (Aratako)
+|MIT (repository LICENSE). Dependencies: dacvae Apache-2.0, sentencepiece Apache-2.0, torch BSD-3-Clause, transformers Apache-2.0.
+|MIT (card of v4.1-Small, v4.1-Small-MF, both SUN/LUNA, Yomi).
+|*Ethical restrictions* on the base card, additional to MIT: no impersonating any individual without explicit consent; no deepfakes or synthetic speech intended to mislead; a statement that a generated voice may *coincidentally* resemble a real person; the developers disclaim liability. Not a licence condition but a stated condition of use; the project's own disclosure duty (an AI VTuber should say the voice is synthetic anyway) covers the practical part.
+
+|Semantic-DACVAE-Japanese-32dim
+|dacvae repository Apache-2.0 (Meta); derived from facebookresearch/dacvae watermark branch.
+|MIT (HF card).
+|Output carries a SilentCipher watermark *when the optional package is installed* (MIT); it was not installed here, so this record's audio is unwatermarked. Card says the codec was trained on Japanese speech; training data not described.
+
+|Text/caption encoder
+|ModernBERT (Apache-2.0 upstream).
+|sbintuitions/modernbert-ja-310m MIT; weights inside the checkpoint.
+|None found specific to Japanese.
+
+|Voice identity
+|Not applicable.
+|SUN and LUNA have *no named voices*; the unconditioned (no_ref) request samples from the model's latent voice space, so each seed gives a different speaker and there is no third-party character voice to credit.
+|This is the licence advantage over VOICEVOX (per-character terms and a mandatory credit line): nothing to credit, but also *no stable voice* without a reference clip or a fixed seed. Voice cloning (a reference clip) remains the operator's own recording or a consented one, with disclosure.
+|===
+
+=== 3.3 What the cards claim, and what this host measured
+
+[cols="2,1,1,1,1",options="header"]
+|===
+|Checkpoint |Card RTF (CPU, 8 cores) |Card CER (its own set) |Measured RTF here (GPU fp32 / GPU bf16) |Measured RTF here (CPU, bf16)
+
+|SUN (24-step RF)
+|1.110 total / 0.550 model
+|1.7%
+|0.658 / 0.745
+|~45 (one utterance; section 9)
+
+|LUNA (4-NFE MeanFlow)
+|0.602 total / 0.105 model
+|2.0%
+|0.585 / 0.245
+|not measured: no reply in 15 min
+|===
+
+The cards' CPU figures were produced on an 8-core VM of unknown type, with 4 threads, 40 plain + 10 clone utterances, watermarking off, CER against kotoba-whisper. On *this* CPU the same recipes are 40-70 times slower than real time, so the card numbers should not be used to size a deployment.
+
+== 4. Workload and method
+
+=== 4.1 Texts
+
+The 50 replies and the 38-item handling set of EXP-0003, reused unchanged from `examples/benchmarks/tts/corpus.py`
+(12-43 characters per reply, mean 26; 32 scored handling items plus 2 URL, 1 symbol and 3 emoji items).
+They were written for one VTuber persona and one annotator's expected readings; nothing was added for this bench.
+
+=== 4.2 What is timed
+
+* *Call time:* wall time of one `InferenceRuntime.synthesize()` call (Python `perf_counter`), including text
+  normalization, tokenization, duration prediction, sampling, codec decode and WAV write. No engine streams, so
+  the time to first audio equals the call time: about 1.1 s (LUNA bf16) to 3.5 s (SUN bf16) after the text is final.
+* *RTF* is the sum of call times over the sum of audio durations (below 1 means faster than real time).
+* *Load time:* `InferenceRuntime.from_key` plus `speed_patch.apply` (checkpoint load, codec download/load,
+  tokenizer fetch, weight folding/fusing). *First call* is the first synthesis after load; three more warm-ups
+  are not recorded.
+* *Peak memory:* resident set of the harness process sampled every 25 ms, and peak CUDA allocation
+  (`torch.cuda.max_memory_allocated`) sampled at the same rate; both are allocator figures, not driver totals.
+* *Determinism:* SHA-256 of the audio as 16-bit PCM for the same text, (a) a second pass in the same process,
+  (b) a fresh process (run1 against run2, first 10 replies).
+
+=== 4.3 Round-trip intelligibility proxy
+
+Unchanged from EXP-0003: each wav is resampled to 16 kHz, padded with 0.3 s of silence before and 0.5 s after,
+transcribed by sherpa-onnx ReazonSpeech k2-v2 int8 (greedy, 4 threads); two micro-averaged CERs over the replies
+with a 95% bootstrap interval (2000 resamples, seed 20261110): *text* CER (orthographic, after the EXP-0002
+normalisation) and *reading* CER (both sides converted to katakana by Open JTalk). Handling items are scored by
+reading CER against the hand-written expected reading; above 0.25 counts as a misreading.
+*This measures what the STT recovers from the audio, not naturalness, prosody or voice quality.*
+
+== 5. Results
+
+=== 5.1 Latency, memory and determinism (50 replies, one run per configuration)
+
+[cols="4,1,1,1,1,1,1,1,1,1",options="header"]
+|===
+|Configuration |p50 s |p95 s |RTF |Load s |First call s |Peak VRAM MB |Peak RSS MB |Same process |Fresh process
+
+|LUNA bf16 DiT + bf16 codec, GPU
+|1.134 |1.355 |0.245 |93.5 |1.43 |3107 |6941 |50/50 |10/10
+
+|LUNA fp32, GPU
+|1.186 |6.856 |0.585 |59.9 |7.13 |3824 |6375 |50/50 |10/10
+
+|SUN fp32, GPU
+|2.850 |3.329 |0.658 |57.5 |16.82 |3861 |6762 |50/50 |10/10
+
+|SUN bf16 DiT + fp32 codec, GPU (the card's recipe)
+|3.461 |4.001 |0.745 |67.0 |4.17 |2929 |6887 |50/50 |10/10
+
+|SUN bf16, CPU 4 threads (1 utterance, synthesize.py, section 9)
+|~150 |n/a |~45 |~100 |n/a |n/a |not measured |not run |not run
+|===
+
+Mean audio per reply: 4.71 s (SUN) and 4.72 s (LUNA) at 48 kHz. Every GPU configuration produced 50 of 50
+replies and 38 of 38 handling items without an error. The reply that produced the shortest audio (2.05 s) and the
+longest (9.5 s) come from the same 50-item set, so the RTF is not an artefact of one length.
+
+=== 5.2 Reading the table
+
+* *One configuration is usable for live replies.* LUNA with its own bf16 recipe answers in about 1.1 s for a
+  4.7 s reply; the p95 of 1.36 s means a producer of 20-character replies hears the voice about 1.1-1.4 s
+  after the text is final. That is slower than the shipped Supertonic path (0.9 s p50 CPU) but in the same
+  order; whether the larger model sounds better is exactly what this record cannot answer (section 6).
+* *SUN is a pre-rendering option at best.* 2.85 s (fp32) or 3.46 s (bf16) per reply is 2.5-3 times the shipped
+  engine's call time and roughly doubles end-to-end latency once the Thinking and gate stages are added.
+* *bf16 is not a free switch.* On SUN it made things *worse* (3.46 s against 2.85 s): the codec stays fp32 and
+  the fused attention converts back to fp32, so the smaller datatype pays conversion without shrinking the part
+  that dominates. On LUNA it is applied to both halves and cuts time by 58%.
+* *fp32 LUNA's p50 hides a tail.* One reply took 25.5 s and another 14.5 s while the median stayed at 1.19 s.
+  Nothing in the request differs (20 and 14 characters); the harness was alone on the GPU apart from a log read.
+  The cause was not isolated (allocator growth or a codec kernel falling back to a slow path are candidates);
+  it is the reason the recommendation names bf16 rather than "either precision".
+* *The sampler is cheap; the codec is not.* LUNA's 4 NFE against SUN's 24 steps changes the GPU fp32 mean by
+  11%, while the bf16 codec cut LUNA's mean by 58%. Any future speed work should target the DACVAE decoder or
+  a streaming/chunked decode, not the flow steps.
+
+=== 5.3 Load, footprint and devices
+
+Cold load is 57-94 s, dominated by reading a 3 GB safetensors checkpoint and building/folding the modules;
+the codec (410 MB) is downloaded on first use and cached afterwards. VRAM peaks at 2.9-3.9 GB with 48 kHz
+output, and the process adds 6.4-6.9 GB of resident memory. On the reference machine (8 GB card) the model fits,
+but a Thinking model cannot share the card with it at the sizes in `docs/local-profile-quickstart.adoc` unless
+the TTS runs on CPU (which this record rejects) or the Thinking model is small. The operator-facing consequence
+is Q3.
+
+=== 5.4 Determinism
+
+All four GPU configurations are bit-identical for the same text: 50 of 50 in a second pass in the same process,
+10 of 10 in a fresh process. The seed and the pinned checkpoints are enough; nothing needed a sampling repeat.
+No path in this record is unseeded.
+
+== 6. Text handling and intelligibility
+
+=== 6.1 Round trip (50 replies, 95% bootstrap interval over replies)
+
+[cols="3,2,2,1,1",options="header"]
+|===
+|Configuration |Text CER % |Reading CER % |Handling misreads |of scored
+
+|SUN bf16, GPU
+|15.8 (11.2-20.8)
+|12.4 (7.5-18.0)
+|3
+|32
+
+|SUN fp32, GPU
+|16.2 (11.6-21.1)
+|13.5 (8.4-19.1)
+|4
+|32
+
+|LUNA bf16, GPU
+|18.1 (13.3-23.2)
+|12.8 (7.9-18.7)
+|3
+|32
+
+|LUNA fp32, GPU
+|17.4 (12.4-22.6)
+|12.9 (8.0-18.9)
+|5
+|32
+|===
+
+For comparison, EXP-0003 measured the shipped engine at 8.2% text / 4.0% reading CER and VOICEVOX at
+12.0% / 2.3% on the same corpus and instrument. *Every Irodori row reads about 13% against 4.0% for the shipped
+engine*: the intervals barely overlap, and 11-15 of the 50 replies scored above 30% text CER. The ordering
+*between* the four Irodori configurations is noise; the gap *to the shipped engine* is not explained by seed
+variation alone. It is the strongest negative result in this record and the reason the recommendation is to defer
+rather than to offer the backend.
+
+=== 6.2 Why the CER is high: lost onsets, not misread kanji
+
+The handling set is nearly clean (3-5 of 32, comparable to the shipped engine's 6 and VOICEVOX's 2), and the
+items that fail are the ones EXP-0003 already flagged as instrument problems: `1日目` came back as `一日目`
+(the STT cannot separate ついたち from いちにち), and `Thank you、また来てね。` came back as `また来てね`
+(the English phrase is missing from the audio or from the transcription). One kanji item (`辛い物が好きです。`)
+came back as a single syllable. The scored handling set therefore does *not* show a kanji-reading problem.
+
+The reply CER is a different picture. Reading the transcripts, several replies lose their *first word* rather
+than mispronouncing later text: `こんにちは、今日も来てくれてありがとう！` came back as
+`今日も来てくれてありがとう`, `わあ、すごい！` as `うわ、すごい`, `あはは、それは面白いね。` as
+`ハハ、それは面白いね`. The generated audio starts speaking within *18-32 ms* of the first sample, with no
+leading silence at all, which is the one measurable correlate: either the model truncates the onset or the STT
+loses it. This instrument cannot separate the two, and EXP-0003's STT warning applies with full force here: a
+0.3 s silence pad before the utterance did not recover the words. *A listening check is required* before the
+gap is attributed to the model.
+
+=== 6.3 Non-speech text (raw engine behaviour)
+
+* URL, symbol and emoji items are handled the way every engine in EXP-0003 handled them: URLs are *spoken* as letter noise, emoji and kaomoji are silently dropped by the model's normalizer. ADR-0004 D-5 (drop them before TTS) stays necessary and stays upstream, so a production path never sends them.
+* Nothing here justifies changing ADR-0004's projection or adding a kanji-reading front end for Irodori.
+
+=== 6.4 Voice identity and cloning (not measured)
+
+The record ran `no_ref` only. The checkpoint supports zero-shot cloning from a 30 s+ reference clip and a
+caption path for voice design; neither was measured, because #409 leaves reference-clip cloning as an open
+decision (section 10, Q1). Note the licence asymmetry: an unconditioned model gives a *different speaker per
+seed*, so a persona would need a fixed seed or an operator-supplied reference clip to sound stable across runs.
+
+== 7. Integration cost
+
+Measured and read on 2026-11-17.
+
+[cols="2,3,3,3",options="header"]
+|===
+|Path |What it needs |Fit with this repository |Cost / risk
+
+|*Official Irodori-TTS-Server* (github.com/Aratako/Irodori-TTS-Server, MIT, 88 stars, last push 2026-11-04)
+|Python 3.10, uv, a CUDA/ROCm GPU (its README says a GPU is recommended); `POST /v1/audio/speech` (OpenAI-compatible), wav/mp3/flac/opus/aac/pcm, long-text chunking, SSE for long text, optional bearer token, `IRODORI_CHECKPOINT` for a local file
+|*Close but not equal* to this project's contract: it is OpenAI-shaped (model/voice/input), not `{text, style, voice_model, viseme_mapping}` with `audio_ref` + `duration_ms`; a thin bridge must translate, exactly as `crates/app/src/voicevox_bridge.rs` does for VOICEVOX
+|*Reuse mode: wrap.* Do not write another HTTP server. The bridge owns the contract mapping only, and the operator installs the server; the project links nothing.
+
+|Official Python package used directly from a new Rust/Python sidecar
+|Shipping `irodori_tts` means shipping a torch stack of several GB; the package is not on PyPI, so it would have to be vendored or fetched at install time
+|Bad fit for a release archive (the reason #409 excludes bundling)
+|*Reject.* Duplicates the server above and moves a PyTorch dependency into the project's own build.
+
+|Local checkpoint + `speed_patch.py` patch
+|The `code_patches/cpu_bf16_ode_fp32.patch` must be applied to the *code*, not the weights: a fingerprint of the patched tree is not published by the checkpoint
+|If a server is wrapped, the patch is the server operator's step
+|*Risk to record:* two operators with the same checkpoints can differ in code (CPU bf16 is rejected without the patch). The backend must be pinned by code commit *and* the checkpoint digest; the operator needs a documented patch step.
+
+|Quantized variants (`Aratako/Irodori-TTS-v4.1-Small-Quantized`, torchao int8/int4/fp8)
+|MIT, same inference interface
+|Not measured
+|*Benchmark first* if VRAM or CPU becomes the constraint; a 0.8 B model at int8 could plausibly fit a smaller card, and there are no published latencies for this host class.
+|===
+
+*Offline behaviour:* first load downloads the codec (410 MB) and tokenizer (8 MB) from the Hub. The checkpoint
+metadata carries the tokenizer repository, so an air-gapped install must pre-seed the HF cache with both; a
+deployment note is required. Nothing downloads at *build* time, and the project's own pipeline is unaffected.
+
+== 8. Limitations
+
+. *No naturalness evidence.* No listening test, MOS, prosody, accent or voice-quality judgement, and no human listener. The round-trip CER shows an STT can recover the words.
+. *The voice is not fixed in this record.* Every row ran `no_ref` with one seed, so each configuration is one sampled speaker, and a different seed is a different voice. A persona decision cannot be made from this record.
+. *STT errors count against the TTS,* and the ReazonSpeech instrument has its own error floor on synthetic speech (EXP-0002), so absolute CER is pessimistic and the ordering among the four configurations is within noise.
+. *The 13%-against-4.0% reading gap is not attributable.* The transcripts show lost first words, and the audio has no leading silence (onset 18-32 ms), which is consistent with both a model artefact and an STT weakness on this voice. It is too large to ignore and too ambiguous to blame on the model; only a listener can settle it.
+. *CPU rows are incomplete and confounded.* SUN was measured with one utterance through the checkpoint's own script; the 3-reply harness run did not reach its second pass in 25 minutes, and LUNA produced no reply in about 15 minutes, both at 4 threads. bf16 on a Zen 2 CPU is emulated, which is the likely dominant cause, and *fp32 CPU was not measured* (one attempt was abandoned for time). "CPU is out" therefore means "on a CPU without hardware bf16, with the cards' bf16 recipes".
+. *One GPU, one run per configuration* (run2 repeats only the first 10 replies), on a machine that also ran monitoring commands. The LUNA fp32 tail (25.5 s, 14.5 s) was not reproduced or explained.
+. *The cards' benchmark method is not reproduced.* Their CER uses kotoba-whisper and a different sentence set, their RTF a different CPU; the comparison in section 3.3 is informative, not a replication.
+. *Watermarking was off* (silentcipher not installed), so the record says nothing about the watermark's latency or its effect on the round trip. The code paths exist.
+. *Not measured:* voice cloning, captions/voice design, streaming or chunked synthesis, quantized variants, concurrency (two syntheses at once, or a synthesis next to Thinking), long replies beyond 43 characters, and the official server itself (only its README was read).
+. *Licences were read from cards, LICENSE files and repository metadata, not from legal advice.* Training data of the checkpoints, the codec and ModernBERT-JA was not read.
+
+== 9. Protocol deviations
+
+* *SUN CPU is a single utterance* through the checkpoint's own `synthesize.py` with `--threads 4`, timed end to
+  end (~250 s including ~100 s of load, 3.36 s of audio); the harness rows for CPU could not be completed.
+* *LUNA CPU produced no output* in about 15 minutes and was stopped; no number is reported for it rather than a
+  zero.
+* *Handling set on CPU:* not run (the reply rows alone did not finish).
+* *The second in-process pass* was run for every GPU row but not for the CPU rows.
+* *run2* repeats the first 10 replies and, because the runner passes `--handling-limit 0`, also the 38 handling
+  items; only the replies are compared.
+* *torch 2.11.0* instead of the `<2.11` the official pyproject pins; `sentencepiece` was not installed (the
+  tokenizer does not need it on this checkpoint); `silentcipher` was not installed.
+* *No model card reproduction:* the cards' own benchmark scripts were not run beyond `synthesize.py`.
+
+== 10. Open questions
+
+. *Q1 (voice identity).* Irodori has no named voice. Does the operator fix a seed, supply their own reference
+   clip, or use captions? A reference clip brings consent, provenance and disclosure duties with it (the same
+   question #409 leaves open).
+. *Q2 (default remains Supertonic).* Is a GPU-only, 1.1 s-per-reply optional backend worth a second install
+   path next to VOICEVOX, or should Irodori wait until the voice-quality comparison (Q4) shows it is better?
+. *Q3 (VRAM budget).* The backend needs 2.9-3.9 GB of VRAM and 6.4-6.9 GB of RSS. On an 8 GB card it does not
+   coexist with a 4-6 GB Thinking model. Which configuration does the product support: TTS on the GPU and a
+   smaller Thinking model, or TTS on a second GPU?
+. *Q4 (listening test).* Nobody has listened to SUN or LUNA, and the round-trip reading CER is about 13%
+   against the shipped engine's 4.0% (section 6.1). A small blinded comparison against Supertonic and VOICEVOX,
+   plus a check of whether the first word is actually audible, is the gate for this backend; without it the
+   issue should stay design-only.
+. *Q5 (bridge).* Wrap the official server behind a `voicevox_bridge`-style translator, or add an
+   OpenAI-`/v1/audio/speech` code path to the existing HTTP adapter? The first touches one place; the second
+   broadens a provider-neutral adapter with a provider-shaped API.
+. *Q6 (CPU later).* If a bf16-capable or AVX-512 CPU appears, or a quantized variant lands, the CPU question
+   should be re-measured rather than assumed from this record.
+. *Q7 (watermark and disclosure).* SilentCipher is MIT and the card's code watermarks when it is installed.
+   Does the operator-facing notice (and the stream) state that the voice is synthetic, and is the watermark a
+   requirement of the backend?
+
+== 11. Related
+
+* #409 (this evaluation), #295 and EXP-0003 (the VOICEVOX optional-backend precedent and the shipped engine),
+  #220 (local profile), #222 and ADR-0004 (speech-text projection), #219 (avatar renderer that consumes the audio).
+* link:../generative-fallback.adoc[Generative fallback and TTS contract], link:../production-runtime.adoc[Production runtime], link:../reuse-first.adoc[Reuse first], link:../supply-chain.adoc[Supply chain], link:../assumptions.adoc[Assumptions], +examples/benchmarks/irodori/README.md+.
