@@ -60,7 +60,8 @@ pub struct OperatorRequest {
     /// `speech_input.device`, `speech_input.duplex` (the capture device and the
     /// half/full duplex choice, #396),
     /// `persona.set`, `persona.get` (the character sheet, #401),
-    /// `memory.seed.get`, `memory.seed.set` (the operator memory seed, #402).
+    /// `memory.seed.get`, `memory.seed.set` (the operator memory seed, #402),
+    /// `panel.url` (show the operation panel URL again, #388).
     pub action: String,
     /// Opaque session secret presented by the operator client.
     pub secret: String,
@@ -100,6 +101,11 @@ pub struct OperatorResponse {
     /// `persona.get`, to the authenticated caller. Never logged or audited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persona: Option<String>,
+    /// The operation panel's launch URL (#388); present only for a successful
+    /// `panel.url`, to the authenticated caller. It carries the per-launch
+    /// panel secret: never logged or audited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panel_url: Option<String>,
 }
 
 /// A memory seed export in seed-file format (`schemas/memory-seed.schema.json`).
@@ -659,6 +665,7 @@ pub fn apply_operator_request<R: RoutePlanner>(
         && !is_tcp_avatar_action(&request.action)
         && !is_speech_input_action(&request.action)
         && !is_persona_action(&request.action)
+        && request.action != "panel.url"
     {
         let detail = format!("unknown action {}", request.action);
         app.audit_operator_action(&request_id, &request.action, &detail, false);
@@ -817,6 +824,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
                 status: Some(snapshot),
                 memory_export: None,
                 persona: None,
+                panel_url: None,
             };
         }
         // Issue #68: capture the bounded support bundle. Generation is
@@ -841,6 +849,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
             status: None,
             memory_export: None,
             persona: None,
+            panel_url: None,
         };
     }
 
@@ -858,6 +867,9 @@ fn apply_with_presented_secret<R: RoutePlanner>(
         "speech_input.control".to_owned()
     } else if is_persona_action(action) {
         "persona.configure".to_owned()
+    } else if action == "panel.url" {
+        // No new capability: the operator endpoint's own `performer.stop`.
+        "panel.url".to_owned()
     } else if action == "memory.export" || is_memory_seed_action(action) {
         "memory.admin".to_owned()
     } else {
@@ -893,6 +905,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
                     status: None,
                     memory_export: None,
                     persona: None,
+                    panel_url: None,
                 }
             }
             Err(detail) => {
@@ -922,6 +935,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
                     status: None,
                     memory_export: None,
                     persona: None,
+                    panel_url: None,
                 }
             }
             Err(detail) => {
@@ -947,6 +961,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
                     status: None,
                     memory_export: None,
                     persona: None,
+                    panel_url: None,
                 }
             }
             Err(detail) => {
@@ -970,6 +985,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
                     status: None,
                     memory_export: None,
                     persona: None,
+                    panel_url: None,
                 }
             }
             Err(detail) => {
@@ -992,6 +1008,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
                     status: None,
                     memory_export: None,
                     persona: outcome.text,
+                    panel_url: None,
                 }
             }
             Err(detail) => {
@@ -1014,6 +1031,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
                     status: None,
                     memory_export: None,
                     persona: None,
+                    panel_url: None,
                 }
             }
             Err(detail) => {
@@ -1037,6 +1055,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
                     status: None,
                     memory_export: None,
                     persona: None,
+                    panel_url: None,
                 }
             }
             Err(detail) => {
@@ -1064,6 +1083,30 @@ fn apply_with_presented_secret<R: RoutePlanner>(
                         content_hash: seed.content_hash(),
                     }),
                     persona: None,
+                    panel_url: None,
+                }
+            }
+            Err(detail) => {
+                app.audit_operator_action(&request_id, action, &detail, false);
+                rejection(&request_id, &detail)
+            }
+        };
+    }
+
+    if action == "panel.url" {
+        // Audited as the bare action: the URL carries the panel secret and is
+        // returned to the caller only.
+        return match app.reveal_panel_url(command.authority()) {
+            Ok(url) => {
+                app.audit_operator_action(&request_id, action, "panel url shown", true);
+                OperatorResponse {
+                    request_id,
+                    ok: true,
+                    detail: "panel url".to_owned(),
+                    status: None,
+                    memory_export: None,
+                    persona: None,
+                    panel_url: Some(url),
                 }
             }
             Err(detail) => {
@@ -1095,6 +1138,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
                         content_hash: export.seed.content_hash(),
                     }),
                     persona: None,
+                    panel_url: None,
                 }
             }
             Err(error) => {
@@ -1125,6 +1169,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
                 status: None,
                 memory_export: None,
                 persona: None,
+                panel_url: None,
             }
         }
         Err(error) => {
@@ -1143,6 +1188,7 @@ fn rejection(request_id: &str, detail: &str) -> OperatorResponse {
         status: None,
         memory_export: None,
         persona: None,
+        panel_url: None,
     }
 }
 
@@ -1231,6 +1277,7 @@ mod tests {
                     status: None,
                     memory_export: None,
                     persona: None,
+                    panel_url: None,
                 });
                 break;
             }
