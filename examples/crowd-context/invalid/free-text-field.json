@@ -1,0 +1,10 @@
+{
+  "schema_version": "0.1.0",
+  "class": "congratulation",
+  "member_count": 5,
+  "unique_actors_estimate": 3,
+  "intensity_milli": 100,
+  "trend": "steady",
+  "window_batches": 1,
+  "text": "hello"
+}

@@ -1,6 +1,6 @@
 use crate::{
-    DomainValidationError, EventEnvelope, EventKind, MAX_SCREEN_OBSERVATION_THINKING_BYTES,
-    SceneContextSnapshot, SourceClass, TrustLevel,
+    CrowdSummary, DomainValidationError, EventEnvelope, EventKind,
+    MAX_SCREEN_OBSERVATION_THINKING_BYTES, SceneContextSnapshot, SourceClass, TrustLevel,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -166,6 +166,12 @@ pub struct ReflexContext {
     /// so a runtime with no scene source serializes exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scene: Option<SceneContextSnapshot>,
+    /// The comment stands for a crowd (#79 S2). Closed vocabulary and counts
+    /// only, built by the runtime from its own aggregation and never from a
+    /// payload field. Omitted when absent, so a request without a crowd
+    /// serializes exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crowd: Option<CrowdSummary>,
 }
 
 impl Default for ReflexContext {
@@ -177,6 +183,7 @@ impl Default for ReflexContext {
             recent: RecentInteractionSnapshot::default(),
             now_ms: None,
             scene: None,
+            crowd: None,
         }
     }
 }
@@ -194,6 +201,9 @@ impl ReflexContext {
         self.recent.validate()?;
         if let Some(scene) = &self.scene {
             scene.validate()?;
+        }
+        if let Some(crowd) = &self.crowd {
+            crowd.validate()?;
         }
         Ok(())
     }

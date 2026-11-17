@@ -17,6 +17,7 @@
 //   .../invalid and .../inconsistent (cross-field) must REJECT; .../replay fixtures must carry schema-valid batches (#90)
 // - examples/scene-context/valid and .../inconsistent (cross-field, rejected by the Rust validator) must conform to
 //   scene-context.schema.json; .../invalid must REJECT (#88 S1)
+// - examples/crowd-context/valid must conform to crowd-context.schema.json; .../invalid must REJECT (#79 S2)
 // - examples/obs-scene-maps/valid and .../inconsistent (cross-field, rejected by the Rust loader) must conform to
 //   obs-scene-map.schema.json; .../invalid must REJECT (#88 S1)
 // - examples/speech-lexicons/valid, .../inconsistent (cross-field, rejected by the Rust loader) and the shipped
@@ -110,6 +111,7 @@ const memorySeed = validators["schemas/memory-seed.schema.json"];
 const perceptionObservation = validators["schemas/perception-observation.schema.json"];
 const sceneContext = validators["schemas/scene-context.schema.json"];
 const obsSceneMap = validators["schemas/obs-scene-map.schema.json"];
+const crowdContext = validators["schemas/crowd-context.schema.json"];
 
 function report(ok, label, validator) {
   if (ok) {
@@ -197,6 +199,7 @@ for (const [validator, validDirs, invalidDir] of [
   [speechLifecycle, ["examples/speech-lifecycle/valid"], "examples/speech-lifecycle/invalid"],
   [perceptionObservation, ["examples/perception-observations/valid"], "examples/perception-observations/invalid"],
   [sceneContext, ["examples/scene-context/valid", "examples/scene-context/inconsistent"], "examples/scene-context/invalid"],
+  [crowdContext, ["examples/crowd-context/valid"], "examples/crowd-context/invalid"],
   [obsSceneMap, ["examples/obs-scene-maps/valid", "examples/obs-scene-maps/inconsistent"], "examples/obs-scene-maps/invalid"],
   [memorySeed, ["examples/memory-seeds/valid", "examples/memory-seeds/inconsistent"], "examples/memory-seeds/invalid"],
   [speechLexicon, ["examples/speech-lexicons/valid", "examples/speech-lexicons/inconsistent", "crates/generative/data"], "examples/speech-lexicons/invalid"],

@@ -1,0 +1,9 @@
+{
+  "schema_version": "0.1.0",
+  "class": "repeated_question",
+  "member_count": 12,
+  "unique_actors_estimate": 12,
+  "intensity_milli": 500,
+  "trend": "unknown",
+  "window_batches": 1
+}

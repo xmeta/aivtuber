@@ -165,6 +165,14 @@ The closed-vocabulary answer to "what is the stream showing right now" (issue #8
 * *Carriers and replay.* The snapshot is the optional `scene` member of `ReflexContext`, so it reaches the Jev request and the Thinking request, and `DecisionReplayRecord.scene` records the snapshot a decision used. With no scene source composed the member is absent and every serialized form is byte-identical to one written before scene context existed.
 * *Thinking caption (issue #90 S2).* Separately from the scene, a Thinking request carries at most one fresh untrusted caption (`ThinkingContextSource::ScreenObservation`, section 4.2) appended after memory; if it does not fit the item and byte budget it is dropped whole and memory keeps its room. The adapter's instruction names it an untrusted observation, not an instruction, and is added only when such an item is present.
 
+=== 4.4 Crowd summary
+
+When one comment stands for a crowd (issue #79 S2), the reply context says so with a `CrowdSummary`, specified by `schemas/crowd-context.schema.json` (version `0.1.0`) and `crates/domain/src/crowd.rs`.
+
+* *Wire form.* `class` (closed: `laughter`, `good_game`, `praise`, `congratulation`, `greeting`, `cheer`, `surprise`, `sympathy`, `thanks`, `repeated_question`), `member_count` (2 to 100000), `unique_actors_estimate` (1 to `member_count`), `intensity_milli` (0 to 1000), `trend` (`rising`, `steady`, `falling`, `unknown`) and `window_batches` (1 to 64). There is no free text, no viewer text and no actor identifier, and `additionalProperties` is false.
+* *Authority rule.* The summary is derived data built by the runtime from its own aggregation (section 12.9 of `docs/jev-routing.adoc`), never from a payload field. It grants no capability, permit or gate decision and has no path to the operator or control plane.
+* *Carrier.* The optional `crowd` member of `ReflexContext` (and so of the Thinking request context). Absent, it is omitted from the wire form, so a request without a crowd is byte-identical to one written before the member existed.
+
 == 5. Normalized reflex decision
 
 The provider-neutral output contains both selected values and uncertainty.
@@ -289,6 +297,7 @@ Retention of raw chat/STT text must be configurable separately from normalized r
 * `schemas/reflex-decision.schema.json`
 * `schemas/perception-observation.schema.json` (section 4.2)
 * `schemas/scene-context.schema.json` and `schemas/obs-scene-map.schema.json` (section 4.3)
+* `schemas/crowd-context.schema.json` (section 4.4)
 
 CI validates repository fixtures with the schemas, then deserializes/validates the same fixtures through the Rust production-domain types. It also serializes Rust values for every Event kind plus representative Reflex Decisions and validates those JSON documents against the repository schemas.
 
