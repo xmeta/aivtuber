@@ -8,6 +8,7 @@ mod burst;
 mod chat_score;
 mod crowd;
 mod jev;
+mod jev_affect;
 mod jev_batch;
 mod pipeline;
 mod retrieval;
@@ -42,6 +43,7 @@ pub use jev::{
     JevCallFailure, JevCancellationToken, JevUsage, NormalizedAnswer, NormalizedResponse,
     SystemOneResponse, TransportError, UreqTransport, normalize_answers, parse_jev_response_body,
 };
+pub use jev_affect::{AFFECT_CLASS_NAMES, AffectJudgeError, JevAffectJudge};
 pub use jev_batch::{
     JevBatchRanker, JevBatchRankerConfig, JevBatchRankerConfigError, JevBatchRankerMetrics,
     MAX_BATCH_RANKER_BREAKER_COOLDOWN, MAX_BATCH_RANKER_BREAKER_THRESHOLD,

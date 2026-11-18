@@ -23,6 +23,7 @@ use serde_json::json;
 use std::error::Error;
 use std::fmt;
 mod affect;
+mod affect_judge;
 mod phrase;
 mod phrase_pipeline;
 mod phrase_stream;
@@ -31,6 +32,11 @@ mod speech_text;
 pub use affect::{
     AFFECT_INTENSITY_CAP, AFFECT_MAX_INPUT_CHARS, AffectClass, AffectConfig, AffectReading,
     AffectState, AffectStrength, classify_affect,
+};
+pub use affect_judge::{
+    AffectDecision, AffectFallbackReason, AffectJudge, AffectJudgeFailure, AffectJudgeRunner,
+    AffectJudgeStats, AffectJudgeStatus, AffectJudgeTicket, AffectSource, DEFAULT_JUDGE_HARD_CAP,
+    MAX_AFFECT_DECISIONS, MAX_JUDGE_IN_FLIGHT,
 };
 pub use phrase::{
     Delivery, MAX_PHRASES_CEILING, PHRASE_SEGMENTATION_VERSION, PhraseConfig, PhraseDelivery,
@@ -124,6 +130,12 @@ pub struct GenerationTrace {
     /// the replay identity and the `projection_passthrough_latin` metric.
     #[serde(default)]
     pub speech_projection: Option<SpeechProjectionTrace>,
+    /// Per-phrase affect decisions of the opt-in System One judge (#426):
+    /// the class and where it came from (`judge` or `rules_fallback` with a
+    /// reason), never text. Empty, and absent on the wire, unless the judge is
+    /// enabled; bounded by [`MAX_AFFECT_DECISIONS`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub affect_decisions: Vec<AffectDecision>,
 }
 
 /// Counts and identity of the speech projections made for one reply. Never
@@ -142,6 +154,12 @@ impl GenerationTrace {
     pub(crate) fn record_thinking_usage(&mut self, usage: Option<ThinkingUsage>) {
         if let Some(call) = self.llm_calls.last_mut() {
             call.usage = usage;
+        }
+    }
+
+    pub(crate) fn record_affect_decision(&mut self, decision: AffectDecision) {
+        if self.affect_decisions.len() < MAX_AFFECT_DECISIONS {
+            self.affect_decisions.push(decision);
         }
     }
 
@@ -176,6 +194,7 @@ impl Default for GenerationTrace {
             cancelled_stage: None,
             budget_denial_reason: None,
             speech_projection: None,
+            affect_decisions: Vec::new(),
         }
     }
 }
@@ -381,6 +400,7 @@ impl GenerationCancellationRegistry {
 pub struct PerformanceCompiler {
     config: PerformanceCompilerConfig,
     affect: Option<AffectConfig>,
+    affect_judge: Option<AffectJudgeRunner>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -521,6 +541,7 @@ impl PerformanceCompiler {
         Ok(Self {
             config,
             affect: None,
+            affect_judge: None,
         })
     }
 
@@ -532,6 +553,20 @@ impl PerformanceCompiler {
     pub fn with_affect(mut self, affect: AffectConfig) -> Self {
         self.affect = Some(affect);
         self
+    }
+
+    /// Opt in to the System One affect judge (#426): each phrase's judge call
+    /// runs in parallel with its synthesis and its answer is used only if it
+    /// is in when the audio is ready; otherwise the S1 rules label stands.
+    /// Only meaningful together with [`Self::with_affect`].
+    #[must_use]
+    pub fn with_affect_judge(mut self, judge: AffectJudgeRunner) -> Self {
+        self.affect_judge = Some(judge);
+        self
+    }
+
+    pub(crate) fn affect_judge(&self) -> Option<&AffectJudgeRunner> {
+        self.affect.as_ref().and(self.affect_judge.as_ref())
     }
 
     pub fn compile(
@@ -2370,6 +2405,65 @@ mod tests {
         assert_eq!(
             compile_phrases(&affected, &texts),
             compile_phrases(&affected, &texts)
+        );
+    }
+
+    /// #426: replay feeds the recorded judge classes back with no judge
+    /// runner and gets the same assets, and a phrase that fell back to the
+    /// rules label compiles exactly as without the judge.
+    #[test]
+    fn recorded_judge_classes_replay_to_identical_assets_without_a_runner() {
+        let affected = compiler().with_affect(AffectConfig::starter_pack());
+        let texts = [
+            "今日の予定を話します",
+            "次はゲームの話です",
+            "最後にお知らせです",
+        ];
+        let offers = [Some(AffectClass::Joy), None, Some(AffectClass::Surprise)];
+        let request = generation_request(7);
+        let speech = SpeechArtifact {
+            audio_ref: "audio://generated/mock.opus".to_owned(),
+            duration_ms: 1_200,
+            viseme_ref: None,
+        };
+        let thinking = MockThinking::success("x").identity();
+        let tts = MockTts::success().identity();
+        let replay = || {
+            let mut affect = AffectState::default();
+            texts
+                .iter()
+                .zip(offers)
+                .enumerate()
+                .map(|(seq, (text, offer))| {
+                    if let Some(class) = offer {
+                        affect.offer_judged_class(class);
+                    }
+                    affected
+                        .compile_phrase(
+                            &request,
+                            seq as u32,
+                            text,
+                            &speech,
+                            &thinking,
+                            &tts,
+                            &mut affect,
+                        )
+                        .expect("compile")
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = replay();
+        assert_eq!(first, replay());
+        assert!(expression_of(&first[0]).unwrap().0.starts_with("smile"));
+        assert!(expression_of(&first[2]).unwrap().0.starts_with("surprise"));
+        // The fallback phrase equals the rules-only compilation of that phrase
+        // at the same position in the same reply state.
+        let rules_only = compile_phrases(&affected, &texts);
+        assert_eq!(expression_of(&rules_only[1]), None);
+        assert_eq!(
+            expression_of(&first[1]),
+            None,
+            "neutral text holds the joy face"
         );
     }
 }

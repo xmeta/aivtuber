@@ -443,6 +443,12 @@ impl GenerativePipeline {
             text: speech_text,
             style: request.style.clone(),
         };
+        // #426: the opt-in judge call starts together with synthesis and is
+        // only polled afterwards; audio never waits for it.
+        let judge_ticket = self
+            .compiler
+            .affect_judge()
+            .map(|judge| judge.start(&approved));
         let started = Instant::now();
         let speech = self
             .synthesize(&speech_request, Some(timeout), trace)
@@ -455,6 +461,23 @@ impl GenerativePipeline {
 
         if cancellation.is_cancelled() {
             return Err(PhraseStop::Cancelled(CancellationStage::AfterTts));
+        }
+
+        // The label is fixed now, when the audio is ready.
+        if let Some(ticket) = judge_ticket {
+            let rules_class = crate::classify_affect(&approved).class;
+            let decision = match ticket.resolve() {
+                Ok(class) => {
+                    affect.offer_judged_class(class);
+                    (crate::AffectSource::Judge, class)
+                }
+                Err(reason) => (crate::AffectSource::RulesFallback(reason), rules_class),
+            };
+            trace.record_affect_decision(crate::AffectDecision {
+                seq,
+                source: decision.0,
+                class: decision.1,
+            });
         }
 
         let asset = self
@@ -1207,5 +1230,264 @@ mod tests {
         // Per-phrase overhead makes total synthesis a little longer, never
         // dramatically so; the win is first audio, not completion.
         assert!(phrased_completion < buffered_first_audio * 2);
+    }
+
+    // ---- #426: opt-in System One affect judge, in parallel with TTS ----
+
+    use crate::{
+        AffectClass, AffectConfig, AffectFallbackReason, AffectJudge, AffectJudgeFailure,
+        AffectJudgeRunner, AffectSource,
+    };
+
+    struct ScriptedJudge {
+        delay: Duration,
+        answer: Result<AffectClass, AffectJudgeFailure>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl AffectJudge for ScriptedJudge {
+        fn judge(
+            &self,
+            _text: &str,
+            _deadline: Duration,
+        ) -> Result<AffectClass, AffectJudgeFailure> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(self.delay);
+            self.answer
+        }
+    }
+
+    type JudgeScript = Option<(u64, Result<AffectClass, AffectJudgeFailure>)>;
+
+    fn judged_pipeline(
+        reply: &str,
+        tts: ScriptedTts,
+        judge: JudgeScript,
+    ) -> (
+        GenerativePipeline,
+        Option<AffectJudgeRunner>,
+        Arc<AtomicUsize>,
+    ) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut compiler = PerformanceCompiler::new(PerformanceCompilerConfig {
+            compiler_version: "0.1.0".to_owned(),
+            avatar_profile: Some("example-live2d-v1".to_owned()),
+            motion_library: Some("starter-v1".to_owned()),
+            expression_preset: Some("speaking.neutral".to_owned()),
+            expression_intensity: 0.4,
+        })
+        .expect("compiler")
+        .with_affect(AffectConfig::starter_pack());
+        let runner = judge.map(|(delay_ms, answer)| {
+            AffectJudgeRunner::new(
+                Arc::new(ScriptedJudge {
+                    delay: Duration::from_millis(delay_ms),
+                    answer,
+                    calls: Arc::clone(&calls),
+                }),
+                Duration::from_millis(500),
+            )
+            .expect("runner")
+        });
+        if let Some(runner) = &runner {
+            compiler = compiler.with_affect_judge(runner.clone());
+        }
+        let pipeline = GenerativePipeline::new(
+            Arc::new(FixedThinking(reply.to_owned())),
+            Arc::new(tts),
+            compiler,
+        );
+        (pipeline, runner, calls)
+    }
+
+    fn slow_tts(ms: u64) -> ScriptedTts {
+        let mut tts = ScriptedTts::new();
+        tts.base_delay = Duration::from_millis(ms);
+        tts
+    }
+
+    fn expressions(delivery: &RecordingDelivery) -> Vec<Option<String>> {
+        delivery
+            .units
+            .iter()
+            .map(|u| u.asset().expression.as_ref().map(|e| e.preset.clone()))
+            .collect()
+    }
+
+    fn wait_judge_idle(runner: &AffectJudgeRunner) {
+        let until = Instant::now() + Duration::from_secs(3);
+        while runner.in_flight() > 0 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(runner.in_flight(), 0, "a judge worker is still running");
+    }
+
+    #[test]
+    fn a_judge_answer_that_is_in_before_audio_picks_the_expression() {
+        // Rules read PHRASE_B as neutral; the judge says joy.
+        let (pipeline, runner, _) =
+            judged_pipeline(PHRASE_B, slow_tts(300), Some((0, Ok(AffectClass::Joy))));
+        let mut delivery = RecordingDelivery::default();
+        let result = run(
+            &pipeline,
+            &GenerationCancellationToken::default(),
+            publish,
+            &mut delivery,
+        );
+        assert!(summary(&result).completed());
+        assert_eq!(expressions(&delivery), vec![Some("smile_soft".to_owned())]);
+        let decisions = &result.trace.affect_decisions;
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].source, AffectSource::Judge);
+        assert_eq!(decisions[0].class, AffectClass::Joy);
+        assert_eq!(runner.unwrap().stats().snapshot().judged, 1);
+    }
+
+    #[test]
+    fn a_late_answer_uses_the_rules_label_and_never_delays_audio() {
+        let (pipeline, runner, _) =
+            judged_pipeline(PHRASE_B, slow_tts(20), Some((450, Ok(AffectClass::Joy))));
+        let mut delivery = RecordingDelivery::default();
+        let started = Instant::now();
+        let result = run(
+            &pipeline,
+            &GenerationCancellationToken::default(),
+            publish,
+            &mut delivery,
+        );
+        let first_audio = delivery.delivered_at[0] - started;
+        assert!(
+            first_audio < Duration::from_millis(300),
+            "audio waited for the judge: {first_audio:?}"
+        );
+        assert_eq!(
+            expressions(&delivery),
+            vec![Some("speaking.neutral".to_owned())],
+            "the rules label (neutral baseline) stands"
+        );
+        assert_eq!(
+            result.trace.affect_decisions[0].source,
+            AffectSource::RulesFallback(AffectFallbackReason::Late)
+        );
+        let runner = runner.unwrap();
+        assert_eq!(runner.stats().snapshot().late, 1);
+        wait_judge_idle(&runner);
+    }
+
+    #[test]
+    fn rate_limit_timeout_and_malformed_answers_fall_back_to_the_rules_label() {
+        for (failure, reason) in [
+            (
+                AffectJudgeFailure::RateLimited,
+                AffectFallbackReason::RateLimited,
+            ),
+            (AffectJudgeFailure::Timeout, AffectFallbackReason::Timeout),
+            (
+                AffectJudgeFailure::Malformed,
+                AffectFallbackReason::Malformed,
+            ),
+            (
+                AffectJudgeFailure::Unavailable,
+                AffectFallbackReason::Unavailable,
+            ),
+        ] {
+            let (pipeline, runner, _) =
+                judged_pipeline(PHRASE_B, slow_tts(200), Some((0, Err(failure))));
+            let mut delivery = RecordingDelivery::default();
+            let result = run(
+                &pipeline,
+                &GenerationCancellationToken::default(),
+                publish,
+                &mut delivery,
+            );
+            assert!(summary(&result).completed(), "{failure:?}");
+            assert_eq!(delivery.units.len(), 1);
+            assert_eq!(
+                result.trace.affect_decisions[0].source,
+                AffectSource::RulesFallback(reason)
+            );
+            wait_judge_idle(&runner.unwrap());
+        }
+    }
+
+    #[test]
+    fn a_cancelled_reply_leaves_no_judge_task_and_no_unit() {
+        let token = GenerationCancellationToken::default();
+        let mut tts = slow_tts(30);
+        tts.cancel_on_call = Some((0, token.clone()));
+        let (pipeline, runner, _) =
+            judged_pipeline(PHRASE_B, tts, Some((200, Ok(AffectClass::Joy))));
+        let mut delivery = RecordingDelivery::default();
+        let _ = run(&pipeline, &token, publish, &mut delivery);
+        assert!(delivery.units.is_empty());
+        let runner = runner.unwrap();
+        wait_judge_idle(&runner);
+        let status = runner.stats().snapshot();
+        assert_eq!(status.cancelled, 1);
+        assert_eq!(status.judged, 0);
+    }
+
+    #[test]
+    fn judged_replies_replay_to_identical_assets() {
+        let run_once = || {
+            let (pipeline, runner, _) = judged_pipeline(
+                &three_phrase_reply(),
+                slow_tts(250),
+                Some((2, Ok(AffectClass::Surprise))),
+            );
+            let mut delivery = RecordingDelivery::default();
+            let result = run(
+                &pipeline,
+                &GenerationCancellationToken::default(),
+                publish,
+                &mut delivery,
+            );
+            wait_judge_idle(&runner.unwrap());
+            (
+                delivery
+                    .units
+                    .iter()
+                    .map(|u| serde_json::to_string(u.asset()).unwrap())
+                    .collect::<Vec<_>>(),
+                result.trace.affect_decisions,
+            )
+        };
+        let first = run_once();
+        assert_eq!(first, run_once());
+        assert!(first.1.iter().all(|d| d.source == AffectSource::Judge));
+    }
+
+    #[test]
+    fn without_a_judge_nothing_changes_and_no_trace_field_is_written() {
+        let (plain, none, calls) = judged_pipeline(&three_phrase_reply(), ScriptedTts::new(), None);
+        assert!(none.is_none());
+        let mut delivery = RecordingDelivery::default();
+        let result = run(
+            &plain,
+            &GenerationCancellationToken::default(),
+            publish,
+            &mut delivery,
+        );
+        assert!(summary(&result).completed());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(result.trace.affect_decisions.is_empty());
+        let json = serde_json::to_value(&result.trace).unwrap();
+        assert!(json.get("affect_decisions").is_none());
+        // The rules-only expressions equal those of the same pipeline when a
+        // judge that always fails is attached (fallback is the S1 label).
+        let (failing, runner, _) = judged_pipeline(
+            &three_phrase_reply(),
+            slow_tts(40),
+            Some((0, Err(AffectJudgeFailure::Unavailable))),
+        );
+        let mut delivery_failing = RecordingDelivery::default();
+        let _ = run(
+            &failing,
+            &GenerationCancellationToken::default(),
+            publish,
+            &mut delivery_failing,
+        );
+        assert_eq!(expressions(&delivery), expressions(&delivery_failing));
+        wait_judge_idle(&runner.unwrap());
     }
 }

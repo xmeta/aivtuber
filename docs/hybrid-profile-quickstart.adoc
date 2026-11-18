@@ -123,6 +123,10 @@ It is a decimal number of USD, greater than 0 and at most 10000, up to six decim
 * A reply already in flight when the cap is reached still completes, so you can overshoot by one reply.
 * The cap resets when you restart the app. For a ceiling that survives restarts, set a credit limit on the key at openrouter.ai.
 
+== Optional: System One affect judgement (not offered here)
+
++AIVTUBER_AFFECT_JUDGE=system-one+ (#426) sends the text of each reply phrase to the System One provider to pick the expression, in parallel with speech and never delaying it. It is an opt-in for +AIVTUBER_MODE=full+ only, with +AIVTUBER_JEV_API_KEY+ set. This profile refuses it at start: nothing but Thinking may leave the machine here. Leave it unset (+rules+, the default) and expressions come from the local rules classifier. Details: link:production-runtime.adoc[production runtime], link:security-threat-model.adoc[threat model section 10.4].
+
 == If something goes wrong
 
 [cols="2,4",options="header"]

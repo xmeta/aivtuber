@@ -242,6 +242,22 @@ pub struct PhraseCommitRecord {
     pub text_chars: usize,
     /// Wall time TTS took for this phrase (measurement only).
     pub synthesis_ms: u64,
+    /// Where this phrase's expression class came from (#426): the System One
+    /// judge or the rules fallback with its reason. `None` unless the opt-in
+    /// judge is composed. Class and source only, never text.
+    pub affect: Option<aivtuber_generative::AffectDecision>,
+}
+
+/// The affect decision the pipeline recorded for phrase `seq` in `trace`.
+pub(crate) fn affect_decision_for(
+    trace: &GenerationTrace,
+    seq: u32,
+) -> Option<aivtuber_generative::AffectDecision> {
+    trace
+        .affect_decisions
+        .iter()
+        .find(|d| d.seq == seq)
+        .copied()
 }
 
 /// The replayable record of one phrased reply: which phrases passed the
@@ -692,6 +708,7 @@ where
                 gate,
                 text_chars: text.chars().count(),
                 synthesis_ms,
+                affect: affect_decision_for(&trace, seq),
             });
             run.committed.push(CommittedPhrase {
                 seq,

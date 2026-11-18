@@ -31,7 +31,10 @@ const JA_NEGATION_WINDOW: usize = 6;
 /// Tokens before an English keyword scanned for a negator.
 const EN_NEGATION_TOKENS: usize = 3;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum AffectClass {
     Neutral,
     Joy,
@@ -491,9 +494,19 @@ impl AffectConfig {
 pub struct AffectState {
     last: Option<AffectClass>,
     held: u8,
+    /// The judge's class for the phrase about to be planned (#426), consumed
+    /// by the next [`Self::plan`]. Never carried across phrases.
+    offered: Option<AffectClass>,
 }
 
 impl AffectState {
+    /// Offer the System One judge's class for the next phrase (#426). The next
+    /// [`Self::plan`] uses it in place of the rules class; the strength still
+    /// comes from the rules reading when both agree, otherwise it is mild.
+    pub fn offer_judged_class(&mut self, class: AffectClass) {
+        self.offered = Some(class);
+    }
+
     /// Decide the expression start for one phrase, or `None` to keep the face
     /// already showing. `neutral` is the compiler's baseline expression.
     ///
@@ -510,10 +523,19 @@ impl AffectState {
         text: &str,
         neutral: &ExpressionTrack,
     ) -> Option<ExpressionTrack> {
+        let offered = self.offered.take();
         if seq == 0 {
             *self = Self::default();
         }
-        let reading = classify_affect(text);
+        let rules = classify_affect(text);
+        let reading = match offered {
+            Some(class) if class == rules.class => rules,
+            Some(class) => AffectReading {
+                class,
+                strength: AffectStrength::Mild,
+            },
+            None => rules,
+        };
         let picked = config.pick(reading);
         // A class the pack cannot play is neutral, for the state machine too.
         let class = if picked.is_some() {

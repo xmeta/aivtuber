@@ -144,6 +144,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         thinking_egress_host,
         thinking_endpoint_is_loopback,
         thinking_meter,
+        affect_judge_stats,
     } = build_generative_runtime(
         &compatibility,
         retention,
@@ -194,6 +195,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let voice_controller = voice_controller.filter(|_| generative.is_some());
     // #367: the usage totals only exist next to a composed generative path.
     let thinking_meter = thinking_meter.filter(|_| generative.is_some());
+    let affect_judge_stats = affect_judge_stats.filter(|_| generative.is_some());
     let adaptation = build_adaptation_runtime(retention)?;
     let scheduler_config = retention.scheduler_config(SchedulerConfig::default());
     let security_config = retention.security_config(SecurityRuntimeConfig::default());
@@ -337,6 +339,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     if let Some(meter) = thinking_meter {
         app = app.with_thinking_meter(meter);
+    }
+    if let Some(stats) = affect_judge_stats {
+        app = app.with_affect_judge_stats(stats);
     }
     if let Some(controller) = voice_controller {
         if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
@@ -1904,6 +1909,8 @@ struct GenerativeParts {
     thinking_endpoint_is_loopback: bool,
     /// #367: Thinking usage totals and the optional spend cap.
     thinking_meter: Option<aivtuber_app::ThinkingMeter>,
+    /// #426: counters of the opt-in System One affect judge.
+    affect_judge_stats: Option<aivtuber_generative::AffectJudgeStats>,
 }
 
 /// The environment-selected TTS bridges and the directories the voice
@@ -1939,6 +1946,7 @@ fn build_generative_runtime(
             thinking_egress_host: None,
             thinking_endpoint_is_loopback: true,
             thinking_meter: None,
+            affect_judge_stats: None,
         });
     }
 
@@ -2157,12 +2165,55 @@ fn build_generative_runtime(
     // #84 S1: the text-to-affect classifier picks the expression of generated
     // replies from what the loaded pack ships. `AIVTUBER_AFFECT_EXPRESSION=false`
     // restores the fixed baseline expression.
-    let compiler = if env_bool("AIVTUBER_AFFECT_EXPRESSION", true)? {
+    let affect_expression = env_bool("AIVTUBER_AFFECT_EXPRESSION", true)?;
+    let compiler = if affect_expression {
         compiler.with_affect(AffectConfig::new(pack_expression_presets(
             &pack_root.join("descriptors"),
         )))
     } else {
         compiler
+    };
+    // #426: opt-in System One affect judgement, in parallel with TTS. Default
+    // `rules` composes nothing; the S1 classifier is then unchanged.
+    let affect_judge_mode = aivtuber_app::AffectJudgeMode::parse(
+        env_optional(aivtuber_app::AFFECT_JUDGE_VAR).as_deref(),
+    )?;
+    affect_judge_mode.validate(
+        profile.as_str(),
+        profile.jev(),
+        affect_expression,
+        env_optional("AIVTUBER_JEV_API_KEY").is_some_and(|key| !key.trim().is_empty()),
+        phrase_mode.is_phrased(),
+    )?;
+    let (compiler, affect_judge_stats) = match affect_judge_mode {
+        aivtuber_app::AffectJudgeMode::Rules => (compiler, None),
+        aivtuber_app::AffectJudgeMode::SystemOne => {
+            let hard_cap = Duration::from_millis(env_u64(
+                aivtuber_app::AFFECT_JUDGE_DEADLINE_VAR,
+                aivtuber_generative::DEFAULT_JUDGE_HARD_CAP.as_millis() as u64,
+            )?);
+            let adapter = JevAdapter::new(
+                JevAdapterConfig {
+                    endpoint: env_string(
+                        "AIVTUBER_JEV_ENDPOINT",
+                        "https://api.typesafe.ai/v1/systemone",
+                    ),
+                    model_alias: env_string("AIVTUBER_JEV_MODEL", "jev-latest"),
+                    ..JevAdapterConfig::default()
+                },
+                JevApiKey::new(env_optional("AIVTUBER_JEV_API_KEY").unwrap_or_default())?,
+            )?;
+            let runner = aivtuber_generative::AffectJudgeRunner::new(
+                Arc::new(aivtuber_app::SystemOneAffectJudge::new(
+                    aivtuber_reflex::JevAffectJudge::new(adapter),
+                )),
+                hard_cap,
+            )?;
+            // Always printed: this is data leaving the machine.
+            eprintln!("{}", aivtuber_app::affect_judge_startup_notice(hard_cap));
+            let stats = runner.stats();
+            (compiler.with_affect_judge(runner), Some(stats))
+        }
     };
 
     // #360: the voice settings share the adapter's target slot (clones follow a
@@ -2233,6 +2284,7 @@ fn build_generative_runtime(
         thinking_egress_host,
         thinking_endpoint_is_loopback,
         thinking_meter: Some(thinking_meter),
+        affect_judge_stats,
     })
 }
 
