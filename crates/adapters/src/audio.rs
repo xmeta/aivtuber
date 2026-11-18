@@ -35,6 +35,9 @@ impl Default for ProcessAudioConfig {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioPlayRequest {
+    /// 呼び出し側（アプリ層の generation 等）が割り当てる任意の再生識別子 (#354)。
+    /// キューに先行投入された未開始フレーズのリコールに使用する。
+    pub id: Option<u64>,
     pub audio_ref: String,
     pub speed_factor: f64,
     /// A later phrase of a reply that is already playing (#83 S3d). A backend
@@ -78,6 +81,12 @@ pub trait AudioPlayer: Send + Sync {
     /// lookahead early. The default is `false`: the command is handed over at
     /// its logical start, as for the process player.
     fn supports_gapless_queue(&self) -> bool {
+        false
+    }
+
+    /// まだ最初のサンプルが出力されていないキュー内アイテムを識別子で取り消す (#354)。
+    fn cancel_queued(&self, id: u64) -> bool {
+        let _ = id;
         false
     }
 }

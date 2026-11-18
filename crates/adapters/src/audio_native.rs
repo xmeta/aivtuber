@@ -29,7 +29,7 @@ use rodio::{ChannelCount, Decoder, Player, SampleRate, Source};
 use rodio::{DeviceSinkBuilder, MixerDeviceSink};
 use std::fs::File;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
@@ -39,26 +39,55 @@ use std::time::Duration;
 /// state; the third is slack for a short phrase.
 pub const MAX_QUEUED_PHRASES: usize = 3;
 
+/// リコール済みだがオーディオミキサーがまだ取り出していないソースを含めた
+/// 生の `rodio::Player` キュー上限（有界性維持のため）。
+const MAX_RAW_APPENDED: usize = MAX_QUEUED_PHRASES * 2;
+
+const ITEM_QUEUED: u8 = 0;
+const ITEM_STARTED: u8 = 1;
+const ITEM_CANCELLED: u8 = 2;
+const ITEM_DRAINED: u8 = 3;
+
 /// Passes samples through until it is asked to drop unstarted audio. Once its
 /// first sample has been produced it always plays on (the phrase being faded
 /// out belongs to the fade, not to the drop).
 struct DropUnstarted<S> {
     inner: S,
     drop_unstarted: Arc<AtomicBool>,
-    started: bool,
+    state: Arc<AtomicU8>,
+    local_started: bool,
 }
 
 impl<S: Source> Iterator for DropUnstarted<S> {
     type Item = S::Item;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if !self.started {
+        if !self.local_started {
             if self.drop_unstarted.load(Ordering::Acquire) {
+                self.state.store(ITEM_DRAINED, Ordering::Release);
                 return None;
             }
-            self.started = true;
+            if self
+                .state
+                .compare_exchange(
+                    ITEM_QUEUED,
+                    ITEM_STARTED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                // リコール済みのため1サンプルも出力せず終了する
+                self.state.store(ITEM_DRAINED, Ordering::Release);
+                return None;
+            }
+            self.local_started = true;
         }
-        self.inner.next()
+        let sample = self.inner.next();
+        if sample.is_none() {
+            self.state.store(ITEM_DRAINED, Ordering::Release);
+        }
+        sample
     }
 }
 
@@ -83,6 +112,7 @@ impl<S: Source> Source for DropUnstarted<S> {
 struct Slot {
     player: Player,
     drop_unstarted: Arc<AtomicBool>,
+    items: Vec<(Option<u64>, Arc<AtomicU8>)>,
 }
 
 impl Slot {
@@ -90,7 +120,22 @@ impl Slot {
         Self {
             player: Player::connect_new(mixer),
             drop_unstarted: Arc::new(AtomicBool::new(false)),
+            items: Vec::new(),
         }
+    }
+
+    fn prune(&mut self) {
+        self.items
+            .retain(|(_, state)| state.load(Ordering::Acquire) != ITEM_DRAINED);
+    }
+
+    fn live_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|(_, state)| {
+                matches!(state.load(Ordering::Acquire), ITEM_QUEUED | ITEM_STARTED)
+            })
+            .count()
     }
 
     /// End everything at once: queued phrases never start, the audible one is
@@ -148,7 +193,8 @@ impl GaplessQueue {
     pub fn queued(&self) -> usize {
         lock(&self.slot)
             .as_ref()
-            .map_or(0, |slot| slot.player.len())
+            .filter(|slot| !slot.player.empty())
+            .map_or(0, Slot::live_count)
     }
 
     pub fn is_idle(&self) -> bool {
@@ -162,6 +208,31 @@ impl GaplessQueue {
         }
     }
 
+    /// 最初のサンプルがまだ再生されていないキュー内アイテムを取り消す (#354)。
+    pub fn cancel_queued(&self, id: u64) -> bool {
+        let mut slot_guard = lock(&self.slot);
+        let Some(slot) = slot_guard.as_mut() else {
+            return false;
+        };
+        slot.prune();
+        let mut cancelled = false;
+        for (item_id, state) in &slot.items {
+            if *item_id == Some(id)
+                && state
+                    .compare_exchange(
+                        ITEM_QUEUED,
+                        ITEM_CANCELLED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+            {
+                cancelled = true;
+            }
+        }
+        cancelled
+    }
+
     /// Queue one already-decoded source. `play` is the file-backed entry.
     pub fn enqueue<S>(
         &self,
@@ -172,10 +243,24 @@ impl GaplessQueue {
     where
         S: Source + Send + 'static,
     {
+        self.enqueue_with_id(None, source, speed_factor, continuation)
+    }
+
+    /// 識別子付きでデコード済みソースをキューに追加する (#354)。
+    pub fn enqueue_with_id<S>(
+        &self,
+        id: Option<u64>,
+        source: S,
+        speed_factor: f64,
+        continuation: bool,
+    ) -> Result<(), EngineError>
+    where
+        S: Source + Send + 'static,
+    {
         let mut slot = lock(&self.slot);
         // A fresh performance replaces whatever still plays (as before this
         // slice); a continuation, or a player that already drained, is reused.
-        let current = match slot.take() {
+        let mut current = match slot.take() {
             Some(previous) if continuation || previous.player.empty() => previous,
             Some(previous) => {
                 previous.hard_stop();
@@ -183,7 +268,8 @@ impl GaplessQueue {
             }
             None => Slot::new(&self.mixer),
         };
-        if current.player.len() >= MAX_QUEUED_PHRASES {
+        current.prune();
+        if current.live_count() >= MAX_QUEUED_PHRASES || current.player.len() >= MAX_RAW_APPENDED {
             self.refused_queue_full.fetch_add(1, Ordering::Relaxed);
             *slot = Some(current);
             return Err(engine_error(
@@ -191,10 +277,13 @@ impl GaplessQueue {
                 "native audio queue is full",
             ));
         }
+        let state = Arc::new(AtomicU8::new(ITEM_QUEUED));
+        current.items.push((id, Arc::clone(&state)));
         current.player.append(DropUnstarted {
             inner: source.speed((1.0 / speed_factor) as f32),
             drop_unstarted: Arc::clone(&current.drop_unstarted),
-            started: false,
+            state,
+            local_started: false,
         });
         *slot = Some(current);
         Ok(())
@@ -227,7 +316,12 @@ impl AudioPlayer for GaplessQueue {
                 format!("failed to decode native audio file: {error}"),
             )
         })?;
-        self.enqueue(source, request.speed_factor, request.continuation)
+        self.enqueue_with_id(
+            request.id,
+            source,
+            request.speed_factor,
+            request.continuation,
+        )
     }
 
     /// A real fade: the volume ramps linearly to zero in 10 ms steps on a
@@ -239,7 +333,7 @@ impl AudioPlayer for GaplessQueue {
             return Ok(AudioStopOutcome::NothingPlaying);
         };
         slot.drop_unstarted.store(true, Ordering::Release);
-        if slot.player.empty() {
+        if slot.player.empty() || slot.live_count() == 0 {
             slot.hard_stop();
             return Ok(AudioStopOutcome::NothingPlaying);
         }
@@ -264,6 +358,10 @@ impl AudioPlayer for GaplessQueue {
 
     fn supports_gapless_queue(&self) -> bool {
         true
+    }
+
+    fn cancel_queued(&self, id: u64) -> bool {
+        GaplessQueue::cancel_queued(self, id)
     }
 }
 
@@ -322,6 +420,11 @@ impl RodioAudioPlayer {
     pub fn refused_queue_full(&self) -> u64 {
         self.queue.refused_queue_full()
     }
+
+    /// 最初のサンプルがまだ再生されていないキュー内アイテムを取り消す (#354)。
+    pub fn cancel_queued(&self, id: u64) -> bool {
+        self.queue.cancel_queued(id)
+    }
 }
 
 #[cfg(feature = "native-audio-spike")]
@@ -336,5 +439,9 @@ impl AudioPlayer for RodioAudioPlayer {
 
     fn supports_gapless_queue(&self) -> bool {
         true
+    }
+
+    fn cancel_queued(&self, id: u64) -> bool {
+        self.queue.cancel_queued(id)
     }
 }

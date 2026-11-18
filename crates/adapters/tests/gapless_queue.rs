@@ -75,6 +75,17 @@ impl Rig {
             .expect("play");
     }
 
+    fn play_id(&self, id: u64, name: &str, speed_factor: f64, continuation: bool) {
+        self.queue
+            .play(&AudioPlayRequest {
+                id: Some(id),
+                audio_ref: format!("audio://{name}"),
+                speed_factor,
+                continuation,
+            })
+            .expect("play");
+    }
+
     fn try_play(
         &self,
         name: &str,
@@ -82,6 +93,7 @@ impl Rig {
         continuation: bool,
     ) -> Result<(), aivtuber_domain::EngineError> {
         self.queue.play(&AudioPlayRequest {
+            id: None,
             audio_ref: format!("audio://{name}"),
             speed_factor,
             continuation,
@@ -346,5 +358,52 @@ fn a_fresh_performance_replaces_what_is_still_playing() {
     assert!(
         last_a.is_none_or(|index| index < first_c),
         "A does not play on under C"
+    );
+}
+
+#[test]
+fn a_preempted_continuation_recalled_before_its_first_sample_is_never_audible() {
+    let (mut rig, root) = rig("recall");
+    let (n, m, k) = (4_800_u32, 3_600_u32, 2_400_u32);
+    write_wav(&root, "a.wav", A, n);
+    write_wav(&root, "b.wav", B, m);
+    write_wav(&root, "c.wav", C, k);
+
+    // キュー上限 (MAX_QUEUED_PHRASES == 3) まで積む。
+    rig.play_id(1, "a.wav", 1.0, false);
+    rig.play_id(2, "b.wav", 1.0, true);
+    rig.play_id(99, "b.wav", 1.0, true);
+    assert_eq!(rig.queue.queued(), MAX_QUEUED_PHRASES);
+
+    // フレーズ A の先頭 1,000 サンプルを再生開始させる。
+    let before = rig.pull(1_000);
+    assert!(before.contains(&a()), "フレーズ A が再生開始していること");
+
+    // すでに開始済みの A はリコール不可、未開始の B とダミーはリコール可能。
+    assert!(!rig.queue.cancel_queued(1));
+    assert!(rig.queue.cancel_queued(2));
+    assert!(!rig.queue.cancel_queued(2), "2回目のリコールは false");
+    assert!(rig.queue.cancel_queued(99));
+    assert_eq!(rig.queue.queued(), 1);
+
+    // リコールでスロットが空いたため、新しい継続フレーズ C が Overloaded にならず追加できる。
+    rig.play_id(3, "c.wav", 1.0, true);
+    assert_eq!(rig.queue.queued(), 2);
+
+    let after = rig.pull(20_000);
+    let mut samples = before;
+    samples.extend(after);
+
+    assert!(
+        !samples.contains(&b()),
+        "リコールされたフレーズ B は 1 サンプルも再生されてはならない"
+    );
+    let a_start = first_audible(&samples);
+    assert_eq!(run_of(&samples, a_start, a()), n as usize);
+    let c_start = a_start + n as usize;
+    assert_eq!(
+        run_of(&samples, c_start, c()),
+        k as usize,
+        "A の直後からギャップ 0 で C が再生される"
     );
 }

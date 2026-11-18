@@ -96,6 +96,7 @@ Design::
 * The app releases a continuation command to a backend that declares `AudioPlayer::supports_gapless_queue()` (`AudioOutput::gapless_queue()`) `AUDIO_LOOKAHEAD_MS` (250 ms, a constant) before its logical `at_ms`. `ProcessAudioPlayer` does not declare it and keeps the hand-over at the logical start.
 * The logical clock is unchanged (ADR-0004 D-6): `Started` is written by the scheduler at the logical `at_ms`; backend acceptance during the lookahead strengthens only the basis of `Finished` and never emits `Started`.
 * Operator stop and barge-in end the shared player through the existing `AudioOutput::stop` primitive inside the 100 ms `AUDIO_STOP_BOUND`: queued-ahead phrases are dropped at the instant of the call (a source that has not produced a sample yet yields nothing), the audible phrase fades, the player is dropped, and the next `play` builds a new player. `Player::clear` is never called (it blocks until the queue drains) and nothing is appended to a stopped player (`append` blocks then too). The scheduler cancels the queued-ahead phrases as `Cancelled` (reached `committed`) in the speech lifecycle.
+* Preemption inside the 250 ms lookahead (#354): `AudioPlayRequest::id` carries the scheduler generation, and `ProductionApp::reconcile_early_audio` recalls a pre-handed continuation via `AudioPlayer::cancel_queued(id)` (`AudioOutput::recall_queued`) whenever it is cancelled before its logical start without stopping the currently playing phrase. `DropUnstarted` marks the queued source cancelled atomically so zero samples are produced. `ProductionApp::record_spoken_text` for early-handed continuations is deferred until the command reaches its logical `Started` time, so neither preempted nor stopped continuations appear in `recent_replies`.
 
 Measured (device-free, `cargo test --locked -p aivtuber-adapters --features gapless-queue --test gapless_queue -- --nocapture`; the queue runs on rodio's offline mixer and the test pulls it sample by sample, so the numbers are exact, not timed):
 
@@ -114,6 +115,8 @@ Measured (device-free, `cargo test --locked -p aivtuber-adapters --features gapl
 |call returns in 88 microseconds (offline mixer; on a device 58 microseconds in `audio_stop`); neither queued phrase produces a sample; silent after the fade; the next play is audible on a new player
 |Speed 0.5 on the continuation
 |phrase A intact (4800); B starts immediately behind it and plays at about half its length (rodio's resampler: 2400 expected, 2656 observed in a probe), so exactness is claimed at speed 1.0 only
+|Preemption recall inside the lookahead (#354)
+|0 samples of the recalled phrase are pulled; queued count drops immediately so a replacement continuation chains at 0 gap after A
 |===
 
 What this establishes: with the next phrase already appended, rodio's queue plus mixer introduce no silence at the boundary *in the sample stream*, for 16-bit mono WAV at 48 kHz and a sink at the same rate, and the lookahead makes "already appended" the normal case. It also establishes the stop semantics above against the real queue code.
@@ -124,8 +127,7 @@ What it does not establish (needs a manual DAC-level measurement, see the PR for
 * Opus/other codecs (only WAV was used; a decoder that reports a different span length could add padding);
 * sample-rate conversion cases (phrase rate different from the device rate, speed other than 1.0);
 * drift between the logical timeline and the device: a phrase's logical end is `start + duration_ms` as reported by TTS, while the device plays the actual samples, so a phrase whose file is longer or shorter than its reported duration shifts the audible chain relative to the logical one (`Started` is logical by design; no drift correction exists);
-* the stop latency to silence at the speaker (the call returns at once and the fade is at most 150 ms, but the device buffer after it is not measured);
-* a preemption that cancels a queued continuation inside its 250 ms window: the already handed-over phrase is not recalled (operator stop and barge-in are handled because they stop the whole player).
+* the stop latency to silence at the speaker (the call returns at once and the fade is at most 150 ms, but the device buffer after it is not measured).
 
 == Device and deployment behavior
 

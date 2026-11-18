@@ -985,6 +985,7 @@ fn a_failed_resynthesis_leaves_the_stale_asset_playable_and_is_not_retried() {
 struct QueueingAudio {
     handed: Arc<Mutex<Vec<AudioPlaybackCommand>>>,
     stops: Arc<Mutex<Vec<u32>>>,
+    recalled: Arc<Mutex<Vec<u64>>>,
     gapless: bool,
 }
 
@@ -993,6 +994,7 @@ impl QueueingAudio {
         Self {
             handed: Arc::new(Mutex::new(Vec::new())),
             stops: Arc::new(Mutex::new(Vec::new())),
+            recalled: Arc::new(Mutex::new(Vec::new())),
             gapless,
         }
     }
@@ -1011,6 +1013,11 @@ impl AudioOutput for QueueingAudio {
 
     fn gapless_queue(&self) -> bool {
         self.gapless
+    }
+
+    fn recall_queued(&mut self, generation: u64) -> bool {
+        self.recalled.lock().unwrap().push(generation);
+        true
     }
 }
 
@@ -1071,6 +1078,10 @@ fn a_gapless_output_gets_the_continuation_one_lookahead_early_and_started_stays_
             .all(|event| !matches!(event.phase, aivtuber_domain::SpeechPhase::Started)),
         "no Started during the lookahead: {p1:?}"
     );
+    // 先行受け渡し時点ではフレーズ 2 のテキストはまだ recent_replies に記録されない。
+    let early_replies: Vec<_> = rig.app.recent_replies().items().collect();
+    assert_eq!(early_replies.len(), 1);
+    assert_eq!(early_replies[0].text, PHRASE_A);
 
     // Started arrives on the logical clock, stamped with the logical start.
     rig.app.tick(a_ms);
@@ -1082,6 +1093,10 @@ fn a_gapless_output_gets_the_continuation_one_lookahead_early_and_started_stays_
     assert_eq!(started.len(), 1);
     assert_eq!(started[0].at_ms, a_ms);
     assert_eq!(audio_count(&rig), 2, "not handed over twice");
+    // 論理 Started 到達時にフレーズ 2 のテキストが結合記録される。
+    let started_replies: Vec<_> = rig.app.recent_replies().items().collect();
+    assert_eq!(started_replies.len(), 1);
+    assert_eq!(started_replies[0].text, format!("{PHRASE_A}{PHRASE_B}"));
 }
 
 #[test]
@@ -1155,6 +1170,162 @@ fn an_operator_stop_inside_the_lookahead_stops_the_output_and_cancels_the_queued
         audio_count(&rig),
         2,
         "nothing is handed over after the stop"
+    );
+    let stopped_replies: Vec<_> = rig.app.recent_replies().items().collect();
+    assert_eq!(stopped_replies.len(), 1);
+    assert_eq!(
+        stopped_replies[0].text, PHRASE_A,
+        "停止前に未開始だったフレーズ 2 は記録されない"
+    );
+}
+
+#[derive(Clone)]
+struct DonationPreemptRouter {
+    generate: FixedGenerateRoute,
+}
+
+impl RoutePlanner for DonationPreemptRouter {
+    fn route(&mut self, event: &EventEnvelope) -> Result<PlaybackRoute, AppError> {
+        if event.kind == aivtuber_domain::EventKind::ChatDonation {
+            Ok(PlaybackRoute::AssetId("reaction.surprise.01".to_owned()))
+        } else {
+            self.generate.route(event)
+        }
+    }
+}
+
+#[test]
+fn a_preemption_inside_the_lookahead_recalls_the_queued_continuation_and_agrees_with_lifecycle() {
+    let audio = QueueingAudio::new(true);
+    let audio_log = Arc::clone(&audio.handed);
+    let security = SecurityRuntime::new(
+        SecurityRuntimeConfig::default(),
+        SchedulerConfig {
+            min_reaction_spacing_ms: 0,
+            ..SchedulerConfig::default()
+        },
+        SecretRedactor::default(),
+        None,
+    )
+    .expect("security runtime");
+    let runtime = generative_runtime(
+        MockThinking {
+            reply: three_phrase_reply(),
+            failure: None,
+        },
+        PhraseTts::new(),
+    )
+    .with_phrase_mode(phrased())
+    .expect("phrase mode");
+    let mut app = ProductionApp::new(
+        security,
+        performer(),
+        LocalVisemeStore::new(pack_root()),
+        DonationPreemptRouter {
+            generate: FixedGenerateRoute {
+                reply_context: ReflexContext::default(),
+                fallback_variant_group: None,
+            },
+        },
+        Box::new(audio.clone()),
+        Box::new(RecordingAvatar::default()),
+        Box::new(NoopStreamOutput),
+        250,
+    )
+    .with_generation(runtime);
+    app.startup().expect("startup");
+
+    // 3 フレーズ返信を開始し、フレーズ 1・2 がスケジュールされるまで進める。
+    let chat_raw = serde_json::to_vec(&chat_event(30)).expect("chat json");
+    app.process_content_bytes(&chat_raw, 0, 30)
+        .expect("generation submission");
+    for _ in 0..5_000 {
+        app.tick(0);
+        let phrase_count = app
+            .performer()
+            .scheduler()
+            .items()
+            .iter()
+            .filter(|item| item.phrase.is_some())
+            .count();
+        if phrase_count == 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // lookahead ウィンドウでフレーズ 2 が先行受け渡しされる。
+    let a_ms = duration_of(PHRASE_A);
+    app.tick(a_ms - AUDIO_LOOKAHEAD_MS);
+    let handed_before = audio_log.lock().unwrap().clone();
+    assert_eq!(handed_before.len(), 2);
+    assert_eq!(handed_before[1].event_id, "evt-30#p1");
+    let _ = app.drain_speech_lifecycle(usize::MAX);
+
+    // プリエンプション（高優先度の ChatDonation）を lookahead ウィンドウ内で投入する。
+    let mut donation = chat_event(99);
+    donation.kind = aivtuber_domain::EventKind::ChatDonation;
+    donation.source_class = aivtuber_domain::SourceClass::Donation;
+    let donation_raw = serde_json::to_vec(&donation).expect("donation json");
+    app.process_content_bytes(&donation_raw, a_ms - AUDIO_LOOKAHEAD_MS + 10, 99)
+        .expect("donation ingress");
+
+    // 再生中のフレーズ 1 は全体停止されず、先行投入済みのフレーズ 2 のみがリコールされる。
+    assert_eq!(
+        audio.recalled.lock().unwrap().as_slice(),
+        &[handed_before[1].generation],
+        "先行投入されたフレーズ 2 の generation がリコールされる"
+    );
+    assert!(
+        audio.stops.lock().unwrap().is_empty(),
+        "再生中のフレーズ 1 に対して AudioPlayer::stop は呼ばれない"
+    );
+
+    // 論理開始時刻を越えてディスパッチ遅延上限 (250 ms) 以内の刻みで進める。
+    app.tick(a_ms);
+    app.tick(a_ms + 100);
+    app.tick(a_ms + 200);
+    app.tick(a_ms + 300);
+
+    let events = app.drain_speech_lifecycle(usize::MAX);
+    let p0 = lifecycle_of(&events, "evt-30");
+    assert!(
+        p0.iter()
+            .any(|event| matches!(event.phase, aivtuber_domain::SpeechPhase::Finished)),
+        "フレーズ 1 は Finished まで完了する: {p0:?}"
+    );
+    let p1 = lifecycle_of(&events, "evt-30#p1");
+    assert!(
+        p1.iter()
+            .all(|event| !matches!(event.phase, aivtuber_domain::SpeechPhase::Started)),
+        "フレーズ 2 は Started になってはならない: {p1:?}"
+    );
+    assert!(
+        p1.iter().any(|event| matches!(
+            event.phase,
+            aivtuber_domain::SpeechPhase::Cancelled {
+                reason: aivtuber_domain::SpeechCancelReason::Superseded,
+                reached: aivtuber_domain::SpeechReached::Committed,
+                spoken_ms: None,
+            }
+        )),
+        "フレーズ 2 は Superseded/Committed で Cancelled になる: {p1:?}"
+    );
+
+    let replies: Vec<_> = app.recent_replies().items().collect();
+    let chat_reply = replies
+        .iter()
+        .find(|item| item.event_id == "evt-30")
+        .expect("フレーズ 1 のテキストが記録されていること");
+    assert_eq!(
+        chat_reply.text, PHRASE_A,
+        "プリエンプトされたフレーズ 2 のテキストは記録されない"
+    );
+
+    let handed_after = audio_log.lock().unwrap().clone();
+    assert!(
+        handed_after.iter().any(|cmd| cmd.event_id == "evt-99"),
+        "後続の Donation が再生コマンドとして渡されること: {handed_after:?}"
     );
 }
 

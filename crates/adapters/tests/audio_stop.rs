@@ -36,6 +36,7 @@ fn player(name: &str, body_unix: &str, body_windows: &str) -> ProcessAudioPlayer
 
 fn request() -> AudioPlayRequest {
     AudioPlayRequest {
+        id: None,
         audio_ref: "audio://clip.opus".to_owned(),
         speed_factor: 1.0,
         continuation: false,
@@ -140,6 +141,7 @@ fn the_native_backend_fades_and_returns_at_once() {
     let play = || {
         player
             .play(&AudioPlayRequest {
+                id: None,
                 audio_ref: "audio://silence.wav".to_owned(),
                 speed_factor: 1.0,
                 continuation: false,

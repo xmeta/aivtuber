@@ -327,6 +327,7 @@ fn websocket_and_audio_faults_are_independent() {
     .expect("audio adapter");
     let error = audio
         .play(&AudioPlayRequest {
+            id: None,
             audio_ref: "audio://missing.opus".to_owned(),
             speed_factor: 1.0,
             continuation: false,
