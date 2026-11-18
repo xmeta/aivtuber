@@ -9,16 +9,15 @@ use aivtuber_adapters::{
     AdapterClock, CaptionLanguage, LocalAvatarConfig, LocalAvatarHandle, LocalAvatarServer,
     NormalizedHttpTtsAdapter, NormalizedHttpTtsConfig, ObsScreenSource, ObsScreenshotRequest,
     ObsWebSocketAdapter, ObsWebSocketConfig, OpenAiResponsesAdapter, OpenAiResponsesConfig,
-    ProcessAudioConfig, ProcessAudioPlayer, ScreenDescriber, ScreenDescriberConfig,
-    ScreenImageFormat, ScreenObservationProducer, ScreenProducerConfig, SecretString, StreamLimits,
-    SystemHostResolver, ThinkingAuthentication, VTubeStudioAdapter, VTubeStudioConfig,
-    endpoint_origin, verify_loopback_endpoint,
+    ScreenDescriber, ScreenDescriberConfig, ScreenImageFormat, ScreenObservationProducer,
+    ScreenProducerConfig, SecretString, StreamLimits, SystemHostResolver, ThinkingAuthentication,
+    VTubeStudioAdapter, VTubeStudioConfig, endpoint_origin, verify_loopback_endpoint,
 };
 use aivtuber_app::{
     AIVIS_ENDPOINT_VAR, AIVIS_KEY_FILE_VAR, AIVIS_KEY_VAR, AIVIS_TIMEOUT_VAR, AIVIS_VISEMES_VAR,
     AVATAR_DIR_VAR, AVATAR_SETTINGS_VAR, AdaptationRuntime, AdapterHealth, AivisBridge,
-    AivisSettings, AvatarController, AvatarEnvironment, AvatarOutput, BargeInConfig,
-    BargeInMetrics, CHAT_SETTINGS_VAR, ChatBurstConfig, ChatIngressController,
+    AivisSettings, AudioBackendKind, AvatarController, AvatarEnvironment, AvatarOutput,
+    BargeInConfig, BargeInMetrics, CHAT_SETTINGS_VAR, ChatBurstConfig, ChatIngressController,
     ChatIngressEnvironment, CompositionProfile, DEFAULT_WARMUP_TIMEOUT_MS,
     GenerationFallbackCounts, GenerativeBudgetPolicy, GenerativeRuntime, IntentRoutePlanner,
     IntentShadowPolicy, IrodoriBridge, IrodoriSettings, LocalAvatarOutput, LocalRoutePlanner,
@@ -35,9 +34,9 @@ use aivtuber_app::{
     VOICE_SETTINGS_VAR, VoiceController, VoiceEnvironment, VoicePaths, VoicevoxBridge,
     VoicevoxSettings, VtsAvatarOutput, VtsPlaybackConfig, WarmupMode, YOUTUBE_API_BASE_VAR,
     YOUTUBE_KEY_FILE_VAR, apply_dispatched_request, apply_thinking_provider_env,
-    audit_pack_readiness, is_acceptable_api_base, is_valid_key, openrouter_preset_active,
-    panel_settings, pump_bounded_records, read_voice_settings, remembered_model,
-    start_thinking_warmup, stt_sidecar_args, switch_warmup_for, warmup_timeout,
+    audit_pack_readiness, build_audio_output, is_acceptable_api_base, is_valid_key,
+    openrouter_preset_active, panel_settings, pump_bounded_records, read_voice_settings,
+    remembered_model, start_thinking_warmup, stt_sidecar_args, switch_warmup_for, warmup_timeout,
 };
 use aivtuber_asset_store::{AssetStore, RuntimeCompatibility};
 use aivtuber_domain::{
@@ -221,14 +220,23 @@ fn run() -> Result<(), Box<dyn Error>> {
         env_optional("AIVTUBER_INGRESS_SOURCE_CLASSES").as_deref(),
     )?);
 
-    let mut audio_config = ProcessAudioConfig {
-        root: audio_root.clone(),
-        ..ProcessAudioConfig::default()
-    };
-    if let Some(program) = env_optional("AIVTUBER_AUDIO_PROGRAM") {
-        audio_config.program = program;
+    // Issue #354: audio backend selection. Default is "process" (ProcessAudioPlayer).
+    // "rodio-gapless" composes RodioAudioPlayer with gapless queueing under the native-audio feature.
+    let audio_backend_str =
+        env_optional("AIVTUBER_AUDIO_BACKEND").unwrap_or_else(|| "process".to_owned());
+    let audio_backend = AudioBackendKind::parse(&audio_backend_str)?;
+    let audio_program = env_optional("AIVTUBER_AUDIO_PROGRAM");
+    let selection = build_audio_output(audio_backend, &audio_root, audio_program.as_deref())?;
+    if let Some(reason) = &selection.fallback_reason {
+        eprintln!(
+            "audio: requested backend {} not used, falling back to {}: {reason}",
+            audio_backend.as_str(),
+            selection.active.as_str()
+        );
     }
-    let audio = ProcessAudioPlayer::new(audio_config)?;
+    let audio = selection.output;
+    let audio_active = selection.active;
+    let audio_supports_gapless = audio.gapless_queue();
 
     let mut avatar_launch_url: Option<String> = None;
     let mut avatar_server: Option<(LocalAvatarHandle, Option<PathBuf>)> = None;
@@ -298,7 +306,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         performer,
         visemes,
         active_planner,
-        Box::new(audio),
+        audio,
         avatar,
         stream,
         max_lateness_ms,
@@ -465,6 +473,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     // without leaking secrets.
     if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
         eprintln!("{}", startup_summary.log_line());
+        eprintln!(
+            "audio: backend={} supports_gapless={audio_supports_gapless}",
+            audio_active.as_str()
+        );
     }
     if let Some(notice) = startup_summary.egress_notice() {
         eprintln!("{notice}");

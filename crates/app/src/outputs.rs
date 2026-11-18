@@ -373,6 +373,98 @@ impl StreamOutput for NoopStreamOutput {
     }
 }
 
+/// Supported audio output backends (#354).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioBackendKind {
+    /// External process player (e.g. ffplay), the production baseline.
+    Process,
+    /// Rust native gapless audio player via rodio/cpal.
+    RodioGapless,
+}
+
+impl AudioBackendKind {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "process" => Ok(Self::Process),
+            "rodio-gapless" | "rodio" => Ok(Self::RodioGapless),
+            other => Err(format!(
+                "invalid AIVTUBER_AUDIO_BACKEND: '{other}'; valid options are 'process', 'rodio-gapless'"
+            )),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Process => "process",
+            Self::RodioGapless => "rodio-gapless",
+        }
+    }
+}
+
+/// The audio output actually chosen at start, and why it differs from the
+/// request when it does (#354). Selection degrades to the process player; it
+/// never stops the app or the performer.
+pub struct AudioBackendSelection {
+    pub output: Box<dyn AudioOutput>,
+    pub active: AudioBackendKind,
+    /// One-line reason when `active` is not the requested backend.
+    pub fallback_reason: Option<String>,
+}
+
+fn build_process_output(
+    audio_root: &std::path::Path,
+    program: Option<&str>,
+) -> Result<Box<dyn AudioOutput>, String> {
+    let mut config = aivtuber_adapters::ProcessAudioConfig {
+        root: audio_root.to_path_buf(),
+        ..aivtuber_adapters::ProcessAudioConfig::default()
+    };
+    if let Some(program) = program {
+        config.program = program.to_owned();
+    }
+    aivtuber_adapters::ProcessAudioPlayer::new(config)
+        .map(|p| Box::new(p) as Box<dyn AudioOutput>)
+        .map_err(|e| format!("failed to initialize process audio player: {e}"))
+}
+
+/// Construct the configured [`AudioOutput`] backend (#354). The native backend
+/// is opt-in twice (`native-audio` feature, `AIVTUBER_AUDIO_BACKEND`); when it
+/// is requested but unavailable the process player is used and the reason is
+/// reported. Only a failing process player is an error, as before.
+pub fn build_audio_output(
+    requested: AudioBackendKind,
+    audio_root: &std::path::Path,
+    program: Option<&str>,
+) -> Result<AudioBackendSelection, String> {
+    let fallback_reason = match requested {
+        AudioBackendKind::Process => None,
+        AudioBackendKind::RodioGapless => {
+            #[cfg(feature = "native-audio")]
+            {
+                match aivtuber_adapters::RodioAudioPlayer::new(audio_root) {
+                    Ok(player) => {
+                        return Ok(AudioBackendSelection {
+                            output: Box::new(player),
+                            active: AudioBackendKind::RodioGapless,
+                            fallback_reason: None,
+                        });
+                    }
+                    Err(error) => Some(format!("native audio unavailable ({error})")),
+                }
+            }
+            #[cfg(not(feature = "native-audio"))]
+            {
+                Some("this build has no native-audio feature".to_owned())
+            }
+        }
+    };
+    Ok(AudioBackendSelection {
+        output: build_process_output(audio_root, program)?,
+        active: AudioBackendKind::Process,
+        fallback_reason,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

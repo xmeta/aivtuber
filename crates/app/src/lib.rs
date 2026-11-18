@@ -6152,6 +6152,7 @@ mod tests {
 
     mod affect_judge_status_tests;
     mod aivis_cloud_tts_tests;
+    mod audio_backend_tests;
     mod avatar_control_tests;
     mod chat_burst_tests;
     mod chat_ingress_tests;
