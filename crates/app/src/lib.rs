@@ -3590,9 +3590,73 @@ where
             })
     }
 
-    /// Whether the performer can take a reply now. Built only from trusted
-    /// runtime state: the operator mute flag, the scheduler's speech
-    /// lifecycle and the generation runtime. No event field is an input.
+    /// #81 会話フロアが人間の発話または発話待機により保持されているか判定する。
+    /// 信頼された音声観測・トランスクリプト・フロアキューのみを参照し、公開チャット入力は一切見ない。
+    fn floor_holds_reply(&self, now_ms: u64) -> bool {
+        let Some(floor) = self.speech_floor.as_ref() else {
+            return false;
+        };
+        // 音声入力が構成されておりオフの場合はフロア保持とみなさない
+        if self
+            .speech_input
+            .as_ref()
+            .is_some_and(|i| i.composed() && !i.is_on())
+        {
+            return false;
+        }
+        if floor.metrics().queued > 0 {
+            return true;
+        }
+        let mut speakers = std::collections::BTreeSet::new();
+        if let Some(observations) = self.speech_observations.as_ref() {
+            speakers.extend(observations.speaker_ids());
+        }
+        if let Some(transcripts) = self.speech_transcripts.as_ref() {
+            speakers.extend(transcripts.speaker_ids());
+        }
+        if speakers.is_empty() {
+            return false;
+        }
+        let feed_age_ms = self
+            .speech_feed_heartbeat_ms
+            .map(|beat| now_ms.saturating_sub(beat));
+        let scene = self.floor_scene(now_ms);
+        let reply_inbox = self.chat_burst.is_some();
+        for speaker in speakers {
+            let input = aivtuber_domain::FloorInput {
+                now_ms,
+                user: speech_floor::floor_evidence(
+                    self.speech_observations.as_ref(),
+                    speaker,
+                    now_ms,
+                    feed_age_ms,
+                ),
+                hold: self
+                    .speech_transcripts
+                    .as_ref()
+                    .map_or(aivtuber_domain::TranscriptHold::None, |transcripts| {
+                        speech_floor::transcript_hold(transcripts, speaker, now_ms)
+                    }),
+                own: aivtuber_domain::OwnSpeech::Idle,
+                reply_waiting: true,
+                scene,
+                reply_inbox,
+            };
+            let evaluation = aivtuber_scheduler::evaluate(floor.config(), &input);
+            // SceneProtected による延長は後続の SceneProtected 分岐に委ねる
+            if evaluation.action != aivtuber_domain::FloorAction::TakeTurn
+                && evaluation.reason != aivtuber_domain::FloorReason::SceneProtected
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// パフォーマーが今返信を受け付けられるか判定する。信頼されたランタイム状態
+    /// （オペレーターのミュートフラグ、スケジューラの発話ライフサイクル、生成ランタイム、
+    /// #81 会話フロア、#88 信頼されたシーン割り込み可否）のみから構築し、
+    /// イベントフィールドは一切入力にしない。
     fn reply_availability(&self, now_ms: u64) -> ReplyAvailability {
         if self.security.is_muted() {
             ReplyAvailability::Busy(BusyCause::Muted)
@@ -3604,6 +3668,8 @@ where
             .is_some_and(GenerativeRuntime::is_generating)
         {
             ReplyAvailability::Busy(BusyCause::Generating)
+        } else if self.floor_holds_reply(now_ms) {
+            ReplyAvailability::Busy(BusyCause::FloorHeld)
         } else if self.scene.as_ref().is_some_and(|scene| {
             scene.scheduling_interruptibility(now_ms) == Interruptibility::Uninterruptible
         }) {
