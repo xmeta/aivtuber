@@ -123,9 +123,11 @@ It is a decimal number of USD, greater than 0 and at most 10000, up to six decim
 * A reply already in flight when the cap is reached still completes, so you can overshoot by one reply.
 * The cap resets when you restart the app. For a ceiling that survives restarts, set a credit limit on the key at openrouter.ai.
 
-== Optional: System One affect judgement (not offered here)
+== Optional: System One affect judgement
 
-+AIVTUBER_AFFECT_JUDGE=system-one+ (#426) sends the text of each reply phrase to the System One provider to pick the expression, in parallel with speech and never delaying it. It is an opt-in for +AIVTUBER_MODE=full+ only, with +AIVTUBER_JEV_API_KEY+ set. This profile refuses it at start: nothing but Thinking may leave the machine here. Leave it unset (+rules+, the default) and expressions come from the local rules classifier. Details: link:production-runtime.adoc[production runtime], link:security-threat-model.adoc[threat model section 10.4].
+*日本語:* 既定(+rules+)ではローカルのルールで表情を決めます。+AIVTUBER_AFFECT_JUDGE=system-one+ を明示すると、返答の *各フレーズの本文* が System One プロバイダ(+AIVTUBER_JEV_ENDPOINT+、HTTPS のみ)へ送信されます。応答モデルへ送る内容に加えて、フレーズごとの本文が外部に出ます。+AIVTUBER_JEV_API_KEY+ と +AIVTUBER_PHRASE_MODE=phrase+(この構成の既定は phrase、+buffered+ を指定すると起動時に拒否されます)が必要です。起動時に必ず通知行が出ます。
+
++AIVTUBER_AFFECT_JUDGE=system-one+ (#426) sends the text of each reply phrase to the System One provider to pick the expression, in parallel with speech and never delaying it. It is an explicit opt-in, with +AIVTUBER_JEV_API_KEY+ set and +AIVTUBER_JEV_ENDPOINT+ an HTTPS DNS name (default +https://api.typesafe.ai/v1/systemone+). This is the only role besides Thinking that may leave the machine here, and only while the opt-in is set; it needs phrased replies (the default here; +AIVTUBER_PHRASE_MODE=buffered+ is refused at start with a message naming +AIVTUBER_PHRASE_MODE=phrase+). Leave it unset (+rules+, the default) and expressions come from the local rules classifier. Details: link:production-runtime.adoc[production runtime], link:security-threat-model.adoc[threat model section 10.4].
 
 == If something goes wrong
 

@@ -2179,8 +2179,11 @@ fn build_generative_runtime(
         env_optional(aivtuber_app::AFFECT_JUDGE_VAR).as_deref(),
     )?;
     affect_judge_mode.validate(
-        profile.as_str(),
-        profile.jev(),
+        profile,
+        &env_string(
+            "AIVTUBER_JEV_ENDPOINT",
+            "https://api.typesafe.ai/v1/systemone",
+        ),
         affect_expression,
         env_optional("AIVTUBER_JEV_API_KEY").is_some_and(|key| !key.trim().is_empty()),
         phrase_mode.is_phrased(),

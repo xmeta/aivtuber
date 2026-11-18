@@ -7,11 +7,15 @@
 //! S1 rules classifier exactly as it was.
 //!
 //! This is a new egress role: reply text leaves the machine to the System One
-//! provider, per phrase. It is therefore refused under the `local` and
-//! `hybrid` profiles, whose non-Thinking roles are loopback-only by policy
-//! (#220, #364), and is allowed only where Jev is already a composed provider
-//! (`full`).
+//! provider, per phrase. It is refused under `local` (loopback-only, #220) and
+//! `cached`. Where Jev is already a composed provider (`reflex`, `full`) it is
+//! allowed. Under `hybrid` (#364), whose non-Thinking roles are otherwise
+//! loopback-only, it is allowed by one narrow exception (#426): only this
+//! role, only because the operator set `AIVTUBER_AFFECT_JUDGE=system-one`,
+//! and only to the configured System One endpoint, which must be HTTPS to a
+//! DNS name without credentials. No other role gains egress.
 
+use crate::profile::CompositionProfile;
 use aivtuber_generative::{AffectClass, AffectJudge, AffectJudgeFailure};
 use aivtuber_reflex::{AffectJudgeError, JevAffectJudge};
 use std::time::Duration;
@@ -45,8 +49,8 @@ impl AffectJudgeMode {
     /// where the judge could not work. Called before anything is composed.
     pub fn validate(
         self,
-        profile_name: &str,
-        profile_allows_jev_egress: bool,
+        profile: CompositionProfile,
+        jev_endpoint: &str,
         affect_expression_enabled: bool,
         jev_api_key_present: bool,
         phrased_replies: bool,
@@ -54,10 +58,22 @@ impl AffectJudgeMode {
         if self == Self::Rules {
             return Ok(());
         }
-        if !profile_allows_jev_egress {
-            return Err(format!(
-                "{AFFECT_JUDGE_VAR}=system-one sends reply text to the System One provider, which profile {profile_name:?} does not allow (its non-Thinking roles are loopback-only); use the \"full\" profile or leave it at \"rules\""
-            ));
+        // Reaching here means the operator opted in explicitly.
+        match profile {
+            CompositionProfile::Reflex | CompositionProfile::Full => {}
+            CompositionProfile::Hybrid => {
+                if aivtuber_adapters::https_endpoint_target(jev_endpoint).is_err() {
+                    return Err(format!(
+                        "{AFFECT_JUDGE_VAR}=system-one under profile \"hybrid\" needs AIVTUBER_JEV_ENDPOINT to be HTTPS to a DNS name without credentials"
+                    ));
+                }
+            }
+            CompositionProfile::Local | CompositionProfile::Cached => {
+                return Err(format!(
+                    "{AFFECT_JUDGE_VAR}=system-one sends reply text to the System One provider, which profile {:?} does not allow (its roles are loopback-only or have no provider); use the \"hybrid\" or \"full\" profile or leave it at \"rules\"",
+                    profile.as_str()
+                ));
+            }
         }
         if !affect_expression_enabled {
             return Err(format!(
@@ -66,7 +82,7 @@ impl AffectJudgeMode {
         }
         if !phrased_replies {
             return Err(format!(
-                "{AFFECT_JUDGE_VAR}=system-one runs per phrase and needs phrased replies (set AIVTUBER_PHRASE_MODE=phrase; the full profile defaults to buffered replies)"
+                "{AFFECT_JUDGE_VAR}=system-one runs per phrase and needs phrased replies (set AIVTUBER_PHRASE_MODE=phrase; the full profile defaults to buffered replies, and AIVTUBER_PHRASE_MODE=buffered turns phrases off in any profile)"
             ));
         }
         if !jev_api_key_present {
@@ -129,23 +145,55 @@ mod tests {
         // `rules` never refuses, whatever else is configured.
         assert!(
             AffectJudgeMode::Rules
-                .validate("local", false, false, false, false)
+                .validate(CompositionProfile::Local, "", false, false, false)
                 .is_ok()
         );
     }
 
     #[test]
     fn system_one_is_refused_where_text_may_not_leave_or_nothing_could_use_it() {
+        use CompositionProfile as P;
+        const EP: &str = "https://api.typesafe.ai/v1/systemone";
         let sys = AffectJudgeMode::SystemOne;
-        assert!(sys.validate("full", true, true, true, true).is_ok());
-        for profile in ["local", "hybrid"] {
-            let error = sys.validate(profile, false, true, true, true).unwrap_err();
-            assert!(error.contains("loopback-only"), "{error}");
+        assert!(sys.validate(P::Full, EP, true, true, true).is_ok());
+        // hybrid + explicit opt-in is allowed (#426).
+        assert!(sys.validate(P::Hybrid, EP, true, true, true).is_ok());
+        // local (and cached) stay refused.
+        for profile in [P::Local, P::Cached] {
+            let error = sys.validate(profile, EP, true, true, true).unwrap_err();
+            assert!(error.contains("does not allow"), "{error}");
         }
-        assert!(sys.validate("full", true, false, true, true).is_err());
-        assert!(sys.validate("full", true, true, false, true).is_err());
-        let buffered = sys.validate("full", true, true, true, false).unwrap_err();
-        assert!(buffered.contains("phrased replies"), "{buffered}");
+        assert!(sys.validate(P::Full, EP, false, true, true).is_err());
+        assert!(sys.validate(P::Full, EP, true, false, true).is_err());
+        let buffered = sys.validate(P::Hybrid, EP, true, true, false).unwrap_err();
+        assert!(
+            buffered.contains("AIVTUBER_PHRASE_MODE=phrase"),
+            "{buffered}"
+        );
+    }
+
+    #[test]
+    fn hybrid_allows_only_an_https_dns_endpoint_without_credentials() {
+        let sys = AffectJudgeMode::SystemOne;
+        for bad in [
+            "http://api.typesafe.ai/v1/systemone",
+            "https://user:pw@api.typesafe.ai/v1/systemone",
+            "https://127.0.0.1/v1/systemone",
+            "https://[::1]/v1/systemone",
+            "not a url",
+            "",
+        ] {
+            let error = sys
+                .validate(CompositionProfile::Hybrid, bad, true, true, true)
+                .unwrap_err();
+            assert!(error.contains("HTTPS"), "{bad}: {error}");
+        }
+        // Without the opt-in, hybrid is never asked and nothing is refused.
+        assert!(
+            AffectJudgeMode::Rules
+                .validate(CompositionProfile::Hybrid, "", false, false, false)
+                .is_ok()
+        );
     }
 
     #[test]
