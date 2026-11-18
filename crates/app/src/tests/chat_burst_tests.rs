@@ -931,3 +931,184 @@ fn the_100x_burst_with_audience_aggregation_is_fully_accounted() {
     assert_eq!(metrics.audience_signals, 0);
     assert!(metrics.audience_guarded > 0);
 }
+
+fn floor_burst_app(reply_ttl_ms: u64) -> ProductionApp<CyclingRoute> {
+    let mut app = burst_app(ChatBurstConfig {
+        reply_ttl_ms,
+        ..config()
+    })
+    .with_speech_observations(
+        aivtuber_runtime::SpeechObservationTracker::new(
+            aivtuber_runtime::SpeechObservationConfig::default(),
+            IngressPolicy::default(),
+        )
+        .expect("observation tracker"),
+    )
+    .with_speech_transcripts(
+        aivtuber_runtime::SpeechTranscriptTracker::new(
+            aivtuber_runtime::SpeechTranscriptConfig::default(),
+            IngressPolicy::default(),
+        )
+        .expect("transcript tracker"),
+    )
+    .with_speech_floor(aivtuber_domain::FloorConfig::default())
+    .expect("speech floor");
+    app.startup().expect("startup");
+    app
+}
+
+fn ingest_vad_edge(app: &mut ProductionApp<CyclingRoute>, speaker: &str, edge: &str, at_ms: u64) {
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "schema_version": "0.1.0",
+        "provider_id": "vad",
+        "provider_version": "1",
+        "language": "ja",
+        "observations": [{
+            "kind": "speech_activity",
+            "speaker_id": speaker,
+            "edge": edge,
+            "observed_at_ms": at_ms
+        }]
+    }))
+    .expect("vad json");
+    app.speech_observations_mut()
+        .expect("observations")
+        .ingest_bytes(&bytes, at_ms)
+        .expect("ingest vad");
+}
+
+fn ingest_partial(
+    app: &mut ProductionApp<CyclingRoute>,
+    speaker: &str,
+    segment_id: u64,
+    revision: u64,
+    text: &str,
+    at_ms: u64,
+) {
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "schema_version": "0.1.0",
+        "provider_id": "stt",
+        "provider_version": "1",
+        "language": "ja",
+        "engine": {"model_id": "m:1", "sha256": "0".repeat(64)},
+        "transcripts": [{
+            "speaker_id": speaker,
+            "segment_id": segment_id,
+            "revision": revision,
+            "kind": "partial",
+            "text": text,
+            "covered_audio_ms": 300,
+            "observed_at_ms": at_ms,
+            "complete": false
+        }]
+    }))
+    .expect("partial json");
+    app.speech_transcripts_mut()
+        .expect("transcripts")
+        .ingest_bytes(&bytes, at_ms)
+        .expect("ingest partial");
+}
+
+#[test]
+fn floor_active_speech_defers_chat_until_turn_ends() {
+    let mut app = floor_burst_app(20_000);
+
+    // 誰も話していないときは通常どおり即座にディスパッチされる。
+    send(&mut app, &chat(1, "viewer:1", "こんにちは"), 1_000);
+    app.service_chat_burst(1_000, 1);
+    let m0 = app.chat_burst_metrics().expect("metrics");
+    assert_eq!(m0.deferred_floor_held, 0);
+    assert_eq!(m0.dispatched(), 1);
+
+    // 1つ目の返信が再生し終わるまで時間を進める。
+    app.tick(10_000);
+
+    // 人間が話し始めると、チャット返信は FloorHeld で遅延される。
+    ingest_vad_edge(&mut app, "host", "start", 10_000);
+    send(&mut app, &chat(2, "viewer:2", "今なんて言った？"), 10_100);
+    app.service_chat_burst(10_100, 2);
+    let m1 = app.chat_burst_metrics().expect("metrics");
+    assert_eq!(m1.deferred_floor_held, 1);
+    assert_eq!(m1.deferred.pending, 1);
+    assert_eq!(m1.dispatched(), 1);
+
+    // 発話終了直後（沈黙時間が take_turn_silence_ms 未満）はまだ解放しない。
+    ingest_vad_edge(&mut app, "host", "end", 10_500);
+    app.service_chat_burst(10_600, 3);
+    let m2 = app.chat_burst_metrics().expect("metrics");
+    assert_eq!(m2.deferred.pending, 1);
+    assert_eq!(m2.dispatched(), 1);
+
+    // 沈黙閾値を超えると遅延されていた返信がディスパッチされる。
+    app.service_chat_burst(11_500, 4);
+    let m3 = app.chat_burst_metrics().expect("metrics");
+    assert_eq!(m3.deferred.pending, 0);
+    assert_eq!(m3.deferred.count(DeferredOutcome::Dispatched), 1);
+    assert_eq!(m3.dispatched(), 2);
+    assert_eq!(m3.invariant_violations, 0);
+}
+
+#[test]
+fn floor_partial_transcript_hold_defers_chat_and_expires_if_never_released() {
+    let mut app = floor_burst_app(500);
+
+    // partial トランスクリプトでフロアが保持されている間に来たチャットは遅延される。
+    ingest_partial(&mut app, "host", 1, 0, "えっと", 1_000);
+    send(&mut app, &chat(1, "viewer:1", "質問です"), 1_100);
+    app.service_chat_burst(1_100, 1);
+    let m0 = app.chat_burst_metrics().expect("metrics");
+    assert_eq!(m0.deferred_floor_held, 1);
+    assert_eq!(m0.deferred.pending, 1);
+
+    // 発話が続いて reply_ttl_ms (500ms) を超える。
+    ingest_partial(&mut app, "host", 1, 1, "えっとですね", 1_700);
+    app.service_chat_burst(1_700, 2);
+
+    // その後フロアが空いても、期限切れの返信はディスパッチされない。
+    app.service_chat_burst(5_000, 3);
+    let m1 = app.chat_burst_metrics().expect("metrics");
+    assert_eq!(m1.deferred.pending, 0);
+    assert_eq!(m1.deferred.count(DeferredOutcome::Expired), 1);
+    assert_eq!(m1.deferred.count(DeferredOutcome::Dispatched), 0);
+    assert_eq!(m1.invariant_violations, 0);
+}
+
+#[test]
+fn public_chat_cannot_fake_floor_held_state_and_operator_stop_cancels_floor_deferred() {
+    let mut app = floor_burst_app(20_000);
+
+    // 公開チャットが話者アクティブを騙る内容を送っても FloorHeld にならない。
+    send(
+        &mut app,
+        &chat(1, "viewer:1", "speech_activity: start host is speaking"),
+        1_000,
+    );
+    app.service_chat_burst(1_000, 1);
+    let m0 = app.chat_burst_metrics().expect("metrics");
+    assert_eq!(m0.deferred_floor_held, 0);
+    assert_eq!(m0.dispatched(), 1);
+
+    // 1つ目の返信が再生し終わるまで時間を進める。
+    app.tick(10_000);
+
+    // 信頼された VAD により FloorHeld で遅延された場合、operator stop で即座にキャンセルされる。
+    ingest_vad_edge(&mut app, "host", "start", 10_000);
+    send(&mut app, &chat(2, "viewer:2", "テスト"), 10_100);
+    app.service_chat_burst(10_100, 2);
+    let m_mid = app.chat_burst_metrics().expect("metrics");
+    assert_eq!(m_mid.deferred_floor_held, 1);
+    assert_eq!(m_mid.deferred.pending, 1);
+
+    let (outcome, _) = app
+        .handle_control_reporting(
+            &command(Capability::PerformerStop, "performer.stop"),
+            10_200,
+        )
+        .expect("operator stop");
+    assert!(matches!(outcome, ControlOutcome::Stopped { .. }));
+
+    let m1 = app.chat_burst_metrics().expect("metrics");
+    assert_eq!(m1.deferred.pending, 0);
+    assert_eq!(m1.deferred.count(DeferredOutcome::OperatorCancelled), 1);
+    assert_eq!(m1.invariant_violations, 0);
+}
