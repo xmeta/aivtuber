@@ -129,6 +129,10 @@ What it does not establish (needs a manual DAC-level measurement, see the PR for
 * drift between the logical timeline and the device: a phrase's logical end is `start + duration_ms` as reported by TTS, while the device plays the actual samples, so a phrase whose file is longer or shorter than its reported duration shifts the audible chain relative to the logical one (`Started` is logical by design; no drift correction exists);
 * the stop latency to silence at the speaker (the call returns at once and the fade is at most 150 ms, but the device buffer after it is not measured).
 
+== Backend selection (#354)
+
+The app picks its audio output at start from `AIVTUBER_AUDIO_BACKEND`: `process` (default, the external player) or `rodio-gapless` (alias `rodio`; any other value is a start-up error naming the valid ones). The native backend is opt-in twice: build `aivtuber-app` with `--features native-audio` (forwards to `aivtuber-adapters/native-audio-spike`; no new dependency, not in the release archive) and set the variable. When it is requested but unavailable (feature not built, or no output device) the app starts with the process player and logs one line, `audio: requested backend rodio-gapless not used, falling back to process: <reason>`; selection never stops the performer. Device loss after start and real-DAC latency (#354 items 3 and 4) are not part of this slice.
+
 == Device and deployment behavior
 
 Windows::
