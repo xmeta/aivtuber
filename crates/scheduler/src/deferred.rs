@@ -153,6 +153,8 @@ pub enum BusyCause {
     /// operator's OBS scene table, ADR-0007 rank 1 to 3). Never perception: a
     /// perceived scene is untrusted model output and cannot reach this cause.
     SceneProtected,
+    /// #81 会話フロアが人間の発話中または発話待機中であると判定している。
+    FloorHeld,
 }
 
 impl ReplyAvailability {

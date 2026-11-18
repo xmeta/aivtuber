@@ -649,6 +649,11 @@ impl SpeechTranscriptTracker {
         self.finals.clear();
     }
 
+    /// 現在追跡中の話者 ID を決定論的順序で返す。
+    pub fn speaker_ids(&self) -> impl Iterator<Item = &str> {
+        self.speakers.keys().map(String::as_str)
+    }
+
     /// What the partials say about one speaker's floor right now. Read-only.
     pub fn floor_hold(&self, speaker_id: &str, now_ms: u64) -> FloorHold {
         let Some(open) = self

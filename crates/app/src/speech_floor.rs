@@ -100,6 +100,10 @@ impl SpeechFloor {
         })
     }
 
+    pub(crate) fn config(&self) -> &FloorConfig {
+        self.policy.config()
+    }
+
     pub(crate) fn own_tracker(&self) -> &OwnSpeechTracker {
         &self.own
     }

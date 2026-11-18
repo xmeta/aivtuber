@@ -251,6 +251,8 @@ pub struct ChatBurstMetrics {
     pub deferred_muted: u64,
     /// Deferred because a trusted source marked the live scene uninterruptible (#88).
     pub deferred_scene_protected: u64,
+    /// #81 会話フロアが人間の発話・待機により保持されていたため遅延した回数。
+    pub deferred_floor_held: u64,
     /// Times `admitted != terminal + inbox.offered + held` was observed. Must
     /// be 0.
     pub invariant_violations: u64,
@@ -791,6 +793,7 @@ impl ChatBurstLane {
             BusyCause::Generating => self.metrics.deferred_generating += 1,
             BusyCause::Muted => self.metrics.deferred_muted += 1,
             BusyCause::SceneProtected => self.metrics.deferred_scene_protected += 1,
+            BusyCause::FloorHeld => self.metrics.deferred_floor_held += 1,
         }
         let reason = match cause {
             BusyCause::Muted => TimingReason::OperatorMuted,
