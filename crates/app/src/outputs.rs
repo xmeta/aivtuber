@@ -17,6 +17,7 @@ where
 {
     fn execute(&mut self, command: &AudioPlaybackCommand) -> Result<(), EngineError> {
         self.play(&AudioPlayRequest {
+            id: Some(command.generation),
             audio_ref: command.audio_ref.clone(),
             speed_factor: command.speed_factor,
             continuation: command.continuation,
@@ -29,6 +30,10 @@ where
 
     fn gapless_queue(&self) -> bool {
         self.supports_gapless_queue()
+    }
+
+    fn recall_queued(&mut self, generation: u64) -> bool {
+        self.cancel_queued(generation)
     }
 }
 

@@ -122,6 +122,15 @@ impl AudioChannel {
         self.gapless
     }
 
+    /// 先行投入された未開始フレーズを非ブロッキングでバックエンドから取り消す (#354)。
+    pub(crate) fn recall_queued(&self, generation: u64) -> bool {
+        match self.output.try_lock() {
+            Ok(mut output) => output.recall_queued(generation),
+            Err(TryLockError::Poisoned(poison)) => poison.into_inner().recall_queued(generation),
+            Err(TryLockError::WouldBlock) => false,
+        }
+    }
+
     /// Dispatch one playback command. Never blocks: while a stop holds the
     /// output the command is refused as unavailable.
     pub(crate) fn execute(&self, command: &AudioPlaybackCommand) -> Result<(), EngineError> {

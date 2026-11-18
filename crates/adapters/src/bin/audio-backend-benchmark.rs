@@ -53,11 +53,13 @@ mod windows_bench {
         let native_init_us = micros(native_init_started.elapsed());
 
         let short = AudioPlayRequest {
+            id: None,
             audio_ref: "audio://short.wav".to_owned(),
             speed_factor: 1.0,
             continuation: false,
         };
         let long = AudioPlayRequest {
+            id: None,
             audio_ref: "audio://long.wav".to_owned(),
             speed_factor: 1.0,
             continuation: false,

@@ -208,6 +208,9 @@ use std::time::{Duration, Instant};
 /// to decode and append a phrase, far below the 400 ms barge-in confirm.
 pub const AUDIO_LOOKAHEAD_MS: u64 = 250;
 
+/// 先行受け渡し中の音声コマンド保持数の上限 (#354)。
+const MAX_EARLY_AUDIO_COMMANDS: usize = 32;
+
 pub trait AudioOutput: Send {
     fn execute(&mut self, command: &AudioPlaybackCommand) -> Result<(), EngineError>;
 
@@ -225,6 +228,12 @@ pub trait AudioOutput: Send {
     /// handed a continuation command [`AUDIO_LOOKAHEAD_MS`] before its logical
     /// start; the default (`false`) keeps the hand-over at the logical start.
     fn gapless_queue(&self) -> bool {
+        false
+    }
+
+    /// ギャップレスバックエンドへ先行投入した未開始コマンドを識別子で取り消す (#354)。
+    fn recall_queued(&mut self, generation: u64) -> bool {
+        let _ = generation;
         false
     }
 }
@@ -1249,6 +1258,8 @@ where
     stream: Box<dyn StreamOutput>,
     pending_audio: PendingAudio,
     pending_avatar: PendingAvatar,
+    /// lookahead により論理開始より前にバックエンドへ渡した音声コマンド (#354)。
+    early_audio: Vec<AudioPlaybackCommand>,
     /// Text of the audio the output accepted, for the local panel (#335).
     recent_replies: RecentReplies,
     max_dispatch_lateness_ms: u64,
@@ -1327,6 +1338,7 @@ where
             stream,
             pending_audio: PendingAudio::default(),
             pending_avatar: PendingAvatar::default(),
+            early_audio: Vec::new(),
             recent_replies: RecentReplies::default(),
             max_dispatch_lateness_ms,
             interaction_deadlines: InteractionDeadlinePolicy::default(),
@@ -5287,6 +5299,7 @@ where
         // timeline advance can report it finished (ADR-0004 truth rules).
         self.account_undeliverable_audio(now_ms);
         self.performer.scheduler_mut().advance_to(now_ms);
+        self.reconcile_early_audio(now_ms);
         self.update_phrase_progress();
         self.dispatch_audio(now_ms);
         self.dispatch_avatar(now_ms);
@@ -5494,12 +5507,17 @@ where
             match self.audio.execute(&command) {
                 Ok(()) => {
                     self.health.audio_error = None;
-                    self.record_spoken_text(&command);
                     self.performer.scheduler_mut().report_speech_output(
                         command.generation,
                         OutputObservation::Accepted,
                         now_ms,
                     );
+                    if now_ms >= command.at_ms {
+                        self.record_spoken_text(&command);
+                    } else if self.early_audio.len() < MAX_EARLY_AUDIO_COMMANDS {
+                        // lookahead による先行受け渡し中は論理 Started に達してから記録する (#354)
+                        self.early_audio.push(command);
+                    }
                 }
                 Err(error) => {
                     self.health.audio_error = Some(error.to_string());
@@ -5513,6 +5531,60 @@ where
             }
         }
         self.pending_audio.commands = keep;
+    }
+
+    /// 先行受け渡し済みのコマンドを論理時刻およびスケジューラ状態と照合する (#354)。
+    /// 論理開始に到達したものだけ発話テキストを記録し、開始前にキャンセルされたものは
+    /// オーディオバックエンドからリコールする。
+    fn reconcile_early_audio(&mut self, now_ms: u64) {
+        if self.early_audio.is_empty() {
+            return;
+        }
+        let commands = std::mem::take(&mut self.early_audio);
+        let mut keep = Vec::new();
+        for command in commands {
+            if self.security.is_muted() {
+                let _ = self.audio.recall_queued(command.generation);
+                continue;
+            }
+            if let Some(item) = self
+                .performer
+                .scheduler()
+                .live_item_by_generation(command.generation)
+            {
+                if item
+                    .cancel_at_ms
+                    .is_some_and(|cancel| command.at_ms >= cancel)
+                {
+                    let _ = self.audio.recall_queued(command.generation);
+                } else if now_ms >= command.at_ms {
+                    self.record_spoken_text(&command);
+                } else {
+                    keep.push(command);
+                }
+            } else {
+                let started_in_history = now_ms >= command.at_ms
+                    && self
+                        .performer
+                        .scheduler()
+                        .history()
+                        .filter(|entry| entry.item.plan.generation == command.generation)
+                        .last()
+                        .is_some_and(|entry| {
+                            entry.item.status == Status::Completed
+                                || entry
+                                    .item
+                                    .cancel_at_ms
+                                    .is_some_and(|cancel| cancel > command.at_ms)
+                        });
+                if started_in_history {
+                    self.record_spoken_text(&command);
+                } else {
+                    let _ = self.audio.recall_queued(command.generation);
+                }
+            }
+        }
+        self.early_audio = keep;
     }
 
     /// Remember the display text of audio the output just accepted, bounded
@@ -5631,6 +5703,10 @@ where
             // after it.
             if let Some(lane) = self.chat_burst.as_mut() {
                 lane.cancel_all(at_ms);
+            }
+        } else if matches!(outcome, ControlOutcome::Muted) {
+            for command in std::mem::take(&mut self.early_audio) {
+                let _ = self.audio.recall_queued(command.generation);
             }
         }
         let stop_report = is_override.then(|| {
@@ -5821,6 +5897,19 @@ where
     }
 
     fn purge_cancelled_pending(&mut self) {
+        let mut keep_early = Vec::with_capacity(self.early_audio.len());
+        for command in std::mem::take(&mut self.early_audio) {
+            if command_not_cancelled(
+                self.performer.scheduler(),
+                command.generation,
+                command.at_ms,
+            ) {
+                keep_early.push(command);
+            } else {
+                let _ = self.audio.recall_queued(command.generation);
+            }
+        }
+        self.early_audio = keep_early;
         let scheduler = self.performer.scheduler();
         self.pending_audio
             .commands
@@ -13699,6 +13788,7 @@ mod tests {
                 (player, marker)
             }
             let play = AudioPlayRequest {
+                id: None,
                 audio_ref: "audio://clip.opus".to_owned(),
                 speed_factor: 1.0,
                 continuation: false,
