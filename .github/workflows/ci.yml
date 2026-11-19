@@ -116,13 +116,18 @@ jobs:
 
       # Issue #83 S3d: the gapless phrase queue on rodio's offline mixer. The
       # gapless-queue feature does not enable rodio's `playback` (cpal), so it
-      # needs no ALSA headers and no audio device; native-audio-spike (the
-      # device) is not built here.
+      # needs no ALSA headers and no audio device. The device itself
+      # (native-audio-spike) is linted by the `Native audio backend` job below.
       - name: Clippy gapless queue
         run: cargo clippy --locked -p aivtuber-adapters --features gapless-queue --all-targets -- -D warnings
 
       - name: Test gapless queue (sample-exact falsifier)
         run: cargo test --locked -p aivtuber-adapters --features gapless-queue --test gapless_queue
+
+      # Issue #354: the device-change rule and the reconnect counters are
+      # device-free on purpose, so they run here with no sound card.
+      - name: Test native device rules (device-free)
+        run: cargo test --locked -p aivtuber-adapters --features gapless-queue --test device_watch
 
       - name: Build
         run: cargo build --locked --workspace
@@ -164,6 +169,34 @@ jobs:
           path: crates/scheduler/proptest-regressions/
           if-no-files-found: ignore
           retention-days: 14
+
+  # Issue #354: the native output device (cpal through rodio's `playback`).
+  # Before this job existed the reconnect code was never *compiled* in CI: the
+  # required `Rust checks` job runs on Linux, where cpal needs ALSA headers, so
+  # the opt-in feature was left out of it. A Windows runner needs nothing extra
+  # and no sound card: this job only compiles and lints the adapters crate with
+  # the feature and checks the app composition that selects it. The device-free
+  # behaviour is tested in the required `Rust checks` job.
+  native-audio:
+    name: Native audio backend (native-audio-spike, Windows)
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+
+      - name: Clippy the native backend
+        run: cargo clippy --locked -p aivtuber-adapters --features native-audio-spike --all-targets -- -D warnings
+
+      # The composition root's `native-audio` feature (AIVTUBER_AUDIO_BACKEND=rodio-gapless)
+      # is what production would use; it must keep compiling with the backend.
+      - name: Check the app composition with the native backend
+        run: cargo check --locked -p aivtuber-app --features native-audio
 
   # Issue #92 S3b: the optional local Japanese STT worker (the `sherpa-stt`
   # feature, the official sherpa-onnx crate). It is a separate job, not part of
