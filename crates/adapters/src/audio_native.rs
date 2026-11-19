@@ -17,6 +17,9 @@
 //!   is taken out, faded and dropped, and the next `play` builds a new one.
 //! * Phrases queued behind the audible one are dropped at the instant of the
 //!   stop, not at the end of the fade.
+//! * The mixer a new player connects to can be replaced (`set_mixer`), which is
+//!   how a lost or changed output device is rebuilt (#354); phrases queued on
+//!   the old mixer are ended, because their endpoint is gone.
 
 use crate::audio::{
     AudioPlayRequest, AudioPlayer, AudioStopOutcome, MAX_AUDIO_STOP_FADE_MS, engine_error,
@@ -149,7 +152,9 @@ impl Slot {
 /// The device-free core of the native backend.
 pub struct GaplessQueue {
     root: PathBuf,
-    mixer: Mixer,
+    /// Mixer a new player is connected to. Replaced when the output device is
+    /// rebuilt (#354); the slot in use is ended at that point.
+    mixer: Mutex<Mixer>,
     slot: Mutex<Option<Slot>>,
     refused_queue_full: AtomicU64,
 }
@@ -173,7 +178,7 @@ impl GaplessQueue {
         }
         Ok(Self {
             root,
-            mixer,
+            mixer: Mutex::new(mixer),
             slot: Mutex::new(None),
             refused_queue_full: AtomicU64::new(0),
         })
@@ -199,6 +204,22 @@ impl GaplessQueue {
 
     pub fn is_idle(&self) -> bool {
         self.queued() == 0
+    }
+
+    /// Replace the mixer new players connect to (#354). Whatever is playing or
+    /// queued is ended first: it is connected to the old mixer, whose device is
+    /// the one that went away. Never blocks.
+    pub fn set_mixer(&self, mixer: Mixer) {
+        let previous = lock(&self.slot).take();
+        if let Some(previous) = previous {
+            previous.hard_stop();
+        }
+        *lock(&self.mixer) = mixer;
+    }
+
+    /// The mixer new players connect to.
+    pub fn mixer(&self) -> Mixer {
+        lock(&self.mixer).clone()
     }
 
     /// Hard stop (no fade): used by benchmarks and a zero-length fade.
@@ -257,6 +278,7 @@ impl GaplessQueue {
     where
         S: Source + Send + 'static,
     {
+        let mixer = self.mixer();
         let mut slot = lock(&self.slot);
         // A fresh performance replaces whatever still plays (as before this
         // slice); a continuation, or a player that already drained, is reused.
@@ -264,9 +286,9 @@ impl GaplessQueue {
             Some(previous) if continuation || previous.player.empty() => previous,
             Some(previous) => {
                 previous.hard_stop();
-                Slot::new(&self.mixer)
+                Slot::new(&mixer)
             }
-            None => Slot::new(&self.mixer),
+            None => Slot::new(&mixer),
         };
         current.prune();
         if current.live_count() >= MAX_QUEUED_PHRASES || current.player.len() >= MAX_RAW_APPENDED {
@@ -365,11 +387,204 @@ impl AudioPlayer for GaplessQueue {
     }
 }
 
+/// Result of comparing the device an output stream is open on with the host's
+/// current default output device (#354).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceDecision {
+    /// Same name, or nothing to compare: keep the stream.
+    Keep,
+    /// A different named default device: rebuild the stream.
+    Changed,
+}
+
+/// Whether the open stream is still the host's default output device (#354).
+/// Device-free, so the rule is tested without a sound card.
+///
+/// Only a different *name* counts. `None` on either side means "not enough
+/// information" - no default device at all, or a host that will not name its
+/// device - and keeps the stream: ending audio that still works is worse than
+/// following the default one phrase later.
+pub fn device_decision(opened: Option<&str>, current: Option<&str>) -> DeviceDecision {
+    match (opened, current) {
+        (Some(opened), Some(current)) if opened != current => DeviceDecision::Changed,
+        _ => DeviceDecision::Keep,
+    }
+}
+
+/// The native backend's device bookkeeping (#354): the device its stream was
+/// opened from, a pending rebuild, and the counters.
+///
+/// Device-free on purpose. The watcher thread only has to report the host's
+/// default device name and the cpal callback only has to report an error, so
+/// both rules and every counter are tested on any host with no audio device.
+#[derive(Debug, Default)]
+pub struct DeviceWatch {
+    opened: Mutex<Option<String>>,
+    pending: AtomicBool,
+    reconnects: AtomicU64,
+    reopen_failures: AtomicU64,
+    degraded: AtomicBool,
+}
+
+impl DeviceWatch {
+    /// The device of the stream that was opened last.
+    pub fn opened(&self) -> Option<String> {
+        lock(&self.opened).clone()
+    }
+
+    /// Record the device of the stream that was just opened.
+    pub fn record_opened(&self, identity: Option<String>) {
+        *lock(&self.opened) = identity;
+    }
+
+    /// The watcher's lookup, off the play path: request a rebuild when the
+    /// host's default device is no longer the one this player opened.
+    pub fn note_default(&self, current: Option<&str>) -> DeviceDecision {
+        let decision = device_decision(lock(&self.opened).as_deref(), current);
+        if decision == DeviceDecision::Changed {
+            self.pending.store(true, Ordering::Release);
+        }
+        decision
+    }
+
+    /// The stream's error callback: the endpoint is gone or invalid.
+    pub fn note_stream_error(&self) {
+        self.pending.store(true, Ordering::Release);
+    }
+
+    /// Take a pending rebuild. This is the only device bookkeeping the play
+    /// path does, so `play` never enumerates devices itself.
+    pub fn take_rebuild(&self) -> bool {
+        self.pending.swap(false, Ordering::AcqRel)
+    }
+
+    /// A stream was just opened: count the reconnect and leave the degraded
+    /// state.
+    pub fn note_reconnected(&self) -> u64 {
+        self.degraded.store(false, Ordering::Release);
+        self.reconnects.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// A reopen found no usable device; `true` the first time in a run of
+    /// failures, so the log says it once rather than once per phrase.
+    pub fn note_reopen_failure(&self) -> bool {
+        self.reopen_failures.fetch_add(1, Ordering::Relaxed);
+        !self.degraded.swap(true, Ordering::AcqRel)
+    }
+
+    /// Output streams reopened after a loss or a default-device change.
+    pub fn reconnects(&self) -> u64 {
+        self.reconnects.load(Ordering::Relaxed)
+    }
+
+    /// Reopen attempts that found no usable output device.
+    pub fn reopen_failures(&self) -> u64 {
+        self.reopen_failures.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(feature = "native-audio-spike")]
+/// How often the watcher looks up the default output device. It runs on its own
+/// thread (#354), so a phrase burst on the play path never queries the host.
+const DEVICE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+#[cfg(feature = "native-audio-spike")]
+/// Name of the host's current default output device, if it reports one.
+fn default_device_identity() -> Option<String> {
+    use rodio::cpal::traits::{DeviceTrait, HostTrait};
+    rodio::cpal::default_host()
+        .default_output_device()
+        .and_then(|device| device.description().ok())
+        .map(|description| description.name().to_owned())
+}
+
+#[cfg(feature = "native-audio-spike")]
+/// Watch the default output device on a thread of its own (#354). `play` only
+/// reads the flag this sets; the thread ends when the player is dropped.
+fn spawn_device_watcher(watch: Arc<DeviceWatch>, stopping: Arc<AtomicBool>) -> std::io::Result<()> {
+    thread::Builder::new()
+        .name("aivtuber-audio-device-watch".to_owned())
+        .spawn(move || {
+            // One line per newly seen device, not one per interval: a rebuild
+            // that keeps failing retries from the play path, quietly.
+            let mut announced: Option<String> = None;
+            while !stopping.load(Ordering::Acquire) {
+                thread::sleep(DEVICE_CHECK_INTERVAL);
+                let current = default_device_identity();
+                if watch.note_default(current.as_deref()) == DeviceDecision::Changed
+                    && current != announced
+                {
+                    eprintln!(
+                        "audio: default output device changed to {}; the native stream is rebuilt before the next phrase",
+                        current.as_deref().unwrap_or("unknown")
+                    );
+                    announced = current;
+                }
+            }
+        })
+        .map(|_detached| ())
+}
+
+#[cfg(feature = "native-audio-spike")]
+/// Open the default output device and record it in `watch`, whose stream error
+/// callback requests a rebuild (Windows reports a removed endpoint there)
+/// (#354).
+fn open_device(watch: Arc<DeviceWatch>) -> Result<MixerDeviceSink, String> {
+    let identity = default_device_identity();
+    let callback_watch = Arc::clone(&watch);
+    let opened = DeviceSinkBuilder::from_default_device().and_then(|builder| {
+        builder
+            .with_error_callback(move |error| {
+                eprintln!("audio: native output stream error: {error}");
+                callback_watch.note_stream_error();
+            })
+            .open_stream()
+    });
+    let (mut sink, identity) = match opened {
+        Ok(sink) => (sink, identity),
+        // The default device would not open: take the fallback the plain
+        // `open_default_sink` takes, but without a name to compare against, so
+        // only a stream error reopens this one.
+        Err(_) => (
+            DeviceSinkBuilder::open_default_sink().map_err(|error| error.to_string())?,
+            None,
+        ),
+    };
+    // A reopen drops the previous sink on purpose; the player logs that itself,
+    // once, rather than one line per dropped stream.
+    sink.log_on_drop(false);
+    watch.record_opened(identity);
+    Ok(sink)
+}
+
 #[cfg(feature = "native-audio-spike")]
 /// The default output device with a [`GaplessQueue`] on its mixer.
+///
+/// The stream is not held for the lifetime of the player: before each `play`
+/// it is reopened when a rebuild is pending (#354). A watcher thread compares
+/// the default output device with the one this player opened, and the stream's
+/// error callback reports a removed endpoint; both only set a flag, so the play
+/// path never enumerates devices. A reopen ends the audio in flight (its
+/// endpoint is the one that went away) and drops the phrases queued behind it;
+/// the first phrase after it plays on the new device. Counters:
+/// [`Self::reconnects`] and [`Self::reopen_failures`].
+///
+/// A missing device never stops the performer: `play` fails with
+/// `Unavailable` (the scheduler records the failure and carries on) and `stop`
+/// keeps working, because it needs no device.
 pub struct RodioAudioPlayer {
-    _stream: MixerDeviceSink,
     queue: GaplessQueue,
+    device: Mutex<Option<MixerDeviceSink>>,
+    watch: Arc<DeviceWatch>,
+    /// Ends the watcher thread when the player is dropped.
+    stopping: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "native-audio-spike")]
+impl Drop for RodioAudioPlayer {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+    }
 }
 
 #[cfg(feature = "native-audio-spike")]
@@ -377,6 +592,8 @@ impl std::fmt::Debug for RodioAudioPlayer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RodioAudioPlayer")
             .field("queue", &self.queue)
+            .field("reconnects", &self.reconnects())
+            .field("reopen_failures", &self.reopen_failures())
             .finish_non_exhaustive()
     }
 }
@@ -391,16 +608,27 @@ impl RodioAudioPlayer {
                 "audio root must not be empty",
             ));
         }
-        let stream = DeviceSinkBuilder::open_default_sink().map_err(|error| {
+        let watch = Arc::new(DeviceWatch::default());
+        let device = open_device(Arc::clone(&watch)).map_err(|reason| {
             engine_error(
                 EngineErrorKind::Unavailable,
-                format!("failed to open default native audio stream: {error}"),
+                format!("failed to open default native audio stream: {reason}"),
             )
         })?;
-        let queue = GaplessQueue::new(root, stream.mixer().clone())?;
+        let queue = GaplessQueue::new(root, device.mixer().clone())?;
+        let stopping = Arc::new(AtomicBool::new(false));
+        if let Err(error) = spawn_device_watcher(Arc::clone(&watch), Arc::clone(&stopping)) {
+            // Without the watcher only the stream error reopens the device; the
+            // backend still works, so this is one line, not a failure.
+            eprintln!(
+                "audio: could not start the native device watcher ({error}); only a stream error will reopen the device"
+            );
+        }
         Ok(Self {
-            _stream: stream,
             queue,
+            device: Mutex::new(Some(device)),
+            watch,
+            stopping,
         })
     }
 
@@ -421,15 +649,64 @@ impl RodioAudioPlayer {
         self.queue.refused_queue_full()
     }
 
+    /// Output streams reopened after a loss or a default-device change.
+    pub fn reconnects(&self) -> u64 {
+        self.watch.reconnects()
+    }
+
+    /// Reopen attempts that found no usable output device.
+    pub fn reopen_failures(&self) -> u64 {
+        self.watch.reopen_failures()
+    }
+
     /// 最初のサンプルがまだ再生されていないキュー内アイテムを取り消す (#354)。
     pub fn cancel_queued(&self, id: u64) -> bool {
         self.queue.cancel_queued(id)
+    }
+
+    /// Rebuild the output stream when one is pending (#354). Called before every
+    /// `play`, which is why it does no host lookup at all: the watcher thread
+    /// and the stream callback set the flag, and this only takes it.
+    fn ensure_device(&self) -> Result<(), EngineError> {
+        let mut device = lock(&self.device);
+        let rebuild = self.watch.take_rebuild();
+        if device.is_some() && !rebuild {
+            return Ok(());
+        }
+        // The old endpoint is gone or is no longer the default: end it (with
+        // the phrase in flight) before opening the new one.
+        *device = None;
+        match open_device(Arc::clone(&self.watch)) {
+            Ok(sink) => {
+                self.queue.set_mixer(sink.mixer().clone());
+                *device = Some(sink);
+                let count = self.watch.note_reconnected();
+                let identity = self.watch.opened();
+                eprintln!(
+                    "audio: native output device reopened after a change or loss (reconnect {count}, device {})",
+                    identity.as_deref().unwrap_or("unknown")
+                );
+                Ok(())
+            }
+            Err(reason) => {
+                if self.watch.note_reopen_failure() {
+                    eprintln!(
+                        "audio: native output device unavailable; playback stays off until one is back: {reason}"
+                    );
+                }
+                Err(engine_error(
+                    EngineErrorKind::Unavailable,
+                    format!("native audio output device unavailable: {reason}"),
+                ))
+            }
+        }
     }
 }
 
 #[cfg(feature = "native-audio-spike")]
 impl AudioPlayer for RodioAudioPlayer {
     fn play(&self, request: &AudioPlayRequest) -> Result<(), EngineError> {
+        self.ensure_device()?;
         self.queue.play(request)
     }
 
