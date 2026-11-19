@@ -764,3 +764,38 @@ fn a_missing_sidecar_program_is_refused_over_the_control_endpoint_and_stays_off(
     assert_eq!(std::fs::read_to_string(&file).unwrap(), OFF);
     app.finish();
 }
+
+/// #440: the running sidecar's newest level is in the status while voice
+/// input is on, and absent (no signal) when it is off or the child went quiet.
+#[test]
+fn the_status_carries_the_live_level_only_while_on() {
+    let dir = scratch("level");
+    let (lock, file) = (dir.join("alive.lock"), dir.join("local-speech-input.json"));
+    let started = Instant::now();
+    let mut input = controller(DOUBLE, "level-stall", &lock, &file, started);
+    let (mut observations, mut transcripts) = trackers();
+    let status = input.status();
+    assert_eq!((status.level, status.speech_prob), (None, None), "off");
+
+    input.enable(|_, _| {}).expect("enable");
+    assert_eq!(input.status().level, None, "on, but nothing heard yet");
+    // Poll and read in the same instant so the one-second freshness window
+    // cannot lapse in between on a slow host.
+    wait_for("a level in the status", Duration::from_secs(10), || {
+        let now_ms = started.elapsed().as_millis() as u64;
+        input.poll(&mut observations, Some(&mut transcripts), now_ms);
+        let status = input.status();
+        status.level == Some(40) && status.speech_prob == Some(95)
+    });
+    // The double sends three and goes quiet: after a second it is no signal.
+    wait_for("the level to go stale", Duration::from_secs(10), || {
+        let now_ms = started.elapsed().as_millis() as u64;
+        input.poll(&mut observations, Some(&mut transcripts), now_ms);
+        input.status().level.is_none()
+    });
+    assert_eq!(input.status().state, SpeechInputStateName::On, "still on");
+
+    input.disable(|_, _| {});
+    assert_eq!(input.status().level, None);
+    std::fs::remove_dir_all(&dir).ok();
+}

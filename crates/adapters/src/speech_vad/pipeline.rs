@@ -1,4 +1,5 @@
 use crate::speech_vad::edges::{EdgeDetector, HysteresisConfig};
+use crate::speech_vad::level::LevelAccum;
 use crate::speech_vad::preroll::PreRoll;
 use crate::speech_vad::resample::Resampler;
 use aivtuber_domain::SpeechEdge;
@@ -47,6 +48,8 @@ pub struct VadPipeline<S: FrameScorer> {
     /// 16 kHz samples already consumed into scored frames.
     scored_samples: u64,
     stats: PipelineStats,
+    /// Display-only meter data (#440); never feeds the edge decision.
+    level: LevelAccum,
 }
 
 impl<S: FrameScorer> VadPipeline<S> {
@@ -65,11 +68,18 @@ impl<S: FrameScorer> VadPipeline<S> {
             frame: Vec::with_capacity(FRAME_SAMPLES * 2),
             scored_samples: 0,
             stats: PipelineStats::default(),
+            level: LevelAccum::default(),
         })
     }
 
     pub fn stats(&self) -> PipelineStats {
         self.stats
+    }
+
+    /// Meter data of the frames scored so far (#440); the sidecar takes it
+    /// at its own rate.
+    pub fn level_mut(&mut self) -> &mut LevelAccum {
+        &mut self.level
     }
 
     /// Read hook for the S3 transcriber. Nothing in S2 consumes it.
@@ -94,6 +104,7 @@ impl<S: FrameScorer> VadPipeline<S> {
             match self.scorer.score(frame) {
                 Ok(p) if p.is_finite() => {
                     self.stats.frames_scored += 1;
+                    self.level.observe(frame, p);
                     if let Some(edge) = self.detector.push(p) {
                         match edge {
                             SpeechEdge::Start => self.stats.start_edges += 1,
@@ -251,6 +262,20 @@ mod tests {
         assert_eq!(a.len(), 2);
         assert_eq!(a, run(480));
         assert_eq!(a, run(97));
+    }
+
+    #[test]
+    fn the_level_covers_the_scored_frames_and_does_not_change_the_edges() {
+        let mut p = pipeline(16_000);
+        let mut edges = Vec::new();
+        assert_eq!(p.level_mut().take(), None);
+        p.push_input(&vec![0.0; 2_048], &mut edges);
+        let quiet = p.level_mut().take().expect("frames scored");
+        assert_eq!((quiet.rms, quiet.p), (0, 2));
+        p.push_input(&tone(16_000, 200, 0.5), &mut edges);
+        let loud = p.level_mut().take().expect("frames scored");
+        assert!(loud.rms > 80 && loud.p == 95, "{loud:?}");
+        assert_eq!(edges.len(), 1, "one start edge, as without a meter");
     }
 
     #[test]

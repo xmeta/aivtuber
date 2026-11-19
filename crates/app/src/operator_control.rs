@@ -129,6 +129,9 @@ pub struct OperatorStatusSnapshot {
     pub content_queue: usize,
     pub scheduler_items: usize,
     pub generation_active: bool,
+    /// Whether the performer is speaking now (#440). Display data only.
+    #[serde(default)]
+    pub speaking: bool,
     /// Live screen perception (#90 S1b). Absent unless perception is composed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perception: Option<OperatorPerceptionStatus>,
@@ -231,6 +234,7 @@ impl OperatorStatusSnapshot {
             generation_active: generation
                 .as_ref()
                 .is_some_and(|snapshot| !snapshot.is_quiescent()),
+            speaking: app.performer_speaking(),
             perception: app
                 .perception()
                 .map(|service| OperatorPerceptionStatus::from_report(&service.report(now_ms))),

@@ -985,6 +985,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             sidecar_args.push("--feed-heartbeat-ms".to_owned());
             sidecar_args.push("64".to_owned());
         }
+        // Issue #440: the input level for the operation panel meter, 10 Hz at
+        // most. An explicit --level-ms (0 turns it off) wins.
+        if !sidecar_args.iter().any(|arg| arg == "--level-ms") {
+            sidecar_args.push("--level-ms".to_owned());
+            sidecar_args.push("100".to_owned());
+        }
         let mut config = SpeechSidecarConfig::new(program, sidecar_args);
         config.resync_interval =
             Duration::from_millis(env_u64("AIVTUBER_SPEECH_SIDECAR_RESYNC_MS", 5_000)?);

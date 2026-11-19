@@ -469,3 +469,70 @@ fn malformed_beats_neither_count_as_liveness_nor_degrade() {
     assert_eq!(sidecar.feed_heartbeat_ms(), None);
     assert!(!sidecar.is_degraded());
 }
+
+// ---- Issue #440: the input level through the same supervisor ----
+
+/// Level lines are routed by their `vad` key, never offered to the
+/// observation tracker, and read as the newest sample while fresh.
+#[test]
+fn level_lines_are_routed_by_key_and_read_while_fresh() {
+    let started = Instant::now();
+    let mut observations = tracker(1_000);
+    let mut sidecar = spawn("level", 250, started);
+    assert_eq!(
+        sidecar.level_at(0),
+        None,
+        "no level before the child sends one"
+    );
+    let done = run_until(Duration::from_secs(10), || {
+        poll_both(&mut sidecar, &mut observations, None, started);
+        sidecar.stats().level_lines >= 3
+    });
+    assert!(done, "{:?}", sidecar.stats());
+    let now_ms = started.elapsed().as_millis() as u64;
+    let level = sidecar.level_at(now_ms).expect("a fresh level");
+    assert_eq!((level.rms, level.p), (40, 95));
+    let stats = sidecar.stats();
+    assert_eq!((stats.lines_rejected, stats.batches_ingested), (0, 0));
+    assert_eq!(observations.metrics().batches_rejected_invalid, 0);
+    assert!(!sidecar.is_degraded());
+}
+
+/// A child that lives but stops sending levels reads as no signal once the
+/// newest one is a second old; the supervisor does not degrade.
+#[test]
+fn a_stalled_level_goes_stale_after_a_second_without_degrading() {
+    let started = Instant::now();
+    let mut observations = tracker(1_000);
+    let mut sidecar = spawn("level-stall", 250, started);
+    let done = run_until(Duration::from_secs(10), || {
+        poll_both(&mut sidecar, &mut observations, None, started);
+        sidecar.stats().level_lines >= 3
+    });
+    assert!(done, "{:?}", sidecar.stats());
+    std::thread::sleep(Duration::from_millis(400));
+    poll_both(&mut sidecar, &mut observations, None, started);
+    assert_eq!(sidecar.stats().level_lines, 3, "the child stopped sending");
+    let now_ms = started.elapsed().as_millis() as u64;
+    assert_eq!(sidecar.level_at(now_ms + 5_000), None, "stale");
+    assert!(!sidecar.is_degraded());
+}
+
+/// Malformed, out-of-range and oversize level lines say nothing: no level,
+/// counted as rejected lines, and they never count toward the 32 consecutive
+/// invalid batches that stop the child.
+#[test]
+fn malformed_level_lines_show_nothing_and_do_not_degrade() {
+    let started = Instant::now();
+    let mut observations = tracker(1_000);
+    let mut sidecar = spawn("level-garbage", 250, started);
+    let done = run_until(Duration::from_secs(10), || {
+        poll_both(&mut sidecar, &mut observations, None, started);
+        sidecar.stats().lines_rejected >= 80
+    });
+    assert!(done, "{:?}", sidecar.stats());
+    let now_ms = started.elapsed().as_millis() as u64;
+    assert_eq!(sidecar.level_at(now_ms), None);
+    assert_eq!(sidecar.stats().level_lines, 0);
+    assert!(!sidecar.is_degraded());
+}
