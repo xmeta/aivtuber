@@ -117,6 +117,8 @@ Measured (device-free, `cargo test --locked -p aivtuber-adapters --features gapl
 |phrase A intact (4800); B starts immediately behind it and plays at about half its length (rodio's resampler: 2400 expected, 2656 observed in a probe), so exactness is claimed at speed 1.0 only
 |Preemption recall inside the lookahead (#354)
 |0 samples of the recalled phrase are pulled; queued count drops immediately so a replacement continuation chains at 0 gap after A
+|Device rebuild (#354)
+|the old player is ended and its device goes silent (nothing migrates); the first play after `set_mixer` is audible on the new mixer
 |===
 
 What this establishes: with the next phrase already appended, rodio's queue plus mixer introduce no silence at the boundary *in the sample stream*, for 16-bit mono WAV at 48 kHz and a sink at the same rate, and the lookahead makes "already appended" the normal case. It also establishes the stop semantics above against the real queue code.
@@ -131,15 +133,50 @@ What it does not establish (needs a manual DAC-level measurement, see the PR for
 
 == Backend selection (#354)
 
-The app picks its audio output at start from `AIVTUBER_AUDIO_BACKEND`: `process` (default, the external player) or `rodio-gapless` (alias `rodio`; any other value is a start-up error naming the valid ones). The native backend is opt-in twice: build `aivtuber-app` with `--features native-audio` (forwards to `aivtuber-adapters/native-audio-spike`; no new dependency, not in the release archive) and set the variable. When it is requested but unavailable (feature not built, or no output device) the app starts with the process player and logs one line, `audio: requested backend rodio-gapless not used, falling back to process: <reason>`; selection never stops the performer. Device loss after start and real-DAC latency (#354 items 3 and 4) are not part of this slice.
+The app picks its audio output at start from `AIVTUBER_AUDIO_BACKEND`: `process` (default, the external player) or `rodio-gapless` (alias `rodio`; any other value is a start-up error naming the valid ones). The native backend is opt-in twice: build `aivtuber-app` with `--features native-audio` (forwards to `aivtuber-adapters/native-audio-spike`; no new dependency, not in the release archive) and set the variable. When it is requested but unavailable (feature not built, or no output device) the app starts with the process player and logs one line, `audio: requested backend rodio-gapless not used, falling back to process: <reason>`; selection never stops the performer. A device lost or changed after start is rebuilt as described in the next section; the DAC-level measurement is still manual ("Manual measurement: WASAPI loopback").
+
+== Device loss and default-device change (#354)
+
+The native backend follows the output device instead of holding the one it started with. That is the item #354 listed as the blocker for making it the default.
+
+* *What is watched, and where.* Two things, both cheap, and neither on the play path: the stream's error callback (installed with `rodio::DeviceSinkBuilder::with_error_callback`), which is where the Windows host reports an endpoint that was removed or invalidated, and the default output device's name (`Device::description().name()`), which a watcher thread looks up once per `DEVICE_CHECK_INTERVAL` (one second), never from the audio callback. Both only set a flag (`DeviceWatch`), so `play` does one atomic swap and never queries the host. The rule and the counters are device-free and tested with no sound card: `cargo test --locked -p aivtuber-adapters --features gapless-queue --test device_watch`.
+* *What a rebuild does.* The old sink is dropped, which ends the phrase in flight: its endpoint is the one that went away, and nothing can be migrated to the new one. The phrases queued behind it are discarded exactly like a stop (they produce no sample), the new stream is opened, and the queue's mixer is replaced (`GaplessQueue::set_mixer`; that is the device-free part, and the falsifier above covers it). The next `play` is audible on the new device, and its continuation queue works as before.
+* *Counters and lines.* `RodioAudioPlayer::reconnects()` counts rebuilds and `reopen_failures()` counts attempts that found no usable device. A rebuild logs one line, `audio: native output device reopened after a change or loss (reconnect N, device <name>)`; a device that is gone logs `audio: native output device unavailable; playback stays off until one is back: <reason>` once per outage, not once per phrase, and the next successful rebuild logs the first line again.
+* *Never freezes.* With no device, `play` returns `Unavailable`: the scheduler records the failed action and the deterministic performer carries on. `stop` still works, because it needs only the queue (mixer and player), not a device. No call blocks on a device.
+* *Bounds.* The name comparison cannot tell two devices with the same name apart, and a host that will not name its default device is followed only through the stream error, so a silent switch there is not seen (the old stream keeps playing to the old endpoint). A rebuild in the middle of a phrase costs the rest of that phrase and the phrases queued behind it; the next phrase recovers. Only Windows has been built and run; Linux and macOS device behavior is unverified.
+
+== Manual measurement: WASAPI loopback and stop latency (procedure, not yet run)
+
+This is #354 item 4. It is a *manual* measurement because it needs a real output device and a loopback capture; nothing here runs in CI, and no number is recorded until someone runs it and adds a dated evidence file beside `examples/benchmarks/audio-backend-windows-2026-09-28.json`.
+
+Why a loopback::
+The sample-exactness above is proved on rodio's offline mixer. At the speaker, cpal's callback buffering, WASAPI shared mode and the driver sit after that mixer, so only a capture of what the device actually renders can show the gap a listener hears.
+
+Prerequisites::
+Windows 10/11 with a working default output device; a loopback recorder (OBS "Audio Output Capture (WASAPI)", or Audacity with the *Windows WASAPI* host and the speaker as the recording device - no virtual driver needed); `ffmpeg`/`ffprobe` for trimming and inspection, or Audacity's own measurement; the app built with `--features native-audio` and `AIVTUBER_AUDIO_BACKEND=rodio-gapless`.
+
+Procedure::
+. Record at the device's own rate (48 kHz in the recorded setup) and note the buffer size rodio opened (`DeviceSinkConfig`; rodio's default is 100 ms of buffer, `DeviceSinkBuilder::from_device` aims for 50 ms of audio).
+. Have the performer say a two-phrase reply whose phrases are known WAV files (a synthesized pair is enough; a real TTS pair is better). Note the wall-clock time of the logical start and of the operator stop, which the app logs.
+. Capture the loopback for the whole reply, then export the WAV unchanged (same rate, no resampling, no normalisation).
+. In the capture, find the end of the first phrase and the start of the second (first sample above the noise floor after the boundary) and compute the gap in samples and in milliseconds. Repeat at least 10 times and record p50/p95/min/max.
+. Stop latency: mark the time the operator stop was issued (log line) and the first silent sample after it in the same capture; report the difference. Repeat 10 times, with the 120 ms fade and with a hard stop (`fade_ms = 0`).
+. Contrast: repeat the gap run with `AIVTUBER_AUDIO_BACKEND=process` so the report shows both backends on the same machine.
+. Record the host, Windows build, device and driver, WASAPI mode, buffer size, date, and the commands in the evidence file; add a row to "Phrase continuity" only for what the capture actually shows.
+
+What would count as passing::
+A two-phrase WAV chain whose boundary contains no silent sample at the capture rate (one sample at 48 kHz is 20.8 us, which is the resolution to report), and a stop whose audible silence begins within the fade plus the device buffer. Anything the capture does not resolve is reported as unresolved, not as zero.
+
+What it still would not establish::
+Opus and other codecs, a phrase rate different from the device rate, drift between the logical timeline and the device (see "Phrase continuity"), and behaviour on Linux or macOS.
 
 == Device and deployment behavior
 
 Windows::
-The feature build and live benchmark succeeded against the default Windows output device. `RodioAudioPlayer::new` fails with an unavailable error when the default stream cannot be opened. Device-loss reconnect is a *known gap*: nothing rebuilds the stream after device removal or a default-device change (a play then keeps appending to a player whose device is gone). It must be closed before the native backend can become the default.
+The feature build and live benchmark succeeded against the default Windows output device. `RodioAudioPlayer::new` fails with an unavailable error when the default stream cannot be opened. Device loss after start and a default-device change are rebuilt as described in "Device loss and default-device change (#354)"; a physical unplug and a device switch on the deployment machine are still a manual check, because no CI runner has a sound card. The DAC-level gap and stop latency remain unmeasured ("Manual measurement: WASAPI loopback").
 
 Features and other platforms::
-Two opt-in features, neither in a default build. `gapless-queue` enables rodio *without* its `playback` feature: the device-free `GaplessQueue`, which builds and tests on any host with no ALSA headers (CI runs its clippy and the falsifier). `native-audio-spike` adds rodio's `playback` (cpal) and `RodioAudioPlayer`/the benchmark; cpal needs ALSA development headers on Linux exactly like `mic-capture`, so default CI does not build it. The Windows-only gate was removed from the code in #83 S3d, but `native-audio-spike` has been built and run on Windows only; Linux and macOS device behavior is unverified.
+Two opt-in features, neither in a default build. `gapless-queue` enables rodio *without* its `playback` feature: the device-free `GaplessQueue`, which builds and tests on any host with no ALSA headers (CI runs its clippy and the falsifier). `native-audio-spike` adds rodio's `playback` (cpal) and `RodioAudioPlayer`/the benchmark; cpal needs ALSA development headers on Linux exactly like `mic-capture`, so the required Linux CI job does not build it. A separate Windows job (`native-audio` in `.github/workflows/ci.yml`) lints the feature with `-D warnings` and checks the app composition with `--features native-audio`, so the device code cannot rot unbuilt; it needs no sound card. The Windows-only gate was removed from the code in #83 S3d, but `native-audio-spike` has still been built and run on Windows only; Linux and macOS device behavior is unverified.
 
 Fallback::
 The process backend remains available and remains the production default. Failure of the optional native experiment therefore does not remove the existing operational path.
@@ -154,11 +191,12 @@ The process backend remains available and remains the production default. Failur
 
 == Reproduction and verification
 
-Default CI does not require a native audio device:
+No CI job needs a native audio device. The device code is compiled and linted on a Windows runner, and the device-free rules are tested on Linux:
 
 [source,text]
 ----
 cargo test --locked -p aivtuber-adapters
+cargo test --locked -p aivtuber-adapters --features gapless-queue --test device_watch
 ----
 
 The optional implementation can be type-checked without changing the application default. The recorded live evidence was produced on Windows:
@@ -177,6 +215,6 @@ Reconsider replacing the process default when at least one of these produces new
 
 * #58 shows audio backend startup is material in the end-to-end latency budget;
 * #83 needs phrase-level gap/continuity below what process playback can provide (the sample-stream part is now measured, see "Phrase continuity"; the DAC-level part is not);
-* an acoustic loopback/microphone measurement confirms the proxy advantage at first audible output;
-* production device-loss/reconnect tests establish a robust persistent-stream lifecycle;
+* production device-loss/reconnect behaviour on the actual deployment machine (the automatic rebuild is implemented and device-free-part tested; a physical unplug and a switch still need a person with a sound card);
+* an acoustic loopback/microphone measurement confirms the proxy advantage at first audible output, and the speaker-level gap and stop latency follow the manual procedure above;
 * isolated CPU/memory measurements reveal a material regression or advantage.

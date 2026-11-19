@@ -362,6 +362,43 @@ fn a_fresh_performance_replaces_what_is_still_playing() {
 }
 
 #[test]
+fn a_mixer_swap_ends_the_old_player_and_the_next_play_uses_the_new_one() {
+    // #354: a lost or changed output device rebuilds the stream; the queue part
+    // is device-free, so the swap is exercised here on two offline mixers.
+    let (mut rig, root) = rig("swap");
+    write_wav(&root, "a.wav", A, 96_000);
+    write_wav(&root, "c.wav", C, 4_800);
+    rig.play("a.wav", 1.0, false);
+    let before = rig.pull(1_000);
+    assert!(before.contains(&a()), "phrase A plays on the old device");
+    assert_eq!(rig.queue.queued(), 1);
+
+    let (mixer_b, mut out_b) = mixer(
+        NonZero::new(1).expect("mono"),
+        NonZero::new(RATE).expect("rate"),
+    );
+    rig.queue.set_mixer(mixer_b);
+    assert_eq!(rig.queue.queued(), 0, "the old device's player is ended");
+    // The player was stopped, so at most the mixer's own buffer drains: the
+    // old device goes silent and nothing is handed to the new one.
+    let tail = rig.pull(30_000);
+    assert!(
+        tail.iter().all(|s| *s != c()),
+        "nothing moves from the old device to the new one"
+    );
+    let after = rig.pull(4_800);
+    assert!(after.iter().all(|s| *s == 0.0), "the old device is silent");
+
+    rig.play("c.wav", 1.0, false);
+    assert_eq!(rig.queue.queued(), 1, "the new device holds the phrase");
+    let on_new: Vec<f32> = (&mut out_b).take(8_000).collect();
+    assert!(
+        on_new.contains(&c()),
+        "the first play after the swap is audible on the new device"
+    );
+}
+
+#[test]
 fn a_preempted_continuation_recalled_before_its_first_sample_is_never_audible() {
     let (mut rig, root) = rig("recall");
     let (n, m, k) = (4_800_u32, 3_600_u32, 2_400_u32);
