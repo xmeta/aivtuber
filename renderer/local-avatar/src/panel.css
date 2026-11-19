@@ -231,9 +231,12 @@ label.field select { color: var(--text); }
 #other-wrap ul { margin: var(--s2) 0; padding-left: var(--s5); color: var(--text-muted); font-size: .88rem; }
 
 @media (min-width: 900px) {
+  /* Header is pinned to --header-h so the sticky side column can sit exactly below it. */
+  :root { --header-h: 3.25rem; --side-top: calc(var(--s2) + var(--header-h) + var(--s3)); }
   body { padding: var(--s5); }
+  main > header { box-sizing: border-box; min-height: var(--header-h); }
   .layout { grid-template-columns: minmax(0, 1fr) 23rem; grid-template-areas: "chat side" "settings side"; grid-template-rows: auto 1fr; align-items: start; }
-  .layout > .side { grid-area: side; position: sticky; top: 5rem; max-height: calc(100vh - 6rem); overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; padding-bottom: var(--s5); }
+  .layout > .side { grid-area: side; position: sticky; top: var(--side-top); box-sizing: border-box; max-height: calc(100vh - var(--side-top) - var(--s4)); overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; padding-bottom: var(--s5); }
   .layout > .side::after { content: ""; position: sticky; bottom: calc(-1 * var(--s5)); height: var(--s6); margin-top: calc(-1 * var(--s6) - var(--s4)); background: linear-gradient(transparent, var(--bg)); pointer-events: none; }
   .layout > .chat { grid-area: chat; }
   .layout > .settings { grid-area: settings; }
