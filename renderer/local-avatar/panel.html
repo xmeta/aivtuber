@@ -90,7 +90,7 @@
     <h2 id="h-chat">話しかける</h2>
     <div id="chat-log" class="log" aria-live="polite"></div>
     <textarea id="chat-input" rows="3" maxlength="500" placeholder="ここに入力(Ctrl+Enterで送信)" aria-label="話しかける内容"></textarea>
-    <div class="buttons"><button id="send" type="button">送信</button></div>
+    <div class="buttons"><button id="send" type="button" class="primary">送信</button></div>
     <p id="chat-error" class="error" role="alert"></p>
     <div id="other-wrap" hidden>
       <h3>最近の発話(ほかの入力への返答)</h3>
@@ -200,7 +200,7 @@
       <p class="hint">モデルのライセンスが求める表記を確認し、必要なら直してください。配信の概要欄などに表示してください。</p>
       <label class="check"><input id="voice-egress" type="checkbox"> 返信のテキストがインターネット上の Aivis Cloud に送信されることを理解しました</label>
       <div class="buttons wrap">
-        <button id="voice-enable" type="button">この声を使う</button>
+        <button id="voice-enable" type="button" class="primary">この声を使う</button>
       </div>
     </div>
 
