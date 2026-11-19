@@ -643,3 +643,64 @@ fn stt_options_without_a_worker_are_refused() {
     assert!(!ok);
     assert!(stderr.contains("--stt-worker"), "{stderr}");
 }
+
+/// Issue #440: the input-level line is opt-in, at most 10 Hz, follows the
+/// signal (silence, then a loud voiced stretch) and sits next to unchanged
+/// edges.
+#[test]
+fn the_level_line_is_opt_in_bounded_and_follows_the_signal() {
+    use aivtuber_adapters::speech_vad::parse_level_line;
+    let wav = write_wav("level-vowel.wav", 16_000, 1, &synthetic_vowel_16k());
+    let (off, stderr, ok) = run_wav(&wav, &["--pace", "realtime"]);
+    assert!(ok, "{stderr}");
+    assert!(
+        off.iter()
+            .all(|line| parse_level_line(line.as_bytes()).is_none())
+    );
+
+    let started = Instant::now();
+    let (on, stderr, ok) = run_wav(&wav, &["--pace", "realtime", "--level-ms", "100"]);
+    let elapsed = started.elapsed();
+    assert!(ok, "{stderr}");
+    let levels: Vec<_> = on
+        .iter()
+        .filter_map(|line| parse_level_line(line.as_bytes()))
+        .collect();
+    assert!(levels.len() >= 8, "{levels:?}");
+    let bound = (elapsed.as_secs_f64() * 10.0).ceil() as usize + 1;
+    assert!(
+        levels.len() <= bound,
+        "{} lines in {elapsed:?}",
+        levels.len()
+    );
+    assert_eq!(levels[0].rms, 0, "the clip starts in digital silence");
+    assert!(levels[0].p < 20, "{:?}", levels[0]);
+    assert!(
+        levels.iter().any(|l| l.rms >= 70 && l.p >= 90),
+        "the vowel is loud and scored as speech: {levels:?}"
+    );
+    // Everything that is not a level line is still a valid batch, the same
+    // edges as without the flag.
+    let rest: Vec<String> = on
+        .into_iter()
+        .filter(|line| parse_level_line(line.as_bytes()).is_none())
+        .collect();
+    assert_eq!(
+        parse_edges(&rest).iter().map(|e| e.0).collect::<Vec<_>>(),
+        vec![SpeechEdge::Start, SpeechEdge::End]
+    );
+}
+
+#[test]
+fn a_level_interval_out_of_range_is_refused() {
+    for bad in ["50", "1001", "x"] {
+        let status = Command::new(SIDECAR)
+            .args(["--language", "ja", "--level-ms", bad])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run");
+        assert!(!status.success(), "{bad}");
+    }
+}

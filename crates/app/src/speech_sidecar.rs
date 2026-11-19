@@ -27,7 +27,8 @@
 use crate::raw_ingress::{RawIngressConfig, RawIngressMetrics, pump_bounded_records};
 use aivtuber_adapters::speech_stt::{SttStatus, SttUnavailableReason, parse_stt_status_line};
 use aivtuber_adapters::speech_vad::{
-    DeviceReport, encode_clock_sync_line, parse_device_report_line, parse_feed_heartbeat_line,
+    DeviceReport, LevelSample, encode_clock_sync_line, parse_device_report_line,
+    parse_feed_heartbeat_line, parse_level_line,
 };
 use aivtuber_domain::{MAX_SPEECH_OBSERVATION_BATCH_BYTES, MAX_SPEECH_TRANSCRIPT_BATCH_BYTES};
 use aivtuber_runtime::{
@@ -46,6 +47,16 @@ use std::time::{Duration, Instant};
 
 /// Most child arguments accepted from configuration.
 pub const MAX_SPEECH_SIDECAR_ARGS: usize = 32;
+
+/// A level older than this (receipt time to now) is shown as no signal (#440).
+pub const LEVEL_STALE_MS: u64 = 1_000;
+
+/// The level if it was received at most [`LEVEL_STALE_MS`] before `now_ms`.
+fn fresh_level(level: Option<(LevelSample, u64)>, now_ms: u64) -> Option<LevelSample> {
+    level
+        .filter(|(_, at_ms)| now_ms.saturating_sub(*at_ms) <= LEVEL_STALE_MS)
+        .map(|(sample, _)| sample)
+}
 
 /// Routing probe: only which top-level keys are present.
 #[derive(Deserialize)]
@@ -201,6 +212,8 @@ pub struct SpeechSidecarStats {
     pub transcript_lines_ignored: u64,
     /// Well-formed feed-liveness beats received (#81 S2).
     pub feed_heartbeats: u64,
+    /// Well-formed input-level lines received (#440).
+    pub level_lines: u64,
 }
 
 pub struct SpeechSidecar {
@@ -220,6 +233,9 @@ pub struct SpeechSidecar {
     /// The capture devices and the opened one, as the child reported them
     /// once at start (#396). `None` until it does (a WAV input never does).
     device_report: Option<DeviceReport>,
+    /// The newest input level and the runtime time it was received (#440).
+    /// Display data: never an input to any decision.
+    level: Option<(LevelSample, u64)>,
     stats: SpeechSidecarStats,
     config: SpeechSidecarConfig,
 }
@@ -283,6 +299,7 @@ impl SpeechSidecar {
             transcript_path: SpeechTranscriptPath::NotReported,
             feed_heartbeat_ms: None,
             device_report: None,
+            level: None,
             stats: SpeechSidecarStats::default(),
             config,
         })
@@ -306,6 +323,16 @@ impl SpeechSidecar {
     /// as "stale".
     pub fn feed_heartbeat_ms(&self) -> Option<u64> {
         self.feed_heartbeat_ms
+    }
+
+    /// The newest input level (0..=100 each) if one arrived within
+    /// [`LEVEL_STALE_MS`] of `now_ms`, else `None`: a silent child, a stalled
+    /// microphone and a degraded sidecar all read as "no signal" (#440).
+    pub fn level_at(&self, now_ms: u64) -> Option<LevelSample> {
+        if self.is_degraded() {
+            return None;
+        }
+        fresh_level(self.level, now_ms)
     }
 
     /// What the child reported about its capture devices, if it has.
@@ -363,6 +390,9 @@ impl SpeechSidecar {
                             // degrading.
                             if let Some(report) = parse_device_report_line(&line) {
                                 self.device_report = Some(report);
+                            } else if let Some(sample) = parse_level_line(&line) {
+                                self.level = Some((sample, now_ms));
+                                self.stats.level_lines += 1;
                             } else if parse_feed_heartbeat_line(&line).is_some() {
                                 self.feed_heartbeat_ms =
                                     Some(self.feed_heartbeat_ms.map_or(now_ms, |p| p.max(now_ms)));
@@ -611,6 +641,19 @@ mod tests {
         let mut bad = ok;
         bad.max_consecutive_invalid = 0;
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn a_level_is_fresh_for_one_second_after_its_receipt_and_never_from_the_future() {
+        let sample = LevelSample { rms: 40, p: 95 };
+        assert_eq!(fresh_level(None, 5_000), None);
+        let held = Some((sample, 1_000));
+        assert_eq!(fresh_level(held, 1_000), Some(sample));
+        assert_eq!(fresh_level(held, 1_000 + LEVEL_STALE_MS), Some(sample));
+        assert_eq!(fresh_level(held, 1_000 + LEVEL_STALE_MS + 1), None);
+        // A receipt time ahead of `now_ms` (the loop clock never goes back, but
+        // be safe) counts as fresh, not as a wrapped huge age.
+        assert_eq!(fresh_level(held, 10), Some(sample));
     }
 
     #[test]

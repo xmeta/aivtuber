@@ -14,6 +14,10 @@
 //!
 //! Feed-liveness modes (#81 S2): `beat`, `beat-stall`, `beat-garbage`.
 //!
+//! Input-level modes (#440): `level` (one `{"vad":{"level":...}}` line per sync,
+//! rms 40 and p 95), `level-stall` (only the first three) and `level-garbage`
+//! (malformed, out-of-range and oversize level lines).
+//!
 //! Transcript modes (#92 S3b), also clocked by the sync lines: `transcripts`
 //! (a ready status, then per segment two partials and a final, each stamped
 //! with the sync time), `stt-fail` (edges, a ready status, then an
@@ -157,6 +161,45 @@ fn main() -> ExitCode {
             });
             ExitCode::SUCCESS
         }
+        "level" | "level-stall" => {
+            let stall = mode == "level-stall";
+            let mut n = 0_u64;
+            let _ = pump_clock_syncs(BufReader::new(io::stdin().lock()), |_| {
+                if !stall || n < 3 {
+                    emit(
+                        &mut out,
+                        &aivtuber_adapters::speech_vad::encode_level_line(
+                            aivtuber_adapters::speech_vad::LevelSample { rms: 40, p: 95 },
+                        ),
+                    );
+                }
+                n += 1;
+            });
+            ExitCode::SUCCESS
+        }
+        "level-garbage" => {
+            let long = format!(
+                "{{\"vad\":{{\"level\":{{\"rms\":1,\"p\":1}}}}}}{}
+",
+                " ".repeat(200)
+            );
+            let _ = pump_clock_syncs(BufReader::new(io::stdin().lock()), |_| {
+                for bad in [
+                    "{\"vad\":{\"level\":{\"rms\":101,\"p\":0}}}
+",
+                    "{\"vad\":{\"level\":{\"rms\":-1,\"p\":0}}}
+",
+                    "{\"vad\":{\"level\":{\"rms\":1.5,\"p\":0}}}
+",
+                    "{\"vad\":{\"level\":{\"rms\":1,\"p\":1,\"x\":2}}}
+",
+                    long.as_str(),
+                ] {
+                    emit(&mut out, bad);
+                }
+            });
+            ExitCode::SUCCESS
+        }
         "beat-garbage" => {
             let _ = pump_clock_syncs(BufReader::new(io::stdin().lock()), |_| {
                 emit(&mut out, "{\"vad\":{\"heartbeat\":{\"seq\":\"x\"}}}\n");
@@ -243,7 +286,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: speech-sidecar-double clock|crash|garbage|flood|oversize|hang|with-worker|transcripts|stt-fail|transcript-garbage|beat|beat-stall|beat-garbage|devices"
+                "usage: speech-sidecar-double clock|crash|garbage|flood|oversize|hang|with-worker|transcripts|stt-fail|transcript-garbage|beat|beat-stall|beat-garbage|level|level-stall|level-garbage|devices"
             );
             ExitCode::FAILURE
         }

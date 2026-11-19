@@ -40,6 +40,10 @@
   <section id="voice-input-section" aria-labelledby="h-voice-input" hidden>
     <h2 id="h-voice-input"><svg class="ico" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>音声入力</h2>
     <p id="voice-input-state" role="status"></p>
+    <div id="voice-meter" class="meter" hidden>
+      <div id="voice-meter-bar" class="meter-bar" role="meter" aria-label="マイク入力レベル" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
+      <span id="voice-meter-text" class="meter-text"></span>
+    </div>
     <p id="voice-input-explanation" class="hint"></p>
     <p id="voice-input-cloud" class="hint cloud" hidden></p>
     <p id="voice-input-device-line"></p>

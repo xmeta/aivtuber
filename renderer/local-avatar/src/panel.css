@@ -256,3 +256,16 @@ label.field select { color: var(--text); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; }
 }
+
+/* Voice-input level meter (#440): segmented, lit by the host's peak level. */
+.meter { display: flex; align-items: center; gap: var(--s3); margin: var(--s2) 0; }
+.meter-bar { display: flex; gap: 2px; flex: 1 1 auto; height: 14px; min-width: 8rem; }
+.meter-bar .seg {
+  flex: 1 1 0; border-radius: 2px; background: var(--surface-3);
+  transition: background var(--t);
+}
+.meter-bar .seg.on { background: var(--text-muted); }
+.meter-bar.speech .seg.on { background: var(--ok); }
+.meter-bar.nosignal .seg { background: var(--surface-2); outline: 1px dashed var(--border); outline-offset: -1px; }
+.meter-text { flex: 0 0 auto; font-size: .85rem; color: var(--text-muted); min-width: 7rem; text-align: right; }
+.meter-bar.speech + .meter-text { color: var(--ok); font-weight: 600; }
