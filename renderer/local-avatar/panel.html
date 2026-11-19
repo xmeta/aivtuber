@@ -23,13 +23,13 @@
 <div class="layout">
 <div class="side">
   <section aria-labelledby="h-status">
-    <h2 id="h-status">状態</h2>
+    <h2 id="h-status"><svg class="ico" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>状態</h2>
     <div id="status" class="rows"></div>
     <p><a id="avatar-link" href="about:blank" target="_blank" rel="noopener noreferrer" hidden>アバター画面を開く</a></p>
   </section>
 
   <section aria-labelledby="h-control" class="emergency">
-    <h2 id="h-control">緊急操作</h2>
+    <h2 id="h-control"><svg class="ico" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M12 3 2 20h20L12 3z"/><path d="M12 10v4M12 17.5v.01"/></svg>緊急操作</h2>
     <div class="buttons">
       <button id="stop" type="button" class="danger">緊急停止</button>
       <button id="mute" type="button" class="danger">ミュート</button>
@@ -38,7 +38,7 @@
   </section>
 
   <section id="voice-input-section" aria-labelledby="h-voice-input" hidden>
-    <h2 id="h-voice-input">音声入力</h2>
+    <h2 id="h-voice-input"><svg class="ico" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>音声入力</h2>
     <p id="voice-input-state" role="status"></p>
     <p id="voice-input-explanation" class="hint"></p>
     <p id="voice-input-cloud" class="hint cloud" hidden></p>
@@ -57,7 +57,7 @@
   </section>
 
   <section id="persona-section" aria-labelledby="h-persona" hidden>
-    <h2 id="h-persona">キャラクター設定</h2>
+    <h2 id="h-persona"><svg class="ico" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-7 8-7s8 3 8 7"/></svg>キャラクター設定</h2>
     <p id="persona-explanation" class="hint"></p>
     <p id="persona-cloud" class="hint cloud" hidden></p>
     <p id="persona-memory-only" class="hint" hidden></p>
@@ -71,7 +71,7 @@
   </section>
 
   <section id="memory-section" aria-labelledby="h-memory" hidden>
-    <h2 id="h-memory">記憶</h2>
+    <h2 id="h-memory"><svg class="ico" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>記憶</h2>
     <p id="memory-explanation" class="hint"></p>
     <p id="memory-cloud" class="hint cloud" hidden></p>
     <p id="memory-memory-only" class="hint" hidden></p>
@@ -87,10 +87,13 @@
 </div>
 
   <section aria-labelledby="h-chat" class="chat">
-    <h2 id="h-chat">話しかける</h2>
+    <h2 id="h-chat"><svg class="ico" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1.2-4.3A8 8 0 1 1 21 12z"/></svg>話しかける</h2>
+    <p class="sub">AI VTuber に話しかけます。返事はここに表示されます</p>
     <div id="chat-log" class="log" aria-live="polite"></div>
+    <div class="composer">
     <textarea id="chat-input" rows="3" maxlength="500" placeholder="ここに入力(Ctrl+Enterで送信)" aria-label="話しかける内容"></textarea>
-    <div class="buttons"><button id="send" type="button">送信</button></div>
+    <div class="buttons"><button id="send" type="button" class="primary">送信</button></div>
+    </div>
     <p id="chat-error" class="error" role="alert"></p>
     <div id="other-wrap" hidden>
       <h3>最近の発話(ほかの入力への返答)</h3>
@@ -101,7 +104,7 @@
 <div class="settings">
 
   <details id="model-section" class="card" hidden>
-    <summary><h2 id="h-model">応答モデル</h2></summary>
+    <summary><h2 id="h-model"><svg class="ico" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></svg>応答モデル</h2><span class="sub">応答に使うモデルを選びます</span></summary>
     <div class="buttons">
       <select id="model-select" aria-label="応答に使うモデル"></select>
       <button id="model-apply" type="button">切り替える</button>
@@ -110,7 +113,7 @@
   </details>
 
   <details id="avatar-section" class="card" hidden>
-    <summary><h2 id="h-avatar">アバター</h2></summary>
+    <summary><h2 id="h-avatar"><svg class="ico" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-7 8-7s8 3 8 7"/></svg>アバター</h2><span class="sub">表示するVRMモデルを選び、管理します</span></summary>
     <p id="avatar-summary" role="status"></p>
     <p id="avatar-credit" class="hint"></p>
     <p id="avatar-error" class="error" role="alert"></p>
@@ -148,13 +151,13 @@
   </details>
 
   <details id="usage-section" class="card" hidden>
-    <summary><h2 id="h-usage">応答の使用量</h2></summary>
+    <summary><h2 id="h-usage"><svg class="ico" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M5 20V10M12 20V4M19 20v-7"/></svg>応答の使用量</h2><span class="sub">今回の配信のトークン数と費用を確認します</span></summary>
     <p id="usage-summary" role="status"></p>
     <p id="usage-cap" role="status" hidden></p>
   </details>
 
   <details id="voice-section" class="card" hidden>
-    <summary><h2 id="h-voice">声</h2></summary>
+    <summary><h2 id="h-voice"><svg class="ico" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M3 10v4M7 7v10M11 4v16M15 7v10M19 10v4"/></svg>声</h2><span class="sub">話し声(TTS)の声・APIキー・調整を設定します</span></summary>
     <p id="voice-summary" role="status"></p>
     <p id="voice-error" class="error" role="alert"></p>
 
@@ -200,7 +203,7 @@
       <p class="hint">モデルのライセンスが求める表記を確認し、必要なら直してください。配信の概要欄などに表示してください。</p>
       <label class="check"><input id="voice-egress" type="checkbox"> 返信のテキストがインターネット上の Aivis Cloud に送信されることを理解しました</label>
       <div class="buttons wrap">
-        <button id="voice-enable" type="button">この声を使う</button>
+        <button id="voice-enable" type="button" class="primary">この声を使う</button>
       </div>
     </div>
 
@@ -224,7 +227,7 @@
   </details>
 
   <details id="ingress-section" class="card" hidden>
-    <summary><h2 id="h-ingress">配信チャット</h2></summary>
+    <summary><h2 id="h-ingress"><svg class="ico" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1.2-4.3A8 8 0 1 1 21 12z"/></svg>配信チャット</h2><span class="sub">Twitch / YouTube のコメント取り込みを設定します</span></summary>
     <p class="hint">配信のコメントを読み取って返事をします。読み取り専用で、コメントの投稿や配信側の操作はしません。コメントは外部からの入力として扱われ、操作権限は持ちません。</p>
     <p id="ingress-error" class="error" role="alert"></p>
 
