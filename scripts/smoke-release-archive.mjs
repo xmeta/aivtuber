@@ -22,6 +22,9 @@
 //   * a tampered library beside a program is refused with exit 2;
 //   * the avatar page files and the operation panel page (#335) are present, and
 //     the panel page loads no script or style from anywhere but its own files;
+//   * the panel page itself runs: a headless browser on the machine opens the
+//     shipped page against a loopback fake host, reaches 接続済み, renders the
+//     status rows and mutes through the real button (scripts/smoke-panel-page.mjs);
 //   * the first-run command (aivtuber-setup, issue #294 S2) prints its plan with
 //     --dry-run and refuses --offline when nothing is fetched, without touching
 //     the network or writing a file.
@@ -77,12 +80,12 @@ function assert(condition, message) {
 
 /// Runs a program with a closed stdin and a minimal environment (no AIVTUBER_*
 /// variable, no library path), bounded in time.
-function run(file, args, cwd) {
+function run(file, args, cwd, timeout = 30_000) {
   const env = {};
-  for (const key of ["PATH", "SystemRoot", "SYSTEMROOT", "TEMP", "TMP", "HOME", "USERPROFILE"]) {
+  for (const key of ["PATH", "SystemRoot", "SYSTEMROOT", "TEMP", "TMP", "HOME", "USERPROFILE", "LOCALAPPDATA", "ProgramFiles", "ProgramFiles(x86)", "AIVTUBER_SMOKE_BROWSER"]) {
     if (process.env[key] !== undefined) env[key] = process.env[key];
   }
-  const result = spawnSync(file, args, { cwd, env, input: "", timeout: 30_000, encoding: "utf8", windowsHide: true });
+  const result = spawnSync(file, args, { cwd, env, input: "", timeout, encoding: "utf8", windowsHide: true });
   if (result.error) throw new Error(`could not start ${file}: ${result.error.message}`);
   return { status: result.status, out: `${result.stdout}\n${result.stderr}` };
 }
@@ -198,6 +201,17 @@ try {
     assert(bundle.length === 1, `expected one panel bundle, got ${bundle.join(", ")}`);
     const js = readFileSync(join(page, "assets", bundle[0]), "utf8");
     assert(js.includes("X-Panel-Token") && !/[?&]token=/.test(js), "panel bundle does not use the header-only secret");
+  });
+
+  // The page itself, in a browser the machine already has: the static checks
+  // above cannot show that the shipped bundle boots, talks to the host with
+  // the fragment's secret and renders what the host returns (#335).
+  check("the operation panel page runs in a headless browser", () => {
+    const page = join(root, "renderer", "local-avatar", "dist");
+    const result = run(process.execPath, [join(scriptDir, "smoke-panel-page.mjs"), page], root, 90_000);
+    const output = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
+    assert(result.status === 0, `exit ${result.status}: ${output.split("\n").filter((line) => line.startsWith("FAIL")).join(" | ") || output.slice(-400)}`);
+    return output.split("\n").filter((line) => line.startsWith("ok")).length + " page checks";
   });
 
   check("no Node script ships: the first-run command replaces them", () => {
