@@ -13,6 +13,8 @@ export interface PanelState {
     content_queue: number;
     scheduler_items: number;
     generation_active: boolean;
+    /** The performer is speaking now (#440); absent from an older host. Display only. */
+    speaking?: boolean;
     /** The local Thinking model selector (#357); absent unless the app composed it. */
     thinking_model?: ThinkingModelState | null;
     /** The voice settings (#360); absent unless the app composed them. */
@@ -264,6 +266,7 @@ export function parseState(value: unknown): PanelState | null {
     ...(v as PanelState),
     status: {
       ...v.status,
+      speaking: typeof v.status.speaking === "boolean" ? v.status.speaking : undefined,
       thinking_model: thinkingModel,
       voice,
       chat_ingress: chatIngress,
@@ -291,12 +294,17 @@ export function safeAvatarUrl(url: string | null | undefined): string | null {
 export type Health = "ok" | "warn";
 
 export interface StatusRow {
+  /** Stable id of a row the page updates between full renders. */
+  key?: string;
   label: string;
   value: string;
   health: Health;
   /** Raw host text behind a translated value, for support (tooltip). */
   raw?: string;
 }
+
+/** The status-card text while the performer is speaking (#440). */
+export const SPEAKING_TEXT = "話しています";
 
 /** The rows the status card shows, in order, with Japanese labels. */
 export function statusRows(state: PanelState): StatusRow[] {
@@ -309,6 +317,7 @@ export function statusRows(state: PanelState): StatusRow[] {
     { label: "アバター", value: err(s.avatar_error), health: s.avatar_error === null ? "ok" : "warn", ...raw(s.avatar_error) },
     { label: "配信連携", value: err(s.stream_error), health: s.stream_error === null ? "ok" : "warn", ...raw(s.stream_error) },
     { label: "応答生成", value: s.generation_active ? "生成中" : "待機中", health: "ok" },
+    ...(s.speaking === undefined ? [] : [{ key: "speaking", label: "アバターの声", value: s.speaking ? SPEAKING_TEXT : "話していません", health: "ok" as Health }]),
     { label: "入力待ち", value: String(s.content_queue), health: "ok" },
     { label: "再生予定", value: String(s.scheduler_items), health: "ok" },
   ];
@@ -318,6 +327,8 @@ export interface ChatEntry {
   /** Event id the runtime gave the line (`panel-chat-N`), once accepted. */
   id: string | null;
   text: string;
+  /** Page-local send time (epoch ms), display only; never sent to the host. */
+  sentAt: number;
   /** Pending until the runtime answers, then the admission result. */
   note: string;
 }
@@ -332,6 +343,35 @@ export function pushChat(log: ChatEntry[], entry: ChatEntry): ChatEntry[] {
 export function repliesFor(state: PanelState | null, id: string | null): string[] {
   if (state === null || id === null) return [];
   return state.replies.filter((r) => r.event_id === id).map((r) => r.text);
+}
+
+/** Replies that answer a panel line, with their seq (for the first-seen time). */
+export function replyRecordsFor(state: PanelState | null, id: string | null): { seq: number; text: string }[] {
+  if (state === null || id === null) return [];
+  return state.replies.filter((r) => r.event_id === id).map(({ seq, text }) => ({ seq, text }));
+}
+
+/** Reply first-seen times kept in the page; bounded like the chat log. */
+export const MAX_SEEN_REPLIES = 200;
+
+/** When this page first saw reply `seq` (stable across re-renders/polls). Display only. */
+export function firstSeen(seen: Map<number, number>, seq: number, now: number): number {
+  const known = seen.get(seq);
+  if (known !== undefined) return known;
+  seen.set(seq, now);
+  if (seen.size > MAX_SEEN_REPLIES) seen.delete(seen.keys().next().value as number);
+  return now;
+}
+
+/** Local HH:MM of an epoch-ms instant. */
+export function formatClock(ms: number): string {
+  const d = new Date(ms);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+/** Speaker label and time shown above a bubble. */
+export function bubbleMeta(who: "operator" | "ai", ms: number): { label: string; time: string } {
+  return { label: who === "operator" ? "オペレーター" : "AI", time: formatClock(ms) };
 }
 
 /** Replies that answer something other than a panel line (stdin, speech...). */
@@ -917,12 +957,20 @@ export interface VoiceInputState {
   duplex: VoiceInputDuplex;
   /** Segments dropped for starting during playback (half duplex). */
   dropped_during_playback: number;
+  /** Microphone input level 0..100 (#440); null is no signal (not running, or the host heard nothing for a second). */
+  level: number | null;
+  /** Highest speech probability 0..100 in the same interval; null with `level`. */
+  speech_prob: number | null;
 }
 
 const deviceName = (value: unknown): value is string =>
   typeof value === "string" &&
   value.length > 0 &&
   new TextEncoder().encode(value).length <= MAX_VOICE_INPUT_DEVICE_NAME_BYTES;
+
+/** A 0..100 integer, else null: meter data is display only, so a bad value is no signal, not a reason to hide the card. */
+const percent = (value: unknown): number | null =>
+  typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 100 ? value : null;
 
 /**
  * The voice-input state, only if it has exactly the documented shape. An older
@@ -958,10 +1006,45 @@ export function parseVoiceInputState(value: unknown): VoiceInputState | null {
     devices: [...devices],
     duplex,
     dropped_during_playback: dropped,
+    level: percent(v.level),
+    speech_prob: percent(v.speech_prob),
+  };
+}
+
+/** Segments in the meter; the lit count is `ceil(level * METER_SEGMENTS / 100)`. */
+export const METER_SEGMENTS = 20;
+/** Speech probability (percent) at or above which the meter shows "speech detected". */
+export const SPEECH_DETECTED_PERCENT = 50;
+
+export interface VoiceMeterView {
+  /** Lit segments, 0..METER_SEGMENTS. */
+  lit: number;
+  /** Speech is detected: the lit segments are highlighted. */
+  speech: boolean;
+  /** No level reached the panel recently: shown as no signal, not as silence. */
+  noSignal: boolean;
+  /** The level, for assistive technology and the label. */
+  value: number;
+  text: string;
+}
+
+/** What the meter shows for the host level and speech probability (null: no signal). */
+export function voiceMeterView(level: number | null, speechProb: number | null): VoiceMeterView {
+  if (level === null) return { lit: 0, speech: false, noSignal: true, value: 0, text: "信号なし(マイクの音が届いていません)" };
+  const clamped = Math.min(100, Math.max(0, Math.round(level)));
+  const speech = speechProb !== null && speechProb >= SPEECH_DETECTED_PERCENT;
+  return {
+    lit: Math.ceil((clamped * METER_SEGMENTS) / 100),
+    speech,
+    noSignal: false,
+    value: clamped,
+    text: speech ? "話し声を検出" : "入力レベル",
   };
 }
 
 export interface VoiceInputView {
+  /** The live input meter; null unless voice input is on (#440). */
+  meter: VoiceMeterView | null;
   /** オフ / 聞き取り中 / 失敗: …. */
   stateText: string;
   health: Health;
@@ -1014,6 +1097,7 @@ export function voiceInputView(state: PanelState | null): VoiceInputView | null 
     headset: v.duplex === "full",
     headsetLabel: VOICE_INPUT_HEADSET_LABEL,
     headsetHint: v.duplex === "full" ? VOICE_INPUT_HEADSET_HINT_FULL : VOICE_INPUT_HEADSET_HINT_HALF,
+    meter: v.state === "on" ? voiceMeterView(v.level, v.speech_prob) : null,
     droppedText: v.dropped_during_playback > 0 ? `話し中に始まったため無視した音声: ${v.dropped_during_playback} 件` : null,
   };
   switch (v.state) {

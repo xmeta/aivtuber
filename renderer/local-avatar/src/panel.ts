@@ -49,10 +49,15 @@ import {
   voiceInputDuplexBody,
   voiceInputResultText,
   voiceInputView,
+  METER_SEGMENTS,
+  type VoiceMeterView,
   otherReplies,
   parseSearchPage,
   parseState,
   pushChat,
+  replyRecordsFor,
+  firstSeen,
+  bubbleMeta,
   repliesFor,
   safeAvatarUrl,
   searchPageCount,
@@ -64,6 +69,10 @@ import {
 } from "./panel-core";
 
 const POLL_MS = 1000;
+// While the voice-input meter is on screen the state is read faster so it moves
+// smoothly (the host publishes it every 200 ms then); everything else is still
+// redrawn at POLL_MS.
+const FAST_POLL_MS = 250;
 const REQUEST_TIMEOUT_MS = 6000;
 
 // The secret lives only in this variable: not in storage, not in a cookie, and
@@ -73,6 +82,7 @@ history.replaceState(null, "", location.pathname);
 
 let state: PanelState | null = null;
 let chat: ChatEntry[] = [];
+const replySeen = new Map<number, number>();
 let connection: ConnectionKind = { kind: "connecting" };
 let focusedChat = false;
 let connectionLost = false;
@@ -139,6 +149,7 @@ function render(): void {
     for (const row of statusRows(state)) {
       const item = document.createElement("div");
       item.className = `row ${row.health}`;
+      if (row.key !== undefined) item.dataset.key = row.key;
       const label = document.createElement("span");
       label.className = "label";
       label.textContent = row.label;
@@ -176,19 +187,32 @@ function render(): void {
 
   const log = $("chat-log");
   log.replaceChildren();
+  const meta = (who: "operator" | "ai", ms: number): HTMLElement => {
+    const m = bubbleMeta(who, ms);
+    const el = document.createElement("div");
+    el.className = `meta ${who === "operator" ? "mine" : "reply"}`;
+    const label = document.createElement("span");
+    label.textContent = m.label;
+    const time = document.createElement("time");
+    time.textContent = m.time;
+    el.append(label, time);
+    return el;
+  };
   for (const entry of chat) {
+    log.append(meta("operator", entry.sentAt));
     const mine = document.createElement("div");
     mine.className = "bubble mine";
     mine.textContent = entry.text;
     log.append(mine);
-    const replies = repliesFor(state, entry.id);
+    const replies = replyRecordsFor(state, entry.id);
     if (replies.length === 0) {
       const note = document.createElement("div");
       note.className = "note";
       note.textContent = entry.note;
       log.append(note);
     }
-    for (const text of replies) {
+    for (const { seq, text } of replies) {
+      log.append(meta("ai", firstSeen(replySeen, seq, Date.now())));
       const bubble = document.createElement("div");
       bubble.className = "bubble reply";
       bubble.textContent = text;
@@ -215,6 +239,7 @@ function renderVoiceInput(): void {
   stateLine.textContent = view.stateText;
   stateLine.className = view.health === "warn" ? "error" : "";
   $("voice-input-explanation").textContent = view.explanation;
+  renderMeter(view.meter);
   const cloud = $("voice-input-cloud");
   cloud.textContent = view.cloudNote ?? "";
   cloud.hidden = view.cloudNote === null;
@@ -254,6 +279,42 @@ function renderVoiceInput(): void {
 }
 
 let voiceInputBusy = false;
+
+/** The segmented input meter (#440). Segments are built once and only toggled. */
+function renderMeter(meter: VoiceMeterView | null): void {
+  const wrap = $("voice-meter");
+  wrap.hidden = meter === null;
+  if (meter === null) return;
+  const bar = $("voice-meter-bar");
+  if (bar.childElementCount !== METER_SEGMENTS) {
+    bar.replaceChildren(
+      ...Array.from({ length: METER_SEGMENTS }, () => {
+        const segment = document.createElement("span");
+        segment.className = "seg";
+        return segment;
+      }),
+    );
+  }
+  bar.classList.toggle("speech", meter.speech);
+  bar.classList.toggle("nosignal", meter.noSignal);
+  bar.setAttribute("aria-valuenow", String(meter.value));
+  bar.setAttribute("aria-valuetext", meter.text);
+  Array.from(bar.children).forEach((segment, i) => segment.classList.toggle("on", i < meter.lit));
+  $("voice-meter-text").textContent = meter.text;
+}
+
+/** The meter is on screen and moving: voice input is on and its card is shown. */
+function meterActive(): boolean {
+  return !connectionLost && connection.kind === "connected" && document.visibilityState === "visible" && voiceInputView(state)?.meter != null;
+}
+
+/** Between full redraws: only what changes every few hundred ms. */
+function renderLive(): void {
+  renderMeter(voiceInputView(state)?.meter ?? null);
+  const row = state === null ? undefined : statusRows(state).find((r) => r.key === "speaking");
+  const value = document.querySelector(".row[data-key=speaking] .value");
+  if (row !== undefined && value !== null) value.textContent = row.value;
+}
 
 async function setVoiceInput(enabled: boolean): Promise<void> {
   voiceInputBusy = true;
@@ -1060,7 +1121,19 @@ async function saveKey(): Promise<void> {
   await voicePost("/api/voice/key", { key: checked.key }, (detail) => `キーを保存しました(${detail})`);
 }
 
+let polling = false;
+let lastPoll = 0;
+let lastFull = 0;
+
+async function tick(): Promise<void> {
+  if (polling) return;
+  if (!meterActive() && Date.now() - lastPoll < POLL_MS - 100) return;
+  await poll();
+}
+
 async function poll(): Promise<void> {
+  polling = true;
+  lastPoll = Date.now();
   try {
     const { status, json } = await api("/api/state");
     if (status === 401) {
@@ -1084,6 +1157,12 @@ async function poll(): Promise<void> {
   } catch {
     connection = { kind: "reconnecting" };
   }
+  polling = false;
+  if (meterActive() && Date.now() - lastFull < POLL_MS - 100) {
+    renderLive();
+    return;
+  }
+  lastFull = Date.now();
   render();
 }
 
@@ -1104,7 +1183,7 @@ async function send(): Promise<void> {
     const { status, json } = await api("/api/chat", { method: "POST", body: JSON.stringify({ text: checked.text }) });
     const body = (json ?? {}) as { ok?: boolean; detail?: string; id?: string | null };
     if (status === 200 && body.ok) {
-      chat = pushChat(chat, { id: body.id ?? null, text: checked.text, note: "返答を待っています…" });
+      chat = pushChat(chat, { id: body.id ?? null, text: checked.text, sentAt: Date.now(), note: "返答を待っています…" });
       input.value = "";
     } else {
       $("chat-error").textContent = `送信できませんでした: ${body.detail ?? status}`;
@@ -1214,5 +1293,5 @@ if (token === null) {
 } else {
   render();
   void poll();
-  pollTimer = setInterval(() => void poll(), POLL_MS);
+  pollTimer = setInterval(() => void tick(), FAST_POLL_MS);
 }

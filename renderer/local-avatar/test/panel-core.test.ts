@@ -40,6 +40,9 @@ import {
   parseState,
   parsePersonaEditorState,
   parseVoiceInputState,
+  voiceMeterView,
+  METER_SEGMENTS,
+  SPEAKING_TEXT,
   MAX_SEED_ENTRIES,
   MAX_SEED_FILE_BYTES,
   SEED_CLOUD_NOTE,
@@ -67,6 +70,11 @@ import {
   PERSONA_MEMORY_ONLY_NOTE,
   parseVoiceState,
   pushChat,
+  replyRecordsFor,
+  firstSeen,
+  formatClock,
+  bubbleMeta,
+  MAX_SEEN_REPLIES,
   repliesFor,
   safeAvatarUrl,
   searchPageCount,
@@ -167,10 +175,32 @@ describe("chat", () => {
   });
 
   test("the log is bounded", () => {
-    let log: { id: string | null; text: string; note: string }[] = [];
-    for (let i = 0; i < MAX_CHAT_LOG + 10; i++) log = pushChat(log, { id: null, text: String(i), note: "" });
+    let log: { id: string | null; text: string; sentAt: number; note: string }[] = [];
+    for (let i = 0; i < MAX_CHAT_LOG + 10; i++) log = pushChat(log, { id: null, text: String(i), sentAt: 0, note: "" });
     expect(log).toHaveLength(MAX_CHAT_LOG);
     expect(log.at(-1)?.text).toBe(String(MAX_CHAT_LOG + 9));
+  });
+
+  test("bubble labels and local HH:MM", () => {
+    const at = new Date(2026, 10, 20, 9, 5, 59).getTime();
+    expect(formatClock(at)).toBe("09:05");
+    expect(bubbleMeta("operator", at)).toEqual({ label: "オペレーター", time: "09:05" });
+    expect(bubbleMeta("ai", at)).toEqual({ label: "AI", time: "09:05" });
+  });
+
+  test("reply first-seen time is stable across polls and bounded", () => {
+    const seen = new Map<number, number>();
+    expect(firstSeen(seen, 1, 1000)).toBe(1000);
+    expect(firstSeen(seen, 1, 9999)).toBe(1000);
+    for (let i = 2; i < MAX_SEEN_REPLIES + 10; i++) firstSeen(seen, i, i);
+    expect(seen.size).toBe(MAX_SEEN_REPLIES);
+    expect(replyRecordsFor(state(), "panel-chat-1")).toEqual([{ seq: 1, text: "こんにちは" }]);
+    expect(replyRecordsFor(state(), null)).toEqual([]);
+  });
+
+  test("panel.ts renders chat text without innerHTML", async () => {
+    const src = await Bun.file(new URL("../src/panel.ts", import.meta.url)).text();
+    expect(src.includes("innerHTML")).toBe(false);
   });
 
   test("checkChat trims, refuses empty and over-long text", () => {
@@ -1195,6 +1225,8 @@ describe("voice input state", () => {
       devices: [],
       duplex: "full",
       dropped_during_playback: 0,
+      level: null,
+      speech_prob: null,
     });
     // The host omits `reason` unless failed; null and the longest reason are fine.
     expect(parseVoiceInputState(voiceInput({ state: "failed", reason: null }))!.reason).toBeNull();
@@ -1585,5 +1617,65 @@ describe("memory seed view", () => {
     expect(seedResultText("reload", false, undefined, 503)).toBe("読み込みできませんでした (503)");
     expect(seedResultText("save", true, "x", 500)).toContain("できませんでした");
     expect(seedResultText("save", false, "x".repeat(5000), 409).length).toBeLessThan(MAX_HOST_TEXT_CHARS + 60);
+  });
+});
+
+// ---- live input meter and speaking indicator (#440) ----
+
+describe("voice input level meter", () => {
+  test("the host level and speech probability are kept only as 0..100 integers", () => {
+    const parsed = parseVoiceInputState(voiceInput({ state: "on", level: 42, speech_prob: 97 }))!;
+    expect([parsed.level, parsed.speech_prob]).toEqual([42, 97]);
+    expect([parseVoiceInputState(voiceInput())!.level, parseVoiceInputState(voiceInput())!.speech_prob]).toEqual([null, null]);
+    // Display data: a bad value is no signal, never a reason to hide the card.
+    for (const bad of [-1, 101, 1.5, "40", null, Number.NaN, {}]) {
+      const state = parseVoiceInputState(voiceInput({ state: "on", level: bad, speech_prob: bad }));
+      expect(state).not.toBeNull();
+      expect([state!.level, state!.speech_prob]).toEqual([null, null]);
+    }
+  });
+
+  test("lit segments follow the level and the highlight follows the speech probability", () => {
+    expect(voiceMeterView(0, 0)).toMatchObject({ lit: 0, speech: false, noSignal: false });
+    expect(voiceMeterView(1, 0).lit).toBe(1);
+    expect(voiceMeterView(50, 10).lit).toBe(METER_SEGMENTS / 2);
+    expect(voiceMeterView(100, 10).lit).toBe(METER_SEGMENTS);
+    expect(voiceMeterView(250, 10).lit).toBe(METER_SEGMENTS);
+    expect(voiceMeterView(40, 49).speech).toBe(false);
+    const talking = voiceMeterView(40, 50);
+    expect(talking.speech).toBe(true);
+    expect(talking.text).toBe("話し声を検出");
+    expect(voiceMeterView(40, null).speech).toBe(false);
+  });
+
+  test("no level is shown as no signal, not as silence", () => {
+    const none = voiceMeterView(null, 90);
+    expect(none).toMatchObject({ lit: 0, speech: false, noSignal: true, value: 0 });
+    expect(none.text).toContain("信号なし");
+    expect(voiceMeterView(0, 0).noSignal).toBe(false);
+  });
+
+  test("the card shows the meter only while voice input is on", () => {
+    const on = voiceInputView(withVoiceInput(voiceInput({ state: "on", level: 60, speech_prob: 80 })))!;
+    expect(on.meter).toMatchObject({ lit: 12, speech: true, noSignal: false });
+    expect(voiceInputView(withVoiceInput(voiceInput({ state: "on" })))!.meter!.noSignal).toBe(true);
+    expect(voiceInputView(withVoiceInput(voiceInput({ state: "off", level: 60 })))!.meter).toBeNull();
+    expect(voiceInputView(withVoiceInput(voiceInput({ state: "failed", level: 60 })))!.meter).toBeNull();
+  });
+});
+
+describe("speaking indicator", () => {
+  const withSpeaking = (speaking: unknown) => state({ status: { ...state()!.status, speaking } })!;
+
+  test("the status card says the performer is speaking", () => {
+    const row = statusRows(withSpeaking(true)).find((r) => r.key === "speaking")!;
+    expect(row.value).toBe(SPEAKING_TEXT);
+    expect(row.health).toBe("ok");
+    expect(statusRows(withSpeaking(false)).find((r) => r.key === "speaking")!.value).toBe("話していません");
+  });
+
+  test("an older host without the field shows no row, and a non-boolean is ignored", () => {
+    expect(statusRows(state()!).some((r) => r.key === "speaking")).toBe(false);
+    expect(statusRows(withSpeaking("yes")).some((r) => r.key === "speaking")).toBe(false);
   });
 });

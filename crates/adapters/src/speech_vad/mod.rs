@@ -21,6 +21,7 @@ mod devices;
 mod edges;
 mod emit;
 mod heartbeat;
+mod level;
 #[cfg(feature = "mic-capture")]
 pub mod mic;
 mod pipeline;
@@ -42,6 +43,10 @@ pub use emit::{LineHandle, LineSink, ObservationStamper, SinkStats, StamperConfi
 pub use heartbeat::{
     FEED_HEARTBEAT_MAX_LINE_BYTES, FEED_HEARTBEAT_MAX_MS, FEED_HEARTBEAT_MIN_MS, FeedHeartbeat,
     encode_feed_heartbeat_line, parse_feed_heartbeat_line,
+};
+pub use level::{
+    LEVEL_FLOOR_DB, LEVEL_MAX_LINE_BYTES, LEVEL_MAX_MS, LEVEL_MIN_MS, LevelAccum, LevelBeat,
+    LevelSample, encode_level_line, parse_level_line, rms_to_meter,
 };
 pub use pipeline::{
     FRAME_MS, FRAME_SAMPLES, FrameScorer, PipelineStats, RawEdge, SAMPLE_RATE_HZ, VadPipeline,

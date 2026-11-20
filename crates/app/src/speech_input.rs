@@ -140,6 +140,14 @@ pub struct SpeechInputStatus {
     /// own playback (half duplex).
     #[serde(default)]
     pub dropped_during_playback: u64,
+    /// Live microphone input level, 0..=100 (peak frame RMS, dBFS -60..0), and
+    /// the highest speech probability in the same interval (#440). Display
+    /// data only: absent (no signal) when voice input is not running or the
+    /// sidecar sent nothing for a second. Never authority, never audited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speech_prob: Option<u8>,
 }
 
 fn full_duplex() -> SpeechDuplex {
@@ -293,6 +301,14 @@ impl SpeechInputController {
             State::On => (SpeechInputStateName::On, None),
             State::Failed(reason) => (SpeechInputStateName::Failed, Some(reason.clone())),
         };
+        let level = if self.state == State::On {
+            let now_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            self.sidecar
+                .as_ref()
+                .and_then(|sidecar| sidecar.level_at(now_ms))
+        } else {
+            None
+        };
         SpeechInputStatus {
             composed: self.composed(),
             state,
@@ -307,6 +323,8 @@ impl SpeechInputController {
             devices: self.known_devices.clone(),
             duplex: self.duplex(),
             dropped_during_playback: 0,
+            level: level.map(|sample| sample.rms),
+            speech_prob: level.map(|sample| sample.p),
         }
     }
 
@@ -715,6 +733,27 @@ mod tests {
         assert!(input.set_device(None, |_, _| {}).is_ok());
         assert_eq!(read_settings(&path).device, None);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn the_level_is_display_data_and_absent_from_json_when_unknown() {
+        let mut status = controller(&[], None).status();
+        assert_eq!((status.level, status.speech_prob), (None, None));
+        let json = serde_json::to_value(&status).unwrap();
+        assert!(json.get("level").is_none() && json.get("speech_prob").is_none());
+        status.level = Some(42);
+        status.speech_prob = Some(97);
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            (json["level"].as_u64(), json["speech_prob"].as_u64()),
+            (Some(42), Some(97))
+        );
+        // An older document without them still reads.
+        let mut old = json;
+        old.as_object_mut().unwrap().remove("level");
+        old.as_object_mut().unwrap().remove("speech_prob");
+        let back: SpeechInputStatus = serde_json::from_value(old).unwrap();
+        assert_eq!(back.level, None);
     }
 
     #[test]

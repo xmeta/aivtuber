@@ -2524,6 +2524,14 @@ where
             .is_some_and(speech_input::SpeechInputController::composed)
     }
 
+    /// Whether voice input is running (#440): the panel publishes its state
+    /// faster then, so the input meter moves.
+    pub fn speech_input_is_on(&self) -> bool {
+        self.speech_input
+            .as_ref()
+            .is_some_and(speech_input::SpeechInputController::is_on)
+    }
+
     /// The voice-input state for the operator surfaces; `None` when no speech
     /// sidecar is configured.
     pub fn speech_input_status(&self) -> Option<speech_input::SpeechInputStatus> {
@@ -2532,6 +2540,20 @@ where
             status.dropped_during_playback = self.speech_playback.dropped_during_playback();
             status
         })
+    }
+
+    /// Whether the performer is speaking now (#440): an audio item is playing,
+    /// or a phrased reply that already spoke is between two phrases. Display
+    /// data for the operator surfaces; no decision reads it.
+    pub fn performer_speaking(&self) -> bool {
+        self.performer.scheduler().playing_items().any(|item| {
+            item.plan
+                .channels
+                .contains(&aivtuber_scheduler::BlendChannel::Audio)
+        }) || self
+            .generative
+            .as_ref()
+            .is_some_and(|generative| generative.phrase.has_active_spoken_run())
     }
 
     /// Whether the performer listens while it speaks (#396). Without a
@@ -10727,6 +10749,12 @@ mod tests {
                         app.speech_floor_own() == Some(aivtuber_domain::OwnSpeech::Speaking),
                         audio_playing(app),
                         "own speech vs scheduler at {at_ms} ms"
+                    );
+                    // #440: the panel's "speaking now" reads the same scheduler state.
+                    assert_eq!(
+                        app.performer_speaking(),
+                        audio_playing(app),
+                        "performer_speaking vs scheduler at {at_ms} ms"
                     );
                 }
 

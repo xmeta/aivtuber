@@ -192,7 +192,7 @@ Neutral names come from the existing contracts (+AvatarPlaybackCommand+, +perfor
 |Neutral command |Neutral argument range |Renderer profile mapping (spike +vrm1-default@1+) |three-vrm API
 
 |+Expression { preset, intensity }+
-|preset: renderer-profile vocabulary (spike: neutral, joy, anger, sadness, calm, surprise); intensity 0..1 (clamped)
+|preset: renderer-profile vocabulary (spike: neutral, joy, anger, sadness, calm, surprise); intensity 0..1 (clamped). One active expression: the command zeroes every other preset's target before setting this one (#445), so presets do not stack
 |joy to +happy+, anger to +angry+, sadness to +sad+, calm to +relaxed+, surprise to +surprised+, neutral to +neutral+
 |+expressionManager.setValue+
 

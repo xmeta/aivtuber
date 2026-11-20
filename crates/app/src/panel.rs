@@ -61,6 +61,9 @@ const PERSONA_PER_TICK: usize = 4;
 const MEMORY_SEED_PER_TICK: usize = 4;
 const CHAT_PER_TICK: usize = 4;
 const PUBLISH_INTERVAL_MS: u64 = 500;
+/// While voice input is on the page shows a live level meter and reads the state
+/// every 250 ms; at most one document per 200 ms is built then (#440).
+const PUBLISH_INTERVAL_METER_MS: u64 = 200;
 /// Refusal counts are logged at most this often. A stale page from an earlier
 /// launch polls once a second with an old secret; one line per refusal buried
 /// every other log line.
@@ -525,7 +528,12 @@ impl PanelService {
         }
         if changed || now_ms >= self.next_publish_ms {
             self.publish(app, now_ms);
-            self.next_publish_ms = now_ms.saturating_add(PUBLISH_INTERVAL_MS);
+            let interval = if app.speech_input_is_on() {
+                PUBLISH_INTERVAL_METER_MS
+            } else {
+                PUBLISH_INTERVAL_MS
+            };
+            self.next_publish_ms = now_ms.saturating_add(interval);
         }
         let metrics = self.inbox.metrics();
         if self.refusal_log.due(metrics, now_ms) {
