@@ -604,7 +604,7 @@ fn rfc3339_utc_now() -> String {
 }
 
 /// Civil date from Unix seconds (Howard Hinnant's algorithm); no clock crate.
-fn rfc3339_utc(secs: u64) -> String {
+pub(crate) fn rfc3339_utc(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let z = days + 719_468;
