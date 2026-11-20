@@ -42,6 +42,10 @@ import {
   seedView,
   parseSeedDocument,
   SEED_KINDS,
+  seedChipView,
+  seedOpenAfterAdd,
+  seedOpenAfterDelete,
+  seedOpenAfterOpen,
   type SeedDocument,
   type SeedEntry,
   type SeedKind,
@@ -435,6 +439,8 @@ let memoryBusy = false;
 /** The document's identity fields are kept as the host sent them. */
 let memoryDocument: Pick<SeedDocument, "seed_id" | "revision"> = { seed_id: "local-memory-seed", revision: "1" };
 let memoryEntries: SeedEntry[] = [];
+/** Index of the one entry whose editor is open; the rest are chips. */
+let memoryOpen: number | null = null;
 
 function renderMemory(): void {
   const view = seedView(state, memoryEntries);
@@ -463,6 +469,7 @@ function renderMemory(): void {
   view.rows.forEach((row, index) => {
     const item = items[index];
     if (!item) return;
+    item.querySelector(".seed-chip")?.classList.toggle("warn", row.health === "warn");
     const bytes = item.querySelector(".seed-bytes");
     if (bytes) {
       bytes.textContent = row.bytesText;
@@ -479,12 +486,40 @@ function renderMemory(): void {
   $<HTMLButtonElement>("memory-reload").disabled = connectionLost || memoryBusy;
 }
 
-/** Rebuild the rows from `memoryEntries` (after a load, an add or a delete). */
-function buildMemoryRows(): void {
+/** Rebuild the list from `memoryEntries` (after a load, add, delete, open or close).
+ * Only the open entry is an editor; typing never calls this, so focus stays put. */
+function buildMemoryRows(focus: "claim" | { chip: number } | null = null): void {
   const list = $("memory-list");
   list.replaceChildren();
+  let claimInput: HTMLInputElement | null = null;
+  let chipToFocus: HTMLButtonElement | null = null;
   memoryEntries.forEach((entry, index) => {
     const li = document.createElement("li");
+    if (index !== memoryOpen) {
+      li.className = "seed-item";
+      const view = seedChipView(entry, index);
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "seed-chip";
+      chip.title = view.title;
+      chip.setAttribute("aria-label", view.ariaLabel);
+      const kindLabel = document.createElement("span");
+      kindLabel.className = "seed-chip-kind";
+      kindLabel.textContent = view.kindLabel;
+      const text = document.createElement("span");
+      text.className = view.title === "" ? "seed-chip-text empty" : "seed-chip-text";
+      text.textContent = view.text;
+      chip.append(kindLabel, text);
+      chip.addEventListener("click", () => {
+        memoryOpen = seedOpenAfterOpen(memoryOpen, index, memoryEntries.length);
+        buildMemoryRows("claim");
+        renderMemory();
+      });
+      li.append(chip);
+      if (typeof focus === "object" && focus !== null && focus.chip === index) chipToFocus = chip;
+      list.append(li);
+      return;
+    }
     li.className = "seed-row";
     const kind = document.createElement("select");
     kind.setAttribute("aria-label", `項目 ${index + 1} の種類`);
@@ -509,6 +544,7 @@ function buildMemoryRows(): void {
       entry.claim = claim.value;
       renderMemory();
     });
+    claimInput = claim;
     const bytes = document.createElement("span");
     bytes.className = "seed-bytes hint";
     const remove = document.createElement("button");
@@ -517,15 +553,27 @@ function buildMemoryRows(): void {
     remove.setAttribute("aria-label", `項目 ${index + 1} を削除`);
     remove.addEventListener("click", () => {
       memoryEntries.splice(index, 1);
+      memoryOpen = seedOpenAfterDelete(memoryOpen, index);
       buildMemoryRows();
+      renderMemory();
+    });
+    const done = document.createElement("button");
+    done.type = "button";
+    done.textContent = "完了";
+    done.setAttribute("aria-label", `項目 ${index + 1} の編集を完了`);
+    done.addEventListener("click", () => {
+      memoryOpen = null;
+      buildMemoryRows({ chip: index });
       renderMemory();
     });
     const problem = document.createElement("p");
     problem.className = "seed-problem error";
     problem.hidden = true;
-    li.append(kind, claim, bytes, remove, problem);
+    li.append(kind, claim, bytes, done, remove, problem);
     list.append(li);
   });
+  if (focus === "claim") (claimInput as HTMLInputElement | null)?.focus();
+  else (chipToFocus as HTMLButtonElement | null)?.focus();
 }
 
 async function loadMemory(): Promise<void> {
@@ -538,6 +586,7 @@ async function loadMemory(): Promise<void> {
     if (status === 200 && body.ok === true && loaded !== null) {
       memoryDocument = { seed_id: loaded.seed_id, revision: loaded.revision };
       memoryEntries = loaded.entries;
+      memoryOpen = null;
       memoryLoaded = true;
       buildMemoryRows();
       out.textContent = "";
@@ -1298,7 +1347,8 @@ $("persona-save").addEventListener("click", () => void savePersona());
 $("persona-reload").addEventListener("click", () => void loadPersona());
 $("memory-add").addEventListener("click", () => {
   memoryEntries.push({ kind: "persona-fact", claim: "" });
-  buildMemoryRows();
+  memoryOpen = seedOpenAfterAdd(memoryEntries.length);
+  buildMemoryRows("claim");
   renderMemory();
 });
 $("memory-save").addEventListener("click", () => void saveMemory());
