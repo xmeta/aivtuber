@@ -183,6 +183,39 @@ describe("command mapping", () => {
     expect(h.state.headPose()).toEqual({ x: 0, y: 0 });
   });
 
+  test("expression is exclusive: joy -> surprise -> joy leaves only joy non-zero (#445)", () => {
+    const h = harness();
+    ready(h);
+    const nonZero = () =>
+      Object.entries(h.state.current.expressions).filter(([, v]) => v > 1e-6).map(([k]) => k);
+    h.host("epoch-1", 1, { op: "expression", preset: "joy", intensity: 0.6 });
+    for (let i = 0; i < 100; i++) h.state.step(0.05);
+    h.host("epoch-1", 2, { op: "expression", preset: "surprise", intensity: 0.5 });
+    expect(h.state.target.expressions.joy).toBe(0);
+    h.state.step(SMOOTHING_TAU_S); // smooth, not a snap
+    expect(h.state.current.expressions.joy).toBeGreaterThan(0);
+    for (let i = 0; i < 100; i++) h.state.step(0.05);
+    expect(nonZero()).toEqual(["surprise"]);
+    h.host("epoch-1", 3, { op: "expression", preset: "joy", intensity: 0.4 });
+    for (let i = 0; i < 100; i++) h.state.step(0.05);
+    expect(nonZero()).toEqual(["joy"]);
+    expect(h.state.current.expressions.joy).toBeCloseTo(0.4, 3);
+  });
+
+  test("a neutral/0 expression clears the face; reset still snaps (#445)", () => {
+    const state = new AvatarState();
+    state.apply({ op: "expression", preset: "joy", intensity: 1 });
+    for (let i = 0; i < 100; i++) state.step(0.05);
+    state.apply({ op: "expression", preset: "neutral", intensity: 0 });
+    expect(Object.values(state.target.expressions).every((v) => v === 0)).toBe(true);
+    for (let i = 0; i < 100; i++) state.step(0.05);
+    expect(Object.values(state.current.expressions).every((v) => v < 1e-6)).toBe(true);
+    state.apply({ op: "expression", preset: "surprise", intensity: 1 });
+    for (let i = 0; i < 100; i++) state.step(0.05);
+    state.apply({ op: "reset" });
+    expect(Object.values(state.current.expressions).every((v) => v === 0)).toBe(true);
+  });
+
   test("interpolation converges and is frame-delta driven", () => {
     const state = new AvatarState();
     state.apply({ op: "expression", preset: "joy", intensity: 1 });
