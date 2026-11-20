@@ -56,6 +56,13 @@ fn command(capability: Capability, action: &str) -> AuthenticatedControlCommand 
 }
 
 fn burst_app(config: ChatBurstConfig) -> ProductionApp<CyclingRoute> {
+    burst_app_with_avatar(config, RecordingAvatar::default())
+}
+
+fn burst_app_with_avatar(
+    config: ChatBurstConfig,
+    avatar: RecordingAvatar,
+) -> ProductionApp<CyclingRoute> {
     let security = SecurityRuntime::new(
         SecurityRuntimeConfig {
             // The burst falsifier pushes ~100 events a second from many
@@ -78,7 +85,7 @@ fn burst_app(config: ChatBurstConfig) -> ProductionApp<CyclingRoute> {
         LocalVisemeStore::new(pack_root()),
         CyclingRoute::default(),
         Box::new(RecordingAudio::default()),
-        Box::new(RecordingAvatar::default()),
+        Box::new(avatar),
         Box::new(NoopStreamOutput),
         250,
     )
@@ -933,10 +940,20 @@ fn the_100x_burst_with_audience_aggregation_is_fully_accounted() {
 }
 
 fn floor_burst_app(reply_ttl_ms: u64) -> ProductionApp<CyclingRoute> {
-    let mut app = burst_app(ChatBurstConfig {
-        reply_ttl_ms,
-        ..config()
-    })
+    floor_burst_app_with_avatar(reply_ttl_ms, RecordingAvatar::default())
+}
+
+fn floor_burst_app_with_avatar(
+    reply_ttl_ms: u64,
+    avatar: RecordingAvatar,
+) -> ProductionApp<CyclingRoute> {
+    let mut app = burst_app_with_avatar(
+        ChatBurstConfig {
+            reply_ttl_ms,
+            ..config()
+        },
+        avatar,
+    )
     .with_speech_observations(
         aivtuber_runtime::SpeechObservationTracker::new(
             aivtuber_runtime::SpeechObservationConfig::default(),
@@ -1111,4 +1128,201 @@ fn public_chat_cannot_fake_floor_held_state_and_operator_stop_cancels_floor_defe
     assert_eq!(m1.deferred.pending, 0);
     assert_eq!(m1.deferred.count(DeferredOutcome::OperatorCancelled), 1);
     assert_eq!(m1.invariant_violations, 0);
+}
+
+// ---- #75 immediate non-verbal ack of a deferred reply ----
+
+fn acks(avatar: &RecordingAvatar) -> Vec<AvatarPlaybackCommand> {
+    avatar
+        .commands
+        .lock()
+        .expect("avatar log")
+        .iter()
+        .filter(|command| {
+            matches!(
+                command,
+                AvatarPlaybackCommand::Gesture { generation: 0, preset, .. }
+                    if preset == "nod_small"
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+/// Make the performer speak for `duration_ms` on the audio and face channels
+/// only. The starter pack's cached replies all carry a gesture, which would
+/// (by design) suppress the ack, so the speech is planned directly. Returns
+/// when it ends.
+fn make_speaking(app: &mut ProductionApp<CyclingRoute>, duration_ms: u64) -> u64 {
+    let plan = aivtuber_scheduler::PlannedPerformance {
+        event_id: "evt-speaking".to_owned(),
+        asset_id: "asset.speaking".to_owned(),
+        priority: aivtuber_scheduler::Priority::Conversation,
+        interruptible: true,
+        interrupt_points_ms: vec![duration_ms],
+        start_at_ms: 0,
+        duration_ms,
+        generation: 0,
+        exclusive: false,
+        channels: BTreeSet::from([
+            aivtuber_scheduler::BlendChannel::Audio,
+            aivtuber_scheduler::BlendChannel::Face,
+        ]),
+    };
+    let planned = app
+        .performer
+        .scheduler_mut()
+        .schedule(plan)
+        .expect("schedule speech");
+    app.tick(0);
+    assert!(matches!(
+        app.reply_availability(1),
+        ReplyAvailability::Busy(BusyCause::Speaking)
+    ));
+    planned.end_at_ms()
+}
+
+#[test]
+fn a_busy_performer_acks_a_deferred_comment_once_without_a_scheduler_item() {
+    let avatar = RecordingAvatar::default();
+    let mut app = burst_app_with_avatar(config(), avatar.clone());
+    let end = make_speaking(&mut app, 5_000);
+    let items_before = app.scheduler_item_count();
+    let terminal_before = app.performer.scheduler().last_terminal_at();
+
+    let second = send(&mut app, &chat(2, "viewer:b", "how did you do that?"), 10);
+    assert!(second.playback.is_none());
+    let commands = acks(&avatar);
+    assert_eq!(commands.len(), 1, "exactly one ack: {commands:?}");
+    assert!(matches!(
+        commands[0],
+        AvatarPlaybackCommand::Gesture { at_ms: 10, .. }
+    ));
+    assert_eq!(app.scheduler_item_count(), items_before);
+    assert_eq!(
+        app.performer.scheduler().last_terminal_at(),
+        terminal_before
+    );
+    assert!(app.health.avatar_error.is_none());
+    let metrics = app.chat_burst_metrics().expect("metrics");
+    assert_eq!((metrics.ack.acked, metrics.deferred.pending), (1, 1));
+
+    // The spoken reply still dispatches later; the ack does not replace it.
+    let free_at = end + 50;
+    app.tick(free_at);
+    app.service_chat_burst(free_at, 9);
+    let reports = app.take_deferred_reply_reports(8);
+    assert_eq!(reports.len(), 1);
+    assert!(reports[0].dispatched);
+    assert_eq!(acks(&avatar).len(), 1, "dispatching adds no further ack");
+}
+
+#[test]
+fn a_muted_performer_gives_no_ack() {
+    let avatar = RecordingAvatar::default();
+    let mut app = burst_app_with_avatar(config(), avatar.clone());
+    app.handle_control_reporting(&command(Capability::PerformerMute, "performer.mute"), 0)
+        .expect("mute");
+    assert!(app.is_muted());
+    send(&mut app, &chat(1, "viewer:a", "hello?"), 10);
+    let metrics = app.chat_burst_metrics().expect("metrics");
+    assert_eq!(metrics.deferred_muted, 1);
+    assert!(acks(&avatar).is_empty());
+    assert_eq!(metrics.ack.acked, 0);
+    assert_eq!(metrics.ack.skipped_cause, 1);
+}
+
+#[test]
+fn a_human_holding_the_floor_gives_no_ack() {
+    let avatar = RecordingAvatar::default();
+    let mut app = floor_burst_app_with_avatar(20_000, avatar.clone());
+    ingest_vad_edge(&mut app, "host", "start", 1_000);
+    send(&mut app, &chat(1, "viewer:1", "質問です"), 1_100);
+    let metrics = app.chat_burst_metrics().expect("metrics");
+    assert_eq!(metrics.deferred_floor_held, 1);
+    assert!(acks(&avatar).is_empty());
+    assert_eq!(metrics.ack.skipped_cause, 1);
+}
+
+#[test]
+fn a_100_comment_burst_is_bounded_by_the_window_and_the_actor_map() {
+    let avatar = RecordingAvatar::default();
+    let mut app = burst_app_with_avatar(config(), avatar.clone());
+    let end = make_speaking(&mut app, 30_000);
+    // 100 distinct actors inside one 10 s window while the first reply speaks.
+    assert!(end > 1_000, "the first reply must outlast the burst");
+    for index in 0..100_u64 {
+        let at = 10 + index * 5;
+        send(
+            &mut app,
+            &chat(2 + index, &format!("viewer:{index}"), "what is this?"),
+            at,
+        );
+    }
+    let commands = acks(&avatar);
+    assert!(commands.len() <= 3, "at most 3 acks per 10 s: {commands:?}");
+    let metrics = app.chat_burst_metrics().expect("metrics");
+    assert_eq!(metrics.ack.acked as usize, commands.len());
+    assert!(
+        metrics.ack.skipped_global_cooldown + metrics.ack.skipped_window > 0,
+        "the bounds must have been exercised"
+    );
+    assert!(app.chat_burst.as_ref().expect("lane").ack_tracked_actors() <= 64);
+    assert_eq!(metrics.invariant_violations, 0);
+}
+
+#[test]
+fn operator_stop_clears_the_ack_gate() {
+    let avatar = RecordingAvatar::default();
+    let mut app = burst_app_with_avatar(config(), avatar.clone());
+    make_speaking(&mut app, 60_000);
+    send(&mut app, &chat(2, "viewer:b", "hello?"), 10);
+    assert_eq!(acks(&avatar).len(), 1);
+    assert_eq!(
+        app.chat_burst.as_ref().expect("lane").ack_tracked_actors(),
+        1
+    );
+
+    app.handle_control_reporting(&command(Capability::PerformerStop, "performer.stop"), 20)
+        .expect("stop");
+    assert_eq!(
+        app.chat_burst.as_ref().expect("lane").ack_tracked_actors(),
+        0
+    );
+}
+
+#[test]
+fn the_same_input_gives_an_identical_ack_command_list() {
+    let run = || {
+        let avatar = RecordingAvatar::default();
+        let mut app = burst_app_with_avatar(config(), avatar.clone());
+        make_speaking(&mut app, 60_000);
+        for index in 0..30_u64 {
+            send(
+                &mut app,
+                &chat(2 + index, &format!("viewer:{}", index % 7), "again?"),
+                10 + index * 400,
+            );
+        }
+        acks(&avatar)
+    };
+    let first = run();
+    assert!(!first.is_empty());
+    assert_eq!(first, run());
+}
+
+#[test]
+fn a_disabled_ack_emits_nothing() {
+    let avatar = RecordingAvatar::default();
+    let mut app = burst_app_with_avatar(
+        ChatBurstConfig {
+            deferred_ack: false,
+            ..config()
+        },
+        avatar.clone(),
+    );
+    make_speaking(&mut app, 60_000);
+    send(&mut app, &chat(2, "viewer:b", "hello?"), 10);
+    assert!(acks(&avatar).is_empty());
+    assert_eq!(app.chat_burst_metrics().expect("m").ack.acked, 0);
 }

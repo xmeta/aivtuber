@@ -36,9 +36,9 @@ use aivtuber_reflex::{
     RetrievalScorer, TerminalOutcome,
 };
 use aivtuber_scheduler::{
-    BusyCause, DeferredConfig, DeferredConfigError, DeferredInbox, DeferredItem, DeferredMetrics,
-    DeferredOutcome, DeferredTerminal, ReadyDeferred, ReplyAvailability, ResponseDisposition,
-    TimingReason,
+    BusyCause, DeferResult, DeferredConfig, DeferredConfigError, DeferredInbox, DeferredItem,
+    DeferredMetrics, DeferredOutcome, DeferredTerminal, ReadyDeferred, ReplyAvailability,
+    ResponseDisposition, TimingReason,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, VecDeque};
@@ -66,6 +66,9 @@ pub struct ChatBurstConfig {
     /// (the default) leaves a crowd carrier dispatched like any comment.
     /// Needs `audience`, since routing reads the clusters it produces.
     pub crowd: Option<CrowdConfig>,
+    /// #75: one bounded non-verbal ack (a small nod) when a selected reply is
+    /// deferred because the performer is speaking or generating.
+    pub deferred_ack: bool,
 }
 
 impl Default for ChatBurstConfig {
@@ -76,6 +79,7 @@ impl Default for ChatBurstConfig {
             reply_ttl_ms: 20_000,
             audience: None,
             crowd: None,
+            deferred_ack: true,
         }
     }
 }
@@ -276,6 +280,8 @@ pub struct ChatBurstMetrics {
     pub crowd_non_verbal: u64,
     pub crowd_replies: u64,
     pub crowd_fallback_replies: u64,
+    /// #75: immediate non-verbal acks of deferred replies. Not outcomes.
+    pub ack: crate::deferred_ack::DeferredAckMetrics,
 }
 
 impl ChatBurstMetrics {
@@ -378,11 +384,12 @@ pub(crate) struct ChatBurstLane {
     reports: VecDeque<DeferredReplyReport>,
     signals: VecDeque<AudienceSignal>,
     last_ms: u64,
+    ack: crate::deferred_ack::AckGate,
 }
 
 /// Source-scoped fairness key. Length-prefixed so two different
 /// `(source, actor)` pairs can never produce the same key.
-fn actor_key(event: &EventEnvelope) -> Option<String> {
+pub(crate) fn actor_key(event: &EventEnvelope) -> Option<String> {
     event
         .actor_id
         .as_ref()
@@ -434,6 +441,7 @@ impl ChatBurstLane {
             reports: VecDeque::new(),
             signals: VecDeque::new(),
             last_ms: 0,
+            ack: crate::deferred_ack::AckGate::new(config.deferred_ack),
         })
     }
 
@@ -457,6 +465,7 @@ impl ChatBurstLane {
             audience_members_represented: burst.audience_members_represented,
             audience_guarded: burst.audience_guarded.values().sum(),
             crowd_routed: burst.crowd_routed,
+            ack: self.ack.metrics(),
             ..self.metrics
         }
     }
@@ -780,7 +789,8 @@ impl ChatBurstLane {
     /// Hold a selected or quiet reply until the performer is available. The
     /// expiry is `arrival + reply_ttl`; the cause is a trusted runtime input.
     /// The caller has already checked [`Self::still_fresh`].
-    pub(crate) fn defer(&mut self, candidate: Candidate, now_ms: u64, cause: BusyCause) {
+    /// Returns whether the inbox accepted (will hold) the reply.
+    pub(crate) fn defer(&mut self, candidate: Candidate, now_ms: u64, cause: BusyCause) -> bool {
         let Candidate {
             event,
             arrived_ms,
@@ -812,9 +822,34 @@ impl ChatBurstLane {
             ),
             payload: DeferredReply { event, crowd },
         };
-        let (_result, terminals) = self.inbox.defer(item, now_ms);
+        let (result, terminals) = self.inbox.defer(item, now_ms);
         self.record_deferred(terminals, now_ms);
         self.check_invariant();
+        matches!(result, DeferResult::Accepted)
+    }
+
+    /// #75: whether a deferred reply earns an immediate non-verbal ack. The
+    /// gate counts every refusal; the caller executes the gesture on `true`.
+    pub(crate) fn ack_admit(
+        &mut self,
+        ctx: &crate::deferred_ack::AckContext<'_>,
+        at_ms: u64,
+    ) -> bool {
+        self.ack.admit(ctx, at_ms)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ack_tracked_actors(&self) -> usize {
+        self.ack.tracked_actors()
+    }
+
+    pub(crate) fn ack_output_failed(&mut self) {
+        self.ack.note_output_failed();
+    }
+
+    /// Forget ack cooldowns (avatar reset, operator stop, erasure).
+    pub(crate) fn clear_ack(&mut self) {
+        self.ack.clear();
     }
 
     /// Sweep expiry and hand out the best deferred reply when the performer
@@ -847,6 +882,7 @@ impl ChatBurstLane {
     pub(crate) fn erase_actor(&mut self, source: &str, actor: &str, now_ms: u64) {
         let now_ms = self.advance(now_ms);
         let key = format!("{}:{}:{}", source.len(), source, actor);
+        self.ack.clear();
         let terminals = self.inbox.cancel_actor(&key, DeferredOutcome::Erased);
         self.record_deferred(terminals, now_ms);
         for state in self.held.values_mut() {
@@ -864,6 +900,7 @@ impl ChatBurstLane {
     /// Operator stop: cancel everything held, with an explicit outcome.
     pub(crate) fn cancel_all(&mut self, now_ms: u64) {
         let now_ms = self.advance(now_ms);
+        self.ack.clear();
         let terminals = self.inbox.cancel_all(DeferredOutcome::OperatorCancelled);
         self.record_deferred(terminals, now_ms);
         for state in self.held.values_mut() {

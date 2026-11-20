@@ -8,6 +8,7 @@ mod budget;
 mod chat_burst;
 mod chat_ingress;
 mod deadline;
+mod deferred_ack;
 mod face_settle;
 mod irodori_bridge;
 mod memory_compare;
@@ -3840,8 +3841,14 @@ where
         }
         match self.reply_availability(at_ms) {
             ReplyAvailability::Busy(cause) => {
-                if let Some(lane) = self.chat_burst.as_mut() {
-                    lane.defer(candidate, at_ms, cause);
+                let actor = chat_burst::actor_key(&candidate.event);
+                let crowd = candidate.crowd.is_some();
+                let accepted = self
+                    .chat_burst
+                    .as_mut()
+                    .is_some_and(|lane| lane.defer(candidate, at_ms, cause));
+                if accepted {
+                    self.ack_deferred_reply(cause, crowd, actor.as_deref(), at_ms);
                 }
                 None
             }
@@ -3855,6 +3862,52 @@ where
                 }
                 Some(result)
             }
+        }
+    }
+
+    /// #75: one bounded non-verbal ack for a reply that had to wait. Executed
+    /// directly on the avatar output like [`Self::service_face_settle`]: no
+    /// scheduler item, so reaction spacing and `last_terminal_at` are untouched
+    /// and the ack cannot delay the reply it acknowledges. A failure is only
+    /// counted; it never sets `health.avatar_error`.
+    fn ack_deferred_reply(
+        &mut self,
+        cause: BusyCause,
+        crowd: bool,
+        actor: Option<&str>,
+        at_ms: u64,
+    ) {
+        let gesture_busy = self.performer.scheduler().items().iter().any(|item| {
+            matches!(item.status, Status::Queued | Status::Playing)
+                && item
+                    .plan
+                    .channels
+                    .contains(&aivtuber_scheduler::BlendChannel::Body)
+        });
+        let context = deferred_ack::AckContext {
+            cause,
+            crowd,
+            muted: self.security.is_muted(),
+            gesture_busy,
+            actor,
+        };
+        if !self
+            .chat_burst
+            .as_mut()
+            .is_some_and(|lane| lane.ack_admit(&context, at_ms))
+        {
+            return;
+        }
+        let result = self.avatar.execute(&AvatarPlaybackCommand::Gesture {
+            generation: 0,
+            at_ms,
+            preset: deferred_ack::ACK_GESTURE_PRESET.to_owned(),
+            amplitude: deferred_ack::ACK_GESTURE_AMPLITUDE,
+        });
+        if result.is_err()
+            && let Some(lane) = self.chat_burst.as_mut()
+        {
+            lane.ack_output_failed();
         }
     }
 
@@ -5916,6 +5969,9 @@ where
         // Every reset path funnels here: no settle step may outlive it (#447).
         if let Some(settle) = self.face_settle.as_mut() {
             settle.clear();
+        }
+        if let Some(lane) = self.chat_burst.as_mut() {
+            lane.clear_ack();
         }
         match self
             .avatar

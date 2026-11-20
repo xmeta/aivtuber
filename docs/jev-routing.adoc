@@ -398,7 +398,16 @@ Falsifier (`crates/app/src/tests/chat_burst_tests.rs`): the #78 100x burst (2060
 
 Audience aggregation (#79 S1) is section 12.7.
 
-Not yet: #79 semantic/topic grouping and windowed trends across batches, #80 topic features, #58 cost comparison, an immediate non-verbal acknowledgement with a deferred spoken reply, and an operator no-interruption window (needs a new authenticated control action, which is a wire change).
+Not yet: #79 semantic/topic grouping and windowed trends across batches, #80 topic features, #58 cost comparison, and an operator no-interruption window (needs a new authenticated control action, which is a wire change).
+
+=== 12.10 Immediate non-verbal acknowledgement of a deferred reply (issue #75)
+
+When a selected comment is deferred because the performer is speaking or generating, the avatar gives one small nod (`nod_small`) so the viewer sees the comment was noticed; the spoken reply still dispatches later from the inbox, unchanged. `AIVTUBER_DEFERRED_ACK=on|off` (default on, only meaningful with `AIVTUBER_CHAT_BURST_MODE=true`; an invalid value refuses startup like the neighbouring knobs).
+
+* *Direct execute, no scheduler item.* The ack is a host-direct `avatar.execute(Gesture { generation: 0 })` at the comment's logical time (ADR-0006, precedent `reset_avatar_neutral` and the face settle). It creates no scheduler item, so `min_reaction_spacing_ms`, `last_terminal_at` and asset cooldowns are untouched and the ack cannot delay the reply it acknowledges. It is not a `DeferredOutcome`. It runs in the content lane only, after the inbox accepted the deferral; the operator path is not involved.
+* *Which deferrals.* Only `BusyCause::Speaking` and `BusyCause::Generating`. `Muted`, `SceneProtected` and `FloorHeld` never ack (a nod while a human holds the floor reads as a reaction to the speaker). A crowd carrier never acks (the crowd reaction is its answer). No ack while muted or while a Body-channel scheduler item is queued or playing (a cached reply carrying its own gesture already answers visually).
+* *Bounds (logical ms, `crates/app/src/deferred_ack.rs`).* A global cooldown of 2000 ms, a per-actor cooldown of 15000 ms in a map of at most 64 actor keys (oldest evicted), and at most 3 acks in any 10000 ms window. Operator stop, avatar reset and actor erasure clear the gate.
+* *Failure.* An output failure is counted (`ChatBurstMetrics::ack.output_failed`) and never sets `health.avatar_error`. Counters: `acked`, `skipped_cause`, `skipped_crowd`, `skipped_muted`, `skipped_busy_channel`, `skipped_global_cooldown`, `skipped_actor_cooldown`, `skipped_window`, `output_failed`.
 
 === 12.7 Audience-signal aggregation (issue #79, S1)
 

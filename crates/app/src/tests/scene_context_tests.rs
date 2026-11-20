@@ -481,10 +481,11 @@ fn the_caption_is_dropped_whole_when_it_does_not_fit_the_request() {
 /// perceived scene, whatever it shows, never does.
 #[test]
 fn only_a_trusted_scene_can_make_the_performer_busy() {
+    let avatar = RecordingAvatar::default();
     let mut app = app(
         FixedAssetRoute("reaction.agree.01"),
         Box::new(RecordingAudio::default()),
-        Box::new(RecordingAvatar::default()),
+        Box::new(avatar.clone()),
         Box::new(NoopStreamOutput),
     )
     .with_chat_burst(ChatBurstConfig::default())
@@ -561,6 +562,19 @@ fn only_a_trusted_scene_can_make_the_performer_busy() {
             .deferred_scene_protected,
         1
     );
+    // #75: a protected scene is not a reason for a nod; no ack was sent.
+    assert!(
+        !avatar
+            .commands
+            .lock()
+            .expect("avatar log")
+            .iter()
+            .any(|command| matches!(
+                command,
+                AvatarPlaybackCommand::Gesture { generation: 0, .. }
+            ))
+    );
+    assert_eq!(app.chat_burst_metrics().expect("metrics").ack.acked, 0);
 
     // OBS moves to an interruptible scene: the deferred reply goes out.
     let tracker = app.scene_context_mut().expect("scene").tracker_mut();
