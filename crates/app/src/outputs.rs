@@ -188,6 +188,11 @@ impl AvatarOutput for VtsAvatarOutput {
         }
         Ok(())
     }
+
+    /// An expression is a hotkey trigger: intensity is not carried (#447).
+    fn graded_expression(&self) -> bool {
+        false
+    }
 }
 
 /// Local VRM renderer output (ADR-0003, #219). `execute` only authorizes and
@@ -677,6 +682,11 @@ mod tests {
     fn parameters(action: &aivtuber_domain::AuthorizedAvatarAction) -> BTreeMap<String, f64> {
         assert_eq!(action.action().action, "parameters.inject");
         action.action().parameters.clone()
+    }
+
+    #[test]
+    fn vts_expressions_carry_no_intensity() {
+        assert!(!output(None).graded_expression());
     }
 
     #[test]

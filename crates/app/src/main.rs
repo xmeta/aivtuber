@@ -144,6 +144,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         thinking_endpoint_is_loopback,
         thinking_meter,
         affect_judge_stats,
+        face_settle_baseline,
     } = build_generative_runtime(
         &compatibility,
         retention,
@@ -195,6 +196,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     // #367: the usage totals only exist next to a composed generative path.
     let thinking_meter = thinking_meter.filter(|_| generative.is_some());
     let affect_judge_stats = affect_judge_stats.filter(|_| generative.is_some());
+    let face_settle_baseline = face_settle_baseline.filter(|_| generative.is_some());
     let adaptation = build_adaptation_runtime(retention)?;
     let scheduler_config = retention.scheduler_config(SchedulerConfig::default());
     let security_config = retention.security_config(SecurityRuntimeConfig::default());
@@ -350,6 +352,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     if let Some(stats) = affect_judge_stats {
         app = app.with_affect_judge_stats(stats);
+    }
+    // #447: only with affect expression on; `AIVTUBER_AFFECT_EXPRESSION=false`
+    // keeps the previous fixed behavior.
+    if let Some((preset, intensity)) = face_settle_baseline {
+        app = app.with_face_settle(preset, intensity);
     }
     if let Some(controller) = voice_controller {
         if aivtuber_adapters::log_verbosity::diagnostics_enabled() {
@@ -1929,6 +1936,9 @@ struct GenerativeParts {
     thinking_meter: Option<aivtuber_app::ThinkingMeter>,
     /// #426: counters of the opt-in System One affect judge.
     affect_judge_stats: Option<aivtuber_generative::AffectJudgeStats>,
+    /// #447: the baseline expression the face settles to after a reply; `None`
+    /// unless affect expression is enabled.
+    face_settle_baseline: Option<(String, f64)>,
 }
 
 /// The environment-selected TTS bridges and the directories the voice
@@ -1965,6 +1975,7 @@ fn build_generative_runtime(
             thinking_endpoint_is_loopback: true,
             thinking_meter: None,
             affect_judge_stats: None,
+            face_settle_baseline: None,
         });
     }
 
@@ -2170,14 +2181,12 @@ fn build_generative_runtime(
         env_optional("AIVTUBER_TTS_API_KEY").map(SecretString::new),
     )?;
 
+    let baseline_preset = env_string("AIVTUBER_GENERATED_EXPRESSION_PRESET", "speaking.neutral");
     let compiler = PerformanceCompiler::new(PerformanceCompilerConfig {
         compiler_version: compatibility.compiler_version.clone(),
         avatar_profile: compatibility.avatar_profile.clone(),
         motion_library: compatibility.motion_library.clone(),
-        expression_preset: Some(env_string(
-            "AIVTUBER_GENERATED_EXPRESSION_PRESET",
-            "speaking.neutral",
-        )),
+        expression_preset: Some(baseline_preset.clone()),
         expression_intensity: 0.4,
     })?;
     // #84 S1: the text-to-affect classifier picks the expression of generated
@@ -2306,6 +2315,7 @@ fn build_generative_runtime(
         thinking_endpoint_is_loopback,
         thinking_meter: Some(thinking_meter),
         affect_judge_stats,
+        face_settle_baseline: affect_expression.then_some((baseline_preset, 0.4)),
     })
 }
 

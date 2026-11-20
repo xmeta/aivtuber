@@ -8,6 +8,7 @@ mod budget;
 mod chat_burst;
 mod chat_ingress;
 mod deadline;
+mod face_settle;
 mod irodori_bridge;
 mod memory_compare;
 mod memory_context;
@@ -249,6 +250,12 @@ pub trait AvatarOutput: Send {
         Ok(())
     }
     fn execute(&mut self, command: &AvatarPlaybackCommand) -> Result<(), EngineError>;
+
+    /// Whether an `Expression` can show a partial intensity. A hotkey-style
+    /// output cannot, so the face settle sends it only the baseline step.
+    fn graded_expression(&self) -> bool {
+        true
+    }
 }
 
 pub trait StreamOutput: Send {
@@ -1258,6 +1265,8 @@ where
     stream: Box<dyn StreamOutput>,
     pending_audio: PendingAudio,
     pending_avatar: PendingAvatar,
+    /// Face settle after a reply (#447); `None` composes nothing.
+    face_settle: Option<face_settle::FaceSettle>,
     /// lookahead により論理開始より前にバックエンドへ渡した音声コマンド (#354)。
     early_audio: Vec<AudioPlaybackCommand>,
     /// Text of the audio the output accepted, for the local panel (#335).
@@ -1338,6 +1347,7 @@ where
             stream,
             pending_audio: PendingAudio::default(),
             pending_avatar: PendingAvatar::default(),
+            face_settle: None,
             early_audio: Vec::new(),
             recent_replies: RecentReplies::default(),
             max_dispatch_lateness_ms,
@@ -5325,6 +5335,7 @@ where
         self.update_phrase_progress();
         self.dispatch_audio(now_ms);
         self.dispatch_avatar(now_ms);
+        self.service_face_settle(now_ms);
         self.drive_resynthesis();
         self.pump_speech_lifecycle();
     }
@@ -5404,6 +5415,68 @@ where
         surface: &str,
     ) -> aivtuber_runtime::SurfaceInvalidation {
         self.performer.invalidate_speech_surface(surface)
+    }
+
+    /// Settle the face back to `baseline_preset` at `baseline_intensity` after
+    /// a reply (#447). Off unless composed; see [`face_settle::FaceSettle`] for
+    /// the guards and why this bypasses the scheduler.
+    pub fn with_face_settle(
+        mut self,
+        baseline_preset: impl Into<String>,
+        baseline_intensity: f64,
+    ) -> Self {
+        self.face_settle = Some(face_settle::FaceSettle::new(
+            baseline_preset,
+            baseline_intensity,
+        ));
+        self
+    }
+
+    /// Execute the settle step due at `now_ms`, directly on the avatar output,
+    /// when the performer is idle (nothing queued or playing, no phrased reply
+    /// still to commit) and not muted. Runs after the tick's drain and advance,
+    /// so a reply committed this tick is already in the scheduler.
+    fn service_face_settle(&mut self, now_ms: u64) {
+        if self.face_settle.is_none() {
+            return;
+        }
+        if self.security.is_muted() {
+            if let Some(settle) = self.face_settle.as_mut() {
+                settle.clear();
+            }
+            return;
+        }
+        let busy = self
+            .performer
+            .scheduler()
+            .items()
+            .iter()
+            .any(|item| matches!(item.status, Status::Queued | Status::Playing))
+            || self
+                .generative
+                .as_ref()
+                .is_some_and(|generative| generative.phrase.has_active_spoken_run());
+        if busy {
+            return;
+        }
+        let idle_since_ms = self.performer.scheduler().last_terminal_at().unwrap_or(0);
+        let graded = self.avatar.graded_expression();
+        let Some(step) = self
+            .face_settle
+            .as_mut()
+            .and_then(|settle| settle.due(idle_since_ms, now_ms, graded))
+        else {
+            return;
+        };
+        match self.avatar.execute(&AvatarPlaybackCommand::Expression {
+            generation: 0,
+            at_ms: step.at_ms,
+            preset: step.preset,
+            intensity: step.intensity,
+        }) {
+            Ok(()) => self.health.avatar_error = None,
+            Err(error) => self.health.avatar_error = Some(error.to_string()),
+        }
     }
 
     /// Opt in to retaining speech lifecycle events for replay (#222 S3): the
@@ -5661,7 +5734,18 @@ where
                 .find(|item| item.plan.generation == avatar_generation(&command))
                 .map(|item| item.plan.event_id.clone());
             match self.avatar.execute(&command) {
-                Ok(()) => self.health.avatar_error = None,
+                Ok(()) => {
+                    self.health.avatar_error = None;
+                    if let (
+                        Some(settle),
+                        AvatarPlaybackCommand::Expression {
+                            preset, intensity, ..
+                        },
+                    ) = (self.face_settle.as_mut(), &command)
+                    {
+                        settle.note_expression(preset, *intensity, at_ms);
+                    }
+                }
                 Err(error) => {
                     self.health.avatar_error = Some(error.to_string());
                     if let Some(event_id) = event_id {
@@ -5807,6 +5891,10 @@ where
     /// directly: the cancelled generation is no longer live, so a scheduled
     /// `Reset` would be (correctly) dropped as cancelled.
     fn reset_avatar_neutral(&mut self, generation: u64, at_ms: u64) -> bool {
+        // Every reset path funnels here: no settle step may outlive it (#447).
+        if let Some(settle) = self.face_settle.as_mut() {
+            settle.clear();
+        }
         match self
             .avatar
             .execute(&AvatarPlaybackCommand::Reset { generation, at_ms })
@@ -6179,6 +6267,7 @@ mod tests {
     mod chat_burst_tests;
     mod chat_ingress_tests;
     mod crowd_routing_tests;
+    mod face_settle_tests;
     mod irodori_tts_tests;
     mod local_thinking_fallback_tests;
     mod memory_seed_tests;
@@ -10710,6 +10799,46 @@ mod tests {
                             u64::from(!error)
                         );
                     }
+                }
+
+                /// #447: the reset a barge-in sends clears a pending face settle,
+                /// so no step follows it and the next reply starts from neutral.
+                #[test]
+                fn a_barge_in_reset_clears_a_pending_face_settle() {
+                    let mut rig = rig(Backend::Fading, Some(BargeInConfig::default()));
+                    rig.app = rig.app.with_face_settle("speaking.neutral", 0.4);
+                    speak(&mut rig.app, 0, &json!({"duration_ms": 8_000}));
+                    let generation = rig.app.performer.scheduler().items()[0].plan.generation;
+                    rig.app
+                        .pending_avatar
+                        .commands
+                        .push(AvatarPlaybackCommand::Expression {
+                            generation,
+                            at_ms: 0,
+                            preset: "smile_bright".to_owned(),
+                            intensity: 0.6,
+                        });
+                    rig.app.tick(100);
+                    vad_edge(&mut rig.app, &start_edge(1_000), 1_000);
+                    rig.app.note_speech_feed_heartbeat(1_400);
+                    let record = rig.app.service_barge_in(1_400).expect("confirmed");
+                    assert_eq!(record.avatar_reset, Some(true));
+                    for now in (1_500..=20_000).step_by(100) {
+                        rig.app.tick(now);
+                    }
+                    let commands = rig.avatar.commands.lock().expect("avatar log").clone();
+                    assert!(
+                        matches!(commands.last(), Some(AvatarPlaybackCommand::Reset { .. })),
+                        "nothing follows the reset: {commands:?}"
+                    );
+                    assert_eq!(
+                        commands
+                            .iter()
+                            .filter(|c| matches!(c, AvatarPlaybackCommand::Expression { .. }))
+                            .count(),
+                        1,
+                        "no settle step was sent"
+                    );
                 }
 
                 /// The run is acted on once however long the user keeps talking.
