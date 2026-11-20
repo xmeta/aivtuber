@@ -1746,8 +1746,26 @@ export function controlResultText(action: "stop" | "mute", ok: boolean, detail: 
   return { text: parts.length === 0 ? `${name}しました` : `${name}しました(${parts.join("、")})`, raw };
 }
 
+/** Confirm text before ending the app (#449). */
+export const SHUTDOWN_CONFIRM_TEXT = "配信中なら止まります。アプリを終了しますか?";
+
+/** Shown once the host accepted `app.shutdown`; polling stops, so nothing says "reconnecting". */
+export const SHUTDOWN_ENDED_TEXT = "終了しました。もう一度使うには aivtuber-setup start を実行してください";
+
+/**
+ * Result of `POST /api/shutdown`. Accepted: the ended message (the host answers
+ * before it exits, with `shutting down; stopped N items; ...`). Refused: the
+ * app is still running, so say so and keep the page live.
+ */
+export function shutdownResultText(ok: boolean, detail: unknown, status: number): { ended: boolean; text: string; raw: string } {
+  const raw = typeof detail === "string" ? bounded(detail) : "";
+  if (ok && status === 200) return { ended: true, text: SHUTDOWN_ENDED_TEXT, raw };
+  return { ended: false, text: `終了できませんでした${raw === "" ? ` (${status})` : `: ${raw}`}`, raw };
+}
+
 export type ConnectionKind =
   | { kind: "connecting" }
+  | { kind: "ended" }
   | { kind: "connected" }
   | { kind: "reconnecting" }
   | { kind: "lost" }
@@ -1762,6 +1780,8 @@ export function connectionText(c: ConnectionKind): string {
       return "接続しています…";
     case "connected":
       return "接続済み";
+    case "ended":
+      return "アプリは終了しました";
     case "reconnecting":
       return "再接続中…(アプリが終了した可能性があります)";
     case "lost":

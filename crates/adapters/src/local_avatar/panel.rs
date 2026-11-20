@@ -109,10 +109,11 @@ pub const MAX_PANEL_KEY_CHARS: usize = 256;
 /// One model search may take this long, end to end.
 const SEARCH_DEADLINE: Duration = Duration::from_secs(6);
 /// Every state-changing endpoint (all are `POST`).
-const STATE_CHANGING: [&str; 24] = [
+const STATE_CHANGING: [&str; 25] = [
     "/api/chat",
     "/api/stop",
     "/api/mute",
+    "/api/shutdown",
     "/api/model",
     "/api/voice",
     "/api/voice/key",
@@ -206,6 +207,9 @@ pub enum PanelRequest {
     Chat(String),
     Stop,
     Mute,
+    /// End the whole app (#449): the emergency stop, the answer, then a
+    /// graceful exit decided on the composition thread.
+    Shutdown,
     /// Switch the local Thinking model (#357). Only the alias, already checked
     /// for shape; whether it is allowed is decided on the composition thread.
     SelectModel(String),
@@ -896,6 +900,13 @@ fn route(
     let (request, queue) = match path {
         "/api/stop" => (PanelRequest::Stop, &shared.control_tx),
         "/api/mute" => (PanelRequest::Mute, &shared.control_tx),
+        "/api/shutdown" => match empty_object(&body) {
+            Ok(()) => (PanelRequest::Shutdown, &shared.control_tx),
+            Err((status, detail)) => {
+                shared.count(&shared.counters.rejected_request);
+                return json(status, false, detail);
+            }
+        },
         "/api/voice/preview" => (PanelRequest::VoicePreview, &shared.voice_tx),
         "/api/voice/key/remove" => (PanelRequest::VoiceKeyRemove, &shared.voice_tx),
         "/api/voice/key/check" => (PanelRequest::VoiceKeyCheck, &shared.voice_tx),
@@ -1946,6 +1957,45 @@ mod tests {
         });
         assert_eq!(stop.status, 409);
         assert!(stop.body.contains("\"ok\":false"));
+    }
+
+    #[test]
+    fn a_shutdown_needs_the_token_origin_and_an_empty_object_then_reaches_the_control_queue() {
+        let f = fixture();
+        let good = good(&f);
+        // No token, a foreign origin and a non-empty body never reach the queue.
+        assert_eq!(
+            post(&f, "/api/shutdown", &with(&good, "x-panel-token"), "{}").status,
+            401
+        );
+        let mut foreign = with(&good, "origin");
+        foreign.push(("Origin", "http://evil.example"));
+        assert_eq!(post(&f, "/api/shutdown", &foreign, "{}").status, 403);
+        let headers = with(&good, "none");
+        assert_eq!(post(&f, "/api/shutdown", &headers, "").status, 400);
+        assert_eq!(
+            post(&f, "/api/shutdown", &headers, "{\"now\":true}").status,
+            400
+        );
+        assert!(f.inbox.drain_control(8).is_empty());
+        let accepted = thread::scope(|s| {
+            let handle = s.spawn(|| post(&f, "/api/shutdown", &headers, "{}"));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut commands = Vec::new();
+            while commands.is_empty() && Instant::now() < deadline {
+                commands = f.inbox.drain_control(4);
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(commands.len(), 1);
+            assert_eq!(commands[0].request, PanelRequest::Shutdown);
+            commands
+                .into_iter()
+                .next()
+                .unwrap()
+                .respond(true, "shutting down");
+            handle.join().unwrap()
+        });
+        assert_eq!(accepted.status, 200, "{}", accepted.body);
     }
 
     #[test]

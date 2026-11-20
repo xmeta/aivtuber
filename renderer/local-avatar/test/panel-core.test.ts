@@ -85,6 +85,9 @@ import {
   connectionText,
   controlResultText,
   reasonText,
+  SHUTDOWN_CONFIRM_TEXT,
+  SHUTDOWN_ENDED_TEXT,
+  shutdownResultText,
   tokenFromHash,
   tuningPatch,
   voiceInputBody,
@@ -1087,6 +1090,28 @@ describe("connectionText", () => {
     expect(connectionText({ kind: "lost" })).toContain("切断されました");
     expect(connectionText({ kind: "http-error", status: 502 })).toContain("502");
     expect(connectionText({ kind: "http-error", status: Number.NaN })).toContain("0");
+  });
+});
+
+describe("shutdown (#449)", () => {
+  test("an accepted shutdown shows the ended message, never reconnecting", () => {
+    const r = shutdownResultText(true, "shutting down; stopped 1 items; audio_stop=hard_stopped avatar_reset=ok", 200);
+    expect(r.ended).toBe(true);
+    expect(r.text).toBe(SHUTDOWN_ENDED_TEXT);
+    expect(r.text).toContain("aivtuber-setup start");
+    expect(r.text).not.toContain("再接続");
+    expect(connectionText({ kind: "ended" })).not.toContain("再接続");
+    expect(connectionText({ kind: "ended" })).toContain("終了");
+  });
+  test("a refusal keeps the page live and says the app is still running", () => {
+    const r = shutdownResultText(false, "authentication failed", 409);
+    expect(r.ended).toBe(false);
+    expect(r.text).toBe("終了できませんでした: authentication failed");
+    expect(shutdownResultText(true, "x", 500).ended).toBe(false);
+    expect(shutdownResultText(false, undefined, 503).text).toBe("終了できませんでした (503)");
+  });
+  test("the confirm text warns that a running stream stops", () => {
+    expect(SHUTDOWN_CONFIRM_TEXT).toBe("配信中なら止まります。アプリを終了しますか?");
   });
 });
 
