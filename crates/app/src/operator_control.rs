@@ -1227,14 +1227,65 @@ fn wall_unix_millis() -> u64 {
 /// The scheduler/runtime timeline is a monotonic millisecond counter, so the
 /// operator envelope timestamp uses the same epoch-relative encoding used by
 /// benchmarks instead of deriving wall-clock time in the control path.
+/// `observed_at` for an operator command from the app's logical clock (ms
+/// since launch), rendered as a valid RFC 3339 instant counted from the Unix
+/// epoch. The minutes field must roll over into hours and days: a bare
+/// `00:MM:SS` became `00:60:00` after one hour of uptime, the envelope failed
+/// validation, and every privileged action, emergency stop included, was
+/// refused as "authentication failed".
 fn rfc3339_from_ms(now_ms: u64) -> String {
-    let seconds = now_ms / 1_000;
-    format!("1970-01-01T00:{:02}:{:02}Z", seconds / 60, seconds % 60)
+    crate::panel::rfc3339_utc(now_ms / 1_000)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operator_commands_still_authenticate_after_an_hour_of_uptime() {
+        use aivtuber_domain::{
+            AuthorizationMethod, Capability, ControlSecret, LocalControlIngress,
+            OperatorCommandInput,
+        };
+        use std::collections::BTreeSet;
+        let secret = [0x5A_u8; 32];
+        let ingress = LocalControlIngress::new(
+            "operator-control",
+            "operator:local",
+            AuthorizationMethod::SignedLocalApi,
+            BTreeSet::from([Capability::PerformerStop]),
+            ControlSecret::new(secret),
+        )
+        .expect("ingress");
+        assert_eq!(rfc3339_from_ms(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339_from_ms(3_599_999), "1970-01-01T00:59:59Z");
+        assert_eq!(rfc3339_from_ms(3_600_000), "1970-01-01T01:00:00Z");
+        assert_eq!(
+            rfc3339_from_ms(86_400_000 * 45 + 1_000),
+            "1970-02-15T00:00:01Z"
+        );
+        for now_ms in [
+            0,
+            3_599_999,
+            3_600_000,
+            7_265_000,
+            86_400_000,
+            86_400_000 * 400,
+        ] {
+            let input = OperatorCommandInput {
+                event_id: "operator-test".to_owned(),
+                correlation_id: "operator-test".to_owned(),
+                sequence: 0,
+                observed_at: rfc3339_from_ms(now_ms),
+                action: "performer.stop".to_owned(),
+                payload: std::collections::BTreeMap::new(),
+            };
+            assert!(
+                ingress.authenticate(input, &secret).is_ok(),
+                "stop must authenticate at uptime {now_ms} ms"
+            );
+        }
+    }
 
     #[test]
     fn status_request_round_trip_in_lib() {
