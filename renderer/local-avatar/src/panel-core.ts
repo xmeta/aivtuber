@@ -327,6 +327,8 @@ export interface ChatEntry {
   /** Event id the runtime gave the line (`panel-chat-N`), once accepted. */
   id: string | null;
   text: string;
+  /** Page-local send time (epoch ms), display only; never sent to the host. */
+  sentAt: number;
   /** Pending until the runtime answers, then the admission result. */
   note: string;
 }
@@ -341,6 +343,35 @@ export function pushChat(log: ChatEntry[], entry: ChatEntry): ChatEntry[] {
 export function repliesFor(state: PanelState | null, id: string | null): string[] {
   if (state === null || id === null) return [];
   return state.replies.filter((r) => r.event_id === id).map((r) => r.text);
+}
+
+/** Replies that answer a panel line, with their seq (for the first-seen time). */
+export function replyRecordsFor(state: PanelState | null, id: string | null): { seq: number; text: string }[] {
+  if (state === null || id === null) return [];
+  return state.replies.filter((r) => r.event_id === id).map(({ seq, text }) => ({ seq, text }));
+}
+
+/** Reply first-seen times kept in the page; bounded like the chat log. */
+export const MAX_SEEN_REPLIES = 200;
+
+/** When this page first saw reply `seq` (stable across re-renders/polls). Display only. */
+export function firstSeen(seen: Map<number, number>, seq: number, now: number): number {
+  const known = seen.get(seq);
+  if (known !== undefined) return known;
+  seen.set(seq, now);
+  if (seen.size > MAX_SEEN_REPLIES) seen.delete(seen.keys().next().value as number);
+  return now;
+}
+
+/** Local HH:MM of an epoch-ms instant. */
+export function formatClock(ms: number): string {
+  const d = new Date(ms);
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+/** Speaker label and time shown above a bubble. */
+export function bubbleMeta(who: "operator" | "ai", ms: number): { label: string; time: string } {
+  return { label: who === "operator" ? "オペレーター" : "AI", time: formatClock(ms) };
 }
 
 /** Replies that answer something other than a panel line (stdin, speech...). */

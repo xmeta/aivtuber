@@ -70,6 +70,11 @@ import {
   PERSONA_MEMORY_ONLY_NOTE,
   parseVoiceState,
   pushChat,
+  replyRecordsFor,
+  firstSeen,
+  formatClock,
+  bubbleMeta,
+  MAX_SEEN_REPLIES,
   repliesFor,
   safeAvatarUrl,
   searchPageCount,
@@ -170,10 +175,32 @@ describe("chat", () => {
   });
 
   test("the log is bounded", () => {
-    let log: { id: string | null; text: string; note: string }[] = [];
-    for (let i = 0; i < MAX_CHAT_LOG + 10; i++) log = pushChat(log, { id: null, text: String(i), note: "" });
+    let log: { id: string | null; text: string; sentAt: number; note: string }[] = [];
+    for (let i = 0; i < MAX_CHAT_LOG + 10; i++) log = pushChat(log, { id: null, text: String(i), sentAt: 0, note: "" });
     expect(log).toHaveLength(MAX_CHAT_LOG);
     expect(log.at(-1)?.text).toBe(String(MAX_CHAT_LOG + 9));
+  });
+
+  test("bubble labels and local HH:MM", () => {
+    const at = new Date(2026, 10, 20, 9, 5, 59).getTime();
+    expect(formatClock(at)).toBe("09:05");
+    expect(bubbleMeta("operator", at)).toEqual({ label: "オペレーター", time: "09:05" });
+    expect(bubbleMeta("ai", at)).toEqual({ label: "AI", time: "09:05" });
+  });
+
+  test("reply first-seen time is stable across polls and bounded", () => {
+    const seen = new Map<number, number>();
+    expect(firstSeen(seen, 1, 1000)).toBe(1000);
+    expect(firstSeen(seen, 1, 9999)).toBe(1000);
+    for (let i = 2; i < MAX_SEEN_REPLIES + 10; i++) firstSeen(seen, i, i);
+    expect(seen.size).toBe(MAX_SEEN_REPLIES);
+    expect(replyRecordsFor(state(), "panel-chat-1")).toEqual([{ seq: 1, text: "こんにちは" }]);
+    expect(replyRecordsFor(state(), null)).toEqual([]);
+  });
+
+  test("panel.ts renders chat text without innerHTML", async () => {
+    const src = await Bun.file(new URL("../src/panel.ts", import.meta.url)).text();
+    expect(src.includes("innerHTML")).toBe(false);
   });
 
   test("checkChat trims, refuses empty and over-long text", () => {
