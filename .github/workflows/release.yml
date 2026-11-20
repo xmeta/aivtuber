@@ -188,6 +188,7 @@ jobs:
         with:
           sparse-checkout: |
             scripts/smoke-release-archive.mjs
+            scripts/smoke-panel-page.mjs
             scripts/pe-imports.mjs
             scripts/release-notices.mjs
             packaging/third-party/
