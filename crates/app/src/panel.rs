@@ -249,6 +249,7 @@ impl PanelService {
             let action = match &command.request {
                 PanelRequest::Stop => "stop",
                 PanelRequest::Mute => "mute",
+                PanelRequest::Shutdown => "app.shutdown",
                 PanelRequest::SelectModel(alias) => {
                     argument = Some(alias);
                     "model.select"

@@ -215,6 +215,11 @@ label.field select { color: var(--text); }
 .emergency .buttons { gap: var(--s3); }
 .emergency .buttons button { flex: 1; min-height: 4rem; font-size: 1rem; font-weight: 800; border-radius: var(--r-lg); box-shadow: 0 2px 0 rgba(0, 0, 0, .35); }
 .emergency .buttons button:active:not(:disabled) { box-shadow: none; }
+.emergency .buttons.quit { margin-top: var(--s3); }
+.emergency .buttons.quit button { min-height: 2.25rem; font-size: .88rem; font-weight: 600; box-shadow: none; }
+button.danger-outline { background: transparent; color: var(--danger); border-color: color-mix(in srgb, var(--danger) 60%, var(--border)); }
+button.danger-outline:hover:not(:disabled) { background: color-mix(in srgb, var(--danger) 14%, transparent); }
+button.danger-outline:disabled { background: var(--surface-2); color: var(--text-muted); border-color: var(--border); }
 
 /* Chat */
 .chat { border-color: color-mix(in srgb, var(--accent) 55%, var(--border)); }

@@ -91,6 +91,10 @@ enum Command {
     Stop,
     /// Latch the operator mute state (unmute is restart-only).
     Mute,
+    /// Stop all performer work, then end the whole app (issue #449): the same
+    /// stop as `stop`, then a graceful exit. Under `aivtuber-setup start` the
+    /// local model server ends with it. Same secret as `stop`.
+    Shutdown,
     /// Capture a bounded, redacted diagnostic/support bundle (issue #68).
     /// Uses the status path (secret verification only, no control authority).
     Diagnose,
@@ -515,6 +519,7 @@ fn action_name(command: &Command) -> &'static str {
         Command::Status => "status",
         Command::Stop => "stop",
         Command::Mute => "mute",
+        Command::Shutdown => "app.shutdown",
         Command::Diagnose => "diagnose",
         Command::PanelUrl => "panel.url",
         Command::PerceptionOn => "perception.enable",
@@ -1129,6 +1134,13 @@ mod tests {
             full.extend_from_slice(args);
             assert!(Cli::try_parse_from(full).is_err(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn shutdown_maps_to_its_action_and_takes_no_argument() {
+        let command = parse(&["shutdown"]);
+        assert_eq!(action_name(&command), "app.shutdown");
+        assert!(Cli::try_parse_from(["aivtuberctl", "shutdown", "extra"]).is_err());
     }
 
     #[test]

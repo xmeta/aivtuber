@@ -232,6 +232,10 @@ fn capability_for_action(action: &str) -> Option<Capability> {
         // local ingress can mint it, and the panel secret it reveals already
         // carries stop and mute. No new capability.
         "panel.url" => Some(Capability::PerformerStop),
+        // Ending the whole app (#449) reuses `performer.stop` too: whoever can
+        // stop and latch mute can already end the show, so quitting grants
+        // nothing new. Only the authenticated local ingress can mint it.
+        "app.shutdown" => Some(Capability::PerformerStop),
         "obs.control" => Some(Capability::ObsControl),
         "avatar.control" => Some(Capability::AvatarControl),
         // The memory seed view/edit actions (#402) reuse the closed `memory.admin`.
@@ -307,6 +311,21 @@ mod tests {
                 .authority()
                 .has_capability(Capability::PerformerStop)
         );
+    }
+
+    #[test]
+    fn app_shutdown_needs_the_existing_performer_stop_capability() {
+        let secret = [7_u8; CONTROL_SECRET_LEN];
+        let error = ingress(Capability::PerformerMute, secret)
+            .authenticate(input("app.shutdown"), &secret)
+            .expect_err("mute alone does not end the app");
+        assert_eq!(
+            error,
+            ControlIngressError::CapabilityNotGranted(Capability::PerformerStop)
+        );
+        ingress(Capability::PerformerStop, secret)
+            .authenticate(input("app.shutdown"), &secret)
+            .expect("the operator endpoint holds performer.stop");
     }
 
     #[test]

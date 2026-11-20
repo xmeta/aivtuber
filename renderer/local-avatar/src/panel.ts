@@ -16,6 +16,8 @@ import {
   type ConnectionKind,
   avatarLinkState,
   connectionText,
+  SHUTDOWN_CONFIRM_TEXT,
+  shutdownResultText,
   controlResultText,
   chatIngressView,
   connectBody,
@@ -1167,7 +1169,7 @@ async function poll(): Promise<void> {
 }
 
 function setBusy(busy: boolean): void {
-  for (const id of ["send", "stop", "mute"]) $<HTMLButtonElement>(id).disabled = busy;
+  for (const id of ["send", "stop", "mute", "shutdown"]) $<HTMLButtonElement>(id).disabled = busy;
 }
 
 async function send(): Promise<void> {
@@ -1213,6 +1215,37 @@ async function control(action: "stop" | "mute"): Promise<void> {
     setBusy(false);
     void poll();
   }
+}
+
+/**
+ * End the whole app (#449). Confirmed first. After the host accepts, the page
+ * shows the ended message and never polls or reconnects again.
+ */
+async function shutdownApp(): Promise<void> {
+  if (!window.confirm(SHUTDOWN_CONFIRM_TEXT)) return;
+  setBusy(true);
+  $<HTMLButtonElement>("shutdown").disabled = true;
+  try {
+    const { status, json } = await api("/api/shutdown", { method: "POST", body: "{}" });
+    const body = (json ?? {}) as { ok?: boolean; detail?: string };
+    const shown = shutdownResultText(status === 200 && body.ok === true, body.detail, status);
+    const out = $("control-result");
+    out.textContent = shown.text;
+    out.title = shown.raw;
+    if (shown.ended) {
+      clearInterval(pollTimer);
+      connectionLost = true;
+      connection = { kind: "ended" };
+      render();
+      return;
+    }
+  } catch {
+    $("control-result").textContent = "失敗しました(アプリに接続できません)";
+    $("control-result").title = "";
+  }
+  $<HTMLButtonElement>("shutdown").disabled = false;
+  setBusy(false);
+  void poll();
 }
 
 // Pasting a new launch URL into this same tab only changes the fragment, so the
@@ -1284,6 +1317,7 @@ $<HTMLInputElement>("voice-input-headset").addEventListener(
 );
 $("stop").addEventListener("click", () => void control("stop"));
 $("mute").addEventListener("click", () => void control("mute"));
+$("shutdown").addEventListener("click", () => void shutdownApp());
 
 if (token === null) {
   connection = { kind: "no-token" };
