@@ -563,6 +563,10 @@ Decided items are marked; the rest stay open for the supervisor.
 . *Q12 (persona and budget contracts) - OPEN, see S-7*: #72 ceilings and #89 budgets are assumed to expose the queries in D3 and D5. Is that the intended direction, or should #84 wait for them?
 . *Q13 (starter pack)*: map the starter pack's free-string presets into authored intents and profile tables, or leave them as legacy assets indefinitely?
 
+== Addendum: immediate acknowledgement of a deferred reply (issue #75)
+
+The non-verbal acknowledgement of a deferred chat reply (`docs/jev-routing.adoc` section 12.10) reuses the direct-execute path this ADR describes for resets: a host-direct `avatar.execute()` with generation 0 and a logical time, creating no scheduler item, so it neither delays the reply it acknowledges nor moves `last_terminal_at`. Its gesture preset is code-owned (`nod_small`); nothing a viewer or a model writes can select it, and its failures are counted, not surfaced as output health.
+
 == Related
 
 * Issue: #84. Related issues: #54, #58, #59, #66, #72, #81, #83, #88, #89, #219, #222.

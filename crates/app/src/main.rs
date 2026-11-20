@@ -700,6 +700,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 )?,
             },
             reply_ttl_ms: env_u64("AIVTUBER_CHAT_REPLY_TTL_MS", defaults.reply_ttl_ms)?,
+            deferred_ack: env_bool("AIVTUBER_DEFERRED_ACK", defaults.deferred_ack)?,
             audience: if audience_requested {
                 let audience_defaults = aivtuber_reflex::AudienceConfig::default();
                 Some(aivtuber_reflex::AudienceConfig {
