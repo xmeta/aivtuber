@@ -55,6 +55,10 @@ export class AvatarState {
     switch (cmd.op) {
       case "expression":
         if (!isExpressionPreset(cmd.preset)) return "unknown_preset";
+        // One active expression at a time, like `viseme`: the face is a single
+        // channel, so presets must not stack across commands (#445). `neutral`
+        // is a preset like any other; intensity 0 clears the face.
+        for (const key of EXPRESSION_KEYS) this.target.expressions[key] = 0;
         this.target.expressions[cmd.preset] = clamp01(cmd.intensity);
         return null;
       case "viseme":

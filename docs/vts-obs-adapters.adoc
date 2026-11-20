@@ -211,7 +211,7 @@ host -> renderer:  {v, epoch, seq, cmd}   cmd.op = expression | gesture | gaze |
 renderer -> host:  hello{v, epoch, model_hash, profile} | ready{epoch} | ack{epoch, seq} | reject{epoch, seq, reason}
 ----
 
-The renderer mints `epoch`; the host mints `seq` (per epoch, starting at 1). `generation` and `at_ms` never go on the wire. `ready` is sent only after the first neutral frame of the epoch; the host sends nothing before it and then sends `reset` as `seq` 1.
+The renderer mints `epoch`; the host mints `seq` (per epoch, starting at 1). `generation` and `at_ms` never go on the wire. The face is one channel: an `expression` command makes its preset the only active expression (every other preset's target goes to 0, `neutral` or intensity 0 clears the face), the same way `viseme` keeps one active viseme; presets never stack, and the renderer still interpolates smoothly toward the new targets (only `reset` snaps). `ready` is sent only after the first neutral frame of the epoch; the host sends nothing before it and then sends `reset` as `seq` 1.
 
 === Restart and failure semantics
 
