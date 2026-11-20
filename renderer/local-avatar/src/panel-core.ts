@@ -1966,6 +1966,56 @@ export function seedView(state: PanelState | null, entries: readonly SeedEntry[]
   };
 }
 
+/** Longest claim (in characters) a chip shows before it is cut with an ellipsis. */
+export const SEED_CHIP_MAX_CHARS = 40;
+export const SEED_EMPTY_CHIP_TEXT = "(空の項目)";
+
+export interface SeedChipView {
+  /** The kind label, shown small before the claim. */
+  kindLabel: string;
+  /** The claim cut to one short line, or the placeholder for an empty claim. */
+  text: string;
+  /** The whole claim for the title attribute; empty for an empty claim. */
+  title: string;
+  /** Names the 1-based index and kind for assistive tech. */
+  ariaLabel: string;
+}
+
+/** What a collapsed entry shows as a chip. Cuts by code point so a surrogate pair is never split. */
+export function seedChipView(entry: SeedEntry, index: number): SeedChipView {
+  const kindLabel = SEED_KINDS.find((k) => k.kind === entry.kind)?.label ?? entry.kind;
+  const claim = entry.claim.trim();
+  const points = Array.from(claim);
+  const text =
+    claim === ""
+      ? SEED_EMPTY_CHIP_TEXT
+      : points.length > SEED_CHIP_MAX_CHARS
+        ? `${points.slice(0, SEED_CHIP_MAX_CHARS).join("")}…`
+        : claim;
+  return {
+    kindLabel,
+    text,
+    title: claim,
+    ariaLabel: `項目 ${index + 1}(${kindLabel}): ${text} - 編集`,
+  };
+}
+
+/** The open editor after an add: the new last entry. */
+export function seedOpenAfterAdd(length: number): number {
+  return length - 1;
+}
+
+/** The open editor after `removed` is deleted: closed if it was that one, shifted if it was after it. */
+export function seedOpenAfterDelete(open: number | null, removed: number): number | null {
+  if (open === null || open === removed) return null;
+  return open > removed ? open - 1 : open;
+}
+
+/** Clicking a chip opens it; at most one editor is open, so this replaces any other. */
+export function seedOpenAfterOpen(open: number | null, index: number, length: number): number | null {
+  return index >= 0 && index < length ? index : open;
+}
+
 /** The body of `POST /api/memory-seed/set`: the whole document, claims trimmed, nothing else. */
 export function seedSetBody(seed: Pick<SeedDocument, "seed_id" | "revision">, entries: readonly SeedEntry[]): SeedDocument {
   return {

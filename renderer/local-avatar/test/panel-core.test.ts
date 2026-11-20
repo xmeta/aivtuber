@@ -52,7 +52,13 @@ import {
   parseMemorySeedEditorState,
   parseSeedDocument,
   seedClaimBytes,
+  SEED_CHIP_MAX_CHARS,
+  SEED_EMPTY_CHIP_TEXT,
+  seedChipView,
   seedGetBody,
+  seedOpenAfterAdd,
+  seedOpenAfterDelete,
+  seedOpenAfterOpen,
   seedResultText,
   seedSetBody,
   seedTextFrom,
@@ -1702,5 +1708,40 @@ describe("speaking indicator", () => {
   test("an older host without the field shows no row, and a non-boolean is ignored", () => {
     expect(statusRows(state()!).some((r) => r.key === "speaking")).toBe(false);
     expect(statusRows(withSpeaking("yes")).some((r) => r.key === "speaking")).toBe(false);
+  });
+});
+
+describe("memory chips (#402)", () => {
+  test("a short claim is shown whole with kind, title and aria label", () => {
+    const v = seedChipView(seedEntry("  配信は週3回  ", "commitment"), 1);
+    expect(v.kindLabel).toBe("約束");
+    expect(v.text).toBe("配信は週3回");
+    expect(v.title).toBe("配信は週3回");
+    expect(v.ariaLabel).toContain("項目 2");
+    expect(v.ariaLabel).toContain("約束");
+  });
+
+  test("a long claim is cut by code point with an ellipsis; title keeps it all", () => {
+    const long = "😀".repeat(SEED_CHIP_MAX_CHARS + 5);
+    const v = seedChipView(seedEntry(long), 0);
+    expect(v.text).toBe("😀".repeat(SEED_CHIP_MAX_CHARS) + "…");
+    expect(v.title).toBe(long);
+    expect(seedChipView(seedEntry("a".repeat(SEED_CHIP_MAX_CHARS)), 0).text).toBe("a".repeat(SEED_CHIP_MAX_CHARS));
+  });
+
+  test("an empty claim shows the placeholder and no title", () => {
+    const v = seedChipView(seedEntry("   "), 0);
+    expect(v.text).toBe(SEED_EMPTY_CHIP_TEXT);
+    expect(v.title).toBe("");
+  });
+
+  test("which editor is open after add, delete and open", () => {
+    expect(seedOpenAfterAdd(4)).toBe(3);
+    expect(seedOpenAfterDelete(2, 2)).toBeNull();
+    expect(seedOpenAfterDelete(3, 1)).toBe(2);
+    expect(seedOpenAfterDelete(0, 1)).toBe(0);
+    expect(seedOpenAfterDelete(null, 1)).toBeNull();
+    expect(seedOpenAfterOpen(0, 2, 3)).toBe(2);
+    expect(seedOpenAfterOpen(1, 5, 3)).toBe(1);
   });
 });

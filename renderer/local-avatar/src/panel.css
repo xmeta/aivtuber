@@ -190,8 +190,17 @@ label.field select { color: var(--text); }
 .model-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: var(--s2); align-items: center; padding: var(--s2) var(--s3); background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--r-md); font-size: .88rem; overflow-wrap: anywhere; }
 .model-row.active { font-weight: 600; border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
 .model-row small { display: block; font-weight: 400; color: var(--warn); }
-.seed-list { list-style: none; margin: var(--s2) 0; padding: 0; display: flex; flex-direction: column; gap: var(--s2); }
-.seed-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: var(--s2); align-items: center; padding-bottom: var(--s2); border-bottom: 1px solid var(--border); }
+.seed-list { list-style: none; margin: var(--s2) 0; padding: 0; display: flex; flex-flow: row wrap; gap: var(--s2); align-items: flex-start; }
+.seed-item { min-width: 0; max-width: 100%; }
+.seed-chip { display: inline-flex; align-items: baseline; gap: var(--s2); max-width: 100%; padding: var(--s1) var(--s3); border: 1px solid var(--border-strong); border-radius: 999px; background: var(--surface-2); color: var(--text); font: inherit; font-size: .85rem; cursor: pointer; }
+.seed-chip:hover { background: var(--surface-3); }
+.seed-chip:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.seed-chip.warn { border-color: var(--warn); color: var(--warn); }
+.seed-chip-kind { flex: none; font-size: .72rem; color: var(--text-muted); }
+.seed-chip.warn .seed-chip-kind { color: inherit; }
+.seed-chip-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.seed-chip-text.empty { font-style: italic; color: var(--text-muted); }
+.seed-row { flex: 1 0 100%; display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; gap: var(--s2); align-items: center; padding-bottom: var(--s2); border-bottom: 1px solid var(--border); }
 .seed-row .seed-claim { min-width: 0; width: 100%; grid-column: 1 / -1; grid-row: 2; }
 .seed-row .seed-problem { grid-column: 1 / -1; margin: 0; }
 .seed-bytes { font-variant-numeric: tabular-nums; white-space: nowrap; }
