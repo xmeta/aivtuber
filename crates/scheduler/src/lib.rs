@@ -424,6 +424,11 @@ impl Scheduler {
         self.now_ms
     }
 
+    /// Logical time the latest item ended or was cut short, if any.
+    pub fn last_terminal_at(&self) -> Option<u64> {
+        self.last_terminal_at
+    }
+
     pub fn current_generation(&self) -> u64 {
         self.generation
     }
