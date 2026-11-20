@@ -75,6 +75,12 @@ use std::time::{Duration, Instant};
 /// grew a field. It runs on a thread with a stack that cannot be the limit.
 const RUN_STACK_BYTES: usize = 32 * 1024 * 1024;
 
+/// After an `app.shutdown` (#449): how long the composition loop keeps running
+/// so the answer reaches the caller before the app ends.
+const SHUTDOWN_REPLY_GRACE_MS: u64 = 500;
+/// The hard bound on the graceful stop; then the process exits anyway.
+const SHUTDOWN_DEADLINE_MS: u64 = 5_000;
+
 fn main() {
     let worker = thread::Builder::new()
         .name("aivtuber-app".to_owned())
@@ -1051,6 +1057,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut sequence_seed = 0_u64;
     let mut next_maintenance_ms = 0_u64;
     let mut last_raw_ingress_metrics = RawIngressMetricsSnapshot::default();
+    // #449: when an authenticated `app.shutdown` was seen, the loop keeps
+    // turning for a short grace so the HTTP / control reply is written, then
+    // ends the app. The reply is never cut off by an exit.
+    let mut shutdown_exit_at_ms: Option<u64> = None;
 
     loop {
         match receiver.recv_timeout(Duration::from_millis(10)) {
@@ -1135,6 +1145,29 @@ fn run() -> Result<(), Box<dyn Error>> {
         // same admission as a stdin line), after the operator endpoint drain.
         if let Some(panel) = panel.as_mut() {
             panel.service(&mut app, now_ms, &mut sequence_seed);
+        }
+        if app.shutdown_requested() {
+            let exit_at = *shutdown_exit_at_ms
+                .get_or_insert_with(|| now_ms.saturating_add(SHUTDOWN_REPLY_GRACE_MS));
+            if now_ms >= exit_at {
+                eprintln!("shutdown: stopped from the operator (app.shutdown); exiting");
+                // Bounded: if a sidecar or worker will not stop, the process
+                // still ends (exit 0, the shutdown was requested) after the
+                // deadline. Started only now, after the reply grace.
+                thread::spawn(|| {
+                    thread::sleep(Duration::from_millis(SHUTDOWN_DEADLINE_MS));
+                    eprintln!("shutdown: deadline reached; exiting anyway");
+                    std::process::exit(0);
+                });
+                if let Some(service) = app.perception_mut() {
+                    service.shutdown();
+                }
+                app.shutdown(now_ms);
+                app.shutdown_voice();
+                app.shutdown_chat_ingress();
+                app.shutdown_speech_input();
+                break;
+            }
         }
         // #360: collect a finished key check and submit a waiting voice
         // preview line. Never blocks: the check runs on its own thread.

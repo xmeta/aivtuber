@@ -61,7 +61,8 @@ pub struct OperatorRequest {
     /// half/full duplex choice, #396),
     /// `persona.set`, `persona.get` (the character sheet, #401),
     /// `memory.seed.get`, `memory.seed.set` (the operator memory seed, #402),
-    /// `panel.url` (show the operation panel URL again, #388).
+    /// `panel.url` (show the operation panel URL again, #388),
+    /// `app.shutdown` (stop everything, answer, then end the app, #449).
     pub action: String,
     /// Opaque session secret presented by the operator client.
     pub secret: String,
@@ -675,6 +676,7 @@ pub fn apply_operator_request<R: RoutePlanner>(
         && !is_speech_input_action(&request.action)
         && !is_persona_action(&request.action)
         && request.action != "panel.url"
+        && request.action != "app.shutdown"
     {
         let detail = format!("unknown action {}", request.action);
         app.audit_operator_action(&request_id, &request.action, &detail, false);
@@ -782,7 +784,7 @@ pub fn apply_operator_action<R: RoutePlanner>(
     presented: &[u8; 32],
     now_ms: u64,
 ) -> OperatorResponse {
-    if !matches!(action, "stop" | "mute" | "model.select")
+    if !matches!(action, "stop" | "mute" | "model.select" | "app.shutdown")
         && !is_voice_action(action)
         && !is_ingress_action(action)
         && !is_avatar_action(action)
@@ -1160,7 +1162,18 @@ fn apply_with_presented_secret<R: RoutePlanner>(
 
     match app.handle_control_reporting(&command, now_ms) {
         Ok((outcome, stop_report)) => {
+            // `app.shutdown` (#449): the emergency stop above has run; latch
+            // the exit. The composition loop ends the app only after this
+            // reply has been flushed.
+            let shutting_down = action == "app.shutdown";
+            if shutting_down && let Err(detail) = app.request_shutdown(command.authority()) {
+                app.audit_operator_action(&request_id, action, &detail, false);
+                return rejection(&request_id, &detail);
+            }
             let mut detail = match outcome {
+                ControlOutcome::Stopped { cancelled } if shutting_down => {
+                    format!("shutting down; stopped {cancelled} items")
+                }
                 ControlOutcome::Stopped { cancelled } => format!("stopped {cancelled} items"),
                 ControlOutcome::Muted => "muted".to_owned(),
                 ControlOutcome::AuthenticatedOther => "authenticated".to_owned(),

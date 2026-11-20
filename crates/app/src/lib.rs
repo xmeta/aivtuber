@@ -1225,6 +1225,10 @@ where
     /// `panel.url` (#388); redacted `Debug`, never logged, audited or put in
     /// status or the support bundle.
     panel_url: Option<aivtuber_adapters::SecretString>,
+    /// Set by an authenticated `app.shutdown` (#449) after the emergency stop
+    /// ran; the composition loop reads it and exits. Never set by anything
+    /// else, and never serialized.
+    shutdown_requested: bool,
     thinking_meter: Option<thinking_meter::ThinkingMeter>,
     /// Counters of the opt-in System One affect judge (#426); `None` (default)
     /// when the judge is not composed.
@@ -1326,6 +1330,7 @@ where
             persona: None,
             persona_editor: None,
             panel_url: None,
+            shutdown_requested: false,
             thinking_meter: None,
             affect_judge_stats: None,
             voice: None,
@@ -2032,6 +2037,23 @@ where
         self.persona_editor = Some(editor);
         self.persona.get_or_insert(persona::PersonaLoad::Absent);
         self
+    }
+
+    /// Whether an authenticated `app.shutdown` asked the app to end (#449).
+    pub fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested
+    }
+
+    /// Latch the exit request. `authority` must be the authenticated local
+    /// operator capability (`performer.stop`); the caller has already run the
+    /// emergency stop. Only the composition loop acts on the flag, after the
+    /// reply is flushed.
+    pub fn request_shutdown(&mut self, authority: &AuthenticatedControl) -> Result<(), String> {
+        if !authority.has_capability(aivtuber_domain::Capability::PerformerStop) {
+            return Err("shutdown is not authorized".to_owned());
+        }
+        self.shutdown_requested = true;
+        Ok(())
     }
 
     /// Remember the operation panel's launch URL so an authenticated
@@ -6276,6 +6298,7 @@ mod tests {
     mod persona_tests;
     mod phrase_commit_tests;
     mod scene_context_tests;
+    mod shutdown_tests;
     mod speech_lifecycle_tests;
     mod streaming_thinking_tests;
     mod thinking_cost_cap_tests;

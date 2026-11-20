@@ -975,7 +975,9 @@ fn run_app(app: &Path, env: &BTreeMap<String, String>, open: bool) -> Result<i32
         .stdin(Stdio::piped())
         .spawn()
         .map_err(|e| format!("cannot start {}: {e}", app.display()))?;
+    let stdin_closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     if let Some(mut app_stdin) = child.stdin.take() {
+        let closed = stdin_closed.clone();
         // Detached on purpose: it blocks on the terminal read and ends with
         // this process once the app has exited.
         std::thread::spawn(move || {
@@ -986,6 +988,7 @@ fn run_app(app: &Path, env: &BTreeMap<String, String>, open: bool) -> Result<i32
                 std::io::stderr(),
                 &mut wrapper,
             );
+            closed.store(true, std::sync::atomic::Ordering::Release);
         });
     }
     if open {
@@ -997,7 +1000,23 @@ fn run_app(app: &Path, env: &BTreeMap<String, String>, open: bool) -> Result<i32
     let status = child
         .wait()
         .map_err(|e| format!("waiting for {}: {e}", app.display()))?;
-    Ok(status.code().unwrap_or(1))
+    let code = status.code().unwrap_or(1);
+    if let Some(line) = exit_note(
+        code,
+        stdin_closed.load(std::sync::atomic::Ordering::Acquire),
+    ) {
+        eprintln!("{line}");
+    }
+    Ok(code)
+}
+
+/// Printed when the app ended with exit 0 while the terminal input was still
+/// open: the only way that happens is a requested shutdown (the operation
+/// panel or `aivtuberctl shutdown`, #449), a normal end and not an error.
+const STOPPED_FROM_PANEL: &str = "パネルから終了しました。 / Stopped from the panel.";
+
+fn exit_note(code: i32, stdin_closed: bool) -> Option<&'static str> {
+    (code == 0 && !stdin_closed).then_some(STOPPED_FROM_PANEL)
 }
 
 /// Printed when `--open` could not open the browser; not an error (#388).
@@ -1077,6 +1096,17 @@ fn open_panel_when_ready(app: &Path, env: &BTreeMap<String, String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exit_zero_with_the_terminal_still_open_is_a_requested_shutdown() {
+        // A shutdown from the panel (#449): one Japanese-first line, no error.
+        let note = exit_note(0, false).expect("a note");
+        assert!(note.starts_with("パネルから終了しました"));
+        // Terminal input closed (Ctrl+D): the user ended it, nothing to say.
+        assert_eq!(exit_note(0, true), None);
+        // A failure is never described as a normal end.
+        assert_eq!(exit_note(1, false), None);
+    }
 
     #[test]
     fn the_browser_is_opened_without_a_shell_with_the_url_as_one_argument() {

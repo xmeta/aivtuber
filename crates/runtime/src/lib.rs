@@ -874,7 +874,9 @@ impl SecurityRuntime {
             .ok_or(RuntimeError::UnauthorizedControl("missing action"))?;
 
         let outcome = match action {
-            "stop" | "performer.stop" => {
+            // `app.shutdown` (#449) is an emergency stop first: the app then
+            // exits on its own composition loop, after the reply is flushed.
+            "stop" | "performer.stop" | "app.shutdown" => {
                 require_capability(authority, Capability::PerformerStop)?;
                 let cancelled = scheduler.stop_all(at_ms).len();
                 ControlOutcome::Stopped { cancelled }
