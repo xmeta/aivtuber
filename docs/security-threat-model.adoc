@@ -105,6 +105,7 @@ Initial capabilities:
 * `avatar.configure`
 * `speech_input.control`
 * `persona.configure`
+* `initiative.control`
 
 The requested operation must be allowlisted and covered by the authenticated local authority. `AuthorizationContext` alone cannot authorize an OBS/avatar/tool adapter; Rust privileged adapter helpers require `AuthenticatedControl`.
 
@@ -310,7 +311,7 @@ Before public speech/display, generated output passes a deterministic publicatio
 
 The current production Rust policy is intentionally narrower than general content moderation. It checks only:
 
-* known control-plane command terms (`obs.control`, `perception.control`, `model.select`, `voice.configure`, `ingress.control`, `avatar.configure`, `speech_input.control`, `persona.configure`, `tool.grant`, `memory.admin`, `performer.stop`, `performer.mute`), which are replaced with the configured cached reaction or suppressed when no fallback exists;
+* known control-plane command terms (`obs.control`, `perception.control`, `model.select`, `voice.configure`, `ingress.control`, `avatar.configure`, `speech_input.control`, `persona.configure`, `initiative.control`, `tool.grant`, `memory.admin`, `performer.stop`, `performer.mute`), which are replaced with the configured cached reaction or suppressed when no fallback exists;
 * explicitly configured secret values, which are redacted before publication/TTS.
 
 All other text is allowed by this stage. Passing this gate therefore does *not* establish that output is generally safe, non-toxic, non-harassing, sexually appropriate, brand-safe, or otherwise content-moderated.
@@ -395,6 +396,8 @@ The baseline regression fixtures are:
 * `examples/security/chat-claims-speech-input-control.json` (an untrusted chat line and model output claiming `speech_input.control`; control is not authorized)
 * `examples/events/invalid/forged-persona-configure.json` (a chat source claiming `persona.configure` in an operator command; must be rejected by the Event Envelope schema)
 * `examples/security/chat-claims-persona-configure.json` (an untrusted chat line and model output claiming `persona.configure`; control is not authorized)
+* `examples/events/invalid/forged-initiative-control.json` (a chat source claiming `initiative.control` in an operator command; must be rejected by the Event Envelope schema)
+* `examples/security/chat-claims-initiative-control.json` (an untrusted chat line and model output claiming `initiative.control`; control is not authorized)
 
 They conform to `schemas/security-regression-case.schema.json`.
 

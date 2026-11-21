@@ -115,6 +115,13 @@ pub enum Capability {
     /// capability, a permit or a trust level gains none.
     #[serde(rename = "persona.configure")]
     PersonaConfigure,
+    /// Turns the idle initiative on or off while the app runs (#87): whether
+    /// the performer may start speaking on its own when no chat arrives. Held
+    /// only by an authenticated local ingress and only when the generative path
+    /// is composed. It grants nothing but that one switch: it cannot say what
+    /// is spoken, raise trust or mint a permit.
+    #[serde(rename = "initiative.control")]
+    InitiativeControl,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -620,6 +627,21 @@ mod tests {
                 .authorization
                 .as_ref()
                 .is_some_and(|auth| auth.capabilities.contains(&Capability::SpeechInputControl))
+        );
+        let error = event.validate().expect_err("a chat source cannot carry it");
+        assert_eq!(error.field(), "source_class");
+    }
+
+    #[test]
+    fn repository_forged_initiative_control_fixture_is_rejected() {
+        let json = include_str!("../../../examples/events/invalid/forged-initiative-control.json");
+        let event: EventEnvelope =
+            serde_json::from_str(json).expect("the capability name is a closed, known one");
+        assert!(
+            event
+                .authorization
+                .as_ref()
+                .is_some_and(|auth| auth.capabilities.contains(&Capability::InitiativeControl))
         );
         let error = event.validate().expect_err("a chat source cannot carry it");
         assert_eq!(error.field(), "source_class");

@@ -93,6 +93,7 @@ const VOICE_QUEUE: usize = 4;
 const INGRESS_QUEUE: usize = 4;
 const AVATAR_QUEUE: usize = 4;
 const SPEECH_INPUT_QUEUE: usize = 4;
+const INITIATIVE_QUEUE: usize = 4;
 const PERSONA_QUEUE: usize = 4;
 const MEMORY_SEED_QUEUE: usize = 4;
 /// Largest `memory-seed.set` body: the seed file bound (64 KiB) plus room for a
@@ -109,7 +110,7 @@ pub const MAX_PANEL_KEY_CHARS: usize = 256;
 /// One model search may take this long, end to end.
 const SEARCH_DEADLINE: Duration = Duration::from_secs(6);
 /// Every state-changing endpoint (all are `POST`).
-const STATE_CHANGING: [&str; 25] = [
+const STATE_CHANGING: [&str; 26] = [
     "/api/chat",
     "/api/stop",
     "/api/mute",
@@ -129,6 +130,7 @@ const STATE_CHANGING: [&str; 25] = [
     "/api/avatar/delete",
     "/api/avatar/discard",
     "/api/speech-input",
+    "/api/initiative",
     "/api/persona/set",
     "/api/persona/get",
     "/api/memory-seed/set",
@@ -260,6 +262,12 @@ pub enum PanelRequest {
     SpeechInputDuplex {
         full: bool,
     },
+    /// Let the performer speak on its own when no chat arrives, or not (#87).
+    /// Only the wish: the composition thread decides whether the initiative is
+    /// composed.
+    Initiative {
+        enabled: bool,
+    },
     /// Replace the character sheet (#401) with this text (empty clears it).
     /// Redacted in `Debug`; the composition thread validates it.
     PersonaSet(PanelSecret),
@@ -371,6 +379,7 @@ struct Shared {
     ingress_tx: SyncSender<PanelCommand>,
     avatar_tx: SyncSender<PanelCommand>,
     speech_input_tx: SyncSender<PanelCommand>,
+    initiative_tx: SyncSender<PanelCommand>,
     persona_tx: SyncSender<PanelCommand>,
     memory_seed_tx: SyncSender<PanelCommand>,
     chat_tx: SyncSender<PanelCommand>,
@@ -410,6 +419,7 @@ pub struct PanelInbox {
     ingress_rx: Mutex<Receiver<PanelCommand>>,
     avatar_rx: Mutex<Receiver<PanelCommand>>,
     speech_input_rx: Mutex<Receiver<PanelCommand>>,
+    initiative_rx: Mutex<Receiver<PanelCommand>>,
     persona_rx: Mutex<Receiver<PanelCommand>>,
     memory_seed_rx: Mutex<Receiver<PanelCommand>>,
     chat_rx: Mutex<Receiver<PanelCommand>>,
@@ -463,6 +473,17 @@ impl PanelInbox {
     /// microphone can never sit in front of a stop or a mute.
     pub fn drain_speech_input(&self, max: usize) -> Vec<PanelCommand> {
         self.speech_input_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .try_iter()
+            .take(max)
+            .collect()
+    }
+
+    /// Idle-initiative on/off requests (#87). Their own queue, so the switch
+    /// can never sit in front of a stop or a mute.
+    pub fn drain_initiative(&self, max: usize) -> Vec<PanelCommand> {
+        self.initiative_rx
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .try_iter()
@@ -563,6 +584,7 @@ impl LocalPanelServer {
         let (ingress_tx, ingress_rx) = sync_channel(INGRESS_QUEUE);
         let (avatar_tx, avatar_rx) = sync_channel(AVATAR_QUEUE);
         let (speech_input_tx, speech_input_rx) = sync_channel(SPEECH_INPUT_QUEUE);
+        let (initiative_tx, initiative_rx) = sync_channel(INITIATIVE_QUEUE);
         let (persona_tx, persona_rx) = sync_channel(PERSONA_QUEUE);
         let (memory_seed_tx, memory_seed_rx) = sync_channel(MEMORY_SEED_QUEUE);
         let (chat_tx, chat_rx) = sync_channel(CHAT_QUEUE);
@@ -581,6 +603,7 @@ impl LocalPanelServer {
             ingress_tx,
             avatar_tx,
             speech_input_tx,
+            initiative_tx,
             persona_tx,
             memory_seed_tx,
             chat_tx,
@@ -605,6 +628,7 @@ impl LocalPanelServer {
             ingress_rx: Mutex::new(ingress_rx),
             avatar_rx: Mutex::new(avatar_rx),
             speech_input_rx: Mutex::new(speech_input_rx),
+            initiative_rx: Mutex::new(initiative_rx),
             persona_rx: Mutex::new(persona_rx),
             memory_seed_rx: Mutex::new(memory_seed_rx),
             chat_rx: Mutex::new(chat_rx),
@@ -946,6 +970,14 @@ fn route(
                 PanelRequest::SpeechInput { enabled },
                 &shared.speech_input_tx,
             ),
+            Err((status, detail)) => {
+                shared.count(&shared.counters.rejected_request);
+                return json(status, false, detail);
+            }
+        },
+        "/api/initiative" => match speech_input_body(&body) {
+            // The same strict `{"enabled": boolean}` as the voice input switch.
+            Ok(enabled) => (PanelRequest::Initiative { enabled }, &shared.initiative_tx),
             Err((status, detail)) => {
                 shared.count(&shared.counters.rejected_request);
                 return json(status, false, detail);
@@ -2458,6 +2490,60 @@ mod tests {
         assert!(f.inbox.drain_control(8).is_empty());
         assert!(f.inbox.drain_voice(8).is_empty());
         assert!(f.inbox.drain_ingress(8).is_empty());
+        assert!(f.inbox.drain_chat(8).is_empty());
+    }
+
+    // ---- idle initiative (#87) ----
+
+    #[test]
+    fn initiative_requests_are_authenticated_same_origin_strict_and_on_their_own_queue() {
+        let f = fixture();
+        let good = good(&f);
+        let path = "/api/initiative";
+        let body = "{\"enabled\":true}";
+        let mut foreign = with(&good, "origin");
+        foreign.push(("Origin", "http://evil.example"));
+        assert_eq!(post(&f, path, &foreign, body).status, 403);
+        assert_eq!(
+            post(&f, path, &with(&good, "x-panel-token"), body).status,
+            401
+        );
+        assert_eq!(get(&f, path, "").status, 405);
+        let headers = with(&good, "none");
+        for bad in [
+            "",
+            "{}",
+            "{\"enabled\":\"true\"}",
+            "{\"enabled\":true,\"kind\":\"audience_question\"}",
+            "{\"enabled\":true,\"text\":\"say this\"}",
+        ] {
+            assert_eq!(post(&f, path, &headers, bad).status, 400, "{bad:?}");
+        }
+        assert!(
+            f.inbox.drain_initiative(8).is_empty(),
+            "nothing got through"
+        );
+        for (body, enabled) in [("{\"enabled\":true}", true), ("{\"enabled\":false}", false)] {
+            let answer = thread::scope(|s| {
+                let handle = s.spawn(|| post(&f, path, &headers, body));
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let mut commands = Vec::new();
+                while commands.is_empty() && Instant::now() < deadline {
+                    commands = f.inbox.drain_initiative(4);
+                    thread::sleep(Duration::from_millis(5));
+                }
+                assert_eq!(commands.len(), 1);
+                let command = commands.into_iter().next().unwrap();
+                assert_eq!(command.request, PanelRequest::Initiative { enabled });
+                command.respond(true, "ok");
+                handle.join().unwrap()
+            });
+            assert_eq!(answer.status, 200, "{}", answer.body);
+        }
+        // Never in the stop/mute, voice input, voice or chat queues.
+        assert!(f.inbox.drain_control(8).is_empty());
+        assert!(f.inbox.drain_speech_input(8).is_empty());
+        assert!(f.inbox.drain_voice(8).is_empty());
         assert!(f.inbox.drain_chat(8).is_empty());
     }
 

@@ -60,6 +60,8 @@ pub struct OperatorRequest {
     /// `speech_input.device`, `speech_input.duplex` (the capture device and the
     /// half/full duplex choice, #396),
     /// `persona.set`, `persona.get` (the character sheet, #401),
+    /// `initiative.enable`, `initiative.disable` (speak on its own when no
+    /// chat arrives, #87),
     /// `memory.seed.get`, `memory.seed.set` (the operator memory seed, #402),
     /// `panel.url` (show the operation panel URL again, #388),
     /// `app.shutdown` (stop everything, answer, then end the app, #449).
@@ -178,6 +180,11 @@ pub struct OperatorStatusSnapshot {
     /// a cloud model. Never a claim. Absent unless composed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_seed_editor: Option<crate::MemorySeedEditorStatus>,
+    /// The idle initiative (#87): the operator toggle and the counters (fired,
+    /// completed, failed, preempted, suppressed by reason). Text-free. Absent
+    /// unless composed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiative: Option<crate::InitiativeStatus>,
 }
 
 /// Operator-visible, text-free perception status: whether it is running, why
@@ -249,6 +256,7 @@ impl OperatorStatusSnapshot {
             persona: app.persona_status(),
             persona_editor: app.persona_editor_status(),
             memory_seed_editor: app.memory_seed_editor_status(),
+            initiative: app.initiative_status(),
         }
     }
 }
@@ -351,6 +359,8 @@ pub struct OperatorEndpointOptions {
     /// Live memory-seed editing is composed (#402): the closed `memory.admin`
     /// is held for the `memory.seed.*` actions as well as `memory.export`.
     pub memory_seed_edit: bool,
+    /// The idle initiative is composed (#87): `initiative.control`.
+    pub initiative_control: bool,
 }
 
 /// Authenticated operator control endpoint.
@@ -410,6 +420,7 @@ impl OperatorControlServer {
             speech_input_control,
             persona_configure,
             memory_seed_edit,
+            initiative_control,
         } = options;
         let name = name.trim();
         if name.is_empty() {
@@ -457,6 +468,12 @@ impl OperatorControlServer {
             // mint it. The text it sets is data in the Thinking request and
             // grants nothing.
             capabilities.insert(aivtuber_domain::Capability::PersonaConfigure);
+        }
+        if initiative_control {
+            // `initiative.control` is held only so the `initiative.*` actions
+            // can mint it. It switches whether the performer may speak on its
+            // own; it cannot say what is spoken.
+            capabilities.insert(aivtuber_domain::Capability::InitiativeControl);
         }
         if memory_export || memory_seed_edit {
             // `memory.admin` is held only so `memory.export` and the
@@ -675,6 +692,7 @@ pub fn apply_operator_request<R: RoutePlanner>(
         && !is_tcp_avatar_action(&request.action)
         && !is_speech_input_action(&request.action)
         && !is_persona_action(&request.action)
+        && !is_initiative_action(&request.action)
         && request.action != "panel.url"
         && request.action != "app.shutdown"
     {
@@ -749,6 +767,12 @@ fn is_persona_action(action: &str) -> bool {
     matches!(action, "persona.set" | "persona.get")
 }
 
+/// The idle-initiative switch (#87), both under `initiative.control`. The
+/// operator endpoint (`aivtuberctl`) and the panel may send both.
+fn is_initiative_action(action: &str) -> bool {
+    matches!(action, "initiative.enable" | "initiative.disable")
+}
+
 /// The memory seed actions (#402), both under the existing `memory.admin`. The
 /// operator endpoint (`aivtuberctl`) and the panel may send both; nothing else
 /// that holds `memory.admin` (export, erase) is reachable from the panel.
@@ -790,6 +814,7 @@ pub fn apply_operator_action<R: RoutePlanner>(
         && !is_avatar_action(action)
         && !is_speech_input_action(action)
         && !is_persona_action(action)
+        && !is_initiative_action(action)
         && !is_memory_seed_action(action)
     {
         let detail = format!("unknown action {action}");
@@ -878,6 +903,8 @@ fn apply_with_presented_secret<R: RoutePlanner>(
         "speech_input.control".to_owned()
     } else if is_persona_action(action) {
         "persona.configure".to_owned()
+    } else if is_initiative_action(action) {
+        "initiative.control".to_owned()
     } else if action == "panel.url" {
         // No new capability: the operator endpoint's own `performer.stop`.
         "panel.url".to_owned()
@@ -1019,6 +1046,27 @@ fn apply_with_presented_secret<R: RoutePlanner>(
                     status: None,
                     memory_export: None,
                     persona: outcome.text,
+                    panel_url: None,
+                }
+            }
+            Err(detail) => {
+                app.audit_operator_action(&request_id, action, &detail, false);
+                rejection(&request_id, &detail)
+            }
+        };
+    }
+
+    if is_initiative_action(action) {
+        return match app.configure_initiative(command.authority(), action, now_ms) {
+            Ok(detail) => {
+                app.audit_operator_action(&request_id, action, &detail, true);
+                OperatorResponse {
+                    request_id,
+                    ok: true,
+                    detail,
+                    status: None,
+                    memory_export: None,
+                    persona: None,
                     panel_url: None,
                 }
             }

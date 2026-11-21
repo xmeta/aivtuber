@@ -43,6 +43,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let without = ReflexContext::default();
     let with = ReflexContext {
         crowd: Some(summaries[3].clone()),
+        initiative: None,
         ..ReflexContext::default()
     };
     with.validate()?;

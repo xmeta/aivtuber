@@ -136,6 +136,10 @@ pub struct SupportResourceCounters {
     /// budget types; empty when the budget feature is disabled.
     #[serde(default)]
     pub generative_budget: Vec<GenerativeBudgetRecord>,
+    /// The idle initiative (#87): the switch and counters (fired, failed,
+    /// preempted, suppressed by reason). Text-free; absent unless composed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiative: Option<crate::InitiativeStatus>,
 }
 
 /// One redacted audit summary line (bounded decision text; never a payload).
@@ -375,6 +379,7 @@ impl SupportBundleBuilder {
             generation_completed: generation.completed,
             generation_failed: generation.failed,
             generative_budget: app.generative_budget_snapshot(generated_unix_ms),
+            initiative: app.initiative_status(),
         };
 
         // Recent incident references from the security runtime's bounded

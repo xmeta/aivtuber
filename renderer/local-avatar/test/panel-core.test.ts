@@ -40,6 +40,10 @@ import {
   parseState,
   parsePersonaEditorState,
   parseVoiceInputState,
+  parseInitiativeState,
+  initiativeView,
+  initiativeBody,
+  initiativeResultText,
   voiceMeterView,
   METER_SEGMENTS,
   SPEAKING_TEXT,
@@ -1743,5 +1747,91 @@ describe("memory chips (#402)", () => {
     expect(seedOpenAfterDelete(null, 1)).toBeNull();
     expect(seedOpenAfterOpen(0, 2, 3)).toBe(2);
     expect(seedOpenAfterOpen(1, 5, 3)).toBe(1);
+  });
+});
+
+// ---- idle initiative (#87) ----
+
+const initiative = (over: Record<string, unknown> = {}) => ({
+  enabled: true,
+  idle_secs: 45,
+  pending: false,
+  fired: 3,
+  completed: 2,
+  failed: 1,
+  preempted_chat: 1,
+  preempted_speech: 0,
+  preempted_stop: 0,
+  suppressed_total: 4,
+  suppressed: [
+    ["floor_held", 1],
+    ["budget_gap", 3],
+  ],
+  ...over,
+});
+
+const withInitiative = (value: unknown) =>
+  parseState({
+    schema: "local-panel/1",
+    uptime_ms: 5,
+    status: {
+      muted: false,
+      audio_error: null,
+      avatar_error: null,
+      stream_error: null,
+      content_queue: 0,
+      scheduler_items: 0,
+      generation_active: false,
+      ...(value === undefined ? {} : { initiative: value }),
+    },
+    replies: [],
+    avatar_url: null,
+  });
+
+describe("idle initiative switch (#87)", () => {
+  test("the card is hidden unless the host composed it, and a malformed state drops it", () => {
+    expect(initiativeView(withInitiative(undefined))).toBeNull();
+    expect(initiativeView(withInitiative(null))).toBeNull();
+    for (const bad of [
+      initiative({ enabled: "yes" }),
+      initiative({ fired: -1 }),
+      initiative({ idle_secs: 1.5 }),
+      initiative({ suppressed: [["<b>x</b>", 1]] }),
+      initiative({ suppressed: [["floor_held"]] }),
+      initiative({ suppressed: Array.from({ length: 17 }, () => ["muted", 1]) }),
+      "text",
+    ]) {
+      expect(parseInitiativeState(bad)).toBeNull();
+      expect(initiativeView(withInitiative(bad))).toBeNull();
+    }
+  });
+
+  test("the switch shows the label, the idle time and text-free counters", () => {
+    const view = initiativeView(withInitiative(initiative()))!;
+    expect(view.label).toBe("沈黙時に自分から話す");
+    expect(view.checked).toBe(true);
+    expect(view.hint).toContain("45 秒");
+    expect(view.summary).toContain("話しかけた回数 3");
+    expect(view.summary).toContain("失敗 1");
+    expect(view.summary).toContain("譲った回数 1");
+    expect(view.summary).toContain("相手が話し中 1");
+    expect(view.summary).toContain("間隔の上限 3");
+    expect(initiativeView(withInitiative(initiative({ enabled: false, suppressed_total: 0, suppressed: [] })))!.checked).toBe(false);
+    expect(initiativeView(withInitiative(initiative({ suppressed_total: 0, suppressed: [] })))!.summary).not.toContain("見送り");
+  });
+
+  test("an unknown reason name is shown as other, never as host text", () => {
+    const view = initiativeView(withInitiative(initiative({ suppressed: [["brand_new", 2]] })))!;
+    expect(view.summary).toContain("その他 2");
+    expect(view.summary).not.toContain("brand_new");
+  });
+
+  test("the request body is a boolean and nothing else, and the result line is short", () => {
+    expect(initiativeBody(true)).toEqual({ enabled: true });
+    expect(Object.keys(initiativeBody(false))).toEqual(["enabled"]);
+    expect(initiativeResultText(true, true, "initiative on", 200)).toBe("自分から話すようにしました");
+    expect(initiativeResultText(false, true, "", 200)).toBe("自分からは話さないようにしました");
+    expect(initiativeResultText(true, false, "initiative is not configured", 200)).toContain("initiative is not configured");
+    expect(initiativeResultText(true, false, undefined, 503)).toContain("503");
   });
 });
