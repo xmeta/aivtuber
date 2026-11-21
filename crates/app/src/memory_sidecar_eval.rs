@@ -38,6 +38,7 @@ use aivtuber_runtime::{MemoryWriteDecision, SecurityRuntime, SecurityRuntimeConf
 use aivtuber_scheduler::SchedulerConfig;
 use aivtuber_telemetry::SecretRedactor;
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
 
 use crate::memory_context::bounded_prefix;
 use crate::memory_eval::{
@@ -71,6 +72,25 @@ struct AcceptedItem {
     retained_text: String,
 }
 
+/// One case's recall latency, measured around the service's `recall` call.
+///
+/// This is wall-clock context for a run, never a quality statement, so it is
+/// kept out of the comparable report and handed to the caller separately
+/// (issue #280).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecallSample {
+    pub case: String,
+    pub recall_us: u64,
+}
+
+/// A measured run: the comparable report, plus the recall samples that were
+/// deliberately kept out of it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SidecarEvaluation {
+    pub outcome: MemoryEvalOutcome,
+    pub recall: Vec<RecallSample>,
+}
+
 /// Measure `fixture` against `sidecar`.
 ///
 /// `scope_prefix` namespaces the service scopes the run opens: every case gets
@@ -82,6 +102,18 @@ pub fn evaluate_sidecar(
     fixture: &MemoryEvalFixture,
     scope_prefix: &str,
 ) -> Result<MemoryEvalOutcome, MemoryEvalError> {
+    Ok(evaluate_sidecar_measured(sidecar, fixture, scope_prefix)?.outcome)
+}
+
+/// Measure `fixture` against `sidecar`, keeping each case's recall latency.
+///
+/// The report is the same one [`evaluate_sidecar`] produces — latency never
+/// enters it — so asking for timing cannot change what a comparison sees.
+pub fn evaluate_sidecar_measured(
+    sidecar: &dyn MemorySidecar,
+    fixture: &MemoryEvalFixture,
+    scope_prefix: &str,
+) -> Result<SidecarEvaluation, MemoryEvalError> {
     fixture.validate()?;
     if !is_scope_token(scope_prefix) {
         return Err(MemoryEvalError::InvalidFixture(format!(
@@ -91,12 +123,17 @@ pub fn evaluate_sidecar(
     let admin = memory_admin();
     let mut cases = Vec::with_capacity(fixture.cases.len());
     let mut violations = Vec::new();
+    let mut recall = Vec::with_capacity(fixture.cases.len());
     for case in &fixture.cases {
-        let (report, case_violations) = run_sidecar_case(sidecar, case, scope_prefix, &admin)?;
+        let (report, case_violations) =
+            run_sidecar_case(sidecar, case, scope_prefix, &admin, &mut recall)?;
         violations.extend(case_violations);
         cases.push(report);
     }
-    Ok(outcome_for(fixture, cases, violations))
+    Ok(SidecarEvaluation {
+        outcome: outcome_for(fixture, cases, violations),
+        recall,
+    })
 }
 
 /// Measure one case against `sidecar`.
@@ -110,6 +147,7 @@ fn run_sidecar_case(
     case: &MemoryEvalCase,
     scope_prefix: &str,
     admin: &AuthenticatedControl,
+    recall: &mut Vec<RecallSample>,
 ) -> Result<(CaseReport, Vec<String>), MemoryEvalError> {
     let scope = scope_token(scope_prefix, &case.id);
     let sidecar_error = |message: String| MemoryEvalError::Sidecar {
@@ -120,7 +158,7 @@ fn run_sidecar_case(
         .open_scope(&scope)
         .map_err(|error| sidecar_error(format!("open scope {scope:?}: {error}")))?;
 
-    let measured = measure_case_in_scope(sidecar, case, &scope, admin);
+    let measured = measure_case_in_scope(sidecar, case, &scope, admin, recall);
     let closed = sidecar.close_scope(&scope);
     match (measured, closed) {
         (Ok(value), Ok(())) => Ok(value),
@@ -145,6 +183,7 @@ fn measure_case_in_scope(
     case: &MemoryEvalCase,
     scope: &str,
     admin: &AuthenticatedControl,
+    recall: &mut Vec<RecallSample>,
 ) -> Result<(CaseReport, Vec<String>), MemoryEvalError> {
     let config = case.config.apply();
     let pseudonymizer = eval_pseudonymizer();
@@ -316,9 +355,17 @@ fn measure_case_in_scope(
     recall_query
         .validate()
         .map_err(|error| sidecar_error(format!("recall query: {error}")))?;
+    // Timing wraps the service call alone: the project's own admission,
+    // retention, and budget work stays outside it, so the sample describes
+    // retrieval and not this runner's overhead.
+    let started = Instant::now();
     let items = sidecar
         .recall(scope, &recall_query)
         .map_err(|error| sidecar_error(format!("recall: {error}")))?;
+    recall.push(RecallSample {
+        case: case.id.clone(),
+        recall_us: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+    });
 
     let mut accepted: Vec<AcceptedItem> = Vec::new();
     let mut refused: Vec<RefusedItem> = Vec::new();

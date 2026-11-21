@@ -16,6 +16,7 @@ mod memory_context;
 mod memory_eval;
 mod memory_seed;
 mod memory_sidecar_eval;
+mod memory_sidecar_timing;
 mod memory_writer;
 mod model_switch;
 mod moderation_evidence;
@@ -92,6 +93,7 @@ pub use memory_seed::{
     MemorySeedExport, MemorySeedIdentity, MemorySeedOutcome, SeedEntry, SeedKind,
 };
 pub use memory_sidecar_eval::*;
+pub use memory_sidecar_timing::*;
 pub use memory_writer::{
     MEMORY_WRITER_EVENT_PREFIX, MEMORY_WRITER_MAX_LIVE_ENTRIES_CEILING, MemoryWriterConfig,
     MemoryWriterMetrics,

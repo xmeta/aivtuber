@@ -16,8 +16,9 @@
 //! * the request budget applied to a service's answer is the runtime's own.
 
 use aivtuber_app::{
-    MemoryEvalCase, MemoryEvalClaim, MemoryEvalFixture, MemoryEvalQuery, RefusalReason, compare,
-    evaluate, evaluate_sidecar, measure_case,
+    MemoryEvalCase, MemoryEvalClaim, MemoryEvalFixture, MemoryEvalQuery, ProcessUsage,
+    RefusalReason, SIDECAR_TIMING_SCHEMA_VERSION, compare, evaluate, evaluate_sidecar,
+    evaluate_sidecar_measured, measure_case, timing_report,
 };
 use aivtuber_domain::{
     EngineError, EngineErrorKind, MAX_SIDECAR_RECALL_ITEMS, MAX_THINKING_CONTEXT_BYTES,
@@ -25,6 +26,7 @@ use aivtuber_domain::{
 };
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+use std::time::Duration;
 
 /// How the fake service answers a recall.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -806,6 +808,90 @@ fn an_equivalent_candidate_is_no_improvement() {
         comparison.reasons
     );
     assert!(!comparison.is_regression());
+}
+
+/// Timing is opt-in context and never part of the comparable report: asking
+/// for it leaves the report byte-identical, and it gives one sample per case
+/// in fixture order.
+#[test]
+fn a_timed_run_reports_exactly_the_same_result() {
+    let fixture = fixture(vec![
+        case(
+            "first",
+            vec![claim(
+                "evt-1",
+                Some("viewer-1"),
+                Some("game-x"),
+                1000,
+                "the first claim",
+            )],
+            query(Some("game-x"), 3000, 64),
+            &["evt-1"],
+            &[],
+        ),
+        case(
+            "second",
+            vec![claim(
+                "evt-2",
+                Some("viewer-1"),
+                Some("game-x"),
+                1500,
+                "the second claim",
+            )],
+            query(Some("game-x"), 3000, 64),
+            &["evt-2"],
+            &[],
+        ),
+    ]);
+    let plain = evaluate_fake(Answer::Conforming, &fixture);
+    let timed = evaluate_sidecar_measured(&FakeSidecar::new(Answer::Conforming), &fixture, "test")
+        .expect("the fake sidecar answers");
+
+    assert_eq!(
+        plain.report, timed.outcome.report,
+        "asking for timing must not change the report a comparison reads"
+    );
+    assert_eq!(
+        timed
+            .recall
+            .iter()
+            .map(|sample| sample.case.as_str())
+            .collect::<Vec<&str>>(),
+        ["first", "second"],
+        "one sample per case, in fixture order"
+    );
+
+    let timing = timing_report(
+        &fixture,
+        &timed.recall,
+        ProcessUsage::default(),
+        ProcessUsage::default(),
+        Duration::from_millis(25),
+    );
+    assert_eq!(timing.schema_version, SIDECAR_TIMING_SCHEMA_VERSION);
+    assert_ne!(
+        timing.schema_version, plain.report.schema_version,
+        "the timing artifact is not the measured report"
+    );
+    assert_eq!(timing.fixture_digest, plain.report.fixture_digest);
+    assert_eq!(timing.totals.cases, 2);
+    assert_eq!(timing.totals.samples, 2);
+    let p50 = timing.totals.p50_recall_us.expect("two samples have a p50");
+    let p95 = timing.totals.p95_recall_us.expect("two samples have a p95");
+    assert!(p95 >= p50, "p95 {p95} < p50 {p50}");
+    assert!(timing.totals.max_recall_us >= p95);
+    assert_eq!(timing.process.wall_ms, 25);
+    assert_eq!(timing.process.cpu_ms, None);
+    assert_eq!(timing.process.peak_rss_bytes, None);
+
+    // The comparison sees the same candidate whether or not timing was asked
+    // for, and the artifact never becomes an input to it.
+    let runtime = evaluate(&fixture).expect("the runtime measures the fixture");
+    let timed_comparison =
+        compare(&fixture, &runtime.report, &timed.outcome.report).expect("comparable reports");
+    let plain_comparison =
+        compare(&fixture, &runtime.report, &plain.report).expect("comparable reports");
+    assert_eq!(timed_comparison, plain_comparison);
 }
 
 /// The runner never hands the service a claim the project did not admit, and
