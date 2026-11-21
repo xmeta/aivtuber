@@ -367,7 +367,7 @@ Measured (A-SPEECH-OBS-001): see the assumption entry. Stamp-to-arrival lag of a
 
 * `cargo test --locked -p aivtuber-adapters --lib speech_vad` (no features): hysteresis and no-debounce, resampler band-limiting and chunk invariance, pre-roll bound, clock map and handshake reader (junk and 5 MiB line flood), stamper schema validity, bounded output under a stalled reader, pipeline mechanics on synthetic signals with a stand-in scorer.
 * `cargo test --locked -p aivtuber-adapters --features silero-vad --test speech_vad_sidecar`: the real binary and the real model (fetched with a SHA-256 check, or `AIVTUBER_SILERO_MODEL`): silence emits nothing, a synthetic vowel emits one raw start/end pair that parses as a valid batch, a very short burst is still an edge pair, 48 kHz stereo input, the clock handshake and its lag measurement, re-sync, exit on stdin close, refusal to stamp without a sync, refusal of an unpinned model. CI runs this in the same job as the workspace tests.
-* `cargo test --locked -p aivtuber-app --test speech_sidecar_e2e`: supervisor against `speech-sidecar-double` (handshake, crash, garbage flood, valid flood, oversize lines, silent child, operator ceiling).
+* `cargo test --locked -p aivtuber-app --test speech_sidecar_e2e`: supervisor against `speech-sidecar-double` (handshake, crash, garbage flood, valid flood, oversize lines, silent child, operator ceiling, and that an argument which is not `--lock <path>` never becomes a file, #451). The double takes its liveness and worker lock only from `--lock <path>` or `SPEECH_SIDECAR_DOUBLE_LOCK`, never from a bare argument, because the app appends its own flags (`--level-ms 100`) to the sidecar's arguments.
 
 == Speech transcripts (issue #92, S3b)
 

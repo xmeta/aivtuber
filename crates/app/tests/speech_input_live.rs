@@ -92,7 +92,11 @@ fn controller(
 ) -> SpeechInputController {
     let mut config = SpeechSidecarConfig::new(
         program,
-        vec![mode.to_owned(), lock.to_string_lossy().into_owned()],
+        vec![
+            mode.to_owned(),
+            "--lock".to_owned(),
+            lock.to_string_lossy().into_owned(),
+        ],
     );
     config.resync_interval = Duration::from_millis(250);
     SpeechInputController::new(config, started, Some(file.to_path_buf()), true)
@@ -508,7 +512,7 @@ impl RunningApp {
             .env("AIVTUBER_SPEECH_SIDECAR", program)
             .env(
                 "AIVTUBER_SPEECH_SIDECAR_ARGS",
-                format!("clock {}", lock.display()),
+                format!("clock --lock {}", lock.display()),
             )
             .env("AIVTUBER_SPEECH_INPUT_SETTINGS", file)
             .stdin(Stdio::piped())

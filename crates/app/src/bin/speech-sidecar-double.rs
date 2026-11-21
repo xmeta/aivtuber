@@ -25,7 +25,7 @@
 //! edges continue) and `transcript-garbage` (valid edges plus two invalid
 //! transcript lines per sync).
 //!
-//! Capture-device mode (#396): `devices <lock> [--input-device NAME]` reports
+//! Capture-device mode (#396): `devices [--lock <path>] [--input-device NAME]` reports
 //! three capture devices like the real sidecar does (the opened one is NAME if
 //! it is one of them, else `Mic A`; an unknown NAME is reported as opened
 //! nothing and the process exits with status 2), appends `pid device` to
@@ -34,9 +34,14 @@
 //! Worker-lifetime modes (#400): `with-worker` spawns a child of itself as a
 //! stand-in for the STT worker (piped stdin and stdout, like the real one) and
 //! then idles; `worker` (that child) exits when its stdin reaches end of
-//! input. With a lock file named as the second argument the worker holds
-//! `<file>.worker`, so a test can tell whether the "worker" outlives a parent
-//! that was killed without any chance to clean up.
+//! input. With `--lock <path>` the worker holds `<path>.worker`, so a test can
+//! tell whether the "worker" outlives a parent that was killed without any
+//! chance to clean up.
+//!
+//! The liveness lock is named only by `--lock <path>` or
+//! `SPEECH_SIDECAR_DOUBLE_LOCK`. A bare argument is never a path (#451): the
+//! app appends its own flags to the sidecar's arguments (`--level-ms 100`), and
+//! reading one as a path wrote a file named `--level-ms` into the working tree.
 
 use aivtuber_adapters::speech_vad::pump_clock_syncs;
 use std::io::{self, BufRead, BufReader, Write};
@@ -61,15 +66,24 @@ fn emit(out: &mut impl Write, line: &str) {
     let _ = out.write_all(line.as_bytes()).and_then(|()| out.flush());
 }
 
-/// Test hook (#400): with a file named as the second argument (or by
-/// `SPEECH_SIDECAR_DOUBLE_LOCK`), hold an exclusive lock on it for the life of
-/// the process, so a test can tell that the double is running (the lock is
-/// busy) or gone (the lock is free). The lock is released by the OS however
-/// the process ends.
+/// The liveness lock path, from an explicit `--lock <path>` or
+/// `SPEECH_SIDECAR_DOUBLE_LOCK`, and from nothing else (#451).
+fn lock_path() -> Option<std::path::PathBuf> {
+    let mut args = std::env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        if arg.to_str() == Some("--lock") {
+            return args.next().map(std::path::PathBuf::from);
+        }
+    }
+    std::env::var_os("SPEECH_SIDECAR_DOUBLE_LOCK").map(std::path::PathBuf::from)
+}
+
+/// Test hook (#400): with `--lock <path>` (or `SPEECH_SIDECAR_DOUBLE_LOCK`),
+/// hold an exclusive lock on it for the life of the process, so a test can
+/// tell that the double is running (the lock is busy) or gone (the lock is
+/// free). The lock is released by the OS however the process ends.
 fn hold_liveness_lock() -> Option<std::fs::File> {
-    let path = std::env::args_os()
-        .nth(2)
-        .or_else(|| std::env::var_os("SPEECH_SIDECAR_DOUBLE_LOCK"))?;
+    let path = lock_path()?;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -238,9 +252,8 @@ fn main() -> ExitCode {
                 None => Some(AVAILABLE[0]),
                 Some(name) => AVAILABLE.iter().copied().find(|device| device == name),
             };
-            if let Some(lock) = std::env::args_os().nth(2) {
-                let mut log = lock;
-                log.push(".log");
+            if let Some(mut log) = lock_path() {
+                log.as_mut_os_string().push(".log");
                 if let Ok(mut file) = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -265,10 +278,9 @@ fn main() -> ExitCode {
         "with-worker" => {
             let mut command = std::process::Command::new(std::env::current_exe().expect("exe"));
             command.arg("worker");
-            if let Some(lock) = std::env::args_os().nth(2) {
-                let mut worker_lock = lock;
-                worker_lock.push(".worker");
-                command.arg(worker_lock);
+            if let Some(mut worker_lock) = lock_path() {
+                worker_lock.as_mut_os_string().push(".worker");
+                command.arg("--lock").arg(worker_lock);
             }
             let _worker = command
                 .stdin(std::process::Stdio::piped())
@@ -286,7 +298,7 @@ fn main() -> ExitCode {
         }
         _ => {
             eprintln!(
-                "usage: speech-sidecar-double clock|crash|garbage|flood|oversize|hang|with-worker|transcripts|stt-fail|transcript-garbage|beat|beat-stall|beat-garbage|level|level-stall|level-garbage|devices"
+                "usage: speech-sidecar-double clock|crash|garbage|flood|oversize|hang|with-worker|transcripts|stt-fail|transcript-garbage|beat|beat-stall|beat-garbage|level|level-stall|level-garbage|devices [--lock <path>] [--input-device NAME]"
             );
             ExitCode::FAILURE
         }
