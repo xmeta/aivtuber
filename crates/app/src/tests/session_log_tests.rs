@@ -375,3 +375,46 @@ fn only_the_operator_endpoint_that_composed_the_log_holds_the_capability() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_turn_answered_by_a_fallback_gets_a_fallback_record_and_counts_once() {
+    let dir = temp_dir("fallback");
+    let mut app = generation_app(
+        FixedGenerateRoute {
+            reply_context: ReflexContext::default(),
+            fallback_variant_group: None,
+        },
+        MockThinking {
+            reply: String::new(),
+            failure: Some(EngineErrorKind::Unavailable),
+        },
+        MockTts::default(),
+        SecretRedactor::default(),
+        None,
+        RecordingAudio::default(),
+        RecordingAvatar::default(),
+    )
+    .with_session_log(SessionLog::from_settings(
+        dir.join("logs"),
+        dir.join("settings.json"),
+    ));
+    app.startup().expect("startup");
+    switch(&mut app, "session_log.enable").expect("on");
+    chat(&mut app, 1, MARKER, 1_000);
+    app.session_log().expect("log").flush();
+
+    let records = records(&dir);
+    let fallbacks: Vec<_> = records.iter().filter(|r| r.t == "fallback").collect();
+    assert_eq!(fallbacks.len(), 1, "{records:?}");
+    assert_eq!(fallbacks[0].fallback.as_deref(), Some("unavailable"));
+    assert_eq!(fallbacks[0].kind.as_deref(), Some("visible"));
+    assert!(fallbacks[0].text.is_none(), "never viewer text");
+    let input = records.iter().find(|r| r.t == "input").expect("input");
+    assert_eq!(fallbacks[0].turn, input.turn, "same turn as the input");
+    assert!(records.iter().all(|r| r.t != "phrase"));
+
+    // The route and fallback records name one turn: it counts once.
+    let text = std::fs::read_to_string(session_files(&dir).last().expect("file")).expect("read");
+    assert_eq!(summarize(text.as_bytes()).fallbacks, 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}

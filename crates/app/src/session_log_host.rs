@@ -178,6 +178,19 @@ where
         log.route(event_id, route, cache, fallback, at_ms);
     }
 
+    /// A turn answered by a typed fallback (#469).
+    pub(crate) fn session_log_fallback(
+        &mut self,
+        event_id: &str,
+        reason: &str,
+        visible: bool,
+        at_ms: u64,
+    ) {
+        if let Some(log) = self.session_log.as_mut() {
+            log.fallback(event_id, reason, visible, at_ms);
+        }
+    }
+
     /// A fixed-vocabulary event on a turn.
     pub(crate) fn session_log_note(
         &mut self,
