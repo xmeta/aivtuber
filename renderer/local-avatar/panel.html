@@ -20,6 +20,16 @@
     <span class="hint">最初にアバター画面を開いてください。開くと、応答に合わせてアバターが動きます。</span>
   </p>
 
+  <section id="obs-url" class="card" aria-labelledby="h-obs" hidden>
+    <h2 id="h-obs">OBS 用のアバター URL</h2>
+    <div class="buttons wrap">
+      <button id="obs-url-copy" type="button">OBS 用の URL をコピー</button>
+      <span id="obs-url-state" role="status"></span>
+    </div>
+    <input id="obs-url-field" type="text" readonly hidden spellcheck="false" autocomplete="off" aria-label="OBS 用のアバター URL">
+    <p class="hint">OBS の「ブラウザ」ソースの URL 欄に貼り付けます。幅と高さは配信のキャンバスに合わせ(例 1920 x 1080)、「非表示のときにソースをシャットダウン」はオフにしてください。このページは同時に 1 つしか接続できないので、他のタブで開いているアバター画面は閉じてください。URL には起動ごとの合言葉が含まれます。他人に見せないでください。</p>
+  </section>
+
 <div class="layout">
 <div class="side">
   <section aria-labelledby="h-status">

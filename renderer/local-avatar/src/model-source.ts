@@ -42,3 +42,34 @@ export function shouldReload(baseline: string | null, body: unknown): boolean {
   const id = (body as { id?: unknown }).id;
   return typeof id === "string" && MODEL_ID.test(id) && id !== baseline;
 }
+
+// ---- Missing or refused token (#458) ----------------------------------------
+
+/** Why the page cannot talk to the host, for the visible message. */
+export type TokenProblem = "missing" | "rejected";
+
+/** The per-launch secret is 64 lowercase hex characters; anything else cannot be valid. */
+export function tokenProblem(token: string): TokenProblem | null {
+  return /^[0-9a-f]{64}$/.test(token) ? null : "missing";
+}
+
+/**
+ * Visible text for the operator (the page shows nothing else when it cannot
+ * connect, and an OBS Browser Source has no console). Never includes the token
+ * or any part of the address.
+ */
+export function tokenProblemMessage(problem: TokenProblem): string {
+  const head =
+    problem === "missing"
+      ? "このアバター画面を開くための URL に、合言葉(token)が付いていません。"
+      : "この URL の合言葉(token)が正しくないか、古くなっています(アプリを起動し直すたびに変わります)。";
+  return `${head} 操作パネルの「OBS 用の URL をコピー」で URL をコピーし、貼り付け直してください。`;
+}
+
+/** Marker thrown by the page's model fetch when the host answered 403. */
+export class TokenRejectedError extends Error {
+  constructor() {
+    super("the host refused the token");
+    this.name = "TokenRejectedError";
+  }
+}

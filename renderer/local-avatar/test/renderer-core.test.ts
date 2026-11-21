@@ -11,6 +11,8 @@ import {
   activeModelUrl,
   modelIdFromHeader,
   shouldReload,
+  tokenProblem,
+  tokenProblemMessage,
 } from "../src/model-source";
 import { PROFILE_ID } from "../src/profile";
 import { decodeHostFrame, type RendererFrame } from "../src/protocol";
@@ -286,5 +288,22 @@ describe("active model source (#362)", () => {
   test("the poll is slow enough to be cheap and fast enough to feel live", () => {
     expect(RELOAD_POLL_MS).toBeGreaterThanOrEqual(1000);
     expect(RELOAD_POLL_MS).toBeLessThanOrEqual(5000);
+  });
+});
+
+describe("missing or refused token (#458)", () => {
+  test("only a 64-hex token is plausible", () => {
+    expect(tokenProblem("")).toBe("missing");
+    expect(tokenProblem("abc")).toBe("missing");
+    expect(tokenProblem("a".repeat(64))).toBeNull();
+  });
+  test("messages are Japanese, point at the panel button and reveal nothing", () => {
+    for (const p of ["missing", "rejected"] as const) {
+      const m = tokenProblemMessage(p);
+      expect(m).toContain("OBS 用の URL をコピー");
+      expect(m).toMatch(/[぀-ヿ]/);
+      expect(m).not.toMatch(/[0-9a-f]{16}/);
+      expect(m).not.toContain("127.0.0.1");
+    }
   });
 });

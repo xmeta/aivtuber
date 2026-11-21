@@ -164,6 +164,8 @@ To switch the motion off (the rest pose stays), add `&idle=0` to the launch URL;
 === OBS Browser Source capture (no paid software)
 
 . Start the runtime as above and copy the `local avatar renderer URL` printed on stderr (`http://127.0.0.1:<port>/?token=...`). The token changes on every launch, so update the source URL after each restart.
++
+The operation panel also has an 「OBS 用の URL をコピー」 button (#458) that copies the same URL through the clipboard API in the loopback panel page (the URL is kept in page memory only; when the clipboard is unavailable it is shown selected in a read-only field). An avatar page opened without a valid token, or with a refused one, shows a visible Japanese message pointing at that button; the message never contains the token.
 . In OBS add a *Browser* source, paste that URL, and set *Width* and *Height* to your canvas, for example 1920 and 1080 (a portrait source such as 1080 by 1920 also works; the camera backs away to keep the avatar's shoulders in frame).
 . Leave *Custom CSS* empty and keep *Shutdown source when not visible* off, otherwise the page disconnects and returns to neutral whenever the scene is hidden.
 . The page background and canvas are transparent (`alpha` canvas, `clear alpha 0`), so the avatar composites over your scene without a chroma key. Do not add a background color in OBS.

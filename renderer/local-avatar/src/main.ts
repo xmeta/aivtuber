@@ -30,6 +30,10 @@ import {
   modelIdFromHeader,
   MODEL_ID_HEADER,
   shouldReload,
+  tokenProblem,
+  tokenProblemMessage,
+  TokenRejectedError,
+  type TokenProblem,
 } from "./model-source";
 
 const MAX_MODEL_BYTES = 64 * 1024 * 1024; // same ceiling as the host's static server
@@ -193,6 +197,7 @@ async function fetchModel(fallback: boolean): Promise<FetchedModel> {
   const explicit = params.get("model");
   const url = explicit !== null ? resolveModelUrl(explicit).toString() : activeModelUrl(token, fallback);
   const response = await fetch(url, { credentials: "omit", cache: "no-store" });
+  if (response.status === 403 && explicit === null) throw new TokenRejectedError();
   if (!response.ok) throw new Error(`model fetch failed: HTTP ${response.status}`);
   const bytes = await response.arrayBuffer();
   if (bytes.byteLength > MAX_MODEL_BYTES) throw new Error("model exceeds size limit");
@@ -231,7 +236,25 @@ function watchActiveModel(baseline: string | null): void {
   }, RELOAD_POLL_MS);
 }
 
+/** Visible, secret-free explanation on the page itself (OBS has no console). */
+function showTokenProblem(problem: TokenProblem): void {
+  const box = document.createElement("div");
+  box.id = "token-problem";
+  box.setAttribute("role", "alert");
+  box.textContent = tokenProblemMessage(problem);
+  box.style.cssText =
+    "position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:2rem;" +
+    "box-sizing:border-box;text-align:center;font:600 1.25rem/1.6 system-ui,sans-serif;color:#fff;" +
+    "background:rgba(160,30,30,.92)";
+  document.body.append(box);
+}
+
 async function boot(): Promise<void> {
+  const problem = tokenProblem(token);
+  if (problem !== null) {
+    showTokenProblem(problem);
+    return;
+  }
   let fetched = await fetchModel(false);
   let loaded: VRM;
   try {
@@ -301,6 +324,10 @@ function installDebugHook(model: VRM, modelHash: string): void {
 }
 
 boot().catch((error: unknown) => {
+  if (error instanceof TokenRejectedError) {
+    showTokenProblem("rejected");
+    return;
+  }
   // No connection is attempted without a rendered model, so the host keeps
   // reporting `disconnected` rather than a renderer that cannot draw.
   console.error("[local-avatar] boot failed:", error);
