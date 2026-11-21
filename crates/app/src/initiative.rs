@@ -63,8 +63,10 @@ pub const MIN_IDLE_SECS: u64 = 5;
 pub const MIN_GAP_MS: u64 = 60_000;
 /// Length of the sliding window the initiative budget applies to.
 pub const WINDOW_MS: u64 = 600_000;
-/// Most initiatives inside one [`WINDOW_MS`].
-pub const WINDOW_MAX: usize = 6;
+/// Most initiatives inside one [`WINDOW_MS`]. Ten, so at the one-a-minute
+/// gap the window never binds by itself (#456: six left 3-minute silences);
+/// it stays as a ceiling should the gap ever be shortened.
+pub const WINDOW_MAX: usize = 10;
 /// How long the performer must have been quiet before it may speak again.
 pub const SETTLE_MS: u64 = 4_000;
 /// How long an operator stop keeps the initiative quiet.
@@ -801,7 +803,7 @@ mod tests {
     }
 
     #[test]
-    fn the_budget_allows_one_per_minute_and_six_per_ten_minutes() {
+    fn the_budget_allows_one_per_minute_and_the_window_never_binds_at_that_pace() {
         let mut d = director();
         let mut t = 45 * SEC;
         fire(&mut d, t);
@@ -811,24 +813,20 @@ mod tests {
             d.evaluate(&idle(t + 59_999)),
             Decision::Suppressed(Suppression::BudgetGap)
         );
-        // Six in ten minutes, one a minute apart.
+        // Ten in ten minutes, one a minute apart: the window is full.
         for _ in 1..WINDOW_MAX {
             t += MIN_GAP_MS;
             fire(&mut d, t);
             d.completed(t + SEC, None);
         }
         assert_eq!(d.metrics().fired as usize, WINDOW_MAX);
-        // The seventh would be a minute after the sixth, still inside the
-        // ten-minute window of the first.
-        assert_eq!(
-            d.evaluate(&idle(t + MIN_GAP_MS)),
-            Decision::Suppressed(Suppression::BudgetWindow)
-        );
-        // Once the first has left the window, one more is allowed.
+        // One more a minute later is allowed: the first has just left the
+        // ten-minute window, so a steady one-a-minute pace never stalls.
         assert!(matches!(
-            d.evaluate(&idle(45 * SEC + WINDOW_MS)),
+            d.evaluate(&idle(t + MIN_GAP_MS)),
             Decision::Fire { .. }
         ));
+        assert_eq!(d.metrics().suppressed_by(Suppression::BudgetWindow), 0);
     }
 
     #[test]
