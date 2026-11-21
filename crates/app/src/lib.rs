@@ -5009,6 +5009,9 @@ where
                 .generative
                 .as_mut()
                 .and_then(|generative| generative.phrase.take_run(completion.generation_id));
+            let cancelled_by_deadline = phrased_run
+                .as_ref()
+                .is_some_and(phrase_commit::PhraseRun::cancelled_by_deadline);
             if let Some(run) = phrased_run
                 && run.first_handled
             {
@@ -5045,9 +5048,42 @@ where
                 ) {
                     reservation.release(governor);
                 }
+                // #469: a reply that missed its interaction deadline is not an
+                // operator stop or a newer line superseding it, so the viewer
+                // must not be left with nothing: the typed fallback runs
+                // (once, no retry) and is counted. Cancellation by anything
+                // else, and initiatives (#87), stay silent.
+                let missed_deadline = deadline_expired
+                    && (!completion.cancellation.is_cancelled() || cancelled_by_deadline)
+                    && self.generative.as_ref().is_some_and(|generative| {
+                        !generative.is_shutting_down()
+                            && generative.is_current(completion.generation_id, &event_id)
+                    })
+                    && !self.is_initiative_event(&completion.request.source_event);
+                // The late reply itself is discarded either way.
                 if trace.cancelled_stage.is_none() {
                     trace.cancelled_stage = Some(CancellationStage::BeforePublish);
                 }
+                let late_fallback = if missed_deadline {
+                    trace.fallback_reason = FallbackReason::Timeout;
+                    let played = self
+                        .play_fallback_directive(
+                            &completion.request.source_event,
+                            &completion.fallback,
+                            trace.clone(),
+                            now_ms,
+                            completion.request.seed,
+                        )
+                        .unwrap_or(HandledGeneration {
+                            playback: None,
+                            route: RouteClass::NonVerbalFallback,
+                            trace: trace.clone(),
+                            cache_level: None,
+                        });
+                    Some(played)
+                } else {
+                    None
+                };
                 let exhaustion = if deadline_expired {
                     (DeadlineStage::Commit, DeadlineExhaustionReason::Expired)
                 } else if completion.cancellation.is_cancelled() {
@@ -5060,15 +5096,24 @@ where
                 };
                 let deadline = completion_deadline_observation(&completion, Some(exhaustion));
 
+                let (playback, route, trace, cache_level) = match late_fallback {
+                    Some(played) => (
+                        played.playback,
+                        played.route,
+                        played.trace,
+                        played.cache_level,
+                    ),
+                    None => (None, RouteClass::Generated, trace, None),
+                };
                 let handled = HandledEvent {
-                    playback: None,
-                    route: RouteClass::Generated,
+                    playback,
+                    route,
                     routing_latency_us: completion.context.routing_latency_us,
                     generation_latency_us: Some(completion.generation_latency_us),
                     generation_trace: Some(trace),
                     decision: completion.context.decision,
                     template_fallback: completion.context.template_fallback,
-                    cache_level: None,
+                    cache_level,
                     deadline: Some(deadline),
                     deferred_generation: false,
                     admitted_bytes: None,
@@ -5286,6 +5331,7 @@ where
             {
                 self.generation_fallbacks
                     .note(reason, handled.playback.is_some());
+                self.session_log_fallback(event_id, reason, handled.playback.is_some(), at_ms);
             }
         }
 
@@ -6511,6 +6557,7 @@ mod tests {
     mod scene_context_tests;
     mod session_log_tests;
     mod shutdown_tests;
+    mod silent_chat_drop_tests;
     mod speech_lifecycle_tests;
     mod streaming_thinking_tests;
     mod thinking_cost_cap_tests;

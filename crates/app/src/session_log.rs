@@ -13,7 +13,8 @@
 //! of the character sheet and memory seed, never their text), `input` (a chat
 //! line or transcript, or an idle initiative), `phrase` (one committed phrase
 //! as spoken, with the repeat verdict of #89), `route` (how the turn was
-//! answered, and any fallback) and `note` (a fixed vocabulary of events such as
+//! answered, and any fallback), `fallback` (a turn answered by a typed fallback
+//! instead of a reply, with its reason and whether the viewer saw it) and `note` (a fixed vocabulary of events such as
 //! a refused initiative repeat). Records of one turn share a `turn` id
 //! (`t-0001`), assigned here: raw event ids are never written.
 //!
@@ -85,7 +86,7 @@ const FILE_SUFFIX: &str = ".jsonl";
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     pub v: u32,
-    /// `session`, `config`, `input`, `phrase`, `route`, `note` or `capped`.
+    /// `session`, `config`, `input`, `phrase`, `route`, `fallback`, `note` or `capped`.
     pub t: String,
     pub seq: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -501,6 +502,25 @@ impl SessionLog {
         });
     }
 
+    /// A turn answered by a fallback instead of a reply (#469): `reason` is the
+    /// closed fallback vocabulary, `visible` says whether the viewer was shown
+    /// a cached reaction. Never viewer text.
+    pub fn fallback(&mut self, event_id: &str, reason: &str, visible: bool, logical_ms: u64) {
+        if !self.enabled {
+            return;
+        }
+        let index = self.turn_index(event_id, "chat");
+        let turn = self.turns[index].id.clone();
+        self.emit(Record {
+            t: "fallback".to_owned(),
+            turn: Some(turn),
+            logical_ms: Some(logical_ms),
+            kind: Some(if visible { "visible" } else { "silent" }.to_owned()),
+            fallback: Some(cut_chars(reason, 48)),
+            ..Record::default()
+        });
+    }
+
     /// A fixed-vocabulary event on a turn (`kind` and `detail` are never
     /// viewer text).
     pub fn note(&mut self, event_id: &str, kind: &'static str, detail: &str, logical_ms: u64) {
@@ -847,6 +867,7 @@ pub fn summarize(reader: impl BufRead) -> SessionSummary {
     let mut summary = SessionSummary::default();
     let mut input_ms: HashMap<String, u64> = HashMap::new();
     let mut answered: HashSet<String> = HashSet::new();
+    let mut fallback_turns: HashSet<String> = HashSet::new();
     let mut last_initiative: Option<u64> = None;
     let mut reader = reader;
     loop {
@@ -920,7 +941,15 @@ pub fn summarize(reader: impl BufRead) -> SessionSummary {
                     summary.first_audio_ms.push(ms.saturating_sub(*started));
                 }
             }
-            "route" if record.fallback.is_some() => summary.fallbacks += 1,
+            // A turn counts once however many records name its fallback.
+            "route" | "fallback" if record.fallback.is_some() => match record.turn {
+                Some(turn) => {
+                    if fallback_turns.insert(turn) {
+                        summary.fallbacks += 1;
+                    }
+                }
+                None => summary.fallbacks += 1,
+            },
             "capped" => summary.capped = true,
             _ => {}
         }

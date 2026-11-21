@@ -389,6 +389,12 @@ impl PhraseRun {
         }
     }
 
+    /// The app cancelled this reply because phrase 0 missed the interaction
+    /// deadline (as opposed to an operator stop, barge-in or supersession).
+    pub(crate) fn cancelled_by_deadline(&self) -> bool {
+        self.cancel_cause == Some(PhraseCause::DeadlineExpired)
+    }
+
     pub(crate) fn has_committed(&self) -> bool {
         !self.committed.is_empty()
     }
