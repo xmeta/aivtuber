@@ -43,7 +43,8 @@ export type Capability =
   | "avatar.configure"
   | "speech_input.control"
   | "persona.configure"
-  | "initiative.control";
+  | "initiative.control"
+  | "session_log.control";
 
 export const CAPABILITIES: readonly Capability[] = [
   "performer.mute",
@@ -60,6 +61,7 @@ export const CAPABILITIES: readonly Capability[] = [
   "speech_input.control",
   "persona.configure",
   "initiative.control",
+  "session_log.control",
 ];
 
 export type AuthorizationMethod =

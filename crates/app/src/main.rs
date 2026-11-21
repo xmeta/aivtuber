@@ -554,6 +554,21 @@ fn run() -> Result<(), Box<dyn Error>> {
     // sidecar starts as before and cannot be switched.
     let speech_program = env_optional("AIVTUBER_SPEECH_SIDECAR");
     let speech_settings = env_path(aivtuber_app::speech_input::SPEECH_INPUT_SETTINGS_VAR);
+    // #463: the opt-in session conversation log. Composed only when the launcher
+    // names both the directory and the remembered-choice file; it starts off
+    // unless the operator turned it on earlier, writes nothing and creates
+    // nothing while off, and is only ever switched by the operator endpoint.
+    if let (Some(dir), Some(settings)) = (
+        env_path(aivtuber_app::session_log::SESSION_LOG_DIR_VAR),
+        env_path(aivtuber_app::session_log::SESSION_LOG_SETTINGS_VAR),
+    ) {
+        let log = aivtuber_app::session_log::SessionLog::from_settings(dir, settings);
+        eprintln!(
+            "session log: {} (a local file of the conversation, switch in the panel or with aivtuberctl log)",
+            if log.enabled() { "on" } else { "off" }
+        );
+        app = app.with_session_log(log);
+    }
     // #321: the memory export needs the writer's live entries, so the endpoint
     // holds `memory.admin` only when the writer is composed.
     let (operator_server, mut operator_receiver) = OperatorControlServer::with_options(
@@ -578,7 +593,11 @@ fn run() -> Result<(), Box<dyn Error>> {
             // live seed editing is composed.
             memory_seed_edit: app.memory_seed_editor_composed(),
             // #87: `initiative.control` only when the initiative is composed.
-            initiative_control: app.initiative_composed(),
+            // It is composed whenever the generative path is, but later than
+            // this point, so ask the same question here.
+            initiative_control: generative_composed,
+            // #463: `session_log.control` only when the session log is composed.
+            session_log_control: app.session_log_composed(),
         },
     )?;
     let operator_ingress = operator_server.ingress();

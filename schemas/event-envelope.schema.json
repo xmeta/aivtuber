@@ -140,7 +140,8 @@
               "avatar.configure",
               "speech_input.control",
               "persona.configure",
-              "initiative.control"
+              "initiative.control",
+              "session_log.control"
             ]
           }
         }

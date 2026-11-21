@@ -333,6 +333,7 @@ where
             format!("kind={}", kind.name()),
         );
         self.security.push_external_audit(record);
+        self.session_log_initiative(event_id, kind.name(), at_ms);
         match self.submit_generation(event, *route, at_ms, seed, provider_deadline, context) {
             Ok(GenerationSubmission::Deferred) => {}
             Ok(GenerationSubmission::Immediate { handled, .. }) => {

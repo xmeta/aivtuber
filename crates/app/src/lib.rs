@@ -39,6 +39,8 @@ mod routing;
 mod scenario;
 mod scene_context;
 mod semantic;
+pub mod session_log;
+mod session_log_host;
 mod shadow;
 mod shadow_evidence;
 mod shadow_orchestrator;
@@ -129,6 +131,7 @@ pub use routing::*;
 pub use scenario::*;
 pub use scene_context::*;
 pub use semantic::*;
+pub use session_log::SessionLogStatus;
 pub use shadow::*;
 pub use shadow_evidence::*;
 pub use shadow_orchestrator::*;
@@ -1282,6 +1285,9 @@ where
     /// The bounded idle initiative (#87 S1); `None` (default) composes nothing
     /// and the performer stays silent when nobody writes.
     initiative: Option<initiative::InitiativeDirector>,
+    /// The opt-in local session conversation log (#463); `None` (default)
+    /// composes nothing and no turn is ever recorded.
+    session_log: Option<session_log::SessionLog>,
     /// Logical sequence of minted initiative events.
     initiative_sequence: u64,
     /// The pending initiative's reply fell back to the idle gesture.
@@ -1377,6 +1383,7 @@ where
             speech_input: None,
             chat_burst: None,
             initiative: None,
+            session_log: None,
             initiative_sequence: 0,
             initiative_fell: false,
             crowd_context: None,
@@ -3544,6 +3551,8 @@ where
                 });
             }
         }
+        // #463: opt-in session log; a no-op unless the operator turned it on.
+        self.session_log_input(&event, at_ms);
         if self.chat_burst.is_some() {
             return self.process_through_chat_burst(
                 admission,
@@ -5276,6 +5285,17 @@ where
             }
         }
 
+        // #463: how the turn was answered (a closed vocabulary, never text).
+        if self.session_log_composed() {
+            let fallback = observation.fallback_reason.clone();
+            self.session_log_route(
+                event_id,
+                observation.route,
+                observation.cache_level,
+                fallback.as_deref(),
+                at_ms,
+            );
+        }
         self.telemetry.record(observation);
         self.commit_causal_trace(event_id, handled);
     }
@@ -5842,7 +5862,9 @@ where
                 repeat_guard::PhraseOrigin::ChatReply
             };
             // Measure only: a spoken phrase is never refused here (#89 S1).
-            self.repeat_guard.record_spoken(text, origin, command.at_ms);
+            let repeat = self.repeat_guard.record_spoken(text, origin, command.at_ms);
+            // #463: the same text and verdict, when the operator opted in.
+            self.session_log_phrase(&command.event_id, generated, text, repeat, command.at_ms);
         }
     }
 
@@ -5882,6 +5904,16 @@ where
             ),
         );
         self.security.push_external_audit(record);
+        self.session_log_note(
+            &event.event_id,
+            "initiative_repeat_suppressed",
+            if repeat == repeat_guard::Repeat::Exact {
+                "exact"
+            } else {
+                "near"
+            },
+            now_ms,
+        );
         true
     }
 
@@ -6473,6 +6505,7 @@ mod tests {
     mod persona_tests;
     mod phrase_commit_tests;
     mod scene_context_tests;
+    mod session_log_tests;
     mod shutdown_tests;
     mod speech_lifecycle_tests;
     mod streaming_thinking_tests;

@@ -255,6 +255,10 @@ fn capability_for_action(action: &str) -> Option<Capability> {
         "initiative.control" | "initiative.enable" | "initiative.disable" => {
             Some(Capability::InitiativeControl)
         }
+        "session_log.control"
+        | "session_log.enable"
+        | "session_log.disable"
+        | "session_log.delete" => Some(Capability::SessionLogControl),
         _ => None,
     }
 }

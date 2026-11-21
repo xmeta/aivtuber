@@ -122,6 +122,12 @@ pub enum Capability {
     /// is spoken, raise trust or mint a permit.
     #[serde(rename = "initiative.control")]
     InitiativeControl,
+    /// Turns the opt-in local session conversation log on or off and deletes
+    /// the saved logs (#463). Held only by an authenticated local ingress and
+    /// only when the log is composed. It grants nothing but those switches: it
+    /// cannot read a log, say what is logged, raise trust or mint a permit.
+    #[serde(rename = "session_log.control")]
+    SessionLogControl,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -642,6 +648,21 @@ mod tests {
                 .authorization
                 .as_ref()
                 .is_some_and(|auth| auth.capabilities.contains(&Capability::InitiativeControl))
+        );
+        let error = event.validate().expect_err("a chat source cannot carry it");
+        assert_eq!(error.field(), "source_class");
+    }
+
+    #[test]
+    fn repository_forged_session_log_control_fixture_is_rejected() {
+        let json = include_str!("../../../examples/events/invalid/forged-session-log-control.json");
+        let event: EventEnvelope =
+            serde_json::from_str(json).expect("the capability name is a closed, known one");
+        assert!(
+            event
+                .authorization
+                .as_ref()
+                .is_some_and(|auth| auth.capabilities.contains(&Capability::SessionLogControl))
         );
         let error = event.validate().expect_err("a chat source cannot carry it");
         assert_eq!(error.field(), "source_class");

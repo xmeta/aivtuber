@@ -50,6 +50,12 @@ import {
   type SeedEntry,
   type SeedKind,
   initiativeBody,
+  sessionLogBody,
+  sessionLogDeleteBody,
+  sessionLogDeleteResultText,
+  sessionLogResultText,
+  sessionLogView,
+  SESSION_LOG_DELETE_CONFIRM_TEXT,
   initiativeResultText,
   initiativeView,
   voiceInputBody,
@@ -174,6 +180,7 @@ function render(): void {
   renderUsage();
   renderVoiceInput();
   renderInitiative();
+  renderSessionLog();
   renderPersona();
   renderMemory();
   renderVoice();
@@ -317,6 +324,56 @@ async function setInitiative(enabled: boolean): Promise<void> {
     out.textContent = "失敗しました(アプリに接続できません)";
   } finally {
     initiativeBusy = false;
+    void poll();
+  }
+}
+
+let sessionLogBusy = false;
+
+/** The session-log card (#463): hidden unless the app composed it. Counters and the location only. */
+function renderSessionLog(): void {
+  const view = sessionLogView(state);
+  $("session-log-section").hidden = view === null;
+  if (view === null) return;
+  $("session-log-label").textContent = view.label;
+  $("session-log-hint").textContent = view.hint;
+  $("session-log-summary").textContent = view.summary;
+  $("session-log-warning").textContent = view.warning;
+  const toggle = $<HTMLInputElement>("session-log-toggle");
+  toggle.checked = view.checked;
+  toggle.disabled = connectionLost || sessionLogBusy;
+  $<HTMLButtonElement>("session-log-delete").disabled = connectionLost || sessionLogBusy || !view.canDelete;
+}
+
+async function setSessionLog(enabled: boolean): Promise<void> {
+  sessionLogBusy = true;
+  renderSessionLog();
+  const out = $("session-log-result");
+  try {
+    const { status, json } = await api("/api/session-log", { method: "POST", body: JSON.stringify(sessionLogBody(enabled)) });
+    const body = (json ?? {}) as { ok?: boolean; detail?: string };
+    out.textContent = sessionLogResultText(enabled, status === 200 && body.ok === true, body.detail, status);
+  } catch {
+    out.textContent = "失敗しました(アプリに接続できません)";
+  } finally {
+    sessionLogBusy = false;
+    void poll();
+  }
+}
+
+async function deleteSessionLogs(): Promise<void> {
+  if (!window.confirm(SESSION_LOG_DELETE_CONFIRM_TEXT)) return;
+  sessionLogBusy = true;
+  renderSessionLog();
+  const out = $("session-log-result");
+  try {
+    const { status, json } = await api("/api/session-log/delete", { method: "POST", body: JSON.stringify(sessionLogDeleteBody()) });
+    const body = (json ?? {}) as { ok?: boolean; detail?: string };
+    out.textContent = sessionLogDeleteResultText(status === 200 && body.ok === true, body.detail, status);
+  } catch {
+    out.textContent = "失敗しました(アプリに接続できません)";
+  } finally {
+    sessionLogBusy = false;
     void poll();
   }
 }
@@ -1392,6 +1449,11 @@ $<HTMLInputElement>("initiative-toggle").addEventListener(
   "change",
   (event) => void setInitiative((event.target as HTMLInputElement).checked),
 );
+$<HTMLInputElement>("session-log-toggle").addEventListener(
+  "change",
+  (event) => void setSessionLog((event.target as HTMLInputElement).checked),
+);
+$("session-log-delete").addEventListener("click", () => void deleteSessionLogs());
 $("voice-input-on").addEventListener("click", () => void setVoiceInput(true));
 $("voice-input-off").addEventListener("click", () => void setVoiceInput(false));
 $<HTMLSelectElement>("voice-input-device").addEventListener(

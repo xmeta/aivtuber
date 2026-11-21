@@ -47,6 +47,13 @@
 //! `aivtuber-setup start`, where it starts on). It only switches whether the
 //! performer may speak on its own; it cannot say what is said.
 //!
+//! `log` (issue #463) turns the opt-in local session conversation log on or
+//! off (`log on`, `log off`), deletes every saved session file (`log delete`),
+//! like the operation panel's switch; needs the daemon to run with the log
+//! composed (`aivtuber-setup start`). `log summary <file>` reads one session
+//! file offline (no daemon, no secret) and prints turn counts, repeat rates,
+//! chat-to-first-audio and initiative spacing; it never prints logged text.
+//!
 //! `persona` (issue #401) shows, replaces or clears the operator's character
 //! sheet while the daemon runs, like the operation panel: `persona show` prints
 //! the text, `persona set --file <path>` sends it (the whole text, checked as
@@ -176,6 +183,16 @@ enum Command {
         #[command(subcommand)]
         action: InitiativeCommand,
     },
+    /// The opt-in local session conversation log (issue #463): `log on` /
+    /// `log off` save the conversation to a local file or stop, `log delete`
+    /// removes every saved file, `log summary FILE` reads one offline. The file
+    /// holds viewer text (pseudonymised) and what was said; it never leaves
+    /// this machine. `on`, `off` and `delete` need the daemon to run with the
+    /// log composed (`aivtuber-setup start`).
+    Log {
+        #[command(subcommand)]
+        action: LogCommand,
+    },
     /// Show, replace or clear the character sheet (issue #401); needs the
     /// daemon to run with the generative path (the local and hybrid profiles
     /// started by `aivtuber-setup start`). The text goes to the model with
@@ -259,6 +276,22 @@ enum VoiceInputCommand {
         /// `half` or `full`.
         #[arg(value_parser = ["half", "full"])]
         mode: String,
+    },
+}
+
+#[derive(Subcommand, Clone, PartialEq, Eq)]
+enum LogCommand {
+    /// Start saving the conversation to a local file.
+    On,
+    /// Stop saving. Files already saved stay.
+    Off,
+    /// Delete every saved session file.
+    Delete,
+    /// Print turn counts, repeat rates, chat-to-first-audio and initiative
+    /// spacing of one session file. Works offline; no secret needed.
+    Summary {
+        /// A file from the logs/sessions directory.
+        file: PathBuf,
     },
 }
 
@@ -558,6 +591,12 @@ fn action_name(command: &Command) -> &'static str {
             PersonaCommand::Show => "persona.get",
             PersonaCommand::Set { .. } | PersonaCommand::Clear => "persona.set",
         },
+        Command::Log { action } => match action {
+            LogCommand::On => "session_log.enable",
+            LogCommand::Off => "session_log.disable",
+            // `summary` never reaches the daemon (see `main`).
+            LogCommand::Delete | LogCommand::Summary { .. } => "session_log.delete",
+        },
         Command::Initiative { action } => match action {
             InitiativeCommand::On => "initiative.enable",
             InitiativeCommand::Off => "initiative.disable",
@@ -590,8 +629,32 @@ fn action_name(command: &Command) -> &'static str {
     }
 }
 
+/// `log summary FILE` (issue #463). Reads at most the bounded part of the file
+/// and prints counts and timings only.
+fn summarize_log(file: &std::path::Path) -> ExitCode {
+    match std::fs::File::open(file) {
+        Ok(handle) => {
+            let summary = aivtuber_app::session_log::summarize(std::io::BufReader::new(handle));
+            print!("{}", aivtuber_app::session_log::render_summary(&summary));
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("aivtuberctl: cannot read {}: {error}", file.display());
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    // Offline: reads a file, never talks to the daemon, needs no secret.
+    if let Command::Log {
+        action: LogCommand::Summary { file },
+    } = &cli.command
+    {
+        return summarize_log(file);
+    }
 
     let Some(secret) = cli.secret.as_deref() else {
         eprintln!("aivtuberctl: no operator secret. Set AIVTUBER_CONTROL_SECRET or pass --secret.");
@@ -833,6 +896,24 @@ fn print_response(response: &OperatorResponse) {
             );
             for name in &voice_input.devices {
                 println!("voice_input_device {name:?}");
+            }
+        }
+        if let Some(log) = &status.session_log {
+            // State and counters only (#463): never the location's contents.
+            println!(
+                "session_log enabled={} files_kept={} lines_written={} bytes_written={} dropped_queue_full={} dropped_file_full={} write_errors={} capped={} settings_save_failed={}",
+                log.enabled,
+                log.files_kept,
+                log.lines_written,
+                log.bytes_written,
+                log.dropped_queue_full,
+                log.dropped_file_full,
+                log.write_errors,
+                log.capped,
+                log.settings_save_failed,
+            );
+            if let Some(location) = &log.location {
+                println!("session_log_location {location:?}");
             }
         }
         if let Some(initiative) = &status.initiative {
@@ -1260,6 +1341,36 @@ mod tests {
             &["persona"][..],
             &["persona", "set"][..],
             &["persona", "set", "--text", "x"][..],
+        ] {
+            let mut full = vec![
+                "aivtuberctl",
+                "--secret",
+                "01234567890123456789012345678901",
+            ];
+            full.extend_from_slice(args);
+            assert!(Cli::try_parse_from(full).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn log_subcommand_maps_to_the_actions_and_summary_takes_a_file() {
+        assert_eq!(action_name(&parse(&["log", "on"])), "session_log.enable");
+        assert_eq!(action_name(&parse(&["log", "off"])), "session_log.disable");
+        assert_eq!(
+            action_name(&parse(&["log", "delete"])),
+            "session_log.delete"
+        );
+        assert!(matches!(
+            parse(&["log", "summary", "a.jsonl"]),
+            Command::Log {
+                action: LogCommand::Summary { .. }
+            }
+        ));
+        for args in [
+            &["log"][..],
+            &["log", "summary"][..],
+            &["log", "on", "--path", "x"][..],
+            &["log", "delete", "everything"][..],
         ] {
             let mut full = vec![
                 "aivtuberctl",

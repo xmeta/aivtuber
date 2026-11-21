@@ -171,6 +171,7 @@ mod tests {
             Capability::SpeechInputControl => "speech_input.control",
             Capability::PersonaConfigure => "persona.configure",
             Capability::InitiativeControl => "initiative.control",
+            Capability::SessionLogControl => "session_log.control",
         };
         let secret = [13_u8; 32];
         let ingress = LocalControlIngress::new(
