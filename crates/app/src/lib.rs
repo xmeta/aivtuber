@@ -1188,6 +1188,9 @@ pub struct GenerationFallbackCounts {
     /// Fallbacks that produced nothing because the pack has no usable asset
     /// for the fallback group (the typed `NonVerbalReaction` carries none).
     pub silent: u64,
+    /// Chat turns ended on purpose because a newer line (or an operator stop)
+    /// took over before they were answered (#469). Counted, never silent.
+    pub superseded: u64,
 }
 
 impl GenerationFallbackCounts {
@@ -5096,6 +5099,14 @@ where
                 };
                 let deadline = completion_deadline_observation(&completion, Some(exhaustion));
 
+                // #469: a chat turn ended on purpose by a newer line or an
+                // operator stop is counted and logged, never silent.
+                let ended_on_purpose = late_fallback.is_none()
+                    && self
+                        .generative
+                        .as_ref()
+                        .is_some_and(|generative| !generative.is_shutting_down())
+                    && !self.is_initiative_event(&completion.request.source_event);
                 let (playback, route, trace, cache_level) = match late_fallback {
                     Some(played) => (
                         played.playback,
@@ -5120,6 +5131,10 @@ where
                     correlation_id: Some(completion.context.correlation_id.clone()),
                 };
                 self.record_handled_event(&event_id, &handled, now_ms);
+                if ended_on_purpose {
+                    self.generation_fallbacks.superseded += 1;
+                    self.session_log_fallback(&event_id, "superseded", false, now_ms);
+                }
 
                 if let Some(generative) = self.generative.as_mut() {
                     generative.note_cancelled_or_stale();
