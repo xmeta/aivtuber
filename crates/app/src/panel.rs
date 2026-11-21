@@ -25,7 +25,9 @@
 //!   `speech_input.disable`, both `speech_input.control`, on their own queue;
 //!   the request is a boolean and nothing else) and the character sheet of
 //!   #401 (`persona.set`, `persona.get`, both `persona.configure`, on their
-//!   own queue; the text is never logged and only `persona.get` returns it)
+//!   own queue; the text is never logged and only `persona.get` returns it),
+//!   and #87 S2 (`topics.set`, `topics.get`: the operator topic list, on the
+//!   same queue and under the same capability)
 //!   and the operator memory seed of #402 (`memory.seed.set`,
 //!   `memory.seed.get`, both under the existing `memory.admin`, on their own
 //!   queue; no claim is ever logged and only `memory.seed.get` returns the
@@ -281,6 +283,8 @@ impl PanelService {
                 | PanelRequest::SessionLogDelete
                 | PanelRequest::PersonaSet(_)
                 | PanelRequest::PersonaGet
+                | PanelRequest::TopicsSet(_)
+                | PanelRequest::TopicsGet
                 | PanelRequest::MemorySeedSet(_)
                 | PanelRequest::MemorySeedGet => {
                     command.respond(false, "not a control request");
@@ -504,6 +508,8 @@ impl PanelService {
             let (action, argument) = match &command.request {
                 PanelRequest::PersonaSet(text) => ("persona.set", Some(text.expose())),
                 PanelRequest::PersonaGet => ("persona.get", None),
+                PanelRequest::TopicsSet(text) => ("topics.set", Some(text.expose())),
+                PanelRequest::TopicsGet => ("topics.get", None),
                 _ => {
                     command.respond(false, "not a character sheet request");
                     continue;

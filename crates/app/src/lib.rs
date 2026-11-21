@@ -57,6 +57,7 @@ mod thinking_meter;
 mod thinking_provider;
 mod thinking_warmup;
 mod tool_execution;
+pub mod topics;
 mod tts_sidecar;
 mod voice_control;
 mod voicevox_bridge;
@@ -1292,6 +1293,8 @@ where
     initiative_sequence: u64,
     /// The pending initiative's reply fell back to the idle gesture.
     initiative_fell: bool,
+    /// Live editing of the operator topic list (#87 S2); `None` = not composed.
+    topics_editor: Option<topics::TopicsEditor>,
     /// #79 S2: the crowd summary for the one reply being dispatched right now.
     /// Set by the crowd path immediately before `dispatch_admitted_event` and
     /// taken by `handle_event`, so it can never reach another event.
@@ -1386,6 +1389,7 @@ where
             session_log: None,
             initiative_sequence: 0,
             initiative_fell: false,
+            topics_editor: None,
             crowd_context: None,
             speech_feed_heartbeat_ms: None,
             speech_playback: speech_duplex::PlaybackGate::default(),

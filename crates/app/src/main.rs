@@ -587,7 +587,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             avatar_configure: app.avatar_configured(),
             // #400: `speech_input.control` only when voice input is composed.
             speech_input_control: speech_program.is_some() && speech_settings.is_some(),
-            // #401: `persona.configure` only when live editing is composed.
+            // #401: `persona.configure` only when live editing is composed (it
+            // also covers the #87 S2 topic list, composed on the same condition).
             persona_configure: app.persona_editor_composed(),
             // #402: `memory.admin` also for the `memory.seed.*` actions when
             // live seed editing is composed.
@@ -1081,6 +1082,31 @@ fn run() -> Result<(), Box<dyn Error>> {
             idle_secs
         );
         app = app.with_initiative(config);
+        // #87 S2: the operator's topic list (「雑談ネタ」), one line per topic
+        // in the file named by AIVTUBER_TOPICS_FILE. Read once, bounded; a
+        // missing or refused file is an empty list, and the panel or
+        // `aivtuberctl topics set` can still fill it (the same
+        // `persona.configure` capability as the character sheet). The always
+        // printed line says how many were loaded and, under a remote Thinking
+        // endpoint, that the topic of an initiative is sent to the cloud model.
+        let topics_path = env_path(aivtuber_app::topics::TOPICS_FILE_VAR);
+        let topics_load = topics_path
+            .as_deref()
+            .map(aivtuber_app::topics::load_topics_file)
+            .unwrap_or(aivtuber_app::topics::TopicsLoad::Absent);
+        eprintln!(
+            "{}{}",
+            topics_load.line(),
+            if thinking_leaves_machine {
+                " (the topic of an initiative is sent to the cloud model)"
+            } else {
+                ""
+            }
+        );
+        app = app.with_topics(
+            aivtuber_app::topics::TopicsEditor::new(topics_path, thinking_leaves_machine),
+            &topics_load.list(),
+        );
     }
     // #88 S1: the scene context (rank 2 OBS program scene through the
     // operator's table, rank 4 perception). Composed only when the operator

@@ -125,7 +125,7 @@ pub fn contains_character_tag(text: &str) -> bool {
 /// that reorder or hide text (bidi controls and a stray byte-order mark).
 /// Full-width punctuation and the ideographic space are ordinary Japanese and
 /// are allowed.
-fn forbidden(c: char) -> bool {
+pub(crate) fn forbidden(c: char) -> bool {
     if c == '\n' || c == '\t' {
         return false;
     }

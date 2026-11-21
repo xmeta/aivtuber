@@ -20,6 +20,7 @@ use super::*;
 use crate::initiative::{
     self, Decision, InitiativeDirector, InitiativeInputs, InitiativeMetrics, Preemption,
 };
+use crate::topics::{TopicsEditor, TopicsOutcome, TopicsStatus};
 
 /// A pending initiative that has not ended after this long is forced to end:
 /// the provider deadline plus a generous playback allowance. A bound, not a
@@ -43,10 +44,17 @@ pub struct InitiativeStatus {
     pub suppressed_total: u64,
     /// `(reason, count)` for every reason that ever suppressed one.
     pub suppressed: Vec<(String, u64)>,
+    /// The operator topic list (#87 S2): counts only, never text. Absent
+    /// unless live topic editing is composed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topics: Option<TopicsStatus>,
 }
 
 impl InitiativeStatus {
-    pub(crate) fn from_director(director: &InitiativeDirector) -> Self {
+    pub(crate) fn from_director(
+        director: &InitiativeDirector,
+        editor: Option<&TopicsEditor>,
+    ) -> Self {
         let metrics: InitiativeMetrics = director.metrics();
         Self {
             enabled: director.enabled(),
@@ -66,6 +74,13 @@ impl InitiativeStatus {
                     (count > 0).then(|| (reason.name().to_owned(), count))
                 })
                 .collect(),
+            topics: editor.map(|editor| TopicsStatus {
+                count: director.topic_count(),
+                persisted: editor.path().is_some(),
+                thinking_remote: editor.thinking_remote(),
+                used: metrics.topics_used,
+                without_topic: metrics.without_topic,
+            }),
         }
     }
 }
@@ -88,7 +103,91 @@ where
     pub fn initiative_status(&self) -> Option<InitiativeStatus> {
         self.initiative
             .as_ref()
-            .map(InitiativeStatus::from_director)
+            .map(|director| InitiativeStatus::from_director(director, self.topics_editor.as_ref()))
+    }
+
+    /// Opt in to the operator topic list (#87 S2): `list` is what the file
+    /// held at start, `editor` says where a live save goes. Only meaningful
+    /// next to `with_initiative`; without it nothing is composed.
+    pub fn with_topics(mut self, editor: TopicsEditor, list: &aivtuber_domain::TopicList) -> Self {
+        if let Some(director) = self.initiative.as_mut() {
+            director.set_topics(list.entries());
+            self.topics_editor = Some(editor);
+        }
+        self
+    }
+
+    /// Whether the topic list can be edited while running (the operator
+    /// endpoint then holds `persona.configure` for `topics.*`).
+    pub fn topics_editor_composed(&self) -> bool {
+        self.topics_editor.is_some()
+    }
+
+    /// Apply one topic-list operator request (#87 S2). `authority` must be the
+    /// authenticated local ingress capability (`persona.configure`, the same
+    /// closed capability as the character sheet: both are operator-written
+    /// text the Thinking request carries as `operator_curated` data).
+    /// `action` is `topics.set` (`argument` is the whole new list, one topic
+    /// per line; empty clears) or `topics.get`.
+    ///
+    /// A set is validated by the same kind of parser as the start-up file,
+    /// written atomically when a file is configured, and only then becomes the
+    /// live list: any refusal, or a failed write, leaves the live list and the
+    /// file unchanged. An initiative already being generated keeps its topic.
+    /// Details are fixed phrases plus the count, never the text; only
+    /// `topics.get` returns it, to the authenticated caller.
+    pub fn configure_topics(
+        &mut self,
+        authority: &AuthenticatedControl,
+        action: &str,
+        argument: Option<&str>,
+    ) -> Result<TopicsOutcome, String> {
+        if !authority.has_capability(aivtuber_domain::Capability::PersonaConfigure) {
+            return Err("topic list editing is not authorized".to_owned());
+        }
+        let (Some(editor), Some(director)) =
+            (self.topics_editor.as_ref(), self.initiative.as_ref())
+        else {
+            return Err("topic list editing is not configured".to_owned());
+        };
+        match action {
+            "topics.get" => Ok(TopicsOutcome {
+                detail: format!("topics: {}", director.topic_count()),
+                text: Some(director.topic_text()),
+            }),
+            "topics.set" => {
+                let Some(text) = argument else {
+                    return Err("topics not changed: no text given".to_owned());
+                };
+                let list = aivtuber_domain::parse_topics(text.as_bytes())
+                    .map_err(|error| format!("topics not changed: {}", error.reason()))?;
+                let persisted = match editor.path() {
+                    Some(path) => {
+                        if crate::persona::write_persona_file_atomic(path, &list.to_text()).is_err()
+                        {
+                            return Err("topics not changed: the topics file could not be written"
+                                .to_owned());
+                        }
+                        true
+                    }
+                    None => false,
+                };
+                let count = list.len();
+                if let Some(director) = self.initiative.as_mut() {
+                    director.set_topics(list.entries());
+                }
+                let kept = if persisted {
+                    "saved to the topics file"
+                } else {
+                    "applied in memory only (no topics file is configured)"
+                };
+                Ok(TopicsOutcome {
+                    detail: format!("topics updated, {kept}: {count}"),
+                    text: None,
+                })
+            }
+            _ => Err("not a topic list action".to_owned()),
+        }
     }
 
     pub fn initiative_director(&self) -> Option<&InitiativeDirector> {
@@ -153,8 +252,13 @@ where
             Some(director) => director.evaluate(&inputs),
             None => return,
         };
-        if let Decision::Fire { event_id, kind } = decision {
-            self.start_initiative(&event_id, kind, now_ms, seed);
+        if let Decision::Fire {
+            event_id,
+            kind,
+            topic,
+        } = decision
+        {
+            self.start_initiative(&event_id, kind, topic, now_ms, seed);
         }
     }
 
@@ -186,21 +290,7 @@ where
                 .chat_burst
                 .as_ref()
                 .is_some_and(|lane| lane.pending_deferred() > 0),
-            have_summaries: !self.initiative_summaries().is_empty(),
         }
-    }
-
-    /// The performer's own last replies (not initiatives), cut and capped.
-    fn initiative_summaries(&self) -> Vec<String> {
-        let mut summaries: Vec<String> = self
-            .recent_replies
-            .items()
-            .filter(|reply| !reply.event_id.starts_with(initiative::EVENT_ID_PREFIX))
-            .map(|reply| initiative::bounded_chars(&reply.text))
-            .collect();
-        let skip = summaries.len().saturating_sub(initiative::SUMMARY_COUNT);
-        summaries.drain(..skip);
-        summaries
     }
 
     /// Whether the generation or any of its speech is still in flight.
@@ -268,18 +358,19 @@ where
         &mut self,
         event_id: &str,
         kind: aivtuber_domain::InitiativeKind,
+        topic: Option<initiative::TopicPick>,
         at_ms: u64,
         seed: u64,
     ) {
         self.initiative_sequence = self.initiative_sequence.saturating_add(1);
         let event = initiative::mint_event(event_id, kind, at_ms, self.initiative_sequence);
-        let summaries = self.initiative_summaries();
         let recent: Vec<String> = self
             .initiative
             .as_ref()
             .map(|director| director.recent_texts().map(str::to_owned).collect())
             .unwrap_or_default();
-        let Ok(thinking) = initiative::build_request(&event, kind, &summaries, &recent) else {
+        let topic_text = topic.as_ref().map(|pick| pick.text.as_str());
+        let Ok(thinking) = initiative::build_request(&event, kind, topic_text, &recent) else {
             self.initiative_unavailable(at_ms);
             return;
         };
@@ -330,7 +421,11 @@ where
             Some(event_id),
             AuditCategory::Generation,
             "initiative_fired",
-            format!("kind={}", kind.name()),
+            // The topic is the operator's text: the audit names its position.
+            match &topic {
+                Some(pick) => format!("kind={} topic=#{}", kind.name(), pick.index + 1),
+                None => format!("kind={} topic=none", kind.name()),
+            },
         );
         self.security.push_external_audit(record);
         self.session_log_initiative(event_id, kind.name(), at_ms);

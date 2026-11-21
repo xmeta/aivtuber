@@ -60,6 +60,8 @@ pub struct OperatorRequest {
     /// `speech_input.device`, `speech_input.duplex` (the capture device and the
     /// half/full duplex choice, #396),
     /// `persona.set`, `persona.get` (the character sheet, #401),
+    /// `topics.set`, `topics.get` (the operator topic list, #87 S2; also
+    /// `persona.configure`),
     /// `initiative.enable`, `initiative.disable` (speak on its own when no
     /// chat arrives, #87),
     /// `session_log.enable`, `session_log.disable`, `session_log.delete` (the
@@ -103,7 +105,8 @@ pub struct OperatorResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_export: Option<OperatorMemoryExport>,
     /// The character sheet text (#401); present only for a successful
-    /// `persona.get`, to the authenticated caller. Never logged or audited.
+    /// `persona.get` (and the topic list text for `topics.get`, #87 S2), to the
+    /// authenticated caller. Never logged or audited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persona: Option<String>,
     /// The operation panel's launch URL (#388); present only for a successful
@@ -713,6 +716,7 @@ pub fn apply_operator_request<R: RoutePlanner>(
         && !is_tcp_avatar_action(&request.action)
         && !is_speech_input_action(&request.action)
         && !is_persona_action(&request.action)
+        && !is_topics_action(&request.action)
         && !is_initiative_action(&request.action)
         && !is_session_log_action(&request.action)
         && request.action != "panel.url"
@@ -789,6 +793,13 @@ fn is_persona_action(action: &str) -> bool {
     matches!(action, "persona.set" | "persona.get")
 }
 
+/// The operator topic list actions (#87 S2), also under `persona.configure`:
+/// both are operator-written text the Thinking request carries as
+/// `operator_curated` data, so no new capability is minted for them.
+fn is_topics_action(action: &str) -> bool {
+    matches!(action, "topics.set" | "topics.get")
+}
+
 /// The idle-initiative switch (#87), both under `initiative.control`. The
 /// operator endpoint (`aivtuberctl`) and the panel may send both.
 fn is_initiative_action(action: &str) -> bool {
@@ -845,6 +856,7 @@ pub fn apply_operator_action<R: RoutePlanner>(
         && !is_avatar_action(action)
         && !is_speech_input_action(action)
         && !is_persona_action(action)
+        && !is_topics_action(action)
         && !is_initiative_action(action)
         && !is_session_log_action(action)
         && !is_memory_seed_action(action)
@@ -933,7 +945,7 @@ fn apply_with_presented_secret<R: RoutePlanner>(
         "avatar.configure".to_owned()
     } else if is_speech_input_action(action) {
         "speech_input.control".to_owned()
-    } else if is_persona_action(action) {
+    } else if is_persona_action(action) || is_topics_action(action) {
         "persona.configure".to_owned()
     } else if is_initiative_action(action) {
         "initiative.control".to_owned()
@@ -1057,6 +1069,31 @@ fn apply_with_presented_secret<R: RoutePlanner>(
                     status: None,
                     memory_export: None,
                     persona: None,
+                    panel_url: None,
+                }
+            }
+            Err(detail) => {
+                app.audit_operator_action(&request_id, action, &detail, false);
+                rejection(&request_id, &detail)
+            }
+        };
+    }
+
+    if is_topics_action(action) {
+        // Audited without the argument: the text is the operator's topic list.
+        // The detail is a fixed phrase with the count.
+        return match app.configure_topics(command.authority(), action, argument) {
+            Ok(outcome) => {
+                app.audit_operator_action(&request_id, action, &outcome.detail, true);
+                OperatorResponse {
+                    request_id,
+                    ok: true,
+                    detail: outcome.detail,
+                    status: None,
+                    memory_export: None,
+                    // The same text slot as the character sheet: only a
+                    // successful `topics.get` fills it.
+                    persona: outcome.text,
                     panel_url: None,
                 }
             }

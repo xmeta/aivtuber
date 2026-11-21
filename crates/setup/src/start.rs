@@ -294,6 +294,13 @@ pub const PERSONA_FILE: &str = "local-persona.md";
 /// Same name as `aivtuber_app::persona::PERSONA_FILE_VAR`; a test pins the two
 /// together by value (the app crate is not linked here).
 const PERSONA_FILE_VAR: &str = "AIVTUBER_PERSONA_FILE";
+/// The operator's chat-topic list beside the env file (#87 S2): one topic per
+/// line, edited in the panel or with `aivtuberctl topics`. The app reads it
+/// once at start; missing or empty means no topics.
+pub const TOPICS_FILE: &str = "local-topics.txt";
+/// Same name as `aivtuber_app::topics::TOPICS_FILE_VAR`; a test pins the two
+/// together by value (the app crate is not linked here).
+const TOPICS_FILE_VAR: &str = "AIVTUBER_TOPICS_FILE";
 /// The operator memory seed beside the env file (#402): the JSON the streamer
 /// edits in the panel or with `aivtuberctl memory-seed`
 /// (`schemas/memory-seed.schema.json`). `start` creates it empty when absent so
@@ -615,6 +622,42 @@ pub fn app_persona_env(
     file_env: &BTreeMap<String, String>,
     process_env: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<(String, String)> {
+    generative_file_env(
+        env_file,
+        file_env,
+        process_env,
+        PERSONA_FILE_VAR,
+        PERSONA_FILE,
+    )
+}
+
+/// Where the app finds the operator's chat-topic list (#87 S2):
+/// `local-topics.txt` beside the env file, for the local and hybrid profiles,
+/// exactly as the character sheet above. An explicit value wins; the file need
+/// not exist (a missing file is an empty list).
+pub fn app_topics_env(
+    env_file: &Path,
+    file_env: &BTreeMap<String, String>,
+    process_env: &dyn Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    generative_file_env(
+        env_file,
+        file_env,
+        process_env,
+        TOPICS_FILE_VAR,
+        TOPICS_FILE,
+    )
+}
+
+/// `var` = a file named `file` beside the env file, only in a profile with a
+/// Thinking model and only when the user has not set `var` themselves.
+fn generative_file_env(
+    env_file: &Path,
+    file_env: &BTreeMap<String, String>,
+    process_env: &dyn Fn(&str) -> Option<String>,
+    var: &str,
+    file: &str,
+) -> Vec<(String, String)> {
     let value = |name: &str| {
         file_env
             .get(name)
@@ -623,12 +666,12 @@ pub fn app_persona_env(
             .filter(|v| !v.trim().is_empty())
     };
     let generative = matches!(value("AIVTUBER_MODE").as_deref(), Some("local" | "hybrid"));
-    if !generative || value(PERSONA_FILE_VAR).is_some() {
+    if !generative || value(var).is_some() {
         return Vec::new();
     }
     vec![(
-        PERSONA_FILE_VAR.to_owned(),
-        env_file.with_file_name(PERSONA_FILE).display().to_string(),
+        var.to_owned(),
+        env_file.with_file_name(file).display().to_string(),
     )]
 }
 
@@ -822,6 +865,8 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
     env.extend(speech_input_vars);
     let persona_vars = app_persona_env(&opts.env_file, &env, &|name| std::env::var(name).ok());
     env.extend(persona_vars);
+    let topics_vars = app_topics_env(&opts.env_file, &env, &|name| std::env::var(name).ok());
+    env.extend(topics_vars);
     let seed_vars = app_memory_seed_env(&opts.env_file, &env, &|name| std::env::var(name).ok());
     for (_, path) in &seed_vars {
         ensure_memory_seed_file(Path::new(path))
@@ -1289,6 +1334,36 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn the_app_is_told_where_the_topic_list_is_for_local_and_hybrid_only() {
+        let env_file = Path::new("/x/local-profile.env");
+        let none = |_: &str| None;
+        for mode in ["local", "hybrid"] {
+            let got = app_topics_env(env_file, &map(&[("AIVTUBER_MODE", mode)]), &none);
+            assert_eq!(got.len(), 1, "{mode}");
+            assert_eq!(got[0].0, "AIVTUBER_TOPICS_FILE");
+            assert!(got[0].1.ends_with(TOPICS_FILE), "{got:?}");
+            // Beside the env file, next to the character sheet.
+            assert_eq!(Path::new(&got[0].1).parent(), env_file.parent(), "{got:?}");
+        }
+        // The names are the app's: a test in the app pins the same literals.
+        assert_eq!(TOPICS_FILE, "local-topics.txt");
+        assert_eq!(TOPICS_FILE_VAR, "AIVTUBER_TOPICS_FILE");
+        assert!(app_topics_env(env_file, &map(&[("AIVTUBER_MODE", "cached")]), &none).is_empty());
+        assert!(app_topics_env(env_file, &map(&[]), &none).is_empty());
+        let explicit = map(&[
+            ("AIVTUBER_MODE", "local"),
+            ("AIVTUBER_TOPICS_FILE", "/mine.txt"),
+        ]);
+        assert!(app_topics_env(env_file, &explicit, &none).is_empty());
+        // The character sheet's variable does not stand in for it.
+        let persona_only = map(&[
+            ("AIVTUBER_MODE", "local"),
+            ("AIVTUBER_PERSONA_FILE", "/p.md"),
+        ]);
+        assert_eq!(app_topics_env(env_file, &persona_only, &none).len(), 1);
     }
 
     #[test]

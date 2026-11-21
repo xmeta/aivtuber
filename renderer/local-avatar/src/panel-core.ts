@@ -1170,6 +1170,34 @@ export interface InitiativeState {
   preempted_stop: number;
   suppressed_total: number;
   suppressed: [string, number][];
+  /** The operator topic list (#87 S2): counts only; absent unless live topic editing is composed. */
+  topics: TopicsState | null;
+}
+
+/** Mirrors `TopicsStatus` (crates/app/src/topics.rs). Counts and two facts, never the topics. */
+export interface TopicsState {
+  count: number;
+  /** A save is written to the topics file and survives a restart. */
+  persisted: boolean;
+  /** The Thinking endpoint leaves this machine: a topic goes to a cloud model with its initiative. */
+  thinking_remote: boolean;
+  used: number;
+  without_topic: number;
+}
+
+/** The topics object only if it has exactly the documented shape; anything else hides the topic card, not the switch. */
+export function parseTopicsState(value: unknown): TopicsState | null {
+  if (typeof value !== "object" || value === null) return null;
+  const v = value as Record<string, unknown>;
+  if (typeof v.persisted !== "boolean" || typeof v.thinking_remote !== "boolean") return null;
+  if (!count(v.count) || !count(v.used) || !count(v.without_topic)) return null;
+  return {
+    count: v.count,
+    persisted: v.persisted,
+    thinking_remote: v.thinking_remote,
+    used: v.used,
+    without_topic: v.without_topic,
+  };
 }
 
 const MAX_INITIATIVE_REASONS = 16;
@@ -1211,6 +1239,8 @@ export function parseInitiativeState(value: unknown): InitiativeState | null {
     preempted_stop: v.preempted_stop as number,
     suppressed_total: v.suppressed_total as number,
     suppressed,
+    // Absent from an older host: the card stays hidden, the switch still works.
+    topics: parseTopicsState(v.topics),
   };
 }
 
@@ -1265,6 +1295,105 @@ export function initiativeResultText(enabled: boolean, ok: boolean, detail: unkn
   const raw = typeof detail === "string" ? bounded(detail) : "";
   if (ok && status === 200) return enabled ? "自分から話すようにしました" : "自分からは話さないようにしました";
   return `切り替えできませんでした${raw === "" ? ` (${status})` : `: ${raw}`}`;
+}
+
+// ---- operator topic list (#87 S2) ----
+
+/** Mirrors `MAX_TOPICS` and `MAX_TOPIC_CHARS` (crates/domain/src/topics.rs). */
+export const MAX_TOPICS = 32;
+export const MAX_TOPIC_CHARS = 80;
+/** Mirrors `MAX_TOPICS_FILE_BYTES`: the longest text the page will accept back from the host. */
+const MAX_TOPICS_TEXT_BYTES = 16 * 1024;
+
+/**
+ * The topics the host will keep for this text (`parse_topics`): LF line endings,
+ * each line trimmed, blank lines dropped, a repeated line kept once.
+ */
+export function topicLines(text: string): string[] {
+  const lines: string[] = [];
+  for (const raw of text.replace(/\r\n?/g, "\n").split("\n")) {
+    const line = raw.trim();
+    if (line !== "" && !lines.includes(line)) lines.push(line);
+  }
+  return lines;
+}
+
+/** Characters as the host counts them (code points, not UTF-16 units). */
+export function topicChars(line: string): number {
+  return Array.from(line).length;
+}
+
+export const TOPICS_LABEL = "雑談ネタ";
+export const TOPICS_EXPLANATION =
+  "沈黙時に自分から話すときの話題を、1行に1つずつ書きます(最大 32 個、1個 80 文字まで)。順番に1つずつ使い、直前に使った話題は飛ばします。空のときは話題なしで話します。保存すると次に話すときから反映されます";
+export const TOPICS_CLOUD_NOTE =
+  "話題は、それを使う発話のたびにクラウドのモデルへ送信されます / sent to the cloud model with the initiative that uses it";
+export const TOPICS_MEMORY_ONLY_NOTE =
+  "保存先のファイルが設定されていないため、この内容はアプリを再起動すると元に戻ります";
+
+export interface TopicsView {
+  /** `3 / 32 個`. */
+  counterText: string;
+  /** warn once a bound is exceeded. */
+  health: Health;
+  /** The first problem the host would refuse the text for, or null. */
+  problem: string | null;
+  explanation: string;
+  cloudNote: string | null;
+  memoryOnlyNote: string | null;
+  canSave: boolean;
+  /** One line of counters, never a topic. */
+  summary: string;
+}
+
+/** What the topic card shows for the text in the editor, or `null` when it stays hidden. */
+export function topicsView(state: PanelState | null, text: string): TopicsView | null {
+  const topics = state?.status.initiative?.topics ?? null;
+  if (topics === null) return null;
+  const lines = topicLines(text);
+  const tooMany = lines.length > MAX_TOPICS;
+  const tooLong = lines.some((line) => topicChars(line) > MAX_TOPIC_CHARS);
+  const problem = tooMany
+    ? `話題は ${MAX_TOPICS} 個までです`
+    : tooLong
+      ? `1つの話題は ${MAX_TOPIC_CHARS} 文字までです`
+      : null;
+  return {
+    counterText: `${lines.length} / ${MAX_TOPICS} 個`,
+    health: problem === null ? "ok" : "warn",
+    problem,
+    explanation: TOPICS_EXPLANATION,
+    cloudNote: topics.thinking_remote ? TOPICS_CLOUD_NOTE : null,
+    memoryOnlyNote: topics.persisted ? null : TOPICS_MEMORY_ONLY_NOTE,
+    canSave: problem === null,
+    summary: `話題を使った回数 ${topics.used} · 話題なしで話した回数 ${topics.without_topic}`,
+  };
+}
+
+/** The body of `POST /api/topics/set`: the whole text and nothing else. */
+export function topicsSetBody(text: string): { text: string } {
+  return { text };
+}
+
+/** The body of `POST /api/topics/get`: an empty object. */
+export function topicsGetBody(): Record<string, never> {
+  return {};
+}
+
+/** The text a `topics/get` answer carries, only if it is a string within the file bound. */
+export function topicsTextFrom(json: unknown): string | null {
+  if (typeof json !== "object" || json === null) return null;
+  const text = (json as Record<string, unknown>).text;
+  if (typeof text !== "string" || new TextEncoder().encode(text).length > MAX_TOPICS_TEXT_BYTES) return null;
+  return text;
+}
+
+/** The line shown after a save or a reload; the host's own text is only a short tail. */
+export function topicsResultText(kind: "save" | "reload", ok: boolean, detail: unknown, status: number): string {
+  const raw = typeof detail === "string" ? bounded(detail) : "";
+  if (ok && status === 200) return kind === "save" ? "保存しました。次に話すときから反映されます" : "読み込みました";
+  const name = kind === "save" ? "保存" : "読み込み";
+  return `${name}できませんでした${raw === "" ? ` (${status})` : `: ${raw}`}`;
 }
 
 // ---- session conversation log (#463) ----

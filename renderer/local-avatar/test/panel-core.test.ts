@@ -41,6 +41,18 @@ import {
   parsePersonaEditorState,
   parseVoiceInputState,
   parseInitiativeState,
+  parseTopicsState,
+  topicsView,
+  topicsSetBody,
+  topicsGetBody,
+  topicsTextFrom,
+  topicsResultText,
+  topicLines,
+  TOPICS_CLOUD_NOTE,
+  TOPICS_EXPLANATION,
+  TOPICS_MEMORY_ONLY_NOTE,
+  MAX_TOPICS,
+  MAX_TOPIC_CHARS,
   initiativeView,
   initiativeBody,
   initiativeResultText,
@@ -1840,6 +1852,91 @@ describe("idle initiative switch (#87)", () => {
     expect(initiativeResultText(false, true, "", 200)).toBe("自分からは話さないようにしました");
     expect(initiativeResultText(true, false, "initiative is not configured", 200)).toContain("initiative is not configured");
     expect(initiativeResultText(true, false, undefined, 503)).toContain("503");
+  });
+});
+
+// ---- operator topic list (#87 S2) ----
+
+const topicsState = (over: Record<string, unknown> = {}) => ({
+  count: 3,
+  persisted: true,
+  thinking_remote: false,
+  used: 4,
+  without_topic: 1,
+  ...over,
+});
+
+describe("operator topic list (#87 S2)", () => {
+  test("the topic card needs the topics object; a malformed one drops the card, not the switch", () => {
+    expect(topicsView(withInitiative(initiative()), "a")).toBeNull();
+    for (const bad of [
+      topicsState({ persisted: "yes" }),
+      topicsState({ thinking_remote: undefined }),
+      topicsState({ count: -1 }),
+      topicsState({ used: 1.5 }),
+      topicsState({ without_topic: "1" }),
+      "x",
+      7,
+    ]) {
+      expect(parseTopicsState(bad)).toBeNull();
+      const parsed = withInitiative(initiative({ topics: bad }));
+      expect(initiativeView(parsed)).not.toBeNull();
+      expect(topicsView(parsed, "a")).toBeNull();
+    }
+    expect(parseTopicsState(topicsState())).toEqual({ count: 3, persisted: true, thinking_remote: false, used: 4, without_topic: 1 });
+    expect(topicsView(null, "")).toBeNull();
+  });
+
+  test("lines are counted as the host counts them", () => {
+    expect(topicLines("a\r\n\r\n b \nb\n\u3000c\u3000\r")).toEqual(["a", "b", "c"]);
+    const state = withInitiative(initiative({ topics: topicsState() }));
+    expect(topicsView(state, "")!.counterText).toBe("0 / 32 個");
+    expect(topicsView(state, "a\nb")!.counterText).toBe("2 / 32 個");
+    expect(topicsView(state, "a\na\n\n")!.counterText).toBe("1 / 32 個");
+  });
+
+  test("the bounds disable saving by code points, not UTF-16 units", () => {
+    const state = withInitiative(initiative({ topics: topicsState() }));
+    const atCount = Array.from({ length: MAX_TOPICS }, (_, i) => "t" + i).join("\n");
+    expect(topicsView(state, atCount)!.canSave).toBe(true);
+    const over = topicsView(state, atCount + "\nextra")!;
+    expect(over.canSave).toBe(false);
+    expect(over.health).toBe("warn");
+    expect(over.problem).toContain("32");
+    // 80 four-byte characters are 160 UTF-16 units but 80 characters: allowed.
+    expect(topicsView(state, "\u{1F600}".repeat(MAX_TOPIC_CHARS))!.canSave).toBe(true);
+    const long = topicsView(state, "\u{1F600}".repeat(MAX_TOPIC_CHARS + 1))!;
+    expect(long.canSave).toBe(false);
+    expect(long.problem).toContain("80");
+    expect(topicsView(state, "a\n" + "あ".repeat(81))!.canSave).toBe(false);
+  });
+
+  test("the notes follow the host's facts and the summary is counters only", () => {
+    const local = topicsView(withInitiative(initiative({ topics: topicsState({ thinking_remote: false, persisted: true }) })), "x")!;
+    expect(local.cloudNote).toBeNull();
+    expect(local.memoryOnlyNote).toBeNull();
+    expect(local.explanation).toBe(TOPICS_EXPLANATION);
+    expect(local.summary).toBe("話題を使った回数 4 · 話題なしで話した回数 1");
+    const remote = topicsView(withInitiative(initiative({ topics: topicsState({ thinking_remote: true, persisted: false }) })), "x")!;
+    expect(remote.cloudNote).toBe(TOPICS_CLOUD_NOTE);
+    expect(TOPICS_CLOUD_NOTE).toContain("クラウドのモデルへ送信されます");
+    expect(TOPICS_CLOUD_NOTE).toContain("sent to the cloud model");
+    expect(remote.memoryOnlyNote).toBe(TOPICS_MEMORY_ONLY_NOTE);
+  });
+
+  test("the bodies carry only the text, and answers are bounded", () => {
+    expect(topicsSetBody("a\nb")).toEqual({ text: "a\nb" });
+    expect(Object.keys(topicsSetBody("x"))).toEqual(["text"]);
+    expect(JSON.stringify(topicsGetBody())).toBe("{}");
+    expect(topicsTextFrom({ ok: true, text: "a\nb" })).toBe("a\nb");
+    expect(topicsTextFrom({ ok: true, text: "" })).toBe("");
+    for (const bad of [null, {}, { text: 3 }, { text: "x".repeat(16 * 1024 + 1) }]) {
+      expect(topicsTextFrom(bad)).toBeNull();
+    }
+    expect(topicsResultText("save", true, "x", 200)).toContain("保存しました");
+    expect(topicsResultText("reload", true, "x", 200)).toBe("読み込みました");
+    expect(topicsResultText("save", false, "topics not changed: more than 32 topics", 409)).toContain("more than 32 topics");
+    expect(topicsResultText("reload", false, undefined, 503)).toContain("503");
   });
 });
 

@@ -140,6 +140,8 @@ Raw transcript or stream-history fields are not part of either request type. If 
 
 An `operator_curated` item (#404) is the operator's character sheet: one item, `trusted`, with no event identity, source class or epistemic class, placed first in `curated_context` and never dropped by the context budget (retained memory fills the rest). The OpenAI-compatible adapter renders it in the fixed part of the prompt, between `<character>` tags before the JSON, and omits it from the JSON. It describes identity and style only and is not authorization. There is no wire or schema change: the source value already existed.
 
+An `operator_curated` item with `source_class` `operator` (#87 S2) is instead one operator topic of the idle initiative: `trusted`, at most 80 characters, no event identity or epistemic class, never the character sheet (which has no source class). The adapter renders it between `<topic>` tags after the character block, with its own note, and omits it from the JSON. It is data, not authorization. Again no wire or schema change: both values already existed.
+
 The initial internal request schema versions are `ReflexRequest 0.1.0`, `ReflexContext 0.1.0`, and `ThinkingRequest 0.1.0`. Reflex replay records carry both the request and context schema versions.
 
 === 4.2 Perception observations
@@ -178,7 +180,7 @@ When one comment stands for a crowd (issue #79 S2), the reply context says so wi
 When the performer speaks on its own because no chat arrived (issue #87 S1), the reply context says so with an `InitiativeContext`, specified by `schemas/initiative-context.schema.json` (version `0.1.0`) and `crates/domain/src/initiative.rs`.
 
 * *Wire form.* `kind` (closed: `audience_question`, `idle_observation`, `revisit_topic`) and `schema_version`. There is no free text, no viewer text and no history, and `additionalProperties` is false.
-* *Authority rule.* The context is derived data minted by the runtime's initiative director (`crates/app/src/initiative.rs`), never from a payload field. It grants no capability, permit or gate decision and has no path to the operator or control plane. The request's `input` is a code-owned sentence per kind, not viewer text; the performer's own last replies and earlier initiative texts travel as bounded `recent_interaction` data items.
+* *Authority rule.* The context is derived data minted by the runtime's initiative director (`crates/app/src/initiative.rs`), never from a payload field. It grants no capability, permit or gate decision and has no path to the operator or control plane. The request's `input` is a code-owned sentence per kind, not viewer text; the performer's own earlier initiative texts (its avoid-list) travel as bounded `recent_interaction` data items, and since S2 no reply summaries do. The director never selects `revisit_topic` (the member stays for wire compatibility until #80 provides real topic state). The operator's chosen topic travels as one `operator_curated` item (see section 4.1), not in this context.
 * *Carrier.* The optional `initiative` member of `ReflexContext` (and so of the Thinking request context). Absent, it is omitted from the wire form, so a request without one is byte-identical to one written before the member existed.
 
 == 5. Normalized reflex decision

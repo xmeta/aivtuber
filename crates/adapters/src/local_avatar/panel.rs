@@ -55,6 +55,12 @@
 //!   queue. The set body has its own larger bound, checked before the body is
 //!   read; the text is held as a [`PanelSecret`] so it never reaches a `Debug`
 //!   line, and only the get answer carries it back (`text`);
+//! * the operator topic list (#87 S2) adds `POST /api/topics/set` with
+//!   `{"text": string}` (one topic per line) and `POST /api/topics/get` with
+//!   `{}`, on the character sheet's queue and under the same capability, with
+//!   a 16 KiB set bound checked before the body is read and the same
+//!   redaction: the text reaches no `Debug` line and only the get answer
+//!   carries it back;
 //! * the operator memory seed (#402) adds `POST /api/memory-seed/set`, whose
 //!   body is the seed document itself (`schemas/memory-seed.schema.json`, parsed
 //!   and bounded by the composition thread), and `POST /api/memory-seed/get`
@@ -105,13 +111,17 @@ pub const MAX_PANEL_MEMORY_SEED_BODY_BYTES: usize = 96 * 1024;
 /// newline, tab, quote or backslash escapes to 6,000 bytes, plus the envelope.
 /// A sheet over 3,000 bytes is refused by the app's validator, not here.
 pub const MAX_PANEL_PERSONA_BODY_BYTES: usize = 8 * 1024;
+/// Largest `topics.set` body (#87 S2): 32 topics of 80 characters stay under
+/// 10 KiB of UTF-8 even at four bytes a character; this leaves room for JSON
+/// escapes. A list over its bounds is refused by the app's validator, not here.
+pub const MAX_PANEL_TOPICS_BODY_BYTES: usize = 16 * 1024;
 const CHAT_QUEUE: usize = 8;
 /// Longest accepted API key, in characters (Aivis keys are about 40).
 pub const MAX_PANEL_KEY_CHARS: usize = 256;
 /// One model search may take this long, end to end.
 const SEARCH_DEADLINE: Duration = Duration::from_secs(6);
 /// Every state-changing endpoint (all are `POST`).
-const STATE_CHANGING: [&str; 28] = [
+const STATE_CHANGING: [&str; 30] = [
     "/api/chat",
     "/api/stop",
     "/api/mute",
@@ -136,6 +146,8 @@ const STATE_CHANGING: [&str; 28] = [
     "/api/session-log/delete",
     "/api/persona/set",
     "/api/persona/get",
+    "/api/topics/set",
+    "/api/topics/get",
     "/api/memory-seed/set",
     "/api/memory-seed/get",
     "/api/speech-input/device",
@@ -283,6 +295,12 @@ pub enum PanelRequest {
     PersonaSet(PanelSecret),
     /// Read the character sheet back into the editor (#401).
     PersonaGet,
+    /// Replace the operator topic list (#87 S2) with this text, one topic per
+    /// line (empty clears it). Redacted in `Debug`; the composition thread
+    /// validates it. Shares the character sheet's queue and capability.
+    TopicsSet(PanelSecret),
+    /// Read the topic list back into the editor (#87 S2).
+    TopicsGet,
     /// Replace the operator memory seed (#402) with this document. Redacted in
     /// `Debug`; the composition thread parses and validates it.
     MemorySeedSet(PanelSecret),
@@ -930,6 +948,8 @@ fn route(
     };
     let body_limit = if path == "/api/persona/set" {
         MAX_PANEL_PERSONA_BODY_BYTES
+    } else if path == "/api/topics/set" {
+        MAX_PANEL_TOPICS_BODY_BYTES
     } else if path == "/api/memory-seed/set" {
         MAX_PANEL_MEMORY_SEED_BODY_BYTES
     } else {
@@ -1043,6 +1063,20 @@ fn route(
         },
         "/api/memory-seed/get" => match empty_object(&body) {
             Ok(()) => (PanelRequest::MemorySeedGet, &shared.memory_seed_tx),
+            Err((status, detail)) => {
+                shared.count(&shared.counters.rejected_request);
+                return json(status, false, detail);
+            }
+        },
+        "/api/topics/set" => match persona_set_body(&body) {
+            Ok(text) => (PanelRequest::TopicsSet(text), &shared.persona_tx),
+            Err((status, detail)) => {
+                shared.count(&shared.counters.rejected_request);
+                return json(status, false, detail);
+            }
+        },
+        "/api/topics/get" => match empty_object(&body) {
+            Ok(()) => (PanelRequest::TopicsGet, &shared.persona_tx),
             Err((status, detail)) => {
                 shared.count(&shared.counters.rejected_request);
                 return json(status, false, detail);
@@ -2832,6 +2866,113 @@ mod tests {
         raw.extend_from_slice(b"{\"text\":\"\xFF\xFE\"}");
         assert_eq!(send_bytes(&f, &raw).status, 400);
         assert!(f.inbox.drain_persona(8).is_empty());
+    }
+
+    // ---- operator topic list (#87 S2) ----
+
+    #[test]
+    fn topics_requests_are_authenticated_same_origin_strict_and_share_the_persona_queue() {
+        let f = fixture();
+        let good = good(&f);
+        for path in ["/api/topics/set", "/api/topics/get"] {
+            let body = if path.ends_with("set") {
+                "{\"text\":\"x\"}"
+            } else {
+                "{}"
+            };
+            let mut foreign = with(&good, "origin");
+            foreign.push(("Origin", "http://evil.example"));
+            assert_eq!(post(&f, path, &foreign, body).status, 403, "{path}");
+            assert_eq!(
+                post(&f, path, &with(&good, "x-panel-token"), body).status,
+                401,
+                "{path}"
+            );
+            let mut form = with(&good, "content-type");
+            form.push(("Content-Type", "application/x-www-form-urlencoded"));
+            assert_eq!(post(&f, path, &form, body).status, 415, "{path}");
+            assert_eq!(get(&f, path, "").status, 405, "{path}");
+        }
+        // Only a string `text`: nothing else can ride along, and a bad body
+        // never reaches the queue.
+        let headers = with(&good, "none");
+        for bad in [
+            "",
+            "[]",
+            "{}",
+            "{\"text\":1}",
+            "{\"text\":\"x\",\"capability\":\"persona.configure\"}",
+            "{\"text\":\"x\"}{\"text\":\"y\"}",
+        ] {
+            assert_eq!(
+                post(&f, "/api/topics/set", &headers, bad).status,
+                400,
+                "{bad:?}"
+            );
+        }
+        for bad in ["", "[]", "{\"text\":\"x\"}"] {
+            assert_eq!(
+                post(&f, "/api/topics/get", &headers, bad).status,
+                400,
+                "{bad:?}"
+            );
+        }
+        assert!(f.inbox.drain_persona(8).is_empty(), "nothing got through");
+
+        let (answer, request) = persona_round_trip(
+            &f,
+            "/api/topics/set",
+            "{\"text\":\"好きな食べ物\\n天気\"}",
+            None,
+        );
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        let PanelRequest::TopicsSet(text) = &request else {
+            panic!("{request:?}");
+        };
+        assert_eq!(text.expose(), "好きな食べ物\n天気");
+        // The text is redacted in Debug, and the set answer carries none.
+        assert!(!format!("{request:?}").contains("好きな"));
+        assert!(!answer.body.contains("好きな") && !answer.body.contains("\"text\""));
+        // The get answer carries the text, and only that answer does.
+        let (answer, request) =
+            persona_round_trip(&f, "/api/topics/get", "{}", Some("好きな食べ物\n天気"));
+        assert_eq!(request, PanelRequest::TopicsGet);
+        let value: serde_json::Value = serde_json::from_str(&answer.body).unwrap();
+        assert_eq!(value["text"], "好きな食べ物\n天気");
+        let token = f.server.token().to_owned();
+        let state = get(&f, "/api/state", &format!("X-Panel-Token: {token}\r\n"));
+        assert!(!state.body.contains("好きな"));
+
+        // Never in the stop/mute, voice, chat-connection, speech or chat queues.
+        assert!(f.inbox.drain_control(8).is_empty());
+        assert!(f.inbox.drain_voice(8).is_empty());
+        assert!(f.inbox.drain_ingress(8).is_empty());
+        assert!(f.inbox.drain_speech_input(8).is_empty());
+        assert!(f.inbox.drain_chat(8).is_empty());
+    }
+
+    #[test]
+    fn the_topics_body_has_its_own_bound_checked_before_it_is_read() {
+        let f = fixture();
+        let good = good(&f);
+        let headers = with(&good, "none");
+        let declared = (MAX_PANEL_TOPICS_BODY_BYTES + 1).to_string();
+        let mut long = headers.clone();
+        long.push(("Content-Length", &declared));
+        assert_eq!(post(&f, "/api/topics/set", &long, "{").status, 413);
+        // Above the persona bound but within the topics one is read.
+        let big = format!(
+            "{{\"text\":\"{}\"}}",
+            "a".repeat(MAX_PANEL_PERSONA_BODY_BYTES + 100)
+        );
+        let (answer, request) = persona_round_trip(&f, "/api/topics/set", &big, None);
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        assert!(matches!(request, PanelRequest::TopicsSet(_)));
+        // The persona bound is untouched by it.
+        let declared = (MAX_PANEL_PERSONA_BODY_BYTES + 1).to_string();
+        let mut other = headers.clone();
+        other.push(("Content-Length", &declared));
+        assert_eq!(post(&f, "/api/persona/set", &other, "{").status, 413);
     }
 
     // ---- memory seed (#402) ----

@@ -251,7 +251,9 @@ fn capability_for_action(action: &str) -> Option<Capability> {
         | "speech_input.disable"
         | "speech_input.device"
         | "speech_input.duplex" => Some(Capability::SpeechInputControl),
-        "persona.configure" | "persona.set" | "persona.get" => Some(Capability::PersonaConfigure),
+        "persona.configure" | "persona.set" | "persona.get" | "topics.set" | "topics.get" => {
+            Some(Capability::PersonaConfigure)
+        }
         "initiative.control" | "initiative.enable" | "initiative.disable" => {
             Some(Capability::InitiativeControl)
         }
