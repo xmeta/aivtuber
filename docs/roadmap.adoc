@@ -13,12 +13,39 @@ For day-to-day execution, GitHub issue metadata is the live source of truth:
 * `status:agent-ready` = dependencies are satisfied and an implementation agent may start;
 * `status:blocked` = do not start until the named blocker is resolved.
 * `status:design-ready` = architecture/research/evaluation design may proceed even when implementation remains blocked; it does not authorize code implementation.
+* `status:parked` = deliberately deferred by a product decision, not by a dependency; the issue comment names the unpark condition, and no implementation starts while it is set.
 
 Research-derived design questions and external paper/OSS mappings are tracked in link:research-register.adoc[Research and Design Register].
 This allows non-implementation work to progress without changing the active milestone hierarchy or prematurely marking issues implementation-ready.
 
 The older Phase 0-6 sequence is retained at the end of this document as implementation history.
 It describes how the architecture was bootstrapped; it is not a second active PM hierarchy.
+
+== Active product milestones (from 2026-11-21)
+
+The Stage 1-5 milestones describe *what kind* of capability an issue adds.
+The product milestones below decide *what ships next*. While a product milestone is open, an agent continuing autonomously self-selects only issues in the earliest open product milestone (bug fixes excepted).
+
+[cols="1,3,3",options="header"]
+|===
+|Milestone |Exit condition |Why now
+
+|v0.2 - First Real Stream (due 2026-12-05)
+|#456: one 60-minute operator-observed stream on the `local` profile with real chat, the VRM avatar through OBS Browser Source and voice input, recorded as a link:current-constraint.adoc[constraint evidence packet] plus an link:after-action-review.adoc[AAR].
+|The only 30+ minute live run on record (2026-10-02) used the cached profile with Thinking, voice and chat off. Everything added since has never run together for an hour, so no measured constraint exists to rank work.
+
+|v0.3 - Watchable Hour (due 2026-12-26)
+|The constraint measured in v0.2 is fixed and re-measured; dead air, repetition and latency meet SLO targets calibrated from measured baselines (#71).
+|Japanese AITuber operators most often report API cost, latency, dead air, loops/repetition and long-run stalls; YouTube does not monetise repetitious "inauthentic content".
+
+|v0.4 - First External Creators (due 2027-01-31)
+|3-5 external Japanese streamers go from a release archive to a first reaction in under 15 minutes and run their own stream; their friction is recorded.
+|Demand, pricing and licensing are hypotheses until someone outside the project uses it.
+|===
+
+Parked by the same decision (`status:parked`): the dependable-agent and desktop workstream (#200, #202-#205, #191, #72), rich long-term memory (#105, #280, #281, #283, #284), moderation actions and shadow evaluation (#74, #76, #77, #211), and later natural-performance/multimodal scope (#93, #104, #106-#108, #221). Each issue names its unpark condition.
+
+Business hypotheses (not decisions): the primary user is a Japanese individual AITuber operator; the differentiator is a zero-paid local run with type-enforced authority, operator emergency control and bounded long-run behaviour; the licence direction is free for personal use with a separate commercial licence. Revisit after v0.4.
 
 == Cross-stage product workstreams
 

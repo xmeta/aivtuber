@@ -8,7 +8,12 @@ It does not replace link:roadmap.adoc[the strategic roadmap], milestone ordering
 == 1. Current status
 
 Status:: Not yet established from representative live product evidence.
-As of:: 2026-10-01.
+As of:: 2026-11-21.
+Owning issue:: #456 (v0.2 - First Real Stream).
+
+The 2026-10-02 v0.1 live smoke (34m32s, link:release-v0.1.adoc[section 12]) exercised the cached profile only: Thinking, Jev, voice input and live chat were disabled.
+No run since has exercised the `local` profile, live chat ingress, the VRM renderer through OBS Browser Source and the operation panel together for 30 minutes or more.
+#456 collects that evidence and replaces this status with a section 5 packet.
 
 The repository has strong deterministic/local evidence, but the remaining #97 provider/adapter conformance and 30-60 minute operator-observed live-smoke evidence has not been completed for the selected v0.1 production profile.
 
