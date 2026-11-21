@@ -185,6 +185,10 @@ pub struct OperatorStatusSnapshot {
     /// unless composed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initiative: Option<crate::InitiativeStatus>,
+    /// Repeated-phrase counters (#89): spoken, exact and near repeats by
+    /// origin, and initiative phrases refused for repeating. Text-free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeats: Option<crate::RepeatStatus>,
 }
 
 /// Operator-visible, text-free perception status: whether it is running, why
@@ -257,6 +261,7 @@ impl OperatorStatusSnapshot {
             persona_editor: app.persona_editor_status(),
             memory_seed_editor: app.memory_seed_editor_status(),
             initiative: app.initiative_status(),
+            repeats: Some(app.repeat_status()),
         }
     }
 }

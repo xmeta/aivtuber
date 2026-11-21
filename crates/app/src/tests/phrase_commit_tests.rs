@@ -1380,3 +1380,101 @@ fn the_benchmark_model_matches_the_real_phrased_pipeline() {
         .collect();
     assert_eq!(real, modelled);
 }
+
+/// An app whose initiative is pending (as after a fire at 45 s), and the
+/// pending initiative's own event.
+fn with_pending_initiative(rig: &mut Rig) -> EventEnvelope {
+    use crate::initiative::{
+        Decision, InitiativeConfig, InitiativeDirector, InitiativeInputs, mint_event,
+    };
+    let mut director = InitiativeDirector::new(InitiativeConfig::default(), 0);
+    let Decision::Fire { event_id, kind } = director.evaluate(&InitiativeInputs {
+        now_ms: 45_000,
+        ..InitiativeInputs::default()
+    }) else {
+        panic!("the initiative fires");
+    };
+    rig.app.initiative = Some(director);
+    mint_event(&event_id, kind, 45_000, 1)
+}
+
+#[test]
+fn a_repeated_later_initiative_phrase_ends_the_reply_at_the_last_committed_phrase() {
+    let (mut units, summary) = make_units(&chat_event(30));
+    let mut rig = rig_with(phrased(), "unused", PhraseTts::new());
+    let event = with_pending_initiative(&mut rig);
+    // Phrase two was said recently (word for word, modulo punctuation).
+    rig.app.repeat_guard.record_spoken(
+        "このあとはゲームを遊びながら、お話しします",
+        crate::repeat_guard::PhraseOrigin::Initiative,
+        1_000,
+    );
+    let token = register_run(&mut rig, &event);
+    let third = units.pop().unwrap();
+    let second = units.pop().unwrap();
+    let first = units.pop().unwrap();
+    let first_text = first.display_text().to_owned();
+    let second_text = second.display_text().to_owned();
+    send(&rig, message(first, allow(&first_text)));
+    send(&rig, message(second, allow(&second_text)));
+    rig.app.tick(45_000);
+
+    assert!(token.is_cancelled(), "the worker is told to stop");
+    assert_eq!(phrase_items(&rig).len(), 1, "only phrase one was committed");
+    send(&rig, message(third, allow(PHRASE_C)));
+    rig.app.tick(45_000);
+    assert_eq!(phrase_items(&rig).len(), 1, "no later phrase is committed");
+    finish(&mut rig, &summary);
+    assert_eq!(
+        the_record(&rig).end,
+        PhraseResponseEnd::Partial {
+            cause: PhraseCause::RepeatRefused
+        }
+    );
+    assert_eq!(rig.app.repeat_status().suppressed_repeat, 1);
+}
+
+#[test]
+fn a_repeated_first_initiative_phrase_speaks_nothing_and_leaves_the_gesture_to_the_initiative() {
+    let (mut units, _summary) = make_units(&chat_event(30));
+    let mut rig = rig_with(phrased(), "unused", PhraseTts::new());
+    let event = with_pending_initiative(&mut rig);
+    rig.app.repeat_guard.record_spoken(
+        PHRASE_A,
+        crate::repeat_guard::PhraseOrigin::Initiative,
+        1_000,
+    );
+    let token = register_run(&mut rig, &event);
+    let first = units.remove(0);
+    send(&rig, message(first, allow(PHRASE_A)));
+    rig.app.tick(45_000);
+
+    assert!(token.is_cancelled());
+    assert_eq!(audio_count(&rig), 0);
+    assert!(
+        rig.app.performer().scheduler().items().is_empty(),
+        "no spoken cached reaction replaces an initiative"
+    );
+    assert!(rig.app.initiative_fell, "the idle gesture was played");
+    assert_eq!(rig.app.repeat_status().suppressed_repeat, 1);
+}
+
+#[test]
+fn a_chat_reply_that_repeats_is_committed_and_only_counted() {
+    let (mut units, _summary) = make_units(&chat_event(30));
+    let mut rig = rig_with(phrased(), "unused", PhraseTts::new());
+    rig.app.repeat_guard.record_spoken(
+        PHRASE_A,
+        crate::repeat_guard::PhraseOrigin::ChatReply,
+        1_000,
+    );
+    register_run(&mut rig, &chat_event(30));
+    let first = units.remove(0);
+    send(&rig, message(first, allow(PHRASE_A)));
+    rig.app.tick(45_000);
+
+    assert_eq!(audio_count(&rig), 1, "a repeated chat reply still speaks");
+    let status = rig.app.repeat_status();
+    assert_eq!(status.suppressed_repeat, 0);
+    assert_eq!(status.by_origin[0], ("chat_reply".to_owned(), 2, 1, 0));
+}

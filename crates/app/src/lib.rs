@@ -33,6 +33,7 @@ mod profile;
 mod raw_ingress;
 pub mod ready_guide;
 mod recent_replies;
+pub mod repeat_guard;
 mod retention;
 mod routing;
 mod scenario;
@@ -122,6 +123,7 @@ pub use raw_ingress::*;
 pub use recent_replies::{
     RECENT_REPLY_CAPACITY, RECENT_REPLY_MAX_CHARS, RecentReplies, ReplyRecord,
 };
+pub use repeat_guard::RepeatStatus;
 pub use retention::*;
 pub use routing::*;
 pub use scenario::*;
@@ -1303,6 +1305,8 @@ where
     early_audio: Vec<AudioPlaybackCommand>,
     /// Text of the audio the output accepted, for the local panel (#335).
     recent_replies: RecentReplies,
+    /// Text-free repeated-phrase measurement and initiative refusal (#89).
+    repeat_guard: repeat_guard::RepeatGuard,
     max_dispatch_lateness_ms: u64,
     interaction_deadlines: InteractionDeadlinePolicy,
     /// Generative resource budget governor (issue #69); `None` when the
@@ -1386,6 +1390,7 @@ where
             face_settle: None,
             early_audio: Vec::new(),
             recent_replies: RecentReplies::default(),
+            repeat_guard: repeat_guard::RepeatGuard::random(),
             max_dispatch_lateness_ms,
             interaction_deadlines: InteractionDeadlinePolicy::default(),
             budget: None,
@@ -4912,6 +4917,17 @@ where
 
                 self.record_worker_output_decision(output_decision.as_ref());
 
+                // #89: an idle initiative that repeats a recent phrase is
+                // refused like any other refused output: the idle gesture
+                // replaces speech, with no regeneration.
+                if self.initiative_repeat_refused(event, &generated_text, at_ms) {
+                    trace.fallback_reason = FallbackReason::PolicyOverride;
+                    return self.play_fallback_directive(event, fallback, trace, at_ms, seed);
+                }
+                if self.is_initiative_event(event) {
+                    self.repeat_guard.stage(&generated_text, at_ms);
+                }
+
                 let asset_id = asset.id.clone();
                 self.performer
                     .assets_mut()
@@ -5813,7 +5829,60 @@ where
         };
         if let Some(text) = asset.speech.as_ref().and_then(|s| s.text.as_deref()) {
             self.recent_replies.record(&command.event_id, text);
+            let generated = asset
+                .provenance
+                .as_ref()
+                .and_then(|provenance| provenance.generated)
+                .unwrap_or(false);
+            let origin = if !generated {
+                repeat_guard::PhraseOrigin::Cached
+            } else if command.event_id.starts_with(initiative::EVENT_ID_PREFIX) {
+                repeat_guard::PhraseOrigin::Initiative
+            } else {
+                repeat_guard::PhraseOrigin::ChatReply
+            };
+            // Measure only: a spoken phrase is never refused here (#89 S1).
+            self.repeat_guard.record_spoken(text, origin, command.at_ms);
         }
+    }
+
+    /// The text-free repeated-phrase counters (#89).
+    pub fn repeat_status(&self) -> RepeatStatus {
+        self.repeat_guard.status()
+    }
+
+    /// An idle initiative phrase that repeats a recent one must not be
+    /// committed (#89). Chat replies are never refused: answering the same
+    /// question the same way can be correct. Counts and audits a refusal.
+    pub(crate) fn initiative_repeat_refused(
+        &mut self,
+        event: &EventEnvelope,
+        text: &str,
+        now_ms: u64,
+    ) -> bool {
+        if !self.is_initiative_event(event) {
+            return false;
+        }
+        let repeat = self.repeat_guard.check(text, now_ms);
+        if repeat == repeat_guard::Repeat::None {
+            return false;
+        }
+        self.repeat_guard.note_suppressed_repeat();
+        let record = self.security.redactor_record(
+            Some(&event.event_id),
+            aivtuber_telemetry::AuditCategory::Generation,
+            "initiative_repeat_suppressed",
+            format!(
+                "repeat={}",
+                if repeat == repeat_guard::Repeat::Exact {
+                    "exact"
+                } else {
+                    "near"
+                }
+            ),
+        );
+        self.security.push_external_audit(record);
+        true
     }
 
     /// The last few replies the performer spoke (newest last).

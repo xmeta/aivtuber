@@ -140,6 +140,9 @@ pub struct SupportResourceCounters {
     /// preempted, suppressed by reason). Text-free; absent unless composed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initiative: Option<crate::InitiativeStatus>,
+    /// Repeated-phrase counters (#89); text-free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeats: Option<crate::RepeatStatus>,
 }
 
 /// One redacted audit summary line (bounded decision text; never a payload).
@@ -380,6 +383,7 @@ impl SupportBundleBuilder {
             generation_failed: generation.failed,
             generative_budget: app.generative_budget_snapshot(generated_unix_ms),
             initiative: app.initiative_status(),
+            repeats: Some(app.repeat_status()),
         };
 
         // Recent incident references from the security runtime's bounded
