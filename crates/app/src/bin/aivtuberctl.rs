@@ -854,6 +854,21 @@ fn print_response(response: &OperatorResponse) {
                 println!("initiative_suppressed reason={reason} count={count}");
             }
         }
+        if let Some(repeats) = &status.repeats {
+            // Counters only (#89): never anything that was said.
+            println!(
+                "repeats phrases_spoken={} exact_repeats={} near_repeats={} suppressed_repeat={}",
+                repeats.phrases_spoken,
+                repeats.exact_repeats,
+                repeats.near_repeats,
+                repeats.suppressed_repeat,
+            );
+            for (origin, spoken, exact, near) in &repeats.by_origin {
+                println!(
+                    "repeats_origin origin={origin} phrases_spoken={spoken} exact_repeats={exact} near_repeats={near}"
+                );
+            }
+        }
         if let Some(persona) = &status.persona {
             // Identity only (#404): never the character sheet's text.
             println!(

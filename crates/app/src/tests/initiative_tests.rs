@@ -19,7 +19,21 @@ struct InitiativeThinking {
     requests: Arc<Mutex<Vec<ThinkingRequest>>>,
     gate: Option<Arc<BlockingGate>>,
     fail_initiative: Option<EngineErrorKind>,
+    /// Say something different each time (the default repeats one phrase).
+    distinct: bool,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
 }
+
+const DISTINCT_PHRASES: [&str; 8] = [
+    "最近どう過ごしてる？",
+    "今日は何を食べようかな",
+    "窓の外の雲がきれいだよ",
+    "好きな音楽を教えてほしいな",
+    "ちょっと伸びをしようっと",
+    "明日の天気は晴れるかなあ",
+    "コーヒーが飲みたくなってきた",
+    "みんなの趣味って何だろう",
+];
 
 impl ThinkingEngine for InitiativeThinking {
     fn generate<'a>(&'a self, request: &'a ThinkingRequest) -> EngineFuture<'a, GeneratedReply> {
@@ -28,6 +42,8 @@ impl ThinkingEngine for InitiativeThinking {
             .expect("requests")
             .push(request.clone());
         let initiative = request.context.initiative.is_some();
+        let call = self.calls.fetch_add(1, Ordering::Relaxed);
+        let distinct = self.distinct;
         Box::pin(async move {
             if initiative {
                 if let Some(kind) = self.fail_initiative {
@@ -43,7 +59,9 @@ impl ThinkingEngine for InitiativeThinking {
                 }
             }
             Ok(GeneratedReply {
-                text: if initiative {
+                text: if initiative && distinct {
+                    DISTINCT_PHRASES[call % DISTINCT_PHRASES.len()].to_owned()
+                } else if initiative {
                     "最近どう過ごしてる？".to_owned()
                 } else {
                     "こんにちは！".to_owned()
@@ -599,7 +617,13 @@ fn the_toggle_needs_the_capability_and_switches_the_initiative() {
 
 #[test]
 fn five_quiet_minutes_give_at_least_three_initiatives_and_none_overlaps_a_reply() {
-    let mut rig = rig();
+    let mut rig = rig_with(
+        InitiativeThinking {
+            distinct: true,
+            ..InitiativeThinking::default()
+        },
+        InitiativeConfig::default(),
+    );
     let mut max_live_audio = 0;
     for second in 0..300_u64 {
         let at_ms = second * 1_000;
@@ -685,4 +709,54 @@ fn the_same_script_replays_to_the_same_decisions_and_requests() {
     );
     // Silence the unused imports a replay-only run does not touch.
     let _ = (Decision::Wait, Outcome::Completed, Preemption::Chat);
+}
+
+#[test]
+fn a_repeated_initiative_phrase_is_refused_and_falls_back_to_the_gesture() {
+    let mut rig = rig();
+    step(&mut rig, 45_000);
+    rig.app.tick(50_000);
+    rig.app.service_initiative(50_000, 1);
+    let status = rig.app.initiative_status().expect("status");
+    assert_eq!((status.fired, status.completed, status.failed), (1, 1, 0));
+    assert_eq!(gestures(&rig.avatar), 0);
+    let repeats = rig.app.repeat_status();
+    assert_eq!((repeats.phrases_spoken, repeats.exact_repeats), (1, 0));
+    assert_eq!(repeats.by_origin[1].1, 1, "counted as an initiative phrase");
+
+    // The stub says the same thing again. It is refused before commit: the
+    // idle gesture plays, nothing is scheduled, and nothing is regenerated.
+    step(&mut rig, 115_000);
+    rig.app.tick(120_000);
+    rig.app.service_initiative(120_000, 2);
+    let status = rig.app.initiative_status().expect("status");
+    assert_eq!((status.fired, status.completed, status.failed), (2, 1, 1));
+    assert!(!status.pending);
+    assert_eq!(gestures(&rig.avatar), 1);
+    assert_eq!(initiative_requests(&rig.thinking).len(), 2);
+    assert!(
+        initiative_items(&rig.app)
+            .iter()
+            .all(|(_, id)| id == "initiative-000001"),
+        "the repeat was never scheduled"
+    );
+    let repeats = rig.app.repeat_status();
+    assert_eq!(repeats.suppressed_repeat, 1);
+    // Nothing repeated was spoken.
+    assert_eq!((repeats.phrases_spoken, repeats.exact_repeats), (1, 0));
+}
+
+#[test]
+fn chat_replies_are_measured_but_never_refused_for_repeating() {
+    let mut rig = rig();
+    for id in 1..=2_u64 {
+        let at_ms = id * 20_000;
+        chat_at(&mut rig.app, id, at_ms);
+        wait_for_generation_completion(&mut rig.app, at_ms);
+        rig.app.tick(at_ms + 10_000);
+    }
+    let repeats = rig.app.repeat_status();
+    assert_eq!(repeats.suppressed_repeat, 0);
+    assert_eq!(repeats.by_origin[0], ("chat_reply".to_owned(), 2, 1, 0));
+    assert_eq!(rig.app.recent_replies().len(), 2);
 }

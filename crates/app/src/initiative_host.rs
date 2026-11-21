@@ -229,6 +229,8 @@ where
         if self.initiative_in_flight(&id) && !overdue {
             return;
         }
+        // Phrases staged for the refusal check but never heard are forgotten.
+        self.repeat_guard.clear_staged();
         let spoke = self
             .recent_replies
             .items()
@@ -431,6 +433,7 @@ where
             }
         }
         self.initiative_fell = false;
+        self.repeat_guard.clear_staged();
         if let Some(director) = self.initiative.as_mut() {
             director.preempted(at_ms, cause);
         }

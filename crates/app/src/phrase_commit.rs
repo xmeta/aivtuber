@@ -160,6 +160,8 @@ pub enum PhraseCause {
     DeadlineExpired,
     /// The output gate (worker or composition recheck) refused a phrase.
     GateRejected,
+    /// An idle initiative phrase repeated a recently spoken one (#89).
+    RepeatRefused,
     /// The shared scheduler refused a phrase (the reply could not continue).
     SchedulerRejected(Rejection),
     SynthesisFailed(FallbackReason),
@@ -179,6 +181,7 @@ impl PhraseCause {
             Self::Shutdown => "shutdown",
             Self::DeadlineExpired => "deadline_expired",
             Self::GateRejected => "gate_rejected",
+            Self::RepeatRefused => "repeat_refused",
             Self::SchedulerRejected(_) => "scheduler_rejected",
             Self::SynthesisFailed(_) => "synthesis_failed",
             Self::CompileFailed => "compile_failed",
@@ -621,6 +624,28 @@ where
             return;
         }
         self.record_worker_output_decision(output_decision.as_ref());
+        // #89: an initiative phrase that repeats a recent one ends the reply
+        // here (phrase 0: the idle gesture instead). No regeneration.
+        let initiative_event = self
+            .generative
+            .as_mut()
+            .and_then(|generative| generative.phrase.run_mut(generation_id))
+            .map(|run| run.event.clone());
+        if let Some(event) = &initiative_event {
+            if self.initiative_repeat_refused(event, &text, now_ms) {
+                self.refuse_phrase(
+                    generation_id,
+                    seq,
+                    PhraseCause::RepeatRefused,
+                    trace,
+                    now_ms,
+                );
+                return;
+            }
+            if self.is_initiative_event(event) {
+                self.repeat_guard.stage(&text, now_ms);
+            }
+        }
         let gate = output_decision
             .as_ref()
             .map_or(PhraseGateOutcome::Allowed, gate_outcome);
@@ -848,7 +873,10 @@ where
         if seq == 0 {
             // Nothing was spoken: the event is observed exactly like a buffered
             // reply whose commit refused (a policy override has no playback).
-            if cause == PhraseCause::GateRejected {
+            if matches!(
+                cause,
+                PhraseCause::GateRejected | PhraseCause::RepeatRefused
+            ) {
                 trace.fallback_reason = FallbackReason::PolicyOverride;
                 self.record_unspoken_phrased_reply(generation_id, trace, now_ms);
             } else if let Some(generative) = self.generative.as_ref() {
@@ -1092,7 +1120,9 @@ where
                         | PhraseCause::Superseded
                         | PhraseCause::Shutdown
                         | PhraseCause::DeadlineExpired => metrics.cancelled_after_commit += 1,
-                        PhraseCause::GateRejected | PhraseCause::SchedulerRejected(_) => {}
+                        PhraseCause::GateRejected
+                        | PhraseCause::RepeatRefused
+                        | PhraseCause::SchedulerRejected(_) => {}
                     }
                 }
             }
