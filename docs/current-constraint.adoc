@@ -7,27 +7,28 @@ It does not replace link:roadmap.adoc[the strategic roadmap], milestone ordering
 
 == 1. Current status
 
-Status:: Provisional: idle-initiative pacing (the budget window leaves silences of about 3 minutes).
+Status:: Established: idle-initiative content quality (invented recollections and topic fixation).
 As of:: 2026-11-22.
-Owning issue:: #87 (budget re-tune); evidence link:live-runs/2026-11-22-v0.2-gate.adoc[#456 run record and the #89 follow-up].
+Owning issue:: #87 (S2); evidence link:live-runs/2026-11-22-v0.2-gate.adoc[#456 run record, pacing follow-up].
 
-The previous established constraint, repetition of generated speech, was addressed by #89 S1.
-In the follow-up run it measured 0 exact and 0 near repeats in 48 phrases, with 1 initiative refused, against 30% of initiative phrases repeated before.
+Pacing was fixed by raising the window cap (#466). Spacing is now 60 s in quiet windows, against a 3-minute silence before, with 0 repeats.
 
 [source,text]
 ----
-Constraint: idle-initiative pacing
+Constraint: idle-initiative content quality
 Decision date: 2026-11-22
-Evidence status: provisional (two 15-minute unattended runs)
+Evidence status: established (session log of a 15-minute unattended run, read by the supervisor)
 
-Observed magnitude: initiatives about every 60 s; once the 6-per-10-minute window is used up,
-  silence of about 3 minutes inside a no-chat window (both runs)
-Competing candidate constraints: chat-to-first-audio 2.5-3.3 s; OBS setup friction (#458);
-  quality of what is said (not measurable until the #463 session log exists)
-Planned intervention / owning issue: re-tune the #87 budget now that repeats are refused
-  (#89), measured with the #463 session log
-Next measurement / review condition: the same script with the #463 log on; target no silence
-  over 90 s in a no-chat window, with 0 exact repeats
+Observed magnitude: most of the 7 spoken initiatives claimed something was "said earlier" that was
+  not; one invented topic dominated later initiatives; 3 of 10 initiatives were refused as exact
+  repeats (gesture only)
+Competing candidate constraints: chat-to-first-audio p50 3.97 s / p95 5.64 s (session log);
+  farewell wording on odd input; OBS setup friction (#458)
+Planned intervention / owning issue: #87 S2. Drop revisit_topic until #80 supplies real topics;
+  ground initiatives in an operator-written topic list rotated deterministically; forbid claims
+  about earlier conversation that the request does not carry
+Next measurement / review condition: the same script with the session log; no invented
+  recollection in a supervisor read of the log, refused-as-repeat at most 1 in 10
 ----
 
 == 2. Evidence available now

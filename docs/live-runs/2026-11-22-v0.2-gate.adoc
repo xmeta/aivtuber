@@ -56,3 +56,19 @@ Changes::
 |===
 
 Result: the #89 S1 done condition (0 exact repeats among spoken initiative phrases) is met.
+
+== Follow-up run: #87 pacing and the #463 session log
+
+[cols="1,3"]
+|===
+|Window |2026-11-22 04:48-05:03 local, the same part B script, with the session log on
+|Build |`origin/main` `4ce26bb4` (window cap 10 per 10 minutes, #463 log, the initiative switch fix)
+|Switch |`aivtuberctl initiative off` / `on` took effect live. The #87 capability was not held on `9772e3d6`-`8c20622e`; #463 fixed it.
+|Pacing |Initiative spacing was 60.0 s (p50) inside both no-chat windows. The 180 s maximum spans the chat window, not a quiet one. The 3-minute silence inside a quiet window is gone.
+|Repeats (session log summary) |0 exact and 0 near across 47 phrases (25 chat, 22 initiative). 3 of the 10 initiatives were refused as exact repeats and fell back to the gesture, so those minutes were silent.
+|Chat to first audio |p50 3.97 s, p95 5.64 s, max 5.64 s (14 chat turns, session log). This replaces the earlier 2.5-3.3 s estimate, which was taken from phrase-commit offsets.
+|Content review (operator-side reading of the log, quoted text omitted) a|
+* *Invented recollections.* `revisit_topic` and some `audience_question` initiatives referred to things "said earlier" that nobody said, including a topic attributed to a named person. No topic state exists yet (#80), so the kind asks the model to recall something it does not have.
+* *Topic fixation.* After the first invented topic, most later initiatives returned to it in new words. The bigram near-duplicate check does not catch this, by design.
+* *Farewell on odd input.* Replies to the injection line and to `/stop` ended with a goodbye mid-stream. The authority boundary held (nothing stopped), but the wording misleads viewers.
+|===
