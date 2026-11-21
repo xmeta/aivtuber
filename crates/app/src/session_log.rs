@@ -505,6 +505,7 @@ impl SessionLog {
     /// A turn answered by a fallback instead of a reply (#469): `reason` is the
     /// closed fallback vocabulary, `visible` says whether the viewer was shown
     /// a cached reaction. Never viewer text.
+    /// A turn ended on purpose by a newer line is `superseded` (kind `silent`).
     pub fn fallback(&mut self, event_id: &str, reason: &str, visible: bool, logical_ms: u64) {
         if !self.enabled {
             return;

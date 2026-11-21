@@ -102,3 +102,66 @@ fn a_whitespace_only_reply_ends_in_a_counted_fallback() {
         assert_counted_visible_fallback(&mut rig, "policy_override");
     }
 }
+
+/// #469 (reopened): three chat lines arrive while the first generation is
+/// still stalled. The first two are superseded by newer lines, the last one
+/// misses its deadline; none may end with only a `route` record.
+#[test]
+fn chat_queued_behind_a_stalled_generation_always_ends_in_a_reply_a_fallback_or_a_logged_supersession()
+ {
+    use crate::session_log::{Record, SessionLog};
+    for mode in both_modes() {
+        let dir = std::env::temp_dir().join(format!(
+            "aivtuber-469b-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let mut rig = rig_with(
+            "今日は来てくれてありがとう。",
+            Duration::from_millis(600),
+            mode,
+            300,
+        );
+        rig.app = rig
+            .app
+            .with_session_log(SessionLog::new(dir.join("logs"), None, true));
+        for sequence in 71..=73 {
+            submit_free_text_line(&mut rig, sequence);
+        }
+        wait_until_quiescent(&mut rig.app);
+        play_out(&mut rig.app);
+        rig.app.session_log().expect("log").flush();
+
+        let file = std::fs::read_dir(dir.join("logs"))
+            .expect("logs")
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .max()
+            .expect("a session file");
+        let records: Vec<Record> = std::fs::read_to_string(file)
+            .expect("read")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("record"))
+            .collect();
+        let turns: Vec<String> = records
+            .iter()
+            .filter(|r| r.t == "input")
+            .filter_map(|r| r.turn.clone())
+            .collect();
+        assert_eq!(turns.len(), 3, "{records:?}");
+        for turn in &turns {
+            let ends = records
+                .iter()
+                .filter(|r| r.turn.as_ref() == Some(turn) && (r.t == "phrase" || r.t == "fallback"))
+                .count();
+            assert_eq!(ends, 1, "turn {turn} must end exactly once: {records:?}");
+        }
+        let counts = rig.app.generation_fallback_counts();
+        let counted: u64 = counts.by_reason.values().sum::<u64>() + counts.superseded;
+        assert_eq!(counted, 3, "{counts:?}");
+        assert!(counts.superseded >= 1, "{counts:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
