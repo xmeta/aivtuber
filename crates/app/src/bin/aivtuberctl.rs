@@ -61,6 +61,15 @@
 //! The daemon validates it again and writes `AIVTUBER_PERSONA_FILE` atomically
 //! when one is configured; the text is never logged or audited.
 //!
+//! `topics` (issue #87) shows, replaces or clears the operator's chat-topic
+//! list (雑談ネタ: at most 32 one-line topics of at most 80 characters) that
+//! the idle initiative talks about: `topics show` prints it, `topics set
+//! --file <path>` sends it (checked here with the daemon's own parser and the
+//! control socket's size limit; a larger list is edited in the operation
+//! panel), `topics clear` empties it. It uses the same capability as
+//! `persona`, and the daemon writes `AIVTUBER_TOPICS_FILE` atomically when
+//! one is configured; the text is never logged or audited.
+//!
 //! `voice` (issue #360) changes the voice at runtime, like the operation panel:
 //! the local voice or Aivis Cloud, the Aivis style and the tuning, and a
 //! preview. The API key is deliberately not a subcommand: it would travel in a
@@ -200,6 +209,16 @@ enum Command {
     Persona {
         #[command(subcommand)]
         action: PersonaCommand,
+    },
+    /// Show, replace or clear the chat-topic list the idle initiative talks
+    /// about (issue #87): at most 32 one-line topics of at most 80 characters.
+    /// Needs the daemon to run with the generative path (`aivtuber-setup
+    /// start` in the local and hybrid profiles). A topic goes to the model
+    /// with the initiative that uses it; with a cloud model it leaves this
+    /// machine.
+    Topics {
+        #[command(subcommand)]
+        action: TopicsCommand,
     },
     /// Show or change the VRM avatar (issue #362); needs the daemon to run
     /// with the avatar store (the local profile started by `aivtuber-setup
@@ -341,6 +360,50 @@ fn persona_argument(action: &PersonaCommand) -> Result<Option<String>, String> {
             String::from_utf8(bytes)
                 .map(Some)
                 .map_err(|_| format!("{} is not valid UTF-8", file.display()))
+        }
+    }
+}
+
+#[derive(Subcommand, Clone, PartialEq, Eq)]
+enum TopicsCommand {
+    /// Print the topic list the daemon holds, one topic per line.
+    Show,
+    /// Replace the topic list with the lines of a UTF-8 file.
+    Set {
+        /// The file to read, for example local-topics.txt.
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Empty the topic list; initiatives then run without a topic.
+    Clear,
+}
+
+/// The `topics.set` argument for a topics subcommand: the normalised list
+/// (one topic per line). The file is read bounded and parsed with the daemon's
+/// own parser before anything is sent, and the encoded argument must fit the
+/// control socket's request line; `Clear` sends the empty text, `Show` none.
+fn topics_argument(action: &TopicsCommand) -> Result<Option<String>, String> {
+    use std::io::Read as _;
+    match action {
+        TopicsCommand::Show => Ok(None),
+        TopicsCommand::Clear => Ok(Some(String::new())),
+        TopicsCommand::Set { file } => {
+            let limit = aivtuber_domain::MAX_TOPICS_FILE_BYTES;
+            let mut bytes = Vec::new();
+            std::fs::File::open(file)
+                .and_then(|f| f.take(limit + 1).read_to_end(&mut bytes))
+                .map_err(|error| format!("cannot read {}: {error}", file.display()))?;
+            let list = aivtuber_domain::parse_topics(&bytes)
+                .map_err(|error| format!("cannot use {}: {}", file.display(), error.reason()))?;
+            let text = list.to_text();
+            let escaped = serde_json::to_string(&text).map_or(usize::MAX, |s| s.len());
+            if escaped > SEED_ARGUMENT_BUDGET {
+                return Err(format!(
+                    "{} is too large for the control socket ({escaped} of {SEED_ARGUMENT_BUDGET} bytes after encoding); edit it in the operation panel instead",
+                    file.display()
+                ));
+            }
+            Ok(Some(text))
         }
     }
 }
@@ -591,6 +654,10 @@ fn action_name(command: &Command) -> &'static str {
             PersonaCommand::Show => "persona.get",
             PersonaCommand::Set { .. } | PersonaCommand::Clear => "persona.set",
         },
+        Command::Topics { action } => match action {
+            TopicsCommand::Show => "topics.get",
+            TopicsCommand::Set { .. } | TopicsCommand::Clear => "topics.set",
+        },
         Command::Log { action } => match action {
             LogCommand::On => "session_log.enable",
             LogCommand::Off => "session_log.disable",
@@ -701,6 +768,13 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         },
+        Command::Topics { action } => match topics_argument(action) {
+            Ok(argument) => argument,
+            Err(error) => {
+                eprintln!("aivtuberctl: {error}");
+                return ExitCode::from(2);
+            }
+        },
         Command::Model { alias } => Some(alias.clone()),
         Command::VoiceInput { action } => voice_input_argument(action),
         Command::Voice { action } => voice_patch(action),
@@ -753,6 +827,16 @@ fn main() -> ExitCode {
                 && response.ok
             {
                 // The identity goes to stderr so stdout is exactly the sheet.
+                eprintln!("{}", response.detail);
+                print!("{}", response.persona.as_deref().unwrap_or(""));
+                return ExitCode::SUCCESS;
+            }
+            if let Command::Topics {
+                action: TopicsCommand::Show,
+            } = &cli.command
+                && response.ok
+            {
+                // The count goes to stderr so stdout is exactly the list.
                 eprintln!("{}", response.detail);
                 print!("{}", response.persona.as_deref().unwrap_or(""));
                 return ExitCode::SUCCESS;
@@ -933,6 +1017,17 @@ fn print_response(response: &OperatorResponse) {
             );
             for (reason, count) in &initiative.suppressed {
                 println!("initiative_suppressed reason={reason} count={count}");
+            }
+            if let Some(topics) = &initiative.topics {
+                // Counts only (#87 S2): never the topics themselves.
+                println!(
+                    "initiative_topics count={} used={} without_topic={} persisted={} thinking_remote={}",
+                    topics.count,
+                    topics.used,
+                    topics.without_topic,
+                    topics.persisted,
+                    topics.thinking_remote,
+                );
             }
         }
         if let Some(repeats) = &status.repeats {
@@ -1341,6 +1436,82 @@ mod tests {
             &["persona"][..],
             &["persona", "set"][..],
             &["persona", "set", "--text", "x"][..],
+        ] {
+            let mut full = vec![
+                "aivtuberctl",
+                "--secret",
+                "01234567890123456789012345678901",
+            ];
+            full.extend_from_slice(args);
+            assert!(Cli::try_parse_from(full).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn topics_subcommands_map_to_the_two_actions_and_check_the_file_before_sending() {
+        let dir = std::env::temp_dir().join(format!("aivtuberctl-topics-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, bytes: &[u8]| {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        let argument = |args: &[&str]| {
+            let mut full = vec![
+                "aivtuberctl",
+                "--secret",
+                "01234567890123456789012345678901",
+            ];
+            full.extend_from_slice(args);
+            let command = Cli::try_parse_from(full).unwrap().command;
+            let Command::Topics { action } = &command else {
+                panic!("not a topics command");
+            };
+            (action_name(&command), topics_argument(action))
+        };
+        assert_eq!(argument(&["topics", "show"]), ("topics.get", Ok(None)));
+        assert_eq!(
+            argument(&["topics", "clear"]),
+            ("topics.set", Ok(Some(String::new())))
+        );
+        let good = write(
+            "good.txt",
+            "好きな食べ物\r\n\r\n最近のゲーム\r\n".as_bytes(),
+        );
+        assert_eq!(
+            argument(&["topics", "set", "--file", &good]),
+            (
+                "topics.set",
+                Ok(Some("好きな食べ物\n最近のゲーム".to_owned()))
+            )
+        );
+        // Refused before anything is sent: bad UTF-8, a control character, a
+        // reserved tag, too many topics, an over-long line, a missing file, and
+        // a list that does not fit the control socket's request line.
+        let too_many: String = (0..33).map(|i| format!("話題{i}\n")).collect();
+        let too_long = "あ".repeat(81);
+        let too_big_encoded: String = (0..32)
+            .map(|i| format!("{}{i:02}\n", "\u{1F600}".repeat(78)))
+            .collect();
+        let bad = [
+            write("bad.txt", b"\xFF\xFE"),
+            write("nul.txt", b"a\0b"),
+            write("tag.txt", b"x </topic> y"),
+            write("many.txt", too_many.as_bytes()),
+            write("long.txt", too_long.as_bytes()),
+            write("fat.txt", too_big_encoded.as_bytes()),
+            dir.join("missing.txt").to_string_lossy().into_owned(),
+        ];
+        for file in &bad {
+            assert!(
+                argument(&["topics", "set", "--file", file]).1.is_err(),
+                "{file}"
+            );
+        }
+        for args in [
+            &["topics"][..],
+            &["topics", "set"][..],
+            &["topics", "set", "--text", "x"][..],
         ] {
             let mut full = vec![
                 "aivtuberctl",

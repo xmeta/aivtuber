@@ -24,6 +24,7 @@ mod speech_lifecycle;
 mod speech_transcript;
 mod task;
 mod thinking_model;
+mod topics;
 mod voice_settings;
 
 pub use avatar::Viseme;
@@ -95,6 +96,10 @@ pub use task::{
     TaskTransitionReason, TaskVerificationOutcome, VerificationResult,
 };
 pub use thinking_model::*;
+pub use topics::{
+    MAX_TOPIC_CHARS, MAX_TOPICS, MAX_TOPICS_FILE_BYTES, TopicList, TopicsError,
+    contains_reserved_tag, parse_topics, topic_thinking_content,
+};
 pub use voice_settings::*;
 
 /// Runtime time-scale layers.

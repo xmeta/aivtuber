@@ -1388,7 +1388,7 @@ fn with_pending_initiative(rig: &mut Rig) -> EventEnvelope {
         Decision, InitiativeConfig, InitiativeDirector, InitiativeInputs, mint_event,
     };
     let mut director = InitiativeDirector::new(InitiativeConfig::default(), 0);
-    let Decision::Fire { event_id, kind } = director.evaluate(&InitiativeInputs {
+    let Decision::Fire { event_id, kind, .. } = director.evaluate(&InitiativeInputs {
         now_ms: 45_000,
         ..InitiativeInputs::default()
     }) else {

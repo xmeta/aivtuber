@@ -71,6 +71,21 @@
     <p id="initiative-result" role="status"></p>
   </section>
 
+  <section id="topics-section" aria-labelledby="h-topics" hidden>
+    <h2 id="h-topics"><svg class="ico" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/></svg>雑談ネタ</h2>
+    <p id="topics-explanation" class="hint"></p>
+    <p id="topics-cloud" class="hint cloud" hidden></p>
+    <p id="topics-memory-only" class="hint" hidden></p>
+    <textarea id="topics-text" rows="8" spellcheck="false" aria-label="雑談ネタ(1行に1つ)" aria-describedby="topics-counter"></textarea>
+    <p id="topics-counter" class="hint" role="status"></p>
+    <p id="topics-summary" class="hint"></p>
+    <div class="buttons wrap">
+      <button id="topics-save" type="button">保存</button>
+      <button id="topics-reload" type="button">読み込み直す</button>
+    </div>
+    <p id="topics-result" role="status"></p>
+  </section>
+
   <section id="session-log-section" aria-labelledby="h-session-log" hidden>
     <h2 id="h-session-log"><svg class="ico" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M6 3h9l4 4v14H6z"/><path d="M14 3v5h5M9 13h7M9 17h7"/></svg>配信ログ</h2>
     <label class="check"><input id="session-log-toggle" type="checkbox"> <span id="session-log-label"></span></label>

@@ -31,6 +31,11 @@ import {
   modelView,
   usageView,
   personaGetBody,
+  topicsGetBody,
+  topicsResultText,
+  topicsSetBody,
+  topicsTextFrom,
+  topicsView,
   personaResultText,
   personaSetBody,
   personaTextFrom,
@@ -182,6 +187,7 @@ function render(): void {
   renderInitiative();
   renderSessionLog();
   renderPersona();
+  renderTopics();
   renderMemory();
   renderVoice();
   renderIngress();
@@ -518,6 +524,81 @@ async function savePersona(): Promise<void> {
     personaBusy = false;
     void poll();
     renderPersona();
+  }
+}
+
+/** Operator topic list (#87 S2): hidden unless the app composed live topic editing. Loaded from
+ * the host once when the card first shows and again on "reload"; a poll never overwrites what
+ * is being typed. Every string goes in with textContent or `.value`, never as HTML. */
+let topicsLoaded = false;
+let topicsTried = false;
+let topicsBusy = false;
+
+function renderTopics(): void {
+  const field = $<HTMLTextAreaElement>("topics-text");
+  const view = topicsView(state, field.value);
+  $("topics-section").hidden = view === null;
+  if (view === null) {
+    topicsLoaded = false;
+    topicsTried = false;
+    return;
+  }
+  if (!topicsLoaded && !topicsBusy && !topicsTried) {
+    topicsTried = true;
+    void loadTopics();
+  }
+  $("topics-explanation").textContent = view.explanation;
+  const cloud = $("topics-cloud");
+  cloud.textContent = view.cloudNote ?? "";
+  cloud.hidden = view.cloudNote === null;
+  const memoryOnly = $("topics-memory-only");
+  memoryOnly.textContent = view.memoryOnlyNote ?? "";
+  memoryOnly.hidden = view.memoryOnlyNote === null;
+  const counter = $("topics-counter");
+  counter.textContent = view.problem === null ? view.counterText : `${view.counterText} · ${view.problem}`;
+  counter.className = view.health === "warn" ? "error" : "hint";
+  $("topics-summary").textContent = view.summary;
+  $<HTMLButtonElement>("topics-save").disabled = connectionLost || topicsBusy || !view.canSave || !topicsLoaded;
+  $<HTMLButtonElement>("topics-reload").disabled = connectionLost || topicsBusy;
+}
+
+async function loadTopics(): Promise<void> {
+  topicsBusy = true;
+  const out = $("topics-result");
+  try {
+    const { status, json } = await api("/api/topics/get", { method: "POST", body: JSON.stringify(topicsGetBody()) });
+    const body = (json ?? {}) as { ok?: boolean; detail?: string };
+    const text = topicsTextFrom(json);
+    if (status === 200 && body.ok === true && text !== null) {
+      $<HTMLTextAreaElement>("topics-text").value = text;
+      topicsLoaded = true;
+      out.textContent = "";
+    } else {
+      out.textContent = topicsResultText("reload", false, body.detail, status);
+    }
+  } catch {
+    out.textContent = "読み込めませんでした(アプリに接続できません)";
+  } finally {
+    topicsBusy = false;
+    renderTopics();
+  }
+}
+
+async function saveTopics(): Promise<void> {
+  topicsBusy = true;
+  renderTopics();
+  const out = $("topics-result");
+  try {
+    const text = $<HTMLTextAreaElement>("topics-text").value;
+    const { status, json } = await api("/api/topics/set", { method: "POST", body: JSON.stringify(topicsSetBody(text)) });
+    const body = (json ?? {}) as { ok?: boolean; detail?: string };
+    out.textContent = topicsResultText("save", status === 200 && body.ok === true, body.detail, status);
+  } catch {
+    out.textContent = "保存できませんでした(アプリに接続できません)";
+  } finally {
+    topicsBusy = false;
+    void poll();
+    renderTopics();
   }
 }
 
@@ -1437,6 +1518,9 @@ for (const key of TUNING_KEYS) {
 $("persona-text").addEventListener("input", () => renderPersona());
 $("persona-save").addEventListener("click", () => void savePersona());
 $("persona-reload").addEventListener("click", () => void loadPersona());
+$("topics-text").addEventListener("input", () => renderTopics());
+$("topics-save").addEventListener("click", () => void saveTopics());
+$("topics-reload").addEventListener("click", () => void loadTopics());
 $("memory-add").addEventListener("click", () => {
   memoryEntries.push({ kind: "persona-fact", claim: "" });
   memoryOpen = seedOpenAfterAdd(memoryEntries.length);

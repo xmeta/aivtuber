@@ -27,6 +27,20 @@
 //! 6. the budget allows it: at most one per [`MIN_GAP_MS`] and
 //!    [`WINDOW_MAX`] per [`WINDOW_MS`].
 //!
+//! # Kind and topic (S2)
+//!
+//! The kind alternates between `idle_observation` and `audience_question`.
+//! `revisit_topic` stays in the wire enum but is never chosen: there is no
+//! real topic state to revisit yet (#80), and a model asked to "come back to
+//! something said earlier" invents it. The request carries no reply summaries
+//! for the same reason (the first invented topic fed back into every later
+//! request). What an initiative may talk about is the operator's topic list
+//! (`set_topics`): one topic per initiative, round-robin in logical time,
+//! skipping the topics used in the last N = min([`TOPIC_RECENT_MAX`], len-1)
+//! initiatives. With no topic the initiative runs without one and is counted.
+//! The choice is charged when the director fires, like the budget, so a failed
+//! generation never re-picks.
+//!
 //! The budget is charged when the director fires, not when the reply
 //! succeeds, so a failing backend can never turn into a retry loop.
 //!
@@ -34,8 +48,9 @@
 //!
 //! The firing window holds at most [`WINDOW_MAX`] times, the decision log
 //! [`LOG_CAPACITY`] records, the remembered initiative texts
-//! [`RECENT_TEXTS_MAX`] entries of at most [`TEXT_MAX_CHARS`] characters, and
-//! every counter saturates. Nothing grows with run length.
+//! [`RECENT_TEXTS_MAX`] entries of at most [`TEXT_MAX_CHARS`] characters, the
+//! topic list [`aivtuber_domain::MAX_TOPICS`] entries and the used-topic ring
+//! [`TOPIC_RECENT_MAX`], and every counter saturates. Nothing grows with run length.
 //!
 //! # Preemption
 //!
@@ -50,7 +65,7 @@ use aivtuber_domain::{
     DomainValidationError, EVENT_SCHEMA_VERSION, EventEnvelope, EventKind, InitiativeContext,
     InitiativeKind, MAX_THINKING_TEXT_BYTES, PrivacyClass, ReflexContext, RetrievalSnapshot,
     SecurityPlane, SourceClass, ThinkingContent, ThinkingContextSource, ThinkingRequest,
-    TrustLevel,
+    TrustLevel, topic_thinking_content,
 };
 
 /// Default seconds without chat before the performer may speak on its own.
@@ -77,8 +92,9 @@ pub const LOG_CAPACITY: usize = 32;
 pub const RECENT_TEXTS_MAX: usize = 3;
 /// Characters kept per remembered text and per reply summary.
 pub const TEXT_MAX_CHARS: usize = 160;
-/// Reply summaries a request carries (the last N).
-pub const SUMMARY_COUNT: usize = 3;
+/// Most recently used topics remembered; the skip window is
+/// `min(TOPIC_RECENT_MAX, topics - 1)`.
+pub const TOPIC_RECENT_MAX: usize = 5;
 /// The prefix of an initiative event id; also how a reply is recognised.
 pub const EVENT_ID_PREFIX: &str = "initiative-";
 /// The gesture played when no reply can be generated. Code-owned: nothing a
@@ -132,8 +148,6 @@ pub struct InitiativeInputs {
     pub content_queued: bool,
     /// A deferred chat reply is waiting for the performer.
     pub deferred_pending: bool,
-    /// There is at least one earlier reply a revisit could refer to.
-    pub have_summaries: bool,
 }
 
 /// Why an initiative did not fire although the idle time had elapsed.
@@ -214,7 +228,17 @@ pub enum Decision {
     Fire {
         event_id: String,
         kind: InitiativeKind,
+        /// The operator topic chosen for it, if the list is not empty.
+        topic: Option<TopicPick>,
     },
+}
+
+/// The topic a firing initiative talks about: its position in the list (what
+/// the decision log and audit record) and its text (what the request carries).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopicPick {
+    pub index: usize,
+    pub text: String,
 }
 
 /// One recorded decision, for replay comparison and diagnostics. Edge
@@ -222,7 +246,11 @@ pub enum Decision {
 /// evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    Fired(InitiativeKind),
+    /// `topic` is the index in the operator list, never the text.
+    Fired {
+        kind: InitiativeKind,
+        topic: Option<usize>,
+    },
     Suppressed(Suppression),
     Preempted(Preemption),
     Completed,
@@ -245,6 +273,10 @@ pub struct InitiativeMetrics {
     pub preempted_chat: u64,
     pub preempted_speech: u64,
     pub preempted_stop: u64,
+    /// Initiatives that fired with an operator topic.
+    pub topics_used: u64,
+    /// Initiatives that fired with no topic (the list was empty).
+    pub without_topic: u64,
     pub suppressed: [u64; Suppression::ALL.len()],
 }
 
@@ -281,6 +313,12 @@ pub struct InitiativeDirector {
     pending: Option<Pending>,
     last_suppression: Option<Suppression>,
     recent_texts: VecDeque<String>,
+    /// The operator's topic list (at most `MAX_TOPICS`).
+    topics: Vec<String>,
+    /// Where the next round-robin pick starts.
+    topic_cursor: usize,
+    /// Topics used lately, oldest first (at most [`TOPIC_RECENT_MAX`]).
+    recent_topics: VecDeque<String>,
     log: VecDeque<DecisionRecord>,
     next_seq: u64,
     metrics: InitiativeMetrics,
@@ -299,6 +337,9 @@ impl InitiativeDirector {
             pending: None,
             last_suppression: None,
             recent_texts: VecDeque::new(),
+            topics: Vec::new(),
+            topic_cursor: 0,
+            recent_topics: VecDeque::new(),
             log: VecDeque::new(),
             next_seq: 0,
             metrics: InitiativeMetrics::default(),
@@ -325,6 +366,31 @@ impl InitiativeDirector {
         self.pending
             .as_ref()
             .map(|pending| pending.event_id.as_str())
+    }
+
+    /// How many topics the operator list holds.
+    pub fn topic_count(&self) -> usize {
+        self.topics.len()
+    }
+
+    /// The live list as the file holds it (one topic per line). Only the
+    /// authenticated `topics.get` reads it.
+    pub fn topic_text(&self) -> String {
+        self.topics.join("\n")
+    }
+
+    /// Replace the operator's topic list (already validated by
+    /// `aivtuber_domain::parse_topics`; capped again here). A different list
+    /// restarts the round-robin at its first entry; the recently-used ring is
+    /// kept, by text, so a topic still in the list is not repeated at once. The
+    /// same list changes nothing.
+    pub fn set_topics(&mut self, topics: &[String]) {
+        let capped = &topics[..topics.len().min(aivtuber_domain::MAX_TOPICS)];
+        if self.topics.as_slice() == capped {
+            return;
+        }
+        self.topics = capped.to_vec();
+        self.topic_cursor = 0;
     }
 
     pub fn recent_texts(&self) -> impl ExactSizeIterator<Item = &str> {
@@ -358,6 +424,8 @@ impl InitiativeDirector {
         self.last_fired_ms = None;
         self.window.clear();
         self.recent_texts.clear();
+        self.recent_topics.clear();
+        self.topic_cursor = 0;
         self.stop_hold_until_ms = None;
         self.last_suppression = None;
     }
@@ -410,7 +478,16 @@ impl InitiativeDirector {
             return Decision::Suppressed(reason);
         }
         self.last_suppression = None;
-        let kind = self.select_kind(inputs.have_summaries);
+        let kind = self.select_kind();
+        let topic = self.select_topic();
+        match topic {
+            Some(_) => {
+                self.metrics.topics_used = self.metrics.topics_used.saturating_add(1);
+            }
+            None => {
+                self.metrics.without_topic = self.metrics.without_topic.saturating_add(1);
+            }
+        }
         self.window.push_back(now);
         self.last_fired_ms = Some(now);
         self.metrics.fired = self.metrics.fired.saturating_add(1);
@@ -419,8 +496,18 @@ impl InitiativeDirector {
             event_id: event_id.clone(),
             fired_at_ms: now,
         });
-        self.record(now, Outcome::Fired(kind));
-        Decision::Fire { event_id, kind }
+        self.record(
+            now,
+            Outcome::Fired {
+                kind,
+                topic: topic.as_ref().map(|pick| pick.index),
+            },
+        );
+        Decision::Fire {
+            event_id,
+            kind,
+            topic,
+        }
     }
 
     fn budget_reason(&mut self, now: u64) -> Option<Suppression> {
@@ -443,15 +530,46 @@ impl InitiativeDirector {
         None
     }
 
-    /// The kind rotates with the number fired so far, so two runs of the same
-    /// inputs choose the same kinds. A revisit needs something to revisit.
-    fn select_kind(&self, have_summaries: bool) -> InitiativeKind {
-        match self.metrics.fired % 3 {
-            0 => InitiativeKind::IdleObservation,
-            1 => InitiativeKind::AudienceQuestion,
-            _ if have_summaries => InitiativeKind::RevisitTopic,
-            _ => InitiativeKind::IdleObservation,
+    /// The kind alternates with the number fired so far, so two runs of the
+    /// same inputs choose the same kinds. `RevisitTopic` is never chosen (#87
+    /// S2): there is no real topic state to revisit until #80.
+    fn select_kind(&self) -> InitiativeKind {
+        if self.metrics.fired.is_multiple_of(2) {
+            InitiativeKind::IdleObservation
+        } else {
+            InitiativeKind::AudienceQuestion
         }
+    }
+
+    /// Round-robin from the cursor, skipping the topics used in the last
+    /// N = min([`TOPIC_RECENT_MAX`], len - 1) initiatives, so with one topic
+    /// it repeats and with two it alternates. Pure in the list, the cursor and
+    /// the ring: nothing here reads a clock or randomness.
+    fn select_topic(&mut self) -> Option<TopicPick> {
+        let len = self.topics.len();
+        if len == 0 {
+            return None;
+        }
+        let window = TOPIC_RECENT_MAX.min(len - 1);
+        let start = self.topic_cursor % len;
+        let index = (0..len)
+            .map(|offset| (start + offset) % len)
+            .find(|candidate| {
+                !self
+                    .recent_topics
+                    .iter()
+                    .rev()
+                    .take(window)
+                    .any(|used| *used == self.topics[*candidate])
+            })
+            .unwrap_or(start);
+        let text = self.topics[index].clone();
+        self.topic_cursor = (index + 1) % len;
+        if self.recent_topics.len() == TOPIC_RECENT_MAX {
+            self.recent_topics.pop_front();
+        }
+        self.recent_topics.push_back(text.clone());
+        Some(TopicPick { index, text })
     }
 
     fn note_suppressed(&mut self, reason: Suppression, now: u64) {
@@ -590,20 +708,21 @@ pub fn mint_event(
 
 /// The typed, bounded Thinking request for one initiative.
 ///
-/// `summaries` are the performer's own last replies and `recent_initiatives`
-/// its own earlier initiative texts; both are cut to [`TEXT_MAX_CHARS`] and
-/// capped in number, and travel as data items, never in `input`. No raw
-/// history map, no viewer text and no event payload is copied.
+/// `topic` is the operator's chosen topic (an `operator_curated` item, data
+/// like the character sheet) and `recent_initiatives` the performer's own
+/// earlier initiative texts; the latter are cut to [`TEXT_MAX_CHARS`] and
+/// capped in number, and travel as data items, never in `input`. There are no
+/// reply summaries (#87 S2), no raw history map, no viewer text and no event
+/// payload.
 pub fn build_request(
     event: &EventEnvelope,
     kind: InitiativeKind,
-    summaries: &[String],
+    topic: Option<&str>,
     recent_initiatives: &[String],
 ) -> Result<ThinkingRequest, DomainValidationError> {
     let mut curated = Vec::new();
-    let skip = summaries.len().saturating_sub(SUMMARY_COUNT);
-    for text in summaries.iter().skip(skip) {
-        curated.push(data_item("recent_reply", text));
+    if let Some(topic) = topic {
+        curated.push(topic_thinking_content(topic));
     }
     let skip = recent_initiatives.len().saturating_sub(RECENT_TEXTS_MAX);
     for text in recent_initiatives.iter().skip(skip) {
@@ -870,23 +989,36 @@ mod tests {
         assert_eq!(d.pending_event_id(), None);
     }
 
+    fn topics(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_owned()).collect()
+    }
+
+    /// Fire at `*t`, finish the initiative and advance one budget gap.
+    fn fire_one(d: &mut InitiativeDirector, t: &mut u64) -> (InitiativeKind, Option<TopicPick>) {
+        let decision = d.evaluate(&idle(*t));
+        let Decision::Fire { kind, topic, .. } = decision else {
+            panic!("expected a fire at {t}, got {decision:?}");
+        };
+        d.completed(*t, None);
+        *t += MIN_GAP_MS;
+        (kind, topic)
+    }
+
+    fn picked(d: &mut InitiativeDirector, t: &mut u64, n: usize) -> Vec<String> {
+        (0..n)
+            .map(|_| {
+                fire_one(d, t)
+                    .1
+                    .map_or_else(|| "(none)".to_owned(), |pick| pick.text)
+            })
+            .collect()
+    }
+
     #[test]
-    fn kinds_rotate_and_a_revisit_needs_something_to_revisit() {
+    fn the_kind_alternates_and_a_revisit_is_never_chosen() {
         let mut d = director();
-        let mut kinds = Vec::new();
         let mut t = 45 * SEC;
-        for have_summaries in [false, false, false, true, true, true] {
-            let decision = d.evaluate(&InitiativeInputs {
-                have_summaries,
-                ..idle(t)
-            });
-            let Decision::Fire { kind, .. } = decision else {
-                panic!("expected fire, got {decision:?}")
-            };
-            kinds.push(kind);
-            d.completed(t, None);
-            t += MIN_GAP_MS;
-        }
+        let kinds: Vec<_> = (0..8).map(|_| fire_one(&mut d, &mut t).0).collect();
         use InitiativeKind::*;
         assert_eq!(
             kinds,
@@ -894,11 +1026,113 @@ mod tests {
                 IdleObservation,
                 AudienceQuestion,
                 IdleObservation,
+                AudienceQuestion,
                 IdleObservation,
                 AudienceQuestion,
-                RevisitTopic
+                IdleObservation,
+                AudienceQuestion
             ]
         );
+        assert!(!kinds.contains(&RevisitTopic));
+    }
+
+    #[test]
+    fn topics_rotate_round_robin_in_logical_time() {
+        let mut d = director();
+        d.set_topics(&topics(&["a", "b", "c"]));
+        let mut t = 45 * SEC;
+        assert_eq!(
+            picked(&mut d, &mut t, 7),
+            ["a", "b", "c", "a", "b", "c", "a"]
+        );
+        assert_eq!(d.metrics().topics_used, 7);
+        assert_eq!(d.metrics().without_topic, 0);
+        // The log names the index, never the text.
+        let indexes: Vec<_> = d
+            .log()
+            .filter_map(|record| match record.outcome {
+                Outcome::Fired { topic, .. } => Some(topic),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(indexes, [0, 1, 2, 0, 1, 2, 0].map(Some).to_vec());
+    }
+
+    #[test]
+    fn recently_used_topics_are_skipped_after_the_list_is_edited() {
+        let mut d = director();
+        d.set_topics(&topics(&["a", "b", "c", "d", "e", "f"]));
+        let mut t = 45 * SEC;
+        assert_eq!(picked(&mut d, &mut t, 3), ["a", "b", "c"]);
+        // Reordered: the round-robin restarts at its first entry, but c and a
+        // were used within the last five, so the first free one is d.
+        d.set_topics(&topics(&["c", "a", "d", "e", "f", "b"]));
+        assert_eq!(picked(&mut d, &mut t, 3), ["d", "e", "f"]);
+        // Wrapping round: b is blocked by its own recent use, c is blocked, a
+        // is the first topic not among the last five (b c d e f).
+        assert_eq!(picked(&mut d, &mut t, 1), ["a"]);
+        // The same list saved again changes nothing (no restart).
+        let before = d.topic_cursor;
+        d.set_topics(&topics(&["c", "a", "d", "e", "f", "b"]));
+        assert_eq!(d.topic_cursor, before);
+    }
+
+    #[test]
+    fn short_lists_use_a_window_of_len_minus_one() {
+        let mut one = director();
+        one.set_topics(&topics(&["a"]));
+        let mut t = 45 * SEC;
+        assert_eq!(picked(&mut one, &mut t, 3), ["a", "a", "a"]);
+        let mut two = director();
+        two.set_topics(&topics(&["a", "b"]));
+        let mut t = 45 * SEC;
+        assert_eq!(picked(&mut two, &mut t, 4), ["a", "b", "a", "b"]);
+        // The window never exceeds TOPIC_RECENT_MAX: with a long list the
+        // ring holds five and no more.
+        let mut long = director();
+        long.set_topics(&topics(&["a", "b", "c", "d", "e", "f", "g", "h"]));
+        let mut t = 45 * SEC;
+        let _ = picked(&mut long, &mut t, 40);
+        assert!(long.recent_topics.len() <= TOPIC_RECENT_MAX);
+    }
+
+    #[test]
+    fn an_empty_list_runs_without_a_topic_and_counts_it() {
+        let mut d = director();
+        let mut t = 45 * SEC;
+        assert_eq!(picked(&mut d, &mut t, 2), ["(none)", "(none)"]);
+        assert_eq!(d.metrics().without_topic, 2);
+        assert_eq!(d.metrics().topics_used, 0);
+        // Emptying the list again goes back to no topic.
+        d.set_topics(&topics(&["a"]));
+        assert_eq!(picked(&mut d, &mut t, 1), ["a"]);
+        d.set_topics(&[]);
+        assert_eq!(picked(&mut d, &mut t, 1), ["(none)"]);
+        assert_eq!(d.topic_count(), 0);
+    }
+
+    #[test]
+    fn a_failed_initiative_has_still_used_its_topic() {
+        let mut d = director();
+        d.set_topics(&topics(&["a", "b"]));
+        let first = fire(&mut d, 45 * SEC);
+        assert_eq!(first, "initiative-000001");
+        d.failed(46 * SEC);
+        let mut t = 45 * SEC + MIN_GAP_MS;
+        assert_eq!(picked(&mut d, &mut t, 1), ["b"]);
+    }
+
+    #[test]
+    fn the_topic_list_is_capped_and_clear_forgets_the_rotation() {
+        let mut d = director();
+        let many: Vec<String> = (0..100).map(|i| format!("t{i}")).collect();
+        d.set_topics(&many);
+        assert_eq!(d.topic_count(), aivtuber_domain::MAX_TOPICS);
+        let mut t = 45 * SEC;
+        assert_eq!(picked(&mut d, &mut t, 2), ["t0", "t1"]);
+        d.clear();
+        assert!(d.recent_topics.is_empty());
+        assert_eq!(d.topic_count(), aivtuber_domain::MAX_TOPICS);
     }
 
     #[test]
@@ -934,12 +1168,17 @@ mod tests {
                 if step == 250 {
                     d.note_operator_stop(now_ms);
                 }
+                if step == 60 {
+                    d.set_topics(&topics(&["a", "b", "c", "d"]));
+                }
+                if step == 300 {
+                    d.set_topics(&topics(&["c", "a"]));
+                }
                 let inputs = InitiativeInputs {
                     now_ms,
                     muted: (150..160).contains(&step),
                     floor_held: step % 37 == 0,
                     speaking: step % 53 == 0,
-                    have_summaries: step > 120,
                     ..InitiativeInputs::default()
                 };
                 let decision = d.evaluate(&inputs);
@@ -962,33 +1201,62 @@ mod tests {
     }
 
     #[test]
-    fn the_request_is_typed_bounded_and_carries_no_event_payload() {
-        let event = mint_event("initiative-000001", InitiativeKind::RevisitTopic, 5_000, 1);
+    fn the_request_is_typed_bounded_and_carries_no_reply_summaries_or_event_payload() {
+        let event = mint_event(
+            "initiative-000001",
+            InitiativeKind::AudienceQuestion,
+            5_000,
+            1,
+        );
         event.validate().expect("the minted event is valid");
         assert_eq!(event.kind, EventKind::TimerTick);
         assert_eq!(event.trust_level, TrustLevel::Trusted);
+        // The event payload names the closed kind only: no topic text.
+        assert!(!format!("{:?}", event.payload).contains("好きな食べ物"));
         let many: Vec<String> = (0..10)
-            .map(|i| format!("返答{i}{}", "あ".repeat(500)))
+            .map(|i| format!("発話{i}{}", "あ".repeat(500)))
             .collect();
-        let request = build_request(&event, InitiativeKind::RevisitTopic, &many, &many)
-            .expect("a bounded request validates");
-        assert_eq!(request.input.text, input_text(InitiativeKind::RevisitTopic));
+        let request = build_request(
+            &event,
+            InitiativeKind::AudienceQuestion,
+            Some("好きな食べ物"),
+            &many,
+        )
+        .expect("a bounded request validates");
+        assert_eq!(
+            request.input.text,
+            input_text(InitiativeKind::AudienceQuestion)
+        );
         assert_eq!(
             request.context.initiative,
-            Some(InitiativeContext::new(InitiativeKind::RevisitTopic))
+            Some(InitiativeContext::new(InitiativeKind::AudienceQuestion))
         );
-        assert_eq!(
-            request.curated_context.len(),
-            SUMMARY_COUNT + RECENT_TEXTS_MAX
-        );
-        for item in &request.curated_context {
+        // One topic, then at most RECENT_TEXTS_MAX recent initiatives; no
+        // `recent_reply` item exists any more.
+        assert_eq!(request.curated_context.len(), 1 + RECENT_TEXTS_MAX);
+        let topic = &request.curated_context[0];
+        assert_eq!(topic.source, ThinkingContextSource::OperatorCurated);
+        assert_eq!(topic.source_class, Some(SourceClass::Operator));
+        assert_eq!(topic.text, "好きな食べ物");
+        for item in &request.curated_context[1..] {
+            assert!(item.text.starts_with("recent_initiative: "));
             assert!(item.text.chars().count() <= TEXT_MAX_CHARS + 20);
             assert_eq!(item.source, ThinkingContextSource::RecentInteraction);
             assert_ne!(item.trust_level, TrustLevel::Trusted);
         }
-        // The newest summaries are the ones kept.
-        assert!(request.curated_context[0].text.contains("返答7"));
-        assert!(request.curated_context[2].text.contains("返答9"));
+        assert!(
+            !request
+                .curated_context
+                .iter()
+                .any(|item| item.text.contains("recent_reply"))
+        );
+        // The newest recent initiatives are the ones kept.
+        assert!(request.curated_context[1].text.contains("発話7"));
+        assert!(request.curated_context[3].text.contains("発話9"));
+        // With no topic the request is just the closed kind and the avoid-list.
+        let bare = build_request(&event, InitiativeKind::IdleObservation, None, &[])
+            .expect("a bare request validates");
+        assert!(bare.curated_context.is_empty());
     }
 
     #[test]
