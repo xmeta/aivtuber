@@ -72,3 +72,14 @@ Result: the #89 S1 done condition (0 exact repeats among spoken initiative phras
 * *Topic fixation.* After the first invented topic, most later initiatives returned to it in new words. The bigram near-duplicate check does not catch this, by design.
 * *Farewell on odd input.* Replies to the injection line and to `/stop` ended with a goodbye mid-stream. The authority boundary held (nothing stopped), but the wording misleads viewers.
 |===
+
+== Follow-up runs: #87 S2, #469 and the v0.2 close-out
+
+[cols="1,3"]
+|===
+|`8bb4c416` (#87 S2, 5 operator topics) |10 initiatives, all completed, every one on a listed topic in rotation; 0 repeats; no invented recollection, named person or mid-stream goodbye in initiatives. Defect found: one chat line was never answered and the next waited 18.6 s (#469).
+|`ef198b88` (#470) |A startup burst of three chat lines behind a 20 s warm-up: one got the timeout fallback, two were superseded with no record. #469 was reopened and fixed in #471: supersession is now counted and logged.
+|`2e7dfb4e` (v0.2 close-out, #458) |15 chat turns, all answered (0 unended, 0 fallbacks); 10 initiatives, all completed; 45 phrases, 0 exact and 0 near repeats; chat to first audio p50 2.51 s, p95 4.18 s; initiative spacing 60 s in quiet windows. Checked in a browser: the panel's 「OBS 用の URL をコピー」 (clipboard refused in the test browser, the selected-field fallback worked), the copied URL connecting the avatar, and the no-token message on the avatar page.
+|===
+
+Owner direction recorded on #79: in busy chat, picking the comments worth reacting to is normal streamer behaviour. Superseding other lines is accepted; *which* line wins is the v0.3 question.
