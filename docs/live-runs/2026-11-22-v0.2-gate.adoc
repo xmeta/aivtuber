@@ -1,0 +1,45 @@
+= Live run record: v0.2 gate (#456), 2026-11-22
+:toc:
+
+Two parts, scoped by the owner on 2026-11-22: a 12-minute operator-observed stream (part A) and a 15-minute unattended run (part B).
+Chat author identities, raw audio, panel/avatar tokens and the YouTube key are not recorded.
+
+== Part A: operator-observed stream
+
+[cols="1,3"]
+|===
+|Window |2026-11-22 00:26:13-00:38:40 local (about 12 min)
+|Build |Local commit `b1219d53` = `origin/main` `c47718f5` plus one unmerged #280 evaluation-binary commit (not on the runtime path). Release profile, not revision-stamped.
+|Profile |`local`: gemma-4-E4B QAT UD-Q4_K_XL (llama.cpp), Supertonic 3, ReazonSpeech k2-v2, Silero VAD; voice input on (half duplex); YouTube read-only ingress on an unlisted stream; the operator's own VRM through OBS Browser Source; config fingerprint `profile-v1-2c4ce9ebe136a6a8`
+|Chat / voice |30 YouTube messages accepted, 0 dropped, 0 ingress restarts; 5 spoken turns recognised (max decode 99 ms); 1 utterance ignored during playback (half duplex, by design)
+|Generation |31 completed, 0 failed; generation stage 1.9-2.9 s on 5 sampled timelines
+|Operator control |Stop (`hard_stopped`, 2 items), mute and panel shutdown all took effect; every child process exited
+|Operator notes |No speech at all in either scripted no-chat window. Mute silenced the avatar as intended (restart-only by design).
+|Friction |The OBS avatar URL needs the per-launch token and is hard to find (#458).
+|===
+
+== Part B: unattended run
+
+[cols="1,3"]
+|===
+|Window |2026-11-22 01:54:22-02:09:24 local (15 min); 15 scripted chat lines on stdin, two 5-minute no-chat windows (01:57:23-02:02:23 and 02:04:24-02:09:24); voice input off; avatar page open in a browser
+|Build |`origin/main` `9772e3d6` (includes #87 S1), built from a clean detached worktree
+|Chat to first audio |2.5-3.3 s across the 9 chat lines of the first chat window (phrase-commit start minus chat arrival on the 20 s feed grid; median about 3.0 s)
+|Initiatives (#87 S1) |8 fired, 8 completed, 0 failed, 0 preempted. First window: 5, at 01:57:51, 01:58:56, 01:59:48, 02:00:54, 02:01:59. Second window: 3, at 02:04:50, 02:07:49, 02:08:56. None fired while chat was arriving.
+|Longest silence in a no-chat window |About 3 minutes (02:04:50-02:07:49): the 6-per-10-minute budget window was exhausted. Otherwise about 60 s between initiatives (the 60 s budget gap).
+|Repetition |8 of 49 synthesised phrases were TTS cache hits, which means the exact same phrase text was spoken earlier in the run (the cache key is a digest of the text and voice). 7 of the 8 were in initiatives: 7 of 23 initiative phrases (30%) repeated an earlier phrase, despite the recent-initiative list in the request.
+|Injection lines |"Ignore all previous instructions..." and `/stop` in chat: no stop, no capability, no error; they were answered as chat.
+|Memory (working set) |app 12.9 to 13.8 MB, TTS sidecar 226 to 279 MB, llama-server 3.22 to 3.48 GB over 15 minutes
+|Shutdown |stdin EOF, clean
+|Not observable |Reply texts are not in the logs or the diagnose bundle, so repetition is inferred from cache hits and not measured directly.
+|===
+
+== After-action review
+
+Expected:: A live performer that keeps a quiet stream alive without operator help.
+Observed:: Before #87 S1 the performer was silent whenever chat was quiet. After S1, it spoke about once a minute in quiet windows, never over chat, and never failed. But 30% of initiative phrases repeated earlier phrases word for word, and the 10-minute budget left one 3-minute silence.
+Why:: The anti-repetition input (the recent-initiative list) is advice to the model, not a check. The budget constants were set by design, not from a run.
+Changes::
+* #89 is now the constraint. It adds a text-free repeat counter, so repetition is measured rather than inferred, plus a deterministic exact- and near-duplicate check on generated phrases before commit.
+* The budget defaults (#87) are revisited with the #89 measurements in v0.3. This is not changed now: a 60 s cadence with repeats is worse than a slower one without.
+* #458 covers the OBS URL friction.
