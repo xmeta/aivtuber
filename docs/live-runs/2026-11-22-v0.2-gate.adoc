@@ -27,7 +27,7 @@ Chat author identities, raw audio, panel/avatar tokens and the YouTube key are n
 |Chat to first audio |2.5-3.3 s across the 9 chat lines of the first chat window (phrase-commit start minus chat arrival on the 20 s feed grid; median about 3.0 s)
 |Initiatives (#87 S1) |8 fired, 8 completed, 0 failed, 0 preempted. First window: 5, at 01:57:51, 01:58:56, 01:59:48, 02:00:54, 02:01:59. Second window: 3, at 02:04:50, 02:07:49, 02:08:56. None fired while chat was arriving.
 |Longest silence in a no-chat window |About 3 minutes (02:04:50-02:07:49): the 6-per-10-minute budget window was exhausted. Otherwise about 60 s between initiatives (the 60 s budget gap).
-|Repetition |8 of 49 synthesised phrases were TTS cache hits, which means the exact same phrase text was spoken earlier in the run (the cache key is a digest of the text and voice). 7 of the 8 were in initiatives: 7 of 23 initiative phrases (30%) repeated an earlier phrase, despite the recent-initiative list in the request.
+|Repetition |8 of 49 synthesised phrases were TTS cache hits: the same phrase text had been synthesised before. The cache key is a digest of the text and voice, and the cache persists on disk, so a hit means a repeat within this run *or* of an earlier run on the same install (correction, 2026-11-22). 7 of the 8 were in initiatives (7 of 23 initiative phrases, 30%), despite the recent-initiative list in the request.
 |Injection lines |"Ignore all previous instructions..." and `/stop` in chat: no stop, no capability, no error; they were answered as chat.
 |Memory (working set) |app 12.9 to 13.8 MB, TTS sidecar 226 to 279 MB, llama-server 3.22 to 3.48 GB over 15 minutes
 |Shutdown |stdin EOF, clean
@@ -43,3 +43,16 @@ Changes::
 * #89 is now the constraint. It adds a text-free repeat counter, so repetition is measured rather than inferred, plus a deterministic exact- and near-duplicate check on generated phrases before commit.
 * The budget defaults (#87) are revisited with the #89 measurements in v0.3. This is not changed now: a 60 s cadence with repeats is worse than a slower one without.
 * #458 covers the OBS URL friction.
+
+== Follow-up run: #89 S1 verification
+
+[cols="1,3"]
+|===
+|Window |2026-11-22 03:43-03:58 local, the same part B script
+|Build |`origin/main` `8c20622e` (#87 S1 and #89 S1)
+|Repeats (in-process guard, direct count) |48 phrases spoken (28 chat reply, 20 initiative); 0 exact and 0 near repeats in either origin; 1 initiative refused as a repeat and fell back to the idle gesture
+|TTS cache hits |1 of 48 (against 8 of 49 before). The cache persists across runs, so a hit can be a repeat of an earlier run, which the per-run guard does not cover.
+|Initiatives |8 fired: 7 spoke, 1 was refused as a repeat; 0 preempted. The cadence was about 60 s, and the 10-minute budget window again left a silence of about 3 minutes (03:51:12-03:54:17).
+|===
+
+Result: the #89 S1 done condition (0 exact repeats among spoken initiative phrases) is met.

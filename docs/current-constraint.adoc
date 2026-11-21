@@ -7,41 +7,28 @@ It does not replace link:roadmap.adoc[the strategic roadmap], milestone ordering
 
 == 1. Current status
 
-Status:: Established: repetition of generated speech, above all in idle initiatives.
+Status:: Provisional: idle-initiative pacing (the budget window leaves silences of about 3 minutes).
 As of:: 2026-11-22.
-Owning issue:: #89; evidence link:live-runs/2026-11-22-v0.2-gate.adoc[#456 run record].
+Owning issue:: #87 (budget re-tune); evidence link:live-runs/2026-11-22-v0.2-gate.adoc[#456 run record and the #89 follow-up].
+
+The previous established constraint, repetition of generated speech, was addressed by #89 S1.
+In the follow-up run it measured 0 exact and 0 near repeats in 48 phrases, with 1 initiative refused, against 30% of initiative phrases repeated before.
 
 [source,text]
 ----
-Constraint: repetition of generated speech (idle initiatives first)
+Constraint: idle-initiative pacing
 Decision date: 2026-11-22
-Evidence status: established (one 15-minute unattended run; one 12-minute operator run)
+Evidence status: provisional (two 15-minute unattended runs)
 
-Dataset / workload / session: #456 part B, 15 scripted chat lines, two 5-minute no-chat windows
-Config/profile fingerprint: local, profile-v1-2c4ce9ebe136a6a8
-Relevant commit/version: origin/main 9772e3d6
-Observed magnitude: 7 of 23 initiative phrases (30%) and 8 of 49 phrases overall were word-for-word
-  repeats of earlier phrases (TTS cache hits; the cache key is a digest of the text)
-Competing candidate constraints: dead air (fixed by #87 S1: 8 initiatives, 0 failures; one 3-minute
-  silence where the 10-minute budget ran out), chat-to-first-audio 2.5-3.3 s, OBS setup friction (#458)
-Why this constraint is actionable: the repetition happens in every quiet stretch; YouTube does not
-  monetise repetitious content; #89 already holds the design
-Hard guardrails: deterministic check, bounded history, model output stays data, no extra model call
-  on the critical path, a refused phrase falls back without freezing the performer
-Planned intervention / owning issue: #89 S1 (text-free repeat measurement plus a pre-commit duplicate check)
-Next measurement / review condition: rerun the #456 part B script; target 0 exact repeats among
-  initiative phrases, and re-tune the #87 budget from the measured repeat rate
+Observed magnitude: initiatives about every 60 s; once the 6-per-10-minute window is used up,
+  silence of about 3 minutes inside a no-chat window (both runs)
+Competing candidate constraints: chat-to-first-audio 2.5-3.3 s; OBS setup friction (#458);
+  quality of what is said (not measurable until the #463 session log exists)
+Planned intervention / owning issue: re-tune the #87 budget now that repeats are refused
+  (#89), measured with the #463 session log
+Next measurement / review condition: the same script with the #463 log on; target no silence
+  over 90 s in a no-chat window, with 0 exact repeats
 ----
-
-The previous provisional constraint, dead air while no chat arrives (#456 part A), was addressed by #87 S1 and measured in part B.
-
-The 2026-10-02 v0.1 live smoke (34m32s, link:release-v0.1.adoc[section 12]) exercised the cached profile only: Thinking, Jev, voice input and live chat were disabled.
-No run since has exercised the `local` profile, live chat ingress, the VRM renderer through OBS Browser Source and the operation panel together for 30 minutes or more.
-#456 collects that evidence and replaces this status with a section 5 packet.
-
-The repository has strong deterministic/local evidence, but the remaining #97 provider/adapter conformance and 30-60 minute operator-observed live-smoke evidence has not been completed for the selected v0.1 production profile.
-
-Do not infer a product bottleneck merely from which subsystem has the most open issues or implementation activity.
 
 == 2. Evidence available now
 
