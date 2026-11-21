@@ -7,9 +7,35 @@ It does not replace link:roadmap.adoc[the strategic roadmap], milestone ordering
 
 == 1. Current status
 
-Status:: Not yet established from representative live product evidence.
-As of:: 2026-11-21.
-Owning issue:: #456 (v0.2 - First Real Stream).
+Status:: Provisional: dead air while no chat arrives.
+As of:: 2026-11-22.
+Owning issue:: #456 (v0.2 - First Real Stream); intervention #87 S1.
+
+[source,text]
+----
+Constraint: dead air while no chat arrives
+Decision date: 2026-11-22
+Evidence status: provisional
+
+Dataset / workload / session: #456 attempt 1, operator-observed, about 12 minutes,
+  YouTube unlisted stream, 30 chat messages, 5 spoken turns, two scripted no-chat windows
+Config/profile fingerprint: local, profile-v1-2c4ce9ebe136a6a8
+Relevant commit/version: main b1219d53 (v0.1.11 plus later commits)
+Observed magnitude: no speech at all in either no-chat window (operator observation;
+  no initiative path exists in code)
+Competing candidate constraints: reply latency (generation stage 1.9-2.9 s on 5 sampled
+  timelines; end-to-first-audio not measured), repetition (#89, not measured),
+  OBS setup friction (#458)
+Why this constraint is actionable: every quiet stream minute is affected, independent of
+  load; #87 already holds the design
+Hard guardrails: initiative never preempts chat, speech or operator control; bounded
+  budget; model output stays data; fallback never freezes the performer
+Planned intervention / owning issue: #87 S1 (bounded idle initiative)
+Next measurement / review condition: #456 part B, a 15-minute unattended run after S1,
+  measuring the share of no-chat minutes with speech and the repeat rate
+----
+
+Not yet covered: quantitative dead-air, repetition and latency numbers (#456 part B, 15 minutes). Hour-scale duration effects are out of scope for v0.2 by owner decision; the automated failure/boundedness soak covers boundedness.
 
 The 2026-10-02 v0.1 live smoke (34m32s, link:release-v0.1.adoc[section 12]) exercised the cached profile only: Thinking, Jev, voice input and live chat were disabled.
 No run since has exercised the `local` profile, live chat ingress, the VRM renderer through OBS Browser Source and the operation panel together for 30 minutes or more.
