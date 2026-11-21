@@ -7,29 +7,25 @@ It does not replace link:roadmap.adoc[the strategic roadmap], milestone ordering
 
 == 1. Current status
 
-Status:: Established: idle-initiative content quality (invented recollections and topic fixation).
-As of:: 2026-11-22.
-Owning issue:: #87 (S2); evidence link:live-runs/2026-11-22-v0.2-gate.adoc[#456 run record, pacing follow-up].
+Status:: Provisional: conversational grounding of chat replies and comment selection.
+As of:: 2026-11-22 (v0.2 closed).
+Owning issues:: #79 (which comment to answer), #80 (topic state); evidence link:live-runs/2026-11-22-v0.2-gate.adoc[v0.2 run record].
 
-Pacing was fixed by raising the window cap (#466). Spacing is now 60 s in quiet windows, against a 3-minute silence before, with 0 repeats.
+v0.2 measured and closed four constraints in order:
+. dead air (#87 S1);
+. repetition (#89 S1);
+. initiative pacing (#466);
+. initiative content quality (#87 S2).
 
-[source,text]
-----
-Constraint: idle-initiative content quality
-Decision date: 2026-11-22
-Evidence status: established (session log of a 15-minute unattended run, read by the supervisor)
+It also closed one defect, chat lines dropped silently (#469).
+The close-out run on `2e7dfb4e` answered all 15 chat lines with 0 repeats, at p50 2.51 s and p95 4.18 s to first audio.
 
-Observed magnitude: most of the 7 spoken initiatives claimed something was "said earlier" that was
-  not; one invented topic dominated later initiatives; 3 of 10 initiatives were refused as exact
-  repeats (gesture only)
-Competing candidate constraints: chat-to-first-audio p50 3.97 s / p95 5.64 s (session log);
-  farewell wording on odd input; OBS setup friction (#458)
-Planned intervention / owning issue: #87 S2. Drop revisit_topic until #80 supplies real topics;
-  ground initiatives in an operator-written topic list rotated deterministically; forbid claims
-  about earlier conversation that the request does not carry
-Next measurement / review condition: the same script with the session log; no invented
-  recollection in a supervisor read of the log, refused-as-repeat at most 1 in 10
-----
+Candidates for v0.3, not yet ranked by measurement:
+
+* chat replies invent earlier conversation when asked about it, because no topic state exists (#80);
+* the runtime answers the latest line in a burst, not the most reaction-worthy one (#79, owner direction);
+* idle observations are monotonous (#87 later slices);
+* one generation worker, so a stalled call delays later chat until the deadline fallback.
 
 == 2. Evidence available now
 
