@@ -299,6 +299,24 @@ export function safeAvatarUrl(url: string | null | undefined): string | null {
   return null;
 }
 
+/** Copy-button feedback (#458). Neither text contains the URL or its token. */
+export const OBS_COPY_DONE = "コピーしました。OBS のブラウザソースの URL 欄に貼り付けてください";
+export const OBS_COPY_MANUAL = "自動でコピーできませんでした。下の URL を選択済みです。Ctrl+C でコピーしてください";
+
+/** `copied`, or `manual` when the clipboard is unavailable and the URL must be shown for Ctrl+C. */
+export async function copyText(
+  text: string,
+  clipboard: { writeText(t: string): Promise<void> } | undefined,
+): Promise<"copied" | "manual"> {
+  try {
+    if (clipboard === undefined) return "manual";
+    await clipboard.writeText(text);
+    return "copied";
+  } catch {
+    return "manual";
+  }
+}
+
 export type Health = "ok" | "warn";
 
 export interface StatusRow {

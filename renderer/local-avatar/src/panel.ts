@@ -80,6 +80,9 @@ import {
   bubbleMeta,
   repliesFor,
   safeAvatarUrl,
+  copyText,
+  OBS_COPY_DONE,
+  OBS_COPY_MANUAL,
   searchPageCount,
   shouldReloadForHash,
   statusRows,
@@ -201,6 +204,7 @@ function render(): void {
   const cta = $<HTMLAnchorElement>("avatar-cta");
   $("avatar-cta-wrap").hidden = !needsAvatar;
   if (url !== null) cta.href = url;
+  renderObsUrl(url);
   openForAttention();
   if (!focusedChat && connection.kind === "connected") {
     // First connected render: the chat box is the first thing a new user needs.
@@ -877,6 +881,33 @@ function fillWarnings(list: HTMLElement, warnings: string[]): void {
     list.append(item);
   }
 }
+
+/** The tokenised avatar URL for OBS (#458); held in memory only, never logged or sent anywhere. */
+let obsUrl: string | null = null;
+
+function renderObsUrl(url: string | null): void {
+  obsUrl = url;
+  $("obs-url").hidden = url === null;
+}
+
+async function copyObsUrl(): Promise<void> {
+  const stateEl = $("obs-url-state");
+  const field = $<HTMLInputElement>("obs-url-field");
+  if (obsUrl === null) return;
+  if ((await copyText(obsUrl, navigator.clipboard)) === "copied") {
+    field.hidden = true;
+    stateEl.textContent = OBS_COPY_DONE;
+    return;
+  }
+  // No clipboard permission (or no API): show the URL selected so Ctrl+C works.
+  field.value = obsUrl;
+  field.hidden = false;
+  field.focus();
+  field.select();
+  stateEl.textContent = OBS_COPY_MANUAL;
+}
+
+$("obs-url-copy").addEventListener("click", () => void copyObsUrl());
 
 function renderAvatar(): void {
   const view = avatarView(state);

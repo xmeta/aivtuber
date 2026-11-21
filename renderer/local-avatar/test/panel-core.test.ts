@@ -1,6 +1,10 @@
 // Unit tests for the operation panel's pure logic (issue #335).
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
+  copyText,
+  OBS_COPY_DONE,
+  OBS_COPY_MANUAL,
   AVATAR_WARNING_TEXT,
   CHAT_PLATFORMS,
   MAX_VRM_BYTES,
@@ -2040,5 +2044,33 @@ describe("session conversation log switch (#463)", () => {
     expect(sessionLogResultText(true, false, "session log is not configured", 200)).toContain("not configured");
     expect(sessionLogDeleteResultText(true, "session logs deleted", 200)).toBe("保存した配信ログを削除しました");
     expect(sessionLogDeleteResultText(false, undefined, 503)).toContain("503");
+  });
+});
+
+describe("OBS avatar URL copy (#458)", () => {
+  const url = "http://127.0.0.1:8765/?token=" + "a".repeat(64);
+  test("copies the URL through the clipboard API", async () => {
+    let written = "";
+    const result = await copyText(url, { writeText: async (t) => void (written = t) });
+    expect(result).toBe("copied");
+    expect(written).toBe(url);
+  });
+  test("falls back to manual selection when the clipboard is missing or refuses", async () => {
+    expect(await copyText(url, undefined)).toBe("manual");
+    expect(await copyText(url, { writeText: () => Promise.reject(new Error("denied")) })).toBe("manual");
+  });
+  test("feedback texts never carry the URL or token", () => {
+    for (const t of [OBS_COPY_DONE, OBS_COPY_MANUAL]) {
+      expect(t).not.toContain("token");
+      expect(t).not.toContain("127.0.0.1");
+    }
+  });
+  test("the panel page has the button and the OBS hint", () => {
+    const html = readFileSync(new URL("../panel.html", import.meta.url), "utf8");
+    expect(html).toContain('id="obs-url-copy"');
+    expect(html).toContain("OBS 用の URL をコピー");
+    expect(html).toContain("非表示のときにソースをシャットダウン");
+    expect(html).toContain("他のタブ");
+    expect(html).toMatch(/id="obs-url-field"[^>]*readonly/);
   });
 });
