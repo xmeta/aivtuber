@@ -334,6 +334,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     // #401: the sheet can be replaced while running whenever the generative
     // path is composed; a save goes to the file when one is named.
+    let generative_composed = generative.is_some();
     if generative.is_some() {
         app = app.with_persona_editor(aivtuber_app::persona::PersonaEditor::new(
             persona_path,
@@ -576,6 +577,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             // #402: `memory.admin` also for the `memory.seed.*` actions when
             // live seed editing is composed.
             memory_seed_edit: app.memory_seed_editor_composed(),
+            // #87: `initiative.control` only when the initiative is composed.
+            initiative_control: app.initiative_composed(),
         },
     )?;
     let operator_ingress = operator_server.ingress();
@@ -1041,6 +1044,25 @@ fn run() -> Result<(), Box<dyn Error>> {
         let service = build_perception_service(profile, started)?;
         app = app.with_perception(service);
     }
+    // #87 S1: the bounded idle initiative. Composed whenever the generative
+    // path is, so the panel switch and `aivtuberctl initiative` exist; it
+    // starts on in the local profile and off elsewhere unless
+    // AIVTUBER_INITIATIVE says otherwise. A bad idle value refuses startup.
+    if generative_composed {
+        let idle_secs = env_u64(
+            "AIVTUBER_INITIATIVE_IDLE_SECS",
+            aivtuber_app::initiative::DEFAULT_IDLE_SECS,
+        )?;
+        let enabled = env_bool("AIVTUBER_INITIATIVE", profile == CompositionProfile::Local)?;
+        let config =
+            aivtuber_app::initiative::InitiativeConfig::with_idle_secs(enabled, idle_secs)?;
+        eprintln!(
+            "initiative: {} (speaks on its own after {} s without chat; switch in the panel or with aivtuberctl initiative)",
+            if enabled { "on" } else { "off" },
+            idle_secs
+        );
+        app = app.with_initiative(config);
+    }
     // #88 S1: the scene context (rank 2 OBS program scene through the
     // operator's table, rank 4 perception). Composed only when the operator
     // names a scene table or perception is composed; otherwise nothing changes.
@@ -1300,6 +1322,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             app.service_chat_burst(now_ms, sequence_seed);
             report_chat_burst(&mut app, &mut last_chat_burst_accounted);
         }
+        // #87: after chat and speech were served, so arrivals this turn have
+        // already restarted the idle clock. Never blocks.
+        sequence_seed = sequence_seed.saturating_add(8);
+        app.service_initiative(now_ms, sequence_seed);
         app.tick(now_ms);
         report_generation_fallbacks(
             app.generation_fallback_counts(),

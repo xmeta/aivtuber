@@ -85,6 +85,7 @@ fn authenticated(capability: Capability) -> aivtuber_domain::AuthenticatedContro
         Capability::AvatarConfigure => "avatar.configure",
         Capability::SpeechInputControl => "speech_input.control",
         Capability::PersonaConfigure => "persona.configure",
+        Capability::InitiativeControl => "initiative.control",
     };
     let secret = [11_u8; 32];
     let ingress = LocalControlIngress::new(

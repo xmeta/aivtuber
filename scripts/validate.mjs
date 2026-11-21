@@ -18,6 +18,7 @@
 // - examples/scene-context/valid and .../inconsistent (cross-field, rejected by the Rust validator) must conform to
 //   scene-context.schema.json; .../invalid must REJECT (#88 S1)
 // - examples/crowd-context/valid must conform to crowd-context.schema.json; .../invalid must REJECT (#79 S2)
+// - examples/initiative-context/valid must conform to initiative-context.schema.json; .../invalid must REJECT (#87 S1)
 // - examples/obs-scene-maps/valid and .../inconsistent (cross-field, rejected by the Rust loader) must conform to
 //   obs-scene-map.schema.json; .../invalid must REJECT (#88 S1)
 // - examples/speech-lexicons/valid, .../inconsistent (cross-field, rejected by the Rust loader) and the shipped
@@ -112,6 +113,7 @@ const perceptionObservation = validators["schemas/perception-observation.schema.
 const sceneContext = validators["schemas/scene-context.schema.json"];
 const obsSceneMap = validators["schemas/obs-scene-map.schema.json"];
 const crowdContext = validators["schemas/crowd-context.schema.json"];
+const initiativeContext = validators["schemas/initiative-context.schema.json"];
 
 function report(ok, label, validator) {
   if (ok) {
@@ -200,6 +202,7 @@ for (const [validator, validDirs, invalidDir] of [
   [perceptionObservation, ["examples/perception-observations/valid"], "examples/perception-observations/invalid"],
   [sceneContext, ["examples/scene-context/valid", "examples/scene-context/inconsistent"], "examples/scene-context/invalid"],
   [crowdContext, ["examples/crowd-context/valid"], "examples/crowd-context/invalid"],
+  [initiativeContext, ["examples/initiative-context/valid"], "examples/initiative-context/invalid"],
   [obsSceneMap, ["examples/obs-scene-maps/valid", "examples/obs-scene-maps/inconsistent"], "examples/obs-scene-maps/invalid"],
   [memorySeed, ["examples/memory-seeds/valid", "examples/memory-seeds/inconsistent"], "examples/memory-seeds/invalid"],
   [speechLexicon, ["examples/speech-lexicons/valid", "examples/speech-lexicons/inconsistent", "crates/generative/data"], "examples/speech-lexicons/invalid"],

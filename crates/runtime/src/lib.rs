@@ -453,7 +453,7 @@ pub struct PublicOutputPolicy {
 
 impl PublicOutputPolicy {
     pub fn evaluate(&self, text: &str) -> PublicOutput {
-        const CONTROL_TERMS: [&str; 12] = [
+        const CONTROL_TERMS: [&str; 13] = [
             "obs.control",
             "perception.control",
             "model.select",
@@ -462,6 +462,7 @@ impl PublicOutputPolicy {
             "avatar.configure",
             "speech_input.control",
             "persona.configure",
+            "initiative.control",
             "tool.grant",
             "memory.admin",
             "performer.stop",
@@ -1682,6 +1683,7 @@ mod tests {
             "avatar.configure",
             "speech_input.control",
             "persona.configure",
+            "initiative.control",
             "tool.grant",
             "memory.admin",
             "performer.stop",

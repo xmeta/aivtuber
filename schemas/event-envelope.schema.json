@@ -139,7 +139,8 @@
               "ingress.control",
               "avatar.configure",
               "speech_input.control",
-              "persona.configure"
+              "persona.configure",
+              "initiative.control"
             ]
           }
         }

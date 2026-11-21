@@ -105,6 +105,7 @@ describe("normalizeEvent", () => {
       "avatar.configure",
       "speech_input.control",
       "persona.configure",
+      "initiative.control",
     ]);
   });
 });

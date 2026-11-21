@@ -173,6 +173,14 @@ When one comment stands for a crowd (issue #79 S2), the reply context says so wi
 * *Authority rule.* The summary is derived data built by the runtime from its own aggregation (section 12.9 of `docs/jev-routing.adoc`), never from a payload field. It grants no capability, permit or gate decision and has no path to the operator or control plane.
 * *Carrier.* The optional `crowd` member of `ReflexContext` (and so of the Thinking request context). Absent, it is omitted from the wire form, so a request without a crowd is byte-identical to one written before the member existed.
 
+=== 4.5 Initiative context
+
+When the performer speaks on its own because no chat arrived (issue #87 S1), the reply context says so with an `InitiativeContext`, specified by `schemas/initiative-context.schema.json` (version `0.1.0`) and `crates/domain/src/initiative.rs`.
+
+* *Wire form.* `kind` (closed: `audience_question`, `idle_observation`, `revisit_topic`) and `schema_version`. There is no free text, no viewer text and no history, and `additionalProperties` is false.
+* *Authority rule.* The context is derived data minted by the runtime's initiative director (`crates/app/src/initiative.rs`), never from a payload field. It grants no capability, permit or gate decision and has no path to the operator or control plane. The request's `input` is a code-owned sentence per kind, not viewer text; the performer's own last replies and earlier initiative texts travel as bounded `recent_interaction` data items.
+* *Carrier.* The optional `initiative` member of `ReflexContext` (and so of the Thinking request context). Absent, it is omitted from the wire form, so a request without one is byte-identical to one written before the member existed.
+
 == 5. Normalized reflex decision
 
 The provider-neutral output contains both selected values and uncertainty.
@@ -298,6 +306,7 @@ Retention of raw chat/STT text must be configurable separately from normalized r
 * `schemas/perception-observation.schema.json` (section 4.2)
 * `schemas/scene-context.schema.json` and `schemas/obs-scene-map.schema.json` (section 4.3)
 * `schemas/crowd-context.schema.json` (section 4.4)
+* `schemas/initiative-context.schema.json` (section 4.5)
 
 CI validates repository fixtures with the schemas, then deserializes/validates the same fixtures through the Rust production-domain types. It also serializes Rust values for every Event kind plus representative Reflex Decisions and validates those JSON documents against the repository schemas.
 

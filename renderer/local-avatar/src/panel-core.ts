@@ -29,6 +29,8 @@ export interface PanelState {
     persona_editor?: PersonaEditorState | null;
     /** Live memory-seed editing (#402); absent from an older host, or when the app did not compose it. */
     memory_seed_editor?: MemorySeedEditorState | null;
+    /** The idle initiative (#87): the switch and its text-free counters; absent unless the app composed it. */
+    initiative?: InitiativeState | null;
     /** Session Thinking tokens/cost and the optional spend cap (#367); absent unless composed. */
     thinking_usage?: ThinkingUsageState | null;
   };
@@ -262,6 +264,7 @@ export function parseState(value: unknown): PanelState | null {
   const personaEditor = parsePersonaEditorState(v.status.persona_editor);
   const memorySeedEditor = parseMemorySeedEditorState(v.status.memory_seed_editor);
   const thinkingUsage = parseUsageState(v.status.thinking_usage);
+  const initiative = parseInitiativeState(v.status.initiative);
   return {
     ...(v as PanelState),
     status: {
@@ -275,6 +278,7 @@ export function parseState(value: unknown): PanelState | null {
       persona_editor: personaEditor,
       memory_seed_editor: memorySeedEditor,
       thinking_usage: thinkingUsage,
+      initiative,
     },
   };
 }
@@ -1145,6 +1149,118 @@ export function voiceInputResultText(enabled: boolean, ok: boolean, detail: unkn
   const name = enabled ? "オンにする" : "オフにする";
   if (ok && status === 200) return enabled ? "音声入力をオンにしました" : "音声入力をオフにしました";
   return `${name}ことができませんでした${raw === "" ? ` (${status})` : `: ${raw}`}`;
+}
+
+// ---- idle initiative (#87) ----
+
+/** Mirrors `InitiativeStatus` (crates/app/src/initiative_host.rs). Counters only, never text. */
+export interface InitiativeState {
+  enabled: boolean;
+  idle_secs: number;
+  pending: boolean;
+  fired: number;
+  completed: number;
+  failed: number;
+  preempted_chat: number;
+  preempted_speech: number;
+  preempted_stop: number;
+  suppressed_total: number;
+  suppressed: [string, number][];
+}
+
+const MAX_INITIATIVE_REASONS = 16;
+
+/** An absent or malformed state is dropped (the card stays hidden); the rest of the page still works. */
+export function parseInitiativeState(value: unknown): InitiativeState | null {
+  if (typeof value !== "object" || value === null) return null;
+  const v = value as Record<string, unknown>;
+  if (typeof v.enabled !== "boolean" || typeof v.pending !== "boolean") return null;
+  const numbers = [
+    v.idle_secs,
+    v.fired,
+    v.completed,
+    v.failed,
+    v.preempted_chat,
+    v.preempted_speech,
+    v.preempted_stop,
+    v.suppressed_total,
+  ];
+  if (!numbers.every(count)) return null;
+  const reasons = v.suppressed;
+  if (!Array.isArray(reasons) || reasons.length > MAX_INITIATIVE_REASONS) return null;
+  const suppressed: [string, number][] = [];
+  for (const entry of reasons) {
+    if (!Array.isArray(entry) || entry.length !== 2) return null;
+    const [name, n] = entry as [unknown, unknown];
+    if (typeof name !== "string" || !/^[a-z_]{1,32}$/.test(name) || !count(n)) return null;
+    suppressed.push([name, n]);
+  }
+  return {
+    enabled: v.enabled,
+    idle_secs: v.idle_secs as number,
+    pending: v.pending,
+    fired: v.fired as number,
+    completed: v.completed as number,
+    failed: v.failed as number,
+    preempted_chat: v.preempted_chat as number,
+    preempted_speech: v.preempted_speech as number,
+    preempted_stop: v.preempted_stop as number,
+    suppressed_total: v.suppressed_total as number,
+    suppressed,
+  };
+}
+
+export const INITIATIVE_LABEL = "沈黙時に自分から話す";
+
+const INITIATIVE_REASON_TEXT: Record<string, string> = {
+  muted: "ミュート中",
+  operator_stopped: "停止直後",
+  floor_held: "相手が話し中",
+  speaking: "話している最中",
+  generating: "返答を作っている最中",
+  content_queued: "コメント処理待ち",
+  deferred_pending: "返信待ちのコメントあり",
+  settling: "発話直後",
+  budget_gap: "間隔の上限",
+  budget_window: "回数の上限",
+};
+
+export interface InitiativeView {
+  label: string;
+  checked: boolean;
+  hint: string;
+  /** One line of counters; reasons are the closed vocabulary the host names, never free text. */
+  summary: string;
+}
+
+/** What the initiative card shows, or `null` when it must stay hidden (absent: not composed). */
+export function initiativeView(state: PanelState | null): InitiativeView | null {
+  const v = state?.status.initiative ?? null;
+  if (v === null) return null;
+  const reasons = v.suppressed
+    .map(([name, n]) => `${INITIATIVE_REASON_TEXT[name] ?? "その他"} ${n}`)
+    .join("、");
+  const preempted = v.preempted_chat + v.preempted_speech + v.preempted_stop;
+  const parts = [`話しかけた回数 ${v.fired}`, `失敗 ${v.failed}`, `譲った回数 ${preempted}`];
+  if (v.suppressed_total > 0) parts.push(`見送り ${v.suppressed_total}(${reasons})`);
+  return {
+    label: INITIATIVE_LABEL,
+    checked: v.enabled,
+    hint: `コメントも音声も ${v.idle_secs} 秒ない間だけ、自分から短く話しかけます。コメントや音声が来たらすぐやめて、そちらを優先します`,
+    summary: parts.join(" · "),
+  };
+}
+
+/** The body of `POST /api/initiative`: a boolean and nothing else (the app refuses anything more). */
+export function initiativeBody(enabled: boolean): { enabled: boolean } {
+  return { enabled };
+}
+
+/** The line shown after an on/off request; the host's own text is only a short tail. */
+export function initiativeResultText(enabled: boolean, ok: boolean, detail: unknown, status: number): string {
+  const raw = typeof detail === "string" ? bounded(detail) : "";
+  if (ok && status === 200) return enabled ? "自分から話すようにしました" : "自分からは話さないようにしました";
+  return `切り替えできませんでした${raw === "" ? ` (${status})` : `: ${raw}`}`;
 }
 
 // ---- character sheet (#401) ----

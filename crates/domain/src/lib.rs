@@ -10,6 +10,7 @@ mod deadline;
 mod error;
 mod event;
 mod floor;
+mod initiative;
 mod interfaces;
 mod perception;
 mod persona;
@@ -48,6 +49,7 @@ pub use event::{
     EventKind, SecurityPlane, SourceClass, TrustLevel,
 };
 pub use floor::*;
+pub use initiative::*;
 pub use interfaces::{
     Authorized, AuthorizedAvatarAction, AuthorizedStreamAction, AuthorizedToolAction, AvatarAction,
     AvatarAdapter, DecisionEngine, DeltaFlow, EngineError, EngineErrorKind, EngineFuture,

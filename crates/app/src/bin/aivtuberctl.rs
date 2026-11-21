@@ -41,6 +41,12 @@
 //! with voice input composed (`aivtuber-setup start`). Transcribed speech is
 //! admitted as untrusted speech either way.
 //!
+//! `initiative` (issue #87) turns on or off the performer speaking up by itself
+//! when no chat arrives, like the operation panel's switch; needs the daemon to
+//! run with the generative path (the local profile started by
+//! `aivtuber-setup start`, where it starts on). It only switches whether the
+//! performer may speak on its own; it cannot say what is said.
+//!
 //! `persona` (issue #401) shows, replaces or clears the operator's character
 //! sheet while the daemon runs, like the operation panel: `persona show` prints
 //! the text, `persona set --file <path>` sends it (the whole text, checked as
@@ -160,6 +166,16 @@ enum Command {
         #[command(subcommand)]
         action: VoiceInputCommand,
     },
+    /// Let the performer speak on its own when no chat or voice arrives for a
+    /// while (issue #87), or not: `initiative on` / `initiative off`, the same
+    /// switch as the operation panel's "沈黙時に自分から話す". Needs the daemon to
+    /// run with the generative path (the local profile started by
+    /// `aivtuber-setup start`, where it starts on). `AIVTUBER_INITIATIVE_IDLE_SECS`
+    /// sets the quiet time (default 45); `status` prints the counters.
+    Initiative {
+        #[command(subcommand)]
+        action: InitiativeCommand,
+    },
     /// Show, replace or clear the character sheet (issue #401); needs the
     /// daemon to run with the generative path (the local and hybrid profiles
     /// started by `aivtuber-setup start`). The text goes to the model with
@@ -244,6 +260,14 @@ enum VoiceInputCommand {
         #[arg(value_parser = ["half", "full"])]
         mode: String,
     },
+}
+
+#[derive(Subcommand, Clone, PartialEq, Eq)]
+enum InitiativeCommand {
+    /// Speak up on its own when it has been quiet.
+    On,
+    /// Stay silent until someone writes or speaks.
+    Off,
 }
 
 #[derive(Subcommand, Clone, PartialEq, Eq)]
@@ -534,6 +558,10 @@ fn action_name(command: &Command) -> &'static str {
             PersonaCommand::Show => "persona.get",
             PersonaCommand::Set { .. } | PersonaCommand::Clear => "persona.set",
         },
+        Command::Initiative { action } => match action {
+            InitiativeCommand::On => "initiative.enable",
+            InitiativeCommand::Off => "initiative.disable",
+        },
         Command::VoiceInput { action } => match action {
             VoiceInputCommand::On => "speech_input.enable",
             VoiceInputCommand::Off => "speech_input.disable",
@@ -805,6 +833,25 @@ fn print_response(response: &OperatorResponse) {
             );
             for name in &voice_input.devices {
                 println!("voice_input_device {name:?}");
+            }
+        }
+        if let Some(initiative) = &status.initiative {
+            // Counters only (#87): never anything that was said.
+            println!(
+                "initiative enabled={} idle_secs={} pending={} fired={} completed={} failed={} preempted_chat={} preempted_speech={} preempted_stop={} suppressed={}",
+                initiative.enabled,
+                initiative.idle_secs,
+                initiative.pending,
+                initiative.fired,
+                initiative.completed,
+                initiative.failed,
+                initiative.preempted_chat,
+                initiative.preempted_speech,
+                initiative.preempted_stop,
+                initiative.suppressed_total,
+            );
+            for (reason, count) in &initiative.suppressed {
+                println!("initiative_suppressed reason={reason} count={count}");
             }
         }
         if let Some(persona) = &status.persona {
@@ -1198,6 +1245,29 @@ mod tests {
             &["persona"][..],
             &["persona", "set"][..],
             &["persona", "set", "--text", "x"][..],
+        ] {
+            let mut full = vec![
+                "aivtuberctl",
+                "--secret",
+                "01234567890123456789012345678901",
+            ];
+            full.extend_from_slice(args);
+            assert!(Cli::try_parse_from(full).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn initiative_subcommand_maps_to_the_two_actions_and_takes_no_argument() {
+        let command = parse(&["initiative", "on"]);
+        assert_eq!(action_name(&command), "initiative.enable");
+        assert_eq!(
+            action_name(&parse(&["initiative", "off"])),
+            "initiative.disable"
+        );
+        for args in [
+            &["initiative"][..],
+            &["initiative", "say"][..],
+            &["initiative", "on", "--text", "x"][..],
         ] {
             let mut full = vec![
                 "aivtuberctl",

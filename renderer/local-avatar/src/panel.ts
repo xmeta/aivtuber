@@ -49,6 +49,9 @@ import {
   type SeedDocument,
   type SeedEntry,
   type SeedKind,
+  initiativeBody,
+  initiativeResultText,
+  initiativeView,
   voiceInputBody,
   voiceInputChoiceResultText,
   voiceInputDeviceBody,
@@ -170,6 +173,7 @@ function render(): void {
   renderModel();
   renderUsage();
   renderVoiceInput();
+  renderInitiative();
   renderPersona();
   renderMemory();
   renderVoice();
@@ -285,6 +289,37 @@ function renderVoiceInput(): void {
 }
 
 let voiceInputBusy = false;
+
+let initiativeBusy = false;
+
+/** The idle-initiative switch (#87): hidden unless the app composed it. Counters only. */
+function renderInitiative(): void {
+  const view = initiativeView(state);
+  $("initiative-section").hidden = view === null;
+  if (view === null) return;
+  $("initiative-label").textContent = view.label;
+  $("initiative-hint").textContent = view.hint;
+  $("initiative-summary").textContent = view.summary;
+  const toggle = $<HTMLInputElement>("initiative-toggle");
+  toggle.checked = view.checked;
+  toggle.disabled = connectionLost || initiativeBusy;
+}
+
+async function setInitiative(enabled: boolean): Promise<void> {
+  initiativeBusy = true;
+  renderInitiative();
+  const out = $("initiative-result");
+  try {
+    const { status, json } = await api("/api/initiative", { method: "POST", body: JSON.stringify(initiativeBody(enabled)) });
+    const body = (json ?? {}) as { ok?: boolean; detail?: string };
+    out.textContent = initiativeResultText(enabled, status === 200 && body.ok === true, body.detail, status);
+  } catch {
+    out.textContent = "失敗しました(アプリに接続できません)";
+  } finally {
+    initiativeBusy = false;
+    void poll();
+  }
+}
 
 /** The segmented input meter (#440). Segments are built once and only toggled. */
 function renderMeter(meter: VoiceMeterView | null): void {
@@ -1353,6 +1388,10 @@ $("memory-add").addEventListener("click", () => {
 });
 $("memory-save").addEventListener("click", () => void saveMemory());
 $("memory-reload").addEventListener("click", () => void loadMemory());
+$<HTMLInputElement>("initiative-toggle").addEventListener(
+  "change",
+  (event) => void setInitiative((event.target as HTMLInputElement).checked),
+);
 $("voice-input-on").addEventListener("click", () => void setVoiceInput(true));
 $("voice-input-off").addEventListener("click", () => void setVoiceInput(false));
 $<HTMLSelectElement>("voice-input-device").addEventListener(

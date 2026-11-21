@@ -57,6 +57,7 @@ const VOICE_PER_TICK: usize = 4;
 const INGRESS_PER_TICK: usize = 4;
 const AVATAR_PER_TICK: usize = 4;
 const SPEECH_INPUT_PER_TICK: usize = 4;
+const INITIATIVE_PER_TICK: usize = 4;
 const PERSONA_PER_TICK: usize = 4;
 const MEMORY_SEED_PER_TICK: usize = 4;
 const CHAT_PER_TICK: usize = 4;
@@ -274,6 +275,7 @@ impl PanelService {
                 | PanelRequest::SpeechInput { .. }
                 | PanelRequest::SpeechInputDevice(_)
                 | PanelRequest::SpeechInputDuplex { .. }
+                | PanelRequest::Initiative { .. }
                 | PanelRequest::PersonaSet(_)
                 | PanelRequest::PersonaGet
                 | PanelRequest::MemorySeedSet(_)
@@ -395,6 +397,33 @@ impl PanelService {
                 &format!("panel-ctl-{}", self.control_seq),
                 action,
                 argument,
+                &self.control_secret.0,
+                now_ms,
+            );
+            eprintln!(
+                "panel: {action} ok={} detail={:?}",
+                response.ok, response.detail
+            );
+            command.respond(response.ok, response.detail);
+            changed = true;
+        }
+        // #87: the idle-initiative switch, on its own queue.
+        for command in self.inbox.drain_initiative(INITIATIVE_PER_TICK) {
+            let action = match &command.request {
+                PanelRequest::Initiative { enabled: true } => "initiative.enable",
+                PanelRequest::Initiative { enabled: false } => "initiative.disable",
+                _ => {
+                    command.respond(false, "not an initiative request");
+                    continue;
+                }
+            };
+            self.control_seq += 1;
+            let response = apply_operator_action(
+                &self.ingress,
+                app,
+                &format!("panel-ctl-{}", self.control_seq),
+                action,
+                None,
                 &self.control_secret.0,
                 now_ms,
             );

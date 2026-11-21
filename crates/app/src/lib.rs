@@ -10,6 +10,8 @@ mod chat_ingress;
 mod deadline;
 mod deferred_ack;
 mod face_settle;
+pub mod initiative;
+mod initiative_host;
 mod irodori_bridge;
 mod memory_compare;
 mod memory_context;
@@ -81,6 +83,7 @@ pub use chat_ingress::{
     parse_disconnect_argument, read_chat_settings,
 };
 pub use deadline::*;
+pub use initiative_host::InitiativeStatus;
 pub use irodori_bridge::*;
 pub use memory_compare::*;
 pub use memory_context::*;
@@ -1024,6 +1027,23 @@ impl GenerativeRuntime {
             && self.cancellation.active_event_id().as_deref() == Some(event_id)
     }
 
+    /// Cancel and release the generation of `event_id` so it no longer counts
+    /// as busy (#87: chat must not wait behind an idle initiative). Its late
+    /// completion is then read as stale. Returns whether one was active.
+    fn abandon_active(&mut self, event_id: &str) -> bool {
+        if self.cancellation.active_event_id().as_deref() != Some(event_id) {
+            return false;
+        }
+        self.cancellation.cancel_active();
+        self.cancellation.finish(event_id);
+        if let Some(generation_id) = self.active_generation_id.take() {
+            self.phrase
+                .runs
+                .retain(|run| run.generation_id != generation_id);
+        }
+        true
+    }
+
     fn finish(&mut self, generation_id: u64, event_id: &str) {
         if self.active_generation_id == Some(generation_id) {
             self.active_generation_id = None;
@@ -1257,6 +1277,13 @@ where
     /// Live chat-burst selection and deferred replies (#75 S1, #78 S2); `None`
     /// unless composed, so the default per-event path is unchanged.
     chat_burst: Option<chat_burst::ChatBurstLane>,
+    /// The bounded idle initiative (#87 S1); `None` (default) composes nothing
+    /// and the performer stays silent when nobody writes.
+    initiative: Option<initiative::InitiativeDirector>,
+    /// Logical sequence of minted initiative events.
+    initiative_sequence: u64,
+    /// The pending initiative's reply fell back to the idle gesture.
+    initiative_fell: bool,
     /// #79 S2: the crowd summary for the one reply being dispatched right now.
     /// Set by the crowd path immediately before `dispatch_admitted_event` and
     /// taken by `handle_event`, so it can never reach another event.
@@ -1345,6 +1372,9 @@ where
             speech_barge_in: None,
             speech_input: None,
             chat_burst: None,
+            initiative: None,
+            initiative_sequence: 0,
+            initiative_fell: false,
             crowd_context: None,
             speech_feed_heartbeat_ms: None,
             speech_playback: speech_duplex::PlaybackGate::default(),
@@ -1803,6 +1833,10 @@ where
         committed_text: &str,
         now_ms: u64,
     ) {
+        // #87: what the performer says on its own is not a conversation turn.
+        if event.kind == aivtuber_domain::EventKind::TimerTick {
+            return;
+        }
         let Some(mut writer) = self.memory_writer.take() else {
             return;
         };
@@ -3480,6 +3514,9 @@ where
         let event = self.security.pop_content().ok_or_else(|| {
             AppError::Routing("queued content was unavailable for dispatch".to_owned())
         })?;
+        // #87: chat or speech restarts the idle clock and cancels a pending
+        // idle initiative before anything else can wait behind it.
+        self.note_content_arrival(event.kind, at_ms);
         // #305: an exact viewer self-erase command is consumed here, before
         // routing, so it can neither be spoken, remembered, nor reach a model.
         // The scope is the envelope's own pseudonym (the runtime mints the
@@ -4771,6 +4808,17 @@ where
         at_ms: u64,
         seed: u64,
     ) -> Result<HandledGeneration, AppError> {
+        // #87: an idle initiative that cannot be generated is never replaced by
+        // a spoken cached reaction; it is a visual gesture only.
+        if self.is_initiative_event(event) {
+            self.initiative_fell_back(at_ms);
+            return Ok(HandledGeneration {
+                playback: None,
+                route: RouteClass::NonVerbalFallback,
+                trace,
+                cache_level: None,
+            });
+        }
         match directive {
             FallbackDirective::CachedReaction { asset_id, .. } => {
                 let outcome = self.performer.handle_asset_id(
@@ -5869,6 +5917,7 @@ where
         );
         if is_override {
             self.note_phrase_cancel_cause(PhraseCause::OperatorStop);
+            self.note_operator_override(at_ms);
         }
         let generation_cancelled = if is_override {
             self.generative
@@ -6346,6 +6395,7 @@ mod tests {
     mod chat_ingress_tests;
     mod crowd_routing_tests;
     mod face_settle_tests;
+    mod initiative_tests;
     mod irodori_tts_tests;
     mod local_thinking_fallback_tests;
     mod memory_seed_tests;

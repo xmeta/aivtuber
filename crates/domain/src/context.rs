@@ -1,5 +1,5 @@
 use crate::{
-    CrowdSummary, DomainValidationError, EventEnvelope, EventKind,
+    CrowdSummary, DomainValidationError, EventEnvelope, EventKind, InitiativeContext,
     MAX_SCREEN_OBSERVATION_THINKING_BYTES, SceneContextSnapshot, SourceClass, TrustLevel,
 };
 use serde::{Deserialize, Serialize};
@@ -172,6 +172,12 @@ pub struct ReflexContext {
     /// serializes exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub crowd: Option<CrowdSummary>,
+    /// The performer speaks on its own, not in answer to `input` (#87 S1). A
+    /// closed kind only, minted by the runtime's initiative director and never
+    /// from a payload field. Omitted when absent, so a request without one
+    /// serializes exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initiative: Option<InitiativeContext>,
 }
 
 impl Default for ReflexContext {
@@ -184,6 +190,7 @@ impl Default for ReflexContext {
             now_ms: None,
             scene: None,
             crowd: None,
+            initiative: None,
         }
     }
 }
@@ -204,6 +211,9 @@ impl ReflexContext {
         }
         if let Some(crowd) = &self.crowd {
             crowd.validate()?;
+        }
+        if let Some(initiative) = &self.initiative {
+            initiative.validate()?;
         }
         Ok(())
     }

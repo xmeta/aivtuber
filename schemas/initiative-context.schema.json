@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xmeta/aivtuber/schemas/initiative-context.schema.json",
+  "title": "AI VTuber Initiative Context",
+  "description": "Idle-initiative marker for a reply context (issue #87 S1). Serialized form of aivtuber_domain::InitiativeContext: one closed kind saying the performer decided, in deterministic code, to speak on its own because the stream went quiet, so the request's input was not written by a viewer. There is no free text, no viewer text and no history in this contract. It is carried as the optional `initiative` member of the Reflex context and of the Thinking request context; the member is omitted when absent, so a request without one is byte-identical to one built before this contract existed. Authority rule: the context is derived data minted by the runtime's initiative director, never from a payload field, and it grants no capability, permit or gate decision; it cannot reach the operator or control plane.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "kind"],
+  "properties": {
+    "schema_version": {"const": "0.1.0"},
+    "kind": {
+      "enum": ["audience_question", "idle_observation", "revisit_topic"],
+      "description": "Closed vocabulary of what the performer may start on its own."
+    }
+  }
+}
