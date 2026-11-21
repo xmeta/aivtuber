@@ -31,6 +31,8 @@ export interface PanelState {
     memory_seed_editor?: MemorySeedEditorState | null;
     /** The idle initiative (#87): the switch and its text-free counters; absent unless the app composed it. */
     initiative?: InitiativeState | null;
+    /** The opt-in session conversation log (#463): the switch, where it writes and counters; absent unless composed. */
+    session_log?: SessionLogState | null;
     /** Session Thinking tokens/cost and the optional spend cap (#367); absent unless composed. */
     thinking_usage?: ThinkingUsageState | null;
   };
@@ -265,6 +267,7 @@ export function parseState(value: unknown): PanelState | null {
   const memorySeedEditor = parseMemorySeedEditorState(v.status.memory_seed_editor);
   const thinkingUsage = parseUsageState(v.status.thinking_usage);
   const initiative = parseInitiativeState(v.status.initiative);
+  const sessionLog = parseSessionLogState(v.status.session_log);
   return {
     ...(v as PanelState),
     status: {
@@ -279,6 +282,7 @@ export function parseState(value: unknown): PanelState | null {
       memory_seed_editor: memorySeedEditor,
       thinking_usage: thinkingUsage,
       initiative,
+      session_log: sessionLog,
     },
   };
 }
@@ -1261,6 +1265,133 @@ export function initiativeResultText(enabled: boolean, ok: boolean, detail: unkn
   const raw = typeof detail === "string" ? bounded(detail) : "";
   if (ok && status === 200) return enabled ? "自分から話すようにしました" : "自分からは話さないようにしました";
   return `切り替えできませんでした${raw === "" ? ` (${status})` : `: ${raw}`}`;
+}
+
+// ---- session conversation log (#463) ----
+
+/** Mirrors `SessionLogStatus` (crates/app/src/session_log.rs). Counters and the location, never logged text. */
+export interface SessionLogState {
+  enabled: boolean;
+  location: string | null;
+  max_file_bytes: number;
+  retain_sessions: number;
+  files_kept: number;
+  lines_written: number;
+  bytes_written: number;
+  dropped_queue_full: number;
+  dropped_file_full: number;
+  write_errors: number;
+  capped: boolean;
+  settings_save_failed: boolean;
+}
+
+const MAX_LOG_LOCATION_CHARS = 512;
+
+/** An absent or malformed state is dropped (the card stays hidden); the rest of the page still works. */
+export function parseSessionLogState(value: unknown): SessionLogState | null {
+  if (typeof value !== "object" || value === null) return null;
+  const v = value as Record<string, unknown>;
+  if (typeof v.enabled !== "boolean" || typeof v.capped !== "boolean" || typeof v.settings_save_failed !== "boolean") {
+    return null;
+  }
+  const numbers = [
+    v.max_file_bytes,
+    v.retain_sessions,
+    v.files_kept,
+    v.lines_written,
+    v.bytes_written,
+    v.dropped_queue_full,
+    v.dropped_file_full,
+    v.write_errors,
+  ];
+  if (!numbers.every(count)) return null;
+  const location = v.location;
+  if (location !== undefined && location !== null && (typeof location !== "string" || location.length > MAX_LOG_LOCATION_CHARS)) {
+    return null;
+  }
+  return {
+    enabled: v.enabled,
+    location: typeof location === "string" ? location : null,
+    max_file_bytes: v.max_file_bytes as number,
+    retain_sessions: v.retain_sessions as number,
+    files_kept: v.files_kept as number,
+    lines_written: v.lines_written as number,
+    bytes_written: v.bytes_written as number,
+    dropped_queue_full: v.dropped_queue_full as number,
+    dropped_file_full: v.dropped_file_full as number,
+    write_errors: v.write_errors as number,
+    capped: v.capped,
+    settings_save_failed: v.settings_save_failed,
+  };
+}
+
+export const SESSION_LOG_LABEL = "配信ログを保存";
+
+export interface SessionLogView {
+  label: string;
+  checked: boolean;
+  /** Says plainly what is stored and where; the location is the host's own path text, shown as text. */
+  hint: string;
+  /** One line of counters. */
+  summary: string;
+  /** Problems the operator should know about (empty when none). */
+  warning: string;
+  /** Delete-all is offered only when there is something saved. */
+  canDelete: boolean;
+}
+
+const megabytes = (bytes: number): string => `${Math.max(1, Math.round(bytes / (1024 * 1024)))} MB`;
+
+/** What the session-log card shows, or `null` when it must stay hidden (absent: not composed). */
+export function sessionLogView(state: PanelState | null): SessionLogView | null {
+  const v = state?.status.session_log ?? null;
+  if (v === null) return null;
+  const where = v.location === null ? "このPCの中" : v.location;
+  const warnings: string[] = [];
+  if (v.capped) warnings.push(`このファイルが上限(${megabytes(v.max_file_bytes)})に達したため、これ以降は保存していません`);
+  if (v.write_errors > 0) warnings.push(`書き込みに失敗した回数 ${v.write_errors}`);
+  if (v.dropped_queue_full > 0) warnings.push(`保存が追いつかず見送った行 ${v.dropped_queue_full}`);
+  if (v.settings_save_failed) warnings.push("オンオフの設定を保存できませんでした(次回起動時は元に戻ります)");
+  return {
+    label: SESSION_LOG_LABEL,
+    checked: v.enabled,
+    hint:
+      `オンの間、コメントや音声の文字起こし(視聴者名は「viewer-01」のような仮名に置き換え)と、話した内容、` +
+      `返答の種類(キャッシュ/生成)、繰り返し判定を、このPCの ${where} にファイルで保存します。` +
+      `音声・キーやトークン・キャラクター設定や記憶の本文は保存しません。外部には送りません。` +
+      `コメントは視聴者のものなので、取り扱いは配信者の責任です。` +
+      `直近 ${v.retain_sessions} 回分だけ残り、古いものは自動で消えます。`,
+    summary: `保存済みファイル ${v.files_kept} · 書き込んだ行 ${v.lines_written}`,
+    warning: warnings.join("。"),
+    canDelete: v.files_kept > 0,
+  };
+}
+
+/** The body of `POST /api/session-log`: a boolean and nothing else (the app refuses anything more). */
+export function sessionLogBody(enabled: boolean): { enabled: boolean } {
+  return { enabled };
+}
+
+/** The body of `POST /api/session-log/delete`: an empty object (the app refuses anything more). */
+export function sessionLogDeleteBody(): Record<string, never> {
+  return {};
+}
+
+export const SESSION_LOG_DELETE_CONFIRM_TEXT =
+  "保存した配信ログをすべて削除します。元に戻せません。よろしいですか?";
+
+/** The line shown after an on/off request; the host's own text is only a short tail. */
+export function sessionLogResultText(enabled: boolean, ok: boolean, detail: unknown, status: number): string {
+  const raw = typeof detail === "string" ? bounded(detail) : "";
+  if (ok && status === 200) return enabled ? "配信ログを保存するようにしました" : "配信ログを保存しないようにしました";
+  return `切り替えできませんでした${raw === "" ? ` (${status})` : `: ${raw}`}`;
+}
+
+/** The line shown after delete-all. */
+export function sessionLogDeleteResultText(ok: boolean, detail: unknown, status: number): string {
+  const raw = typeof detail === "string" ? bounded(detail) : "";
+  if (ok && status === 200) return "保存した配信ログを削除しました";
+  return `削除できませんでした${raw === "" ? ` (${status})` : `: ${raw}`}`;
 }
 
 // ---- character sheet (#401) ----

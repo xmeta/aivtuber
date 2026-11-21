@@ -1076,6 +1076,28 @@ Expected behavior:
 
 To include OBS in the same smoke, also set the OBS variables above. OBS is not required for cached avatar/audio playback.
 
+== Session conversation log (issue #463)
+
+An opt-in local file of the conversation, so a live run can be measured afterwards (repetition, chat-to-first-audio, initiative spacing). Policy and privacy: docs/security-threat-model.adoc section 10.5 and docs/runtime-retention.adoc "Explicit session log".
+
+* +AIVTUBER_SESSION_LOG_DIR+ (the directory) and +AIVTUBER_SESSION_LOG_SETTINGS+ (the remembered choice, +local-session-log-settings/1+) compose it; +aivtuber-setup start+ sets them to +logs/sessions+ and +local-session-log.json+ beside the env file unless the env file or the process environment names others. Without both the app offers no switch. It starts off unless the file says enabled.
+* The switch is the panel's 「配信ログを保存」 card (+POST /api/session-log+ with +{"enabled": boolean}+, +POST /api/session-log/delete+ with +{}+, their own queue) and +aivtuberctl log on|off|delete+ (+session_log.enable+ / +session_log.disable+ / +session_log.delete+ under the closed capability +session_log.control+, held only when composed). The panel card also shows where the files are, the number saved and any write problem.
+* +aivtuberctl log summary <file>+ works offline (no daemon, no secret): +lines/malformed+, +turns+ by origin (+chat+, +voice+, +initiative+, +operator+), +repeat+ lines per origin (+cached+ for cached phrases) with exact and near rates, +first_audio_ms+ (p50/p95, from the input record to the first phrase of the same turn, logical time) and +initiative_spacing_ms+. A damaged or oversized line is counted, not fatal.
+* +aivtuberctl status+ prints +session_log enabled=... files_kept=... lines_written=... dropped_queue_full=... dropped_file_full=... write_errors=... capped=...+ and the location; +diagnose+ carries the same counters without the location.
+
+Record format (one JSON object per line; fake data):
+
+[source,json]
+----
+{"v":1,"t":"session","seq":0,"wall":"2026-11-22T10:00:00Z","session":"3fa91c07","schema":"aivtuber-session-log/1"}
+{"v":1,"t":"config","seq":1,"wall":"2026-11-22T10:00:05Z","persona_sha256":"9c1f0a7e22b4","memory_seed_sha256":"41d0e6aa7b13"}
+{"v":1,"t":"input","seq":2,"turn":"t-0001","logical_ms":61200,"wall":"2026-11-22T10:01:05Z","origin":"chat","viewer":"viewer-01","text":"こんばんは！"}
+{"v":1,"t":"phrase","seq":3,"turn":"t-0001","logical_ms":62340,"wall":"2026-11-22T10:01:06Z","origin":"chat","idx":0,"route":"generated","text":"こんばんは、来てくれてありがとう！","repeat":"none"}
+{"v":1,"t":"route","seq":4,"turn":"t-0001","logical_ms":62340,"wall":"2026-11-22T10:01:06Z","route":"generated"}
+{"v":1,"t":"input","seq":5,"turn":"t-0002","logical_ms":121000,"wall":"2026-11-22T10:02:05Z","origin":"initiative","kind":"idle_observation"}
+{"v":1,"t":"phrase","seq":6,"turn":"t-0002","logical_ms":122100,"wall":"2026-11-22T10:02:06Z","origin":"initiative","idx":0,"route":"generated","text":"最近どう過ごしてる？","repeat":"near"}
+----
+
 == Idle initiative (issue #87 S1)
 
 When no chat or voice arrives for a while the performer would otherwise stay silent. With the generative path composed, the +InitiativeDirector+ (+crates/app/src/initiative.rs+, host side in +initiative_host.rs+) decides in deterministic code, on logical time only, whether to speak on its own; what is said comes from the existing generative path through a typed bounded request.

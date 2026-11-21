@@ -44,6 +44,13 @@ import {
   initiativeView,
   initiativeBody,
   initiativeResultText,
+  parseSessionLogState,
+  sessionLogView,
+  sessionLogBody,
+  sessionLogDeleteBody,
+  sessionLogResultText,
+  sessionLogDeleteResultText,
+  SESSION_LOG_DELETE_CONFIRM_TEXT,
   voiceMeterView,
   METER_SEGMENTS,
   SPEAKING_TEXT,
@@ -1833,5 +1840,108 @@ describe("idle initiative switch (#87)", () => {
     expect(initiativeResultText(false, true, "", 200)).toBe("自分からは話さないようにしました");
     expect(initiativeResultText(true, false, "initiative is not configured", 200)).toContain("initiative is not configured");
     expect(initiativeResultText(true, false, undefined, 503)).toContain("503");
+  });
+});
+
+// ---- session conversation log (#463) ----
+
+const sessionLog = (over: Record<string, unknown> = {}) => ({
+  enabled: true,
+  location: "C:\\aivtuber\\logs\\sessions",
+  max_file_bytes: 5242880,
+  retain_sessions: 20,
+  files_kept: 3,
+  lines_written: 120,
+  bytes_written: 40000,
+  dropped_queue_full: 0,
+  dropped_file_full: 0,
+  write_errors: 0,
+  capped: false,
+  settings_save_failed: false,
+  ...over,
+});
+
+const withSessionLog = (value: unknown) =>
+  parseState({
+    schema: "local-panel/1",
+    uptime_ms: 5,
+    status: {
+      muted: false,
+      audio_error: null,
+      avatar_error: null,
+      stream_error: null,
+      content_queue: 0,
+      scheduler_items: 0,
+      generation_active: false,
+      ...(value === undefined ? {} : { session_log: value }),
+    },
+    replies: [],
+    avatar_url: null,
+  });
+
+describe("session conversation log switch (#463)", () => {
+  test("the card is hidden unless the host composed it, and a malformed state drops it", () => {
+    expect(sessionLogView(withSessionLog(undefined))).toBeNull();
+    expect(sessionLogView(withSessionLog(null))).toBeNull();
+    for (const bad of [
+      sessionLog({ enabled: "yes" }),
+      sessionLog({ files_kept: -1 }),
+      sessionLog({ write_errors: 1.5 }),
+      sessionLog({ capped: 0 }),
+      sessionLog({ location: 5 }),
+      sessionLog({ location: "x".repeat(513) }),
+      "text",
+    ]) {
+      expect(parseSessionLogState(bad)).toBeNull();
+      expect(sessionLogView(withSessionLog(bad))).toBeNull();
+    }
+  });
+
+  test("the card says plainly what is stored and where, and what is not", () => {
+    const view = sessionLogView(withSessionLog(sessionLog()))!;
+    expect(view.label).toBe("配信ログを保存");
+    expect(view.checked).toBe(true);
+    expect(view.hint).toContain("C:\\aivtuber\\logs\\sessions");
+    expect(view.hint).toContain("viewer-01");
+    expect(view.hint).toContain("音声");
+    expect(view.hint).toContain("外部には送りません");
+    expect(view.hint).toContain("20 回分");
+    expect(view.summary).toContain("保存済みファイル 3");
+    expect(view.warning).toBe("");
+    expect(view.canDelete).toBe(true);
+    expect(sessionLogView(withSessionLog(sessionLog({ enabled: false })))!.checked).toBe(false);
+  });
+
+  test("delete is offered only when something is saved", () => {
+    expect(sessionLogView(withSessionLog(sessionLog({ files_kept: 0 })))!.canDelete).toBe(false);
+  });
+
+  test("failures are reported, never hidden", () => {
+    const view = sessionLogView(
+      withSessionLog(
+        sessionLog({ capped: true, write_errors: 2, dropped_queue_full: 4, settings_save_failed: true }),
+      ),
+    )!;
+    expect(view.warning).toContain("上限(5 MB)");
+    expect(view.warning).toContain("書き込みに失敗した回数 2");
+    expect(view.warning).toContain("見送った行 4");
+    expect(view.warning).toContain("設定を保存できませんでした");
+  });
+
+  test("a host without a location still says where in general terms", () => {
+    const view = sessionLogView(withSessionLog(sessionLog({ location: null })))!;
+    expect(view.hint).toContain("このPCの中");
+  });
+
+  test("the request bodies carry nothing but the choice, and the result lines are short", () => {
+    expect(sessionLogBody(true)).toEqual({ enabled: true });
+    expect(Object.keys(sessionLogBody(false))).toEqual(["enabled"]);
+    expect(sessionLogDeleteBody()).toEqual({});
+    expect(SESSION_LOG_DELETE_CONFIRM_TEXT).toContain("元に戻せません");
+    expect(sessionLogResultText(true, true, "session log on", 200)).toBe("配信ログを保存するようにしました");
+    expect(sessionLogResultText(false, true, "", 200)).toBe("配信ログを保存しないようにしました");
+    expect(sessionLogResultText(true, false, "session log is not configured", 200)).toContain("not configured");
+    expect(sessionLogDeleteResultText(true, "session logs deleted", 200)).toBe("保存した配信ログを削除しました");
+    expect(sessionLogDeleteResultText(false, undefined, 503)).toContain("503");
   });
 });

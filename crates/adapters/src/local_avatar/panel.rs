@@ -94,6 +94,7 @@ const INGRESS_QUEUE: usize = 4;
 const AVATAR_QUEUE: usize = 4;
 const SPEECH_INPUT_QUEUE: usize = 4;
 const INITIATIVE_QUEUE: usize = 4;
+const SESSION_LOG_QUEUE: usize = 4;
 const PERSONA_QUEUE: usize = 4;
 const MEMORY_SEED_QUEUE: usize = 4;
 /// Largest `memory-seed.set` body: the seed file bound (64 KiB) plus room for a
@@ -110,7 +111,7 @@ pub const MAX_PANEL_KEY_CHARS: usize = 256;
 /// One model search may take this long, end to end.
 const SEARCH_DEADLINE: Duration = Duration::from_secs(6);
 /// Every state-changing endpoint (all are `POST`).
-const STATE_CHANGING: [&str; 26] = [
+const STATE_CHANGING: [&str; 28] = [
     "/api/chat",
     "/api/stop",
     "/api/mute",
@@ -131,6 +132,8 @@ const STATE_CHANGING: [&str; 26] = [
     "/api/avatar/discard",
     "/api/speech-input",
     "/api/initiative",
+    "/api/session-log",
+    "/api/session-log/delete",
     "/api/persona/set",
     "/api/persona/get",
     "/api/memory-seed/set",
@@ -268,6 +271,13 @@ pub enum PanelRequest {
     Initiative {
         enabled: bool,
     },
+    /// Save the conversation to a local file, or not (#463). Only the wish:
+    /// the composition thread decides whether the log is composed.
+    SessionLog {
+        enabled: bool,
+    },
+    /// Delete every saved session log (#463).
+    SessionLogDelete,
     /// Replace the character sheet (#401) with this text (empty clears it).
     /// Redacted in `Debug`; the composition thread validates it.
     PersonaSet(PanelSecret),
@@ -380,6 +390,7 @@ struct Shared {
     avatar_tx: SyncSender<PanelCommand>,
     speech_input_tx: SyncSender<PanelCommand>,
     initiative_tx: SyncSender<PanelCommand>,
+    session_log_tx: SyncSender<PanelCommand>,
     persona_tx: SyncSender<PanelCommand>,
     memory_seed_tx: SyncSender<PanelCommand>,
     chat_tx: SyncSender<PanelCommand>,
@@ -420,6 +431,7 @@ pub struct PanelInbox {
     avatar_rx: Mutex<Receiver<PanelCommand>>,
     speech_input_rx: Mutex<Receiver<PanelCommand>>,
     initiative_rx: Mutex<Receiver<PanelCommand>>,
+    session_log_rx: Mutex<Receiver<PanelCommand>>,
     persona_rx: Mutex<Receiver<PanelCommand>>,
     memory_seed_rx: Mutex<Receiver<PanelCommand>>,
     chat_rx: Mutex<Receiver<PanelCommand>>,
@@ -484,6 +496,17 @@ impl PanelInbox {
     /// can never sit in front of a stop or a mute.
     pub fn drain_initiative(&self, max: usize) -> Vec<PanelCommand> {
         self.initiative_rx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .try_iter()
+            .take(max)
+            .collect()
+    }
+
+    /// Session log on/off and delete requests (#463). Their own queue, so they
+    /// can never sit in front of a stop or a mute.
+    pub fn drain_session_log(&self, max: usize) -> Vec<PanelCommand> {
+        self.session_log_rx
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .try_iter()
@@ -585,6 +608,7 @@ impl LocalPanelServer {
         let (avatar_tx, avatar_rx) = sync_channel(AVATAR_QUEUE);
         let (speech_input_tx, speech_input_rx) = sync_channel(SPEECH_INPUT_QUEUE);
         let (initiative_tx, initiative_rx) = sync_channel(INITIATIVE_QUEUE);
+        let (session_log_tx, session_log_rx) = sync_channel(SESSION_LOG_QUEUE);
         let (persona_tx, persona_rx) = sync_channel(PERSONA_QUEUE);
         let (memory_seed_tx, memory_seed_rx) = sync_channel(MEMORY_SEED_QUEUE);
         let (chat_tx, chat_rx) = sync_channel(CHAT_QUEUE);
@@ -604,6 +628,7 @@ impl LocalPanelServer {
             avatar_tx,
             speech_input_tx,
             initiative_tx,
+            session_log_tx,
             persona_tx,
             memory_seed_tx,
             chat_tx,
@@ -629,6 +654,7 @@ impl LocalPanelServer {
             avatar_rx: Mutex::new(avatar_rx),
             speech_input_rx: Mutex::new(speech_input_rx),
             initiative_rx: Mutex::new(initiative_rx),
+            session_log_rx: Mutex::new(session_log_rx),
             persona_rx: Mutex::new(persona_rx),
             memory_seed_rx: Mutex::new(memory_seed_rx),
             chat_rx: Mutex::new(chat_rx),
@@ -978,6 +1004,21 @@ fn route(
         "/api/initiative" => match speech_input_body(&body) {
             // The same strict `{"enabled": boolean}` as the voice input switch.
             Ok(enabled) => (PanelRequest::Initiative { enabled }, &shared.initiative_tx),
+            Err((status, detail)) => {
+                shared.count(&shared.counters.rejected_request);
+                return json(status, false, detail);
+            }
+        },
+        "/api/session-log" => match speech_input_body(&body) {
+            // The same strict `{"enabled": boolean}` as the other switches.
+            Ok(enabled) => (PanelRequest::SessionLog { enabled }, &shared.session_log_tx),
+            Err((status, detail)) => {
+                shared.count(&shared.counters.rejected_request);
+                return json(status, false, detail);
+            }
+        },
+        "/api/session-log/delete" => match empty_object(&body) {
+            Ok(()) => (PanelRequest::SessionLogDelete, &shared.session_log_tx),
             Err((status, detail)) => {
                 shared.count(&shared.counters.rejected_request);
                 return json(status, false, detail);
@@ -2543,6 +2584,89 @@ mod tests {
         // Never in the stop/mute, voice input, voice or chat queues.
         assert!(f.inbox.drain_control(8).is_empty());
         assert!(f.inbox.drain_speech_input(8).is_empty());
+        assert!(f.inbox.drain_voice(8).is_empty());
+        assert!(f.inbox.drain_chat(8).is_empty());
+    }
+
+    // ---- session conversation log (#463) ----
+
+    #[test]
+    fn session_log_requests_are_authenticated_same_origin_strict_and_on_their_own_queue() {
+        let f = fixture();
+        let good = good(&f);
+        let body = "{\"enabled\":true}";
+        for path in ["/api/session-log", "/api/session-log/delete"] {
+            let mut foreign = with(&good, "origin");
+            foreign.push(("Origin", "http://evil.example"));
+            assert_eq!(post(&f, path, &foreign, body).status, 403, "{path}");
+            assert_eq!(
+                post(&f, path, &with(&good, "x-panel-token"), body).status,
+                401,
+                "{path}"
+            );
+            assert_eq!(get(&f, path, "").status, 405, "{path}");
+        }
+        let headers = with(&good, "none");
+        for bad in [
+            "",
+            "{}",
+            "{\"enabled\":\"true\"}",
+            "{\"enabled\":true,\"path\":\"/tmp/x\"}",
+        ] {
+            assert_eq!(
+                post(&f, "/api/session-log", &headers, bad).status,
+                400,
+                "{bad:?}"
+            );
+        }
+        for bad in ["", "[]", "{\"all\":true}", "{\"path\":\"/\"}"] {
+            assert_eq!(
+                post(&f, "/api/session-log/delete", &headers, bad).status,
+                400,
+                "{bad:?}"
+            );
+        }
+        assert!(
+            f.inbox.drain_session_log(8).is_empty(),
+            "nothing got through"
+        );
+        for (path, body, expected) in [
+            (
+                "/api/session-log",
+                "{\"enabled\":true}",
+                PanelRequest::SessionLog { enabled: true },
+            ),
+            (
+                "/api/session-log",
+                "{\"enabled\":false}",
+                PanelRequest::SessionLog { enabled: false },
+            ),
+            (
+                "/api/session-log/delete",
+                "{}",
+                PanelRequest::SessionLogDelete,
+            ),
+        ] {
+            let answer = thread::scope(|s| {
+                let handle = s.spawn(|| post(&f, path, &headers, body));
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let mut commands = Vec::new();
+                while commands.is_empty() && Instant::now() < deadline {
+                    commands = f.inbox.drain_session_log(4);
+                    thread::sleep(Duration::from_millis(5));
+                }
+                assert_eq!(commands.len(), 1);
+                let command = commands.into_iter().next().unwrap();
+                assert_eq!(command.request, expected);
+                command.respond(true, "ok");
+                handle.join().unwrap()
+            });
+            assert_eq!(answer.status, 200, "{}", answer.body);
+        }
+        // Never in the stop/mute, voice input, initiative, voice or chat queues.
+        assert!(f.inbox.drain_control(8).is_empty());
+        assert!(f.inbox.drain_speech_input(8).is_empty());
+        assert!(f.inbox.drain_initiative(8).is_empty());
         assert!(f.inbox.drain_voice(8).is_empty());
         assert!(f.inbox.drain_chat(8).is_empty());
     }

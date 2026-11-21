@@ -51,7 +51,7 @@ All limits are configurable through +AIVTUBER_RETENTION_*+ environment variables
 |Generated/dynamic L0 assets |Bounded count/bytes |Static/preloaded assets are pinned and are not displaced by dynamic churn
 |Promotion metadata |Bounded RAM |Metadata may outlive full L0 assets but cannot grow with process lifetime
 |Cached recent-variant groups |Bounded RAM |Group keys use deterministic logical recency
-|Working-memory entries |Bounded count/time/bytes |No hidden transcript is retained
+|Working-memory entries |Bounded count/time/bytes |No hidden transcript is retained (the explicit, opt-in session log below is the only transcript-like file)
 |Working-memory compaction history |Bounded RAM |Oldest diagnostic records are evicted
 |Adaptation feedback/recent groups |Bounded RAM |Logical recency determines deterministic eviction
 |Adaptation decisions |Bounded RAM |Oldest decision detail is evicted
@@ -63,6 +63,9 @@ All limits are configurable through +AIVTUBER_RETENTION_*+ environment variables
 |Perception observation state (#90, S1a) |Bounded count + logical TTL |Latest observation per (enabled source, kind), at most 8 allowlisted and 2 enabled sources by default, a text-free diagnostic ring of 8, idle TTL 5 minutes; no frame, image or durable write exists. `PerceptionTracker` is not composed into the production app yet, so it has no `RuntimeRetentionPolicy` row or environment variable until S1b
 |Scene context state (#88 S1) |Bounded count + logical age |One OBS reading (the operator's table row, never the scene name; silent after `obs_max_age_ms`, default 15 s), the current `SceneContextSnapshot` (at most 8 labels) and a ring of at most 16 (hard cap 64) class transitions, oldest dropped and counted; no free text, no frame and no durable write exist
 |Generation queue/completions |Bounded RAM |#121 owns execution semantics; no per-request tombstone history is retained
+|Session log assembler (#463) |Bounded count + bytes, nothing while off |At most 256 viewer pseudonyms and 256 turn ids in RAM (never persisted), 400 characters per text field; the app thread only formats one line and `try_send`s it
+|Session log writer queue (#463) |Bounded queue |512 lines; a full queue drops the newest and counts it in `dropped_queue_full`
+|Session log files on disk (#463) |Bounded bytes + count, opt-in |5 MiB per file (then it stops and says so), newest 20 files kept, deletable from the panel; see "Explicit session log" below
 |===
 
 Future retained-state features must either derive a limit from this policy, document an equivalent bounded/external contract, or explicitly justify why an unbounded structure is safe outside the production event path.
@@ -77,6 +80,18 @@ When a previously unseen source arrives:
 . if the hard key limit is still reached, the unseen source is rate-dropped;
 . active buckets are not evicted merely to admit a new attacker-controlled key.
 This keeps memory bounded without turning eviction into a token-bucket reset primitive. The implementation stays local rather than adopting +governor+ for #51: +governor+ provides useful quota/GCRA and clock primitives but does not remove the need for this repository-owned hard key admission/retention policy.
+
+== Explicit session log (#463)
+
+"No hidden transcript is retained" stays the rule: the structures above never keep what was said. The operator may *choose* to keep a conversation log. It is an explicit, opt-in (off by default), bounded, local, pseudonymised file, not a hidden retention path:
+
+* One JSON Lines file per app session under +logs/sessions/+ next to the launcher's env file (+session-<UTC time>-<id>.jsonl+), written only while the panel switch 「配信ログを保存」 (or +aivtuberctl log on+) is on, remembered across launches in +local-session-log.json+. While off nothing is written and no directory is created.
+* Each line is one record of a closed set: +session+ (header), +config+ (character sheet and memory seed SHA-256 prefixes, never their text), +input+ (a chat line or transcript, or an idle initiative), +phrase+ (one committed phrase as spoken, with the #89 repeat verdict and route), +route+ (how a turn was answered and any fallback), +note+ and +capped+. Records of a turn share a per-session turn id; there are no raw event ids. Ordering is +seq+ plus the monotonic +logical_ms+; the UTC +wall+ time is display only.
+* Viewer and channel ids are replaced per session by pseudonyms (+viewer-01+ ...); known secrets are redacted and URLs become +[url]+; no audio, key, token, character sheet or memory seed text is written.
+* Bounds: 400 characters per text field, 5 MiB per file (then a +capped+ record and no more lines), the newest 20 files kept (older ones deleted when a new file starts), delete-all from the panel or +aivtuberctl log delete+ (only +session-*.jsonl+ files in that directory).
+* Writing is on its own thread behind a 512-line queue. A full queue, a full file or an I/O error is counted and shown in the status and never blocks or fails a reply or an operator command.
+* The files are never part of the diagnose bundle (counters only), never uploaded or synced, and nothing in the app reads them back. +aivtuberctl log summary <file>+ reads one offline: turn counts by origin, exact and near repeat rates by origin, chat-to-first-audio p50/p95 and initiative spacing, printing counts and timings only.
+* Viewer text in the file is third-party data; keeping, sharing and deleting it is the operator's responsibility (docs/security-threat-model.adoc section 10.5).
 
 == Determinism and time
 

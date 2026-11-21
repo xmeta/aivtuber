@@ -143,6 +143,10 @@ pub struct SupportResourceCounters {
     /// Repeated-phrase counters (#89); text-free.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeats: Option<crate::RepeatStatus>,
+    /// The opt-in session log (#463): the switch and counters only. The
+    /// location and the logged text are never part of a bundle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_log: Option<crate::SessionLogStatus>,
 }
 
 /// One redacted audit summary line (bounded decision text; never a payload).
@@ -384,6 +388,7 @@ impl SupportBundleBuilder {
             generative_budget: app.generative_budget_snapshot(generated_unix_ms),
             initiative: app.initiative_status(),
             repeats: Some(app.repeat_status()),
+            session_log: app.session_log_counters(),
         };
 
         // Recent incident references from the security runtime's bounded

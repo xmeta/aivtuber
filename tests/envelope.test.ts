@@ -106,6 +106,7 @@ describe("normalizeEvent", () => {
       "speech_input.control",
       "persona.configure",
       "initiative.control",
+      "session_log.control",
     ]);
   });
 });

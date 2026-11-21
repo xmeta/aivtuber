@@ -302,6 +302,15 @@ pub const MEMORY_SEED_FILE: &str = "local-memory-seed.json";
 /// Same name as `aivtuber_app::MEMORY_SEED_FILE_VAR`; a test pins the two
 /// together by value (the app crate is not linked here).
 const MEMORY_SEED_FILE_VAR: &str = "AIVTUBER_MEMORY_SEED";
+/// The opt-in session conversation log (#463): `logs/sessions` beside the env
+/// file, and the remembered on/off choice next to it. Same names as
+/// `aivtuber_app::session_log::{SESSION_LOG_DIR_VAR, SESSION_LOG_SETTINGS_VAR}`;
+/// a test pins them. Nothing is created here: the app creates the directory
+/// when the operator first turns the log on.
+pub const SESSION_LOG_DIR: &str = "logs/sessions";
+pub const SESSION_LOG_SETTINGS_FILE: &str = "local-session-log.json";
+const SESSION_LOG_DIR_VAR: &str = "AIVTUBER_SESSION_LOG_DIR";
+const SESSION_LOG_SETTINGS_VAR: &str = "AIVTUBER_SESSION_LOG_SETTINGS";
 /// The empty seed written when the file is absent. It is a fixture the app's
 /// own loader test validates, so it cannot drift from the seed contract.
 const EMPTY_MEMORY_SEED: &str =
@@ -652,6 +661,39 @@ pub fn app_memory_seed_env(
     )]
 }
 
+/// Where the app writes the opt-in session log (#463) and keeps its on/off
+/// choice, for every profile. The log is off until the operator turns it on, so
+/// naming the places changes nothing by itself. An explicit value in the env
+/// file or the process environment wins.
+pub fn app_session_log_env(
+    env_file: &Path,
+    file_env: &BTreeMap<String, String>,
+    process_env: &dyn Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    let set = |name: &str| {
+        file_env.get(name).is_some_and(|v| !v.trim().is_empty())
+            || process_env(name).is_some_and(|v| !v.trim().is_empty())
+    };
+    let base = env_file.parent().unwrap_or_else(|| Path::new("."));
+    let mut vars = Vec::new();
+    if !set(SESSION_LOG_DIR_VAR) {
+        vars.push((
+            SESSION_LOG_DIR_VAR.to_owned(),
+            base.join(SESSION_LOG_DIR).display().to_string(),
+        ));
+    }
+    if !set(SESSION_LOG_SETTINGS_VAR) {
+        vars.push((
+            SESSION_LOG_SETTINGS_VAR.to_owned(),
+            env_file
+                .with_file_name(SESSION_LOG_SETTINGS_FILE)
+                .display()
+                .to_string(),
+        ));
+    }
+    vars
+}
+
 /// Creates the empty seed at `path` unless something is already there (an
 /// existing file, valid or not, is the streamer's and is never overwritten).
 pub fn ensure_memory_seed_file(path: &Path) -> std::io::Result<()> {
@@ -786,6 +828,9 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
             .map_err(|e| format!("cannot create {path}: {e}"))?;
     }
     env.extend(seed_vars);
+    let session_log_vars =
+        app_session_log_env(&opts.env_file, &env, &|name| std::env::var(name).ok());
+    env.extend(session_log_vars);
     let plan = match &llm {
         Llm::Managed(_) => plan_models(&env, &Manifest::embedded(), &settings, &|p| {
             std::fs::metadata(p).ok().map(|m| m.len())
@@ -1244,6 +1289,35 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn the_app_is_told_where_the_session_log_goes_unless_the_user_chose() {
+        let env_file = Path::new("/x/local-profile.env");
+        let none = |_: &str| None;
+        let got = app_session_log_env(env_file, &map(&[]), &none);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0].0, "AIVTUBER_SESSION_LOG_DIR");
+        assert!(
+            got[0].1.replace('\\', "/").ends_with("/x/logs/sessions"),
+            "{got:?}"
+        );
+        assert_eq!(got[1].0, "AIVTUBER_SESSION_LOG_SETTINGS");
+        assert!(got[1].1.ends_with(SESSION_LOG_SETTINGS_FILE), "{got:?}");
+        assert_eq!(Path::new(&got[1].1).parent(), env_file.parent(), "{got:?}");
+        // The names are the app's.
+        assert_eq!(SESSION_LOG_DIR, "logs/sessions");
+        assert_eq!(SESSION_LOG_SETTINGS_FILE, "local-session-log.json");
+        // An explicit value wins, per variable.
+        let explicit = map(&[("AIVTUBER_SESSION_LOG_DIR", "/mine")]);
+        let got = app_session_log_env(env_file, &explicit, &none);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "AIVTUBER_SESSION_LOG_SETTINGS");
+        let process =
+            |n: &str| (n == "AIVTUBER_SESSION_LOG_SETTINGS").then(|| "/p.json".to_owned());
+        let got = app_session_log_env(env_file, &map(&[]), &process);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "AIVTUBER_SESSION_LOG_DIR");
     }
 
     #[test]

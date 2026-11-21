@@ -58,6 +58,7 @@ const INGRESS_PER_TICK: usize = 4;
 const AVATAR_PER_TICK: usize = 4;
 const SPEECH_INPUT_PER_TICK: usize = 4;
 const INITIATIVE_PER_TICK: usize = 4;
+const SESSION_LOG_PER_TICK: usize = 4;
 const PERSONA_PER_TICK: usize = 4;
 const MEMORY_SEED_PER_TICK: usize = 4;
 const CHAT_PER_TICK: usize = 4;
@@ -276,6 +277,8 @@ impl PanelService {
                 | PanelRequest::SpeechInputDevice(_)
                 | PanelRequest::SpeechInputDuplex { .. }
                 | PanelRequest::Initiative { .. }
+                | PanelRequest::SessionLog { .. }
+                | PanelRequest::SessionLogDelete
                 | PanelRequest::PersonaSet(_)
                 | PanelRequest::PersonaGet
                 | PanelRequest::MemorySeedSet(_)
@@ -414,6 +417,34 @@ impl PanelService {
                 PanelRequest::Initiative { enabled: false } => "initiative.disable",
                 _ => {
                     command.respond(false, "not an initiative request");
+                    continue;
+                }
+            };
+            self.control_seq += 1;
+            let response = apply_operator_action(
+                &self.ingress,
+                app,
+                &format!("panel-ctl-{}", self.control_seq),
+                action,
+                None,
+                &self.control_secret.0,
+                now_ms,
+            );
+            eprintln!(
+                "panel: {action} ok={} detail={:?}",
+                response.ok, response.detail
+            );
+            command.respond(response.ok, response.detail);
+            changed = true;
+        }
+        // #463: the session log switch and delete-all, on their own queue.
+        for command in self.inbox.drain_session_log(SESSION_LOG_PER_TICK) {
+            let action = match &command.request {
+                PanelRequest::SessionLog { enabled: true } => "session_log.enable",
+                PanelRequest::SessionLog { enabled: false } => "session_log.disable",
+                PanelRequest::SessionLogDelete => "session_log.delete",
+                _ => {
+                    command.respond(false, "not a session log request");
                     continue;
                 }
             };

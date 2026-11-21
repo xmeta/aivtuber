@@ -62,6 +62,8 @@ pub struct OperatorRequest {
     /// `persona.set`, `persona.get` (the character sheet, #401),
     /// `initiative.enable`, `initiative.disable` (speak on its own when no
     /// chat arrives, #87),
+    /// `session_log.enable`, `session_log.disable`, `session_log.delete` (the
+    /// opt-in local session conversation log and deleting its files, #463),
     /// `memory.seed.get`, `memory.seed.set` (the operator memory seed, #402),
     /// `panel.url` (show the operation panel URL again, #388),
     /// `app.shutdown` (stop everything, answer, then end the app, #449).
@@ -189,6 +191,10 @@ pub struct OperatorStatusSnapshot {
     /// origin, and initiative phrases refused for repeating. Text-free.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeats: Option<crate::RepeatStatus>,
+    /// The opt-in session conversation log (#463): the switch, where it
+    /// writes and counters. Never any logged text. Absent unless composed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_log: Option<crate::SessionLogStatus>,
 }
 
 /// Operator-visible, text-free perception status: whether it is running, why
@@ -262,6 +268,7 @@ impl OperatorStatusSnapshot {
             memory_seed_editor: app.memory_seed_editor_status(),
             initiative: app.initiative_status(),
             repeats: Some(app.repeat_status()),
+            session_log: app.session_log_status(),
         }
     }
 }
@@ -366,6 +373,8 @@ pub struct OperatorEndpointOptions {
     pub memory_seed_edit: bool,
     /// The idle initiative is composed (#87): `initiative.control`.
     pub initiative_control: bool,
+    /// The session conversation log is composed (#463): `session_log.control`.
+    pub session_log_control: bool,
 }
 
 /// Authenticated operator control endpoint.
@@ -426,6 +435,7 @@ impl OperatorControlServer {
             persona_configure,
             memory_seed_edit,
             initiative_control,
+            session_log_control,
         } = options;
         let name = name.trim();
         if name.is_empty() {
@@ -479,6 +489,12 @@ impl OperatorControlServer {
             // can mint it. It switches whether the performer may speak on its
             // own; it cannot say what is spoken.
             capabilities.insert(aivtuber_domain::Capability::InitiativeControl);
+        }
+        if session_log_control {
+            // `session_log.control` is held only so the `session_log.*`
+            // actions can mint it. It switches recording and deletes saved
+            // logs; it cannot read a log or say what is logged.
+            capabilities.insert(aivtuber_domain::Capability::SessionLogControl);
         }
         if memory_export || memory_seed_edit {
             // `memory.admin` is held only so `memory.export` and the
@@ -698,6 +714,7 @@ pub fn apply_operator_request<R: RoutePlanner>(
         && !is_speech_input_action(&request.action)
         && !is_persona_action(&request.action)
         && !is_initiative_action(&request.action)
+        && !is_session_log_action(&request.action)
         && request.action != "panel.url"
         && request.action != "app.shutdown"
     {
@@ -778,6 +795,15 @@ fn is_initiative_action(action: &str) -> bool {
     matches!(action, "initiative.enable" | "initiative.disable")
 }
 
+/// The session log actions (#463), all under `session_log.control`. The
+/// operator endpoint (`aivtuberctl`) and the panel may send all three.
+fn is_session_log_action(action: &str) -> bool {
+    matches!(
+        action,
+        "session_log.enable" | "session_log.disable" | "session_log.delete"
+    )
+}
+
 /// The memory seed actions (#402), both under the existing `memory.admin`. The
 /// operator endpoint (`aivtuberctl`) and the panel may send both; nothing else
 /// that holds `memory.admin` (export, erase) is reachable from the panel.
@@ -820,6 +846,7 @@ pub fn apply_operator_action<R: RoutePlanner>(
         && !is_speech_input_action(action)
         && !is_persona_action(action)
         && !is_initiative_action(action)
+        && !is_session_log_action(action)
         && !is_memory_seed_action(action)
     {
         let detail = format!("unknown action {action}");
@@ -910,6 +937,8 @@ fn apply_with_presented_secret<R: RoutePlanner>(
         "persona.configure".to_owned()
     } else if is_initiative_action(action) {
         "initiative.control".to_owned()
+    } else if is_session_log_action(action) {
+        "session_log.control".to_owned()
     } else if action == "panel.url" {
         // No new capability: the operator endpoint's own `performer.stop`.
         "panel.url".to_owned()
@@ -1051,6 +1080,29 @@ fn apply_with_presented_secret<R: RoutePlanner>(
                     status: None,
                     memory_export: None,
                     persona: outcome.text,
+                    panel_url: None,
+                }
+            }
+            Err(detail) => {
+                app.audit_operator_action(&request_id, action, &detail, false);
+                rejection(&request_id, &detail)
+            }
+        };
+    }
+
+    if is_session_log_action(action) {
+        // The detail is a fixed phrase (never a path), so the audit record
+        // carries the action and its outcome only.
+        return match app.configure_session_log(command.authority(), action) {
+            Ok(detail) => {
+                app.audit_operator_action(&request_id, action, &detail, true);
+                OperatorResponse {
+                    request_id,
+                    ok: true,
+                    detail,
+                    status: None,
+                    memory_export: None,
+                    persona: None,
                     panel_url: None,
                 }
             }
