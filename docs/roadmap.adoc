@@ -31,7 +31,7 @@ The product milestones below decide *what ships next*. While a product milestone
 |Milestone |Exit condition |Why now
 
 |v0.2 - First Real Stream (due 2026-12-05)
-|#456: one 60-minute operator-observed stream on the `local` profile with real chat, the VRM avatar through OBS Browser Source and voice input, recorded as a link:current-constraint.adoc[constraint evidence packet] plus an link:after-action-review.adoc[AAR].
+|#456: a 12-minute operator-observed stream on the `local` profile with real chat, the VRM avatar through OBS Browser Source and voice input, plus a 60-minute unattended duration run, recorded as a link:current-constraint.adoc[constraint evidence packet] plus an link:after-action-review.adoc[AAR].
 |The only 30+ minute live run on record (2026-10-02) used the cached profile with Thinking, voice and chat off. Everything added since has never run together for an hour, so no measured constraint exists to rank work.
 
 |v0.3 - Watchable Hour (due 2026-12-26)
