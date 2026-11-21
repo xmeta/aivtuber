@@ -536,3 +536,48 @@ fn malformed_level_lines_show_nothing_and_do_not_degrade() {
     assert_eq!(sidecar.stats().level_lines, 0);
     assert!(!sidecar.is_degraded());
 }
+
+/// #451: the app appends its own flags to the sidecar's arguments
+/// (`--level-ms 100`), so a flag is never a lock path. Run the double in an
+/// empty directory with such a flag and assert it writes nothing there.
+#[test]
+fn an_argument_that_is_not_lock_never_becomes_a_file() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "aivtuber-double-args-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+
+    let mut child = std::process::Command::new(DOUBLE)
+        .args(["clock", "--level-ms", "100"])
+        .current_dir(&dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the double");
+    drop(child.stdin.take());
+    let status = child.wait().expect("wait for the double");
+    assert!(status.success(), "{status:?}");
+
+    let mut written: Vec<String> = std::fs::read_dir(&dir)
+        .expect("read the scratch dir")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    written.sort();
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        written.is_empty(),
+        "a sidecar argument became a file: {written:?}"
+    );
+}
