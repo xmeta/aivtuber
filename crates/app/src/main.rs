@@ -1664,6 +1664,9 @@ fn report_chat_burst<R: aivtuber_app::RoutePlanner>(
                 .map_or("", String::as_str)
         );
     }
+    for (class, members) in app.take_crowd_routes(16) {
+        eprintln!("chat_burst: crowd routed class={class:?} members={members}");
+    }
     let Some(metrics) = app.chat_burst_metrics() else {
         return;
     };

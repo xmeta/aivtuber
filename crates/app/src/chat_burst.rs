@@ -383,6 +383,9 @@ pub(crate) struct ChatBurstLane {
     records: VecDeque<ChatBurstRecord>,
     reports: VecDeque<DeferredReplyReport>,
     signals: VecDeque<AudienceSignal>,
+    /// #79 S2: (class, member count) of each routed crowd reaction; no text,
+    /// no actor ids. Bounded like `signals`.
+    crowd_routes: VecDeque<(aivtuber_domain::CrowdClass, u32)>,
     last_ms: u64,
     ack: crate::deferred_ack::AckGate,
 }
@@ -440,6 +443,7 @@ impl ChatBurstLane {
             records: VecDeque::new(),
             reports: VecDeque::new(),
             signals: VecDeque::new(),
+            crowd_routes: VecDeque::new(),
             last_ms: 0,
             ack: crate::deferred_ack::AckGate::new(config.deferred_ack),
         })
@@ -485,6 +489,16 @@ impl ChatBurstLane {
     pub(crate) fn take_audience_signals(&mut self, max: usize) -> Vec<AudienceSignal> {
         let take = max.min(self.signals.len());
         self.signals.drain(..take).collect()
+    }
+
+    /// Remove and return up to `max` routed crowd reactions as (class,
+    /// member count), oldest first, for a no-text log line.
+    pub(crate) fn take_crowd_routes(
+        &mut self,
+        max: usize,
+    ) -> Vec<(aivtuber_domain::CrowdClass, u32)> {
+        let take = max.min(self.crowd_routes.len());
+        self.crowd_routes.drain(..take).collect()
     }
 
     /// A crowd carrier was answered with a non-verbal crowd reaction.
@@ -655,6 +669,13 @@ impl ChatBurstLane {
                     self.metrics.audience_signals_dropped += 1;
                 }
                 self.signals.push_back(signal.clone());
+            }
+            for route in &record.crowd {
+                if self.crowd_routes.len() >= MAX_AUDIENCE_SIGNALS {
+                    self.crowd_routes.pop_front();
+                }
+                self.crowd_routes
+                    .push_back((route.summary.class, route.summary.member_count));
             }
             // #79 S2: the engine's routing, keyed by the carrier's event id.
             let crowd_of: BTreeMap<&str, CrowdDispatch> = record
@@ -1134,6 +1155,68 @@ mod tests {
             scorer.score("aaaaaaaa", local_score_milli("aaaaaaaa"), 0),
             0
         );
+    }
+
+    /// Wave shape and timings from the #79 live runs (distinct actors, one
+    /// scam outlier). Reactions split into GG and congratulation families, so
+    /// at the default 1.5 s window and ~350 ms spacing neither family reaches
+    /// 3 members in one batch; a window that holds the wave does.
+    fn run_wave(window_ms: u64, gap_ms: u64) -> (Vec<aivtuber_reflex::AudienceSignal>, u64) {
+        let mut lane = ChatBurstLane::new(ChatBurstConfig {
+            burst: BurstConfig {
+                window_ms,
+                ..BurstConfig::default()
+            },
+            audience: Some(aivtuber_reflex::AudienceConfig::default()),
+            crowd: Some(aivtuber_reflex::CrowdConfig::default()),
+            ..ChatBurstConfig::default()
+        })
+        .expect("lane");
+        let wave = [
+            ("c2", "GG"),
+            ("c3", "おめでとう！"),
+            ("c4", "GG!"),
+            ("c5", "おめでとう"),
+            ("c6", "gg"),
+            ("c7", "おめでとうございます"),
+            (
+                "x1",
+                "【無料】今すぐ受け取り→ http://free-gift.example/claim でギフト券を入手",
+            ),
+            ("c3", "GGWP"),
+            ("c2", "おめでとう〜"),
+            ("c4", "草"),
+            ("c5", "草草"),
+            ("c6", "www"),
+        ];
+        for (i, (actor, text)) in wave.iter().enumerate() {
+            let mut event = sample(&format!("w{i}"));
+            event.sequence = i as u64 + 1;
+            event.actor_id = Some(format!("viewer:{actor}"));
+            event
+                .payload
+                .insert("text".to_owned(), serde_json::json!(text));
+            let _ = lane.offer(event, 1_000 + i as u64 * gap_ms);
+        }
+        let _ = lane.resolve_ready(1_000 + wave.len() as u64 * gap_ms + 10_000);
+        let signals = lane.take_audience_signals(16);
+        assert_eq!(lane.metrics().audience_guarded, 1, "scam outlier guarded");
+        let routes = lane.take_crowd_routes(16);
+        assert_eq!(routes.len(), signals.len());
+        (signals, lane.metrics().crowd_routed)
+    }
+
+    #[test]
+    fn live_wave_yields_signal_and_crowd_route_when_window_holds_it() {
+        let (signals, routed) = run_wave(1_500, 150);
+        assert!(!signals.is_empty() && routed > 0);
+        let (signals, routed) = run_wave(4_000, 350);
+        assert!(!signals.is_empty() && routed > 0);
+        assert!(signals.iter().all(|s| s.count >= 3));
+        // Live run D: default window, 350 ms spacing, GG and congratulation
+        // each stay below 3 per batch (deliberate thresholds, not a bug).
+        let (signals, _) = run_wave(1_500, 350);
+        assert!(signals.is_empty());
     }
 
     fn sample(id: &str) -> EventEnvelope {
