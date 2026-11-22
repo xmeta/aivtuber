@@ -124,8 +124,8 @@ fn a_mixed_token_celebration_yields_one_selected_carrier_and_suppresses_the_rest
         .iter()
         .find(|record| !record.crowd.is_empty())
         .expect("a routed batch");
-    // おめでとう, GG/nice/congrats cluster by family: several clusters, one group.
-    assert!(record.crowd.len() >= 2, "several families share one moment");
+    // おめでとう, GG/nice/congrats group by crowd class (#79 S3b): one cluster.
+    assert_eq!(record.crowd.len(), 1, "one celebration, one route");
     assert!(record.crowd.iter().all(|route| route.action
         == CrowdAction::NonVerbal {
             group: CrowdReactionGroup::Celebration

@@ -110,7 +110,7 @@ impl Default for BurstConfig {
             max_candidates: 32,
             max_bytes: 16 * 1024,
             max_ready_batches: 4,
-            top_k: 3,
+            top_k: 1,
             max_per_actor: 1,
             actor_cooldown_ms: 10_000,
             request_candidates: 12,
@@ -1365,6 +1365,7 @@ mod tests {
         let config = BurstConfig {
             max_candidates: 5,
             burst_enter_count: 2,
+            top_k: 3,
             ..BurstConfig::default()
         };
         let mut engine = engine(config);

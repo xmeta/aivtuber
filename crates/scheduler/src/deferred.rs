@@ -177,7 +177,7 @@ pub struct DeferredConfig {
 impl Default for DeferredConfig {
     fn default() -> Self {
         Self {
-            capacity: 32,
+            capacity: 6,
             per_actor_cap: 2,
             max_ttl_ms: 60_000,
         }
