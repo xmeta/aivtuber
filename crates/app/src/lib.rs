@@ -3696,6 +3696,15 @@ where
             .unwrap_or_default()
     }
 
+    /// Remove and return up to `max` routed crowd reactions (#79 S2) as
+    /// (class, member count), oldest first. No text and no actor ids.
+    pub fn take_crowd_routes(&mut self, max: usize) -> Vec<(aivtuber_domain::CrowdClass, u32)> {
+        self.chat_burst
+            .as_mut()
+            .map(|lane| lane.take_crowd_routes(max))
+            .unwrap_or_default()
+    }
+
     /// Remove and return up to `max` reports of replies dispatched from the
     /// deferred inbox.
     pub fn take_deferred_reply_reports(&mut self, max: usize) -> Vec<DeferredReplyReport> {
