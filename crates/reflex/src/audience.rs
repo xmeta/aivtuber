@@ -1039,28 +1039,16 @@ fn strict_link(folded: &str) -> bool {
     false
 }
 
-/// True when the folded text hits a reviewed scam term.
-fn scam_hit(folded: &str) -> bool {
-    let table = guard_table();
-    let padded = padded_words(folded);
-    table
-        .ascii
-        .iter()
-        .any(|(reason, term)| *reason == GuardReason::Scam && padded.contains(&format!(" {term} ")))
-        || table
-            .other
-            .iter()
-            .any(|(reason, term)| *reason == GuardReason::Scam && folded.contains(term.as_str()))
-}
-
-/// True when a comment is a lure (#79): a scam term or a strict link. Such a
+/// True when a comment is a link lure (#79): it carries a strict link. Such a
 /// comment must never be answered aloud or absorbed into a crowd, because a
-/// reply invites viewers to engage with it. Deliberately narrower than
-/// [`guard_text`], whose broad substring link check suits "never group" but
-/// would silence ordinary chat ("v0.3", "node.js", "persona.set") here.
+/// reply invites viewers to follow it. Deliberately narrower than
+/// [`guard_text`]: its broad substring link check and its scam word list
+/// suit "never group", where a false positive costs nothing, but here they
+/// would silence ordinary chat ("v0.3", "チャンネル登録しました", "follow
+/// した", "誕生日プレゼント"). A scam phrase without a link is answered like
+/// any comment; the persona contract, not silence, handles it.
 pub fn is_unsafe_to_engage(text: &str) -> bool {
-    let folded = fold(text);
-    scam_hit(&folded) || strict_link(&folded)
+    strict_link(&fold(text))
 }
 
 /// A reviewed question marker (ASCII or full-width).
@@ -1218,6 +1206,13 @@ mod tests {
             "e.g. this",
             "1.5秒",
             "performer.stop now",
+            "チャンネル登録しました",
+            "フォローしたよ",
+            "誕生日プレゼントもらった",
+            "free time",
+            "LINEスタンプかわいい",
+            "無料ガチャ引いた",
+            "free bitcoin giveaway",
         ] {
             assert!(!is_unsafe_to_engage(text), "{text}");
         }
@@ -1227,8 +1222,7 @@ mod tests {
             "www.example.com",
             "free.example.com/x",
             "example.comで配布中",
-            "【無料】今すぐ受け取り",
-            "free bitcoin giveaway",
+            "【無料】今すぐ受け取り→ http://free-gift.example/claim",
         ] {
             assert!(is_unsafe_to_engage(text), "{text}");
         }

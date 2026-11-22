@@ -3561,9 +3561,10 @@ where
                 });
             }
         }
-        // #79: a public-chat comment the audience guard classifies as a
-        // scam or link lure is never answered aloud,
-        // burst or not (answering a lure invites viewers to engage with it).
+        // #79: a public-chat comment carrying a strict link (a link lure) is
+        // never answered aloud, burst or not (answering it invites viewers to
+        // follow it). Scam words alone do not decline: they match ordinary
+        // chat such as "チャンネル登録しました".
         // It is not deleted: the session log below still records it.
         let guarded = event.kind == aivtuber_domain::EventKind::ChatMessage
             && event.source_class == aivtuber_domain::SourceClass::PublicChat
