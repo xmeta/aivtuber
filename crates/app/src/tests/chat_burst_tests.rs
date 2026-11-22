@@ -851,23 +851,25 @@ fn audience_cluster_is_aggregated_while_outliers_keep_their_own_outcome() {
         .map(|(id, _)| id.as_str())
         .collect();
     assert_eq!(represented, ["evt-3", "evt-5", "evt-7", "evt-9"]);
-    // Outliers (threat, scam, question) are individual candidates.
-    for id in ["evt-4", "evt-6", "evt-8"] {
+    // Outliers (threat, question) are individual candidates; the scam link
+    // (evt-6) is declined before the lane (#79), so it has no outcome here.
+    assert!(!run.terminals.contains_key("evt-6"));
+    for id in ["evt-4", "evt-8"] {
         assert!(
             !run.terminals[id].contains(&ChatOutcome::RepresentedByAggregate),
             "{id} must not be absorbed"
         );
     }
     // Exact accounting: every comment that entered the lane ended exactly once.
-    assert_eq!(run.terminals.len(), 9);
+    assert_eq!(run.terminals.len(), 8);
     assert!(run.terminals.values().all(|outcomes| outcomes.len() == 1));
     let metrics = run.metrics;
-    assert_eq!(metrics.admitted, 9);
+    assert_eq!(metrics.admitted, 8);
     assert_eq!(metrics.accounted(), metrics.admitted);
     assert_eq!(metrics.terminal[10], 4);
     assert_eq!(metrics.audience_members_represented, 4);
     assert_eq!(metrics.audience_signals, 1);
-    assert_eq!(metrics.audience_guarded, 2, "threat and scam link guarded");
+    assert_eq!(metrics.audience_guarded, 1, "threat guarded in the lane");
     assert_eq!(metrics.held, 0);
     assert_eq!(
         metrics.invariant_violations + metrics.burst_invariant_violations,
@@ -1325,4 +1327,56 @@ fn a_disabled_ack_emits_nothing() {
     send(&mut app, &chat(2, "viewer:b", "hello?"), 10);
     assert!(acks(&avatar).is_empty());
     assert_eq!(app.chat_burst_metrics().expect("m").ack.acked, 0);
+}
+
+const SCAM: &str = "【無料】今すぐ受け取り→ http://free-gift.example/claim でギフト券を入手";
+
+#[test]
+fn a_scam_link_is_never_answered_with_burst_off() {
+    let mut app = app(
+        FixedAssetRoute("reaction.agree.01"),
+        Box::new(RecordingAudio::default()),
+        Box::new(RecordingAvatar::default()),
+        Box::new(NoopStreamOutput),
+    );
+    app.startup().expect("startup");
+    let outcome = send_plain(&mut app, &chat(1, "viewer:x1", SCAM), 0);
+    assert!(outcome.playback.is_none(), "a lure gets no spoken reply");
+    assert_eq!(app.guarded_declined(), 1);
+    let ok = send_plain(&mut app, &chat(2, "viewer:c1", "GGだったね"), 10);
+    assert!(ok.playback.is_some(), "ordinary chat still replies");
+}
+
+#[test]
+fn a_scam_link_in_a_wave_is_never_selected_with_burst_on() {
+    let mut app = burst_app(config());
+    for (i, (actor, text)) in [
+        ("c1", "GG"),
+        ("c2", "おめでとう"),
+        ("x1", SCAM),
+        ("c3", "神"),
+        ("c4", "やった"),
+        ("c5", "どうやったの？"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let at = 1_000 + i as u64 * 100;
+        let outcome = send(
+            &mut app,
+            &chat(i as u64 + 1, &format!("viewer:{actor}"), text),
+            at,
+        );
+        if *actor == "x1" {
+            assert!(outcome.playback.is_none());
+        }
+        app.service_chat_burst(at, at);
+    }
+    app.service_chat_burst(30_000, 30_000);
+    assert_eq!(app.guarded_declined(), 1);
+    let records = outcomes(&mut app);
+    assert!(
+        records.iter().all(|(id, _)| id != "evt-3"),
+        "the lure never enters the lane, so it cannot be selected or absorbed"
+    );
 }

@@ -991,6 +991,18 @@ fn dominant_family(members: &[usize], families: &[Option<ReactionFamily>]) -> Re
         .map_or(ReactionFamily::Laughter, |(family, _)| family)
 }
 
+/// True when the existing guard classifies a text as a lure: a scam or a link
+/// (#79). Such a comment must never be answered aloud or absorbed into a
+/// crowd, because a reply invites viewers to engage with it. Reuses
+/// [`guard_text`]; the other reasons only argue against grouping, and a
+/// threat or injection phrase still reaches the gated model path as data.
+pub fn is_unsafe_to_engage(text: &str) -> bool {
+    matches!(
+        guard_text(text),
+        Some(GuardReason::Scam | GuardReason::Link)
+    )
+}
+
 /// A reviewed question marker (ASCII or full-width).
 fn has_question_mark(text: &str) -> bool {
     text.contains('?') || text.contains('？')

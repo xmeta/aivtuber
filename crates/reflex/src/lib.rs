@@ -18,7 +18,7 @@ pub use audience::{
     AudienceConfig, AudienceConfigError, AudienceInput, AudiencePlan, AudienceSignal,
     AudienceSignalClass, AudienceTrend, AudienceWindow, GuardReason, MAX_AUDIENCE_MIN_CLUSTER,
     MAX_DUPLICATE_TEXT_CHARS, MAX_SIGNAL_REPRESENTATIVES, ReactionFamily, guard_text,
-    plan_audience, reaction_family,
+    is_unsafe_to_engage, plan_audience, reaction_family,
 };
 pub use burst::{
     BATCH_ENGAGEMENT_SCHEMA_VERSION, BatchCandidate, BatchEngagementRequest, BatchRankFailure,
