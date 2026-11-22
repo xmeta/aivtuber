@@ -714,3 +714,225 @@ fn crowd_routing_needs_audience_aggregation() {
     config.audience = None;
     assert!(config.validate().is_err());
 }
+
+fn mute_command() -> AuthenticatedControlCommand {
+    let secret = [0x47_u8; 32];
+    LocalControlIngress::new(
+        "local-test",
+        "operator:test",
+        AuthorizationMethod::OperatorHotkey,
+        BTreeSet::from([Capability::PerformerMute]),
+        ControlSecret::new(secret),
+    )
+    .expect("control ingress")
+    .authenticate(
+        OperatorCommandInput {
+            event_id: "evt-performer.mute".to_owned(),
+            correlation_id: "corr-crowd".to_owned(),
+            sequence: 97,
+            observed_at: "2026-09-24T00:00:00Z".to_owned(),
+            action: "performer.mute".to_owned(),
+            payload: BTreeMap::new(),
+        },
+        &secret,
+    )
+    .expect("authenticated command")
+}
+
+fn read_session(dir: &std::path::Path) -> Vec<crate::session_log::Record> {
+    let file = std::fs::read_dir(dir.join("logs"))
+        .expect("logs")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .last()
+        .expect("a session file");
+    std::fs::read_to_string(file)
+        .expect("read")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("record"))
+        .collect()
+}
+
+#[test]
+fn a_crowd_route_while_the_performer_is_busy_ends_in_one_recorded_outcome() {
+    // #79: the carrier waits behind a busy performer and its reply time-to-live
+    // passes. The lane already counted that; the session log must record it
+    // too, once, with a reason, and no viewer text.
+    use crate::session_log::SessionLog;
+    let fixture = fixture();
+    let dir = std::env::temp_dir().join(format!(
+        "aivtuber-crowd-busy-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    let mut rig = rig(lane_config(&fixture, true));
+    rig.app = rig
+        .app
+        .with_session_log(SessionLog::new(dir.join("logs"), None, true));
+    rig.app
+        .handle_control_reporting(&mute_command(), 0)
+        .expect("mute");
+    for (_, at, event) in expand(&fixture)
+        .into_iter()
+        .take_while(|(phase, _, _)| phase == "celebration")
+    {
+        let raw = serde_json::to_vec(&event).expect("event json");
+        rig.app
+            .process_content_bytes(&raw, at, at ^ 0x55)
+            .expect("content");
+        rig.app.service_chat_burst(at, at);
+    }
+    for end in [5_000, 30_000, 200_000] {
+        rig.app.tick(end);
+        rig.app.service_chat_burst(end, end);
+    }
+    rig.app.shutdown(200_001);
+    rig.app.session_log().expect("log").flush();
+    let records = read_session(&dir);
+    let crowds: Vec<_> = records.iter().filter(|r| r.t == "crowd").collect();
+    assert!(!crowds.is_empty(), "the crowd was routed");
+    for crowd in &crowds {
+        let turn = crowd.turn.as_ref().expect("turn");
+        let ends: Vec<_> = records
+            .iter()
+            .filter(|r| r.t == "fallback" && r.turn.as_ref() == Some(turn))
+            .collect();
+        assert_eq!(ends.len(), 1, "one recorded end per routed crowd");
+        assert!(
+            matches!(
+                ends[0].fallback.as_deref(),
+                Some("expired_while_busy" | "crowd_cooldown")
+            ),
+            "got {:?}",
+            ends[0].fallback
+        );
+        assert!(ends[0].text.is_none() && ends[0].viewer.is_none());
+    }
+    let metrics = rig.app.chat_burst_metrics().expect("metrics");
+    assert!(metrics.crowd_unvoiced >= 1);
+    assert_eq!(metrics.invariant_violations, 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_crowd_route_that_is_voiced_has_no_unvoiced_end() {
+    // The same burst with an available performer: the carrier turn is
+    // answered, so there is no fallback record (only the crowd and its reply).
+    use crate::session_log::SessionLog;
+    let fixture = fixture();
+    let dir = std::env::temp_dir().join(format!(
+        "aivtuber-crowd-voiced-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    let mut rig = rig(lane_config(&fixture, true));
+    rig.app = rig
+        .app
+        .with_session_log(SessionLog::new(dir.join("logs"), None, true));
+    for (_, at, event) in expand(&fixture)
+        .into_iter()
+        .take_while(|(phase, _, _)| phase == "celebration")
+    {
+        let raw = serde_json::to_vec(&event).expect("event json");
+        rig.app
+            .process_content_bytes(&raw, at, at ^ 0x55)
+            .expect("content");
+        rig.app.service_chat_burst(at, at);
+    }
+    for end in [5_000, 30_000] {
+        rig.app.tick(end);
+        rig.app.service_chat_burst(end, end);
+    }
+    rig.app.session_log().expect("log").flush();
+    let records = read_session(&dir);
+    let carriers: Vec<_> = records.iter().filter(|r| r.t == "crowd").collect();
+    assert!(!carriers.is_empty());
+    for crowd in carriers {
+        let turn = crowd.turn.as_ref().expect("turn");
+        // A carrier suppressed by the crowd cooldown legitimately has its own
+        // end; none may have expired or failed.
+        assert!(
+            records
+                .iter()
+                .filter(|r| r.t == "fallback" && r.turn.as_ref() == Some(turn))
+                .all(|r| r.fallback.as_deref() == Some("crowd_cooldown")),
+            "a dispatched crowd carrier is not an unvoiced end"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_crowd_carrier_is_dispatched_before_older_deferred_replies_and_is_voiced() {
+    // #79: a crowd lands while a reply is speaking and an older single-viewer
+    // reply already waits. When the speech ends, the crowd reaction goes
+    // first: it stands for many viewers. Same 20 s TTL, no second queue.
+    let fixture = fixture();
+    let mut rig = rig(lane_config(&fixture, true));
+    let app = &mut rig.app;
+    let duration = 6_000;
+    let plan = aivtuber_scheduler::PlannedPerformance {
+        event_id: "evt-speaking".to_owned(),
+        asset_id: "asset.speaking".to_owned(),
+        priority: aivtuber_scheduler::Priority::Conversation,
+        interruptible: true,
+        interrupt_points_ms: vec![duration],
+        start_at_ms: 0,
+        duration_ms: duration,
+        generation: 0,
+        exclusive: false,
+        channels: BTreeSet::from([
+            aivtuber_scheduler::BlendChannel::Audio,
+            aivtuber_scheduler::BlendChannel::Face,
+        ]),
+    };
+    let planned = app
+        .performer
+        .scheduler_mut()
+        .schedule(plan)
+        .expect("schedule speech");
+    app.tick(0);
+    let end = planned.end_at_ms();
+    let old_text = "what game is this again";
+    let mut old = chat_event(9_001);
+    old.actor_id = Some("viewer:old".to_owned());
+    old.payload
+        .insert("text".to_owned(), serde_json::json!(old_text));
+    old.payload.remove("intent");
+    let raw = serde_json::to_vec(&old).expect("json");
+    app.process_content_bytes(&raw, 1, 1 ^ 0x55).expect("old");
+    let old_id = old.event_id.clone();
+    for (_, at, event) in expand(&fixture)
+        .into_iter()
+        .take_while(|(phase, _, _)| phase == "celebration")
+    {
+        let at = at + 2;
+        let raw = serde_json::to_vec(&event).expect("event json");
+        app.process_content_bytes(&raw, at, at ^ 0x55)
+            .expect("content");
+        app.service_chat_burst(at, at);
+    }
+    app.service_chat_burst(3_000, 3_000);
+    assert!(
+        app.chat_burst_metrics().expect("metrics").deferred.pending >= 2,
+        "the old reply and the crowd carrier both wait behind the speech"
+    );
+    let mut reports = Vec::new();
+    for at in [end + 1, end + 250, end + 500, end + 3_000] {
+        app.tick(at);
+        app.service_chat_burst(at, at);
+        reports.extend(app.take_deferred_reply_reports(usize::MAX));
+    }
+    let first = reports.first().expect("a deferred dispatch");
+    assert_ne!(
+        first.event_id, old_id,
+        "the crowd goes before the old reply"
+    );
+    assert_ne!(text_of(&first.event_id), old_text);
+    assert!(first.dispatched);
+    assert!(first.asset_id.is_some(), "the crowd reaction is voiced");
+}

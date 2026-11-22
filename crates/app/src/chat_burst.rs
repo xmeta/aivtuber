@@ -41,7 +41,7 @@ use aivtuber_scheduler::{
     ResponseDisposition, TimingReason,
 };
 use serde::Serialize;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// Hard ceiling on the logical lifetime of a deferred reply.
 pub const MAX_REPLY_TTL_MS: u64 = aivtuber_scheduler::MAX_DEFERRED_TTL_MS;
@@ -51,6 +51,10 @@ pub const MAX_CHAT_BURST_RECORDS: usize = 256;
 pub const MAX_DEFERRED_REPORTS: usize = 64;
 /// Retained audience signals (#79; oldest dropped, counted).
 pub const MAX_AUDIENCE_SIGNALS: usize = 64;
+/// Routed crowd carriers whose terminal outcome is still awaited. A carrier
+/// waits at most one reply time-to-live, so this only bounds a pathological
+/// burst; past it a carrier is not tracked (and so not session-logged).
+const MAX_TRACKED_CROWD_CARRIERS: usize = 256;
 
 /// Operator-facing configuration. Validated, never clamped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,6 +284,10 @@ pub struct ChatBurstMetrics {
     pub crowd_non_verbal: u64,
     pub crowd_replies: u64,
     pub crowd_fallback_replies: u64,
+    /// #79: routed carriers that ended without being voiced (expired while the
+    /// performer was busy, superseded, cancelled, ...). Each one is session
+    /// logged with its reason, so every routed crowd has one recorded end.
+    pub crowd_unvoiced: u64,
     /// #75: immediate non-verbal acks of deferred replies. Not outcomes.
     pub ack: crate::deferred_ack::DeferredAckMetrics,
 }
@@ -327,6 +335,32 @@ pub(crate) fn crowd_asset_groups(
         G::Sympathy => &["crowd.sympathy", "reaction.neutral"],
         G::Greeting => &["crowd.greeting", "reaction.agree"],
     }
+}
+
+/// Why a routed crowd carrier ended without being handed to the performer
+/// path (#79). `None` when it was dispatched: the reply (or the non-verbal
+/// reaction) is then its recorded outcome. Closed vocabulary, never text.
+fn unvoiced_reason(outcome: ChatOutcome) -> Option<&'static str> {
+    use DeferredOutcome as D;
+    Some(match outcome {
+        ChatOutcome::DispatchedNow | ChatOutcome::Deferred(D::Dispatched) => return None,
+        ChatOutcome::DispatchFailed | ChatOutcome::Deferred(D::DispatchFailed) => "dispatch_failed",
+        ChatOutcome::ExpiredBeforeDispatch => "expired_before_dispatch",
+        ChatOutcome::Deferred(D::Expired) => "expired_while_busy",
+        ChatOutcome::Deferred(D::Superseded) => "superseded",
+        ChatOutcome::ErasedBeforeSelection | ChatOutcome::Deferred(D::Erased) => "erased",
+        ChatOutcome::CancelledBeforeSelection | ChatOutcome::Deferred(D::OperatorCancelled) => {
+            "operator_cancelled"
+        }
+        ChatOutcome::Deferred(D::RevalidationRefused) => "revalidation_refused",
+        ChatOutcome::Deferred(D::EvictedForCapacity) => "evicted_for_capacity",
+        ChatOutcome::Deferred(D::RejectedActorCap | D::RejectedInvalid) => "not_deferrable",
+        ChatOutcome::ShutdownBeforeSelection | ChatOutcome::Deferred(D::ShutdownDropped) => {
+            "shutdown"
+        }
+        ChatOutcome::SuppressedCrowdCooldown => "crowd_cooldown",
+        _ => "not_answered",
+    })
 }
 
 /// A routed crowd as the session log records it: no text, no actor ids.
@@ -398,6 +432,11 @@ pub(crate) struct ChatBurstLane {
     /// #79 S3c: routed crowds for the session log (class, members, unique
     /// actors, carrier event id). Ids and counts only; bounded like `signals`.
     crowd_notes: VecDeque<CrowdRouteNote>,
+    /// #79: routed carriers that have not reached a terminal outcome yet.
+    crowd_carriers: BTreeSet<String>,
+    /// #79: (carrier, reason) of routed carriers that ended unvoiced, not yet
+    /// written to the session log. Ids and closed vocabulary only.
+    crowd_ends: VecDeque<(String, &'static str)>,
     last_ms: u64,
     ack: crate::deferred_ack::AckGate,
 }
@@ -457,6 +496,8 @@ impl ChatBurstLane {
             signals: VecDeque::new(),
             crowd_routes: VecDeque::new(),
             crowd_notes: VecDeque::new(),
+            crowd_carriers: BTreeSet::new(),
+            crowd_ends: VecDeque::new(),
             last_ms: 0,
             ack: crate::deferred_ack::AckGate::new(config.deferred_ack),
         })
@@ -519,6 +560,12 @@ impl ChatBurstLane {
         self.crowd_notes.drain(..).collect()
     }
 
+    /// Remove and return the unvoiced ends of routed crowd carriers that are
+    /// not yet written to the session log (#79).
+    pub(crate) fn take_crowd_ends(&mut self) -> Vec<(String, &'static str)> {
+        self.crowd_ends.drain(..).collect()
+    }
+
     /// A crowd carrier was answered with a non-verbal crowd reaction.
     pub(crate) fn note_crowd_non_verbal(&mut self) {
         self.metrics.crowd_non_verbal += 1;
@@ -555,6 +602,15 @@ impl ChatBurstLane {
         if self.records.len() >= MAX_CHAT_BURST_RECORDS {
             self.records.pop_front();
             self.metrics.records_dropped += 1;
+        }
+        if self.crowd_carriers.remove(&event_id)
+            && let Some(reason) = unvoiced_reason(outcome)
+        {
+            self.metrics.crowd_unvoiced += 1;
+            if self.crowd_ends.len() >= MAX_AUDIENCE_SIGNALS {
+                self.crowd_ends.pop_front();
+            }
+            self.crowd_ends.push_back((event_id.clone(), reason));
         }
         self.records.push_back(ChatBurstRecord {
             event_id,
@@ -701,6 +757,9 @@ impl ChatBurstLane {
                 {
                     if self.crowd_notes.len() >= MAX_AUDIENCE_SIGNALS {
                         self.crowd_notes.pop_front();
+                    }
+                    if self.crowd_carriers.len() < MAX_TRACKED_CROWD_CARRIERS {
+                        self.crowd_carriers.insert(carrier.clone());
                     }
                     self.crowd_notes.push_back(CrowdRouteNote {
                         class: route.summary.class,
@@ -866,14 +925,22 @@ impl ChatBurstLane {
         let item = DeferredItem {
             id: event.event_id.clone(),
             actor: actor_key(&event),
-            disposition: ResponseDisposition::when_available(
-                arrived_ms.saturating_add(self.reply_ttl_ms),
+            disposition: {
+                let expires = arrived_ms.saturating_add(self.reply_ttl_ms);
                 // #80 (topic context) is not available yet: supersession is
                 // keyed by the event id only, so a revised/replayed event id
                 // replaces its own earlier deferral.
-                Some(event.event_id.clone()),
-                reason,
-            ),
+                let key = Some(event.event_id.clone());
+                if crowd.is_some() {
+                    // #79: a crowd carrier stands for several viewers, so it
+                    // dispatches ahead of single-viewer replies when the
+                    // performer frees up. The inbox's own deadline class
+                    // gives that order; the TTL is unchanged.
+                    ResponseDisposition::before_deadline(expires, key)
+                } else {
+                    ResponseDisposition::when_available(expires, key, reason)
+                }
+            },
             payload: DeferredReply { event, crowd },
         };
         let (result, terminals) = self.inbox.defer(item, now_ms);
