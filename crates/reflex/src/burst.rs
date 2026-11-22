@@ -106,7 +106,7 @@ impl Default for BurstConfig {
     fn default() -> Self {
         Self {
             window_ms: 1_500,
-            burst_enter_count: 4,
+            burst_enter_count: 3,
             max_candidates: 32,
             max_bytes: 16 * 1024,
             max_ready_batches: 4,

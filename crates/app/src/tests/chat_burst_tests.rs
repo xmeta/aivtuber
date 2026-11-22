@@ -381,7 +381,12 @@ fn muted_output_holds_replies_until_they_expire() {
 
 #[test]
 fn an_erased_actor_never_gets_a_deferred_reply() {
-    let mut app = burst_app(config());
+    // Three comments in 20 ms would enter a burst at the default enter count
+    // of 3; this test is about deferral while a reply speaks, so it keeps the
+    // quiet path with an enter count of 4.
+    let mut cfg = config();
+    cfg.burst.burst_enter_count = 4;
+    let mut app = burst_app(cfg);
     let first = send(&mut app, &chat(1, "viewer:a", "hello there"), 0);
     let playback = first.playback.expect("reply");
     send(&mut app, &chat(2, "viewer:erasing", "remember me?"), 10);
