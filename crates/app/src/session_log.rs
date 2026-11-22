@@ -118,6 +118,12 @@ pub struct Record {
     pub fallback: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
+    /// `crowd` records (#79): members the crowd reaction stands for, and the
+    /// distinct viewers among them. Counts only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub members: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actors: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -522,6 +528,33 @@ impl SessionLog {
         });
     }
 
+    /// A crowd reaction was routed to the turn of its carrier (#79): `class`
+    /// is the closed crowd vocabulary; no viewer text and no actor ids. The
+    /// phrases later spoken on this turn are the crowd reaction.
+    pub fn crowd(
+        &mut self,
+        event_id: &str,
+        class: &str,
+        members: u32,
+        actors: u32,
+        logical_ms: u64,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let index = self.turn_index(event_id, "chat");
+        let turn = self.turns[index].id.clone();
+        self.emit(Record {
+            t: "crowd".to_owned(),
+            turn: Some(turn),
+            logical_ms: Some(logical_ms),
+            kind: Some(cut_chars(class, 32)),
+            members: Some(members),
+            actors: Some(actors),
+            ..Record::default()
+        });
+    }
+
     /// A fixed-vocabulary event on a turn (`kind` and `detail` are never
     /// viewer text).
     pub fn note(&mut self, event_id: &str, kind: &'static str, detail: &str, logical_ms: u64) {
@@ -828,6 +861,20 @@ pub struct OriginRepeat {
     pub near: u64,
 }
 
+/// One routed crowd reaction (#79) and what was spoken for its carrier.
+/// Counts and indexes only.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CrowdRouteSummary {
+    pub class: String,
+    pub members: u32,
+    pub actors: u32,
+    pub turn: String,
+    /// Phrases spoken on the carrier's turn, and how many were cached.
+    pub phrases: u32,
+    pub cached_phrases: u32,
+    pub first_audio_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SessionSummary {
     pub lines: u64,
@@ -841,6 +888,14 @@ pub struct SessionSummary {
     /// Logical milliseconds from a chat, voice or operator input to the first
     /// phrase of the same turn.
     pub first_audio_ms: Vec<u64>,
+    /// The same measurement split by how the reply was dispatched (#79 S3c):
+    /// a selected comment answered at once, one that waited in the deferred
+    /// inbox, and a crowd reaction. Initiative and cached turns without a
+    /// recorded path count as direct.
+    pub first_audio_direct_ms: Vec<u64>,
+    pub first_audio_deferred_ms: Vec<u64>,
+    pub first_audio_crowd_ms: Vec<u64>,
+    pub crowd_routes: Vec<CrowdRouteSummary>,
     /// Logical milliseconds between consecutive initiative turns.
     pub initiative_spacing_ms: Vec<u64>,
     pub fallbacks: u64,
@@ -870,6 +925,9 @@ pub fn summarize(reader: impl BufRead) -> SessionSummary {
     let mut answered: HashSet<String> = HashSet::new();
     let mut fallback_turns: HashSet<String> = HashSet::new();
     let mut last_initiative: Option<u64> = None;
+    let mut deferred_turns: HashSet<String> = HashSet::new();
+    let mut first_audio_by_turn: Vec<(String, u64)> = Vec::new();
+    let mut turn_phrases: HashMap<String, (u32, u32)> = HashMap::new();
     let mut reader = reader;
     loop {
         if summary.lines >= SUMMARY_MAX_LINES as u64 {
@@ -935,11 +993,20 @@ pub fn summarize(reader: impl BufRead) -> SessionSummary {
                     Some("near") => entry.near += 1,
                     _ => {}
                 }
+                if let Some(turn) = record.turn.as_ref() {
+                    let counts = turn_phrases.entry(turn.clone()).or_default();
+                    counts.0 += 1;
+                    if record.route.as_deref() == Some("cached") {
+                        counts.1 += 1;
+                    }
+                }
                 if let (Some(turn), Some(ms)) = (record.turn.as_ref(), record.logical_ms)
                     && answered.insert(turn.clone())
                     && let Some(started) = input_ms.get(turn)
                 {
-                    summary.first_audio_ms.push(ms.saturating_sub(*started));
+                    let took = ms.saturating_sub(*started);
+                    summary.first_audio_ms.push(took);
+                    first_audio_by_turn.push((turn.clone(), took));
                 }
             }
             // A turn counts once however many records name its fallback.
@@ -951,11 +1018,55 @@ pub fn summarize(reader: impl BufRead) -> SessionSummary {
                 }
                 None => summary.fallbacks += 1,
             },
+            "crowd" => {
+                if let Some(turn) = record.turn.clone() {
+                    summary.crowd_routes.push(CrowdRouteSummary {
+                        class: record.kind.clone().unwrap_or_default(),
+                        members: record.members.unwrap_or(0),
+                        actors: record.actors.unwrap_or(0),
+                        turn,
+                        ..CrowdRouteSummary::default()
+                    });
+                }
+            }
+            "note" if record.kind.as_deref() == Some("path") => {
+                if record.fallback.as_deref() == Some("deferred")
+                    && let Some(turn) = record.turn.clone()
+                {
+                    deferred_turns.insert(turn);
+                }
+            }
             "capped" => summary.capped = true,
             _ => {}
         }
     }
+    let crowd_turns: HashSet<String> = summary
+        .crowd_routes
+        .iter()
+        .map(|route| route.turn.clone())
+        .collect();
+    for (turn, took) in &first_audio_by_turn {
+        if crowd_turns.contains(turn) {
+            summary.first_audio_crowd_ms.push(*took);
+        } else if deferred_turns.contains(turn) {
+            summary.first_audio_deferred_ms.push(*took);
+        } else {
+            summary.first_audio_direct_ms.push(*took);
+        }
+    }
+    for route in &mut summary.crowd_routes {
+        let (phrases, cached) = turn_phrases.get(&route.turn).copied().unwrap_or_default();
+        route.phrases = phrases;
+        route.cached_phrases = cached;
+        route.first_audio_ms = first_audio_by_turn
+            .iter()
+            .find(|(turn, _)| *turn == route.turn)
+            .map(|(_, took)| *took);
+    }
     summary.first_audio_ms.sort_unstable();
+    summary.first_audio_direct_ms.sort_unstable();
+    summary.first_audio_deferred_ms.sort_unstable();
+    summary.first_audio_crowd_ms.sort_unstable();
     summary.initiative_spacing_ms.sort_unstable();
     summary.turns.sort();
     summary.repeats.sort_by(|a, b| a.origin.cmp(&b.origin));
@@ -1010,6 +1121,38 @@ pub fn render_summary(summary: &SessionSummary) -> String {
         opt(percentile(&summary.first_audio_ms, 95)),
         opt(summary.first_audio_ms.last().copied()),
     ));
+    for (path, values) in [
+        ("direct", &summary.first_audio_direct_ms),
+        ("deferred", &summary.first_audio_deferred_ms),
+        ("crowd", &summary.first_audio_crowd_ms),
+    ] {
+        out.push_str(&format!(
+            "first_audio_ms path={path} count={} p50={} p95={} max={}
+",
+            values.len(),
+            opt(percentile(values, 50)),
+            opt(percentile(values, 95)),
+            opt(values.last().copied()),
+        ));
+    }
+    out.push_str(&format!(
+        "crowd_routes count={}
+",
+        summary.crowd_routes.len()
+    ));
+    for route in &summary.crowd_routes {
+        out.push_str(&format!(
+            "crowd_route turn={} class={} members={} actors={} phrases={} cached_phrases={} first_audio_ms={}
+",
+            route.turn,
+            route.class,
+            route.members,
+            route.actors,
+            route.phrases,
+            route.cached_phrases,
+            opt(route.first_audio_ms),
+        ));
+    }
     out.push_str(&format!(
         "initiative_spacing_ms count={} min={} p50={} max={}\n",
         summary.initiative_spacing_ms.len(),
@@ -1054,6 +1197,66 @@ mod tests {
 
     fn redactor() -> SecretRedactor {
         SecretRedactor::new(["sk-secret-value"])
+    }
+
+    #[test]
+    fn the_summary_splits_first_audio_by_path_and_lists_crowd_routes() {
+        let lines = [
+            r#"{"v":1,"t":"input","seq":1,"turn":"t-0001","logical_ms":1000,"origin":"chat","viewer":"viewer-01","text":"hi"}"#,
+            r#"{"v":1,"t":"note","seq":2,"turn":"t-0001","logical_ms":1000,"kind":"path","fallback":"direct"}"#,
+            r#"{"v":1,"t":"phrase","seq":3,"turn":"t-0001","logical_ms":3000,"origin":"chat","route":"generated","idx":0}"#,
+            r#"{"v":1,"t":"input","seq":4,"turn":"t-0002","logical_ms":2000,"origin":"chat","viewer":"viewer-02","text":"q"}"#,
+            r#"{"v":1,"t":"note","seq":5,"turn":"t-0002","logical_ms":9000,"kind":"path","fallback":"deferred"}"#,
+            r#"{"v":1,"t":"phrase","seq":6,"turn":"t-0002","logical_ms":10000,"origin":"chat","route":"generated","idx":0}"#,
+            r#"{"v":1,"t":"input","seq":7,"turn":"t-0003","logical_ms":4000,"origin":"chat","viewer":"viewer-03","text":"GG"}"#,
+            r#"{"v":1,"t":"crowd","seq":8,"turn":"t-0003","logical_ms":5000,"kind":"congratulation","members":5,"actors":4}"#,
+            r#"{"v":1,"t":"phrase","seq":9,"turn":"t-0003","logical_ms":6500,"origin":"cached","route":"cached","idx":0}"#,
+        ]
+        .join("
+");
+        let summary = summarize(lines.as_bytes());
+        assert_eq!(summary.first_audio_direct_ms, vec![2000]);
+        assert_eq!(summary.first_audio_deferred_ms, vec![8000]);
+        assert_eq!(summary.first_audio_crowd_ms, vec![2500]);
+        assert_eq!(summary.crowd_routes.len(), 1);
+        let route = &summary.crowd_routes[0];
+        assert_eq!(
+            (
+                route.class.as_str(),
+                route.members,
+                route.actors,
+                route.phrases
+            ),
+            ("congratulation", 5, 4, 1)
+        );
+        assert_eq!(route.cached_phrases, 1);
+        let text = render_summary(&summary);
+        assert!(text.contains("first_audio_ms path=crowd count=1 p50=2500"));
+        assert!(text.contains("crowd_route turn=t-0003 class=congratulation members=5 actors=4"));
+        assert!(!text.contains("viewer"), "no viewer ids in the summary");
+    }
+
+    #[test]
+    fn a_crowd_record_carries_counts_and_no_viewer_text() {
+        let dir = temp_dir("crowd");
+        let mut log = SessionLog::new(dir.join("logs"), None, true);
+        log.input(
+            &redactor(),
+            "e1",
+            "chat",
+            Some("UCabc"),
+            Some("GG"),
+            None,
+            1,
+        );
+        log.crowd("e1", "celebration", 5, 4, 2);
+        log.flush();
+        let records = lines(&dir.join("logs"));
+        let crowd = records.iter().find(|r| r.t == "crowd").expect("crowd");
+        assert_eq!(crowd.turn.as_deref(), Some("t-0001"));
+        assert_eq!((crowd.members, crowd.actors), (Some(5), Some(4)));
+        assert!(crowd.text.is_none() && crowd.viewer.is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -3887,6 +3887,7 @@ where
             .as_mut()
             .map(|lane| lane.resolve_ready(at_ms))
             .unwrap_or_default();
+        self.session_log_crowd_routes(at_ms);
         for (index, candidate) in selected.into_iter().enumerate() {
             let id = candidate.event.event_id.clone();
             let result = self.reply_now_or_defer(
@@ -3950,6 +3951,7 @@ where
             ReplyAvailability::Available => {
                 let chat_burst::Candidate { event, crowd, .. } = candidate;
                 let id = event.event_id.clone();
+                self.session_log_note(&id, "path", "direct", at_ms);
                 let result =
                     self.dispatch_maybe_crowd(event, crowd, at_ms, seed, interaction_started);
                 if let Some(lane) = self.chat_burst.as_mut() {
@@ -4148,6 +4150,7 @@ where
                 }
                 continue;
             }
+            self.session_log_note(&ready.item.id, "path", "deferred", at_ms);
             let result = self.dispatch_maybe_crowd(
                 event,
                 crowd,
@@ -4183,6 +4186,7 @@ where
             .as_mut()
             .map(|lane| lane.resolve_ready(now_ms))
             .unwrap_or_default();
+        self.session_log_crowd_routes(now_ms);
         for (index, candidate) in selected.into_iter().enumerate() {
             let id = candidate.event.event_id.clone();
             if let Some(result) = self.reply_now_or_defer(

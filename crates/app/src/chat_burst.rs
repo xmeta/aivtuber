@@ -329,6 +329,15 @@ pub(crate) fn crowd_asset_groups(
     }
 }
 
+/// A routed crowd as the session log records it: no text, no actor ids.
+#[derive(Debug, Clone)]
+pub(crate) struct CrowdRouteNote {
+    pub class: aivtuber_domain::CrowdClass,
+    pub members: u32,
+    pub actors: u32,
+    pub carrier: String,
+}
+
 /// How a crowd carrier is to be answered, with its typed summary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CrowdDispatch {
@@ -386,6 +395,9 @@ pub(crate) struct ChatBurstLane {
     /// #79 S2: (class, member count) of each routed crowd reaction; no text,
     /// no actor ids. Bounded like `signals`.
     crowd_routes: VecDeque<(aivtuber_domain::CrowdClass, u32)>,
+    /// #79 S3c: routed crowds for the session log (class, members, unique
+    /// actors, carrier event id). Ids and counts only; bounded like `signals`.
+    crowd_notes: VecDeque<CrowdRouteNote>,
     last_ms: u64,
     ack: crate::deferred_ack::AckGate,
 }
@@ -444,6 +456,7 @@ impl ChatBurstLane {
             reports: VecDeque::new(),
             signals: VecDeque::new(),
             crowd_routes: VecDeque::new(),
+            crowd_notes: VecDeque::new(),
             last_ms: 0,
             ack: crate::deferred_ack::AckGate::new(config.deferred_ack),
         })
@@ -499,6 +512,11 @@ impl ChatBurstLane {
     ) -> Vec<(aivtuber_domain::CrowdClass, u32)> {
         let take = max.min(self.crowd_routes.len());
         self.crowd_routes.drain(..take).collect()
+    }
+
+    /// Remove and return the routed crowds not yet written to the session log.
+    pub(crate) fn take_crowd_notes(&mut self) -> Vec<CrowdRouteNote> {
+        self.crowd_notes.drain(..).collect()
     }
 
     /// A crowd carrier was answered with a non-verbal crowd reaction.
@@ -676,6 +694,21 @@ impl ChatBurstLane {
                 }
                 self.crowd_routes
                     .push_back((route.summary.class, route.summary.member_count));
+                if let Some(carrier) = record
+                    .audience_signals
+                    .get(route.signal)
+                    .and_then(|signal| signal.representative_event_ids.first())
+                {
+                    if self.crowd_notes.len() >= MAX_AUDIENCE_SIGNALS {
+                        self.crowd_notes.pop_front();
+                    }
+                    self.crowd_notes.push_back(CrowdRouteNote {
+                        class: route.summary.class,
+                        members: route.summary.member_count,
+                        actors: route.summary.unique_actors_estimate,
+                        carrier: carrier.clone(),
+                    });
+                }
             }
             // #79 S2: the engine's routing, keyed by the carrier's event id.
             let crowd_of: BTreeMap<&str, CrowdDispatch> = record
@@ -1217,6 +1250,75 @@ mod tests {
         // celebration words now group by class into one signal and a route.
         let (signals, routed) = run_wave(1_500, 350);
         assert!(!signals.is_empty() && routed > 0);
+    }
+
+    /// S3c tuning evidence: a celebration wave of `lines` comments from 7
+    /// actors at `gap_ms`, at the default burst settings. Returns (signals,
+    /// comments answered on the quiet path, crowd carriers selected for a
+    /// spoken or played reaction).
+    fn wave_with_defaults(lines: usize, gap_ms: u64) -> (usize, u64, usize) {
+        let mut lane = ChatBurstLane::new(ChatBurstConfig {
+            audience: Some(aivtuber_reflex::AudienceConfig::default()),
+            crowd: Some(aivtuber_reflex::CrowdConfig::default()),
+            ..ChatBurstConfig::default()
+        })
+        .expect("lane");
+        let words = [
+            "GG",
+            "おめでとう",
+            "神",
+            "やった",
+            "gg",
+            "おめでとうございます",
+            "GGWP",
+            "やったー",
+            "おめでとう！",
+            "神すぎ",
+        ];
+        let mut quiet = 0;
+        let mut crowd_carriers = 0;
+        for i in 0..lines {
+            let mut event = sample(&format!("w{i}"));
+            event.sequence = i as u64 + 1;
+            event.actor_id = Some(format!("viewer:c{}", i % 7));
+            event
+                .payload
+                .insert("text".to_owned(), serde_json::json!(words[i % words.len()]));
+            let at = 1_000 + i as u64 * gap_ms;
+            if matches!(lane.offer(event, at), Offer::Quiet(_)) {
+                quiet += 1;
+            }
+            crowd_carriers += lane
+                .resolve_ready(at)
+                .iter()
+                .filter(|candidate| candidate.crowd.is_some())
+                .count();
+        }
+        let end = 1_000 + lines as u64 * gap_ms + 10_000;
+        crowd_carriers += lane
+            .resolve_ready(end)
+            .iter()
+            .filter(|candidate| candidate.crowd.is_some())
+            .count();
+        (lane.take_audience_signals(16).len(), quiet, crowd_carriers)
+    }
+
+    /// A 2-3 comments/s reaction wave is one crowd moment (#79 S3c). Counting
+    /// arrivals while a batch is open keeps the lane in burst mode after a
+    /// flush, so a continuing wave no longer leaks into one individual reply
+    /// per comment. At the default 1.5 s window a long wave may produce two
+    /// signals, but the crowd cooldown keeps it to one crowd reaction.
+    #[test]
+    fn a_reaction_wave_is_one_crowd_reaction_at_350_and_500_ms() {
+        for gap in [350, 500] {
+            for lines in [8, 9, 10] {
+                let (signals, quiet, crowd_carriers) = wave_with_defaults(lines, gap);
+                assert!(signals >= 1, "gap={gap} lines={lines}");
+                assert!(signals <= 2, "gap={gap} lines={lines}");
+                assert_eq!(crowd_carriers, 1, "gap={gap} lines={lines}: one reaction");
+                assert!(quiet <= 3, "gap={gap} lines={lines}: quiet={quiet}");
+            }
+        }
     }
 
     fn sample(id: &str) -> EventEnvelope {

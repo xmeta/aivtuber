@@ -733,7 +733,8 @@ impl BurstEngine {
         }
         self.metrics.admitted += 1;
 
-        if self.pending.is_none() && !self.in_burst(now_ms) {
+        let in_burst = self.in_burst(now_ms);
+        if self.pending.is_none() && !in_burst {
             self.metrics.terminal[TerminalOutcome::QuietPassthrough.category()] += 1;
             self.check_invariant();
             return (Disposition::QuietPassthrough, shed);
