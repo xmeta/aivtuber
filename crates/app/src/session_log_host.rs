@@ -193,10 +193,10 @@ where
 
     /// Write the crowd routes the lane produced since the last call (#79).
     pub(crate) fn session_log_crowd_routes(&mut self, at_ms: u64) {
-        let notes = self
+        let (notes, ends) = self
             .chat_burst
             .as_mut()
-            .map(|lane| lane.take_crowd_notes())
+            .map(|lane| (lane.take_crowd_notes(), lane.take_crowd_ends()))
             .unwrap_or_default();
         if let Some(log) = self.session_log.as_mut() {
             for note in notes {
@@ -205,6 +205,10 @@ where
                     .and_then(|value| value.as_str().map(str::to_owned))
                     .unwrap_or_default();
                 log.crowd(&note.carrier, &class, note.members, note.actors, at_ms);
+            }
+            // The one recorded end of a routed crowd that was never voiced.
+            for (carrier, reason) in ends {
+                log.fallback(&carrier, reason, false, at_ms);
             }
         }
     }

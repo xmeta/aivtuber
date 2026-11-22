@@ -6293,6 +6293,7 @@ where
         if let Some(lane) = self.chat_burst.as_mut() {
             lane.shutdown(at_ms);
         }
+        self.session_log_crowd_routes(at_ms);
         if let Some(generative) = self.generative.as_mut() {
             generative.shutdown();
         }
