@@ -191,6 +191,24 @@ where
         }
     }
 
+    /// Write the crowd routes the lane produced since the last call (#79).
+    pub(crate) fn session_log_crowd_routes(&mut self, at_ms: u64) {
+        let notes = self
+            .chat_burst
+            .as_mut()
+            .map(|lane| lane.take_crowd_notes())
+            .unwrap_or_default();
+        if let Some(log) = self.session_log.as_mut() {
+            for note in notes {
+                let class = serde_json::to_value(note.class)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_default();
+                log.crowd(&note.carrier, &class, note.members, note.actors, at_ms);
+            }
+        }
+    }
+
     /// A fixed-vocabulary event on a turn.
     pub(crate) fn session_log_note(
         &mut self,

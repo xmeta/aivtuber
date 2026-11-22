@@ -656,6 +656,59 @@ fn a_crowd_reaction_with_no_fitting_asset_falls_back_to_the_ordinary_reply() {
 }
 
 #[test]
+fn a_crowd_route_is_written_to_the_session_log_with_counts_only() {
+    use crate::session_log::{Record, SessionLog};
+    let fixture = fixture();
+    let dir = std::env::temp_dir().join(format!(
+        "aivtuber-crowd-log-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    let mut rig = rig(lane_config(&fixture, true));
+    rig.app = rig
+        .app
+        .with_session_log(SessionLog::new(dir.join("logs"), None, true));
+    for (_, at, event) in expand(&fixture)
+        .into_iter()
+        .take_while(|(phase, _, _)| phase == "celebration")
+    {
+        let raw = serde_json::to_vec(&event).expect("event json");
+        rig.app
+            .process_content_bytes(&raw, at, at ^ 0x55)
+            .expect("content");
+        rig.app.service_chat_burst(at, at);
+    }
+    for end in [5_000, 30_000] {
+        rig.app.tick(end);
+        rig.app.service_chat_burst(end, end);
+    }
+    rig.app.session_log().expect("log").flush();
+    let file = std::fs::read_dir(dir.join("logs"))
+        .expect("logs")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .last()
+        .expect("a session file");
+    let raw = std::fs::read_to_string(file).expect("read");
+    let records: Vec<Record> = raw
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("record"))
+        .collect();
+    let crowds: Vec<&Record> = records.iter().filter(|r| r.t == "crowd").collect();
+    assert!(!crowds.is_empty(), "a routed crowd is logged");
+    for crowd in &crowds {
+        assert!(crowd.members.unwrap_or(0) >= 3 && crowd.actors.unwrap_or(0) >= 2);
+        assert!(crowd.text.is_none() && crowd.viewer.is_none());
+        assert!(crowd.turn.is_some());
+    }
+    let summary = crate::session_log::summarize(raw.as_bytes());
+    assert_eq!(summary.crowd_routes.len(), crowds.len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn crowd_routing_needs_audience_aggregation() {
     let mut config = lane_config(&fixture(), true);
     config.audience = None;
