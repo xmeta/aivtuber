@@ -33,6 +33,7 @@ mod profile;
 mod raw_ingress;
 pub mod ready_guide;
 mod recent_replies;
+pub mod recent_turns;
 pub mod repeat_guard;
 mod retention;
 mod routing;
@@ -1294,6 +1295,9 @@ where
     /// The opt-in local session conversation log (#463); `None` (default)
     /// composes nothing and no turn is ever recorded.
     session_log: Option<session_log::SessionLog>,
+    /// The performer's own recent turns for recall (#80 S1); `None` (default)
+    /// composes nothing and a request is unchanged.
+    recent_turns: Option<recent_turns::RecentTurns>,
     /// Logical sequence of minted initiative events.
     initiative_sequence: u64,
     /// The pending initiative's reply fell back to the idle gesture.
@@ -1393,6 +1397,7 @@ where
             guarded_declined: 0,
             initiative: None,
             session_log: None,
+            recent_turns: None,
             initiative_sequence: 0,
             initiative_fell: false,
             topics_editor: None,
@@ -4437,6 +4442,8 @@ where
         self.attach_scene_context(&mut route, scene, at_ms);
         // #79 S2: the typed crowd summary, when this reply stands for a crowd.
         self.attach_crowd_context(&mut route);
+        // #80 S1: the performer's own recent turns, for recall questions.
+        self.attach_recent_turns(&event, &mut route, at_ms);
         let routing_latency_us = elapsed_us(route_started);
         let decision = self.router.decision_record().cloned();
         let template_fallback = self
@@ -5955,6 +5962,7 @@ where
         };
         if let Some(text) = asset.speech.as_ref().and_then(|s| s.text.as_deref()) {
             self.recent_replies.record(&command.event_id, text);
+            self.note_recent_turn(&command.event_id, text, command.at_ms);
             let generated = asset
                 .provenance
                 .as_ref()
@@ -6610,6 +6618,7 @@ mod tests {
     mod panel_url_tests;
     mod persona_tests;
     mod phrase_commit_tests;
+    mod recent_turns_tests;
     mod scene_context_tests;
     mod session_log_tests;
     mod shutdown_tests;

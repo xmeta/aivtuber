@@ -1082,6 +1082,13 @@ fn run() -> Result<(), Box<dyn Error>> {
             idle_secs
         );
         app = app.with_initiative(config);
+        // #80 S1: the performer's own recent turns, for recall questions.
+        // Off until live-verified; sends only its own cut phrases (never
+        // viewer text) to the Thinking model.
+        if env_bool("AIVTUBER_RECENT_TOPICS", false)? {
+            app = app.with_recent_turns();
+            eprintln!("recent_topics: on (chat replies see the performer's last turns)");
+        }
         // #87 S2: the operator's topic list (「雑談ネタ」), one line per topic
         // in the file named by AIVTUBER_TOPICS_FILE. Read once, bounded; a
         // missing or refused file is an empty list, and the panel or
