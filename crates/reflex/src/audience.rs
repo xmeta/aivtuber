@@ -991,16 +991,76 @@ fn dominant_family(members: &[usize], families: &[Option<ReactionFamily>]) -> Re
         .map_or(ReactionFamily::Laughter, |(family, _)| family)
 }
 
-/// True when the existing guard classifies a text as a lure: a scam or a link
-/// (#79). Such a comment must never be answered aloud or absorbed into a
-/// crowd, because a reply invites viewers to engage with it. Reuses
-/// [`guard_text`]; the other reasons only argue against grouping, and a
-/// threat or injection phrase still reaches the gated model path as data.
+/// Final labels accepted by the strict link check (#79). A small reviewed
+/// list: a decline-to-reply rule needs precision, unlike the broad
+/// [`LINK_MARKERS`] used only to keep text out of a crowd.
+const STRICT_TLDS: &[&str] = &[
+    "com", "net", "org", "jp", "io", "gg", "xyz", "ly", "me", "tv", "co", "info", "app", "dev",
+    "link", "site", "online", "shop", "top", "cc", "to", "ru", "cn", "biz",
+];
+
+/// Strict link check on already folded text: an explicit scheme, `www.`, or a
+/// dotted ASCII host whose final label is in [`STRICT_TLDS`] and which is
+/// followed by the end, a path/port/query character, whitespace or non-ASCII
+/// text. Version strings, decimals and names like `node.js` never match.
+fn strict_link(folded: &str) -> bool {
+    if folded.contains("http://") || folded.contains("https://") || folded.contains("www.") {
+        return true;
+    }
+    let chars: Vec<char> = folded.chars().collect();
+    let host_char = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '.';
+    let mut start = 0;
+    while start < chars.len() {
+        if !host_char(chars[start]) {
+            start += 1;
+            continue;
+        }
+        let mut end = start;
+        while end < chars.len() && host_char(chars[end]) {
+            end += 1;
+        }
+        let run: String = chars[start..end].iter().collect();
+        let host = run.trim_end_matches('.');
+        let labels: Vec<&str> = host.split('.').collect();
+        let next = chars.get(end).copied();
+        let ends_ok = next.is_none_or(|c| {
+            c.is_whitespace() || matches!(c, '/' | ':' | '?' | '#') || !c.is_ascii()
+        });
+        if labels.len() >= 2
+            && labels.iter().all(|label| !label.is_empty())
+            && labels.last().is_some_and(|tld| STRICT_TLDS.contains(tld))
+            && labels[0].chars().any(|c| c.is_ascii_alphabetic())
+            && ends_ok
+        {
+            return true;
+        }
+        start = end;
+    }
+    false
+}
+
+/// True when the folded text hits a reviewed scam term.
+fn scam_hit(folded: &str) -> bool {
+    let table = guard_table();
+    let padded = padded_words(folded);
+    table
+        .ascii
+        .iter()
+        .any(|(reason, term)| *reason == GuardReason::Scam && padded.contains(&format!(" {term} ")))
+        || table
+            .other
+            .iter()
+            .any(|(reason, term)| *reason == GuardReason::Scam && folded.contains(term.as_str()))
+}
+
+/// True when a comment is a lure (#79): a scam term or a strict link. Such a
+/// comment must never be answered aloud or absorbed into a crowd, because a
+/// reply invites viewers to engage with it. Deliberately narrower than
+/// [`guard_text`], whose broad substring link check suits "never group" but
+/// would silence ordinary chat ("v0.3", "node.js", "persona.set") here.
 pub fn is_unsafe_to_engage(text: &str) -> bool {
-    matches!(
-        guard_text(text),
-        Some(GuardReason::Scam | GuardReason::Link)
-    )
+    let folded = fold(text);
+    scam_hit(&folded) || strict_link(&folded)
 }
 
 /// A reviewed question marker (ASCII or full-width).
@@ -1146,6 +1206,32 @@ mod tests {
         assert_eq!(guard_text("nice diet"), None);
         assert_eq!(guard_text("草"), None);
         assert_eq!(guard_text("how did you beat the boss?"), None);
+    }
+
+    #[test]
+    fn strict_lure_check_is_precise() {
+        for text in [
+            "v0.3楽しみ",
+            "3.5倍",
+            "node.js好き",
+            "persona.set",
+            "e.g. this",
+            "1.5秒",
+            "performer.stop now",
+        ] {
+            assert!(!is_unsafe_to_engage(text), "{text}");
+        }
+        for text in [
+            "https://x.test/a",
+            "ＨＴＴＰＳ：／／ｘ．ｔｅｓｔ／ａ",
+            "www.example.com",
+            "free.example.com/x",
+            "example.comで配布中",
+            "【無料】今すぐ受け取り",
+            "free bitcoin giveaway",
+        ] {
+            assert!(is_unsafe_to_engage(text), "{text}");
+        }
     }
 
     #[test]
