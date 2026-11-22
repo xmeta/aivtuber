@@ -1286,6 +1286,8 @@ where
     /// Live chat-burst selection and deferred replies (#75 S1, #78 S2); `None`
     /// unless composed, so the default per-event path is unchanged.
     chat_burst: Option<chat_burst::ChatBurstLane>,
+    /// #79: public-chat comments the audience guard kept from a spoken reply.
+    guarded_declined: u64,
     /// The bounded idle initiative (#87 S1); `None` (default) composes nothing
     /// and the performer stays silent when nobody writes.
     initiative: Option<initiative::InitiativeDirector>,
@@ -1388,6 +1390,7 @@ where
             speech_barge_in: None,
             speech_input: None,
             chat_burst: None,
+            guarded_declined: 0,
             initiative: None,
             session_log: None,
             initiative_sequence: 0,
@@ -3558,6 +3561,26 @@ where
                 });
             }
         }
+        // #79: a public-chat comment the audience guard classifies as a
+        // scam or link lure is never answered aloud,
+        // burst or not (answering a lure invites viewers to engage with it).
+        // It is not deleted: the session log below still records it.
+        let guarded = event.kind == aivtuber_domain::EventKind::ChatMessage
+            && event.source_class == aivtuber_domain::SourceClass::PublicChat
+            && event
+                .payload
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(aivtuber_reflex::is_unsafe_to_engage);
+        if guarded {
+            self.session_log_input(&event, at_ms);
+            self.guarded_declined += 1;
+            return Ok(ContentProcessOutcome {
+                admission,
+                playback: None,
+                memory_erasure: None,
+            });
+        }
         // #463: opt-in session log; a no-op unless the operator turned it on.
         self.session_log_input(&event, at_ms);
         if self.chat_burst.is_some() {
@@ -3613,6 +3636,11 @@ where
             self.record_handled_event(&event_id, &handled, at_ms);
         }
         Ok(handled.playback)
+    }
+
+    /// Comments declined from spoken replies by the audience guard (#79).
+    pub fn guarded_declined(&self) -> u64 {
+        self.guarded_declined
     }
 
     /// Opt in to live chat-burst selection and deferred replies (#75 S1,

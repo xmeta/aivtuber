@@ -247,11 +247,16 @@ fn replay(config: ChatBurstConfig) -> Replay {
         last_phase = phase.clone();
         last_at = *at;
         let raw = serde_json::to_vec(event).expect("event json");
+        let declined_before = rig.app.guarded_declined();
         let outcome = rig
             .app
             .process_content_bytes(&raw, *at, *at ^ 0x55)
             .expect("content");
-        admitted_ids.push((event.event_id.clone(), phase.clone()));
+        // A scam or link lure is declined before the lane (#79): it has no
+        // lane outcome and is never answered.
+        if rig.app.guarded_declined() == declined_before {
+            admitted_ids.push((event.event_id.clone(), phase.clone()));
+        }
         if let Some(playback) = outcome.playback {
             played.push((event.event_id.clone(), playback.asset_id));
         }
@@ -440,6 +445,12 @@ fn a_celebration_burst_yields_one_crowd_reaction_and_outliers_stay_individual() 
         "what is your favorite boss?",
     ]) {
         assert_eq!(text_of(id), text, "fixture position of {id}");
+        if text.contains("http") {
+            // Lure: declined before the lane, never selected or routed.
+            assert!(!replay.terminals.contains_key(*id), "{id}");
+            assert!(!replay.routed.iter().any(|routed| routed == id), "{id}");
+            continue;
+        }
         assert!(
             !replay.terminals[*id].contains(&ChatOutcome::RepresentedByAggregate),
             "{id} must not be absorbed"
@@ -499,10 +510,11 @@ fn a_repeated_question_burst_yields_one_representative_reply_with_a_typed_summar
         .count();
     assert_eq!(represented, 11);
     // The second question and the scam link of that burst stay individual.
-    for id in ["evt-105", "evt-106"] {
-        assert!(!replay.terminals[id].contains(&ChatOutcome::RepresentedByAggregate));
-        assert!(replay.routed.iter().any(|routed| routed == id), "{id}");
-    }
+    assert!(!replay.terminals["evt-106"].contains(&ChatOutcome::RepresentedByAggregate));
+    assert!(replay.routed.iter().any(|routed| routed == "evt-106"));
+    // The scam link (evt-105) is declined before the lane and never answered.
+    assert!(!replay.terminals.contains_key("evt-105"));
+    assert!(!replay.routed.iter().any(|routed| routed == "evt-105"));
 }
 
 #[test]
