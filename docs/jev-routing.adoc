@@ -365,7 +365,7 @@ Every field is validated, never clamped.
 |===
 |Field |Default (hard cap) |Meaning
 |`window_ms` |1500 (5000) |Longest a candidate waits; also the burst-density window
-|`burst_enter_count` |4 (64) |Arrivals inside the window that start batching; at least 2 so quiet chat never waits
+|`burst_enter_count` |3 (64) |Arrivals inside the window that start batching; at least 2 so quiet chat never waits
 |`max_candidates` |32 (64) |Count flush bound
 |`max_bytes` |16 KiB (32 KiB) |Retained-byte flush bound
 |`max_ready_batches` |4 (16) |Flushed batches awaiting resolution; the oldest is shed with terminal accounting beyond it
