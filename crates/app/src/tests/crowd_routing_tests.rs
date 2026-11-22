@@ -619,13 +619,27 @@ fn a_crowd_reaction_with_no_fitting_asset_falls_back_to_the_ordinary_reply() {
     assert_eq!(metrics.crowd_non_verbal, 0, "no asset to play");
     assert_eq!(metrics.crowd_fallback_replies, 1, "one fallback reply");
     assert!(!routed.lock().expect("routed").is_empty());
-    let crowd_requests = requests
-        .lock()
-        .expect("requests")
-        .iter()
-        .filter(|request| request.context.crowd.is_some())
-        .count();
-    assert_eq!(crowd_requests, 1, "the fallback reply carries the summary");
+    // Generation runs on its own thread: wait (bounded) for it to record the
+    // request instead of racing it on a loaded machine.
+    let count_crowd_requests = || {
+        requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .filter(|request| request.context.crowd.is_some())
+            .count()
+    };
+    for _ in 0..2_000 {
+        if count_crowd_requests() >= 1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(
+        count_crowd_requests(),
+        1,
+        "the fallback reply carries the summary"
+    );
     assert_eq!(metrics.invariant_violations, 0);
 }
 
