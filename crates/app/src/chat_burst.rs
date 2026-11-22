@@ -76,7 +76,7 @@ impl Default for ChatBurstConfig {
         Self {
             burst: BurstConfig::default(),
             deferred: DeferredConfig::default(),
-            reply_ttl_ms: 20_000,
+            reply_ttl_ms: 8_000,
             audience: None,
             crowd: None,
             deferred_ack: true,
@@ -1159,8 +1159,8 @@ mod tests {
 
     /// Wave shape and timings from the #79 live runs (distinct actors, one
     /// scam outlier). Reactions split into GG and congratulation families, so
-    /// at the default 1.5 s window and ~350 ms spacing neither family reaches
-    /// 3 members in one batch; a window that holds the wave does.
+    /// they now group by crowd class (Celebration), so the default 1.5 s window
+    /// at ~350 ms spacing yields a signal.
     fn run_wave(window_ms: u64, gap_ms: u64) -> (Vec<aivtuber_reflex::AudienceSignal>, u64) {
         let mut lane = ChatBurstLane::new(ChatBurstConfig {
             burst: BurstConfig {
@@ -1175,8 +1175,8 @@ mod tests {
         let wave = [
             ("c2", "GG"),
             ("c3", "おめでとう！"),
-            ("c4", "GG!"),
-            ("c5", "おめでとう"),
+            ("c4", "神"),
+            ("c5", "やった"),
             ("c6", "gg"),
             ("c7", "おめでとうございます"),
             (
@@ -1213,10 +1213,10 @@ mod tests {
         let (signals, routed) = run_wave(4_000, 350);
         assert!(!signals.is_empty() && routed > 0);
         assert!(signals.iter().all(|s| s.count >= 3));
-        // Live run D: default window, 350 ms spacing, GG and congratulation
-        // each stay below 3 per batch (deliberate thresholds, not a bug).
-        let (signals, _) = run_wave(1_500, 350);
-        assert!(signals.is_empty());
+        // Live run D shape: at the default window and 350 ms spacing the mixed
+        // celebration words now group by class into one signal and a route.
+        let (signals, routed) = run_wave(1_500, 350);
+        assert!(!signals.is_empty() && routed > 0);
     }
 
     fn sample(id: &str) -> EventEnvelope {

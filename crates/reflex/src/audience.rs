@@ -35,6 +35,7 @@
 //! and no JSON Schema, so it cannot become a second implicit wire contract.
 //! A later slice that sends it across a boundary must define the schema first.
 
+use crate::crowd::{CrowdReactionGroup, reaction_group};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
@@ -43,7 +44,7 @@ use std::sync::OnceLock;
 pub const AUDIENCE_SIGNAL_SCHEMA_VERSION: &str = "0.1.0";
 /// Version of the grouping method, guard lists and reaction table. Bump it
 /// whenever any of them change so replay records say which rules produced them.
-pub const AUDIENCE_METHOD_VERSION: &str = "0.1.0";
+pub const AUDIENCE_METHOD_VERSION: &str = "0.2.0";
 /// Event ids retained per signal (the carrier first).
 pub const MAX_SIGNAL_REPRESENTATIVES: usize = 3;
 /// Hard ceiling on `min_cluster_size`.
@@ -127,7 +128,9 @@ pub enum ReactionFamily {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AudienceSignalClass {
-    /// Several viewers sent a reaction from one reviewed family.
+    /// Several viewers sent reactions of one crowd class. `family` is the
+    /// most frequent fine family among them (the class is
+    /// `reaction_group(family)`).
     Reaction { family: ReactionFamily },
     /// Several viewers sent the same short remark.
     RepeatedText,
@@ -662,6 +665,7 @@ const REACTION_TABLE: &[(ReactionFamily, &[&str])] = &[
             "congratulations",
             "grats",
             "祝",
+            "やった",
             "🎉",
         ],
     ),
@@ -844,7 +848,9 @@ pub fn reaction_family(text: &str) -> Option<ReactionFamily> {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum GroupKey {
-    Family(ReactionFamily),
+    /// Reactions group by crowd class (a mixed GG / omedetou / kami wave is one
+    /// celebration), not by the fine word family.
+    Class(CrowdReactionGroup),
     Text(String),
 }
 
@@ -858,6 +864,7 @@ pub fn plan_audience(
 ) -> AudiencePlan {
     let mut plan = AudiencePlan::default();
     let mut groups: BTreeMap<GroupKey, Vec<usize>> = BTreeMap::new();
+    let mut families: Vec<Option<ReactionFamily>> = vec![None; inputs.len()];
     for (index, input) in inputs.iter().enumerate() {
         // Safety ordering: the guard sees every candidate before any grouping.
         if let Some(reason) = guard_text(input.text) {
@@ -865,8 +872,9 @@ pub fn plan_audience(
             continue;
         }
         if let Some(family) = reaction_family(input.text) {
+            families[index] = Some(family);
             groups
-                .entry(GroupKey::Family(family))
+                .entry(GroupKey::Class(reaction_group(family)))
                 .or_default()
                 .push(index);
             continue;
@@ -902,8 +910,10 @@ pub fn plan_audience(
 
     for (position, (key, members, unique)) in clusters.into_iter().enumerate() {
         let (class, method) = match &key {
-            GroupKey::Family(family) => (
-                AudienceSignalClass::Reaction { family: *family },
+            GroupKey::Class(_) => (
+                AudienceSignalClass::Reaction {
+                    family: dominant_family(&members, &families),
+                },
                 AggregationMethod::ReactionFamily,
             ),
             GroupKey::Text(_) => {
@@ -923,7 +933,7 @@ pub fn plan_audience(
         let count = members.len();
         let question = members.iter().all(|&m| has_question_mark(inputs[m].text));
         let topic_key = match &key {
-            GroupKey::Family(_) => 0,
+            GroupKey::Class(_) => 0,
             GroupKey::Text(text) => fnv1a64(text.as_bytes()),
         };
         let best = members
@@ -966,6 +976,19 @@ pub fn plan_audience(
         });
     }
     plan
+}
+
+/// Most frequent fine family among a class group's members; a tie goes to the
+/// lowest family order, so the choice never depends on arrival timing.
+fn dominant_family(members: &[usize], families: &[Option<ReactionFamily>]) -> ReactionFamily {
+    let mut counts: BTreeMap<ReactionFamily, usize> = BTreeMap::new();
+    for family in members.iter().filter_map(|&m| families[m]) {
+        *counts.entry(family).or_insert(0) += 1;
+    }
+    counts
+        .into_iter()
+        .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
+        .map_or(ReactionFamily::Laughter, |(family, _)| family)
 }
 
 /// A reviewed question marker (ASCII or full-width).
@@ -1125,6 +1148,35 @@ mod tests {
         let plan = plan_audience(&inputs, &AudienceConfig::default(), 1, WINDOW);
         assert!(plan.clusters.is_empty());
         assert_eq!(plan.guarded[&GuardReason::Threat], 5);
+    }
+
+    #[test]
+    fn mixed_celebration_words_form_one_signal_and_classes_stay_apart() {
+        let inputs = vec![
+            input("e0", "a0", 0, "GG"),
+            input("e1", "a1", 350, "おめでとう"),
+            input(
+                "e2",
+                "a2",
+                700,
+                "【無料】今すぐ受け取り http://free.example/x",
+            ),
+            input("e3", "a3", 1050, "神"),
+            input("e4", "a4", 1400, "やった"),
+            input("e5", "a5", 1500, "草"),
+            input("e6", "a6", 1600, "wow"),
+        ];
+        let plan = plan_audience(&inputs, &AudienceConfig::default(), 3, WINDOW);
+        assert_eq!(plan.clusters.len(), 1, "laughter/surprise stay separate");
+        let cluster = &plan.clusters[0];
+        assert_eq!(cluster.members, vec![0, 1, 3, 4]);
+        assert!(!cluster.members.contains(&2), "scam outlier not absorbed");
+        assert_eq!(plan.guarded.values().sum::<u64>(), 1);
+        let AudienceSignalClass::Reaction { family } = cluster.signal.class else {
+            panic!("reaction class");
+        };
+        assert_eq!(reaction_group(family), CrowdReactionGroup::Celebration);
+        assert_eq!(cluster.signal.method_version, "0.2.0");
     }
 
     #[test]
