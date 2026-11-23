@@ -704,6 +704,36 @@ pub fn app_memory_seed_env(
     )]
 }
 
+/// The chat-flow modes the local profile runs with (#79): burst selection,
+/// audience aggregation and crowd reactions. Live A/B on 45c4b356 voiced two
+/// of three crowd routes with class-fitting lines and did not slow direct
+/// replies, so `start` turns them on. The app's own defaults stay off for
+/// other hosts. If the user set any of the three explicitly, in the env file
+/// or the process environment, nothing is added, so a partial choice is
+/// never combined with injected values into a startup error.
+pub const CHAT_FLOW_VARS: [&str; 3] = [
+    "AIVTUBER_CHAT_BURST_MODE",
+    "AIVTUBER_CHAT_AUDIENCE_MODE",
+    "AIVTUBER_CHAT_CROWD_MODE",
+];
+
+pub fn app_chat_flow_env(
+    file_env: &BTreeMap<String, String>,
+    process_env: &dyn Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    let any_set = CHAT_FLOW_VARS.iter().any(|name| {
+        file_env.get(*name).is_some_and(|v| !v.trim().is_empty())
+            || process_env(name).is_some_and(|v| !v.trim().is_empty())
+    });
+    if any_set {
+        return Vec::new();
+    }
+    CHAT_FLOW_VARS
+        .iter()
+        .map(|name| ((*name).to_owned(), "true".to_owned()))
+        .collect()
+}
+
 /// Where the app writes the opt-in session log (#463) and keeps its on/off
 /// choice, for every profile. The log is off until the operator turns it on, so
 /// naming the places changes nothing by itself. An explicit value in the env
@@ -876,6 +906,8 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
     let session_log_vars =
         app_session_log_env(&opts.env_file, &env, &|name| std::env::var(name).ok());
     env.extend(session_log_vars);
+    let chat_flow_vars = app_chat_flow_env(&env, &|name| std::env::var(name).ok());
+    env.extend(chat_flow_vars);
     let plan = match &llm {
         Llm::Managed(_) => plan_models(&env, &Manifest::embedded(), &settings, &|p| {
             std::fs::metadata(p).ok().map(|m| m.len())
@@ -1364,6 +1396,23 @@ mod tests {
             ("AIVTUBER_PERSONA_FILE", "/p.md"),
         ]);
         assert_eq!(app_topics_env(env_file, &persona_only, &none).len(), 1);
+    }
+
+    #[test]
+    fn chat_flow_modes_are_on_unless_the_user_chose_any_of_them() {
+        let none = |_: &str| None;
+        let got = app_chat_flow_env(&map(&[]), &none);
+        assert_eq!(got.len(), 3);
+        assert!(got.iter().all(|(_, v)| v == "true"));
+        for name in CHAT_FLOW_VARS {
+            assert!(got.iter().any(|(n, _)| n == name));
+        }
+        let off = map(&[("AIVTUBER_CHAT_BURST_MODE", "false")]);
+        assert!(app_chat_flow_env(&off, &none).is_empty());
+        let process = |n: &str| (n == "AIVTUBER_CHAT_CROWD_MODE").then(|| "false".to_owned());
+        assert!(app_chat_flow_env(&map(&[]), &process).is_empty());
+        let blank = map(&[("AIVTUBER_CHAT_AUDIENCE_MODE", "  ")]);
+        assert_eq!(app_chat_flow_env(&blank, &none).len(), 3);
     }
 
     #[test]
