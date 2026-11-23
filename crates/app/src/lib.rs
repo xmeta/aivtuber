@@ -3943,8 +3943,14 @@ where
         }
         match self.reply_availability(at_ms) {
             ReplyAvailability::Busy(cause) => {
-                let actor = chat_burst::actor_key(&candidate.event);
                 let crowd = candidate.crowd.is_some();
+                // A crowd has no single actor (#79 S4): the carrier is one
+                // member's event, so its actor must not gate or be stamped.
+                let actor = if crowd {
+                    None
+                } else {
+                    chat_burst::actor_key(&candidate.event)
+                };
                 let accepted = self
                     .chat_burst
                     .as_mut()
@@ -4005,7 +4011,11 @@ where
             generation: 0,
             at_ms,
             preset: deferred_ack::ACK_GESTURE_PRESET.to_owned(),
-            amplitude: deferred_ack::ACK_GESTURE_AMPLITUDE,
+            amplitude: if crowd {
+                deferred_ack::ACK_CROWD_GESTURE_AMPLITUDE
+            } else {
+                deferred_ack::ACK_GESTURE_AMPLITUDE
+            },
         });
         if result.is_err()
             && let Some(lane) = self.chat_burst.as_mut()
@@ -9558,7 +9568,7 @@ mod tests {
         );
 
         let report = app.startup().expect("startup");
-        assert_eq!(report.indexed.usable, 8);
+        assert_eq!(report.indexed.usable, 21);
         assert!(app.health().stream_error.is_some());
 
         let raw = serde_json::to_vec(&chat_event(1)).expect("event json");

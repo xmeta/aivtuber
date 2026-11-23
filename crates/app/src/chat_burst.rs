@@ -320,20 +320,24 @@ pub(crate) struct Candidate {
     pub crowd: Option<CrowdDispatch>,
 }
 
-/// Asset variant groups a crowd reaction prefers, most specific first. A pack
-/// may ship `crowd.<group>` assets for a sharper reaction; the generic
-/// `reaction.*` groups are the fallback. Code-owned and closed: neither a
-/// viewer nor a model can name a group.
+/// Asset variant groups a crowd reaction prefers, most specific first. The
+/// starter pack ships reviewed `crowd.<group>` lines (#79 S4: celebration,
+/// laughter, surprise, greeting; a cheer wave is routed as celebration). A
+/// generic `reaction.*` group is a fallback only where its line fits the mood:
+/// `reaction.agree` ("わかる、それ！") does not fit a celebration, a laugh or a
+/// greeting, so those three have none and a pack without `crowd.*` lines falls
+/// back to the generated crowd-level reply instead of a mismatched line.
+/// Code-owned and closed: neither a viewer nor a model can name a group.
 pub(crate) fn crowd_asset_groups(
     group: aivtuber_reflex::CrowdReactionGroup,
 ) -> &'static [&'static str] {
     use aivtuber_reflex::CrowdReactionGroup as G;
     match group {
-        G::Celebration => &["crowd.celebration", "reaction.agree"],
-        G::Laughter => &["crowd.laughter", "reaction.agree"],
+        G::Celebration => &["crowd.celebration"],
+        G::Laughter => &["crowd.laughter"],
         G::Surprise => &["crowd.surprise", "reaction.surprise"],
         G::Sympathy => &["crowd.sympathy", "reaction.neutral"],
-        G::Greeting => &["crowd.greeting", "reaction.agree"],
+        G::Greeting => &["crowd.greeting"],
     }
 }
 

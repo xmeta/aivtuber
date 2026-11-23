@@ -225,18 +225,18 @@ mod tests {
     fn missing_audio_is_counted_once_with_the_reason() {
         let dir = Dir::new("missing");
         let report = audited("example-voice-v1", &dir.0);
-        // Six speech descriptors name audio; the two reaction.neutral ones are speechless.
-        assert_eq!(report.indexed, 8);
-        assert_eq!(report.missing_audio, 6);
+        // Nineteen speech descriptors name audio; the two reaction.neutral ones are speechless.
+        assert_eq!(report.indexed, 21);
+        assert_eq!(report.missing_audio, 19);
         assert_eq!(report.voice_model_mismatch, 0);
-        assert_eq!(report.unusable, 6);
+        assert_eq!(report.unusable, 19);
         assert_eq!(report.ready, 2);
         let lines = report.warning_lines(Some("example-voice-v1"), &dir.0);
         assert!(
-            lines[0].contains("6 of 8 descriptors are unusable"),
+            lines[0].contains("19 of 21 descriptors are unusable"),
             "{lines:?}"
         );
-        assert!(lines[0].contains("missing_audio=6 voice_model_mismatch=0"));
+        assert!(lines[0].contains("missing_audio=19 voice_model_mismatch=0"));
         assert_eq!(lines.len(), 2);
         assert!(lines[1].contains("aivtuber-setup local"));
     }
@@ -247,16 +247,16 @@ mod tests {
         write_audio(&dir.0);
         let report = audited("some-other-voice", &dir.0);
         // The two speechless reaction.neutral descriptors name no voice.
-        assert_eq!(report.voice_model_mismatch, 6);
+        assert_eq!(report.voice_model_mismatch, 19);
         assert_eq!(report.missing_audio, 0);
-        assert_eq!(report.unusable, 6);
+        assert_eq!(report.unusable, 19);
         assert!(report.other_mismatch.is_empty());
         let lines = report.warning_lines(Some("some-other-voice"), &dir.0);
         assert!(
-            lines[0].contains("6 of 8 descriptors are unusable"),
+            lines[0].contains("19 of 21 descriptors are unusable"),
             "{lines:?}"
         );
-        assert!(lines[0].contains("voice_model_mismatch=6"));
+        assert!(lines[0].contains("voice_model_mismatch=19"));
         assert_eq!(lines.len(), 2);
         assert!(lines[1].contains("[example-voice-v1]"));
         assert!(lines[1].contains("AIVTUBER_VOICE_MODEL=some-other-voice"));
@@ -274,13 +274,13 @@ mod tests {
         );
         store.index_local().unwrap();
         let report = audit(&store, &dir.0);
-        assert_eq!(report.voice_model_mismatch, 6);
-        assert_eq!(report.missing_audio, 6);
-        assert_eq!(report.other_mismatch, vec![("motion_library", 8)]);
-        assert_eq!(report.unusable, 8);
+        assert_eq!(report.voice_model_mismatch, 19);
+        assert_eq!(report.missing_audio, 19);
+        assert_eq!(report.other_mismatch, vec![("motion_library", 21)]);
+        assert_eq!(report.unusable, 21);
         let lines = report.warning_lines(None, &dir.0);
         assert_eq!(lines.len(), 3);
-        assert!(lines[0].contains("other_incompatible=motion_library=8"));
+        assert!(lines[0].contains("other_incompatible=motion_library=21"));
         assert!(lines[1].contains("AIVTUBER_VOICE_MODEL=<unset>"));
     }
 
@@ -290,7 +290,7 @@ mod tests {
         write_audio(&dir.0);
         let report = audited("example-voice-v1", &dir.0);
         assert!(report.is_ready());
-        assert_eq!((report.indexed, report.ready, report.unusable), (8, 8, 0));
+        assert_eq!((report.indexed, report.ready, report.unusable), (21, 21, 0));
         assert!(
             report
                 .warning_lines(Some("example-voice-v1"), &dir.0)

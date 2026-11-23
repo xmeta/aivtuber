@@ -32,11 +32,11 @@ describe("synthesize-starter-audio", () => {
     const { base, work, provenance } = await run();
     try {
       const { targets } = readTargets(packRoot);
-      expect(targets.length).toBe(6); // reaction.neutral is speechless
+      expect(targets.length).toBe(19); // reaction.neutral is speechless
       const expected = targets.map((t) => t.fileName).sort();
       expect(readdirSync(join(base, "starter")).filter((n) => n.endsWith(".opus")).sort()).toEqual(expected);
       expect(readdirSync(join(base, "starter"))).toContain("PROVENANCE.json");
-      expect(provenance.files.length).toBe(6);
+      expect(provenance.files.length).toBe(19);
       expect(provenance.voice_model_identity).toBe("example-voice-v1");
       expect(provenance.licence_notice).toContain("OpenRAIL-M");
       expect(provenance.seed_rule).toContain("sha256");

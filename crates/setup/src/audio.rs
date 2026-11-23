@@ -435,9 +435,9 @@ mod tests {
     }
 
     #[test]
-    fn the_real_pack_yields_six_speech_targets_and_one_voice() {
+    fn the_real_pack_yields_nineteen_speech_targets_and_one_voice() {
         let (targets, voice) = read_targets(&pack()).unwrap();
-        assert_eq!(targets.len(), 6);
+        assert_eq!(targets.len(), 19);
         assert_eq!(voice.as_deref(), Some("example-voice-v1"));
     }
 
@@ -466,7 +466,7 @@ mod tests {
             speed: 1,
         };
         let p = materialize(&pack(), &audio, &mut synth, &mut encode, engine.clone()).unwrap();
-        assert_eq!(p.files.len(), 6);
+        assert_eq!(p.files.len(), 19);
         assert!(starter_audio_present(&pack(), &audio));
         let text = fs::read_to_string(audio.join("starter/PROVENANCE.json")).unwrap();
         assert!(text.contains("\"schema\": \"starter-audio-provenance/1\""));

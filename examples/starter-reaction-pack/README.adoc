@@ -2,12 +2,14 @@
 
 This pack is a source-controlled descriptor/timing fixture for the Rust cached playback path.
 
-It contains four families with two variants each:
+It contains four families with two variants each, plus the crowd lines below:
 
 * `reaction.surprise`
 * `reaction.agree`
 * `filler.thinking`
 * `reaction.neutral` (speechless: an expression and a nod, no audio and no viseme track; the `local` profile and any route without a fallback group play it when generation fails, issue #288; it uses only presets the local avatar renderer draws, and has no semantic embedding so it is never a retrieval candidate)
+
+* `crowd.celebration` (4), `crowd.laughter` (3), `crowd.surprise` (3), `crowd.greeting` (3): short reviewed lines (12 characters or fewer, persona-neutral, never quoting a viewer) that crowd routing plays for a reaction wave of that class (#79 S4, `docs/jev-routing.adoc` section 12.9). They carry no semantic embedding, so they are never retrieval candidates for a single comment. Sympathy has none.
 
 `descriptors/` contains Performance Asset JSON files. Each starter descriptor also carries a small precomputed `starter-semantic@1` embedding used by AssetStore -> `SemanticIndex` integration tests; production retrieval never computes these embeddings in the scheduler/frame path. `viseme/` contains compact local timing tracks consumed by `crates/runtime::cached_playback`.
 
@@ -15,7 +17,7 @@ Audio remains external through `audio://starter/...` references. Generated audio
 
 == Starter audio (generated locally)
 
-Six descriptors name `audio://starter/*.opus` (`reaction.neutral` is speechless). Generate the files on your machine with the pinned local TTS sidecar (Supertonic 3 int8, language `ja`, text-derived seed, speaker 0):
+Nineteen descriptors name `audio://starter/*.opus` (`reaction.neutral` is speechless). Generate the files on your machine with the pinned local TTS sidecar (Supertonic 3 int8, language `ja`, text-derived seed, speaker 0):
 
 [source,sh]
 ----

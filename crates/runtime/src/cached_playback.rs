@@ -1220,9 +1220,9 @@ mod tests {
             .index_and_preload_fast_path()
             .expect("index and preload starter pack");
 
-        assert_eq!(report.indexed.indexed, 8);
-        assert_eq!(report.indexed.usable, 8);
-        assert_eq!(report.preloaded, 8);
+        assert_eq!(report.indexed.indexed, 21);
+        assert_eq!(report.indexed.usable, 21);
+        assert_eq!(report.preloaded, 21);
 
         for id in [
             "reaction.surprise.01",

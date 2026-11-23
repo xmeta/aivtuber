@@ -1,0 +1,71 @@
+{
+  "schema_version": "0.1.0",
+  "id": "crowd.celebration.03",
+  "intent": "crowd.celebration",
+  "class": "reaction",
+  "variant_group": "crowd.celebration",
+  "speech": {
+    "text": "うれしい、ありがとう！",
+    "audio_ref": "audio://starter/crowd-celebration-03.opus",
+    "duration_ms": 2400,
+    "viseme_ref": "viseme/crowd-celebration-03.json"
+  },
+  "expression": {
+    "preset": "smile_bright",
+    "intensity": 0.7
+  },
+  "gesture": {
+    "preset": "nod_small",
+    "amplitude": 0.7
+  },
+  "gaze": "camera",
+  "timeline": [
+    {
+      "at_ms": 0,
+      "event": "expression.start",
+      "payload": {
+        "preset": "smile_bright"
+      }
+    },
+    {
+      "at_ms": 70,
+      "event": "speech.start"
+    },
+    {
+      "at_ms": 120,
+      "event": "gesture.start",
+      "payload": {
+        "preset": "nod_small"
+      }
+    },
+    {
+      "at_ms": 1200,
+      "event": "phrase.boundary"
+    },
+    {
+      "at_ms": 2470,
+      "event": "speech.end"
+    }
+  ],
+  "interrupt_points_ms": [
+    1200,
+    2400
+  ],
+  "variation": {
+    "speed_pct": 6,
+    "amplitude_pct": 6,
+    "start_delay_ms": 60
+  },
+  "compatibility": {
+    "compiler_version": "0.1.0",
+    "voice_model": "example-voice-v1",
+    "avatar_profile": "example-live2d-v1",
+    "viseme_mapping": "ja-5vowel-v1",
+    "motion_library": "starter-v1"
+  },
+  "provenance": {
+    "generated": false,
+    "generator": null,
+    "created_at": "2026-11-23T00:00:00Z"
+  }
+}
