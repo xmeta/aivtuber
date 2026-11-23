@@ -1085,7 +1085,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         // #80 S1: the performer's own recent turns, for recall questions.
         // Off until live-verified; sends only its own cut phrases (never
         // viewer text) to the Thinking model.
-        if env_bool("AIVTUBER_RECENT_TOPICS", false)? {
+        if env_bool("AIVTUBER_RECENT_TOPICS", true)? {
             app = app.with_recent_turns();
             eprintln!("recent_topics: on (chat replies see the performer's last turns)");
         }
