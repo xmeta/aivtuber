@@ -80,6 +80,7 @@ struct Rig {
     app: ProductionApp<ProbeRoute>,
     routed: Arc<Mutex<Vec<String>>>,
     requests: Arc<Mutex<Vec<ThinkingRequest>>>,
+    avatar: Arc<Mutex<Vec<AvatarPlaybackCommand>>>,
 }
 
 fn lane_config(fixture: &serde_json::Value, crowd: bool) -> ChatBurstConfig {
@@ -128,13 +129,15 @@ fn rig(config: ChatBurstConfig) -> Rig {
     let routed = Arc::clone(&route.routed);
     let thinking = CaptureThinking::default();
     let requests = Arc::clone(&thinking.requests);
+    let recording_avatar = RecordingAvatar::default();
+    let avatar = Arc::clone(&recording_avatar.commands);
     let mut app = ProductionApp::new(
         security,
         performer(),
         LocalVisemeStore::new(pack_root()),
         route,
         Box::new(RecordingAudio::default()),
-        Box::new(RecordingAvatar::default()),
+        Box::new(recording_avatar),
         Box::new(NoopStreamOutput),
         250,
     )
@@ -146,6 +149,7 @@ fn rig(config: ChatBurstConfig) -> Rig {
         app,
         routed,
         requests,
+        avatar,
     }
 }
 
@@ -935,4 +939,170 @@ fn a_crowd_carrier_is_dispatched_before_older_deferred_replies_and_is_voiced() {
     assert_ne!(text_of(&first.event_id), old_text);
     assert!(first.dispatched);
     assert!(first.asset_id.is_some(), "the crowd reaction is voiced");
+    // #79 S4: the avatar acknowledged the wave at once, while the speech was
+    // still playing, through the existing host-direct Gesture command.
+    let nods: Vec<_> = rig
+        .avatar
+        .lock()
+        .expect("avatar log")
+        .iter()
+        .filter_map(|command| match command {
+            AvatarPlaybackCommand::Gesture {
+                generation: 0,
+                at_ms,
+                preset,
+                amplitude,
+            } if preset == "nod_small" => Some((*at_ms, *amplitude)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        nods.iter().any(|(at, amp)| *at < end
+            && (*amp - deferred_ack::ACK_CROWD_GESTURE_AMPLITUDE).abs() < 1e-9),
+        "a crowd nod before the speech ended: {nods:?} {:?}",
+        rig.app.chat_burst_metrics().expect("metrics").ack
+    );
+    assert_eq!(
+        rig.app
+            .chat_burst_metrics()
+            .expect("metrics")
+            .ack
+            .acked_crowd,
+        1
+    );
+}
+
+/// The reviewed crowd lines, read from the pack descriptors on disk.
+fn crowd_lines() -> BTreeMap<String, Vec<String>> {
+    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for entry in fs::read_dir(pack_root().join("descriptors")).expect("descriptors") {
+        let path = entry.expect("entry").path();
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read")).expect("json");
+        let group = value["variant_group"].as_str().unwrap_or_default();
+        if group.starts_with("crowd.") {
+            groups
+                .entry(group.to_owned())
+                .or_default()
+                .push(value["speech"]["text"].as_str().expect("text").to_owned());
+        }
+    }
+    groups
+}
+
+#[test]
+fn every_crowd_class_ships_two_to_four_short_lines() {
+    let lines = crowd_lines();
+    for group in ["celebration", "laughter", "surprise", "greeting"] {
+        let texts = &lines[&format!("crowd.{group}")];
+        assert!((2..=4).contains(&texts.len()), "{group}: {texts:?}");
+        for text in texts {
+            assert!(text.chars().count() <= 12, "{text} is too long");
+            // Never quotes a viewer or names one: fixed wording, no
+            // placeholders, digits, @-mentions or latin text.
+            assert!(
+                !text
+                    .chars()
+                    .any(|c| c.is_ascii_alphanumeric() || c == '@' || c == '{'),
+                "{text}"
+            );
+        }
+        let unique: BTreeSet<_> = texts.iter().collect();
+        assert_eq!(unique.len(), texts.len(), "{group} has a duplicate line");
+    }
+    // Sympathy has no line: it keeps its speechless fallback.
+    assert!(!lines.contains_key("crowd.sympathy"));
+}
+
+/// Play `n` crowd reactions of `group` back to back and return the asset ids.
+fn play_group(group: aivtuber_reflex::CrowdReactionGroup, n: u64) -> Vec<String> {
+    let fixture = fixture();
+    let mut rig = rig(lane_config(&fixture, true));
+    let mut ids = Vec::new();
+    for i in 0..n {
+        let mut event = chat_event(100 + i);
+        event.payload.remove("intent");
+        let at = 10_000 * (i + 1);
+        let played = rig
+            .app
+            .play_crowd_reaction(&event, group, at, 7)
+            .expect("the pack has a line for this group")
+            .expect("playback")
+            .expect("outcome");
+        ids.push(played.asset_id);
+        rig.app.tick(at + 9_000);
+    }
+    ids
+}
+
+#[test]
+fn each_crowd_group_plays_only_a_line_of_its_own_class() {
+    use aivtuber_reflex::CrowdReactionGroup as G;
+    for (group, prefix) in [
+        (G::Celebration, "crowd.celebration."),
+        (G::Laughter, "crowd.laughter."),
+        (G::Greeting, "crowd.greeting."),
+        (G::Surprise, "crowd.surprise."),
+    ] {
+        let ids = play_group(group, 12);
+        assert!(
+            ids.iter().all(|id| id.starts_with(prefix)),
+            "{prefix}: {ids:?}"
+        );
+        // 12 plays reach more than one line: it rotates, it is not stuck.
+        assert!(ids.iter().collect::<BTreeSet<_>>().len() >= 2, "{ids:?}");
+    }
+}
+
+#[test]
+fn a_crowd_line_never_repeats_back_to_back_and_replays_identically() {
+    use aivtuber_reflex::CrowdReactionGroup as G;
+    for group in [G::Celebration, G::Laughter, G::Greeting, G::Surprise] {
+        let first = play_group(group, 24);
+        assert!(
+            first.windows(2).all(|pair| pair[0] != pair[1]),
+            "{group:?} repeated back to back: {first:?}"
+        );
+        assert_eq!(first, play_group(group, 24), "{group:?} is replay-stable");
+    }
+}
+
+#[test]
+fn a_celebration_is_never_given_a_mismatched_generic_line() {
+    use aivtuber_reflex::CrowdReactionGroup as G;
+    for group in [G::Celebration, G::Laughter, G::Greeting] {
+        assert!(
+            chat_burst::crowd_asset_groups(group)
+                .iter()
+                .all(|g| g.starts_with("crowd.")),
+            "{group:?} must not fall back to a generic reaction line"
+        );
+    }
+    // A pack that has the generic agree lines but no crowd lines: no fitting
+    // asset, so the caller takes the generated crowd-level fallback.
+    let dir = TestDir::new("crowd-agree-only");
+    for name in ["reaction-agree-01.json", "reaction-agree-02.json"] {
+        fs::copy(
+            pack_root().join("descriptors").join(name),
+            dir.path().join(name),
+        )
+        .expect("copy");
+    }
+    let fixture = fixture();
+    let mut rig = rig(lane_config(&fixture, true));
+    rig.app.performer = CachedPerformer::new(
+        AssetStore::new(dir.path(), runtime_compatibility()),
+        Scheduler::new(SchedulerConfig {
+            min_reaction_spacing_ms: 0,
+            ..aivtuber_scheduler::SchedulerConfig::default()
+        }),
+        CachedPlaybackConfig::default(),
+    );
+    let mut event = chat_event(1);
+    event.payload.remove("intent");
+    assert!(
+        rig.app
+            .play_crowd_reaction(&event, G::Celebration, 1_000, 1)
+            .is_none()
+    );
 }

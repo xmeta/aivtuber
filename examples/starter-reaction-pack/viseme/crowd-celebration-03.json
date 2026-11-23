@@ -1,0 +1,51 @@
+{
+  "schema_version": "0.1.0",
+  "duration_ms": 2400,
+  "cues": [
+    {
+      "at_ms": 0,
+      "viseme": "U",
+      "weight": 0.75
+    },
+    {
+      "at_ms": 233,
+      "viseme": "E",
+      "weight": 0.75
+    },
+    {
+      "at_ms": 466,
+      "viseme": "I",
+      "weight": 0.75
+    },
+    {
+      "at_ms": 700,
+      "viseme": "I",
+      "weight": 0.75
+    },
+    {
+      "at_ms": 933,
+      "viseme": "A",
+      "weight": 0.75
+    },
+    {
+      "at_ms": 1166,
+      "viseme": "I",
+      "weight": 0.75
+    },
+    {
+      "at_ms": 1400,
+      "viseme": "A",
+      "weight": 0.75
+    },
+    {
+      "at_ms": 1633,
+      "viseme": "O",
+      "weight": 0.75
+    },
+    {
+      "at_ms": 1866,
+      "viseme": "U",
+      "weight": 0.75
+    }
+  ]
+}

@@ -1,0 +1,71 @@
+{
+  "schema_version": "0.1.0",
+  "id": "crowd.laughter.03",
+  "intent": "crowd.laughter",
+  "class": "reaction",
+  "variant_group": "crowd.laughter",
+  "speech": {
+    "text": "えへへ、たのしい！",
+    "audio_ref": "audio://starter/crowd-laughter-03.opus",
+    "duration_ms": 1800,
+    "viseme_ref": "viseme/crowd-laughter-03.json"
+  },
+  "expression": {
+    "preset": "smile_bright",
+    "intensity": 0.7
+  },
+  "gesture": {
+    "preset": "nod_small",
+    "amplitude": 0.6
+  },
+  "gaze": "camera",
+  "timeline": [
+    {
+      "at_ms": 0,
+      "event": "expression.start",
+      "payload": {
+        "preset": "smile_bright"
+      }
+    },
+    {
+      "at_ms": 70,
+      "event": "speech.start"
+    },
+    {
+      "at_ms": 120,
+      "event": "gesture.start",
+      "payload": {
+        "preset": "nod_small"
+      }
+    },
+    {
+      "at_ms": 900,
+      "event": "phrase.boundary"
+    },
+    {
+      "at_ms": 1870,
+      "event": "speech.end"
+    }
+  ],
+  "interrupt_points_ms": [
+    900,
+    1800
+  ],
+  "variation": {
+    "speed_pct": 6,
+    "amplitude_pct": 6,
+    "start_delay_ms": 60
+  },
+  "compatibility": {
+    "compiler_version": "0.1.0",
+    "voice_model": "example-voice-v1",
+    "avatar_profile": "example-live2d-v1",
+    "viseme_mapping": "ja-5vowel-v1",
+    "motion_library": "starter-v1"
+  },
+  "provenance": {
+    "generated": false,
+    "generator": null,
+    "created_at": "2026-11-23T00:00:00Z"
+  }
+}

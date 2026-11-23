@@ -40,6 +40,11 @@ pub const ACK_ACTOR_CAPACITY: usize = 64;
 pub const ACK_GESTURE_PRESET: &str = "nod_small";
 /// Gentle on purpose: an ack, not a reply.
 pub const ACK_GESTURE_AMPLITUDE: f64 = 0.6;
+/// A crowd carrier's ack (#79 S4) is a slightly firmer nod: a wave noticed,
+/// not one comment. The renderer draws only nod and shake, so every crowd
+/// class nods (a shake would read as "no"); a class-specific gesture needs a
+/// renderer gesture, which is not built here.
+pub const ACK_CROWD_GESTURE_AMPLITUDE: f64 = 0.8;
 
 /// Outcome counters. The ack is not a `DeferredOutcome`: it is not a terminal
 /// outcome of any comment, only a side effect of deferring one.
@@ -47,7 +52,8 @@ pub const ACK_GESTURE_AMPLITUDE: f64 = 0.6;
 pub struct DeferredAckMetrics {
     pub acked: u64,
     pub skipped_cause: u64,
-    pub skipped_crowd: u64,
+    /// Acks that stood for a crowd carrier (included in `acked`).
+    pub acked_crowd: u64,
     pub skipped_muted: u64,
     pub skipped_busy_channel: u64,
     pub skipped_global_cooldown: u64,
@@ -62,7 +68,9 @@ pub struct DeferredAckMetrics {
 #[derive(Debug, Clone, Copy)]
 pub struct AckContext<'a> {
     pub cause: BusyCause,
-    /// The deferred item is a crowd carrier: the crowd reaction is its answer.
+    /// The deferred item is a crowd carrier. It acks like any deferral, but its
+    /// `actor` must be `None`: a crowd has no single actor, so a crowd ack
+    /// neither obeys nor stamps a member's per-actor cooldown.
     pub crowd: bool,
     pub muted: bool,
     /// A Gesture-channel scheduler item is queued or playing.
@@ -123,10 +131,6 @@ impl AckGate {
             self.metrics.skipped_cause += 1;
             return false;
         }
-        if ctx.crowd {
-            self.metrics.skipped_crowd += 1;
-            return false;
-        }
         if ctx.muted {
             self.metrics.skipped_muted += 1;
             return false;
@@ -135,9 +139,12 @@ impl AckGate {
             self.metrics.skipped_busy_channel += 1;
             return false;
         }
-        if self
-            .last_ack_ms
-            .is_some_and(|last| at_ms.saturating_sub(last) < ACK_GLOBAL_COOLDOWN_MS)
+        // A crowd ack is not held back by a single comment's ack a moment
+        // earlier (the wave is the bigger signal); the window still bounds it.
+        if !ctx.crowd
+            && self
+                .last_ack_ms
+                .is_some_and(|last| at_ms.saturating_sub(last) < ACK_GLOBAL_COOLDOWN_MS)
         {
             self.metrics.skipped_global_cooldown += 1;
             return false;
@@ -168,6 +175,9 @@ impl AckGate {
             self.remember_actor(actor, at_ms);
         }
         self.metrics.acked += 1;
+        if ctx.crowd {
+            self.metrics.acked_crowd += 1;
+        }
         true
     }
 
@@ -224,13 +234,6 @@ mod tests {
         let mut gate = AckGate::new(true);
         assert!(!gate.admit(
             &AckContext {
-                crowd: true,
-                ..ctx(None)
-            },
-            0
-        ));
-        assert!(!gate.admit(
-            &AckContext {
                 muted: true,
                 ..ctx(None)
             },
@@ -245,14 +248,29 @@ mod tests {
         ));
         let m = gate.metrics();
         assert_eq!(
-            (
-                m.skipped_crowd,
-                m.skipped_muted,
-                m.skipped_busy_channel,
-                m.acked
-            ),
-            (1, 1, 1, 0)
+            (m.skipped_muted, m.skipped_busy_channel, m.acked),
+            (1, 1, 0)
         );
+    }
+
+    #[test]
+    fn a_crowd_carrier_acks_without_touching_an_actor_cooldown() {
+        let mut gate = AckGate::new(true);
+        let crowd = AckContext {
+            crowd: true,
+            ..ctx(None)
+        };
+        assert!(gate.admit(&crowd, 0));
+        assert_eq!(gate.tracked_actors(), 0, "a crowd stamps no actor");
+        // An ordinary ack right after it still waits out the global cooldown...
+        assert!(!gate.admit(&ctx(None), 1_000));
+        assert!(gate.admit(&ctx(Some("a")), 2_000));
+        // ...but a crowd ack is not held back by a single comment's ack, only
+        // by the shared window.
+        assert!(gate.admit(&crowd, 2_100));
+        assert!(!gate.admit(&crowd, 2_200), "the window bounds crowd acks");
+        let m = gate.metrics();
+        assert_eq!((m.acked, m.acked_crowd, m.skipped_window), (3, 2, 1));
     }
 
     #[test]
