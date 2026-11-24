@@ -424,9 +424,37 @@ The baseline regression fixtures are:
 * `examples/events/invalid/forged-session-log-control.json` (a chat source claiming `session_log.control` in an operator command; must be rejected by the Event Envelope schema)
 * `examples/security/chat-claims-session-log-control.json` (an untrusted chat line and model output claiming `session_log.control`; control is not authorized)
 
-They conform to `schemas/security-regression-case.schema.json`.
+The nine files under `examples/security/` conform to `schemas/security-regression-case.schema.json`; the invalid envelope fixtures are separate negative Event Envelope schema cases.
 
-The runtime implementation should load these fixtures and assert the expected authorization, memory-write, and model-dependency outcomes.
+=== 14.1 Evidence boundaries (#498, #497)
+
+The Bun reference evaluator (`src/regression.ts`, `tests/security-regression.test.ts`) remains a regression harness, not the production authorization implementation. Schema parity validates serialization and fixture acceptance; it does not prove behavioral equivalence. In Rust, a serialized authorization claim is never the authenticated capability object required to mint a memory write permit or execute control.
+
+The integration tests in `crates/runtime/tests/security_fixtures.rs` enumerate all nine security cases (schema version 0.1.0). An added, removed or renamed case requires an explicit inventory decision. They use the real Rust event validation, content admission, memory permit and authenticated scheduler control boundaries, not a second security implementation.
+
+[cols="2,3,3",options="header"]
+|===
+|Fixture(s) |Direct Rust fixture evidence |Separate evidence / remaining limits
+|Four chat-claims-* control cases
+|Original content admitted without authorization; no memory permit or control audit; copied model authorization rejected on content ingress.
+|Domain forged-envelope tests and authenticated panel tests cover additional boundaries. The copied claim is a synthetic mutation, not a real provider response.
+|prompt-injection-chat, model-output-forged-authorization
+|Original chat admitted without authority or permit; serialized model authorization injection rejected where present.
+|Runtime publication containment and chat adapter forgery tests are independent. Actual model-output action handling is not exercised by this runner.
+|memory-poisoning-chat
+|Original event denied a memory permit; separate serialized versus authenticated MemoryAdmin test.
+|No model invocation, durable store write or retrieval is exercised.
+|oversized-chat-flood
+|Single original event only, admitted without authority or permit.
+|Metadata (500 repeats, one second, 4096 payload bytes) is not expanded. Existing runtime byte, rate and backpressure tests are separate; 4096 bytes alone is below the default payload cap. Full workload/provider evidence remains open.
+|emergency-stop-offline
+|Serialized operator event refused on content ingress. Independent test credentials mint a fixed stop via LocalControlIngress; the real scheduler cancels scheduled audio.
+|The app test +stop_works_with_a_saturated_content_queue_and_a_failed_model+ independently asserts hard audio stop with unavailable provider doubles. The fixture runner has no model or audio backend; it does not demonstrate physical output or all fixture service conditions.
+|===
+
+No `requires_model` field is marked proven merely by the reference evaluator's boolean or this runtime-only test. Existing Bun, Rust app, domain and security tests remain required; the broader provider/output/flood fixture mapping is tracked in #497.
+
+Run the direct fixture evidence with `cargo test --locked -p aivtuber-runtime --test security_fixtures` (also exercised by the normal workspace test gate).
 
 == 15. Local operation panel (loopback web surface, issue #335)
 
