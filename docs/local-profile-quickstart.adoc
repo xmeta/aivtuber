@@ -41,7 +41,7 @@ Issues #294 S1 and S2. This is the whole path for a streamer who only wants to r
 
 *You need:*
 
-* Windows 11 x64 or Linux x64, about 6 GB of free disk (the language model alone is 2.4 GiB), and a network connection for the first run only.
+* Windows 11 x64 or Linux x64, at least about 8 GB of free disk for the default profile (the language model alone is 4.2 GB, or 3.93 GiB), and a network connection for the first run only.
 * FFmpeg with `ffplay` and `ffmpeg` on `PATH`. Windows: `winget install Gyan.FFmpeg`, then open a new terminal. *A clean Windows image can have no `winget`* (Windows Sandbox does not): then download `ffmpeg-release-essentials.zip` from the official Windows builds page linked from ffmpeg.org (gyan.dev, or the BtbN GitHub releases), unzip it to a folder without spaces such as `C:\ffmpeg`, and put its `bin` folder (the one holding `ffmpeg.exe` and `ffplay.exe`; the zip contains a versioned folder, so it is for example `C:\ffmpeg\ffmpeg-9.0.2-essentials_build\bin`) on `PATH` for your user, for example `[Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path","User") + ";C:\ffmpeg\ffmpeg-9.0.2-essentials_build\bin", "User")` (use the folder name you actually have), then open a new terminal and check `ffplay -version`. Setup and the app both find `ffplay` and `ffmpeg` by name on `PATH` only (there is no setting for a custom location), so copying `ffplay.exe` somewhere else does not help unless that folder is on `PATH`. Linux: `sudo apt install ffmpeg`. (`ffplay` plays the voice; `ffmpeg` encodes the starter reaction audio. Setup warns, and tells you the command, if either is missing.)
 * Windows only: the *Microsoft Visual C++ 2015-2022 Redistributable (x64)*. The language-model server (llama.cpp) imports it and this release does *not* bundle it. Install `vc_redist.x64.exe` from Microsoft (https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist); most machines that run games or Office already have it. `aivtuber-setup local` and `aivtuber-setup start` check for it, name it and exit with an error before starting llama-server if it is missing; they never download or run an installer. Nothing else is needed on Windows (no admin rights beyond that installer).
 * A browser (Chrome or Edge), or OBS Studio with a Browser Source, to show the avatar.
@@ -75,7 +75,7 @@ sha256sum -c SHA256SUMS --ignore-missing     # must print: aivtuber-local-<versi
 ----
 ./aivtuber-setup local --dry-run        # Windows: .\aivtuber-setup.exe local --dry-run
 ----
-5. Run the setup once. It downloads about 2.8 GB, so it takes a while on a slow line, and it can be interrupted and run again: a finished file is kept, a half-finished one resumes.
+5. Run the setup once. The current default profile downloads about 4.6 GB (decimal GB, from the pinned sizes for one llama.cpp build, the LLM, VAD, STT, TTS archive and sample avatar). This excludes the release archive itself and optional models. Allow additional disk space for extracted libraries and models, starter audio, and runtime caches/logs; the free-space recommendation is headroom, not an exact installed size. The dry-run plan above lists the actual files and sizes for your selected profile. A slow download can be interrupted and run again: a finished file is kept, a half-finished one resumes.
 +
 [source,sh]
 ----
