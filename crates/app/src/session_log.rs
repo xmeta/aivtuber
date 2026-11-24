@@ -852,6 +852,9 @@ fn civil(time: SystemTime) -> (i64, u32, u32, u32, u32, u32) {
 pub const SUMMARY_MAX_LINE_BYTES: usize = 16 * 1024;
 /// A summary reads at most this many lines.
 pub const SUMMARY_MAX_LINES: usize = 200_000;
+/// Total bytes examined, including discarded malformed records. Above the
+/// 5 MiB writer cap, but bounded even for an imported or damaged file.
+pub const SUMMARY_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct OriginRepeat {
@@ -989,8 +992,8 @@ pub fn percentile(sorted: &[u64], percent: u64) -> Option<u64> {
     sorted.get(rank - 1).copied()
 }
 
-/// Read one session file. Bounded in line length and line count; a damaged
-/// line is counted, never fatal.
+/// Read one session file. Bounded in line length, line count and total bytes;
+/// a damaged line is counted. Read failures mark the evidence incomplete.
 pub fn summarize(reader: impl BufRead) -> SessionSummary {
     let mut summary = SessionSummary::default();
     let mut input_ms: HashMap<String, u64> = HashMap::new();
@@ -1002,9 +1005,9 @@ pub fn summarize(reader: impl BufRead) -> SessionSummary {
     let mut turn_phrases: HashMap<String, (u32, u32)> = HashMap::new();
     // Offline only, bounded by SUMMARY_MAX_LINES like the existing turn maps.
     let mut timing_points: HashMap<String, TimingPoints> = HashMap::new();
-    let mut reader = reader;
+    let mut reader = reader.take(SUMMARY_MAX_BYTES);
     loop {
-        if summary.lines >= SUMMARY_MAX_LINES as u64 {
+        if summary.lines >= SUMMARY_MAX_LINES as u64 || reader.limit() == 0 {
             summary.truncated_read = true;
             break;
         }
@@ -1013,18 +1016,28 @@ pub fn summarize(reader: impl BufRead) -> SessionSummary {
             .take(SUMMARY_MAX_LINE_BYTES as u64 + 1)
             .read_until(b'\n', &mut buffer);
         match read {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
+            Err(_) => {
+                summary.truncated_read = true;
+                break;
+            }
             Ok(_) => {}
         }
         summary.lines += 1;
         if buffer.len() > SUMMARY_MAX_LINE_BYTES {
             summary.malformed += 1;
-            // Drop the rest of the oversized line.
-            let mut sink = Vec::new();
-            if !buffer.ends_with(b"\n") {
-                let _ = reader.read_until(b'\n', &mut sink);
+            // Drain without allocating the tail. Take also bounds this work.
+            if !buffer.ends_with(b"\n") && reader.skip_until(b'\n').is_err() {
+                summary.truncated_read = true;
+                break;
             }
             continue;
+        }
+        // A byte cap can cut through an otherwise valid JSON prefix. Do
+        // not count a partial final record as an observed event.
+        if reader.limit() == 0 && !buffer.ends_with(b"\n") {
+            summary.truncated_read = true;
+            break;
         }
         let Ok(record) = serde_json::from_slice::<Record>(&buffer) else {
             summary.malformed += 1;
@@ -1934,6 +1947,42 @@ mod tests {
         let empty = summarize(&b""[..]);
         assert_eq!(empty.lines, 0);
         assert!(render_summary(&empty).contains("first_audio_ms count=0 p50=n/a"));
+    }
+
+    #[test]
+    fn summary_bounds_total_input_including_unterminated_oversized_records() {
+        // A generated reader needs no allocation proportional to the bad line.
+        let source = std::io::repeat(b'x').take(SUMMARY_MAX_BYTES + 1);
+        let mut reader = std::io::BufReader::new(source);
+        let summary = summarize(&mut reader);
+        assert_eq!(summary.lines, 1);
+        assert_eq!(summary.malformed, 1);
+        assert!(summary.truncated_read);
+        assert_eq!(summary.phrases, 0);
+        // The next byte was not consumed by the summary.
+        assert_eq!(reader.fill_buf().unwrap(), b"x");
+    }
+
+    #[test]
+    fn summary_marks_io_failures_during_read_and_oversize_discard() {
+        struct Fails;
+        impl Read for Fails {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("synthetic read failure"))
+            }
+        }
+        let valid = b"{\"v\":1,\"t\":\"phrase\",\"seq\":1,\"origin\":\"chat\"}\n";
+        let input = std::io::BufReader::new(valid.as_slice().chain(Fails));
+        let summary = summarize(input);
+        assert_eq!(summary.phrases, 1);
+        assert!(summary.truncated_read);
+        assert!(render_summary(&summary).contains("truncated_read=true"));
+
+        let oversized = std::io::repeat(b'x').take((SUMMARY_MAX_LINE_BYTES * 2) as u64);
+        let summary = summarize(std::io::BufReader::new(oversized.chain(Fails)));
+        assert_eq!(summary.malformed, 1);
+        assert_eq!(summary.phrases, 0);
+        assert!(summary.truncated_read);
     }
 
     #[test]

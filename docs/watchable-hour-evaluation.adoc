@@ -113,7 +113,7 @@ The existing `first_audio_ms path=crowd` remains carrier-input-to-first-phrase, 
 Each new stage reports its own eligible count and total observed crowd routes; missing endpoints, ambiguous observations or reversed timestamps are not zero-duration samples.
 An unvoiced route can contribute an observed input-to-route interval but cannot contribute first-phrase timing.
 Do not sum independently pooled percentiles. A zero-length same-tick interval is valid only with two observed endpoints.
-Where the log was capped, truncated, malformed or records were dropped, treat the summary as incomplete evidence.
+Where the log was capped, truncated, malformed or records were dropped, treat the summary as incomplete evidence. The offline reader marks `truncated_read=true` on its line/16 MiB input limit or any read/discard I/O failure (#500); do not treat the already-read prefix as a complete run. The writer cap remains 5 MiB.
 No new transcript or runtime log records are collected.
 
 No absolute thresholds are set by this protocol. The earlier #79 3.5 s crowd target is a slice-level reference, not a calibrated hour SLO.
