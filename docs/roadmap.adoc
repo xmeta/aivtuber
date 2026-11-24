@@ -30,12 +30,12 @@ The product milestones below decide *what ships next*. While a product milestone
 |===
 |Milestone |Exit condition |Why now
 
-|v0.2 - First Real Stream (due 2026-12-05)
+|v0.2 - First Real Stream (completed 2026-11-22)
 |#456: a 12-minute operator-observed stream on the `local` profile with real chat, the VRM avatar through OBS Browser Source and voice input, plus a 15-minute unattended run, recorded as a link:current-constraint.adoc[constraint evidence packet] plus an link:after-action-review.adoc[AAR].
-|The only 30+ minute live run on record (2026-10-02) used the cached profile with Thinking, voice and chat off. Everything added since has never run together for an hour, so no measured constraint exists to rank work.
+|Completed: link:live-runs/2026-11-22-v0.2-gate.adoc[v0.2 evidence]. The short local-profile runs established provisional constraints, not a representative hour.
 
 |v0.3 - Watchable Hour (due 2026-12-26)
-|The constraint measured in v0.2 is fixed and re-measured; dead air, repetition and latency meet SLO targets calibrated from measured baselines (#71).
+|https://github.com/xmeta/aivtuber/issues/489[#489]: the v0.2 constraints are addressed and re-measured in representative hour-long sessions; dead air, repetition and latency meet applicable SLO targets calibrated from measured baselines (#71), with human quality evidence (#59), hard guardrails, and recorded GO/NO-GO.
 |Japanese AITuber operators most often report API cost, latency, dead air, loops/repetition and long-run stalls; YouTube does not monetise repetitious "inauthentic content".
 
 |v0.4 - First External Creators (due 2027-01-31)
