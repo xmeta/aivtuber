@@ -19,8 +19,15 @@ fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {
 const DOUBLE: &str = env!("CARGO_BIN_EXE_local-tts-sidecar-double");
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("aivtuber-tts-sup-{name}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = std::env::temp_dir().join(format!(
+        "aivtuber-tts-sup-{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&dir).unwrap();
     dir
 }
 
@@ -189,25 +196,39 @@ fn a_failing_engine_degrades_every_request_without_taking_the_sidecar_down() {
 #[test]
 fn a_busy_sidecar_is_refused_with_overloaded_and_never_queues() {
     let root = scratch("busy");
-    let sidecar = TtsSidecar::spawn(&config(&root, &["--synth-delay-ms", "700"])).expect("ready");
+    let sidecar = TtsSidecar::spawn(&config(&root, &["--mode", "gated"])).expect("ready");
     let addr = sidecar.ready().listen;
     let slow = std::thread::spawn(move || {
-        let adapter = adapter(addr, Duration::from_secs(5));
+        let adapter = adapter(addr, Duration::from_secs(15));
         adapter.synthesize_sync(&SpeechRequest {
             text: "ゆっくり".to_owned(),
             style: None,
         })
     });
-    std::thread::sleep(Duration::from_millis(250));
-    let started = Instant::now();
-    let error = adapter(addr, Duration::from_secs(5))
-        .synthesize_sync(&SpeechRequest {
-            text: "別の文".to_owned(),
-            style: None,
-        })
-        .unwrap_err();
-    assert_eq!(error.kind, EngineErrorKind::Overloaded);
-    assert!(started.elapsed() < Duration::from_millis(500));
+    // Wait for the actual engine entry, not a guessed scheduling delay.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !root.join("test-synth-entered").try_exists().unwrap() {
+        assert!(
+            !slow.is_finished(),
+            "first request ended before entering the gate"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "first request did not enter the gate"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // A queued second request cannot complete while the first is held.
+    let second = adapter(addr, Duration::from_secs(3)).synthesize_sync(&SpeechRequest {
+        text: "別の文".to_owned(),
+        style: None,
+    });
+    let first_still_held = !slow.is_finished();
+    // Release before assertions so a failed assertion cannot strand the worker.
+    std::fs::File::create(root.join("test-synth-release")).unwrap();
     assert!(slow.join().unwrap().is_ok());
+    assert!(first_still_held);
+    assert_eq!(second.unwrap_err().kind, EngineErrorKind::Overloaded);
+    drop(sidecar);
     let _ = std::fs::remove_dir_all(&root);
 }
