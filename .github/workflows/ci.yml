@@ -174,9 +174,10 @@ jobs:
   # Before this job existed the reconnect code was never *compiled* in CI: the
   # required `Rust checks` job runs on Linux, where cpal needs ALSA headers, so
   # the opt-in feature was left out of it. A Windows runner needs nothing extra
-  # and no sound card: this job only compiles and lints the adapters crate with
-  # the feature and checks the app composition that selects it. The device-free
-  # behaviour is tested in the required `Rust checks` job.
+  # and no sound card: this job compiles and lints the adapters crate with
+  # the feature, checks app composition, and exercises model-free adapter
+  # regressions on Windows (#309). Native device rules are tested in the
+  # required `Rust checks` job.
   native-audio:
     name: Native audio backend (native-audio-spike, Windows)
     runs-on: windows-latest
@@ -197,6 +198,18 @@ jobs:
       # is what production would use; it must keep compiling with the backend.
       - name: Check the app composition with the native backend
         run: cargo check --locked -p aivtuber-app --features native-audio
+
+      # #309: exercise the actual Windows TCP and supervised-child paths.
+      # Repeated parallel suites are evidence, not retries: any failed round
+      # immediately fails the job, even if a later attempt might pass.
+      - name: Windows adapter concurrency regression
+        shell: pwsh
+        run: |
+          foreach ($round in 1..3) {
+            Write-Host "Adapter regression round $round / 3"
+            cargo test --locked -p aivtuber-adapters --lib --test tts_sidecar_supervisor -- --test-threads=8
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
 
   # Issue #92 S3b: the optional local Japanese STT worker (the `sherpa-stt`
   # feature, the official sherpa-onnx crate). It is a separate job, not part of

@@ -1221,25 +1221,71 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// Hold the first synthesis until the test has observed the competing
+    /// request. This gate is owned by the test, not the production server.
+    struct HeldSynthesis {
+        gate: std::sync::Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+    }
+
+    fn held_synthesis() -> (HeldSynthesis, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        (
+            HeldSynthesis {
+                gate: std::sync::Mutex::new(Some((entered_tx, release_rx))),
+            },
+            entered_rx,
+            release_tx,
+        )
+    }
+
+    impl Synthesizer for HeldSynthesis {
+        fn synthesize(
+            &self,
+            text: &str,
+            settings: &GenerationSettings,
+            deadline: Instant,
+        ) -> Result<crate::speech_tts::Pcm, SynthError> {
+            let gate = self.gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                entered.send(()).map_err(|_| SynthError::DeadlineExceeded)?;
+                release
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .map_err(|_| SynthError::DeadlineExceeded)?;
+            }
+            ToneSynthesizer::default().synthesize(text, settings, deadline)
+        }
+
+        fn bundle_sha256(&self) -> &str {
+            "held-synthesis-test"
+        }
+    }
+
     #[test]
     fn a_second_synthesis_while_one_runs_is_refused_busy() {
         let root = scratch("busy");
-        let server = start(
-            config(&root),
-            ToneSynthesizer {
-                delay: Duration::from_millis(700),
-                ..ToneSynthesizer::default()
-            },
-        );
+        let (synth, entered, release) = held_synthesis();
+        let server = start(config(&root), synth);
         let addr = server.local_addr();
         let first = thread::spawn(move || post(addr, &ok_body("一つめ")));
-        thread::sleep(Duration::from_millis(200));
+        entered
+            .recv_timeout(Duration::from_secs(3))
+            .expect("first synthesis entered");
         let second = post(addr, &ok_body("二つめ"));
+        release.send(()).unwrap();
+        assert_eq!(first.join().unwrap().status, 200);
         assert_eq!(second.status, 503);
         assert!(second.headers.contains("Retry-After"));
-        assert_eq!(first.join().unwrap().status, 200);
         assert_eq!(server.stats().busy_rejected, 1);
-        // Free again afterwards.
+        // The HTTP response and the worker's guard drop are distinct events.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while server.inner.busy.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "synthesis guard was not released"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
         assert_eq!(post(addr, &ok_body("三つめ")).status, 200);
         server.stop();
         let _ = fs::remove_dir_all(&root);
@@ -1248,16 +1294,13 @@ mod tests {
     #[test]
     fn the_adapter_maps_the_busy_status_to_overloaded() {
         let root = scratch("busy-adapter");
-        let server = start(
-            config(&root),
-            ToneSynthesizer {
-                delay: Duration::from_millis(600),
-                ..ToneSynthesizer::default()
-            },
-        );
+        let (synth, entered, release) = held_synthesis();
+        let server = start(config(&root), synth);
         let addr = server.local_addr();
         let first = thread::spawn(move || post(addr, &ok_body("一つめ")));
-        thread::sleep(Duration::from_millis(200));
+        entered
+            .recv_timeout(Duration::from_secs(3))
+            .expect("first synthesis entered");
         let adapter = NormalizedHttpTtsAdapter::new(
             NormalizedHttpTtsConfig {
                 endpoint: format!("http://{addr}{DEFAULT_PATH}"),
@@ -1271,14 +1314,13 @@ mod tests {
             None,
         )
         .unwrap();
-        let error = adapter
-            .synthesize_sync(&SpeechRequest {
-                text: "別の文".to_owned(),
-                style: None,
-            })
-            .unwrap_err();
-        assert_eq!(error.kind, EngineErrorKind::Overloaded);
-        first.join().unwrap();
+        let second = adapter.synthesize_sync(&SpeechRequest {
+            text: "別の文".to_owned(),
+            style: None,
+        });
+        release.send(()).unwrap();
+        assert_eq!(first.join().unwrap().status, 200);
+        assert_eq!(second.unwrap_err().kind, EngineErrorKind::Overloaded);
         server.stop();
         let _ = fs::remove_dir_all(&root);
     }

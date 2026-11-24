@@ -4,20 +4,65 @@
 //! and must never be used as a voice; it exists so the app's supervision and
 //! the contract can be tested with no model and no engine libraries.
 //!
-//! Extra flags: `--mode normal|exit|hang|never-ready|fail`, `--after-ms N`
+//! Extra flags: `--mode normal|exit|hang|never-ready|fail|gated`, `--after-ms N`
 //! (delay before `exit`/`hang`), `--synth-delay-ms N`.
 //! * `normal`      serve.
 //! * `exit`        become ready, then exit with code 1 after `--after-ms`.
 //! * `hang`        become ready, then stop answering (the socket stays open).
 //! * `never-ready` print nothing and wait.
 //! * `fail`        serve, but every synthesis fails.
+//! * `gated`       signal entry and wait for the test's release marker in the audio root.
 
-use aivtuber_adapters::speech_tts::ToneSynthesizer;
 use aivtuber_adapters::speech_tts::runner::{parse_flags, run, server_config_from_flags};
 use aivtuber_adapters::speech_tts::server::TtsServer;
+use aivtuber_adapters::speech_tts::{
+    GenerationSettings, Pcm, SynthError, Synthesizer, ToneSynthesizer,
+};
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+// Only the test double supports this synchronization protocol. The caller
+// owns a fresh scratch directory; no production server or engine is changed.
+struct GatedTone {
+    root: PathBuf,
+    tone: ToneSynthesizer,
+}
+
+impl Synthesizer for GatedTone {
+    fn synthesize(
+        &self,
+        text: &str,
+        settings: &GenerationSettings,
+        deadline: Instant,
+    ) -> Result<Pcm, SynthError> {
+        let release = self.root.join("test-synth-release");
+        let io_error = |_| SynthError::Engine("test synthesis gate I/O failed".to_owned());
+        if !release.try_exists().map_err(io_error)? {
+            // Entry here proves the actual server holds its synthesis guard.
+            std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(self.root.join("test-synth-entered"))
+                .map_err(io_error)?;
+            while !release.try_exists().map_err(io_error)? {
+                if Instant::now() >= deadline {
+                    return Err(SynthError::DeadlineExceeded);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(SynthError::DeadlineExceeded);
+        }
+        self.tone.synthesize(text, settings, deadline)
+    }
+
+    fn bundle_sha256(&self) -> &str {
+        self.tone.bundle_sha256()
+    }
+}
 
 fn main() {
     let mut flags = parse_flags(std::env::args().skip(1)).unwrap_or_else(|e| {
@@ -52,7 +97,15 @@ fn main() {
         fail: mode == "fail",
         ..ToneSynthesizer::default()
     };
-    let server = TtsServer::bind(config, Arc::new(synth)).unwrap_or_else(|e| {
+    let synth: Arc<dyn Synthesizer> = if mode == "gated" {
+        Arc::new(GatedTone {
+            root: config.audio_root.clone(),
+            tone: synth,
+        })
+    } else {
+        Arc::new(synth)
+    };
+    let server = TtsServer::bind(config, synth).unwrap_or_else(|e| {
         eprintln!("local-tts-sidecar-double: {e}");
         std::process::exit(2);
     });
