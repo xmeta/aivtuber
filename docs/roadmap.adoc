@@ -43,7 +43,7 @@ The product milestones below decide *what ships next*. While a product milestone
 |Demand, pricing and licensing are hypotheses until someone outside the project uses it.
 |===
 
-Parked by the same decision (`status:parked`): the dependable-agent and desktop workstream (#200, #202-#205, #191, #72), rich long-term memory (#105, #280, #281, #283, #284), moderation actions and shadow evaluation (#74, #76, #77, #211), and later natural-performance/multimodal scope (#93, #104, #106-#108, #221). Each issue names its unpark condition.
+Parked by the same decision (`status:parked`): the dependable-agent and desktop workstream (#200, #202-#205, #191, #72), rich long-term memory (#105, #280, #281, #283, #284), moderation actions and shadow evaluation (#74, #76, #77, #211), and later natural-performance/multimodal scope (#93, #104, #106-#108, #221). Each issue names its unpark condition. #80 S1 is shipped; its remaining thread/reply/topic linkage (S2) is parked in Stage 3 pending representative evidence or a concrete dependency. #489 evaluates the shipped S1 and #79 defaults; #79 remains open for residual crowd timing and optional gestures.
 
 Business hypotheses (not decisions): the primary user is a Japanese individual AITuber operator; the differentiator is a zero-paid local run with type-enforced authority, operator emergency control and bounded long-run behaviour; the licence direction is free for personal use with a separate commercial licence. Revisit after v0.4.
 

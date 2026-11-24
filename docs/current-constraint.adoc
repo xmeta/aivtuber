@@ -7,9 +7,9 @@ It does not replace link:roadmap.adoc[the strategic roadmap], milestone ordering
 
 == 1. Current status
 
-Status:: Provisional: conversational grounding of chat replies and comment selection.
+Status:: Provisional: representative-hour watchability, including the residual crowd-reaction delay. Short-run grounding and selection improvements are already shipped.
 As of:: 2026-11-24 (v0.2 closed; v0.3 active).
-Owning issues:: #80 (topic state); #79 (comment selection, implementation closed; live effectiveness still to be evaluated); #489 (v0.3 release gate). Evidence: link:live-runs/2026-11-22-v0.2-gate.adoc[v0.2 run record].
+Owning issues:: #489 (v0.3 release gate); #79 (residual crowd timing and optional gestures); #80 (S1 shipped, remaining S2 parked). Evidence: link:live-runs/2026-11-22-v0.2-gate.adoc[v0.2 run record], https://github.com/xmeta/aivtuber/pull/482[#482], https://github.com/xmeta/aivtuber/pull/485[#485].
 
 v0.2 measured and closed four constraints in order:
 . dead air (#87 S1);
@@ -20,10 +20,15 @@ v0.2 measured and closed four constraints in order:
 It also closed one defect, chat lines dropped silently (#469).
 The close-out run on `2e7dfb4e` answered all 15 chat lines with 0 repeats, at p50 2.51 s and p95 4.18 s to first audio.
 
-Candidates for v0.3, not yet ranked by measurement:
+Subsequent short-run v0.3 evidence (not a representative-hour baseline):
 
-* chat replies invent earlier conversation when asked about it, because no topic state exists (#80);
-* the v0.2 runtime answered the latest line in a burst rather than the most reaction-worthy one; #79's selection intervention has landed, but its live effectiveness is not yet established;
+* #80 S1 (#479/#482): B4/B5 answered the recall probe truthfully in 2/2 runs; A4/A5 fabricated earlier conversation. The B5/A5 idle-control first-audio p50 difference was +0.21 s (within the slice's 0.3 s bar). Recent-turn recall is now default-on. The full thread/reply/topic scope (S2) is unscheduled and parked.
+* #79 S4 (#484/#485): B6 vs A6 direct first-audio p50 was 1.9 vs 2.2 s, silent supersessions 0 vs 22, and repeats 0 in both. Two of three crowd routes were voiced; the third was held by cooldown. The recall probe was truthful in both and the link lure was not answered. Local setup enables the three modes unless the operator explicitly sets any of them. Crowd first audio was 4.3–4.5 s, missing the slice target of 3.5 s. #79 is reopened for residual work, not a rollback of the shipped default.
+
+Candidates for v0.3, not yet ranked by representative measurement:
+
+* residual crowd latency (#79): distinguish queue wait, asset/playback and immediate visible acknowledgement;
+* missing or ambiguous prior context despite the bounded S1 intervention (#80 S1 regression evidence; S2 only if warranted);
 * idle observations are monotonous (#87 later slices);
 * one generation worker, so a stalled call delays later chat until the deadline fallback.
 
@@ -45,7 +50,7 @@ They are useful candidate-constraint evidence, but a synthetic or hosted-runner 
 
 For v0.3, #489 owns the representative watchable-hour evidence and release decision:
 
-* compare #80 conversational grounding against the v0.2 baseline, including missing or expired antecedents;
+* evaluate the shipped #80 S1 default, including missing or expired antecedents; use the earlier A/B runs as short-run reference, not a substitute for hour-scale evidence;
 * measure the delivered #79 selection policy under representative bursts; distinguish answered, coalesced, superseded and dropped comments;
 * run compatible mixed local-profile sessions with quiet windows, voice/chat, interruption and operator control; record revision, profile/configuration and enabled adapters;
 * collect privacy-safe human quality judgments (#59), latency distributions, resource trends, fallback outcomes and clean shutdown;
@@ -111,7 +116,7 @@ Hard security, privacy, authorization, operator-control, stale-dispatch, and bou
 
 == 7. Next decision point
 
-Evaluate the smallest production #80 grounding intervention, compare the delivered #79 selection behavior, and collect the #489 representative-hour evidence.
+Evaluate the shipped #80 S1 and #79 defaults and collect the #489 representative-hour evidence. Investigate residual crowd delay (#79) before selecting further implementation. Do not reimplement S1 or start parked S2 without new evidence or an explicit dependency.
 
 . update the constraint evidence packet with compatible measurements and #59 quality evidence;
 . calibrate applicable #71 indicators only from representative evidence; unresolved indicators are not demonstrated passes;
