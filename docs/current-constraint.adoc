@@ -23,7 +23,7 @@ The close-out run on `2e7dfb4e` answered all 15 chat lines with 0 repeats, at p5
 Subsequent short-run v0.3 evidence (not a representative-hour baseline):
 
 * #80 S1 (#479/#482): B4/B5 answered the recall probe truthfully in 2/2 runs; A4/A5 fabricated earlier conversation. The B5/A5 idle-control first-audio p50 difference was +0.21 s (within the slice's 0.3 s bar). Recent-turn recall is now default-on. The full thread/reply/topic scope (S2) is unscheduled and parked.
-* #79 S4 (#484/#485): B6 vs A6 direct first-audio p50 was 1.9 vs 2.2 s, silent supersessions 0 vs 22, and repeats 0 in both. Two of three crowd routes were voiced; the third was held by cooldown. The recall probe was truthful in both and the link lure was not answered. Local setup enables the three modes unless the operator explicitly sets any of them. Crowd first audio was 4.3–4.5 s, missing the slice target of 3.5 s. #79 is reopened for residual work, not a rollback of the shipped default.
+* #79 S4 (#484/#485): B6 vs A6 direct first-audio p50 was 1.9 vs 2.2 s, silent supersessions 0 vs 22, and repeats 0 in both. Two of three crowd routes were voiced; the third was held by cooldown. The recall probe was truthful in both and the link lure was not answered. Local setup enables the three modes unless the operator explicitly sets any of them. Reported crowd first audio was 4.3–4.5 s. The existing session-log metric starts at carrier input, whereas the slice target of 3.5 s starts at wave routing; whether the exact target was missed is not established without matching timestamps (#494). #79 is reopened for residual work, not a rollback of the shipped default.
 
 Candidates for v0.3, not yet ranked by representative measurement:
 
