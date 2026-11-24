@@ -48,7 +48,7 @@ They are useful candidate-constraint evidence, but a synthetic or hosted-runner 
 
 == 3. Evidence still missing for constraint selection
 
-For v0.3, #489 owns the representative watchable-hour evidence and release decision:
+For v0.3, #489 owns the representative watchable-hour evidence and release decision: See link:watchable-hour-evaluation.adoc[the evaluation protocol] (#492).
 
 * evaluate the shipped #80 S1 default, including missing or expired antecedents; use the earlier A/B runs as short-run reference, not a substitute for hour-scale evidence;
 * measure the delivered #79 selection policy under representative bursts; distinguish answered, coalesced, superseded and dropped comments;

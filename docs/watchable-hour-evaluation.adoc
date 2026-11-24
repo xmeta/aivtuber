@@ -1,0 +1,110 @@
+= Watchable Hour Evaluation (#489, #492)
+:toc:
+
+This is the operator protocol for v0.3, not a new production SLO or a claim that a watchable hour has passed.
+Reuse the local profile, session log (#463), quality review (#59), and replay/SLO tools (#70/#71).
+Keep the following evidence tracks distinct.
+
+[cols="1,3,2",options="header"]
+|===
+|Track |Method |What it cannot prove
+|A: synthetic live feed
+|One hour of paced synthetic public chat through the real local runtime, LLM, TTS and avatar; operator observation where available.
+|Real platform delivery, microphone accuracy, or external-user demand.
+|B: operator/platform observation
+|Separate private or unlisted stream, read-only real chat, consented microphone, OBS Browser Source; include stop/mute and clean shutdown.
+|A fixed repeatable chat workload or a calibrated SLO by itself.
+|C: reproducible replay and fault evidence
+|Existing #70 scenarios, #40 overlays, benchmark reports and #71 SLO calibration on compatible series.
+|Actual acoustic output, human naturalness, or real platform behavior.
+|===
+
+== A. Versioned synthetic workload
+
+`scripts/watchable-hour-feed.mjs` owns `watchable-hour-chat-v1`.
+64 authored Japanese/short reaction messages from six synthetic actors, not real viewer records.
+The first event is at offset zero; the feed holds stdin open for the full 3600 seconds.
+The manifest has a fixed illustrative timestamp, whereas paced envelopes use the actual wall-time start plus their scheduled offset; pacing itself uses monotonic time.
+All envelopes are ordinary untrusted public-chat content with unique run-scoped IDs.
+The feed never connects to a service or issues a privileged action. It sends no intent, authorization, or memory writes.
+Change the dataset identifier and update the test when the workload changes; compare like with like.
+
+[cols="1,3",options="header"]
+|===
+|Window |Exercise
+|00:00–12:00 |Initial recall, ordinary questions, winter food, celebration/laughter waves, repeated question, link lure and injection-as-data.
+|12:00–18:00 |No chat; observe initiative spacing, content, quiet time and repetitions.
+|18:00–30:00 |Return to conversation, unsupported viewer-specific recall, topic switches, surprise and greeting waves, ambiguous antecedents.
+|30:00–40:00 |No chat; TTL boundary and long quiet period (initiatives may still speak, so do not assume the ring is empty).
+|40:00–53:00 |Stale/cross-viewer recall probe, distinct question inside wave, ordinary use of a potentially suspicious word, /stop as chat, mid-stream goodbye check.
+|53:00–58:00 |No chat.
+|58:00–60:00 |Recall and normal final chat, then stdin EOF.
+|===
+
+Offline inspection from the repository root (Node 22, no runtime/model required):
+
+[source,shell]
+----
+node scripts/watchable-hour-feed.mjs --manifest review-a
+bun install --frozen-lockfile
+bun test tests/watchable-hour-feed.test.ts
+----
+
+For a dedicated local install, use a new run ID each time and the same script revision for A/B.
+Do not pipe into an existing live public broadcast.
+The following Bash example assumes a configured release directory, Node on PATH, and an absolute path to the checkout; use a UTF-8-capable shell (PowerShell 7 or direct Node writer on Windows, not PowerShell 5).
+The lead-in is explicitly chosen to cover startup; it is not included in the one-hour measurement.
+Abort if the app is not ready before the first event, if any feed error occurs, or if the profile is not the intended local configuration.
+The feed exits nonzero if more than 250 ms late, rather than silently compressing a burst. Its start and completion lines record UTC boundaries, run identity at start, emitted count and maximum scheduling lateness.
+Do not restart or splice a failed run under the same run ID.
+
+[source,shell]
+----
+set -o pipefail
+node /absolute/checkout/scripts/watchable-hour-feed.mjs --pace run-a1 --lead-in-seconds 180 | ./aivtuber-setup start --voice-input off
+----
+
+For Windows, use the corresponding `aivtuber-setup.exe`.
+The 180 seconds is an example, not a measured readiness guarantee (0–600 seconds supported).
+Do not redirect terminal output into a committed file: startup can print private panel/avatar URLs.
+Before the measurement, use the operation panel to opt in to session logging and verify the local avatar is connected. See link:local-profile-quickstart.adoc[local quickstart] and link:production-runtime.adoc[session conversation log].
+Keep the microphone off and real chat disconnected in A, including all quiet windows.
+If an operator cannot confirm readiness and logging before the first event, mark the run incomplete.
+No auto-start, account connection or logging enable is performed by the feed.
+
+== B. Operator observations
+
+Perform on a separate run; never introduce unscheduled real inputs into an A/B series.
+Use the local profile with OBS Browser Source, microphone and real read-only chat in an isolated/private test environment; obtain participant consent and disclose AI voice and performer.
+With the microphone in its default half-duplex mode, verify that playback is not re-ingested; if testing full duplex, use a headset, record the changed setting, and test interruption separately.
+Observe gaze, visemes, expressions, visible acknowledgement and audible response, including crowd timing.
+Test authorized stop and mute while speaking through the existing operator controls; mute is latched until restart, so perform it at the end or in a separate fault run.
+Never simulate authorization using a chat envelope. Verify no post-stop stale audio, expected fallback/recovery and clean process shutdown; record any unobserved case as such.
+
+== Evidence packet
+
+Use one run record per session under link:live-runs/[live-runs] containing only privacy-safe aggregates and approved/synthetic examples.
+Keep raw logs, transcripts, keys, account identifiers, control URLs, exact local paths, and diagnostic bundles outside Git.
+Session log is explicit opt-in, bounded and local; disable it after evaluation if no longer needed.
+Offline `aivtuberctl log summary <file>` does not contact a daemon. Inspect its malformed counts, per-origin repeats, first-audio p50/p95 (including direct/deferred/crowd), crowd routes and initiative spacing.
+Verify log status counters for dropped records and file/write caps; incomplete accounting is not zero failures. The summary covers the whole session, including pre-roll: keep that result labelled whole-session. For hour-specific values, delimit the measurement by the recorded feed start/end and actual first/last synthetic inputs in the local log; do not silently mix pre-roll or post-roll. Initial recall may legitimately reflect pre-roll speech, so judge against the actual earlier output, not an assumed empty ring. If a clean hour window cannot be reconstructed, mark its metrics unavailable.
+
+[cols="1,3",options="header"]
+|===
+|Field |Record
+|Identity |Unique run ID, dataset/version, build commit, profile/config fingerprint, model/voice versions, flags, cache/warmup state, hardware, relevant GPU contention, actual duration, A/B order, enabled adapters.
+|Input disposition |Planned/emitted/admitted counts; answered/coalesced/superseded/dropped/unknown; classify expected policy outcomes separately from lost accounting. Report denominators and reconcile discrepancies; not every comment needs an answer.
+|Latency |p50/p95 from supported summary; p99 only from actual eligible per-turn observations with sample count and a stated quantile rule. Split direct/deferred/crowd. Logical accepted-audio is not physical speaker onset. Do not infer visible ack latency from audio.
+|Quality |Human review of contextual appropriateness, unsupported recollection/attribution, semantic repetition beyond exact/near text, crowd class fit, timing, misleading farewell, topic variety. Compare paired A/B cases where possible using #59 review labels; mark not reviewed if no human.
+|Quiet periods |Longest observed unintended silence and initiative spacing, count each quiet window separately; distinguish intentional silence or mute.
+|Health |Fallbacks, deadlines, provider failures/recovery, working set and GPU memory at start/end and regular intervals (e.g. once/minute), observed peak/trend, interference and crash/exit status.
+|Hard guardrails |Authorization, post-stop dispatch, bounds and retention, secret/privacy protection, operator control. Each is pass/fail/not observed with evidence; not observed is not pass.
+|Decision |GO/NO-GO/incomplete, remaining constraints, linked owning issue, next falsifying measurement and AAR.
+|===
+
+No absolute thresholds are set by this protocol. The earlier #79 3.5 s crowd target is a slice-level reference, not a calibrated hour SLO.
+Pool compatible evidence only; changes in model, traffic, host, cache or GPU load can invalidate a comparison.
+A single run does not calibrate an SLO. `slo-report` reads a `BenchmarkReport`, not session conversation JSONL (even with `--provenance live-session`).
+Use link:operational-slo.adoc[the existing SLO procedure] for track C; do not relabel A/B logs or replay metrics as measured physical/live performance.
+If a required live indicator cannot be reconstructed with the current artifacts, record the gap on #71/#489 before attempting calibration.
+Mandatory missing evidence or hard guardrail failure is NO-GO for #489, not a waiver.
