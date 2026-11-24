@@ -31,7 +31,7 @@ Read this before you run it. Under `hybrid`, every generated reply sends a bound
 
 == What you need
 
-* The same machine as the link:local-profile-quickstart.adoc[local quickstart's release archive path]: Windows 11 x64 or Linux x64, an unpacked release archive, `ffplay` and `ffmpeg` on `PATH`, a browser or OBS. *No GPU, no Vulkan and no Visual C++ runtime are needed*: there is no llama.cpp. The download is about 0.3 GB (voice, speech models, sample avatar) instead of 2.8 GB.
+* The same machine as the link:local-profile-quickstart.adoc[local quickstart's release archive path]: Windows 11 x64 or Linux x64, an unpacked release archive, `ffplay` and `ffmpeg` on `PATH`, a browser or OBS. *No GPU, no Vulkan and no Visual C++ runtime are needed*: there is no llama.cpp. The download is about 0.3 GB (voice, speech models, sample avatar) instead of about 4.6 GB for the current default local profile; these are network sizes, excluding the release archive and extracted files.
 * An OpenRouter account with credit and an API key.
 
 == 1. Get an OpenRouter key
