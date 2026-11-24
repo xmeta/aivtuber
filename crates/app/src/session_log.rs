@@ -873,6 +873,78 @@ pub struct CrowdRouteSummary {
     pub phrases: u32,
     pub cached_phrases: u32,
     pub first_audio_ms: Option<u64>,
+    /// Separate logical-time intervals reconstructed from existing log records.
+    pub timing: CrowdTiming,
+}
+
+/// Only intervals with observed, unambiguous, ordered endpoints are reported.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CrowdTiming {
+    pub input_to_route_ms: Option<u64>,
+    pub route_to_dispatch_ms: Option<u64>,
+    pub dispatch_to_phrase_ms: Option<u64>,
+    pub route_to_phrase_ms: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+enum TimingStamp {
+    #[default]
+    Unseen,
+    Observed(Option<u64>),
+    Ambiguous,
+}
+
+impl TimingStamp {
+    fn observe(&mut self, ms: Option<u64>) {
+        *self = match self {
+            Self::Unseen => Self::Observed(ms),
+            _ => Self::Ambiguous,
+        };
+    }
+
+    fn value(&self) -> Option<u64> {
+        match self {
+            Self::Observed(ms) => *ms,
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct TimingPoints {
+    input: TimingStamp,
+    route: TimingStamp,
+    dispatch: TimingStamp,
+    phrase: TimingStamp,
+}
+
+impl TimingPoints {
+    fn intervals(&self) -> CrowdTiming {
+        let stamps = [&self.input, &self.route, &self.dispatch, &self.phrase];
+        if stamps
+            .iter()
+            .any(|stamp| matches!(stamp, TimingStamp::Ambiguous))
+        {
+            return CrowdTiming::default();
+        }
+        let [input, route, dispatch, phrase] = stamps.map(TimingStamp::value);
+        // A log is ordered by writes, not necessarily by logical time. Do not
+        // turn an inconsistent timestamp into a zero-duration observation.
+        let known: Vec<_> = [input, route, dispatch, phrase]
+            .into_iter()
+            .flatten()
+            .collect();
+        if known.windows(2).any(|pair| pair[0] > pair[1]) {
+            return CrowdTiming::default();
+        }
+        let delta = |start: Option<u64>, end: Option<u64>| end?.checked_sub(start?);
+        CrowdTiming {
+            input_to_route_ms: delta(input, route),
+            route_to_dispatch_ms: delta(route, dispatch),
+            dispatch_to_phrase_ms: delta(dispatch, phrase),
+            route_to_phrase_ms: delta(route, phrase),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -928,6 +1000,8 @@ pub fn summarize(reader: impl BufRead) -> SessionSummary {
     let mut deferred_turns: HashSet<String> = HashSet::new();
     let mut first_audio_by_turn: Vec<(String, u64)> = Vec::new();
     let mut turn_phrases: HashMap<String, (u32, u32)> = HashMap::new();
+    // Offline only, bounded by SUMMARY_MAX_LINES like the existing turn maps.
+    let mut timing_points: HashMap<String, TimingPoints> = HashMap::new();
     let mut reader = reader;
     loop {
         if summary.lines >= SUMMARY_MAX_LINES as u64 {
@@ -956,6 +1030,40 @@ pub fn summarize(reader: impl BufRead) -> SessionSummary {
             summary.malformed += 1;
             continue;
         };
+        // The timestamp of the first recorded phrase is only usable when its
+        // index is zero. A missing first phrase is not a faster later phrase.
+        if let Some(turn) = record.turn.as_ref() {
+            let ms = record.logical_ms;
+            match record.t.as_str() {
+                "input" => timing_points
+                    .entry(turn.clone())
+                    .or_default()
+                    .input
+                    .observe(ms),
+                "crowd" => timing_points
+                    .entry(turn.clone())
+                    .or_default()
+                    .route
+                    .observe(ms),
+                "note"
+                    if record.kind.as_deref() == Some("path")
+                        && matches!(record.fallback.as_deref(), Some("direct" | "deferred")) =>
+                {
+                    timing_points
+                        .entry(turn.clone())
+                        .or_default()
+                        .dispatch
+                        .observe(ms);
+                }
+                "phrase" => {
+                    let stamp = &mut timing_points.entry(turn.clone()).or_default().phrase;
+                    if matches!(stamp, TimingStamp::Unseen) || record.idx == Some(0) {
+                        stamp.observe(if record.idx == Some(0) { ms } else { None });
+                    }
+                }
+                _ => {}
+            }
+        }
         match record.t.as_str() {
             "input" => {
                 let origin = record.origin.clone().unwrap_or_else(|| "chat".to_owned());
@@ -1062,6 +1170,9 @@ pub fn summarize(reader: impl BufRead) -> SessionSummary {
             .iter()
             .find(|(turn, _)| *turn == route.turn)
             .map(|(_, took)| *took);
+        if let Some(points) = timing_points.get(&route.turn) {
+            route.timing = points.intervals();
+        }
     }
     summary.first_audio_ms.sort_unstable();
     summary.first_audio_direct_ms.sort_unstable();
@@ -1153,6 +1264,46 @@ pub fn render_summary(summary: &SessionSummary) -> String {
             opt(route.first_audio_ms),
         ));
     }
+    // Keep the legacy input-to-audio fields above unchanged. These intervals
+    // are deliberately named after their log boundaries, not physical audio.
+    for (stage, get) in [
+        (
+            "input_to_route_observation",
+            (|t: &CrowdTiming| t.input_to_route_ms) as fn(&CrowdTiming) -> Option<u64>,
+        ),
+        ("route_observation_to_dispatch", |t: &CrowdTiming| {
+            t.route_to_dispatch_ms
+        }),
+        ("dispatch_to_first_phrase", |t: &CrowdTiming| {
+            t.dispatch_to_phrase_ms
+        }),
+        ("route_observation_to_first_phrase", |t: &CrowdTiming| {
+            t.route_to_phrase_ms
+        }),
+    ] {
+        let mut values: Vec<_> = summary
+            .crowd_routes
+            .iter()
+            .filter_map(|route| get(&route.timing))
+            .collect();
+        values.sort_unstable();
+        out.push_str(&format!(
+            "crowd_timing_ms stage={stage} count={} routes={} p50={} p95={} max={}\n",
+            values.len(),
+            summary.crowd_routes.len(),
+            opt(percentile(&values, 50)),
+            opt(percentile(&values, 95)),
+            opt(values.last().copied()),
+        ));
+    }
+    for route in &summary.crowd_routes {
+        let t = &route.timing;
+        out.push_str(&format!(
+            "crowd_timing turn={} input_to_route_ms={} route_to_dispatch_ms={} dispatch_to_phrase_ms={} route_to_phrase_ms={}\n",
+            route.turn, opt(t.input_to_route_ms), opt(t.route_to_dispatch_ms),
+            opt(t.dispatch_to_phrase_ms), opt(t.route_to_phrase_ms),
+        ));
+    }
     out.push_str(&format!(
         "initiative_spacing_ms count={} min={} p50={} max={}\n",
         summary.initiative_spacing_ms.len(),
@@ -1230,10 +1381,117 @@ mod tests {
             ("congratulation", 5, 4, 1)
         );
         assert_eq!(route.cached_phrases, 1);
+        assert_eq!(route.timing.input_to_route_ms, Some(1000));
+        assert_eq!(route.timing.route_to_phrase_ms, Some(1500));
+        assert_eq!(route.timing.route_to_dispatch_ms, None);
+        assert_eq!(route.timing.dispatch_to_phrase_ms, None);
         let text = render_summary(&summary);
         assert!(text.contains("first_audio_ms path=crowd count=1 p50=2500"));
         assert!(text.contains("crowd_route turn=t-0003 class=congratulation members=5 actors=4"));
         assert!(!text.contains("viewer"), "no viewer ids in the summary");
+    }
+
+    #[test]
+    fn crowd_timing_decomposes_direct_and_deferred_paths_without_text() {
+        let mut lines = Vec::new();
+        for (turn, dispatch, first, path) in
+            [("a", 2000, 2500, "direct"), ("b", 4000, 4700, "deferred")]
+        {
+            for (kind, ms, extra) in [
+                (
+                    "input",
+                    1000,
+                    serde_json::json!({"origin":"chat","text":"PRIVATE"}),
+                ),
+                (
+                    "crowd",
+                    2000,
+                    serde_json::json!({"kind":"praise","members":3,"actors":3}),
+                ),
+                (
+                    "note",
+                    dispatch,
+                    serde_json::json!({"kind":"path","fallback":path}),
+                ),
+                (
+                    "phrase",
+                    first,
+                    serde_json::json!({"idx":0,"route":"cached","text":"PRIVATE"}),
+                ),
+                (
+                    "phrase",
+                    first + 100,
+                    serde_json::json!({"idx":1,"route":"cached"}),
+                ),
+            ] {
+                let mut record = serde_json::json!({"v":1,"t":kind,"seq":lines.len(),"turn":turn,"logical_ms":ms});
+                record
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                lines.push(record.to_string());
+            }
+        }
+        let summary = summarize(lines.join("\n").as_bytes());
+        assert_eq!(summary.first_audio_crowd_ms, vec![1500, 3700]);
+        assert_eq!(
+            summary.crowd_routes[0].timing,
+            CrowdTiming {
+                input_to_route_ms: Some(1000),
+                route_to_dispatch_ms: Some(0),
+                dispatch_to_phrase_ms: Some(500),
+                route_to_phrase_ms: Some(500)
+            }
+        );
+        assert_eq!(
+            summary.crowd_routes[1].timing,
+            CrowdTiming {
+                input_to_route_ms: Some(1000),
+                route_to_dispatch_ms: Some(2000),
+                dispatch_to_phrase_ms: Some(700),
+                route_to_phrase_ms: Some(2700)
+            }
+        );
+        let text = render_summary(&summary);
+        assert!(
+            text.contains(
+                "stage=route_observation_to_first_phrase count=2 routes=2 p50=500 p95=2700"
+            )
+        );
+        assert!(!text.contains("PRIVATE"));
+    }
+
+    #[test]
+    fn crowd_timing_excludes_ambiguous_or_reversed_points_and_unvoiced_audio() {
+        let records = [
+            r#"{"v":1,"t":"input","seq":1,"turn":"a","logical_ms":1000}"#,
+            r#"{"v":1,"t":"crowd","seq":2,"turn":"a","logical_ms":2000}"#,
+            r#"{"v":1,"t":"note","seq":3,"turn":"a","logical_ms":1500,"kind":"path","fallback":"direct"}"#,
+            r#"{"v":1,"t":"phrase","seq":4,"turn":"a","logical_ms":2500,"idx":0}"#,
+            r#"{"v":1,"t":"crowd","seq":5,"turn":"b","logical_ms":2000}"#,
+            r#"{"v":1,"t":"crowd","seq":6,"turn":"b","logical_ms":2000}"#,
+            r#"{"v":1,"t":"phrase","seq":7,"turn":"b","logical_ms":3000,"idx":0}"#,
+            r#"{"v":1,"t":"input","seq":8,"turn":"c","logical_ms":1000}"#,
+            r#"{"v":1,"t":"crowd","seq":9,"turn":"c","logical_ms":2000}"#,
+            r#"{"v":1,"t":"fallback","seq":10,"turn":"c","logical_ms":3000,"kind":"silent","fallback":"crowd_cooldown"}"#,
+            r#"{"v":1,"t":"crowd","seq":11,"turn":"d","logical_ms":2000}"#,
+            r#"{"v":1,"t":"phrase","seq":12,"turn":"d","logical_ms":3000,"idx":1}"#,
+            r#"{"v":1,"t":"crowd","seq":13,"turn":"e"}"#,
+            r#"{"v":1,"t":"phrase","seq":14,"turn":"e","logical_ms":3000,"idx":0}"#,
+        ];
+        let summary = summarize(records.join("\n").as_bytes());
+        assert_eq!(summary.crowd_routes.len(), 6);
+        for route in &summary.crowd_routes {
+            assert_eq!(route.timing.route_to_phrase_ms, None, "{}", route.turn);
+        }
+        let unvoiced = &summary.crowd_routes[3];
+        assert_eq!(unvoiced.turn, "c");
+        assert_eq!(unvoiced.phrases, 0);
+        assert_eq!(unvoiced.timing.input_to_route_ms, Some(1000));
+        assert!(
+            render_summary(&summary)
+                .contains("stage=route_observation_to_first_phrase count=0 routes=6 p50=n/a")
+        );
     }
 
     #[test]

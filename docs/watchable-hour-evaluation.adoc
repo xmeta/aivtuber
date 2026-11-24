@@ -102,6 +102,20 @@ Verify log status counters for dropped records and file/write caps; incomplete a
 |Decision |GO/NO-GO/incomplete, remaining constraints, linked owning issue, next falsifying measurement and AAR.
 |===
 
+For crowd timing (#494), use the additional `crowd_timing_ms` summary lines and their per-turn `crowd_timing` records:
+
+* `input_to_route_observation`: carrier input to the crowd routing observation (includes the batch window).
+* `route_observation_to_dispatch`: time between the routing observation and the existing direct/deferred dispatch note; an indication of waiting, not a ranker wall-clock measure.
+* `dispatch_to_first_phrase`: dispatch note to the first recorded phrase (includes any subsequent scheduling/generation/output delay).
+* `route_observation_to_first_phrase`: the interval closest to the earlier #79 routing-to-audio objective, still only logical time and recorded output, not acoustic or visible onset.
+
+The existing `first_audio_ms path=crowd` remains carrier-input-to-first-phrase, not route-to-phrase. Do not compare it directly to the 3.5 s target.
+Each new stage reports its own eligible count and total observed crowd routes; missing endpoints, ambiguous observations or reversed timestamps are not zero-duration samples.
+An unvoiced route can contribute an observed input-to-route interval but cannot contribute first-phrase timing.
+Do not sum independently pooled percentiles. A zero-length same-tick interval is valid only with two observed endpoints.
+Where the log was capped, truncated, malformed or records were dropped, treat the summary as incomplete evidence.
+No new transcript or runtime log records are collected.
+
 No absolute thresholds are set by this protocol. The earlier #79 3.5 s crowd target is a slice-level reference, not a calibrated hour SLO.
 Pool compatible evidence only; changes in model, traffic, host, cache or GPU load can invalidate a comparison.
 A single run does not calibrate an SLO. `slo-report` reads a `BenchmarkReport`, not session conversation JSONL (even with `--provenance live-session`).
