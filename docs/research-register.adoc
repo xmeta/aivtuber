@@ -252,7 +252,7 @@ adaptive budget-constrained routing research;
 adaptive-compute / reasoning-budget research
 |Route based on expected incremental value versus latency/cost; also choose a bounded thinking-budget class
 |#58, #64, #69, #104
-|Pairwise quality calibration on aivtuber data; deadline/budget veto behavior; provider-specific compute controls
+|Pairwise quality calibration on aivtuber data; deadline/budget veto behavior; provider-specific compute controls. Proposed offline-calibrated deterministic `MarginalValuePolicy`, `ThinkingBudgetClass`, and #64 shadow promotion path for #104: link:adr/0023-marginal-value-routing-and-thinking-budget.adoc[ADR-0023] (Proposed; design only, blocked on #59/#64 evidence and parked)
 
 |Prompt caching
 |Recent prompt-caching evaluations;
