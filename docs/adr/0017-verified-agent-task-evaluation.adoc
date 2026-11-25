@@ -1,0 +1,168 @@
+= ADR-0017: Verified agent-task evaluation and first-class false-success benchmarking
+:status: Proposed
+:date: 2026-11-25
+
+== Context
+
+Issue #203 (`priority:P1`, `status:blocked`, `status:design-ready`, `status:parked`, Stage 3, tracked by #200) asks for a deterministic, offline-capable evaluation contract that measures whether the agent *actually completes requested tasks* rather than merely emitting plausible plans or succeeding at individual tool calls.
+
+This ADR records a proposed evaluation architecture, failure taxonomy, fixture matrix, and artifact boundary only. Implementation remains `status:blocked` on #201 (`AgentTask` lifecycle) and #165 (evidence export path where applicable) and `status:parked` until v0.3 closes. It authorizes no production code, changes no wire schemas, adds no dependencies, and leaves all v0.3 defaults unchanged.
+
+Inputs this ADR builds on, present on `main` at `31a09b1`:
+
+* `crates/app/src/task_plane.rs`: already separates `Failed` from `NotVerified` outcomes and tests stale/cancelled verification fences.
+* link:0002-mcp-tool-authority-boundary.adoc[ADR-0002] (#193, Accepted): proves tool-call dispatch success and verified requested outcome are distinct boundaries.
+* link:0016-mcp-tool-catalog-risk-and-approval.adoc[ADR-0016] (#202) and link:0015-dynamic-action-window.adoc[ADR-0015] (#221): define `schema_fingerprint` provenance, drift invalidation, and `ActionWindow` exposure boundaries.
+* #58 (machine-readable benchmark result schema/artifacts) and #59 (human/pairwise review workflow).
+
+== Hard constraints
+
+* *Evaluation has zero runtime authority* (`A-CTRL-001`): Running the evaluator can never promote permissions, mint `ToolGrant`/`ActionApproval`, or execute privileged external actions.
+* *Reuse `TaskPlane` outcomes — do not build a second completion state machine*: Build directly on `crates/app/src/task_plane.rs` (`Verified`, `Failed`, `NotVerified`, stale/cancelled fences) and ADR-0002 verification boundaries.
+* *`FalseSuccess` is a first-class error distinct from ordinary failure*: `reported_complete` (completion claim) and `VerifierOutcome` (`Verified`, `PostConditionMismatch`, `NotVerified`) are evaluated as separate axes. Never collapse missing/unavailable evidence (`NotVerified`) into `Verified` or fabricate a `PostConditionMismatch`.
+* *Deterministic, offline-capable CI*: Core verifier fixtures must run in normal CI with zero live third-party accounts, zero paid services, and no mandatory LLM-as-judge for deterministic post-conditions.
+* *Version-pinned comparability*: Every evaluation artifact must retain `(fixture_id, tool_ids, schema_fingerprints, policy_version, seed)` so runs remain reproducible and comparable across schema/policy changes.
+* *No single opaque "agent quality" score or leaderboard optimization*: Report decomposed failure dimensions and never copy external benchmark thresholds into aivtuber SLOs.
+
+== Assumptions
+
+Existing invariants referenced:
+
+* `A-CTRL-001` (Invariant): model output and evaluation fixtures never hold runtime authority.
+* `A-MEM-001` (Invariant): durable memory writes require non-serializable `MemoryWritePermit`.
+
+Proposed new assumptions (to be added to link:../assumptions.adoc[Assumption Register] only if accepted):
+
+* *A-EVAL-TASK-001* (*Needs validation*): A small deterministic suite of 7 local disposable-fixture cases (read verification, mutable post-condition, silent-success mismatch, precondition drift, schema drift, tool-error recovery, pre-completion cancellation) catches the primary failure modes of agentic tool loops before any live connector integration (#204). *Evidence:* unverified until implemented and run against real #201/#202 loops.
+
+== Alternatives considered
+
+. *Evaluate per-tool call success rate only*: rejected. Directly masks the primary failure mode (`FalseSuccess`: tool returned HTTP 200 / ok, but the requested post-condition is absent).
+. *Rely on an LLM-as-judge over model prose*: rejected for deterministic completion cases. Non-deterministic, expensive, and vulnerable to persuasive hallucinated completion claims.
+. *Adopt an external live-account benchmark suite directly in CI*: rejected. Violates offline/no-live-account CI constraints and risks drifting external SaaS state. Reuse MCPMark / ComplexMCP / MCPEvol ideas as *reference only*.
+. *Deterministic post-condition verifier suite separating completion claim vs `VerifierOutcome`, emitting machine-readable #58-compatible artifacts (proposed)*: zero external accounts, zero extra runtime authority, directly reuses `TaskPlane` outcomes.
+
+== Reuse / Adapt / Build comparison
+
+Reuse-first vocabulary per link:../reuse-first.adoc[reuse-first]. No external benchmark framework dependency is proposed.
+
+[cols="2,2,3,3,2"]
+|===
+|Candidate |Scope |Pattern / capability |Conflict or gap |Mode
+
+|*MCPMark / ComplexMCP / MCPEvol*
+|External research
+|Post-condition verifiers, version-pinned environments, large-tool-space selection/recovery scenarios, schema-evolution tests.
+|Live external environments and leaderboard thresholds cannot be imported directly into offline CI or product SLOs.
+|*Reference only.* Adopt post-condition verification and schema-evolution scenario structure.
+
+|*`TaskPlane` (`crates/app/src/task_plane.rs`) & ADR-0002 `execute_verified_tool`*
+|Existing project components
+|Already separates `Failed` vs `NotVerified`, enforces generation/cancellation fences, and normalizes bounded observations.
+|Does not yet aggregate multi-case benchmark artifacts or tag `FalseSuccess` vs ordinary failure.
+|*Reuse.* Consume `TaskPlane` outcomes directly inside the offline evaluator.
+
+|*#58 benchmark artifacts & #59 review conventions*
+|Existing project conventions
+|Versioned machine-readable JSON artifacts, series pinning, and optional human-review linkage.
+|Currently focused on latency/replay/reaction-quality rather than task-completion failure dimensions.
+|*Reuse / Extend.* Emit a dedicated versioned agent-task evaluation artifact alongside #58/#59.
+
+|*`AgentTaskEvaluator` & local disposable fixture runner*
+|New offline eval harness
+|Two-axis `(reported_complete, VerifierOutcome)` classification, decomposed failure counters, and deterministic replay across 7 core scenarios.
+|Project-specific intersection of `TaskPlane`, #202 `schema_fingerprint`, and #221 `ActionWindow`.
+|*Custom.* Offline evaluation crate/binary (never linked into production authority paths).
+|===
+
+== Evidence
+
+* *Repository executable evidence*:
+  - `crates/app/src/task_plane.rs` proves `Failed` vs `NotVerified` separation and stale/cancelled verification tests already exist.
+  - `crates/adapters/tests/mcp_tool.rs` proves deterministic in-memory MCP tool tests run cleanly in offline CI.
+* *Design input recorded on #203*:
+  - Community review comment on #203 (`2026-10-24`) highlighted the exact two-axis contrast: replaying a rejected post-condition with `reported_complete = false` (ordinary failure) vs `reported_complete = true` (`FalseSuccess`) while preserving `NotVerified` for missing evidence and freezing approval/expected digests before execution rather than recomputing them from delivered bytes.
+* *Unverified expectation (explicitly not yet measured)*:
+  - Baseline false-success and tool-selection error rates on #201/#202 agent loops are unmeasured until those prerequisites land.
+
+== Decision
+
+=== 1. Two-axis completion classification (first-class `FalseSuccess`)
+
+For every evaluated task case, record `reported_complete: bool` (whether the agent/fixture claimed completion) independently from `VerifierOutcome` (computed from the actual post-execution destination against frozen pre-execution expectations):
+
+[cols="2,2,2",options="header"]
+|===
+|`reported_complete` |`VerifierOutcome` |Task classification
+|`true` |`Verified` |`VerifiedSuccess`
+|`true` |`PostConditionMismatch` or `NotVerified` |*`FalseSuccess`* (primary failure)
+|`false` |`PostConditionMismatch` |`OrdinaryFailure`
+|`false` |`NotVerified` |`UnverifiedIncomplete`
+|`false` |`Verified` |`UnderReportedSuccess` (diagnostic)
+|===
+
+=== 2. Decomposed failure taxonomy (no opaque single score)
+
+Every evaluation artifact (`schema_version = "0.1.0"`) records per-case and aggregate counts for:
+
+* *Outcome classes*: `verified_success`, `false_success`, `ordinary_failure`, `unverified_incomplete`, `cancellation_correct`.
+* *Failure attribution*: `tool_selection_failure`, `invalid_or_missing_argument`, `precondition_check_skipped`, `execution_error`, `schema_drift_rejected`, `verification_mismatch`, `recovery_succeeded`, `recovery_failed`.
+* *Efficiency & safety*: `unnecessary_tool_calls`, `unnecessary_approvals`, `unnecessary_mutating_actions`, `task_duration_ms`, `tool_call_count`, `external_cost_microusd` (optional).
+* *Comparability metadata*: `fixture_id`, `seed`, `tool_identities`, `schema_fingerprints`, `policy_version`, `action_window_enabled`.
+
+=== 3. Mandatory 7-case offline deterministic fixture matrix
+
+All 7 cases run against disposable in-memory/tempdir fixtures with zero network/account requirements:
+
+1. *Read & verify exact field*: read one fixture resource and assert exact requested field extraction.
+2. *Mutate disposable fixture & verify post-condition*: write/update a disposable target and verify digest + format validity against frozen expectations.
+3. *Tool reports ok, post-condition absent (`FalseSuccess` probe)*: mock tool returns success without applying the mutation; replay with `reported_complete = true` (must flag `FalseSuccess`) and `reported_complete = false` (must flag `OrdinaryFailure`).
+4. *Precondition drift*: required precondition changes between planning and execution; agent must detect or fail closed rather than claiming completion.
+5. *Schema drift (#202 / #221)*: tool schema changes between discovery and execution; must reject via `SchemaDrift` and invalidate stale approvals/windows.
+6. *Recovery after first tool failure*: primary tool fails with typed error; valid fallback/recovery path exists and is verified.
+7. *Cancellation before stale completion*: task is cancelled before a late tool completion arrives; `TaskPlane` generation fence must reject completion and never report `VerifiedSuccess`.
+
+=== 4. Cheapest falsifier
+
+Once #201 lands and #203 unparks:
+
+1. Implement the offline 7-case fixture runner reusing `TaskPlane` and in-memory MCP doubles.
+2. Assert deterministic byte-identical artifact reproduction across repeated runs under the same seed/config.
+3. Verify Case 3 catches 100% of `FalseSuccess` regressions and Case 7 catches 100% of stale-completion races before integrating live #204 connector profiles.
+
+== Consequences
+
+=== Positive
+
+* Makes `FalseSuccess` structurally impossible to hide behind per-tool HTTP-200 success metrics.
+* Reuses existing `TaskPlane` outcomes and #58/#59 artifact conventions without introducing a second completion state machine or live-account CI fragility.
+* Directly validates #202 schema drift and #221 `ActionWindow` false-success prevention.
+
+=== Costs / trade-offs
+
+* Requires maintaining frozen post-condition verifiers for each disposable fixture case.
+* Deterministic verifiers cover objective post-conditions; open-ended subjective tasks still require optional #59 human review.
+
+=== Known limitations
+
+* Blocked on #201 (`AgentTask` lifecycle) and #165, and parked until v0.3 closes.
+* Disposable local fixtures validate verifier/fencing correctness, not real third-party SaaS rate limits or UI quirks (#204).
+
+== Staging and rollback
+
+1. *Stage 0 (this ADR)*: evaluation contract and 7-case fixture matrix only; zero runtime change.
+2. *Stage 1 (offline 7-case verifier harness)*: add schema-validated artifact and deterministic local fixtures running in CI with zero live accounts.
+3. *Stage 2 (#202 / #221 integration)*: add catalog-vs-`ActionWindow` and schema-drift comparison suites.
+4. *Stage 3 (#58 / #59 linkage)*: link agent-task artifacts into #58 trend reports and optional #59 human review for subjective tasks. Rollback is cleanly removing/disabling the offline eval target (zero production runtime coupling).
+
+== Revisit conditions
+
+* #201 `AgentTask` lifecycle or `crates/app/src/task_plane.rs` changes outcome variants.
+* #204 connector profiles introduce multi-step external side effects requiring new verifier patterns (e.g., idempotency keys or compensating rollback checks).
+
+== Related
+
+* Issue: #203 (parent), #200, #201, #202, #204, #221, #193, #165, #58, #59
+* PR: (to be linked on PR creation)
+* Assumptions: `A-CTRL-001`, `A-MEM-001`; proposed `A-EVAL-TASK-001`
+* Other ADRs: link:0001-three-layer-runtime.adoc[ADR-0001], link:0002-mcp-tool-authority-boundary.adoc[ADR-0002], link:0015-dynamic-action-window.adoc[ADR-0015], link:0016-mcp-tool-catalog-risk-and-approval.adoc[ADR-0016]
