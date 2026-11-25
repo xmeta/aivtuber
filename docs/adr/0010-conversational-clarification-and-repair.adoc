@@ -1,0 +1,244 @@
+= ADR-0010: Deterministic conversational clarification, uncertainty, and bounded evidence-probe repair policy
+:status: Proposed
+:date: 2026-11-25
+
+== Context
+
+Issue #85 (`priority:P1`, `status:design-ready`, Stage 4) asks for explicit conversational clarification, uncertainty acknowledgement, and repair policies so the AI VTuber recognizes insufficient or ambiguous context and chooses a natural, bounded repair action rather than confidently hallucinating missing antecedents.
+
+This ADR records a proposed architecture and evaluation design for #85. It authorizes no production code, changes no wire schemas, adds no dependencies, and preserves all v0.3 release-gate defaults.
+
+Inputs this ADR builds on, all present on `main` at `49fd8d9`:
+
+* #80 S1 (`crates/app/src/recent_turns.rs`): `RecentTurns` maintains a bounded, in-memory, logical-clock ring of the performer's own gated audible turn openings (`RECENT_TURNS_MAX = 6`, `RECENT_TURNS_TTL_MS = 10 min`, `PHRASE_MAX_CHARS = 40`). Viewer text is never stored in `RecentTurns`. Full multi-turn thread tracking (#80 S2) remains parked.
+* #54 template route (`crates/app/src/lib.rs`, `PlaybackRoute::Template`): curated templates render with bounded slots and pass through `SecurityRuntime::publish_text` before playback, providing a low-latency, zero-LLM output path for short repair phrases.
+* `crates/domain/src/reflex.rs` and `crates/domain/src/context.rs`: `ReflexDecision` carries `route.confidence` (route selection confidence, not context sufficiency) with `#[serde(deny_unknown_fields)]`; `ThinkingRequest` carries bounded `curated_context` (`MAX_THINKING_CONTEXT_ITEMS`) with explicit `ThinkingContextSource`, `TrustLevel`, `PrivacyClass`, and `EpistemicClass`.
+* `crates/runtime/src/lib.rs`: `PublicOutputPolicy` gates public speech before TTS; `MemoryWritePermit` enforces non-serializable durable memory write authority.
+* #88 (`SceneContext`), #79 (`CrowdContext`), #75 (`DeferredInbox`), #67 (interaction deadline), and #59 (reaction-quality evaluation dataset and pairwise review workflow).
+
+Without an explicit repair boundary, ambiguous Japanese stream chat such as "さっきのやつどうだった？" ("How was that thing earlier?"), "それってどっち？" ("Which one is that?"), or "いや、前の話" ("No, the earlier topic") either forces the LLM to fabricate an antecedent or falls back to a generic long apology.
+
+== Hard constraints
+
+* *Model and Jev output are data, never runtime authority* (`A-CTRL-001`). Jev may estimate context sufficiency or recommend a repair action; deterministic policy decides the disposition and route.
+* *No leakage or reconstruction of deleted, moderated, or private content* (`A-MEM-001`, `docs/security-threat-model.adoc`). Neither an evidence probe nor a clarification prompt may access deleted/moderated chat, private operator notes, or unauthorized memory entries. A viewer asking "What did that deleted user say?" must never reconstruct hidden content.
+* *Append-only history and replay integrity*. Self-correction must never rewrite prior audit records, session logs, or replay events. Corrections emit a new event carrying a bounded reference to the prior event.
+* *Explicitly bounded state and deterministic logical-clock replay*. All repair state (evidence probe results, per-actor repair cooldowns, consecutive repair counters) must be strictly bounded and keyed by monotonic/logical time, never wall-clock time.
+* *Deadline accounting and motor-loop isolation*. Evidence probes and repair decisions run outside the frame/motor loop and charge all elapsed time to the #67 interaction deadline.
+* *No automatic full-LLM escalation on low confidence*. Low context sufficiency must not reflexively trigger an expensive generative call; curated templates (#54), cached phrases, or skipping are preferred when adequate.
+* *Single-pass probing only*. The policy must not recursively ask an LLM to generate additional evidence-retrieval queries.
+
+== Assumptions
+
+Existing invariants referenced:
+
+* `A-CTRL-001` (Invariant): serialized authorization and model output are never runtime authority.
+* `A-MEM-001` (Invariant): durable memory writes require non-serializable `MemoryWritePermit`.
+
+Proposed new assumptions (to be added to link:../assumptions.adoc[Assumption Register] only if this ADR is accepted):
+
+* *A-REPAIR-001* (*Needs validation*): One bounded local evidence probe over already-visible runtime state (`RecentTurns`, `SceneContext`, `CrowdContext`, approved visible `WorkingMemory`, correlation metadata) resolves or safely narrows the majority of ambiguous Japanese stream-chat references without requiring multi-hop LLM tool calls. *Evidence:* unverified design hypothesis. *Revisit when:* #59 offline scenario evaluation shows probe resolution fails to improve over direct clarification or exceeds the #67 deadline budget.
+* *A-REPAIR-002* (*Needs validation*): Short template/cached clarifications (e.g., "さっきのって[候補]のこと？") achieve acceptable perceived naturalness on Japanese livestreams while keeping clarification latency within the fast-path budget, reserving `ThinkingEngine` wording only for multi-candidate disambiguation. *Evidence:* unverified; requires #59 human/pairwise review.
+* *A-REPAIR-003* (*Needs validation*): Bounding consecutive repairs to at most 1 repair per actor within a cooldown window prevents apology/clarification loops without causing abrupt silence on legitimate follow-up corrections. *Evidence:* unverified; requires #59 replay evaluation.
+
+== Alternatives considered
+
+. *Status quo (prompt-only LLM handling)*: rely on system prompts to tell `ThinkingEngine` "ask if unsure". Rejected: incurs full LLM latency on every ambiguous message, cannot enforce non-leakage or repair-loop caps deterministically, and produces inconsistent hallucinated-context guesses across models.
+. *Unconditional clarification on low semantic/route confidence*: ask a clarifying question whenever retrieval or route confidence is low. Rejected: directly violates #85 non-goals; causes annoying over-clarification on casual stream banter where skipping or a light non-verbal/cached reaction is preferable.
+. *Recursive agentic evidence gathering (LLM-driven multi-hop query loop)*: allow a model to iteratively query memory, chat logs, and scene state until confident. Rejected: violates #67 interaction latency budgets, breaks deterministic replay, risks cost blow-up under chat bursts, and widens prompt-injection / private-data extraction surfaces.
+. *Single bounded evidence probe + deterministic `RepairDisposition` policy (proposed)*: decouple `ContextSufficiency` from `RouteDecision.confidence`, allow at most one deterministic local probe under a strict `EvidenceProbeBudget`, and dispatch through typed dispositions preferring templates/cached responses over full LLM calls.
+
+== Reuse / Adapt / Build comparison
+
+Reuse-first vocabulary per link:../reuse-first.adoc[reuse-first]. No external runtime crate or service dependency is proposed.
+
+[cols="2,2,3,3,2"]
+|===
+|Candidate |Scope |Pattern / capability |Conflict or gap |Mode
+
+|*ReCoVERR / Selective Prediction* (Findings of ACL 2024, https://aclanthology.org/2024.findings-acl.767/)
+|External research
+|Bounded evidence-gathering step before committing to either abstention/clarification or an answer.
+|Paper targets VLM visual-evidence verification and model-generated queries; not directly usable as a Rust runtime component.
+|*Reference only.* Adopt the single-pass bounded evidence-probe principle; reject recursive model-generated queries and VLM coupling.
+
+|*Existing runtime context sources* (`RecentTurns` #80 S1, `SceneContext` #88, `CrowdContext` #79, `WorkingMemory` #105, `EventEnvelope` correlation)
+|Existing project components
+|Already bounded, logical-clocked, trust-tagged, and privacy-scoped in-memory snapshots.
+|Do not yet expose a unified bounded read-only probe view or a `ContextSufficiency` assessment.
+|*Reuse.* Read these existing snapshots directly through a read-only adapter; do not introduce a parallel history store.
+
+|*Template route (#54) & `PublicOutputPolicy`* (`crates/app`, `crates/runtime`)
+|Existing project components
+|Deterministic template rendering with bounded slots and mandatory `publish_text` containment.
+|Needs curated repair/clarification template families and slot bounds.
+|*Reuse / Adapt.* Route simple repairs through #54 before invoking `ThinkingEngine`.
+
+|*`RepairPolicy` & `EvidenceProbeBudget`*
+|New domain/reflex/app policy
+|Pure deterministic disposition mapping, single-probe budget enforcement, per-actor loop cap, and append-only `CorrectionRef`.
+|No external crate implements aivtuber's trust planes, logical-clock replay, non-leakage guarantees, and #67 deadline integration.
+|*Custom.* Small, pure, deterministic policy module over project-owned domain types.
+|===
+
+== Evidence
+
+* *Repository executable evidence*:
+  - `crates/app/src/recent_turns.rs` proves bounded logical-clock retention of performer-only turn openings (`RECENT_TURNS_MAX = 6`, `RECENT_TURNS_TTL_MS = 10 min`).
+  - `crates/runtime/tests/security_fixtures.rs` and `crates/app/src/tests/security_fixture_evidence_tests.rs` (#498, #504) prove `PublicOutputPolicy` containment and non-serializable `MemoryWritePermit` boundaries.
+  - `crates/domain/src/reflex.rs` confirms `ReflexDecision` uses `#[serde(deny_unknown_fields)]`, so any wire addition requires a deliberate versioned schema update per `AGENTS.md`.
+* *External research reference*:
+  - ReCoVERR (Findings of ACL 2024) establishes the conceptual separation between insufficient-context detection, bounded evidence gathering, and abstention/clarification.
+* *Unverified expectation (explicitly not yet measured)*:
+  - No Japanese livestream clarification dataset or human-rated appropriateness benchmark has been run yet.
+  - Initial `EvidenceProbeBudget` defaults (`max_sources = 3`, `max_items = 4`, `max_bytes = 1024`, `max_time_ms = 40`) are analytical design hypotheses, not calibrated SLOs.
+
+== Decision
+
+=== 1. Separate `ContextSufficiency` from `RouteDecision.confidence`
+
+Route confidence answers "which execution path fits this event?" (cached reaction, template, generate, silent). Context sufficiency answers "do we have enough safe, visible antecedent evidence to answer truthfully without guessing?".
+
+Proposed closed enum (domain-level, provider-neutral):
+
+[source,text]
+----
+ContextSufficiency:
+  Sufficient              // Antecedent/topic is resolved within visible context
+  AmbiguousAntecedent     // Deictic reference ("さっきのやつ", "それ") lacks a single clear target
+  CompetingTopics         // >= 2 plausible active candidates (e.g. recent turn vs current scene)
+  StaleOrExpired          // Explicit reply parent or referenced turn aged out of bounded window
+  UnavailableOrRestricted // Target refers to deleted, moderated, or non-public content
+  ContradictedByUser      // User explicitly corrects a recent performer utterance ("いや、前の話")
+----
+
+=== 2. Typed `RepairDisposition`
+
+Deterministic policy maps `(ContextSufficiency, probe_outcome, loop_budget, deadline_remaining)` to a closed `RepairDisposition`:
+
+[source,text]
+----
+RepairDisposition:
+  AnswerDirectly          // Context sufficient (initially or after single probe)
+  Clarify                 // Ask a concise question naming at most 1-2 safe candidates
+  ConfirmUnderstanding    // Brief confirmation before answering a competing-topic reference
+  AcknowledgeUncertainty  // Persona-compatible short admission of missing context
+  SelfCorrect             // Append-only correction referencing prior event id (no history rewrite)
+  ContextExpired          // Stale/expired parent: short "lost context" template or skip
+  CannotResolveSafely     // Deleted/moderated/private target: refuse reconstruction or skip
+  Skip                    // Low value, loop cap reached, or insufficient deadline remaining
+----
+
+=== 3. Single bounded evidence probe (`EvidenceProbeBudget`)
+
+When `ContextSufficiency` is `AmbiguousAntecedent` or `CompetingTopics` (never for `UnavailableOrRestricted`), policy may run *at most one* deterministic read-only probe before choosing `Clarify`, `AcknowledgeUncertainty`, or `Skip`:
+
+[source,text]
+----
+EvidenceProbeBudget:
+  max_sources: u8   = 3      // Ordered allowlist of visible local snapshots
+  max_items: usize  = 4      // Total candidate snippets returned across all sources
+  max_bytes: usize  = 1024   // Total UTF-8 payload cap across probe results
+  max_time_ms: u64  = 40     // Charged against #67 interaction deadline
+  max_one_probe: bool = true // Non-recursive; never re-entered on the same turn
+----
+
+Allowed read-only probe sources (strictly already-authorized, visible state):
+
+1. Event correlation / explicit reply metadata (if present and not deleted/moderated).
+2. `RecentTurns` (#80 S1) — performer's own gated audible turn openings.
+3. `SceneContext` (#88) and `CrowdContext` (#79) — current active scene/topic summaries.
+4. Approved visible `WorkingMemory` entries (#105) scoped to public/performer-experience classes only (never private/admin/deleted items).
+
+Flow:
+
+[source,text]
+----
+Event -> Normalizer -> ContextSufficiency estimate (deterministic heuristics + optional Jev hint)
+  |
+  +-- UnavailableOrRestricted -------------------------> CannotResolveSafely (template or Skip)
+  +-- StaleOrExpired ----------------------------------> ContextExpired (template or Skip)
+  +-- ContradictedByUser (+ loop budget ok) -----------> SelfCorrect (append-only CorrectionRef)
+  +-- Sufficient --------------------------------------> AnswerDirectly
+  +-- AmbiguousAntecedent / CompetingTopics
+        |
+        v (if deadline_remaining >= probe_budget.max_time_ms)
+      [Single Bounded Evidence Probe (max_one_probe = true)]
+        |
+        +-- Resolved uniquely -------------------------> AnswerDirectly (with bounded probe item)
+        +-- 1-2 safe candidates & loop budget ok ------> Clarify / ConfirmUnderstanding
+        |                                                (prefer #54 template; bounded ThinkingRequest only if needed)
+        +-- Still unresolved / deadline tight / capped -> AcknowledgeUncertainty or Skip
+----
+
+=== 4. Concrete Japanese boundary examples
+
+*Example A — Ambiguous deictic reference ("さっきのやつどうだった？"):*
+
+1. Viewer posts `"さっきのやつどうだった？"` with no explicit reply parent.
+2. Heuristic / Jev marks `ContextSufficiency::AmbiguousAntecedent`.
+3. Single bounded probe reads `RecentTurns` (1 recent performer turn mentioning `"ボス戦"` within TTL) and `SceneContext` (no competing active event).
+4. If uniquely resolved with high confidence, route proceeds to `AnswerDirectly` with the bounded `RecentTurns` item in `ThinkingRequest.curated_context`. If two candidates exist (e.g. `"ボス戦"` and `"ガチャ"`), policy selects `RepairDisposition::Clarify` and renders a #54 template: `"さっきのってボス戦のこと？"` — zero full-LLM call, bounded latency, no fabricated detail.
+
+*Example B — Deleted/moderated source ("さっき消された人なんて言ってたの？"):*
+
+1. Viewer asks about a deleted/moderated message.
+2. Target is absent from visible state or flagged moderated/deleted (`ContextSufficiency::UnavailableOrRestricted`).
+3. Policy skips the evidence probe entirely and selects `RepairDisposition::CannotResolveSafely` (either `Skip` or a fixed safe template such as `"見えなくなっちゃったコメントは拾えないんだよね"`). Internal memory or raw logs are never queried or reconstructed.
+
+=== 5. Loop bounds and append-only self-correction
+
+* Per-actor repair state is bounded in an LRU/ring map (e.g., max 64 actors, logical-clock TTL): at most 1 clarification or self-correction per actor per cooldown window (initial hypothesis: 30 s logical time). Further ambiguous messages within the cooldown degrade to `Skip` or a non-verbal reaction rather than an apology loop.
+* `SelfCorrect` attaches `CorrectionRef { prior_event_id: String, relation: "self_correction" }` to the new outbound event/telemetry record. Prior audit and replay entries remain immutable.
+
+=== 6. Cheapest falsifier before implementation
+
+Before writing production Rust code or bumping wire schemas:
+
+1. Construct an offline #59 evaluation mini-set covering all 8 scenarios listed in #85 (ambiguous pronoun, two competing topics, explicit reply metadata, expired parent, deleted/moderated source, user correction, no safe context, and obvious context where clarification would be annoying).
+2. Measure two opposing failure rates on the baseline (status quo) vs proposed deterministic policy:
+   - *Hallucinated-context error rate* (confident fabricated answer when antecedent is missing);
+   - *Unnecessary-clarification rate* (asking when context was already obvious).
+3. Only open an implementation slice (starting with pure deterministic `RepairPolicy` + #54 template integration, without touching `ReflexDecision` wire schema until Jev hint fields are proven needed) if the offline scenarios confirm net improvement without regressing latency or leaking restricted items.
+
+== Consequences
+
+=== Positive
+
+* Prevents hallucinated context on ambiguous Japanese stream chat without relying on fragile prompt engineering.
+* Keeps simple clarifications on the #54 template / cached fast path, avoiding unnecessary LLM cost and latency.
+* Enforces non-leakage of deleted/moderated/private content structurally before any probe or model call.
+* Preserves immutable replay/audit history during self-correction.
+
+=== Costs / trade-offs
+
+* Adds a new deterministic policy step and bounded per-actor repair state to maintain and test.
+* Heuristic/Jev misclassifications of `ContextSufficiency` can still cause occasional false clarifications or unnecessary skips until calibrated with #59 labeled data.
+* Adding optional Jev sufficiency hints to `ReflexDecision` later will require a versioned schema change (`schemas/reflex-decision.schema.json`) and parity fixtures.
+
+=== Known limitations
+
+* Without #80 S2 (full multi-turn viewer thread tracking), the evidence probe can only inspect performer-side `RecentTurns` plus scene/crowd/approved-memory snapshots, not arbitrary viewer-to-viewer subthreads.
+* Initial `EvidenceProbeBudget` limits and cooldown durations are uncalibrated hypotheses until tested against real Japanese dialogue recordings.
+* Does not cover multi-party / co-host speaker disambiguation (#93).
+
+== Staging and rollback
+
+1. *Stage 0 (this ADR)*: design and #59 offline scenario specification only. Zero runtime impact; trivial rollback (doc revert).
+2. *Stage 1 (shadow telemetry)*: run `ContextSufficiency` estimation and single-probe resolution in shadow mode (logging dispositions without altering public output) to measure candidate accuracy and probe latency against #67 deadlines.
+3. *Stage 2 (opt-in template repair)*: enable `CannotResolveSafely`, `ContextExpired`, and simple `Clarify` via #54 templates behind an explicit opt-in flag (`default = off`). Rollback is toggling the flag off.
+4. *Stage 3 (optional Jev hint & bounded `ThinkingRequest` repair wording)*: only after Stage 2 proves net quality uplift on #59; requires versioned schema update (`schemas/reflex-decision.schema.json`), which is the first point where rollback carries wire-compatibility cost.
+
+== Revisit conditions
+
+* Offline #59 evaluation shows unnecessary-clarification rate exceeds acceptable bounds or single-probe resolution adds negligible value over direct template fallback.
+* #80 S2 (multi-turn conversation-thread tracking) is unparked and changes available antecedent structures.
+* Measured probe latency approaches or exceeds the #67 fast-path budget.
+* Any security review identifies a side-channel where clarification wording leaks existence of moderated/deleted messages.
+
+== Related
+
+* Issue: #85 (parent), #54, #59, #67, #72, #74, #75, #79, #80, #88, #105
+* PR: (to be linked on PR creation)
+* Assumptions: `A-CTRL-001`, `A-MEM-001`; proposed `A-REPAIR-001`, `A-REPAIR-002`, `A-REPAIR-003`
+* Other ADRs: link:0001-three-layer-runtime.adoc[ADR-0001], link:0004-speech-lifecycle-and-text-projection.adoc[ADR-0004], link:0005-conversational-floor-policy.adoc[ADR-0005], link:0008-cross-session-memory-persistence.adoc[ADR-0008]

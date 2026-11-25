@@ -119,7 +119,7 @@ Twitch/emote-aware moderation research
 |ReCoVERR / selective-prediction research
 |One bounded evidence probe before unnecessary clarification or confident guessing
 |#85
-|Which sources improve correctness without exceeding interaction deadline; prevent recovery of deleted/private content
+|Which sources improve correctness without exceeding interaction deadline; prevent recovery of deleted/private content. Proposed deterministic `ContextSufficiency` / `RepairDisposition` policy, single-pass `EvidenceProbeBudget`, reuse review, and #59 falsifier for #85: link:adr/0010-conversational-clarification-and-repair.adoc[ADR-0010] (Proposed; design only, nothing run or measured)
 
 |Long-term conversational memory
 |LoCoMo (ACL 2024);
