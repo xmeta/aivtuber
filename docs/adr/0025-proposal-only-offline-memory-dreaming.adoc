@@ -1,0 +1,144 @@
+= ADR-0025: Proposal-only offline memory consolidation (Dreaming) behind existing write authority
+:status: Proposed
+:date: 2026-11-25
+
+== Context
+
+Issue #281 (`priority:P2`, `status:design-ready`, `status:parked`, parent #105) asks to apply offline sleep-time consolidation ideas (Anthropic component-memory / LightMem) to propose deduplication, contradiction resolution, supersessions, scope-preserving abstractions, and cleanup of expired derived views — *without* creating a parallel memory write authority or permanent transcript archive.
+
+This ADR records the proposed proposal-only contract (`MemoryConsolidationProposal`), deterministic rejection validator, snapshot/provenance rules, and falsifier only. Implementation remains `status:parked` until v0.3 closes and #280 comparison baselines exist. It authorizes no production code, changes no wire schemas, adds no dependencies, and leaves all v0.3 defaults unchanged.
+
+Inputs this ADR builds on, present on `main` at `78b2ae7`:
+
+* link:0008-cross-session-memory-persistence.adoc[ADR-0008] (#282, Accepted): owns disk persistence, bounded retention (`WorkingMemoryConfig`), and erasure semantics; #281 must not create an independent permanent transcript or proposal archive.
+* link:0021-versioned-typed-persona-contract.adoc[ADR-0021] (#72): restricts Dreaming persona feedback to operator-reviewed bounded suggestions only.
+* `crates/runtime/src/lib.rs` (`MemoryWritePermit`) and `crates/adaptation/src/lib.rs` (`EpistemicClass`, `WorkingMemory`): enforce non-serializable durable write authority and epistemic classification (`VerifiedFact`, `ViewerClaim`, `Observation`, `PerformerExperience`).
+* #280 (shared synthetic memory-quality/deletion benchmark fixtures), #284 (uncertain event-time semantics), and #80 (short-lived working thread context, never copied into durable memory).
+
+== Hard constraints
+
+* *Proposal-only — zero direct write authority* (`A-MEM-001`, `A-CTRL-001`): Offline consolidation emits untrusted `MemoryConsolidationProposal` suggestions only. It can *never* mint `MemoryWritePermit`, auto-apply mutations, or invoke privileged persona/tool authority. Any future apply phase must recheck live state and require authenticated operator/trusted-system permit minting.
+* *Read immutable snapshots of already permit-approved, still-live memories only*: Never read unbounded raw chat streams or create a hidden durable copy of working-only #80 thread context.
+* *Strict scope, epistemic, and erasure preservation*: Deterministically reject proposals that cross actor/private boundaries, reference deleted/expired nodes, lack source support, attempt to upgrade `ViewerClaim`/`Observation` to `VerifiedFact`, assert inferred dates as verified facts (#284), or overrun count/byte/token/edge limits. Deleting/expiring a source memory leaves zero hidden content in proposal logs or caches.
+* *Non-blocking worker & optional local model*: Runs strictly outside Jev/LLM frame/motor loops with bounded queue/concurrency/time/compute limits; if an optional local model is absent, proposal generation is skipped with zero impact on audio, avatar, Task Plane, or existing retrieval. Zero paid SaaS baseline (#220).
+
+== Assumptions
+
+Existing invariants referenced:
+
+* `A-CTRL-001` (Invariant): model output and proposals never hold runtime authority.
+* `A-MEM-001` (Invariant): durable memory writes require non-serializable `MemoryWritePermit`.
+* `A-MEM-002` (Needs validation): retained durable memory stays within ADR-0008 bounds.
+
+Proposed new assumptions (to be added to link:../assumptions.adoc[Assumption Register] only if accepted):
+
+* *A-DREAM-001* (*Needs validation*): Offline proposal-only consolidation over permit-approved snapshots produces source-supported deduplication/contradiction improvements on #280 held-out synthetic cases without increasing stale facts or privacy leakage. *Evidence:* unverified; if falsified, reject automatic apply permanently and keep Dreaming strictly as an offline analysis tool.
+
+== Alternatives considered
+
+. *Status quo (online bounded retention & TTL expiry only)*: zero consolidation overhead, but repeated claims and multi-session contradictions accumulate until TTL expiry.
+. *Autonomous background sleep-time writer modifying `WorkingMemory` directly*: rejected. Creates a second memory write authority, risks prompt-injection amplification during offline summarization, and breaks replay/erasure guarantees.
+. *Proposal-only offline `DreamingWorker` + deterministic `ProposalValidator` behind existing `MemoryWritePermit` (proposed)*: preserves single write authority, guarantees fail-closed validation, and degrades cleanly to a no-op when no local model is configured.
+
+== Reuse / Adapt / Build comparison
+
+Reuse-first vocabulary per link:../reuse-first.adoc[reuse-first]. No external memory framework or paid service is proposed.
+
+[cols="2,2,3,3,2"]
+|===
+|Candidate |Scope |Pattern / capability |Conflict or gap |Mode
+
+|*Anthropic component-memory* & *LightMem* (arXiv:2510.18866) & *LoCoMo* (ACL 2024)
+|External research
+|Sleep-time deduplication, supersession, and consolidation framing.
+|Assume autonomous background writes without aivtuber's non-serializable `MemoryWritePermit` or strict actor-scope erasure.
+|*Reference only.* Adopt proposal-only consolidation concepts behind deterministic validation.
+
+|*ADR-0008 persistence, `WorkingMemory`, `MemoryWritePermit`, #280 synthetic fixtures*
+|Existing project components
+|Permit-gated durable writes, epistemic classes, actor pseudonymization, and deletion/recall evaluation fixtures.
+|Do not yet define `MemoryConsolidationProposal` or a deterministic proposal validator.
+|*Reuse.* Read immutable snapshots from `WorkingMemory`; evaluate quality deltas strictly against #280 baselines.
+
+|*`MemoryConsolidationProposal` & `ProposalValidator`*
+|New adaptation module
+|Typed proposal schema, deterministic scope/epistemic/erasure/budget rejection rules, and bounded worker supervision.
+|Project-specific security and replay contract.
+|*Custom.* Pure Rust schema + validator (~200 lines) in `crates/adaptation`.
+|===
+
+== Evidence
+
+* *Repository executable evidence*:
+  - ADR-0008 (`docs/adr/0008-cross-session-memory-persistence.adoc`) and `crates/adaptation/tests/long_range_eval.rs` prove bounded retention, erasure, and long-range memory evaluation exist on `main`.
+* *Unverified expectation (explicitly not yet measured)*:
+  - Consolidation recall uplift vs stale-fact/leakage delta has not yet been measured against #280 baselines.
+
+== Decision
+
+=== 1. Typed `MemoryConsolidationProposal` contract (untrusted suggestion)
+
+[source,text]
+----
+MemoryConsolidationProposal (schema-versioned, bounded, visibly untrusted):
+  schema_version: "0.1.0"
+  proposal_id: BoundedId
+  snapshot_epoch: u64                // Immutable read snapshot + retention epoch
+  action: ConsolidationAction        // Deduplicate | Supersede | MarkContradiction | ScopePreservingSummary | PruneDerivedView
+  source_memory_ids: Vec<u64>        // Max 8 live, permit-approved IDs within ONE actor/source scope
+  supporting_event_ids: Vec<BoundedId> // Provenance refs (no raw hidden transcript)
+  target_epistemic_class: EpistemicClass // <= min(source epistemic classes); never upgrades to VerifiedFact
+  proposed_claim: Option<BoundedString>  // <= WorkingMemoryConfig::max_claim_bytes
+  explanation: BoundedString         // <= 256 UTF-8 bytes
+  confidence: f64                    // [0.0, 1.0]
+  expected_cost_units: u32
+  policy_version: BoundedString
+----
+
+=== 2. Deterministic fail-closed `ProposalValidator`
+
+Every proposal passes deterministic validation *before* entering any review queue (zero auto-apply in Slice 1):
+
+1. *Scope isolation*: all `source_memory_ids` must share the same actor/source privacy scope (reject `CrossActorScope`).
+2. *Liveness & epoch*: snapshot epoch matches current retention epoch and every source ID is still live/non-deleted (reject `StaleSnapshot` / `DeletedSource`).
+3. *Source support*: non-empty `source_memory_ids` and `supporting_event_ids` (reject `MissingEvidence`).
+4. *Epistemic monotonicity*: `target_epistemic_class` can never exceed the lowest source class (reject `EpistemicEscalation`).
+5. *Bounds & containment*: enforce count/byte/token/edge limits and `PublicOutputPolicy` control-term checks (reject `BoundsExceeded` / `PromptInjectionDetected`).
+
+=== 3. Cheapest falsifier
+
+1. Deterministic unit/fixture tests covering all 8 required negative/positive cases: multi-session contradiction, repeated claim, correction, stale snapshot, deleted source, mixed viewer scope, missing supporting evidence, and prompt injection.
+2. Benchmark on #280 held-out synthetic memory fixtures comparing baseline vs validated proposals on recall delta, stale-fact rate, privacy leakage (must be 0), and compute cost; reject future auto-apply if stale facts or leakage increase.
+
+== Consequences
+
+=== Positive
+
+* Enables offline memory hygiene and contradiction analysis without weakening `MemoryWritePermit`, ADR-0008 erasure, or #80 working-only boundaries.
+* Degrades cleanly to a zero-cost no-op when no local model is configured.
+
+=== Costs / trade-offs
+
+* Proposal-only mode requires operator/trusted review before any memory mutation takes effect.
+
+=== Known limitations
+
+* Parked until v0.3 closes; any recall uplift claim must compare against #280 baselines.
+
+== Staging and rollback
+
+1. *Stage 0 (this ADR)*: proposal schema, validator rules, and falsifier only; zero runtime change.
+2. *Stage 1 (proposal-only validator + offline worker, `default = off`)*: emits validated untrusted proposals for inspection/benchmarking only; zero writes. Rollback is disabling the worker.
+3. *Stage 2 (future authenticated apply — separate ADR/review required)*: revalidates live state and requires non-serializable `MemoryWritePermit` via authenticated operator/trusted path.
+
+== Revisit conditions
+
+* #280 held-out comparison shows offline consolidation yields negligible recall improvement or raises stale-fact risk (keep analysis-only or reject).
+* ADR-0008 persistence schema or #284 event-time fields change snapshot representation.
+
+== Related
+
+* Issue: #281 (parent), #105, #280, #282, #283, #284, #51, #59, #72, #80, #220
+* PR: (to be linked on PR creation)
+* Assumptions: `A-CTRL-001`, `A-MEM-001`, `A-MEM-002`; proposed `A-DREAM-001`
+* Other ADRs: link:0008-cross-session-memory-persistence.adoc[ADR-0008], link:0021-versioned-typed-persona-contract.adoc[ADR-0021]
