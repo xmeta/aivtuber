@@ -164,7 +164,7 @@ Microsoft Playwright MCP;
 provider-maintained Google Workspace / Notion MCP servers where available
 |Prefer reviewed connector profiles and existing servers before native service adapters; pin server identity/version/tool allowlist and put local policy above server annotations
 |#202, #204
-|Credential scope; server update/schema drift; read-only/default toolset; subprocess/network failure; whether connector removal leaves core runtime unaffected
+|Credential scope; server update/schema drift; read-only/default toolset; subprocess/network failure; whether connector removal leaves core runtime unaffected. Proposed declarative `ConnectorProfile`, transport-level discovery byte/page containment (PR #213 follow-up), and zero-paid priority order for #204: link:adr/0019-curated-mcp-connector-profiles.adoc[ADR-0019] (Proposed; design only, blocked on #202 and parked)
 
 |Agent-task evaluation
 |MCPMark-style post-condition verifiers;

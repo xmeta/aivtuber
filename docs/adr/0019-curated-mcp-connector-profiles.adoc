@@ -1,0 +1,165 @@
+= ADR-0019: Curated MCP connector profiles and bounded transport-level discovery
+:status: Proposed
+:date: 2026-11-25
+
+== Context
+
+Issue #204 (`priority:P2`, `status:blocked`, `status:design-ready`, `status:parked`, Stage 3, tracked by #200) asks to enable real-world external integrations by composing maintained MCP servers behind aivtuber's local policy rather than authoring one native service adapter per platform.
+
+This ADR records the proposed connector profile contract, priority ordering under the zero-paid-dependency baseline (#220), security/isolation boundaries, and the mandatory transport-level discovery containment fix flagged in PR #213 review. Implementation remains `status:blocked` on #202 and `status:parked` until v0.3 closes. It authorizes no production code, changes no wire schemas, adds no dependencies, and leaves all v0.3 defaults unchanged.
+
+Inputs this ADR builds on, present on `main` at `a81e22b`:
+
+* link:0002-mcp-tool-authority-boundary.adoc[ADR-0002] (#193, Accepted): adopts official `rmcp` behind `RmcpToolAdapter` with non-serializable `ToolGrant` capability minting and verified completion.
+* link:0016-mcp-tool-catalog-risk-and-approval.adoc[ADR-0016] (#202): defines local `ToolCatalog`, asymmetric untrusted-annotation rules, `schema_fingerprint` provenance, and action-bound `ActionApproval`.
+* PR #213 follow-up recorded on #204: `RmcpToolAdapter::discover()` currently calls `rmcp::list_all_tools()`, which follows pagination and accumulates all returned tools before the local `MAX_TOOL_DISCOVERY_ITEMS = 64` check runs — bounding accepted catalog size, not bytes/items received during discovery.
+* #220 (zero-paid-dependency baseline): optional connectors must never become baseline runtime requirements or require paid SaaS subscriptions.
+
+== Hard constraints
+
+* *Transport-level discovery containment before external servers are enabled* (PR #213 follow-up): Discovery must enforce per-frame/per-response byte caps, page caps, and item caps *before* unbounded memory accumulation (replacing unbounded `list_all_tools()` accumulation). Pagination alone is insufficient if a single response frame can be oversized.
+* *External MCP servers are untrusted processes, never control authority* (`A-CTRL-001`, ADR-0002, ADR-0016): Server/tool descriptions are untrusted content; no connector can bypass #202 risk/approval or #201 verification.
+* *No auto-install of unreviewed servers from public registries*: Every enabled connector profile pins an explicit server/package identity, compatibility version range, transport mode, and explicit tool allowlist.
+* *Read-only / narrowest default*: Profiles default to read-only tool subsets where the server supports it; mutating/external-write tools require explicit opt-in and #202 `High`-risk approval.
+* *Scoped non-prompt-visible credentials*: Credentials live in environment/secret stores referenced by symbolic `CredentialScopeId`; secrets never enter prompts, catalog descriptions, or logs.
+* *Independent failure degradation and clean removal*: Connector startup, health checks, and reconnects are strictly bounded; an unavailable or removed connector never breaks or changes core performer/domain contracts.
+* *Zero-paid-service baseline (#220)*: Account-free local/OSS connectors outrank free-tier user-owned API connectors, which outrank optional commercial integrations (Google Workspace, Notion).
+
+== Assumptions
+
+Existing invariants referenced:
+
+* `A-CTRL-001` (Invariant): external servers and model output never hold runtime authority.
+* `A-MEM-001` (Invariant): durable memory writes require non-serializable `MemoryWritePermit`.
+
+Proposed new assumptions (to be added to link:../assumptions.adoc[Assumption Register] only if accepted):
+
+* *A-CONN-001* (*Needs validation*): Maintained official MCP servers (GitHub official MCP, Microsoft Playwright MCP, bounded local filesystem reference MCP) cover the initial Developer profile without requiring custom native service adapters. *Evidence:* README/ecosystem level only; requires live conformance checks separate from CI.
+* *A-CONN-002* (*Needs validation*): A native adapter is justified only when a concrete, documented MCP gap exists (e.g., realtime streaming latency, unsupported auth flow, or deterministic safety semantics that MCP transport cannot express). *Evidence:* architectural policy, revisited per connector.
+
+== Alternatives considered
+
+. *Write a custom native Rust adapter per external service (GitHub, browser, Notion, Google Workspace)*: rejected as default. High maintenance burden across rapidly evolving SaaS APIs; introduces unnecessary service-specific wire code when maintained MCP servers already exist.
+. *Build an aivtuber-specific plugin protocol / open marketplace auto-installer*: rejected (explicit non-goal of #204). Duplicates MCP and widens supply-chain/security attack surface.
+. *Allow unbounded `list_all_tools()` discovery and rely on post-hoc catalog truncation*: rejected (PR #213 security gap). A hostile or buggy server can exhaust memory via oversized frames or infinite pagination before local limits run.
+. *Curated declarative `ConnectorProfile`s over `RmcpToolAdapter` with bounded transport-level discovery and #202 policy enforcement (proposed)*: zero new plugin protocol, clean removal, strict memory/process containment, and deterministic offline CI fixtures separated from live conformance.
+
+== Reuse / Adapt / Build comparison
+
+Reuse-first vocabulary per link:../reuse-first.adoc[reuse-first]. External MCP servers run as isolated optional subprocesses/endpoints, never compiled into core crates.
+
+[cols="2,2,3,3,2"]
+|===
+|Candidate |Scope |Pattern / capability |Conflict or gap |Mode
+
+|*GitHub Official MCP Server*, *Microsoft Playwright MCP*, *reference local filesystem MCP*
+|External optional servers (Developer profile)
+|Maintained official tool implementations over standard MCP.
+|Upstream schema/version drift, broad default toolsets, and untrusted server metadata.
+|*Sidecar (opt-in).* Pin version/compatibility, enforce explicit tool allowlist, read-only default, and #202 risk overrides.
+
+|*Google Workspace / Notion official MCP servers*
+|External optional servers (Personal Agent profile)
+|User-owned productivity integrations.
+|Require external accounts/OAuth; outside #220 zero-paid baseline.
+|*Sidecar (later opt-in).* Evaluate only after Developer profile is stable; never baseline.
+
+|*`RmcpToolAdapter` & `ToolCatalog`* (ADR-0002, ADR-0016)
+|Existing / planned project components
+|MCP transport, `ToolGrant` capability boundary, `schema_fingerprint` provenance, and `RiskClass`/`ActionApproval`.
+|Current `discover()` uses unbounded `list_all_tools()`.
+|*Adapt.* Replace `list_all_tools()` with bounded single-page + transport byte-cap discovery before enabling external profiles.
+
+|*`ConnectorProfile` loader & supervisor*
+|New bounded profile module
+|Declarative profile schema, pinned identity/version, bounded subprocess lifecycle/reconnect limits, and health reporting.
+|Project-specific lifecycle and policy integration.
+|*Custom.* Thin declarative profile layer (~200 lines) with zero service-specific wire code.
+|===
+
+== Evidence
+
+* *Repository executable evidence*:
+  - ADR-0002 (`docs/adr/0002-mcp-tool-authority-boundary.adoc`) and `crates/adapters/tests/mcp_tool.rs` prove `RmcpToolAdapter` handles bounded descriptors/observations, timeouts, and closed transports in offline CI.
+  - PR #213 review comment on #204 documents the exact `list_all_tools()` unbounded discovery accumulation gap.
+* *Unverified expectation (explicitly not yet measured)*:
+  - Live conformance of GitHub MCP / Playwright MCP / local filesystem MCP under Windows/WSL subprocess supervision has not yet been executed.
+
+== Decision
+
+=== 1. Declarative `ConnectorProfile` contract
+
+[source,text]
+----
+ConnectorProfile (schema-versioned, opt-in):
+  profile_id: BoundedId                  // e.g. "dev.filesystem.readonly", "dev.github.readonly", "dev.playwright"
+  server_identity: McpServerIdentity     // Package/binary name + pinned version/digest range
+  transport: ConnectorTransport          // StdioSubprocess { argv_allowlist, env_allowlist } | LoopbackHttp
+  discovery_limits: DiscoveryBounds      // max_response_bytes (e.g. 256 KiB), max_pages (e.g. 4), max_tools (<= 64)
+  tool_allowlist: Vec<BoundedId>         // Explicit allowlist; empty = fail closed
+  default_read_only: bool                // true by default where server supports it
+  credential_scope: Option<CredentialScopeId> // Symbolic only; never prompt-visible
+  local_risk_overrides: BTreeMap<BoundedId, RiskClass> // Feeds #202 ToolCatalog (can only raise or fix)
+  supervision: SupervisionBounds         // startup_timeout_ms, health_interval_ms, max_restarts, backoff_ms
+  privacy_class: PrivacyClass            // Declares egress/data boundary
+----
+
+=== 2. Mandatory transport-level discovery bound (PR #213 prerequisite)
+
+Before any external `ConnectorProfile` may be enabled:
+
+1. Replace `list_all_tools()` in `RmcpToolAdapter::discover()` with an explicit bounded pagination loop (`list_tools(cursor)`).
+2. Enforce a hard transport-level byte cap (`max_response_bytes`) on incoming JSON-RPC frames before deserialization so a single oversized discovery response is aborted before memory accumulation.
+3. Enforce `max_pages` and `max_tools` (`<= 64`) incrementally on each page; exceeding any bound fails closed with a typed `DiscoveryError::BoundsExceeded` and leaves the core performer unaffected.
+
+=== 3. Profile priority order & native-adapter gate
+
+1. *Tier 1 (zero-paid local/account-free OSS)*: bounded local filesystem MCP, local Playwright MCP.
+2. *Tier 2 (official free/user-owned account)*: GitHub official MCP (read-only default).
+3. *Tier 3 (optional commercial/personal productivity, outside #220 baseline)*: Google Workspace, Notion — evaluated only after Developer profile is stable.
+4. *Native-adapter gate*: A native service adapter may be proposed only with a documented ADR/evidence note showing a concrete MCP gap that a `ConnectorProfile` cannot satisfy.
+
+=== 4. Cheapest falsifier
+
+Once #202 lands and #204 unparks:
+
+1. Add deterministic offline regression tests against a mock hostile MCP server emitting: (a) a single oversized discovery response exceeding `max_response_bytes`, (b) infinite pagination exceeding `max_pages`, and (c) tools outside `tool_allowlist` or crashing on startup — asserting bounded memory, fail-closed rejection, and unaffected core performer state.
+2. Verify one Developer profile (starting with read-only bounded local filesystem or Playwright MCP) end-to-end with zero service-specific wire code in `aivtuber-domain`, and confirm deleting the profile file compiles and passes all core tests cleanly.
+
+== Consequences
+
+=== Positive
+
+* Unlocks maintained external integrations (GitHub, Playwright, filesystem, and later Workspace/Notion) without multiplying bespoke native adapters.
+* Closes the PR #213 unbounded discovery memory-accumulation risk before untrusted external servers are connected.
+* Keeps the core performer runtime cleanly decoupled and faithful to the #220 zero-paid-dependency baseline.
+
+=== Costs / trade-offs
+
+* Requires maintaining pinned compatibility ranges and tool allowlists as upstream MCP servers release new versions.
+* Live conformance tests against real third-party accounts must remain manual/opt-in and separate from deterministic CI.
+
+=== Known limitations
+
+* Blocked on #202 (`ToolCatalog` / `RiskClass` / `ActionApproval`) and parked until v0.3 closes.
+* Subprocess supervision behavior (signal handling, orphan cleanup) must be verified separately on Windows and Linux/WSL.
+
+== Staging and rollback
+
+1. *Stage 0 (this ADR)*: profile contract and transport-bound specification only; zero runtime change.
+2. *Stage 1 (transport discovery bound)*: replace `list_all_tools()` with bounded frame/page/item discovery and add hostile-server offline regression tests.
+3. *Stage 2 (Developer profile MVP, opt-in `default = off`)*: ship one read-only Developer profile (bounded local filesystem or Playwright MCP) gated by #202 catalog/approval. Rollback is removing/disabling the profile config (zero domain contract change).
+4. *Stage 3 (optional Personal Agent profiles)*: add Google Workspace / Notion profiles only after Developer profile stability is proven.
+
+== Revisit conditions
+
+* Upstream `rmcp` adds native per-frame byte caps and bounded pagination helpers that replace the custom transport wrapper.
+* A critical integration demonstrates a documented MCP gap (latency, streaming, or verification semantics) justifying a dedicated native adapter.
+* #202 `ToolCatalog` schema changes how risk overrides or credential scopes are represented.
+
+== Related
+
+* Issue: #204 (parent), #200, #193, #201, #202, #203, #205, #220
+* PR: (to be linked on PR creation); follows up PR #213 review note
+* Assumptions: `A-CTRL-001`, `A-MEM-001`; proposed `A-CONN-001`, `A-CONN-002`
+* Other ADRs: link:0001-three-layer-runtime.adoc[ADR-0001], link:0002-mcp-tool-authority-boundary.adoc[ADR-0002], link:0016-mcp-tool-catalog-risk-and-approval.adoc[ADR-0016], link:0017-verified-agent-task-evaluation.adoc[ADR-0017]
