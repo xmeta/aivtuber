@@ -314,7 +314,7 @@ High-rate realtime media is a separate bounded data plane from the control/decis
 |TypeScript module(s) (`src/`) |Production Rust owner (`crates/`) |Current reference role
 |`envelope.ts` |`crates/domain` |Wire-contract and Event Envelope normalization reference for schema/fixture tests.
 |`security.ts`, `output-gate.ts`, `rate-limit.ts` |`crates/runtime` |Reference security policy, public-output containment, and content admission/rate-limit rules.
-|`event-bus.ts`, `scheduler.ts`, `performer.ts`, `session.ts`, `rng.ts` |`crates/scheduler`, `crates/app` |Deterministic event ordering, scheduling, performer state machine, replay session, and seeded PRNG reference.
+|`event-bus.ts`, `scheduler.ts`, `performer.ts`, `session.ts`, `rng.ts` |`crates/scheduler`, `crates/app` |Deterministic event ordering, scheduling, performer state machine, replay session, and seeded PRNG reference (shared Mulberry32 and `applyVariation` golden vectors pinned across Rust and TypeScript in `examples/rng/mulberry32-golden.json`, #506).
 |`asset-store.ts` |`crates/asset-store` |Performance Asset validation and lookup reference.
 |`reflex.ts`, `adapters-jev.ts` |`crates/reflex`, `crates/adapters` |Semantic retrieval and Jev-compatible reflex decision reference.
 |`thinking.ts`, `tts.ts`, `adapters.ts`, `adapters-mocks.ts` |`crates/generative`, `crates/adapters` |Generated-response, TTS, and deterministic mock adapter reference.

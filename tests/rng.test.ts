@@ -1,6 +1,24 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 import { createRng, applyVariation } from "../src/rng.js";
+
+interface RngGoldenFixture {
+  schema_version: string;
+  algorithm: string;
+  stream_vectors: Array<{ label: string; seed: number; raw_u32: number[]; values: number[] }>;
+  variation_cases: Array<{
+    label: string;
+    seed: number;
+    spec: { speed_pct: number; amplitude_pct: number; start_delay_ms: number };
+    expected: { speed_factor: number; amplitude_factor: number; start_delay_ms: number };
+  }>;
+}
+
+const goldenFixture: RngGoldenFixture = JSON.parse(
+  readFileSync(join(import.meta.dir, "..", "examples", "rng", "mulberry32-golden.json"), "utf8"),
+);
 
 describe("seeded rng", () => {
   test("same seed produces identical streams", () => {
@@ -51,5 +69,31 @@ describe("applyVariation", () => {
     expect(v.speedFactor).toBe(1);
     expect(v.amplitudeFactor).toBe(1);
     expect(v.startDelayMs).toBe(0);
+  });
+});
+
+describe("shared golden fixture (#41, #506)", () => {
+  test("stream vectors match mulberry32-golden.json across boundary seeds", () => {
+    expect(goldenFixture.schema_version).toBe("0.1.0");
+    expect(goldenFixture.algorithm).toBe("mulberry32");
+    expect(goldenFixture.stream_vectors.length).toBeGreaterThan(0);
+
+    for (const vector of goldenFixture.stream_vectors) {
+      const rng = createRng(vector.seed);
+      const actual = vector.values.map(() => rng());
+      expect(actual.map((v) => v * 4294967296)).toEqual(vector.raw_u32);
+      expect(actual).toEqual(vector.values);
+    }
+  });
+
+  test("variation cases match mulberry32-golden.json across boundary seeds", () => {
+    expect(goldenFixture.variation_cases.length).toBeGreaterThan(0);
+
+    for (const entry of goldenFixture.variation_cases) {
+      const actual = applyVariation(entry.spec, createRng(entry.seed));
+      expect(actual.speedFactor).toBe(entry.expected.speed_factor);
+      expect(actual.amplitudeFactor).toBe(entry.expected.amplitude_factor);
+      expect(actual.startDelayMs).toBe(entry.expected.start_delay_ms);
+    }
   });
 });
