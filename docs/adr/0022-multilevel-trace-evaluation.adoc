@@ -1,0 +1,149 @@
+= ADR-0022: Multi-level trace evaluation, deterministic failure attribution, and optional OTel export
+:status: Proposed
+:date: 2026-11-25
+
+== Context
+
+Issue #108 (`priority:P2`, `status:blocked`, `status:design-ready`, `status:parked`, Stage 2) asks to evaluate retained causal traces across three distinct levels (system outcome, trace trajectory, and individual node/stage) and emit machine-readable `FailureAttribution` records so human engineers and AI coding agents can diagnose *where* a regression originated rather than seeing only an aggregate benchmark score.
+
+This ADR records a proposed three-level evaluation contract, deterministic-first evaluator hierarchy, privacy boundary, and optional OpenTelemetry (OTel) GenAI export layer. Implementation remains `status:blocked` (on sufficient #59 labeled outcomes to validate attribution quality) and `status:parked` until v0.3 closes. It authorizes no production code, changes no wire schemas, adds no dependencies, and preserves all v0.3 defaults.
+
+Inputs this ADR builds on, present on `main` at `ccb04a3`:
+
+* `crates/telemetry/src/causal_trace.rs` (#65): already owns aivtuber's bounded causal trace model and `TraceStage` vocabulary.
+* `crates/telemetry/src/benchmark_gate.rs` & `schemas/benchmark-result.schema.json` (#58): machine-readable benchmark result artifacts.
+* #59 (`examples/evaluation/reaction-quality/`): human-labeled outcome datasets and pairwise review workflows.
+* #62 (after-action reviews) and link:0017-verified-agent-task-evaluation.adoc[ADR-0017] (#203 decomposed agent-task failure taxonomy).
+
+== Hard constraints
+
+* *Evaluation is strictly diagnostic, never runtime authority* (`A-CTRL-001`): Neither deterministic evaluators nor optional offline LLM judges may alter runtime routing, safety, or control decisions.
+* *Keep `causal_trace.rs` and `TraceStage` authoritative*: OpenTelemetry GenAI semantic conventions are an optional export mapping only — never the retained internal causal model, and never a required CI or runtime SaaS dependency.
+* *Privacy-safe by default*: Automatic evaluators read redacted trace/metric identifiers (`evidence_refs[]`, timing spans, reason codes, route/stage enums), never raw prompts, replies, audio, or video unless an explicitly authorized offline evaluation path permits it.
+* *Deterministic-first ordering*: Always run cheapest reproducible evaluators (invariant rules, threshold/reason analysis, expected-scenario comparison) before any optional offline LLM judge; CI and benchmark artifacts must remain fully useful when no LLM judge is available.
+* *No opaque single score and no false causality claims*: Separate system, trace, and node levels explicitly; record `evaluator_id/version` and `confidence` and treat automatic attribution as likely-stage triage subject to #59 human validation.
+
+== Assumptions
+
+Existing invariants referenced:
+
+* `A-CTRL-001` (Invariant): evaluator/judge output never holds runtime authority.
+* `A-MEM-001` (Invariant): durable memory writes require non-serializable `MemoryWritePermit`.
+
+Proposed new assumptions (to be added to link:../assumptions.adoc[Assumption Register] only if accepted):
+
+* *A-TRACE-EVAL-001* (*Needs validation*): Deterministic rule/threshold attribution over `causal_trace.rs` spans resolves the majority of latency, fallback-branch, deadline-exhaustion, and cancellation regressions without invoking an offline LLM judge. *Evidence:* unverified; must be measured as rule-vs-judge resolution rate and human agreement against #59 labels.
+
+== Alternatives considered
+
+. *Status quo (aggregate #58 pass/fail metrics + manual log inspection)*: detects regressions but forces engineers and coding agents to manually correlate timestamps across spans to find whether latency was deliberate floor wait (#81) or provider slowness.
+. *Adopt an external observability SaaS / Phoenix as the primary trace store and evaluator*: rejected. Introduces external service dependency into CI/runtime and replaces project-owned `TraceStage` semantics. Keep Phoenix strictly as an optional local/offline consumer of exported OTel traces.
+. *LLM-judge-only trace attribution*: rejected. Expensive, non-deterministic, unavailable in offline CI, and risks fabricating causal explanations from redacted traces.
+. *Three-level deterministic-first `FailureAttribution` over `causal_trace.rs` + optional OTel GenAI export (proposed)*: zero required external services, machine-readable for #58/#62/coding agents, and directly validated against #59 human attribution labels.
+
+== Reuse / Adapt / Build comparison
+
+Reuse-first vocabulary per link:../reuse-first.adoc[reuse-first]. No external crate or SaaS dependency is added by this ADR.
+
+[cols="2,2,3,3,2"]
+|===
+|Candidate |Scope |Pattern / capability |Conflict or gap |Mode
+
+|*`crates/telemetry/src/causal_trace.rs`* (#65) & *#58 benchmark artifacts*
+|Existing project components
+|Retained bounded `TraceStage` spans, causal correlation IDs, and schema-validated benchmark results.
+|Do not yet attach structured `FailureAttribution` records.
+|*Reuse / Extend.* Keep `causal_trace.rs` authoritative; attach optional `FailureAttribution` to #58 artifacts.
+
+|*OpenTelemetry GenAI semantic conventions* & *Arize Phoenix*
+|External standards / optional offline tool
+|Standard span interchange for agent/workflow/tool traces and local offline trace inspection/annotation.
+|Cannot own internal causal semantics or become a CI/runtime requirement.
+|*Reference / Optional export only.* Map retained `TraceStage` spans to OTel JSON/OTLP optionally at export time.
+
+|*`TraceEvaluator` & `FailureAttribution`*
+|New offline telemetry module
+|3-level classification (`System`, `Trace`, `Node`), ordered deterministic-first pipeline, and evaluator-quality metrics.
+|Project-specific intersection of `TraceStage`, #67 deadlines, #81 floor waits, #83 phrase commit, and #59 labels.
+|*Custom.* Small pure Rust evaluator (~200–300 lines) in `crates/telemetry`.
+|===
+
+== Evidence
+
+* *Repository executable evidence*:
+  - `crates/telemetry/src/causal_trace.rs` and `crates/app/src/bin/replay-benchmark.rs` confirm bounded causal traces and machine-readable benchmark outputs exist on `main`.
+* *Unverified expectation (explicitly not yet measured)*:
+  - Human-vs-rule attribution agreement rate, false-attribution rate, and unknown/ambiguous rate are unmeasured until sufficient #59 labeled failure cases exist.
+
+== Decision
+
+=== 1. Three distinct evaluation levels
+
+1. *`System` level*: final interaction utility (useful vs stale/wrong response, operator action success, SLO/deadline satisfaction).
+2. *`Trace` level*: cross-stage trajectory invariants (expected fallback sequence, unnecessary generative escalation, stage-by-stage #67 deadline consumption, post-moderation branching, cancellation propagation).
+3. *`Node` level*: specific `TraceStage` fault isolation (retrieval mismatch, Jev hint error, deterministic policy override, provider latency, #83 phrase-commit gap, scheduler preemption, stale #80/#88 context, #72 persona conformance failure).
+
+=== 2. Bounded versioned `FailureAttribution` contract
+
+[source,text]
+----
+FailureAttribution (schema-versioned, bounded):
+  schema_version: "0.1.0"
+  level: AttributionLevel            // System | Trace | Node
+  outcome_label: OutcomeLabel        // Pass | Regression | Stale | SafetyFallback | Timeout | Cancelled
+  primary_stage: Option<TraceStage>  // Authoritative aivtuber TraceStage
+  contributing_stages: Vec<TraceStage> // Max 4
+  reason_codes: Vec<ReasonCode>      // Closed vocabulary, max 8
+  evidence_refs: Vec<EvidenceRef>    // Redacted trace_id/span_id/metric_key only (no raw transcript)
+  evaluator_id: BoundedId            // e.g. "rule.deadline-stage-v1"
+  evaluator_version: BoundedString
+  confidence: f64                    // [0.0, 1.0]; 1.0 reserved for deterministic invariant violations
+----
+
+=== 3. Five-tier evaluator ordering
+
+1. Deterministic invariant/rule evaluator (e.g., missing cancellation propagation, deadline exhausted at provider vs deliberate #81 floor wait).
+2. Benchmark threshold and typed reason-code analyzer.
+3. Labeled expected-scenario diff comparison.
+4. Optional offline LLM judge (only for ambiguous qualitative cases, strictly outside CI/runtime authority).
+5. Human review (#59 / #62 AAR) for disputed or high-impact failures, feeding back evaluator-quality metrics (`human_agreement_rate`, `false_attribution_rate`, `unknown_rate`, `rule_vs_judge_ratio`).
+
+=== 4. Cheapest falsifier (when #108 unparks)
+
+1. Run the deterministic rule evaluator over a small curated set of #59 labeled regressions (distinguishing provider slowness vs deliberate #81 floor wait, missing cancellation, and unnecessary generative escalation) with zero LLM judge and zero OTel exporter.
+2. Measure rule resolution rate and agreement with human #59 labels; confirm #58 artifacts parse cleanly by AI coding agents without scraping prose logs.
+
+== Consequences
+
+=== Positive
+
+* Enables coding agents and #62 AARs to pinpoint failing `TraceStage`s automatically from redacted traces.
+* Keeps CI 100% offline, deterministic, and independent of external observability SaaS.
+
+=== Costs / trade-offs
+
+* Deterministic attribution rules must be updated when new `TraceStage`s or fallback reasons are added.
+* Qualitative failures (tone/humor nuance) still require #59 human review.
+
+=== Known limitations
+
+* Blocked on sufficient #59 labeled outcomes and parked until v0.3 closes.
+* Automatic attribution identifies likely failing stages, not formal causal proof.
+
+== Staging and rollback
+
+1. *Stage 0 (this ADR)*: contract and evaluator hierarchy only; zero runtime change.
+2. *Stage 1 (deterministic `FailureAttribution` on #58 artifacts)*: offline rule evaluator reading `causal_trace.rs` spans; rollback is disabling the offline pass.
+3. *Stage 2 (optional OTel GenAI export)*: opt-in exporter mapping `TraceStage` to OTel JSON/OTLP for local tools like Phoenix; absence of exporter alters nothing.
+
+== Revisit conditions
+
+* `crates/telemetry/src/causal_trace.rs` changes `TraceStage` granularity.
+* Human agreement rate on deterministic attribution falls below acceptable triage utility on #59 labeled data.
+
+== Related
+
+* Issue: #108 (parent), #65, #58, #59, #62, #67, #81, #83, #196, #203
+* PR: (to be linked on PR creation)
+* Assumptions: `A-CTRL-001`, `A-MEM-001`; proposed `A-TRACE-EVAL-001`
+* Other ADRs: link:0001-three-layer-runtime.adoc[ADR-0001], link:0005-conversational-floor-policy.adoc[ADR-0005], link:0017-verified-agent-task-evaluation.adoc[ADR-0017]
