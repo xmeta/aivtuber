@@ -45,6 +45,11 @@ The product milestones below decide *what ships next*. While a product milestone
 
 Parked by the same decision (`status:parked`): the dependable-agent and desktop workstream (#200, #202-#205, #191, #72), rich long-term memory (#105, #280, #281, #283, #284), moderation actions and shadow evaluation (#74, #76, #77, #211), and later natural-performance/multimodal scope (#93, #104, #106-#108, #221). Each issue names its unpark condition. #80 S1 is shipped; its remaining thread/reply/topic linkage (S2) is parked in Stage 3 pending representative evidence or a concrete dependency. #489 evaluates the shipped S1 and #79 defaults; #79 remains open for residual crowd timing and optional gestures.
 
+Scope discipline (2026-11-25 maintainer triage):
+
+* While an active product milestone (currently `v0.3 - Watchable Hour`) is open, **new ADR proposals for `status:parked` workstreams are frozen** unless an explicit unpark condition is met or a direct dependency of the active product milestone requires one. This prevents speculative design backlog from crowding out release-gate evidence and maintenance work.
+* `v0.3 - Watchable Hour` is focused on `#489` (release gate) and `#79` (crowd-routing residual latency/selection) as P1, with `#87` and `#89` held as P2 evidence-gated candidates. `#84` (S2+ `PerformanceIntent`) and `#354` (gapless audio pre-default verification) remain in Stage 4 and re-enter v0.3 only if `#489` representative-hour evidence identifies them as top watchability constraints.
+
 Business hypotheses (not decisions): the primary user is a Japanese individual AITuber operator; the differentiator is a zero-paid local run with type-enforced authority, operator emergency control and bounded long-run behaviour; the licence direction is free for personal use with a separate commercial licence. Revisit after v0.4.
 
 == Cross-stage product workstreams
