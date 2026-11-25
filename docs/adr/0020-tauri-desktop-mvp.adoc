@@ -1,0 +1,155 @@
+= ADR-0020: Thin Tauri v2 desktop shell hosting the existing Rust runtime and local operation panel
+:status: Proposed
+:date: 2026-11-25
+
+== Context
+
+Issue #205 (`priority:P2`, `status:blocked`, `status:design-ready`, `status:parked`, Stage 3, tracked by #200) asks to make dual-role `aivtuber` usable on the desktop without hand-editing env/config files or manually assembling sidecar services, using a thin desktop shell over the existing Rust runtime rather than building a second application architecture.
+
+This ADR records a proposed Tauri v2 shell architecture, authority boundary, first-run local-first onboarding flow, and falsifier only. Implementation remains `status:blocked` on #201 (`AgentTask` lifecycle) and #191 Slice A (manual `RoleBlend`), and `status:parked` until v0.3 closes. It authorizes no production code, adds no Tauri crates to `Cargo.toml`/`Cargo.lock`, changes no wire schemas, and preserves all v0.3 defaults.
+
+Inputs this ADR builds on, present on `main` at `c8ae3a9`:
+
+* #335 loopback operation panel (`crates/app/src/panel.rs`, `crates/adapters/src/local_avatar/panel.rs`, `docs/security-threat-model.adoc` §15): already serves a loopback (`127.0.0.1`) web UI with read-only status and strict `deny_unknown_fields` typed JSON action endpoints (`stop`, `mute`, `model.select`, `voice.configure`, `ingress.control`, `avatar.configure`, `speech_input.control`, `persona.configure`, `session_log.control`, `memory.admin`), authenticating via constant-time 32-byte `ControlSecret` inside `LocalControlIngress` over separate bounded queues. As noted on #205 (`2026-11-12`), the Tauri app can host this same panel surface rather than inventing a second UI.
+* `crates/setup` (`aivtuber-setup local|start`, `packaging/local-profile-pins.json`): already owns SHA-256-verified asset acquisition, starter audio synthesis, license/provenance notices (`PROVENANCE.json`, `THIRD-PARTY-NOTICES.txt`), and local profile launch.
+* link:0003-local-vrm-renderer.adoc[ADR-0003] (#219): zero-paid local OSS VRM avatar renderer (`@pixiv/three-vrm`).
+* link:0016-mcp-tool-catalog-risk-and-approval.adoc[ADR-0016] (#202), link:0018-continuous-roleblend-modulation.adoc[ADR-0018] (#191), and link:0019-curated-mcp-connector-profiles.adoc[ADR-0019] (#204).
+
+== Hard constraints
+
+* *UI holds zero runtime authority* (`A-CTRL-001`, `docs/security-threat-model.adoc` §15): The webview / Tauri frontend may submit typed requests, but can never mint capabilities or bypass `LocalControlIngress`, #202 `RiskClass`/`ActionApproval`, or `MemoryWritePermit` (`A-MEM-001`) by serializing flags.
+* *No duplicate domain or business logic in the UI layer*: All validation, scheduling, `RoleBlend` derivation, `ToolCatalog` policy, and task verification remain inside the Rust runtime (`crates/`).
+* *Zero-paid, account-free local-first default onboarding (#219 / #220)*: The recommended first-run journey must reach a working local VRM + local LLM + local TTS performer without requiring OBS, VTube Studio, cloud LLM/TTS keys, or paid SaaS accounts. Optional #204 MCP connectors must not block the local-only desktop baseline.
+* *Explicit user consent before large weight downloads & visible license/provenance*: Never silently download multi-gigabyte model weights; surface pinned SHA-256 provenance and license notices (e.g., OpenRAIL-M / Gemma terms) before acquisition.
+* *Emergency stop/mute survives sidecar failures*: Operator `stop` / `mute` remains reachable via the independent local control path even if optional sidecars (LLM, TTS, STT, OBS, MCP servers) hang or crash.
+* *Secrets stay outside model-visible state and logs*: API keys and OAuth credentials are stored via OS secret storage / env files managed outside prompts and diagnostic bundles.
+* *Reuse maintained Tauri v2 mechanisms*: Use official Tauri v2 shell, single-instance, autostart, dialog, and signed updater plugins rather than building custom desktop IPC/updater frameworks, subject to `cargo deny --locked check` (#100) when eventually unparked.
+
+== Assumptions
+
+Existing invariants referenced:
+
+* `A-CTRL-001` (Invariant): UI/model payloads never hold runtime authority.
+* `A-MEM-001` (Invariant): durable memory writes require non-serializable `MemoryWritePermit`.
+
+Proposed new assumptions (to be added to link:../assumptions.adoc[Assumption Register] only if accepted):
+
+* *A-DESK-001* (*Needs validation*): Hosting the existing #335 loopback operation panel inside a Tauri v2 webview (extended with RoleBlend, Task/Approval, and Connector views) avoids maintaining two divergent UIs while keeping webview memory/IPC overhead modest on an 8 GiB VRAM Windows host. *Evidence:* unverified; requires Windows/Linux packaging and memory-footprint spike when unparked.
+* *A-DESK-002* (*Needs validation*): Native Tauri v2 packaging (`msi`/`nsis` on Windows, `AppImage`/`deb` on Linux) can supervise `aivtuber-app` and `aivtuber-setup` cleanly without leaving orphaned sidecar processes on crash or quit. *Evidence:* unverified; requires OS process-tree shutdown tests.
+
+== Alternatives considered
+
+. *Status quo (CLI `aivtuber-setup` + manual browser tab to `127.0.0.1` panel)*: works for technical users and remains supported, but lacks single-instance desktop packaging, native file dialogs, OS tray/stop access, and guided first-run onboarding.
+. *Electron desktop shell*: rejected. Ships a full Chromium runtime (~150+ MB bundle, higher idle RAM on 8 GiB hosts) and introduces a Node.js main process alongside an already Rust-native backend.
+. *Pure Rust immediate-mode/native GUI (`egui`/`iced`) rewriting the #335 panel*: rejected for MVP. Duplicates the existing web panel and VRM WebGL/WebGPU preview surface (`@pixiv/three-vrm`) and lacks mature signed-updater/OS-packaging ecosystem out of the box.
+. *Thin Tauri v2 shell hosting the #335 loopback panel + Rust runtime supervision (proposed)*: reuses the existing Rust runtime, `aivtuber-setup` provisioning, and #335 panel with minimal bundle size and zero duplicated domain logic.
+
+== Reuse / Adapt / Build comparison
+
+Reuse-first vocabulary per link:../reuse-first.adoc[reuse-first]. No dependency is added by this ADR; Tauri crates enter `Cargo.lock` only after #205 unparks and passes `cargo deny`.
+
+[cols="2,2,3,3,2"]
+|===
+|Candidate |Scope |Pattern / capability |Conflict or gap |Mode
+
+|*Tauri v2* (`tauri-apps/tauri`, Apache-2.0 / MIT) + first-party plugins (`single-instance`, `updater`, `autostart`, `dialog`)
+|External desktop shell (future opt-in workspace crate)
+|Native webview shell, OS packaging, signed auto-updater, single-instance lock, native file picker, sidecar launch.
+|Tauri IPC commands can accidentally become a privileged bypass if business logic is placed in JS/TS.
+|*Adopt (thin shell only).* Keep Tauri commands strictly limited to process lifecycle, native file dialogs, and forwarding authenticated requests to `LocalControlIngress`.
+
+|*#335 Loopback operation panel* (`crates/app/src/panel.rs`, `crates/adapters/src/local_avatar/panel.rs`)
+|Existing project component
+|Already implements status, chat, stop/mute, model/voice/ingress/avatar/persona/session-log/memory-seed controls with `LocalControlIngress` auth.
+|Needs additional panels for #191 manual `RoleBlend`, #201/#202 active task & concrete `ActionApproval` cards, and #204 connector toggle/permission summary.
+|*Reuse / Extend.* Host the same panel inside the Tauri webview instead of building a second frontend.
+
+|*`aivtuber-setup`* (`crates/setup`)
+|Existing project component
+|SHA-256 verified downloads, starter audio synthesis, `PROVENANCE.json`, `local-profile.env` generation.
+|Currently CLI-driven; needs structured progress events for the desktop onboarding wizard.
+|*Reuse / Adapt.* Invoke `aivtuber-setup` with machine-readable progress rather than reimplementing download/verification in JS.
+|===
+
+== Evidence
+
+* *Repository executable evidence*:
+  - `crates/app/src/panel.rs` and `crates/app/src/tests/panel_url_tests.rs` prove the loopback panel already enforces `LocalControlIngress` secret verification, own-queue isolation, and `deny_unknown_fields`.
+  - `crates/setup` and release dry-run `#45341772311` prove pinned Windows archive packaging and SHA-256 verified local provisioning work end-to-end.
+* *Unverified expectation (explicitly not yet measured)*:
+  - Tauri v2 WebView2 + local VRM preview + 8 GiB VRAM co-residency overhead on Windows has not yet been measured.
+
+== Decision
+
+=== 1. Thin-shell architecture (single authority, single UI)
+
+[source,text]
+----
+Tauri v2 Shell (thin Rust host + WebView)
+  |-- Hosts #335 Loopback Operation Panel (extended with RoleBlend / Task / Approval / Connector views)
+  |-- Supervises `aivtuber-app` + `aivtuber-setup` (clean process-tree shutdown, single-instance)
+  |-- Passes ephemeral 32-byte ControlSecret to authenticated local panel session (never logged / never in prompts)
+  |-- Native OS dialogs (VRM file picker, support-bundle export) + signed updater (opt-in)
+  |
+  v (strictly typed requests -> LocalControlIngress)
+Existing Rust Runtime (`crates/app`, `crates/runtime`, `crates/scheduler`, ...)
+----
+
+=== 2. First-run onboarding flow (local-first, zero-paid default)
+
+1. *Install & single-instance launch* -> verify clean state.
+2. *Avatar selection (#219)*: choose bundled OSS sample VRM or import local `.vrm` via native file picker (VTube Studio offered as optional branch).
+3. *Persona & RoleBlend (#72 / #191)*: select Persona version and set initial manual `0..=100` `RoleBlend` slider (explicitly labeled as behavior/presentation only, never permissions).
+4. *Local inference & TTS (#220)*: show disk/VRAM estimate, license/provenance notices, and require explicit user click before running `aivtuber-setup` to fetch pinned weights (cloud LLM/TTS offered as optional branch).
+5. *Start runtime & local preview*: launch `aivtuber-app`, verify health, preview performer locally, expose emergency `Stop` / `Mute` persistently in the top bar.
+6. *Optional branches (post-MVP / non-blocking)*: OBS capture, VTube Studio, cloud providers, and #204 curated MCP connector profiles with explicit permission/risk summary before enabling.
+
+=== 3. Required MVP surfaces & approval UX
+
+* Persistent top bar: `Start`/`Stop` runtime, emergency `Stop`/`Mute`, overall health badge (showing degraded optional sidecars without blocking stop).
+* Persona + manual `RoleBlend` slider (`0..=100`).
+* Task & approval drawer (#201 / #202 / #203): clearly distinguishes `Executing`, `WaitingApproval`, `Verifying`, `VerifiedComplete`, `Failed`, `NotVerified`, and renders concrete approval details `(server_id, tool_id, operation, bounded args summary, credential_scope, RiskClass, expiry)` before explicit user confirmation.
+* Connector manager (#204, optional): enable/disable curated profiles, read-only badge, permission summary.
+* Diagnostics / support-bundle export (redacted via `SecretRedactor`, zero secrets).
+
+=== 4. Cheapest falsifier (when #205 unparks)
+
+1. Build a minimal Tauri v2 wrapper crate (`desktop/`, excluded from default headless CI until gated) that launches `aivtuber-app` against a local fixture pack, loads the existing #335 panel, and passes `cargo deny --locked check`.
+2. Verify 4 invariants on Windows: (a) clean onboarding from empty config reaches local fixture preview without editing files, (b) `RoleBlend` change leaves permissions/capabilities unchanged, (c) killing an optional sidecar leaves emergency `Stop`/`Mute` functional, and (d) closing the desktop window cleanly terminates all child processes with zero orphans.
+
+== Consequences
+
+=== Positive
+
+* Reuses the shipped #335 panel, `aivtuber-setup`, and Rust runtime instead of creating a second frontend or authority path.
+* Delivers a zero-paid, account-free first-run experience aligned with #219/#220 while leaving clean extension points for #204/#201.
+
+=== Costs / trade-offs
+
+* Adds Tauri v2 crates and platform installer build jobs to the release pipeline when unparked (must pass `cargo deny` and supply-chain review #100).
+* Windows WebView2 and Linux WebKitGTK have minor CSS/WebGL differences that must be smoke-tested per platform.
+
+=== Known limitations
+
+* Blocked on #201 (`AgentTask` lifecycle) and #191 Slice A (manual `RoleBlend`), and parked until v0.3 closes.
+* Mobile clients and consumer plugin marketplaces remain explicit non-goals.
+
+== Staging and rollback
+
+1. *Stage 0 (this ADR)*: architecture and onboarding contract only; zero runtime or `Cargo.lock` change.
+2. *Stage 1 (thin Tauri shell over existing #335 panel + `aivtuber-setup`)*: local-only desktop package with start/stop/status, VRM preview, Persona, and manual `RoleBlend` (no SaaS connectors required).
+3. *Stage 2 (Task/Approval & #204 Connector surfaces)*: wire #201 task states, #202 concrete approval cards, and optional #204 connector toggles.
+4. *Rollback*: desktop shell is purely additive over `aivtuber-app` and `aivtuber-setup`; CLI + browser panel remains fully functional if the desktop wrapper is disabled or removed.
+
+== Revisit conditions
+
+* Tauri v2 supply-chain audit (`cargo deny`) flags an unresolvable transitive dependency or license conflict.
+* WebView2 memory/VRAM overhead materially degrades 8 GiB local-profile performance (#220).
+* #335 panel architecture changes significantly before #205 unparks.
+
+== Related
+
+* Issue: #205 (parent), #200, #335, #191, #193, #201, #202, #203, #204, #219, #220, #72, #100
+* PR: (to be linked on PR creation)
+* Assumptions: `A-CTRL-001`, `A-MEM-001`; proposed `A-DESK-001`, `A-DESK-002`
+* Other ADRs: link:0001-three-layer-runtime.adoc[ADR-0001], link:0002-mcp-tool-authority-boundary.adoc[ADR-0002], link:0003-local-vrm-renderer.adoc[ADR-0003], link:0016-mcp-tool-catalog-risk-and-approval.adoc[ADR-0016], link:0018-continuous-roleblend-modulation.adoc[ADR-0018], link:0019-curated-mcp-connector-profiles.adoc[ADR-0019]
