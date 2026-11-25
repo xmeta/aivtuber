@@ -7,9 +7,9 @@ It does not replace link:roadmap.adoc[the strategic roadmap], milestone ordering
 
 == 1. Current status
 
-Status:: Provisional: representative-hour watchability, including the residual crowd-reaction delay. Short-run grounding and selection improvements are already shipped.
-As of:: 2026-11-24 (v0.2 closed; v0.3 active).
-Owning issues:: #489 (v0.3 release gate); #79 (residual crowd timing and optional gestures); #80 (S1 shipped, remaining S2 parked). Evidence: link:live-runs/2026-11-22-v0.2-gate.adoc[v0.2 run record], https://github.com/xmeta/aivtuber/pull/482[#482], https://github.com/xmeta/aivtuber/pull/485[#485].
+Status:: Provisional (Track A 60-minute synthetic run + Track C SLO calibration completed; Track B operator/OBS/active-stop and #59 human quality review still pending): `#79` crowd-route dispatch wait (`3.18 s` `route_to_dispatch`) and single-worker `deferred` tail latency (`8.57 s` p50).
+As of:: 2026-11-26 (v0.2 closed; v0.3 active).
+Owning issues:: #489 (v0.3 release gate); #79 (residual crowd routing coverage and `route_to_dispatch` wait); #80 (S1 shipped, pending human recall-probe review on the Track A log; S2 parked). Evidence: link:live-runs/2026-11-22-v0.2-gate.adoc[v0.2 run record], link:live-runs/2026-11-26-v0.3-track-a-c-evidence.adoc[v0.3 Track A & C evidence], https://github.com/xmeta/aivtuber/pull/482[#482], https://github.com/xmeta/aivtuber/pull/485[#485], https://github.com/xmeta/aivtuber/pull/538[#538].
 
 v0.2 measured and closed four constraints in order:
 . dead air (#87 S1);
