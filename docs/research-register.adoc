@@ -244,7 +244,7 @@ Neuro SDK separate voice transport;
 local VAD pre-roll failure patterns
 |Keep high-rate PCM/video off control queues; use bounded local side-channel/IPC with normalized observations crossing into core
 |#90, #92, #93
-|Backpressure/drop behavior; queue isolation; pre-roll duration; clipped utterance starts; reconnect; raw-media privacy/retention; no paid hosted transport requirement
+|Backpressure/drop behavior; queue isolation; pre-roll duration; clipped utterance starts; reconnect; raw-media privacy/retention; no paid hosted transport requirement. Proposed multi-party `SpeakerRegistry`, #81/#91 arbitration, and self-hosted OSS WebRTC boundary for #93: link:adr/0028-multiparty-speaker-routing.adoc[ADR-0028] (Proposed; design only, Stage 5 parked)
 
 |LLM routing / adaptive compute
 |RouteLLM;

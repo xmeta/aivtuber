@@ -1,0 +1,132 @@
+= ADR-0028: Multi-party and co-host speaker routing, attention arbitration, and self-hosted WebRTC boundary
+:status: Proposed
+:date: 2026-11-25
+
+== Context
+
+Issue #93 (`priority:P3`, `status:design-ready`, `status:parked`, Stage 5) asks to extend conversation context, turn-taking (#81), and gaze/attention (#91) to support multiple concurrent speakers (human co-host, another AI character, voice-call participant, multiple STT speakers, plus simultaneous audience chat) while keeping bounded state, strict content-plane trust separation, and deterministic replay.
+
+This ADR records a proposed bounded `SpeakerSession` model, multi-party #81 floor arbitration, #91 anti-oscillation gaze rules, and the self-hosted OSS WebRTC/SFU ownership boundary (LiveKit server evaluated first, zero mandatory SFU for local mic). Implementation remains `status:parked` (Stage 5 future expansion). It authorizes no production code, changes no wire schemas, adds no dependencies, and preserves all v0.3 defaults.
+
+Inputs this ADR builds on, present on `main` at `5be1316`:
+
+* link:0005-conversational-floor-policy.adoc[ADR-0005] (#81): deterministic conversational-floor policy with reversibility-tiered timing and tentative interruption.
+* link:0024-continuous-listening-performance-prior.adoc[ADR-0024] (#107): continuous listening-performance prior modulated by co-host speech.
+* #92 (`crates/adapters/src/speech_vad/`, `speech_stt/`): bounded provider-neutral speech-activity and transcript observations.
+* #91 (attention/gaze orchestration), #80 (bounded conversation context), and #220 (zero-paid-dependency baseline).
+
+== Hard constraints
+
+* *Speaker identity is never authorization* (`A-CTRL-001`): A human co-host, voice participant, or second AI character remains strictly on the *content plane* unless separately authenticated via `LocalControlIngress`. Spoken commands can never mint operator, moderation, or tool capabilities.
+* *Bounded per-speaker state and zero permanent social graphs*: Cap active speakers (`MAX_ACTIVE_SPEAKERS`), per-speaker recent context, speaker/topic links, and partial speech buffers; never persist permanent co-host or audience social profiles (`A-MEM-001`).
+* *No bespoke WebRTC/RTP media server*: Reuse mature self-hosted OSS WebRTC/SFU infrastructure (e.g., Apache-2.0 LiveKit server) for remote participant media tracks; keep hosted cloud conferencing optional and require *zero* SFU for same-machine local microphone paths (#220).
+* *Prevent two AI voices talking over each other by default*: #81 floor arbitration coordinates performer, co-host, voice participants, and deferred replies deterministically, avoiding uncontrolled overlap.
+* *Anti-oscillation gaze/attention*: #91 attention shifts between speakers obey hysteresis and #89 `gaze_shift_cooldown_ms`.
+* *Deterministic logical-clock replay*: Record normalized speaker/turn observations and arbitration decisions without reconnecting to live media tracks.
+
+== Assumptions
+
+Existing invariants referenced:
+
+* `A-CTRL-001` (Invariant): participant identity/speech never grants control authority.
+* `A-MEM-001` (Invariant): durable memory writes require non-serializable `MemoryWritePermit`.
+
+Proposed new assumptions (to be added to link:../assumptions.adoc[Assumption Register] only if accepted):
+
+* *A-MULTI-001* (*Needs validation*): A bounded active-speaker table (`MAX_ACTIVE_SPEAKERS = 8`) fed by normalized per-track/diarized observations from a self-hosted WebRTC/SFU layer suffices for co-host and small-panel streams without pushing raw PCM/WebRTC state into core crates. *Evidence:* unverified Stage 5 hypothesis.
+
+== Alternatives considered
+
+. *Status quo (single-speaker floor assumption)*: sufficient for solo v0.3 streams, but breaks down when a co-host and audience chat arrive simultaneously.
+. *Build a custom RTP/WebRTC media server and jitter buffer in Rust*: rejected. Massive maintenance burden; reuse self-hosted OSS WebRTC/SFU instead.
+. *Replace aivtuber's Rust core with LiveKit Agents / Pipecat for multi-party streams*: rejected (same authority/scheduler conflict documented in ADR-0005). Keep WebRTC strictly as the media transport layer.
+. *Self-hosted OSS WebRTC transport + bounded `SpeakerRegistry` feeding #81 floor and #91 attention (proposed)*: zero mandatory SFU for solo local setups, strict content-plane trust separation, and deterministic replay.
+
+== Reuse / Adapt / Build comparison
+
+Reuse-first vocabulary per link:../reuse-first.adoc[reuse-first]. No dependency is added by this ADR.
+
+[cols="2,2,3,3,2"]
+|===
+|Candidate |Scope |Pattern / capability |Conflict or gap |Mode
+
+|*Self-hosted LiveKit Server* (Apache-2.0) / standard WebRTC SFU
+|Optional external media layer (Stage 5)
+|RTP/WebRTC transport, remote participant tracks, reconnect/jitter plumbing.
+|Must stay outside core domain/scheduler; never mandatory for local mic profiles.
+|*Sidecar (optional, self-hosted first).* Emit normalized speaker/turn observations into core.
+
+|*ADR-0005 Floor policy (#81), #91 Attention/Gaze, ADR-0013 `NaturalnessBudget` (#89), #80 Context*
+|Existing / designed project components
+|Deterministic floor arbitration, gaze cooldowns, and bounded topic context.
+|Currently model a single external speaker rather than a bounded multi-speaker set.
+|*Extend.* Generalize floor/attention inputs to carry `SpeakerId`.
+
+|*`SpeakerRegistry` & multi-party arbitration adapter*
+|New bounded module
+|Capped active-speaker map, speaker-to-topic association, and anti-oscillation attention selection.
+|Project-specific trust and replay boundary.
+|*Custom.* Pure deterministic Rust state (~150 lines) gated behind optional Stage 5 feature.
+|===
+
+== Evidence
+
+* *Repository executable evidence*:
+  - ADR-0005 (`docs/adr/0005-conversational-floor-policy.adoc`) establishes the single-speaker deterministic floor state machine and LiveKit/Pipecat reuse boundary.
+* *Unverified expectation (explicitly not yet measured)*:
+  - Overlap rate, speaker monopolization, gaze-speaker mismatch, and diarization uncertainty behavior under live co-host streams are unmeasured (Stage 5).
+
+== Decision
+
+=== 1. Ownership split (media transport vs deterministic core)
+
+[source,text]
+----
+Optional OSS/self-hosted WebRTC layer (e.g. LiveKit SFU; absent for local mic)
+  -> normalized SpeechObservation { speaker_id, source_type, turn_state, confidence, at_ms }
+  v
+aivtuber Core (bounded, content-plane only):
+  SpeakerRegistry (max 8 active speakers, pseudonymous key, trust class, last_seen_ms)
+    -> #80 topic/speaker association (prefer explicit platform/conference reply metadata)
+    -> #81 multi-party floor arbitration (listen | backchannel | take_turn | yield | policy_interrupt)
+    -> #91 gaze/attention target with #89 cooldown hysteresis
+    -> Replay log (normalized observations + arbitration decisions)
+----
+
+=== 2. Cheapest falsifier (when Stage 5 / #93 unparks)
+
+1. Deterministic offline replay suite covering 4 mandatory multi-party cases: (a) co-host monologue (performer listens/backchannels without talking over), (b) audience chat event arriving during co-host turn (deferred or brief gaze without stealing floor), (c) simultaneous speaker start (deterministic priority/yield), and (d) abrupt speaker disappearance/disconnect (clean TTL eviction and floor release).
+2. Security test proving a co-host spoken command cannot mint operator, moderation, or tool authority.
+
+== Consequences
+
+=== Positive
+
+* Cleanly separates remote media transport from aivtuber's deterministic floor, gaze, and security boundaries.
+* Keeps solo local-mic profiles completely free of SFU/WebRTC operational overhead.
+
+=== Costs / trade-offs
+
+* Diarization accuracy on single-track mixed audio remains provider-limited; per-participant tracks from an SFU are preferred when available.
+
+=== Known limitations
+
+* Parked (Stage 5); does not belong in v0.3 or baseline solo profiles.
+
+== Staging and rollback
+
+1. *Stage 0 (this ADR)*: speaker model, ownership split, and replay test plan only; zero runtime change.
+2. *Stage 1 (offline multi-party `SpeakerRegistry` + #81/#91 replay)*: pure deterministic multi-speaker arbitration behind feature flag (`default = off`); rollback is disabling the flag.
+3. *Stage 2 (optional self-hosted WebRTC/LiveKit bridge)*: separate sidecar adapter; solo profiles unaffected.
+
+== Revisit conditions
+
+* #81 floor policy or #92 `SpeechObservation` schema changes speaker/track identity fields.
+* Self-hosted WebRTC/SFU ecosystem shifts away from Apache-2.0 LiveKit.
+
+== Related
+
+* Issue: #93 (parent), #81, #91, #80, #90, #92, #72, #51, #220
+* PR: (to be linked on PR creation)
+* Assumptions: `A-CTRL-001`, `A-MEM-001`; proposed `A-MULTI-001`
+* Other ADRs: link:0005-conversational-floor-policy.adoc[ADR-0005], link:0013-naturalness-budgets-and-multimodal-anti-repetition.adoc[ADR-0013], link:0024-continuous-listening-performance-prior.adoc[ADR-0024]
