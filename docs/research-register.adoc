@@ -195,6 +195,14 @@ maintained first-party desktop plugins
 |#191, #200, #72, #201
 |Persona continuity across `0..=100`; curve calibration under #59 review; zero impact on #202 risk/approval or #203 verification. Proposed `RoleBlend`, `DerivedBehaviorProfile`, two-slice delivery, and falsifier for #191: link:adr/0018-continuous-roleblend-modulation.adoc[ADR-0018] (Proposed; design only, parked)
 
+|Typed persona contract & conformance
+|EMNLP 2025 Findings persona-consistency analysis;
+Nature MI 2025 Big Five calibration (optional authoring reference only);
+ALMA (DFKI)
+|Versioned bounded `PersonaContract` paired with shipped `PersonaSheet`, cheap-first deterministic `PersonaConformanceGate`, operator-gated #281 Dreaming suggestions, and falsifiable optional OCEAN defaults
+|#72, #59, #281, #191
+|#59 persona consistency vs semantic correctness; deterministic check precision without second LLM pass; explicit style vs OCEAN falsifier. Proposed contract, conformance gate, and Dreaming/OCEAN boundaries for #72: link:adr/0021-versioned-typed-persona-contract.adoc[ADR-0021] (Proposed; design only, parked)
+
 |Local OSS avatar runtime
 |`@pixiv/three-vrm`;
 V-Sekai `godot-vrm`;
