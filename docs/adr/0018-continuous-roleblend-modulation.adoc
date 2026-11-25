@@ -1,0 +1,157 @@
+= ADR-0018: Continuous Agent-to-Entertainer RoleBlend with bounded context modulation
+:status: Proposed
+:date: 2026-11-25
+
+== Context
+
+Issue #191 (`priority:P2`, `status:blocked`, `status:design-ready`, `status:parked`, Stage 3, tracked by #200) asks to allow the same persistent persona (#72) to operate continuously between a reliable task-focused agent (`0`) and an expressive entertainer / VTuber (`100`) — without switching personalities, building a second runtime, or weakening security/verification boundaries.
+
+This ADR records a proposed domain contract, versioned parameter derivation, two-slice delivery split (Slice A manual baseline, Slice B automatic Task Plane modulation), and falsifier only. Implementation remains `status:blocked` and `status:parked` until v0.3 closes. It authorizes no production code, changes no wire schemas, adds no dependencies, and leaves all v0.3 defaults unchanged.
+
+Inputs this ADR builds on, present on `main` at `96bfeac`:
+
+* `docs/dual-role-agent-architecture.adoc` (Section 8): separates the Interaction Plane from the Task Plane and establishes `Persona` (who the character is) vs `RoleBlend` (how task-focused vs entertainment-focused it behaves right now) vs `Situation` (what the current context requires).
+* link:0016-mcp-tool-catalog-risk-and-approval.adoc[ADR-0016] (#202) and link:0017-verified-agent-task-evaluation.adoc[ADR-0017] (#203): explicitly require that risk classification, approval gates, and verified task completion remain *independent* of RoleBlend and Persona.
+* link:0011-segment-planning-and-initiative-utility.adoc[ADR-0011] (#487), link:0012-bounded-autonomic-regulation.adoc[ADR-0012] (#486), and link:0013-naturalness-budgets-and-multimodal-anti-repetition.adoc[ADR-0013] (#89): consume RoleBlend only as read-only presentation/pacing input while keeping affect/regulation and safety budgets separate.
+* #72 (stable Persona contract) and #201 (`AgentTask` lifecycle state for Slice B automatic modulation).
+
+== Hard constraints
+
+* *Strict non-authority and safety independence* (`A-CTRL-001`, ADR-0016, ADR-0017): RoleBlend can *never* mint capabilities, alter #202 `RiskClass`, waive `ActionApproval`, weaken `PublicOutputPolicy`, change privacy/memory write permits (`A-MEM-001`), or relax verified-completion requirements — even at `entertainment = 100`.
+* *Persona identity stability*: RoleBlend modulates behavioral emphasis (banter, initiative, expressiveness, verbosity), never the character's identity, voice identity, or core persona rules (#72).
+* *Zero LLM calls to compute role transitions*: Effective RoleBlend and derived behavior profiles are pure deterministic functions of bounded manual/context inputs and logical time — never inferred from unbounded chat history or model prose.
+* *Untrusted chat cannot force RoleBlend shifts*: Public viewer text can never set `Manual` or `ContextOverride` RoleBlend values; only authenticated operator controls and trusted Task Plane / runtime state may modulate it.
+* *Single user-facing slider, bounded internal derivation*: Expose one continuous user control (`0..=100` / `0.0..=1.0`) rather than exposing every internal behavior parameter as a separate slider; version the derivation curve for deterministic replay.
+* *Automatic modulation may only lower effective entertainment toward task focus during active/critical work*: Auto mode shifts down during `FocusedTask` / `HighRiskTask` / `Incident` and smoothly returns toward the operator's baseline after a terminal task outcome, with hysteresis to prevent rapid oscillation.
+
+== Assumptions
+
+Existing invariants referenced:
+
+* `A-CTRL-001` (Invariant): model output and presentation parameters never hold runtime authority.
+* `A-MEM-001` (Invariant): durable memory writes require non-serializable `MemoryWritePermit`.
+
+Proposed new assumptions (to be added to link:../assumptions.adoc[Assumption Register] only if accepted):
+
+* *A-ROLE-001* (*Needs validation*): A single continuous `0..=100` slider mapped through a versioned deterministic derivation curve gives operators sufficient control over Agent vs Entertainer behavior without needing per-parameter tuning UI. *Evidence:* unverified UX hypothesis; revisit during #205 onboarding/testing.
+* *A-ROLE-002* (*Needs validation*): Automatic downward modulation during typed #201 `FocusedTask`/`HighRiskTask` states reduces unwanted banter during work while returning cleanly to the user's baseline after task completion without feeling like a jarring personality switch. *Evidence:* unverified; requires #59 blind comparison.
+
+== Alternatives considered
+
+. *Binary `AgentMode | EntertainerMode` switch*: rejected. Forces an abrupt all-or-nothing shift and cannot express intermediate styles (e.g., an engaging coding companion at `entertainment = 35` or a calm presenter at `entertainment = 60`).
+. *Separate personas / separate runtimes for Agent and VTuber*: rejected. Breaks character continuity and duplicates lifecycle, memory, and safety infrastructure.
+. *LLM-selected role mode from raw chat transcript*: rejected. Violates determinism, latency budgets, and non-tampering (prompt injection in chat could flip the character out of focused work or into chaotic banter).
+. *Continuous bounded `RoleBlend` + versioned `DerivedBehaviorProfile` + two-slice delivery (proposed)*: cleanly separates manual baseline (Slice A) from typed Task Plane auto-modulation (Slice B) with zero LLM overhead and provable safety independence.
+
+== Reuse / Adapt / Build comparison
+
+Reuse-first vocabulary per link:../reuse-first.adoc[reuse-first]. No external crate or framework dependency is proposed.
+
+[cols="2,2,3,3,2"]
+|===
+|Candidate |Scope |Pattern / capability |Conflict or gap |Mode
+
+|*AIRI* (`moeru-ai/airi`, MIT)
+|External OSS reference
+|Embodied companion UI and mode presentation patterns.
+|No project-owned continuous derivation curve, Task Plane modulation, or replay/authority separation.
+|*Reference only.* Use for UI slider ergonomics only; keep RoleBlend semantics project-owned.
+
+|*#72 Persona contract & existing consumers (`InitiativeDirector` #87, `NaturalnessBudget` #89, `PerformanceIntent` #84)*
+|Existing / planned project components
+|Own stable persona identity and presentation/pacing controls.
+|Do not yet accept a unified bounded `DerivedBehaviorProfile`.
+|*Reuse.* Compose `DerivedBehaviorProfile` as a read-only clamped input alongside #72 bounds.
+
+|*`RoleBlend` & `DerivedBehaviorProfile` evaluator*
+|New domain/runtime module
+|Bounded `0..=1000` (milli-unit) continuous control, versioned derivation table, and Task Plane auto-modulation with logical-clock hysteresis/return ramp.
+|Project-specific product policy; no external library fits.
+|*Custom.* Pure deterministic Rust module (~150 lines) in `crates/domain` + `crates/runtime`.
+|===
+
+== Evidence
+
+* *Repository executable / architectural evidence*:
+  - `docs/dual-role-agent-architecture.adoc` fixes the Interaction Plane vs Task Plane boundary and RoleBlend's non-authority rule.
+  - ADR-0016 (`docs/adr/0016-mcp-tool-catalog-risk-and-approval.adoc`) and ADR-0017 (`docs/adr/0017-verified-agent-task-evaluation.adoc`) enforce risk/approval/verification independence from RoleBlend.
+* *Unverified expectation (explicitly not yet measured)*:
+  - Optimal derivation curve slopes (mapping `0..=100` to `humor`, `initiative`, `visual_expressiveness`, `banter`, `task_report_verbosity`, `clarification_strictness`) and return-to-baseline ramp timing are uncalibrated hypotheses pending #59 evaluation.
+
+== Decision
+
+=== 1. Bounded `RoleBlend` domain model
+
+[source,text]
+----
+RoleBlend (schema-versioned, bounded):
+  schema_version: "0.1.0"
+  baseline_entertainment: u16        // 0..=1000 (operator slider 0..=100 * 10)
+  effective_entertainment: u16       // 0..=1000 (after optional Slice B modulation; <= baseline during auto focus)
+  source: RoleBlendSource            // Manual | Automatic | ContextOverride
+  modulation_reason: Option<ModulationReason> // FocusedTask | HighRiskTask | Incident | ReturningToBaseline
+  derivation_version: BoundedString  // e.g. "roleblend-curve-v1" (recorded for replay)
+  updated_at_ms: u64                 // Logical clock
+----
+
+=== 2. Versioned `DerivedBehaviorProfile` (pure deterministic mapping)
+
+Given `effective_entertainment` (`e ∈ [0.0, 1.0]`) and #72 persona bounds, compute a bounded, clamped `DerivedBehaviorProfile` (all fields in `0.0..=1.0`, clamped by #72 persona min/max and global safety ceilings):
+
+* *Increases with `e`*: `humor`, `banter`, `reaction_intensity`, `initiative`, `visual_expressiveness`.
+* *Decreases with `e`*: `task_report_verbosity` (concise structured status at low `e`), `clarification_strictness` (stricter verification/clarification before acting at low `e`).
+
+Hard exclusion list (RoleBlend *never* feeds): `ToolGrant`, `RiskClass`, `ActionApproval`, `PublicOutputPolicy`, `MemoryWritePermit`, `VerifierOutcome`, or operator stop/mute.
+
+=== 3. Two-slice delivery split (per #191)
+
+* *Slice A — Manual `RoleBlend` contract* (depends only on #72 Persona foundation, does *not* wait for #201 `AgentTask`):
+  - Operator sets `baseline_entertainment` (`0..=100`) via authenticated control / #205 UI.
+  - Pure `derive_profile(role_blend, persona_bounds)` feeds one or two existing behavior consumers first (e.g., #87 `InitiativeDirector` spacing/utility preference and response-style prompt framing).
+  - Security/replay tests prove `entertainment = 100` cannot alter capabilities, risk, approval, privacy, or verification, and identical `(baseline, persona, seed)` replays byte-identically.
+* *Slice B — Automatic Task Plane modulation* (depends on #201 `AgentTask` lifecycle):
+  - Reads typed Task Plane state (`FocusedTask`, `HighRiskTask`, `Incident`, terminal outcome) — never inferred from untrusted chat or model prose.
+  - Temporarily clamps `effective_entertainment <= target_cap` (e.g., `30` for `FocusedTask`, `10` for `HighRiskTask`/`Incident`) and ramps smoothly back to `baseline_entertainment` over a bounded logical-clock window after task completion, with hysteresis to prevent flapping.
+
+=== 4. Cheapest falsifier
+
+Before wiring RoleBlend across all Stage 4 subsystems:
+
+1. Implement Slice A with 1–2 existing consumers and run deterministic unit/security tests proving zero effect on `RiskClass`, `ActionApproval`, `PublicOutputPolicy`, `MemoryWritePermit`, or `VerifierOutcome` across `entertainment ∈ {0, 50, 100}`.
+2. Run a small #59 blind comparison at `entertainment = 15` (focused task scenario) vs `entertainment = 85` (casual stream scenario) verifying recognizable persona continuity alongside clear behavioral adaptation.
+
+== Consequences
+
+=== Positive
+
+* Unifies autonomous VTuber entertainment and dependable personal-agent operation under one persistent persona and one runtime.
+* Decouples manual user control (Slice A) from Task Plane automation (Slice B) so work does not stall on the full agent stack.
+* Guarantees zero LLM overhead and structural safety/authority independence.
+
+=== Costs / trade-offs
+
+* Adds a versioned derivation curve that must be maintained and re-evaluated if consumer semantics change.
+* Misconfigured curves could feel either too flat at `80` or too chatty at `20`; requires #59 human review before locking defaults.
+
+=== Known limitations
+
+* Slice B cannot land until #201 (`AgentTask` lifecycle) exists; #191 remains parked until v0.3 closes.
+* Does not replace #86/#486 affect/regulation (emotional state) or #89 naturalness budgets (presentation rate limits).
+
+== Staging and rollback
+
+1. *Stage 0 (this ADR)*: design and two-slice contract only; zero runtime change.
+2. *Stage 1 (Slice A — manual baseline + 1–2 consumers, `default = fixed neutral/off`)*: opt-in manual slider and replay metadata; rollback is disabling the derivation hook.
+3. *Stage 2 (Slice B — opt-in Task Plane auto-modulation)*: gated behind #201 and an explicit `auto_modulate` toggle (`default = off`). Rollback is toggling `auto_modulate = false` (reverts to manual baseline).
+
+== Revisit conditions
+
+* #72 Persona contract or #201 `AgentTask` state vocabulary changes materially.
+* #59 evaluation shows a single slider cannot express a needed operator preference (e.g., high visual expressiveness with low verbal banter) without a small secondary control.
+
+== Related
+
+* Issue: #191 (parent), #200, #72, #201, #202, #203, #205, #84, #86, #87, #89, #486, #487, #59
+* PR: (to be linked on PR creation)
+* Assumptions: `A-CTRL-001`, `A-MEM-001`; proposed `A-ROLE-001`, `A-ROLE-002`
+* Other ADRs: link:0001-three-layer-runtime.adoc[ADR-0001], link:0011-segment-planning-and-initiative-utility.adoc[ADR-0011], link:0012-bounded-autonomic-regulation.adoc[ADR-0012], link:0013-naturalness-budgets-and-multimodal-anti-repetition.adoc[ADR-0013], link:0016-mcp-tool-catalog-risk-and-approval.adoc[ADR-0016], link:0017-verified-agent-task-evaluation.adoc[ADR-0017]

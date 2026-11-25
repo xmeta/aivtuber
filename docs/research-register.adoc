@@ -188,6 +188,13 @@ maintained first-party desktop plugins
 |#205
 |Windows/WSL packaging path; sidecar process supervision; secret handling; signed update/release path; UI cannot mint capability
 
+|Continuous RoleBlend modulation
+|AIRI embodied companion UI patterns (reference only);
+`docs/dual-role-agent-architecture.adoc`
+|Single continuous `0..=100` Agent-to-Entertainer control mapped via a versioned deterministic derivation curve (Slice A manual baseline; Slice B typed Task Plane auto-modulation) strictly decoupled from security, risk, approval, and verification
+|#191, #200, #72, #201
+|Persona continuity across `0..=100`; curve calibration under #59 review; zero impact on #202 risk/approval or #203 verification. Proposed `RoleBlend`, `DerivedBehaviorProfile`, two-slice delivery, and falsifier for #191: link:adr/0018-continuous-roleblend-modulation.adoc[ADR-0018] (Proposed; design only, parked)
+
 |Local OSS avatar runtime
 |`@pixiv/three-vrm`;
 V-Sekai `godot-vrm`;
