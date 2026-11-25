@@ -25,3 +25,10 @@ node_modules/
 # Local profile written by `aivtuber-setup local --from-target` in a checkout.
 /local-profile.env
 /local-assets/
+
+# Local tool and agent state: Claude Code worktrees/attachments and Python bytecode
+# are per-machine artifacts, never repository content.
+.claude/
+.cloud-attachments/
+__pycache__/
+*.stackdump
