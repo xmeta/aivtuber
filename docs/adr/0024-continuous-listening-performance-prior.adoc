@@ -1,0 +1,139 @@
+= ADR-0024: Continuous deterministic listening-performance prior with reactive modulation
+:status: Proposed
+:date: 2026-11-25
+
+== Context
+
+Issue #107 (`priority:P2`, `status:blocked`, `status:design-ready`, `status:parked`, Stage 4) asks to give the VTuber a bounded, continuous listening/presence behavior while it is not delivering a foreground performance, distinct from #82 latency masking (short processing waits), using deterministic reusable motion families rather than neural video/avatar diffusion.
+
+This ADR records a proposed `ListeningPerformanceState`, foreground-to-listening handoff rules, #89 naturalness-budget enforcement, optional #486 regulation modulation boundary, and falsifier only. Implementation remains `status:blocked` (on #84 `PerformanceIntent`, #89 naturalness budgets, and #91 attention/gaze orchestration) and `status:parked` until v0.3 closes. It authorizes no production code, changes no wire schemas, adds no dependencies, and leaves all v0.3 defaults unchanged.
+
+Inputs this ADR builds on, present on `main` at `1aec65c`:
+
+* link:0003-local-vrm-renderer.adoc[ADR-0003] (#219): local OSS VRM renderer (`@pixiv/three-vrm`) exposing symbolic `Expression`, `Gesture`, `Gaze`, and idle breathing/blink hooks.
+* link:0006-performance-intent.adoc[ADR-0006] (#84): foreground `PerformanceIntent` owning explicit speech, major gesture, expression, and deliberate gaze sequences.
+* link:0013-naturalness-budgets-and-multimodal-anti-repetition.adoc[ADR-0013] (#89): `NaturalnessBudget` and `BehaviorHistory` constraining continuous motion so the avatar avoids over-animation and repetitive habits.
+* link:0012-bounded-autonomic-regulation.adoc[ADR-0012] (#486): optional read-only `RegulationSummary` modulation (no direct body controller or literal hormone-to-frame mapping).
+* #81 (backchannel opportunities), #82 (latency masking, explicitly separate), #91 (attention/gaze orchestration), and #59 (overactive / static / context-inappropriate evaluation).
+
+== Hard constraints
+
+* *Single scheduler and zero frame-loop model inference* (`A-CTRL-001`): Do not create a second scheduler or invoke LLMs/Jev/neural motion generators inside the frame loop. Select bounded symbolic motion families only, not arbitrary raw avatar parameters.
+* *#89 naturalness budgets remain authoritative*: All blinks, micro-motions, gaze shifts, and reactive nods are constrained by #89 cooldowns/rate limits and logged in `BehaviorHistory`.
+* *Reactive modulation is not floor-taking or semantic agreement*: A listening nod or gaze orientation toward a speaker/chat surge does not claim the #81 conversational floor and must not be interpreted as semantic agreement with untrusted claims.
+* *Foreground override and smooth settle*: Foreground #84/#83 performances cleanly take ownership of gesture/expression/gaze/speech and smoothly settle back into `ListeningPerformanceState` on completion (never snapping harshly to a static neutral pose). Operator `stop`/`mute` resets cleanly.
+* *Deterministic logical-clock replay*: Bounded state, `SeededRng` (`examples/rng/mulberry32-golden.json`), deterministic cooldowns, and recorded transition reasons.
+
+== Assumptions
+
+Existing invariants referenced:
+
+* `A-CTRL-001` (Invariant): presentation state never holds runtime authority.
+* `A-MEM-001` (Invariant): durable memory writes require non-serializable `MemoryWritePermit`.
+
+Proposed new assumptions (to be added to link:../assumptions.adoc[Assumption Register] only if accepted):
+
+* *A-LISTEN-001* (*Needs validation*): Selecting bounded symbolic motion families (`posture_family`, `micro_motion_family`, `blink_profile`, `head_motion_profile`) modulated by speaker/chat/game cues and constrained by #89 budgets improves perceived "aliveness" over static idle without triggering #59 `over-animated` or `misleading-agreement` labels. *Evidence:* unverified hypothesis.
+
+== Alternatives considered
+
+. *Status quo (static neutral pose between discrete reaction assets)*: creates abrupt freezes during listening and lulls.
+. *Neural listening-motion / video-diffusion generator*: rejected. Violates zero-paid/8 GiB local VRAM baseline (#220), deterministic replay, and frame-loop isolation.
+. *Continuous random parameter noise on head/eyes*: rejected. Produces mechanical jitter ("over-animated") and violates #89 anti-repetition.
+. *Deterministic `ListeningPerformanceState` selecting bounded motion families under #89/#91 (proposed)*: zero extra models, smooth foreground handoff, replayable variation, and clean opt-in modulation from #486.
+
+== Reuse / Adapt / Build comparison
+
+Reuse-first vocabulary per link:../reuse-first.adoc[reuse-first]. No external crate or neural model is proposed.
+
+[cols="2,2,3,3,2"]
+|===
+|Candidate |Scope |Pattern / capability |Conflict or gap |Mode
+
+|*AIRI* (`moeru-ai/airi`, MIT)
+|External OSS reference
+|Auto-blink, auto look-at, and subtle idle presence UX patterns.
+|Renderer-coupled client loop without aivtuber's #89 budgets, logical-clock replay, or #84 foreground arbitration.
+|*Reference only.* Reuse idle presence UX ideas behind symbolic motion families.
+
+|*ADR-0003 VRM renderer, ADR-0006 `PerformanceIntent`, ADR-0013 `NaturalnessBudget`, `SeededRng`*
+|Existing / designed project components
+|Symbolic avatar commands, foreground intent ownership, presentation rate caps, and deterministic variation.
+|Need a bounded background listening state machine between foreground items.
+|*Reuse.* Emit symbolic motion-family updates into existing avatar/scheduler channels.
+
+|*`ListeningPerformanceState` controller*
+|New bounded state machine
+|Background presence modes, reactive modulation rules, smooth foreground-to-listening settle, and transition logging.
+|Project-specific intersection of #84, #89, #91, #81, and #486.
+|*Custom.* Pure deterministic Rust state machine (~150–200 lines), off by default.
+|===
+
+== Evidence
+
+* *Repository executable evidence*:
+  - `crates/app/src/tests/face_settle_tests.rs` and `crates/adapters/tests/local_avatar_preset_coverage.rs` prove bounded symbolic expression settle and preset coverage exist on `main`.
+* *Unverified expectation (explicitly not yet measured)*:
+  - Optimal blink/gaze/micro-motion cadences and foreground-to-listening settle timings require #59 human evaluation.
+
+== Decision
+
+=== 1. Bounded `ListeningPerformanceState`
+
+[source,text]
+----
+ListeningPerformanceState (bounded, symbolic families only):
+  presence_mode: PresenceMode            // Idle | AttentiveListening | CrowdWatching | GameWatching | SettlingFromForeground
+  attention_target: AttentionTarget      // From #91 (Chat | Screen | CoHost | Neutral)
+  posture_family: FamilyTag              // e.g. "breathing_calm", "lean_in_subtle"
+  micro_motion_family: FamilyTag         // e.g. "head_drift_slow", "still"
+  blink_profile: BlinkProfile            // Calm | Alert | Slow
+  head_motion_profile: HeadMotionProfile // Minimal | Gentle | Responsive
+  ack_readiness: AckReadiness            // Closed | NonVerbalOnly (never claims floor)
+  affect_band: AffectBand                // From #86 (and optional #486 summary)
+  entered_at_ms: u64                     // Logical clock
+----
+
+=== 2. Reactive modulation & foreground handoff
+
+* *Modulation triggers*: partner/co-host speaking (#93/#81), chat surge (#79), important comment, game event (#88), #91 attention change, #81 backchannel opportunity, or optional #486 `RegulationSummary` (activation/recovery pacing only).
+* *Foreground handoff*: When #84/#83 foreground performance starts, `ListeningPerformanceState` yields gesture/expression/gaze cleanly. On foreground `Finished` (ADR-0004), it enters `SettlingFromForeground` and blends back to the appropriate `presence_mode` without snapping.
+* *Safety & restraint*: Every reactive nod or gaze shift passes #89 `NaturalnessBudget` before dispatch; operator `stop`/`mute` immediately resets to neutral still posture.
+
+=== 3. Cheapest falsifier (when #107 unparks)
+
+1. Replay synthetic listening timelines (co-host monologue, chat surge, foreground reply + settle, low/high #486 activation, operator stop/mute) asserting zero frame-loop model calls, strict #89 budget compliance, and byte-identical replay.
+2. Run #59 blind comparison against static idle measuring `over-animated`, `static/frozen`, `abrupt foreground transition`, and `misleading agreement` labels.
+
+== Consequences
+
+=== Positive
+
+* Eliminates unnatural frozen-avatar intervals between discrete reactions without neural motion dependencies.
+* Keeps listening motion replayable, #89-bounded, and cleanly separated from #82 latency masking and #81 floor-taking.
+
+=== Costs / trade-offs
+
+* Requires curated subtle motion/blink profiles in starter VRM / avatar presets.
+
+=== Known limitations
+
+* Blocked on #84, #89, and #91; parked until v0.3 closes.
+
+== Staging and rollback
+
+1. *Stage 0 (this ADR)*: state contract and handoff rules only; zero runtime change.
+2. *Stage 1 (baseline idle prior, `default = off`)*: subtle breathing/blink/posture-family state machine behind #89 budgets; rollback is toggling the flag off.
+3. *Stage 2 (reactive modulation & optional #486 pacing)*: opt-in modulation from #81/#91/#79/#486 validated by #59 review.
+
+== Revisit conditions
+
+* #59 review shows continuous listening motion increases `over-animated` or `misleading-agreement` labels despite #89 caps.
+* #84 `PerformanceIntent` or #91 attention state changes handoff semantics.
+
+== Related
+
+* Issue: #107 (parent), #84, #89, #91, #81, #82, #86, #486, #59, #219, #220
+* PR: (to be linked on PR creation)
+* Assumptions: `A-CTRL-001`, `A-MEM-001`; proposed `A-LISTEN-001`
+* Other ADRs: link:0003-local-vrm-renderer.adoc[ADR-0003], link:0006-performance-intent.adoc[ADR-0006], link:0012-bounded-autonomic-regulation.adoc[ADR-0012], link:0013-naturalness-budgets-and-multimodal-anti-repetition.adoc[ADR-0013]

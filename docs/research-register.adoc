@@ -99,7 +99,7 @@ recent speculative full-duplex speech work
 AIRI implementation patterns
 |Continuous listening/presence prior distinct from discrete reaction and latency-masking assets
 |#59, #84, #89, #91, #107
-|How much motion is enough; foreground-to-listening transitions; avoid random over-animation. Proposed S2+ text-free `BehaviorHistory`, `NaturalnessBudget`, and 6-step deterministic variant ranking for #89 (building on shipped `RepeatGuard` S1): link:adr/0013-naturalness-budgets-and-multimodal-anti-repetition.adoc[ADR-0013] (Proposed; design only, awaiting #489 representative-hour evidence)
+|How much motion is enough; foreground-to-listening transitions; avoid random over-animation. Proposed S2+ text-free `BehaviorHistory`, `NaturalnessBudget`, and 6-step deterministic variant ranking for #89 (building on shipped `RepeatGuard` S1): link:adr/0013-naturalness-budgets-and-multimodal-anti-repetition.adoc[ADR-0013] (Proposed; design only, awaiting #489 representative-hour evidence). Proposed deterministic `ListeningPerformanceState`, foreground handoff, and optional #486 modulation boundary for #107: link:adr/0024-continuous-listening-performance-prior.adoc[ADR-0024] (Proposed; design only, blocked on #84/#89/#91 and parked)
 
 |Causal co-speech motion
 |EMAGE (CVPR 2024);
