@@ -1,0 +1,206 @@
+= ADR-0011: Bounded advisory stream-segment context and deterministic initiative-utility scoring
+:status: Proposed
+:date: 2026-11-25
+
+== Context
+
+Issue #487 (`priority:P2`, `status:blocked`, `status:design-ready`, Stage 4, tracked by #94) asks to evaluate whether a small advisory stream-segment context and deterministic utility-based candidate selection improve entertainment quality during quiet periods and transitions compared to the existing #87 idle-initiative baseline — *without* introducing a second `InitiativeDirector`, scheduler, task plane, authorization mechanism, or additional LLM director.
+
+This ADR records a proposed evaluation and architecture design only. Implementation remains blocked until a measured #87 baseline and usable #80/#88 context exist. It authorizes no production code, changes no wire schemas, adds no dependencies, and leaves all v0.3 defaults unchanged.
+
+Inputs this ADR builds on, all present on `main` at `89ad1f3`:
+
+* #87 (`crates/app/src/initiative.rs`, `crates/domain/src/initiative.rs`): `InitiativeDirector` already owns idle timing (`InitiativeConfig`), 10 deterministic `Suppression` gates (`Muted`, `OperatorStopped`, `FloorHeld`, `Speaking`, `Generating`, `ContentQueued`, `DeferredPending`, `Settling`, `BudgetGap`, `BudgetWindow`), and the closed `InitiativeKind` vocabulary (`AudienceQuestion`, `IdleObservation`, `RevisitTopic`) with wire schema `schemas/initiative-context.schema.json`.
+* #80 S1 (`crates/app/src/recent_turns.rs`): `RecentTurns` holds at most 6 bounded performer-only turn openings (`RECENT_TURNS_TTL_MS = 10 min`) keyed by logical clock.
+* #88 (`crates/domain/src/scene.rs`, `crates/runtime/src/scene_context.rs`): `SceneContextSnapshot` and `SceneContextTracker` expose bounded, TTL-guarded scene/game context.
+* #86 (affect/energy baseline), #89 (anti-repetition budgets), #191 (RoleBlend), #69 (thinking cost cap), #221 (context-valid ActionWindow), #58 (benchmark/telemetry), and #59 (blind pairwise evaluation).
+
+Today, once `InitiativeDirector`'s idle timer elapses and no `Suppression` gate blocks it, the performer speaks simply because silence expired rather than comparing whether waiting, a lightweight visual acknowledgement, a cached/template commentary, revisiting a topic, asking a question, or proposing a segment transition is actually worthwhile in the current moment.
+
+== Hard constraints
+
+* *Single `InitiativeDirector` and scheduler authority*: Do not create a second director, scheduler, task plane, or authorization surface. Utility scoring runs strictly *inside* or *behind* existing `InitiativeDirector` admission, suppression, floor, cooldown, pending/deferred reply, moderation, #89 repetition, #191 role, #69 cost-budget, and operator stop/mute gates.
+* *Operator-defined segment/scene limits are authoritative*: Any advisory segment plan or transition proposal is data, never control authority (`A-CTRL-001`). High-priority viewer activity, operator stop/mute, or active Agent tasks always preempt proposals.
+* *No arbitrary model-authored objective and no dark patterns*: Scoring must never optimize for donations, compulsive engagement, or private viewer profiling.
+* *`Wait` (no-action) is always an explicit, valid candidate*: Silence timer expiration must not force speech when waiting scores higher than speaking.
+* *No direct tool/game invocation*: Any context-valid game/tool action remains gated by #221 (`ActionWindow`) and #202 risk/approval; initiative utility cannot lower risk or bypass approval.
+* *Deterministic, logical-clock, bounded replay*: All segment state, candidate scores, tie-breaking, and suppression reasons must be pure functions of bounded inputs and logical time, logged with config/policy version for replay.
+* *Zero extra LLM/service required for baseline*: Feature-off preserves the exact #87 baseline; optional low-frequency model suggestions are deferred to a separate opt-in experiment only if deterministic scoring leaves a measured gap.
+
+== Assumptions
+
+Existing invariants referenced:
+
+* `A-CTRL-001` (Invariant): model output and advisory context are data, never runtime authority.
+* `A-MEM-001` (Invariant): durable memory writes require non-serializable `MemoryWritePermit`.
+
+Proposed new assumptions (to be added to link:../assumptions.adoc[Assumption Register] only if accepted):
+
+* *A-INIT-UTIL-001* (*Needs validation*): A fixed-weight linear/bounded utility score over ~5–6 interpretable features (novelty/relevance, conversational space, persona preference, #86 affect/energy fit, repetition penalty, generation cost penalty) outperforms timer-only #87 selection on held-out quiet/transition scenarios without requiring an extra LLM director. *Evidence:* unverified design hypothesis. *Revisit when:* #59 blind comparison shows no net improvement over #87 baseline.
+* *A-INIT-UTIL-002* (*Needs validation*): Including an explicit `Wait` floor score reduces unnecessary speech and direct-response displacement during intense gameplay, loading screens, and focused Agent tasks without creating perceived dead air during open chat lulls. *Evidence:* unverified; requires #58/#59 scenario evaluation.
+
+== Alternatives considered
+
+. *Status quo (#87 timer-triggered baseline)*: emit an initiative whenever idle time elapses and all 10 `Suppression` gates clear. Simple and deterministic, but cannot weigh scene intensity, segment goal, or topic staleness against waiting.
+. *Dedicated LLM "stream director" service*: run a periodic LLM call to author segment plans and decide when/what to say. Rejected for baseline: adds latency, VRAM/cost overhead, non-determinism, and a new prompt-injection surface before proving deterministic scoring is insufficient.
+. *Online reinforcement learning (e.g. homeostatic RL optimizing viewer engagement)*: rejected due to non-determinism, replay drift, sparse/noisy stream rewards, and risk of optimizing for compulsive/monetization engagement.
+. *Bounded advisory `SegmentContext` + deterministic utility scorer inside `InitiativeDirector` (proposed)*: zero extra models, pure deterministic scoring over a closed candidate set including `Wait`, strict adherence to existing suppression/budget gates, and direct offline A/B comparability against #87 baseline.
+
+== Reuse / Adapt / Build comparison
+
+Reuse-first vocabulary per link:../reuse-first.adoc[reuse-first]. No external crate or paid service (#220) is proposed.
+
+[cols="2,2,3,3,2"]
+|===
+|Candidate |Scope |Pattern / capability |Conflict or gap |Mode
+
+|*Homeostatic RL* (Keramati & Gutkin, eLife 2014)
+|External research
+|Conceptual motivation for balancing competing drives (novelty, pacing, rest/wait) against cost.
+|RL optimization and online reward loops conflict with deterministic replay and non-manipulation constraints.
+|*Reference only.* Borrow bounded multi-factor trade-off framing, not RL training.
+
+|*Generative Agents* (Park et al., arXiv:2304.03442)
+|External research
+|Explicit high-level plan/segment structure guiding moment-to-moment behavior.
+|LLM-authored unconstrained plans and reflection loops violate latency, cost, and authority boundaries.
+|*Reference only.* Borrow bounded segment-goal context, constrained to operator-approved closed values.
+
+|*`InitiativeDirector` (#87)* (`crates/app/src/initiative.rs`)
+|Existing project component
+|Owns idle timers, all 10 `Suppression` gates, budget windows, and `InitiativeKind` dispatch.
+|Currently lacks segment awareness and multi-candidate utility comparison including `Wait`.
+|*Reuse / Adapt.* Keep `InitiativeDirector` as sole owner; add an opt-in candidate scorer behind existing gates.
+
+|*`RecentTurns` (#80 S1), `SceneContext` (#88), `Affect` (#86), anti-repetition (#89), `RoleBlend` (#191)*
+|Existing project components
+|Provide bounded, logical-clocked read-only signals for topic freshness, scene intensity, energy, repetition, and role.
+|Need a small read-only feature projection into the utility scorer.
+|*Reuse.* Read existing snapshots; do not duplicate state.
+
+|*`SegmentContext` + `InitiativeUtilityScorer`*
+|New bounded module
+|Closed advisory segment struct + pure deterministic integer/fixed-scale scorer over eligible candidates.
+|No external library fits aivtuber's closed candidate set, suppression hierarchy, and replay trace schema.
+|*Custom.* Small pure Rust policy (~150–250 lines) gated behind opt-in config (`default = off`).
+|===
+
+== Evidence
+
+* *Repository executable evidence*:
+  - `crates/app/src/initiative.rs` proves the existing 10-gate `Suppression` pipeline and bounded `InitiativeConfig` (`MIN_IDLE_SECS..=MAX_IDLE_SECS`).
+  - `crates/domain/src/initiative.rs` confirms `InitiativeContext` is closed (`#[serde(deny_unknown_fields)]`, 3 `InitiativeKind` variants).
+  - `crates/app/src/recent_turns.rs` and `crates/runtime/src/scene_context.rs` confirm bounded logical-clock snapshots exist for recent turns and scene context.
+* *Unverified expectation (explicitly not yet measured)*:
+  - No measured #87 representative-hour baseline exists yet (blocked on #489).
+  - Feature weights, `Wait` threshold, and transition-proposal frequency are uncalibrated hypotheses pending offline scenario simulation and #59 blind comparison.
+
+== Decision
+
+=== 1. Bounded advisory `SegmentContext`
+
+An operator-configured or scene-derived advisory snapshot, strictly bounded and carrying expiry/epoch and provenance:
+
+[source,text]
+----
+SegmentContext (advisory only, max 1 active):
+  segment_id: BoundedId              // e.g. "opening", "gameplay.boss", "loading", "just_chatting"
+  segment_goal: SegmentGoalKind      // Closed enum: WarmUp | PlayFocus | FillTransition | ChatEngage | WindDown
+  allowed_transitions: Vec<BoundedId> // Max 4 operator-allowed next segments
+  recent_topics: Vec<BoundedTopic>   // Max 4, projected from #80 RecentTurns (never raw viewer text)
+  epoch: u64                         // Monotonic; stale proposals rejected on mismatch
+  expires_at_ms: u64                 // Logical clock expiry; expired context degrades to default baseline
+  provenance: SegmentProvenance      // OperatorConfig | SceneAdapter (never UntrustedChat / ModelOutput)
+----
+
+=== 2. Closed candidate set (explicitly including `Wait`)
+
+After `InitiativeDirector`'s existing 10 `Suppression` gates and #69/#89/#191 checks pass, the scorer evaluates only eligible actions from a closed set:
+
+[source,text]
+----
+InitiativeCandidate:
+  Wait                     // Explicit no-action baseline (zero speech, zero LLM cost)
+  VisualAck                // Non-verbal presence/gesture only (reuses IDLE_GESTURE_PRESET / #84 intent)
+  CachedOrTemplateComment  // #54 template or cached reaction (zero LLM call)
+  AskAudienceQuestion      // Maps to InitiativeKind::AudienceQuestion
+  RevisitActiveTopic       // Maps to InitiativeKind::RevisitTopic (requires fresh #80 topic)
+  ProposeTransition        // Advisory spoken transition cue (requires valid allowed_transitions & fresh epoch)
+----
+
+=== 3. Pure deterministic utility scoring
+
+Each eligible candidate `c` receives a bounded integer/milli-unit score `score(c) ∈ [-1000, +1000]` computed purely from bounded inputs (no wall clock, no RNG except deterministic tie-break if ever needed, deterministic total order on `InitiativeCandidate` as final tie-breaker):
+
+[source,text]
+----
+score(c) =
+    w_relevance  * relevance(c, segment_context, scene_context)
+  + w_space      * conversational_space(c, idle_elapsed_ms, crowd_pace)
+  + w_persona    * persona_preference(c, persona_profile)
+  + w_affect     * affect_fit(c, affect_energy)
+  - w_repeat     * repetition_penalty(c, recent_initiatives, #89_budget)
+  - w_cost       * cost_penalty(c, remaining_#69_budget)
+----
+
+Rules:
+
+* `Wait` has an explicit configurable floor score (e.g., boosted during `PlayFocus`, intense scene activity, or high Agent role weight in #191).
+* Any candidate whose prerequisite is stale or missing (e.g., `RevisitActiveTopic` with expired `RecentTurns`, `ProposeTransition` with expired `epoch` or empty `allowed_transitions`) is marked ineligible with a typed rejection reason before scoring.
+* If `score(best) <= score(Wait)`, `InitiativeDirector` records a `UtilitySelectedWait` trace and emits no speech.
+* Every evaluation logs a bounded decision record: `(policy_version, segment_id, epoch, candidate_scores, winner, rejection_reasons)` for deterministic replay and #58/#59 analysis.
+
+=== 4. Cheapest falsifier & evaluation protocol (before implementation)
+
+Once a measured #87 baseline exists:
+
+1. Build deterministic held-out scenario sequences covering all 7 regimes required by #487:
+   - quiet chat lull;
+   - intense gameplay (`PlayFocus`);
+   - loading / intermission transition (`FillTransition`);
+   - repeated topics (testing #89 anti-repetition penalty);
+   - sudden viewer question arriving mid-evaluation (preemption);
+   - focused Agent task (#191 high Agent weight);
+   - muted / operator-stopped / stale-plan / stale-topic states.
+2. Run identical scenarios and budgets with `utility_scoring = off` (#87 baseline) vs `utility_scoring = on`.
+3. Measure #58 metrics (`initiative turns/hour`, `generation calls/hour`, `response delay`, `CPU/RAM`, `rejection reasons`, `repeated pattern rate`) and run #59 blind pairwise comparison (`segment relevance`, `entertainment`, `unnecessary speech`, `timing`, `direct-response displacement`, `topic repetition`).
+4. *Adopt / narrow / reject gate*: reject the added scorer if it increases direct-response displacement, raises unnecessary speech, or fails to show a clear blind-comparison win on held-out scenarios. Do not add an LLM director unless deterministic scoring is proven insufficient.
+
+== Consequences
+
+=== Positive
+
+* Eliminates timer-driven chatter during gameplay focus, loading loops, and Agent tasks by making `Wait` and `VisualAck` first-class scored choices.
+* Reuses `InitiativeDirector`, `RecentTurns`, `SceneContext`, and #54 templates with zero new services, zero extra LLM calls, and full replay determinism.
+* Keeps operator segment limits and suppression hierarchy strictly authoritative.
+
+=== Costs / trade-offs
+
+* Introduces a small set of scoring weights that must be calibrated against #59 blind evaluations rather than guessed.
+* Adds bounded per-decision score trace logging to telemetry/replay output.
+* Extending `InitiativeKind` on the wire (e.g., for `ProposeTransition`) would require a versioned `schemas/initiative-context.schema.json` update if not mapped onto existing kinds/templates in Stage 1.
+
+=== Known limitations
+
+* Cannot invent novel stream segments beyond operator-configured `allowed_transitions`.
+* Effectiveness depends on #80/#88 context freshness; when both are absent or expired, the scorer cleanly degrades to `Wait` / `VisualAck` / #87 baseline.
+
+== Staging and rollback
+
+1. *Stage 0 (this ADR)*: design and evaluation protocol only; zero runtime change.
+2. *Stage 1 (shadow scoring)*: run `InitiativeUtilityScorer` in shadow mode inside `InitiativeDirector` (logging candidate scores without altering #87 dispatch) on held-out replay scenarios and live opt-in sessions.
+3. *Stage 2 (opt-in active selection, `default = off`)*: enable utility selection behind a feature/config toggle using existing `InitiativeKind` + `Wait` + `VisualAck` + #54 templates (no wire schema break). Rollback is toggling the flag off.
+4. *Stage 3 (optional wire extension or low-frequency advisory suggestions)*: only if Stage 2 proves clear blind-review uplift and identifies a concrete gap; requires separate ADR/schema review.
+
+== Revisit conditions
+
+* Measured #87 baseline on representative-hour data (#489) shows idle initiative timing is already satisfactory without segment/utility scoring.
+* #59 blind comparison shows deterministic scoring fails to beat #87 baseline or increases direct-response displacement.
+* #80 S2 or #88 changes the structure or freshness guarantees of topic/scene snapshots.
+
+== Related
+
+* Issue: #487 (parent), #94, #87, #80, #88, #86, #89, #191, #221, #69, #58, #59, #220
+* PR: (to be linked on PR creation)
+* Assumptions: `A-CTRL-001`, `A-MEM-001`; proposed `A-INIT-UTIL-001`, `A-INIT-UTIL-002`
+* Other ADRs: link:0001-three-layer-runtime.adoc[ADR-0001], link:0005-conversational-floor-policy.adoc[ADR-0005], link:0006-performance-intent.adoc[ADR-0006], link:0010-conversational-clarification-and-repair.adoc[ADR-0010]
