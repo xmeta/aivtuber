@@ -1,0 +1,149 @@
+= ADR-0029: Opt-in cross-session character-state continuity without viewer profiling
+:status: Proposed
+:date: 2026-11-25
+
+== Context
+
+Issue #488 (`priority:P3`, `status:design-ready`, `status:parked`, Stage 4, tracked by #94) asks to evaluate whether resuming a character's own bounded fictional mood/energy baseline across restarts improves perceived continuity versus resetting to neutral on every session start — strictly *without* persistent viewer emotional profiles, biological claims, background overnight processes, or autonomous persona rewriting.
+
+This ADR records a proposed character-only aggregate schema, data-minimization & lifecycle diagram, clock/crash/erasure policy, optional lazy circadian presentation preference, and go/no-go falsifier only. Implementation remains `status:parked` (unpark only after #86 and #486 demonstrate session-local benefit and #282 persistence/retention review permits). It authorizes no production code, changes no wire schemas, adds no dependencies, and leaves all v0.3 defaults unchanged.
+
+Inputs this ADR builds on, present on `main` at `94811b0`:
+
+* link:0008-cross-session-memory-persistence.adoc[ADR-0008] (#282, Accepted): owns approved local persistence and erasure; #488 must integrate with approved persistence rather than creating a separate independent store.
+* link:0012-bounded-autonomic-regulation.adoc[ADR-0012] (#486): defines session-bounded functional `strain` and `recovery` variables evaluated against the #86 affect baseline.
+* link:0021-versioned-typed-persona-contract.adoc[ADR-0021] (#72) & link:0025-proposal-only-offline-memory-dreaming.adoc[ADR-0025] (#281): only operator-approved #72 edits change canonical character identity.
+
+== Hard constraints
+
+* *Strict data minimization — zero viewer profiling* (`A-MEM-001`, `docs/security-threat-model.adoc`): Stored state may contain *only* bounded character-aggregate numeric scalars and version metadata. It MUST NOT contain chat text, viewer/actor IDs, embeddings, inferred viewer emotions, or per-viewer relationship scores.
+* *Approved persistence only — no independent store*: Reuse the ADR-0008 (#282) approved persistence and atomic reset/delete mechanism; if storage is unavailable or corrupt, fall back cleanly to session reset.
+* *Wall-clock changes never grant authority or govern replay ordering* (`A-CTRL-001`): Cross-session elapsed recovery is computed lazily on startup with explicit clamping against clock rollback, timezone shifts, and maximum-age expiry (`max_age_ms`, e.g., 72 hours -> full reset to neutral baseline).
+* *Zero overnight background processes or LLM calls*: Optional fictional circadian presentation preference is separately switchable (`default = off`), computed lazily from saved timestamp/local-hour preference at session start with zero background daemons or LLM calls.
+* *Safety, stop/mute, task authority, and canonical persona identity remain completely unaffected*.
+
+== Assumptions
+
+Existing invariants referenced:
+
+* `A-CTRL-001` (Invariant): persisted presentation state never holds runtime authority.
+* `A-MEM-001` (Invariant): durable memory writes and erasure follow canonical #105/#282 authority.
+
+Proposed new assumptions (to be added to link:../assumptions.adoc[Assumption Register] only if accepted):
+
+* *A-CONT-001* (*Needs validation*): Resuming a bounded decayed character mood/energy baseline across short restarts (e.g., resuming after a tough boss loss or high-energy stream) is preferred in #59 blind review over clean session reset, justifying the added persistence/migration surface. *Evidence:* unverified; if falsified or if clean erasure/replay cannot be proved, retain session-only reset permanently.
+
+== Alternatives considered
+
+. *Status quo (session-only reset on every restart)*: simplest, zero cross-session state or clock-anomaly complexity. Mandatory baseline to beat; stay at status quo unless #59 blind comparison proves clear continuity uplift.
+. *Persist per-viewer emotional relationship graphs or full chat mood logs*: rejected. Violates data-minimization and non-profiling constraints.
+. *Background overnight daemon simulating biological sleep/circadian cycles*: rejected. Unnecessary operational complexity, wasted resources, and anthropomorphic framing.
+. *Opt-in bounded character-only aggregate snapshot inside ADR-0008 persistence with lazy clamped recovery (proposed)*: zero viewer data, zero background daemons, trivial reset/delete, and clean fallback on corruption/mismatch.
+
+== Reuse / Adapt / Build comparison
+
+Reuse-first vocabulary per link:../reuse-first.adoc[reuse-first]. No new crate, database, or background service is proposed.
+
+[cols="2,2,3,3,2"]
+|===
+|Candidate |Scope |Pattern / capability |Conflict or gap |Mode
+
+|*ALMA layered affect* (Gebhard, DFKI)
+|External research
+|Multi-timescale mood baseline concept.
+|Not a persistence, clock-safety, or erasure design.
+|*Reference only.*
+
+|*ADR-0008 persistence (#282) & #86/#486 affect/regulation*
+|Existing / designed project components
+|Approved atomic local persistence, erasure, and bounded session-local mood/strain/recovery scalars.
+|Currently reset on every process start.
+|*Reuse.* Store the tiny character-only aggregate record inside the existing approved persistence boundary.
+
+|*`CharacterContinuitySnapshot` & lazy recovery function*
+|New bounded module
+|Versioned character-only scalar struct, persona/config compatibility check, clamped elapsed recovery, and corruption fallback.
+|Project-specific lifecycle and clock-anomaly contract.
+|*Custom.* Tiny pure Rust module (~80–120 lines), `default = off`.
+|===
+
+== Evidence
+
+* *Repository executable / architectural evidence*:
+  - ADR-0008 (`docs/adr/0008-cross-session-memory-persistence.adoc`) defines approved single-file persistence and atomic erasure.
+  - ADR-0012 (`docs/adr/0012-bounded-autonomic-regulation.adoc`) defines the bounded session-local `strain`/`recovery` scalars that would decay across sessions.
+* *Unverified expectation (explicitly not yet measured)*:
+  - Viewer preference for resumed baseline vs clean session reset is unmeasured (parked pending #86/#486 session-local evidence).
+
+== Decision
+
+=== 1. Data-minimized schema & lifecycle diagram
+
+[source,text]
+----
+CharacterContinuitySnapshot (opt-in, default = off, <= 256 bytes, ZERO viewer data):
+  schema_version: "0.1.0"
+  persona_id: BoundedId
+  persona_config_fingerprint: [u8; 32]   // Mismatch -> discard & reset cleanly
+  saved_at_unix_ms: i64                  // Used ONLY for clamped lazy recovery, NEVER replay/auth
+  valence_milli: i16                     // -1000..=1000
+  arousal_milli: u16                     // 0..=1000
+  strain_milli: u16                      // 0..=1000 (from #486 if enabled)
+  recovery_milli: u16                    // 0..=1000 (from #486 if enabled)
+  max_age_ms: u64                        // e.g. 72 hours; older -> full reset
+----
+
+Lifecycle:
+
+[source,text]
+----
+Session end / clean shutdown (if opt-in enabled)
+  -> write CharacterContinuitySnapshot atomically via ADR-0008 persistence
+Next startup:
+  -> read snapshot -> validate schema + persona_config_fingerprint + checksum
+       - missing / corrupt / fingerprint mismatch / operator reset -> baseline neutral
+       - clock rollback (now < saved_at) or elapsed > max_age_ms   -> clamp dt = 0 or full reset
+       - valid elapsed dt in [0, max_age_ms]                       -> lazy decay toward neutral baseline
+       - optional circadian preference (separate toggle, off)      -> lazy presentation offset only
+Operator erase / delete-all -> atomically removes snapshot -> next start is clean baseline
+----
+
+=== 2. Cheapest falsifier & explicit go/no-go
+
+Once #86 and #486 demonstrate session-local benefit and #488 unparks:
+
+1. Run deterministic synthetic A/B fixtures (same persona/model) across all 8 required regimes: restart after win/loss, long idle (> `max_age_ms`), clock rollback, timezone change, persona config migration, operator reset/erase, retention expiry, and storage unavailable/corrupt.
+2. Run #58/#59 blind comparison (`session reset` vs `opt-in continuity`).
+3. *Go / no-go*: if continuity is not clearly preferred over session reset, or if clean erasure and deterministic replay cannot be proved, retain session-only state permanently.
+
+== Consequences
+
+=== Positive
+
+* Tests cross-session character continuity with <= 256 bytes of strictly non-personal data and zero background processes.
+* Preserves deterministic replay, clean erasure, and resilience against clock anomalies and storage corruption.
+
+=== Costs / trade-offs
+
+* Adds persona-fingerprint migration handling and clock-anomaly edge cases to maintain.
+
+=== Known limitations
+
+* Parked until #86/#486 prove session-local benefit and #282 persistence review permits.
+
+== Staging and rollback
+
+1. *Stage 0 (this ADR)*: data-minimization contract, lifecycle diagram, and A/B test plan only; zero runtime change.
+2. *Stage 1 (offline synthetic A/B + #59 comparison, `default = off`)*: evaluate against session-reset baseline; rollback is toggling continuity off (immediate clean session reset).
+
+== Revisit conditions
+
+* #86/#486 fails to show session-local continuity benefit (reject #488).
+* ADR-0008 persistence boundary changes storage format or erasure guarantees.
+
+== Related
+
+* Issue: #488 (parent), #94, #72, #86, #105, #281, #282, #486, #58, #59
+* PR: (to be linked on PR creation)
+* Assumptions: `A-CTRL-001`, `A-MEM-001`; proposed `A-CONT-001`
+* Other ADRs: link:0008-cross-session-memory-persistence.adoc[ADR-0008], link:0012-bounded-autonomic-regulation.adoc[ADR-0012], link:0021-versioned-typed-persona-contract.adoc[ADR-0021], link:0025-proposal-only-offline-memory-dreaming.adoc[ADR-0025]
