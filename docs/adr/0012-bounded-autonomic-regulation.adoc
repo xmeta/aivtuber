@@ -1,0 +1,177 @@
+= ADR-0012: Bounded functional regulation layer evaluated against the affect baseline
+:status: Proposed
+:date: 2026-11-25
+
+== Context
+
+Issue #486 (`priority:P2`, `status:blocked`, `status:design-ready`, Stage 4, tracked by #94) asks to compare a small, bounded regulation layer against the existing #86 affect baseline to determine whether tracking accumulated load and recovery improves emotional continuity and coordinated non-verbal presence more than valence/arousal decay alone.
+
+This ADR records a proposed comparison design and architecture boundary only. Implementation remains blocked until #86 exposes a measured deterministic affect baseline and #72 defines compatible persona bounds. It authorizes no production code, changes no wire schemas, adds no dependencies, and leaves all v0.3 defaults unchanged.
+
+Inputs this ADR builds on, present on `main` at `e40c722`:
+
+* `crates/generative/src/affect.rs`: per-reply bounded `AffectState` (`AffectClass`, `AffectStrength`, `AffectConfig`, anti-repetition hold/relaxation) and `crates/app/src/affect_judge.rs` (optional System One affect class hint).
+* #86 (session-scoped bounded affect/energy continuity with decay and hysteresis — parent baseline to compare against).
+* #72 (typed persona contract bounds), #84 (`PerformanceIntent`, ADR-0006), #107 (continuous listening-performance prior), #87 (`InitiativeDirector`, advisory consumer only), #191 (`RoleBlend`, explicitly separate), #58 (benchmark/telemetry), and #59 (blind pairwise review).
+
+These regulation variables are *functional control variables*, not biological measurements, literal hormone chemistry, or claims of subjective emotion.
+
+== Hard constraints
+
+* *Single affect ownership and scheduler authority*: Do not create a competing `AffectState` or scheduler. The regulation state sits alongside #86's logical clock, validated event impulse boundary, bounds, and replay metadata.
+* *Strict non-authority and non-tampering* (`A-CTRL-001`): Untrusted chat and model outputs can never directly set regulation variables or bypass community moderation, floor control, scheduler priorities, operator stop/mute, safety gates, or task verification.
+* *Read-only advisory projection only*: Regulation state projects a compact read-only summary to #84 `PerformanceIntent` and #107 listening prior (once available), and may be read by #87 as advisory input only. No direct actuator writes, no extra LLM calls, no new sidecar, and no frame-loop inference.
+* *Session-bounded, opt-in, and non-profiling*: Off by default (`default = off`); reset cleanly on session end or operator reset. No durable viewer emotional profiles, no external self-preservation objectives, and no forced rest or autonomous shutdown.
+* *Deterministic logical-clock replay*: Pure deterministic update function over bounded inputs and monotonic logical time; resistant to clock anomalies (regression/large jumps) and chat bursts/spam.
+* *At most two additional independent state dimensions*: Dimensions must correspond to concrete observed failure cases (abrupt reset, over-persistence, flat exhaustion after sustained intensity), not metaphorical hormone names.
+
+== Assumptions
+
+Existing invariants referenced:
+
+* `A-CTRL-001` (Invariant): untrusted content and model output never hold runtime authority.
+* `A-MEM-001` (Invariant): durable memory writes require non-serializable `MemoryWritePermit`.
+
+Proposed new assumptions (to be added to link:../assumptions.adoc[Assumption Register] only if accepted):
+
+* *A-REG-001* (*Needs validation*): Adding at most two bounded functional dimensions (`strain` and `recovery`) reduces abrupt emotional resets and unnatural over-persistence after sustained high-intensity gameplay or bursty chat compared to valence/arousal decay alone. *Evidence:* unverified hypothesis. *Revisit when:* #59 blind comparison shows no meaningful improvement over #86 baseline or higher instability/cost.
+* *A-REG-002* (*Needs validation*): Fixed-point/clamped deterministic decay with per-window impulse caps prevents chat spam or repetitive bursts from saturating `strain` into permanent flatness. *Evidence:* unverified; must be tested on synthetic burst/spam fixtures before any live enablement.
+
+== Alternatives considered
+
+. *Status quo (#86 valence/arousal decay baseline)*: simplest and lowest complexity. Retained as the mandatory baseline; if the candidate fails to show a clear blind-review win on held-out scenarios, stay with status quo and reject the added state.
+. *Literal neurochemical / hormone simulation (e.g., dopamine/cortisol/serotonin curves)*: rejected. Adds uncalibrated coupled parameters, invites anthropomorphic claims, and obscures failure attribution without improving deterministic control.
+. *LLM-driven mood narration or external emotion sidecar*: rejected. Adds latency, non-determinism, VRAM/cost overhead, and prompt-injection exposure; violates #486's zero-extra-LLM constraint.
+. *Two-dimension bounded functional regulation (`strain`, `recovery`) as a pure deterministic update function (proposed)*: minimal extra state, directly tied to concrete continuity failures, zero extra LLM calls, and cleanly testable off vs on against identical #86 streams.
+
+== Reuse / Adapt / Build comparison
+
+Reuse-first vocabulary per link:../reuse-first.adoc[reuse-first]. No external crate or paid dependency (#220) is proposed.
+
+[cols="2,2,3,3,2"]
+|===
+|Candidate |Scope |Pattern / capability |Conflict or gap |Mode
+
+|*ALMA* (Gebhard, DFKI)
+|External research
+|Multi-timescale layering separating fast emotions from slower mood/baseline tendencies.
+|Full OCC appraisal engine and personality-to-PAD equations are heavyweight and uncalibrated for livestream chat/game telemetry.
+|*Reference only.* Borrow timescale separation (fast impulse vs slower load/recovery); reject OCC appraisal stack.
+
+|*Homeostatic RL* (Keramati & Gutkin, eLife 2014)
+|External research
+|Bounded deviation-and-recovery dynamics around an operating setpoint.
+|Online RL optimization conflicts with deterministic replay and non-goal of autonomous self-preservation drives.
+|*Reference only.* Borrow bounded setpoint/recovery framing only.
+
+|*#86 Affect baseline & `crates/generative/src/affect.rs`*
+|Existing project component
+|Owns logical clock, impulse validation, `AffectConfig` preset bounds, and replay metadata.
+|Does not track sustained load/recovery across multi-minute bursts or quiet recovery stretches.
+|*Reuse.* Extend/compose alongside #86 without duplicating `AffectState` or preset selection.
+
+|*`RegulationState` (`strain`, `recovery`) + pure update*
+|New bounded module
+|Deterministic clamped update with impulse rate-capping, hysteresis, and read-only projection to #84/#107/#87.
+|No external crate provides project-owned logical-clock, spam-bounded, replay-logged regulation.
+|*Custom.* Small pure Rust function (~100–150 lines), session-bounded, off by default.
+|===
+
+== Evidence
+
+* *Repository executable evidence*:
+  - `crates/generative/src/affect.rs` proves bounded per-reply `AffectState` and `AffectConfig` preset clamping (`AFFECT_INTENSITY_CAP`, `MAX_AVAILABLE_PRESETS`).
+  - `crates/app/src/affect_judge.rs` proves affect hints remain advisory and fall back cleanly to deterministic rules.
+* *Unverified expectation (explicitly not yet measured)*:
+  - No measured #86 session-level affect baseline or #72 persona-bound coupling exists yet.
+  - All decay constants, saturation caps, and hysteresis bands below are analytical starting points for synthetic offline comparison, not calibrated production parameters.
+
+== Decision
+
+=== 1. Two bounded functional dimensions (not hormones)
+
+Select exactly two independent clamped state variables in `[0.0, 1.0]` (or fixed-scale milli-units `0..=1000` for bit-exact deterministic replay):
+
+* *`strain`* (`0..=1000`, baseline `0`): accumulated short-to-medium-term interaction/gameplay intensity load. Targets *abrupt reset* (prevents snapping instantly from peak excitement to flat neutral on a single quiet tick) and *burst/spam resistance* (impulse contribution per logical window is strictly capped).
+* *`recovery`* (`0..=1000`, baseline `1000`): remaining expressiveness/pacing headroom over a long stream session. Targets *over-persistence* (gently dampens repeated peak arousal spikes after sustained high-load stretches and recovers smoothly during quiet stretches without ever forcing rest or silence).
+
+=== 2. Pure deterministic update contract
+
+[source,text]
+----
+RegulationInput (validated by #86 / normalizer, never raw untrusted chat):
+  now_ms: u64                     // Monotonic logical clock (clamped on regression; dt capped on large jumps)
+  impulse_magnitude: u16          // 0..=1000, derived from validated game/scene/affect events
+  impulse_source: ImpulseSource   // TrustedGameEvent | ValidatedAffectReading | QuietTick | OperatorReset
+  persona_bounds: PersonaRegBounds // From #72 (max_strain_gain, recovery_rate_bounds)
+
+update(state, input) -> (next_state, RegulationSummary, reason_code):
+  1. If OperatorReset: return (RegulationState::baseline(), summary, "operator_reset").
+  2. Clamp dt = min(now_ms.saturating_sub(state.last_ms), MAX_STEP_MS).
+  3. Cap impulse contribution per sliding logical window so burst/spam cannot peg `strain`.
+  4. Apply bounded exponential/piecewise-linear decay on `strain` and recovery on `recovery`.
+  5. Apply hysteresis band before flipping discrete summary tier (Calm | Engaged | HighLoad | CoolingDown).
+----
+
+=== 3. Read-only projection boundaries
+
+`RegulationSummary` is strictly read-only advisory data:
+
+* *To #84 (`PerformanceIntent`)*: bounded intensity/tempo modulation hint (never overrides safety, operator mute/stop, or pack preset caps).
+* *To #107 (listening prior)*: subtle posture/settle pacing hint during quiet recovery.
+* *To #87 (`InitiativeDirector`)*: optional advisory input to utility scoring (ADR-0011); never triggers speech or bypasses suppression gates.
+* *Separate from #191 (`RoleBlend`)*: task-vs-entertainer role balance remains owned by #191.
+
+=== 4. Cheapest falsifier & go/no-go gate (before implementation)
+
+Once #86 exposes a measured affect baseline and #72 defines compatible persona bounds:
+
+1. Build deterministic timestamped synthetic scenarios covering all 7 regimes required by #486:
+   - game wins and losses;
+   - sudden surprise spike;
+   - repetitive / spammy chat burst (verifying spam resistance);
+   - quiet recovery stretch;
+   - long stream duration (testing boundedness and memory plateau);
+   - operator reset and clock anomalies (regression / large gap);
+   - degraded-provider regime (zero extra LLM calls).
+2. Replay identical event streams, persona, seed, budget, and logical timestamps with `regulation = off` (#86 baseline) vs `regulation = on`, logging reason codes and config/version.
+3. Run #58 performance/overhead checks (update cost, p95 overhead, memory plateau, zero extra LLM calls) and #59 blind comparison (`abrupt reset`, `over-persistence`, `affect/voice/motion coherence`, `initiative disruption`, `both-unacceptable`).
+4. *Go / no-go decision*: reject the added regulation state if held-out blind comparison shows no meaningful improvement over #86 baseline, or if instability, initiative disruption, or runtime cost rises.
+
+== Consequences
+
+=== Positive
+
+* Addresses concrete multi-minute emotional continuity failures (abrupt reset, over-persistence) with at most two interpretable, bounded control variables.
+* Zero extra LLM calls, zero external dependencies, zero durable viewer profiling, and bit-exact logical-clock replay.
+* Cleanly falsifiable off-vs-on against identical #86 streams.
+
+=== Costs / trade-offs
+
+* Adds two state variables, hysteresis parameters, and persona-bound coupling (#72) that must be calibrated and maintained.
+* If #86's own valence/arousal decay already solves continuity well enough, this layer would be unnecessary complexity — hence the explicit reject gate.
+
+=== Known limitations
+
+* Cannot be calibrated or promoted until #86 baseline and #72 persona bounds exist.
+* Synthetic scenarios validate boundedness, spam resistance, and mechanics, not live audience perception; human-rated #59 blind review remains mandatory before any promotion.
+
+== Staging and rollback
+
+1. *Stage 0 (this ADR)*: design and synthetic falsifier specification only; zero runtime change.
+2. *Stage 1 (offline replay comparison)*: run candidate pure update function against #86 baseline on synthetic scenarios; document go/no-go decision in #486.
+3. *Stage 2 (opt-in shadow/live flag, `default = off`)*: only if Stage 1 passes blind #59 and #58 guardrails; rollback is toggling the flag off (preserves exact #86 baseline).
+4. *Stage 3 (promotion)*: requires separate review after representative live evidence.
+
+== Revisit conditions
+
+* #86 baseline alone passes #59 continuity evaluations without abrupt reset or over-persistence failures (reject #486).
+* Synthetic burst/spam or clock-anomaly tests reveal oscillation or runaway saturation despite impulse caps.
+* #72 persona bounds or #84 `PerformanceIntent` modulation contract changes materially.
+
+== Related
+
+* Issue: #486 (parent), #94, #86, #72, #84, #87, #107, #191, #58, #59, #220
+* PR: (to be linked on PR creation)
+* Assumptions: `A-CTRL-001`, `A-MEM-001`; proposed `A-REG-001`, `A-REG-002`
+* Other ADRs: link:0001-three-layer-runtime.adoc[ADR-0001], link:0006-performance-intent.adoc[ADR-0006], link:0011-segment-planning-and-initiative-utility.adoc[ADR-0011]
