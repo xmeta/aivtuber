@@ -207,7 +207,7 @@ local model ecosystems
 |VedalAI Neuro SDK dynamic action registration / ActionWindow patterns
 |Expose only epoch/TTL-bounded high-level actions that are valid now; keep #202 risk/approval and aivtuber verification authoritative
 |#88, #202, #221
-|Stale-window rejection; action-set size; schema drift; scene transition races; dispatch-success vs verified-outcome false positives; avoid frame-level LLM control
+|Stale-window rejection; action-set size; schema drift; scene transition races; dispatch-success vs verified-outcome false positives; avoid frame-level LLM control. Proposed bounded `ActionWindow` lifecycle, #202 catalog intersection, fail-closed proposal checks, and falsifier for #221: link:adr/0015-dynamic-action-window.adoc[ADR-0015] (Proposed; design only, blocked on #202 and parked)
 
 |Speech lifecycle and pronunciation projection
 |AIRI display-vs-speech pronunciation proposal;
