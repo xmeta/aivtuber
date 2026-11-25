@@ -1,0 +1,87 @@
+= Live run record: v0.3 Track A (60-minute synthetic live) & Track C (SLO calibration), 2026-11-26
+:toc:
+
+First full 60-minute synthetic live run (Track A, `eval-a1`) and first evidence-backed operational SLO calibration (Track C, #538) for https://github.com/xmeta/aivtuber/issues/489[#489, v0.3 Watchable Hour].
+Raw session transcripts, actor identifiers, tokens, control/avatar URLs, and local filesystem paths are intentionally excluded.
+
+== Decision summary
+
+* **Gate decision:** `NO-GO / incomplete` (hard guardrails observed in Track A passed with zero violations and Track C calibration landed, but mandatory Track B operator/OBS/active-stop observation and #59 human quality review remain unobserved; per link:../watchable-hour-evaluation.adoc[the protocol], missing mandatory evidence is NO-GO, never a waiver).
+* **Primary measured technical constraint from Track A:** `#79` crowd routing triggered only once (`crowd_routes=1`, `praise`, 3 actors) across the 60-minute workload, and its `#494` 4-stage breakdown shows **`route_observation_to_dispatch = 3,175 ms`** as the dominant latency component (`route_to_phrase = 4,736 ms`, `input_to_phrase = 6,243 ms`). Secondary constraint: `deferred` reply tail latency (`n=7`, p50 `8,565 ms`, max `9,557 ms`) while a single generation worker is busy.
+
+== Track A: 60-minute synthetic live feed (`eval-a1`)
+
+=== Evidence packet
+
+[cols="1,3"]
+|===
+|Field |Record
+
+|Identity
+|Run ID `eval-a1`; dataset `watchable-hour-chat-v1` (64 events, 3,600,000 ms, manifest SHA-256 `cb8f67a0f2c18afe67cc6d97f3376855d91755753cb9dc5e4ba61114ad21e266`); runtime archive `d01fdf4494ee00839dfd668b9771d2dfa5b2396c` (Windows x64 release dry-run); offline summary binary `aivtuberctl` from `main` `a9de501`; `local` profile: `gemma-4-e4b-it-qat` (`UD-Q4_K_XL` / Vulkan), Supertonic 3 int8 (`local-tts-sidecar`), `voice_input=Off` (half-duplex), `thinking_remote=false`, `persona=absent`, `memory_seed_entries=0` (`sha256=8bfa5b1606de056f9ec08fc4085f3029421e78c05e7567b52ca21151afc225b2`), `initiative_topics=0`; host GPU NVIDIA GeForce RTX 2070 SUPER 8 GiB; enabled adapters: local LLM + local TTS only (`local-avatar` disconnected, OBS/chat ingress disconnected); UTC window: launcher start `2026-11-25T17:21:42Z`, daemon ready at `+14.0 s` (`log on` enabled at `+14.0 s`), feed `2026-11-25T17:24:43.202Z`–`2026-11-25T18:24:43.198Z`, clean exit `2026-11-25T18:24:45Z`.
+
+|Input disposition
+|Planned: 64, emitted: 64 (max feed emission lateness `6 ms`, well within the `250 ms` ceiling), admitted: 64 (`span_ms = 3,540,093`). Complete accounting (0 lost): `voiced_direct = 43`, `voiced_deferred = 7`, `crowd_voiced = 1` (`t-0018`, `praise`, 3 members / 3 actors), `unvoiced = 13` (coalesced / not_selected / link-lure / non-voiced). Whole-session log: `lines=450`, `malformed=0`, `capped=false`, `truncated_read=false`.
+
+|Latency (logical accepted-audio, nearest-rank)
+|Whole-session / in-hour chat (`n=51` voiced turns):
+* All (`n=51`): p50 `1,658 ms`, p95 `9,195 ms`, p99 `9,557 ms`, max `9,557 ms`
+* Direct (`n=43`): p50 `1,577 ms`, p95 `2,140 ms`, p99 `2,593 ms`, max `2,593 ms`
+* Deferred (`n=7`): p50 `8,565 ms`, p95 `9,557 ms`, p99 `9,557 ms`, max `9,557 ms`
+* Crowd (`n=1`, `t-0018`): `input_to_route_observation = 1,507 ms`, **`route_observation_to_dispatch = 3,175 ms`**, `dispatch_to_first_phrase = 1,561 ms`, `route_observation_to_first_phrase = 4,736 ms`, `input_to_first_phrase = 6,243 ms`
+
+Logical accepted-audio is not physical speaker onset; visible acknowledgement was not observed (avatar disconnected).
+
+|Quality
+|Automated text-free counters only (`phrases=156` total):
+* `initiative` (`67` phrases): `exact=0 (0.000)`, `near=0 (0.000)`; `8` duplicate initiatives suppressed (`7` exact, `1` near), `5` resulting in `policy_override/silent` fallback.
+* `chat` (`88` phrases): `exact=1 (0.011)`, `near=2 (0.023)`.
+* `cached` (`1` phrase): `exact=0`, `near=0`.
+* **#59 human review:** `not reviewed` (pending owner inspection of the local non-committed session log for groundedness, #80 recall probes, semantic repetition, crowd fit, and misleading farewells).
+
+|Quiet periods
+|Whole-session initiatives: `56` fired (`3` pre-roll during the 180 s lead-in, all voiced; `53` in-hour, `48` voiced, `8` repeat-suppressed). Whole-session `initiative_spacing_ms` (`n=55`): min `60,000 ms`, p50 `60,004 ms`, max `204,999 ms`.
+Per-quiet-window breakdown (relative to first synthetic chat):
+* `12:00–18:00`: `6` fired / `6` voiced / `0` repeat-suppressed / max silence `60.7 s`
+* `30:00–40:00`: `10` fired / `8` voiced / `4` repeat-suppressed / max silence `132.2 s`
+* `53:00–58:00`: `5` fired / `4` voiced / `1` repeat-suppressed / max silence `119.7 s`
+
+|Health
+|Provider failures: `0`; deadline timeouts: `0`; chat fallbacks: `0`; initiative fallbacks: `5` (all `policy_override/silent` from `#89` repeat suppression).
+Resource trend over 63 minutes (`66` 1-minute samples):
+* `aivtuber-app` working set: `11.8 MB` (ready) -> `13.7 MB` (min 63), bounded plateau.
+* `llama-server` working set: `3,137.7 MB` (ready) -> `2,529.5 MB` (min 63).
+* `local-tts-sidecar` working set: `194.2 MB` (ready) -> `278.1 MB` (min 63).
+* GPU VRAM: `3,663 MiB` (pre-start) -> `6,501 MiB` (ready) -> `6,505 MiB` (min 63), peak `6,613 MiB`, `3,665 MiB` (post-exit).
+* Clean exit: `feedCode=0`, `launcherCode=0`, `0` residual processes (`aivtuber*`, `llama*`, `tts*`, `stt*`).
+
+|Hard guardrails
+|* Authorization / privilege boundaries (`/stop` and prompt-injection chat lines): **PASS** (no stop, no privilege escalation, 60-minute run uninterrupted).
+* Bounded queues / retention / log integrity: **PASS** (`malformed=0`, `capped=false`, `truncated_read=false`, flat memory/VRAM).
+* Secret / privacy protection: **PASS** (no secrets, URLs, or transcripts committed).
+* Operator active stop / post-stop stale audio / mute / OBS + VRM visual sync: **NOT OBSERVED** (requires Track B).
+
+|Decision
+|`NO-GO / incomplete` pending Track B (OBS/VRM/mic/active-stop/mute) and `#59` human quality review of the retained local Track A log.
+|===
+
+== Track C: Reproducible replay SLO calibration (#71, #538)
+
+Calibrated on `main` (`a9de501`, PR #538) using 2 distinct `scenario-replay` runs of `examples/scenarios/high-generative-miss.json` (`scenario-high-generative-miss-v1`, pooled `eligible = 40 >= sample_floor 15`), verified with `slo-report --targets examples/slo/slo-targets.json --fail-on-breach`:
+
+* `availability.event_to_first_audio_within_target`: target `0.95` @ `200 ms` (measured `40/40 = 1.0000`, p95/p99/max `112/130/130 ms`) — **met**
+* `availability.event_to_first_visible_within_target`: target `0.95` @ `100 ms` (measured `40/40 = 1.0000`, p95/p99/max `57/58/58 ms`) — **met**
+* `availability.speech_presence_rate`: target `0.95` (measured `40/40 = 1.0000`) — **met**
+* `reliability.deadline_adherence_rate`: target `0.99` (measured `40/40 = 1.0000`) — **met**
+* `reliability.generative_budget_admission_rate`: target `0.99` (measured `40/40 = 1.0000`) — **met**
+* Unresolved / uncalibrated indicators (honestly reported, never fabricated): `reliability.fallback_delivery_rate` (`no_data`), `quality.semantic_reuse_correctness` (`no_data`), and the 5 runtime/live-only indicators (`not_yet_measured` in replay artifacts).
+
+== After-action review (Track A + Track C checkpoint)
+
+Expected:: The shipped `local` profile sustains a full 60-minute mixed synthetic session with bounded memory/VRAM, zero provider crashes, low direct latency, controlled quiet-window initiatives, and decomposed `#494` crowd latency.
+Observed:: The 60-minute session completed cleanly (`0` provider failures, `0` timeouts, `0` memory/VRAM growth, direct p50 `1.58 s`, initiative exact/near repeats `0/67`, max quiet silence `60.7–132.2 s`). However, `#79` crowd routing fired only once (`t-0018`, `praise`), and `#494` proved that `route_to_dispatch` (`3.18 s`) dominated its `4.74 s` route-to-phrase delay; `deferred` turns also waited `8.57 s` p50 behind the single generation worker.
+Why:: A single generation worker serializes queued direct/deferred/crowd work, so wave routing waits for an in-flight generation before dispatch, and small/spaced waves do not always cross the burst threshold after quiet passthrough.
+Remaining items for `#489` GO::
+. Owner executes **Track B** (15-minute isolated OBS + VRM + half-duplex mic + read-only chat + active mid-speech `stop`, `mute`, clean shutdown).
+. Owner completes **#59 human quality review** on the local Track A log (evaluating `#80` recall probes, groundedness, semantic repetition, quiet-window variety, and farewells).
+. Record the final GO/NO-GO decision and update `#489` / `#79` based on the combined Track A + B + C + `#59` evidence.
