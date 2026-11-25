@@ -10,8 +10,58 @@ permissions:
   contents: read
 
 jobs:
+  # Docs-only PR 判定ジョブ。ブランチ保護の必須チェック 3 種 (validate / rust / schema) は
+  # 維持したまま、純粋なドキュメント変更 PR の重いビルド/テストをスキップする。
+  # push to main および validate.mjs / Bun テストが内容を検証する docs は常にフル CI を実行する。
+  changes:
+    name: Detect docs-only PR
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.check.outputs.docs_only || 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 0
+
+      - name: Check whether PR touches only non-validated docs
+        id: check
+        shell: bash
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mapfile -t files < <(git diff --name-only "$BASE_SHA...$HEAD_SHA")
+          if [[ "${#files[@]}" -eq 0 ]]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          for f in "${files[@]}"; do
+            case "$f" in
+              docs/property-testing.adoc|\
+              docs/provider-conformance.adoc|\
+              docs/production-runtime.adoc|\
+              docs/local-profile-quickstart.adoc)
+                echo "Validated doc changed ($f); running full CI."
+                echo "docs_only=false" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+            esac
+            if [[ "$f" =~ ^docs/.*\.(adoc|md|txt)$ ]] || [[ "$f" =~ ^(README|AGENTS|CHANGELOG|CONTRIBUTING|SECURITY)\.md$ ]] || [[ "$f" =~ ^LICENSE ]]; then
+              continue
+            fi
+            echo "Non-doc file changed ($f); running full CI."
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          done
+          echo "Docs-only PR detected (${#files[@]} file(s)); skipping heavy build/test jobs."
+          echo "docs_only=true" >> "$GITHUB_OUTPUT"
+
   supply-chain:
     name: Supply chain (cargo-deny)
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -42,6 +92,7 @@ jobs:
 
   validate:
     name: Validate schemas and fixtures
+    needs: changes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -56,32 +107,51 @@ jobs:
             exit 1
           fi
 
+      - name: Skip schema/Bun checks on docs-only PR
+        if: needs.changes.outputs.docs_only == 'true'
+        run: echo "Docs-only PR: LF line-ending check passed; skipping Bun/schema checks."
+
       - uses: oven-sh/setup-bun@v2
+        if: needs.changes.outputs.docs_only != 'true'
         with:
           bun-version: 1.3.14
       - name: Install Rust
+        if: needs.changes.outputs.docs_only != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
-      - run: bun install --frozen-lockfile
-      - run: bun run validate:toolchains
-      - run: bun run validate
-      - run: bun run validate:rust-parity
-      - run: bun test
+      - if: needs.changes.outputs.docs_only != 'true'
+        run: bun install --frozen-lockfile
+      - if: needs.changes.outputs.docs_only != 'true'
+        run: bun run validate:toolchains
+      - if: needs.changes.outputs.docs_only != 'true'
+        run: bun run validate
+      - if: needs.changes.outputs.docs_only != 'true'
+        run: bun run validate:rust-parity
+      - if: needs.changes.outputs.docs_only != 'true'
+        run: bun test
 
   rust:
     name: Rust checks
+    needs: changes
     runs-on: ubuntu-latest
     steps:
+      - name: Skip Rust checks on docs-only PR
+        if: needs.changes.outputs.docs_only == 'true'
+        run: echo "Docs-only PR: skipping Rust checks."
+
       - uses: actions/checkout@v4
+        if: needs.changes.outputs.docs_only != 'true'
 
       - name: Install Rust
+        if: needs.changes.outputs.docs_only != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
           components: rustfmt, clippy
 
       - name: Format
+        if: needs.changes.outputs.docs_only != 'true'
         run: cargo fmt --all -- --check
 
       # `fuzz/` is excluded from the workspace (issue #146), so `cargo fmt --all`
@@ -91,16 +161,20 @@ jobs:
       # removes it from these gates. Stable is sufficient: the crate needs
       # nightly only to *run* a campaign, not to format or lint.
       - name: Format fuzz crate
+        if: needs.changes.outputs.docs_only != 'true'
         run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
 
       # --locked keeps CI from silently rewriting the reviewed fuzz/Cargo.lock.
       - name: Clippy fuzz crate
+        if: needs.changes.outputs.docs_only != 'true'
         run: cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
 
       - name: Clippy
+        if: needs.changes.outputs.docs_only != 'true'
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Test
+        if: needs.changes.outputs.docs_only != 'true'
         run: cargo test --locked --workspace
 
       # Issue #92 S2: the Silero VAD v6 sidecar (tract inference) sits behind the
@@ -109,9 +183,11 @@ jobs:
       # and is exercised locally). The tests fetch the pinned model and verify its
       # SHA-256; the model is never committed.
       - name: Clippy speech sidecar
+        if: needs.changes.outputs.docs_only != 'true'
         run: cargo clippy --locked -p aivtuber-adapters --features silero-vad --all-targets -- -D warnings
 
       - name: Test speech sidecar
+        if: needs.changes.outputs.docs_only != 'true'
         run: cargo test --locked -p aivtuber-adapters --features silero-vad --test speech_vad_sidecar
 
       # Issue #83 S3d: the gapless phrase queue on rodio's offline mixer. The
@@ -119,28 +195,35 @@ jobs:
       # needs no ALSA headers and no audio device. The device itself
       # (native-audio-spike) is linted by the `Native audio backend` job below.
       - name: Clippy gapless queue
+        if: needs.changes.outputs.docs_only != 'true'
         run: cargo clippy --locked -p aivtuber-adapters --features gapless-queue --all-targets -- -D warnings
 
       - name: Test gapless queue (sample-exact falsifier)
+        if: needs.changes.outputs.docs_only != 'true'
         run: cargo test --locked -p aivtuber-adapters --features gapless-queue --test gapless_queue
 
       # Issue #354: the device-change rule and the reconnect counters are
       # device-free on purpose, so they run here with no sound card.
       - name: Test native device rules (device-free)
+        if: needs.changes.outputs.docs_only != 'true'
         run: cargo test --locked -p aivtuber-adapters --features gapless-queue --test device_watch
 
       - name: Build
+        if: needs.changes.outputs.docs_only != 'true'
         run: cargo build --locked --workspace
 
       - name: Replay benchmark smoke
+        if: needs.changes.outputs.docs_only != 'true'
         run: cargo run --locked -p aivtuber-app --bin replay-benchmark -- examples/benchmarks/replay-comparison.json target/ci-benchmark
 
       - name: Failure/soak hardening smoke
+        if: needs.changes.outputs.docs_only != 'true'
         run: cargo run --locked -p aivtuber-hardening --bin failure-soak -- target/ci-hardening-soak.json 5000
 
       # Issue #58 Phase D: verifies the resource benchmark still emits a
       # schema-valid result and its hard bounded-state invariants stay clean.
       - name: Resource benchmark smoke
+        if: needs.changes.outputs.docs_only != 'true'
         run: cargo run --locked -p aivtuber-hardening --bin resource-bench -- target/ci-resource-bench 5000
 
       # Issue #147: the same seeded property subset the `regressions` job runs,
@@ -153,6 +236,7 @@ jobs:
       # Both steps carry the same pinned environment; scripts/validate.mjs
       # asserts the values appear in this job so the two copies cannot drift.
       - name: Bounded property regression subset (gating)
+        if: needs.changes.outputs.docs_only != 'true'
         run: cargo test --locked -p aivtuber-scheduler --test properties
         env:
           PROPTEST_CASES: "64"
@@ -162,7 +246,7 @@ jobs:
       # `if: always()` for the same reason as the standalone job: the artifact
       # matters most when the run above has just failed and persisted a new case.
       - name: Persist any newly discovered regression case (gating)
-        if: always()
+        if: always() && needs.changes.outputs.docs_only != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: proptest-regressions-rust-checks
@@ -180,6 +264,8 @@ jobs:
   # required `Rust checks` job.
   native-audio:
     name: Native audio backend (native-audio-spike, Windows)
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: windows-latest
     timeout-minutes: 25
     steps:
@@ -224,6 +310,8 @@ jobs:
   # the feature and never download anything.
   speech-stt:
     name: Speech STT worker (sherpa-stt feature, no model)
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -329,6 +417,8 @@ jobs:
   # cargo step below. The default workspace gates never enable the feature.
   speech-tts:
     name: Local TTS sidecar (sherpa-tts feature, no model)
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -413,6 +503,8 @@ jobs:
 
   regressions:
     name: Bounded property regressions
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     # Issue #147. `cargo test --workspace` runs the proptest suite with
     # proptest's defaults, so every PR explores a *different* random space and
     # the same code path is never replayed twice. This job pins the RNG seed and
@@ -472,20 +564,29 @@ jobs:
 
   schema:
     name: Schema and security fixtures
+    needs: changes
     runs-on: ubuntu-latest
     steps:
+      - name: Skip schema checks on docs-only PR
+        if: needs.changes.outputs.docs_only == 'true'
+        run: echo "Docs-only PR: skipping schema and security fixture checks."
+
       - uses: actions/checkout@v4
+        if: needs.changes.outputs.docs_only != 'true'
 
       - name: Install validator
+        if: needs.changes.outputs.docs_only != 'true'
         run: python -m pip install --disable-pip-version-check check-jsonschema==0.38.0
 
       - name: Validate Performance Assets
+        if: needs.changes.outputs.docs_only != 'true'
         run: |
           check-jsonschema --schemafile schemas/performance-asset.schema.json \
             examples/performance-assets/valid/*.json \
             examples/starter-reaction-pack/descriptors/*.json
 
       - name: Reject invalid Performance Assets
+        if: needs.changes.outputs.docs_only != 'true'
         shell: bash
         run: |
           if check-jsonschema --schemafile schemas/performance-asset.schema.json examples/performance-assets/invalid/*.json; then
@@ -494,11 +595,13 @@ jobs:
           fi
 
       - name: Validate Event Envelopes
+        if: needs.changes.outputs.docs_only != 'true'
         run: |
           check-jsonschema --schemafile schemas/event-envelope.schema.json \
             examples/events/*.json
 
       - name: Reject forged Event Envelopes
+        if: needs.changes.outputs.docs_only != 'true'
         shell: bash
         run: |
           if check-jsonschema --schemafile schemas/event-envelope.schema.json examples/events/invalid/*.json; then
@@ -507,9 +610,11 @@ jobs:
           fi
 
       - name: Validate Reflex Decisions
+        if: needs.changes.outputs.docs_only != 'true'
         run: check-jsonschema --schemafile schemas/reflex-decision.schema.json examples/reflex-decisions/*.json
 
       - name: Reject invalid Reflex Decisions
+        if: needs.changes.outputs.docs_only != 'true'
         shell: bash
         run: |
           if check-jsonschema --schemafile schemas/reflex-decision.schema.json examples/reflex-decisions/invalid/*.json; then
@@ -518,12 +623,15 @@ jobs:
           fi
 
       - name: Validate security regression fixtures
+        if: needs.changes.outputs.docs_only != 'true'
         run: check-jsonschema --schemafile schemas/security-regression-case.schema.json examples/security/*.json
 
       - name: Validate benchmark results
+        if: needs.changes.outputs.docs_only != 'true'
         run: check-jsonschema --schemafile schemas/benchmark-result.schema.json examples/benchmarks/result/valid/*.json
 
       - name: Reject invalid benchmark results
+        if: needs.changes.outputs.docs_only != 'true'
         shell: bash
         run: |
           if check-jsonschema --schemafile schemas/benchmark-result.schema.json examples/benchmarks/result/invalid/*.json; then
@@ -543,6 +651,8 @@ jobs:
   # renderer changes.
   renderer:
     name: Local avatar renderer
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
