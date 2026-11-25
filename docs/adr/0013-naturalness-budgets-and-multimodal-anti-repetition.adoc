@@ -1,0 +1,185 @@
+= ADR-0013: Naturalness budgets and multimodal behavior anti-repetition beyond phrase digests
+:status: Proposed
+:date: 2026-11-25
+
+== Context
+
+Issue #89 (`priority:P1`, `status:design-ready`, `v0.3 - Watchable Hour`) asks to extend anti-repetition from asset IDs and spoken phrase digests to observable multimodal performance behavior and bounded naturalness budgets, so the avatar avoids both repetitive habits (same gesture, nod, gaze shift, filler, or opening family) and unnatural hyperactivity (constant head motion, continuous expressions, or random variation on every event).
+
+This ADR records the proposed S2+ architecture and falsifier building on shipped #89 S1. It authorizes no production code, changes no wire schemas, adds no dependencies, and leaves all v0.3 release-gate defaults unchanged until representative-hour evidence (#489) identifies the dominant repetition/over-animation constraint.
+
+Inputs this ADR builds on, present on `main` at `09bbbba`:
+
+* #89 S1 (`crates/app/src/repeat_guard.rs`): `RepeatGuard` already tracks a text-free, keyed-SHA-256 ring of spoken phrase digests (`RING_CAPACITY = 64`, `WINDOW_MS = 900_000` ms, `STAGED_CAPACITY = 8`, bigram Jaccard `>= 4/5`) split by `PhraseOrigin` (`ChatReply`, `Initiative`, `Cached`). It refuses exact/near repeats for `Initiative` at phrase commit (falling back to the idle gesture with zero regeneration loop) while remaining measure-only for `ChatReply` and `Cached`. Live #456 part B verification reduced spoken initiative exact repeats from 30% to 0%; short #489 startup smoke (`d01fdf4`) confirmed chat measure-only behavior.
+* `crates/generative/src/affect.rs`: per-reply `AffectState` already holds and relaxes repeated expression classes within a single reply.
+* `crates/asset-store` & `crates/scheduler`: Performance Assets support bounded procedural variation (`SeededRng` / `apply_variation`, pinned in `examples/rng/mulberry32-golden.json`) and per-asset cooldowns.
+* link:0006-performance-intent.adoc[ADR-0006] (#84 `PerformanceIntent`), #72 (persona preferred ranges), #81 (backchannel levels), #87 (`InitiativeDirector`), and #59 (reaction-quality evaluation).
+
+== Hard constraints
+
+* *Presentation constraints only, never security authority* (`A-CTRL-001`): Naturalness budgets and behavior history cannot authorize control actions, weaken `PublicOutputPolicy`, block operator stop/mute, or freeze the deterministic performer.
+* *Text-free behavior history*: Never store raw viewer or performer transcripts merely for repetition detection. Retain only closed behavior-family tags and keyed digests (extending #89 S1's non-reversible privacy rule).
+* *Appropriateness outranks diversity*: Never vary emotion, gaze, or gesture in a way that contradicts #84 `PerformanceIntent` or persona constraints merely to avoid repetition. Never refuse a truthful repeated `ChatReply` when distinct viewers ask the same factual question.
+* *Zero extra LLM/regeneration loops*: Suppression or budget exhaustion degrades deterministically (select next compatible variant, downgrade to subtler motion, or omit optional embellishment) with zero extra model calls.
+* *Bounded logical-clock state & deterministic replay*: Every ring buffer, cooldown map, and sliding rate counter must be explicitly bounded and keyed by monotonic logical time (`at_ms`), with seeded deterministic tie-breaking.
+* *Global runtime bounds override persona preferences*: #72 persona profiles may tune preferred rates within runtime-enforced safety/naturalness ceilings, never exceed them.
+
+== Assumptions
+
+Existing invariants referenced:
+
+* `A-CTRL-001` (Invariant): model output and presentation hints never hold runtime authority.
+* `A-MEM-001` (Invariant): durable memory writes require non-serializable `MemoryWritePermit`.
+
+Proposed new assumptions (to be added to link:../assumptions.adoc[Assumption Register] only if accepted):
+
+* *A-NAT-001* (*Needs validation*): After #89 S1 eliminates verbatim initiative phrase repeats, the next viewer-visible monotony in a representative 1-hour stream comes from repeated gesture/expression/filler families or cross-route cached/template reuse rather than verbatim LLM repeats. *Evidence:* unverified; must be checked on #489 representative-hour logs before implementing S2.
+* *A-NAT-002* (*Needs validation*): Explicit per-family cooldowns and rate budgets (gesture rate, large-gesture cooldown, gaze-shift cooldown, expression-transition rate, filler rate) reduce both "repetitive" and "over-animated" labels in #59 blind review without causing perceived stiffness ("under-animated"). *Evidence:* unverified hypothesis.
+
+== Alternatives considered
+
+. *Status quo (#89 S1 phrase-only `RepeatGuard` + per-asset cooldown)*: handles verbatim/near-verbatim initiative phrases and identical asset IDs, but misses cross-route repetition (e.g., cached + template + generated all opening with `"なるほど！"`) and multimodal over-animation (constant nods/gaze shifts across different assets).
+. *Embedding-based semantic deduplication across all outputs*: rejected for baseline. Adds embedding model latency/VRAM/dependency overhead and non-deterministic drift before explicit family tags and bounded digests are proven insufficient.
+. *Unconstrained random variant shuffling / entropy maximization*: rejected. Maximizing diversity entropy without appropriateness produces mechanically random, jittery avatar motion and violates #84 `PerformanceIntent` coherence.
+. *Bounded `BehaviorHistory` + `NaturalnessBudget` layered with `RepeatGuard` (proposed)*: extends #89 S1's text-free, logical-clock design to closed multimodal behavior descriptors and explicit rate/cooldown budgets, preserving deterministic variant ranking and zero extra model calls.
+
+== Reuse / Adapt / Build comparison
+
+Reuse-first vocabulary per link:../reuse-first.adoc[reuse-first]. No external crate or service is proposed.
+
+[cols="2,2,3,3,2"]
+|===
+|Candidate |Scope |Pattern / capability |Conflict or gap |Mode
+
+|*`RepeatGuard` (#89 S1)* (`crates/app/src/repeat_guard.rs`)
+|Existing project component
+|Text-free keyed-SHA-256 ring (`RING_CAPACITY = 64`, `WINDOW_MS = 15 min`), bigram Jaccard near-repeat detection, origin-split counters.
+|Covers spoken phrases only; does not track gesture/gaze/expression/filler families or enforce presentation rate budgets.
+|*Reuse / Extend.* Keep `RepeatGuard` for phrase digests; compose multimodal `BehaviorHistory` and `NaturalnessBudget` alongside it.
+
+|*`AffectState` (`crates/generative/src/affect.rs`) & `Scheduler` cooldowns*
+|Existing project components
+|Per-reply expression hold/relaxation and per-asset-ID cooldowns.
+|Scoped to single reply or single asset ID rather than cross-route behavior families over minutes.
+|*Reuse.* Feed chosen expression/asset descriptors into the shared behavior history rather than replacing either component.
+
+|*`SeededRng` / `apply_variation`* (`crates/scheduler/src/lib.rs`, `examples/rng/mulberry32-golden.json`)
+|Existing project component
+|Deterministic bounded procedural variation within asset schema bounds.
+|Variation alone cannot prevent repeating the same high-level behavior family.
+|*Reuse.* Apply seeded variation only *after* deterministic variant selection passes naturalness budgets.
+
+|*`BehaviorHistory` + `NaturalnessBudget` + variant ranker*
+|New bounded policy module
+|Closed descriptor ring, sliding logical-clock rate/cooldown caps, cross-route family tagging, and 6-step deterministic selection order.
+|No external library fits aivtuber's text-free replay invariants and #84/#72 contracts.
+|*Custom.* Pure deterministic Rust module (~200–300 lines), gated behind opt-in config until calibrated.
+|===
+
+== Evidence
+
+* *Repository executable evidence*:
+  - `crates/app/src/repeat_guard.rs` and live #456 part B run (`8c20622e`) prove text-free phrase digest refusal eliminated initiative exact repeats (0/20 spoken initiatives) with zero extra model calls.
+  - Short #489 startup smoke (`d01fdf4`, 2026-11-24) recorded 11 chat-origin phrases with `exact=1, near=0` during a celebration wave where crowd routing (#79) did not trigger — confirming chat measure-only must not blindly suppress valid repeated answers.
+* *Unverified expectation (explicitly not yet measured)*:
+  - Representative 1-hour multimodal behavior frequencies (gesture rate, gaze shifts, expression transitions, filler repeats) are not yet measured (waiting on #489).
+  - Numeric budget defaults below are starting hypotheses for replay testing, not final SLOs.
+
+== Decision
+
+=== 1. Text-free bounded `BehaviorHistory`
+
+Retain a bounded ring (`MAX_BEHAVIOR_ENTRIES = 64`, logical-clock `WINDOW_MS = 900_000` ms) of closed, non-text descriptors emitted across all routes (`Cached`, `Template`, `Generated`, `Backchannel`, `Initiative`):
+
+[source,text]
+----
+BehaviorDescriptor (closed tags / keyed digests only; no raw text):
+  at_ms: u64
+  route: RouteOrigin                  // Cached | Template | Generated | Backchannel | Initiative
+  response_family: Option<FamilyTag>  // e.g. "agree", "surprise", "greeting"
+  opening_digest: Option<[u8; 32]>    // Keyed SHA-256 of normalized opening token/clause (reuses S1 key)
+  filler_family: Option<FamilyTag>    // e.g. "naruhodo", "eeto", "maa"
+  gesture_family: Option<FamilyTag>   // e.g. "nod", "wave", "tilt_head"
+  gesture_scale: GestureScale         // None | Subtle | Large
+  gaze_transition: Option<FamilyTag>  // e.g. "to_chat", "to_screen", "away"
+  expression_family: Option<FamilyTag>
+  affect_band: AffectBand             // Neutral | Mild | Strong
+  backchannel_level: BackchannelLevel // None | NonVerbal | ShortSpoken
+  initiative_kind: Option<InitiativeKind>
+----
+
+=== 2. Bounded `NaturalnessBudget`
+
+Sliding logical-clock rate caps and cooldowns (presentation-only; global runtime ceilings clamp #72 persona overrides):
+
+[source,text]
+----
+NaturalnessBudgetConfig (initial analytical hypotheses, calibrated from #489/#59):
+  max_spoken_fillers_per_min: u8        // e.g. 2
+  max_backchannels_per_min: u8          // e.g. 4
+  max_gestures_per_min: u8              // e.g. 8
+  large_gesture_cooldown_ms: u64        // e.g. 15_000
+  gaze_shift_cooldown_ms: u64           // e.g. 2_500
+  max_expression_transitions_per_min: u8 // e.g. 10
+  same_family_cooldown_ms: u64          // e.g. 20_000
+----
+
+When a budget is exhausted:
+
+* *Non-essential embellishments* (optional gesture, large gesture, gaze shift, spoken filler) are deterministically downgraded (`Large -> Subtle -> None`) or omitted, incrementing a typed `budget_suppression` counter.
+* *Essential speech/answer* is never silently dropped solely because a gesture or filler budget is exhausted.
+
+=== 3. Deterministic 6-step variant selection order
+
+When multiple behaviorally compatible variants exist (e.g., cached reaction variants, #54 template variants, or #84 gesture candidates), select strictly in this priority order:
+
+1. Semantic and #84 `PerformanceIntent` compatibility (hard filter; never violated for diversity).
+2. #72 persona constraints and global safety bounds.
+3. Current affect/context suitability.
+4. `BehaviorHistory` recency penalty (prefer least-recently-used family outside `same_family_cooldown_ms`).
+5. `NaturalnessBudget` admissibility (prefer variants within remaining rate/cooldown headroom).
+6. Deterministic `SeededRng` tie-break and bounded `apply_variation` within schema limits.
+
+=== 4. Cheapest falsifier & staging after #489
+
+1. Inspect #489 representative-hour logs first to confirm *which* repetition/over-animation failure actually occurs most (cached-variant rotation, cross-route opening/filler repetition, or avatar gesture/expression hyperactivity).
+2. Implement only the highest-impact S2 slice first (e.g., cached/template variant rotation + cross-route `BehaviorHistory` measurement counters, measure-only before active suppression).
+3. Validate with #59 blind pairwise review tracking *both* `repetitive` and `over-animated` / `under-animated` labels (treating diversity entropy as diagnostic only, never as an optimization target).
+
+== Consequences
+
+=== Positive
+
+* Unifies cross-route repetition visibility (cached, template, generated, backchannel, initiative) without storing raw transcripts.
+* Prevents both monotonous repetition and hyperactive over-animation with zero extra LLM calls and deterministic replay.
+* Respects #84 `PerformanceIntent` coherence and #72 persona ranges within global runtime bounds.
+
+=== Costs / trade-offs
+
+* Requires consistent `FamilyTag` metadata on starter/custom Performance Assets and #54 templates to maximize cross-route coverage.
+* Poorly tuned cooldowns could make an energetic persona feel stiff; requires #59 human-rated calibration rather than synthetic entropy tuning.
+
+=== Known limitations
+
+* Cross-route detection for free-form generated speech relies on normalized opening/filler digests rather than full semantic paraphrase equivalence.
+* Cross-session repetition (persisting digests across restarts) is explicitly deferred until single-session representative-hour data (#489) proves it is needed.
+
+== Staging and rollback
+
+1. *Stage 0 (this ADR)*: design and measurement contract only; zero runtime change.
+2. *Stage 1 (S2a — measure-only `BehaviorHistory` + cached-variant rotation)*: log cross-route family repeat rates and budget-would-suppress counters without dropping gestures/expressions; rotate compatible cached asset variants deterministically. Rollback via config toggle.
+3. *Stage 2 (S2b — opt-in `NaturalnessBudget` enforcement, `default = off`)*: enable gesture/gaze/expression/filler rate caps and `Large -> Subtle -> None` downgrades behind a feature flag. Rollback is toggling the flag off (preserves #89 S1 behavior).
+4. *Stage 3 (persona-bound tuning)*: bind #72 persona ranges within global ceilings after Stage 2 passes #59 review.
+
+== Revisit conditions
+
+* Representative 1-hour run (#489) shows multimodal repetition or over-animation is not a user-visible bottleneck (defer S2b).
+* #59 blind review reports increased `under-animated` / stiffness labels under budget enforcement.
+* #84 `PerformanceIntent` or #72 persona schema changes the set of controllable behavior families.
+
+== Related
+
+* Issue: #89 (parent), #489, #84, #72, #81, #87, #59, #58, #456
+* PR: (to be linked on PR creation)
+* Assumptions: `A-CTRL-001`, `A-MEM-001`; proposed `A-NAT-001`, `A-NAT-002`
+* Other ADRs: link:0001-three-layer-runtime.adoc[ADR-0001], link:0006-performance-intent.adoc[ADR-0006], link:0011-segment-planning-and-initiative-utility.adoc[ADR-0011]
