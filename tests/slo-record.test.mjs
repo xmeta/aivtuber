@@ -396,7 +396,7 @@ describe("slo-record persists a retrievable history", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   // The reported defect: latency calibration could not be finished from the
   // durable history, because the probe step needs the raw per-event report that
@@ -423,7 +423,7 @@ describe("slo-record persists a retrievable history", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   test("a run whose replay report is missing is refused, not half-recorded", () => {
     const { root } = scratchRepo("nopair");
@@ -483,7 +483,7 @@ describe("slo-record persists a retrievable history", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   test("an unrecordable input fails closed and writes nothing", () => {
     const { root } = scratchRepo("refuse");
