@@ -1,0 +1,136 @@
+= ADR-0027: Separating optional event validity time from logical record time in episodic memory
+:status: Proposed
+:date: 2026-11-25
+
+== Context
+
+Issue #284 (`priority:P2`, `status:design-ready`, `status:parked`, parent #105) asks to distinguish when an episodic event *happened or was valid* from when it was *observed or recorded* in `WorkingMemory`, so time-changing preferences and past-tense statements are handled truthfully without breaking logical-clock replay, retention TTLs, or write-authority boundaries.
+
+This ADR records a proposed optional `EventValidityTime` contract, Japanese relative-time uncertainty rules, record-time replay preservation, and falsifier only. Implementation remains `status:parked` until v0.3 closes. It authorizes no production code, changes no wire schemas, adds no dependencies, and leaves all v0.3 defaults unchanged.
+
+Inputs this ADR builds on, present on `main` at `28beebd`:
+
+* `crates/adaptation/src/lib.rs` (`MemoryEntry::created_at_ms`, `expires_at_ms`, `TemporalBefore`, `Supersedes`) and `crates/adaptation/tests/long_range_eval.rs` (which explicitly models `event_at_ms` as ground truth the current store does not retain).
+* link:0008-cross-session-memory-persistence.adoc[ADR-0008] (#282, Accepted): single-file bounded persistence and canonical retention/erasure policy.
+* link:0025-proposal-only-offline-memory-dreaming.adoc[ADR-0025] (#281): Dreaming may suggest dates as untrusted proposals only and can never assert inferred dates as `VerifiedFact`.
+
+== Hard constraints
+
+* *Logical record time remains authoritative for replay, authorization, deadlines, and retention TTL* (`A-CTRL-001`, `A-MEM-001`): `created_at_ms` and `expires_at_ms` continue to govern deterministic replay ordering, `Supersedes` causal gates, and canonical TTL expiry/deletion. Model-supplied or viewer-supplied event time can *never* grant authority, bypass `MemoryWritePermit`, retroactively boost freshness, or postpone TTL expiry.
+* *Never silently infer definite timestamps from vague Japanese relative speech*: Expressions such as `昨日` ("yesterday"), `前の配信` ("last stream"), `最近` ("recently"), ambiguous time zones, or low-trust model text must remain `Unknown` or explicitly `Qualified` (`Precision::Approximate` / `RelativeWindow`), never coerced into exact timestamps.
+* *Provenance and actor-scope bound*: Every optional event-time field carries explicit `TimeOrigin` (`TrustedEventTimestamp`, `ExplicitViewerStatement`, `ModelInferred`), `TimePrecision`, and provenance refs bound to the same actor/source privacy scope (never crossing viewers).
+* *Zero default increase in per-event generation cost & bounded payload*: Optional field omitted when absent, preserving byte-stable record-time replay for existing fixtures.
+
+== Assumptions
+
+Existing invariants referenced:
+
+* `A-CTRL-001` (Invariant): event-time claims never hold runtime authority.
+* `A-MEM-001` (Invariant): durable writes require non-serializable `MemoryWritePermit`.
+
+Proposed new assumptions (to be added to link:../assumptions.adoc[Assumption Register] only if accepted):
+
+* *A-TIME-001* (*Needs validation*): A compact optional `EventValidityTime` (`valid_from_ms`, `valid_to_ms`, `origin`, `precision`) resolves backfill, past-tense preference change, and out-of-order event queries in `long_range_eval.rs` without requiring a full bitemporal graph database. *Evidence:* unverified design hypothesis.
+
+== Alternatives considered
+
+. *Status quo (record time `created_at_ms` only)*: simple and byte-stable, but cannot distinguish "I used to main Fox last year" recorded today from a current preference.
+. *Full bitemporal graph database (e.g. Graphiti)*: rejected. Violates bounded-state and zero-heavy-dependency constraints (#100/#220, ADR-0008 `A-MEM-002`).
+. *Auto-parsing every Japanese relative phrase into an exact UTC timestamp via LLM*: rejected. Produces hallucinated dates and violates zero extra generation cost.
+. *Compact optional `EventValidityTime` alongside authoritative logical `created_at_ms` (proposed)*: preserves exact record-time replay/TTL semantics while representing explicit validity windows and uncertainty cleanly.
+
+== Reuse / Adapt / Build comparison
+
+Reuse-first vocabulary per link:../reuse-first.adoc[reuse-first]. No external bitemporal database or NLP date-parsing crate is proposed.
+
+[cols="2,2,3,3,2"]
+|===
+|Candidate |Scope |Pattern / capability |Conflict or gap |Mode
+
+|*Graphiti* & *THEANINE* (NAACL 2025) & *LoCoMo* (ACL 2024)
+|External research
+|Bitemporal distinction between event validity time and ingestion/record time.
+|Unbounded graph storage and LLM timestamp extraction conflict with bounded deterministic replay.
+|*Reference only.* Adopt minimal two-time separation with explicit uncertainty.
+
+|*`MemoryEntry` & `long_range_eval.rs`* (`crates/adaptation`)
+|Existing project components
+|Logical `created_at_ms`, `expires_at_ms`, `Supersedes`, and long-range eval harness already modeling `event_at_ms`.
+|Store does not yet retain optional `EventValidityTime` or separate temporal errors in eval reports.
+|*Reuse / Extend.* Add optional bounded `EventValidityTime` without altering `created_at_ms`/`expires_at_ms` semantics.
+
+|*`EventValidityTime` struct & temporal query filter*
+|New domain/adaptation contract
+|Optional validity interval + origin + precision, keeping vague Japanese speech explicitly qualified.
+|Project-specific intersection of replay determinism and epistemic provenance.
+|*Custom.* Tiny pure Rust value type (~80–120 lines).
+|===
+
+== Evidence
+
+* *Repository executable evidence*:
+  - `crates/adaptation/tests/long_range_eval.rs` already models `event_at_ms` as ground truth separate from `created_at_ms`.
+  - ADR-0008 (`docs/adr/0008-cross-session-memory-persistence.adoc`) defines the canonical retention/erasure boundary.
+* *Unverified expectation (explicitly not yet measured)*:
+  - Temporal-accuracy uplift on backfill/preference-change queries is unmeasured until evaluated on extended `long_range_eval.rs` cases.
+
+== Decision
+
+=== 1. Explicit temporal definitions
+
+* *`recorded_at_ms`* (existing `MemoryEntry::created_at_ms`): logical clock timestamp when the entry was admitted into `WorkingMemory`. Authoritative for replay ordering, `TemporalBefore`, and TTL expiry (`expires_at_ms`).
+* *`observed_at_ms`* (from `EventEnvelope`): when the source event was observed by ingress.
+* *`event_validity: Option<EventValidityTime>`* (optional, omitted when unknown):
+
+[source,text]
+----
+EventValidityTime (bounded, optional):
+  valid_from_ms: Option<i64>         // Explicit epoch ms only when known; None if vague/unknown
+  valid_to_ms: Option<i64>           // Optional end of validity (past-tense / superseded preference)
+  origin: TimeOrigin                 // TrustedEventTimestamp | ExplicitViewerStatement | ModelInferred
+  precision: TimePrecision           // Exact | Day | RelativeWindow | Unknown
+  qualifier: Option<BoundedString>   // Optional <= 32 UTF-8 bytes (e.g. "previous_stream")
+----
+
+Rules:
+
+* `ModelInferred` can never be promoted to `VerifiedFact` and never overrides `TrustedEventTimestamp`.
+* Vague Japanese relative phrases (`昨日`, `前の配信`, `最近`) without a trusted anchor resolve to `precision = RelativeWindow | Unknown` with `valid_from_ms = None`.
+* `expires_at_ms` and deletion remain governed exclusively by `recorded_at_ms` + canonical retention policy.
+
+=== 2. Cheapest falsifier
+
+1. Extend `crates/adaptation/tests/long_range_eval.rs` with 7 synthetic temporal cases: backfill, preference change, same-tick events, correction, out-of-order events, valid-time vs record-time queries, and ambiguous Japanese relative dates (`昨日`/`前の配信`/`最近`).
+2. Report temporal errors separately from stale/supersession and rank errors, and verify byte-stable replay when `event_validity` is `None`.
+
+== Consequences
+
+=== Positive
+
+* Eliminates false present-tense recall of past/backfilled claims without introducing a bitemporal graph DB or wall-clock replay drift.
+* Keeps vague Japanese temporal phrasing honest (`Unknown`/`RelativeWindow`) instead of hallucinating exact dates.
+
+=== Costs / trade-offs
+
+* Adds an optional versioned field to `MemoryEntry` when implemented (requires schema/parity update per `AGENTS.md`).
+
+=== Known limitations
+
+* Parked until v0.3 closes; does not perform automatic calendar/timezone resolution of ambiguous viewer speech.
+
+== Staging and rollback
+
+1. *Stage 0 (this ADR)*: temporal definitions and eval plan only; zero runtime or schema change.
+2. *Stage 1 (optional `EventValidityTime` + `long_range_eval.rs` cases)*: backward-compatible optional field (`None` default preserves exact existing replay); rollback is ignoring/omitting the optional field.
+
+== Revisit conditions
+
+* `long_range_eval.rs` shows `Supersedes` + record time already handles target preference-change scenarios without explicit `EventValidityTime`.
+* ADR-0008 persistence format or #283 retrieval ranking requires indexed validity-interval queries.
+
+== Related
+
+* Issue: #284 (parent), #105, #280, #281, #282, #283, #80, #59
+* PR: (to be linked on PR creation)
+* Assumptions: `A-CTRL-001`, `A-MEM-001`; proposed `A-TIME-001`
+* Other ADRs: link:0008-cross-session-memory-persistence.adoc[ADR-0008], link:0025-proposal-only-offline-memory-dreaming.adoc[ADR-0025], link:0026-bounded-hybrid-memory-retrieval.adoc[ADR-0026]

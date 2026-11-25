@@ -141,7 +141,7 @@ THEANINE (NAACL 2025);
 Reflective Memory Management (ACL 2025)
 |Temporal/causal links among retained memories; explicit update/supersession; bounded retrieval neighborhood
 |#51, #80, #105
-|Retention plateau; stale-fact reduction; deterministic deletion/edge cleanup; privacy. Proposed proposal-only offline consolidation (`MemoryConsolidationProposal` + deterministic `ProposalValidator`, zero auto-apply) for #281: link:adr/0025-proposal-only-offline-memory-dreaming.adoc[ADR-0025] (Proposed; design only, parked)
+|Retention plateau; stale-fact reduction; deterministic deletion/edge cleanup; privacy. Proposed proposal-only offline consolidation (`MemoryConsolidationProposal` + deterministic `ProposalValidator`, zero auto-apply) for #281: link:adr/0025-proposal-only-offline-memory-dreaming.adoc[ADR-0025] (Proposed; design only, parked). Proposed optional `EventValidityTime` separation from logical record time for #284: link:adr/0027-event-validity-vs-record-time.adoc[ADR-0027] (Proposed; design only, parked)
 
 |Hybrid / epistemic memory
 |Hindsight (built-in MCP retain/recall/reflect);
