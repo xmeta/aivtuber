@@ -1,6 +1,104 @@
 {
   "schema_version": "1",
   "catalog_version": "slo-catalog-v1",
-  "description": "Operational SLO targets (issue #71). Intentionally empty: no numeric target is checked in until one is calibrated from measured baseline evidence produced by `cargo run --locked -p aivtuber-app --bin slo-report`, on a representative workload series whose pooled denominators reach the indicator's sample floor — evidence that cannot decide an objective cannot justify a target for it. A target entry must name the artifact and the #58 compatibility series it was calibrated from, and evaluation applies a target only to that series. A zero-tolerance invariant must never appear here. This file is deliberately NOT benchmarks/budgets.json: those are per-pull-request regression budgets, these are absolute operational objectives.",
-  "targets": {}
+  "description": "Operational SLO targets (issue #71 / #489 Track C). Calibrated from 2 distinct scenario-replay runs of scenario-high-generative-miss-v1 (pooled eligible=40 >= sample_floor 15 per indicator). Unmeasured indicators (reliability.fallback_delivery_rate, quality.semantic_reuse_correctness) and live acoustic/visual metrics remain uncalibrated until representative evidence exists. Each target entry cites the exact #58 compatibility series it was calibrated from, and evaluation applies it only to that series. Zero-tolerance invariants never appear here. This file is deliberately NOT benchmarks/budgets.json: those are per-pull-request regression budgets, these are absolute operational objectives.",
+  "targets": {
+    "availability.event_to_first_audio_within_target": {
+      "target": 0.95,
+      "threshold_ms": 200,
+      "baseline": {
+        "value": 1.0,
+        "source": "slo-baseline: 2 distinct session run(s) [v03-high-generative-miss-1,v03-high-generative-miss-2]; series=full_generative|scenario-high-generative-miss-v1|replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0|9001; datasets=scenario-high-generative-miss-v1; revisions=123bbbcc267aeb043c15e5c0aec994833e8c9380; config=replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0; mode=full_generative; seed=9001; probe_threshold_ms=200",
+        "series": "full_generative|scenario-high-generative-miss-v1|replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0|9001",
+        "runs": [
+          {
+            "run_id": "v03-high-generative-miss-1",
+            "git_commit": "123bbbcc267aeb043c15e5c0aec994833e8c9380"
+          },
+          {
+            "run_id": "v03-high-generative-miss-2",
+            "git_commit": "123bbbcc267aeb043c15e5c0aec994833e8c9380"
+          }
+        ],
+        "eligible": 40
+      }
+    },
+    "availability.event_to_first_visible_within_target": {
+      "target": 0.95,
+      "threshold_ms": 100,
+      "baseline": {
+        "value": 1.0,
+        "source": "slo-baseline: 2 distinct session run(s) [v03-high-generative-miss-1,v03-high-generative-miss-2]; series=full_generative|scenario-high-generative-miss-v1|replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0|9001; datasets=scenario-high-generative-miss-v1; revisions=123bbbcc267aeb043c15e5c0aec994833e8c9380; config=replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0; mode=full_generative; seed=9001; probe_threshold_ms=100",
+        "series": "full_generative|scenario-high-generative-miss-v1|replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0|9001",
+        "runs": [
+          {
+            "run_id": "v03-high-generative-miss-1",
+            "git_commit": "123bbbcc267aeb043c15e5c0aec994833e8c9380"
+          },
+          {
+            "run_id": "v03-high-generative-miss-2",
+            "git_commit": "123bbbcc267aeb043c15e5c0aec994833e8c9380"
+          }
+        ],
+        "eligible": 40
+      }
+    },
+    "availability.speech_presence_rate": {
+      "target": 0.95,
+      "baseline": {
+        "value": 1.0,
+        "source": "slo-baseline: 2 distinct session run(s) [v03-high-generative-miss-1,v03-high-generative-miss-2]; series=full_generative|scenario-high-generative-miss-v1|replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0|9001; datasets=scenario-high-generative-miss-v1; revisions=123bbbcc267aeb043c15e5c0aec994833e8c9380; config=replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0; mode=full_generative; seed=9001",
+        "series": "full_generative|scenario-high-generative-miss-v1|replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0|9001",
+        "runs": [
+          {
+            "run_id": "v03-high-generative-miss-1",
+            "git_commit": "123bbbcc267aeb043c15e5c0aec994833e8c9380"
+          },
+          {
+            "run_id": "v03-high-generative-miss-2",
+            "git_commit": "123bbbcc267aeb043c15e5c0aec994833e8c9380"
+          }
+        ],
+        "eligible": 40
+      }
+    },
+    "reliability.deadline_adherence_rate": {
+      "target": 0.99,
+      "baseline": {
+        "value": 1.0,
+        "source": "slo-baseline: 2 distinct session run(s) [v03-high-generative-miss-1,v03-high-generative-miss-2]; series=full_generative|scenario-high-generative-miss-v1|replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0|9001; datasets=scenario-high-generative-miss-v1; revisions=123bbbcc267aeb043c15e5c0aec994833e8c9380; config=replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0; mode=full_generative; seed=9001",
+        "series": "full_generative|scenario-high-generative-miss-v1|replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0|9001",
+        "runs": [
+          {
+            "run_id": "v03-high-generative-miss-1",
+            "git_commit": "123bbbcc267aeb043c15e5c0aec994833e8c9380"
+          },
+          {
+            "run_id": "v03-high-generative-miss-2",
+            "git_commit": "123bbbcc267aeb043c15e5c0aec994833e8c9380"
+          }
+        ],
+        "eligible": 40
+      }
+    },
+    "reliability.generative_budget_admission_rate": {
+      "target": 0.99,
+      "baseline": {
+        "value": 1.0,
+        "source": "slo-baseline: 2 distinct session run(s) [v03-high-generative-miss-1,v03-high-generative-miss-2]; series=full_generative|scenario-high-generative-miss-v1|replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0|9001; datasets=scenario-high-generative-miss-v1; revisions=123bbbcc267aeb043c15e5c0aec994833e8c9380; config=replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0; mode=full_generative; seed=9001",
+        "series": "full_generative|scenario-high-generative-miss-v1|replay-benchmark-v1;top_k=2;reuse_threshold=0.85;min_route_confidence=0.5;min_reaction_spacing_ms=0;llm_cost_microunits=0;tts_cost_microunits=0|9001",
+        "runs": [
+          {
+            "run_id": "v03-high-generative-miss-1",
+            "git_commit": "123bbbcc267aeb043c15e5c0aec994833e8c9380"
+          },
+          {
+            "run_id": "v03-high-generative-miss-2",
+            "git_commit": "123bbbcc267aeb043c15e5c0aec994833e8c9380"
+          }
+        ],
+        "eligible": 40
+      }
+    }
+  }
 }
