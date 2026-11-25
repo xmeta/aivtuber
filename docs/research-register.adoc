@@ -186,7 +186,7 @@ ACP-capable agent runtimes such as Goose
 maintained first-party desktop plugins
 |Reuse desktop packaging/process/updater/autostart/single-instance primitives; keep business logic and authority in the Rust runtime
 |#205
-|Windows/WSL packaging path; sidecar process supervision; secret handling; signed update/release path; UI cannot mint capability
+|Windows/WSL packaging path; sidecar process supervision; secret handling; signed update/release path; UI cannot mint capability. Proposed thin Tauri v2 shell hosting the #335 loopback panel and `aivtuber-setup` local-first onboarding for #205: link:adr/0020-tauri-desktop-mvp.adoc[ADR-0020] (Proposed; design only, blocked on #201/#191 and parked)
 
 |Continuous RoleBlend modulation
 |AIRI embodied companion UI patterns (reference only);
