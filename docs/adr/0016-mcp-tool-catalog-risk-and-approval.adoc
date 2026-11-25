@@ -1,0 +1,202 @@
+= ADR-0016: Bounded local MCP tool catalog, risk policy, schema provenance, and action-bound approval gates
+:status: Proposed
+:date: 2026-11-25
+
+== Context
+
+Issue #202 (`priority:P1`, `status:blocked`, `status:design-ready`, `status:parked`, Stage 3, tracked by #200) asks to scale external MCP tool use safely without exposing every discovered tool directly to the model or trusting server-provided metadata as authorization.
+
+This ADR records a proposed local catalog, trust/risk policy, execution schema-provenance binding (PR #213 follow-up), and action-bound approval design only. Implementation remains `status:blocked` on #201 (`AgentTask` lifecycle/approval state) and `status:parked` until v0.3 closes. It authorizes no production code, changes no wire schemas, adds no dependencies, and leaves all v0.3 defaults unchanged.
+
+Inputs this ADR builds on, present on `main` at `438869e`:
+
+* link:0002-mcp-tool-authority-boundary.adoc[ADR-0002] (#193, Accepted): adopts official `rmcp` behind thin `RmcpToolAdapter` and fixes `ToolAction -> AuthorizedToolAction -> ToolAdapter -> ToolExecutionResult -> deterministic verification` with non-serializable `ToolGrant`, 16 KiB descriptor bounds, and 32 KiB observation bounds.
+* PR #213 follow-up recorded on #202: MCP discovery currently computes a schema fingerprint, but `RmcpToolAdapter::execute()` builds `ToolExecutionResult` with `schema_fingerprint = None`, leaving execution audits unable to prove which discovered schema governed the call.
+* link:0015-dynamic-action-window.adoc[ADR-0015] (#221): `ActionWindow` consumes the reviewed #202 catalog as an additional temporal/context intersection filter and cannot lower local risk or bypass approval.
+* `docs/dual-role-agent-architecture.adoc`: preserves the Interaction Plane vs Task Plane boundary and forbids framework-owned authority or completion semantics.
+
+== Hard constraints
+
+* *Server annotations are untrusted hints, never authority* (`A-CTRL-001`, ADR-0002): MCP server metadata (e.g., `readOnlyHint`, `destructiveHint`, `openWorldHint`) can never mint local trust, lower local `RiskClass`, or waive approval.
+* *Fail-closed on unknown tools and schema drift*: Any tool absent from the reviewed local catalog or whose live `schema_fingerprint` diverges from the pinned catalog entry must fail closed before execution, invalidating stale approvals and stale `ActionWindow`s (ADR-0015).
+* *Risk policy is independent of RoleBlend (#191) and Persona (#72)*: Entertainer/persona style changes can never relax `RiskClass` or approval requirements.
+* *Credentials and secrets never enter prompt-visible catalog metadata*: Credential scopes are symbolic identifiers only (`CredentialScopeId`); secret values stay outside `ThinkingRequest` and catalog descriptions.
+* *Action-bound, non-replayable approvals*: Approvals bind to concrete `(server_id, tool_id, schema_fingerprint, operation, canonical_args_digest, credential_scope, task_id, step_id, expires_at_ms)` and cannot be silently reused for materially different arguments or expired steps.
+* *No second plugin protocol*: The catalog is a bounded local policy/index above MCP (`rmcp`) and native adapters, not a custom plugin protocol.
+* *Bounded durable/in-memory state & deterministic replay*: Unbounded server descriptions are truncated/rejected at ingress (16 KiB cap); replay records the exact catalog entry identity, `schema_fingerprint`, policy decision, and approval digest.
+
+== Assumptions
+
+Existing invariants referenced:
+
+* `A-CTRL-001` (Invariant): model output and serialized claims never hold runtime authority.
+* `A-MEM-001` (Invariant): durable memory writes require non-serializable `MemoryWritePermit`.
+
+Proposed new assumptions (to be added to link:../assumptions.adoc[Assumption Register] only if accepted):
+
+* *A-CAT-001* (*Needs validation*): A bounded deterministic exposure pipeline (`discovered ∩ operator allowlist ∩ profile filter ∩ task-relevant subset`) keeps model-visible tools small enough (<= 16–24 tools) without requiring learned/embedding tool retrieval in initial releases. *Evidence:* unverified; revisit if #203 benchmarks show missed tool selection at larger connector counts (#204).
+* *A-CAT-002* (*Needs validation*): Canonical JSON argument hashing (`canonical_args_digest`) provides a practical approval-binding boundary for high-risk actions without causing excessive re-approval prompts on benign whitespace/key-order differences. *Evidence:* unverified.
+
+== Alternatives considered
+
+. *Status quo (expose all discovered MCP tools directly and trust server hints)*: rejected. Allows malicious/misconfigured servers to self-classify as low-risk read-only tools and floods the model context.
+. *Semantic/embedding tool retriever as the primary exposure layer*: rejected for initial slice. Adds model dependency and non-deterministic selection before a bounded deterministic catalog + allowlist + profile filter is measured insufficient.
+. *Free-floating adapter-side schema cache*: rejected (explicitly flagged in PR #213 follow-up). A detached adapter cache can silently associate a stale schema fingerprint with a later execution after server update/drift.
+. *Bounded local `ToolCatalog` + fail-closed `RiskPolicy` + execution-bound `schema_fingerprint` + concrete `ActionApproval` (proposed)*: keeps authority, risk, provenance, and approval strictly project-owned above `RmcpToolAdapter`.
+
+== Reuse / Adapt / Build comparison
+
+Reuse-first vocabulary per link:../reuse-first.adoc[reuse-first]. No new external crate is proposed (`rmcp` is already adopted by ADR-0002).
+
+[cols="2,2,3,3,2"]
+|===
+|Candidate |Scope |Pattern / capability |Conflict or gap |Mode
+
+|*Official MCP schemas / `rmcp`* (adopted in ADR-0002)
+|Existing dependency
+|Tool discovery metadata, JSON Schema definitions, and advisory annotations (`readOnlyHint`, `destructiveHint`, `openWorldHint`).
+|Annotations are server-authored and untrusted; `RmcpToolAdapter::execute()` currently emits `schema_fingerprint = None`.
+|*Reuse / Adapt.* Ingest discovery metadata through bounded normalization; carry catalog-selected `schema_fingerprint` into execution and audit results.
+
+|*ADR-0002 `AuthorizedToolAction` & `ToolGrant`* (`crates/domain`, `crates/runtime`)
+|Existing project components
+|Non-serializable capability minting, generation/cancellation fencing, and verified completion.
+|Does not yet consult a local `ToolCatalog`, `RiskClass`, or action-bound `ActionApproval`.
+|*Reuse.* Layer `ToolCatalog` + `RiskPolicy` + `ActionApproval` directly in front of `ToolGrant` minting.
+
+|*`ToolCatalog`, `RiskPolicy`, `ActionApproval`*
+|New domain/runtime module
+|Bounded server/tool registry, fail-closed risk classification, drift invalidation, and canonical-argument approval binding.
+|Project-specific security and replay contract; no external library fits.
+|*Custom.* Pure deterministic Rust policy module (~250–350 lines).
+|===
+
+== Evidence
+
+* *Repository executable evidence*:
+  - ADR-0002 (`docs/adr/0002-mcp-tool-authority-boundary.adoc`) and `crates/adapters/tests/mcp_tool.rs` prove bounded 16 KiB descriptor / 32 KiB observation enforcement and forged-capability rejection.
+  - PR #213 review comment on #202 documents the exact `schema_fingerprint = None` provenance gap in `RmcpToolAdapter::execute()`.
+* *Unverified expectation (explicitly not yet measured)*:
+  - Prompt token savings and approval UX friction under curated connector profiles (#204) are not yet measured (requires #201 and #203).
+
+== Decision
+
+=== 1. Bounded `ToolCatalog` model
+
+[source,text]
+----
+McpServerEntry (bounded, max 32 servers):
+  server_id: BoundedId               // Pinned identity (never raw URL/secret)
+  server_version: BoundedString
+  trust_class: ServerTrustClass      // FirstPartyLocal | ReviewedCurated | UntrustedExternal
+  health: ServerHealth               // Healthy | Degraded | Unavailable
+  enabled_profiles: BTreeSet<ProfileId>
+
+CatalogToolEntry (bounded, max 128 tools total):
+  server_id: BoundedId
+  tool_id: BoundedId                 // Stable (server_id, tool_id) pair
+  schema_fingerprint: [u8; 32]       // SHA-256 of canonical parameter JSON Schema
+  schema_version: BoundedString
+  local_risk_class: RiskClass        // Low | Medium | High (local policy authoritative)
+  effect_class: EffectClass          // ReadOnly | BoundedLocalMutation | ExternalOrDestructive
+  open_world_network: bool           // Local classification (server hint may only raise, never lower)
+  credential_scope: Option<CredentialScopeId> // Symbolic only; no secret bytes
+  approval_policy: ApprovalPolicy    // None | ExplicitOnce | ExplicitPerAction
+  enabled_profiles: BTreeSet<ProfileId>
+  bounded_summary: BoundedString     // <= 256 UTF-8 bytes; untrusted server prose stripped/clamped
+----
+
+=== 2. Fail-closed `RiskClass` and asymmetric hint rule
+
+* *`Low`*: read / search / list / inspect with no external mutation.
+* *`Medium`*: bounded local mutation or reversible configuration within workspace/profile scope.
+* *`High`*: send / publish / delete / purchase / permission change / irreversible external side effect.
+* *Unknown tool*: unconditionally rejected (`CatalogDecision::UnknownTool`).
+* *Asymmetric server-hint rule*: a server declaring `destructiveHint = true` or `openWorldHint = true` may *escalate* local risk toward `High`, but a server declaring `readOnlyHint = true` can *never* lower a locally assigned `Medium`/`High` risk class.
+
+=== 3. Execution schema provenance (PR #213 follow-up)
+
+* Every `ToolAction` dispatched from the catalog carries the exact `expected_schema_fingerprint: [u8; 32]` selected for that invocation — never resolved from a detached adapter cache.
+* Before execution (and on discovery refresh), if the server's current `schema_fingerprint` differs from `expected_schema_fingerprint`:
+  1. Fail closed (`CatalogError::SchemaDrift`).
+  2. Invalidate all pending `ActionApproval` tokens referencing the old fingerprint.
+  3. Signal `ActionWindow` (ADR-0015) to supersede/close affected windows.
+* `ToolExecutionResult` and the execution audit log record the verified `schema_fingerprint` actually used.
+
+=== 4. Action-bound `ActionApproval`
+
+For `RiskClass::High` (by default) and any tool configured with `ApprovalPolicy::ExplicitPerAction`:
+
+[source,text]
+----
+ActionApproval (non-serializable runtime proof minted by authenticated local approval UI/CLI):
+  approval_id: u64
+  server_id: BoundedId
+  tool_id: BoundedId
+  schema_fingerprint: [u8; 32]
+  operation: BoundedString
+  canonical_args_digest: [u8; 32]    // SHA-256 of canonicalized bounded arguments
+  credential_scope: Option<CredentialScopeId>
+  task_id: BoundedId
+  step_id: u64
+  expires_at_ms: u64                 // Logical clock expiry
+  single_use: bool                   // Consumed atomically on dispatch (prevents approval replay)
+----
+
+=== 5. Exposure pipeline & cheapest falsifier
+
+[source,text]
+----
+discovered MCP tools
+  ∩ operator/user allowlist
+  ∩ active profile filter
+  ∩ task-relevant bounded subset (and ADR-0015 ActionWindow when active)
+  -> model-visible tool list
+----
+
+Cheapest falsifier (once #201 unblocks and #202 unparks):
+
+1. Offline deterministic test suite covering all 5 adversarial cases required by #202:
+   - malicious server annotation claiming `readOnlyHint = true` on a locally `High`-risk tool (must remain `High` and require approval);
+   - unknown/unreviewed tool (must fail closed);
+   - schema drift between discovery/approval and execution (must reject with `SchemaDrift` and invalidate approval + window);
+   - approval replay attempt with modified arguments or expired timestamp (must reject);
+   - prompt-visible catalog serialization check confirming zero secret/credential bytes leak.
+
+== Consequences
+
+=== Positive
+
+* Closes the PR #213 `schema_fingerprint = None` execution-audit gap structurally without a stale adapter cache.
+* Prevents server-metadata spoofing, approval replay, and full-catalog prompt bloat while preserving ADR-0002 and #221 boundaries.
+* Keeps risk policy completely decoupled from RoleBlend (#191) and Persona (#72).
+
+=== Costs / trade-offs
+
+* Requires maintaining a reviewed local catalog / connector profile definitions (#204) for each enabled MCP server.
+* High-risk tools require explicit per-action approval UX (#201/#205) with canonical argument digests.
+
+=== Known limitations
+
+* Blocked on #201 (`AgentTask` lifecycle/approval state) and parked until v0.3 closes.
+* Does not cover semantic tool retrieval for hundreds of simultaneous tools (deferred until measured necessary).
+
+== Staging and rollback
+
+1. *Stage 0 (this ADR)*: design and adversarial test specification only; zero runtime change.
+2. *Stage 1 (catalog + schema provenance)*: add `ToolCatalog`, `RiskClass`, fail-closed unknown/drift checks, and carry `schema_fingerprint` into `ToolExecutionResult` and audit logs.
+3. *Stage 2 (action-bound approval gates)*: wire `ActionApproval` with #201 `AgentTask` lifecycle; enforce `High -> ExplicitPerAction` by default.
+4. *Stage 3 (connector profiles & `ActionWindow`)*: feed #204 curated profiles and ADR-0015 `ActionWindow` intersection.
+
+== Revisit conditions
+
+* #201 `AgentTask` lifecycle changes step/approval identity semantics.
+* #203 benchmarks show deterministic bounded subset filtering misses relevant tools at target #204 connector counts.
+* Upstream MCP specification changes tool-schema versioning or annotation semantics.
+
+== Related
+
+* Issue: #202 (parent), #200, #193, #201, #203, #204, #205, #221, #191, #72
+* PR: (to be linked on PR creation); follows up PR #213 review note
+* Assumptions: `A-CTRL-001`, `A-MEM-001`; proposed `A-CAT-001`, `A-CAT-002`
+* Other ADRs: link:0001-three-layer-runtime.adoc[ADR-0001], link:0002-mcp-tool-authority-boundary.adoc[ADR-0002], link:0015-dynamic-action-window.adoc[ADR-0015]

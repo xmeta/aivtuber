@@ -156,7 +156,7 @@ Letta
 Rig / +rig-rmcp+
 |Reuse protocol lifecycle, tool discovery/schema plumbing, provider-neutral tool-loop mechanics, and dynamic tool registration; keep action authority, approval/risk, bounded execution, result verification, and replay in aivtuber
 |#193, #201, #202
-|Dependency/runtime footprint; tool timeout/cancellation; dynamic tool-list behavior; forged-authority rejection; whether tool results can be verified without framework-owned task semantics
+|Dependency/runtime footprint; tool timeout/cancellation; dynamic tool-list behavior; forged-authority rejection; whether tool results can be verified without framework-owned task semantics. Transport/authority boundary (#193): link:adr/0002-mcp-tool-authority-boundary.adoc[ADR-0002] (Accepted). Proposed local `ToolCatalog`, fail-closed `RiskClass`, execution `schema_fingerprint` provenance (PR #213 follow-up), and action-bound `ActionApproval` for #202: link:adr/0016-mcp-tool-catalog-risk-and-approval.adoc[ADR-0016] (Proposed; design only, blocked on #201 and parked)
 
 |MCP service ecosystem
 |GitHub official MCP server;
