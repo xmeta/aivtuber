@@ -6632,6 +6632,7 @@ mod tests {
     mod phrase_commit_tests;
     mod recent_turns_tests;
     mod scene_context_tests;
+    mod security_fixture_evidence_tests;
     mod session_log_tests;
     mod shutdown_tests;
     mod silent_chat_drop_tests;

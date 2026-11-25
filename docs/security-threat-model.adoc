@@ -426,35 +426,38 @@ The baseline regression fixtures are:
 
 The nine files under `examples/security/` conform to `schemas/security-regression-case.schema.json`; the invalid envelope fixtures are separate negative Event Envelope schema cases.
 
-=== 14.1 Evidence boundaries (#498, #497)
+=== 14.1 Evidence boundaries (#498, #497, #504)
 
 The Bun reference evaluator (`src/regression.ts`, `tests/security-regression.test.ts`) remains a regression harness, not the production authorization implementation. Schema parity validates serialization and fixture acceptance; it does not prove behavioral equivalence. In Rust, a serialized authorization claim is never the authenticated capability object required to mint a memory write permit or execute control.
 
-The integration tests in `crates/runtime/tests/security_fixtures.rs` enumerate all nine security cases (schema version 0.1.0). An added, removed or renamed case requires an explicit inventory decision. They use the real Rust event validation, content admission, memory permit and authenticated scheduler control boundaries, not a second security implementation.
+Direct Rust fixture evidence spans two layers:
+
+* Runtime boundary (`crates/runtime/tests/security_fixtures.rs`): enumerates all nine security cases (schema version 0.1.0). An added, removed or renamed case requires an explicit inventory decision. Exercises real Rust event validation, content admission (including synthetic flood expansion and payload-byte bounds), `publish_text` public-output gating, non-serializable memory permits, and authenticated scheduler control boundaries.
+* Composition boundary (`crates/app/src/tests/security_fixture_evidence_tests.rs`): exercises `ProductionApp` with provider doubles (`CountingUnavailableThinking`, `CountingUnavailableTts`, `MockThinking`, `MockTts`, `RecordingStreamOutput`, `AdaptationRuntime`) so provider-output containment, `requires_model == false` under unavailable providers, and durable memory non-writes are tested end-to-end inside the app composition root.
 
 [cols="2,3,3",options="header"]
 |===
 |Fixture(s) |Direct Rust fixture evidence |Separate evidence / remaining limits
 |Four chat-claims-* control cases
-|Original content admitted without authorization; no memory permit or control audit; copied model authorization rejected on content ingress.
-|Domain forged-envelope tests and authenticated panel tests cover additional boundaries. The copied claim is a synthetic mutation, not a real provider response.
+|Original content admitted without authorization; no memory permit or control audit; copied model authorization rejected on content ingress; structured `model_output` contained by `SecurityRuntime::publish_text` (`Suppress`/`ReplaceWithCached`, reason `control_plane_text`) with zero `authorized_control` audit records.
+|Domain forged-envelope tests and authenticated panel tests cover additional boundaries. The copied claim is a synthetic mutation, not a live network provider response.
 |prompt-injection-chat, model-output-forged-authorization
-|Original chat admitted without authority or permit; serialized model authorization injection rejected where present.
-|Runtime publication containment and chat adapter forgery tests are independent. Actual model-output action handling is not exercised by this runner.
+|Original chat admitted without authority or permit; serialized model authorization injection rejected where present; runtime `publish_text` contains structured `model_output`; app composition test feeds fixture `model_output` through `MockThinking` and asserts zero TTS synthesis calls, zero `StreamOutput` executions, and zero `authorized_control` audits (both with and without a cached fallback).
+|Chat adapter forgery tests cover platform-specific ingress independently. Live external LLM/OBS network transport is not invoked by deterministic CI tests.
 |memory-poisoning-chat
-|Original event denied a memory permit; separate serialized versus authenticated MemoryAdmin test.
-|No model invocation, durable store write or retrieval is exercised.
+|Original event denied a memory permit; runtime test explicitly distinguishes that plain-text `model_output` passes `publish_text` (`Allow`) while durable memory writes remain blocked at the non-serializable `MemoryWritePermit` boundary; app composition test runs `AdaptationRuntime` (memory writer both default-OFF and explicitly ON) and asserts zero viewer-attributed entries, zero `VerifiedFact` promotions, and no `admin`/`trusted-user` claims persisted.
+|Separate serialized-versus-authenticated `MemoryAdmin` and `memory_writer_tests` cover retention caps, erasure, and performer-only extraction rules.
 |oversized-chat-flood
-|Single original event only, admitted without authority or permit.
-|Metadata (500 repeats, one second, 4096 payload bytes) is not expanded. Existing runtime byte, rate and backpressure tests are separate; 4096 bytes alone is below the default payload cap. Full workload/provider evidence remains open.
+|Runtime test expands `input.flood` metadata (500 repeats / 1 s / 4096 bytes) against default 16 KiB bounds (rate drops >= 400, bounded queue), explicit 4095-byte and 16 KiB+1 payload rejections (`DroppedPayloadBytes`), and authenticated `performer.stop` under queue saturation (`DroppedBackpressure`). App composition test runs the same workload with unavailable `ThinkingEngine`/`TtsEngine` doubles (`services: unavailable`, `expected.requires_model == false`) and asserts zero model calls, zero stream actions, and immediate authenticated `stop`.
+|4096 bytes alone is intentionally below the default 16 KiB payload cap (enforced by rate/backpressure rather than payload size unless lowered). Physical audio hardware stop is not exercised in headless CI; `stop_works_with_a_saturated_content_queue_and_a_failed_model` covers `audio_stop=hard_stopped` with a `SpyAudio` double.
 |emergency-stop-offline
-|Serialized operator event refused on content ingress. Independent test credentials mint a fixed stop via LocalControlIngress; the real scheduler cancels scheduled audio.
-|The app test +stop_works_with_a_saturated_content_queue_and_a_failed_model+ independently asserts hard audio stop with unavailable provider doubles. The fixture runner has no model or audio backend; it does not demonstrate physical output or all fixture service conditions.
+|Serialized operator event refused on content ingress. Independent test credentials mint a fixed stop via `LocalControlIngress`; the real scheduler cancels scheduled audio.
+|The app test `stop_works_with_a_saturated_content_queue_and_a_failed_model` independently asserts hard audio stop with unavailable provider doubles. Physical audio device/loopback behavior still requires host verification (tracked under release soak gates).
 |===
 
-No `requires_model` field is marked proven merely by the reference evaluator's boolean or this runtime-only test. Existing Bun, Rust app, domain and security tests remain required; the broader provider/output/flood fixture mapping is tracked in #497.
+No `requires_model` field is marked proven solely by the reference evaluator's boolean. Existing Bun, Rust app, domain, and runtime security tests remain required; retirement of overlapping TypeScript harness modules is governed by the boundary rules in `docs/architecture.adoc` (Section 11.1) and tracked in #497 / #41.
 
-Run the direct fixture evidence with `cargo test --locked -p aivtuber-runtime --test security_fixtures` (also exercised by the normal workspace test gate).
+Run the direct Rust fixture evidence with `cargo test --locked -p aivtuber-runtime --test security_fixtures` and `cargo test --locked -p aivtuber-app security_fixture_evidence_tests` (both are also exercised by the normal workspace test gate).
 
 == 15. Local operation panel (loopback web surface, issue #335)
 

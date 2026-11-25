@@ -305,6 +305,30 @@ External or local inference services remain process/network boundaries when prac
 
 High-rate realtime media is a separate bounded data plane from the control/decision plane. Raw PCM/video should remain in local media/sidecar transport; only validated, timestamped observations cross into the core event/context model. #90 and #92 own this future boundary.
 
+=== 11.1 TypeScript reference and regression boundary (#41, #497)
+
+`crates/` is the sole production-core authority. The 17 TypeScript modules under `src/` remain a reference implementation and regression harness for schema parity, replay fixtures, and cross-checking; they do not hold production runtime authority and MUST NOT be treated as a parallel production contract.
+
+[cols="2,2,3",options="header"]
+|===
+|TypeScript module(s) (`src/`) |Production Rust owner (`crates/`) |Current reference role
+|`envelope.ts` |`crates/domain` |Wire-contract and Event Envelope normalization reference for schema/fixture tests.
+|`security.ts`, `output-gate.ts`, `rate-limit.ts` |`crates/runtime` |Reference security policy, public-output containment, and content admission/rate-limit rules.
+|`event-bus.ts`, `scheduler.ts`, `performer.ts`, `session.ts`, `rng.ts` |`crates/scheduler`, `crates/app` |Deterministic event ordering, scheduling, performer state machine, replay session, and seeded PRNG reference.
+|`asset-store.ts` |`crates/asset-store` |Performance Asset validation and lookup reference.
+|`reflex.ts`, `adapters-jev.ts` |`crates/reflex`, `crates/adapters` |Semantic retrieval and Jev-compatible reflex decision reference.
+|`thinking.ts`, `tts.ts`, `adapters.ts`, `adapters-mocks.ts` |`crates/generative`, `crates/adapters` |Generated-response, TTS, and deterministic mock adapter reference.
+|`regression.ts` |`crates/runtime/tests/security_fixtures.rs`, `crates/app/src/tests/security_fixture_evidence_tests.rs`, `crates/hardening` |Bun security-fixture regression harness (`tests/security-regression.test.ts`).
+|===
+
+Retirement criteria for `src/*.ts` modules (no module is removed until all criteria hold):
+
+1. Every contract, replay, and security invariant exercised by the module has a direct, CI-enforced Rust test mapping under `crates/`.
+2. Schema validation and parity gates (`bun run validate`, `bun run validate:rust-parity`, `bun test`) no longer depend on the module.
+3. Removal is performed in a dedicated PR outside an active release-gate validation freeze (such as the v0.3 soak/gate window).
+
+Explicit non-targets of `src/*.ts` retirement: `schemas/`, `scripts/` validation tooling, `tests/` schema-parity checks, and `renderer/` (the local OSS VRM avatar renderer) are not part of the `src/` prototype retirement scope.
+
 == 12. Security and privacy
 
 * Secrets MUST come from environment/secret stores, never committed files.
