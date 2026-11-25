@@ -1,0 +1,142 @@
+= ADR-0026: Bounded lexical-plus-structured memory retrieval and deterministic rank fusion
+:status: Proposed
+:date: 2026-11-25
+
+== Context
+
+Issue #283 (`priority:P2`, `status:blocked`, `status:design-ready`, `status:parked`, parent #105) asks to improve recall of short Japanese chat messages, paraphrases, and explicit proper nouns via a measured, deterministic, bounded lexical-plus-structured retrieval path and rank fusion — without prematurely adopting a bespoke vector database, Graphiti, or unconditional dense embeddings of public chat.
+
+This ADR records a proposed two-arm retrieval pipeline (`WorkingMemory::relevant_linked` + bounded in-memory lexical arm), deterministic post-filter Reciprocal Rank Fusion (RRF), strict erasure/scope invariants, and go/no-go falsifier only. Implementation remains `status:blocked` on #280 (retrieval baseline and deletion/isolation fixtures) and `status:parked` until v0.3 closes. It authorizes no production code, changes no wire schemas, adds no dependencies, and leaves all v0.3 defaults unchanged.
+
+Inputs this ADR builds on, present on `main` at `d266310`:
+
+* `crates/adaptation/src/lib.rs` (`WorkingMemory::relevant_linked`, actor/source privacy filtering, `EpistemicClass`, supersession/stale handling, bounded `WorkingMemoryConfig`) and `crates/adaptation/tests/long_range_eval.rs`.
+* link:0008-cross-session-memory-persistence.adoc[ADR-0008] (#282, Accepted): single-file bounded persistence (2,048 entries, linear scan under `A-MEM-002`), meaning the first lexical experiment stays strictly in-memory unless a future persistence ADR approves SQLite FTS5.
+* #280 (Hindsight shadow benchmark baseline & deletion fixtures), #51 (retention), #100 (supply chain), and #220 (zero-paid baseline).
+
+== Hard constraints
+
+* *Canonical admission/privacy/erasure gates wrap every retrieval arm*: Actor/source privacy scope, `EpistemicClass`, supersession/stale checks, and read-time validity are enforced *before and after* every retrieval arm. Deletion or expiry must immediately hide content even if index cleanup fails — no stale cache or FTS entry may ever be exposed.
+* *Deterministic rank fusion and bounded budgets*: Fixed RRF parameters, recorded `(retriever_version, config_fingerprint)`, deterministic total-order tie-breaking (`memory_id`), and hard caps on hops, candidate nodes, UTF-8 bytes, tokens, and CPU/time.
+* *In-memory first; zero mandatory external sidecar or vector DB*: First lexical experiment is strictly in-memory (no SQLite/FTS5 without persistence ADR approval, no dense embeddings or LLM rerankers in default baseline).
+* *Clean fallback*: Any lexical-index error, timeout, deletion uncertainty, or absent optional dependency falls back deterministically to existing `WorkingMemory::relevant_linked`.
+
+== Assumptions
+
+Existing invariants referenced:
+
+* `A-CTRL-001` (Invariant): retrieved memory is data, never authority.
+* `A-MEM-001` (Invariant): durable writes require non-serializable `MemoryWritePermit`.
+* `A-MEM-002` (Needs validation): retained durable memory stays in the low thousands of entries (<= 2,048).
+
+Proposed new assumptions (to be added to link:../assumptions.adoc[Assumption Register] only if accepted):
+
+* *A-RET-001* (*Needs validation*): A bounded in-memory lexical arm (NFKC/width-folded character n-gram + exact proper-noun token match, mirroring `crates/app/src/repeat_guard.rs` normalization) fused with `WorkingMemory::relevant_linked` via fixed RRF improves Japanese short-message and proper-noun recall over baseline without requiring dense embeddings or an external vector DB. *Evidence:* unverified; must be measured against #280 baselines.
+
+== Alternatives considered
+
+. *Status quo (`WorkingMemory::relevant_linked` structured/topic/recency scan only)*: zero index overhead, but can miss exact proper nouns or short Japanese queries when topic tags diverge.
+. *Unconditional dense vector embeddings + external vector DB / Graphiti*: rejected for baseline. Adds heavy runtime/VRAM/supply-chain footprint (#100/#220) and deletion-synchronization complexity before in-memory lexical+structured retrieval is measured insufficient.
+. *LLM reranking on every chat message*: rejected. Violates #67 latency budgets and #69 cost caps.
+. *Bounded in-memory lexical arm + `WorkingMemory::relevant_linked` + post-filter deterministic RRF (proposed)*: zero new dependencies, instant erasure safety, clean fallback, and direct A/B comparability against #280 baselines and optional Hindsight shadow sidecar.
+
+== Reuse / Adapt / Build comparison
+
+Reuse-first vocabulary per link:../reuse-first.adoc[reuse-first]. No new crate or external service is proposed in Stage 1.
+
+[cols="2,2,3,3,2"]
+|===
+|Candidate |Scope |Pattern / capability |Conflict or gap |Mode
+
+|*Hindsight* & *Graphiti*
+|External research / shadow reference
+|Hybrid lexical+structured+semantic recall and RRF fusion patterns.
+|Heavy runtime/sidecar stack; external store cannot own aivtuber's privacy/erasure authority.
+|*Reference / Shadow benchmark only (#280).* Compare quality against Hindsight shadow without adopting its store.
+
+|*`WorkingMemory::relevant_linked`* (`crates/adaptation/src/lib.rs`) & *`repeat_guard::normalize`* (`crates/app/src/repeat_guard.rs`)
+|Existing project components
+|Canonical actor/epistemic/staleness filtering and dependency-free Japanese width/case normalization.
+|Needs an in-memory lexical scoring arm and deterministic RRF combiner.
+|*Reuse.* Keep `WorkingMemory::relevant_linked` as the structured arm and canonical post-filter.
+
+|*SQLite FTS5*
+|Optional future persistence index
+|Mature BM25 full-text index.
+|Requires persistence ADR approval (#282 / ADR-0008 currently uses single-file persistence under `A-MEM-002`).
+|*Defer.* Revisit only if memory volume exceeds `A-MEM-002` or in-memory lexical scan misses latency budgets.
+
+|*In-memory `LexicalIndex` + `RrfRanker`*
+|New adaptation module
+|Bounded Japanese character-bigram/exact-token scorer + fixed-k RRF (`k = 60`) with `memory_id` tie-break.
+|Project-specific erasure-safe integration with `WorkingMemory`.
+|*Custom.* Small pure Rust module (~150–200 lines) in `crates/adaptation`.
+|===
+
+== Evidence
+
+* *Repository executable evidence*:
+  - `crates/adaptation/src/lib.rs` and `crates/adaptation/tests/long_range_eval.rs` prove `WorkingMemory::relevant_linked` and long-range memory evaluation exist on `main`.
+  - ADR-0008 (`docs/adr/0008-cross-session-memory-persistence.adoc`) establishes the 2,048-entry bounded linear-scan budget (`A-MEM-002`).
+* *Unverified expectation (explicitly not yet measured)*:
+  - Recall@k, precision, MRR/nDCG, and false-recall deltas on Japanese short messages vs #280 baselines are unmeasured.
+
+== Decision
+
+=== 1. Two-arm erasure-safe retrieval pipeline
+
+[source,text]
+----
+Query (actor_scope, topic_hints, query_text, now_ms, budget)
+  |-- Arm A (structured): WorkingMemory::relevant_linked (live, scope-filtered)
+  |-- Arm B (lexical):    In-memory normalized exact-token + Japanese char-bigram index
+  v
+Post-arm canonical verification gate (re-check live in WorkingMemory, actor scope, TTL, not superseded/deleted)
+  v
+Deterministic RRF fusion: score(id) = sum_arm( w_arm / (k + rank_arm(id)) ), k = 60, tie-break by memory_id
+  v
+Apply hard (max_nodes, max_bytes, max_tokens) cap -> ThinkingRequest curated_context
+----
+
+Because the post-arm canonical gate re-verifies every candidate ID against live `WorkingMemory` entries, a deleted or expired entry can *never* leak even if the lexical index lags or fails cleanup.
+
+=== 2. Cheapest falsifier & go/no-go for semantic/graph work
+
+Once #280 baselines land and #283 unparks:
+
+1. Run identical synthetic queries comparing (a) current `WorkingMemory::relevant_linked`, (b) lexical + structured RRF, and (c) #280 optional Hindsight shadow sidecar across Japanese short messages, mixed script, exact proper nouns, paraphrases, two unrelated same-topic viewers (zero cross-viewer leakage), supersession, deletion, and no-match abstention.
+2. Report `recall@k`, `precision`, `MRR/nDCG`, `false_recall`, `stale/other-viewer leakage` (must be 0), and `p50/p95` latency overhead.
+3. Only consider an optional local embedding arm in a later ADR if error analysis shows concrete paraphrase failures that lexical+structured retrieval cannot solve within latency/VRAM budgets.
+
+== Consequences
+
+=== Positive
+
+* Improves Japanese proper-noun and short-message recall with zero external dependencies, deterministic replay, and structural erasure safety.
+* Defers heavyweight vector DB / embedding dependencies unless measured data proves they are needed.
+
+=== Costs / trade-offs
+
+* Pure lexical+structured retrieval has weaker paraphrase recall than dense embeddings (intentionally measured before adding semantic models).
+
+=== Known limitations
+
+* Blocked on #280 baseline fixtures and parked until v0.3 closes.
+
+== Staging and rollback
+
+1. *Stage 0 (this ADR)*: pipeline and evaluation contract only; zero runtime change.
+2. *Stage 1 (in-memory lexical + RRF benchmark, `default = off`)*: compare offline against #280 fixtures; rollback is toggling back to `WorkingMemory::relevant_linked`.
+3. *Stage 2 (optional SQLite FTS5 or local semantic arm)*: separate ADR/review gated on Stage 1 error analysis and `A-MEM-002`.
+
+== Revisit conditions
+
+* Retained memory volume exceeds `A-MEM-002` (~5,000 entries) and linear/in-memory indexing misses latency budgets.
+* #280 benchmark shows paraphrase errors dominate and require a bounded local semantic arm.
+
+== Related
+
+* Issue: #283 (parent), #105, #280, #281, #282, #284, #51, #59, #100, #220
+* PR: (to be linked on PR creation)
+* Assumptions: `A-CTRL-001`, `A-MEM-001`, `A-MEM-002`; proposed `A-RET-001`
+* Other ADRs: link:0008-cross-session-memory-persistence.adoc[ADR-0008], link:0025-proposal-only-offline-memory-dreaming.adoc[ADR-0025]
