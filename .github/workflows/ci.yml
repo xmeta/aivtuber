@@ -109,7 +109,8 @@ jobs:
 
       - name: Skip schema/Bun checks on docs-only PR
         if: needs.changes.outputs.docs_only == 'true'
-        run: echo "Docs-only PR: LF line-ending check passed; skipping Bun/schema checks."
+        run: |
+          echo "Docs-only PR: LF line-ending check passed; skipping Bun/schema checks."
 
       - uses: oven-sh/setup-bun@v2
         if: needs.changes.outputs.docs_only != 'true'
@@ -138,7 +139,8 @@ jobs:
     steps:
       - name: Skip Rust checks on docs-only PR
         if: needs.changes.outputs.docs_only == 'true'
-        run: echo "Docs-only PR: skipping Rust checks."
+        run: |
+          echo "Docs-only PR: skipping Rust checks."
 
       - uses: actions/checkout@v4
         if: needs.changes.outputs.docs_only != 'true'
@@ -569,7 +571,8 @@ jobs:
     steps:
       - name: Skip schema checks on docs-only PR
         if: needs.changes.outputs.docs_only == 'true'
-        run: echo "Docs-only PR: skipping schema and security fixture checks."
+        run: |
+          echo "Docs-only PR: skipping schema and security fixture checks."
 
       - uses: actions/checkout@v4
         if: needs.changes.outputs.docs_only != 'true'
