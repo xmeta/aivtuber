@@ -92,7 +92,7 @@ LiveKit Agents / Pipecat
 recent speculative full-duplex speech work
 |Prepare expensive work before final turn commitment, but publish only through a deterministic irreversible commit barrier
 |#67, #81, #83, #106
-|Useful latency saved versus wasted LLM/TTS cost; stale-result rejection; self-correction safety
+|Useful latency saved versus wasted LLM/TTS cost; stale-result rejection; self-correction safety. Proposed tiered `SpeculativeGeneration`, 8-condition local `CommitBarrier`, reuse review, and falsifier for #106: link:adr/0014-preemptive-generation-and-commit-barrier.adoc[ADR-0014] (Proposed; design only, parked/blocked on prerequisites)
 
 |Listening avatar behavior
 |Recent listening/speaking avatar research;
