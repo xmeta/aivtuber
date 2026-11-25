@@ -172,7 +172,7 @@ ComplexMCP-style tool-selection/recovery scenarios;
 schema/tool-evolution robustness benchmarks
 |Evaluate user-task completion separately from tool-call success; make false-success, skipped precondition verification, recovery failure, and schema drift explicit
 |#203
-|Verifier reproducibility; task/tool version identity; false-success rate; recovery after first error; large-tool-space behavior; no live-account requirement in normal CI
+|Verifier reproducibility; task/tool version identity; false-success rate; recovery after first error; large-tool-space behavior; no live-account requirement in normal CI. Proposed two-axis `(reported_complete, VerifierOutcome)` classification, 7-case offline fixture matrix, and #58/#59 artifact contract for #203: link:adr/0017-verified-agent-task-evaluation.adoc[ADR-0017] (Proposed; design only, blocked on #201/#165 and parked)
 
 |External agent delegation
 |Agent Client Protocol (ACP);
