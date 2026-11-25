@@ -1366,6 +1366,102 @@ mod tests {
     }
 
     #[test]
+    fn mulberry32_and_variation_match_shared_golden_fixture() {
+        #[derive(Deserialize)]
+        struct StreamVector {
+            label: String,
+            seed: u64,
+            raw_u32: Vec<u32>,
+            values: Vec<f64>,
+        }
+
+        #[derive(Deserialize)]
+        struct VariationCase {
+            label: String,
+            seed: u64,
+            spec: VariationSpec,
+            expected: AppliedVariation,
+        }
+
+        #[derive(Deserialize)]
+        struct RngGoldenFixture {
+            schema_version: String,
+            algorithm: String,
+            stream_vectors: Vec<StreamVector>,
+            variation_cases: Vec<VariationCase>,
+        }
+
+        // Rust と TypeScript (tests/rng.test.ts) の双方が同一ゴールデンベクタを検証する (#41, #506)
+        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/rng/mulberry32-golden.json");
+        let raw = std::fs::read_to_string(&fixture_path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", fixture_path.display()));
+        let fixture: RngGoldenFixture =
+            serde_json::from_str(&raw).expect("parse mulberry32-golden.json");
+
+        assert_eq!(fixture.schema_version, "0.1.0");
+        assert_eq!(fixture.algorithm, "mulberry32");
+        assert!(!fixture.stream_vectors.is_empty());
+        assert!(!fixture.variation_cases.is_empty());
+
+        for vector in &fixture.stream_vectors {
+            assert_eq!(vector.raw_u32.len(), vector.values.len());
+            let mut rng = SeededRng::new(vector.seed);
+            for (step, (&expected_raw, &expected_f64)) in
+                vector.raw_u32.iter().zip(vector.values.iter()).enumerate()
+            {
+                let actual = rng.next_f64();
+                // 32bit 分子 (actual * 2^32) は JSON 十進パーサ誤差の影響を受けず完全一致する
+                let actual_raw = (actual * (u32::MAX as f64 + 1.0)) as u32;
+                assert_eq!(
+                    actual_raw, expected_raw,
+                    "raw_u32 mismatch for {} (seed={}, step={})",
+                    vector.label, vector.seed, step
+                );
+                // JSON 十進浮動小数点パーサの 1 ULP 丸め差のみ許容する
+                assert!(
+                    actual.to_bits().abs_diff(expected_f64.to_bits()) <= 1,
+                    "stream mismatch for {} (seed={}, step={}): got {actual:?}, want {expected_f64:?}",
+                    vector.label,
+                    vector.seed,
+                    step
+                );
+            }
+        }
+
+        for case in &fixture.variation_cases {
+            let actual = apply_variation(case.spec, &mut SeededRng::new(case.seed));
+            assert!(
+                actual
+                    .speed_factor
+                    .to_bits()
+                    .abs_diff(case.expected.speed_factor.to_bits())
+                    <= 1,
+                "speed_factor mismatch for {}: got {:?}, want {:?}",
+                case.label,
+                actual.speed_factor,
+                case.expected.speed_factor
+            );
+            assert!(
+                actual
+                    .amplitude_factor
+                    .to_bits()
+                    .abs_diff(case.expected.amplitude_factor.to_bits())
+                    <= 1,
+                "amplitude_factor mismatch for {}: got {:?}, want {:?}",
+                case.label,
+                actual.amplitude_factor,
+                case.expected.amplitude_factor
+            );
+            assert_eq!(
+                actual.start_delay_ms, case.expected.start_delay_ms,
+                "start_delay_ms mismatch for {}",
+                case.label
+            );
+        }
+    }
+
+    #[test]
     fn same_seed_reproduces_identical_variation() {
         let spec = VariationSpec {
             speed_pct: 10.0,
