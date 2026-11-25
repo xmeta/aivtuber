@@ -1,0 +1,176 @@
+= ADR-0021: Versioned typed PersonaContract, deterministic PersonaConformanceGate, and bounded authoring defaults
+:status: Proposed
+:date: 2026-11-25
+
+== Context
+
+Issue #72 (`priority:P2`, `status:design-ready`, `status:parked`, Stage 3) asks to represent the VTuber persona as a versioned, bounded, machine-readable policy contract so cached assets, templates, reflex decisions, naturalness budgets, and generated output can be evaluated for persona consistency rather than relying solely on a free-text prompt sheet.
+
+This ADR records a proposed typed contract layered cleanly alongside the shipped character-sheet `PersonaSheet`, a cheap-first `PersonaConformanceGate`, the offline Dreaming (#281) suggestion boundary, and the optional Big Five (OCEAN) authoring-convenience falsifier. Implementation remains `status:parked` until v0.3 closes. It authorizes no production code, changes no wire schemas, adds no dependencies, and leaves all v0.3 defaults unchanged.
+
+Inputs this ADR builds on, present on `main` at `826ab07`:
+
+* `crates/domain/src/persona.rs` & `crates/app/src/persona.rs` (#401): already implement a bounded, UTF-8-validated character sheet (`Persona`, `PersonaSheet` with SHA-256 digest, `MAX_PERSONA_FILE_BYTES`, redacted `Debug`, `examples/persona/starter.ja.md`), authenticated `Capability::PersonaConfigure` editing, and bounded `ThinkingContent` projection via `ProductionApp::attach_persona`.
+* link:0013-naturalness-budgets-and-multimodal-anti-repetition.adoc[ADR-0013] (#89), link:0012-bounded-autonomic-regulation.adoc[ADR-0012] (#486), link:0011-segment-planning-and-initiative-utility.adoc[ADR-0011] (#487), link:0018-continuous-roleblend-modulation.adoc[ADR-0018] (#191), and link:0016-mcp-tool-catalog-risk-and-approval.adoc[ADR-0016] (#202): all consume bounded persona preferences/bounds while keeping RoleBlend (role, not identity) and security/risk policies strictly separate.
+* #54 (template route), #58 (replay/version identity), #59 (human-evaluated persona consistency), #67 (interaction deadline), #69 (thinking cost cap), and #281 (offline Dreaming suggestions).
+
+== Hard constraints
+
+* *Persona configuration is data, never runtime authority* (`A-CTRL-001`): Persona contracts cannot mint privileged control capabilities, bypass `PublicOutputPolicy`, grant OBS/MCP tool permissions, alter #202 `RiskClass`/`ActionApproval`, override privacy/memory permits (`A-MEM-001`), disable operator stop/mute, or contain arbitrary executable scripts.
+* *Bounded curated projection only*: `ThinkingRequest` receives only the curated bounded subset of persona state needed for generation — never an unbounded configuration dump or persona history.
+* *Version and fingerprint comparability*: Every material change to a persona contract produces a new `(persona_id, persona_version, config_fingerprint)` recorded in #58/#59 replay and evaluation metadata; quality metrics must never be compared across unrecorded persona revisions.
+* *Deterministic conformance checks before any LLM repair*: Never add a mandatory second LLM pass to every response. Cheap deterministic checks run first; optional generative repair runs only if #67 deadline and #69 budget allow, degrading cleanly to a safe compatible fallback on failure.
+* *No autonomous persona mutation by offline Dreaming (#281)*: Memory-derived learning may emit bounded suggestions only; only authenticated operator approval (`Capability::PersonaConfigure`) or a separately reviewed deterministic policy may publish a new Persona version/fingerprint.
+* *No demographic/occupational stereotypes as hard constraints*: Express behavioral bounds directly (verbosity, register, reaction families, intensity caps), not vague demographic archetypes.
+* *Explicit creator settings always outrank optional trait defaults*: If an optional bounded OCEAN authoring helper is tested, explicit style bounds take precedence; agreeableness never implies factual acquiescence, and neuroticism never alters moderation or risk policy.
+
+== Assumptions
+
+Existing invariants referenced:
+
+* `A-CTRL-001` (Invariant): persona configuration and model output never hold runtime authority.
+* `A-MEM-001` (Invariant): durable memory writes require non-serializable `MemoryWritePermit`.
+
+Proposed new assumptions (to be added to link:../assumptions.adoc[Assumption Register] only if accepted):
+
+* *A-PERS-001* (*Needs validation*): A compact typed `PersonaContract` (~10 bounded fields) paired with the existing `PersonaSheet` text improves #59 persona-consistency ratings and enables deterministic asset/template filtering without over-constraining creative phrasing. *Evidence:* unverified design hypothesis.
+* *A-PERS-002* (*Needs validation*): Cheap deterministic checks in `PersonaConformanceGate` (verbosity bounds, disallowed reaction families, prohibited self-description markers, language/register checks) catch the majority of gross persona-policy violations without triggering a second LLM call. *Evidence:* unverified; requires #59 evaluation.
+* *A-PERS-003* (*Needs validation*): An optional bounded OCEAN trait layer provides authoring convenience over direct style fields; if #59 held-out behavioral scenarios show direct style settings are equally good, omit the trait layer. *Evidence:* unverified; must be falsified on held-out scenarios, not model self-report questionnaires.
+
+== Alternatives considered
+
+. *Status quo (free-text `PersonaSheet` only)*: simple and already shipped (#401), but downstream subsystems (#89 naturalness budgets, #87/#487 initiative, #86/#486 affect/regulation, #191 RoleBlend, #59 consistency checks) cannot read typed bounds or enforce deterministic conformance without fragile prompt parsing.
+. *Mandatory second-pass LLM persona critic on every reply*: rejected. Doubles latency and LLM/VRAM cost on the 8 GiB local profile (#220) and violates #67/#69 budgets.
+. *Mandatory psychometric / Big Five engine as the sole persona representation*: rejected. Forces creators into indirect trait sliders even when they want explicit style bounds, and risks uncalibrated mappings. Keep OCEAN strictly optional and falsifiable.
+. *Versioned typed `PersonaContract` alongside `PersonaSheet` + cheap-first `PersonaConformanceGate` + explicit Dreaming/OCEAN boundaries (proposed)*: preserves existing #401 character sheets while giving every subsystem bounded, versioned, replayable persona data.
+
+== Reuse / Adapt / Build comparison
+
+Reuse-first vocabulary per link:../reuse-first.adoc[reuse-first]. No external crate or service is proposed.
+
+[cols="2,2,3,3,2"]
+|===
+|Candidate |Scope |Pattern / capability |Conflict or gap |Mode
+
+|*Shipped `Persona` / `PersonaSheet`* (`crates/domain/src/persona.rs`, `crates/app/src/persona.rs`)
+|Existing project component
+|Bounded UTF-8 character sheet, SHA-256 digest, `Capability::PersonaConfigure` atomic editor, redacted `Debug`, `ThinkingContent` projection.
+|Unstructured prose only; lacks typed bounds for verbosity, reaction families, intensity caps, and asset compatibility.
+|*Reuse / Extend.* Keep `PersonaSheet` as the prose layer; pair it with typed `PersonaContract` under the same `PersonaConfigure` authority boundary.
+
+|*PublicOutputPolicy* (`crates/runtime/src/lib.rs`) & *#54 Template route*
+|Existing project components
+|Mandatory post-generation containment gate and deterministic template fallback.
+|Enforces security/control-plane containment, not persona style conformance.
+|*Reuse.* Run `PersonaConformanceGate` *after* candidate creation and *inside* existing `PublicOutputPolicy` + #54 fallback boundaries (never weakening security).
+
+|*Research references* (EMNLP 2025 Findings persona consistency; Nature MI 2025 Big Five; ALMA)
+|External research
+|Multi-context behavioral consistency checks and trait-to-style authoring inspiration.
+|Cannot substitute for local Japanese livestream evaluation or justify extra LLM passes.
+|*Reference only.* Inform `PersonaConformanceGate` and optional OCEAN falsifier only.
+
+|*`PersonaContract` & `PersonaConformanceGate`*
+|New domain/runtime policy
+|Schema-versioned typed bounds, asset/template compatibility tags, deterministic conformance checks, and Dreaming suggestion validator.
+|Project-specific contract spanning #54, #59, #86, #87, #89, #191, #281.
+|*Custom.* Small pure Rust contract + gate (~200–250 lines).
+|===
+
+== Evidence
+
+* *Repository executable evidence*:
+  - `crates/domain/src/persona.rs` and `crates/app/src/persona.rs` prove bounded persona parsing, SHA-256 fingerprinting, redacted `Debug`, and `Capability::PersonaConfigure` enforcement are already shipped.
+  - `examples/events/invalid/forged-persona-configure.json` proves untrusted chat cannot forge `persona.configure`.
+* *Unverified expectation (explicitly not yet measured)*:
+  - #59 persona-consistency uplift from typed contracts vs prose-only `PersonaSheet` and the OCEAN-vs-direct-style falsifier are unmeasured until #72 unparks.
+
+== Decision
+
+=== 1. Versioned typed `PersonaContract` (paired with `PersonaSheet`)
+
+[source,text]
+----
+PersonaContract (schema-versioned, bounded, deny_unknown_fields):
+  schema_version: "0.1.0"
+  persona_id: BoundedId                  // e.g. "mikoto"
+  persona_version: BoundedString         // Semver / monotonic revision
+  config_fingerprint: [u8; 32]           // SHA-256 over canonical contract + optional PersonaSheet digest
+  language_register: LanguageRegister    // Closed enum (e.g. JaCasual | JaPolite | EnCasual | ...)
+  formality_range: UnitRange             // [min, max] in 0..=1000
+  verbosity_bounds: VerbosityBounds      // max_chars_per_reply, preferred_sentences
+  emotional_intensity_bounds: UnitRange  // Clamped by global runtime AFFECT_INTENSITY_CAP
+  preferred_reaction_families: Vec<FamilyTag>   // Max 16
+  disallowed_reaction_families: Vec<FamilyTag>  // Max 16
+  prohibited_style_markers: Vec<BoundedString>  // Max 16 literal/normalized markers (never regex DoS)
+  humor_banter_range: UnitRange          // Consumed by #191 RoleBlend / #87 Initiative
+  repetition_tolerance: u16              // Advisory bound for #89 NaturalnessBudget (clamped by global ceiling)
+  compatible_pack_versions: Vec<BoundedString>  // Optional; old assets stay valid unless explicitly incompatible
+  optional_ocean_defaults: Option<OceanProfile> // Authoring convenience only; explicit fields always win
+----
+
+=== 2. Cheap-first `PersonaConformanceGate`
+
+Runs on generated/cached/template candidates *in addition to* (never replacing) `PublicOutputPolicy`:
+
+[source,text]
+----
+Candidate response
+  -> Deterministic PersonaConformanceGate (zero LLM cost):
+       1. verbosity_bounds check
+       2. disallowed_reaction_families check
+       3. prohibited_style_markers check
+       4. language_register / basic formality check
+  -> Pass -----------------------------> PublicOutputPolicy -> commit
+  -> Minor mismatch -------------------> deterministic trim / #54 compatible template rewrite
+  -> Major mismatch:
+       if #67 deadline_remaining & #69 budget allow -> at most 1 bounded generative repair
+       else or if repair fails ---------------------> degrade to safe compatible cached/template fallback
+----
+
+=== 3. Offline Dreaming (#281) & optional OCEAN boundaries
+
+* *Dreaming (#281)*: May emit `PersonaSuggestion { target_field, proposed_delta, supporting_memory_ids, confidence }` into an operator review queue. It can *never* write `PersonaContract` automatically. Deleting a supporting memory invalidates unapproved suggestions referencing it.
+* *Optional OCEAN authoring helper*: Each retained trait must map deterministically to >= 2 independently observable behaviors (e.g., extraversion -> initiative + conversational space; openness -> topic exploration; conscientiousness -> clarification/planning strictness). Explicit creator fields always override derived values. Omit the OCEAN layer entirely if #59 held-out scenarios show no advantage over direct style settings.
+
+=== 4. Cheapest falsifier (when #72 unparks)
+
+1. Unit/security tests covering: out-of-bounds persona configs (rejected), forged/malicious Dreaming override (rejected), single-event overfitting, supporting-memory deletion invalidation, and `PersonaContract` zero-authority invariance.
+2. #59 held-out behavioral comparison (same model and assets): prose-only `PersonaSheet` vs `PersonaSheet + PersonaContract + deterministic PersonaConformanceGate`, plus direct-style vs OCEAN-derived defaults, measuring persona consistency separately from semantic correctness.
+
+== Consequences
+
+=== Positive
+
+* Gives #54, #59, #86/#486, #87/#487, #89, #191, and #281 one canonical, versioned, replayable persona contract without replacing the shipped #401 `PersonaSheet`.
+* Catches gross persona violations deterministically at near-zero latency before ever spending a second LLM call.
+* Prevents silent persona drift by pinning `config_fingerprint` and gating Dreaming suggestions behind operator approval.
+
+=== Costs / trade-offs
+
+* Adds a versioned JSON Schema (`schemas/persona-contract.schema.json`) and compatibility metadata to maintain.
+* Deterministic style checks cannot judge subtle humor or emotional nuance; #59 human review remains authoritative for nuance.
+
+=== Known limitations
+
+* Remains `status:parked` until v0.3 closes.
+* Asset/template compatibility is opt-in metadata; unannotated legacy assets remain usable under default compatibility rules.
+
+== Staging and rollback
+
+1. *Stage 0 (this ADR)*: contract, conformance gate, and falsifier specification only; zero runtime change.
+2. *Stage 1 (schema + read-only fingerprint)*: add `PersonaContract` schema/validator and record `(persona_id, persona_version, config_fingerprint)` in replay/telemetry alongside existing `PersonaSheet`.
+3. *Stage 2 (deterministic `PersonaConformanceGate`, `default = off`)*: enable measure-only logging first, then opt-in deterministic repair/fallback. Rollback is toggling the gate off.
+4. *Stage 3 (optional Dreaming suggestions & OCEAN falsifier)*: evaluate behind explicit opt-in flags; drop OCEAN if direct style settings match it in #59.
+
+== Revisit conditions
+
+* #59 evaluation shows prose-only `PersonaSheet` already achieves target consistency with negligible style drift.
+* #89, #191, or #281 requires additional typed persona fields not covered by the initial 10-field contract.
+
+== Related
+
+* Issue: #72 (parent), #401, #54, #58, #59, #67, #69, #86, #87, #89, #191, #281, #486, #487
+* PR: (to be linked on PR creation)
+* Assumptions: `A-CTRL-001`, `A-MEM-001`; proposed `A-PERS-001`, `A-PERS-002`, `A-PERS-003`
+* Other ADRs: link:0001-three-layer-runtime.adoc[ADR-0001], link:0011-segment-planning-and-initiative-utility.adoc[ADR-0011], link:0012-bounded-autonomic-regulation.adoc[ADR-0012], link:0013-naturalness-budgets-and-multimodal-anti-repetition.adoc[ADR-0013], link:0018-continuous-roleblend-modulation.adoc[ADR-0018]
