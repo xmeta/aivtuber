@@ -1,0 +1,173 @@
+= ADR-0014: Cancellable preemptive generation with an authoritative local CommitBarrier
+:status: Proposed
+:date: 2026-11-25
+
+== Context
+
+Issue #106 (`priority:P1`, `status:blocked`, `status:design-ready`, `status:parked`, Stage 4) asks to reduce perceived response latency by allowing bounded, disposable preparation to start before a conversational turn/context is fully committed, while guaranteeing that speculative work never becomes public output until a deterministic `CommitBarrier` revalidates it.
+
+This ADR records a proposed architecture and evaluation design only. Issue #106 is explicitly `status:blocked` and `status:parked` (no implementation starts while parked or before v0.3 closes). It authorizes no production code, changes no wire schemas, adds no dependencies, and preserves all v0.3 defaults.
+
+Inputs this ADR builds on, all present on `main` at `1adf453`:
+
+* `crates/app/src/lib.rs` (`GenerationExecutor`, non-blocking background worker #121) and `crates/app/src/phrase_commit.rs` (#83 S1 atomic phrase commit): the worker already runs Thinking/TTS off the composition thread and never touches the scheduler, asset store, or audit log; the composition thread rechecks currency, cancellation (`GenerationCancellationToken`), and `PublicOutputPolicy` before committing each phrase to `Scheduler::schedule_phrase_at`.
+* link:0005-conversational-floor-policy.adoc[ADR-0005] (#81 conversational floor policy): separates early reversible preparation from late irreversible `TakeTurn` commit and tentative/false interruption handling.
+* link:0004-speech-lifecycle-and-text-projection.adoc[ADR-0004] (#222): scheduler-owned audible lifecycle (`Started`/`Boundary`/`Finished` with `basis`).
+* link:0010-conversational-clarification-and-repair.adoc[ADR-0010] (#85): `ContextSufficiency` and repair state that can invalidate a tentative interpretation.
+* #67 (interaction deadline), #69 (thinking cost cap), and #104 (marginal-value routing).
+
+== Hard constraints
+
+* *Speculative work is disposable data, never public output or runtime authority* (`A-CTRL-001`, `docs/architecture.adoc` §6.3.1, `docs/generative-fallback.adoc`). No speculative result may reach TTS playback, audio/avatar sinks, durable memory, or scheduler state without passing the composition-thread `CommitBarrier`.
+* *Local generation/revision fencing is authoritative*: Provider cancellation is best-effort only. A late provider completion after cancellation, supersession, or epoch change must be discarded deterministically on the composition thread and never replayed.
+* *Single concurrency and scheduler architecture*: Build strictly on existing `GenerationExecutor`, `GenerationCancellationToken`, `PublicOutputPolicy`, and `Scheduler::schedule_phrase_at` (#83). Do not introduce a second concurrency model or replace the shared scheduler with an end-to-end voice framework.
+* *#83 atomic phrase commit remains the irreversible speech boundary*: Never speak unconfirmed partial interpretations.
+* *#67 deadline and #69 cost budget remain authoritative*: Speculative starts must respect bounded concurrency (at most 1 in-flight speculative job) and #69 budget ceilings, and never starve committed turns or operator emergency control.
+* *Deterministic replay*: Replay records why every speculative job started, committed, or was discarded (`discard_reason`), using monotonic logical time and revision/epoch identity.
+
+== Assumptions
+
+Existing invariants referenced:
+
+* `A-CTRL-001` (Invariant): model output and speculative work never hold runtime authority.
+* `A-MEM-001` (Invariant): durable memory writes require non-serializable `MemoryWritePermit`.
+
+Proposed new assumptions (to be added to link:../assumptions.adoc[Assumption Register] only if accepted):
+
+* *A-SPEC-001* (*Needs validation*): Starting retrieval/template lookup (Tier 1) or Thinking-only generation (Tier 2, *not* speculative TTS) during late tentative turn pauses saves meaningful perceived TTFA on Japanese turns without exceeding acceptable wasted-compute ratios under #69 budgets. *Evidence:* unverified design hypothesis; requires replay and #58 cost-vs-latency evaluation.
+* *A-SPEC-002* (*Needs validation*): Input-revision equivalence checking (comparing the confirmed transcript/event against the speculative `input_revision` and `turn_epoch`) prevents stale replies under user self-correction and rapid chat supersession without excessive false discards. *Evidence:* unverified.
+
+== Alternatives considered
+
+. *Status quo (no speculation; start generation only after final turn commit)*: zero wasted compute, simplest replay. Baseline to beat; if speculation does not save meaningful latency within acceptable waste bounds, remain at status quo.
+. *Adopt LiveKit Agents or Pipecat as the end-to-end turn/speculation orchestrator*: rejected (same conflict documented in ADR-0005). Their pipelines own cancellation and audio handles outside aivtuber's scheduler, `PublicOutputPolicy`, and ADR-0004 lifecycle truth. Reuse their state-machine patterns as *reference only*.
+. *Unconditional speculative Thinking + speculative TTS on every partial transcript*: rejected. Multiplies LLM/TTS cost and VRAM contention on the 8 GiB local profile (#220) and risks synthesizing stale audio on fast self-corrections.
+. *Tiered cancellable speculation behind an authoritative composition-thread `CommitBarrier` (proposed)*: start with Tier 1 (retrieval/template only), optionally test Tier 2 (Thinking-only, `preemptive_tts = false` by default), and enforce strict 8-condition `CommitBarrier` revalidation on the composition thread before any #83 phrase commit.
+
+== Reuse / Adapt / Build comparison
+
+Reuse-first vocabulary per link:../reuse-first.adoc[reuse-first]. No external crate or framework dependency is proposed.
+
+[cols="2,2,3,3,2"]
+|===
+|Candidate |Scope |Pattern / capability |Conflict or gap |Mode
+
+|*LiveKit Agents* (`livekit/agents`, Apache-2.0, reviewed in ADR-0005)
+|External OSS reference
+|Preemptive LLM-only generation (`preemptive_tts = false` default), capped retries, `on_preflight_stale` cancellation on transcript drift, commit only on transcript/context equivalence.
+|Framework owns speech handle and cancellation directly, conflicting with aivtuber's scheduler authority and `PublicOutputPolicy`.
+|*Reference only.* Adopt LLM-only default, stale-preflight cancellation, and transcript/context equivalence check.
+
+|*`GenerationExecutor` & `phrase_commit.rs`* (`crates/app/src/lib.rs`, `crates/app/src/phrase_commit.rs`)
+|Existing project components
+|Non-blocking worker (#121), `GenerationCancellationToken`, composition-thread currency + `PublicOutputPolicy` recheck before `Scheduler::schedule_phrase_at`.
+|Currently lacks typed `SpeculativeGeneration` identity (`input_revision`, `turn_epoch`) and pre-commit holding buffer separate from committed replies.
+|*Reuse / Adapt.* Extend existing worker and commit path rather than building a second execution pool.
+
+|*`CommitBarrier` & `SpeculativeGeneration` state*
+|New bounded composition-thread gate
+|8-condition deterministic revalidation, explicit discard reasons, and useful-vs-wasted cost counters.
+|Project-specific intersection of #67, #69, #81, #83, #85, and `PublicOutputPolicy`.
+|*Custom.* Small pure validation gate (~150–200 lines) inside the composition root.
+|===
+
+== Evidence
+
+* *Repository executable evidence*:
+  - `crates/app/src/phrase_commit.rs` proves the composition thread already enforces worker isolation, generation cancellation, and `PublicOutputPolicy` rechecks before scheduling phrases.
+  - ADR-0005 (`docs/adr/0005-conversational-floor-policy.adoc`) documents LiveKit Agents' `preemptive_generation` / `on_preflight_stale` lifecycle and confirms `preemptive_tts = false` as the safe default.
+* *Unverified expectation (explicitly not yet measured)*:
+  - Latency saved vs wasted LLM/TTS units on Japanese livestream/voice workloads is unmeasured.
+  - Speculation aggressiveness thresholds (when #104/#69 permits starting Tier 2) are uncalibrated.
+
+== Decision
+
+=== 1. Typed `SpeculativeGeneration` identity
+
+Every speculative job carries a bounded, immutable identity:
+
+[source,text]
+----
+SpeculativeGeneration:
+  source_event_id: String      // Root event or utterance being prepared for
+  correlation_id: String       // Causal trace link
+  input_revision: u64          // Monotonic revision of transcript/context snapshot
+  turn_epoch: u64              // Monotonic floor/turn epoch from #81
+  generation_id: u64           // Local fencing token (authoritative over provider)
+  tier: SpeculationTier        // RetrievalTemplateOnly | ThinkingOnly | ThinkingAndTts (opt-in only)
+  created_at_ms: u64           // Logical clock
+  expires_at_ms: u64           // Bounded TTL <= #67 interaction deadline
+  backend_identity: BackendIdentity
+----
+
+Hard concurrency cap: at most **1** active speculative job at any instant; a newer `input_revision` or `turn_epoch` immediately signals `GenerationCancellationToken` on the old job and advances `generation_id`.
+
+=== 2. Authoritative composition-thread `CommitBarrier`
+
+Speculative output sits in a bounded disposable holding slot on the composition thread. Upon turn/context confirmation, `CommitBarrier::evaluate` approves transition into the #83 phrase-commit path *if and only if all 8 conditions hold*:
+
+1. `source_event_id`, `input_revision` (or normalized text equivalence), and `turn_epoch` match current confirmed state.
+2. `generation_id` is still current and `GenerationCancellationToken` is uncancelled.
+3. #81 floor/turn state permits a response (no active operator stop/mute, no higher-priority preemption).
+4. Event has not expired, been superseded, or been moderated/deleted.
+5. Remaining #67 interaction deadline is sufficient to play at least the first phrase.
+6. #69 generative budget still permits completion (and TTS synthesis if Tier 2).
+7. #85 repair/evidence state (`ADR-0010`) has not invalidated the interpretation.
+8. `PublicOutputPolicy::evaluate` passes and the phrase unit satisfies #83 atomic commit preconditions.
+
+Failure of *any* condition atomically discards the speculative result with a typed `SpeculativeDiscardReason` (`RevisionStale`, `EpochChanged`, `Cancelled`, `FloorDenied`, `ModeratedOrSuperseded`, `DeadlineExpired`, `BudgetExhausted`, `RepairInvalidated`, `OutputGateRejected`) and logs it for replay.
+
+=== 3. Tiered speculation policy & telemetry
+
+* *Tier 0 (`Off`, default)*: no speculation; exact baseline.
+* *Tier 1 (`RetrievalTemplateOnly`)*: zero-LLM speculative retrieval and #54 template lookup during tentative pauses.
+* *Tier 2 (`ThinkingOnly`)*: speculative `ThinkingEngine` text generation only (`preemptive_tts = false`), gated by #69 remaining budget and #104 marginal-value criteria.
+* *Tier 3 (`ThinkingAndTts`)*: experimental opt-in only; never default due to wasted synthesis/VRAM cost.
+
+Mandatory telemetry (#58): `speculative_starts`, `speculative_commits`, `speculative_discards` (by `SpeculativeDiscardReason`), `wasted_thinking_calls`, `wasted_tts_calls`, `latency_saved_ms` (committed only), `cancellation_latency_ms`, and `stale_completions_rejected`.
+
+=== 4. Cheapest falsifier (after prerequisites unpark)
+
+Before enabling Tier 2 by default:
+
+1. Replay held-out turn/chat traces containing user self-corrections, partial transcript revisions, higher-priority interruptions, moderation removals, and operator stops across Tier 0 vs Tier 1 vs Tier 2.
+2. Verify 0 leaked/stale commits, 0 `PublicOutputPolicy` bypasses, and deterministic replay of all discard reasons.
+3. Compare p50/p95 committed TTFA saved against wasted LLM call ratio; reject Tier 2 if wasted compute exceeds budget guardrails or latency savings are negligible on local hardware.
+
+== Consequences
+
+=== Positive
+
+* Separates latency optimization ("prepare early") from publication safety ("commit late") without weakening `PublicOutputPolicy`, scheduler authority, or ADR-0004 lifecycle truth.
+* Makes late provider completions provably harmless via authoritative local generation/revision fencing.
+* Directly reuses `GenerationExecutor` (#121) and `phrase_commit.rs` (#83).
+
+=== Costs / trade-offs
+
+* Tier 2 increases LLM compute/VRAM pressure on single-GPU local setups (#220) whenever tentative turns are revised or cancelled.
+* Adds bounded revision/epoch tracking and holding-slot bookkeeping on the composition thread.
+
+=== Known limitations
+
+* Remains `status:blocked` and `status:parked` until #81/#83/#67/#69/#104 prerequisites and representative-hour baselines (#489) are settled.
+* Provider-side cancellation of in-flight HTTP streams depends on backend support; local fencing prevents publication, not always upstream token billing.
+
+== Staging and rollback
+
+1. *Stage 0 (this ADR)*: design and falsifier specification only; zero runtime change.
+2. *Stage 1 (Tier 1 — retrieval/template speculation)*: zero-LLM, off by default; validates `SpeculativeGeneration` fencing and `CommitBarrier` discard telemetry with zero model waste.
+3. *Stage 2 (Tier 2 — opt-in Thinking-only speculation, `default = off`)*: enabled only behind explicit config toggle and #69 waste cap. Rollback is toggling `speculation_tier = Off`.
+4. *Stage 3 (Tier 3 / adaptive #104 gating)*: only if Stage 2 demonstrates net TTFA uplift within #58/#69 guardrails.
+
+== Revisit conditions
+
+* Streaming TTFA without speculation (via #83 phrase commit + #220 local tuning) already meets #58/#71 latency targets, making speculative compute unnecessary.
+* Local GPU VRAM/compute contention under Tier 2 degrades committed-turn latency or triggers #69 cost caps.
+* #81 floor or #85 repair state machines change turn-epoch semantics.
+
+== Related
+
+* Issue: #106 (parent), #121, #83, #81, #67, #69, #85, #104, #58, #220
+* PR: (to be linked on PR creation)
+* Assumptions: `A-CTRL-001`, `A-MEM-001`; proposed `A-SPEC-001`, `A-SPEC-002`
+* Other ADRs: link:0001-three-layer-runtime.adoc[ADR-0001], link:0004-speech-lifecycle-and-text-projection.adoc[ADR-0004], link:0005-conversational-floor-policy.adoc[ADR-0005], link:0010-conversational-clarification-and-repair.adoc[ADR-0010]
