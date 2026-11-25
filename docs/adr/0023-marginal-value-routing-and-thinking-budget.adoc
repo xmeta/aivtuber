@@ -1,0 +1,151 @@
+= ADR-0023: Offline-calibrated marginal-value escalation routing and bounded ThinkingBudgetClass
+:status: Proposed
+:date: 2026-11-25
+
+== Context
+
+Issue #104 (`priority:P2`, `status:blocked`, `status:design-ready`, `status:parked`, Stage 3) asks to replace ad-hoc "hard vs easy" generative escalation heuristics with an evidence-calibrated, deterministic policy that evaluates whether escalating from the best cheap candidate (cached / semantic / template) to a slower/more expensive generative route — and at which provider-neutral `ThinkingBudgetClass` — is worth the added latency, cost, and #69 budget consumption.
+
+This ADR records a proposed `EscalationContext`, offline-calibrated deterministic `MarginalValuePolicy`, provider-neutral `ThinkingBudgetClass` mapping, and shadow-first promotion path (#64). Implementation remains `status:blocked` (on calibrated #59 pairwise labels and #64 shadow evidence) and `status:parked` until v0.3 closes. It authorizes no production code, changes no wire schemas, adds no dependencies, and preserves all v0.3 defaults.
+
+Inputs this ADR builds on, present on `main` at `2fc9610`:
+
+* `crates/app/src/shadow_evidence.rs` (#64): side-effect-free shadow policy evaluation and divergence reporting.
+* `crates/app/src/tests/thinking_cost_cap_tests.rs` (#69): authoritative generative cost/call budgets.
+* #58 (benchmark artifacts), #59 (pairwise cheap-vs-generative quality labels), #67 (interaction deadline), and #74 (Jev engagement triage).
+
+== Hard constraints
+
+* *Cheap-first hierarchy and non-authority* (`A-CTRL-001`): The policy never bypasses cached/semantic/template candidates, never executes providers directly, and never holds security/control authority.
+* *#67 deadline and #69 budget hold hard veto power*: Even high expected incremental quality cannot override an exhausted #67 deadline or #69 generative budget.
+* *Offline-calibrated deterministic policy first — zero online exploration in initial production*: Never deploy online contextual bandits or live exploration on real users in the first slice. Policy parameters are calibrated offline from #59 pairwise labels and #64 shadow traces, with `(policy_id, version, config_fingerprint)` recorded in replay metadata.
+* *Bounded typed `EscalationContext` only*: Never pass raw unbounded conversation history or arbitrary provider state into routing decisions.
+* *Provider-neutral `ThinkingBudgetClass`*: Core domain recommends a closed class (`None`, `Short`, `Normal`, `Deep`); adapters map it to supported provider reasoning/token knobs.
+* *Deterministic fallback on escalation failure*: If an escalated provider fails or times out, degrade cleanly to the best cheap candidate without freezing the performer.
+
+== Assumptions
+
+Existing invariants referenced:
+
+* `A-CTRL-001` (Invariant): routing policy and model hints never hold security/control authority.
+* `A-MEM-001` (Invariant): durable memory writes require non-serializable `MemoryWritePermit`.
+
+Proposed new assumptions (to be added to link:../assumptions.adoc[Assumption Register] only if accepted):
+
+* *A-ROUTE-001* (*Needs validation*): A compact offline-calibrated deterministic table / bounded linear-logistic score over `EscalationContext` features reduces unnecessary generative escalations while preserving or improving #59 pairwise win rate compared to fixed confidence thresholds. *Evidence:* unverified; requires #59 labeled cheap-vs-generative pairs and #64 shadow traces.
+
+== Alternatives considered
+
+. *Status quo (static confidence/route heuristic)*: simple, but ignores remaining #67 deadline, #69 budget pressure, provider health, and the actual quality gap between the best cheap candidate and generation.
+. *Online contextual bandit / RL router in production*: rejected for initial slice. Breaks deterministic replay, risks unsafe/degraded live exploration on viewers, and cannot be audited before #58/#59/#64 baselines exist.
+. *Monolithic neural router with raw chat input*: rejected. Adds inference overhead, non-determinism, and unbounded input complexity.
+. *Offline-calibrated deterministic `MarginalValuePolicy` + provider-neutral `ThinkingBudgetClass` promoted via #64 shadow mode (proposed)*: preserves cheap-first determinism, respects #67/#69 hard vetoes, and separates route vs thinking-budget evaluation.
+
+== Reuse / Adapt / Build comparison
+
+Reuse-first vocabulary per link:../reuse-first.adoc[reuse-first]. No external router crate or hosted service is proposed.
+
+[cols="2,2,3,3,2"]
+|===
+|Candidate |Scope |Pattern / capability |Conflict or gap |Mode
+
+|*RouteLLM* (2024) & *Adaptive LLM Routing under Budget Constraints* (EMNLP 2025 Findings)
+|External research
+|Framing escalation as expected incremental quality vs latency/cost under budget constraints, plus route × compute-budget allocation.
+|Online feedback loops and external benchmark weights cannot be imported directly into aivtuber production routing.
+|*Reference only.* Adopt incremental-value framing and bounded compute classes with offline calibration.
+
+|*#64 Shadow evaluation (`crates/app/src/shadow_evidence.rs`), #59 pairwise review, #67 deadline, #69 cost cap*
+|Existing project components
+|Side-effect-free shadow comparison, pairwise cheap-vs-generative labels (`cheap_preferred | gen_preferred | tie | both_unacceptable`), and hard deadline/budget enforcement.
+|Need a typed `EscalationContext` and `MarginalValuePolicy` consumer.
+|*Reuse.* Promote exclusively through #64 shadow evidence calibrated on #59 labels.
+
+|*`MarginalValuePolicy` & `ThinkingBudgetClass`*
+|New reflex/app policy
+|Pure deterministic scoring table / logistic weights, #67/#69 hard vetoes, and replayable reason codes.
+|Project-specific intersection of cheap-first routes and budgets.
+|*Custom.* Pure Rust policy (~150–200 lines), versioned and off by default.
+|===
+
+== Evidence
+
+* *Repository executable evidence*:
+  - `crates/app/src/shadow_evidence.rs` and `crates/app/src/tests/thinking_cost_cap_tests.rs` confirm shadow divergence logging and #69 budget enforcement exist on `main`.
+* *Unverified expectation (explicitly not yet measured)*:
+  - Calibration curves, unnecessary-escalation rate, and missed-beneficial-escalation rate are unmeasured until sufficient #59 cheap-vs-generative pairwise labels exist.
+
+== Decision
+
+=== 1. Bounded `EscalationContext` and output decision
+
+[source,text]
+----
+EscalationContext (bounded, no raw chat history):
+  current_best_route: CheapRouteClass       // Cached | SemanticReuse | Template | Silent
+  current_route_confidence: f64             // [0.0, 1.0]
+  semantic_margin: Option<f64>              // Top-1 minus Top-2 retrieval margin
+  event_class: EngagementClass
+  timing_class: ResponseTimingClass         // Immediate | Deferred | Idle
+  remaining_deadline_ms: u64                // From #67
+  budget_remaining_ratio: f64               // From #69 [0.0, 1.0]
+  provider_health: ProviderHealthClass      // Healthy | Degraded | Unavailable
+  queue_load: LoadClass                     // Low | Medium | High
+  cost_class: CostClass                     // LocalZero | LowRemote | HighRemote
+  quality_requirement: QualityClass         // Casual | Normal | HighStakes
+
+EscalationDecision:
+  action: Escalate | KeepCheap
+  thinking_budget: ThinkingBudgetClass      // None | Short | Normal | Deep
+  expected_delta_quality: f64               // Offline-calibrated incremental uplift estimate
+  veto_reason: Option<VetoReason>           // DeadlineTight | BudgetExhausted | ProviderUnavailable | None
+  policy_version: BoundedString
+----
+
+=== 2. Provider-neutral `ThinkingBudgetClass`
+
+* `None`: cached/semantic/template route (`KeepCheap`).
+* `Short`: straightforward generative wording with tight token/latency budget.
+* `Normal`: standard conversational reasoning.
+* `Deep`: rare high-value reasoning when #67 deadline and #69 budget permit.
+
+Adapters map `ThinkingBudgetClass` to provider-specific token/reasoning parameters; raw provider knobs never enter `aivtuber-domain`.
+
+=== 3. Calibration & cheapest falsifier
+
+1. Collect #59 pairwise labels comparing best cheap candidate vs generative candidate (`cheap_preferred`, `gen_preferred`, `tie`, `both_unacceptable`).
+2. Fit a compact versioned threshold table / logistic score offline on development partitions; evaluate on held-out partitions measuring *unnecessary escalation rate*, *missed beneficial escalation rate*, *deadline misses*, and *LLM/TTS calls per stream hour* (separately for route and `ThinkingBudgetClass`).
+3. Run side-effect-free in #64 shadow mode; promote to opt-in active routing only if held-out and shadow evidence show clear net improvement over the baseline heuristic.
+
+== Consequences
+
+=== Positive
+
+* Makes generative escalation and reasoning compute measurable, replayable, and jointly sensitive to quality uplift, #67 deadline, and #69 budget.
+* Prevents low-confidence inputs from reflexively burning LLM budget when cheap fallback is equal or better.
+
+=== Costs / trade-offs
+
+* Requires periodic offline recalibration when models, templates, or starter packs change materially.
+
+=== Known limitations
+
+* Blocked on #59 pairwise label volume and #64 shadow evidence; parked until v0.3 closes.
+
+== Staging and rollback
+
+1. *Stage 0 (this ADR)*: contract and calibration protocol only; zero runtime change.
+2. *Stage 1 (#64 shadow-only policy)*: log `EscalationDecision` alongside active routing with zero live side effects.
+3. *Stage 2 (opt-in active `MarginalValuePolicy`, `default = off`)*: enable behind config toggle after held-out #59 + #64 validation; rollback is toggling back to the baseline router.
+
+== Revisit conditions
+
+* Local model latency/cost (#220) shifts enough that the cheap-vs-generative frontier moves materially.
+* #59 calibration error by event class remains high under a compact deterministic model.
+
+== Related
+
+* Issue: #104 (parent), #58, #59, #64, #67, #69, #74, #106
+* PR: (to be linked on PR creation)
+* Assumptions: `A-CTRL-001`, `A-MEM-001`; proposed `A-ROUTE-001`
+* Other ADRs: link:0001-three-layer-runtime.adoc[ADR-0001], link:0014-preemptive-generation-and-commit-barrier.adoc[ADR-0014], link:0022-multilevel-trace-evaluation.adoc[ADR-0022]
