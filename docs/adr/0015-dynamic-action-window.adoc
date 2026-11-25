@@ -1,0 +1,185 @@
+= ADR-0015: Bounded provider-neutral ActionWindow for context-valid high-level actions
+:status: Proposed
+:date: 2026-11-25
+
+== Context
+
+Issue #221 (`priority:P1`, `status:blocked`, `status:design-ready`, `status:parked`, Stage 4, tracked by #94) asks for a provider-neutral, bounded `ActionWindow` that exposes only the high-level actions valid in the current game, application, or scene state — rather than dumping the entire global tool catalog into every model prompt.
+
+This ADR records a proposed contract, lifecycle, authority boundary, and falsifier only. Implementation remains `status:blocked` on #202 (tool catalog, trust classes, risk policy, approval gates) and `status:parked` until v0.3 closes. It authorizes no production code, changes no wire schemas, adds no dependencies, and leaves all v0.3 defaults unchanged.
+
+Inputs this ADR builds on, present on `main` at `13662c1`:
+
+* link:0002-mcp-tool-authority-boundary.adoc[ADR-0002] (#193, Accepted): establishes `ToolAction -> AuthorizedToolAction -> ToolAdapter -> ToolExecutionResult -> deterministic verification` as the project-owned execution and verification boundary, with non-serializable `ToolGrant` capability minting and explicit 16 KiB descriptor / 32 KiB observation bounds.
+* `docs/dual-role-agent-architecture.adoc`: separates the Interaction Plane from the Task Plane and forbids replacing project-owned authority or verified-completion semantics with framework defaults.
+* #88 (`crates/domain/src/scene.rs`, `crates/runtime/src/scene_context.rs`): `SceneContextSnapshot` and `SceneContextTracker` expose bounded, TTL-guarded scene/game transitions without raw game state entering core domain contracts.
+* #202 (dependency: reviewed tool catalog, trust classes, risk policy, and approval gates) and #203 (verified agent-task evaluation and false-success benchmarks).
+
+== Hard constraints
+
+* *`ActionWindow` is availability context, never authority* (`A-CTRL-001`, ADR-0002): Opening a window or listing an action grants zero capability. Model selection produces a disposable `ActionProposal`; execution still requires #202 policy/approval and non-serializable `ToolGrant` / `AuthorizedToolAction` minting by authenticated local ingress.
+* *Server/game metadata cannot lower local risk*: A game adapter or MCP server may narrow availability or supply schema fingerprints, but can never downgrade local risk class, bypass approval, or widen the #202 reviewed catalog / user allowlist.
+* *Fail-closed on stale, expired, superseded, unknown, or schema-drifted proposals*: Any proposal targeting a closed/expired/superseded `window_id` or `scene_epoch`, an unknown `action_id`, or a mismatched `schema_fingerprint` must fail closed before privileged dispatch.
+* *High-level intent only (no frame-level LLM control)*: LLMs choose high-level actions (`ActionProposal`); high-APM or continuous motor/game control is delegated to deterministic or specialized local controllers outside the LLM/frame loop.
+* *Execution dispatch is not verified task completion* (ADR-0002): Unlike Neuro SDK-style immediate validation acknowledgements, requested outcomes succeed only after normalized observation and project-owned verification.
+* *No second plugin protocol*: MCP (#193/#204), native adapters, and game adapters feed the same provider-neutral `ActionWindow` contract.
+* *Bounded state and deterministic offline replay*: Window size (`max_actions`), descriptor bytes, and history are strictly bounded; replay reproduces availability, proposal, authorization, observation, and verification boundaries without reconnecting to any live game or app.
+
+== Assumptions
+
+Existing invariants referenced:
+
+* `A-CTRL-001` (Invariant): model output and serialized claims never hold runtime authority.
+* `A-MEM-001` (Invariant): durable memory writes require non-serializable `MemoryWritePermit`.
+
+Proposed new assumptions (to be added to link:../assumptions.adoc[Assumption Register] only if accepted):
+
+* *A-ACTWIN-001* (*Needs validation*): Narrowing model-visible actions via a bounded `ActionWindow` (`max_actions <= 16`) reduces invalid/out-of-context tool proposals and prompt token cost compared to exposing the full #202 catalog on every turn. *Evidence:* unverified design hypothesis; must be tested in #203 benchmarks.
+* *A-ACTWIN-002* (*Needs validation*): Epoch + logical-clock TTL fencing catches scene-transition race conditions (proposals completing after a menu/cutscene transition) without causing unacceptable false rejections on normal latency turns. *Evidence:* unverified; requires synthetic transition-race tests.
+
+== Alternatives considered
+
+. *Status quo (expose full #202 catalog every turn)*: wastes prompt budget, increases out-of-context tool selection errors, and gives the model no structural signal for scene-valid transitions.
+. *Adopt Neuro SDK protocol directly as aivtuber's tool/action runtime*: rejected. Neuro SDK acknowledges action validity before effect completion and does not carry aivtuber's non-serializable `ToolGrant`, #202 risk/approval gates, or verified-completion semantics. Reuse its dynamic high-level registration/windowing concept as *reference only*.
+. *Let the LLM poll raw game state and emit frame-level inputs*: rejected. Violates motor-loop isolation, bounded context rules, and latency budgets.
+. *Bounded provider-neutral `ActionWindow` layered between #202 catalog and model context (proposed)*: preserves ADR-0002 authority and verification, enforces strict lifecycle/epoch fencing, and unifies MCP/native/game adapters under one availability contract.
+
+== Reuse / Adapt / Build comparison
+
+Reuse-first vocabulary per link:../reuse-first.adoc[reuse-first]. No new external dependency or plugin protocol is proposed.
+
+[cols="2,2,3,3,2"]
+|===
+|Candidate |Scope |Pattern / capability |Conflict or gap |Mode
+
+|*VedalAI Neuro SDK* (https://github.com/VedalAI/neuro-sdk)
+|External OSS reference
+|Dynamic high-level action registration/unregistration scoped to current game context (`register_actions` / `unregister_actions` / forced action window).
+|Immediate validation-only completion semantics and game-driven action authority conflict with ADR-0002 verified completion and #202 risk/approval gates.
+|*Reference only.* Adopt dynamic context-scoped high-level action windowing; reject validation-as-completion and game-minted authority.
+
+|*ADR-0002 `RmcpToolAdapter` & `execute_verified_tool`* (`crates/adapters`, `crates/runtime`)
+|Existing project components
+|Bounded 16 KiB descriptors, 32 KiB observations, `ToolGrant` capability minting, generation/cancellation fencing, and post-execution verification.
+|Operates on static/global tool discovery rather than epoch-scoped context windows.
+|*Reuse.* Keep ADR-0002 execution and verification unchanged below `ActionWindow`.
+
+|*`SceneContextTracker` (#88)* (`crates/domain/src/scene.rs`, `crates/runtime/src/scene_context.rs`)
+|Existing project component
+|Bounded, TTL-guarded scene transitions and trusted source classification.
+|Emits scene snapshots only; does not yet track active action windows or epochs.
+|*Reuse.* Feed trusted #88 scene transitions as window open/supersede/close triggers.
+
+|*`ActionWindow` & `WindowAction` contract*
+|New domain/runtime module
+|Bounded versioned availability window, lifecycle state machine (`Building -> Active -> Superseded | Expired | Closed`), schema-fingerprint pinning, and fail-closed proposal validation.
+|No external crate implements project-owned catalog intersection, epoch fencing, and offline replay recording.
+|*Custom.* Small pure Rust contract + validator (~200 lines) in `crates/domain` + `crates/runtime`.
+|===
+
+== Evidence
+
+* *Repository executable evidence*:
+  - ADR-0002 (`docs/adr/0002-mcp-tool-authority-boundary.adoc`) and `crates/adapters/tests/mcp_tool.rs` prove bounded descriptor/observation enforcement, forged-capability rejection, and post-execution generation/cancellation fencing.
+  - `crates/runtime/src/scene_context.rs` proves bounded logical-clock scene tracking without raw game state entering core domain state.
+* *Unverified expectation (explicitly not yet measured)*:
+  - Reduction in invalid tool proposals vs full-catalog exposure has not been measured yet (requires #202 catalog and #203 evaluation harness).
+  - Default `max_actions` (`16`) and window TTL defaults are starting hypotheses.
+
+== Decision
+
+=== 1. Exposure pipeline (intersection, never widening)
+
+[source,text]
+----
+#202 reviewed tool catalog
+  ∩ operator/profile allowlist
+  ∩ current Active ActionWindow (bounded subset, max_actions <= 16)
+  -> bounded model-visible WindowAction list
+----
+
+No adapter or window update can expose an action that is absent from the #202 reviewed catalog or blocked by the operator allowlist.
+
+=== 2. Provider-neutral `ActionWindow` & `WindowAction` model
+
+[source,text]
+----
+ActionWindow (schema-versioned, bounded):
+  window_id: BoundedId
+  scene_epoch: u64                 // Monotonic; increments on trusted #88 / adapter transition
+  state: WindowState               // Building | Active | Superseded | Expired | Closed
+  opened_at_ms: u64                // Logical clock
+  expires_at_ms: u64               // Bounded TTL
+  context_refs: Vec<BoundedId>     // Max 4 refs (e.g. scene_id, task_id)
+  allowed_actions: Vec<WindowAction> // Max 16 actions
+  source: WindowSource             // TrustedSceneAdapter | OperatorProfile | TaskPlane (never UntrustedChat / ModelOutput)
+
+WindowAction:
+  action_id: BoundedId             // Stable catalog identity
+  schema_fingerprint: [u8; 32]     // SHA-256 of pinned parameter schema (detects drift)
+  description: BoundedString       // Bounded UTF-8 summary
+  local_risk_class: RiskClass      // Owned by #202 local policy; adapter cannot lower
+  approval_required: bool          // Owned by #202 local policy
+  execution_class: ExecutionClass  // DiscreteTool | DelegatedController
+----
+
+=== 3. Lifecycle and fail-closed proposal validation
+
+[source,text]
+----
+Building -> Active -> (Superseded | Expired | Closed)   // Terminal states are immutable
+----
+
+When the model emits `ActionProposal { window_id, scene_epoch, action_id, schema_fingerprint, arguments }`:
+
+1. Verify `window_id` is `Active`, `now_ms < expires_at_ms`, and `scene_epoch` matches current epoch (otherwise reject with `StaleWindow` / `ExpiredWindow` / `EpochMismatch`).
+2. Verify `action_id` exists in `allowed_actions` and `schema_fingerprint` matches (otherwise reject with `UnknownAction` / `SchemaDrift`).
+3. Hand off to #202 risk/approval policy and ADR-0002 `AuthorizedToolAction` capability minting.
+4. Execute via `ToolAdapter` (or deterministic local controller for `DelegatedController`) and record normalized `ToolExecutionResult` + post-execution `VerificationOutcome`.
+
+=== 4. Replay contract & cheapest falsifier
+
+Replay records `(window_id, scene_epoch, action_ids + schema_fingerprints, lifecycle_reason, proposal_id, auth_result, observation, verification_outcome)` without reconnecting to any live game/app.
+
+Cheapest falsifier (once #202 unblocks and #221 unparks):
+
+1. Build deterministic offline unit/integration fixtures covering all 7 edge cases required by #221: `supersede`, `expiry`, `schema_drift`, `stale_proposal` (scene transition race), `approval_denial`, `cancellation`, and `verifier_failure` (dispatch succeeded, outcome unverified -> must not report success).
+2. Benchmark in #203 (`exposed actions/window`, `stale proposal rejection`, `unknown-action rejection`, `false-success prevention`) comparing full-catalog exposure vs `ActionWindow` exposure.
+
+== Consequences
+
+=== Positive
+
+* Dramatically shrinks model-visible tool/action surface to context-valid actions while keeping #202 and ADR-0002 strictly authoritative.
+* Prevents scene-transition race conditions and silent schema drift via monotonic `scene_epoch` and `schema_fingerprint` pinning.
+* Keeps continuous/high-APM game control out of the LLM/frame loop via `ExecutionClass::DelegatedController`.
+
+=== Costs / trade-offs
+
+* Requires game/app adapters to emit bounded window updates on scene transitions (or derive them from #88 snapshots).
+* Adds one deterministic validation layer and replay event family above ADR-0002.
+
+=== Known limitations
+
+* Blocked on #202 (`RiskClass`, reviewed catalog, approval gates) and parked until v0.3 closes.
+* Effectiveness on complex multi-step games depends on adapter quality in defining meaningful high-level actions.
+
+== Staging and rollback
+
+1. *Stage 0 (this ADR)*: design and falsifier contract only; zero runtime change.
+2. *Stage 1 (domain contract + offline tests)*: implement `ActionWindow` / `WindowAction` schema, validator, and all 7 fail-closed edge-case tests without wiring live game adapters.
+3. *Stage 2 (opt-in #202 catalog intersection)*: filter MCP/native tool exposure through `ActionWindow` behind a feature/config flag (`default = off`). Rollback is toggling the flag off (reverts to #202 allowlist).
+4. *Stage 3 (#88 scene-driven game windows & delegated controllers)*: opt-in per-adapter integration validated by #203 benchmarks.
+
+== Revisit conditions
+
+* #202 tool catalog or approval model changes the representation of `RiskClass` or schema fingerprints.
+* #203 benchmarks show full-catalog exposure has negligible error/cost overhead at target tool counts (making windowing unnecessary for non-game workflows).
+* Any security review identifies a race where an adapter closes a window after dispatch without invalidating post-execution verification.
+
+== Related
+
+* Issue: #221 (parent), #94, #202, #203, #204, #193, #88
+* PR: (to be linked on PR creation)
+* Assumptions: `A-CTRL-001`, `A-MEM-001`; proposed `A-ACTWIN-001`, `A-ACTWIN-002`
+* Other ADRs: link:0001-three-layer-runtime.adoc[ADR-0001], link:0002-mcp-tool-authority-boundary.adoc[ADR-0002], link:0011-segment-planning-and-initiative-utility.adoc[ADR-0011]
