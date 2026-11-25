@@ -48,7 +48,7 @@ jobs:
                 exit 0
                 ;;
             esac
-            if [[ "$f" =~ ^docs/.*\.(adoc|md|txt)$ ]] || [[ "$f" =~ ^(README|AGENTS|CHANGELOG|CONTRIBUTING|SECURITY)\.md$ ]] || [[ "$f" =~ ^LICENSE ]]; then
+            if [[ "$f" =~ ^docs/.*\.(adoc|md|txt)$ ]] || [[ "$f" =~ ^(README|AGENTS|CHANGELOG|CONTRIBUTING|SECURITY)\.(md|adoc)$ ]] || [[ "$f" =~ ^LICENSE ]]; then
               continue
             fi
             echo "Non-doc file changed ($f); running full CI."
@@ -121,6 +121,17 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
+      - name: Cache cargo
+        if: needs.changes.outputs.docs_only != 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target
+          key: validate-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: validate-cargo-${{ runner.os }}-
       - if: needs.changes.outputs.docs_only != 'true'
         run: bun install --frozen-lockfile
       - if: needs.changes.outputs.docs_only != 'true'
@@ -151,6 +162,18 @@ jobs:
         with:
           toolchain: 1.98.1
           components: rustfmt, clippy
+
+      - name: Cache cargo
+        if: needs.changes.outputs.docs_only != 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target
+          key: rust-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: rust-cargo-${{ runner.os }}-
 
       - name: Format
         if: needs.changes.outputs.docs_only != 'true'
@@ -279,6 +302,17 @@ jobs:
           toolchain: 1.98.1
           components: clippy
 
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target
+          key: native-audio-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: native-audio-cargo-${{ runner.os }}-
+
       - name: Clippy the native backend
         run: cargo clippy --locked -p aivtuber-adapters --features native-audio-spike --all-targets -- -D warnings
 
@@ -327,6 +361,17 @@ jobs:
         with:
           toolchain: 1.98.1
           components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target
+          key: speech-stt-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: speech-stt-cargo-${{ runner.os }}-
 
       - name: Install cargo-deny
         uses: taiki-e/install-action@v2
@@ -435,6 +480,17 @@ jobs:
           toolchain: 1.98.1
           components: clippy
 
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target
+          key: speech-tts-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: speech-tts-cargo-${{ runner.os }}-
+
       - name: Install cargo-deny
         uses: taiki-e/install-action@v2
         with:
@@ -532,6 +588,17 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target
+          key: regressions-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: regressions-cargo-${{ runner.os }}-
 
       # PROPTEST_RNG_SEED fixes the generated space; PROPTEST_CASES bounds it.
       # Both values are asserted by scripts/validate.mjs so they cannot drift
