@@ -237,18 +237,19 @@ fn nothing_is_calibrated_until_a_target_file_says_so() {
 }
 
 /// The checked-in target file must stay valid against this catalog and stay
-/// empty until a target cites measured evidence from a representative series
-/// at a sufficient denominator. The first calibration cycle ran on the
-/// mock-driven smoke fixture, whose pooled denominators sat below the sample
-/// floors — evidence that cannot decide an objective cannot justify a target
-/// for it (docs/operational-slo.adoc, PR #228 review).
+/// Calibrated targets checked into `examples/slo/slo-targets.json` must stay
+/// schema-valid, cite measured baseline evidence from a representative series
+/// with pooled denominators meeting each indicator's sample floor, and preserve
+/// the distinction from per-PR regression budgets (docs/operational-slo.adoc,
+/// issues #71 and #489 Track C).
 #[test]
-fn the_checked_in_target_file_is_valid_and_still_empty() {
+fn the_checked_in_target_file_is_valid_and_evidence_backed() {
     let bytes =
         std::fs::read(repository_path("examples/slo/slo-targets.json")).expect("targets file");
     let targets = SloTargets::from_json(&bytes).expect("parse targets");
+    let catalog = aivtuber_telemetry::catalog();
     targets
-        .validate(&aivtuber_telemetry::catalog())
+        .validate(&catalog)
         .expect("targets describe this catalog");
 
     assert_eq!(
@@ -256,10 +257,27 @@ fn the_checked_in_target_file_is_valid_and_still_empty() {
         aivtuber_telemetry::SLO_CATALOG_VERSION
     );
     assert!(
-        targets.targets.is_empty(),
-        "a numeric target may only be checked in once it cites measured baseline evidence from a \
-         representative series whose pooled denominators reach the sample floor"
+        !targets.targets.is_empty(),
+        "calibrated Track C baseline targets must be present once calibrated from representative series"
     );
+    for (id, entry) in &targets.targets {
+        let indicator = catalog
+            .iter()
+            .find(|item| item.id == id)
+            .expect("validated indicator exists in catalog");
+        assert!(
+            entry.baseline.series.is_some(),
+            "{id}: calibrated target must name its #58 compatibility series"
+        );
+        assert!(
+            entry.baseline.runs.len() >= 2,
+            "{id}: calibrated target must pool at least 2 distinct runs"
+        );
+        assert!(
+            entry.baseline.eligible.unwrap_or(0) >= indicator.sample_floor,
+            "{id}: pooled eligible denominator must meet the indicator sample floor"
+        );
+    }
     let description = targets
         .description
         .expect("the target file must explain which contract it is not");
