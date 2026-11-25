@@ -121,6 +121,13 @@ Twitch/emote-aware moderation research
 |#85
 |Which sources improve correctness without exceeding interaction deadline; prevent recovery of deleted/private content. Proposed deterministic `ContextSufficiency` / `RepairDisposition` policy, single-pass `EvidenceProbeBudget`, reuse review, and #59 falsifier for #85: link:adr/0010-conversational-clarification-and-repair.adoc[ADR-0010] (Proposed; design only, nothing run or measured)
 
+|Stream-segment planning / initiative utility
+|Homeostatic RL (eLife 2014, conceptual motivation only);
+Generative Agents (arXiv:2304.03442, bounded plan reference only)
+|Advisory bounded segment context and deterministic multi-factor utility scoring (explicitly including `Wait`) inside existing `InitiativeDirector` before considering any extra LLM director
+|#87, #487
+|Held-out blind #59 comparison against measured #87 baseline; unnecessary speech vs direct-response displacement; stale plan/topic handling. Proposed bounded `SegmentContext`, deterministic scorer, reuse review, and falsifier for #487: link:adr/0011-segment-planning-and-initiative-utility.adoc[ADR-0011] (Proposed; design only, blocked on measured #87 baseline)
+
 |Long-term conversational memory
 |LoCoMo (ACL 2024);
 THEANINE (NAACL 2025);
