@@ -3941,7 +3941,20 @@ where
         {
             return None;
         }
-        match self.reply_availability(at_ms) {
+        // #79 S5: a crowd carrier that a reviewed cached line answers never
+        // touches the generation worker, so a generation already in flight
+        // must not add its queue wait to the crowd's route-to-dispatch interval
+        // (Track A 2026-11-26: 3,175 ms of that route's 4,736 ms). Speech,
+        // mute, the conversation floor and a protected scene still defer it.
+        let availability = match self.reply_availability(at_ms) {
+            ReplyAvailability::Busy(BusyCause::Generating)
+                if self.crowd_answered_from_pack(&candidate, seed) =>
+            {
+                ReplyAvailability::Available
+            }
+            other => other,
+        };
+        match availability {
             ReplyAvailability::Busy(cause) => {
                 let crowd = candidate.crowd.is_some();
                 // A crowd has no single actor (#79 S4): the carrier is one
@@ -4063,6 +4076,42 @@ where
         result
     }
 
+    /// The reviewed crowd line this group would play, if the pack has one
+    /// (#79 S4), most specific group first. Pure: it only reads the asset
+    /// descriptors, so "needs no generation" and "plays from the pack" are the
+    /// same decision.
+    fn crowd_reaction_intent(
+        &self,
+        event: &EventEnvelope,
+        group: aivtuber_reflex::CrowdReactionGroup,
+        seed: u64,
+    ) -> Option<&'static str> {
+        let variant_seed = seed.wrapping_add(event.sequence);
+        chat_burst::crowd_asset_groups(group)
+            .iter()
+            .copied()
+            .find(|candidate| {
+                self.performer
+                    .assets()
+                    .select_variant_id(candidate, variant_seed, &[])
+                    .is_some()
+            })
+    }
+
+    /// Whether a routed crowd carrier is answered from the pack alone (#79
+    /// S5). Such an answer makes no provider call, so the single generation
+    /// worker is not part of its latency.
+    fn crowd_answered_from_pack(&self, candidate: &chat_burst::Candidate, seed: u64) -> bool {
+        let Some(crowd) = candidate.crowd.as_ref() else {
+            return false;
+        };
+        let aivtuber_reflex::CrowdAction::NonVerbal { group } = crowd.action else {
+            return false;
+        };
+        self.crowd_reaction_intent(&candidate.event, group, seed)
+            .is_some()
+    }
+
     /// Play a cached or non-verbal reaction for a crowd moment, or `None` when
     /// the pack has no fitting asset (the caller then falls back). Bypasses the
     /// router on purpose: nothing is generated or retrieved from the carrier's
@@ -4074,20 +4123,12 @@ where
         at_ms: u64,
         seed: u64,
     ) -> Option<Result<Option<CachedPlaybackOutcome>, AppError>> {
-        let variant_seed = seed.wrapping_add(event.sequence);
-        let intent = chat_burst::crowd_asset_groups(group)
-            .iter()
-            .find(|candidate| {
-                self.performer
-                    .assets()
-                    .select_variant_id(candidate, variant_seed, &[])
-                    .is_some()
-            })?;
+        let intent = self.crowd_reaction_intent(event, group, seed)?;
         let event_id = event.event_id.clone();
         let mut reaction = event.clone();
         reaction.payload.insert(
             "intent".to_owned(),
-            serde_json::Value::String((*intent).to_owned()),
+            serde_json::Value::String(intent.to_owned()),
         );
         let played = self.performer.handle_event(
             &reaction,
