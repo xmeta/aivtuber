@@ -989,6 +989,77 @@ fn a_cached_crowd_reaction_does_not_wait_for_a_generation_in_flight() {
 }
 
 #[test]
+fn a_representative_reply_crowd_still_waits_for_the_generation_worker() {
+    // #79 S5 keeps the exception narrow. Only a carrier the pack answers skips
+    // the queue; a repeated question is answered by generated text, so it must
+    // wait for the worker and be answered by it, never be thrown out of the
+    // queue as if a cached line existed for it.
+    let fixture = fixture();
+    let gate = Arc::new(BlockingGate::default());
+    let mut rig = rig_with_thinking(
+        lane_config(&fixture, true),
+        BlockingThinking {
+            gate: Arc::clone(&gate),
+            reply: "a farming sim".to_owned(),
+        },
+    );
+
+    // An ordinary reply holds the single generation worker.
+    let mut direct = chat_event(90_002);
+    direct.payload.remove("intent");
+    rig.app
+        .dispatch_admitted_event(direct, 1_000, 1, std::time::Instant::now())
+        .expect("the generation starts");
+    gate.wait_until_entered();
+
+    // A repeated question is routed as a representative reply, not a pack line.
+    for (_, at, event) in expand(&fixture)
+        .into_iter()
+        .filter(|(phase, _, _)| phase == "question")
+    {
+        let raw = serde_json::to_vec(&event).expect("event json");
+        rig.app
+            .process_content_bytes(&raw, at, at ^ 0x55)
+            .expect("content");
+        rig.app.service_chat_burst(at, at);
+    }
+    rig.app.service_chat_burst(62_000, 62_000);
+
+    let metrics = rig.app.chat_burst_metrics().expect("metrics");
+    assert!(
+        metrics.crowd_routed >= 1,
+        "the repeated question was routed: {metrics:?}"
+    );
+    assert_eq!(
+        metrics.crowd_non_verbal, 0,
+        "a repeated question is not answered from the pack: {metrics:?}"
+    );
+    assert_eq!(
+        metrics.crowd_replies, 0,
+        "the generated crowd reply waited for the worker: {metrics:?}"
+    );
+    assert!(
+        metrics.deferred.pending >= 1,
+        "the carrier sits in the deferred inbox: {metrics:?}"
+    );
+
+    // Once the worker frees up, the representative reply is generated.
+    gate.release();
+    for step in 1..=40_u64 {
+        let at = 62_000 + step * 250;
+        rig.app.tick(at);
+        rig.app.service_chat_burst(at, at);
+        wait_for_generation_completion(&mut rig.app, at);
+    }
+    let metrics = rig.app.chat_burst_metrics().expect("metrics");
+    assert!(
+        metrics.crowd_replies >= 1,
+        "the representative reply was answered after the worker freed: {metrics:?}"
+    );
+    assert_eq!(metrics.invariant_violations, 0);
+}
+
+#[test]
 fn a_crowd_carrier_is_dispatched_before_older_deferred_replies_and_is_voiced() {
     // #79: a crowd lands while a reply is speaking and an older single-viewer
     // reply already waits. When the speech ends, the crowd reaction goes
