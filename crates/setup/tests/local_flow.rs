@@ -76,7 +76,7 @@ struct Fixture {
     manifest: Manifest,
     server: Server,
     root: PathBuf,
-    base: PathBuf,
+    base: TestDir,
 }
 
 /// `evil_llama`: the llama archive carries a path-traversal entry.

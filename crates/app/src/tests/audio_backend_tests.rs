@@ -1,7 +1,6 @@
 //! Issue #354: Audio backend selection tests.
 
 use crate::{AudioBackendKind, build_audio_output};
-use std::fs;
 
 #[test]
 fn audio_backend_kind_parses_valid_options() {
@@ -34,9 +33,7 @@ fn audio_backend_kind_rejects_unknown_options() {
 
 #[test]
 fn build_process_audio_backend() {
-    let root =
-        std::env::temp_dir().join(format!("audio-backend-process-test-{}", std::process::id()));
-    fs::create_dir_all(&root).expect("root");
+    let root = crate::test_dir::scratch_for_test_thread("audio-backend-process-test");
     let selection = build_audio_output(AudioBackendKind::Process, &root, None).expect("process");
     assert_eq!(selection.active, AudioBackendKind::Process);
     assert!(selection.fallback_reason.is_none());
@@ -46,9 +43,7 @@ fn build_process_audio_backend() {
 #[cfg(feature = "native-audio")]
 #[test]
 fn rodio_request_uses_native_or_degrades_with_a_reason() {
-    let root =
-        std::env::temp_dir().join(format!("audio-backend-rodio-test-{}", std::process::id()));
-    fs::create_dir_all(&root).expect("root");
+    let root = crate::test_dir::scratch_for_test_thread("audio-backend-rodio-test");
     let selection =
         build_audio_output(AudioBackendKind::RodioGapless, &root, None).expect("never fails");
     match selection.active {
@@ -67,9 +62,7 @@ fn rodio_request_uses_native_or_degrades_with_a_reason() {
 #[cfg(not(feature = "native-audio"))]
 #[test]
 fn rodio_request_without_feature_degrades_to_process() {
-    let root =
-        std::env::temp_dir().join(format!("audio-backend-nofeat-test-{}", std::process::id()));
-    fs::create_dir_all(&root).expect("root");
+    let root = crate::test_dir::scratch_for_test_thread("audio-backend-nofeat-test");
     let selection = build_audio_output(AudioBackendKind::RodioGapless, &root, None).expect("ok");
     assert_eq!(selection.active, AudioBackendKind::Process);
     assert!(

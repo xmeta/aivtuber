@@ -116,8 +116,7 @@ mod tests {
 
     #[test]
     fn find_on_path_uses_the_given_directories() {
-        let dir = std::env::temp_dir().join(format!("aivtuber-prereq-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::named("aivtuber-prereq");
         let name = if cfg!(windows) {
             "faketool.exe"
         } else {

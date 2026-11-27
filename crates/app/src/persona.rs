@@ -246,8 +246,7 @@ mod tests {
     use aivtuber_domain::MAX_PERSONA_BYTES;
 
     fn write(name: &str, bytes: &[u8]) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("aivtuber-persona-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
+        let dir = crate::test_dir::scratch_for_test_thread("aivtuber-persona");
         let path = dir.join(name);
         std::fs::write(&path, bytes).expect("write");
         path

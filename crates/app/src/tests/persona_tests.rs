@@ -246,8 +246,7 @@ fn a_hostile_sheet_changes_no_authority_and_the_request_stays_valid() {
 /// the file.
 #[test]
 fn a_chat_line_cannot_change_the_sheet_its_identity_or_the_file() {
-    let dir = std::env::temp_dir().join(format!("aivtuber-persona-app-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("dir");
+    let dir = crate::test_dir::scratch_for_test_thread("aivtuber-persona-app");
     let path = dir.join("local-persona.md");
     std::fs::write(&path, "名前: ミコト\n一人称: ボク\n").expect("write");
     let load = load_persona_file(&path);
@@ -365,12 +364,7 @@ mod live {
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "aivtuber-persona-live-{}-{name}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("dir");
-        dir
+        crate::test_dir::scratch_for_test_thread(&format!("aivtuber-persona-live-{name}"))
     }
 
     fn editable(
