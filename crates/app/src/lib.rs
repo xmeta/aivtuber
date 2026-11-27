@@ -1302,6 +1302,8 @@ where
     initiative_sequence: u64,
     /// The pending initiative's reply fell back to the idle gesture.
     initiative_fell: bool,
+    /// The pending initiative's text refused as a repeat (#541); bounded.
+    initiative_refused_text: Option<String>,
     /// Live editing of the operator topic list (#87 S2); `None` = not composed.
     topics_editor: Option<topics::TopicsEditor>,
     /// #79 S2: the crowd summary for the one reply being dispatched right now.
@@ -1400,6 +1402,7 @@ where
             recent_turns: None,
             initiative_sequence: 0,
             initiative_fell: false,
+            initiative_refused_text: None,
             topics_editor: None,
             crowd_context: None,
             speech_feed_heartbeat_ms: None,
@@ -6070,6 +6073,8 @@ where
             ),
         );
         self.security.push_external_audit(record);
+        self.initiative_refused_text =
+            Some(text.chars().take(initiative::TEXT_MAX_CHARS).collect());
         self.session_log_note(
             &event.event_id,
             "initiative_repeat_suppressed",

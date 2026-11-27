@@ -327,6 +327,7 @@ where
             .find(|reply| reply.event_id == id)
             .map(|reply| reply.text.clone());
         let fell = std::mem::take(&mut self.initiative_fell);
+        let refused = self.initiative_refused_text.take();
         match (spoke, fell) {
             (Some(text), _) => {
                 if let Some(director) = self.initiative.as_mut() {
@@ -335,19 +336,27 @@ where
             }
             (None, true) => {
                 // The gesture was played where the reply fell back.
-                if let Some(director) = self.initiative.as_mut() {
-                    director.failed(now_ms);
-                }
+                self.initiative_ended_silent(now_ms, refused.as_deref());
             }
             (None, false) => {
                 // Nothing was spoken and nothing said why (stale completion,
                 // a refused phrase, an output that never played): the same
                 // visual fallback, once.
                 self.play_idle_gesture(now_ms);
-                if let Some(director) = self.initiative.as_mut() {
-                    director.failed(now_ms);
-                }
+                self.initiative_ended_silent(now_ms, refused.as_deref());
             }
+        }
+    }
+
+    /// The initiative ended with nothing spoken. A repeat refusal (#541) is
+    /// told apart from a failure: it alone may grant the one early re-fire.
+    fn initiative_ended_silent(&mut self, now_ms: u64, refused_text: Option<&str>) {
+        let Some(director) = self.initiative.as_mut() else {
+            return;
+        };
+        match refused_text {
+            Some(text) => director.repeat_refused(now_ms, Some(text)),
+            None => director.failed(now_ms),
         }
     }
 
@@ -529,6 +538,7 @@ where
             }
         }
         self.initiative_fell = false;
+        self.initiative_refused_text = None;
         self.repeat_guard.clear_staged();
         if let Some(director) = self.initiative.as_mut() {
             director.preempted(at_ms, cause);

@@ -44,6 +44,22 @@
 //! The budget is charged when the director fires, not when the reply
 //! succeeds, so a failing backend can never turn into a retry loop.
 //!
+//! # One early re-fire after a silent repeat refusal (#541)
+//!
+//! A repeat refused before anything was spoken (#89, phrase 0) is the one
+//! failure that is not a backend fault, and with the budget charged at fire it
+//! would cost a whole extra [`MIN_GAP_MS`] of dead air. The host reports it
+//! through [`InitiativeDirector::repeat_refused`], which grants a single early
+//! fire: the next evaluation may fire once [`REFIRE_GAP_MS`] has passed since
+//! the refusal instead of [`MIN_GAP_MS`] since the fire. The grant is
+//! one-shot and never chains: a refused replacement grants nothing and waits
+//! the normal gap, and `failed` (any backend or gate failure) never grants.
+//! The early fire still passes every other gate in the list above, still
+//! counts in the window, and is dropped by chat, an operator stop or `clear`.
+//! The replacement is the next kind and topic in the usual rotation, and the
+//! refused text joins the remembered texts so the request asks the model to
+//! avoid it.
+//!
 //! # Bounds
 //!
 //! The firing window holds at most [`WINDOW_MAX`] times, the decision log
@@ -84,6 +100,9 @@ pub const WINDOW_MS: u64 = 600_000;
 pub const WINDOW_MAX: usize = 10;
 /// How long the performer must have been quiet before it may speak again.
 pub const SETTLE_MS: u64 = 4_000;
+/// After a silent repeat refusal, how long until the one early re-fire may
+/// happen (it still needs the [`SETTLE_MS`] quiet time and every other gate).
+pub const REFIRE_GAP_MS: u64 = 5_000;
 /// How long an operator stop keeps the initiative quiet.
 pub const STOP_HOLD_MS: u64 = 300_000;
 /// Decision records kept for replay and diagnostics.
@@ -296,6 +315,9 @@ impl InitiativeMetrics {
 struct Pending {
     event_id: String,
     fired_at_ms: u64,
+    /// It fired early because of a repeat refusal: if it is refused too, no
+    /// further early fire is granted.
+    replacement: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,6 +330,8 @@ pub struct InitiativeDirector {
     /// from it.
     last_busy_ms: Option<u64>,
     last_fired_ms: Option<u64>,
+    /// When a silent repeat refusal granted the one early re-fire (#541).
+    refire_from_ms: Option<u64>,
     window: VecDeque<u64>,
     stop_hold_until_ms: Option<u64>,
     pending: Option<Pending>,
@@ -332,6 +356,7 @@ impl InitiativeDirector {
             last_chat_ms: started_at_ms,
             last_busy_ms: None,
             last_fired_ms: None,
+            refire_from_ms: None,
             window: VecDeque::new(),
             stop_hold_until_ms: None,
             pending: None,
@@ -408,6 +433,7 @@ impl InitiativeDirector {
     /// left for the host to cancel and report through [`Self::preempted`].
     pub fn note_chat(&mut self, at_ms: u64) {
         self.last_chat_ms = self.last_chat_ms.max(at_ms);
+        self.refire_from_ms = None;
         self.last_suppression = None;
     }
 
@@ -415,6 +441,7 @@ impl InitiativeDirector {
     pub fn note_operator_stop(&mut self, at_ms: u64) {
         self.last_chat_ms = self.last_chat_ms.max(at_ms);
         self.stop_hold_until_ms = Some(at_ms.saturating_add(STOP_HOLD_MS));
+        self.refire_from_ms = None;
         self.last_suppression = None;
     }
 
@@ -422,6 +449,7 @@ impl InitiativeDirector {
     /// counters and the decision log are kept.
     pub fn clear(&mut self) {
         self.last_fired_ms = None;
+        self.refire_from_ms = None;
         self.window.clear();
         self.recent_texts.clear();
         self.recent_topics.clear();
@@ -471,7 +499,7 @@ impl InitiativeDirector {
         {
             Some(Suppression::Settling)
         } else {
-            self.budget_reason(now)
+            self.budget_reason(now, self.refire_open(now))
         };
         if let Some(reason) = reason {
             self.note_suppressed(reason, now);
@@ -488,6 +516,8 @@ impl InitiativeDirector {
                 self.metrics.without_topic = self.metrics.without_topic.saturating_add(1);
             }
         }
+        // A replacement is a fire the normal gap would still have refused.
+        let replacement = self.refire_from_ms.take().is_some() && !self.gap_elapsed(now);
         self.window.push_back(now);
         self.last_fired_ms = Some(now);
         self.metrics.fired = self.metrics.fired.saturating_add(1);
@@ -495,6 +525,7 @@ impl InitiativeDirector {
         self.pending = Some(Pending {
             event_id: event_id.clone(),
             fired_at_ms: now,
+            replacement,
         });
         self.record(
             now,
@@ -510,7 +541,18 @@ impl InitiativeDirector {
         }
     }
 
-    fn budget_reason(&mut self, now: u64) -> Option<Suppression> {
+    /// Whether the one early re-fire granted by a repeat refusal is open.
+    fn refire_open(&self, now: u64) -> bool {
+        self.refire_from_ms
+            .is_some_and(|from| now.saturating_sub(from) >= REFIRE_GAP_MS)
+    }
+
+    fn gap_elapsed(&self, now: u64) -> bool {
+        self.last_fired_ms
+            .is_none_or(|last| now.saturating_sub(last) >= MIN_GAP_MS)
+    }
+
+    fn budget_reason(&mut self, now: u64, early: bool) -> Option<Suppression> {
         while self
             .window
             .front()
@@ -518,10 +560,7 @@ impl InitiativeDirector {
         {
             self.window.pop_front();
         }
-        if self
-            .last_fired_ms
-            .is_some_and(|last| now.saturating_sub(last) < MIN_GAP_MS)
-        {
+        if !early && !self.gap_elapsed(now) {
             return Some(Suppression::BudgetGap);
         }
         if self.window.len() >= WINDOW_MAX {
@@ -617,6 +656,25 @@ impl InitiativeDirector {
         self.record(at_ms, Outcome::Failed);
     }
 
+    /// The pending initiative's only phrase was refused as a repeat (#89)
+    /// before anything was spoken. Counted as failed like any fallback, but
+    /// it grants the one early re-fire (see the module docs) unless the
+    /// initiative was itself that early re-fire. `text` is remembered so the
+    /// next request asks the model to avoid it.
+    pub fn repeat_refused(&mut self, at_ms: u64, text: Option<&str>) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        self.metrics.failed = self.metrics.failed.saturating_add(1);
+        if !pending.replacement {
+            self.refire_from_ms = Some(at_ms);
+        }
+        if let Some(text) = text {
+            self.remember_text(text);
+        }
+        self.record(at_ms, Outcome::Failed);
+    }
+
     /// The pending initiative was cancelled by chat, speech or an operator
     /// stop. Only a pending initiative counts.
     pub fn preempted(&mut self, at_ms: u64, cause: Preemption) {
@@ -637,6 +695,8 @@ impl InitiativeDirector {
         if text.is_empty() {
             return;
         }
+        // A text already remembered becomes the newest, never a duplicate.
+        self.recent_texts.retain(|seen| *seen != text);
         if self.recent_texts.len() == RECENT_TEXTS_MAX {
             self.recent_texts.pop_front();
         }
@@ -968,6 +1028,210 @@ mod tests {
             Decision::Suppressed(Suppression::BudgetGap)
         );
         assert_eq!(d.metrics().fired, 1);
+    }
+
+    #[test]
+    fn a_silent_repeat_refusal_grants_one_early_refire_after_the_short_gap() {
+        let mut d = director();
+        fire(&mut d, 45 * SEC);
+        d.repeat_refused(46 * SEC, Some("said before"));
+        assert_eq!(d.metrics().failed, 1);
+        // The normal gap would hold until 105 s; the early re-fire opens at
+        // refusal + REFIRE_GAP_MS.
+        assert_eq!(
+            d.evaluate(&idle(46 * SEC + REFIRE_GAP_MS - 1)),
+            Decision::Suppressed(Suppression::BudgetGap)
+        );
+        assert!(matches!(
+            d.evaluate(&idle(46 * SEC + REFIRE_GAP_MS)),
+            Decision::Fire { .. }
+        ));
+        assert_eq!(d.metrics().fired, 2);
+    }
+
+    #[test]
+    fn the_replacement_uses_the_next_kind_and_asks_to_avoid_the_refused_text() {
+        let mut d = director();
+        let Decision::Fire { kind: first, .. } = d.evaluate(&idle(45 * SEC)) else {
+            panic!("expected a fire");
+        };
+        d.repeat_refused(46 * SEC, Some("refused line"));
+        let Decision::Fire { kind: second, .. } = d.evaluate(&idle(60 * SEC)) else {
+            panic!("expected the early re-fire");
+        };
+        assert_ne!(first, second, "the rotation moved on");
+        assert_eq!(d.recent_texts().collect::<Vec<_>>(), ["refused line"]);
+        // Remembering the same text again keeps one copy, as the newest.
+        d.completed(62 * SEC, Some("other"));
+        d.remember_text("refused line");
+        assert_eq!(
+            d.recent_texts().collect::<Vec<_>>(),
+            ["other", "refused line"]
+        );
+    }
+
+    #[test]
+    fn a_refused_replacement_does_not_chain_another_early_fire() {
+        let mut d = director();
+        fire(&mut d, 45 * SEC);
+        d.repeat_refused(46 * SEC, None);
+        fire(&mut d, 60 * SEC);
+        d.repeat_refused(61 * SEC, None);
+        // Nothing early now: the normal gap runs from the replacement's fire.
+        assert_eq!(
+            d.evaluate(&idle(120 * SEC - 1)),
+            Decision::Suppressed(Suppression::BudgetGap)
+        );
+        assert!(matches!(
+            d.evaluate(&idle(120 * SEC)),
+            Decision::Fire { .. }
+        ));
+    }
+
+    #[test]
+    fn a_voiced_replacement_makes_the_next_refusal_eligible_again() {
+        let mut d = director();
+        fire(&mut d, 45 * SEC);
+        d.repeat_refused(46 * SEC, None);
+        fire(&mut d, 60 * SEC);
+        d.completed(62 * SEC, Some("fresh"));
+        fire(&mut d, 120 * SEC);
+        d.repeat_refused(121 * SEC, None);
+        assert!(matches!(
+            d.evaluate(&idle(126 * SEC)),
+            Decision::Fire { .. }
+        ));
+    }
+
+    #[test]
+    fn a_normal_fire_after_a_late_refusal_is_not_marked_a_replacement() {
+        let mut d = director();
+        fire(&mut d, 45 * SEC);
+        // Refused so late that the normal gap has already passed.
+        d.repeat_refused(110 * SEC, None);
+        fire(&mut d, 111 * SEC);
+        d.repeat_refused(112 * SEC, None);
+        assert!(matches!(
+            d.evaluate(&idle(117 * SEC)),
+            Decision::Fire { .. }
+        ));
+    }
+
+    #[test]
+    fn a_failure_never_grants_the_early_fire_and_a_stray_report_changes_nothing() {
+        let mut d = director();
+        fire(&mut d, 45 * SEC);
+        d.failed(46 * SEC);
+        assert_eq!(
+            d.evaluate(&idle(60 * SEC)),
+            Decision::Suppressed(Suppression::BudgetGap)
+        );
+        let mut d = director();
+        d.repeat_refused(1, Some("x"));
+        assert_eq!(d.metrics().failed, 0);
+        assert_eq!(d.recent_texts().count(), 0);
+        assert!(matches!(d.evaluate(&idle(45 * SEC)), Decision::Fire { .. }));
+    }
+
+    #[test]
+    fn chat_drops_the_early_fire() {
+        let mut d = director();
+        fire(&mut d, 45 * SEC);
+        d.repeat_refused(46 * SEC, None);
+        d.note_chat(47 * SEC);
+        // Idle again at 92 s, the normal gap (105 s) still rules.
+        assert_eq!(
+            d.evaluate(&idle(95 * SEC)),
+            Decision::Suppressed(Suppression::BudgetGap)
+        );
+    }
+
+    #[test]
+    fn an_operator_stop_drops_the_early_fire_and_holds_the_initiative() {
+        let mut d = director();
+        fire(&mut d, 45 * SEC);
+        d.repeat_refused(46 * SEC, None);
+        d.note_operator_stop(47 * SEC);
+        assert_eq!(
+            d.evaluate(&idle(120 * SEC)),
+            Decision::Suppressed(Suppression::OperatorStopped)
+        );
+        assert!(d.refire_from_ms.is_none());
+    }
+
+    #[test]
+    fn clear_forgets_the_early_fire() {
+        let mut d = director();
+        fire(&mut d, 45 * SEC);
+        d.repeat_refused(46 * SEC, None);
+        d.clear();
+        assert!(d.refire_from_ms.is_none());
+    }
+
+    #[test]
+    fn the_early_fire_still_obeys_the_settle_time_and_the_mute() {
+        let mut d = director();
+        fire(&mut d, 45 * SEC);
+        d.repeat_refused(46 * SEC, None);
+        let busy = InitiativeInputs {
+            now_ms: 52 * SEC,
+            speaking: true,
+            ..InitiativeInputs::default()
+        };
+        assert_eq!(
+            d.evaluate(&busy),
+            Decision::Suppressed(Suppression::Speaking)
+        );
+        assert_eq!(
+            d.evaluate(&idle(52 * SEC + 1)),
+            Decision::Suppressed(Suppression::Settling)
+        );
+        let muted = InitiativeInputs {
+            now_ms: 60 * SEC,
+            muted: true,
+            ..InitiativeInputs::default()
+        };
+        assert_eq!(d.evaluate(&muted), Decision::Suppressed(Suppression::Muted));
+        assert!(matches!(
+            d.evaluate(&idle(52 * SEC + SETTLE_MS)),
+            Decision::Fire { .. }
+        ));
+    }
+
+    #[test]
+    fn the_early_fire_cannot_exceed_the_window_ceiling() {
+        let mut d = director();
+        let mut t = 45 * SEC;
+        for _ in 1..WINDOW_MAX {
+            fire(&mut d, t);
+            d.completed(t + 1, None);
+            t += MIN_GAP_MS;
+        }
+        // The tenth fire fills the window and is refused as a repeat.
+        fire(&mut d, t);
+        assert_eq!(d.window.len(), WINDOW_MAX);
+        d.repeat_refused(t + 1, None);
+        assert_eq!(
+            d.evaluate(&idle(t + 1 + REFIRE_GAP_MS)),
+            Decision::Suppressed(Suppression::BudgetWindow)
+        );
+    }
+
+    #[test]
+    fn repeat_refusals_replay_to_the_same_decisions() {
+        fn run() -> Vec<DecisionRecord> {
+            let mut d = director();
+            let mut t = 45 * SEC;
+            for _ in 0..12 {
+                if let Decision::Fire { .. } = d.evaluate(&idle(t)) {
+                    d.repeat_refused(t + 2 * SEC, Some("same"));
+                }
+                t += 3 * SEC;
+            }
+            d.log().cloned().collect()
+        }
+        assert_eq!(run(), run());
+        assert!(run().len() <= LOG_CAPACITY);
     }
 
     #[test]
