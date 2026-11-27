@@ -109,6 +109,19 @@ fn lane_config(fixture: &serde_json::Value, crowd: bool) -> ChatBurstConfig {
 }
 
 fn rig(config: ChatBurstConfig) -> Rig {
+    let thinking = CaptureThinking::default();
+    let requests = Arc::clone(&thinking.requests);
+    let mut rig = rig_with_thinking(config, thinking);
+    rig.requests = requests;
+    rig
+}
+
+/// The same rig with the caller's thinking engine, so a test can hold the
+/// single generation worker busy (#79 S5).
+fn rig_with_thinking<Thinking>(config: ChatBurstConfig, thinking: Thinking) -> Rig
+where
+    Thinking: ThinkingEngine + 'static,
+{
     let security = SecurityRuntime::new(
         SecurityRuntimeConfig {
             // The falsifier pushes ~100 comments from one source; the
@@ -127,8 +140,6 @@ fn rig(config: ChatBurstConfig) -> Rig {
     .expect("security runtime");
     let route = ProbeRoute::default();
     let routed = Arc::clone(&route.routed);
-    let thinking = CaptureThinking::default();
-    let requests = Arc::clone(&thinking.requests);
     let recording_avatar = RecordingAvatar::default();
     let avatar = Arc::clone(&recording_avatar.commands);
     let mut app = ProductionApp::new(
@@ -148,7 +159,7 @@ fn rig(config: ChatBurstConfig) -> Rig {
     Rig {
         app,
         routed,
-        requests,
+        requests: Arc::new(Mutex::new(Vec::new())),
         avatar,
     }
 }
@@ -868,6 +879,184 @@ fn a_crowd_route_that_is_voiced_has_no_unvoiced_end() {
         );
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_cached_crowd_reaction_does_not_wait_for_a_generation_in_flight() {
+    // #79 S5. Track A (60 min, 2026-11-26) measured the crowd's
+    // route-to-dispatch at 3,175 ms of its 4,736 ms route-to-first-phrase while
+    // one generation worker was busy. A celebration wave is answered by a
+    // reviewed cached line, so that worker is not needed for it at all: the
+    // wave's wait is the worker's queue, not the crowd's work.
+    let fixture = fixture();
+    let gate = Arc::new(BlockingGate::default());
+    let mut rig = rig_with_thinking(
+        lane_config(&fixture, true),
+        BlockingThinking {
+            gate: Arc::clone(&gate),
+            reply: "a generated reply".to_owned(),
+        },
+    );
+    let dir = TestDir::new("crowd-generation-in-flight");
+    rig.app = rig
+        .app
+        .with_session_log(crate::session_log::SessionLog::new(
+            dir.path().join("logs"),
+            None,
+            true,
+        ));
+
+    // An ordinary reply holds the single generation worker.
+    let mut direct = chat_event(90_001);
+    direct.payload.remove("intent");
+    rig.app
+        .dispatch_admitted_event(direct, 1_000, 1, std::time::Instant::now())
+        .expect("the generation starts");
+    gate.wait_until_entered();
+    assert!(
+        rig.app
+            .generation_cancellation_registry()
+            .and_then(|registry| registry.active_event_id())
+            .is_some(),
+        "a generation is in flight"
+    );
+
+    // The wave lands while that worker is busy.
+    for (_, at, event) in expand(&fixture)
+        .into_iter()
+        .take_while(|(phase, _, _)| phase == "celebration")
+    {
+        let at = at + 2_000;
+        let raw = serde_json::to_vec(&event).expect("event json");
+        rig.app
+            .process_content_bytes(&raw, at, at ^ 0x55)
+            .expect("content");
+        rig.app.service_chat_burst(at, at);
+    }
+    rig.app.service_chat_burst(6_000, 6_000);
+
+    // Answered from the pack while the worker is still held: this is the
+    // carrier, so it fails if the wave waited for the worker.
+    let metrics = rig.app.chat_burst_metrics().expect("metrics");
+    assert!(
+        metrics.crowd_non_verbal >= 1,
+        "the wave was answered from the pack while the worker was busy: {metrics:?}"
+    );
+    let reports = rig.app.take_deferred_reply_reports(usize::MAX);
+    assert!(
+        reports
+            .iter()
+            .any(|report| report.dispatched && report.asset_id.is_some()),
+        "the crowd reaction was dispatched from the pack: {reports:?}"
+    );
+
+    // Releasing the worker must leave the deterministic performer intact.
+    gate.release();
+    for step in 1..=40_u64 {
+        let at = 6_000 + step * 250;
+        rig.app.tick(at);
+        rig.app.service_chat_burst(at, at);
+    }
+    rig.app.shutdown(30_000);
+    rig.app.session_log().expect("log").flush();
+    assert_eq!(
+        rig.app
+            .chat_burst_metrics()
+            .expect("metrics")
+            .invariant_violations,
+        0
+    );
+
+    // The offline reader sees the wave answered with no route→dispatch wait.
+    let file = std::fs::read_dir(dir.path().join("logs"))
+        .expect("logs")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .last()
+        .expect("a session file");
+    let bytes = std::fs::read(file).expect("read");
+    let summary = crate::session_log::summarize(bytes.as_slice());
+    assert!(!summary.crowd_routes.is_empty(), "the crowd was routed");
+    // The first wave of the run is the one Track A measured: it must reach
+    // dispatch at the routing instant, not after the worker freed up.
+    assert_eq!(
+        summary.crowd_routes[0].timing.route_to_dispatch_ms,
+        Some(0),
+        "the cached reaction was dispatched at the routing instant: {:?}",
+        summary.crowd_routes
+    );
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+#[test]
+fn a_representative_reply_crowd_still_waits_for_the_generation_worker() {
+    // #79 S5 keeps the exception narrow. Only a carrier the pack answers skips
+    // the queue; a repeated question is answered by generated text, so it must
+    // wait for the worker and be answered by it, never be thrown out of the
+    // queue as if a cached line existed for it.
+    let fixture = fixture();
+    let gate = Arc::new(BlockingGate::default());
+    let mut rig = rig_with_thinking(
+        lane_config(&fixture, true),
+        BlockingThinking {
+            gate: Arc::clone(&gate),
+            reply: "a farming sim".to_owned(),
+        },
+    );
+
+    // An ordinary reply holds the single generation worker.
+    let mut direct = chat_event(90_002);
+    direct.payload.remove("intent");
+    rig.app
+        .dispatch_admitted_event(direct, 1_000, 1, std::time::Instant::now())
+        .expect("the generation starts");
+    gate.wait_until_entered();
+
+    // A repeated question is routed as a representative reply, not a pack line.
+    for (_, at, event) in expand(&fixture)
+        .into_iter()
+        .filter(|(phase, _, _)| phase == "question")
+    {
+        let raw = serde_json::to_vec(&event).expect("event json");
+        rig.app
+            .process_content_bytes(&raw, at, at ^ 0x55)
+            .expect("content");
+        rig.app.service_chat_burst(at, at);
+    }
+    rig.app.service_chat_burst(62_000, 62_000);
+
+    let metrics = rig.app.chat_burst_metrics().expect("metrics");
+    assert!(
+        metrics.crowd_routed >= 1,
+        "the repeated question was routed: {metrics:?}"
+    );
+    assert_eq!(
+        metrics.crowd_non_verbal, 0,
+        "a repeated question is not answered from the pack: {metrics:?}"
+    );
+    assert_eq!(
+        metrics.crowd_replies, 0,
+        "the generated crowd reply waited for the worker: {metrics:?}"
+    );
+    assert!(
+        metrics.deferred.pending >= 1,
+        "the carrier sits in the deferred inbox: {metrics:?}"
+    );
+
+    // Once the worker frees up, the representative reply is generated.
+    gate.release();
+    for step in 1..=40_u64 {
+        let at = 62_000 + step * 250;
+        rig.app.tick(at);
+        rig.app.service_chat_burst(at, at);
+        wait_for_generation_completion(&mut rig.app, at);
+    }
+    let metrics = rig.app.chat_burst_metrics().expect("metrics");
+    assert!(
+        metrics.crowd_replies >= 1,
+        "the representative reply was answered after the worker freed: {metrics:?}"
+    );
+    assert_eq!(metrics.invariant_violations, 0);
 }
 
 #[test]
