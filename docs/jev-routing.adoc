@@ -369,7 +369,7 @@ Every field is validated, never clamped.
 |`max_candidates` |32 (64) |Count flush bound
 |`max_bytes` |16 KiB (32 KiB) |Retained-byte flush bound
 |`max_ready_batches` |4 (16) |Flushed batches awaiting resolution; the oldest is shed with terminal accounting beyond it
-|`top_k` |3 |Comments selected per batch (at most `request_candidates`)
+|`top_k` |1 |Comments selected per batch (at most `request_candidates`)
 |`max_per_actor` |1 |Selected comments per actor per batch (at most `top_k`)
 |`actor_cooldown_ms` |10000 |Logical time before an actor can be selected again; `0` disables
 |`request_candidates` |12 (16) |Candidates shown to a ranker
