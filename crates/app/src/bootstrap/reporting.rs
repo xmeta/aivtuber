@@ -70,19 +70,9 @@ pub(crate) fn report_chat_burst<R: aivtuber_app::RoutePlanner>(
         return;
     };
     // #79: one line that separates why a wave did or did not become a crowd
-    // reaction. `batched` is derived (`admitted - quiet_passthrough`), and
-    // `cooldown_suppressed` is a subset of `unvoiced` (reason `crowd_cooldown`),
-    // so the columns are diagnostic, not additive. Cumulative session counters,
-    // printed whenever any of them moves; no new counter is incremented here.
-    let crowd = [
-        metrics.quiet_passthrough,
-        metrics.admitted.saturating_sub(metrics.quiet_passthrough),
-        metrics.audience_below_threshold,
-        metrics.crowd_routed,
-        metrics.crowd_non_verbal + metrics.crowd_replies + metrics.crowd_fallback_replies,
-        metrics.crowd_unvoiced,
-        metrics.crowd_cooldown_suppressed(),
-    ];
+    // reaction. Cumulative session counters, printed whenever any of them
+    // moves; nothing is counted here.
+    let crowd = metrics.crowd_diagnostic();
     if crowd != *last_crowd {
         *last_crowd = crowd;
         eprintln!(

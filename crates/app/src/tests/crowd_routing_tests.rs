@@ -317,11 +317,12 @@ fn replay_fixture(
     let requests = rig.requests.lock().expect("requests").clone();
     let summary = log_dir.and_then(|dir| {
         rig.app.session_log().expect("log").flush();
+        // `max` by name (the newest session file) rather than directory order.
         let file = std::fs::read_dir(dir.join("logs"))
             .ok()?
             .filter_map(Result::ok)
             .map(|entry| entry.path())
-            .last()?;
+            .max()?;
         let bytes = std::fs::read(file).ok()?;
         Some(crate::session_log::summarize(bytes.as_slice()))
     });
@@ -1343,9 +1344,12 @@ fn a_celebration_is_never_given_a_mismatched_generic_line() {
 #[test]
 fn deterministic_timing_scenario_reports_crowd_stage_distributions() {
     let fixture: serde_json::Value = serde_json::from_str(TIMING_FIXTURE).expect("fixture");
-    let expected = fixture["expected"]["crowd_routes"]
-        .as_u64()
-        .expect("crowd_routes");
+    let expect = |key: &str| {
+        fixture["expected"][key]
+            .as_u64()
+            .unwrap_or_else(|| panic!("expected.{key}"))
+    };
+    let expected = expect("crowd_routes");
     let dir = TestDir::new("crowd-timing");
     let (first, summary) = replay_fixture(
         lane_config(&fixture, true),
@@ -1372,8 +1376,11 @@ fn deterministic_timing_scenario_reports_crowd_stage_distributions() {
             .filter(|route| route.class == class)
             .count()
     };
-    assert_eq!(class_count("congratulation"), 6);
-    assert_eq!(class_count("laughter"), 2);
+    assert_eq!(
+        class_count("congratulation"),
+        expect("celebration_routes") as usize
+    );
+    assert_eq!(class_count("laughter"), expect("laughter_routes") as usize);
     assert_eq!(class_count("repeated_question"), 1);
     assert!(
         summary

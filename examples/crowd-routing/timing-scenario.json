@@ -94,7 +94,6 @@
   "expected": {
     "celebration_routes": 6,
     "laughter_routes": 2,
-    "representative_replies": 1,
     "crowd_routes": 9,
     "overlap_note": "overlap-laughter arrives while overlap-celebration is speaking, so its carrier waits for the performer instead of dispatching at the routing instant"
   }

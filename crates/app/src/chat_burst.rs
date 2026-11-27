@@ -190,7 +190,7 @@ impl ChatOutcome {
 
     /// Category among the outcomes the lane itself accounts. `Deferred(_)`
     /// outcomes are accounted by the inbox.
-    pub(crate) fn immediate_category(self) -> Option<usize> {
+    fn immediate_category(self) -> Option<usize> {
         Some(match self {
             Self::DispatchedNow => 0,
             Self::DispatchFailed => 1,
@@ -317,10 +317,24 @@ impl ChatBurstMetrics {
     /// counted in [`ChatBurstMetrics::crowd_unvoiced`] with reason
     /// `crowd_cooldown`, so this is a subset, not an additional total.
     pub fn crowd_cooldown_suppressed(&self) -> u64 {
-        match ChatOutcome::SuppressedCrowdCooldown.immediate_category() {
-            Some(index) => self.terminal[index],
-            None => 0,
-        }
+        ChatOutcome::SuppressedCrowdCooldown
+            .immediate_category()
+            .map_or(0, |index| self.terminal[index])
+    }
+
+    /// #79: the seven cumulative totals the crowd diagnostic line prints, in
+    /// column order. Diagnostic only, not additive: `batched` is derived and
+    /// `cooldown_suppressed` is already inside `unvoiced`.
+    pub fn crowd_diagnostic(&self) -> [u64; 7] {
+        [
+            self.quiet_passthrough,
+            self.admitted.saturating_sub(self.quiet_passthrough),
+            self.audience_below_threshold,
+            self.crowd_routed,
+            self.crowd_non_verbal + self.crowd_replies + self.crowd_fallback_replies,
+            self.crowd_unvoiced,
+            self.crowd_cooldown_suppressed(),
+        ]
     }
 }
 
@@ -1455,33 +1469,21 @@ mod tests {
         // 1 s spacing never opens a batch, so all five stay on the quiet path.
         let (signals, quiet, crowd_carriers) = wave_with_defaults(5, 1_000);
         assert_eq!((signals, crowd_carriers, quiet), (0, 0, 5), "gap=1000");
-        // The crowd diagnostic line reads the same waves: quiet, batched
-        // (`admitted - quiet`), below the cluster threshold, routed, and the
-        // crowd cooldown (none here).
-        let (lane, _, _) = wave_lane_with_defaults(4, 700);
-        let metrics = lane.metrics();
+        // The crowd diagnostic line reads the same waves through one method:
+        // [quiet_passthrough, batched (`admitted - quiet`), below_threshold,
+        //  routed, voiced, unvoiced, cooldown_suppressed].
+        let (lane, ..) = wave_lane_with_defaults(4, 700);
         assert_eq!(
-            (
-                metrics.quiet_passthrough,
-                metrics.admitted - metrics.quiet_passthrough,
-                metrics.audience_below_threshold,
-                metrics.crowd_routed,
-                metrics.crowd_cooldown_suppressed(),
-            ),
-            (2, 2, 2, 0, 0),
+            lane.metrics().crowd_diagnostic(),
+            [2, 2, 2, 0, 0, 0, 0],
             "silent cold wave"
         );
-        let (lane, _, _) = wave_lane_with_defaults(5, 700);
-        let metrics = lane.metrics();
+        // The routed carrier is still held here (this helper never answers it),
+        // so it is neither voiced nor unvoiced yet.
+        let (lane, ..) = wave_lane_with_defaults(5, 700);
         assert_eq!(
-            (
-                metrics.quiet_passthrough,
-                metrics.admitted - metrics.quiet_passthrough,
-                metrics.audience_below_threshold,
-                metrics.crowd_routed,
-                metrics.crowd_cooldown_suppressed(),
-            ),
-            (2, 3, 0, 1, 0),
+            lane.metrics().crowd_diagnostic(),
+            [2, 3, 0, 1, 0, 0, 0],
             "routed cold wave"
         );
     }
