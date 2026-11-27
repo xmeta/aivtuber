@@ -1382,16 +1382,47 @@ fn deterministic_timing_scenario_reports_crowd_stage_distributions() {
     );
     assert_eq!(class_count("laughter"), expect("laughter_routes") as usize);
     assert_eq!(class_count("repeated_question"), 1);
+    // #79: measured, not inferred. No route in this scenario ended without
+    // being voiced: `crowd_unvoiced` counts carriers that never dispatched
+    // (expired, cooldown, ...), and the crowd cooldown suppressed none. The
+    // last wave routes on the final settle step, so it is dispatched at the
+    // routing instant but its phrase is not committed before the replay ends.
+    assert_eq!(
+        (
+            first.metrics.crowd_routed,
+            first.metrics.crowd_unvoiced,
+            first.metrics.crowd_cooldown_suppressed(),
+        ),
+        (expected, expect("unvoiced_routes"), 0),
+        "every route was dispatched; nothing expired and the cooldown hid none"
+    );
+    let unphrased: Vec<_> = summary
+        .crowd_routes
+        .iter()
+        .filter(|route| route.timing.route_to_phrase_ms.is_none())
+        .collect();
+    assert_eq!(
+        unphrased.len(),
+        1,
+        "only the final wave lacks a committed phrase: {:?}",
+        summary.crowd_routes
+    );
+    assert_eq!(unphrased[0].class, "laughter");
+    assert_eq!(
+        unphrased[0].timing.route_to_dispatch_ms,
+        Some(0),
+        "the overlap is dispatched at the routing instant too"
+    );
+    assert_eq!(
+        unphrased[0].unvoiced_reason, None,
+        "a dispatched carrier records no end reason"
+    );
     assert!(
         summary
             .crowd_routes
             .iter()
-            .any(|route| route.timing.route_to_phrase_ms.is_some())
-            && summary
-                .crowd_routes
-                .iter()
-                .any(|route| route.timing.route_to_phrase_ms.is_none()),
-        "the scenario covers a voiced and an unvoiced route: {:?}",
+            .all(|route| route.unvoiced_reason.is_none()),
+        "no route records an unvoiced end: {:?}",
         summary.crowd_routes
     );
 
@@ -1456,6 +1487,7 @@ fn deterministic_timing_scenario_reports_crowd_stage_distributions() {
                 "phrases": route.phrases,
                 "cached_phrases": route.cached_phrases,
                 "first_audio_ms": route.first_audio_ms,
+                "unvoiced_reason": route.unvoiced_reason,
                 "input_to_route_ms": route.timing.input_to_route_ms,
                 "route_to_dispatch_ms": route.timing.route_to_dispatch_ms,
                 "dispatch_to_phrase_ms": route.timing.dispatch_to_phrase_ms,

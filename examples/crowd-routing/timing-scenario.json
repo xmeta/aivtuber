@@ -1,7 +1,7 @@
 {
   "fixture_id": "crowd-routing-timing-v1",
   "issue": "#79 / #489",
-  "description": "Deterministic crowd-timing scenario for the replay harness. It has the same lane shape as falsifier.json (burst_enter_count 2, top_k 8, max_per_actor 4, reply_ttl_ms 20000, crowd window 60000, cooldown 20000) and its waves are spaced 30 s apart, beyond the crowd cooldown, so every wave routes exactly once: six celebration waves, two laughter waves and one repeated-question wave. The last two phases overlap on purpose (the laughter wave arrives 1.5 s after the celebration wave) so one route ends unvoiced while the performer is busy. Nothing here is wall-clock; every instant is the fixture's own logical milliseconds. The point is to exercise the #494 crowd stages (input to route observation, route observation to dispatch, dispatch to first phrase, route observation to first phrase) without waiting for an hour-long live run.",
+  "description": "Deterministic crowd-timing scenario for the replay harness. It has the same lane shape as falsifier.json (burst_enter_count 2, top_k 8, max_per_actor 4, reply_ttl_ms 20000, crowd window 60000, cooldown 20000) and its waves are spaced 30 s apart, beyond the crowd cooldown, so every wave routes exactly once: six celebration waves, two laughter waves and one repeated-question wave. The last two phases overlap on purpose (the laughter wave arrives 1.5 s after the celebration wave). Each phase is settled for the replay's fixed horizon before the next one is fed, so the final wave is routed on the last settle step and its phrase is never committed; that is a property of this harness, not an expired or cooldown-suppressed carrier, and `expected.unvoiced_routes` pins it at 0. Nothing here is wall-clock; every instant is the fixture's own logical milliseconds. The point is to exercise the #494 crowd stages (input to route observation, route observation to dispatch, dispatch to first phrase, route observation to first phrase) without waiting for an hour-long live run.",
   "lane": {
     "burst": {
       "window_ms": 1500,
@@ -95,6 +95,7 @@
     "celebration_routes": 6,
     "laughter_routes": 2,
     "crowd_routes": 9,
-    "overlap_note": "overlap-laughter arrives while overlap-celebration is speaking, so its carrier waits for the performer instead of dispatching at the routing instant"
+    "unvoiced_routes": 0,
+    "overlap_note": "overlap-laughter arrives while overlap-celebration is speaking; both still dispatch at their routing instant. The final wave routes on the last settle step, so it has no committed phrase in the replay (no end record, no expiry, no cooldown)"
   }
 }

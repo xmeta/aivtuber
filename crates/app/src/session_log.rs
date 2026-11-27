@@ -876,6 +876,9 @@ pub struct CrowdRouteSummary {
     pub phrases: u32,
     pub cached_phrases: u32,
     pub first_audio_ms: Option<u64>,
+    /// The closed reason a routed carrier ended without being voiced, from its
+    /// one silent `fallback` record (#79); `None` when it was voiced.
+    pub unvoiced_reason: Option<String>,
     /// Separate logical-time intervals reconstructed from existing log records.
     pub timing: CrowdTiming,
 }
@@ -1003,6 +1006,8 @@ pub fn summarize(reader: impl BufRead) -> SessionSummary {
     let mut deferred_turns: HashSet<String> = HashSet::new();
     let mut first_audio_by_turn: Vec<(String, u64)> = Vec::new();
     let mut turn_phrases: HashMap<String, (u32, u32)> = HashMap::new();
+    // The one silent end of a routed crowd, by turn (#79).
+    let mut unvoiced_reason_by_turn: HashMap<String, String> = HashMap::new();
     // Offline only, bounded by SUMMARY_MAX_LINES like the existing turn maps.
     let mut timing_points: HashMap<String, TimingPoints> = HashMap::new();
     let mut reader = reader.take(SUMMARY_MAX_BYTES);
@@ -1130,9 +1135,17 @@ pub fn summarize(reader: impl BufRead) -> SessionSummary {
                     first_audio_by_turn.push((turn.clone(), took));
                 }
             }
-            // A turn counts once however many records name its fallback.
+            // A turn counts once however many records name its fallback. A
+            // routed crowd's end is the silent fallback on its carrier's turn;
+            // a visible fallback there is an ordinary answered reply.
             "route" | "fallback" if record.fallback.is_some() => match record.turn {
                 Some(turn) => {
+                    if record.t == "fallback"
+                        && record.kind.as_deref() == Some("silent")
+                        && let Some(reason) = record.fallback.as_ref()
+                    {
+                        unvoiced_reason_by_turn.insert(turn.clone(), reason.clone());
+                    }
                     if fallback_turns.insert(turn) {
                         summary.fallbacks += 1;
                     }
@@ -1183,6 +1196,11 @@ pub fn summarize(reader: impl BufRead) -> SessionSummary {
             .iter()
             .find(|(turn, _)| *turn == route.turn)
             .map(|(_, took)| *took);
+        // Only a route with no phrase on its turn was never voiced; a later
+        // silent fallback on an answered turn is not its end.
+        if phrases == 0 {
+            route.unvoiced_reason = unvoiced_reason_by_turn.get(&route.turn).cloned();
+        }
         if let Some(points) = timing_points.get(&route.turn) {
             route.timing = points.intervals();
         }
@@ -1501,6 +1519,10 @@ mod tests {
         assert_eq!(unvoiced.turn, "c");
         assert_eq!(unvoiced.phrases, 0);
         assert_eq!(unvoiced.timing.input_to_route_ms, Some(1000));
+        // The route keeps the reason of its one silent end, and an answered
+        // route's silent fallback is not its end.
+        assert_eq!(unvoiced.unvoiced_reason.as_deref(), Some("crowd_cooldown"));
+        assert_eq!(summary.crowd_routes[0].unvoiced_reason, None);
         assert!(
             render_summary(&summary)
                 .contains("stage=route_observation_to_first_phrase count=0 routes=6 p50=n/a")
