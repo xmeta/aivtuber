@@ -5044,7 +5044,11 @@ where
                     return self.play_fallback_directive(event, fallback, trace, at_ms, seed);
                 }
                 if self.is_initiative_event(event) {
-                    self.repeat_guard.stage(&generated_text, at_ms);
+                    self.repeat_guard.stage(
+                        &generated_text,
+                        repeat_guard::PhraseOrigin::Initiative,
+                        at_ms,
+                    );
                 }
 
                 let asset_id = asset.id.clone();
@@ -6054,37 +6058,42 @@ where
         if !self.is_initiative_event(event) {
             return false;
         }
-        let repeat = self.repeat_guard.check(text, now_ms);
+        let matched = self.repeat_guard.check(text, now_ms);
+        let repeat = matched.repeat;
         if repeat == repeat_guard::Repeat::None {
             return false;
         }
         self.repeat_guard.note_suppressed_repeat();
+        let verdict = if repeat == repeat_guard::Repeat::Exact {
+            "exact"
+        } else {
+            "near"
+        };
+        // #547: which earlier phrase it matched, and whether the request
+        // showed the model that phrase. Origin, logical age and a flag only.
+        let origin = matched
+            .origin
+            .map_or("unknown", repeat_guard::PhraseOrigin::name);
+        let age_ms = matched.age_ms.unwrap_or(0);
+        let shown = self.repeat_guard.was_shown(
+            text,
+            self.initiative
+                .as_ref()
+                .into_iter()
+                .flat_map(|director| director.recent_texts()),
+        );
         let record = self.security.redactor_record(
             Some(&event.event_id),
             aivtuber_telemetry::AuditCategory::Generation,
             "initiative_repeat_suppressed",
             format!(
-                "repeat={}",
-                if repeat == repeat_guard::Repeat::Exact {
-                    "exact"
-                } else {
-                    "near"
-                }
+                "repeat={verdict} matched_origin={origin} matched_age_ms={age_ms} matched_shown={shown}"
             ),
         );
         self.security.push_external_audit(record);
         self.initiative_refused_text =
             Some(text.chars().take(initiative::TEXT_MAX_CHARS).collect());
-        self.session_log_note(
-            &event.event_id,
-            "initiative_repeat_suppressed",
-            if repeat == repeat_guard::Repeat::Exact {
-                "exact"
-            } else {
-                "near"
-            },
-            now_ms,
-        );
+        self.session_log_repeat_refusal(&event.event_id, verdict, (origin, age_ms, shown), now_ms);
         true
     }
 

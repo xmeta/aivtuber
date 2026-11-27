@@ -214,6 +214,20 @@ where
     }
 
     /// A fixed-vocabulary event on a turn.
+    /// An initiative repeat refusal with the matched phrase's origin, logical
+    /// age and shown flag (#547).
+    pub(crate) fn session_log_repeat_refusal(
+        &mut self,
+        event_id: &str,
+        repeat: &str,
+        matched: (&str, u64, bool),
+        at_ms: u64,
+    ) {
+        if let Some(log) = self.session_log.as_mut() {
+            log.note_repeat_refusal(event_id, repeat, matched.0, matched.1, matched.2, at_ms);
+        }
+    }
+
     pub(crate) fn session_log_note(
         &mut self,
         event_id: &str,

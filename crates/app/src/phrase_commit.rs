@@ -649,7 +649,11 @@ where
                 return;
             }
             if self.is_initiative_event(event) {
-                self.repeat_guard.stage(&text, now_ms);
+                self.repeat_guard.stage(
+                    &text,
+                    crate::repeat_guard::PhraseOrigin::Initiative,
+                    now_ms,
+                );
             }
         }
         let gate = output_decision
