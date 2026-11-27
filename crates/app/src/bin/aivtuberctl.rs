@@ -1176,6 +1176,10 @@ async fn connect(endpoint: &str) -> std::io::Result<interprocess::local_socket::
 }
 
 #[cfg(test)]
+#[path = "../test_dir.rs"]
+mod test_dir;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use aivtuber_app::OperatorMemoryExport;
@@ -1304,8 +1308,7 @@ mod tests {
 
     #[test]
     fn memory_seed_subcommands_map_to_the_two_actions_and_validate_the_file_before_sending() {
-        let dir = std::env::temp_dir().join(format!("aivtuberctl-seed-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::scratch_for_test_thread("aivtuberctl-seed");
         let write = |name: &str, text: &str| {
             let path = dir.join(name);
             std::fs::write(&path, text).unwrap();
@@ -1390,8 +1393,7 @@ mod tests {
 
     #[test]
     fn persona_subcommands_map_to_the_two_actions_and_bound_the_file_before_sending() {
-        let dir = std::env::temp_dir().join(format!("aivtuberctl-persona-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::scratch_for_test_thread("aivtuberctl-persona");
         let write = |name: &str, bytes: &[u8]| {
             let path = dir.join(name);
             std::fs::write(&path, bytes).unwrap();
@@ -1449,8 +1451,7 @@ mod tests {
 
     #[test]
     fn topics_subcommands_map_to_the_two_actions_and_check_the_file_before_sending() {
-        let dir = std::env::temp_dir().join(format!("aivtuberctl-topics-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::scratch_for_test_thread("aivtuberctl-topics");
         let write = |name: &str, bytes: &[u8]| {
             let path = dir.join(name);
             std::fs::write(&path, bytes).unwrap();

@@ -8,6 +8,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[path = "../../src/test_dir.rs"]
+mod test_dir;
+pub use test_dir::TestDir;
+
 #[derive(Default)]
 pub struct Behavior {
     /// path -> body
@@ -171,9 +175,6 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     aivtuber_setup::download::hex(&Sha256::digest(bytes))
 }
 
-pub fn scratch(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("aivtuber-setup-it-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+pub fn scratch(tag: &str) -> TestDir {
+    TestDir::named(&format!("aivtuber-setup-it-{tag}"))
 }

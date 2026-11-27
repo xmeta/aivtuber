@@ -4,6 +4,9 @@
 //! (its second argument), which is how these tests tell "running" from "gone"
 //! on every platform.
 
+#[path = "../src/test_dir.rs"]
+mod test_dir;
+
 use aivtuber_app::{
     SpeechInputController, SpeechInputError, SpeechInputStateName, SpeechSidecarConfig,
 };
@@ -29,14 +32,7 @@ const OFF: &str = "{\"schema\":\"local-speech-input-settings/1\",\"enabled\":fal
 const SECRET: &str = "0123456789abcdef0123456789abcdef";
 
 fn scratch(name: &str) -> PathBuf {
-    static RUNS: AtomicU32 = AtomicU32::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "aivtuber-voice-live-{}-{}-{name}",
-        std::process::id(),
-        RUNS.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    test_dir::scratch_for_test_thread(&format!("aivtuber-voice-live-{name}"))
 }
 
 /// Whether a process holds the lock the double takes: true while it runs.

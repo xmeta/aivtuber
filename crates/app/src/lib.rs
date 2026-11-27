@@ -6637,4 +6637,6 @@ fn command_is_live(
 }
 
 #[cfg(test)]
+mod test_dir;
+#[cfg(test)]
 mod tests;

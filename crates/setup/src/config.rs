@@ -440,12 +440,8 @@ mod tests {
         }
     }
 
-    fn scratch(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("aivtuber-config-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(tag: &str) -> crate::test_dir::TestDir {
+        crate::test_dir::TestDir::named(&format!("aivtuber-config-{tag}"))
     }
 
     fn setup(mode: LlmMode) -> LlmSetup {

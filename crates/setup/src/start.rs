@@ -1486,8 +1486,7 @@ mod tests {
 
     #[test]
     fn the_empty_seed_is_created_only_when_absent_and_never_overwrites() {
-        let dir = std::env::temp_dir().join(format!("aivtuber-seed-setup-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::named("aivtuber-seed-setup");
         let path = dir.join(MEMORY_SEED_FILE);
         let _ = std::fs::remove_file(&path);
         ensure_memory_seed_file(&path).unwrap();
@@ -1734,10 +1733,8 @@ mod tests {
         .unwrap()
     }
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("aivtuber-start-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir(tag: &str) -> crate::test_dir::TestDir {
+        crate::test_dir::TestDir::named(&format!("aivtuber-start-{tag}"))
     }
 
     #[test]

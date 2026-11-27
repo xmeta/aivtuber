@@ -3,6 +3,9 @@
 //! `aivtuberctl log summary` reads it offline (no daemon, no secret). With the
 //! log off (no remembered choice) the same run creates no directory.
 
+#[path = "../src/test_dir.rs"]
+mod test_dir;
+
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -11,13 +14,7 @@ const APP: &str = env!("CARGO_BIN_EXE_aivtuber-app");
 const CTL: &str = env!("CARGO_BIN_EXE_aivtuberctl");
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "aivtuber-session-log-{}-{name}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    test_dir::scratch_for_test_thread(&format!("aivtuber-session-log-{name}"))
 }
 
 /// Runs the app, feeds `line` on stdin, waits, closes stdin (its clean

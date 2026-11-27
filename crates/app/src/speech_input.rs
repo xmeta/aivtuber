@@ -576,11 +576,8 @@ mod tests {
     const OFF: &str = "{\"schema\":\"local-speech-input-settings/1\",\"enabled\":false}\n";
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "aivtuber-speech-input-{}-{name}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir =
+            crate::test_dir::scratch_for_test_thread(&format!("aivtuber-speech-input-{name}"));
         dir.join("local-speech-input.json")
     }
 

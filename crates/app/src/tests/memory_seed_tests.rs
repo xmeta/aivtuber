@@ -601,10 +601,7 @@ mod live_edit {
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("aivtuber-seed-live-{}-{name}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
-        dir
+        crate::test_dir::scratch_for_test_thread(&format!("aivtuber-seed-live-{name}"))
     }
 
     fn editable(

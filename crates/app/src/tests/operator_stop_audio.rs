@@ -324,9 +324,15 @@ fn mute_keeps_the_avatar_neutral() {
 /// playing when the operator stopped is killed, not left to finish.
 #[test]
 fn operator_stop_kills_a_real_playback_process() {
-    fn player(name: &str) -> (ProcessAudioPlayer, std::path::PathBuf) {
-        let root = std::env::temp_dir().join(format!("aivtuber-277-{name}-{}", std::process::id()));
-        fs::create_dir_all(&root).expect("root");
+    fn player(
+        name: &str,
+    ) -> (
+        ProcessAudioPlayer,
+        std::path::PathBuf,
+        crate::test_dir::TestDir,
+    ) {
+        let dir = crate::test_dir::TestDir::named(&format!("aivtuber-277-{name}"));
+        let root = dir.to_path_buf();
         fs::write(root.join("clip.opus"), b"not audio").expect("clip");
         let marker = root.join("finished.txt");
         let _ = fs::remove_file(&marker);
@@ -361,7 +367,7 @@ fn operator_stop_kills_a_real_playback_process() {
             args: vec!["{audio}".to_owned()],
         })
         .expect("player");
-        (player, marker)
+        (player, marker, dir)
     }
     let play = AudioPlayRequest {
         id: None,
@@ -371,9 +377,9 @@ fn operator_stop_kills_a_real_playback_process() {
     };
 
     // Control: an identical clip nobody stops runs to its end.
-    let (control, control_marker) = player("control");
+    let (control, control_marker, _control_dir) = player("control");
     control.play(&play).expect("play control");
-    let (stopped, stopped_marker) = player("stopped");
+    let (stopped, stopped_marker, _stopped_dir) = player("stopped");
     stopped.play(&play).expect("play");
     assert_eq!(stopped.tracked_processes(), 1);
 
