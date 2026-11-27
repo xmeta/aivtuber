@@ -1392,6 +1392,45 @@ mod tests {
         }
     }
 
+    /// Boundary measured on 2026-11-27 with the shipped defaults (#79). A cold
+    /// wave enters the lane at its third arrival, so a 4-comment wave can hold
+    /// at most two candidates and never reaches the audience cluster minimum,
+    /// whatever the spacing. Five comments route only while the fifth still
+    /// lands before the batch deadline `opened + window_ms = 3 * gap + 1500`,
+    /// which is `gap < 750`. Pins the defaults; it changes none of them.
+    #[test]
+    fn cold_small_wave_routes_only_while_five_comments_fit_the_window() {
+        for gap in [150, 350, 500, 700, 750] {
+            let (signals, quiet, crowd_carriers) = wave_with_defaults(4, gap);
+            assert_eq!(
+                signals, 0,
+                "gap={gap}: four cold comments are below the cluster minimum"
+            );
+            assert_eq!(crowd_carriers, 0, "gap={gap}: no crowd route");
+            assert_eq!(quiet, 2, "gap={gap}: two arrivals are quiet passthrough");
+        }
+        // At 1 s spacing not even three arrivals fall inside the window, so no
+        // batch opens and the whole wave stays on the quiet path.
+        let (signals, quiet, crowd_carriers) = wave_with_defaults(4, 1_000);
+        assert_eq!((signals, crowd_carriers, quiet), (0, 0, 4), "gap=1000");
+        for gap in [350, 500, 700] {
+            let (signals, quiet, crowd_carriers) = wave_with_defaults(5, gap);
+            assert_eq!(signals, 1, "gap={gap}: one celebration signal");
+            assert_eq!(crowd_carriers, 1, "gap={gap}: one crowd route");
+            assert_eq!(quiet, 2, "gap={gap}: two arrivals are quiet passthrough");
+        }
+        let (signals, quiet, crowd_carriers) = wave_with_defaults(5, 750);
+        assert_eq!(
+            signals, 0,
+            "gap=750: the fifth comment flushes the batch instead of joining it"
+        );
+        assert_eq!(crowd_carriers, 0, "gap=750: no crowd route");
+        assert_eq!(quiet, 2, "gap=750: two arrivals are quiet passthrough");
+        // 1 s spacing never opens a batch, so all five stay on the quiet path.
+        let (signals, quiet, crowd_carriers) = wave_with_defaults(5, 1_000);
+        assert_eq!((signals, crowd_carriers, quiet), (0, 0, 5), "gap=1000");
+    }
+
     fn sample(id: &str) -> EventEnvelope {
         use aivtuber_domain::{
             EVENT_SCHEMA_VERSION, EventKind, SecurityPlane, SourceClass, TrustLevel,
