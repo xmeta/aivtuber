@@ -1,0 +1,59 @@
+= Deterministic crowd-timing replay evidence, 2026-11-27
+:toc:
+
+Offline, deterministic replay evidence for the https://github.com/xmeta/aivtuber/issues/79[#79] crowd stages and the https://github.com/xmeta/aivtuber/issues/489[#489, v0.3 Watchable Hour] evidence gap, produced without a live run.
+Raw session text and actor identifiers are not reproduced here; only counts and logical intervals.
+
+== What this is, and what it is not
+
+* It is a replay of the production burst/audience/crowd lane and its composition path (`process_content_bytes`, `service_chat_burst`, deferred inbox, session log #463) over a checked-in scenario, summarized by the same offline reader the live runs use (`aivtuberctl log summary`, #494 stages).
+* It is **not** a live run and **not** representative-hour evidence. It holds no generation worker, no audio device and no wall clock: every instant is the fixture's own logical milliseconds, and a phrase interval is a recorded commit, not acoustic or visible onset.
+* It therefore cannot by itself move link:../current-constraint.adoc[the current measured constraint]. It bounds the shipped pack-answered path and gives #489 a deterministic before/after instrument that runs in under a second.
+
+== Scenario
+
+`examples/crowd-routing/timing-scenario.json` (`crowd-routing-timing-v1`) keeps the shape of `examples/crowd-routing/falsifier.json`: `window_ms=1500`, `burst_enter_count=2`, `top_k=8`, `max_per_actor=4`, `max_candidates=64`, `reply_ttl_ms=20000`, crowd window `60000`, crowd cooldown `20000`.
+
+Seven waves are spaced 30 s apart, beyond the crowd cooldown, so each routes exactly once: five celebration waves (steps 5, 20, 60, 15 and 25 ms), one laughter wave and one repeated-question wave. A final pair overlaps on purpose (laughter arrives 1.5 s after a celebration) so one route ends unvoiced while the performer is busy.
+
+== Reproduction
+
+[source,sh]
+----
+cargo test -p aivtuber-app --locked --lib \
+  deterministic_timing_scenario_reports_crowd_stage_distributions -- --nocapture
+----
+
+The test replays the scenario twice (asserting a byte-identical summary), prints the offline summary, and writes the per-route stages to `target/crowd-routing-timing/crowd-routing-timing-v1.json` (not committed).
+
+== Measured (default local profile lane settings as in the fixture)
+
+Run: branch `test/chat-burst-small-wave-boundary-79` on base `main` `9451583c`, 2026-11-27.
+Log: `lines=168`, `malformed=0`, `capped=false`, `truncated_read=false`.
+
+[cols="2,1,1,1,1",options="header"]
+|===
+|Stage (logical ms) |Eligible / routes |p50 |p95 |max
+
+|`input_to_route_observation` |9 / 9 |1620 |25080 |25080
+|`route_observation_to_dispatch` |9 / 9 |0 |0 |0
+|`dispatch_to_first_phrase` |8 / 9 |83 |127 |127
+|`route_observation_to_first_phrase` |8 / 9 |83 |127 |127
+|===
+
+Routes: `crowd_routes=9` — 6 `congratulation`, 2 `laughter`, 1 `repeated_question` (12 members, 12 actors, 0 cached phrases). Eight were voiced from the pack, one ended unvoiced.
+Whole-session context: `first_audio_ms path=crowd` count 8, p50 1689, p95 1813, max 1813 (carrier input to first phrase, not route to phrase).
+
+== What it shows
+
+* **`route_observation_to_dispatch` is 0 for every route** in this scenario, including the representative reply and the wave that overlapped a speaking performer. That matches the #79 S5 property: a carrier the pack answers is dispatched at the routing instant, and with no generation worker held there is no queue to wait behind. The 3,175 ms Track A wait is therefore a queue effect, not crowd work, and this replay reproduces its *absence* deterministically.
+* **`route_observation_to_first_phrase` is 83–127 ms** once the carrier is dispatched from the pack; the variation comes from scheduling offset, not from selection.
+* **`input_to_route_observation` is dominated by the batch window** (~1.5 s) for isolated waves. The p95/max of 25,080 ms is the overlapping wave: it was routed while the previous reaction was still speaking, sat in the deferred inbox, and expired at its 20 s time-to-live. It contributes an input→route interval but no phrase interval, which is exactly the "unvoiced route" case the protocol says must not become a zero-duration sample.
+
+== Limitations
+
+* Logical time only; no acoustic playback, no visible acknowledgement, no provider or TTS wall clock.
+* One scenario shape (pack-answered celebrations and laughter plus one question) on one lane configuration; it does not cover other crowd classes, other `top_k`/window settings, or a held generation worker (the dedicated #79 S5 unit tests cover that case and also observe 0 ms).
+* The overlap route's 25 s input→route interval reflects the replay's coarse 250 ms service cadence and the deferred TTL, not a measured live wait.
+
+Revisit when a generation-holding scenario is needed to reproduce the Track A queue wait offline, or when the lane defaults change (the scenario must then be re-baselined rather than pooled).

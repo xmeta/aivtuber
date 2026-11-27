@@ -12,8 +12,13 @@
 use super::*;
 use aivtuber_domain::{CrowdClass, CrowdTrend, ThinkingRequest};
 use aivtuber_reflex::{AudienceConfig, BurstConfig, CrowdConfig};
+use std::path::Path;
 
 const FIXTURE: &str = include_str!("../../../../examples/crowd-routing/falsifier.json");
+/// Same lane shape, waves spaced beyond the crowd cooldown: seven routes with
+/// observable crowd stages (#489 evidence without a live hour run).
+const TIMING_FIXTURE: &str =
+    include_str!("../../../../examples/crowd-routing/timing-scenario.json");
 
 #[derive(Clone, Default)]
 struct ProbeRoute {
@@ -228,8 +233,28 @@ struct Replay {
 }
 
 fn replay(config: ChatBurstConfig) -> Replay {
-    let fixture: serde_json::Value = serde_json::from_str(FIXTURE).expect("fixture");
+    replay_fixture(config, FIXTURE, None).0
+}
+
+/// Replay any fixture of the falsifier's shape. With `log_dir` the lane writes
+/// the opt-in session log (#463), so the offline summary can reconstruct the
+/// crowd stages (#494); that summary is returned beside the replay.
+fn replay_fixture(
+    config: ChatBurstConfig,
+    fixture_text: &str,
+    log_dir: Option<&Path>,
+) -> (Replay, Option<crate::session_log::SessionSummary>) {
+    let fixture: serde_json::Value = serde_json::from_str(fixture_text).expect("fixture");
     let mut rig = rig(config);
+    if let Some(dir) = log_dir {
+        rig.app = rig
+            .app
+            .with_session_log(crate::session_log::SessionLog::new(
+                dir.join("logs"),
+                None,
+                true,
+            ));
+    }
     let mut terminals: BTreeMap<String, Vec<ChatOutcome>> = BTreeMap::new();
     let mut signals = Vec::new();
     let mut played = Vec::new();
@@ -290,15 +315,28 @@ fn replay(config: ChatBurstConfig) -> Replay {
     let metrics = rig.app.chat_burst_metrics().expect("metrics");
     let routed = rig.routed.lock().expect("routed").clone();
     let requests = rig.requests.lock().expect("requests").clone();
-    Replay {
-        terminals,
-        signals,
-        played,
-        routed,
-        requests,
-        metrics,
-        admitted_ids,
-    }
+    let summary = log_dir.and_then(|dir| {
+        rig.app.session_log().expect("log").flush();
+        let file = std::fs::read_dir(dir.join("logs"))
+            .ok()?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .last()?;
+        let bytes = std::fs::read(file).ok()?;
+        Some(crate::session_log::summarize(bytes.as_slice()))
+    });
+    (
+        Replay {
+            terminals,
+            signals,
+            played,
+            routed,
+            requests,
+            metrics,
+            admitted_ids,
+        },
+        summary,
+    )
 }
 
 /// Advance logical time in small steps so the burst window flushes, speech
@@ -1294,4 +1332,134 @@ fn a_celebration_is_never_given_a_mismatched_generic_line() {
             .play_crowd_reaction(&event, G::Celebration, 1_000, 1)
             .is_none()
     );
+}
+
+/// #489 evidence before an hour-long live run: the checked-in timing scenario
+/// routes several crowds deterministically (waves spaced beyond the crowd
+/// cooldown), so the offline summary reports the crowd stage distributions
+/// from a replay of the production lane instead of a live session. The numbers
+/// are logical-time intervals between existing log records, not acoustic or
+/// visible onset, and they do not replace a representative hour.
+#[test]
+fn deterministic_timing_scenario_reports_crowd_stage_distributions() {
+    let fixture: serde_json::Value = serde_json::from_str(TIMING_FIXTURE).expect("fixture");
+    let expected = fixture["expected"]["crowd_routes"]
+        .as_u64()
+        .expect("crowd_routes");
+    let dir = TestDir::new("crowd-timing");
+    let (first, summary) = replay_fixture(
+        lane_config(&fixture, true),
+        TIMING_FIXTURE,
+        Some(dir.path()),
+    );
+    let summary = summary.expect("session summary");
+    assert_eq!(summary.malformed, 0, "every log line parses");
+    assert!(!summary.capped && !summary.truncated_read, "a complete log");
+    assert_eq!(
+        summary.crowd_routes.len() as u64,
+        expected,
+        "every wave routes exactly once: {:?}",
+        summary.crowd_routes
+    );
+    assert_eq!(first.metrics.invariant_violations, 0);
+
+    // The scenario's shape is part of the evidence: both reaction classes and
+    // one representative reply, and the overlapping wave ends unvoiced.
+    let class_count = |class: &str| {
+        summary
+            .crowd_routes
+            .iter()
+            .filter(|route| route.class == class)
+            .count()
+    };
+    assert_eq!(class_count("congratulation"), 6);
+    assert_eq!(class_count("laughter"), 2);
+    assert_eq!(class_count("repeated_question"), 1);
+    assert!(
+        summary
+            .crowd_routes
+            .iter()
+            .any(|route| route.timing.route_to_phrase_ms.is_some())
+            && summary
+                .crowd_routes
+                .iter()
+                .any(|route| route.timing.route_to_phrase_ms.is_none()),
+        "the scenario covers a voiced and an unvoiced route: {:?}",
+        summary.crowd_routes
+    );
+
+    let report = crate::session_log::render_summary(&summary);
+    println!("{report}");
+    let stage_line = |stage: &str| {
+        let prefix = format!("crowd_timing_ms stage={stage} ");
+        report
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("stage {stage} missing from the summary"))
+            .to_owned()
+    };
+    let dispatch = stage_line("route_observation_to_dispatch");
+    assert!(
+        dispatch.contains(&format!("count={expected} routes={expected} ")),
+        "every route has both endpoints for dispatch: {dispatch}"
+    );
+    // #79 S5: a pack-answered carrier is dispatched at the routing instant, and
+    // this scenario holds no generation worker, so no route waits to dispatch.
+    assert!(
+        dispatch.contains("p50=0 p95=0 max=0"),
+        "no crowd route waits between routing and dispatch: {dispatch}"
+    );
+    let phrase = stage_line("route_observation_to_first_phrase");
+    assert!(
+        phrase.contains(&format!("routes={expected} ")) && !phrase.contains("count=0 "),
+        "the unvoiced route is excluded from the phrase distribution: {phrase}"
+    );
+
+    // Determinism: the same fixture replays to the same distributions.
+    let again_dir = TestDir::new("crowd-timing-again");
+    let (_, again) = replay_fixture(
+        lane_config(&fixture, true),
+        TIMING_FIXTURE,
+        Some(again_dir.path()),
+    );
+    assert_eq!(
+        report,
+        crate::session_log::render_summary(&again.expect("summary")),
+        "the replay is deterministic"
+    );
+
+    // Evidence artifact for #489 (target/ is not committed): the stages this
+    // replay measured, per route, plus the summary the reader produced.
+    let out = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/crowd-routing-timing");
+    std::fs::create_dir_all(&out).expect("out dir");
+    let id = fixture["fixture_id"].as_str().expect("fixture_id");
+    let artifact = serde_json::json!({
+        "fixture_id": id,
+        "issue": "#79 / #489",
+        "method": "deterministic replay of the production lane; logical time; session-log summary; not a live run",
+        "routes": summary.crowd_routes.len(),
+        "crowd_routes": summary
+            .crowd_routes
+            .iter()
+            .map(|route| serde_json::json!({
+                "turn": route.turn,
+                "class": route.class,
+                "members": route.members,
+                "actors": route.actors,
+                "phrases": route.phrases,
+                "cached_phrases": route.cached_phrases,
+                "first_audio_ms": route.first_audio_ms,
+                "input_to_route_ms": route.timing.input_to_route_ms,
+                "route_to_dispatch_ms": route.timing.route_to_dispatch_ms,
+                "dispatch_to_phrase_ms": route.timing.dispatch_to_phrase_ms,
+                "route_to_phrase_ms": route.timing.route_to_phrase_ms,
+            }))
+            .collect::<Vec<_>>(),
+        "summary": report,
+    });
+    std::fs::write(
+        out.join(format!("{id}.json")),
+        serde_json::to_vec_pretty(&artifact).expect("artifact json"),
+    )
+    .expect("write artifact");
 }
