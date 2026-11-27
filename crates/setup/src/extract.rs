@@ -317,12 +317,8 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    fn scratch(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("aivtuber-extract-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(tag: &str) -> crate::test_dir::TestDir {
+        crate::test_dir::TestDir::named(&format!("aivtuber-extract-{tag}"))
     }
 
     fn limits() -> Limits {

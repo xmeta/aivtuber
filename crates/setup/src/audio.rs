@@ -398,11 +398,8 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/starter-reaction-pack")
     }
 
-    fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("aivtuber-audio-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(tag: &str) -> crate::test_dir::TestDir {
+        crate::test_dir::TestDir::named(&format!("aivtuber-audio-{tag}"))
     }
 
     #[test]

@@ -15,8 +15,8 @@ fn exe(name: &str) -> String {
     }
 }
 
-fn fake_release(tag: &str) -> PathBuf {
-    let root = common::scratch(tag).join("release");
+fn fake_release(tag: &str) -> common::TestDir {
+    let root = common::scratch(tag).exposing("release");
     fs::create_dir_all(&root).unwrap();
     for name in [
         "aivtuber-app",
@@ -275,7 +275,7 @@ fn start_help_lists_voice_input_and_what_it_does() {
 
 /// A minimal env file `start` accepts without running anything: your own model
 /// server, so there is no llama-server to find.
-fn external_env_file(tag: &str, with_sidecar: bool) -> PathBuf {
+fn external_env_file(tag: &str, with_sidecar: bool) -> common::TestDir {
     let dir = common::scratch(tag);
     fs::create_dir_all(&dir).unwrap();
     let mut text = format!(
@@ -290,9 +290,8 @@ AIVTUBER_SETUP_APP={}
 ",
         );
     }
-    let path = dir.join("local-profile.env");
-    fs::write(&path, text).unwrap();
-    path
+    fs::write(dir.join("local-profile.env"), text).unwrap();
+    dir.exposing("local-profile.env")
 }
 
 #[test]

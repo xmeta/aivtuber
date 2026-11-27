@@ -1313,15 +1313,7 @@ mod speech_floor_tests {
             }
 
             fn scratch_file(name: &str) -> PathBuf {
-                let dir = std::env::temp_dir().join(format!(
-                    "aivtuber-400-{name}-{}-{}",
-                    std::process::id(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .expect("clock")
-                        .as_nanos()
-                ));
-                fs::create_dir_all(&dir).expect("scratch dir");
+                let dir = crate::test_dir::scratch_for_test_thread(&format!("aivtuber-400-{name}"));
                 dir.join("local-speech-input.json")
             }
 

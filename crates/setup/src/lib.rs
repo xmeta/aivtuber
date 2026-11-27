@@ -21,4 +21,6 @@ pub mod local;
 pub mod manifest;
 pub mod prereq;
 pub mod start;
+#[cfg(test)]
+mod test_dir;
 pub mod vcruntime;

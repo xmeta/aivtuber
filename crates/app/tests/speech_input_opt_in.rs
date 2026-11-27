@@ -3,6 +3,9 @@
 //! sidecar, so no microphone or model is involved. `AIVTUBER_LOG=verbose`
 //! makes the app print `speech_sidecar: started` when it spawns the program.
 
+#[path = "../src/test_dir.rs"]
+mod test_dir;
+
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -11,12 +14,7 @@ const APP: &str = env!("CARGO_BIN_EXE_aivtuber-app");
 const DOUBLE: &str = env!("CARGO_BIN_EXE_speech-sidecar-double");
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "aivtuber-voice-input-{}-{name}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+    test_dir::scratch_for_test_thread(&format!("aivtuber-voice-input-{name}"))
 }
 
 /// Runs the app until its stdin closes (its clean-shutdown signal) and returns
