@@ -190,7 +190,7 @@ impl ChatOutcome {
 
     /// Category among the outcomes the lane itself accounts. `Deferred(_)`
     /// outcomes are accounted by the inbox.
-    fn immediate_category(self) -> Option<usize> {
+    pub(crate) fn immediate_category(self) -> Option<usize> {
         Some(match self {
             Self::DispatchedNow => 0,
             Self::DispatchFailed => 1,
@@ -274,6 +274,12 @@ pub struct ChatBurstMetrics {
     pub audience_signals: u64,
     pub audience_members_represented: u64,
     pub audience_guarded: u64,
+    /// #79 boundary diagnostics: comments answered without waiting
+    /// (`QuietPassthrough`, mirrored from the engine), and batch members the
+    /// audience plan left below `min_cluster_size`. The crowd diagnostic line
+    /// derives the comments a batch held as `admitted - quiet_passthrough`.
+    pub quiet_passthrough: u64,
+    pub audience_below_threshold: u64,
     /// Signals dropped because their bounded ring was full.
     pub audience_signals_dropped: u64,
     /// #79 S2 crowd routing: clusters routed, carriers answered with a
@@ -304,6 +310,17 @@ impl ChatBurstMetrics {
 
     pub fn dispatched(&self) -> u64 {
         self.terminal[0] + self.deferred.count(DeferredOutcome::Dispatched)
+    }
+
+    /// #79: routed crowd carriers the crowd cooldown held back (`terminal[11]`,
+    /// the category of `ChatOutcome::SuppressedCrowdCooldown`). They are also
+    /// counted in [`ChatBurstMetrics::crowd_unvoiced`] with reason
+    /// `crowd_cooldown`, so this is a subset, not an additional total.
+    pub fn crowd_cooldown_suppressed(&self) -> u64 {
+        match ChatOutcome::SuppressedCrowdCooldown.immediate_category() {
+            Some(index) => self.terminal[index],
+            None => 0,
+        }
     }
 }
 
@@ -526,6 +543,8 @@ impl ChatBurstLane {
             audience_signals: burst.audience_signals,
             audience_members_represented: burst.audience_members_represented,
             audience_guarded: burst.audience_guarded.values().sum(),
+            quiet_passthrough: burst.quiet_passthrough(),
+            audience_below_threshold: burst.audience_below_threshold,
             crowd_routed: burst.crowd_routed,
             ack: self.ack.metrics(),
             ..self.metrics
@@ -1328,6 +1347,13 @@ mod tests {
     /// comments answered on the quiet path, crowd carriers selected for a
     /// spoken or played reaction).
     fn wave_with_defaults(lines: usize, gap_ms: u64) -> (usize, u64, usize) {
+        let (mut lane, quiet, crowd_carriers) = wave_lane_with_defaults(lines, gap_ms);
+        (lane.take_audience_signals(16).len(), quiet, crowd_carriers)
+    }
+
+    /// The lane behind [`wave_with_defaults`], so a test can read the counters
+    /// the crowd diagnostic line prints.
+    fn wave_lane_with_defaults(lines: usize, gap_ms: u64) -> (ChatBurstLane, u64, usize) {
         let mut lane = ChatBurstLane::new(ChatBurstConfig {
             audience: Some(aivtuber_reflex::AudienceConfig::default()),
             crowd: Some(aivtuber_reflex::CrowdConfig::default()),
@@ -1371,7 +1397,7 @@ mod tests {
             .iter()
             .filter(|candidate| candidate.crowd.is_some())
             .count();
-        (lane.take_audience_signals(16).len(), quiet, crowd_carriers)
+        (lane, quiet, crowd_carriers)
     }
 
     /// A 2-3 comments/s reaction wave is one crowd moment (#79 S3c). Counting
@@ -1429,6 +1455,35 @@ mod tests {
         // 1 s spacing never opens a batch, so all five stay on the quiet path.
         let (signals, quiet, crowd_carriers) = wave_with_defaults(5, 1_000);
         assert_eq!((signals, crowd_carriers, quiet), (0, 0, 5), "gap=1000");
+        // The crowd diagnostic line reads the same waves: quiet, batched
+        // (`admitted - quiet`), below the cluster threshold, routed, and the
+        // crowd cooldown (none here).
+        let (lane, _, _) = wave_lane_with_defaults(4, 700);
+        let metrics = lane.metrics();
+        assert_eq!(
+            (
+                metrics.quiet_passthrough,
+                metrics.admitted - metrics.quiet_passthrough,
+                metrics.audience_below_threshold,
+                metrics.crowd_routed,
+                metrics.crowd_cooldown_suppressed(),
+            ),
+            (2, 2, 2, 0, 0),
+            "silent cold wave"
+        );
+        let (lane, _, _) = wave_lane_with_defaults(5, 700);
+        let metrics = lane.metrics();
+        assert_eq!(
+            (
+                metrics.quiet_passthrough,
+                metrics.admitted - metrics.quiet_passthrough,
+                metrics.audience_below_threshold,
+                metrics.crowd_routed,
+                metrics.crowd_cooldown_suppressed(),
+            ),
+            (2, 3, 0, 1, 0),
+            "routed cold wave"
+        );
     }
 
     fn sample(id: &str) -> EventEnvelope {
