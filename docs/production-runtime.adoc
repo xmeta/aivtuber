@@ -1100,6 +1100,8 @@ Record format (one JSON object per line; fake data):
 {"v":1,"t":"phrase","seq":6,"turn":"t-0002","logical_ms":122100,"wall":"2026-11-22T10:02:06Z","origin":"initiative","idx":0,"route":"generated","text":"最近どう過ごしてる？","repeat":"near"}
 ----
 
+An initiative phrase refused as a repeat (#89) is logged as a +note+ with +kind+ +initiative_repeat_suppressed+ and +fallback+ +exact+ or +near+. Since #547 it also carries three additive fields, so a re-run can tell whether the repeat was a phrase the model was shown or only one the guard remembered: +matched_origin+ (+initiative+, +chat_reply+ or +cached+: where the matched earlier phrase came from), +matched_age_ms+ (logical milliseconds since that phrase, under the 900 s guard window) and +matched_shown+ (+true+ when the refused phrase is contained in, or nearly equals, one of the last 3 initiative texts the request showed the model; those are whole replies cut to 160 characters, so a phrase past the cut reads as not shown). The matching audit record gains the same three values in its detail. Never any text. Older logs lack the fields and count as +unknown+. +aivtuberctl log summary+ prints +repeat_refused total=... age_ms_p50=... age_ms_max=...+ and one +repeat_refused matched_origin=... count=...+ / +repeat_refused matched_shown=... count=...+ line per value.
+
 == Idle initiative (issue #87 S1)
 
 When no chat or voice arrives for a while the performer would otherwise stay silent. With the generative path composed, the +InitiativeDirector+ (+crates/app/src/initiative.rs+, host side in +initiative_host.rs+) decides in deterministic code, on logical time only, whether to speak on its own; what is said comes from the existing generative path through a typed bounded request.

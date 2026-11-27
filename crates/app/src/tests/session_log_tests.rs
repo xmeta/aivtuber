@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::initiative::InitiativeConfig;
-use crate::session_log::{Record, SessionLog, summarize};
+use crate::session_log::{Record, SessionLog, render_summary, summarize};
 
 const SECRET: [u8; 32] = [0x5A; 32];
 /// The raw actor id of `chat_event`; it must never reach a file.
@@ -332,9 +332,35 @@ fn an_initiative_is_logged_as_its_own_origin_and_a_refused_repeat_is_noted() {
         .expect("the refusal is noted");
     assert_eq!(note.kind.as_deref(), Some("initiative_repeat_suppressed"));
     assert_eq!(note.fallback.as_deref(), Some("exact"));
+    // #547: the matched phrase is the earlier initiative reply the director
+    // showed the model; only its origin, age and flag are logged.
+    assert_eq!(note.matched_origin.as_deref(), Some("initiative"));
+    assert!(
+        note.matched_age_ms
+            .is_some_and(|age| age > 0 && age < 900_000)
+    );
+    assert_eq!(note.matched_shown, Some(true));
+    let raw = std::fs::read_to_string(session_files(&dir).last().expect("file")).expect("read");
+    let note_line = raw
+        .lines()
+        .find(|line| line.contains("initiative_repeat_suppressed"))
+        .expect("note line");
+    assert!(!note_line.contains("\"text\""));
     let file = std::fs::read(session_files(&dir).last().expect("file")).expect("read");
     let summary = summarize(file.as_slice());
     assert_eq!(summary.initiative_spacing_ms, vec![70_000]);
+    assert_eq!(summary.repeat_refusals, 1);
+    assert_eq!(
+        summary.repeat_refusals_by_origin,
+        vec![("initiative".to_owned(), 1)]
+    );
+    assert_eq!(
+        summary.repeat_refusals_by_shown,
+        vec![("true".to_owned(), 1)]
+    );
+    let rendered = render_summary(&summary);
+    assert!(rendered.contains("repeat_refused matched_origin=initiative count=1"));
+    assert!(rendered.contains("repeat_refused matched_shown=true count=1"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

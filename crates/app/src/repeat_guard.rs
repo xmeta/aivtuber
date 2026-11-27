@@ -94,9 +94,29 @@ pub enum Repeat {
     Near,
 }
 
+/// The verdict of a refusal check plus which remembered phrase it matched
+/// (#547). Origin and logical age only: never the phrase or its digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepeatMatch {
+    pub repeat: Repeat,
+    /// Origin of the matched entry; `None` when there is no repeat.
+    pub origin: Option<PhraseOrigin>,
+    /// Logical milliseconds since the matched entry; bounded by [`WINDOW_MS`].
+    pub age_ms: Option<u64>,
+}
+
+impl RepeatMatch {
+    const NONE: Self = Self {
+        repeat: Repeat::None,
+        origin: None,
+        age_ms: None,
+    };
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Entry {
     at_ms: u64,
+    origin: PhraseOrigin,
     digest: u64,
     /// Sorted, deduplicated keyed digests of the character bigrams.
     bigrams: Vec<u64>,
@@ -162,7 +182,7 @@ impl RepeatGuard {
         u64::from_be_bytes(head)
     }
 
-    fn entry(&self, text: &str, at_ms: u64) -> Option<Entry> {
+    fn entry(&self, text: &str, origin: PhraseOrigin, at_ms: u64) -> Option<Entry> {
         let normalized = normalize(text);
         if normalized.is_empty() {
             return None;
@@ -183,6 +203,7 @@ impl RepeatGuard {
         bigrams.dedup();
         Some(Entry {
             at_ms,
+            origin,
             digest: self.keyed(1, normalized.as_bytes()),
             bigrams,
         })
@@ -194,27 +215,66 @@ impl RepeatGuard {
         self.staged.retain(live);
     }
 
-    fn classify(entries: &[&VecDeque<Entry>], candidate: &Entry) -> Repeat {
-        let mut near = false;
+    /// The verdict and the matched entry: an exact match outranks a near
+    /// one, and the most recent entry of the winning kind is the one named.
+    fn classify(entries: &[&VecDeque<Entry>], candidate: &Entry, now_ms: u64) -> RepeatMatch {
+        let mut best: Option<(Repeat, &Entry)> = None;
         for list in entries {
             for seen in list.iter() {
-                if seen.digest == candidate.digest {
-                    return Repeat::Exact;
+                let repeat = if seen.digest == candidate.digest {
+                    Repeat::Exact
+                } else if is_near(&seen.bigrams, &candidate.bigrams) {
+                    Repeat::Near
+                } else {
+                    continue;
+                };
+                let better = match best {
+                    None => true,
+                    Some((kind, held)) => {
+                        (repeat == Repeat::Exact && kind == Repeat::Near)
+                            || (repeat == kind && seen.at_ms >= held.at_ms)
+                    }
+                };
+                if better {
+                    best = Some((repeat, seen));
                 }
-                near = near || is_near(&seen.bigrams, &candidate.bigrams);
             }
         }
-        if near { Repeat::Near } else { Repeat::None }
+        match best {
+            Some((repeat, seen)) => RepeatMatch {
+                repeat,
+                origin: Some(seen.origin),
+                age_ms: Some(now_ms.saturating_sub(seen.at_ms)),
+            },
+            None => RepeatMatch::NONE,
+        }
     }
 
-    /// Whether `text` repeats a recently spoken or staged phrase. Pure apart
-    /// from dropping entries older than the window.
-    pub fn check(&mut self, text: &str, now_ms: u64) -> Repeat {
+    /// Whether `text` repeats a recently spoken or staged phrase, and which
+    /// one. Pure apart from dropping entries older than the window.
+    pub fn check(&mut self, text: &str, now_ms: u64) -> RepeatMatch {
         self.evict(now_ms);
-        match self.entry(text, now_ms) {
-            Some(candidate) => Self::classify(&[&self.ring, &self.staged], &candidate),
-            None => Repeat::None,
+        match self.entry(text, PhraseOrigin::Initiative, now_ms) {
+            Some(candidate) => Self::classify(&[&self.ring, &self.staged], &candidate, now_ms),
+            None => RepeatMatch::NONE,
         }
+    }
+
+    /// Whether `text` is contained in, or nearly equals, one of the `shown`
+    /// texts (what a request showed the model). Shown texts are whole replies
+    /// cut to a bound while spoken text is one phrase, so containment of the
+    /// normalised phrase counts. Nothing is stored.
+    pub fn was_shown<'a>(&self, text: &str, shown: impl IntoIterator<Item = &'a str>) -> bool {
+        let needle = normalize(text);
+        let Some(candidate) = self.entry(text, PhraseOrigin::Initiative, 0) else {
+            return false;
+        };
+        shown.into_iter().any(|seen| {
+            normalize(seen).contains(&needle)
+                || self
+                    .entry(seen, PhraseOrigin::Initiative, 0)
+                    .is_some_and(|entry| is_near(&entry.bigrams, &candidate.bigrams))
+        })
     }
 
     /// An initiative phrase was refused because it repeated.
@@ -224,9 +284,9 @@ impl RepeatGuard {
 
     /// A phrase was committed but is not heard yet: later phrases of the same
     /// reply are checked against it.
-    pub fn stage(&mut self, text: &str, now_ms: u64) {
+    pub fn stage(&mut self, text: &str, origin: PhraseOrigin, now_ms: u64) {
         self.evict(now_ms);
-        if let Some(entry) = self.entry(text, now_ms) {
+        if let Some(entry) = self.entry(text, origin, now_ms) {
             if self.staged.len() == STAGED_CAPACITY {
                 self.staged.pop_front();
             }
@@ -245,10 +305,10 @@ impl RepeatGuard {
         self.evict(now_ms);
         let slot = origin.index();
         self.spoken[slot] = self.spoken[slot].saturating_add(1);
-        let Some(entry) = self.entry(text, now_ms) else {
+        let Some(entry) = self.entry(text, origin, now_ms) else {
             return Repeat::None;
         };
-        let repeat = Self::classify(&[&self.ring], &entry);
+        let repeat = Self::classify(&[&self.ring], &entry, now_ms).repeat;
         match repeat {
             Repeat::Exact => self.exact[slot] = self.exact[slot].saturating_add(1),
             Repeat::Near => self.near[slot] = self.near[slot].saturating_add(1),
@@ -419,6 +479,12 @@ mod tests {
             .collect()
     }
 
+    impl RepeatGuard {
+        fn verdict(&mut self, text: &str, now_ms: u64) -> Repeat {
+            self.check(text, now_ms).repeat
+        }
+    }
+
     fn guard() -> RepeatGuard {
         RepeatGuard::with_key([7; 16])
     }
@@ -451,7 +517,7 @@ mod tests {
             g.record_spoken("Hello, world!", PhraseOrigin::Initiative, 0),
             Repeat::None
         );
-        assert_eq!(g.check("ＨＥＬＬＯ world", 10), Repeat::Exact);
+        assert_eq!(g.verdict("ＨＥＬＬＯ world", 10), Repeat::Exact);
         assert_eq!(
             g.record_spoken("ﾊﾛｰ", PhraseOrigin::ChatReply, 20),
             Repeat::None
@@ -475,26 +541,26 @@ mod tests {
         let base = "abcdefghijkl";
         g.record_spoken(base, PhraseOrigin::Initiative, 0);
         // Same set plus one new bigram: 11 / 12 >= 0.8.
-        assert_eq!(g.check("abcdefghijklm", 1), Repeat::Near);
+        assert_eq!(g.verdict("abcdefghijklm", 1), Repeat::Near);
         // Two extra bigrams: 11 / 13 = 0.846 still near.
-        assert_eq!(g.check("abcdefghijklmn", 1), Repeat::Near);
+        assert_eq!(g.verdict("abcdefghijklmn", 1), Repeat::Near);
         // Three extra: 11 / 14 = 0.786 is below the threshold.
-        assert_eq!(g.check("abcdefghijklmno", 1), Repeat::None);
+        assert_eq!(g.verdict("abcdefghijklmno", 1), Repeat::None);
         // Exactly 0.8: 8 shared of union 10.
         let mut g = guard();
         g.record_spoken("abcdefghi", PhraseOrigin::Initiative, 0); // 8 bigrams
-        assert_eq!(g.check("abcdefghijk", 1), Repeat::Near); // 8 / 10
-        assert_eq!(g.check("abcdefghijkl", 1), Repeat::None); // 8 / 11
-        assert_eq!(g.check("xyzxyzxyz", 1), Repeat::None);
+        assert_eq!(g.verdict("abcdefghijk", 1), Repeat::Near); // 8 / 10
+        assert_eq!(g.verdict("abcdefghijkl", 1), Repeat::None); // 8 / 11
+        assert_eq!(g.verdict("xyzxyzxyz", 1), Repeat::None);
     }
 
     #[test]
     fn single_character_phrases_only_match_exactly() {
         let mut g = guard();
         g.record_spoken("あ", PhraseOrigin::Cached, 0);
-        assert_eq!(g.check("あ", 1), Repeat::Exact);
-        assert_eq!(g.check("い", 1), Repeat::None);
-        assert_eq!(g.check("!!!", 1), Repeat::None);
+        assert_eq!(g.verdict("あ", 1), Repeat::Exact);
+        assert_eq!(g.verdict("い", 1), Repeat::None);
+        assert_eq!(g.verdict("!!!", 1), Repeat::None);
     }
 
     #[test]
@@ -505,14 +571,14 @@ mod tests {
         }
         assert_eq!(g.ring_len(), RING_CAPACITY);
         // The oldest were forgotten; the newest are remembered.
-        assert_eq!(g.check(&unique(0), 100), Repeat::None);
+        assert_eq!(g.verdict(&unique(0), 100), Repeat::None);
         assert_eq!(
-            g.check(&unique(RING_CAPACITY as u64 + 19), 100),
+            g.verdict(&unique(RING_CAPACITY as u64 + 19), 100),
             Repeat::Exact
         );
         // Older than the window: forgotten.
         assert_eq!(
-            g.check(&unique(RING_CAPACITY as u64 + 19), WINDOW_MS + 200),
+            g.verdict(&unique(RING_CAPACITY as u64 + 19), WINDOW_MS + 200),
             Repeat::None
         );
         assert_eq!(g.ring_len(), 0);
@@ -521,14 +587,14 @@ mod tests {
     #[test]
     fn staged_phrases_block_a_repeat_inside_one_reply_and_are_bounded() {
         let mut g = guard();
-        g.stage("ねえねえ、聞いてる？", 0);
-        assert_eq!(g.check("ねえねえ聞いてる", 1), Repeat::Exact);
+        g.stage("ねえねえ、聞いてる？", PhraseOrigin::Initiative, 0);
+        assert_eq!(g.verdict("ねえねえ聞いてる", 1), Repeat::Exact);
         // Hearing it moves it from staged to spoken (no double counting).
         g.record_spoken("ねえねえ、聞いてる？", PhraseOrigin::Initiative, 2);
         assert_eq!(g.staged_len(), 0);
         assert_eq!(g.ring_len(), 1);
         for n in 0..(STAGED_CAPACITY + 5) {
-            g.stage(&unique(n as u64 + 500), 3);
+            g.stage(&unique(n as u64 + 500), PhraseOrigin::Initiative, 3);
         }
         assert_eq!(g.staged_len(), STAGED_CAPACITY);
         g.clear_staged();
@@ -571,5 +637,64 @@ mod tests {
         assert!(!debug.contains("phrase"));
         let status = serde_json::to_string(&g.status()).expect("json");
         assert!(!status.contains("secret"));
+    }
+
+    #[test]
+    fn a_refusal_names_the_matched_origin_and_logical_age_only() {
+        let mut g = guard();
+        g.record_spoken("alpha beta gamma delta", PhraseOrigin::ChatReply, 1_000);
+        g.record_spoken("abcdefghijklm", PhraseOrigin::Cached, 2_000);
+        let hit = g.check("Alpha, beta gamma delta!", 61_000);
+        assert_eq!(hit.repeat, Repeat::Exact);
+        assert_eq!(hit.origin, Some(PhraseOrigin::ChatReply));
+        assert_eq!(hit.age_ms, Some(60_000));
+        let near = g.check("abcdefghijklmn", 5_000);
+        assert_eq!(near.repeat, Repeat::Near);
+        assert_eq!(near.origin, Some(PhraseOrigin::Cached));
+        assert_eq!(near.age_ms, Some(3_000));
+        let miss = g.check("something else entirely", 5_000);
+        assert_eq!(
+            (miss.repeat, miss.origin, miss.age_ms),
+            (Repeat::None, None, None)
+        );
+    }
+
+    #[test]
+    fn exact_outranks_near_and_the_newest_match_is_named() {
+        let mut g = guard();
+        g.record_spoken("abcdefghijklm", PhraseOrigin::Cached, 1_000);
+        g.record_spoken("abcdefghijklmn", PhraseOrigin::ChatReply, 2_000);
+        // The newer entry is only near; the older exact one is named.
+        let hit = g.check("abcdefghijklm", 10_000);
+        assert_eq!(hit.repeat, Repeat::Exact);
+        assert_eq!(hit.origin, Some(PhraseOrigin::Cached));
+        assert_eq!(hit.age_ms, Some(9_000));
+        // Two exact entries: the staged (newest) one is named.
+        g.stage("abcdefghijklm", PhraseOrigin::Initiative, 4_000);
+        let hit = g.check("abcdefghijklm", 10_000);
+        assert_eq!(hit.origin, Some(PhraseOrigin::Initiative));
+        assert_eq!(hit.age_ms, Some(6_000));
+    }
+
+    #[test]
+    fn the_match_age_never_exceeds_the_window() {
+        let mut g = guard();
+        g.record_spoken("window phrase here", PhraseOrigin::Initiative, 0);
+        let edge = g.check("window phrase here", WINDOW_MS - 1);
+        assert_eq!(edge.age_ms, Some(WINDOW_MS - 1));
+        assert_eq!(
+            g.check("window phrase here", WINDOW_MS).repeat,
+            Repeat::None
+        );
+    }
+
+    #[test]
+    fn shown_means_contained_in_or_near_a_text_the_model_saw() {
+        let g = guard();
+        let shown = ["first line of it. second line of it.", "unrelated words"];
+        assert!(g.was_shown("Second line of it!", shown));
+        assert!(g.was_shown("unrelated words", shown));
+        assert!(!g.was_shown("never shown phrase", shown));
+        assert!(!g.was_shown("second line of it", []));
     }
 }
