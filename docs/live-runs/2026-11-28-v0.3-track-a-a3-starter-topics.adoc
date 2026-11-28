@@ -1,0 +1,143 @@
+= Live run record: v0.3 Track A run `a3` on `6f24a88` with the starter topic list (#551), 2026-11-28
+:toc:
+
+One more compatible run of the Track A 60-minute synthetic session for https://github.com/xmeta/aivtuber/issues/489[#489, v0.3 Watchable Hour], against `main` `6f24a8867263d7a0f24c37b1e8c34c22e1383af4`, which includes #552: `aivtuber-setup local` now seeds a starter `local-topics.txt` on a fresh install.
+Earlier records: link:2026-11-26-v0.3-track-a-c-evidence.adoc[`eval-a1`] (runtime `d01fdf4`) and link:2026-11-28-v0.3-track-a-rerun.adoc[`eval-a2`] (runtime `56db814`).
+The hypothesis under test (from #551): in `eval-a2`, `5` of `7` repeat refusals had `matched_shown=true`, so the missing topic list, not the repeat guard, caused the idle monotony.
+Raw transcripts, actor identifiers, tokens, control/avatar URLs and local filesystem paths are excluded; every number below is a count or a duration.
+
+== Decision summary
+
+* *Gate decision:* `NO-GO / incomplete`, unchanged. This is one run, not a calibrated SLO pass, and the host was not quiet (see <<Host conditions>>). The gate stays NO-GO until Track B (operator OBS + VRM + half-duplex mic + active stop/mute) and the #59 human quality review.
+* *The topics difference is the headline.* `eval-a1` and `eval-a2` ran with `initiative_topics=0`; `a3` ran with `initiative_topics count=24` (the seeded starter list, read from `status` before the feed). `a3` is therefore not directly comparable to `a1`/`a2` on initiative metrics (voiced, repeat refusals, silent fallbacks, spacing, quiet windows, initiative repeat rate). Chat-path metrics are comparable only as far as host load was similar, which it was not.
+* *Observed with topics:* `0` repeat refusals (`a2`: `7`), `0` silent fallbacks (`a1`/`a2`: `5`/`5`), every initiative voiced (`55` of `55`), no early re-fire needed, and the longest quiet-window silence fell to `60.7 / 61.7 / 62.3 s` (`a2`: `65.0 / 110.1 / 121.1 s`). This is consistent with the hypothesis. One run cannot establish it: the build and the host also differ from `a2`, and a no-topics run on the same build and host would be the controlling comparison.
+* *Not improved:* direct first-phrase latency was again slow and noisy (p50 `2,611 ms` against `1,577 ms` in `a1`), on a host whose free RAM was lower than in `a2`. The crowd route fired once again (`n=1`).
+* *Hard guardrails:* unchanged for what Track A can observe: no stop, no privilege escalation, `malformed=0`, `capped=false`, `truncated_read=false`, `0` provider failures, `0` generation fallbacks, clean exit. Operator stop/mute and visual sync remain not observed.
+
+== Identity and differences
+
+[cols="1,2,2,2"]
+|===
+|Field |`eval-a1` |`eval-a2` |`a3` (run id `eval-a3b`)
+
+|Runtime
+|`d01fdf4`
+|`56db814`
+|`6f24a886` (Release archives run `46088955105`, head SHA confirmed; Windows x64 zip SHA-256 checked against the workflow's `SHA256SUMS` before extraction; no public release)
+
+|Dataset
+3+|`watchable-hour-chat-v1`, 64 events, 3,600,000 ms. The manifest generated for the `eval-a1` label has SHA-256 `cb8f67a0f2c18afe67cc6d97f3376855d91755753cb9dc5e4ba61114ad21e266`, as before (a manifest generated for another run label embeds that label and hashes differently, so the check used the `eval-a1` label). The feed script is unchanged.
+
+|Topics
+|none (`initiative_topics=0`)
+|none (`0`)
+|24 starter topics seeded by `aivtuber-setup local` (`local-topics.txt` exists, `24` lines, counted only)
+
+|Profile
+3+|`local`: `gemma-4-e4b-it-qat` (`UD-Q4_K_XL`, Vulkan), Supertonic 3 int8, `voice_input=Off`, `thinking_remote=false`, persona absent, `memory_seed_entries=0`; avatar, OBS and chat ingress disconnected; no OBS, microphone or platform chat touched. Confirmed from `aivtuberctl status` before the feed.
+
+|Lead-in
+|`180 s`
+|`300 s`
+|`300 s`
+
+|Session log
+|`450` lines
+|`454` lines
+|`479` lines, `malformed=0`, `capped=false`, `truncated_read=false`; `log on` at `02:10:11Z`, before the feed
+|===
+
+The first `a3` attempt (run id `eval-a3`, launch `02:02:50Z`) was aborted before any event: `llama-server` was not healthy within the launcher's `180 s` on the freshly extracted install (cold model file, about `3 GiB` free RAM), so no session log existed. It produced no evidence and is not counted. The one retry used a fresh run id, `eval-a3b`: launcher start `02:06:58Z`, daemon ready about `02:10:05Z`, feed `02:11:55.677Z`-`03:11:55.797Z` (max emission lateness `22 ms`, `64` of `64` emitted), clean exit `03:12:07Z` (feed and launcher both `0`).
+The session log was switched off afterwards through the persisted setting, because the app exits on stdin EOF and `log off` is no longer possible by then.
+
+== Comparison
+
+[cols="3,2,2,2"]
+|===
+|Metric (whole session unless marked in-hour) |`a1` (no topics) |`a2` (no topics) |`a3` (24 topics)
+
+4+|*Input disposition (64 planned, 64 emitted, 64 admitted, 0 lost in each)*
+|Feed max emission lateness (ceiling `250 ms`) |`6 ms` |`75 ms` |`22 ms`
+|Voiced direct |`43` |`43` |`43`
+|Voiced deferred |`7` |`8` |`10`
+|Crowd voiced |`1` |`1` |`1`
+|Unvoiced |`13` |`12` |`10`
+
+4+|*First-phrase latency p50 / p95 / p99, logical accepted-audio, nearest-rank (ms)*
+|All (n) |`51`: `1,658` / `9,195` / `9,557` |`52`: `2,885` / `9,080` / `10,529` |`54`: `2,806` / `9,022` / `10,410`
+|Direct (n) |`43`: `1,577` / `2,140` / `2,593` |`43`: `2,751` / `4,534` / `6,176` |`43`: `2,611` / `4,675` / `10,410`
+|Deferred (n) |`7`: `8,565` / `9,557` / `9,557` |`8`: `6,742` / `10,529` / `10,529` |`10`: `6,563` / `9,617` / `9,617`
+|Crowd (n) |`1`: `6,243` |`1`: `9,080` |`1`: `4,071`
+
+4+|*Crowd timing (`crowd_routes=1` in each run, ms)*
+|`input_to_route_observation` |`1,507` |`1,509` |`1,508`
+|`route_observation_to_dispatch` |`3,175` |`6,019` |`1,005`
+|`dispatch_to_first_phrase` |`1,561` |`1,552` |`1,558`
+|`route_observation_to_first_phrase` |`4,736` |`7,571` |`2,563`
+
+4+|*Quiet windows, max silence between consecutive first phrases (s)*
+|`12:00-18:00` |`60.7` |`65.0` |`60.7`
+|`30:00-40:00` |`132.2` |`110.1` |`61.7`
+|`53:00-58:00` |`119.7` |`121.1` |`62.3`
+
+4+|*Initiative (not directly comparable: topics differ)*
+|Fired, whole session (pre-roll) |`56` (`3`) |`57` (`4`) |`55` (`2`)
+|Fired in the hour / voiced in the hour |`53` / `48` |`53` / `48` |`53` / `53`
+|Initiative phrases |`67` |`68` |`107`
+|Early re-fires / voiced |not present |`2` / `1` |`0` / n/a (no refusal preceded one)
+|Repeat-suppressed refusals |`8` |`7` |`0`
+|Silent `policy_override` fallbacks |`5` |`5` |`0`
+|`initiative_spacing_ms` (n; min / p50 / max) |`55`; `60,000` / `60,004` / `204,999` |`56`; `5,718` / `60,006` / `204,995` |`54`; `60,000` / `60,006` / `205,001`
+|Initiatives fired inside each quiet window (`12-18` / `30-40` / `53-58`) |not recorded |not recorded |`6` / `10` / `5`
+|Distinct starter topics used |n/a (none) |n/a (none) |`24` of `24`, derived (see <<Topics used>>)
+
+4+|*Repeats (exact / near)*
+|Chat (phrases) |`88`: `1` / `2` |`88`: `2` / `1` |`86`: `3` (rate `0.035`) / `0`
+|Initiative (phrases) |`67`: `0` / `0` |`68`: `0` / `0` |`107`: `0` / `0`
+|Cached (phrases) |`1`: `0` / `0` |`1`: `0` / `0` |`1`: `0` / `0`
+|Phrases total / fallbacks |`156` / `5` |`157` / `5` |`194` / `0`
+
+4+|*Health*
+|Provider failures / deadline timeouts / chat fallbacks |`0` / `0` / `0` |`0` / `0` / `0` |`0` / `0` / `0`
+|Clean exit; residual processes |feed `0`, launcher `0`; `0` |feed `0`, launcher `0`; `0` |feed `0`, launcher `0`; `0`
+|===
+
+Notes:
+
+* The `a1` and `a2` columns are the numbers in their published records. The `a3` direct p99 is the maximum of `43` observations (one `10,410 ms` outlier); p95/p99 for deferred (`10`) and crowd (`1`) are effectively the maximum. Latency is logical accepted-audio, not physical speaker onset; visible acknowledgement was not observed (avatar disconnected).
+* The `a3` deferred count excludes the crowd carrier, which took the deferred path (`11` raw path notes). `a3` p50/p95 reproduce `aivtuberctl log summary` built from `main` `6f24a886`; p99 is nearest-rank (`ceil(p * n)`) over the same per-turn observations.
+* Quiet-window rule as in the `a2` record: the longest gap between consecutive first phrases (any origin) intersecting the window, measured from the first synthetic chat input. The `a1` column is the number in its record, so a small method difference cannot be excluded.
+* Refusals by `matched_origin` / `matched_shown` / age: `0` refusals in `a3`, so there is nothing to break down (`a2`: `7`, all `initiative`, `5` shown, age p50 `179,017 ms`).
+
+== Topics used
+
+The `local-topics.txt` list holds `24` entries. The initiative rotates through the list one topic per fire with a recent-use skip, and `a3` fired `55` initiatives (more than `24`), each of which takes a topic. `24` of `24` distinct topics used is therefore derived from the code and the fire count, not read from the daemon: the `initiative_topics used=` counter was not sampled before the app exited on stdin EOF (a gap in this run; a future run should read `aivtuberctl status` shortly before the hour ends). The session log does not record which topic a turn used, and no transcript text is kept here.
+
+== Host conditions
+
+* Windows 11, NVIDIA GeForce RTX 2070 SUPER 8 GiB, 32 GiB RAM, local profile only.
+* Start of the retried run: free RAM about `2.9-3.1 GiB` (`a2`: `4.4-6.1 GiB`), CPU load about `35%`, GPU about `2.3 GiB` used by other processes at `0%` utilisation, no `cargo`/`rustc` running. The system drive had `1.6 GiB` free throughout; all downloads and temp files were kept on a non-system drive.
+* Resident applications observed (process counts): Brave `69`, ChatGPT `20`, Docker Desktop `4`, WSL `14`. None was stopped.
+* Memory pressure was worse than in `a2`. During the hour free RAM ranged `0.5-3.2 GiB` (minimum `528 MB`; `27` of the one-minute samples below `1.2 GiB`), against about `2.4-3.6 GiB` in `a2`. The `llama-server` working set again fell from its peak (`3,576 MB`) to about `1.0 GiB`, consistent with pages evicted by the OS. This alone can inflate direct latency (such as the `10.4 s` direct outlier); it was not isolated as the cause.
+
+== Resource trend (`61` one-minute samples including the lead-in)
+
+* `aivtuber-app` working set: `12 MB` (ready) to `9 MB` (end), peak `14 MB`; bounded.
+* `llama-server` working set: `3,134 MB` (ready), peak `3,576 MB`, end `1,122 MB`.
+* `local-tts-sidecar` working set: `192 MB` (ready) to `249 MB` (end), peak `307 MB`.
+* GPU VRAM (whole device): `2,259 MiB` (pre-start), `4,968 MiB` (ready), `5,334 MiB` (end and peak), `2,530 MiB` after exit. No growth beyond the stack's own share of about `3 GiB`.
+* Free RAM: `974 MB` at ready, minimum `528 MB`, end `1,250 MB`.
+
+== What this run does and does not show
+
+* With a topic list the idle initiative produced no repeat refusals, no silent fallbacks, and a maximum silence of about `60-62 s` in each of the three quiet windows. This supports the #551 hypothesis that missing topics caused the monotony seen in `a1`/`a2`, but it is one run, it changes two things relative to `a2` (topics and build), and it does not measure how varied the speech sounds: topic variety and semantic repetition still need the #59 human review. The session log is retained outside Git for that review.
+* The `a3` initiative did not need #545's early re-fire, so that path was not exercised.
+* Chat-path latency did not improve. Direct and deferred latency stayed noisier than `a1` on a loaded host. The crowd route (`n=1`) was faster than in `a2`, which is not a finding at `n=1` with different host load.
+* Chat exact repeats were `3` (rate `0.035`), the highest of the three runs; with `86` phrases this is not distinguishable from noise and is referred to the #59 review.
+
+== Remaining items for `#489` GO
+
+. Owner executes *Track B* (15-minute isolated OBS + VRM + half-duplex mic + read-only chat + active mid-speech `stop`, `mute`, clean shutdown).
+. Owner completes the *#59 human quality review* on the retained local Track A logs, including topic variety for `a3`.
+. Optionally repeat Track A with topics on a quieter host (free RAM above `4 GiB`) and read the `initiative_topics` counter before exit, to separate host effects from code on direct latency.
+. Record the final GO/NO-GO decision on `#489` / `#79` from the combined evidence. Until then: `NO-GO / incomplete`.
