@@ -124,6 +124,15 @@ pub struct Record {
     pub members: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actors: Option<u32>,
+    /// `initiative_repeat_suppressed` notes (#547): the origin of the phrase
+    /// the refusal matched, its logical age, and whether the request showed
+    /// the model that phrase. No text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_age_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_shown: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -574,6 +583,38 @@ impl SessionLog {
     }
 }
 
+impl SessionLog {
+    /// An initiative phrase refused as a repeat (#547): `repeat` is `exact` or
+    /// `near`; the rest says which earlier phrase it matched. Fixed
+    /// vocabulary, a logical age and a flag: never the phrase.
+    pub fn note_repeat_refusal(
+        &mut self,
+        event_id: &str,
+        repeat: &str,
+        matched_origin: &str,
+        matched_age_ms: u64,
+        matched_shown: bool,
+        logical_ms: u64,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let index = self.turn_index(event_id, "chat");
+        let turn = self.turns[index].id.clone();
+        self.emit(Record {
+            t: "note".to_owned(),
+            turn: Some(turn),
+            logical_ms: Some(logical_ms),
+            kind: Some("initiative_repeat_suppressed".to_owned()),
+            fallback: Some(cut_chars(repeat, 48)),
+            matched_origin: Some(cut_chars(matched_origin, 24)),
+            matched_age_ms: Some(matched_age_ms),
+            matched_shown: Some(matched_shown),
+            ..Record::default()
+        });
+    }
+}
+
 struct Writer {
     dir: PathBuf,
     file_name: String,
@@ -977,6 +1018,14 @@ pub struct SessionSummary {
     /// Logical milliseconds between consecutive initiative turns.
     pub initiative_spacing_ms: Vec<u64>,
     pub fallbacks: u64,
+    /// Initiative repeat refusals (#547), counted by the matched phrase's
+    /// origin and by whether the model was shown it. A note from before the
+    /// fields existed counts as `unknown`.
+    pub repeat_refusals: u64,
+    pub repeat_refusals_by_origin: Vec<(String, u64)>,
+    pub repeat_refusals_by_shown: Vec<(String, u64)>,
+    /// Sorted logical ages of the matched phrases.
+    pub repeat_refusal_age_ms: Vec<u64>,
 }
 
 fn bump(list: &mut Vec<(String, u64)>, key: &str) {
@@ -1163,6 +1212,24 @@ pub fn summarize(reader: impl BufRead) -> SessionSummary {
                     });
                 }
             }
+            "note" if record.kind.as_deref() == Some("initiative_repeat_suppressed") => {
+                summary.repeat_refusals += 1;
+                bump(
+                    &mut summary.repeat_refusals_by_origin,
+                    record.matched_origin.as_deref().unwrap_or("unknown"),
+                );
+                bump(
+                    &mut summary.repeat_refusals_by_shown,
+                    match record.matched_shown {
+                        Some(true) => "true",
+                        Some(false) => "false",
+                        None => "unknown",
+                    },
+                );
+                if let Some(age) = record.matched_age_ms {
+                    summary.repeat_refusal_age_ms.push(age);
+                }
+            }
             "note" if record.kind.as_deref() == Some("path") => {
                 if record.fallback.as_deref() == Some("deferred")
                     && let Some(turn) = record.turn.clone()
@@ -1210,6 +1277,9 @@ pub fn summarize(reader: impl BufRead) -> SessionSummary {
     summary.first_audio_deferred_ms.sort_unstable();
     summary.first_audio_crowd_ms.sort_unstable();
     summary.initiative_spacing_ms.sort_unstable();
+    summary.repeat_refusal_age_ms.sort_unstable();
+    summary.repeat_refusals_by_origin.sort();
+    summary.repeat_refusals_by_shown.sort();
     summary.turns.sort();
     summary.repeats.sort_by(|a, b| a.origin.cmp(&b.origin));
     summary
@@ -1254,6 +1324,25 @@ pub fn render_summary(summary: &SessionSummary) -> String {
             entry.near,
             rate(entry.exact, entry.phrases),
             rate(entry.near, entry.phrases),
+        ));
+    }
+    out.push_str(&format!(
+        "repeat_refused total={} age_ms_p50={} age_ms_max={}
+",
+        summary.repeat_refusals,
+        opt(percentile(&summary.repeat_refusal_age_ms, 50)),
+        opt(summary.repeat_refusal_age_ms.last().copied()),
+    ));
+    for (origin, count) in &summary.repeat_refusals_by_origin {
+        out.push_str(&format!(
+            "repeat_refused matched_origin={origin} count={count}
+"
+        ));
+    }
+    for (shown, count) in &summary.repeat_refusals_by_shown {
+        out.push_str(&format!(
+            "repeat_refused matched_shown={shown} count={count}
+"
         ));
     }
     out.push_str(&format!(
@@ -1527,6 +1616,45 @@ mod tests {
             render_summary(&summary)
                 .contains("stage=route_observation_to_first_phrase count=0 routes=6 p50=n/a")
         );
+    }
+
+    #[test]
+    fn repeat_refusals_are_counted_by_matched_origin_and_shown() {
+        let lines = [
+            r#"{"v":1,"t":"note","seq":1,"turn":"a","logical_ms":1,"kind":"initiative_repeat_suppressed","fallback":"exact","matched_origin":"initiative","matched_age_ms":600,"matched_shown":true}"#,
+            r#"{"v":1,"t":"note","seq":2,"turn":"b","logical_ms":2,"kind":"initiative_repeat_suppressed","fallback":"near","matched_origin":"chat_reply","matched_age_ms":9000,"matched_shown":false}"#,
+            r#"{"v":1,"t":"note","seq":3,"turn":"c","logical_ms":3,"kind":"initiative_repeat_suppressed","fallback":"exact"}"#,
+        ];
+        let summary = summarize(
+            lines
+                .join(
+                    "
+",
+                )
+                .as_bytes(),
+        );
+        assert_eq!(summary.repeat_refusals, 3);
+        assert_eq!(
+            summary.repeat_refusals_by_origin,
+            vec![
+                ("chat_reply".to_owned(), 1),
+                ("initiative".to_owned(), 1),
+                ("unknown".to_owned(), 1)
+            ]
+        );
+        assert_eq!(
+            summary.repeat_refusals_by_shown,
+            vec![
+                ("false".to_owned(), 1),
+                ("true".to_owned(), 1),
+                ("unknown".to_owned(), 1)
+            ]
+        );
+        assert_eq!(summary.repeat_refusal_age_ms, vec![600, 9000]);
+        let out = render_summary(&summary);
+        assert!(out.contains("repeat_refused total=3 age_ms_p50=600 age_ms_max=9000"));
+        assert!(out.contains("repeat_refused matched_origin=chat_reply count=1"));
+        assert!(out.contains("repeat_refused matched_shown=unknown count=1"));
     }
 
     #[test]

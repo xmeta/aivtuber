@@ -322,6 +322,10 @@ const SESSION_LOG_SETTINGS_VAR: &str = "AIVTUBER_SESSION_LOG_SETTINGS";
 /// own loader test validates, so it cannot drift from the seed contract.
 const EMPTY_MEMORY_SEED: &str =
     include_str!("../../../examples/memory-seeds/valid/local-empty.json");
+/// The reviewed starter list (#551) written to [`TOPICS_FILE`] when none exists,
+/// so idle initiatives are not monotone on a fresh install. The release archive
+/// carries the same file; a test pins that it parses with `parse_topics`.
+const STARTER_TOPICS: &str = include_str!("../../../packaging/starter-topics.txt");
 /// Directory beside the env file that holds the models uploaded in the panel
 /// (#362), named by content hash, at most a few. The app owns it; no file name
 /// or path ever comes from a client.
@@ -782,6 +786,36 @@ pub fn ensure_memory_seed_file(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Seeds `path` with the starter topic list unless something is already there
+/// (#551). An existing file, even an empty one the operator cleared, is never
+/// touched. The content is written to a temp file and hard-linked into place, so
+/// the final name never holds half a list and never replaces a file.
+pub fn ensure_starter_topics_file(path: &Path) -> std::io::Result<bool> {
+    use std::io::Write as _;
+    if path.exists() {
+        return Ok(false);
+    }
+    let mut name = path.file_name().unwrap_or_default().to_owned();
+    name.push(".starter.tmp");
+    let temp = path.with_file_name(name);
+    let _ = std::fs::remove_file(&temp);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
+    let written = file
+        .write_all(STARTER_TOPICS.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    let linked = written.and_then(|()| std::fs::hard_link(&temp, path));
+    let _ = std::fs::remove_file(&temp);
+    match linked {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 /// Replaces the state file with the on/off document (temp file in the same
 /// directory, then rename, so a crash leaves the old or the new file, never
 /// half of one). Same pattern as the app's own settings writers. The device
@@ -896,6 +930,10 @@ pub fn start(opts: &StartOptions) -> Result<i32, String> {
     let persona_vars = app_persona_env(&opts.env_file, &env, &|name| std::env::var(name).ok());
     env.extend(persona_vars);
     let topics_vars = app_topics_env(&opts.env_file, &env, &|name| std::env::var(name).ok());
+    for (_, path) in &topics_vars {
+        ensure_starter_topics_file(Path::new(path))
+            .map_err(|e| format!("cannot create {path}: {e}"))?;
+    }
     env.extend(topics_vars);
     let seed_vars = app_memory_seed_env(&opts.env_file, &env, &|name| std::env::var(name).ok());
     for (_, path) in &seed_vars {
@@ -1485,9 +1523,45 @@ mod tests {
     }
 
     #[test]
+    fn the_starter_topics_are_a_valid_list_and_seed_only_a_missing_file() {
+        use aivtuber_domain::{MAX_TOPIC_CHARS, MAX_TOPICS, parse_topics};
+        let list = parse_topics(STARTER_TOPICS.as_bytes()).expect("starter list parses");
+        assert!(
+            list.len() >= 20 && list.len() <= MAX_TOPICS,
+            "{}",
+            list.len()
+        );
+        // parse_topics drops blanks and repeats; nothing may have been lost.
+        let lines = STARTER_TOPICS.lines().filter(|l| !l.trim().is_empty());
+        assert_eq!(lines.count(), list.len());
+        assert!(
+            list.entries()
+                .iter()
+                .all(|t| t.chars().count() <= MAX_TOPIC_CHARS)
+        );
+
+        let dir = crate::test_dir::TestDir::named("aivtuber-starter-topics");
+        let path = dir.join(TOPICS_FILE);
+        let _ = std::fs::remove_file(&path);
+        assert!(ensure_starter_topics_file(&path).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), STARTER_TOPICS);
+        assert!(!dir.join("local-topics.txt.starter.tmp").exists());
+        // The operator's file is left byte-identical: edited, or cleared empty.
+        for mine in [
+            "my own topic
+",
+            "",
+        ] {
+            std::fs::write(&path, mine).unwrap();
+            assert!(!ensure_starter_topics_file(&path).unwrap());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), mine);
+        }
+        assert!(ensure_starter_topics_file(&dir.join("missing").join("t.txt")).is_err());
+    }
+
+    #[test]
     fn the_empty_seed_is_created_only_when_absent_and_never_overwrites() {
-        let dir = std::env::temp_dir().join(format!("aivtuber-seed-setup-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::test_dir::TestDir::named("aivtuber-seed-setup");
         let path = dir.join(MEMORY_SEED_FILE);
         let _ = std::fs::remove_file(&path);
         ensure_memory_seed_file(&path).unwrap();
@@ -1734,10 +1808,8 @@ mod tests {
         .unwrap()
     }
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("aivtuber-start-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn temp_dir(tag: &str) -> crate::test_dir::TestDir {
+        crate::test_dir::TestDir::named(&format!("aivtuber-start-{tag}"))
     }
 
     #[test]

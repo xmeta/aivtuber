@@ -1302,6 +1302,8 @@ where
     initiative_sequence: u64,
     /// The pending initiative's reply fell back to the idle gesture.
     initiative_fell: bool,
+    /// The pending initiative's text refused as a repeat (#541); bounded.
+    initiative_refused_text: Option<String>,
     /// Live editing of the operator topic list (#87 S2); `None` = not composed.
     topics_editor: Option<topics::TopicsEditor>,
     /// #79 S2: the crowd summary for the one reply being dispatched right now.
@@ -1400,6 +1402,7 @@ where
             recent_turns: None,
             initiative_sequence: 0,
             initiative_fell: false,
+            initiative_refused_text: None,
             topics_editor: None,
             crowd_context: None,
             speech_feed_heartbeat_ms: None,
@@ -5041,7 +5044,11 @@ where
                     return self.play_fallback_directive(event, fallback, trace, at_ms, seed);
                 }
                 if self.is_initiative_event(event) {
-                    self.repeat_guard.stage(&generated_text, at_ms);
+                    self.repeat_guard.stage(
+                        &generated_text,
+                        repeat_guard::PhraseOrigin::Initiative,
+                        at_ms,
+                    );
                 }
 
                 let asset_id = asset.id.clone();
@@ -6051,35 +6058,42 @@ where
         if !self.is_initiative_event(event) {
             return false;
         }
-        let repeat = self.repeat_guard.check(text, now_ms);
+        let matched = self.repeat_guard.check(text, now_ms);
+        let repeat = matched.repeat;
         if repeat == repeat_guard::Repeat::None {
             return false;
         }
         self.repeat_guard.note_suppressed_repeat();
+        let verdict = if repeat == repeat_guard::Repeat::Exact {
+            "exact"
+        } else {
+            "near"
+        };
+        // #547: which earlier phrase it matched, and whether the request
+        // showed the model that phrase. Origin, logical age and a flag only.
+        let origin = matched
+            .origin
+            .map_or("unknown", repeat_guard::PhraseOrigin::name);
+        let age_ms = matched.age_ms.unwrap_or(0);
+        let shown = self.repeat_guard.was_shown(
+            text,
+            self.initiative
+                .as_ref()
+                .into_iter()
+                .flat_map(|director| director.recent_texts()),
+        );
         let record = self.security.redactor_record(
             Some(&event.event_id),
             aivtuber_telemetry::AuditCategory::Generation,
             "initiative_repeat_suppressed",
             format!(
-                "repeat={}",
-                if repeat == repeat_guard::Repeat::Exact {
-                    "exact"
-                } else {
-                    "near"
-                }
+                "repeat={verdict} matched_origin={origin} matched_age_ms={age_ms} matched_shown={shown}"
             ),
         );
         self.security.push_external_audit(record);
-        self.session_log_note(
-            &event.event_id,
-            "initiative_repeat_suppressed",
-            if repeat == repeat_guard::Repeat::Exact {
-                "exact"
-            } else {
-                "near"
-            },
-            now_ms,
-        );
+        self.initiative_refused_text =
+            Some(text.chars().take(initiative::TEXT_MAX_CHARS).collect());
+        self.session_log_repeat_refusal(&event.event_id, verdict, (origin, age_ms, shown), now_ms);
         true
     }
 
@@ -6636,5 +6650,7 @@ fn command_is_live(
     command_not_cancelled(scheduler, generation, command_at_ms)
 }
 
+#[cfg(test)]
+mod test_dir;
 #[cfg(test)]
 mod tests;

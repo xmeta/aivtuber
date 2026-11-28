@@ -21,6 +21,8 @@ struct InitiativeThinking {
     fail_initiative: Option<EngineErrorKind>,
     /// Say something different each time (the default repeats one phrase).
     distinct: bool,
+    /// Initiative replies by call number (wraps); overrides `distinct`.
+    script: Vec<&'static str>,
     calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -44,6 +46,7 @@ impl ThinkingEngine for InitiativeThinking {
         let initiative = request.context.initiative.is_some();
         let call = self.calls.fetch_add(1, Ordering::Relaxed);
         let distinct = self.distinct;
+        let script = self.script.clone();
         Box::pin(async move {
             if initiative {
                 if let Some(kind) = self.fail_initiative {
@@ -59,7 +62,9 @@ impl ThinkingEngine for InitiativeThinking {
                 }
             }
             Ok(GeneratedReply {
-                text: if initiative && distinct {
+                text: if initiative && !script.is_empty() {
+                    script[call % script.len()].to_owned()
+                } else if initiative && distinct {
                     DISTINCT_PHRASES[call % DISTINCT_PHRASES.len()].to_owned()
                 } else if initiative {
                     "最近どう過ごしてる？".to_owned()
@@ -763,6 +768,81 @@ fn a_repeated_initiative_phrase_is_refused_and_falls_back_to_the_gesture() {
     assert_eq!((repeats.phrases_spoken, repeats.exact_repeats), (1, 0));
 }
 
+fn scripted_rig(script: &[&'static str]) -> Rig {
+    rig_with(
+        InitiativeThinking {
+            script: script.to_vec(),
+            ..InitiativeThinking::default()
+        },
+        InitiativeConfig::default(),
+    )
+}
+
+/// Run one initiative at `at_ms`, then let it finish and settle 5 s later.
+fn run_and_settle(rig: &mut Rig, at_ms: u64) {
+    step(rig, at_ms);
+    rig.app.tick(at_ms + 5_000);
+    rig.app.service_initiative(at_ms + 5_000, at_ms);
+}
+
+#[test]
+fn a_silent_repeat_refusal_is_followed_by_a_voiced_replacement_soon() {
+    let mut rig = scripted_rig(&["同じ一言", "同じ一言", "別の一言"]);
+    run_and_settle(&mut rig, 45_000);
+    run_and_settle(&mut rig, 115_000);
+    let status = rig.app.initiative_status().expect("status");
+    assert_eq!((status.fired, status.completed, status.failed), (2, 1, 1));
+    assert_eq!(rig.app.repeat_status().suppressed_repeat, 1);
+    // The refusal settled at 120 s. Before the short gap nothing fires.
+    rig.app.service_initiative(120_000 + 4_999, 1);
+    assert_eq!(rig.app.initiative_status().expect("status").fired, 2);
+    // Then the replacement fires, well before the normal gap (175 s).
+    run_and_settle(&mut rig, 125_000);
+    let status = rig.app.initiative_status().expect("status");
+    assert_eq!((status.fired, status.completed, status.failed), (3, 2, 1));
+    let requests = initiative_requests(&rig.thinking);
+    assert_eq!(requests.len(), 3);
+    let avoided = requests[2]
+        .curated_context
+        .iter()
+        .filter(|item| item.text.starts_with("recent_initiative:"))
+        .count();
+    assert_eq!(avoided, 1, "the refused text is asked to be avoided, once");
+}
+
+#[test]
+fn a_refused_replacement_waits_the_normal_gap() {
+    let mut rig = scripted_rig(&["同じ一言", "同じ一言", "同じ一言", "別の一言"]);
+    run_and_settle(&mut rig, 45_000);
+    run_and_settle(&mut rig, 115_000);
+    run_and_settle(&mut rig, 125_000);
+    let status = rig.app.initiative_status().expect("status");
+    assert_eq!((status.fired, status.failed), (3, 2));
+    // No chain: the normal gap runs from the replacement's fire at 125 s.
+    rig.app.service_initiative(130_000 + 10_000, 1);
+    rig.app.service_initiative(185_000 - 1, 1);
+    assert_eq!(rig.app.initiative_status().expect("status").fired, 3);
+    run_and_settle(&mut rig, 185_000);
+    let status = rig.app.initiative_status().expect("status");
+    assert_eq!((status.fired, status.completed), (4, 2));
+}
+
+#[test]
+fn a_backend_failure_still_waits_the_normal_gap() {
+    let mut rig = rig_with(
+        InitiativeThinking {
+            fail_initiative: Some(EngineErrorKind::Unavailable),
+            ..InitiativeThinking::default()
+        },
+        InitiativeConfig::default(),
+    );
+    run_and_settle(&mut rig, 45_000);
+    rig.app.service_initiative(60_000, 1);
+    rig.app.service_initiative(104_999, 1);
+    let status = rig.app.initiative_status().expect("status");
+    assert_eq!((status.fired, status.failed), (1, 1));
+}
+
 #[test]
 fn chat_replies_are_measured_but_never_refused_for_repeating() {
     let mut rig = rig();
@@ -860,12 +940,7 @@ mod topics {
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "aivtuber-topics-live-{}-{name}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("dir");
-        dir
+        crate::test_dir::scratch_for_test_thread(&format!("aivtuber-topics-live-{name}"))
     }
 
     #[test]

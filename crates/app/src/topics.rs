@@ -142,8 +142,7 @@ mod tests {
     use super::*;
 
     fn write(name: &str, bytes: &[u8]) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("aivtuber-topics-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
+        let dir = crate::test_dir::scratch_for_test_thread("aivtuber-topics");
         let path = dir.join(name);
         std::fs::write(&path, bytes).expect("write");
         path
