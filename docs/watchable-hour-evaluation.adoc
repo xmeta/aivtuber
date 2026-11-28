@@ -70,6 +70,7 @@ Do not redirect terminal output into a committed file: startup can print private
 Before the measurement, use the operation panel to opt in to session logging and verify the local avatar is connected. See link:local-profile-quickstart.adoc[local quickstart] and link:production-runtime.adoc[session conversation log].
 Keep the microphone off and real chat disconnected in A, including all quiet windows.
 If an operator cannot confirm readiness and logging before the first event, mark the run incomplete.
+Record whether starter chat topics were present: `aivtuber-setup local` seeds `local-topics.txt` on a fresh install (#551), while the first two Track A runs (eval-a1, eval-a2) had no topic list. Runs with and without topics are not directly comparable for idle-initiative repetition.
 No auto-start, account connection or logging enable is performed by the feed.
 
 == B. Operator observations

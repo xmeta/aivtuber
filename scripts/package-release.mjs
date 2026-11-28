@@ -213,6 +213,10 @@ function main() {
     mkdirSync(join(stage, "examples", "persona"), { recursive: true });
     cpSync(join(repo, "examples", "persona", "starter.ja.md"), join(stage, "examples", "persona", "starter.ja.md"));
 
+    // 4c. The starter chat topics (#551). `aivtuber-setup` embeds the same file
+    // and seeds local-topics.txt from it; the copy lets the streamer read it.
+    cpSync(join(repo, "packaging", "starter-topics.txt"), join(stage, "examples", "persona", "starter-topics.txt"));
+
     // 5. Licences and notices.
     if (existsSync(join(repo, "LICENSE"))) cpSync(join(repo, "LICENSE"), join(stage, "LICENSE"));
     cpSync(rustNotices, join(stage, "THIRD-PARTY-LICENSES-RUST.html"));
