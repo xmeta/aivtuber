@@ -529,6 +529,11 @@ impl BurstMetrics {
         self.terminal.iter().sum()
     }
 
+    /// Comments answered without waiting (`QuietPassthrough`).
+    pub fn quiet_passthrough(&self) -> u64 {
+        self.terminal[1]
+    }
+
     /// Ranker (Jev) calls per admitted comment. A per-comment design is 1.0.
     pub fn ranker_calls_per_comment(&self) -> f64 {
         if self.admitted == 0 {

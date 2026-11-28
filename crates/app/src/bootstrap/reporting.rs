@@ -32,6 +32,7 @@ pub(crate) fn report_generation_fallbacks(
 pub(crate) fn report_chat_burst<R: aivtuber_app::RoutePlanner>(
     app: &mut aivtuber_app::ProductionApp<R>,
     last_accounted: &mut u64,
+    last_crowd: &mut [u64; 7],
 ) {
     for report in app.take_deferred_reply_reports(16) {
         eprintln!(
@@ -68,6 +69,17 @@ pub(crate) fn report_chat_burst<R: aivtuber_app::RoutePlanner>(
     let Some(metrics) = app.chat_burst_metrics() else {
         return;
     };
+    // #79: one line that separates why a wave did or did not become a crowd
+    // reaction. Cumulative session counters, printed whenever any of them
+    // moves; nothing is counted here.
+    let crowd = metrics.crowd_diagnostic();
+    if crowd != *last_crowd {
+        *last_crowd = crowd;
+        eprintln!(
+            "chat_burst: crowd quiet_passthrough={} batched={} below_threshold={} routed={} voiced={} unvoiced={} cooldown_suppressed={}",
+            crowd[0], crowd[1], crowd[2], crowd[3], crowd[4], crowd[5], crowd[6]
+        );
+    }
     let accounted = metrics.accounted();
     if accounted == *last_accounted {
         return;

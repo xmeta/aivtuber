@@ -1090,6 +1090,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     let mut last_speech_stats = SpeechSidecarStats::default();
     let mut last_chat_burst_accounted = 0_u64;
+    let mut last_chat_burst_crowd = [0_u64; 7];
     let mut last_generation_fallbacks = GenerationFallbackCounts::default();
     let mut sequence_seed = 0_u64;
     let mut next_maintenance_ms = 0_u64;
@@ -1334,7 +1335,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         if chat_burst_enabled {
             sequence_seed = sequence_seed.saturating_add(32);
             app.service_chat_burst(now_ms, sequence_seed);
-            report_chat_burst(&mut app, &mut last_chat_burst_accounted);
+            report_chat_burst(
+                &mut app,
+                &mut last_chat_burst_accounted,
+                &mut last_chat_burst_crowd,
+            );
         }
         // #87: after chat and speech were served, so arrivals this turn have
         // already restarted the idle clock. Never blocks.

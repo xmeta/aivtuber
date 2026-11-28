@@ -110,6 +110,8 @@ For crowd timing (#494), use the additional `crowd_timing_ms` summary lines and 
 * `dispatch_to_first_phrase`: dispatch note to the first recorded phrase (includes any subsequent scheduling/generation/output delay).
 * `route_observation_to_first_phrase`: the interval closest to the earlier #79 routing-to-audio objective, still only logical time and recorded output, not acoustic or visible onset.
 
+Before an hour run, the checked-in deterministic replay `examples/crowd-routing/timing-scenario.json` exercises the same stages offline: `cargo test -p aivtuber-app --locked --lib deterministic_timing_scenario_reports_crowd_stage_distributions -- --nocapture` replays the production lane, prints the offline summary and writes the per-route stages to `target/crowd-routing-timing/` (see link:live-runs/2026-11-27-crowd-timing-replay.adoc[the replay record]). It is a logical-time instrument for before/after comparison and is not representative-hour evidence.
+
 The existing `first_audio_ms path=crowd` remains carrier-input-to-first-phrase, not route-to-phrase. Do not compare it directly to the 3.5 s target.
 Each new stage reports its own eligible count and total observed crowd routes; missing endpoints, ambiguous observations or reversed timestamps are not zero-duration samples.
 An unvoiced route can contribute an observed input-to-route interval but cannot contribute first-phrase timing.
