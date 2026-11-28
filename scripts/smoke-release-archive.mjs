@@ -228,6 +228,12 @@ try {
     assert(template.includes("名前") && template.length < 3000, "starter.ja.md is not the template");
   });
 
+  check("the starter chat topics ship and are within the topic limits", () => {
+    const lines = readFileSync(join(root, "examples", "persona", "starter-topics.txt"), "utf8").split(/\r?\n/).filter((l) => l.trim());
+    assert(lines.length >= 20 && lines.length <= 32, `${lines.length} starter topics`);
+    assert(lines.every((l) => [...l].length <= 80), "a starter topic is over 80 characters");
+  });
+
   check("no model weights, voice files or avatar models are bundled", () => {
     const hits = [];
     const walk = (dir) => {

@@ -731,6 +731,17 @@ pub fn run<W: Write>(
             )),
         }
         summary.env = Some(outcome);
+        // #551: a fresh install gets a starter chat-topic list; an existing
+        // file (even an emptied one) is the operator's and is left alone.
+        let topics = opts.env_file.with_file_name(crate::start::TOPICS_FILE);
+        match crate::start::ensure_starter_topics_file(&topics) {
+            Ok(true) => ctx.say(format!(
+                "  wrote     {} (starter chat topics; edit them in the panel, or empty the file to turn them off)",
+                topics.display()
+            )),
+            Ok(false) => {}
+            Err(e) => return Err(format!("cannot create {}: {e}", topics.display())),
+        }
     }
 
     // Duties and start command
